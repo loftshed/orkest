@@ -79,6 +79,16 @@ class TaskTests(unittest.TestCase):
         self.assertFalse((self.base / "inbox").exists())
         self.assertFalse((self.base / "wakes").exists())
 
+    def test_expired_sessions_do_not_leave_individual_lock_files(self):
+        for number in range(20):
+            tasks.save(self.base, self.owner | {"session": f"author-{number}"}, next="Review")
+        self.assertEqual(len(tasks.listing(self.base, self.reader, limit=50)["tasks"]), 20)
+        with patch.object(mailbox, "now", return_value=mailbox.now() + dt.timedelta(days=31)):
+            tasks.prune(self.base)
+        tasks.save(self.base, self.owner, next="Fresh checkpoint")
+        self.assertEqual([n["next"] for n in tasks.listing(self.base, self.reader)["tasks"]], ["Fresh checkpoint"])
+        self.assertEqual(len(list((self.base / "tasks").rglob("*.lock"))), 1)
+
 
 class TaskInterfaceTests(unittest.TestCase):
     def test_focus_and_tasks_work_through_mcp_after_the_author_leaves(self):

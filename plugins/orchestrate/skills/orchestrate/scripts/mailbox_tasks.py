@@ -55,7 +55,8 @@ def save(base: Path, peer: dict[str, Any], **details: Any) -> dict[str, Any]:
     if not task:
         raise mailbox.MailboxError("set a task focus before saving a work note")
     path = path_for(base, peer)
-    with mailbox.locked(path):
+    # One stable lock avoids leaving a permanent lock file for every expired session.
+    with mailbox.locked(base / "tasks" / "store"):
         previous = mailbox.load(path)
         kept = (
             {key: previous[key] for key in (*LIMITS, "status") if key in previous}
@@ -74,13 +75,12 @@ def save(base: Path, peer: dict[str, Any], **details: Any) -> dict[str, Any]:
             **details,
         }
         mailbox.write(path, note)
-    prune(base)
     return note
 
 
 def prune(base: Path) -> None:
-    for path in (base / "tasks").glob("*/*.json"):
-        with mailbox.locked(path):
+    with mailbox.locked(base / "tasks" / "store"):
+        for path in (base / "tasks").glob("*/*.json"):
             if not fresh(mailbox.load(path)):
                 path.unlink(missing_ok=True)
 

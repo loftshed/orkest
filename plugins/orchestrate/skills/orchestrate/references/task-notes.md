@@ -15,6 +15,7 @@ Use `focus` at task start and update it at meaningful checkpoints with optional 
 The task title is limited to 200 characters. Owner, checkout, branch and update time are recorded
 automatically. Keep the title stable while updating progress. Changing it starts a fresh card and clears
 the old details. Omitted fields stay as they were for the same title; an empty string clears a field.
+A blank or whitespace-only task title is rejected, including through the CLI.
 
 ```text
 focus(text="Repair export", done="Serializer fixed; 6 focused tests pass",
@@ -28,7 +29,7 @@ resuming or coordinating. They are not inserted into every hook or sent as messa
 not wake anyone. Lists are paginated and project-scoped unless `scope="cross-project"` is explicit.
 
 Each session keeps only its latest card per project, replacing prior text. Notes expire 30 days after
-their last update. An absent owner is shown as “not present”, never automatically marked complete or
+their last update and are removed by `mailbox prune`. An absent owner is shown as “not present”, never automatically marked complete or
 available for takeover. Before continuing, verify the checkout, commit, dirty files and current
 ownership. Use the existing team handover rules when the task is managed by a coordinator.
 
