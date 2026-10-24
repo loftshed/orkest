@@ -59,10 +59,25 @@ SCOPE_INPUT = {
 TOOLS = [
     {
         "name": "board",
-        "description": "The shared project work entry point: interactive items, read-only coordinator records and legacy recovery notes in one bounded view. Pass item for one record; otherwise page with limit/offset. Follow source and route: work mutates interactive items; coordinator state stays in its backend. Read at task boundaries, not by polling. Claims do not protect files or grant user approval.",
+        "description": "The shared project work entry point: interactive items, read-only coordinator records and legacy recovery notes in one bounded view. Pass item for one record; otherwise page with limit/offset. Follow source and route: work mutates interactive items; coordinator state stays in its backend. Use view=status for a compact agent/work update, optionally filtered by agent or channel. Read at task boundaries; local CLI status waits can observe changes without model polling. Claims do not protect files or grant user approval.",
         "inputSchema": {
             "type": "object",
-            "properties": {"item": {"type": "string", "minLength": 1, "maxLength": 128}},
+            "properties": {
+                "item": {"type": "string", "minLength": 1, "maxLength": 128},
+                "view": {"type": "string", "enum": ["work", "status"], "default": "work"},
+                "agent": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200,
+                    "description": "Status view: stable session ID or full name.",
+                },
+                "channel": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200,
+                    "description": "Status view: task-channel members and their associated work.",
+                },
+            },
             "additionalProperties": False,
         },
     },
@@ -439,6 +454,33 @@ WORK_SOURCE_OUTPUT = object_schema(
 )
 WORK_ITEM_OUTPUT = {"anyOf": [WORK_INTERACTIVE_OUTPUT, WORK_SOURCE_OUTPUT]}
 
+STATUS_AGENT_OUTPUT = object_schema(
+    {key: {"type": "string"} for key in ("session", "name", "harness", "state", "presence", "focus", "lastSeenAt")}
+)
+STATUS_ITEM_OUTPUT = object_schema(
+    {
+        **{
+            key: {"type": "string"}
+            for key in (
+                "id",
+                "title",
+                "source",
+                "updatedAt",
+                "state",
+                "next",
+                "blocker",
+                "evidence",
+                "verification",
+                "done",
+                "note",
+            )
+        },
+        **{key: {"anyOf": [{"type": "string"}, {"type": "null"}]} for key in ("owner", "integrator", "recoveryNeeded")},
+        "ready": {"type": "boolean"},
+    }
+)
+
+
 MESSAGE_OUTPUT = object_schema(
     {
         "id": {"type": "string"},
@@ -467,10 +509,16 @@ MAIL_OUTPUT = object_schema(
 OUTPUTS = {
     "board": object_schema(
         {
-            "items": {"type": "array", "items": WORK_ITEM_OUTPUT},
+            "items": {"type": "array", "items": {"anyOf": [WORK_ITEM_OUTPUT, STATUS_ITEM_OUTPUT]}},
+            "agents": {"type": "array", "items": STATUS_AGENT_OUTPUT},
+            "cursor": {"type": "string"},
+            "status": {"type": "string", "enum": ["snapshot"]},
+            "observedAt": {"type": "string"},
+            "total_count": {"type": "integer"},
             "has_more": {"type": "boolean"},
             "next_offset": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
-        }
+        },
+        ["items", "has_more", "next_offset"],
     ),
     "work": object_schema({"item": WORK_INTERACTIVE_OUTPUT, "replayed": {"type": "boolean"}}),
     "tasks": object_schema(
@@ -724,6 +772,11 @@ def argument_problem(
         for key in ("text", "focus", "model", "harnessLabel", "intent", "problem", "needed"):
             if key in arguments and not arguments[key].strip():
                 return f"{key} must contain non-whitespace text"
+    if name == "board":
+        if arguments.get("view", "work") == "status" and arguments.get("item"):
+            return "status view uses agent/channel; use work view for item"
+        if arguments.get("view", "work") != "status" and any(arguments.get(key) for key in ("agent", "channel")):
+            return "agent/channel filters require view=status"
     if name == "send" and len(arguments["text"].encode("utf-8")) > mailbox.MAX_BYTES:
         return "text exceeds 32 KiB UTF-8; send a file path instead"
     if name == "inbox" and arguments.get("markRead", stdio) and arguments.get("offset", 0):
@@ -949,6 +1002,18 @@ class Server:
         offset = arguments.get("offset", 0)
         include_text = arguments.get("response_format") == "json"
         if name == "board":
+            if arguments.get("view") == "status":
+                import mailbox_status
+
+                result = mailbox_status.snapshot(
+                    self.base,
+                    me,
+                    agent=arguments.get("agent"),
+                    channel=arguments.get("channel"),
+                    limit=arguments.get("limit", 10),
+                    offset=offset,
+                )
+                return ToolResponse(mailbox_status.render(result), result)
             result = work.listing(
                 self.base, me, item=arguments.get("item"), limit=arguments.get("limit", 10), offset=offset
             )
