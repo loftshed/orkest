@@ -350,5 +350,5 @@ def join_hint(me: dict[str, Any], others: list[dict[str, Any]]) -> str:
 
 def reads_at_stop(message: dict[str, Any]) -> bool:
     """Mail worth extending a turn for at Stop: a direct message, or a channel post that asked for a wake.
-    Quiet channel posts wait for the next turn, so busy channels never keep each other going."""
-    return not message.get("channel") or bool(message.get("wake"))
+    Quiet channel posts and automatic presence notices wait for the next turn."""
+    return not message.get("presenceNotice") and (not message.get("channel") or bool(message.get("wake")))
