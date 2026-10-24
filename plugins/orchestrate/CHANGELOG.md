@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.35.0
+
+- feat(orchestrate): keep compact task notes for resuming work (#34)
+
 ## 0.34.1
 
 - fix(orchestrate): keep quiet channel posts out of Antigravity's mid-turn steps (#35)
