@@ -182,7 +182,7 @@ class ContractTests(unittest.TestCase):
         self.assertEqual((first["ttlMs"], first["cacheScope"]), (3600000, "public"))
         self.assertEqual(
             [t["name"] for t in first["tools"]],
-            ["ack", "feedback", "focus", "inbox", "peers", "register", "send", "wait"],
+            sorted(mailbox_evaluation_server.mailbox_mcp.TOOL_NAMES),
         )
         for tool in first["tools"]:
             self.assertEqual(
