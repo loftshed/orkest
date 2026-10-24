@@ -105,6 +105,13 @@ a task's invocation allowance, and for a blocked worker asking its conductor.
 
 ## Choose ownership before a model
 
+Start shared work from the [workboard](references/workboard.md) at task entry and handoff boundaries.
+It shows interactive items, coordinator tasks and legacy notes together. Claim a ready interactive
+item within the user's scope, checkpoint it, then submit evidence for acceptance. Coordinator entries
+give the backend route and read its existing state; never copy that status into an interactive item.
+Plain `focus` sets a caption, not another ledger. Do not poll for work. Claims do not lock files or
+grant user authorization.
+
 | Situation                                                                        | Action                                                                          |
 | -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
 | Decisions, failed approaches or coupled changes live mainly in this conversation | Continue here                                                                   |

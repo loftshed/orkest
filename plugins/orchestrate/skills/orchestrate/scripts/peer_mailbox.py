@@ -1090,7 +1090,8 @@ def set_focus(
         import mailbox_channels
 
         peer = mailbox_channels.update(base, session, join=channels)
-    mailbox_tasks.save(base, peer, **details)
+    if task_details:
+        mailbox_tasks.save(base, peer, **details)
     return peer
 
 
@@ -2978,6 +2979,45 @@ poll, retry unchanged, or contact another agent just to collect feedback.
 """.strip()
 
 
+def render_work(result: dict[str, Any]) -> str:
+    """Compact workboard response shared by CLI and MCP; details stay available as JSON."""
+    rows = result.get("items", [result["item"]] if "item" in result else [])
+    lines = ["Project workboard (coordination only; no user approval or file protection)."]
+    for row in rows:
+        owner = row.get("owner") or {}
+        integrator = row.get("integrator") or {}
+        revision = f" r{row['revision']}" if "revision" in row else ""
+        lines.append(f"{row['id']}{revision} [{row['state']}] {row['title']}")
+        source = row.get("source", "interactive")
+        lines.append(f"  Source: {source}" + (" (read-only)" if row.get("readOnly") else ""))
+        if source == "legacy-note":
+            lines.append("  If resuming, create a work item; do not maintain this legacy card alongside it.")
+        if source == "coordinator":
+            lines.append("  Ownership and acceptance: managed by the coordinator; follow its route.")
+        elif source == "legacy-note":
+            lines.append(f"  Recorded author: {owner.get('name', 'unknown')}")
+        else:
+            lines.append(f"  Owner: {owner.get('name', 'unclaimed')}; integrator: {integrator.get('name', 'unknown')}")
+        for field in ("scope", "acceptance", "checkout", "done", "next", "blocker", "evidence", "verification", "note"):
+            if row.get(field):
+                lines.append(f"  {field.capitalize()}: {row[field]}")
+        if row.get("unmetDependencies"):
+            lines.append("  Waiting for: " + ", ".join(row["unmetDependencies"]))
+        if row.get("recoveryNeeded"):
+            lines.append(f"  Recovery needed: {row['recoveryNeeded']}; no ownership was transferred.")
+        if row.get("transfer"):
+            lines.append(f"  Integrator transfer offered to: {row['transfer']['name']}")
+        if command := row.get("route", {}).get("command"):
+            lines.append("  Route: " + shlex.join(command))
+    if not rows:
+        lines.append("No work items.")
+    if result.get("has_more"):
+        lines.append(f"More work items: offset={result['next_offset']}.")
+    if result.get("replayed"):
+        lines.append("Existing item returned for this create key.")
+    return "\n".join(lines)
+
+
 def main(argv: list[str] | None = None) -> int:
     supplied = sys.argv[1:] if argv is None else argv
     if supplied and supplied[0] == "daemon":
@@ -3016,6 +3056,8 @@ def main(argv: list[str] | None = None) -> int:
         "leave",
         "channels",
         "tasks",
+        "board",
+        "work",
     ):
         sub = commands.add_parser(name)
         if name == "name":
@@ -3053,9 +3095,32 @@ def main(argv: list[str] | None = None) -> int:
             sub.add_argument("--before", help="page back from this post id")
         if name == "peers":
             sub.add_argument("--runs", action="store_true", help="include run-scoped worker/conductor sessions")
-        if name == "tasks":
+        if name in {"tasks", "board"}:
             sub.add_argument("--limit", type=int, default=10)
             sub.add_argument("--offset", type=int, default=0)
+        if name == "board":
+            sub.add_argument("--item", help="one project work item by stable id")
+        if name == "work":
+            import mailbox_work
+
+            sub.add_argument("work_action", choices=mailbox_work.ACTIONS)
+            sub.add_argument("--item", help="stable item id; required after create")
+            sub.add_argument("--revision", type=int, help="expected current revision; required after create")
+            sub.add_argument("--key", help="stable idempotency key; required for create")
+            for field in (
+                "title",
+                "scope",
+                "acceptance",
+                "integrator",
+                "blocker",
+                "evidence",
+                "verification",
+                "note",
+                "successor",
+            ):
+                sub.add_argument(f"--{field}")
+            sub.add_argument("--next", dest="next_step", help="concrete next step")
+            sub.add_argument("--dependencies", nargs="+", help="accepted prerequisite item ids")
         if name == "hook":
             sub.add_argument("--event", help="lifecycle event, for hosts whose payload does not name it")
         if name == "send":
@@ -3092,7 +3157,10 @@ def main(argv: list[str] | None = None) -> int:
             import mailbox_tasks
 
             for field, maximum in mailbox_tasks.LIMITS.items():
-                sub.add_argument(f"--{field}", help=f"short task note, at most {maximum} characters")
+                sub.add_argument(
+                    f"--{field}",
+                    help=f"legacy recovery note, at most {maximum} characters; use board/work for current work",
+                )
             sub.add_argument("--status", choices=mailbox_tasks.STATUSES)
             sub.add_argument("--harness-label", help="actual host name, e.g. Antigravity; omit if not known")
             sub.add_argument("--model", help="current model ID/name verified from your runtime; omit if unknown")
@@ -3178,6 +3246,37 @@ def main(argv: list[str] | None = None) -> int:
             reopened = wake_recovery.reopen(base, sessions)
             # Only the chosen recipients: a project-scoped retry never wakes anyone outside that scope.
             output = {"reopened": reopened, "outcomes": wake_recovery.reconcile(base, sessions=sessions)}
+        elif args.action in {"board", "work"}:
+            import mailbox_work
+
+            me = caller(args, base) if args.action == "work" or session_arg(args) else workspace(os.getcwd())
+            if args.action == "board":
+                output = mailbox_work.listing(base, me, item=args.item, limit=args.limit, offset=args.offset)
+            else:
+                fields = {
+                    key: getattr(args, key)
+                    for key in (
+                        "item",
+                        "revision",
+                        "key",
+                        "title",
+                        "scope",
+                        "acceptance",
+                        "dependencies",
+                        "integrator",
+                        "next_step",
+                        "blocker",
+                        "evidence",
+                        "verification",
+                        "note",
+                        "successor",
+                    )
+                    if getattr(args, key) is not None
+                }
+                output = mailbox_work.mutate(base, me, action=args.work_action, **fields)
+            if args.format != "json":
+                print(render_work(output))
+                return 0
         elif args.action == "tasks":
             import mailbox_tasks
 
