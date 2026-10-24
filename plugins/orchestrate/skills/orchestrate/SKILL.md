@@ -1,6 +1,6 @@
 ---
 name: orchestrate
-description: "Delegate bounded implementation or read-only consultation across provider boundaries using local Codex, Antigravity, Claude Code, or OpenCode. Validate model and effort, check live quota, preserve context, record usage and evidence, recover bounded corrections, and audit results. Use for explicitly requested external-agent work or cross-platform handoffs, for example 'ask GPT-5.6 Sol', 'have Gemini check this', 'try it with GLM', or one focused question to a stronger model ('get Opus's opinion on this', 'ask GPT whether X is safe') through `consult`. Always prefer the host harness's built-in tools for messaging or spawning agents within the same harness (GPT in Codex, Gemini in Gemini/Antigravity, Claude in Claude Code). Do not trigger for ordinary coding or same-harness collaboration."
+description: "Delegate bounded implementation or read-only consultation across provider boundaries using local Codex, Antigravity, Claude Code, or OpenCode. Validate model and effort, check live quota, preserve context, record usage and evidence, recover bounded corrections, and audit results. Use for explicitly requested external-agent work or cross-platform handoffs, for example 'ask GPT-5.6 Sol', 'have Gemini check this', 'try it with GLM', or one focused question to a stronger model ('get Opus's opinion on this', 'ask GPT whether X is safe') through `consult`. Always prefer the host harness's built-in tools for messaging or spawning agents within the same harness (GPT in Codex, Gemini in Gemini/Antigravity, Claude in Claude Code). Also use for requests to inspect Orkest agent or team status and follow their updates through the shared workboard. Do not trigger for ordinary coding or same-harness delegation."
 metadata:
   version: 0.36.0
   requirements: Python 3.11+, POSIX file locking, git, and at least one installed/authenticated executor CLI (`codex`, `agy`, `claude`, or `opencode`).
@@ -111,6 +111,11 @@ item within the user's scope, checkpoint it, then submit evidence for acceptance
 give the backend route and read its existing state; never copy that status into an interactive item.
 Plain `focus` sets a caption, not another ledger. Do not poll for work. Claims do not lock files or
 grant user authorization.
+
+When the user asks what agents are doing or wants updates on a selected team, use the board's
+[read-only status view](references/dot-status.md). Dot's local executor can read it without joining
+the mailbox and wait for a change with a bounded local command. Report recorded evidence and staleness;
+do not treat presence as verified progress or completion.
 
 | Situation                                                                        | Action                                                                          |
 | -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |

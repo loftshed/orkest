@@ -4,6 +4,10 @@ Start with `board` for shared work. It shows interactive work, coordinator-manag
 session recovery notes in one place. Each entry names its source and available action; agents never
 maintain the same status in two ledgers. The board does not dispatch agents or run a supervisor loop.
 
+For a read-only overview of agents and their work, including selected-agent or channel updates, use
+the [status view](dot-status.md): `board(view="status")` or `mailbox board --view status`. Dot's local
+executor can wait for a meaningful change without repeatedly asking a model to check.
+
 Read `board` when joining the task, finishing a piece or handling an explicit handoff. Choose a ready
 item within your assigned scope, then claim its current revision before working. A failed claim means
 another agent may own it: reread before deciding what to do. Do not poll an empty board or invent work
