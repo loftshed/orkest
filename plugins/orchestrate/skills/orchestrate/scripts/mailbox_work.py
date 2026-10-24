@@ -165,12 +165,8 @@ def _view(
     }
 
 
-def listing(
-    base: Path, me: dict[str, Any], *, item: str | None = None, limit: int = 10, offset: int = 0
-) -> dict[str, Any]:
-    """Read current work. Presence is advisory; no read changes ownership or persistence."""
-    if type(limit) is not int or not 1 <= limit <= 50 or type(offset) is not int or offset < 0:
-        raise mailbox.MailboxError("work needs limit 1-50 and a nonnegative offset")
+def snapshot(base: Path, me: dict[str, Any], *, item: str | None = None) -> list[dict[str, Any]]:
+    """Read existing work sources once; no read changes ownership or persistence."""
     _project(me)
     path = base / "work" / "board.json"
     with mailbox.locked(path):
@@ -192,6 +188,16 @@ def listing(
     if item is not None and not records:
         raise mailbox.MailboxError("work item not found in this project")
     records.sort(key=lambda i: (str(i.get("updatedAt") or ""), i["id"]), reverse=True)
+    return records
+
+
+def listing(
+    base: Path, me: dict[str, Any], *, item: str | None = None, limit: int = 10, offset: int = 0
+) -> dict[str, Any]:
+    """Read a bounded page of work from the shared snapshot."""
+    if type(limit) is not int or not 1 <= limit <= 50 or type(offset) is not int or offset < 0:
+        raise mailbox.MailboxError("work needs limit 1-50 and a nonnegative offset")
+    records = snapshot(base, me, item=item)
     page: list[dict[str, Any]] = []
     for record in records[offset : offset + limit]:
         candidate = [*page, record]
