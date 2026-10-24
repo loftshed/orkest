@@ -219,7 +219,7 @@ class ChannelTests(unittest.TestCase):
         self.assertEqual(urgent["decision"], "block")
         self.assertIn("urgent: stop the build", urgent["reason"])
 
-    def test_quiet_posts_wait_out_antigravitys_mid_turn_steps(self):
+    def test_quiet_posts_wait_out_mid_turn_steps_in_antigravity(self):
         sender = self.peer("sender", channels=["graph"])
         self.peer("worker", harness="gemini", channels=["graph"])
         payload = {"conversationId": "worker", "workspacePaths": [str(self.repo)]}
