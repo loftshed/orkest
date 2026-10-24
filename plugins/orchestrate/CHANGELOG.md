@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.37.0
+
+- feat(orchestrate): add read-only agent status and change waits (#38)
+
 ## 0.36.0
 
 - feat(orchestrate): unify shared work discovery and ownership (#37)
