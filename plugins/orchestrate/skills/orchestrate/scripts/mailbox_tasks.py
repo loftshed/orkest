@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import json
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,13 @@ SCHEMA = "orchestrate.task-note.v1"
 LIMITS = {"done": 160, "next": 240, "blocker": 160, "refs": 240}
 STATUSES = ("active", "blocked", "complete")
 RETENTION = dt.timedelta(days=30)
+PAGE_BYTES = 12 * 1024
+FIELD_DESCRIPTIONS = {
+    "done": "Last verified result, e.g. '6 focused tests pass'. Empty clears it.",
+    "next": "Next concrete action, e.g. 'Review PR #8'. Empty clears it.",
+    "blocker": "Unresolved dependency or question. Empty clears it.",
+    "refs": "Commit, PR, file or log references, including the working checkout if different. Empty clears it.",
+}
 
 
 def validate(details: dict[str, Any]) -> dict[str, str]:
@@ -104,9 +112,31 @@ def listing(
         if scope == "project" and not mailbox.same_project(reader, note["owner"]):
             continue
         owner = mailbox.load(mailbox.peer_path(base, note["owner"]["session"]))
-        notes.append({**note, "ownerPresent": bool(mailbox.valid_peer(owner) and mailbox.is_live(owner))})
+        # Discovery needs the author's identity, not duplicate repository metadata from storage.
+        notes.append(
+            {
+                **{
+                    key: note[key]
+                    for key in ("task", "checkout", "branch", "updatedAt", "status", *LIMITS)
+                    if key in note
+                },
+                "owner": {key: note["owner"].get(key) for key in ("session", "name", "harness")},
+                "ownerPresent": bool(mailbox.valid_peer(owner) and mailbox.is_live(owner)),
+            }
+        )
     notes.sort(key=lambda note: (note["updatedAt"], note["owner"]["session"]), reverse=True)
-    page = notes[offset : offset + limit]
+    page = []
+    size = 0
+    for note in notes[offset : offset + limit]:
+        cost = len(json.dumps(note, ensure_ascii=True, separators=(",", ":")).encode())
+        if size + cost > PAGE_BYTES:
+            if not page:
+                raise mailbox.MailboxError(
+                    "saved task metadata exceeds the response limit; shorten its focus/references or checkout path"
+                )
+            break
+        page.append(note)
+        size += cost
     more = offset + len(page) < len(notes)
     return {"tasks": page, "has_more": more, "next_offset": offset + len(page) if more else None}
 

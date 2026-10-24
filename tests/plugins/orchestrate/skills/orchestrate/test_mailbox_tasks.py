@@ -91,6 +91,46 @@ class TaskTests(unittest.TestCase):
 
 
 class TaskInterfaceTests(unittest.TestCase):
+    def test_http_task_pages_bound_unicode_output_and_keep_every_card_reachable(self):
+        import test_mailbox_daemon
+
+        client = test_mailbox_daemon.TestMailboxDaemon()
+        client.setUp()
+        self.addCleanup(client.tearDown)
+        client.start()
+        owner = client.peer("author")
+        client.peer("reader", "claude")
+        client.body(client.call("focus", {"text": "Initial task", "next": "Review"}, session="author"))
+        for number in range(12):
+            tasks.save(
+                client.base,
+                owner | {"session": f"author-{number}", "focus": "界" * 200},
+                done="界" * 160,
+                next="界" * 240,
+                blocker="界" * 160,
+                refs="界" * 240,
+            )
+        paths = list((client.base / "tasks").glob("*/*.json"))
+        before = {str(path): path.read_bytes() for path in paths}
+        found, offset = [], 0
+        while True:
+            response = client.call(
+                "tasks", {"limit": 50, "offset": offset, "response_format": "json"}, session="reader"
+            )
+            data = client.body(response)
+            self.assertLessEqual(len(json.dumps(response[1]["result"], ensure_ascii=True).encode()), 32 * 1024)
+            found.extend(note["owner"]["session"] for note in data["tasks"])
+            if not data["has_more"]:
+                break
+            self.assertGreater(data["next_offset"], offset)
+            offset = data["next_offset"]
+        self.assertEqual(set(found), {"author", *(f"author-{number}" for number in range(12))})
+        self.assertEqual(len(found), 13)
+        self.assertTrue(all(path.read_bytes() == before[str(path)] for path in paths))
+        schema = next(tool for tool in client.rpc("tools/list")[1]["result"]["tools"] if tool["name"] == "tasks")
+        self.assertIn("next", schema["outputSchema"]["properties"]["tasks"]["items"]["properties"])
+        self.assertEqual(schema["inputSchema"]["properties"]["limit"]["default"], 10)
+
     def test_focus_and_tasks_work_through_mcp_after_the_author_leaves(self):
         import test_mailbox_mcp_contract
 

@@ -27,6 +27,9 @@ The CLI equivalents are `mailbox focus --text 'Repair export' --done '6 focused 
 --next 'Review PR #8' --refs 'PR #8, commit abc123'` and `mailbox tasks`. Read notes on demand when
 resuming or coordinating. They are not inserted into every hook or sent as messages, and updates do
 not wake anyone. Lists are paginated and project-scoped unless `scope="cross-project"` is explicit.
+Pages default to 10 cards and cap serialized card data at 12 KiB, so a page can contain fewer than
+`limit` cards. Continue at `next_offset` while `has_more` is true. Repository matching metadata stays
+in storage; results include only the owner identity and work context needed for the handoff.
 
 Each session keeps only its latest card per project, replacing prior text. Notes expire 30 days after
 their last update and are removed by `mailbox prune`. An absent owner is shown as “not present”, never automatically marked complete or

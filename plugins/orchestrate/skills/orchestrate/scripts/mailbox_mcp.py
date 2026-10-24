@@ -253,6 +253,23 @@ def object_schema(properties: dict[str, Any], required: list[str] | None = None)
     }
 
 
+TASK_OUTPUT = object_schema(
+    {
+        "owner": object_schema({key: {"type": "string"} for key in ("session", "name", "harness")}),
+        "task": {"type": "string", "maxLength": 200},
+        "checkout": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "branch": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "updatedAt": {"type": "string", "format": "date-time"},
+        "status": {"type": "string", "enum": list(tasks.STATUSES)},
+        "ownerPresent": {"type": "boolean", "description": "Presence only; absence does not transfer ownership."},
+        **{
+            field: {"type": "string", "maxLength": maximum, "description": tasks.FIELD_DESCRIPTIONS[field]}
+            for field, maximum in tasks.LIMITS.items()
+        },
+    },
+    ["owner", "task", "checkout", "branch", "updatedAt", "status", "ownerPresent"],
+)
+
 MESSAGE_OUTPUT = object_schema(
     {
         "id": {"type": "string"},
@@ -281,7 +298,7 @@ MAIL_OUTPUT = object_schema(
 OUTPUTS = {
     "tasks": object_schema(
         {
-            "tasks": {"type": "array", "items": {"type": "object"}},
+            "tasks": {"type": "array", "items": TASK_OUTPUT},
             "has_more": {"type": "boolean"},
             "next_offset": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
         }
@@ -362,8 +379,19 @@ for tool in TOOLS:
         props["limit"] = LIMIT_INPUT
     if name in {"peers", "inbox", "tasks"}:
         props["offset"] = OFFSET_INPUT
+    if name == "tasks":
+        props["limit"] = {
+            **LIMIT_INPUT,
+            "default": 10,
+            "description": "Maximum cards; the byte budget may return fewer. Continue at next_offset.",
+        }
     if name == "focus":
-        props.update({field: {"type": "string", "maxLength": maximum} for field, maximum in tasks.LIMITS.items()})
+        props.update(
+            {
+                field: {"type": "string", "maxLength": maximum, "description": tasks.FIELD_DESCRIPTIONS[field]}
+                for field, maximum in tasks.LIMITS.items()
+            }
+        )
         props["status"] = {"type": "string", "enum": list(tasks.STATUSES)}
         tool["description"] += (
             " Keep a compact work card with optional done, next, blocker, refs and status fields at meaningful checkpoints. Use a stable task title; a changed title clears old details. Cards replace prior notes and survive presence loss for 30 days; read with tasks."
@@ -380,8 +408,8 @@ for tool in TOOLS:
         for key in ("intent", "problem", "needed"):
             props[key].update(minLength=1, maxLength=800)
         props["messageIds"]["items"] = MESSAGE_ID_INPUT
-    for prop in props.values():
-        if "maxLength" in prop:
+    for key, prop in props.items():
+        if "maxLength" in prop and not (name == "focus" and key in tasks.LIMITS):
             prop.pop("description", None)
     tool["outputSchema"] = OUTPUTS[name]
     tool["annotations"] = {
