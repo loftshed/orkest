@@ -2635,6 +2635,9 @@ def hook(
         runtime_model = None
     if not (isinstance(runtime_model, str) and runtime_model.strip()):
         runtime_model = transcript_model(payload)
+    previous = load(peer_path(base, session))
+    # Antigravity runs PreInvocation before every model step, tool results included; only the first starts a turn.
+    mid_turn = event == "PreInvocation" and valid_peer(previous) and previous.get("state") == "busy"
     me = register(
         base,
         session=session,
@@ -2695,8 +2698,9 @@ def hook(
     import mailbox_channels
 
     route_hint = wake_route_hint(base, me) if event == "SessionStart" else ""
-    # At Stop only mail worth extending a turn for is read; quiet channel posts wait for the next turn.
-    delivered = take(base, session, eligible=mailbox_channels.reads_at_stop if event == "Stop" else None)
+    # At Stop or between steps of a turn only mail worth interrupting it for is read; quiet channel posts wait for
+    # the next turn.
+    delivered = take(base, session, eligible=mailbox_channels.reads_at_stop if event == "Stop" or mid_turn else None)
     context = render_all(delivered, me["name"])
     hint = "\n".join(
         value for value in (cleared_notice, team_notice, identity_hint, availability_hint, route_hint) if value
