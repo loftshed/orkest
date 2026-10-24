@@ -219,6 +219,26 @@ class ChannelTests(unittest.TestCase):
         self.assertEqual(urgent["decision"], "block")
         self.assertIn("urgent: stop the build", urgent["reason"])
 
+    def test_quiet_posts_wait_out_mid_turn_steps_in_antigravity(self):
+        sender = self.peer("sender", channels=["graph"])
+        self.peer("worker", harness="gemini", channels=["graph"])
+        payload = {"conversationId": "worker", "workspacePaths": [str(self.repo)]}
+
+        def step(event, **extra):
+            out = peer_mailbox.hook({**payload, **extra}, harness="gemini", event=event, base=self.base)
+            return "\n".join(s["ephemeralMessage"] for s in (out or {}).get("injectSteps", []))
+
+        with patch.object(peer_mailbox, "harness_pid", return_value=os.getpid()):
+            self.post(sender, "graph", "queued while idle")
+            self.assertIn("queued while idle", step("PreInvocation", invocationNum=1))  # a turn starts
+            self.post(sender, "graph", "progress note")
+            self.assertNotIn("progress note", step("PreInvocation", invocationNum=2))  # after a tool call
+            self.post(sender, "graph", "urgent: stop the build", wake=True)
+            self.assertIn("urgent: stop the build", step("PreInvocation", invocationNum=3))
+            self.assertNotIn("progress note", step("Stop", terminationReason="NO_TOOL_CALL"))
+            self.assertEqual(self.inbox("worker"), ["progress note"])
+            self.assertIn("progress note", step("PreInvocation", invocationNum=1))  # the next turn
+
     def test_roster_notices_follow_channel_mates_only(self):
         self.peer("mapper", harness="claude", channels=["graph"])
         self.peer("fetcher", channels=["retrieval"])
