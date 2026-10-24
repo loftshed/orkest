@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.36.0
+
+- feat(orchestrate): unify shared work discovery and ownership (#37)
+
 ## 0.35.0
 
 - feat(orchestrate): keep compact task notes for resuming work (#34)
