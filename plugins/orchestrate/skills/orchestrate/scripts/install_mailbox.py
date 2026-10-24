@@ -19,12 +19,13 @@ from pathlib import Path
 
 import mailbox_configuration as configuration
 import mailbox_daemon
+import mailbox_mcp
 import peer_mailbox as mailbox
 from check_mailbox import RpcClient, check, initialize_codex
 
 EVENTS = ("SessionStart", "UserPromptSubmit", "Stop", "SessionEnd")
 AGY_EVENTS = ("SessionStart", "PreInvocation", "Stop")
-TOOLS = ("peers", "send", "inbox", "wait", "ack", "focus", "register", "feedback")
+TOOLS = tuple(sorted(mailbox_mcp.TOOL_NAMES))
 
 
 def legacy_opencode_map(entries: dict) -> bool:

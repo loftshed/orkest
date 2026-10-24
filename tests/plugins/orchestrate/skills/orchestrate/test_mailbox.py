@@ -2726,7 +2726,7 @@ class McpServerTests(unittest.TestCase):
         self.assertEqual(responses[2]["error"]["code"], -32601)
         self.assertEqual(
             [tool["name"] for tool in responses[3]["result"]["tools"]],
-            ["ack", "feedback", "focus", "inbox", "peers", "register", "send", "wait"],
+            sorted(RUNNER.bundled_module("mailbox_mcp").TOOL_NAMES),
         )
 
     def test_mcp_peer_listing_hides_run_scoped_sessions(self):

@@ -11,6 +11,7 @@ from pathlib import Path
 SCRIPTS = Path(__file__).resolve().parents[5] / "plugins/orchestrate/skills/orchestrate/scripts"
 sys.path.insert(0, str(SCRIPTS))
 import install_mailbox as installer  # noqa: E402 -- exercise the shipped installer
+import mailbox_mcp  # noqa: E402 -- the server defines the installed tool catalog
 
 
 class InstallMailboxTests(unittest.TestCase):
@@ -94,19 +95,34 @@ class InstallMailboxTests(unittest.TestCase):
         self.assertEqual(len(list(self.base.glob("hub.mailbox-bak.*"))), 1)
 
     def test_codex_permissions_cover_only_known_mailbox_tools_and_are_idempotent(self):
+        self.assertEqual(set(installer.TOOLS), {tool["name"] for tool in mailbox_mcp.TOOLS})
         server = {"tools": {"send": {"approval_mode": "approve"}, "unrelated": {"approval_mode": "prompt"}}}
         edits = installer.codex_tool_edits(server)
         self.assertEqual(
             {edit["keyPath"] for edit in edits},
-            {
-                f"mcp_servers.peer-mailbox.tools.{tool}.approval_mode"
-                for tool in ["peers", "inbox", "wait", "ack", "focus", "register", "feedback"]
-            },
+            {f"mcp_servers.peer-mailbox.tools.{tool}.approval_mode" for tool in mailbox_mcp.TOOL_NAMES - {"send"}},
         )
         self.assertTrue(all(edit["value"] == "approve" for edit in edits))
         self.assertEqual(server["tools"]["unrelated"], {"approval_mode": "prompt"})
         configured = {"tools": {tool: {"approval_mode": "approve"} for tool in installer.TOOLS}}
         self.assertEqual(installer.codex_tool_edits(configured), [])
+
+    def test_diagnostics_detect_missing_task_permission_and_repair_covers_it(self):
+        from unittest.mock import patch
+
+        config = self.base / ".codex/config.toml"
+        config.parent.mkdir()
+        original = '[mcp_servers.peer-mailbox]\ncommand = "python3"\n'
+        config.write_text(original)
+        with patch.dict("os.environ", {"CODEX_HOME": str(config.parent)}):
+            missing = installer.configuration_status(self.base, {"codex"})["codex"]["issues"]
+            self.assertIn("Codex mailbox tasks needs scoped tool permission", missing)
+            edits = installer.codex_tool_edits({})
+            task_edit = next(edit for edit in edits if edit["keyPath"].endswith(".tasks.approval_mode"))
+            self.assertEqual(task_edit["value"], "approve")
+            config.write_text(original + '\n[mcp_servers.peer-mailbox.tools.tasks]\napproval_mode = "approve"\n')
+            repaired = installer.configuration_status(self.base, {"codex"})["codex"]["issues"]
+            self.assertNotIn("Codex mailbox tasks needs scoped tool permission", repaired)
 
     def test_diagnostics_explain_missing_registration_and_delivery_hooks(self):
         status = installer.configuration_status(self.base, {"claude"})
