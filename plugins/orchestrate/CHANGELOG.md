@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.34.1
+
+- fix(orchestrate): keep quiet channel posts out of Antigravity's mid-turn steps (#35)
+
 ## 0.34.0
 
 - feat(orchestrate): add task channels to the peer mailbox (#33)
