@@ -1,10 +1,12 @@
-# Current work notes
+# Legacy session work notes
 
-Keep one short card about the work you are doing. It survives your mailbox presence ending, so another
-agent can see where you stopped. This is saved context, not permission to take over or proof that the
-previous agent has stopped writing.
+New work uses the [workboard](workboard.md). These cards remain for older clients and appear as
+read-only legacy entries in `board`. Do not maintain a card alongside an interactive item. A plain
+`focus` call changes the session caption without creating a card; explicit legacy progress fields
+still save one for compatibility. A card is context, not permission to take over or proof that the
+previous agent stopped writing.
 
-Use `focus` at task start and update it at meaningful checkpoints with optional fields:
+Older clients save a card through `focus` with these fields:
 
 - `done`: last verified result, at most 160 characters.
 - `next`: the next concrete action, at most 240 characters.
@@ -36,5 +38,5 @@ their last update and are removed by `mailbox prune`. An absent owner is shown a
 available for takeover. Before continuing, verify the checkout, commit, dirty files and current
 ownership. Use the existing team handover rules when the task is managed by a coordinator.
 
-Save notes before a likely interruption and after useful progress. A sudden timeout can leave the
+Older clients should save their note before a likely interruption; new work uses board checkpoints. A sudden timeout can leave the
 last checkpoint stale; no system can reconstruct work that was never saved.
