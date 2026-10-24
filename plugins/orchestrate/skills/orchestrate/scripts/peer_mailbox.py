@@ -3100,6 +3100,11 @@ def main(argv: list[str] | None = None) -> int:
             sub.add_argument("--offset", type=int, default=0)
         if name == "board":
             sub.add_argument("--item", help="one project work item by stable id")
+            sub.add_argument("--view", choices=("work", "status"), default="work")
+            sub.add_argument("--agent", help="status view: stable session ID or full agent name")
+            sub.add_argument("--channel", help="status view: members of this task channel and their work")
+            sub.add_argument("--since", help="status view: wait for a change from this prior cursor")
+            sub.add_argument("--timeout", type=float, default=300, help="status change wait, at most 600 seconds")
         if name == "work":
             import mailbox_work
 
@@ -3249,6 +3254,26 @@ def main(argv: list[str] | None = None) -> int:
         elif args.action in {"board", "work"}:
             import mailbox_work
 
+            if args.action == "board" and args.view == "status":
+                import mailbox_status
+
+                if args.item:
+                    raise MailboxError("status view uses --agent/--channel; use the work view for --item")
+                # An observer uses the selected working directory without registering or refreshing presence.
+                output = mailbox_status.observe(
+                    base,
+                    workspace(os.getcwd()),
+                    agent=args.agent,
+                    channel=args.channel,
+                    since=args.since,
+                    timeout=args.timeout,
+                    limit=args.limit,
+                    offset=args.offset,
+                )
+                print(json.dumps(output, ensure_ascii=True) if args.format == "json" else mailbox_status.render(output))
+                return 0
+            if args.action == "board" and any((args.agent, args.channel, args.since)):
+                raise MailboxError("--agent, --channel and --since require --view status")
             me = caller(args, base) if args.action == "work" or session_arg(args) else workspace(os.getcwd())
             if args.action == "board":
                 output = mailbox_work.listing(base, me, item=args.item, limit=args.limit, offset=args.offset)
