@@ -189,12 +189,23 @@ def save(directory: Path, state: dict[str, Any]) -> None:
     state["updated_at"] = RUNNER.utc_now()
     with committing():
         RUNNER.write_json_atomic(directory / "task.json", state)
+    index_work(directory, state)
+
+
+def index_work(directory: Path, state: dict[str, Any]) -> None:
+    """Discovery failure must not make a durably saved dispatch look safe to retry."""
+    try:
+        module("mailbox_work_sources").register_coordinator(MAILBOX.root(), directory, state)
+    except (ValueError, OSError) as error:
+        print(f"coordinator: task is saved; board discovery registration failed: {error}", file=sys.stderr)
 
 
 def load(directory: Path) -> dict[str, Any]:
     state = read(directory / "task.json")
     if state.get("schema") != SCHEMA:
         raise CoordinationError("unsupported task schema")
+    # Old arbitrary task directories become discoverable when next opened, without copying state.
+    index_work(directory, state)
     return state
 
 
