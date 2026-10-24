@@ -4,8 +4,10 @@ Agent sessions use one authenticated loopback HTTP daemon to list peers and exch
 `<agent-executor cache>/mailbox-v1/` (`peers/<session>.json`, `inbox/<session>/<id>.json`, with `:` in a
 session id written as `%3A`). Nothing leaves the machine.
 
-For a compact record of current work that survives an agent leaving, use
-[task notes](task-notes.md): update `focus` with `done`, `next`, `blocker` and `refs`, then read `tasks` on demand.
+Start shared work from the [workboard](workboard.md): `board` shows interactive items, coordinator
+tasks and legacy recovery notes together. `work` claims and updates interactive items; coordinator
+entries give their backend route. Read at work boundaries, not in a polling loop. Older
+[task notes](task-notes.md) remain readable for compatibility, not as a second ledger for new work.
 
 ## Setup and repair
 
@@ -103,6 +105,9 @@ The normal server is `scripts/mailbox_daemon.py`. `scripts/mailbox_mcp.py` remai
 | `wait`     | Blocks up to `timeoutSeconds` (max 600) for a message, or for the reply to `replyTo`.                                             |
 | `ack`      | Marks message ids read.                                                                                                           |
 | `focus`    | One line on what this session is working on, shown to agents in the same project; `channels`/`leave` join or leave task channels. |
+| `tasks`    | Legacy session notes for older clients. Use `board` for shared work discovery.                                                    |
+| `board`    | Shared discovery of interactive work, coordinator tasks and legacy recovery notes.                                                |
+| `work`     | Create, claim, checkpoint, review or explicitly hand over a work item. Coordination only; no execution or user-approval grant.    |
 | `feedback` | Record a communication problem, your intent and what you needed instead. Writes locally; sends no message.                        |
 
 ### MCP protocol and bounded responses

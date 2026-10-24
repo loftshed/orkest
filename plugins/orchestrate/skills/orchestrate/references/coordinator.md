@@ -4,6 +4,11 @@ The host agent owns ambiguity, routing, evidence interpretation, and acceptance.
 records and enforces the execution contract. Use native host tools for native models and the
 existing audited runner across providers. No worker or consultant grants new authority.
 
+The [workboard](workboard.md) is the shared discovery entry point. Coordinator tasks register a
+pointer when saved or opened, and the board reads this backend's current state directly. Do not
+create a second interactive item to track the same task. Execution and acceptance still use the
+coordinator's checks below; the board cannot override them.
+
 ## Ownership, candidates, and limits
 
 `coordinator.py route --packet route.json` takes `host`, `engine`, `model` and the conductor's
