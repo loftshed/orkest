@@ -20,7 +20,7 @@ the installed CLIs, the routes in effect, and stale skill copies.
 Before using cross-harness messages on an unfamiliar install, run
 `python3 <skill-directory>/scripts/run_agent.py doctor --check-messaging`. If setup is missing or
 stale, repair it yourself with `doctor --repair-messaging`, then repeat the check. This creates the
-skill hub if needed, registers the shared local HTTP mailbox, installs turn hooks, and permits only its eight local
+skill hub if needed, registers the shared local HTTP mailbox, installs turn hooks, and permits only its local
 Codex tools; it preserves unrelated settings and backs up changed files. Do not leave these routine
 repairs for the user to ask another agent to perform.
 
