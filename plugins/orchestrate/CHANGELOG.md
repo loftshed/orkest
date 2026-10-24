@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.34.0
+
+- feat(orchestrate): add task channels to the peer mailbox (#33)
+
 ## 0.33.2
 
 - fix(orchestrate): retry wakes that did not reach an idle recipient, within bounds (#31)
