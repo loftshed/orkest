@@ -307,8 +307,8 @@ session's channels.
   registration only. Focus text never changes it. Membership ends with the session and survives
   `/clear`.
 - **Quiet by default.** A channel post never wakes anyone unless sent with `wake: true` (CLI `--wake`),
-  and only such a post, or a direct message, may keep a turn going at Stop; quiet posts wait for the
-  member's next turn.
+  and only such a post, or a direct message, may keep a turn going at Stop or reach Antigravity between
+  the steps of a turn; quiet posts wait for the member's next turn.
 - **Delivery.** A post freezes its recipients when accepted and reaches each as an ordinary message
   marked with `channel` and `postId`, so inbox, wait, ack and wake work as usual. With an idempotency
   key (CLI `--id`), a replay finishes the post as accepted: same recipients and sender context, even
