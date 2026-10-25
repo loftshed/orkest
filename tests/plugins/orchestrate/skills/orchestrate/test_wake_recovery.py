@@ -133,6 +133,13 @@ class WakeRecoveryTests(unittest.TestCase):
         self.assertEqual(wake.calls, [("target", sent["id"], True)])
         self.assertFalse(marker.exists())  # lifted, so the adapter really submits again
 
+    def test_an_antigravity_notice_marker_outlives_the_accept_window(self):
+        sent = self.send("hello", first=SUBMITTED)
+        marker = self.base / "wakes" / peer_mailbox.session_key("target") / "agy-wake.json"
+        peer_mailbox.write(marker, {"id": sent["id"], "requestedAt": peer_mailbox.stamp(self.start), "steps": 1})
+        self.at(25, FakeWake())
+        self.assertTrue(marker.exists())  # the adapter decides from the trajectory, not the clock
+
     def test_an_attempt_that_may_have_submitted_waits_out_the_window_like_a_submission(self):
         sent = self.send("hello", first=UNKNOWN)
         self.assertEqual(self.intent()["state"], "submitted")

@@ -222,6 +222,25 @@ def _agy_cascade_request_config(trajectory: dict) -> dict:
     return extra
 
 
+def _agy_step_count(trajectory: dict) -> int | None:
+    inner = trajectory.get("trajectory")
+    steps = inner.get("steps") if isinstance(inner, dict) else None
+    return len(steps) if isinstance(steps, list) else None
+
+
+def _agy_notice_waiting(marker: Path, base: Path, target: dict, steps: int | None) -> bool:
+    """Whether an earlier notice for still-unread mail is still in Antigravity's WHEN_IDLE queue: the
+    trajectory has not grown since it was submitted, so no turn has run. That queue can hold a notice
+    for minutes, so the marker's age alone says nothing about whether it was lost."""
+    import peer_mailbox as mailbox
+
+    previous = mailbox.load(marker) or {}
+    recorded = previous.get("steps")
+    if steps is None or not isinstance(recorded, int) or not previous.get("id"):
+        return False
+    return steps <= recorded and unread(base, target, previous["id"])
+
+
 def agy_route(base: Path, session: str) -> tuple[dict | None, str]:
     """The recorded Antigravity control endpoint for this conversation, or why there is none."""
     import peer_mailbox as mailbox
@@ -270,9 +289,10 @@ def wake_gemini(target: dict, message_id: str, *, base: Path | None = None) -> d
     if not unread(base, target, message_id):
         return {"status": "queued", "reason": "message already handled or outside this project"}
     marker = directory / "agy-wake.json"
-    if recent_marker(marker, base, target):
+    steps = _agy_step_count(trajectory)
+    if recent_marker(marker, base, target) or _agy_notice_waiting(marker, base, target, steps):
         return {"status": "scheduled", "reason": "mailbox wake already queued for this recipient"}
-    mailbox.write(marker, {"id": message_id, "requestedAt": mailbox.stamp()})
+    mailbox.write(marker, {"id": message_id, "requestedAt": mailbox.stamp(), "steps": steps})
     try:
         agy_call(
             control,

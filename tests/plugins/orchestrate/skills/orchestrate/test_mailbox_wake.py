@@ -184,6 +184,21 @@ class AntigravityWakeTests(unittest.TestCase):
         self.assertEqual(future["status"], "scheduled")
         self.assertEqual(len(server.sends()), 2)  # the stale one and the future-dated one, not the fresh repeat
 
+    def test_a_notice_still_in_the_native_queue_is_not_resubmitted_once_its_marker_ages(self):
+        trajectory = {"steps": [{"userInput": {}}]}
+        with AgyServer(trajectory=trajectory) as server:
+            self.control(server.address)
+            self.mail("x")
+            message = peer_mailbox.incoming(self.base, "agy-target")[0]["id"]
+            first = mailbox_wake.wake(self.target, message, base=self.base, retry=True)
+            path = self.base / "wakes" / peer_mailbox.session_key("agy-target") / "agy-wake.json"
+            peer_mailbox.write(path, {**peer_mailbox.load(path), "requestedAt": "2000-01-01T00:00:00Z"})
+            held = mailbox_wake.wake(self.target, message, base=self.base, retry=True)  # no turn has run
+            trajectory["steps"].append({"userInput": {}})  # a turn ran and the mail is still unread
+            resent = mailbox_wake.wake(self.target, message, base=self.base, retry=True)
+        self.assertEqual([first["status"], held["status"], resent["status"]], ["scheduled"] * 3)
+        self.assertEqual(len(server.sends()), 2)
+
     def test_wake_health_reports_the_route_without_sending(self):
         missing = mailbox_wake.wake_health(self.target, base=self.base)
         self.assertFalse(missing["wakeable"])
