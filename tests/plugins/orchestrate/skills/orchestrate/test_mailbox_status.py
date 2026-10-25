@@ -69,7 +69,7 @@ class StatusTests(unittest.TestCase):
 
     def test_heartbeats_do_not_trigger_updates_but_off_page_work_changes_do(self):
         first = status.snapshot(self.base, self.reader, limit=1)
-        mailbox.annotate(self.base, "worker", lastSeenAt="2026-10-24T20:00:00Z")
+        mailbox.annotate(self.base, "worker", lastSeenAt=mailbox.stamp())  # fresh, so presence holds
         self.assertEqual(status.snapshot(self.base, self.reader, limit=1)["cursor"], first["cursor"])
         self.checkpoint(next_step="Review final patch")
         changed = status.observe(self.base, self.reader, since=first["cursor"], timeout=0.1, limit=1)
