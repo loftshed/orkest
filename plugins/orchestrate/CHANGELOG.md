@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.37.1
+
+- fix(orchestrate): stop resubmitting Antigravity wakes still in the native queue (#39)
+
 ## 0.37.0
 
 - feat(orchestrate): add read-only agent status and change waits (#38)
