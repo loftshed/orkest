@@ -31,7 +31,10 @@ RECONCILE_EVERY = 3.0
 # Stops after which automatic activation must wait for the recipient's user: a cancel, a run-budget
 # limit, or an error nobody has classified as transient. Only that user's next prompt clears them.
 PARKED = frozenset(mailbox.ANTIGRAVITY_NO_CONTINUE)
-MARKERS = ("claude-wake.json", "agy-wake.json")
+# Markers lifted once the accept window passes. Not Antigravity's: its notice waits in the language
+# server's WHEN_IDLE queue, which can hold it for minutes, and `mailbox_wake.wake_gemini` reads the
+# trajectory to decide whether it ran. Lifting it here resubmitted a duplicate on every retry.
+MARKERS = ("claude-wake.json",)
 # Phases after which a notice may already be on its way: wait out the accept window before sending again.
 MAYBE_SENT = {"submitted", "unknown"}
 
