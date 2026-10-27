@@ -850,12 +850,23 @@ def is_live(peer: dict[str, Any], moment: dt.datetime | None = None) -> bool:
     return alive if alive is not None else moment - seen <= UNKNOWN_PID_TTL
 
 
+_PID_BIRTH_CACHE: dict[int, tuple[float, str]] = {}
+_PID_BIRTH_TTL = 30.0
+
+
 def process_started(pid: int) -> str | None:
     """The start time ps reports for a pid, which tells a reused pid from the process recorded.
 
     Fixed to UTC and the C locale: harnesses run with different TZ and LANG, and a stamp rendered in one
     must compare equal in another. (pidBirth replaced the earlier local-time pidStarted.)
     """
+    now_mono = time.monotonic()
+    cached = _PID_BIRTH_CACHE.get(pid)
+    if cached is not None and now_mono - cached[0] < _PID_BIRTH_TTL:
+        if pid_alive(pid):
+            return cached[1]
+        _PID_BIRTH_CACHE.pop(pid, None)
+        return None
     try:
         started = subprocess.run(
             ["ps", "-o", "lstart=", "-p", str(pid)],
@@ -866,7 +877,12 @@ def process_started(pid: int) -> str | None:
         ).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         return None
-    return started or None
+    if started:
+        if len(_PID_BIRTH_CACHE) >= 256:
+            _PID_BIRTH_CACHE.clear()
+        _PID_BIRTH_CACHE[pid] = (now_mono, started)
+        return started
+    return None
 
 
 def migrate_legacy_session(base: Path, session: str) -> None:
@@ -925,13 +941,41 @@ def remote_identity(url: str, checkout: str) -> str | None:
     return hashlib.sha256(f"remote:{host}/{path}".encode()).hexdigest()
 
 
+_WORKSPACE_CACHE: dict[str, tuple[bool, Path, Path, bytes, bytes, dict[str, Any]]] = {}
+
+
 def workspace(cwd: str) -> dict[str, Any]:
     """Git directory, checkout, branch and normalized remote identities for this project."""
     if not cwd or not Path(cwd).is_dir():
         return {}
     try:
+        resolved_cwd = str(Path(cwd).resolve())
+    except OSError:
+        resolved_cwd = cwd
+    has_dot_git = (Path(resolved_cwd) / ".git").exists()
+    cached = _WORKSPACE_CACHE.get(resolved_cwd)
+    if cached is not None:
+        cached_dot_git, common_dir, git_dir, cached_config, cached_head, cached_ws = cached
+        with contextlib.suppress(OSError):
+            if (
+                cached_dot_git == has_dot_git
+                and Path(cached_ws["checkout"]).is_dir()
+                and (common_dir / "config").read_bytes() == cached_config
+                and (git_dir / "HEAD").read_bytes() == cached_head
+            ):
+                return {**cached_ws, "remotes": list(cached_ws["remotes"])}
+    try:
         result = subprocess.run(
-            ["git", "-C", cwd, "rev-parse", "--path-format=absolute", "--git-common-dir", "--show-toplevel"],
+            [
+                "git",
+                "-C",
+                cwd,
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
+                "--show-toplevel",
+                "--git-dir",
+            ],
             capture_output=True,
             text=True,
             timeout=3,
@@ -959,12 +1003,29 @@ def workspace(cwd: str) -> dict[str, Any]:
                 remotes.add(identity)
     except (OSError, subprocess.SubprocessError):
         pass  # the common Git directory still identifies sibling worktrees
-    return {
-        "repo": str(Path(lines[0]).resolve()),
-        "checkout": str(Path(lines[1]).resolve()),
+    common_path = Path(lines[0]).resolve()
+    checkout_path = Path(lines[1]).resolve()
+    git_dir_path = Path(lines[2]).resolve() if len(lines) >= 3 else common_path
+    ws = {
+        "repo": str(common_path),
+        "checkout": str(checkout_path),
         "branch": branch or "(detached)",
         "remotes": sorted(remotes),
     }
+    with contextlib.suppress(OSError):
+        config_bytes = (common_path / "config").read_bytes()
+        head_bytes = (git_dir_path / "HEAD").read_bytes()
+        if len(_WORKSPACE_CACHE) >= 128:
+            _WORKSPACE_CACHE.clear()
+        _WORKSPACE_CACHE[resolved_cwd] = (
+            has_dot_git,
+            common_path,
+            git_dir_path,
+            config_bytes,
+            head_bytes,
+            {**ws, "remotes": list(ws["remotes"])},
+        )
+    return ws
 
 
 def project(peer: dict[str, Any]) -> dict[str, Any]:
@@ -2054,7 +2115,7 @@ def wait(
                     category="delivery",
                     operation="wait",
                     scope=scope,
-                    measurements={"waitSeconds": timeout},
+                    measurements={"waitSeconds": round(timeout, 2)},
                 )
             return timeout_result
         if cancelled is not None:
@@ -2115,7 +2176,35 @@ def prune(base: Path) -> dict[str, int]:
             expired = True
         if expired:
             path.unlink(missing_ok=True)
+            path.with_suffix(".lock").unlink(missing_ok=True)
             removed["messages"] += 1
+    for lock_file in [*(base / "peers").glob("*.lock"), *(base / "inbox").glob("*/*.lock")]:
+        if not lock_file.with_suffix(".json").exists():
+            lock_file.unlink(missing_ok=True)
+    for inbox_sub in (base / "inbox").glob("*"):
+        if (
+            inbox_sub.is_dir()
+            and not (base / "peers" / f"{inbox_sub.name}.json").exists()
+            and not any(inbox_sub.glob("*.json"))
+        ):
+            for lock_file in inbox_sub.glob("*.lock"):
+                lock_file.unlink(missing_ok=True)
+            with contextlib.suppress(OSError):
+                inbox_sub.rmdir()
+    for wake_sub in (base / "wakes").glob("*"):
+        with contextlib.suppress(OSError):
+            if (
+                wake_sub.is_dir()
+                and not (base / "peers" / f"{wake_sub.name}.json").exists()
+                and time.time() - wake_sub.stat().st_mtime > MAX_AGE.total_seconds()
+            ):
+                for item in wake_sub.glob("*"):
+                    item.unlink(missing_ok=True)
+                wake_sub.rmdir()
+    for lock_file in (base / "locks").glob("*.lock"):
+        with contextlib.suppress(OSError):
+            if time.time() - lock_file.stat().st_mtime > MAX_AGE.total_seconds():
+                lock_file.unlink(missing_ok=True)
     prune_send_journals(base)
     import mailbox_channels
 
@@ -2204,6 +2293,53 @@ def detect_harness(payload: dict[str, Any] | None = None) -> str:
 
 _TRANSCRIPT_TAIL_BYTES = 256 * 1024
 _MODEL_SET_STDOUT = re.compile(r"<local-command-stdout>Set model to (?:`([^`]+)`|([^\n<(]+))")
+_WAKE_NOTICE_ID = re.compile(r"Local peer mailbox notification \(([A-Za-z0-9._-]+)\)")
+
+
+def wake_notice_id(payload: dict[str, Any], session: str, account: str | None = None) -> str | None:
+    """Message id from a `Local peer mailbox notification (<id>)` turn trigger, if this turn started from one."""
+    for key in ("prompt", "userMessage", "query"):
+        if isinstance(value := payload.get(key), str) and (match := _WAKE_NOTICE_ID.search(value)):
+            return match.group(1)
+    raw_path = payload.get("transcript_path") or payload.get("transcriptPath")
+    path = Path(raw_path).expanduser() if isinstance(raw_path, str) and raw_path.strip() else None
+    if path is None and session:
+        home = Path(account).expanduser() if isinstance(account, str) and account else Path.home() / ".gemini"
+        candidate = home / "antigravity-cli/brain" / session / ".system_generated/logs/transcript.jsonl"
+        if candidate.is_file():
+            path = candidate
+    if path is None:
+        return None
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            offset = max(0, size - 16384)
+            handle.seek(offset)
+            chunk = handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    lines = chunk.splitlines()
+    if offset > 0 and lines:
+        lines = lines[1:]
+    for line in reversed(lines):
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        kind = entry.get("type")
+        if kind in {"USER_INPUT", "user"}:
+            content = entry.get("content")
+            if not isinstance(content, str) and isinstance(entry.get("message"), dict):
+                content = entry["message"].get("content")
+            if isinstance(content, str) and (match := _WAKE_NOTICE_ID.search(content)):
+                return match.group(1)
+            return None
+        if kind in {"SYSTEM_MESSAGE", "PLANNER_RESPONSE", "assistant"}:
+            return None
+    return None
 
 
 def transcript_model(payload: dict[str, Any]) -> str | None:
@@ -2675,7 +2811,7 @@ def hook(
     team_notice = (
         succession_notice(base, me) if event in {"SessionStart", "UserPromptSubmit", "PreInvocation", "Stop"} else ""
     )
-    if event in {"SessionStart", "UserPromptSubmit", "PreInvocation", "Stop"}:
+    if event in {"SessionStart", "UserPromptSubmit"} or (event == "PreInvocation" and not mid_turn):
         wake_dir = base / "wakes" / session_key(session)
         for marker_name in ("agy-wake.json", "claude-wake.json"):
             (wake_dir / marker_name).unlink(missing_ok=True)
@@ -2688,6 +2824,11 @@ def hook(
         if http_mode and event != "Stop":
             live = mailbox_daemon.ensure_running(base, startup_timeout=0.5)
             stale = live.get("runtimeRevision") != mailbox_daemon.runtime_revision()
+            if stale and not mid_turn and not live.get("activeWaits"):
+                with contextlib.suppress(MailboxError, OSError):
+                    if mailbox_daemon.stop_service(base):
+                        live = mailbox_daemon.ensure_running(base, startup_timeout=2.0)
+                        stale = live.get("runtimeRevision") != mailbox_daemon.runtime_revision()
             issue = "HTTP mailbox is running old code; use mailbox daemon restart after upgrade." if stale else ""
             if issue != me.get("httpAvailabilityIssue", ""):
                 availability_hint = issue
@@ -2712,9 +2853,36 @@ def hook(
     # At Stop or between steps of a turn only mail worth interrupting it for is read; quiet channel posts wait for
     # the next turn.
     delivered = take(base, session, eligible=mailbox_channels.reads_at_stop if event == "Stop" or mid_turn else None)
+    stale_wake_notice = ""
+    if (
+        event in {"UserPromptSubmit", "PreInvocation"}
+        and not mid_turn
+        and not delivered
+        and (notice_id := wake_notice_id(payload, session, me.get("accountHome")))
+    ):
+        existing_mail = load(inbox_dir(base, session) / f"{notice_id}.json")
+        if existing_mail and existing_mail.get("readAt"):
+            stale_wake_notice = (
+                f"Mailbox notification ({notice_id}) was already delivered and marked read in an earlier turn "
+                f"(at {existing_mail['readAt']}); no unread peer messages remain. Do not call inbox or ack—finish immediately."
+            )
+        else:
+            stale_wake_notice = (
+                f"Mailbox notification ({notice_id}) has no unread messages waiting in your inbox. "
+                "Do not call inbox or ack—finish immediately."
+            )
     context = render_all(delivered, me["name"])
     hint = "\n".join(
-        value for value in (cleared_notice, team_notice, identity_hint, availability_hint, route_hint) if value
+        value
+        for value in (
+            cleared_notice,
+            team_notice,
+            identity_hint,
+            availability_hint,
+            route_hint,
+            stale_wake_notice,
+        )
+        if value
     )
     if hint:
         context = hint + ("\n\n" + context if context else "")

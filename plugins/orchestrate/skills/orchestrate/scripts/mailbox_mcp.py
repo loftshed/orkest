@@ -727,6 +727,9 @@ ARGUMENT_ALIASES: dict[str, dict[str, str]] = {
     "send": {
         "message": "text",
         "body": "text",
+        "content": "text",
+        "recipient": "to",
+        "target": "to",
         "reply_to": "replyTo",
         "idempotency_key": "idempotencyKey",
         "native_unreachable": "nativeUnreachable",
@@ -912,7 +915,22 @@ class Server:
                 effort=mailbox.runtime_effort(self.harness),
             )
         peer = mailbox.load(mailbox.peer_path(self.base, session))
-        if not mailbox.valid_peer(peer) or not mailbox.is_live(peer):
+        if not mailbox.valid_peer(peer):
+            matches = [
+                candidate
+                for candidate in mailbox.peers(self.base)
+                if session == candidate.get("name") or session in candidate.get("aliases", [])
+            ]
+            if len(matches) == 1:
+                peer = matches[0]
+                session = peer["session"]
+        alive_shared = (
+            mailbox.valid_peer(peer)
+            and peer.get("sharedProcess")
+            and mailbox.pid_alive(peer.get("pid"))
+            and (not peer.get("pidBirth") or mailbox.process_started(peer["pid"]) == peer.get("pidBirth"))
+        )
+        if not mailbox.valid_peer(peer) or not (mailbox.is_live(peer) or alive_shared):
             raise mailbox.MailboxError("unknown or expired caller; register your cwd, harness and native PID again")
         if self.harness != "unknown" and self.harness != peer["harness"]:
             raise mailbox.MailboxError("caller harness differs from registered identity; use this host's own session")

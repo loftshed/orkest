@@ -4,22 +4,21 @@ import { jsonView } from "./render.mjs";
 import { getAccounts } from "./store.mjs";
 import { VERSION } from "./version.mjs";
 
-const INSTRUCTIONS = `Reports remaining subscription quota on this machine's AI accounts (Claude, Codex/ChatGPT, Antigravity/Gemini) so work can be routed where capacity would otherwise go unused.
-Percentages are relative to each account's own allowance and are not comparable in absolute tokens across providers.
-surplusPts = weekly % remaining minus what even use until reset would leave; positive means under-used capacity that is lost at reset unless spent.
-Pools marked expiring are near their weekly rollover with capacity left; that remainder is lost at the rollover, so prefer them (and larger tasks) until it is used. Pools under 10% usable now can only take small tasks.
-A pool with status "credits" (Codex/ChatGPT once its weekly allowance is used up) still takes work of any size: each request is metered against the account's credit balance, which persists, so free quota ranks ahead of it. Only status "blocked" means a pool cannot run anything.
-Switching accounts can switch billing context (e.g. work vs personal); follow the user's rules about which accounts an agent may use.`;
+const INSTRUCTIONS = `Subscription quota across local AI accounts (Claude, Codex, Antigravity/Gemini) for routing work.
+Percentages are per-account allowances. surplusPts = weekly % left minus even-pace remainder; positive is under-used capacity lost at reset.
+Prefer expiring pools (near weekly rollover) and larger tasks there; pools <10% usable now fit small tasks only.
+Status "credits" (Codex after weekly quota) takes any task metered against persistent credits, ranked after free quota; only "blocked" cannot run work.
+Respect user rules when switching accounts changes billing context (work vs personal).`;
 
 const TOOLS = [
   {
     name: "get_usage",
     description:
-      "Current remaining quota for every configured AI account: each rate-limit window (5-hour, weekly, per-model) with % left and reset time, plus a ranked list of where to spend next. Cached for a few minutes; pass refresh=true to re-read now (takes ~5s).",
+      "Remaining quota for configured AI accounts (5h, weekly, per-model windows with % left and reset time) and ranked pools. Cached; set refresh=true to re-query (~5s).",
     inputSchema: {
       type: "object",
       properties: {
-        refresh: { type: "boolean", description: "Bypass the cache and query every provider now." },
+        refresh: { type: "boolean", description: "Bypass cache and query providers now." },
       },
       additionalProperties: false,
     },
@@ -28,16 +27,16 @@ const TOOLS = [
   {
     name: "recommend",
     description:
-      "Ranks the AI accounts/model pools to use next, best first, using remaining quota, time to reset, and whether the account is ahead of or behind even pace. A pool whose included quota is used up but that has a credit balance (Codex) is usable and ranks after pools with free room. Filter by model family (claude, gpt, gemini). Each entry includes a route hint: the CLI that uses that pool.",
+      "Ranks AI account/model pools best-first by remaining quota, reset time, and pace (free quota before credit balances). Filter by family; includes CLI route hints.",
     inputSchema: {
       type: "object",
       properties: {
         family: {
           type: "string",
           enum: ["any", "claude", "gpt", "gemini"],
-          description: "Only consider pools serving this model family.",
+          description: "Model family filter.",
         },
-        refresh: { type: "boolean", description: "Bypass the cache and query every provider now." },
+        refresh: { type: "boolean", description: "Bypass cache and query providers now." },
       },
       additionalProperties: false,
     },
@@ -144,7 +143,7 @@ async function callTool(name, rawArgs) {
   const accounts = await getAccounts({ force: args.refresh === true });
   const view = jsonView(accounts);
   if (name === "get_usage") {
-    return `${expiringSummary(view.lanes)}${summarizeUsage(view)}\n\nWhere to spend next:\n${summarizeLanes(view.lanes)}\n\n${JSON.stringify(compactView(view))}`;
+    return `${expiringSummary(view.lanes)}${summarizeUsage(view)}\n\n${JSON.stringify(compactView(view))}`;
   }
   if (name === "recommend") {
     const family = args.family && args.family !== "any" ? args.family : null;
@@ -155,7 +154,7 @@ async function callTool(name, rawArgs) {
       ? `Best right now: ${best.label}${best.route ? ` (use: ${best.route})` : ""}. ${best.advice}.`
       : "Every matching pool is exhausted right now.";
     const billing = Object.fromEntries(view.accounts.map((a) => [a.id, a.billing]));
-    return `${expiringSummary(lanes)}${head}\n\n${summarizeLanes(lanes)}\n\n${JSON.stringify({ schema: view.schema, generatedAt: view.generatedAt, lanes: compactLanes(lanes, billing) })}`;
+    return `${expiringSummary(lanes)}${head}\n\n${JSON.stringify({ schema: view.schema, generatedAt: view.generatedAt, lanes: compactLanes(lanes, billing) })}`;
   }
   throw Object.assign(new Error(`Unknown tool: ${name}`), { code: -32_602 });
 }
@@ -203,9 +202,41 @@ async function handle(msg) {
 }
 
 export function serveMcp() {
-  const write = (payload) => process.stdout.write(`${JSON.stringify(payload)}\n`);
+  let inFlight = 0;
+  let isStdinClosed = false;
+  let lastActivityAt = Date.now();
+  const initialPpid = process.ppid;
+  const idleMs = Number(process.env.MONITOR_MCP_IDLE_MS ?? 30 * 60_000);
+  const shutdown = () => {
+    clearInterval(watchdog);
+    process.exit(0);
+  };
+  const maybeExitOnDrain = () => {
+    if (isStdinClosed && inFlight === 0) shutdown();
+  };
+  const watchdog = setInterval(() => {
+    if (process.ppid === 1 || process.ppid !== initialPpid) shutdown();
+    if (inFlight === 0 && idleMs > 0 && Date.now() - lastActivityAt >= idleMs) shutdown();
+  }, 30_000);
+  watchdog.unref();
+  for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) process.once(signal, shutdown);
+  process.stdout.on("error", (error) => {
+    if (error?.code === "EPIPE") shutdown();
+  });
+  const write = (payload) => {
+    if (!process.stdout.writableEnded) process.stdout.write(`${JSON.stringify(payload)}\n`);
+  };
   const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
+  rl.on("close", () => {
+    isStdinClosed = true;
+    maybeExitOnDrain();
+  });
+  process.stdin.on("end", () => {
+    isStdinClosed = true;
+    maybeExitOnDrain();
+  });
   rl.on("line", async (line) => {
+    lastActivityAt = Date.now();
     if (!line.trim()) return;
     let msg;
     try {
@@ -213,17 +244,24 @@ export function serveMcp() {
     } catch {
       return write(response(null, { error: { code: -32_700, message: "Parse error" } }));
     }
-    // JSON-RPC batches (MCP 2025-03-26): answer with one array, leaving out notifications.
-    if (Array.isArray(msg)) {
-      if (msg.length === 0)
-        return write(
-          response(null, { error: { code: -32_600, message: "Invalid Request: empty batch" } }),
-        );
-      const replies = (await Promise.all(msg.map(handle))).filter(Boolean);
-      if (replies.length > 0) write(replies);
-      return;
+    inFlight++;
+    try {
+      // JSON-RPC batches (MCP 2025-03-26): answer with one array, leaving out notifications.
+      if (Array.isArray(msg)) {
+        if (msg.length === 0)
+          return write(
+            response(null, { error: { code: -32_600, message: "Invalid Request: empty batch" } }),
+          );
+        const replies = (await Promise.all(msg.map(handle))).filter(Boolean);
+        if (replies.length > 0) write(replies);
+        return;
+      }
+      const reply = await handle(msg);
+      if (reply) write(reply);
+    } finally {
+      inFlight--;
+      lastActivityAt = Date.now();
+      maybeExitOnDrain();
     }
-    const reply = await handle(msg);
-    if (reply) write(reply);
   });
 }

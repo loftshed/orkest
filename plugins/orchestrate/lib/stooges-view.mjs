@@ -604,18 +604,18 @@ export class StoogesView {
       ]);
     }
     const tableWidth = Math.max(headers.length, width - 2);
+    const selectedAgentIndex = visible.findIndex((agent) => agent.id === focused);
     const table = renderTable(headers, rows, tableWidth, {
       weights,
       tier: this.tier,
       rowDetails: visible.map((agent) => (agent.question ? `? ${plain(agent.question)}` : "")),
       rowStyle: (line, index) => {
         const tone = toneForStatus(visible[index]?.status);
-        const isSelected = index === visible.findIndex((agent) => agent.id === focused);
+        const isSelected = index === selectedAgentIndex;
         return ansi(line, `${tone}${isSelected ? " inverse" : ""}`, this.color);
       },
     });
     const headerRows = table.slice(0, 2);
-    const selectedAgentIndex = visible.findIndex((agent) => agent.id === focused);
     selectedIndex = selectedAgentIndex;
     const panelRows = [
       ...headerRows.map((line) => ansi(line, "bold", this.color)),

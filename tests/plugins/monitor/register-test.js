@@ -82,6 +82,23 @@ test("uses the enabled monitor plugin instead of adding a duplicate Claude serve
   });
 });
 
+test("uses the enabled monitor plugin instead of adding a duplicate Codex server", () => {
+  const pluginHome = path.join(home, "codex-plugin-case");
+  const codexDir = path.join(pluginHome, ".codex");
+  mkdirSync(codexDir, { recursive: true });
+  writeFileSync(path.join(codexDir, "config.toml"), '[plugins."monitor@orkest"]\nenabled = true\n');
+
+  const plan = registrationPlan(config(), launcher, { home: pluginHome });
+  const steps = stepsFor(plan, "Codex (CLI and app)");
+
+  expect(steps).toHaveLength(1);
+  expect(steps[0]).toMatchObject({ kind: "file", note: "provided by the monitor plugin" });
+  expect(steps[0].apply()).toStrictEqual({
+    changed: false,
+    note: "provided by the monitor plugin",
+  });
+});
+
 test("deduplicates Claude profiles and skips them when requested", () => {
   const profile = path.join(home, ".claude-personal");
   const accounts = [
