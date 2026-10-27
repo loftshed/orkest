@@ -78,7 +78,10 @@ print(json.dumps({'schema': 'ork.routes.v1', 'routes': rows}))
 
 async function pythonJson(args) {
   try {
-    const { stdout } = await execute("python3", args, { maxBuffer: 8 * 1024 * 1024 });
+    const { stdout } = await execute("python3", args, {
+      maxBuffer: 8 * 1024 * 1024,
+      timeout: 30_000,
+    });
     return JSON.parse(stdout);
   } catch (error) {
     throw new Error(`Could not read local routing data: ${error.stderr?.trim() || error.message}`, {
@@ -271,11 +274,24 @@ async function summaryCommand(argv, stdout) {
 /** Runs gate.py with this terminal, passing signals on and returning its exit code. */
 function gateCommand(argv) {
   const child = spawn("python3", [path.join(scripts, "gate.py"), ...argv], { stdio: "inherit" });
-  for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"])
-    process.on(signal, () => child.kill(signal));
+  const signals = ["SIGINT", "SIGTERM", "SIGHUP"];
+  const handlers = signals.map((signal) => {
+    const forward = () => child.kill(signal);
+    process.on(signal, forward);
+    return [signal, forward];
+  });
+  const detach = () => {
+    for (const [signal, forward] of handlers) process.off(signal, forward);
+  };
   return new Promise((resolve, reject) => {
-    child.on("error", reject);
-    child.on("exit", (code, signal) => resolve(code ?? 128 + (os.constants.signals[signal] ?? 0)));
+    child.on("error", (error) => {
+      detach();
+      reject(error);
+    });
+    child.on("exit", (code, signal) => {
+      detach();
+      resolve(code ?? 128 + (os.constants.signals[signal] ?? 0));
+    });
   });
 }
 
@@ -290,7 +306,9 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
     const script = fileURLToPath(
       new URL("../skills/orchestrate/scripts/peer_mailbox.py", import.meta.url),
     );
-    const { stdout: name } = await execute("python3", [script, "name", ...argv.slice(1)]);
+    const { stdout: name } = await execute("python3", [script, "name", ...argv.slice(1)], {
+      timeout: 30_000,
+    });
     stdout.write(name);
     return;
   }

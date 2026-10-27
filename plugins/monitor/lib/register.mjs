@@ -18,6 +18,17 @@ function pluginEnabled(claudeDir) {
   }
 }
 
+function codexPluginEnabled(home) {
+  try {
+    const toml = readFileSync(path.join(home, ".codex", "config.toml"), "utf8");
+    return /^\[plugins\."monitor@[^"\r\n]+"\]\s*\r?\n(?:[^\][\r\n]*\r?\n)*?enabled\s*=\s*true\b/m.test(
+      toml,
+    );
+  } catch {
+    return false;
+  }
+}
+
 function binary(name, override) {
   try {
     return resolveBinary(name, override);
@@ -70,11 +81,22 @@ export function registrationPlan(
       { CLAUDE_CONFIG_DIR: isDefault ? null : dir },
     );
   }
-  cli(
-    "Codex (CLI and app)",
-    binary("codex"),
-    remove ? ["mcp", "remove", NAME] : ["mcp", "add", NAME, "--", launcher, "mcp"],
-  );
+  const codexTarget = "Codex (CLI and app)";
+  if (!remove && codexPluginEnabled(home)) {
+    const note = "provided by the monitor plugin";
+    plan.push({
+      kind: "file",
+      target: codexTarget,
+      note,
+      apply: () => ({ changed: false, note }),
+    });
+  } else {
+    cli(
+      codexTarget,
+      binary("codex"),
+      remove ? ["mcp", "remove", NAME] : ["mcp", "add", NAME, "--", launcher, "mcp"],
+    );
+  }
   cli(
     "Antigravity (agy)",
     binary("agy"),

@@ -129,6 +129,9 @@ class WakeRecoveryTests(unittest.TestCase):
         wake = FakeWake()
         self.assertEqual(self.at(10, wake), [])  # still inside the accept window
         self.assertTrue(marker.exists())
+        with patch.object(peer_mailbox, "write", wraps=peer_mailbox.write) as spy_write:
+            self.assertEqual(self.at(15, wake), [])
+            spy_write.assert_not_called()
         self.at(25, wake)
         self.assertEqual(wake.calls, [("target", sent["id"], True)])
         self.assertFalse(marker.exists())  # lifted, so the adapter really submits again

@@ -78,11 +78,23 @@ function rpcRateLimits(bin, env, timeoutMs) {
     let buf = "";
     let stderr = "";
     let isSettled = false;
+    let killTimer;
     const finish = (fn, value) => {
       if (isSettled) return;
       isSettled = true;
       clearTimeout(timer);
+      child.stdin.end();
+      child.stdout.destroy();
+      child.stderr.destroy();
       child.kill();
+      killTimer = setTimeout(() => {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // Process already exited.
+        }
+      }, 1000);
+      killTimer.unref();
       fn(value);
     };
     const timer = setTimeout(
@@ -121,6 +133,7 @@ function rpcRateLimits(bin, env, timeoutMs) {
     });
     child.on("error", (err) => finish(reject, err));
     child.on("close", (code) => {
+      clearTimeout(killTimer);
       const detail = stderr.trim().slice(0, 200) || "no output";
       finish(
         reject,

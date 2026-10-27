@@ -61,25 +61,46 @@ export function run(cmd, args, { env, timeoutMs = 60_000, maxBytes = 4 * 1024 * 
       cwd: cwd ?? homedir(),
       stdio: ["ignore", "pipe", "pipe"],
     });
+    const onExit = () => {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // Child already exited.
+      }
+    };
+    process.on("exit", onExit);
     let stdout = "";
     let stderr = "";
+    let isKilledForSize = false;
+    const cleanup = () => {
+      clearTimeout(timer);
+      process.off("exit", onExit);
+    };
     const timer = setTimeout(() => {
+      child.stdout?.destroy();
+      child.stderr?.destroy();
       child.kill("SIGKILL");
+      cleanup();
       reject(new Error(`${cmd} timed out after ${Math.round(timeoutMs / 1000)}s`));
     }, timeoutMs);
     child.stdout.on("data", (d) => {
+      if (isKilledForSize) return;
       stdout += d;
-      if (stdout.length > maxBytes) child.kill("SIGKILL");
+      if (stdout.length <= maxBytes) return;
+      isKilledForSize = true;
+      child.stdout.destroy();
+      child.stderr.destroy();
+      child.kill("SIGKILL");
     });
     child.stderr.on("data", (d) => {
       if (stderr.length < 64 * 1024) stderr += d;
     });
     child.on("error", (err) => {
-      clearTimeout(timer);
+      cleanup();
       reject(err);
     });
     child.on("close", (code) => {
-      clearTimeout(timer);
+      cleanup();
       resolve({ code, stdout, stderr });
     });
   });

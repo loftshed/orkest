@@ -21,6 +21,7 @@ export async function authorityShow(team) {
   try {
     const { stdout } = await execute("python3", [authorityPath, "show", "--team", team], {
       maxBuffer: 8 * 1024 * 1024,
+      timeout: 30_000,
     });
     const { authority } = JSON.parse(stdout);
     return {
@@ -50,6 +51,7 @@ export async function coordinator(args) {
   try {
     const { stdout } = await execute("python3", [coordinatorPath, ...args], {
       maxBuffer: 8 * 1024 * 1024,
+      timeout: 30_000,
     });
     return JSON.parse(stdout);
   } catch (error) {
@@ -249,12 +251,23 @@ export async function dispatchMember(id, memberId, options = {}) {
 
 /** Read task snapshots through the coordinator. A terminal's idle state is never a verdict. */
 export async function observeRoom(
-  id,
-  { root = mailboxRoot(), run = coordinator, authority = authorityShow } = {},
+  idOrRoom,
+  {
+    root = mailboxRoot(),
+    run = coordinator,
+    authority = authorityShow,
+    tasks = new Map(),
+    authorities = new Map(),
+  } = {},
 ) {
-  const room = await readRoom(id, root);
-  if (room.authority) room.lead = await authority(room.authority);
-  const tasks = new Map();
+  const room = typeof idOrRoom === "string" ? await readRoom(idOrRoom, root) : idOrRoom;
+  if (room.authority) {
+    if (!authorities.has(room.authority))
+      authorities.set(room.authority, await authority(room.authority));
+    room.lead = authorities.get(room.authority);
+  }
+  const hasDispatches = room.agents.some((member) => member.dispatch);
+  const roomCwd = hasDispatches ? await realpath(room.cwd) : null;
   for (const member of room.agents) {
     if (!member.dispatch) continue;
     const binding = member.dispatch;
@@ -262,10 +275,7 @@ export async function observeRoom(
       if (!tasks.has(binding.taskDir))
         tasks.set(binding.taskDir, await run(["show", "--task-dir", binding.taskDir]));
       const task = tasks.get(binding.taskDir);
-      if (
-        task.task_id !== binding.taskId ||
-        (await realpath(task.repository)) !== (await realpath(room.cwd))
-      )
+      if (task.task_id !== binding.taskId || (await realpath(task.repository)) !== roomCwd)
         throw new Error("Task identity changed");
       const found = task.runs.filter((entry) => entry.request_id === binding.requestId);
       if (found.length !== 1)
@@ -320,10 +330,11 @@ export async function recoverRoom(id, options = {}) {
   const directories = new Set(
     room.agents.map((member) => member.dispatch?.taskDir).filter(Boolean),
   );
+  const roomCwd = directories.size > 0 ? await realpath(room.cwd) : null;
   for (const directory of directories) {
     const task = await run(["show", "--task-dir", directory]);
     if (
-      (await realpath(task.repository)) !== (await realpath(room.cwd)) ||
+      (await realpath(task.repository)) !== roomCwd ||
       room.agents.some(
         (member) =>
           member.dispatch?.taskDir === directory && member.dispatch.taskId !== task.task_id,
@@ -333,7 +344,7 @@ export async function recoverRoom(id, options = {}) {
   }
   for (const directory of directories)
     await run(["recover", "--task-dir", directory, ...leadArgs(options)]);
-  return observeRoom(id, { root, run, authority: options.authority });
+  return observeRoom(room, { root, run, authority: options.authority });
 }
 
 export async function readLaunchPlan(file) {

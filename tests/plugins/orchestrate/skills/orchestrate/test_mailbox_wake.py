@@ -269,6 +269,38 @@ class AntigravityWakeTests(unittest.TestCase):
         self.assertEqual(result["reason"], "listener")
         listener.assert_called_once()
 
+    def test_stale_queued_wake_notification_tells_agent_message_was_already_read(self):
+        self.mail("handle this during subagent turn")
+        message_id = peer_mailbox.incoming(self.base, "agy-target")[0]["id"]
+        transcript = Path(self.temporary.name) / "transcript.jsonl"
+        payload = {
+            "conversationId": "agy-target",
+            "workspacePaths": [str(SCRIPTS)],
+            "invocationNum": 1,
+            "transcriptPath": str(transcript),
+        }
+        with patch.dict("os.environ", {}, clear=True), patch.object(peer_mailbox, "harness_pid", return_value=None):
+            first = peer_mailbox.hook(payload, harness="gemini", event="PreInvocation", base=self.base)
+            peer_mailbox.hook(
+                {**payload, "terminationReason": "NO_TOOL_CALL"}, harness="gemini", event="Stop", base=self.base
+            )
+            transcript.write_text(
+                json.dumps(
+                    {
+                        "type": "USER_INPUT",
+                        "content": f"<USER_REQUEST>\n{mailbox_wake.notification(message_id)}\n</USER_REQUEST>",
+                    }
+                )
+                + "\n"
+            )
+            popped = peer_mailbox.hook(payload, harness="gemini", event="PreInvocation", base=self.base)
+        self.assertIn("handle this during subagent turn", first["injectSteps"][0]["ephemeralMessage"])
+        self.assertIn(
+            f"Mailbox notification ({message_id}) was already delivered and marked read",
+            popped["injectSteps"][0]["ephemeralMessage"],
+        )
+        self.assertIn("Do not call inbox or ack—finish immediately.", popped["injectSteps"][0]["ephemeralMessage"])
+
 
 class MailboxWakeTests(unittest.TestCase):
     def test_codex_wakes_reach_the_recipients_own_profile_daemon(self):
