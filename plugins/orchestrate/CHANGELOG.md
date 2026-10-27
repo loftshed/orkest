@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.38.0
+
+- feat: mailbox fixes
+
 ## 0.37.1
 
 - fix(orchestrate): stop resubmitting Antigravity wakes still in the native queue (#39)
