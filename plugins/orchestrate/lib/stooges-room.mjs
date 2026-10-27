@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -162,6 +162,32 @@ export async function readRoom(id, root) {
   return room;
 }
 
+function pidAlive(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === "EPERM";
+  }
+}
+
+async function isStaleRoomLock(lock) {
+  try {
+    const rawOwner = await readFile(path.join(lock, "owner"), "utf8");
+    const owner = Math.trunc(Number(rawOwner.trim()));
+    if (Number.isSafeInteger(owner) && owner > 0) return !pidAlive(owner);
+  } catch {
+    // Missing owner file while lock creator is still writing it; check lock age below.
+  }
+  try {
+    const info = await stat(lock);
+    return Date.now() - info.mtimeMs > 15_000;
+  } catch {
+    return false;
+  }
+}
+
 /** Atomic replacement under a bounded, exclusive lock prevents concurrent spawns losing members. */
 export async function updateRoom(id, update, { root = mailboxRoot(), create = false } = {}) {
   const file = roomPath(id, root);
@@ -171,9 +197,14 @@ export async function updateRoom(id, update, { root = mailboxRoot(), create = fa
   for (;;) {
     try {
       await mkdir(lock);
+      await writeFile(path.join(lock, "owner"), `${process.pid}\n`);
       break;
     } catch (error) {
       if (error.code !== "EEXIST") throw error;
+      if (await isStaleRoomLock(lock)) {
+        await rm(lock, { recursive: true, force: true });
+        continue;
+      }
       if (Date.now() >= deadline) throw new Error(`Room is locked: ${id}`, { cause: error });
       await sleep(25);
     }
