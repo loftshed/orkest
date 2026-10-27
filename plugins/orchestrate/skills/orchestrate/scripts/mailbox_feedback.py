@@ -146,11 +146,18 @@ def record(base: Path, payload: dict[str, Any], *, repeat: bool = True) -> dict[
     identifier = "feedback-" + digest(payload)
     destination.mkdir(parents=True, exist_ok=True, mode=0o700)
     path = destination / f"{identifier}.json"
-    lock_key = hashlib.sha256(f"{os.getuid()}:{destination.resolve()}:{identifier}".encode()).hexdigest()[:24]
+    lock_key = hashlib.sha256(f"{os.getuid()}:{destination.resolve()}".encode()).hexdigest()[:24]
     lock_path = Path(tempfile.gettempdir()) / f".agent-executor-feedback-{lock_key}.lock"
     descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX)
+        now_ts = dt.datetime.now(dt.UTC).timestamp()
+        for stale_tmp in destination.glob(".feedback-*"):
+            try:
+                if now_ts - stale_tmp.stat().st_mtime > 60:
+                    stale_tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
         existing = read(path)
         if existing and not repeat:
             return {"id": identifier, "status": "already_recorded", "occurrences": existing["occurrences"]}

@@ -16,6 +16,7 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -25,7 +26,9 @@ import { pathToFileURL } from "node:url";
 const { isAbsolute, relative, resolve, sep } = path;
 
 const LINT_TIMEOUT_MS = 120_000;
+const MAX_ERROR_CHARS = 4000;
 const MAX_FIX_ATTEMPTS = 3;
+const STALE_STATE_MS = 24 * 60 * 60 * 1000;
 const defaultStateDirectory = resolve(tmpdir(), "orkest-turn-lint");
 
 const repositoryPath = (file, projectDirectory) => {
@@ -95,6 +98,21 @@ export const clearTurnState = ({
   });
   if (statePaths) {
     rmSync(statePaths.turnDirectory, { force: true, recursive: true });
+  }
+  try {
+    const cutoff = Date.now() - STALE_STATE_MS;
+    for (const entry of readdirSync(stateDirectory)) {
+      const candidate = resolve(stateDirectory, entry);
+      try {
+        if (statSync(candidate).mtimeMs < cutoff) {
+          rmSync(candidate, { force: true, recursive: true });
+        }
+      } catch {
+        // Concurrent session cleanup can race safely.
+      }
+    }
+  } catch {
+    // State root may not exist yet.
   }
 };
 
@@ -180,14 +198,15 @@ export const commandsFor = (files, { root, ruffVersion } = {}) => {
   const bin = (name) => resolve(root, "node_modules", ".bin", name);
   const javascript = files.filter((file) => /\.(?:c|m)?jsx?$/.test(file));
   const python = files.filter((file) => file.endsWith(".py"));
+  const prettierFiles = files.filter((file) => !file.endsWith(".py") && !file.endsWith(".sh"));
   const commands = [];
   if (javascript.length > 0) {
     commands.push([bin("eslint"), ["--fix", "--no-warn-ignored", "--", ...javascript]]);
   }
-  if (files.length > 0) {
+  if (prettierFiles.length > 0) {
     commands.push([
       bin("prettier"),
-      ["--write", "--ignore-unknown", "--log-level", "warn", "--", ...files],
+      ["--write", "--ignore-unknown", "--log-level", "warn", "--", ...prettierFiles],
     ]);
   }
   if (python.length > 0 && ruffVersion) {
@@ -324,7 +343,10 @@ export const runTurnLintHook = ({
     fingerprint: fixedFingerprint,
     ok: false,
   });
-  const output = [result.stdout, result.stderr, result.error?.message].filter(Boolean).join("\n");
+  const output =
+    result.stderr.length > MAX_ERROR_CHARS
+      ? `${result.stderr.slice(0, MAX_ERROR_CHARS)}\n… (truncated)`
+      : result.stderr;
   writeError(`Lint or formatting failed for files touched this turn:\n${output}`);
   return 2;
 };

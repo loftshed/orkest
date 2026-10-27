@@ -303,12 +303,15 @@ export function creditBalance(account) {
   return creditGauge(account.credits);
 }
 
+const CREDIT_FORMATTER = new Intl.NumberFormat("en-US", {
+  maximumFractionDigits: 2,
+  roundingMode: "trunc",
+});
+
 function creditGauge(credits) {
   if (!credits || (!credits.unlimited && credits.balance === null)) return null;
   if (!credits.unlimited && !Number.isFinite(credits.balance)) return null;
-  let text = credits.unlimited
-    ? "∞ cr"
-    : `${new Intl.NumberFormat("en-US", { maximumFractionDigits: 2, roundingMode: "trunc" }).format(credits.balance)} cr`;
+  let text = credits.unlimited ? "∞ cr" : `${CREDIT_FORMATTER.format(credits.balance)} cr`;
   if (!credits.unlimited && credits.balance > 0 && credits.balance < 0.01) text = "<0.01 cr";
   return { ...credits, text, level: hasUsableCredits(credits) ? "ok" : "out" };
 }
@@ -446,11 +449,20 @@ export function sections(accounts, now = Date.now()) {
 /** Compact per-account figure for status bars: how much can be used right now, per independent pool. */
 export function headline(account, now = Date.now()) {
   if (!account.windows?.length) return { text: "?", level: "error" };
-  const credits = pills(account, now).find((p) => p.credits)?.credits;
-  if (credits) return { text: credits.text, level: credits.level, unit: "credits" };
   const windows = new Map(effectiveWindows(account, now).map((w) => [w.id, w]));
   const independent = independentPools(account);
   if (independent.length === 0) return { text: "?", level: "error" };
+  if (account.provider === "codex") {
+    const codexPool = independent.find((p) => p.id === "codex");
+    const long = codexPool?.windowIds
+      .map((id) => windows.get(id))
+      .filter((w) => w && (w.windowMins ?? 0) >= 1440)
+      .sort((a, b) => a.remainingPct - b.remainingPct)[0];
+    if (long && long.remainingPct <= EXHAUSTED_PCT) {
+      const credits = creditGauge(account.credits);
+      if (credits) return { text: credits.text, level: credits.level, unit: "credits" };
+    }
+  }
   const values = independent.map((p) =>
     Math.min(...p.windowIds.map((id) => windows.get(id)?.remainingPct ?? 100)),
   );
