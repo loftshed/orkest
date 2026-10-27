@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { emitKeypressEvents } from "node:readline";
 
@@ -6,11 +6,41 @@ import { shouldUseColor } from "../../monitor/lib/render.mjs";
 import { CACHE_DIR, CONFIG_PATH } from "../../monitor/lib/store.mjs";
 import { fit, StoogesView } from "../lib/stooges-view.mjs";
 
+const quotaCache = {
+  snapshotPath: "",
+  snapshotMtimeMs: -1,
+  configPath: "",
+  configMtimeMs: -1,
+  accounts: null,
+};
+
+async function mtimeOrNull(filePath) {
+  try {
+    return (await stat(filePath)).mtimeMs;
+  } catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
 /** Follow monitor's shared snapshot without starting provider CLIs from a display. */
 export async function cachedQuota() {
+  const snapshotPath = path.join(CACHE_DIR, "snapshot.json");
+  const snapshotMtimeMs = await mtimeOrNull(snapshotPath);
+  if (snapshotMtimeMs === null) return [];
+  const configMtimeMs = await mtimeOrNull(CONFIG_PATH);
+  if (
+    quotaCache.accounts &&
+    quotaCache.snapshotPath === snapshotPath &&
+    quotaCache.snapshotMtimeMs === snapshotMtimeMs &&
+    quotaCache.configPath === CONFIG_PATH &&
+    quotaCache.configMtimeMs === configMtimeMs
+  ) {
+    return quotaCache.accounts.map((account) => ({ ...account }));
+  }
   let snapshot;
   try {
-    snapshot = JSON.parse(await readFile(path.join(CACHE_DIR, "snapshot.json"), "utf8"));
+    snapshot = JSON.parse(await readFile(snapshotPath, "utf8"));
   } catch (error) {
     if (error.code === "ENOENT") return [];
     throw error;
@@ -23,12 +53,20 @@ export async function cachedQuota() {
   }
   const entries = snapshot.accounts || {};
   const configured = config?.accounts || Object.values(entries);
-  return configured.map((account) => ({
+  const accounts = configured.map((account) => ({
     ...entries[account.id],
     id: account.id,
     label: account.label || account.id,
     short: account.short || account.id.slice(0, 2).toUpperCase(),
   }));
+  Object.assign(quotaCache, {
+    snapshotPath,
+    snapshotMtimeMs,
+    configPath: CONFIG_PATH,
+    configMtimeMs,
+    accounts,
+  });
+  return accounts.map((account) => ({ ...account }));
 }
 
 /** Own only terminal state; workers and room membership survive closing the display. */
@@ -110,6 +148,7 @@ export async function runTui(
     input.off("close", cleanup);
     process.off("SIGINT", cleanup);
     process.off("SIGTERM", cleanup);
+    process.off("SIGHUP", cleanup);
     output.off?.("resize", onResize);
     try {
       if (isRawModeChanged) input.setRawMode(wasRaw);
@@ -160,13 +199,16 @@ export async function runTui(
     isCursorHidden = true;
     await new Promise((resolve) => {
       resolveExit = resolve;
-      timer = setInterval(paint, 200);
+      timer = setInterval(() => {
+        if (view.needsAnimation) paint();
+      }, 200);
       refreshTimer = setInterval(refresh, 1000);
       input.on("keypress", keypress);
       input.on("end", cleanup);
       input.on("close", cleanup);
       process.on("SIGINT", cleanup);
       process.on("SIGTERM", cleanup);
+      process.on("SIGHUP", cleanup);
       output.on?.("resize", onResize);
       paint();
       void refresh();
