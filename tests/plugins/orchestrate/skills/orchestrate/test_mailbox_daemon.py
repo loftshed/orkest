@@ -284,6 +284,10 @@ d.serve(base)
             self.body(self.call("focus", {"text": "caller context"}, session=session)),
             {"status": "set", "focus": "caller context"},
         )
+        self.assertEqual(
+            self.body(self.call("focus", {"text": "by agent name"}, session=peer["name"])),
+            {"status": "set", "focus": "by agent name"},
+        )
         unknown = self.call("focus", {"text": "invalid"}, session="unknown-caller")[1]
         self.assertTrue(unknown["result"]["isError"])
         self.assertFalse(mailbox.peer_path(self.base, "unknown-caller").exists())

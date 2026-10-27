@@ -27,6 +27,8 @@ def MAILBOX_AUTHORITY():  # noqa: N802 -- reads like the other module handles
 
 MAILBOX = RUNNER.bundled_module("peer_mailbox")
 SCRIPTS = Path(MAILBOX.__file__).parent
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
 SERVER = SCRIPTS / "mailbox_mcp.py"
 
 
@@ -70,14 +72,12 @@ def open_test_run(base, run, *, repository, result_path, worker_harness="codex",
 class MailboxTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
         self.base = Path(self.temporary.name) / "mailbox-v1"
         self.repository = Path(self.temporary.name) / "example-app"
         subprocess.run(["git", "init", "-q", "-b", "main", str(self.repository)], check=True)
         self.claude = self.peer("claude-session-1111", "claude", str(self.repository))
         self.codex = self.peer("codex-session-2222", "codex", str(self.repository))
-
-    def tearDown(self):
-        self.temporary.cleanup()
 
     def peer(self, session, harness, cwd, pid=None):
         return MAILBOX.register(self.base, session=session, harness=harness, cwd=cwd, pid=pid or os.getpid())
@@ -2233,6 +2233,7 @@ class McpServerTests(unittest.TestCase):
         replies = [json.loads(server.stdout.readline()) for _ in range(expect or 0)]
         server.stdin.close()
         replies += [json.loads(line) for line in server.stdout]
+        server.stdout.close()
         self.assertEqual(server.wait(timeout=10), 0)
         return replies
 
@@ -2316,6 +2317,7 @@ class McpServerTests(unittest.TestCase):
             server.stdin.write(json.dumps(line) + "\n")
         server.stdin.close()
         replies = [json.loads(line) for line in server.stdout]
+        server.stdout.close()
         server.wait(timeout=10)
         self.assertEqual([reply["id"] for reply in replies], [0, 2])
         self.assertLess(time.monotonic() - started, 15)

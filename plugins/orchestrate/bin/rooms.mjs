@@ -98,9 +98,15 @@ export async function roomsCommand(
   switch (action) {
     case "list": {
       const listing = await listRooms(root);
+      const tasks = new Map();
+      const authorities = new Map();
+      const rooms = [];
+      for (const room of listing.rooms) {
+        rooms.push(await observeRoom(room, { root, run, tasks, authorities }));
+      }
       result = {
         ...listing,
-        rooms: await Promise.all(listing.rooms.map((room) => observeRoom(room.id, { root, run }))),
+        rooms,
       };
 
       break;

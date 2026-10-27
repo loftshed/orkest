@@ -119,14 +119,17 @@ def reconcile_one(
             path.unlink(missing_ok=True)
             return {"session": session, "outcome": "recipient gone"}
         unread = {message["id"] for message in mailbox.incoming(base, session)}
-        messages = [m for m in intent.get("messages", []) if m in unread]
+        original_messages = intent.get("messages", [])
+        messages = [m for m in original_messages if m in unread]
         if not messages:
             path.unlink(missing_ok=True)
             return {"session": session, "outcome": "delivered"}
         intent["messages"] = messages
+        messages_changed = messages != original_messages
         state = intent.get("state")
         if state == "recovery-needed":
-            mailbox.write(path, intent)
+            if messages_changed:
+                mailbox.write(path, intent)
             return None
         created = parse(intent.get("createdAt")) or moment
         if moment - created > MAX_AGE or intent.get("attempts", 0) >= MAX_ATTEMPTS:
@@ -136,12 +139,14 @@ def reconcile_one(
         if state == "submitted":
             submitted = parse(intent.get("submittedAt"))
             if submitted and moment - submitted < ACCEPT_WINDOW:
-                mailbox.write(path, intent)
+                if messages_changed:
+                    mailbox.write(path, intent)
                 return None
         else:
             due = parse(intent.get("nextAt"))
             if due and moment < due:
-                mailbox.write(path, intent)
+                if messages_changed:
+                    mailbox.write(path, intent)
                 return None
         ready, reason = eligible(peer)
         if not ready:
