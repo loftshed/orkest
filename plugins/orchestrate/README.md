@@ -28,6 +28,89 @@ Codex requires one-time approval for command hooks: review them in Codex `/hooks
 
 `<checkout>/plugins/orchestrate/uninstall.sh` removes the skill symlinks while leaving `~/.config/agent-executor`, `~/.cache/agent-executor`, and backups in `~/.local/share/agent-executor/backups` untouched.
 
+## Agent status in terminal footers
+
+Orkest can show each registered session's agent name, model, reasoning effort, task stage, team goal,
+and individual task in its terminal footer. The name's color is stable for that session; `NO_COLOR`
+turns color off. Long fields are shortened to fit, and a dash means the information is not recorded.
+Codex model and effort are read from its local session database when available; harness-provided
+values and mailbox records supply the other displays.
+
+The goal comes from the title of a room explicitly bound to the session. The task and stage come from
+the session's claimed workboard item or its bound coordinator run. A saved focus is shown as the
+individual task when no assignment exists; its saved work note supplies a stage if available.
+Multiple rooms or assignments are marked as such instead of picking one. A session without a matching
+mailbox record has no label.
+
+For example, after creating a room with a descriptive `--title`, bind the interactive conductor:
+
+```sh
+ork rooms bind --room ROOM_ID --member conductor --engine codex --session SESSION_ID
+```
+
+Bind other members using their member IDs and engines. See [rooms](skills/orchestrate/references/rooms.md)
+and the [workboard](skills/orchestrate/references/workboard.md) for creating rooms, binding sessions,
+and recording work. The footer only reads these records; it does not create assignments or advance
+task stages.
+
+### Claude Code and Antigravity
+
+Both harnesses can run a status-line command with their session JSON on standard input. If Claude
+does not already have a status line, add this field to `~/.claude/settings.json`:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "python3 ~/.agents/skills/orchestrate/scripts/agent_statusline.py --harness claude"
+  }
+}
+```
+
+If a status-line command already exists, keep it and pipe the same input to the Orkest command from
+that script. Include the returned label in its existing output. Apply the same change to any other
+Claude profile you use.
+
+For Antigravity, add this field to `~/.gemini/antigravity-cli/settings.json`. The built-in status
+line stays visible above the label:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "python3 ~/.agents/skills/orchestrate/scripts/agent_statusline.py --harness gemini",
+    "stack_with_default": true
+  }
+}
+```
+
+### OpenCode
+
+For OpenCode v2, link the TUI plugin from the repository root and restart the TUI:
+
+```sh
+mkdir -p ~/.config/opencode/plugins
+ln -s "$PWD/plugins/orchestrate/opencode/agent-statusline" ~/.config/opencode/plugins/orkest-agent-statusline
+```
+
+The label appears once the session has registered with the peer mailbox. OpenCode does not currently
+register sessions through this footer; a session must register with Orkest separately. The footer
+does not change an agent's presence. Updates can take up to three seconds. OpenCode places the line
+immediately above the prompt, leaving its existing footer intact.
+
+### Codex
+
+Codex does not accept a custom status-line command. To keep its session title intact, launch it in
+an isolated tmux session with a separate label line:
+
+```sh
+node plugins/orchestrate/bin/ork.mjs label -- codex
+```
+
+The wrapper needs `tmux` on `PATH` and uses a private server with default tmux bindings. It shows
+the status only when exactly one live Codex peer can be matched to that pane, refreshing every three
+seconds. If you detach, it prints the command to reattach; it does not stop the session.
+
 ## Inspect routes, models, and health
 
 In the examples below, `<scripts>` stands for `<checkout>/plugins/orchestrate/skills/orchestrate/scripts` (or `~/.agents/skills/orchestrate/scripts` after running `install.sh`):
