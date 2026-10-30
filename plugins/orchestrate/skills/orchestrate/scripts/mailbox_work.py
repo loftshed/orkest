@@ -191,6 +191,24 @@ def snapshot(base: Path, me: dict[str, Any], *, item: str | None = None) -> list
     return records
 
 
+def assigned(base: Path, me: dict[str, Any]) -> list[dict[str, Any]]:
+    """Read this session's active assignments without locks or presence side effects.
+
+    Writers replace the complete board atomically. This small projection is suitable for a
+    frequently refreshed display; the workboard remains the authority for transitions.
+    """
+    board = _read(base / "work" / "board.json")
+    return [
+        {"title": item["title"], "state": item["state"]}
+        for item in board["items"]
+        if isinstance(item["owner"], dict)
+        and item["owner"].get("session") == me["session"]
+        and item["state"] in {"claimed", "blocked", "review"}
+        and isinstance(item["project"], dict)
+        and mailbox.same_project(me, item["project"])
+    ]
+
+
 def listing(
     base: Path, me: dict[str, Any], *, item: str | None = None, limit: int = 10, offset: int = 0
 ) -> dict[str, Any]:
