@@ -1083,7 +1083,8 @@ class MailboxTests(unittest.TestCase):
         worktree = Path(self.temporary.name) / "shared-feature"
         subprocess.run(["git", "-C", str(repo), "worktree", "add", "-q", "-b", "feature", str(worktree)], check=True)
         other = self.git_checkout("elsewhere")
-        self.assertIsNone(self.hook("codex-repo-1", "codex", repo, "SessionStart"))
+        first_start = self.hook("codex-repo-1", "codex", repo, "SessionStart")
+        self.assertNotIn("Other agent sessions are working", json.dumps(first_start or {}))
         MAILBOX.set_focus(self.base, "codex-repo-1", "rewriting the login form")
         self.hook("opencode-else-1", "opencode", other, "SessionStart")
         notice = self.hook("claude-repo-2", "claude", worktree, "SessionStart")["hookSpecificOutput"][

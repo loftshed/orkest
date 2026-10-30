@@ -174,9 +174,16 @@ See the [MCP audit](../../../../../docs/mailbox-mcp-audit.md) for verification a
 
 ## Wake an idle peer
 
-MCP `send` wakes the receiver by default. Keep peer messages relaxed, friendly, and natural—no stiff
-formality needed; fold any appreciation or context into substantive messages and replies—and use `wake: false`
-for FYI and progress updates. Do not send acknowledgement-only replies. Requests and completions that unblock work should still wake
+MCP `send` wakes the receiver by default when the sender and recipient are on the same task, share a
+task channel or active workboard item, or are continuing a conversation (`replyTo` or prior message
+thread). When a direct send targets a peer working on an unrelated task (disjoint task channels,
+different declared `focus`, or an unshared active workboard/progress assignment with no prior thread),
+the mailbox automatically delivers it quietly (`unrelatedTask: true`, `wake: false`, and `wake.status:
+"queued"` with `phase: "not-sent"`): no idle wake is sent and the message does not block or extend the
+recipient's turn at `Stop` or mid-turn `PreInvocation`, waiting instead for its next turn boundary.
+Keep peer messages relaxed, friendly, and natural—no stiff formality needed; fold any appreciation or
+context into substantive messages and replies—and use `wake: false` for FYI and progress updates. Do
+not send acknowledgement-only replies. Requests and completions that unblock shared work still wake
 the recipient. The CLI equivalent is `mailbox send --no-wake`.
 Mail is saved before activation is attempted, and the result includes a
 `wake` status: `scheduled` (queue accepted it), `queued` (busy Codex), `unsupported`, or
@@ -286,8 +293,10 @@ start the Claude Code and Codex hooks list the other live sessions in the same p
 branch, state and declared `focus`, and repeat it on a later prompt only when that set changes. Hosts without
 hooks get the same rule from the MCP instructions: call `peers` first, which lists only this project by
 default and puts same-repository sessions first. Agents set their own line with `focus`
-(CLI: `run_agent.py mailbox focus --text '...'`) and agree on a
-split before editing files another session is working on. A session launched by the runner is listed as a delegated run worker and gets
+(CLI: `run_agent.py mailbox focus --text '...'`), check peer `focus`, `board` scope, and `git status`
+silently first, and reach out to agree on a split only when they actually need to edit the same files or
+branch in the same checkout—never send preemptive check-in or territory-claiming messages to peers on
+unrelated tasks. A session launched by the runner is listed as a delegated run worker and gets
 no such notice itself: its conductor coordinates for it. When the last colleague leaves, the next prompt says so.
 
 ## Task channels

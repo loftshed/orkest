@@ -18,6 +18,7 @@ SCHEMA = "orchestrate.workboard.v1"
 MAX_ITEMS = 1024
 STORE_BYTES = 4 * 1024 * 1024
 PAGE_BYTES = 12 * 1024
+HELP_BOARD_IDLE_SECONDS = 15 * 60
 LIMITS = {
     "title": 120,
     "scope": 240,
@@ -199,7 +200,7 @@ def assigned(base: Path, me: dict[str, Any]) -> list[dict[str, Any]]:
     """
     board = _read(base / "work" / "board.json")
     return [
-        {"title": item["title"], "state": item["state"]}
+        {"id": item["id"], "title": item["title"], "state": item["state"]}
         for item in board["items"]
         if isinstance(item["owner"], dict)
         and item["owner"].get("session") == me["session"]
@@ -207,6 +208,76 @@ def assigned(base: Path, me: dict[str, Any]) -> list[dict[str, Any]]:
         and isinstance(item["project"], dict)
         and mailbox.same_project(me, item["project"])
     ]
+
+
+def shares_active_work(base: Path, first: dict[str, Any], second: dict[str, Any]) -> bool:
+    """Whether two peers are paired on an active workboard item (creator, integrator, owner or transfer)."""
+    try:
+        board = _read(base / "work" / "board.json")
+    except mailbox.MailboxError:
+        return False
+    pair = {first.get("session"), second.get("session")} - {None}
+    if len(pair) < 2:
+        return False
+    for item in board["items"]:
+        if item.get("state") == "accepted":
+            continue
+        project = item.get("project")
+        if not isinstance(project, dict) or not (
+            mailbox.same_project(first, project) or mailbox.same_project(second, project)
+        ):
+            continue
+        participants = {
+            role.get("session")
+            for key in ("creator", "integrator", "owner", "transfer")
+            if isinstance(role := item.get(key), dict)
+        }
+        if pair <= participants:
+            return True
+    return False
+
+
+def help_board_hint(base: Path, me: dict[str, Any], *, previous: dict[str, Any] | None = None) -> str:
+    """Surface ready workboard items at a turn boundary only when this session's own task is complete and it
+    has been idle for at least HELP_BOARD_IDLE_SECONDS."""
+    if mailbox.is_run_peer(me) or me.get("delegatedRun"):
+        return ""
+    try:
+        _project(me)
+        if assigned(base, me):
+            return ""
+        import agent_progress
+
+        progress = agent_progress.read(base, me)
+        if not progress or progress.get("stage") != "complete":
+            return ""
+        now = mailbox.now()
+        if (now - mailbox.parse_stamp(progress["updatedAt"])).total_seconds() < HELP_BOARD_IDLE_SECONDS:
+            return ""
+        if mailbox.valid_peer(previous):
+            if previous.get("state") != "idle":
+                return ""
+            if (now - mailbox.parse_stamp(previous["lastSeenAt"])).total_seconds() < HELP_BOARD_IDLE_SECONDS:
+                return ""
+        board = _read(base / "work" / "board.json")
+    except (mailbox.MailboxError, OSError, ValueError):
+        return ""
+    presence: dict[str, tuple[dict[str, Any] | None, bool]] = {}
+    ready = [
+        view
+        for record in board["items"]
+        if mailbox.same_project(me, record["project"])
+        and (view := _view(base, board, record, presence))["ready"]
+        and not view.get("owner")
+    ]
+    if not ready:
+        return ""
+    sample = ", ".join(f"{item['id']} ({item['title']})" for item in ready[:2])
+    return (
+        f"Help board: your recorded task is complete and this session was idle; {len(ready)} ready item(s) are open "
+        f"on the project workboard ({sample}). Inspect `mailbox board` and claim one with `mailbox work claim` only "
+        "if the user wants this session to pick up shared work."
+    )
 
 
 def listing(
