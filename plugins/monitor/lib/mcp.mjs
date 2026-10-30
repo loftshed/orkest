@@ -5,6 +5,7 @@ import { getAccounts } from "./store.mjs";
 import { VERSION } from "./version.mjs";
 
 const INSTRUCTIONS = `Subscription quota across local AI accounts (Claude, Codex, Antigravity/Gemini) for routing work.
+Reset history and banked reset expiry are separate from weekly rollovers. Announcements have unverified eligibility and never change pacing. A passed cached reset needs a provider refresh to confirm a refill.
 Percentages are per-account allowances. surplusPts = weekly % left minus even-pace remainder; positive is under-used capacity lost at reset.
 Prefer expiring pools (near weekly rollover) and larger tasks there; pools <10% usable now fit small tasks only.
 Status "credits" (Codex after weekly quota) takes any task metered against persistent credits, ranked after free quota; only "blocked" cannot run work.
@@ -83,11 +84,18 @@ function compactView(view) {
       ok: a.ok,
       error: a.error,
       ageMinutes: a.ageMinutes,
+      ...(a.resetCredits && { resetCredits: a.resetCredits }),
+      ...(a.resetDetails.length > 0 && { resetDetails: a.resetDetails }),
+      ...(a.resetAnnouncements.length > 0 && {
+        resetAnnouncements: a.resetAnnouncements,
+        announcementPolicy: "Eligibility unverified; never used for pacing",
+      }),
       ...(a.credits && { credits: { text: a.credits.text, unlimited: a.credits.unlimited } }),
       windows: a.windows.map((w) => ({
         label: w.label,
         remainingPct: Math.round(w.remainingPct),
         resetsAt: w.resetsAt,
+        ...(w.resetAwaitingRefresh && { resetAwaitingRefresh: true }),
         ...(w.exhausted && { exhausted: true }),
         ...(w.blockedBy && { blockedBy: w.blockedBy }),
       })),
