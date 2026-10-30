@@ -18,7 +18,26 @@ for arg in "$@"; do
   esac
 done
 
-node_bin="$(node -p process.execPath)"
+# Prefer a stable non-shim path over `node -p process.execPath` (which resolves Homebrew symlinks into a
+# versioned Cellar directory that breaks on `brew upgrade node`, falling back to `volta-shim` and spawning
+# two processes per invocation).
+resolve_node() {
+  for candidate in /opt/homebrew/bin/node /usr/local/bin/node; do
+    if [ -x "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return
+    fi
+  done
+  if command -v volta >/dev/null 2>&1; then
+    volta_node="$(volta which node 2>/dev/null || true)"
+    if [ -n "$volta_node" ] && [ -x "$volta_node" ]; then
+      printf '%s\n' "$volta_node"
+      return
+    fi
+  fi
+  node -p process.execPath
+}
+node_bin="$(resolve_node)"
 rmtree() { node -e 'require("fs").rmSync(process.argv[1], { recursive: true, force: true })' "$1"; }
 
 # The launcher runs an installed copy, not the checkout. The menu bar app and MCP servers run monitor in

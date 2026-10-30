@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.38.0
+
+- feat: mailbox fixes
+
+## 0.37.1
+
+- fix(orchestrate): stop resubmitting Antigravity wakes still in the native queue (#39)
+
+## 0.37.0
+
+- feat(orchestrate): add read-only agent status and change waits (#38)
+
+## 0.36.0
+
+- feat(orchestrate): unify shared work discovery and ownership (#37)
+
+## 0.35.0
+
+- feat(orchestrate): keep compact task notes for resuming work (#34)
+
+## 0.34.1
+
+- fix(orchestrate): keep quiet channel posts out of Antigravity's mid-turn steps (#35)
+
+## 0.34.0
+
+- feat(orchestrate): add task channels to the peer mailbox (#33)
+
+## 0.33.2
+
+- fix(orchestrate): retry wakes that did not reach an idle recipient, within bounds (#31)
+
+## 0.33.1
+
+- fix(orchestrate): give wakes recipient-owned routes, honest phases and a health check (#29)
+
+## 0.33.0
+
+- feat(orchestrate): give agents Martian names (#28)
+- feat(orchestrate): add a shared run ledger and monorepo/many-file checks to ork gate (#27)
+
 ## 0.32.0
 
 - feat(orchestrate): add a machine-wide gate for heavy test, build and lint runs (#26)

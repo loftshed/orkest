@@ -627,7 +627,7 @@ class DaemonHandler(http.server.BaseHTTPRequestHandler):
         if is_wait:
 
             def disconnected() -> None:
-                while not finished.wait(0.1) and not cancelled.is_set():
+                while not finished.wait(0.25) and not cancelled.is_set():
                     try:
                         ready, _, _ = select.select([self.connection], [], [], 0)
                         if ready and not self.connection.recv(1, socket.MSG_PEEK):
@@ -826,8 +826,14 @@ def serve(base: Path, port: int = 0) -> None:
                 "persisted daemon endpoint is occupied; resolve the conflict without stopping its owner"
             ) from failure
         mailbox.write(daemon_base(base) / "state.json", server.info)
+        import mailbox_presence
+        import wake_recovery
+
+        # Retries wakes that did not reach an idle recipient, for as long as the daemon serves.
+        threading.Thread(target=wake_recovery.run, args=(base, server.stopping), daemon=True).start()
+        threading.Thread(target=mailbox_presence.run, args=(base, server.stopping), daemon=True).start()
         try:
-            server.serve_forever(poll_interval=0.1)
+            server.serve_forever(poll_interval=0.25)
         finally:
             server.stopping.set()
             with server.drained:

@@ -4,6 +4,11 @@ Agent sessions use one authenticated loopback HTTP daemon to list peers and exch
 `<agent-executor cache>/mailbox-v1/` (`peers/<session>.json`, `inbox/<session>/<id>.json`, with `:` in a
 session id written as `%3A`). Nothing leaves the machine.
 
+Start shared work from the [workboard](workboard.md): `board` shows interactive items, coordinator
+tasks and legacy recovery notes together. `work` claims and updates interactive items; coordinator
+entries give their backend route. Read at work boundaries, not in a polling loop. Older
+[task notes](task-notes.md) remain readable for compatibility, not as a second ledger for new work.
+
 ## Setup and repair
 
 Run `python3 scripts/run_agent.py doctor --repair-messaging` from this skill directory to install
@@ -91,16 +96,19 @@ not a reply; accepted delivery is not evidence of receipt or consideration.
 
 The normal server is `scripts/mailbox_daemon.py`. `scripts/mailbox_mcp.py` remains a stdio fallback; the CLI is `run_agent.py mailbox …`.
 
-| Tool       | Does                                                                                                             |
-| ---------- | ---------------------------------------------------------------------------------------------------------------- |
-| `register` | Hookless HTTP callers register their absolute `cwd`, `harness`, optional native `pid`; returns a `session`.      |
-| `peers`    | Live sessions in this project: name, harness, state (`idle`, `busy`, `waiting`), cwd. Dead ones are pruned.      |
-| `send`     | `to`, `text` (≤ 32 KiB), `replyTo?`; HTTP requires a stable `idempotencyKey` for retries.                        |
-| `inbox`    | Unread messages, oldest first. HTTP keeps them unread until `ack`; stdio/CLI mark returned mail read by default. |
-| `wait`     | Blocks up to `timeoutSeconds` (max 600) for a message, or for the reply to `replyTo`.                            |
-| `ack`      | Marks message ids read.                                                                                          |
-| `focus`    | One line on what this session is working on, shown to agents in the same project.                                |
-| `feedback` | Record a communication problem, your intent and what you needed instead. Writes locally; sends no message.       |
+| Tool       | Does                                                                                                                              |
+| ---------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `register` | Hookless HTTP callers register their absolute `cwd`, `harness`, optional native `pid`; returns a `session`.                       |
+| `peers`    | Live sessions in this project: name, harness, state (`idle`, `busy`, `waiting`), cwd, channels. Dead ones are pruned.             |
+| `send`     | `to` or `channel`, `text` (≤ 32 KiB), `replyTo?`; HTTP requires a stable `idempotencyKey` for retries.                            |
+| `inbox`    | Unread messages, oldest first. HTTP keeps them unread until `ack`; stdio/CLI mark returned mail read by default.                  |
+| `wait`     | Blocks up to `timeoutSeconds` (max 600) for a message, or for the reply to `replyTo`.                                             |
+| `ack`      | Marks message ids read.                                                                                                           |
+| `focus`    | One line on what this session is working on, shown to agents in the same project; `channels`/`leave` join or leave task channels. |
+| `tasks`    | Legacy session notes for older clients. Use `board` for shared work discovery.                                                    |
+| `board`    | Shared discovery of interactive work, coordinator tasks and legacy recovery notes.                                                |
+| `work`     | Create, claim, checkpoint, review or explicitly hand over a work item. Coordination only; no execution or user-approval grant.    |
+| `feedback` | Record a communication problem, your intent and what you needed instead. Writes locally; sends no message.                        |
 
 ### MCP protocol and bounded responses
 
@@ -172,7 +180,10 @@ for FYI and progress updates. Do not send acknowledgement-only replies. Requests
 the recipient. The CLI equivalent is `mailbox send --no-wake`.
 Mail is saved before activation is attempted, and the result includes a
 `wake` status: `scheduled` (queue accepted it), `queued` (busy Codex), `unsupported`, or
-`unavailable`. A wake failure leaves the message unread for normal delivery.
+`unavailable`. A wake failure leaves the message unread for normal delivery. Its `phase` says what
+that proves: `submitted` means a native queue, socket or listener took a notice, not that the
+recipient read anything; `not-sent` means nothing went out and the mail waits for the recipient's next
+turn; `unknown` follows a recovered send. Only the message's `readAt` shows delivery.
 
 An explicit cross-project send follows the same delivery and wake rules. Use `wake: false`
 for an informational message. Receiving it does not authorize work outside the recipient's task.
@@ -186,7 +197,29 @@ Codex and OpenCode serialize wake admission per recipient and reuse an existing 
 notification. They recheck unread mail before admission. Queue inspection failure leaves mail queued
 without scheduling another turn. Mail consumed after admission can still leave one redundant turn.
 
-Claude and Gemini/Antigravity use a persistent streaming listener. Launch it once in the project:
+Every route belongs to the recipient: a Codex wake opens the recipient's own profile daemon (its
+recorded `accountHome`), and Claude session records are read from the recipient's profile first. An
+interactive Claude Code session is woken through its messaging socket. An Antigravity conversation is
+woken through its language server, whose endpoint exists only in the agent's own tool shell, so hooks
+and the daemon cannot learn it; the conversation runs `run_agent.py mailbox attach-wake-route` once
+from that shell, and its session-start hook says so while no route is recorded. A notice covers later
+wakes for still-unread mail for two minutes, the same message included, and then expires.
+
+`run_agent.py mailbox wake-health` lists whether each live peer can be woken while idle, by which
+route, and how to repair it. It reads local records and sends nothing: being live is not the same as
+being wakeable.
+
+A wake that did not get its mail read leaves a pending intent, one per recipient; quiet sends never
+do. The HTTP mailbox daemon retries it every few seconds while the mail is unread and the recipient is
+strictly idle, backing off from 2 seconds to 5 minutes. It never retries mid-turn, through a Claude
+session waiting for input, or after the recipient's last turn ended in a stop that forbids continuing
+(a user cancel, a run budget, an unclassified error); only that user's next prompt clears such a stop.
+A submitted notice whose mail is still unread after 20 seconds has unconfirmed delivery, not proven
+loss, and may be submitted again. After 6 attempts or 30 minutes the intent becomes recovery-needed
+until `run_agent.py mailbox wake-retry [--to PEER]` gives it another chance, which still respects a
+parked stop; `wake-health` shows pending intents.
+
+Headless Claude and Gemini/Antigravity workers use a persistent streaming listener. Launch it once in the project:
 
 ```sh
 python3 <skill-directory>/scripts/run_agent.py listen --engine claude --prompt 'Your task'
@@ -256,6 +289,49 @@ default and puts same-repository sessions first. Agents set their own line with 
 (CLI: `run_agent.py mailbox focus --text '...'`) and agree on a
 split before editing files another session is working on. A session launched by the runner is listed as a delegated run worker and gets
 no such notice itself: its conductor coordinates for it. When the last colleague leaves, the next prompt says so.
+
+## Task channels
+
+When separate teams share a project (say, agents fetching records and agents building a graph from
+them), each joins the channel of its task and posts there, so the other team is not interrupted.
+
+```sh
+python3 <skill-directory>/scripts/run_agent.py mailbox join graph            # or focus --channel graph
+python3 <skill-directory>/scripts/run_agent.py mailbox send --channel graph --text 'Edge list v2 is ready'
+python3 <skill-directory>/scripts/run_agent.py mailbox channels               # channels, members, yours
+python3 <skill-directory>/scripts/run_agent.py mailbox history --channel graph # catch up, newest first
+python3 <skill-directory>/scripts/run_agent.py mailbox leave graph
+```
+
+MCP: `focus(text, channels=[...], leave=[...])`, `send(channel=..., text=...)`; `peers` shows each
+session's channels.
+
+- **Audience.** Every send names exactly one destination: `to` (one peer) or `channel`. A task
+  channel reaches its live members; `all` reaches everyone in the project, worktrees and clones
+  included; `worktree` reaches everyone in the sender's checkout. A session in no channel hears `all`,
+  `worktree` and direct messages, never a task channel.
+- **Membership** changes only when asked: `join`/`leave`, `focus --channel` (which adds, never removes),
+  or `AGENT_MAILBOX_CHANNELS=retrieval,graph` set by whoever launches a session, read at its first
+  registration only. Focus text never changes it. Membership ends with the session and survives
+  `/clear`.
+- **Quiet by default.** A channel post never wakes anyone unless sent with `wake: true` (CLI `--wake`),
+  and only such a post, or a direct message, may keep a turn going at Stop or reach Antigravity between
+  the steps of a turn; quiet posts wait for the member's next turn.
+- **Delivery.** A post freezes its recipients when accepted and reaches each as an ordinary message
+  marked with `channel` and `postId`, so inbox, wait, ack and wake work as usual. With an idempotency
+  key (CLI `--id`), a replay finishes the post as accepted: same recipients and sender context, even
+  after the sender moves, with no later joiners and no second delivery. A new post needs a new key;
+  after seven days an old key is refused.
+- **Native-first exemption.** Channel posts go through this mailbox to every member, including
+  sessions of the sender's own harness and account: no native messaging tool has channels. Direct
+  messages keep the native-first rule.
+- **Replies.** `replyTo` names the message answered; the destination is still explicit: the channel
+  for the group, `to` for the poster alone. A reply to any member's copy of a post is threaded on its
+  `postId`, which the poster waits on (`wait(replyTo=postId)`) and history shows.
+- **Roster.** Hooks list channel-mates in full and other teams as counts, and announce changes only
+  among channel-mates. At session start a channel-less agent is told which channels exist.
+- **Not private.** Anyone in the project may read a channel's history on request; it is never pushed to
+  non-members. History follows mail retention, and `oldestKept` shows where it stops.
 
 ## Communication feedback
 
@@ -450,7 +526,9 @@ resource/context costs and the scope of native-client and synthetic evaluation e
 
 ## Troubleshooting
 
-- **An idle session does not answer.** Check the send result's `wake` status. Unsupported or offline
+- **An idle session does not answer.** Check the send result's `wake` status and `phase`, then
+  `mailbox wake-health` for the recipient's route and its repair. An Antigravity conversation without
+  a route attaches one with `mailbox attach-wake-route` from its own shell. Unsupported or offline
   hosts still need a turn or an `inbox` call; quiet sends deliberately do not activate them.
 - **Run the CLI from Claude Code with the sandbox off.** The store is under `~/.cache/agent-executor`,
   outside the sandbox's write allowlist. The MCP server and hooks are not sandboxed.

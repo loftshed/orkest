@@ -23,7 +23,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from functools import cache
 from pathlib import Path
 from typing import Any
@@ -37,6 +37,8 @@ MAX_RUN_MESSAGES = 1024
 # Run ids name lock files and session ids, so no colon or other separator.
 RUN_ID = r"[A-Za-z0-9_.-]{1,80}"
 MESSAGE_ID = r"[0-9a-f]+-[0-9a-f]{6}"
+# A task channel's name, also the reserved audiences all and worktree (see mailbox_channels).
+CHANNEL = r"[a-z0-9][a-z0-9_-]{0,39}"
 CLIENT_ID = r"[A-Za-z0-9_-]{1,80}"
 RUN_FIELDS = ("session", "name", "harness", "cwd", "role", "run", "counterpart", "repository", "resultPath", "deadline")
 MAX_AGE = dt.timedelta(days=7)
@@ -46,6 +48,8 @@ UNKNOWN_PID_TTL = dt.timedelta(hours=2)
 # after it was last seen; the running process says nothing about it.
 SHARED_PROCESS_IDLE_TTL = dt.timedelta(hours=3)
 HARNESSES = ("claude", "codex", "opencode", "gemini", "unknown")
+# Process names a harness runs under, where they differ from its name: Antigravity's CLI process is agy.
+HARNESS_PROCESSES = {"gemini": ("agy", "antigravity", "gemini")}
 STATES = ("idle", "busy", "waiting")
 SCOPES = ("project", "cross-project")
 # The rule for every harness: a session messages peers of its own harness and account with that harness's
@@ -71,7 +75,8 @@ RULE = (
     "Use scope cross-project explicitly only when the task needs coordination with another project. "
     "Within your own harness and account, always prefer its built-in way of messaging or spawning other agents whenever it has one "
     "(Claude Code: SendMessage and ListAgents; Codex: collaboration.* or codex_tui thread tools; Antigravity/Gemini: send_message and invoke_subagent). "
-    "Use the peer mailbox to reach a session of a different harness, a different account of your harness, or an unreachable separate host."
+    "Use the peer mailbox to reach a session of a different harness, a different account of your harness, or an unreachable separate host. "
+    "Channel posts (a task channel, all, or worktree) always go through the peer mailbox, to every member."
 )
 NAME_RULE = (
     "Call every agent by its full name exactly as listed, in messages and when you mention it to the user; "
@@ -804,6 +809,7 @@ def harness_pid(harness: str, start: int | None = None) -> int | None:
     """The long-lived harness process above this one, so presence ends when the session does."""
     if harness == "claude" and os.environ.get("CLAUDE_PID", "").isdigit():
         return int(os.environ["CLAUDE_PID"])
+    names = HARNESS_PROCESSES.get(harness, (harness,))
     pid = start or os.getppid()
     for _ in range(6):
         try:
@@ -815,7 +821,7 @@ def harness_pid(harness: str, start: int | None = None) -> int | None:
         if not line:
             break
         parent, _, command = line.partition(" ")
-        if harness in Path(command.strip()).name.lower():
+        if any(name in Path(command.strip()).name.lower() for name in names):
             return pid
         if not parent.strip().isdigit() or int(parent) <= 1:
             break
@@ -844,12 +850,23 @@ def is_live(peer: dict[str, Any], moment: dt.datetime | None = None) -> bool:
     return alive if alive is not None else moment - seen <= UNKNOWN_PID_TTL
 
 
+_PID_BIRTH_CACHE: dict[int, tuple[float, str]] = {}
+_PID_BIRTH_TTL = 30.0
+
+
 def process_started(pid: int) -> str | None:
     """The start time ps reports for a pid, which tells a reused pid from the process recorded.
 
     Fixed to UTC and the C locale: harnesses run with different TZ and LANG, and a stamp rendered in one
     must compare equal in another. (pidBirth replaced the earlier local-time pidStarted.)
     """
+    now_mono = time.monotonic()
+    cached = _PID_BIRTH_CACHE.get(pid)
+    if cached is not None and now_mono - cached[0] < _PID_BIRTH_TTL:
+        if pid_alive(pid):
+            return cached[1]
+        _PID_BIRTH_CACHE.pop(pid, None)
+        return None
     try:
         started = subprocess.run(
             ["ps", "-o", "lstart=", "-p", str(pid)],
@@ -860,7 +877,12 @@ def process_started(pid: int) -> str | None:
         ).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         return None
-    return started or None
+    if started:
+        if len(_PID_BIRTH_CACHE) >= 256:
+            _PID_BIRTH_CACHE.clear()
+        _PID_BIRTH_CACHE[pid] = (now_mono, started)
+        return started
+    return None
 
 
 def migrate_legacy_session(base: Path, session: str) -> None:
@@ -919,13 +941,41 @@ def remote_identity(url: str, checkout: str) -> str | None:
     return hashlib.sha256(f"remote:{host}/{path}".encode()).hexdigest()
 
 
+_WORKSPACE_CACHE: dict[str, tuple[bool, Path, Path, bytes, bytes, dict[str, Any]]] = {}
+
+
 def workspace(cwd: str) -> dict[str, Any]:
     """Git directory, checkout, branch and normalized remote identities for this project."""
     if not cwd or not Path(cwd).is_dir():
         return {}
     try:
+        resolved_cwd = str(Path(cwd).resolve())
+    except OSError:
+        resolved_cwd = cwd
+    has_dot_git = (Path(resolved_cwd) / ".git").exists()
+    cached = _WORKSPACE_CACHE.get(resolved_cwd)
+    if cached is not None:
+        cached_dot_git, common_dir, git_dir, cached_config, cached_head, cached_ws = cached
+        with contextlib.suppress(OSError):
+            if (
+                cached_dot_git == has_dot_git
+                and Path(cached_ws["checkout"]).is_dir()
+                and (common_dir / "config").read_bytes() == cached_config
+                and (git_dir / "HEAD").read_bytes() == cached_head
+            ):
+                return {**cached_ws, "remotes": list(cached_ws["remotes"])}
+    try:
         result = subprocess.run(
-            ["git", "-C", cwd, "rev-parse", "--path-format=absolute", "--git-common-dir", "--show-toplevel"],
+            [
+                "git",
+                "-C",
+                cwd,
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
+                "--show-toplevel",
+                "--git-dir",
+            ],
             capture_output=True,
             text=True,
             timeout=3,
@@ -953,12 +1003,29 @@ def workspace(cwd: str) -> dict[str, Any]:
                 remotes.add(identity)
     except (OSError, subprocess.SubprocessError):
         pass  # the common Git directory still identifies sibling worktrees
-    return {
-        "repo": str(Path(lines[0]).resolve()),
-        "checkout": str(Path(lines[1]).resolve()),
+    common_path = Path(lines[0]).resolve()
+    checkout_path = Path(lines[1]).resolve()
+    git_dir_path = Path(lines[2]).resolve() if len(lines) >= 3 else common_path
+    ws = {
+        "repo": str(common_path),
+        "checkout": str(checkout_path),
         "branch": branch or "(detached)",
         "remotes": sorted(remotes),
     }
+    with contextlib.suppress(OSError):
+        config_bytes = (common_path / "config").read_bytes()
+        head_bytes = (git_dir_path / "HEAD").read_bytes()
+        if len(_WORKSPACE_CACHE) >= 128:
+            _WORKSPACE_CACHE.clear()
+        _WORKSPACE_CACHE[resolved_cwd] = (
+            has_dot_git,
+            common_path,
+            git_dir_path,
+            config_bytes,
+            head_bytes,
+            {**ws, "remotes": list(ws["remotes"])},
+        )
+    return ws
 
 
 def project(peer: dict[str, Any]) -> dict[str, Any]:
@@ -999,9 +1066,22 @@ def colleagues(base: Path, me: dict[str, Any]) -> list[dict[str, Any]]:
     return [peer for peer in scoped_peers(base, me) if peer["session"] != me["session"]]
 
 
-def describe_colleagues(rows: list[dict[str, Any]], me: dict[str, Any]) -> str:
+def describe_colleagues(rows: list[dict[str, Any]], me: dict[str, Any], elsewhere: dict[str, int] | None = None) -> str:
+    """The roster: these sessions in full, and other teams (`elsewhere`, sessions per channel) as counts."""
+    import mailbox_channels
+
+    others = ", ".join(
+        f"{count} in {name}" if name else f"{count} without a channel"
+        for name, count in sorted((elsewhere or {}).items(), key=lambda item: (not item[0], item[0]))
+    )
+    teams = (
+        f"Other sessions also work in this project ({others}); they are not listed here. The peer mailbox "
+        "`peers` tool lists everyone with their channels."
+        if others
+        else ""
+    )
     if not rows:
-        return ""
+        return teams
     lines = [
         "Other agent sessions are working in this project right now. Before you edit, make sure you are not "
         "about to change the same files or branch as one of them; if your work overlaps, reach out in a friendly, "
@@ -1026,19 +1106,36 @@ def describe_colleagues(rows: list[dict[str, Any]], me: dict[str, Any]) -> str:
             if (cross_account := account_route(peer, me.get("harness"), me.get("accountHome")))
             else ""
         )
+        channels = mailbox_channels.memberships(peer)
+        tags = f" in channel {', '.join(channels)}" if channels else ""
         line = (
             f"- {display_label(peer)} [id: {peer['session']}] "
-            f"({peer['harness']}, {peer['state']}{role}) repo {repository_name(peer)} "
+            f"({peer['harness']}, {peer['state']}{role}{tags}) repo {repository_name(peer)} "
             f"on {peer.get('branch', '?')}, {where}{native_hint}"
         )
         lines.append(line)
+    if teams:
+        lines.append(teams)
     return "\n".join(lines)
 
 
 def set_focus(
-    base: Path, session: str, text: str, *, model: str | None = None, harness_label: str | None = None
+    base: Path,
+    session: str,
+    text: str,
+    *,
+    model: str | None = None,
+    harness_label: str | None = None,
+    channels: list[str] | None = None,
+    task_details: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """One line on what this session is working on, shown to every agent in the same project."""
+    """One line on what this session is working on, shown to every agent in the same project. `channels` also
+    joins those channels; focus text alone never changes membership."""
+    import mailbox_tasks
+
+    details = mailbox_tasks.validate(task_details or {})
+    if not text.strip():
+        raise MailboxError("task focus cannot be empty")
     peer = load(peer_path(base, session))
     if valid_peer(peer) and not is_run_peer(peer):
         peer = annotate(
@@ -1050,6 +1147,12 @@ def set_focus(
         )
     if not valid_peer(peer) or is_run_peer(peer):  # also when the session ended in between
         raise MailboxError("register this session before setting its focus")
+    if channels:
+        import mailbox_channels
+
+        peer = mailbox_channels.update(base, session, join=channels)
+    if task_details:
+        mailbox_tasks.save(base, peer, **details)
     return peer
 
 
@@ -1078,10 +1181,17 @@ def register(
     with locked(path):
         migrate_legacy_session(base, session)
         peer = load(path) or {}
+        first = not peer
         previous_pid = peer.get("pid")
         moment = stamp()
         if peer.get("harness") not in (None, harness, "unknown") and harness == "unknown":
             harness = peer["harness"]
+        if first:
+            import mailbox_channels
+
+            # The launcher's assignment applies once: a later refresh never undoes an explicit leave.
+            if assigned := mailbox_channels.launch_channels():
+                peer["channels"] = assigned
         peer.update(
             schema=PEER_SCHEMA,
             session=session,
@@ -1179,24 +1289,84 @@ def co_hosted(base: Path, peer: dict[str, Any]) -> list[dict[str, Any]]:
 
 def persist_agy_control(base: Path, session: str, pid: int | None) -> None:
     """Keep the Antigravity language-server endpoint and token in an owner-only file, never in the peer record."""
+    import mailbox_wake
+
     address = os.environ.get("ANTIGRAVITY_LS_ADDRESS")
     token = os.environ.get("ANTIGRAVITY_CSRF_TOKEN")
-    active = os.environ.get("ANTIGRAVITY_CONVERSATION_ID")
-    if not address or not token or (active and active != session):
+    # Only a shell that names this very conversation may record its endpoint: an unset id proves nothing.
+    if not address or not token or os.environ.get("ANTIGRAVITY_CONVERSATION_ID") != session:
         return
+    if not re.fullmatch(mailbox_wake.LOOPBACK_ADDRESS, address):
+        return  # the token must never be sent off this machine
     path = base / "wakes" / session_key(session) / "agy-control.json"
     write(path, {"lsAddress": address, "csrfToken": token, "pid": pid, "updatedAt": stamp()})
     path.chmod(0o600)
 
 
+def check_attach_shell(session: str | None, harness: str | None) -> None:
+    """Refuse an Antigravity attachment from a shell that does not belong to that conversation, before the
+    command registers the session, so a rejected attempt leaves no record behind."""
+    if harness == "gemini" and (not session or os.environ.get("ANTIGRAVITY_CONVERSATION_ID") != session):
+        raise MailboxError("this shell does not belong to that Antigravity conversation; nothing was recorded")
+
+
+def attach_wake_route(base: Path, me: dict[str, Any]) -> dict[str, Any]:
+    """Record this session's own wake route from the runtime that holds it, then report its health.
+    Antigravity puts its control endpoint only in the agent's tool shell, so neither its hooks nor the
+    mailbox daemon can learn it; the agent attaches it once, from that shell."""
+    import mailbox_wake
+
+    if me.get("harness") == "gemini" and not (me.get("listener") or {}).get("adapter"):
+        address = os.environ.get("ANTIGRAVITY_LS_ADDRESS")
+        token = os.environ.get("ANTIGRAVITY_CSRF_TOKEN")
+        if not address or not token:
+            raise MailboxError(
+                "run this from the Antigravity agent's own tool shell; its control endpoint is not set here"
+            )
+        if os.environ.get("ANTIGRAVITY_CONVERSATION_ID") != me["session"]:
+            raise MailboxError("this shell does not belong to that Antigravity conversation; nothing was recorded")
+        if not re.fullmatch(mailbox_wake.LOOPBACK_ADDRESS, address):
+            raise MailboxError("the Antigravity control endpoint is not loopback; nothing was recorded")
+        persist_agy_control(base, me["session"], me.get("pid"))
+    return {"session": me["session"], "name": me.get("name"), **mailbox_wake.wake_health(me, base=base)}
+
+
+def wake_route_hint(base: Path, me: dict[str, Any]) -> str:
+    """An Antigravity conversation with no recorded wake route is told once how to attach one."""
+    import mailbox_wake
+
+    if me.get("harness") != "gemini" or (me.get("listener") or {}).get("adapter"):
+        return ""
+    if mailbox_wake.agy_route(base, me["session"])[0] is not None:
+        return ""
+    command = shlex.join(
+        [
+            "python3",
+            str(Path(__file__).with_name("run_agent.py")),
+            "mailbox",
+            "attach-wake-route",
+            "--session",
+            me["session"],
+            "--harness",
+            "gemini",
+        ]
+    )
+    return f"Peers cannot wake this conversation while it is idle yet. Run this once from your own shell: {command}"
+
+
 def drop_if_dead(path: Path, moment: dt.datetime) -> bool:
     """Remove a stale interactive peer, re-checked under the lock register takes."""
+    import mailbox_presence
+
     with locked(path):
         peer = load(path)
         if is_run_record(peer) or (valid_peer(peer) and is_live(peer, moment)):
             return False
+        if valid_peer(peer):
+            mailbox_presence.record(path.parent.parent, peer)
         path.unlink(missing_ok=True)
-        return True
+    mailbox_presence.deliver(path.parent.parent)
+    return True
 
 
 def unregister(base: Path, session: str) -> None:
@@ -1454,9 +1624,12 @@ def send(
     wake: bool = False,
     idempotency_key: str | None = None,
     native_unreachable: str | None = None,
+    channel: str | None = None,
+    post_id: str | None = None,
 ) -> dict[str, Any]:
     """Deliver to a live peer. `native_unreachable` says why native tools could not reach a peer of the
-    sender's own harness and account; it lifts the native-only refusal and is recorded on the message."""
+    sender's own harness and account; it lifts the native-only refusal and is recorded on the message.
+    `channel` and `post_id` mark one recipient's copy of a channel post (see mailbox_channels.post)."""
     check_scope(scope)
     if native_unreachable is not None and (
         not isinstance(native_unreachable, str) or not native_unreachable.strip() or len(native_unreachable) > 200
@@ -1478,6 +1651,7 @@ def send(
         raise MailboxError(f"message is over {MAX_BYTES // 1024} KiB; send a path to a file instead")
     if reply_to is not None and not re.fullmatch(MESSAGE_ID, reply_to):
         raise MailboxError(f"invalid replyTo id: {reply_to!r}")
+    reply_to = thread_id(base, sender["session"], reply_to)
     if idempotency_key is not None and (
         not isinstance(idempotency_key, str) or not re.fullmatch(CLIENT_ID, idempotency_key)
     ):
@@ -1523,8 +1697,11 @@ def send(
     if target["session"] == sender["session"]:
         raise MailboxError("that address is this session", "self_address")
     native = NATIVE_MESSAGING.get(sender.get("harness"))
-    # Another account of the same harness is out of native reach, so the mailbox carries that traffic.
-    native_only = native and target["harness"] == sender.get("harness") and not other_account(sender, target)
+    # Another account of the same harness is out of native reach, so the mailbox carries that traffic. Channel
+    # posts always do: no native tool has channels, so the user exempted them from native-first.
+    native_only = (
+        not channel and native and target["harness"] == sender.get("harness") and not other_account(sender, target)
+    )
     if native_only and not native_unreachable:
         route = native_route(target, sender.get("harness"), sender.get("accountHome"))
         native_addr = route["nativeAddress"] or target["name"]
@@ -1554,6 +1731,9 @@ def send(
     }
     if native_only:
         message["nativeUnreachable"] = " ".join(native_unreachable.split())
+    if channel:
+        # `wake` records whether the post asked for activation: only such posts may extend a turn at Stop.
+        message.update(channel=channel, postId=post_id, wake=bool(wake))
     if idempotency_key is None:
         write(inbox_dir(base, target["session"]) / f"{message['id']}.json", message)
         result = delivery_result(message, target)
@@ -1569,6 +1749,7 @@ def send(
         "scope": scope,
         "wake": wake,
         "caller": {key: sender.get(key) for key in ("session", "harness", "cwd", "repo", "remotes", "run")},
+        **({"channel": channel, "postId": post_id} if channel else {}),
     }
     operation = (
         base
@@ -1618,8 +1799,10 @@ def send(
             if entry.get("wakeAttempted"):
                 result["wake"] = {
                     "status": "uncertain",
-                    "reason": "delivery recovered; previous activation outcome is unknown and is not retried",
+                    "phase": "unknown",
+                    "reason": "delivery recovered; the earlier activation outcome is unknown, so recovery retries it",
                 }
+                remember_wake(base, target, message["id"], result["wake"])
             else:
                 entry["wakeAttempted"] = True
                 write(operation, entry)
@@ -1637,7 +1820,17 @@ def delivery_wake(base: Path, target: dict[str, Any], identifier: str, scope: st
     check_scope(scope)
     import mailbox_wake
 
-    return mailbox_wake.wake(target, identifier, base=base)
+    result = mailbox_wake.wake(target, identifier, base=base)
+    remember_wake(base, target, identifier, result)
+    return result
+
+
+def remember_wake(base: Path, target: dict[str, Any], identifier: str, result: dict[str, Any]) -> None:
+    """Keep a wake-requesting message's intent so the daemon can retry it; never fail the send over it."""
+    with contextlib.suppress(OSError, ValueError, MailboxError):
+        import wake_recovery
+
+        wake_recovery.record_intent(base, target, identifier, result)
 
 
 def valid_stamp(value: Any) -> bool:
@@ -1785,18 +1978,44 @@ def claim(base: Path, session: str, found: list[dict[str, Any]], *, scope: str =
 
 
 def take(
-    base: Path, session: str, *, mark: bool = True, limit: int = 20, scope: str = "project"
+    base: Path,
+    session: str,
+    *,
+    mark: bool = True,
+    limit: int = 20,
+    scope: str = "project",
+    eligible: Callable[[dict[str, Any]], bool] | None = None,
 ) -> list[dict[str, Any]]:
+    """Unread mail, claimed. `eligible` picks which mail to claim; the rest stays unread for a later read."""
+
+    def unread_now() -> list[dict[str, Any]]:
+        found = incoming(base, session, scope=scope)
+        return [message for message in found if eligible(message)] if eligible else found
+
     if not mark:
-        return incoming(base, session, scope=scope)[:limit]
+        return unread_now()[:limit]
     taken: list[dict[str, Any]] = []
     while len(taken) < limit:  # every pass claims a message, here or in a competing reader, so this ends
         # Re-read after each claim: a concurrent reader may have taken part of the last snapshot.
-        unread = incoming(base, session, scope=scope)[: limit - len(taken)]
+        unread = unread_now()[: limit - len(taken)]
         if not unread:
             break
         taken += claim(base, session, unread, scope=scope)
     return taken
+
+
+def thread_id(base: Path, session: str, reply_to: str | None) -> str | None:
+    """A reply to a channel post threads on its postId, whichever member's copy it names, so the poster's
+    wait(replyTo=postId) and channel history agree with it."""
+    if reply_to is None or not re.fullmatch(MESSAGE_ID, reply_to):
+        return reply_to
+    for path in sorted((base / "inbox").glob(f"*/{reply_to}.json")):
+        message = load(path)
+        if not valid_message(message) or not isinstance(message.get("postId"), str):
+            continue
+        if session in {message["from"].get("session"), message["to"].get("session")}:
+            return message["postId"]
+    return reply_to
 
 
 def reply_target_status(base: Path, session: str, reply_to: str) -> dict[str, Any] | None:
@@ -1856,7 +2075,7 @@ def wait(
     until = time.monotonic() + timeout
     peer = load(peer_path(base, session))
     run_peer = peer if is_run_peer(peer) else None
-    question_ids = {reply_to} if reply_to else set()
+    question_ids = {reply_to, thread_id(base, session, reply_to)} if reply_to else set()
     if run_peer and reply_to:
         question = find_run_question(base, run_peer["run"], reply_to, sender=session)
         if not question:
@@ -1901,7 +2120,7 @@ def wait(
                     category="delivery",
                     operation="wait",
                     scope=scope,
-                    measurements={"waitSeconds": timeout},
+                    measurements={"waitSeconds": round(timeout, 2)},
                 )
             return timeout_result
         if cancelled is not None:
@@ -1939,7 +2158,12 @@ def prune(base: Path) -> dict[str, int]:
                     with contextlib.suppress(OSError):
                         inbox.rmdir()
                 removed["peers"] += 1
-    for path in [*(base / "aliases").glob("*.json"), *(base / "delegations").glob("*.json")]:
+    for path in [
+        *(base / "aliases").glob("*.json"),
+        *(base / "delegations").glob("*.json"),
+        # Channel posts follow mail retention; history shows where they stop.
+        *(base / "channels").glob("*/*.json"),
+    ]:
         with contextlib.suppress(OSError):
             if time.time() - path.stat().st_mtime > MAX_AGE.total_seconds():
                 path.unlink()
@@ -1957,8 +2181,42 @@ def prune(base: Path) -> dict[str, int]:
             expired = True
         if expired:
             path.unlink(missing_ok=True)
+            path.with_suffix(".lock").unlink(missing_ok=True)
             removed["messages"] += 1
+    for lock_file in [*(base / "peers").glob("*.lock"), *(base / "inbox").glob("*/*.lock")]:
+        if not lock_file.with_suffix(".json").exists():
+            lock_file.unlink(missing_ok=True)
+    for inbox_sub in (base / "inbox").glob("*"):
+        if (
+            inbox_sub.is_dir()
+            and not (base / "peers" / f"{inbox_sub.name}.json").exists()
+            and not any(inbox_sub.glob("*.json"))
+        ):
+            for lock_file in inbox_sub.glob("*.lock"):
+                lock_file.unlink(missing_ok=True)
+            with contextlib.suppress(OSError):
+                inbox_sub.rmdir()
+    for wake_sub in (base / "wakes").glob("*"):
+        with contextlib.suppress(OSError):
+            if (
+                wake_sub.is_dir()
+                and not (base / "peers" / f"{wake_sub.name}.json").exists()
+                and time.time() - wake_sub.stat().st_mtime > MAX_AGE.total_seconds()
+            ):
+                for item in wake_sub.glob("*"):
+                    item.unlink(missing_ok=True)
+                wake_sub.rmdir()
+    for lock_file in (base / "locks").glob("*.lock"):
+        with contextlib.suppress(OSError):
+            if time.time() - lock_file.stat().st_mtime > MAX_AGE.total_seconds():
+                lock_file.unlink(missing_ok=True)
     prune_send_journals(base)
+    import mailbox_channels
+
+    mailbox_channels.prune_operations(base)
+    import mailbox_tasks
+
+    mailbox_tasks.prune(base)
     return removed
 
 
@@ -1977,6 +2235,8 @@ def render(message: dict[str, Any], recipient: str | None = None) -> str:
     attributes += f'harness="{escape(sender.get("harness"))}" cwd="{escape(sender.get("cwd"))}" sent="{escape(message["sentAt"])}"'
     if message.get("replyTo"):
         attributes += f' reply-to="{escape(message["replyTo"])}"'
+    if message.get("channel"):
+        attributes += f' channel="{escape(message["channel"])}" post="{escape(message.get("postId"))}"'
     # A peer cannot close the wrapper early and pose as the harness or the user.
     body = re.sub(r"</?\s*peer-message", lambda match: match.group(0).replace("<", "&lt;"), message["text"])
     return f"<peer-message {attributes}>\n{body}\n</peer-message>"
@@ -1994,6 +2254,12 @@ def render_all(found: list[dict[str, Any]], recipient: str | None = None) -> str
         "A completion that unblocks work may need a wake. Use your native way of messaging within your harness "
         "and account."
     )
+    if any(message.get("channel") for message in found):
+        hint += (
+            " A message with a channel went to that channel's members: answer the group with "
+            "send(channel=<that channel>, replyTo=id), or only its sender with send(to=sender, replyTo=id); channel "
+            "posts always go through the peer mailbox."
+        )
     return f"{blocks}\n\n{NOTICE}\n{hint}"
 
 
@@ -2032,6 +2298,53 @@ def detect_harness(payload: dict[str, Any] | None = None) -> str:
 
 _TRANSCRIPT_TAIL_BYTES = 256 * 1024
 _MODEL_SET_STDOUT = re.compile(r"<local-command-stdout>Set model to (?:`([^`]+)`|([^\n<(]+))")
+_WAKE_NOTICE_ID = re.compile(r"Local peer mailbox notification \(([A-Za-z0-9._-]+)\)")
+
+
+def wake_notice_id(payload: dict[str, Any], session: str, account: str | None = None) -> str | None:
+    """Message id from a `Local peer mailbox notification (<id>)` turn trigger, if this turn started from one."""
+    for key in ("prompt", "userMessage", "query"):
+        if isinstance(value := payload.get(key), str) and (match := _WAKE_NOTICE_ID.search(value)):
+            return match.group(1)
+    raw_path = payload.get("transcript_path") or payload.get("transcriptPath")
+    path = Path(raw_path).expanduser() if isinstance(raw_path, str) and raw_path.strip() else None
+    if path is None and session:
+        home = Path(account).expanduser() if isinstance(account, str) and account else Path.home() / ".gemini"
+        candidate = home / "antigravity-cli/brain" / session / ".system_generated/logs/transcript.jsonl"
+        if candidate.is_file():
+            path = candidate
+    if path is None:
+        return None
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            offset = max(0, size - 16384)
+            handle.seek(offset)
+            chunk = handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    lines = chunk.splitlines()
+    if offset > 0 and lines:
+        lines = lines[1:]
+    for line in reversed(lines):
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        kind = entry.get("type")
+        if kind in {"USER_INPUT", "user"}:
+            content = entry.get("content")
+            if not isinstance(content, str) and isinstance(entry.get("message"), dict):
+                content = entry["message"].get("content")
+            if isinstance(content, str) and (match := _WAKE_NOTICE_ID.search(content)):
+                return match.group(1)
+            return None
+        if kind in {"SYSTEM_MESSAGE", "PLANNER_RESPONSE", "assistant"}:
+            return None
+    return None
 
 
 def transcript_model(payload: dict[str, Any]) -> str | None:
@@ -2124,6 +2437,16 @@ def notify_senders(base: Path, found: list[dict[str, Any]], text: Any) -> None:
 
 
 def end_session(base: Path, session: str, *, reason: str, pid: int | None) -> None:
+    # Serialize a normal exit with background disappearance detection. /clear registers its successor
+    # and takes other peer locks, so keep its existing pairing path outside this lock.
+    if reason == "clear":
+        _end_session(base, session, reason=reason, pid=pid)
+    else:
+        with locked(peer_path(base, session)):
+            _end_session(base, session, reason=reason, pid=pid)
+
+
+def _end_session(base: Path, session: str, *, reason: str, pid: int | None) -> None:
     """A session is going away. A /clear keeps it for its successor; any other end tells its waiting senders."""
     peer = load(peer_path(base, session))
     if valid_peer(peer) and not is_run_peer(peer):
@@ -2227,6 +2550,7 @@ def adopt_cleared(base: Path, me: dict[str, Any]) -> str:
         clearedFrom=old["session"],
         awaitingClear=None,
         **({"person": old["person"]} if old.get("person") else {}),
+        **({"channels": old["channels"]} if old.get("channels") else {}),
     )
     me = register(base, session=me["session"], harness=me["harness"], cwd=me["cwd"])
     notify_senders(
@@ -2244,6 +2568,8 @@ def adopt_cleared(base: Path, me: dict[str, Any]) -> str:
     ]
     if old.get("focus"):
         lines.append(f"Before that you were working on: {old['focus']}.")
+    if old.get("channels"):
+        lines.append(f"You are still in channel {', '.join(old['channels'])}; leave it if your task changed.")
     if carried:
         lines.append(
             f"{len(carried)} message(s) addressed to you before /clear follow; the conversation behind them is gone, "
@@ -2471,6 +2797,9 @@ def hook(
         runtime_model = None
     if not (isinstance(runtime_model, str) and runtime_model.strip()):
         runtime_model = transcript_model(payload)
+    previous = load(peer_path(base, session))
+    # Antigravity runs PreInvocation before every model step, tool results included; only the first starts a turn.
+    mid_turn = event == "PreInvocation" and valid_peer(previous) and previous.get("state") == "busy"
     me = register(
         base,
         session=session,
@@ -2485,6 +2814,11 @@ def hook(
         effort=runtime_effort(harness, payload),
     )
     me = mark_delegated(base, me)
+    # How the last turn ended: wake recovery must not set a conversation going that its own user stopped.
+    if gemini and event == "Stop" and payload.get("terminationReason"):
+        me = annotate(base, session, lastStopReason=str(payload["terminationReason"])) or me
+    elif me.get("lastStopReason") and event in {"SessionStart", "UserPromptSubmit", "PreInvocation"}:
+        me = annotate(base, session, lastStopReason=None) or me
     cleared_notice = ""
     if event == "SessionStart" and payload.get("source") == "clear" and not me.get("delegatedRun"):
         cleared_notice = adopt_cleared(base, me)
@@ -2492,7 +2826,7 @@ def hook(
     team_notice = (
         succession_notice(base, me) if event in {"SessionStart", "UserPromptSubmit", "PreInvocation", "Stop"} else ""
     )
-    if event in {"SessionStart", "UserPromptSubmit", "PreInvocation", "Stop"}:
+    if event in {"SessionStart", "UserPromptSubmit"} or (event == "PreInvocation" and not mid_turn):
         wake_dir = base / "wakes" / session_key(session)
         for marker_name in ("agy-wake.json", "claude-wake.json"):
             (wake_dir / marker_name).unlink(missing_ok=True)
@@ -2505,6 +2839,11 @@ def hook(
         if http_mode and event != "Stop":
             live = mailbox_daemon.ensure_running(base, startup_timeout=0.5)
             stale = live.get("runtimeRevision") != mailbox_daemon.runtime_revision()
+            if stale and not mid_turn and not live.get("activeWaits"):
+                with contextlib.suppress(MailboxError, OSError):
+                    if mailbox_daemon.stop_service(base):
+                        live = mailbox_daemon.ensure_running(base, startup_timeout=2.0)
+                        stale = live.get("runtimeRevision") != mailbox_daemon.runtime_revision()
             issue = "HTTP mailbox is running old code; use mailbox daemon restart after upgrade." if stale else ""
             if issue != me.get("httpAvailabilityIssue", ""):
                 availability_hint = issue
@@ -2523,13 +2862,47 @@ def hook(
             annotate(base, session, httpAvailabilityIssue=issue)
     if gemini and event == "Stop" and payload.get("terminationReason") in ANTIGRAVITY_NO_CONTINUE:
         return {}
-    delivered = take(base, session)
+    import mailbox_channels
+
+    route_hint = wake_route_hint(base, me) if event == "SessionStart" else ""
+    # At Stop or between steps of a turn only mail worth interrupting it for is read; quiet channel posts wait for
+    # the next turn.
+    delivered = take(base, session, eligible=mailbox_channels.reads_at_stop if event == "Stop" or mid_turn else None)
+    stale_wake_notice = ""
+    if (
+        event in {"UserPromptSubmit", "PreInvocation"}
+        and not mid_turn
+        and not delivered
+        and (notice_id := wake_notice_id(payload, session, me.get("accountHome")))
+    ):
+        existing_mail = load(inbox_dir(base, session) / f"{notice_id}.json")
+        if existing_mail and existing_mail.get("readAt"):
+            stale_wake_notice = (
+                f"Mailbox notification ({notice_id}) was already delivered and marked read in an earlier turn "
+                f"(at {existing_mail['readAt']}); no unread peer messages remain. Do not call inbox or ack—finish immediately."
+            )
+        else:
+            stale_wake_notice = (
+                f"Mailbox notification ({notice_id}) has no unread messages waiting in your inbox. "
+                "Do not call inbox or ack—finish immediately."
+            )
     context = render_all(delivered, me["name"])
-    hint = "\n".join(value for value in (cleared_notice, team_notice, identity_hint, availability_hint) if value)
+    hint = "\n".join(
+        value
+        for value in (
+            cleared_notice,
+            team_notice,
+            identity_hint,
+            availability_hint,
+            route_hint,
+            stale_wake_notice,
+        )
+        if value
+    )
     if hint:
         context = hint + ("\n\n" + context if context else "")
     if event == "Stop":
-        if not context:
+        if not delivered and not team_notice:  # a hint alone never keeps a turn going
             return {} if gemini else None
         feedback_module().observe(
             base,
@@ -2548,15 +2921,19 @@ def hook(
         annotate(base, session, state="busy")
         decision = "continue" if gemini else "block"
         return {"decision": decision, "reason": f"Peer messages arrived while you worked:\n\n{context}"}
-    # Who else works in this repository: at session start, and again whenever that set changes.
+    # Who else works in this repository: at session start, and again whenever this session's channel-mates (or,
+    # without channels, the other channel-less sessions) change. Other teams appear only as counts.
     others = [] if me.get("delegatedRun") else colleagues(base, me)
-    seen = sorted(peer["session"] for peer in others)
+    mates, elsewhere = mailbox_channels.split(me, others)
+    seen = mailbox_channels.roster_key(me, mates)
     rule_shown = False
     if event == "SessionStart" or seen != me.get("seenColleagues", []):
-        notice = describe_colleagues(others, me)
-        rule_shown = bool(others and notice)
-        if not notice and me.get("seenColleagues") and not me.get("delegatedRun"):
+        notice = describe_colleagues(mates, me, elsewhere)
+        rule_shown = bool(mates and notice)
+        if not notice and not elsewhere and me.get("seenColleagues") and not me.get("delegatedRun"):
             notice = "The other agent sessions in this project have ended; none is working here now."
+        if event == "SessionStart" and (joining := mailbox_channels.join_hint(me, others)):
+            notice = f"{notice}\n{joining}" if notice else joining
         if notice:
             context = f"{notice}\n\n{context}" if context else notice
         annotate(base, session, seenColleagues=seen)
@@ -2785,6 +3162,45 @@ poll, retry unchanged, or contact another agent just to collect feedback.
 """.strip()
 
 
+def render_work(result: dict[str, Any]) -> str:
+    """Compact workboard response shared by CLI and MCP; details stay available as JSON."""
+    rows = result.get("items", [result["item"]] if "item" in result else [])
+    lines = ["Project workboard (coordination only; no user approval or file protection)."]
+    for row in rows:
+        owner = row.get("owner") or {}
+        integrator = row.get("integrator") or {}
+        revision = f" r{row['revision']}" if "revision" in row else ""
+        lines.append(f"{row['id']}{revision} [{row['state']}] {row['title']}")
+        source = row.get("source", "interactive")
+        lines.append(f"  Source: {source}" + (" (read-only)" if row.get("readOnly") else ""))
+        if source == "legacy-note":
+            lines.append("  If resuming, create a work item; do not maintain this legacy card alongside it.")
+        if source == "coordinator":
+            lines.append("  Ownership and acceptance: managed by the coordinator; follow its route.")
+        elif source == "legacy-note":
+            lines.append(f"  Recorded author: {owner.get('name', 'unknown')}")
+        else:
+            lines.append(f"  Owner: {owner.get('name', 'unclaimed')}; integrator: {integrator.get('name', 'unknown')}")
+        for field in ("scope", "acceptance", "checkout", "done", "next", "blocker", "evidence", "verification", "note"):
+            if row.get(field):
+                lines.append(f"  {field.capitalize()}: {row[field]}")
+        if row.get("unmetDependencies"):
+            lines.append("  Waiting for: " + ", ".join(row["unmetDependencies"]))
+        if row.get("recoveryNeeded"):
+            lines.append(f"  Recovery needed: {row['recoveryNeeded']}; no ownership was transferred.")
+        if row.get("transfer"):
+            lines.append(f"  Integrator transfer offered to: {row['transfer']['name']}")
+        if command := row.get("route", {}).get("command"):
+            lines.append("  Route: " + shlex.join(command))
+    if not rows:
+        lines.append("No work items.")
+    if result.get("has_more"):
+        lines.append(f"More work items: offset={result['next_offset']}.")
+    if result.get("replayed"):
+        lines.append("Existing item returned for this create key.")
+    return "\n".join(lines)
+
+
 def main(argv: list[str] | None = None) -> int:
     supplied = sys.argv[1:] if argv is None else argv
     if supplied and supplied[0] == "daemon":
@@ -2816,6 +3232,15 @@ def main(argv: list[str] | None = None) -> int:
         "feedback",
         "feedback-summary",
         "name",
+        "attach-wake-route",
+        "wake-health",
+        "wake-retry",
+        "join",
+        "leave",
+        "channels",
+        "tasks",
+        "board",
+        "work",
     ):
         sub = commands.add_parser(name)
         if name == "name":
@@ -2829,12 +3254,61 @@ def main(argv: list[str] | None = None) -> int:
         )
         sub.add_argument("--harness", choices=HARNESSES)
         sub.add_argument("--format", choices=("text", "json", "context"), default="text")
-        if name in {"peers", "send", "inbox", "wait", "history", "feedback-summary"}:
+        if name in {
+            "peers",
+            "send",
+            "inbox",
+            "wait",
+            "history",
+            "feedback-summary",
+            "wake-health",
+            "wake-retry",
+            "tasks",
+        }:
             sub.add_argument(
                 "--scope", choices=SCOPES, default="project", help="cross-project requires explicit opt-in"
             )
+        if name == "wake-retry":
+            sub.add_argument("--to", help="only this peer; default every peer in scope")
+        if name in {"join", "leave"}:
+            sub.add_argument("channels", nargs="+", help="channel names, e.g. retrieval graph")
+        if name == "history":
+            sub.add_argument("--channel", help="this channel's posts in your project, newest first")
+            sub.add_argument("--limit", type=int, default=20)
+            sub.add_argument("--before", help="page back from this post id")
         if name == "peers":
             sub.add_argument("--runs", action="store_true", help="include run-scoped worker/conductor sessions")
+        if name in {"tasks", "board"}:
+            sub.add_argument("--limit", type=int, default=10)
+            sub.add_argument("--offset", type=int, default=0)
+        if name == "board":
+            sub.add_argument("--item", help="one project work item by stable id")
+            sub.add_argument("--view", choices=("work", "status"), default="work")
+            sub.add_argument("--agent", help="status view: stable session ID or full agent name")
+            sub.add_argument("--channel", help="status view: members of this task channel and their work")
+            sub.add_argument("--since", help="status view: wait for a change from this prior cursor")
+            sub.add_argument("--timeout", type=float, default=300, help="status change wait, at most 600 seconds")
+        if name == "work":
+            import mailbox_work
+
+            sub.add_argument("work_action", choices=mailbox_work.ACTIONS)
+            sub.add_argument("--item", help="stable item id; required after create")
+            sub.add_argument("--revision", type=int, help="expected current revision; required after create")
+            sub.add_argument("--key", help="stable idempotency key; required for create")
+            for field in (
+                "title",
+                "scope",
+                "acceptance",
+                "integrator",
+                "blocker",
+                "evidence",
+                "verification",
+                "note",
+                "successor",
+            ):
+                sub.add_argument(f"--{field}")
+            sub.add_argument("--next", dest="next_step", help="concrete next step")
+            sub.add_argument("--dependencies", nargs="+", help="accepted prerequisite item ids")
         if name == "hook":
             sub.add_argument("--event", help="lifecycle event, for hosts whose payload does not name it")
         if name == "send":
@@ -2845,6 +3319,10 @@ def main(argv: list[str] | None = None) -> int:
                 help="what native messaging failed to do; lifts the same-harness, same-account refusal",
             )
             sub.add_argument("--to", default=os.environ.get("AGENT_MAILBOX_PEER"))
+            sub.add_argument(
+                "--channel", help="post to this channel's members instead of one peer (also: all, worktree)"
+            )
+            sub.add_argument("--wake", action="store_true", help="for a channel post: wake idle members too")
             sub.add_argument("--text", "--message", "--body", dest="text", required=True)
             sub.add_argument("--kind", choices=("question", "reply", "update"))
             sub.add_argument("--id", help="caller ID for idempotent run-message delivery")
@@ -2864,12 +3342,23 @@ def main(argv: list[str] | None = None) -> int:
         if name == "ack":
             sub.add_argument("ids", nargs="+")
         if name == "focus":
+            import mailbox_tasks
+
+            for field, maximum in mailbox_tasks.LIMITS.items():
+                sub.add_argument(
+                    f"--{field}",
+                    help=f"legacy recovery note, at most {maximum} characters; use board/work for current work",
+                )
+            sub.add_argument("--status", choices=mailbox_tasks.STATUSES)
             sub.add_argument("--harness-label", help="actual host name, e.g. Antigravity; omit if not known")
             sub.add_argument("--model", help="current model ID/name verified from your runtime; omit if unknown")
             sub.add_argument(
                 "--text",
                 required=True,
                 help="task display name from your actual assignment; update when the task changes (max 200 characters)",
+            )
+            sub.add_argument(
+                "--channel", action="append", default=[], help="also join this channel (repeatable); never leaves one"
             )
         if name == "feedback":
             sub.add_argument("--category", choices=feedback_module().CATEGORIES, required=True)
@@ -2908,6 +3397,102 @@ def main(argv: list[str] | None = None) -> int:
         elif args.action == "feedback-summary":
             me = caller(args, base) if session_arg(args) else workspace(os.getcwd())
             output = feedback_module().summary(base, peer=None if args.scope == "cross-project" else me)
+        elif args.action == "wake-health":
+            # Read-only: whether each live peer can be woken while idle, without sending anything.
+            import mailbox_wake
+            import wake_recovery
+
+            me = caller(args, base) if session_arg(args) else workspace(os.getcwd())
+            output = []
+            for peer in scoped_peers(base, me, scope=args.scope):
+                row = {"name": peer["name"], "session": peer["session"], "harness": peer["harness"]}
+                row |= mailbox_wake.wake_health(peer, base=base)
+                if pending := wake_recovery.summary(base, peer["session"]):
+                    row["pending"] = pending
+                output.append(row)
+            if args.format != "json":
+                for row in output:
+                    state = "wakeable" if row["wakeable"] else "not wakeable"
+                    repair = f" (repair: {row['repair']})" if row.get("repair") else ""
+                    pending = row.get("pending")
+                    waiting = (
+                        f" [wake {pending['state']}: {pending['messages']} unread, {pending['attempts']} attempts]"
+                        if pending
+                        else ""
+                    )
+                    print(f"{row['name']}: {state} via {row['route']}: {row['reason']}{repair}{waiting}")
+                return 0
+        elif args.action == "wake-retry":
+            # Give intents that ran out of attempts a fresh bounded chance, and try once now.
+            import wake_recovery
+
+            me = caller(args, base) if session_arg(args) else workspace(os.getcwd())
+            if args.to:
+                sessions = [resolve(base, args.to, sender=me, scope=args.scope)["session"]]
+            else:
+                sessions = [peer["session"] for peer in scoped_peers(base, me, scope=args.scope)]
+            reopened = wake_recovery.reopen(base, sessions)
+            # Only the chosen recipients: a project-scoped retry never wakes anyone outside that scope.
+            output = {"reopened": reopened, "outcomes": wake_recovery.reconcile(base, sessions=sessions)}
+        elif args.action in {"board", "work"}:
+            import mailbox_work
+
+            if args.action == "board" and args.view == "status":
+                import mailbox_status
+
+                if args.item:
+                    raise MailboxError("status view uses --agent/--channel; use the work view for --item")
+                # An observer uses the selected working directory without registering or refreshing presence.
+                output = mailbox_status.observe(
+                    base,
+                    workspace(os.getcwd()),
+                    agent=args.agent,
+                    channel=args.channel,
+                    since=args.since,
+                    timeout=args.timeout,
+                    limit=args.limit,
+                    offset=args.offset,
+                )
+                print(json.dumps(output, ensure_ascii=True) if args.format == "json" else mailbox_status.render(output))
+                return 0
+            if args.action == "board" and any((args.agent, args.channel, args.since)):
+                raise MailboxError("--agent, --channel and --since require --view status")
+            me = caller(args, base) if args.action == "work" or session_arg(args) else workspace(os.getcwd())
+            if args.action == "board":
+                output = mailbox_work.listing(base, me, item=args.item, limit=args.limit, offset=args.offset)
+            else:
+                fields = {
+                    key: getattr(args, key)
+                    for key in (
+                        "item",
+                        "revision",
+                        "key",
+                        "title",
+                        "scope",
+                        "acceptance",
+                        "dependencies",
+                        "integrator",
+                        "next_step",
+                        "blocker",
+                        "evidence",
+                        "verification",
+                        "note",
+                        "successor",
+                    )
+                    if getattr(args, key) is not None
+                }
+                output = mailbox_work.mutate(base, me, action=args.work_action, **fields)
+            if args.format != "json":
+                print(render_work(output))
+                return 0
+        elif args.action == "tasks":
+            import mailbox_tasks
+
+            me = caller(args, base) if session_arg(args) else workspace(os.getcwd())
+            output = mailbox_tasks.listing(base, me, scope=args.scope, limit=args.limit, offset=args.offset)
+            if args.format != "json":
+                print(mailbox_tasks.render(output))
+                return 0
         elif args.action == "peers":
             me = caller(args, base) if session_arg(args) else workspace(os.getcwd())
             caller_harness = args.harness or me.get("harness") or detect_harness()
@@ -2933,6 +3518,8 @@ def main(argv: list[str] | None = None) -> int:
                 for peer in rows
             ]
         else:
+            if args.action == "attach-wake-route":
+                check_attach_shell(session_arg(args), args.harness or detect_harness())  # before registering anyone
             me = caller(args, base)
             if args.action == "feedback":
                 output = feedback_module().submit(
@@ -2945,6 +3532,20 @@ def main(argv: list[str] | None = None) -> int:
                     operation=args.operation,
                     scope=args.scope,
                     message_ids=args.message_id,
+                )
+            elif args.action == "send" and args.channel:
+                import mailbox_channels
+
+                if args.to and args.to != os.environ.get("AGENT_MAILBOX_PEER"):
+                    raise MailboxError("send to one peer (--to) or to a channel (--channel), not both")
+                output = mailbox_channels.post(
+                    base,
+                    sender=me,
+                    channel=args.channel,
+                    text=args.text,
+                    reply_to=args.reply_to,
+                    wake=args.wake,
+                    idempotency_key=args.id,
                 )
             elif args.action in {"send", "ask"}:
                 to = args.to or (me.get("counterpart") if is_run_peer(me) else None)
@@ -2995,12 +3596,41 @@ def main(argv: list[str] | None = None) -> int:
                         if is_run_peer(me)
                         else mark_read(base, me["session"], args.ids)
                     }
+                elif args.action == "attach-wake-route":
+                    if is_run_peer(me):
+                        raise MailboxError("run sessions are woken by their runner, not an attached route")
+                    output = attach_wake_route(base, me)
                 elif args.action == "focus":
                     if is_run_peer(me):
                         raise MailboxError("focus is for interactive sessions")
                     output = set_focus(
-                        base, me["session"], args.text, model=args.model, harness_label=args.harness_label
+                        base,
+                        me["session"],
+                        args.text,
+                        model=args.model,
+                        harness_label=args.harness_label,
+                        channels=args.channel,
+                        task_details={
+                            key: getattr(args, key)
+                            for key in (*mailbox_tasks.LIMITS, "status")
+                            if getattr(args, key) is not None
+                        },
                     )
+                elif args.action in {"join", "leave"}:
+                    import mailbox_channels
+
+                    if is_run_peer(me):
+                        raise MailboxError("run sessions report to their conductor, not to channels")
+                    changed = mailbox_channels.update(base, me["session"], **{args.action: args.channels})
+                    output = {"session": me["session"], "channels": mailbox_channels.memberships(changed)}
+                elif args.action == "channels":
+                    import mailbox_channels
+
+                    output = {"channels": mailbox_channels.overview(base, me)}
+                elif args.action == "history" and args.channel:
+                    import mailbox_channels
+
+                    output = mailbox_channels.history(base, me, args.channel, limit=args.limit, before=args.before)
                 elif args.action == "history":
                     output = (
                         run_history(base, me["run"])

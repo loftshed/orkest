@@ -1,8 +1,8 @@
 ---
 name: orchestrate
-description: "Delegate bounded implementation or read-only consultation across provider boundaries using local Codex, Antigravity, Claude Code, or OpenCode. Validate model and effort, check live quota, preserve context, record usage and evidence, recover bounded corrections, and audit results. Use for explicitly requested external-agent work or cross-platform handoffs, for example 'ask GPT-5.6 Sol', 'have Gemini check this', 'try it with GLM', or one focused question to a stronger model ('get Opus's opinion on this', 'ask GPT whether X is safe') through `consult`. Always prefer the host harness's built-in tools for messaging or spawning agents within the same harness (GPT in Codex, Gemini in Gemini/Antigravity, Claude in Claude Code). Do not trigger for ordinary coding or same-harness collaboration."
+description: "Delegate bounded implementation or read-only consultation across provider boundaries using local Codex, Antigravity, Claude Code, or OpenCode. Validate model and effort, check live quota, preserve context, record usage and evidence, recover bounded corrections, and audit results. Use for explicitly requested external-agent work or cross-platform handoffs, for example 'ask GPT-5.6 Sol', 'have Gemini check this', 'try it with GLM', or one focused question to a stronger model ('get Opus's opinion on this', 'ask GPT whether X is safe') through `consult`. Always prefer the host harness's built-in tools for messaging or spawning agents within the same harness (GPT in Codex, Gemini in Gemini/Antigravity, Claude in Claude Code). Also use for requests to inspect Orkest agent or team status and follow their updates through the shared workboard. Do not trigger for ordinary coding or same-harness delegation."
 metadata:
-  version: 0.32.0
+  version: 0.38.0
   requirements: Python 3.11+, POSIX file locking, git, and at least one installed/authenticated executor CLI (`codex`, `agy`, `claude`, or `opencode`).
 ---
 
@@ -20,7 +20,7 @@ the installed CLIs, the routes in effect, and stale skill copies.
 Before using cross-harness messages on an unfamiliar install, run
 `python3 <skill-directory>/scripts/run_agent.py doctor --check-messaging`. If setup is missing or
 stale, repair it yourself with `doctor --repair-messaging`, then repeat the check. This creates the
-skill hub if needed, registers the shared local HTTP mailbox, installs turn hooks, and permits only its eight local
+skill hub if needed, registers the shared local HTTP mailbox, installs turn hooks, and permits only its local
 Codex tools; it preserves unrelated settings and backs up changed files. Do not leave these routine
 repairs for the user to ask another agent to perform.
 
@@ -104,6 +104,18 @@ The coordinator's `--kind investigation` and `consultation` remain for work that
 a task's invocation allowance, and for a blocked worker asking its conductor.
 
 ## Choose ownership before a model
+
+Start shared work from the [workboard](references/workboard.md) at task entry and handoff boundaries.
+It shows interactive items, coordinator tasks and legacy notes together. Claim a ready interactive
+item within the user's scope, checkpoint it, then submit evidence for acceptance. Coordinator entries
+give the backend route and read its existing state; never copy that status into an interactive item.
+Plain `focus` sets a caption, not another ledger. Do not poll for work. Claims do not lock files or
+grant user authorization.
+
+When the user asks what agents are doing or wants updates on a selected team, use the board's
+[read-only status view](references/dot-status.md). Dot's local executor can read it without joining
+the mailbox and wait for a change with a bounded local command. Report recorded evidence and staleness;
+do not treat presence as verified progress or completion.
 
 | Situation                                                                        | Action                                                                          |
 | -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
@@ -371,6 +383,12 @@ or `send` call, or CLI `--scope cross-project`. Explicitly addressed cross-proje
 normal inbox, wait and hooks; acknowledge it normally. Replies across projects still require explicit
 send scope. Receiving mail does not expand task permissions. Declare your work with `focus` and agree on a split
 before editing shared files.
+
+When separate teams share a project, each joins the channel of its task (`mailbox join retrieval`, or
+MCP `focus(channels=[...])`) and posts there with `send --channel retrieval` (MCP `send(channel=...)`),
+so the other team is not interrupted. `all` reaches the whole project and `worktree` this checkout.
+Channel posts are quiet unless `--wake`/`wake: true`, and always go through the peer mailbox, even to
+sessions of your own harness and account. Details: [references/mailbox.md](references/mailbox.md#task-channels).
 
 ### Compact communication commands
 

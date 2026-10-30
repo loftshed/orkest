@@ -15,18 +15,29 @@ const MONTHS = {
 
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
+const DEFAULT_TIME_ZONE = new Intl.DateTimeFormat().resolvedOptions().timeZone;
+const ZONE_FORMATTERS = new Map();
+
+function zoneFormatter(timeZone) {
+  let formatter = ZONE_FORMATTERS.get(timeZone);
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      hourCycle: "h23",
+      year: "numeric",
+      month: "numeric",
+      day: "numeric",
+      hour: "numeric",
+      minute: "numeric",
+      second: "numeric",
+    });
+    ZONE_FORMATTERS.set(timeZone, formatter);
+  }
+  return formatter;
+}
 
 function zoneParts(utcMs, timeZone) {
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone,
-    hourCycle: "h23",
-    year: "numeric",
-    month: "numeric",
-    day: "numeric",
-    hour: "numeric",
-    minute: "numeric",
-    second: "numeric",
-  }).formatToParts(new Date(utcMs));
+  const parts = zoneFormatter(timeZone).formatToParts(new Date(utcMs));
   const get = (type) => Number(parts.find((p) => p.type === type).value);
   return {
     year: get("year"),
@@ -53,7 +64,7 @@ export function zonedTimeToUtc(year, month, day, hour, minute, timeZone) {
 
 function isValidZone(timeZone) {
   try {
-    new Intl.DateTimeFormat("en-US", { timeZone });
+    zoneFormatter(timeZone);
     return true;
   } catch {
     return false;
@@ -80,9 +91,7 @@ export function parseResetText(text, now = Date.now()) {
   }
   const tzMatch = text.match(/\(([^()]+)\)\s*$/);
   const timeZone =
-    tzMatch && isValidZone(tzMatch[1].trim())
-      ? tzMatch[1].trim()
-      : new Intl.DateTimeFormat().resolvedOptions().timeZone;
+    tzMatch && isValidZone(tzMatch[1].trim()) ? tzMatch[1].trim() : DEFAULT_TIME_ZONE;
   const body = tzMatch ? text.slice(0, tzMatch.index) : text;
   const m = body.match(
     /(?:([A-Za-z]{3})[a-z]*\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s*(?:at\s+)?)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/i,

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.14.0
+
+- feat: mailbox fixes
+
 ## 0.13.0
 
 - feat: migrate to orkest and finish orchestration tooling
