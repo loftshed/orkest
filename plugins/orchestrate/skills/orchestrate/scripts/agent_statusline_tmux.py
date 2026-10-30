@@ -24,6 +24,10 @@ def main(arguments: list[str]) -> int:
     if not tmux:
         print("ork label needs tmux on PATH", file=sys.stderr)
         return 2
+    if Path(command[0]).name == "codex":
+        # The TUI knows the visible conversation even when agents share a daemon.
+        # This changes only the private pane title, not Codex's thread name or status line.
+        command = [command[0], "-c", 'tui.terminal_title=["session-id"]', *command[1:]]
     socket = f"orkest-label-{secrets.token_hex(6)}"
     session = "orkest"
     environment = dict(os.environ)
@@ -55,8 +59,17 @@ def main(arguments: list[str]) -> int:
         return create.returncode
 
     script = Path(__file__).with_name("agent_statusline.py")
-    invocation = shlex.join([sys.executable, str(script)]).replace("#", "##")
-    status = f"#({invocation} --pane-pid #{{pane_pid}} --width #{{client_width}} --harness codex --tmux)"
+    invocation = shlex.join(
+        [
+            sys.executable,
+            str(script),
+            "--tmux-server",
+            socket,
+            "--codex-home",
+            str(Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser().resolve()),
+        ]
+    ).replace("#", "##")
+    status = f"#({invocation} --codex-pane #{{pane_id}} --width #{{client_width}} --harness codex --tmux)"
     options = (
         ("status-position", "bottom"),
         ("status-interval", "3"),

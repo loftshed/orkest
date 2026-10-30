@@ -33,6 +33,7 @@ import { cachedQuota, runTui } from "./stooges-tui.mjs";
 const HELP = `ork rooms --help
 ork gate [--heavy] [--label <text>] -- <command>   (also: ork gate status|install|uninstall)
 ork label -- codex [arguments]                     (private tmux session with an agent label)
+ork progress --session ID --goal TEXT --task TEXT --stage working
 ork name [--model <model>] [--effort <level>] [--harness <harness>]
 ork routes [--archetype <name>] [--json] [--width 120]
 ork quota [--line|--json] [--refresh]
@@ -297,6 +298,10 @@ function terminalCommand(script, argv) {
 }
 
 export async function main(argv = process.argv.slice(2), { stdout = process.stdout } = {}) {
+  if (argv[0] === "progress") {
+    process.exitCode = await terminalCommand("agent_progress.py", argv.slice(1));
+    return;
+  }
   if (argv[0] === "gate") {
     process.exitCode = await terminalCommand("gate.py", argv.slice(1));
     return;

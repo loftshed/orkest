@@ -409,6 +409,45 @@ class WorkTests(unittest.TestCase):
                     self.create(dependencies=[item])
         self.assertEqual(self.create()["source"], "interactive")
 
+    def test_shares_active_work_and_help_board_hint_for_completed_long_idle_sessions(self):
+        import datetime as dt
+
+        import agent_progress
+
+        item = self.change(self.create(), self.worker, "claim")
+        self.assertTrue(work.shares_active_work(self.base, self.lead, self.worker))
+        self.assertFalse(work.shares_active_work(self.base, self.lead, self.other))
+        # While paired on active work, direct sends between integrator and owner are treated as same-task even with different focus.
+        mailbox.set_focus(self.base, self.lead["session"], "Integrating export")
+        mailbox.set_focus(self.base, self.worker["session"], "Implementing serializer")
+        mailbox.set_focus(self.base, self.other["session"], "Unrelated docs cleanup")
+        lead = mailbox.load(mailbox.peer_path(self.base, self.lead["session"]))
+        worker = mailbox.load(mailbox.peer_path(self.base, self.worker["session"]))
+        other = mailbox.load(mailbox.peer_path(self.base, self.other["session"]))
+        self.assertFalse(mailbox.unrelated_task(self.base, lead, worker))
+        self.assertTrue(mailbox.unrelated_task(self.base, lead, other))
+        accepted = self.change(self.submit(item), self.lead, "accept")
+        self.assertEqual(accepted["state"], "accepted")
+        self.assertFalse(work.shares_active_work(self.base, self.lead, self.worker))
+
+        # Open a ready help item on the board and verify help_board_hint only surfaces for completed + long-idle peers.
+        help_item = self.create(key="help-item", title="Add focused serializer edge-case test")
+        self.assertEqual(work.help_board_hint(self.base, other, previous=other), "")
+        agent_progress.report(self.base, other, goal="Docs cleanup", task="Update README", stage="working")
+        self.assertEqual(work.help_board_hint(self.base, other, previous=other), "")
+        agent_progress.report(self.base, other, goal="Docs cleanup", task="Update README", stage="complete")
+        # Just completed (< HELP_BOARD_IDLE_SECONDS): still quiet.
+        self.assertEqual(work.help_board_hint(self.base, other, previous=other), "")
+
+        long_ago = mailbox.now() - dt.timedelta(seconds=work.HELP_BOARD_IDLE_SECONDS + 60)
+        with patch.object(mailbox, "now", return_value=long_ago):
+            agent_progress.report(self.base, other, goal="Docs cleanup", task="Update README", stage="complete")
+            idle_previous = {**other, "state": "idle", "lastSeenAt": mailbox.stamp()}
+        hint = work.help_board_hint(self.base, other, previous=idle_previous)
+        self.assertIn("Help board:", hint)
+        self.assertIn(help_item["id"], hint)
+        self.assertIn("Add focused serializer edge-case test", hint)
+
 
 if __name__ == "__main__":
     unittest.main()
