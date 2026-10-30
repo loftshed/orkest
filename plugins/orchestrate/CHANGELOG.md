@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.39.0
+
+- feat(orchestrate): notify peers when an agent disappears (#36)
+
 ## 0.38.0
 
 - feat: mailbox fixes

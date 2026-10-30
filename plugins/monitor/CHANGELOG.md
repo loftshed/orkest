@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.15.0
+
+- feat(monitor): distinguish reset credits and weekly rollover changes (#30)
+- feat(monitor): record quota observations for reset analysis (#32)
+
 ## 0.14.0
 
 - feat: mailbox fixes
