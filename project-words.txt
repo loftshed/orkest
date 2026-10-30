@@ -89,3 +89,4 @@ zorblo
 zorpnik
 zuzzlek
 zwibble
+tcsetwinsize

@@ -97,6 +97,37 @@ export function validateRoom(room) {
       throw new Error("Invalid or duplicate room member");
     ids.add(agent.id);
   }
+  if (ids.has("conductor")) throw new Error("conductor is reserved for the root coordinator");
+  if (room.swarm) {
+    const { maxAgents, maxDepth } = room.swarm;
+    if (
+      !Number.isSafeInteger(maxAgents) ||
+      maxAgents < 1 ||
+      maxAgents > 64 ||
+      !Number.isSafeInteger(maxDepth) ||
+      maxDepth < 1 ||
+      maxDepth > 8
+    )
+      throw new Error("Swarm limits require 1–64 agents and 1–8 levels");
+    if (room.agents.length > maxAgents) throw new Error("Swarm agent limit reached");
+    if (!ENGINES.has(room.conductor?.engine)) throw new Error("A swarm needs a coordinator engine");
+  }
+  for (const agent of room.agents) {
+    if (agent.role !== undefined && !["lead", "worker"].includes(agent.role))
+      throw new Error("Invalid swarm role");
+    const visited = new Set([agent.id]);
+    let parent = agent.parent || "conductor";
+    let depth = 1;
+    while (parent !== "conductor") {
+      const lead = room.agents.find((entry) => entry.id === parent);
+      if (!lead || lead.role !== "lead" || visited.has(parent))
+        throw new Error("Swarm parent must be an existing lead without a cycle");
+      visited.add(parent);
+      depth++;
+      parent = lead.parent || "conductor";
+    }
+    if (room.swarm && depth > room.swarm.maxDepth) throw new Error("Swarm depth limit reached");
+  }
   for (const member of [room.conductor, ...room.agents]) {
     if (!member) continue;
     if (
@@ -122,14 +153,14 @@ export function validateRoom(room) {
   return room;
 }
 
-export function addMembers(room, members) {
+export function addMembers(room, members, { parent = "conductor" } = {}) {
   if (room.agents.length + members.length > 64)
     throw new Error("A room supports at most 64 members");
   for (const member of members) {
     let index = 1;
     const stem = member.label.replaceAll(/[^\w-]/gu, "-").slice(0, 60);
     while (room.agents.some((agent) => agent.id === `${stem}-${index}`)) index++;
-    room.agents.push({ ...member, id: `${stem}-${index}`, status: "queued", output: [] });
+    room.agents.push({ ...member, id: `${stem}-${index}`, parent, status: "queued", output: [] });
   }
   return room;
 }

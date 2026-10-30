@@ -5,6 +5,9 @@ member gets one dispatch through the [coordinator](coordinator.md), which keeps 
 billing policy, deadlines, scope and verification. The examples use `ork`; without it on your PATH,
 use `node <plugin-root>/bin/ork.mjs`.
 
+For an interactive coordinator that builds and supervises its own team, use
+[`ork stooges "objective"`](swarm.md). The commands below also work independently.
+
 ## Create and dispatch
 
 ```sh
@@ -19,7 +22,8 @@ ork rooms dispatch --room cache-review --member haiku-1 \
 Members begin queued: creating a room never starts work. `dispatch` and `launch` may start billable
 work, so dispatch only once the [task specification](brief-template.md) says what you want done.
 Task directories live outside the repository. `ork stooges --preset bug-court` (or `scout-swarm`,
-`heavy-trifecta`) creates a room from a preset team; `ork stooges --attach-room ID` shows a live view.
+`heavy-trifecta`) opens a coordinator with a queued preset team. Add `--json` to create the roster
+without starting a conversation. `ork stooges --attach-room ID --view` shows a live view.
 
 A room works in one checkout, and the runner's writer lease is exclusive per checkout, so a room runs
 one implementation at a time; other members run as investigation, consultation or challenge.

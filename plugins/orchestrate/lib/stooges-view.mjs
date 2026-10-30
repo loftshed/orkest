@@ -396,10 +396,25 @@ function rangeLabel(start, end, total) {
   return total === 0 ? "0 agents" : `${start + 1}–${end} of ${total} agents`;
 }
 
+function treeRoom(room) {
+  if (!room.swarm) return room;
+  const agents = [];
+  const visit = (parent, prefix = "") => {
+    const children = room.agents.filter((agent) => (agent.parent || "conductor") === parent);
+    for (const [index, agent] of children.entries()) {
+      const isLast = index === children.length - 1;
+      agents.push({ ...agent, treePrefix: prefix + (isLast ? "└─ " : "├─ ") });
+      visit(agent.id, prefix + (isLast ? " ".repeat(3) : "│  "));
+    }
+  };
+  visit("conductor");
+  return { ...room, agents };
+}
+
 /** pi-tui compatible component: render(width): string[], handleInput(data), invalidate(). */
 export class StoogesView {
   constructor(room, { now = Date.now, height = 32, color = false, tier = glyphTier() } = {}) {
-    this.room = room;
+    this.room = treeRoom(room);
     this.now = now;
     this.height = height;
     this.color = color;
@@ -412,6 +427,7 @@ export class StoogesView {
   }
 
   pageSizeFor() {
+    if (this.room.swarm) return Math.min(9, Math.max(1, Math.floor((this.height - 10) / 3)));
     const questions = Math.min(4, this.room.agents.filter((agent) => agent.question).length);
     const bodyRows = Math.max(1, this.height - 18 - questions);
     return Math.min(9, bodyRows);
@@ -426,7 +442,7 @@ export class StoogesView {
   }
 
   setRoom(room) {
-    this.room = room;
+    this.room = treeRoom(room);
     if (room.agents.every((agent) => agent.id !== this.focusId)) this.focusId = room.agents[0]?.id;
     if (room.agents.every((agent) => agent.id !== this.pinnedId)) this.pinnedId = undefined;
     this.page = Math.min(this.page, Math.max(0, Math.ceil(room.agents.length / this.pageSize) - 1));
@@ -644,6 +660,7 @@ export class StoogesView {
         this.panel("ork", ["Resize terminal to at least 8 rows"], width),
         width,
       );
+    if (this.room.swarm) return this.renderSwarm(width);
 
     const now = this.now();
     const room = this.room;
@@ -705,5 +722,58 @@ export class StoogesView {
     const all = [...header, ...quota, ...agents, ...detail, footer];
     if (this.height >= 28) all.push(...messages);
     return this.marginLines(all, width);
+  }
+
+  renderSwarm(width) {
+    const room = this.room;
+    const lead = room.conductor;
+    const size = this.pageSizeFor();
+    const pages = Math.max(1, Math.ceil(room.agents.length / size));
+    this.page = Math.min(this.page, pages - 1);
+    const selected = room.agents.slice(this.page * size, (this.page + 1) * size);
+    const phase = (member) => (member.paused ? "new launches paused" : member.status || "unknown");
+    const model = (member) => {
+      const data = member.progress || member;
+      const modelName = member.resolvedModel || data.model || member.engine || "default model";
+      const effort = member.resolvedEffort || data.effort;
+      return `${modelName}${effort && effort !== "—" ? ` / ${effort}` : ""}`;
+    };
+    const lines = [
+      ansi(`Swarm · ${plain(room.title)}`, "bold cyan", this.color),
+      plain(lead.name || "Coordinator"),
+      plain(`${model(lead)} | ${phase(lead)}`),
+      plain(lead.progress?.task || room.objective || "Tell the coordinator what you want done"),
+      "",
+    ];
+    for (const [index, agent] of selected.entries()) {
+      let branch = agent.treePrefix;
+      if (this.tier === "ascii")
+        branch = branch
+          .replaceAll("└", "`")
+          .replaceAll("├", "+")
+          .replaceAll("─", "-")
+          .replaceAll("│", "|");
+      lines.push(
+        ansi(
+          `${branch}${index + 1} ${plain(agent.name || agent.id)}${agent.role === "lead" ? " (lead)" : ""}`,
+          `${toneForStatus(agent.status)}${agent.id === this.focusId ? " bold" : ""}`,
+          this.color,
+        ),
+        plain(`   ${agent.progress?.task || agent.objective || "Awaiting assignment"}`),
+        plain(`   ${model(agent)} | ${phase(agent)}`),
+      );
+    }
+    if (room.agents.length === 0)
+      lines.push("The coordinator will add agents as work is assigned.");
+    const focused = room.agents.find((agent) => agent.id === (this.pinnedId || this.focusId));
+    const detail = focused?.output?.at(-1);
+    if (detail && lines.length < this.height - 4) lines.push(plain(detail));
+    while (lines.length < this.height - 3) lines.push("");
+    lines.push(
+      `${room.agents.length}/${room.swarm.maxAgents} slots · page ${this.page + 1}/${pages}`,
+      "↑↓ select · n page · ? help · q close view",
+      "Ctrl-b Tab: switch pane · Ctrl-b d: detach",
+    );
+    return this.marginLines(lines, width);
   }
 }

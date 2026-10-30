@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 import agent_progress
+import agent_terminal
 import mailbox_tasks
 import mailbox_work
 import peer_mailbox as mailbox
@@ -167,8 +168,10 @@ def codex_settings(peer: dict[str, Any]) -> tuple[str, str]:
     return found.pop() if len(found) == 1 else ("", "")
 
 
-def identity(session: str, harness: str | None = None, payload: Any = None) -> dict[str, Any] | None:
-    base = mailbox.root()
+def identity(
+    session: str, harness: str | None = None, payload: Any = None, *, base: Path | None = None
+) -> dict[str, Any] | None:
+    base = base if base is not None else mailbox.root()
     try:
         peer = mailbox.load(mailbox.peer_path(base, session))
     except mailbox.MailboxError:
@@ -445,34 +448,52 @@ def main() -> int:
     source.add_argument("--session", help="session ID, instead of reading the harness JSON from stdin")
     source.add_argument("--pane-pid", type=int, help="find an unambiguous peer in this tmux pane")
     source.add_argument("--codex-pane", help="read the visible Codex thread ID from this tmux pane")
+    source.add_argument("--terminal-pane", help="read the visible native session bound to this tmux pane")
+    source.add_argument(
+        "--clear-terminal", metavar="SESSION_ID", help="clear this session's pane binding when leaving its view"
+    )
     parser.add_argument("--tmux-server", help="private tmux server name for --codex-pane")
     parser.add_argument("--codex-home", help="Codex account directory for --codex-pane")
     parser.add_argument("--harness", choices=("claude", "codex", "gemini", "opencode"))
+    parser.add_argument(
+        "--native-status", action="store_true", help="native UI callback: bind the outer footer when wrapped"
+    )
     parser.add_argument("--width", type=int, help="maximum terminal width")
     output = parser.add_mutually_exclusive_group()
     output.add_argument("--json", action="store_true", help="emit fields and formatted line as JSON")
     output.add_argument("--plain", action="store_true", help="omit ANSI colors")
     output.add_argument("--tmux", action="store_true", help="emit a tmux-formatted line")
     args = parser.parse_args()
+    if args.clear_terminal:
+        agent_terminal.clear(args.clear_terminal, args.harness)
+        return 0
     if args.pane_pid is not None and not args.harness:
         parser.error("--pane-pid requires --harness")
     if args.codex_pane and (not args.tmux_server or not args.codex_home or args.harness != "codex"):
         parser.error("--codex-pane requires --tmux-server, --codex-home and --harness codex")
+    if args.terminal_pane and (not args.tmux_server or not args.harness):
+        parser.error("--terminal-pane requires --tmux-server and --harness")
     payload = {}
     session = pane_session(args.pane_pid, args.harness) if args.pane_pid is not None else args.session
     if args.codex_pane:
         session = codex_pane_session(args.codex_pane, args.tmux_server, args.codex_home)
-    if args.pane_pid is None and not args.codex_pane and not session:
+    if args.terminal_pane:
+        binding = agent_terminal.read(args.tmux_server, args.terminal_pane, args.harness)
+        session = binding["session"] if binding else None
+        payload = binding["payload"] if binding else {}
+    if args.pane_pid is None and not args.codex_pane and not args.terminal_pane and not session:
         try:
             payload = json.load(sys.stdin)
             session = session_from(payload)
         except (ValueError, OSError):
             return 0
+    if args.native_status and session and not args.tmux and agent_terminal.bind(session, args.harness, payload):
+        return 0  # In a wrapped terminal the native integration only supplies identity to the outer footer.
     if not session or not (item := identity(session, args.harness, payload)):
         if args.tmux:
             print(
                 "#[align=left,bold]Orkest: agent identity appears after the session registers"
-                if args.codex_pane
+                if args.codex_pane or args.terminal_pane
                 else "Orkest: waiting for agent"
             )
         return 0
