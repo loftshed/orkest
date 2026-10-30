@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.41.0
+
+- feat(orchestrate): worker-owned upward scope, quiet cross-task mail, and footer progress (#43)
+
 ## 0.40.0
 
 - feat(orchestrate): show agent status in terminals (#42)
