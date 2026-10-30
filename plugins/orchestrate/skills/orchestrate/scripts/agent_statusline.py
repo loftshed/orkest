@@ -8,6 +8,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import shutil
 import socket
 import sqlite3
@@ -17,12 +18,13 @@ import unicodedata
 from pathlib import Path
 from typing import Any
 
+import agent_progress
 import mailbox_tasks
 import mailbox_work
 import peer_mailbox as mailbox
 
 COLORS = (31, 32, 33, 34, 35, 36)
-TMUX_COLORS = {31: "red", 32: "green", 33: "yellow", 34: "blue", 35: "magenta", 36: "cyan"}
+PALETTE = {31: 203, 32: 114, 33: 221, 34: 111, 35: 176, 36: 80}
 MAX_ROOMS = 1024
 MAX_ROOM_BYTES = 1024 * 1024
 MAX_TASK_BYTES = 4 * 1024 * 1024
@@ -192,6 +194,7 @@ def identity(session: str, harness: str | None = None, payload: Any = None) -> d
         effort = text(model_input.get("effort"))
     effort = effort or text(payload.get("effortLevel") or payload.get("reasoning_effort"))
     recorded_model, recorded_effort = codex_settings(peer)
+    progress = agent_progress.read(base, peer)
 
     rooms = bound_rooms(base, peer)
     goal = "multiple rooms" if len(rooms) > 1 else ""
@@ -203,13 +206,28 @@ def identity(session: str, harness: str | None = None, payload: Any = None) -> d
         assignments = mailbox_work.assigned(base, peer)
     except (OSError, mailbox.MailboxError, TypeError, ValueError):
         assignments = []
+    if progress and progress.get("workContext") != agent_progress.work_context(assignments):
+        progress = None
     for room, member in rooms:
         if coordinator_task := room_task(room, member):
             assignments.append(coordinator_task)
+    if (
+        assignments
+        and progress
+        and not any(text(assignment.get("title")) == progress["task"] for assignment in assignments)
+    ):
+        progress = None  # A new assignment must not inherit the previous task's reported context.
+    manual = False
+    if not goal and progress:
+        goal, manual = text(progress["goal"]), True
     if len(assignments) > 1:
         task, stage = "multiple tasks", "varies"
     elif assignments:
         task, stage = text(assignments[0].get("title")), text(assignments[0].get("state"))
+        if progress and stage == "claimed" and progress["stage"] in {"planning", "working", "testing"}:
+            stage, manual = progress["stage"], True
+    elif progress:
+        task, stage, manual = text(progress["task"]), progress["stage"], True
     else:
         task, stage = text(peer.get("focus")), ""
         try:
@@ -224,14 +242,20 @@ def identity(session: str, harness: str | None = None, payload: Any = None) -> d
                 stage = note["status"]
         except (OSError, mailbox.MailboxError, TypeError, ValueError):
             pass
+    health = "missing" if not all((goal, task, stage)) else "fresh"
+    if manual and progress and progress["stale"]:
+        health = "stale"
+        stage = f"{stage or 'not set'} (stale)"
     return {
         "name": name,
         "color": COLORS[hashlib.sha256(session.encode()).digest()[0] % len(COLORS)],
         "model": model or recorded_model or text(peer.get("model")) or "—",
         "effort": effort or recorded_effort or text(peer.get("effort")) or "—",
-        "goal": goal or "—",
-        "task": task or "—",
-        "stage": stage or "—",
+        "goal": goal or "not set",
+        "task": task or "not set",
+        "stage": stage or "not set",
+        "statusHealth": health,
+        "reportedAt": progress["updatedAt"] if progress else None,
     }
 
 
@@ -272,6 +296,39 @@ def pane_session(pane_pid: int, harness: str) -> str | None:
     return sessions[0] if len(sessions) == 1 else None
 
 
+def codex_pane_session(pane: str, server: str, account: str) -> str | None:
+    """Match the visible native thread ID, including Codex's shortened terminal title."""
+    if not re.fullmatch(r"%\d+", pane):
+        return None
+    try:
+        title = subprocess.run(
+            ["tmux", "-L", server, "display-message", "-p", "-t", pane, "#{pane_title}"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=True,
+        ).stdout.strip()
+        prefix = title.removesuffix("...").removesuffix("…")
+        if not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4,12}", prefix):
+            return None
+        if title == prefix and len(prefix) != 36:
+            return None
+        sessions = []
+        for path in (mailbox.root() / "peers").glob("*.json"):
+            peer = mailbox.load(path)
+            if (
+                mailbox.valid_peer(peer)
+                and peer["harness"] == "codex"
+                and peer["session"].startswith(prefix)
+                and isinstance(peer.get("accountHome"), str)
+                and Path(peer["accountHome"]).resolve() == Path(account).resolve()
+            ):
+                sessions.append(peer["session"])
+        return sessions[0] if len(sessions) == 1 else None
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        return None
+
+
 def display_width(value: str) -> int:
     return sum(
         0 if unicodedata.combining(char) else 2 if unicodedata.east_asian_width(char) in "WF" else 1 for char in value
@@ -299,24 +356,87 @@ def shorten_name(value: str, width: int) -> str:
     return shorten(value, width - display_width(suffix)) + suffix
 
 
-def format_line(item: dict[str, Any], width: int) -> tuple[str, str]:
+def line_parts(item: dict[str, Any], width: int) -> list[tuple[str, str]]:
     values = [item[key] for key in ("name", "model", "effort", "stage", "goal", "task")]
     sizes = [display_width(value) for value in values]
     minima = [min(size, minimum) for size, minimum in zip(sizes, (12, 5, 3, 4, 5, 5), strict=True)]
     # Reserve room for all labels, then share the remaining width across the six values.
-    fixed = display_width("[] / | stage: | goal: | task:")
+    fixed = display_width(" |  /  | stage :  | goal :  | task : ")
     while sum(sizes) + fixed > width and any(size > minimum for size, minimum in zip(sizes, minima, strict=True)):
         index = max(range(len(sizes)), key=lambda i: sizes[i] - minima[i])
         sizes[index] -= 1
     name = shorten_name(values[0], sizes[0])
     model, effort, stage, goal, task = [shorten(value, size) for value, size in zip(values[1:], sizes[1:], strict=True)]
-    label = f"[{name}]"
-    details = f" {model}/{effort} | stage:{stage} | goal:{goal} | task:{task}"
-    if display_width(label + details) > width:
-        if display_width(label) >= width:
-            return shorten(label, width), ""
-        details = shorten(details, width - display_width(label))
-    return label, details
+    parts = [("name", name), ("separator", " | "), ("model", model), ("separator", " / "), ("effort", effort)]
+    for key, value in (("stage", stage), ("goal", goal), ("task", task)):
+        parts.extend([("separator", " | "), ("label", f"{key} : "), (key, value)])
+    fitted = []
+    for key, value in parts:
+        if width <= 0:
+            break
+        fitted.append((key, shorten(value, width)))
+        width -= display_width(value)
+    return fitted
+
+
+def format_line(item: dict[str, Any], width: int) -> tuple[str, str]:
+    parts = line_parts(item, width)
+    return parts[0][1], "".join(value for _, value in parts[1:])
+
+
+def field_colors(item: dict[str, Any]) -> dict[str, int | None]:
+    stage = item["stage"]
+    stage_color = (
+        221
+        if item.get("statusHealth") in {"missing", "stale"}
+        else 203
+        if stage in {"failed", "rejected"}
+        else 221
+        if stage in {"blocked", "reserved"}
+        else 114
+        if stage in {"completed", "complete"}
+        else 117
+        if stage in {"running", "active", "claimed", "review"}
+        else None
+    )
+    return {
+        "name": PALETTE[item["color"]],
+        "model": 117,
+        "effort": 180,
+        "separator": 245,
+        "stage": stage_color,
+    }
+
+
+def tmux_line(item: dict[str, Any], width: int) -> str:
+    """Left-align padded text on the normal background, with color in the remaining space."""
+    colored = not os.environ.get("NO_COLOR")
+    background = PALETTE[item["color"]]
+    style = "align=left,bg=default,fg=default" + (f",fill=colour{background}" if colored else "")
+    colors = field_colors(item)
+    output = [f"#[{style}]   "]
+    for key, value in line_parts(item, width - 6):
+        weight = "bold" if key in {"name", "model", "effort", "stage", "task"} else "nobold"
+        foreground = f"colour{colors[key]}" if colors.get(key) is not None else "default"
+        part_style = f"fg={foreground},{weight}" if colored else weight
+        output.append(f"#[{part_style}]{value.replace('#', '##')}")
+    return "".join(output) + "#[fg=default,nobold]   "
+
+
+def ansi_line(item: dict[str, Any], width: int) -> str:
+    """Use foreground colors for text and paint only the unused space after its padding."""
+    parts = line_parts(item, width - 6)
+    colors = field_colors(item)
+    output = ["\033[0m   "]
+    for key, value in parts:
+        foreground = f"38;5;{colors[key]}" if colors.get(key) is not None else "39"
+        weight = "1" if key in {"name", "model", "effort", "stage", "task"} else "22"
+        output.append(f"\033[{foreground};{weight}m{value}\033[0m")
+    output.append("   ")
+    remaining = max(0, width - 6 - sum(display_width(value) for _, value in parts))
+    if remaining:
+        output.append(f"\033[48;5;{PALETTE[item['color']]}m{' ' * remaining}\033[0m")
+    return "".join(output)
 
 
 def main() -> int:
@@ -324,6 +444,9 @@ def main() -> int:
     source = parser.add_mutually_exclusive_group()
     source.add_argument("--session", help="session ID, instead of reading the harness JSON from stdin")
     source.add_argument("--pane-pid", type=int, help="find an unambiguous peer in this tmux pane")
+    source.add_argument("--codex-pane", help="read the visible Codex thread ID from this tmux pane")
+    parser.add_argument("--tmux-server", help="private tmux server name for --codex-pane")
+    parser.add_argument("--codex-home", help="Codex account directory for --codex-pane")
     parser.add_argument("--harness", choices=("claude", "codex", "gemini", "opencode"))
     parser.add_argument("--width", type=int, help="maximum terminal width")
     output = parser.add_mutually_exclusive_group()
@@ -333,9 +456,13 @@ def main() -> int:
     args = parser.parse_args()
     if args.pane_pid is not None and not args.harness:
         parser.error("--pane-pid requires --harness")
+    if args.codex_pane and (not args.tmux_server or not args.codex_home or args.harness != "codex"):
+        parser.error("--codex-pane requires --tmux-server, --codex-home and --harness codex")
     payload = {}
     session = pane_session(args.pane_pid, args.harness) if args.pane_pid is not None else args.session
-    if args.pane_pid is None and not session:
+    if args.codex_pane:
+        session = codex_pane_session(args.codex_pane, args.tmux_server, args.codex_home)
+    if args.pane_pid is None and not args.codex_pane and not session:
         try:
             payload = json.load(sys.stdin)
             session = session_from(payload)
@@ -343,7 +470,11 @@ def main() -> int:
             return 0
     if not session or not (item := identity(session, args.harness, payload)):
         if args.tmux:
-            print("Orkest: waiting for agent")
+            print(
+                "#[align=left,bold]Orkest: agent identity appears after the session registers"
+                if args.codex_pane
+                else "Orkest: waiting for agent"
+            )
         return 0
     payload_width = payload.get("terminal_width") if isinstance(payload, dict) else None
     width = (
@@ -355,16 +486,11 @@ def main() -> int:
     if args.json:
         print(json.dumps({**item, "label": label, "details": details}))
     elif args.tmux:
-        label, details = label.replace("#", "##"), details.replace("#", "##")
-        print(
-            label + details
-            if os.environ.get("NO_COLOR")
-            else f"#[fg={TMUX_COLORS[item['color']]}]{label}#[default]{details}"
-        )
+        print(tmux_line(item, max(32, min(width, 1000))))
     elif args.plain or os.environ.get("NO_COLOR"):
         print(label + details)
     else:
-        print(f"\033[{item['color']}m{label}\033[0m{details}")
+        print(ansi_line(item, max(32, min(width, 1000))))
     return 0
 
 

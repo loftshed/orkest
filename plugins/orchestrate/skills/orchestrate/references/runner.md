@@ -76,7 +76,13 @@ agy slugs use their base model's tariff. It is not an invoice. See
 - History is judged on this worktree only: branch, HEAD, HEAD reflog, stash. A change there is a
   `history_violation` (21). Commits, branches or worktrees created elsewhere in the repository are
   reported in `concurrent_activity` and do not fail the job.
-- Scope compares the final-state path delta with the allowed prefixes (22).
+- Scope compares the final-state path delta with the allowed prefixes (22). `--allow-path .` (or
+  `allow_paths: ["."]` / `scope_owner: "worker"` in a task spec) grants worker-owned repository
+  scope covering any repository-relative path outside `.git`. When a lower-tier conductor dispatches
+  a mutating run to a higher-tier worker (`--conductor-model`, `AGENT_EXECUTOR_CONDUCTOR_MODEL`, or
+  detected from the active project session in the peer mailbox), the runner automatically widens
+  `allowed_paths` to `["."]`, preserves the original narrow paths in `scope_hints`, and emits
+  `AGENT_NOTE=worker_owned_scope` on stderr. Read-only runs (empty scope) are never widened.
 - Verification commands run through `/bin/sh` after a clean handoff, one `--verify-timeout` each,
   fail fast, keep bounded tails and private logs. The repository is re-audited afterwards (25/26).
 - The report needs the five headings in order. Markdown decoration is tolerated (`**STATUS**`,
@@ -103,9 +109,17 @@ record every native host message.
 
 ## Steering a running job
 
-`steer <job-or-event> --message <text|@file> [--cwd <repo>] [--wait-timeout 2m] [--format json]`
-redirects a detached job. The job is named by its directory, its `job.json`, or any of its event IDs
-or `AGENT_EVENT` paths.
+`steer <job-or-event> [--message <text|@file>] [--allow-path <path>] [--no-interrupt] [--cwd <repo>] [--wait-timeout 2m] [--format json]`
+redirects a detached job or widens its allowed scope mid-run. The job is named by its directory, its
+`job.json`, or any of its event IDs or `AGENT_EVENT` paths.
+
+When `--allow-path <path>` (repeatable; accepts `.` for full repository scope) is passed without
+`--message` (or with `--no-interrupt`), the runner widens `allowed_paths` in-place (`mode:
+live_scope_update`) and updates `job.json` without interrupting the running executor process. When
+`--allow-path` is combined with `--message`, the runner widens `allowed_paths`, interrupts the
+executor, and resumes the same session with the widened scope noted in the steering brief. A
+read-only job (empty `allowed_paths`) holds a shared reader lease and cannot have its scope widened
+mid-run.
 
 The handoff happens inside the job's own runner, the process that holds the worktree lease, so the
 lease never changes hands. `steer` writes the message to `<job>/steers/<n>/message.txt` and a request

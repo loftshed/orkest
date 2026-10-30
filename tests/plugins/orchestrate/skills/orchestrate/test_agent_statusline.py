@@ -92,19 +92,25 @@ class AgentStatuslineTests(unittest.TestCase):
             "200",
             payload={"session_id": "claude-123", "model": {"id": "opus-4"}, "effort": {"level": "high"}},
         )
-        self.assertEqual(line, "[snorfle-opus-high-project-23] opus-4/high | stage:— | goal:— | task:—\n")
+        self.assertEqual(
+            line, "snorfle-opus-high-project-23 | opus-4 / high | stage : not set | goal : not set | task : not set\n"
+        )
         line = self.run_status(
             "--plain",
             "--width",
             "200",
             payload={"conversation_id": "gemini-456", "model": {"id": "gemini-pro", "effort": "low"}},
         )
-        self.assertEqual(line, "[snoobix-gemini-low-project-56] gemini-pro/low | stage:— | goal:— | task:—\n")
+        self.assertEqual(
+            line,
+            "snoobix-gemini-low-project-56 | gemini-pro / low | stage : not set | goal : not set | task : not set\n",
+        )
 
     def test_color_is_stable_and_no_color_is_respected(self):
-        colored = self.run_status(payload={"session_id": "claude-123"})
-        self.assertRegex(colored, r"^\x1b\[3[1-6]m\[snorfle-opus-high-project-23\]\x1b\[0m")
-        self.assertEqual(colored, self.run_status(payload={"session_id": "claude-123"}))
+        colored = self.run_status("--width", "200", payload={"session_id": "claude-123"})
+        self.assertRegex(colored, r"^\x1b\[0m   \x1b\[38;5;[0-9]+;1m(snorfle-opus-high-project-23)\x1b\[0m")
+        self.assertRegex(colored, r"   \x1b\[48;5;[0-9]+m( +)\x1b\[0m\n$")
+        self.assertEqual(colored, self.run_status("--width", "200", payload={"session_id": "claude-123"}))
         self.assertNotIn(
             "\x1b",
             self.run_status(payload={"session_id": "claude-123"}, environment={**self.environment, "NO_COLOR": "1"}),
@@ -117,7 +123,7 @@ class AgentStatuslineTests(unittest.TestCase):
         fields = self.fields()
         self.assertEqual(
             (fields["name"], fields["model"], fields["effort"], fields["task"], fields["stage"]),
-            ("snorfle-opus-max-project-23", "opus", "max", "Review docs", "—"),
+            ("snorfle-opus-max-project-23", "opus", "max", "Review docs", "not set"),
         )
 
     def test_codex_uses_its_own_runtime_model_and_effort_from_its_account(self):
@@ -212,13 +218,13 @@ class AgentStatuslineTests(unittest.TestCase):
         self.assertEqual(self.fields()["stage"], "completed")
         task["runs"][0]["run_id"] = "different"
         mailbox.write(directory / "task.json", task)
-        self.assertEqual((self.fields()["task"], self.fields()["stage"]), ("—", "—"))
+        self.assertEqual((self.fields()["task"], self.fields()["stage"]), ("not set", "not set"))
 
     def test_ambiguous_rooms_and_tasks_do_not_choose_a_winner(self):
         self.room(title="First goal")
         self.room(title="Another goal", name="room-b")
         fields = self.fields()
-        self.assertEqual((fields["goal"], fields["task"], fields["stage"]), ("multiple rooms", "—", "—"))
+        self.assertEqual((fields["goal"], fields["task"], fields["stage"]), ("multiple rooms", "not set", "not set"))
 
         peer = mailbox.load(mailbox.peer_path(self.base, "claude-123"))
         for index in range(2):
@@ -240,7 +246,7 @@ class AgentStatuslineTests(unittest.TestCase):
         mailbox_tasks.save(self.base, peer, status="blocked", blocker="Waiting for review")
         self.assertEqual((self.fields()["task"], self.fields()["stage"]), ("Review docs", "blocked"))
         self.peer("claude-123", "snorfle-opus-high-project-23", "claude", focus="Build a footer")
-        self.assertEqual((self.fields()["task"], self.fields()["stage"]), ("Build a footer", "—"))
+        self.assertEqual((self.fields()["task"], self.fields()["stage"]), ("Build a footer", "not set"))
 
     def test_width_and_untrusted_terminal_text_are_safe(self):
         self.peer(
@@ -254,10 +260,10 @@ class AgentStatuslineTests(unittest.TestCase):
         self.room(title="An overarching goal that is much longer than usual")
         line = self.run_status("--session", "claude-123", "--width", "80", "--plain").strip()
         self.assertLessEqual(len(line), 80)
-        self.assertIn("stage:", line)
-        self.assertIn("goal:", line)
-        self.assertIn("task:", line)
-        self.assertIn("-23]", line)
+        self.assertIn("stage : ", line)
+        self.assertIn("goal : ", line)
+        self.assertIn("task : ", line)
+        self.assertIn("-23", line)
         self.assertNotIn("\x1b", line)
         narrow = self.run_status("--session", "claude-123", "--width", "32", "--plain").strip()
         self.assertLessEqual(len(narrow), 32)
@@ -277,10 +283,54 @@ class AgentStatuslineTests(unittest.TestCase):
 
     def test_pane_matching_requires_exactly_one_live_codex_peer(self):
         self.peer("codex-789", "blip-gpt-high-project-89", "codex", os.getpid())
-        line = self.run_status("--pane-pid", str(os.getpid()), "--harness", "codex", "--plain")
-        self.assertTrue(line.startswith("[blip-gpt-high-project-89]"))
+        line = self.run_status("--pane-pid", str(os.getpid()), "--harness", "codex", "--plain", "--width", "200")
+        self.assertTrue(line.startswith("blip-gpt-high-project-89 | "))
         self.peer("codex-999", "zog-gpt-low-project-99", "codex", os.getpid())
         self.assertEqual(self.run_status("--pane-pid", str(os.getpid()), "--harness", "codex", "--plain"), "")
+
+    def test_visible_codex_thread_selects_its_identity_on_a_shared_daemon(self):
+        first = "01a18d2e-cd95-7043-bc95-2339f2faf78e"
+        second = "01a18d61-329d-7170-af88-c965f50e6366"
+        for session, name in ((first, "blip-gpt-high-project-8e"), (second, "zog-gpt-low-project-66")):
+            self.peer(session, name, "codex", pid=99999999, accountHome=str(self.home))
+        binary = self.home / "tmux"
+        binary.write_text('#!/bin/sh\ncat "$TEST_PANE_TITLE"\n')
+        binary.chmod(0o755)
+        title = self.home / "title"
+        environment = {
+            **self.environment,
+            "PATH": str(self.home) + os.pathsep + os.environ["PATH"],
+            "TEST_PANE_TITLE": str(title),
+        }
+        arguments = (
+            "--codex-pane",
+            "%0",
+            "--tmux-server",
+            "private",
+            "--codex-home",
+            str(self.home),
+            "--harness",
+            "codex",
+            "--json",
+            "--width",
+            "200",
+        )
+        title.write_text(first[:29] + "...")
+        self.assertEqual(
+            json.loads(self.run_status(*arguments, environment=environment))["name"], "blip-gpt-high-project-8e"
+        )
+        title.write_text(second)
+        self.assertEqual(
+            json.loads(self.run_status(*arguments, environment=environment))["name"], "zog-gpt-low-project-66"
+        )
+        title.write_text(first[:29] + "...")
+        self.peer(first[:29] + "0000000", "conflicting-peer", "codex", accountHome=str(self.home))
+        self.assertEqual(self.run_status(*arguments, environment=environment), "")
+        title.write_text("not a native thread ID")
+        self.assertEqual(self.run_status(*arguments, environment=environment), "")
+        title.write_text(second)
+        self.peer(second, "other-account", "codex", accountHome=str(self.home / "different-account"))
+        self.assertEqual(self.run_status(*arguments, environment=environment), "")
 
 
 if __name__ == "__main__":

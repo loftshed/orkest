@@ -11,8 +11,14 @@ executor can wait for a meaningful change without repeatedly asking a model to c
 Read `board` when joining the task, finishing a piece or handling an explicit handoff. Choose a ready
 item within your assigned scope, then claim its current revision before working. A failed claim means
 another agent may own it: reread before deciding what to do. Do not poll an empty board or invent work
-to stay busy. Native tools still handle communication and child-agent execution inside a harness;
-they do not require a duplicate shared work record.
+to stay busy. When you want help on a separable piece of work without interrupting busy colleagues on
+unrelated tasks, create an open item on the board (`work(action="create", ...)`) or dispatch a fresh
+worker with `run_agent.py` instead of cold-messaging an unrelated interactive session. Interactive
+sessions never auto-wake for unrelated board items; turn hooks surface a one-line help-board hint only
+when a session's own task is marked `--stage complete` in `ork progress`, it has no active workboard
+claims, and it has been idle for at least 15 minutes (`HELP_BOARD_IDLE_SECONDS`). Native tools still
+handle communication and child-agent execution inside a harness; they do not require a duplicate shared
+work record.
 
 Interactive items use `work` for claims and checkpoints. Coordinator entries read their existing
 `task.json` directly and give the exact command for the next action. Their execution, evidence checks

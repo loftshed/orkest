@@ -340,6 +340,61 @@ class ChannelTests(unittest.TestCase):
             )
         self.assertEqual(self.inbox("member"), ["via cli"])
 
+    def test_unrelated_task_direct_sends_are_queued_quietly_unless_shared_or_threaded(self):
+        sender = self.peer("sender", channels=["retrieval"])
+        busy_other = self.peer("busy-other", harness="claude", channels=["graph"], state="busy")
+        payload = {"session_id": "busy-other", "cwd": str(self.repo)}
+        with patch.object(mailbox_wake, "wake", return_value={"status": "scheduled", "phase": "submitted"}) as wake:
+            quiet = peer_mailbox.send(
+                self.base,
+                sender=sender,
+                to=busy_other["name"],
+                text="Are you touching graph.py?",
+                wake=True,
+                idempotency_key="unrelated-check-1",
+            )
+            replayed = peer_mailbox.send(
+                self.base,
+                sender=sender,
+                to=busy_other["name"],
+                text="Are you touching graph.py?",
+                wake=True,
+                idempotency_key="unrelated-check-1",
+            )
+            wake.assert_not_called()
+        self.assertEqual(quiet["wake"]["status"], "queued")
+        self.assertEqual(quiet["wake"]["phase"], "not-sent")
+        self.assertIn("unrelated task", quiet["wake"]["reason"])
+        self.assertEqual(replayed["id"], quiet["id"])
+        (stored,) = peer_mailbox.incoming(self.base, "busy-other")
+        self.assertTrue(stored.get("unrelatedTask"))
+        self.assertFalse(stored.get("wake"))
+        with patch.object(peer_mailbox, "harness_pid", return_value=os.getpid()):
+            # Unrelated-task direct mail never extends the recipient's active turn at Stop.
+            self.assertIsNone(
+                peer_mailbox.hook({**payload, "hook_event_name": "Stop"}, harness="claude", base=self.base)
+            )
+            self.assertEqual(self.inbox("busy-other"), ["Are you touching graph.py?"])
+            # It is delivered cleanly at the recipient's next turn boundary.
+            started = peer_mailbox.hook(
+                {**payload, "hook_event_name": "UserPromptSubmit"}, harness="claude", base=self.base
+            )
+            self.assertIn("Are you touching graph.py?", started["hookSpecificOutput"]["additionalContext"])
+
+        # Sharing a channel, replying to a message, or continuing an existing thread restores normal wake & Stop behavior.
+        teammate = self.peer("teammate", harness="claude", channels=["retrieval"], state="busy")
+        team_payload = {"session_id": "teammate", "cwd": str(self.repo)}
+        with patch.object(mailbox_wake, "wake", return_value={"status": "scheduled", "phase": "submitted"}) as wake:
+            shared = peer_mailbox.send(
+                self.base, sender=sender, to=teammate["name"], text="Need retrieval schema", wake=True
+            )
+            wake.assert_called_once()
+        self.assertEqual(shared["wake"]["status"], "scheduled")
+        with patch.object(peer_mailbox, "harness_pid", return_value=os.getpid()):
+            stopped = peer_mailbox.hook({**team_payload, "hook_event_name": "Stop"}, harness="claude", base=self.base)
+        self.assertEqual(stopped["decision"], "block")
+        self.assertIn("Need retrieval schema", stopped["reason"])
+
 
 if __name__ == "__main__":
     unittest.main()
