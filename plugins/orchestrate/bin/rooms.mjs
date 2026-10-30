@@ -12,12 +12,16 @@ import {
   readLaunchPlan,
   recoverRoom,
 } from "../lib/rooms.mjs";
-import { loadPresets, mailboxRoot, parseTeam } from "../lib/stooges-room.mjs";
+import { loadPresets, mailboxRoot, parseTeam, updateRoom } from "../lib/stooges-room.mjs";
+import { pauseBranch, reserveLead } from "../lib/swarm.mjs";
 
 export const ROOMS_HELP = `ork rooms list [--json]
 ork rooms show --room ID [--json]
 ork rooms create --team TEAM [--group GROUP] [--title TITLE] [--cwd PATH] [--id ID] [--authority TEAM_ID]
-ork rooms add --room ID --team TEAM
+ork rooms add --room ID --team TEAM [--parent conductor|MEMBER]
+ork rooms lead --room ID --member ID --objective TEXT   (reserves a native subswarm lead)
+ork rooms objective --room ID --objective TEXT
+ork rooms pause|resume --room ID [--member conductor|MEMBER]   (gates new launches)
 ork rooms init-task --task-spec FILE --task-dir DIR (--host codex|claude|agy|opencode|other | --authority TEAM_ID)
 ork rooms dispatch --room ID --member ID --task-dir DIR [--kind investigation|implementation|consultation|challenge]
                    [--transport executor|native] [--packet FILE] [--request-id ID]
@@ -68,6 +72,8 @@ export async function roomsCommand(
           "authority",
           "lead-session",
           "lead-generation",
+          "parent",
+          "objective",
         ].map((name) => [name, { type: "string" }]),
       ),
     },
@@ -124,8 +130,41 @@ export async function roomsCommand(
       break;
     }
     case "add": {
-      result = await growRoom(requireValue("room"), await team(), root);
+      result = await growRoom(requireValue("room"), await team(), root, values.parent);
 
+      break;
+    }
+    case "lead": {
+      result = await reserveLead(
+        requireValue("room"),
+        requireValue("member"),
+        requireValue("objective"),
+        { root },
+      );
+      break;
+    }
+    case "objective": {
+      const objective = requireValue("objective");
+      if (objective.length > 12_000) throw new Error("Objective must be at most 12000 characters");
+      result = await updateRoom(
+        requireValue("room"),
+        (room) => {
+          room.objective = objective;
+          room.title = objective.replaceAll(/\s+/gu, " ").trim().slice(0, 160);
+          return room;
+        },
+        { root },
+      );
+      break;
+    }
+    case "pause":
+    case "resume": {
+      result = await pauseBranch(
+        requireValue("room"),
+        values.member || "conductor",
+        action === "pause",
+        { root },
+      );
       break;
     }
     case "show": {

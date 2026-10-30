@@ -38,6 +38,26 @@ details say `not set`.
 Codex model and effort are read from its local session database when available; harness-provided
 values and mailbox records supply the other displays.
 
+Use the same outer tmux footer for every harness:
+
+```sh
+ork label -- codex
+ork label -- claude
+ork label -- agy
+ork label -- opencode
+```
+
+The wrapper needs `tmux` on `PATH`. Each launch gets a private server with the Orkest bar on the
+lowest row, below the harness's prompt and built-in footer. Arguments pass through to the harness.
+`plaude` is also supported and retains its own account wrapper. Detaching keeps the session running
+and prints a reattach command.
+
+Codex supplies its visible thread ID through its terminal title. Configure the native adapters below
+for Claude Code, Antigravity and OpenCode. Inside `ork label`, those adapters silently bind the visible
+session to its pane instead of drawing another Orkest bar. Switching conversations updates the binding;
+process ancestry is not used to choose among sessions sharing a background server. Outside the wrapper,
+the adapters retain their native in-app display. Updates can take three seconds.
+
 At the start of substantive work, agents can report all three work fields in one command:
 
 ```sh
@@ -81,7 +101,7 @@ does not already have a status line, add this field to `~/.claude/settings.json`
 {
   "statusLine": {
     "type": "command",
-    "command": "python3 ~/.agents/skills/orchestrate/scripts/agent_statusline.py --harness claude"
+    "command": "python3 ~/.agents/skills/orchestrate/scripts/agent_statusline.py --harness claude --native-status"
   }
 }
 ```
@@ -97,7 +117,7 @@ line stays visible above the label:
 {
   "statusLine": {
     "type": "command",
-    "command": "python3 ~/.agents/skills/orchestrate/scripts/agent_statusline.py --harness gemini",
+    "command": "python3 ~/.agents/skills/orchestrate/scripts/agent_statusline.py --harness gemini --native-status",
     "stack_with_default": true
   }
 }
@@ -114,22 +134,15 @@ ln -s "$PWD/plugins/orchestrate/opencode/agent-statusline" ~/.config/opencode/pl
 
 The label appears once the session has registered with the peer mailbox. OpenCode does not currently
 register sessions through this footer; a session must register with Orkest separately. The footer
-does not change an agent's presence. Updates can take up to three seconds. OpenCode places the line
-immediately above the prompt, leaving its existing footer intact.
+does not change an agent's presence. Updates can take up to three seconds. Inside `ork label`, the plugin
+only reports which session is visible; the shared tmux bar is the lowest row. Without the wrapper,
+OpenCode places its native line immediately above the prompt.
 
 ### Codex
 
-Launch Codex in an isolated tmux session with a left-aligned label and color in the unused space to its right:
-
-```sh
-node plugins/orchestrate/bin/ork.mjs label -- codex
-```
-
-The wrapper needs `tmux` on `PATH` and uses a private server with default tmux bindings. It sets
-that pane's terminal title to Codex's native thread ID and matches it to the registered session,
-including when several agents share Codex's background server. Thread names and Codex's own status
-line stay unchanged. A fresh session shows its agent identity after registering with the mailbox.
-Updates can take three seconds. If you detach, it prints the command to reattach.
+No native adapter setup is needed for Codex. The wrapper sets that pane's terminal title to the native
+thread ID. Thread names and Codex's own status line stay unchanged. A fresh session shows its agent
+identity after registering with the mailbox.
 
 ## Inspect routes, models, and health
 
@@ -221,14 +234,28 @@ Details: [`skills/orchestrate/references/coordinator.md`](skills/orchestrate/ref
 
 ### Swarm rooms and Stooges TUI (`ork`)
 
-`bin/ork.mjs` (`ork`) manages multi-agent rooms over a repository (`ork rooms`) and renders the live Stooges terminal dashboard (`ork stooges`) with preset teams (`scout-swarm`, `bug-court`, `patch-race`, `heavy-trifecta`):
+`ork stooges` opens a coordinator conversation beside a live swarm tree. Give it an objective;
+the coordinator assigns workers and can appoint native subswarm leads. All branches share the
+room's agent and depth limits. Workers use the existing dispatch, evidence and review workflow.
 
 ```sh
-node <checkout>/plugins/orchestrate/bin/ork.mjs stooges --preset bug-court
-node <checkout>/plugins/orchestrate/bin/ork.mjs stooges --attach-room <room-id>
+ork agy      # open Antigravity, then describe your goal in the conversation
+ork codex    # open Codex
+ork claude   # open Claude Code
+ork stooges "Investigate the cache failure and prepare a tested fix"
+ork stooges --engine claude --max-agents 8
+ork stooges --attach-room <room-id>
+ork stooges --attach-room <room-id> --view
 ```
 
-Details: [`skills/orchestrate/references/rooms.md`](skills/orchestrate/references/rooms.md). Full agent instructions: [`skills/orchestrate/SKILL.md`](skills/orchestrate/SKILL.md).
+Codex is the default coordinator. Claude, Antigravity and OpenCode retain their configured accounts,
+models and permissions. **Ctrl-b Tab** switches panes; **Ctrl-b d** detaches. `--view`, `--print` and
+`--json` never launch models. Subswarm leads use their parent's native harness; workers can use other
+harnesses. The initial workflow supports one checkout with serialized mutating worker runs.
+
+Details: [conversational swarms](skills/orchestrate/references/swarm.md),
+[room commands](skills/orchestrate/references/rooms.md) and
+[agent instructions](skills/orchestrate/SKILL.md).
 
 ### Heavy-run gate (`ork gate`)
 

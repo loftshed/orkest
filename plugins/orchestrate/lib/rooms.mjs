@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import { addMembers, createRoom, mailboxRoot, readRoom, updateRoom } from "./stooges-room.mjs";
+import { requireActiveBranch } from "./swarm.mjs";
 
 const execute = promisify(execFile);
 const coordinatorPath = fileURLToPath(
@@ -83,19 +84,34 @@ export async function listRooms(root = mailboxRoot()) {
 
 export async function newRoom(
   members,
-  { id = randomUUID(), cwd, group, title, authority, root = mailboxRoot() } = {},
+  {
+    id = randomUUID(),
+    cwd,
+    group,
+    title,
+    authority,
+    swarm,
+    objective,
+    engine,
+    root = mailboxRoot(),
+  } = {},
 ) {
   const room = createRoom(members, { id, cwd: await realpath(cwd || process.cwd()) });
   room.group = group || path.basename(room.cwd);
   room.title = title || room.id;
   room.machine = hostname();
   if (authority) room.authority = authority;
+  if (swarm) {
+    room.swarm = swarm;
+    room.objective = objective || "";
+    room.conductor = { engine, role: "lead", status: "awaiting session" };
+  }
   await updateRoom(id, () => room, { root, create: true });
   return room;
 }
 
-export async function growRoom(id, members, root = mailboxRoot()) {
-  return updateRoom(id, (room) => addMembers(room, members), { root });
+export async function growRoom(id, members, root = mailboxRoot(), parent = "conductor") {
+  return updateRoom(id, (room) => addMembers(room, members, { parent }), { root });
 }
 
 function memberOf(room, id) {
@@ -114,6 +130,10 @@ export async function bindSession(id, memberId, { session, engine, root = mailbo
       const member = memberOf(room, memberId);
       if (member.engine && member.engine !== engine)
         throw new Error("Session engine differs from room member");
+      if (member.role === "lead" && member.session && member.session.id !== session)
+        throw new Error(
+          "This lead already has a native session; continue supervising that session",
+        );
       member.session = { id: session, engine, machine: hostname(), cwd: room.cwd };
       return room;
     },
@@ -156,6 +176,9 @@ export async function dispatchMember(id, memberId, options = {}) {
     (current) => {
       if (memberId === "conductor") throw new Error("Dispatch a worker, not the conductor");
       const member = memberOf(current, memberId);
+      if (member.role === "lead")
+        throw new Error("A subswarm lead uses native supervision, not worker dispatch");
+      if (!member.dispatch) requireActiveBranch(current, memberId);
       if (member.dispatch) {
         for (const key of ["taskDir", "taskId", "kind", "transport", "billingMode", "packet"])
           if (member.dispatch[key] !== intent[key])
@@ -258,6 +281,7 @@ export async function observeRoom(
     authority = authorityShow,
     tasks = new Map(),
     authorities = new Map(),
+    progress = interactiveProgress,
   } = {},
 ) {
   const room = typeof idOrRoom === "string" ? await readRoom(idOrRoom, root) : idOrRoom;
@@ -288,6 +312,8 @@ export async function observeRoom(
       member.transport = record.transport;
       member.resultPath = record.result_path;
       member.mailboxSession = record.mailbox?.worker;
+      member.resolvedModel = record.model;
+      member.resolvedEffort = record.effort;
       member.verdict =
         task.decisions.findLast((decision) => decision.run_id === record.run_id)?.decision ||
         "pending";
@@ -321,7 +347,47 @@ export async function observeRoom(
       member.output = [error.message];
     }
   }
+  if (room.swarm) {
+    const snapshots = await progress(room, root);
+    for (const member of [room.conductor, ...room.agents]) {
+      const key = member === room.conductor ? "conductor" : member.id;
+      const snapshot = snapshots[key];
+      if (snapshot) {
+        member.progress = snapshot;
+        member.name = snapshot.name;
+        if (!member.dispatch)
+          member.status = snapshot.stage === "complete" ? "reported complete" : snapshot.stage;
+      } else if (member.session && !member.dispatch) member.status = "session unavailable";
+    }
+  }
   return room;
+}
+
+async function interactiveProgress(room, root) {
+  if (
+    [room.conductor, ...room.agents].every((member) => !(member?.session || member?.mailboxSession))
+  )
+    return {};
+  const script = fileURLToPath(
+    new URL("../skills/orchestrate/scripts/swarm_status.py", import.meta.url),
+  );
+  return new Promise((resolve) => {
+    const child = execFile(
+      "python3",
+      [script],
+      { timeout: 5000, maxBuffer: 1024 * 1024 },
+      (error, stdout) => {
+        if (error) return resolve({});
+        try {
+          resolve(JSON.parse(stdout));
+        } catch {
+          resolve({});
+        }
+      },
+    );
+    child.stdin.on("error", () => {});
+    child.stdin.end(JSON.stringify({ room, root }));
+  });
 }
 
 export async function recoverRoom(id, options = {}) {
