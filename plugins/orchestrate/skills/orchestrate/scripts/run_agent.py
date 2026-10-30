@@ -233,6 +233,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Declared billing context; never inferred from credentials",
     )
     parser.add_argument(
+        "--conductor-model",
+        help=(
+            "Calling conductor model ID or selector (auto-detected from the environment or "
+            "peer mailbox when omitted); used to widen mutating scope to worker-owned '.' on "
+            "lower-to-higher capability delegation"
+        ),
+    )
+    parser.add_argument(
         "--resume-result",
         type=Path,
         help="Previous result.json for exact-session correction and cumulative usage baseline",
@@ -1177,13 +1185,18 @@ def path_fingerprint(path: Path) -> dict[str, Any]:
     return {"kind": kind, "sha256": digest.hexdigest()}
 
 
-def normalize_repo_paths(values: list[str], *, option: str) -> list[str]:
+def normalize_repo_paths(values: list[str], *, option: str, allow_root: bool = False) -> list[str]:
     normalized: list[str] = []
     for value in values:
+        stripped = value.strip()
+        if allow_root and stripped == ".":
+            if "." not in normalized:
+                normalized.append(".")
+            continue
         candidate = Path(value)
         if (
             candidate.is_absolute()
-            or value.strip() in {"", "."}
+            or stripped in {"", "."}
             or ".." in candidate.parts
             or (candidate.parts and candidate.parts[0] == ".git")
         ):
@@ -1368,7 +1381,9 @@ def compact_review_bundle(
 
 
 def path_is_allowed(path: str, prefixes: list[str]) -> bool:
-    return any(path == prefix or path.startswith(f"{prefix}/") for prefix in prefixes)
+    if path == ".git" or path.startswith(".git/"):
+        return False
+    return any(prefix == "." or path == prefix or path.startswith(f"{prefix}/") for prefix in prefixes)
 
 
 def find_scope_violations(delta: dict[str, list[str]], allowed_paths: list[str]) -> list[str]:
@@ -2536,10 +2551,12 @@ def validated_run_options(
                 "--task-spec derives scope; do not also pass --allow-path or --track-path",
                 4,
             )
-        allowed_paths = normalize_repo_paths(list(task_spec["allow_paths"]), option="task-spec allow_paths")
+        allowed_paths = normalize_repo_paths(
+            list(task_spec["allow_paths"]), option="task-spec allow_paths", allow_root=True
+        )
         tracked_paths = normalize_repo_paths(list(task_spec["track_paths"]), option="task-spec track_paths")
     else:
-        allowed_paths = normalize_repo_paths(args.allow_path, option="--allow-path")
+        allowed_paths = normalize_repo_paths(args.allow_path, option="--allow-path", allow_root=True)
         tracked_paths = normalize_repo_paths(args.track_path, option="--track-path")
     enforced_paths = list(dict.fromkeys([*allowed_paths, *tracked_paths]))
     if args.expect_changes and not enforced_paths:
@@ -2570,6 +2587,181 @@ def validated_run_options(
         enforced_paths,
         timeout_seconds,
         verify_timeout_seconds,
+    )
+
+
+def detect_conductor_model(repo: Path) -> str | None:
+    """Best-effort detection of the calling conductor's model from the environment or peer mailbox."""
+    raw_env = os.environ.get("AGENT_EXECUTOR_CONDUCTOR_MODEL")
+    if isinstance(raw_env, str) and raw_env.strip():
+        return raw_env.strip()
+    with contextlib.suppress(Exception):
+        mailbox = bundled_module("peer_mailbox")
+        base = mailbox.root()
+        peers_dir = base / "peers"
+        if not peers_dir.is_dir():
+            return None
+        target_ws = mailbox.workspace(str(repo))
+        if not target_ws:
+            return None
+        for env_key in (
+            "AGENT_MAILBOX_SESSION",
+            "CLAUDE_CODE_SESSION_ID",
+            "CODEX_THREAD_ID",
+            "ANTIGRAVITY_CONVERSATION_ID",
+            "OPENCODE_SESSION_ID",
+        ):
+            session = (os.environ.get(env_key) or "").strip()
+            if not session or session.startswith("run-"):
+                continue
+            peer = mailbox.load(mailbox.peer_path(base, session))
+            if (
+                isinstance(peer, dict)
+                and not mailbox.is_run_peer(peer)
+                and mailbox.same_project(target_ws, peer)
+                and isinstance(peer.get("model"), str)
+                and peer["model"].strip()
+            ):
+                return peer["model"].strip()
+        ancestors: set[int] = set()
+        pid = os.getppid()
+        for _ in range(8):
+            if pid <= 1 or pid in ancestors:
+                break
+            ancestors.add(pid)
+            line = subprocess.run(
+                ["ps", "-o", "ppid=", "-p", str(pid)],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            ).stdout.strip()
+            if not line.isdigit():
+                break
+            pid = int(line)
+        if ancestors:
+            matches = [
+                peer
+                for peer in mailbox.peers(base, prune_dead=False)
+                if not peer.get("sharedProcess")
+                and peer.get("pid") in ancestors
+                and mailbox.same_project(target_ws, peer)
+                and isinstance(peer.get("model"), str)
+                and peer["model"].strip()
+            ]
+            if len(matches) == 1:
+                return matches[0]["model"].strip()
+    return None
+
+
+def apply_upward_delegation_policy(
+    args: argparse.Namespace,
+    *,
+    repo: Path,
+    brief: str,
+    task_spec: dict[str, Any] | None,
+    allowed_paths: list[str],
+    tracked_paths: list[str],
+    enforced_paths: list[str],
+    worker_model: str | None = None,
+    emit_note: bool = True,
+) -> tuple[str, dict[str, Any] | None, list[str], list[str], dict[str, Any]]:
+    """Resolve worker-owned scope when a lower-tier conductor delegates a mutating run to a higher-tier worker."""
+    support = bundled_module("execution_support")
+    conductor_model = (
+        getattr(args, "conductor_model", None)
+        or (task_spec or {}).get("conductor_model")
+        or detect_conductor_model(repo)
+    )
+    resolved_worker_model = (
+        worker_model
+        or (task_spec or {}).get("worker_model")
+        or resume_pinned_model(args)
+        or preferred_model(args.engine)
+    )
+    is_mutating = bool(allowed_paths) or (task_spec is not None and task_spec.get("scope_owner") == "worker")
+    if not is_mutating:
+        return (
+            brief,
+            task_spec,
+            allowed_paths,
+            enforced_paths,
+            {
+                "scope_owner": "conductor",
+                "conductor_model": conductor_model,
+                "scope_hints": [],
+                "upward_delegation": False,
+            },
+        )
+    upward = support.is_upward_delegation(conductor_model, resolved_worker_model)
+    explicit_worker_scope = "." in allowed_paths or (task_spec is not None and task_spec.get("scope_owner") == "worker")
+    if not (upward or explicit_worker_scope):
+        return (
+            brief,
+            task_spec,
+            allowed_paths,
+            enforced_paths,
+            {
+                "scope_owner": "conductor",
+                "conductor_model": conductor_model,
+                "scope_hints": [],
+                "upward_delegation": False,
+            },
+        )
+
+    if task_spec is not None:
+        if (
+            task_spec.get("scope_owner") != "worker"
+            or "." not in task_spec.get("allow_paths", [])
+            or (conductor_model and not task_spec.get("conductor_model"))
+            or (resolved_worker_model and not task_spec.get("worker_model"))
+        ):
+            renderer = brief_renderer_module()
+            upgraded_raw = {
+                **task_spec,
+                "scope_owner": "worker",
+                "conductor_model": conductor_model or task_spec.get("conductor_model"),
+                "worker_model": resolved_worker_model or task_spec.get("worker_model"),
+            }
+            task_spec = renderer.validate_spec(upgraded_raw)
+            brief = renderer.render_brief(task_spec)
+        scope_hints = list(task_spec.get("scope_hints", []))
+        allowed_paths = ["."]
+        enforced_paths = list(dict.fromkeys([*allowed_paths, *tracked_paths]))
+    else:
+        scope_hints = [path for path in allowed_paths if path != "."]
+        allowed_paths = ["."]
+        enforced_paths = list(dict.fromkeys([*allowed_paths, *tracked_paths]))
+        if upward and "# Upward-delegation scope authority" not in brief:
+            note_lines = [
+                "",
+                "# Upward-delegation scope authority",
+                "- Scope owner: worker (`.` — full repository scope, excluding `.git`).",
+                f"- Delegated from lower-tier conductor (`{conductor_model}`) to higher-tier worker (`{resolved_worker_model}`).",
+                "- You own the implementation plan, architectural decisions, and file selection across the repository. "
+                "Treat any file lists or step-by-step plans in the brief above as non-binding starting hints.",
+            ]
+            if scope_hints:
+                note_lines.append(f"- Conductor starting hints: {', '.join(scope_hints)}")
+            brief = brief.rstrip() + "\n" + "\n".join(note_lines) + "\n"
+
+    if emit_note and upward:
+        emit_lifecycle(
+            "worker_owned_scope",
+            conductor=conductor_model or "unknown",
+            worker=resolved_worker_model,
+        )
+    return (
+        brief,
+        task_spec,
+        allowed_paths,
+        enforced_paths,
+        {
+            "scope_owner": "worker",
+            "conductor_model": conductor_model,
+            "scope_hints": scope_hints,
+            "upward_delegation": upward,
+        },
     )
 
 
@@ -2616,6 +2808,8 @@ def detached_runner_command(
     notification_mode: str,
     completion_hook: Path | None,
     job_dir: Path | None = None,
+    allowed_paths_override: list[str] | None = None,
+    conductor_model: str | None = None,
 ) -> list[str]:
     if (brief_path is None) == (task_spec_path is None):
         raise RunnerError("detached launch requires exactly one task input", 4)
@@ -2655,6 +2849,8 @@ def detached_runner_command(
         command.extend(["--variant", args.variant])
     if args.effort:
         command.extend(["--effort", args.effort])
+    if conductor_model or getattr(args, "conductor_model", None):
+        command.extend(["--conductor-model", str(conductor_model or args.conductor_model)])
     command.extend(["--billing-mode", args.billing_mode])
     if args.deadline:
         command.extend(["--deadline", args.deadline])
@@ -2671,7 +2867,7 @@ def detached_runner_command(
     for extra in args.add_dir:
         command.extend(["--add-dir", str(extra)])
     if task_spec_path is None:
-        for allowed in args.allow_path:
+        for allowed in allowed_paths_override if allowed_paths_override is not None else args.allow_path:
             command.extend(["--allow-path", allowed])
         for tracked in args.track_path:
             command.extend(["--track-path", tracked])
@@ -2704,7 +2900,7 @@ def launch_detached(args: argparse.Namespace) -> int:
         raise RunnerError(f"--cwd must be the Git repository root: {repo}", 4)
 
     brief, task_spec = resolve_execution_brief(args, repo=repo)
-    _, add_dirs, _allowed_paths, tracked_paths, enforced_paths, timeout_seconds, _ = validated_run_options(
+    _, add_dirs, allowed_paths, tracked_paths, enforced_paths, timeout_seconds, _ = validated_run_options(
         args, task_spec=task_spec
     )
     # Check before detaching so the caller hears about an exhausted pool now, not in a completion event.
@@ -2712,6 +2908,16 @@ def launch_detached(args: argparse.Namespace) -> int:
     # quota, and whether another executor already holds this worktree.
     _executable, _version, _models, model, _reason, catalog = executor_preflight(
         args.engine, args.model, refresh=args.refresh_models
+    )
+    brief, task_spec, allowed_paths, enforced_paths, scope_info = apply_upward_delegation_policy(
+        args,
+        repo=repo,
+        brief=brief,
+        task_spec=task_spec,
+        allowed_paths=allowed_paths,
+        tracked_paths=tracked_paths,
+        enforced_paths=enforced_paths,
+        worker_model=model,
     )
     support = bundled_module("execution_support")
     effort = args.effort
@@ -2775,6 +2981,8 @@ def launch_detached(args: argparse.Namespace) -> int:
         notification_mode=notification_mode,
         completion_hook=completion_hook,
         job_dir=job_dir,
+        allowed_paths_override=allowed_paths if task_spec is None else None,
+        conductor_model=scope_info.get("conductor_model"),
     )
     environment = dict(os.environ)
     environment["PWD"] = str(repo)
@@ -2805,6 +3013,9 @@ def launch_detached(args: argparse.Namespace) -> int:
         "task_input": "task_spec" if task_spec is not None else "brief",
         "allowed_paths": enforced_paths,
         "tracked_paths": tracked_paths,
+        "scope_owner": scope_info["scope_owner"],
+        "conductor_model": scope_info["conductor_model"],
+        "scope_hints": scope_info["scope_hints"],
         "job_dir": str(job_dir),
         "run_dir": str(run_dir),
         "result_path": str(result_path),
@@ -2859,24 +3070,36 @@ def steering_brief(
     verify_commands: list[str],
     expect_changes: bool,
     engine: str | None = None,
+    added_allow_paths: list[str] | None = None,
 ) -> str:
     """The new user turn for a steered continuation: the conductor's message inside the unchanged contract."""
     scope = ", ".join(allowed_paths) if allowed_paths else "none; this is a read-only task, change no files"
     checks = "; ".join(verify_commands) if verify_commands else "none declared"
+    scope_clause = (
+        "This update also widens the repository paths you are authorized to change."
+        if added_allow_paths
+        else "This update\ncannot widen the scope or grant authority the original brief did not."
+    )
+    scope_bullet = (
+        "- Paths you may change (widened in this update): . (worker-owned full repository scope, excluding .git)."
+        if added_allow_paths and "." in allowed_paths
+        else f"- Paths you may change (widened in this update): {scope}."
+        if added_allow_paths
+        else f"- Paths you may change: {scope}."
+    )
     lines = [
         f"STEERING UPDATE {steer_id} FROM THE CONDUCTOR",
         "",
         "The conductor interrupted your previous turn to redirect this same task. This is a continuation,",
         "not a new task: the original brief and every constraint in it still apply, and your earlier",
-        "changes in the workspace remain. Do not undo them unless this update says so. This update",
-        "cannot widen the scope or grant authority the original brief did not.",
+        f"changes in the workspace remain. Do not undo them unless this update says so. {scope_clause}",
         "",
         "--- conductor's update ---",
         message.strip(),
         "--- end of update ---",
         "",
         "Unchanged from the original brief:",
-        f"- Paths you may change: {scope}.",
+        scope_bullet,
         f"- The runner runs these checks after your handoff: {checks}.",
     ]
     if expect_changes:
@@ -2890,7 +3113,9 @@ class JobSteering:
 
     While the executor runs, the runner polls its job directory for a steer request. It claims the
     request by renaming it (so a withdrawn request and a claimed one never both happen), answers it,
-    and, when it accepts, interrupts the executor and resumes the same session in the same process.
+    and, when it accepts, interrupts the executor and resumes the same session in the same process
+    (or widens scope in-place without interrupting when `--allow-path` is given without `--message`
+    or with `--no-interrupt`).
     The lease therefore never leaves this process, and no other runner can slip in between.
     """
 
@@ -2904,6 +3129,10 @@ class JobSteering:
         self.log_path: Path | None = None
         self.session_hint: str | None = None
         self.mailbox_run: str | None = None
+        self.allowed_paths: list[str] = []
+        self.tracked_paths: list[str] = []
+        self.enforced_paths: list[str] = []
+        self.live_steers: list[dict[str, Any]] = []
         self.state: dict[str, Any] = {
             "schema": STEER_STATE_SCHEMA,
             "protocol": STEER_PROTOCOL,
@@ -2922,6 +3151,16 @@ class JobSteering:
         self.state.update(fields)
         self.state["updated_at"] = utc_now()
         write_json_atomic(self.state_path, self.state)
+
+    def _update_job_allowed_paths(self, enforced_paths: list[str]) -> None:
+        job_path = self.job_dir / "job.json"
+        with contextlib.suppress(RunnerError, OSError):
+            job_payload = read_json_file(job_path)
+            if job_payload:
+                job_payload["allowed_paths"] = list(enforced_paths)
+                if "." in enforced_paths:
+                    job_payload["scope_owner"] = "worker"
+                write_json_atomic(job_path, job_payload)
 
     def begin_segment(
         self,
@@ -2985,17 +3224,67 @@ class JobSteering:
             emit_lifecycle("steer_rejected", steer=steer_id)
             return False
 
+        raw_allow = request.get("allow_paths") or []
+        if not isinstance(raw_allow, list) or not all(isinstance(item, str) for item in raw_allow):
+            return reject("invalid allow_paths in steer request")
+        try:
+            extra_allow_paths = normalize_repo_paths(list(raw_allow), option="--allow-path", allow_root=True)
+        except RunnerError as exc:
+            return reject(str(exc))
+        no_interrupt = bool(request.get("no_interrupt"))
+
         try:
             message = (steer_dir / "message.txt").read_text(encoding="utf-8")
         except OSError:
             return reject("the steering message file is missing")
         if text_fingerprint(message) != request.get("message_sha256"):
             return reject("the steering message does not match its request")
-        if not message.strip():
+        if not message.strip() and not extra_allow_paths:
             return reject("the steering message is empty")
+        if extra_allow_paths and not self.enforced_paths:
+            return reject("cannot widen scope on a read-only job")
         remaining = deadline_remaining(self.deadline)
         if remaining is not None and remaining <= 0:
             return reject("the task deadline has passed")
+
+        widened_allowed = list(self.allowed_paths)
+        widened_enforced = list(self.enforced_paths)
+        if extra_allow_paths:
+            for path in extra_allow_paths:
+                if path not in widened_allowed:
+                    widened_allowed.append(path)
+            if "." in widened_allowed:
+                widened_allowed = ["."]
+            widened_enforced = list(dict.fromkeys([*widened_allowed, *self.tracked_paths]))
+
+        if no_interrupt:
+            self.allowed_paths = widened_allowed
+            self.enforced_paths = widened_enforced
+            self._update_job_allowed_paths(widened_enforced)
+            session_id = self.current_session()
+            accepted = {
+                **record,
+                "status": "accepted",
+                "mode": "live_scope_update",
+                "interrupted": False,
+                "session_id": session_id,
+                "added_allow_paths": extra_allow_paths,
+                "allowed_paths": list(self.enforced_paths),
+                "previous_event_id": self.state["completion_event_id"],
+                "previous_result_path": self.state["result_path"],
+                "event_id": self.state["completion_event_id"],
+                "event_path": self.state["completion_event_path"],
+                "run_dir": str(Path(str(self.state["result_path"])).parent),
+                "result_path": self.state["result_path"],
+                "accepted_at": utc_now(),
+            }
+            write_json_atomic(steer_dir / "response.json", {"schema": "agent-executor.steer-response.v1", **accepted})
+            emit_lifecycle("steer_scope_widened", steer=steer_id, allowed_paths=",".join(self.enforced_paths))
+            self.state["steers"].append(accepted)
+            self.live_steers.append(accepted)
+            self.save(allowed_paths=list(self.enforced_paths))
+            return False
+
         session_id = self.current_session()
         if not session_id:
             return reject(
@@ -3003,6 +3292,10 @@ class JobSteering:
                 "resumed. Retry shortly; if no session ID ever appears, stop the job and relaunch with "
                 "the new instruction in the brief (the executor's context is lost)"
             )
+        if extra_allow_paths:
+            self.allowed_paths = widened_allowed
+            self.enforced_paths = widened_enforced
+            self._update_job_allowed_paths(widened_enforced)
         event_path = prepare_completion_event_path()
         if self.mailbox_run:
             # Waiting on the new event finds the run's mail before that event exists.
@@ -3013,7 +3306,11 @@ class JobSteering:
         accepted = {
             **record,
             "status": "accepted",
+            "mode": "interrupt_and_resume",
+            "interrupted": True,
             "session_id": session_id,
+            "added_allow_paths": extra_allow_paths,
+            "allowed_paths": list(self.enforced_paths),
             "previous_event_id": self.state["completion_event_id"],
             "previous_result_path": self.state["result_path"],
             "event_id": event_path.stem,
@@ -3028,7 +3325,7 @@ class JobSteering:
         accepted["interrupted_at"] = utc_now()
         accepted["interrupted_executor_exit_code"] = process.returncode
         self.state["steers"].append(accepted)
-        self.save(phase="steering", executor_pid=None)
+        self.save(phase="steering", executor_pid=None, allowed_paths=list(self.enforced_paths))
         self.pending = {**accepted, "message": message}
         return True
 
@@ -3444,6 +3741,16 @@ def native_handoff(args: argparse.Namespace, host: str) -> int:
         raise RunnerError(f"--cwd must be the Git repository root: {repo}", 4)
     brief, task_spec = resolve_execution_brief(args, repo=repo)
     _, add_dirs, allowed, tracked, enforced, _, _ = validated_run_options(args, task_spec=task_spec)
+    brief, task_spec, allowed, enforced, scope_info = apply_upward_delegation_policy(
+        args,
+        repo=repo,
+        brief=brief,
+        task_spec=task_spec,
+        allowed_paths=allowed,
+        tracked_paths=tracked,
+        enforced_paths=enforced,
+        worker_model=args.model or preferred_model(args.engine),
+    )
     out_dir = prepare_out_dir(args.out_dir, repo)
     scratch = prepare_scratch_dir(out_dir) if not enforced else None
     submitted_path = out_dir / "submitted-brief.txt"
@@ -3482,6 +3789,9 @@ def native_handoff(args: argparse.Namespace, host: str) -> int:
             "native_instructions": instructions,
             "allowed_paths": allowed,
             "tracked_paths": tracked,
+            "scope_owner": scope_info["scope_owner"],
+            "conductor_model": scope_info["conductor_model"],
+            "scope_hints": scope_info["scope_hints"],
             "additional_directories": [str(path) for path in add_dirs],
             "scratch_dir": str(scratch) if scratch else None,
             "verification_commands": args.verify_command,
@@ -3686,8 +3996,9 @@ def parse_steer_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog=f"{Path(sys.argv[0]).name} steer",
         description=(
-            "Redirect a running detached job: its runner interrupts the executor and resumes the same "
-            "session with a new instruction, keeping the lease, scope, gates, timeouts and delivery."
+            "Redirect a running detached job or widen its allowed scope mid-run: its runner interrupts "
+            "the executor and resumes the same session with a new instruction (or widens allowed_paths "
+            "in-place without interrupting when --allow-path is given without --message)."
         ),
     )
     parser.add_argument(
@@ -3695,7 +4006,27 @@ def parse_steer_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="JOB_OR_EVENT",
         help="The job directory, its job.json, or the job's exact event ID or AGENT_EVENT path",
     )
-    parser.add_argument("--message", required=True, help="The new instruction, or @FILE to read it from a file")
+    parser.add_argument(
+        "--message",
+        help="The new instruction, or @FILE to read it from a file (required unless --allow-path is given)",
+    )
+    parser.add_argument(
+        "--allow-path",
+        action="append",
+        default=[],
+        help=(
+            "Widen the running job's allowed scope with an additional repository-relative file or "
+            "directory prefix (or '.' for full repository scope); repeatable"
+        ),
+    )
+    parser.add_argument(
+        "--no-interrupt",
+        action="store_true",
+        help=(
+            "With --allow-path, widen the running job's allowed scope in-place without interrupting "
+            "the running executor process (default when --message is omitted)"
+        ),
+    )
     parser.add_argument("--cwd", type=Path, help="Refuse unless the job runs in this Git repository")
     parser.add_argument(
         "--wait-timeout",
@@ -3852,7 +4183,20 @@ def wait_for_steer_response(
 
 def steer_main(argv: list[str] | None = None) -> int:
     args = parse_steer_args(argv)
-    message = read_steer_message(args.message)
+    extra_allow_paths = (
+        normalize_repo_paths(args.allow_path, option="--allow-path", allow_root=True) if args.allow_path else []
+    )
+    if args.no_interrupt and args.message is not None:
+        raise RunnerError(
+            "--no-interrupt cannot be combined with --message; omit --no-interrupt to interrupt and deliver "
+            "the message, or send an advisory note over the peer mailbox",
+            4,
+        )
+    if args.no_interrupt and not extra_allow_paths:
+        raise RunnerError("--no-interrupt requires at least one --allow-path", 4)
+    if args.message is None and not extra_allow_paths:
+        raise RunnerError("steer requires --message and/or at least one --allow-path", 4)
+    message = read_steer_message(args.message) if args.message is not None else ""
     wait_seconds = parse_duration(args.wait_timeout, option="--wait-timeout")
     job_dir = find_steerable_job_dir(args.job)
     job_path = job_dir / "job.json"
@@ -3876,6 +4220,11 @@ def steer_main(argv: list[str] | None = None) -> int:
         raise RunnerError(
             f"this job was launched by agent-executor {job.get('runner_version')}, which cannot be steered; "
             "wait for it, or stop it and relaunch",
+            EXIT_STEER_REJECTED,
+        )
+    if extra_allow_paths and not job.get("allowed_paths"):
+        raise RunnerError(
+            "cannot widen scope on a read-only job (it holds a shared reader lease); relaunch with --allow-path",
             EXIT_STEER_REJECTED,
         )
     original_event = str(job.get("completion_event_path"))
@@ -3916,6 +4265,8 @@ def steer_main(argv: list[str] | None = None) -> int:
                 "schema": STEER_REQUEST_SCHEMA,
                 "steer_id": steer_id,
                 "message_sha256": text_fingerprint(message),
+                "allow_paths": extra_allow_paths,
+                "no_interrupt": bool(args.no_interrupt or not message),
                 "requested_at": utc_now(),
                 "requested_by_pid": os.getpid(),
             },
@@ -3930,7 +4281,12 @@ def steer_main(argv: list[str] | None = None) -> int:
         return 0
     print("AGENT_STEER_STATUS=accepted")
     print(f"AGENT_STEER_ID={response['steer_id']}")
-    print(f"AGENT_SESSION={response['session_id']}")
+    if response.get("mode"):
+        print(f"AGENT_STEER_MODE={response['mode']}")
+    if response.get("session_id"):
+        print(f"AGENT_SESSION={response['session_id']}")
+    if response.get("allowed_paths") is not None:
+        print(f"AGENT_ALLOWED_PATHS={','.join(response['allowed_paths'])}")
     print(f"AGENT_JOB={job_path}")
     print(f"AGENT_STEERED_FROM={response['previous_event_id']}")
     print(f"AGENT_RESULT={response['result_path']}")
@@ -4070,6 +4426,21 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
         timeout_seconds,
         verify_timeout_seconds,
     ) = validated_run_options(args, task_spec=task_spec)
+    brief, task_spec, allowed_paths, enforced_paths, scope_info = apply_upward_delegation_policy(
+        args,
+        repo=repo,
+        brief=brief,
+        task_spec=task_spec,
+        allowed_paths=allowed_paths,
+        tracked_paths=tracked_paths,
+        enforced_paths=enforced_paths,
+        worker_model=resume_pinned_model(args) or model,
+        emit_note=steering is None,
+    )
+    if steering is not None:
+        steering.allowed_paths = list(allowed_paths)
+        steering.tracked_paths = list(tracked_paths)
+        steering.enforced_paths = list(enforced_paths)
     ensure_hook_outside_workspaces(completion_hook, [repo, *add_dirs])
     out_dir = prepare_out_dir(args.out_dir, repo)
     result_path = out_dir / "result.json"
@@ -4264,6 +4635,9 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
         "git_identity_before": git_identity_before,
         "allowed_paths": enforced_paths,
         "tracked_paths": tracked_paths,
+        "scope_owner": scope_info["scope_owner"],
+        "conductor_model": scope_info["conductor_model"],
+        "scope_hints": scope_info["scope_hints"],
         "expected_changes": args.expect_changes,
         "retry_read_only": args.retry_read_only,
         "heartbeat_seconds": args.heartbeat_seconds,
@@ -4554,6 +4928,12 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
             }
         )
         executor_attempts.append(attempt_record)
+        if steering is not None:
+            allowed_paths = list(steering.allowed_paths)
+            enforced_paths = list(steering.enforced_paths)
+            base_result["allowed_paths"] = enforced_paths
+            if "." in enforced_paths:
+                base_result["scope_owner"] = "worker"
         if steered:
             assert steering is not None and steering.pending is not None and completion_event_path is not None
             pending = steering.pending
@@ -4620,6 +5000,7 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
                     verify_commands=args.verify_command,
                     expect_changes=args.expect_changes,
                     engine=args.engine,
+                    added_allow_paths=pending.get("added_allow_paths"),
                 )
                 + mailbox_module.run_instructions(mailbox_run_id),
             )
@@ -4913,6 +5294,12 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
         "consultation": consultation,
         "scratch": scratch_report,
     }
+    if steering is not None and steering.live_steers:
+        seen_steer_ids = {item.get("steer_id") for item in steers_applied}
+        for live_steer in steering.live_steers:
+            if live_steer.get("steer_id") not in seen_steer_ids:
+                steers_applied.append(live_steer)
+        steers_applied.sort(key=lambda item: int(item.get("steer_id") or 0))
     if steers_applied:
         # History, scope and verification above were judged from the original snapshot: one combined run.
         result["steering"] = {

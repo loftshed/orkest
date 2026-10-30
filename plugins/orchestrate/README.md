@@ -31,16 +31,35 @@ Codex requires one-time approval for command hooks: review them in Codex `/hooks
 ## Agent status in terminal footers
 
 Orkest can show each registered session's agent name, model, reasoning effort, task stage, team goal,
-and individual task in its terminal footer. The name's color is stable for that session; `NO_COLOR`
-turns color off. Long fields are shortened to fit, and a dash means the information is not recorded.
+and individual task in its terminal footer. Text is left-aligned on the terminal's normal background,
+with three spaces of padding and a colored band filling the remaining space to its right. The color
+is stable for that session; `NO_COLOR` turns color off. Long fields are shortened to fit. Missing work
+details say `not set`.
 Codex model and effort are read from its local session database when available; harness-provided
 values and mailbox records supply the other displays.
 
-The goal comes from the title of a room explicitly bound to the session. The task and stage come from
-the session's claimed workboard item or its bound coordinator run. A saved focus is shown as the
-individual task when no assignment exists; its saved work note supplies a stage if available.
-Multiple rooms or assignments are marked as such instead of picking one. A session without a matching
-mailbox record has no label.
+At the start of substantive work, agents can report all three work fields in one command:
+
+```sh
+ork progress --session SESSION_ID --goal 'Ship the feature' --task 'Fix the parser' --stage working
+ork progress --session SESSION_ID --stage testing
+```
+
+Stages are `planning`, `working`, `testing`, `review`, `blocked` and `complete`. Later updates preserve
+omitted fields; passing only the session confirms unchanged work. Update when the assignment or stage
+changes and before the final response. Reports older than 30 minutes are marked stale unless explicitly
+complete. An idle agent is never automatically marked complete. Turn hooks remind Claude Code, Codex
+and Antigravity at session entry and about missing, mismatched or stale reports, at most once every five
+minutes during user turns. They do not extend turns or wake agents. OpenCode uses the same command but
+currently needs the agent to update it without those turn-hook reminders.
+
+Reports describe the display; they do not claim work, verify completion or change the workboard.
+An explicitly bound room supplies the goal, and workboard or coordinator records supply the task and
+state when present. A matching report can show `planning`, `working` or `testing` while an item is claimed;
+it cannot override blocked or review state. Otherwise the report supplies the work fields, with legacy
+focus notes as a fallback. Multiple assignments remain explicit. Context from another checkout or
+account is ignored. Changed assignments require a fresh report of all three fields, even if a new
+work item has the same title. A session without a matching mailbox record has no label.
 
 For example, after creating a room with a descriptive `--title`, bind the interactive conductor:
 
@@ -100,16 +119,17 @@ immediately above the prompt, leaving its existing footer intact.
 
 ### Codex
 
-Codex does not accept a custom status-line command. To keep its session title intact, launch it in
-an isolated tmux session with a separate label line:
+Launch Codex in an isolated tmux session with a left-aligned label and color in the unused space to its right:
 
 ```sh
 node plugins/orchestrate/bin/ork.mjs label -- codex
 ```
 
-The wrapper needs `tmux` on `PATH` and uses a private server with default tmux bindings. It shows
-the status only when exactly one live Codex peer can be matched to that pane, refreshing every three
-seconds. If you detach, it prints the command to reattach; it does not stop the session.
+The wrapper needs `tmux` on `PATH` and uses a private server with default tmux bindings. It sets
+that pane's terminal title to Codex's native thread ID and matches it to the registered session,
+including when several agents share Codex's background server. Thread names and Codex's own status
+line stay unchanged. A fresh session shows its agent identity after registering with the mailbox.
+Updates can take three seconds. If you detach, it prints the command to reattach.
 
 ## Inspect routes, models, and health
 

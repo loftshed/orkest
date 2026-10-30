@@ -39,15 +39,35 @@ only when you want a human-readable preview before dispatch.
 }
 ```
 
-All fields are required. Arrays may be empty only for `allow_paths`, `track_paths`,
-`pre_existing_changes`, and `development_checks`; an empty allowed/track scope is an explicitly
-read-only brief. For read-only tasks, the runner automatically allocates a private per-run scratch
-directory outside the target repository and notes its location in the brief. Artifacts written there
-are collected and retained under `scratch` in the result without triggering scope violations; writes
-inside the repository or symlinks escaping the scratch boundary fail as scope violations. Paths in
-`allow_paths` and `track_paths` must be non-root repository-relative paths. The runner derives its
-effective allowed scope from exactly those two arrays, so scope cannot drift from the submitted
-brief or runner enforcement.
+All fields are required except `plan`, which may be omitted or `[]` when the worker owns scope
+(`"scope_owner": "worker"`, `"allow_paths": ["."]`, or upward delegation from a lower-tier
+`conductor_model` to a higher-tier `worker_model`). Arrays may be empty for `allow_paths`,
+`track_paths`, `pre_existing_changes`, and `development_checks`; an empty allowed/track scope
+(without `scope_owner: "worker"`) is an explicitly read-only brief. For read-only tasks, the runner
+automatically allocates a private per-run scratch directory outside the target repository and notes
+its location in the brief. Artifacts written there are collected and retained under `scratch` in the
+result without triggering scope violations; writes inside the repository or symlinks escaping the
+scratch boundary fail as scope violations. Paths in `track_paths` must be non-root
+repository-relative paths; `allow_paths` accepts non-root repository-relative paths or `"."` for
+worker-owned full repository scope (excluding `.git`). The runner derives its effective allowed scope
+from `allow_paths` and `track_paths`, so scope cannot drift from the submitted brief or runner
+enforcement.
+
+## Upward delegation and worker-owned scope
+
+When a lower-tier conductor (such as Haiku or Sonnet) dispatches a mutating task to a higher-tier
+worker (such as Astra, Sol, Opus, Fable, or Gemini Pro / Argon High), do not micromanage the stronger
+model's file list or implementation steps:
+
+- Set `"allow_paths": ["."]` or `"scope_owner": "worker"` (and optionally pass candidate files in
+  `"scope_hints": ["src/candidate.py"]` and omit or leave `"plan": []`).
+- Even if a lower-tier conductor supplies narrow `allow_paths` and a `plan`, passing
+  `"conductor_model"` and `"worker_model"` in the spec (or `--conductor-model` on the runner /
+  coordinator CLI, or relying on automatic detection from the active session's peer mailbox record)
+  automatically promotes a mutating run to `scope_owner: "worker"` with `allow_paths: ["."]`, moves
+  the conductor's narrow paths into `scope_hints`, and renders both `plan` and `scope_hints` as
+  non-binding starting guidance while keeping `acceptance_criteria` and `--verify-command` gates
+  authoritative.
 
 An optional `context_packet` object accepts four string arrays: `decisions`, `failed_attempts`,
 `evidence`, and `versions`. Include only context needed to finish without unrecorded history.

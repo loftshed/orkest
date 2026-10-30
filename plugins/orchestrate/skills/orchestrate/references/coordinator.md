@@ -25,8 +25,13 @@ Change authentication profiles or billing context only with explicit user author
 
 ## Initialize and dispatch
 
-Create the normal authoritative nine-field task spec. Keep the spec and private task directory
-outside the repository. No clean-worktree requirement is added.
+Create the normal authoritative task spec. Keep the spec and private task directory
+outside the repository. No clean-worktree requirement is added. When a lower-tier conductor
+dispatches an `implementation` or `correction` run to a higher-tier worker (via `--conductor-model`,
+`conductor_model` in the spec, or automatic detection from the active project session in the peer
+mailbox), `coordinator.py dispatch` automatically upgrades mutating specs to `scope_owner: "worker"`
+(`allow_paths: ["."]`), preserves any narrow `allow_paths` as `scope_hints`, and renders the worker's
+brief with full repository scope while keeping acceptance criteria and verification gates intact.
 
 ```bash
 python3 scripts/coordinator.py init --task-dir /private/task \

@@ -3056,6 +3056,45 @@ class SteerTests(unittest.TestCase):
                 self.assertEqual(error.exit_code, expected, str(error))
                 self.assertFalse((job_dir / "steers").exists(), "no request may be written for a refused steer")
 
+    def test_steer_allow_path_widens_scope_live_without_interrupting(self) -> None:
+        job = self.launch()
+        output = io.StringIO()
+        argv = [
+            str(SCRIPT),
+            "steer",
+            job["event_id"],
+            "--allow-path",
+            "outside",
+            "--allow-path",
+            ".",
+            "--cwd",
+            str(self.repository.path),
+        ]
+        with (
+            mock.patch.object(sys, "argv", argv),
+            mock.patch.dict(os.environ, self.environment()),
+            contextlib.redirect_stdout(output),
+        ):
+            self.assertEqual(RUNNER.main(), 0)
+        values = dict(line.split("=", 1) for line in output.getvalue().splitlines() if line.startswith("AGENT_"))
+        self.assertEqual(values["AGENT_STEER_STATUS"], "accepted")
+        self.assertEqual(values["AGENT_STEER_MODE"], "live_scope_update")
+        self.assertEqual(values["AGENT_ALLOWED_PATHS"], ".")
+        # Simulate the running worker modifying an additional file outside the original `allowed` scope,
+        # then release the original executor without having interrupted it:
+        self.repository.write("outside/extra.txt", "worker-selected file\n")
+        job["release"].write_text("go", encoding="utf-8")
+        event = self.wait_event(job["event_id"])
+        self.assertEqual(event["status"], "completed")
+        result = json.loads(job["result_path"].read_text(encoding="utf-8"))
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["allowed_paths"], ["."])
+        self.assertEqual(result["scope_owner"], "worker")
+        self.assertEqual(result["scope_violations"], [])
+        self.assertIn("outside/extra.txt", result["run_delta"]["changed_paths"])
+        self.assertEqual(len(result["executor_attempts"]), 1)
+        self.assertEqual(result["steering"]["steers"][0]["mode"], "live_scope_update")
+
 
 class SteeringUnitTests(unittest.TestCase):
     def test_brief_restates_scope_checks_and_report_contract(self) -> None:
@@ -3268,6 +3307,12 @@ class ProcessAndResumeRegressionTests(unittest.TestCase):
         for status in ("timed_out", "empty_output", "steered", "failed", "malformed_report"):
             with self.subTest(status=status):
                 support.validate_resume({**baseline, "status": status}, current)
+
+        # Widening to worker-owned '.' covers any non-.git path:
+        support.validate_resume(
+            {**baseline, "allowed_paths": ["src/a.py", "other/b.py"]},
+            {**current, "allowed_paths": ["."]},
+        )
 
         with self.assertRaisesRegex(support.ContractError, "no session_id"):
             support.validate_resume({**baseline, "session_id": None}, current)
@@ -3576,3 +3621,70 @@ class ProcessAndResumeRegressionTests(unittest.TestCase):
             self.assertFalse(stale_peer.exists())
             self.assertFalse(stale_mb_lock.exists())
             self.assertTrue(keep_listener.exists())
+
+    def test_upward_delegation_widens_scope_and_preserves_read_only_runs(self) -> None:
+        code, result, out_dir, _, _ = self.run_main(
+            engine="claude",
+            model="fable",
+            fake_output="outside/unplanned.py",
+            allow_path="allowed",
+            verify_commands=["test -f outside/unplanned.py"],
+            extra_args=["--effort", "high", "--conductor-model", "sonnet"],
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["allowed_paths"], ["."])
+        self.assertEqual(result["scope_owner"], "worker")
+        self.assertEqual(result["conductor_model"], "sonnet")
+        self.assertEqual(result["scope_hints"], ["allowed"])
+        self.assertEqual(result["scope_violations"], [])
+        submitted = (out_dir / "submitted-brief.txt").read_text(encoding="utf-8")
+        self.assertIn("# Upward-delegation scope authority", submitted)
+        self.assertIn("Conductor starting hints: allowed", submitted)
+
+        # Peer-mailbox auto-detection for the same repository also triggers upward delegation:
+        mailbox = RUNNER.bundled_module("peer_mailbox")
+        cache_home = self.external_path / "mb-detect-cache"
+        with mock.patch.dict(
+            os.environ,
+            {
+                "AGENT_EXECUTOR_HOME": str(cache_home),
+            },
+        ):
+            mailbox.register(
+                mailbox.root(),
+                session="haiku-conductor-ses",
+                harness="claude",
+                cwd=str(self.repository.path),
+                pid=os.getpid(),
+                model="claude-haiku-4-5",
+            )
+            code_mb, result_mb, _, _, _ = self.run_main(
+                engine="claude",
+                model="fable",
+                fake_output="outside/from_mailbox_detect.py",
+                allow_path="allowed",
+                verify_commands=["test -f outside/from_mailbox_detect.py"],
+                extra_args=["--effort", "high"],
+                extra_env={
+                    "AGENT_EXECUTOR_HOME": str(cache_home),
+                    "CLAUDE_CODE_SESSION_ID": "haiku-conductor-ses",
+                },
+            )
+        self.assertEqual(code_mb, 0)
+        self.assertEqual(result_mb["allowed_paths"], ["."])
+        self.assertEqual(result_mb["scope_owner"], "worker")
+        self.assertEqual(result_mb["conductor_model"], "claude-haiku-4-5")
+
+        # Read-only runs stay read-only even with a lower-tier conductor:
+        code_ro, result_ro, _, _, _ = self.run_main(
+            engine="claude",
+            model="fable",
+            no_change=True,
+            expect_changes=False,
+            allow_path=None,
+            extra_args=["--effort", "high", "--conductor-model", "haiku"],
+        )
+        self.assertEqual(code_ro, 0)
+        self.assertEqual(result_ro["allowed_paths"], [])
+        self.assertEqual(result_ro["scope_owner"], "conductor")

@@ -3,7 +3,6 @@ import { homedir } from "node:os";
 import path from "node:path";
 
 import { Plugin } from "@opencode/plugin/tui";
-import { useTerminalDimensions } from "@opentui/solid";
 import { createEffect, createSignal, onCleanup, Show } from "solid-js";
 
 type Color = 31 | 32 | 33 | 34 | 35 | 36;
@@ -53,15 +52,14 @@ const defaultScript = path.join(
 
 function Label(props: { sessionID?: string; plainColor: string; script: string }) {
   const [item, setItem] = createSignal<Identity | null>(null);
-  const dimensions = useTerminalDimensions();
+  const [columns, setColumns] = createSignal(0);
 
   createEffect(() => {
     const session = props.sessionID;
-    // Leave room for the sidebar when the host has enough columns to show it.
-    const columns = dimensions().width;
-    const width = Math.max(32, columns - (columns >= 120 ? 40 : 6));
+    // Measure the actual composer slot so the band ends before any visible sidebar.
+    const width = columns() - 6;
     setItem(null);
-    if (!session) return;
+    if (!session || width < 32) return;
     let active = true;
     let running = false;
     const refresh = () => {
@@ -96,16 +94,36 @@ function Label(props: { sessionID?: string; plainColor: string; script: string }
   });
 
   return (
-    <Show when={item()}>
-      {(identity) => (
-        <text fg={props.plainColor} wrapMode="none">
-          <span style={{ fg: process.env.NO_COLOR ? props.plainColor : colors[identity().color] }}>
-            {identity().label}
-          </span>
-          {identity().details}
-        </text>
-      )}
-    </Show>
+    <box
+      width="100%"
+      height={item() ? 1 : 0}
+      flexDirection="row"
+      onSizeChange={function () {
+        setColumns(this.width);
+      }}
+    >
+      <Show when={item()}>
+        {(identity) => (
+          <>
+            <text fg={props.plainColor} wrapMode="none" flexShrink={0}>
+              {"   "}
+              <span
+                style={{ fg: process.env.NO_COLOR ? props.plainColor : colors[identity().color] }}
+              >
+                {identity().label}
+              </span>
+              {identity().details}
+              {"   "}
+            </text>
+            <box
+              height={1}
+              flexGrow={1}
+              backgroundColor={process.env.NO_COLOR ? undefined : colors[identity().color]}
+            />
+          </>
+        )}
+      </Show>
+    </box>
   );
 }
 
