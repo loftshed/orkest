@@ -1,51 +1,106 @@
-# orkest
+# Orkest
 
-Personal plugin marketplace and local multi-agent toolkit for Claude Code, Codex, Antigravity (Gemini), and OpenCode.
+Orkest is a local toolkit for working with AI coding agents. It tracks the quota available on your
+accounts, helps route work to the right harness, and gives agents a way to coordinate across
+sessions.
 
-| Plugin                                         | Version | What it does                                                                                                                                         |
-| ---------------------------------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [`monitor`](plugins/monitor/README.md)         | 0.14.0  | Remaining quota across Claude Code profiles, Codex and Antigravity, and where to spend it: MCP server, skill, CLI/TUI, macOS menu bar app.           |
-| [`orchestrate`](plugins/orchestrate/README.md) | 0.38.0  | Cross-harness consultation, bounded delegation, peer mailbox, team succession, and swarm rooms across Claude Code, Codex, Antigravity, and OpenCode. |
+It works with Claude Code, Codex, Antigravity and OpenCode. Each harness still runs its own models
+and keeps its own account settings; Orkest connects the pieces on your machine.
 
-`monitor` is the quota source: `orchestrate`'s launch gate, `quota` command, Stooges room header, and deputy succession all read `monitor`'s cache (`~/.cache/monitor/snapshot.json`) and `~/.config/monitor/config.json`, where an account's `billing` (`work` or `personal`) defines its context.
+| Plugin                                         | Version | What it does                                                                          |
+| ---------------------------------------------- | ------- | ------------------------------------------------------------------------------------- |
+| [`monitor`](plugins/monitor/README.md)         | 0.14.0  | Shows account quota and reset times in a terminal, MCP server and desktop interfaces. |
+| [`orchestrate`](plugins/orchestrate/README.md) | 0.38.0  | Routes bounded work, connects agents through a mailbox and coordinates teams.         |
+
+## What you can do
+
+- **See available capacity.** Monitor reads usage from your provider CLIs and displays quota,
+  rollover times, credit balances and suggested places to spend the remaining allowance. It has a
+  terminal view, MCP tools, a macOS menu bar app and an optional KDE Plasma widget.
+- **Ask or delegate across harnesses.** Orchestrate can request a read-only second opinion or run a
+  bounded implementation task with an allowed file scope and checks. It uses each hosted model's
+  own CLI and keeps account and billing choices explicit.
+- **Coordinate active agents.** The project-scoped peer mailbox supports direct messages, channels,
+  shared work and recovery notes. Rooms and the Stooges terminal view show a team and its progress.
+- **Keep expensive checks from competing.** `ork gate` coordinates test, lint and build runs on the
+  same machine, with a shared ledger and saved logs for heavy or failed runs.
+
+Monitor's cached snapshot is also used by Orchestrate when it checks quota and suggests a deputy.
+Quota rankings are advice; they do not authorize switching accounts or spending credits.
 
 ## Install
 
-Keep `<checkout>` outside `~/Documents`, `~/Desktop`, and `~/Downloads`: macOS asks again for each tool version that reads those folders.
+You need Git, Node.js 22.18 or later, Python 3.11 or later, and an installed, authenticated CLI for
+each provider you want to use. The menu bar app requires macOS; the terminal tools also work on
+other supported platforms.
+
+Clone the repository outside macOS's protected Documents, Desktop and Downloads folders to avoid
+repeated permission prompts:
 
 ```sh
-gh repo clone loftshed/orkest <checkout>
+mkdir -p ~/src
+git clone https://github.com/loftshed/orkest.git ~/src/orkest
+cd ~/src/orkest
 
-# 1. Quota monitor (CLI, macOS menu bar app, skill links, and MCP registrations)
-<checkout>/plugins/monitor/install.sh
+# Install the quota monitor and register its MCP tools.
+./plugins/monitor/install.sh
 ~/.local/bin/monitor mcp-install
 
-# 2. Orchestrate (skill hub, route config, peer-mailbox daemon, and turn hooks)
-<checkout>/plugins/orchestrate/install.sh
+# Link Orchestrate into the installed harnesses and set up the peer mailbox.
+./plugins/orchestrate/install.sh
 ```
 
-### Plugin marketplace (optional)
+Add `~/.local/bin` to your `PATH` if it is not already there.
 
-You can also register `<checkout>` (or `loftshed/orkest` on GitHub) as a plugin marketplace in Claude Code and Codex:
+The Orchestrate installer has a `--dry-run` option. Codex asks you to trust its command hooks once;
+review them with `/hooks`. See the [Orchestrate installation guide](plugins/orchestrate/README.md#install)
+for details and the [Monitor guide](plugins/monitor/README.md#install) for profile and desktop setup.
+
+### Install the Monitor skill as a plugin
+
+For Claude Code and Codex, add this checkout as a marketplace and install Monitor's skill:
 
 ```sh
-claude plugin marketplace add <checkout>
+claude plugin marketplace add ~/src/orkest
 claude plugin install monitor@orkest --scope user
-claude plugin install orchestrate@orkest --scope user
 
-codex plugin marketplace add <checkout>
+codex plugin marketplace add ~/src/orkest
 codex plugin add monitor@orkest
 ```
 
-If Claude Code loads `orchestrate` from the plugin marketplace, run `<checkout>/plugins/orchestrate/install.sh --no-claude` so `install.sh` links the remaining harnesses and sets up the mailbox without creating a duplicate skill in `~/.claude/skills/orchestrate`.
+Orchestrate's installer already links its skill. If you install `orchestrate@orkest` as a Claude
+Code plugin instead, run its installer with `--no-claude` to avoid a duplicate skill.
+
+## Get started
+
+```sh
+# View quota, watch it, or get a machine-readable snapshot.
+monitor
+monitor watch
+monitor json
+
+# Check routes and verify the mailbox without invoking a model.
+python3 ~/.agents/skills/orchestrate/scripts/run_agent.py routes
+python3 ~/.agents/skills/orchestrate/scripts/run_agent.py doctor --check-messaging
+
+# Explore rooms and the shared test/build gate from the checkout.
+node plugins/orchestrate/bin/ork.mjs rooms --help
+node plugins/orchestrate/bin/ork.mjs gate status
+```
+
+Monitor discovers available accounts by default. Run `monitor init --dry-run` to preview its
+configuration, or `monitor init` to create `~/.config/monitor/config.json`. Orchestrate's routes
+are configured in `~/.config/agent-executor/config.json`; see the
+[Orchestrate guide](plugins/orchestrate/README.md) for consultation, delegation and mailbox examples.
 
 ## Development
 
 ```sh
-yarn install                  # dev dependencies and git hooks
-yarn check                    # lint gate: marketplace validator, ESLint, Prettier, markdownlint, cspell, ruff, shellcheck
-yarn test                     # Vitest (JavaScript) and unittest (orchestrate Python)
+yarn install                  # development tools and Git hooks
+yarn check                    # repository lint and validation gate
+yarn test                     # JavaScript and Python tests
 node scripts/release.js plan  # preview the next automated plugin release
 ```
 
-Tests live in `tests/`, mirroring the `plugins/` and `scripts/` directory layout. See [CLAUDE.md](CLAUDE.md) for repository conventions and [docs/README.md](docs/README.md) for [release automation](docs/releases.md) and design records.
+Tests live under `tests/`, mirroring the code they cover. See [CLAUDE.md](CLAUDE.md) for repository
+conventions and [docs/README.md](docs/README.md) for release automation and design records.
