@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.40.0
+
+- feat(orchestrate): show agent status in terminals (#42)
+
 ## 0.39.0
 
 - feat(orchestrate): notify peers when an agent disappears (#36)
