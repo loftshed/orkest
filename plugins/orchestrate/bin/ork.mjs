@@ -32,6 +32,7 @@ import { cachedQuota, runTui } from "./stooges-tui.mjs";
 
 const HELP = `ork rooms --help
 ork gate [--heavy] [--label <text>] -- <command>   (also: ork gate status|install|uninstall)
+ork label -- codex [arguments]                     (private tmux session with an agent label)
 ork name [--model <model>] [--effort <level>] [--harness <harness>]
 ork routes [--archetype <name>] [--json] [--width 120]
 ork quota [--line|--json] [--refresh]
@@ -271,9 +272,9 @@ async function summaryCommand(argv, stdout) {
   return data;
 }
 
-/** Runs gate.py with this terminal, passing signals on and returning its exit code. */
-function gateCommand(argv) {
-  const child = spawn("python3", [path.join(scripts, "gate.py"), ...argv], { stdio: "inherit" });
+/** Runs a terminal command, passing signals on and returning its exit code. */
+function terminalCommand(script, argv) {
+  const child = spawn("python3", [path.join(scripts, script), ...argv], { stdio: "inherit" });
   const signals = ["SIGINT", "SIGTERM", "SIGHUP"];
   const handlers = signals.map((signal) => {
     const forward = () => child.kill(signal);
@@ -297,7 +298,11 @@ function gateCommand(argv) {
 
 export async function main(argv = process.argv.slice(2), { stdout = process.stdout } = {}) {
   if (argv[0] === "gate") {
-    process.exitCode = await gateCommand(argv.slice(1));
+    process.exitCode = await terminalCommand("gate.py", argv.slice(1));
+    return;
+  }
+  if (argv[0] === "label") {
+    process.exitCode = await terminalCommand("agent_statusline_tmux.py", argv.slice(1));
     return;
   }
   if (argv[0] === "rooms") return roomsCommand(argv.slice(1), { stdout });

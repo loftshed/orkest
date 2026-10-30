@@ -22,6 +22,8 @@ and keeps its own account settings; Orkest connects the pieces on your machine.
   own CLI and keeps account and billing choices explicit.
 - **Coordinate active agents.** The project-scoped peer mailbox supports direct messages, channels,
   shared work and recovery notes. Rooms and the Stooges terminal view show a team and its progress.
+- **Identify a terminal session.** An optional [agent status line](plugins/orchestrate/README.md#agent-status-in-terminal-footers)
+  shows its name, model, effort and recorded work alongside its team's goal.
 - **Keep expensive checks from competing.** `ork gate` coordinates test, lint and build runs on the
   same machine, with a shared ledger and saved logs for heavy or failed runs.
 
