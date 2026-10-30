@@ -9,8 +9,8 @@ and keeps its own account settings; Orkest connects the pieces on your machine.
 
 | Plugin                                         | Version | What it does                                                                          |
 | ---------------------------------------------- | ------- | ------------------------------------------------------------------------------------- |
-| [`monitor`](plugins/monitor/README.md)         | 0.14.0  | Shows account quota and reset times in a terminal, MCP server and desktop interfaces. |
-| [`orchestrate`](plugins/orchestrate/README.md) | 0.38.0  | Routes bounded work, connects agents through a mailbox and coordinates teams.         |
+| [`monitor`](plugins/monitor/README.md)         | 0.15.0  | Shows account quota and reset times in a terminal, MCP server and desktop interfaces. |
+| [`orchestrate`](plugins/orchestrate/README.md) | 0.39.0  | Routes bounded work, connects agents through a mailbox and coordinates teams.         |
 
 ## What you can do
 
