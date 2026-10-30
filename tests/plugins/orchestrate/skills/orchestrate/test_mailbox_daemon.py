@@ -56,6 +56,31 @@ class TestMailboxDaemon(unittest.TestCase):
         self.state = daemon.ensure_running(self.base)
         return self.state
 
+    def test_background_presence_check_reports_a_killed_agent_without_a_discovery_call(self):
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+        self.children.append(child)
+        mailbox.register(self.base, session="interrupted", harness="codex", cwd=str(self.project), pid=child.pid)
+        self.peer("survivor", harness="claude")
+        mailbox.set_focus(self.base, "interrupted", "Repair export", task_details={"next": "Review PR #8"})
+        self.start()
+        child.kill()
+        child.wait(timeout=5)
+        deadline = time.monotonic() + 25
+        notices = []
+        while time.monotonic() < deadline:
+            notices = mailbox.messages(self.base, "survivor")
+            if notices:
+                break
+            time.sleep(0.1)
+        self.assertEqual(len(notices), 1)
+        self.assertIn("its recorded process exited", notices[0]["text"])
+        self.assertIn("Next: Review PR #8", notices[0]["text"])
+        mailbox.mark_read(self.base, "survivor", [notices[0]["id"]])
+        daemon.stop_service(self.base)
+        self.start()
+        self.assertEqual(mailbox.messages(self.base, "survivor"), [])
+        self.assertEqual(len(mailbox.messages(self.base, "survivor", unread_only=False)), 1)
+
     def peer(self, session, harness="codex", cwd=None, **kwargs):
         return mailbox.register(
             self.base, session=session, harness=harness, cwd=str(cwd or self.project), pid=os.getpid(), **kwargs

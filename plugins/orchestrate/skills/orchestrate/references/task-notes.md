@@ -40,3 +40,26 @@ ownership. Use the existing team handover rules when the task is managed by a co
 
 Older clients should save their note before a likely interruption; new work uses board checkpoints. A sudden timeout can leave the
 last checkpoint stale; no system can reconstruct work that was never saved.
+
+## When an agent disappears
+
+The HTTP mailbox daemon checks presence every 15 seconds. A confirmed process exit or reused process ID
+produces a different notice from expired presence, which does not prove the agent stopped. Shared-host
+conversations still use the existing presence timeouts; a running host cannot prove an individual
+conversation is alive or dead.
+
+For an unfinished task, one compact notice goes to live peers in the same project and task channels.
+Without channels, it goes to other channel-less peers in the same checkout. Live senders of unread
+direct requests or requests read within the last 24 hours but never answered also receive a notice.
+Cross-project requesters receive only the delivery status, never the saved task context. Completed
+tasks do not trigger team notices.
+
+Notices wait for the recipient's next turn or inbox read. They do not wake agents, extend a turn,
+change task status or transfer ownership. They point to the saved task card, whose checkout and
+progress must be checked before resuming work. Delivery survives daemon restarts and does not repeat
+an acknowledged notice. Local delivery receipts expire after seven days.
+
+Ordinary peer discovery also detects disappearance, so it cannot silently remove the evidence before
+the daemon sees it. In stdio-only mode, discovery or pruning supplies that check; there is no background
+timer. A normal `SessionEnd` keeps its existing unread-message notice; `/clear` keeps its successor
+handoff instead of announcing a crash.

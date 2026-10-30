@@ -1356,12 +1356,17 @@ def wake_route_hint(base: Path, me: dict[str, Any]) -> str:
 
 def drop_if_dead(path: Path, moment: dt.datetime) -> bool:
     """Remove a stale interactive peer, re-checked under the lock register takes."""
+    import mailbox_presence
+
     with locked(path):
         peer = load(path)
         if is_run_record(peer) or (valid_peer(peer) and is_live(peer, moment)):
             return False
+        if valid_peer(peer):
+            mailbox_presence.record(path.parent.parent, peer)
         path.unlink(missing_ok=True)
-        return True
+    mailbox_presence.deliver(path.parent.parent)
+    return True
 
 
 def unregister(base: Path, session: str) -> None:
@@ -2432,6 +2437,16 @@ def notify_senders(base: Path, found: list[dict[str, Any]], text: Any) -> None:
 
 
 def end_session(base: Path, session: str, *, reason: str, pid: int | None) -> None:
+    # Serialize a normal exit with background disappearance detection. /clear registers its successor
+    # and takes other peer locks, so keep its existing pairing path outside this lock.
+    if reason == "clear":
+        _end_session(base, session, reason=reason, pid=pid)
+    else:
+        with locked(peer_path(base, session)):
+            _end_session(base, session, reason=reason, pid=pid)
+
+
+def _end_session(base: Path, session: str, *, reason: str, pid: int | None) -> None:
     """A session is going away. A /clear keeps it for its successor; any other end tells its waiting senders."""
     peer = load(peer_path(base, session))
     if valid_peer(peer) and not is_run_peer(peer):
