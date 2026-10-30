@@ -136,8 +136,89 @@ RESUMABLE_STATUSES = {
 }
 
 
+SELECTOR_TIERS: dict[str, int] = {
+    "claude:fast": 1,
+    "claude:balanced": 2,
+    "claude:best": 3,
+    "claude:frontier": 4,
+    "gpt:luna": 1,
+    "gpt:terra": 2,
+    "gpt:sol": 3,
+    "gpt:astra": 4,
+    "gemini:flash-low": 1,
+    "gemini:fast": 1,
+    "gemini:flash-high": 2,
+    "gemini:argon-low": 2,
+    "gemini:argon": 2,
+    "gemini:pro": 3,
+    "gemini:argon-high": 3,
+    "deepseek:flash": 1,
+    "deepseek:pro": 2,
+    "deepseek": 1,
+    "glm:flash": 1,
+    "glm:full": 2,
+    "glm": 1,
+    "kimi": 2,
+    "kimi:default": 2,
+}
+
+
+def model_capability_tier(model: str | None) -> int | None:
+    """Return a coarse capability tier (1=fast/lightweight .. 4=apex frontier), or None when unknown."""
+    if not isinstance(model, str) or not model.strip():
+        return None
+    normalized = model.strip().lower().removeprefix("latest:")
+    if normalized in SELECTOR_TIERS:
+        return SELECTOR_TIERS[normalized]
+    leaf = normalized.rsplit("/", 1)[-1].split("[", 1)[0]
+    words = {word for word in re.split(r"[^a-z0-9.]+", leaf) if word}
+    if "astra" in words or "fable" in words:
+        return 4
+    if (
+        "opus" in words
+        or "sol" in words
+        or "argon-high" in leaf
+        or "pro-high" in leaf
+        or ("gemini" in leaf and "pro" in words)
+        or (leaf.startswith("gpt-") and not words.intersection({"luna", "terra", "astra", "oss"}))
+    ):
+        return 3
+    if (
+        "haiku" in words
+        or "luna" in words
+        or "flash-low" in leaf
+        or "flash-medium" in leaf
+        or ("flash" in words and "high" not in words)
+    ):
+        return 1
+    if (
+        "sonnet" in words
+        or "terra" in words
+        or "flash-high" in leaf
+        or "argon-low" in leaf
+        or "argon-medium" in leaf
+        or "argon" in words
+        or "kimi" in words
+        or ("deepseek" in leaf and "pro" in words)
+        or ("glm" in leaf and "flash" not in words)
+    ):
+        return 2
+    return None
+
+
+def is_upward_delegation(conductor_model: str | None, worker_model: str | None) -> bool:
+    """True when a lower-tier conductor dispatches to a higher-tier worker."""
+    conductor_tier = model_capability_tier(conductor_model)
+    worker_tier = model_capability_tier(worker_model)
+    if conductor_tier is None or worker_tier is None:
+        return False
+    return conductor_tier < worker_tier
+
+
 def _path_covered(path: str, prefixes: list[str]) -> bool:
-    return any(path == prefix or path.startswith(f"{prefix}/") for prefix in prefixes)
+    if path == ".git" or path.startswith(".git/"):
+        return False
+    return any(prefix == "." or path == prefix or path.startswith(f"{prefix}/") for prefix in prefixes)
 
 
 def validate_resume(previous: dict[str, Any], expected: dict[str, Any]) -> None:

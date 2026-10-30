@@ -590,6 +590,28 @@ def dispatch(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
         raise CoordinationError("native transport requires the current host's native model family")
     if previous_result and previous_result.get("transport") == "native" and args.transport != "native":
         raise CoordinationError("native correction must use the recorded native host session")
+    conductor_model = (
+        getattr(args, "conductor_model", None)
+        or spec.get("conductor_model")
+        or RUNNER.detect_conductor_model(Path(state["repository"]))
+    )
+    if (
+        kind in {"implementation", "correction"}
+        and (bool(spec.get("allow_paths")) or spec.get("scope_owner") == "worker")
+        and (
+            SUPPORT.is_upward_delegation(conductor_model, model_id)
+            or spec.get("scope_owner") == "worker"
+            or "." in spec.get("allow_paths", [])
+        )
+    ):
+        spec = RUNNER.brief_renderer_module().validate_spec(
+            {
+                **spec,
+                "scope_owner": "worker",
+                "conductor_model": conductor_model or spec.get("conductor_model"),
+                "worker_model": model_id,
+            }
+        )
     run_id = uuid.uuid4().hex
     run_dir = directory / "runs" / run_id
     run_dir.mkdir(parents=True, mode=0o700)
@@ -630,6 +652,8 @@ def dispatch(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
         "--mailbox-run-id",
         mailbox_run_id,
     ]
+    if conductor_model:
+        command += ["--conductor-model", conductor_model]
     if effort:
         command += ["--effort", effort]
     if variant:
@@ -650,6 +674,8 @@ def dispatch(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
         "status": "dispatching",
         "engine": engine,
         "model": model_id,
+        "scope_owner": spec.get("scope_owner", "conductor"),
+        "conductor_model": conductor_model,
         "result_path": str(result_path),
         "command": command,
         "mailbox": mailbox_info,
@@ -995,6 +1021,10 @@ def main(argv: list[str] | None = None) -> int:
             sub.add_argument("--model")
             sub.add_argument("--effort")
             sub.add_argument("--variant")
+            sub.add_argument(
+                "--conductor-model",
+                help="Calling conductor model ID or selector (auto-detected when omitted)",
+            )
             sub.add_argument("--billing-mode", choices=("unknown", "subscription", "api"), default="unknown")
             sub.add_argument(
                 "--allow-credits",

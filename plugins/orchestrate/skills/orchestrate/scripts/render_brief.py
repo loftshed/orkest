@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import functools
+import importlib.util
 import json
 import sys
 from pathlib import Path
@@ -84,13 +86,18 @@ def require_text_list(spec: dict[str, Any], field: str) -> list[str]:
     return rendered
 
 
-def normalize_repo_paths(values: list[str], field: str) -> list[str]:
+def normalize_repo_paths(values: list[str], field: str, *, allow_root: bool = False) -> list[str]:
     normalized: list[str] = []
     for value in values:
+        stripped = value.strip()
+        if allow_root and stripped == ".":
+            if "." not in normalized:
+                normalized.append(".")
+            continue
         candidate = Path(value)
         if (
             candidate.is_absolute()
-            or value in {"", "."}
+            or stripped in {"", "."}
             or ".." in candidate.parts
             or (candidate.parts and candidate.parts[0] == ".git")
         ):
@@ -99,6 +106,18 @@ def normalize_repo_paths(values: list[str], field: str) -> list[str]:
         if clean not in normalized:
             normalized.append(clean)
     return normalized
+
+
+@functools.cache
+def _support_module() -> Any:
+    path = Path(__file__).with_name("execution_support.py")
+    spec = importlib.util.spec_from_file_location("agent_executor_brief_support", path)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def markdown_list(values: list[str], *, empty: str = "none") -> str:
@@ -112,23 +131,61 @@ def numbered_list(values: list[str]) -> str:
 
 
 def validate_spec(spec: dict[str, Any]) -> dict[str, Any]:
-    missing = [field for field in REQUIRED_FIELDS if field not in spec]
-    if missing:
-        raise BriefSpecError("missing required fields: " + ", ".join(missing))
+    base_missing = [field for field in REQUIRED_FIELDS if field != "plan" and field not in spec]
+    if base_missing:
+        if "plan" not in spec:
+            base_missing.insert(REQUIRED_FIELDS.index("plan"), "plan")
+        raise BriefSpecError("missing required fields: " + ", ".join(base_missing))
 
     repository_root = Path(require_text(spec, "repository_root")).expanduser()
     if not repository_root.is_absolute():
         raise BriefSpecError("repository_root must be an absolute path")
 
-    plan = require_text_list(spec, "plan")
+    scope_owner_raw = spec.get("scope_owner")
+    if scope_owner_raw is not None and scope_owner_raw not in {"conductor", "worker"}:
+        raise BriefSpecError("scope_owner must be 'conductor' or 'worker'")
+
+    conductor_model = require_text(spec, "conductor_model") if spec.get("conductor_model") is not None else None
+    worker_model = require_text(spec, "worker_model") if spec.get("worker_model") is not None else None
+    explicit_scope_hints = (
+        normalize_repo_paths(require_text_list(spec, "scope_hints"), "scope_hints", allow_root=False)
+        if "scope_hints" in spec and spec.get("scope_hints") is not None
+        else []
+    )
+
+    raw_allow_paths = normalize_repo_paths(require_text_list(spec, "allow_paths"), "allow_paths", allow_root=True)
+    track_paths = normalize_repo_paths(require_text_list(spec, "track_paths"), "track_paths", allow_root=False)
+    support = _support_module()
+    upward = bool(support and support.is_upward_delegation(conductor_model, worker_model))
+    has_root_allow = "." in raw_allow_paths
+    is_mutating = bool(raw_allow_paths or track_paths or scope_owner_raw == "worker")
+    worker_owned = scope_owner_raw == "worker" or (
+        scope_owner_raw is None and (has_root_allow or (upward and is_mutating))
+    )
+
+    if worker_owned:
+        scope_owner = "worker"
+        narrow_paths = [path for path in raw_allow_paths if path != "."]
+        scope_hints = list(dict.fromkeys([*explicit_scope_hints, *narrow_paths]))
+        allow_paths = ["."]
+    else:
+        scope_owner = "conductor"
+        scope_hints = explicit_scope_hints
+        allow_paths = ["."] if has_root_allow else raw_allow_paths
+
+    if "plan" not in spec or spec.get("plan") is None:
+        if scope_owner != "worker":
+            raise BriefSpecError("missing required fields: plan")
+        plan: list[str] = []
+    else:
+        plan = require_text_list(spec, "plan")
+        if not plan and scope_owner != "worker":
+            raise BriefSpecError("plan must contain at least one step")
+
     criteria = require_text_list(spec, "acceptance_criteria")
-    if not plan:
-        raise BriefSpecError("plan must contain at least one step")
     if not criteria:
         raise BriefSpecError("acceptance_criteria must contain at least one item")
 
-    allow_paths = normalize_repo_paths(require_text_list(spec, "allow_paths"), "allow_paths")
-    track_paths = normalize_repo_paths(require_text_list(spec, "track_paths"), "track_paths")
     effective_scope = list(dict.fromkeys([*allow_paths, *track_paths]))
     packet = spec.get("context_packet", {})
     if not isinstance(packet, dict):
@@ -137,7 +194,7 @@ def validate_spec(spec: dict[str, Any]) -> dict[str, Any]:
     if set(packet) - set(packet_fields):
         raise BriefSpecError("unknown context_packet fields")
     packet = {field: require_text_list(packet, field) for field in packet_fields if field in packet}
-    return {
+    result: dict[str, Any] = {
         "objective": require_text(spec, "objective"),
         "repository_root": str(repository_root),
         "current_state": require_text(spec, "current_state"),
@@ -146,10 +203,17 @@ def validate_spec(spec: dict[str, Any]) -> dict[str, Any]:
         "allow_paths": allow_paths,
         "track_paths": track_paths,
         "effective_scope": effective_scope,
+        "scope_owner": scope_owner,
+        "scope_hints": scope_hints,
         "development_checks": require_text_list(spec, "development_checks"),
         "acceptance_criteria": criteria,
         "context_packet": packet,
     }
+    if conductor_model:
+        result["conductor_model"] = conductor_model
+    if worker_model:
+        result["worker_model"] = worker_model
+    return result
 
 
 def render_brief(spec: dict[str, Any]) -> str:
@@ -165,6 +229,31 @@ def render_brief(spec: dict[str, Any]) -> str:
             )
             + "\n"
         )
+    if values.get("scope_owner") == "worker":
+        if values["plan"]:
+            plan_block = (
+                "You own the implementation approach, architectural decisions, and file scope needed to achieve the "
+                "objective and acceptance criteria. Treat the steps below from the dispatching conductor as starting "
+                "guidance and context rather than rigid restrictions—adapt the plan or modify additional repository "
+                "files as the codebase requires:\n\n" + numbered_list(values["plan"])
+            )
+        else:
+            plan_block = (
+                "1. You own the implementation plan, architectural decisions, and file scope. Inspect the repository, "
+                "choose the cleanest design and files to create or modify, and verify against the acceptance criteria."
+            )
+        hints_block = (
+            f"\n- Conductor starting-path hints (non-binding):\n{markdown_list(values['scope_hints'])}"
+            if values.get("scope_hints")
+            else ""
+        )
+        scope_intro = (
+            "- Scope owner: worker (full repository write scope `.`; choose the files to create or modify to achieve "
+            f"the objective while preserving unrelated pre-existing changes).{hints_block}\n"
+        )
+    else:
+        plan_block = numbered_list(values["plan"])
+        scope_intro = ""
     return (
         f"""# Objective
 
@@ -180,11 +269,11 @@ def render_brief(spec: dict[str, Any]) -> str:
 
 # Approved plan
 
-{numbered_list(values["plan"])}
+{plan_block}
 
 # Allowed scope
 
-- May modify or create only these effective paths (tracked deliverables included):
+{scope_intro}- May modify or create only these effective paths (tracked deliverables included):
 {markdown_list(values["effective_scope"], empty="none; this is a read-only brief")}
 - Runner `--allow-path` prefixes:
 {markdown_list(values["allow_paths"])}

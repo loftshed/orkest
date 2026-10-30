@@ -91,6 +91,45 @@ class BriefRendererTests(unittest.TestCase):
         with self.assertRaisesRegex(RENDERER.BriefSpecError, "repository-relative"):
             RENDERER.render_brief(spec)
 
+    def test_worker_owned_scope_allows_repo_root_and_optional_plan(self) -> None:
+        spec = brief_spec()
+        spec["allow_paths"] = ["."]
+        del spec["plan"]
+        spec["scope_hints"] = ["src/jobs", "tests/jobs"]
+        validated = RENDERER.validate_spec(spec)
+        self.assertEqual(validated["scope_owner"], "worker")
+        self.assertEqual(validated["allow_paths"], ["."])
+        self.assertEqual(validated["plan"], [])
+        self.assertEqual(validated["scope_hints"], ["src/jobs", "tests/jobs"])
+        rendered = RENDERER.render_brief(spec)
+        self.assertIn("You own the implementation plan, architectural decisions, and file scope", rendered)
+        self.assertIn("Scope owner: worker (full repository write scope `.`", rendered)
+        self.assertIn("Conductor starting-path hints (non-binding):\n- src/jobs\n- tests/jobs", rendered)
+        self.assertEqual(RUNNER.brief_report_contract_violations(rendered), [])
+
+    def test_upward_delegation_automatically_widens_narrow_scope_and_preserves_hints(self) -> None:
+        spec = brief_spec()
+        spec["conductor_model"] = "claude-sonnet-4-6"
+        spec["worker_model"] = "gpt-6-astra"
+        validated = RENDERER.validate_spec(spec)
+        self.assertEqual(validated["scope_owner"], "worker")
+        self.assertEqual(validated["allow_paths"], ["."])
+        self.assertEqual(validated["scope_hints"], ["src/jobs", "tests/jobs"])
+        rendered = RENDERER.render_brief(spec)
+        self.assertIn("Treat the steps below from the dispatching conductor as starting guidance", rendered)
+        self.assertIn("Conductor starting-path hints (non-binding):\n- src/jobs\n- tests/jobs", rendered)
+        self.assertEqual(RUNNER.brief_report_contract_violations(rendered), [])
+
+        # Read-only specs stay read-only even when conductor_model < worker_model:
+        read_only = brief_spec()
+        read_only["allow_paths"] = []
+        read_only["track_paths"] = []
+        read_only["conductor_model"] = "haiku"
+        read_only["worker_model"] = "gpt-6-astra"
+        validated_ro = RENDERER.validate_spec(read_only)
+        self.assertEqual(validated_ro["scope_owner"], "conductor")
+        self.assertEqual(validated_ro["allow_paths"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

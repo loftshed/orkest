@@ -40,8 +40,14 @@ Claude `--permission-mode bypassPermissions`, Antigravity `--dangerously-skip-pe
 Headless defaults can deny MCP calls; never change global permissions to fix a worker.
 Inspect the returned `wake` status; unavailable hosts retain the message for normal delivery.
 Use `wake: false` (CLI `--no-wake`) for FYI and progress updates. Do not send acknowledgement-only
-replies. Keep waking requests and completions that unblock work. Busy agents keep working and can
-defer requests to their next checkpoint. Never interrupt their turn or launch a second copy to force delivery.
+replies. Keep waking requests and completions that unblock work on a shared task. Check peer `focus`,
+`board` scope, and `git status` silently first—do not message or wake a peer working on an unrelated
+task just to check in or claim files; reach out only when you actually need to edit the same files or
+branch in the same checkout. Direct messages to a peer on an unrelated task (no shared task channel,
+no shared active workboard item, and no prior conversation or `replyTo` thread) are automatically
+queued quietly (`unrelatedTask: true`, `wake: false`) so they neither trigger idle wake activation nor
+extend the recipient's turn at `Stop`. Busy agents keep working and can defer requests to their next
+checkpoint. Never interrupt their turn or launch a second copy to force delivery.
 
 ## Native first; OpenRouter only for open-weight models
 
@@ -107,10 +113,22 @@ a task's invocation allowance, and for a blocked worker asking its conductor.
 
 Start shared work from the [workboard](references/workboard.md) at task entry and handoff boundaries.
 It shows interactive items, coordinator tasks and legacy notes together. Claim a ready interactive
-item within the user's scope, checkpoint it, then submit evidence for acceptance. Coordinator entries
+item within the user's scope, checkpoint it, then submit evidence for acceptance. When you want to
+offer open help work without interrupting peers on unrelated tasks, post a ready item with
+`mailbox work create` (or launch a fresh worker with `run_agent.py`) rather than cold-waking another
+interactive session. Interactive sessions never auto-wake for unrelated board items; turn hooks surface
+a ready help-board hint only when a session's own task is marked `--stage complete`, it holds no active
+workboard claims, and it has been idle for at least 15 minutes. Coordinator entries
 give the backend route and read its existing state; never copy that status into an interactive item.
 Plain `focus` sets a caption, not another ledger. Do not poll for work. Claims do not lock files or
 grant user authorization.
+
+Keep the terminal footer current during substantive work. Run `ork progress --session SESSION_ID
+--goal 'overall goal' --task 'current task' --stage working`, then update the phase at meaningful
+changes and before the final response. Valid stages are `planning`, `working`, `testing`, `review`,
+`blocked` and `complete`; later calls may omit unchanged fields. This is display context, not a
+second ownership or acceptance ledger. Workboard state remains authoritative. Do not invent a task
+for an acknowledgment or mark work complete merely because the harness went idle.
 
 When the user asks what agents are doing or wants updates on a selected team, use the board's
 [read-only status view](references/dot-status.md). Dot's local executor can read it without joining
@@ -239,6 +257,16 @@ never blocks OpenCode.
 
 1. Scope: a JSON `--task-spec` carries authoritative `allow_paths`/`track_paths`; a handwritten brief
    uses repeatable `--allow-path` and `--track-path`. Mutating runs add `--expect-changes`.
+   When a lower-tier conductor (for example Haiku or Sonnet) delegates a mutating task to a
+   higher-tier worker (for example Astra, Sol, Opus, Fable, or Gemini Pro / Argon High), grant
+   worker-owned repository scope (`"allow_paths": ["."]` or `"scope_owner": "worker"`, with optional
+   `scope_hints` and an optional or empty `plan`) so the stronger worker owns file selection and
+   implementation design; `run_agent.py` and `coordinator.py` also widen mutating scope to `["."]`
+   automatically when upward delegation is detected (`--conductor-model`, `AGENT_EXECUTOR_CONDUCTOR_MODEL`,
+   or the active session's peer mailbox record) and frame any narrow conductor paths or plan steps as
+   non-binding hints. You can also widen a running detached job's scope mid-run via
+   `run_agent.py steer <JOB_OR_EVENT> --allow-path <PATH>` (in-place without interrupting when
+   `--message` is omitted or `--no-interrupt` is passed).
    Read-only runs (empty scope) allocate a private per-run scratch directory outside the checkout;
    artifacts written there are retained and reported without failing the source-scope audit, while
    symlinks escaping the scratch boundary fail as scope violations.

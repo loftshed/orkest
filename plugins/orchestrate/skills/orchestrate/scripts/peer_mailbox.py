@@ -1083,10 +1083,11 @@ def describe_colleagues(rows: list[dict[str, Any]], me: dict[str, Any], elsewher
     if not rows:
         return teams
     lines = [
-        "Other agent sessions are working in this project right now. Before you edit, make sure you are not "
-        "about to change the same files or branch as one of them; if your work overlaps, reach out in a friendly, "
-        f"relaxed way to agree on a split first ({RULE}). Say what you are working on with the peer mailbox "
-        f"`focus` tool so they can see it too. {NAME_RULE} (for example `{rows[0]['name']}`)."
+        "Other agent sessions are working in this project right now. Check their `focus`, `board` scope, and "
+        "`git status` silently first—do not message or wake a peer working on an unrelated task just to check in "
+        "or claim files; only if you actually need to edit the same files or branch in the same checkout, reach out "
+        f"in a friendly, relaxed way to agree on a split first ({RULE}). Say what you are working on with the peer "
+        f"mailbox `focus` tool so they can see it too. {NAME_RULE} (for example `{rows[0]['name']}`)."
     ]
     for peer in rows:
         checkout = peer.get("checkout") or peer["cwd"]
@@ -1718,6 +1719,7 @@ def send(
             base, sender, code="native_unreachable_override", category="routing", operation="send", scope=scope
         )
 
+    quiet_unrelated = not channel and unrelated_task(base, sender, target, reply_to=reply_to, scope=scope)
     message = {
         "schema": MAIL_SCHEMA,
         "id": message_id(),
@@ -1734,11 +1736,15 @@ def send(
     if channel:
         # `wake` records whether the post asked for activation: only such posts may extend a turn at Stop.
         message.update(channel=channel, postId=post_id, wake=bool(wake))
+    elif quiet_unrelated:
+        message.update(unrelatedTask=True, wake=False)
     if idempotency_key is None:
         write(inbox_dir(base, target["session"]) / f"{message['id']}.json", message)
         result = delivery_result(message, target)
         if wake:
-            result["wake"] = delivery_wake(base, target, message["id"], scope)
+            result["wake"] = (
+                unrelated_wake_result() if quiet_unrelated else delivery_wake(base, target, message["id"], scope)
+            )
         return result
     if not isinstance(idempotency_key, str) or not re.fullmatch(CLIENT_ID, idempotency_key):
         raise MailboxError("idempotencyKey must be 1-80 letters, digits, underscores or hyphens")
@@ -1796,7 +1802,9 @@ def send(
             write(path, message)
         result = delivery_result(message, target)
         if wake:
-            if entry.get("wakeAttempted"):
+            if message.get("unrelatedTask"):
+                result["wake"] = unrelated_wake_result()
+            elif entry.get("wakeAttempted"):
                 result["wake"] = {
                     "status": "uncertain",
                     "phase": "unknown",
@@ -1810,6 +1818,69 @@ def send(
         entry["response"] = result
         write(operation, entry)
         return result
+
+
+def unrelated_wake_result() -> dict[str, str]:
+    return {
+        "status": "queued",
+        "phase": "not-sent",
+        "reason": "recipient is working on an unrelated task; message queued quietly for its next turn boundary",
+    }
+
+
+def unrelated_task(
+    base: Path,
+    sender: dict[str, Any],
+    target: dict[str, Any],
+    *,
+    reply_to: str | None = None,
+    scope: str = "project",
+) -> bool:
+    """Whether `target` is working on a separate task with no shared channel, workboard item, or active thread."""
+    if scope == "cross-project" or is_run_peer(sender) or is_run_peer(target) or reply_to is not None:
+        return False
+    if any(
+        message.get("from", {}).get("session") == target.get("session")
+        for message in iter_messages(base, sender["session"], unread_only=False)
+    ):
+        return False
+    import mailbox_channels
+    import mailbox_work
+
+    sender_channels = set(mailbox_channels.memberships(sender))
+    target_channels = set(mailbox_channels.memberships(target))
+    if sender_channels & target_channels:
+        return False
+    if mailbox_work.shares_active_work(base, sender, target):
+        return False
+    if sender_channels or target_channels:
+        return True
+    sender_focus = str(sender.get("focus") or "").strip()
+    target_focus = str(target.get("focus") or "").strip()
+    if sender_focus and target_focus:
+        return sender_focus.lower() != target_focus.lower()
+    if mailbox_work.assigned(base, target):
+        return True
+    with contextlib.suppress(MailboxError, OSError, ValueError):
+        import agent_progress
+
+        target_progress = agent_progress.read(base, target)
+        if target_progress and target_progress.get("stage") in {"planning", "working", "testing", "review", "blocked"}:
+            sender_progress = agent_progress.read(base, sender)
+            if sender_progress and (
+                sender_progress.get("task", "").strip().lower() == target_progress.get("task", "").strip().lower()
+                or sender_progress.get("goal", "").strip().lower() == target_progress.get("goal", "").strip().lower()
+            ):
+                return False
+            return not (
+                sender_focus
+                and sender_focus.lower()
+                in {
+                    target_progress.get("task", "").strip().lower(),
+                    target_progress.get("goal", "").strip().lower(),
+                }
+            )
+    return bool(target_focus and not sender_focus)
 
 
 def delivery_result(message: dict[str, Any], target: dict[str, Any]) -> dict[str, Any]:
@@ -2865,6 +2936,16 @@ def hook(
     import mailbox_channels
 
     route_hint = wake_route_hint(base, me) if event == "SessionStart" else ""
+    progress_hint = ""
+    help_hint = ""
+    if event in {"SessionStart", "UserPromptSubmit"} or (gemini and event == "PreInvocation" and not mid_turn):
+        import agent_progress
+        import mailbox_work
+
+        with contextlib.suppress(MailboxError, OSError, ValueError):
+            progress_hint = agent_progress.reminder(base, me, starting=event == "SessionStart")
+        with contextlib.suppress(MailboxError, OSError, ValueError):
+            help_hint = mailbox_work.help_board_hint(base, me, previous=previous)
     # At Stop or between steps of a turn only mail worth interrupting it for is read; quiet channel posts wait for
     # the next turn.
     delivered = take(base, session, eligible=mailbox_channels.reads_at_stop if event == "Stop" or mid_turn else None)
@@ -2895,6 +2976,8 @@ def hook(
             identity_hint,
             availability_hint,
             route_hint,
+            progress_hint,
+            help_hint,
             stale_wake_notice,
         )
         if value

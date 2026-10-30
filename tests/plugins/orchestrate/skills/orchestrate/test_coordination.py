@@ -956,6 +956,60 @@ class CoordinatorTests(unittest.TestCase):
         )
         self.assertLessEqual(len(RUNNER.bound_final_message(raw)), 4000)
 
+    def test_model_capability_tier_and_upward_delegation(self):
+        self.assertEqual(SUPPORT.model_capability_tier("haiku"), 1)
+        self.assertEqual(SUPPORT.model_capability_tier("claude-haiku-4-5"), 1)
+        self.assertEqual(SUPPORT.model_capability_tier("gpt-6-luna"), 1)
+        self.assertEqual(SUPPORT.model_capability_tier("gemini-3.8-flash-medium"), 1)
+        self.assertEqual(SUPPORT.model_capability_tier("sonnet"), 2)
+        self.assertEqual(SUPPORT.model_capability_tier("claude-sonnet-4-6"), 2)
+        self.assertEqual(SUPPORT.model_capability_tier("gpt-5.6-terra"), 2)
+        self.assertEqual(SUPPORT.model_capability_tier("opus"), 3)
+        self.assertEqual(SUPPORT.model_capability_tier("gpt-6-sol"), 3)
+        self.assertEqual(SUPPORT.model_capability_tier("gemini-3.1-pro-high"), 3)
+        self.assertEqual(SUPPORT.model_capability_tier("gemini-4-argon-high"), 3)
+        self.assertEqual(SUPPORT.model_capability_tier("gpt-6-astra"), 4)
+        self.assertEqual(SUPPORT.model_capability_tier("fable"), 4)
+
+        self.assertTrue(SUPPORT.is_upward_delegation("haiku", "sonnet"))
+        self.assertTrue(SUPPORT.is_upward_delegation("sonnet", "gpt-6-astra"))
+        self.assertTrue(SUPPORT.is_upward_delegation("claude-sonnet-4-6", "opus"))
+        self.assertTrue(SUPPORT.is_upward_delegation("sonnet", "gemini-4-argon-high"))
+        self.assertFalse(SUPPORT.is_upward_delegation("gpt-6-astra", "sonnet"))
+        self.assertFalse(SUPPORT.is_upward_delegation("gpt-6-astra", "gpt-6-astra"))
+        self.assertFalse(SUPPORT.is_upward_delegation(None, "gpt-6-astra"))
+
+    def test_coordinator_dispatch_widens_scope_on_upward_delegation(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "FAKE_OUTPUT": "outside/unplanned.py",
+                "FAKE_AGY_MODELS": "gemini-4-argon-high\tGemini 4 Argon (High)",
+            },
+        ):
+            code, run = self.call(
+                "dispatch",
+                "--kind",
+                "implementation",
+                "--request-id",
+                "upward-impl",
+                "--engine",
+                "agy",
+                "--model",
+                "gemini-4-argon-high",
+                "--conductor-model",
+                "sonnet",
+            )
+        self.assertEqual(code, 0, run)
+        self.assertEqual(run["runner_status"], "completed")
+        self.assertEqual(run["scope_owner"], "worker")
+        self.assertEqual(run["conductor_model"], "sonnet")
+        result = json.loads(Path(run["result_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(result["allowed_paths"], ["."])
+        self.assertEqual(result["scope_owner"], "worker")
+        self.assertEqual(result["scope_hints"], ["allowed"])
+        self.assertEqual(result["scope_violations"], [])
+
 
 if __name__ == "__main__":
     unittest.main()
