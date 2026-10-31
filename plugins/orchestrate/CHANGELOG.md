@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.42.1
+
+- perf(orchestrate): reduce status and mailbox work
+
 ## 0.42.0
 
 - feat(orchestrate): add conversational swarms and shared terminal footers
