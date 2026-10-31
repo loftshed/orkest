@@ -8,6 +8,7 @@ import { parseArgs, promisify } from "node:util";
 
 import { jsonView, renderLine, renderReport, shouldUseColor } from "../../monitor/lib/render.mjs";
 import { getAccounts } from "../../monitor/lib/store.mjs";
+import { newRoom, observeRoom } from "../lib/rooms.mjs";
 import {
   addMembers,
   createRoom,
@@ -27,24 +28,31 @@ import {
   StoogesView,
   wrapText,
 } from "../lib/stooges-view.mjs";
+import { coordinatorBrief } from "../lib/swarm.mjs";
 import { roomsCommand } from "./rooms.mjs";
 import { cachedQuota, runTui } from "./stooges-tui.mjs";
 
-const HELP = `ork rooms --help
+const COORDINATORS = new Set(["codex", "claude", "agy", "opencode"]);
+
+const HELP = `ork agy|codex|claude|opencode   (open a coordinator; enter your goal in the conversation)
+ork rooms --help
 ork gate [--heavy] [--label <text>] -- <command>   (also: ork gate status|install|uninstall)
-ork label -- codex [arguments]                     (private tmux session with an agent label)
+ork label -- codex|claude|agy|opencode [arguments]   (one outer tmux footer for every harness)
 ork progress --session ID --goal TEXT --task TEXT --stage working
 ork name [--model <model>] [--effort <level>] [--harness <harness>]
 ork routes [--archetype <name>] [--json] [--width 120]
 ork quota [--line|--json] [--refresh]
 ork telemetry [--runs-dir <directory>] [--json] [--width 120]
+ork stooges ["objective"] [--engine codex|claude|agy|opencode] [--max-agents 12] [--max-depth 3]
 ork stooges [--team "claude:haiku*2,agy:flash*2,codex:luna:max"]
 ork stooges --preset scout-swarm|bug-court|patch-race|heavy-trifecta
 ork stooges spawn --attach-room <id> --team <team>
-ork stooges --attach-room <id> [--print|--json]
+ork stooges --attach-room <id> [--view|--print|--json]
 ork stooges --fixture <room.json> [--print|--json] [--width 120]
 
-New members are queued for the conductor to orchestrate.
+Interactive Stooges opens a coordinator conversation alongside its swarm tree (default: Codex).
+--attach-room reconnects; --view only observes. Subswarm leads use native subagents.
+New members are queued for the coordinator to assign; --print and --json never launch models.
 Use --cwd to choose the room's repository. Closing the view leaves workers running.
 1–9 focus an agent; p pins its detail; n advances the page; q exits the display.
 ? opens key help; g opens the coalesced room log. Set ORK_GLYPHS=ascii|unicode|nerd to choose a glyph tier.
@@ -298,6 +306,8 @@ function terminalCommand(script, argv) {
 }
 
 export async function main(argv = process.argv.slice(2), { stdout = process.stdout } = {}) {
+  const engineShortcut = COORDINATORS.has(argv[0]) ? argv[0] : undefined;
+  if (engineShortcut) argv = ["stooges", ...argv.slice(1)];
   if (argv[0] === "progress") {
     process.exitCode = await terminalCommand("agent_progress.py", argv.slice(1));
     return;
@@ -336,17 +346,17 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
       json: { type: "boolean" },
       width: { type: "string" },
       cwd: { type: "string" },
+      engine: { type: "string" },
+      view: { type: "boolean" },
+      "max-agents": { type: "string" },
+      "max-depth": { type: "string" },
     },
   });
   if (values.help || positionals.length === 0) {
     stdout.write(HELP);
     return;
   }
-  if (
-    positionals[0] !== "stooges" ||
-    positionals.length > 2 ||
-    (positionals[1] && positionals[1] !== "spawn")
-  )
+  if (positionals[0] !== "stooges")
     throw new Error("Expected ork stooges or ork stooges spawn; use --help");
   if (values.team && values.preset) throw new Error("Choose --team or --preset");
   if (values.json && values.print) throw new Error("Choose --json or --print");
@@ -354,10 +364,44 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
   if (!Number.isSafeInteger(width) || width < 1 || width > 1000)
     throw new Error("Width must be 1–1000");
   const isSpawning = positionals[1] === "spawn";
+  const objective = isSpawning ? "" : positionals.slice(1).join(" ").trim();
+  if (objective.length > 12_000) throw new Error("Objective must be at most 12000 characters");
+  if (isSpawning && positionals.length > 2) throw new Error("spawn does not take an objective");
+  if (engineShortcut && values.engine && values.engine !== engineShortcut)
+    throw new Error(`ork ${engineShortcut} selects ${engineShortcut}; omit --engine`);
+  const engine = engineShortcut || values.engine || "codex";
+  if (!COORDINATORS.has(engine)) throw new Error("Unsupported coordinator engine");
+  const maxAgents = Number(values["max-agents"] || 12);
+  const maxDepth = Number(values["max-depth"] || 3);
+  const isInteractive = Boolean(
+    stdout.isTTY && !values.print && !values.json && !values.view && !values.fixture && !isSpawning,
+  );
+  const isNewSwarm = Boolean(
+    isInteractive ||
+    objective ||
+    engineShortcut ||
+    values.engine ||
+    values["max-agents"] ||
+    values["max-depth"],
+  );
+  if (
+    values["attach-room"] &&
+    (objective || engineShortcut || values.engine || values["max-agents"] || values["max-depth"])
+  )
+    throw new Error(
+      "An attached room keeps its coordinator and limits; steer it through its conversation",
+    );
+  if (values.view && !values["attach-room"] && !values.fixture)
+    throw new Error("--view requires --attach-room or --fixture");
   if (isSpawning && !values["attach-room"]) throw new Error("spawn requires --attach-room");
   if (
     values.fixture &&
-    (isSpawning || values["attach-room"] || values.team || values.preset || values.cwd)
+    (isSpawning ||
+      values["attach-room"] ||
+      values.team ||
+      values.preset ||
+      values.cwd ||
+      isNewSwarm)
   )
     throw new Error("--fixture is an offline view and cannot change or launch a room");
   const root = mailboxRoot();
@@ -371,7 +415,11 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
       const preset = (await loadPresets())[values.preset];
       if (!preset) throw new Error(`Unknown preset: ${values.preset}`);
       members = parseTeam(preset.team);
-    } else members = parseTeam(values.team || "claude:haiku,agy:flash,codex:luna:max");
+    } else
+      members =
+        values.team || !isNewSwarm
+          ? parseTeam(values.team || "claude:haiku,agy:flash,codex:luna:max")
+          : [];
     if (values["attach-room"]) {
       room = await readRoom(values["attach-room"], root);
       if (!isSpawning && (values.team || values.preset || values.cwd))
@@ -390,10 +438,34 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
         );
       }
     } else {
-      room = createRoom(members, { cwd: values.cwd });
-      await updateRoom(room.id, () => room, { root, create: true });
+      if (isNewSwarm) {
+        room = await newRoom(members, {
+          cwd: values.cwd,
+          root,
+          engine,
+          objective,
+          title: objective ? objective.replaceAll(/\s+/gu, " ").slice(0, 160) : "New swarm",
+          swarm: { maxAgents, maxDepth },
+        });
+      } else {
+        room = createRoom(members, { cwd: values.cwd });
+        await updateRoom(room.id, () => room, { root, create: true });
+      }
     }
-    load = () => readRoom(room.id, root);
+    if (isInteractive && room.swarm) {
+      const command = room.conductor.engine;
+      const prompt = coordinatorBrief(room);
+      const promptFlag = { agy: "--prompt-interactive", opencode: "--prompt" }[command];
+      const initial = promptFlag ? [promptFlag, prompt] : [prompt];
+      process.exitCode = await terminalCommand(
+        "agent_statusline_tmux.py",
+        values["attach-room"]
+          ? ["--attach-room", room.id]
+          : ["--room", room.id, "--cwd", room.cwd, "--", command, ...initial],
+      );
+      return room;
+    }
+    load = () => observeRoom(room.id, { root });
   }
   room = await load();
   if (!values.fixture) {

@@ -53,22 +53,25 @@ const defaultScript = path.join(
 function Label(props: { sessionID?: string; plainColor: string; script: string }) {
   const [item, setItem] = createSignal<Identity | null>(null);
   const [columns, setColumns] = createSignal(0);
+  const terminal = Boolean(process.env.ORKEST_TERMINAL_SERVER);
 
   createEffect(() => {
     const session = props.sessionID;
     // Measure the actual composer slot so the band ends before any visible sidebar.
     const width = columns() - 6;
     setItem(null);
-    if (!session || width < 32) return;
+    if (!session || (!terminal && width < 32)) return;
     let active = true;
     let running = false;
+    let child: ReturnType<typeof execFile> | undefined;
     const refresh = () => {
       if (running) return;
       running = true;
-      execFile(
+      child = execFile(
         "python3",
         [
           props.script,
+          "--native-status",
           "--session",
           session,
           "--harness",
@@ -80,6 +83,7 @@ function Label(props: { sessionID?: string; plainColor: string; script: string }
         { timeout: 2000 },
         (error, output) => {
           running = false;
+          child = undefined;
           if (active) setItem(error ? null : parseIdentity(output));
         },
       );
@@ -90,6 +94,15 @@ function Label(props: { sessionID?: string; plainColor: string; script: string }
     onCleanup(() => {
       active = false;
       clearInterval(timer);
+      child?.kill();
+      if (terminal) {
+        execFile(
+          "python3",
+          [props.script, "--harness", "opencode", "--clear-terminal", session],
+          { timeout: 2000 },
+          () => {},
+        );
+      }
     });
   });
 

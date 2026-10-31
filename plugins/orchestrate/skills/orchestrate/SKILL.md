@@ -330,30 +330,35 @@ identify the conductor's edits, and run checks affected by those edits. "Almost 
 the acceptance criteria. Scope or history violations require rejection and do not permit resuming
 that run; inspect any proposed changes independently before deciding what can be retained.
 
-## View a stooges team
+## Command a Stooges swarm
 
-Use `run_agent.py stooges` or `node <plugin-root>/bin/ork.mjs stooges` to open the Orchestrate team view.
-It launches, observes, or formats multi-agent swarm rooms under `<agent-executor cache>/rooms-v1/<room-id>.json`.
-Node.js must be available as `node` on `PATH`.
+Use `run_agent.py stooges "objective"` or `node <plugin-root>/bin/ork.mjs stooges "objective"`
+to open a coordinator conversation beside its live swarm tree. The default coordinator is Codex;
+`--engine claude|agy|opencode` selects another installed harness with its configured account and
+permissions. Interactive launch requires Node.js and tmux on `PATH`.
+
+Read [references/swarm.md](references/swarm.md) when coordinating one. Native leads can organize
+subswarms within one room's shared agent and depth limits. Leaf work retains the coordinator's
+existing dispatch, scope, evidence and review contract. Do not nest coordinator CLIs inside audited
+worker jobs. Native leads stay in their parent's harness; workers can use other harnesses.
 
 ```bash
-# Launch a custom team or built-in preset (scout-swarm, bug-court, patch-race, heavy-trifecta)
+# Start a coordinator with a queued custom team or preset.
 python3 <skill-directory>/scripts/run_agent.py stooges --team 'claude:haiku*2,agy:flash*2,codex:luna:max'
 node plugins/orchestrate/bin/ork.mjs stooges --preset scout-swarm
 
-# Observe an existing live room or queue new members for the conductor
-node plugins/orchestrate/bin/ork.mjs stooges --attach-room ROOM_ID
+# Observe an existing room without starting or rejoining a conversation.
+node plugins/orchestrate/bin/ork.mjs stooges --attach-room ROOM_ID --view
 python3 <skill-directory>/scripts/run_agent.py stooges spawn --attach-room ROOM_ID --team 'codex:luna:max'
 
 # Offline fixture inspection and formatting
 node plugins/orchestrate/bin/ork.mjs stooges --fixture /path/to/room.json --print --width 120
 ```
 
-`--json` outputs the room JSON (`agent-executor.room.v1` schema), `--print` renders a single terminal frame
-and exits, and `--fixture` opens saved room state offline without live mutations. The room schema tracks conductor
-status, agent entries (`output`, `question`), and the message stream, while the header card displays quota
-snapshots fetched by `monitor`. Use `spawn --attach-room` to enqueue additional members for the conductor
-to orchestrate into the active room.
+`--json` outputs room JSON, `--print` renders one frame, and `--fixture` reads saved state offline.
+None starts models. Rooms use `agent-executor.room.v1` under `<agent-executor cache>/mailbox-v1/rooms/`.
+`--attach-room ID` reconnects to a live coordinator; add `--view` to observe only. Closing a view
+does not cancel workers. Use `ork rooms add --parent MEMBER` to place workers beneath a native lead.
 
 ## Probe a candidate patch
 
