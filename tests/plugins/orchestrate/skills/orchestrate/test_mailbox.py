@@ -1235,6 +1235,33 @@ class MailboxTests(unittest.TestCase):
         self.assertEqual(result["status"], "timed_out")
         self.assertGreaterEqual(time.monotonic() - started, 0.3)
 
+    def test_wait_observes_late_and_replaced_messages_without_consuming_them(self):
+        old = MAILBOX.send(self.base, sender=self.codex, to=self.claude["name"], text="already read")
+        MAILBOX.mark_read(self.base, self.claude["session"], [old["id"]])
+        inbox = MAILBOX.inbox_dir(self.base, self.claude["session"])
+        old_path = inbox / f"{old['id']}.json"
+        saved = MAILBOX.load(old_path)
+
+        class DeliverAfterScan:
+            delivered = False
+
+            def wait(inner, _timeout):
+                if inner.delivered:
+                    return True
+                inner.delivered = True
+                MAILBOX.write(old_path, {**saved, "text": "replacement", "readAt": None})
+                MAILBOX.write(inbox / "1-000001.json", {**saved, "id": "1-000001", "text": "late", "readAt": None})
+                return False
+
+        result = MAILBOX.wait(
+            self.base, self.claude["session"], timeout=1, poll=0.01, mark=False, cancelled=DeliverAfterScan()
+        )
+        self.assertEqual([message["text"] for message in result["messages"]], ["late", "replacement"])
+        self.assertEqual(
+            [message["text"] for message in MAILBOX.messages(self.base, self.claude["session"])],
+            ["late", "replacement"],
+        )
+
     def test_wait_reply_timeout_reports_recipient_state_and_interactive_history_works(self):
         MAILBOX.annotate(self.base, self.codex["session"], state="busy")
         question = MAILBOX.send(self.base, sender=self.claude, to=self.codex["name"], text="Still working?")

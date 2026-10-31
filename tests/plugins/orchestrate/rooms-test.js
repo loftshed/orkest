@@ -12,7 +12,7 @@ import {
   observeRoom,
   recoverRoom,
 } from "../../../plugins/orchestrate/lib/rooms.mjs";
-import { parseTeam, readRoom } from "../../../plugins/orchestrate/lib/stooges-room.mjs";
+import { parseTeam, readRoom, updateRoom } from "../../../plugins/orchestrate/lib/stooges-room.mjs";
 
 const directories = [];
 async function directory() {
@@ -110,6 +110,13 @@ describe("room execution", () => {
     expect((await observeRoom(room.id, { root, run })).agents[0].status).toBe("review");
     task.decisions.push({ run_id: "run-1", decision: "supported" });
     expect((await observeRoom(room.id, { root, run })).agents[0].status).toBe("completed");
+    task.decisions.length = 0;
+    task.runs[0].runner_status = "failed";
+    expect((await observeRoom(room.id, { root, run })).agents[0].status).toBe("failed");
+    task.decisions.push({ run_id: "run-1", decision: "reject" });
+    expect((await observeRoom(room.id, { root, run })).agents[0].status).toBe("rejected");
+    task.decisions.push({ run_id: "run-1", decision: "takeover" });
+    expect((await observeRoom(room.id, { root, run })).agents[0].status).toBe("blocked");
     task.task_id = "replacement";
     expect((await observeRoom(room.id, { root, run })).agents[0].status).toBe("unknown");
   });
@@ -190,6 +197,121 @@ describe("room execution", () => {
     const observed = await observeRoom(room.id, { root });
     expect(observed.agents[0].runId).toBe("run-1");
     expect(observed.agents[0].status).toBe("review");
+  });
+
+  it("refreshes each task and keeps other members visible when a task is unreadable", async () => {
+    const { root, room, taskDir, task, run } = await fixture();
+    await dispatchMember(room.id, "haiku-1", { root, taskDir, run, requestId: "first" });
+    task.runs[0].status = "finished";
+    task.runs[0].runner_status = "completed";
+    const secondDir = await directory();
+    const secondTask = {
+      ...task,
+      task_id: "task-b",
+      runs: [
+        "engine",
+        {
+          request_id: "second",
+          run_id: "run-b",
+          engine: "codex",
+          transport: "executor",
+          status: "active",
+        },
+      ],
+      decisions: ["unrelated malformed decision"],
+    };
+    await updateRoom(
+      room.id,
+      (current) => {
+        current.agents[1].dispatch = {
+          taskDir: secondDir,
+          taskId: "task-b",
+          requestId: "second",
+          runId: "run-b",
+          transport: "executor",
+        };
+        return current;
+      },
+      { root },
+    );
+    await writeFile(path.join(taskDir, "task.json"), JSON.stringify(task));
+    await writeFile(path.join(secondDir, "task.json"), JSON.stringify(secondTask));
+    expect((await observeRoom(room.id, { root })).agents.map((member) => member.status)).toEqual([
+      "review",
+      "running",
+    ]);
+
+    secondTask.runs.shift();
+    task.decisions.push({ run_id: "run-1", decision: "supported" });
+    await writeFile(path.join(taskDir, "task.json"), JSON.stringify(task));
+    await writeFile(
+      path.join(secondDir, "task.json"),
+      '{"nested":'.repeat(1100) + "0" + "}".repeat(1100),
+    );
+    expect((await observeRoom(room.id, { root })).agents.map((member) => member.status)).toEqual([
+      "completed",
+      "unknown",
+    ]);
+    await writeFile(path.join(secondDir, "task.json"), "{");
+    expect((await observeRoom(room.id, { root })).agents.map((member) => member.status)).toEqual([
+      "completed",
+      "unknown",
+    ]);
+
+    secondTask.runs[0].status = "finished";
+    secondTask.runs[0].runner_status = "completed";
+    await writeFile(path.join(secondDir, "task.json"), JSON.stringify(secondTask));
+    expect((await observeRoom(room.id, { root })).agents.map((member) => member.status)).toEqual([
+      "completed",
+      "review",
+    ]);
+  });
+
+  it("shows different runs of the same task across rooms", async () => {
+    const { root, room, taskDir, task, run } = await fixture();
+    await dispatchMember(room.id, "haiku-1", { root, taskDir, run, requestId: "first" });
+    task.runs[0].status = "finished";
+    task.runs[0].runner_status = "completed";
+    task.runs.push({
+      request_id: "second",
+      run_id: "run-2",
+      engine: "codex",
+      transport: "executor",
+      status: "active",
+    });
+    await writeFile(path.join(taskDir, "task.json"), JSON.stringify(task));
+    const other = await newRoom(parseTeam("codex:luna:max"), {
+      id: "room-b",
+      cwd: room.cwd,
+      root,
+    });
+    await updateRoom(
+      other.id,
+      (current) => {
+        current.agents[0].dispatch = {
+          taskDir,
+          taskId: task.task_id,
+          requestId: "second",
+          runId: "run-2",
+          transport: "executor",
+        };
+        return current;
+      },
+      { root },
+    );
+    let output = "";
+    await roomsCommand(["list", "--json"], {
+      root,
+      stdout: {
+        write: (value) => {
+          output += value;
+        },
+      },
+    });
+    expect(JSON.parse(output).rooms.map((entry) => [entry.id, entry.agents[0].status])).toEqual([
+      ["room-a", "review"],
+      ["room-b", "running"],
+    ]);
   });
 
   it("collects results only while the bound task identity still matches", async () => {

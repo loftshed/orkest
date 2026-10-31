@@ -1939,10 +1939,41 @@ def valid_peer(peer: dict[str, Any] | None) -> bool:
     )
 
 
-def iter_messages(base: Path, session: str, *, unread_only: bool = True) -> Iterator[dict[str, Any]]:
+def _message_file_state(path: Path) -> tuple[int, int, int, int, int] | None:
+    try:
+        info = path.stat()
+        return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+    except OSError:
+        return None
+
+
+def iter_messages(
+    base: Path,
+    session: str,
+    *,
+    unread_only: bool = True,
+    read_cache: dict[Path, tuple[int, int, int, int, int]] | None = None,
+) -> Iterator[dict[str, Any]]:
     for path in sorted(inbox_dir(base, session).glob("*.json")):
+        state = None
+        if read_cache is not None and unread_only:
+            state = _message_file_state(path)
+            if state is not None and read_cache.get(path) == state:
+                continue
+            read_cache.pop(path, None)
         message = load(path)
-        if valid_message(message) and message["id"] == path.stem and not (unread_only and message.get("readAt")):
+        if not valid_message(message) or message["id"] != path.stem:
+            continue
+        if unread_only and message.get("readAt"):
+            # Cache only a stable, acknowledged file; a replacement must be read again.
+            if (
+                read_cache is not None
+                and state is not None
+                and state == _message_file_state(path)
+                and len(read_cache) < 8192
+            ):
+                read_cache[path] = state
+        else:
             yield message
 
 
@@ -1962,14 +1993,20 @@ def allowed_message(peer: dict[str, Any], message: dict[str, Any], scope: str) -
 
 
 def iter_incoming(
-    base: Path, session: str, *, unread_only: bool = True, scope: str = "project", operation: str = "inbox"
+    base: Path,
+    session: str,
+    *,
+    unread_only: bool = True,
+    scope: str = "project",
+    operation: str = "inbox",
+    read_cache: dict[Path, tuple[int, int, int, int, int]] | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Include explicitly addressed cross-project mail without widening peer discovery."""
     check_scope(scope)
     peer = load(peer_path(base, session))
     if not valid_peer(peer):
         return
-    for message in iter_messages(base, session, unread_only=unread_only):
+    for message in iter_messages(base, session, unread_only=unread_only, read_cache=read_cache):
         if allowed_message(peer, message, scope):
             yield message
         elif not is_run_peer(peer):
@@ -2152,9 +2189,12 @@ def wait(
         if not question:
             raise MailboxError("wait requires a question sent by this recipient")
         question_ids = {question["id"], question.get("clientId")} - {None}
+    read_cache: dict[Path, tuple[int, int, int, int, int]] = {}
     while True:
         # A run reply stays replayable after acknowledgement.
-        rows = iter_incoming(base, session, unread_only=not (run_peer and reply_to), scope=scope, operation="wait")
+        rows = iter_incoming(
+            base, session, unread_only=not (run_peer and reply_to), scope=scope, operation="wait", read_cache=read_cache
+        )
         if run_peer:
             rows = (message for message in rows if message.get("run") == run_peer["run"])
         if reply_to:

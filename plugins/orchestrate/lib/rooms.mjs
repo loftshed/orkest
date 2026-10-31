@@ -60,6 +60,29 @@ export async function coordinator(args) {
   }
 }
 
+async function roomTasks(requests) {
+  const script = fileURLToPath(
+    new URL("../skills/orchestrate/scripts/room_tasks.py", import.meta.url),
+  );
+  return new Promise((resolve, reject) => {
+    const child = execFile(
+      "python3",
+      [script],
+      { maxBuffer: 16 * 1024 * 1024, timeout: 30_000 },
+      (error, stdout, stderr) => {
+        if (error) return reject(new Error(stderr?.trim() || error.message, { cause: error }));
+        try {
+          resolve(JSON.parse(stdout));
+        } catch (parseError) {
+          reject(parseError);
+        }
+      },
+    );
+    child.stdin.on("error", () => {});
+    child.stdin.end(JSON.stringify(requests));
+  });
+}
+
 export async function listRooms(root = mailboxRoot()) {
   let files;
   try {
@@ -290,54 +313,71 @@ export async function observeRoom(
       authorities.set(room.authority, await authority(room.authority));
     room.lead = authorities.get(room.authority);
   }
-  const hasDispatches = room.agents.some((member) => member.dispatch);
-  const roomCwd = hasDispatches ? await realpath(room.cwd) : null;
-  for (const member of room.agents) {
-    if (!member.dispatch) continue;
-    const binding = member.dispatch;
+  const dispatched = room.agents.filter((member) => member.dispatch);
+  if (dispatched.length > 0) await realpath(room.cwd);
+  const taskErrors = new Map();
+  if (run !== coordinator) {
+    for (const { dispatch } of dispatched) {
+      if (tasks.has(dispatch.taskDir) || taskErrors.has(dispatch.taskDir)) continue;
+      try {
+        tasks.set(dispatch.taskDir, await run(["show", "--task-dir", dispatch.taskDir]));
+      } catch (error) {
+        taskErrors.set(dispatch.taskDir, error.message);
+      }
+    }
+  }
+  const projections = new Map();
+  const project = async (members) => {
+    const directories = new Set(members.map((member) => member.dispatch.taskDir));
+    const snapshot = await roomTasks({
+      cwd: room.cwd,
+      members: members.map(({ id, engine, dispatch }) => ({ id, engine, dispatch })),
+      tasks: Object.fromEntries([...tasks].filter(([directory]) => directories.has(directory))),
+      errors: Object.fromEntries(
+        [...taskErrors].filter(([directory]) => directories.has(directory)),
+      ),
+    });
+    for (const [directory, task] of Object.entries(snapshot.tasks)) tasks.set(directory, task);
+    for (const [id, projection] of Object.entries(snapshot.members))
+      projections.set(id, projection);
+  };
+  if (dispatched.length > 0) {
     try {
-      if (!tasks.has(binding.taskDir))
-        tasks.set(binding.taskDir, await run(["show", "--task-dir", binding.taskDir]));
-      const task = tasks.get(binding.taskDir);
-      if (task.task_id !== binding.taskId || (await realpath(task.repository)) !== roomCwd)
-        throw new Error("Task identity changed");
-      const found = task.runs.filter((entry) => entry.request_id === binding.requestId);
-      if (found.length !== 1)
-        throw new Error("Dispatch has no unique recorded run; retry the same dispatch to recover");
-      const record = found[0];
-      if (binding.runId && record.run_id !== binding.runId) throw new Error("Run identity changed");
-      if (record.engine !== member.engine || record.transport !== binding.transport)
-        throw new Error("Run executor differs from room member");
+      await project(dispatched);
+    } catch (error) {
+      if (dispatched.length === 1) {
+        projections.set(dispatched[0].id, { error: error.message });
+      } else {
+        // Isolate oversized or otherwise unreadable tasks if a batch cannot be projected.
+        for (const member of dispatched) {
+          try {
+            await project([member]);
+          } catch (memberError) {
+            projections.set(member.id, { error: memberError.message });
+          }
+        }
+      }
+    }
+  }
+  for (const member of dispatched) {
+    try {
+      const item = projections.get(member.id);
+      if (!item?.projection) throw new Error(item?.error || "Task snapshot unavailable");
+      const { run: record, status, verdict, observedAt, objective } = item.projection;
       member.runId = record.run_id;
       member.transport = record.transport;
       member.resultPath = record.result_path;
       member.mailboxSession = record.mailbox?.worker;
       member.resolvedModel = record.model;
       member.resolvedEffort = record.effort;
-      member.verdict =
-        task.decisions.findLast((decision) => decision.run_id === record.run_id)?.decision ||
-        "pending";
-      const states = {
-        reserved: "reserved",
-        active: "running",
-        finished: "review",
-        cancelled: "cancelled",
-      };
-      member.status = Object.hasOwn(states, record.status) ? states[record.status] : "unknown";
-      if (record.runner_status && record.runner_status !== "completed") member.status = "failed";
-      const verdicts = {
-        accept: "completed",
-        supported: "completed",
-        reject: "rejected",
-        takeover: "blocked",
-      };
-      if (Object.hasOwn(verdicts, member.verdict)) member.status = verdicts[member.verdict];
-      member.observedAt = task.updated_at;
+      member.verdict = verdict;
+      member.status = status;
+      member.observedAt = observedAt ?? undefined;
       member.nativeHandle = record.native_handle;
-      member.objective = task.task_spec?.objective;
+      member.objective = objective ?? undefined;
       member.output = [
         member.objective,
-        `Coordinator observed: ${task.updated_at || "unknown"}`,
+        `Coordinator observed: ${member.observedAt || "unknown"}`,
         record.recovery,
         member.dispatchError,
         member.resultPath,
