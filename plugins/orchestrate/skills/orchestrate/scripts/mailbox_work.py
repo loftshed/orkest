@@ -138,13 +138,16 @@ def _present(
     return bool(alive and mailbox.same_project(peer, project))
 
 
+def _states(board: dict[str, Any]) -> dict[str, str]:
+    return {record["id"]: record["state"] for record in board["items"]}
+
+
 def _view(
     base: Path,
-    board: dict[str, Any],
+    states: dict[str, str],
     record: dict[str, Any],
     presence: dict[str, tuple[dict[str, Any] | None, bool]] | None = None,
 ) -> dict[str, Any]:
-    states = {i["id"]: i["state"] for i in board["items"]}
     unmet = [item for item in record["dependencies"] if states.get(item) != "accepted"]
     owner_present = _present(base, record["owner"], record["project"], presence)
     integrator_present = _present(base, record["integrator"], record["project"], presence)
@@ -179,8 +182,9 @@ def snapshot(base: Path, me: dict[str, Any], *, item: str | None = None) -> list
             if item is not None
             else [i for i in board["items"] if mailbox.same_project(me, i["project"])]
         )
+    states = _states(board)
     presence: dict[str, tuple[dict[str, Any] | None, bool]] = {}
-    records = [_view(base, board, record, presence) for record in selected]
+    records = [_view(base, states, record, presence) for record in selected]
     # Other sources have their own writers. Never hold our lock while reading their snapshots.
     if item is None or _external(item):
         import mailbox_work_sources
@@ -262,12 +266,13 @@ def help_board_hint(base: Path, me: dict[str, Any], *, previous: dict[str, Any] 
         board = _read(base / "work" / "board.json")
     except (mailbox.MailboxError, OSError, ValueError):
         return ""
+    states = _states(board)
     presence: dict[str, tuple[dict[str, Any] | None, bool]] = {}
     ready = [
         view
         for record in board["items"]
         if mailbox.same_project(me, record["project"])
-        and (view := _view(base, board, record, presence))["ready"]
+        and (view := _view(base, states, record, presence))["ready"]
         and not view.get("owner")
     ]
     if not ready:
@@ -406,7 +411,8 @@ def _transition(
     if action == "claim":
         if record["state"] != "open" or record["owner"]:
             raise mailbox.MailboxError("work is already claimed")
-        if _view(base, board, record)["unmetDependencies"]:
+        states = _states(board)
+        if _view(base, states, record)["unmetDependencies"]:
             raise mailbox.MailboxError("work dependencies have not been accepted")
         if not _present(base, record["integrator"], record["project"]):
             raise mailbox.MailboxError("work integrator is absent; integrator reassignment is not supported")
@@ -534,7 +540,8 @@ def mutate(
         else:
             record, replayed = _find(board, me, item), False
             _transition(base, board, me, record, action, revision, details, successor)
-        result = {"item": _view(base, board, record), "replayed": replayed}
+        states = _states(board)
+        result = {"item": _view(base, states, record), "replayed": replayed}
         # A later disappearance lengthens these derived fields without a write. Reserve that space now.
         bounded = {
             **result["item"],

@@ -111,8 +111,11 @@ class SwarmLaunchTests(unittest.TestCase):
                     + ", check=True, stdout=subprocess.DEVNULL)\n"
                 )
                 + "print('Coordinator conversation ready', flush=True)\n"
-                "Path(" + repr(str(launched)) + ").write_text(json.dumps({'room': room, 'pid': os.getpid(), "
+                "launch_file = Path(" + repr(str(launched)) + ")\n"
+                "launch_temp = launch_file.with_suffix('.tmp')\n"
+                "launch_temp.write_text(json.dumps({'room': room, 'pid': os.getpid(), "
                 "'socket': os.environ['TMUX'].split(',')[0], 'prompt': sys.argv[-1], 'flags': sys.argv[1:-1]}))\n"
+                "launch_temp.replace(launch_file)\n"
                 "while True:\n"
                 "    value = os.read(0, 4096)\n"
                 "    if not value: break\n"

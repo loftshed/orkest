@@ -23,6 +23,7 @@ import agent_terminal
 import mailbox_tasks
 import mailbox_work
 import peer_mailbox as mailbox
+import room_tasks
 
 COLORS = (31, 32, 33, 34, 35, 36)
 PALETTE = {31: 203, 32: 114, 33: 221, 34: 111, 35: 176, 36: 80}
@@ -105,42 +106,11 @@ def room_task(room: dict[str, Any], member: dict[str, Any]) -> dict[str, str] | 
         if not path.is_absolute() or path.stat().st_size > MAX_TASK_BYTES:
             return None
         task = mailbox.load(path)
-        if (
-            not task
-            or task.get("schema") != "agent-executor.task.v1"
-            or task.get("task_id") != binding.get("taskId")
-            or not isinstance(task.get("repository"), str)
-            or Path(task["repository"]).resolve() != Path(room["cwd"]).resolve()
-            or not isinstance(task.get("task_spec"), dict)
-            or not isinstance(task.get("runs"), list)
-            or not isinstance(task.get("decisions"), list)
-        ):
+        if not task or not isinstance(task.get("task_spec"), dict):
             return None
-        runs = [
-            run for run in task["runs"] if isinstance(run, dict) and run.get("request_id") == binding.get("requestId")
-        ]
-        if len(runs) != 1:
-            return None
-        run = runs[0]
-        if (
-            not isinstance(run.get("run_id"), str)
-            or not run["run_id"]
-            or (binding.get("runId") and run.get("run_id") != binding["runId"])
-            or run.get("engine") != member.get("engine")
-            or run.get("transport") != binding.get("transport")
-        ):
-            return None
-        stages = {"reserved": "reserved", "active": "running", "finished": "review", "cancelled": "cancelled"}
-        stage = stages.get(run.get("status"), "unknown")
-        if run.get("runner_status") and run["runner_status"] != "completed":
-            stage = "failed"
-        decisions = [d for d in task["decisions"] if isinstance(d, dict) and d.get("run_id") == run.get("run_id")]
-        if decisions:
-            stage = {"accept": "completed", "supported": "completed", "reject": "rejected", "takeover": "blocked"}.get(
-                decisions[-1].get("decision"), stage
-            )
-        return {"title": text(task["task_spec"].get("objective")), "state": stage}
-    except (OSError, RuntimeError, TypeError, ValueError):
+        projection = room_tasks.project(room["cwd"], member, task)
+        return {"title": text(projection["objective"]), "state": projection["status"]}
+    except (OSError, RuntimeError, TypeError, ValueError, KeyError, AttributeError):
         return None
 
 
