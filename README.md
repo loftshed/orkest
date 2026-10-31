@@ -81,7 +81,7 @@ The repository ships two plugins. Their guides cover the detailed commands and c
 
 | Plugin                                         | Version | What it does                                                       |
 | ---------------------------------------------- | ------- | ------------------------------------------------------------------ |
-| [`orchestrate`](plugins/orchestrate/README.md) | 0.41.0  | Coordinator conversations, swarms, delegation and shared work.     |
+| [`orchestrate`](plugins/orchestrate/README.md) | 0.42.0  | Coordinator conversations, swarms, delegation and shared work.     |
 | [`monitor`](plugins/monitor/README.md)         | 0.15.0  | Account quota, reset times, credit balances and spending guidance. |
 
 ## Install

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.42.0
+
+- feat(orchestrate): add conversational swarms and shared terminal footers
+- feat(orchestrate): worker-owned upward scope, quiet cross-task mail, and footer progress
+
 ## 0.41.0
 
 - feat(orchestrate): worker-owned upward scope, quiet cross-task mail, and footer progress (#43)
