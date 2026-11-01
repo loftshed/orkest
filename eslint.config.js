@@ -24,7 +24,7 @@ const relaxed = {
 };
 
 export default [
-  { ignores: ["node_modules/**", ".yarn/**"] },
+  { ignores: ["node_modules/**"] },
   js.configs.recommended,
   unicorn.configs.recommended,
   {

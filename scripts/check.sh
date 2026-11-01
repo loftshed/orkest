@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 # The lint gate, shared by the pre-commit hook and CI. Every check runs even
 # after one fails, and the exit status is non-zero if any of them failed.
-# Tools come from ./node_modules/.bin, so yarn does not need to be on PATH.
+# Tools come from ./node_modules/.bin, so pnpm does not need to be on PATH.
 set -u
 cd "$(dirname "$0")/.." || exit 1
 
@@ -9,7 +9,7 @@ cd "$(dirname "$0")/.." || exit 1
 RUFF_VERSION=0.16.9
 
 tools=./node_modules/.bin
-[ -x "$tools/eslint" ] || { echo "check: run \`yarn install\` first." >&2; exit 1; }
+[ -x "$tools/eslint" ] || { echo "check: run \`corepack pnpm install\` first." >&2; exit 1; }
 
 status=0
 step() { "$@" || status=1; }

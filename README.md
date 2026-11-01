@@ -154,8 +154,10 @@ work records and progress reports; it doesn't guess a task or declare it complet
 
 ## Development
 
+Use Corepack to run the project's pinned pnpm version.
+
 ```sh
-yarn install
+corepack pnpm install
 ork gate --heavy -- ./scripts/check.sh
 ork gate --heavy -- ./scripts/test.sh
 node scripts/release.js plan
