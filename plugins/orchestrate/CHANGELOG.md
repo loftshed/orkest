@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.43.0
+
+- feat(orchestrate): support coordinator launch arguments and retire old skill paths
+- build: migrate project tooling to pnpm
+
 ## 0.42.1
 
 - perf(orchestrate): reduce status and mailbox work
