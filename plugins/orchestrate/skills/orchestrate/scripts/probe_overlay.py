@@ -25,6 +25,8 @@ CONFIG_FILES = (
     "cspell.json",
     "eslint.config.js",
     "package.json",
+    "pnpm-lock.yaml",
+    "pnpm-workspace.yaml",
     "release.json",
     "ruff.toml",
     "vitest.config.js",

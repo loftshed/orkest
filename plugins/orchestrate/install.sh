@@ -5,8 +5,8 @@
 #   ./install.sh --dry-run  show what would change
 #   ./install.sh --trust-codex-hooks  trust only the four reviewed mailbox hooks
 #
-# ~/.agents/skills/orchestrate (and ~/.agents/skills/agent-executor for compatibility) points at this
-# checkout; each harness's skills directory points at the hub, so moving the checkout means re-running
+# ~/.agents/skills/orchestrate points at this checkout; each harness's skills directory points at the
+# hub, so moving the checkout means re-running
 # this script once. A real directory where a link belongs (an old hand-copied install) is moved to
 # ~/.local/share/agent-executor/backups, never deleted. Harnesses that load skills from a Claude plugin
 # instead can skip the links with --no-claude.
@@ -55,8 +55,34 @@ link() {
   echo "✓ $place -> $target"
 }
 
+retire_legacy() {
+  place="$1"
+  if [ -L "$place" ] || [ -e "$place" ]; then
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    dest="$backups/$stamp$(dirname "$place" | tr / _)"
+    run mkdir -p "$dest"
+    run mv "$place" "$dest/"
+    echo "• preserved the old skill at $place in $dest/"
+  fi
+}
+
+retire_legacy_skills() {
+  for place in \
+    "$legacy_hub" \
+    "$HOME/.claude/skills/agent-executor" \
+    "$HOME/.claude-personal/skills/agent-executor" \
+    "$HOME/.codex/skills/agent-executor" \
+    "$HOME/.config/opencode/skills/agent-executor" \
+    "$HOME/.gemini/config/skills/agent-executor" \
+    "$HOME/.gemini/antigravity/skills/agent-executor"; do
+    case "$place" in
+      "$HOME/.claude/skills/"*|"$HOME/.claude-personal/skills/"*) [ "$with_claude" = 1 ] || continue ;;
+    esac
+    retire_legacy "$place"
+  done
+}
+
 link "$skill" "$hub"
-link "$skill" "$legacy_hub"
 
 # Harness skill directories, linked only when that harness is installed (its config dir exists).
 for entry in \
@@ -71,15 +97,13 @@ for entry in \
   [ -d "$base" ] || continue
   if [ "$kind" = claude ] && [ "$with_claude" = 0 ]; then continue; fi
   link "$hub" "$base/$sub/orchestrate"
-  if [ -L "$base/$sub/agent-executor" ]; then
-    run rm "$base/$sub/agent-executor"
-  fi
 done
 
 set --
 [ "$trust_hooks" = 0 ] || set -- --trust-codex-hooks
 if [ "$dry_run" = 1 ]; then
   python3 "$skill/scripts/install_mailbox.py" --dry-run "$@"
+  retire_legacy_skills
   exit 0
 fi
 
@@ -90,5 +114,6 @@ else
   python3 "$skill/scripts/run_agent.py" init
 fi
 python3 "$skill/scripts/install_mailbox.py" "$@"
+retire_legacy_skills
 echo
 python3 "$skill/scripts/run_agent.py" doctor

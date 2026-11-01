@@ -79,6 +79,35 @@ class InstallMailboxTests(unittest.TestCase):
         self.assertEqual(self.path.read_bytes(), before)
         self.assertEqual(len(json.loads(before)["hooks"]["Stop"]), 1)
 
+    def test_old_mailbox_hooks_are_updated_to_orchestrate_and_preserve_other_hooks(self):
+        old = "/home/example/.agents/skills/agent-executor/scripts/peer_mailbox.py"
+        new = Path("/home/example/.agents/skills/orchestrate/scripts/peer_mailbox.py")
+        original = json.dumps(
+            {
+                "hooks": {
+                    "Stop": [
+                        {
+                            "hooks": [
+                                {"type": "command", "command": f"python3 {old} hook --harness codex"},
+                                {"type": "command", "command": "other-tool stop"},
+                            ]
+                        }
+                    ]
+                }
+            }
+        )
+        self.path.write_text(original)
+
+        installer.install_hooks(self.path, new, "codex")
+
+        hooks = json.loads(self.path.read_text())["hooks"]
+        self.assertEqual(
+            [entry["command"] for entry in hooks["Stop"][0]["hooks"]],
+            [f"python3 {new} hook --harness codex", "other-tool stop"],
+        )
+        self.assertEqual([p.read_text() for p in self.base.glob("settings.json.mailbox-bak.*")], [original])
+        self.assertFalse(installer.install_hooks(self.path, new, "codex"))
+
     def test_native_plugin_can_create_hub_without_removing_old_content(self):
         skill = self.base / "plugin/skills/agent-executor"
         (skill / "scripts").mkdir(parents=True)
@@ -143,7 +172,7 @@ class InstallMailboxTests(unittest.TestCase):
                             "peer-mailbox": {
                                 "command": [
                                     "python3",
-                                    str(self.base / ".agents/skills/agent-executor/scripts/mailbox_mcp.py"),
+                                    str(self.base / ".agents/skills/orchestrate/scripts/mailbox_mcp.py"),
                                 ]
                             }
                         }

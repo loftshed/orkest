@@ -1,8 +1,5 @@
 # Dependencies and tool state
 node_modules/
-.yarn/*
-!.yarn/releases/
-.pnp.*
 .ruff_cache/
 .venv/
 __pycache__/

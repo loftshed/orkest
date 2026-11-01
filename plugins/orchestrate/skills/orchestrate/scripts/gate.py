@@ -1141,7 +1141,7 @@ def install(*, remove: bool = False, dry_run: bool = False, home: Path | None = 
     import mailbox_configuration as configuration
 
     home = home or Path.home()
-    hub = home / ".agents/skills/agent-executor/scripts/gate.py"
+    hub = home / ".agents/skills/orchestrate/scripts/gate.py"
     script = None if remove else (hub if hub.is_file() else Path(__file__).resolve())
     for harness, path in hook_files(home):
         settings = json.loads(path.read_text()) if path.exists() else {}

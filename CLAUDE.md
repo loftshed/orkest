@@ -11,13 +11,13 @@ Reference: [plugin marketplaces](https://code.claude.com/docs/en/plugin-marketpl
 ## Commands
 
 ```sh
-yarn install   # dev tools, plus the git hooks
-yarn check     # the lint gate (scripts/check.sh); CI runs the same script
-yarn test      # Vitest for JavaScript, unittest for the orchestrate Python (scripts/test.sh)
+corepack pnpm install   # dev tools, plus the git hooks
+corepack pnpm check     # the lint gate (scripts/check.sh); CI runs the same script
+corepack pnpm test      # Vitest for JavaScript, unittest for the orchestrate Python (scripts/test.sh)
 node scripts/release.js plan   # what the next release would publish
 ```
 
-Both scripts call `./node_modules/.bin` directly, so they work without `yarn` on PATH. Single steps: `yarn validate`, `lint`, `lint:fix`, `format`, `format:check`, `markdownlint`, `spell`.
+Both scripts call `./node_modules/.bin` directly, so they work without pnpm on PATH. Single steps: `corepack pnpm validate`, `lint`, `lint:fix`, `format`, `format:check`, `markdownlint`, `spell`.
 
 ## Rules for changes
 
@@ -35,5 +35,5 @@ Both scripts call `./node_modules/.bin` directly, so they work without `yarn` on
 
 ## Tooling notes
 
-- Yarn refuses package versions published in the last 24 hours; a "quarantined" install succeeds once the release is a day old.
+- pnpm avoids resolving package versions published in the last 24 hours.
 - The ruff version is pinned once, in `scripts/check.sh`.

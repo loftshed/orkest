@@ -22,7 +22,9 @@ claude plugin install orchestrate@orkest --scope user
 <checkout>/plugins/orchestrate/install.sh --no-claude
 ```
 
-`install.sh` points `~/.agents/skills/orchestrate` (and `~/.agents/skills/agent-executor` for compatibility) at `<checkout>`, links each detected harness's `skills/` directory to that hub, initializes `~/.config/agent-executor/config.json` if missing, installs the `peer-mailbox` MCP registration and turn hooks, and runs `doctor`.
+`install.sh` points `~/.agents/skills/orchestrate` at `<checkout>`, links each detected harness's `skills/` directory to that hub, initializes `~/.config/agent-executor/config.json` if missing, installs the `peer-mailbox` MCP registration and turn hooks, and runs `doctor`.
+
+After the mailbox checks pass, the installer moves old `agent-executor` skill paths to its backup directory. Close sessions that still use those paths before running it; route settings and mailbox data keep their existing locations.
 
 Codex requires one-time approval for command hooks: review them in Codex `/hooks`, or pass `--trust-codex-hooks` to `install.sh` (which trusts only the four reviewed mailbox hook commands).
 
@@ -189,7 +191,7 @@ Implementation runs take a JSON `--task-spec` (or `--brief` with `--allow-path`/
 ```sh
 python3 <scripts>/run_agent.py \
   --cwd <repo> --task-spec /tmp/spec.json --route implementation \
-  --verify-command 'yarn check' --verify-command 'yarn test' --expect-changes
+  --verify-command 'pnpm check' --verify-command 'pnpm test' --expect-changes
 ```
 
 - **Mid-run steering (`steer`):** Redirect a detached running job without killing its context or releasing its worktree lease. The runner interrupts the CLI with `SIGINT`, records the partial segment, and resumes the same session with the new instruction:
@@ -262,7 +264,7 @@ Details: [conversational swarms](skills/orchestrate/references/swarm.md),
 When several agents share one machine, `ork gate` keeps their test suites, builds and project-wide checks from running all at once. A focused run takes one of two slots. A `--heavy` run (whole suite, production build, project-wide typecheck or lint) waits for every slot, and waiters are told who holds the gate. Inside the gate, Vitest and Jest are capped at two workers, the command runs at nice 10, every completed run is recorded in a shared ledger with an advisory source-metadata digest, and a heavy or failed run's full output is saved to a log, so nobody reruns a suite to get back output that scrolled away.
 
 ```sh
-ork gate --heavy -- yarn test                       # a whole suite, as the final check
+ork gate --heavy -- pnpm test                       # a whole suite, as the final check
 ork gate -- ./node_modules/.bin/vitest run src/a.test.ts
 ork gate status [--all] [--json]
 ork gate install                                    # PreToolUse hook for Claude Code, Codex and Antigravity

@@ -66,7 +66,7 @@ def configuration_status(
         if binaries is not None
         else {name for name in ("claude", "codex", "agy", "opencode") if shutil.which(name)}
     )
-    expected = home / ".agents/skills/agent-executor/scripts/mailbox_mcp.py"
+    expected = home / ".agents/skills/orchestrate/scripts/mailbox_mcp.py"
     checks = {
         "claude": (home / ".claude.json", "mcpServers", home / ".claude/settings.json"),
         "codex": (
@@ -306,7 +306,7 @@ def register(
     if not isinstance(current, dict):
         raise ValueError("mailbox configuration entry must be an object")
     desired = copy.deepcopy({key: value for key, value in current.items() if key not in configuration.TRANSPORT_FIELDS})
-    script = str(Path.home() / ".agents/skills/agent-executor/scripts/mailbox_mcp.py")
+    script = str(Path.home() / ".agents/skills/orchestrate/scripts/mailbox_mcp.py")
     if stdio:
         if harness == "opencode":
             desired = {key: value for key, value in desired.items() if key in {"enabled", "timeout"}}
@@ -502,7 +502,7 @@ def install(
     *, dry_run: bool = False, trust_codex_hooks: bool = False, verify: bool = True, stdio: bool = False
 ) -> None:
     home = Path.home()
-    hub = home / ".agents/skills/agent-executor/scripts"
+    hub = home / ".agents/skills/orchestrate/scripts"
     ensure_hub(hub.parent, Path(__file__).resolve().parent.parent, dry_run=dry_run)
 
     daemon_url = ""

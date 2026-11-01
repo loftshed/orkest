@@ -1,8 +1,7 @@
 node_modules/
 *.log
 
-.yarn/
-yarn.lock
+pnpm-lock.yaml
 .ruff_cache/
 .opencode/
 

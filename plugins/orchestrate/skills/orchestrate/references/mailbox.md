@@ -488,16 +488,16 @@ Each harness configures the daemon as an HTTP MCP server; Claude Code and Codex 
 Start or check the daemon directly:
 
 ```sh
-python3 ~/.agents/skills/agent-executor/scripts/run_agent.py mailbox daemon start
-python3 ~/.agents/skills/agent-executor/scripts/run_agent.py mailbox daemon status
-python3 ~/.agents/skills/agent-executor/scripts/run_agent.py mailbox daemon restart
-python3 ~/.agents/skills/agent-executor/scripts/run_agent.py mailbox daemon stop
+python3 ~/.agents/skills/orchestrate/scripts/run_agent.py mailbox daemon start
+python3 ~/.agents/skills/orchestrate/scripts/run_agent.py mailbox daemon status
+python3 ~/.agents/skills/orchestrate/scripts/run_agent.py mailbox daemon restart
+python3 ~/.agents/skills/orchestrate/scripts/run_agent.py mailbox daemon stop
 ```
 
 To configure the HTTP MCP integration for all supported CLIs (Claude, Codex, Antigravity, OpenCode):
 
 ```sh
-python3 ~/.agents/skills/agent-executor/scripts/install_mailbox.py
+python3 ~/.agents/skills/orchestrate/scripts/install_mailbox.py
 ```
 
 The installer configures:
@@ -511,7 +511,7 @@ The installer configures:
 If needed, you can rollback to the legacy Python subprocess (stdio) mode by running:
 
 ```sh
-python3 ~/.agents/skills/agent-executor/scripts/install_mailbox.py --stdio
+python3 ~/.agents/skills/orchestrate/scripts/install_mailbox.py --stdio
 ```
 
 Rollback changes client registrations. Use `mailbox daemon stop` explicitly when the shared service is no longer needed.
