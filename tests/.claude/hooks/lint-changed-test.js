@@ -43,6 +43,7 @@ const repository = (files = {}) => {
   scratch.push(root);
   mkdirSync(join(root, "node_modules/.bin"), { recursive: true });
   for (const tool of ["eslint", "prettier"]) {
+    symlinkSync(join(project, "node_modules", tool), join(root, "node_modules", tool), "dir");
     symlinkSync(join(project, "node_modules/.bin", tool), join(root, "node_modules/.bin", tool));
   }
   write(
