@@ -128,7 +128,7 @@ class TestMailboxDaemonInstall(unittest.TestCase):
         stale = installer.configuration_status(self.home, {"agy"}, base=self.base)["agy"]
         self.assertIn("Stop mailbox hook missing or stale", stale["issues"])
         installer.install_agy_hooks(
-            self.home / ".gemini/config/hooks.json", self.home / ".agents/skills/agent-executor/scripts/peer_mailbox.py"
+            self.home / ".gemini/config/hooks.json", self.home / ".agents/skills/orchestrate/scripts/peer_mailbox.py"
         )
         before_again = {key: path.read_bytes() for key, path in self.paths.items()}
         self.install()
@@ -141,7 +141,7 @@ class TestMailboxDaemonInstall(unittest.TestCase):
     def test_stdio_rollback_removes_auth_and_preserves_unrelated_settings(self):
         self.install()
         self.install(stdio=True)
-        expected = str(self.home / ".agents/skills/agent-executor/scripts/mailbox_mcp.py")
+        expected = str(self.home / ".agents/skills/orchestrate/scripts/mailbox_mcp.py")
         claude = installer.read_json_config(self.paths["claude"])["mcpServers"]["peer-mailbox"]
         codex = tomllib.loads(self.paths["codex"].read_text())["mcp_servers"]["peer-mailbox"]
         agy = installer.read_json_config(self.paths["agy"])["mcpServers"]["peer-mailbox"]
@@ -168,7 +168,7 @@ class TestMailboxDaemonInstall(unittest.TestCase):
         self.assertIsNone(daemon.load_state(self.base))
 
     def test_hub_upgrade_preserves_old_content_and_profiles(self):
-        hub = self.home / ".agents/skills/agent-executor"
+        hub = self.home / ".agents/skills/orchestrate"
         (hub / "scripts").mkdir(parents=True)
         (hub / "scripts/mailbox_mcp.py").write_text("old entry")
         (hub / "notes.txt").write_text("keep old content")
@@ -177,9 +177,7 @@ class TestMailboxDaemonInstall(unittest.TestCase):
         (profile / "settings.json").write_text('{"custom":"keep"}')
         self.install()
         self.assertEqual(hub.resolve(), SCRIPTS.parent.resolve())
-        self.assertEqual(
-            next(hub.parent.glob("agent-executor.mailbox-bak.*/notes.txt")).read_text(), "keep old content"
-        )
+        self.assertEqual(next(hub.parent.glob("orchestrate.mailbox-bak.*/notes.txt")).read_text(), "keep old content")
         self.assertEqual(json.loads((profile / "settings.json").read_text())["custom"], "keep")
         self.assertEqual(
             installer.read_json_config(profile / ".claude.json")["mcpServers"]["peer-mailbox"]["url"],

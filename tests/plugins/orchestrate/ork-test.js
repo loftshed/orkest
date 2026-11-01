@@ -5,9 +5,35 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 
+import { coordinatorArguments } from "../../../plugins/orchestrate/bin/ork.mjs";
+
 const exec = promisify(execFile);
 const cli = path.resolve("plugins/orchestrate/bin/ork.mjs");
 const temporary = [];
+
+describe("coordinator launch arguments", () => {
+  it.each([
+    ["codex", ["--yolo"], ["--yolo", "the coordinator prompt"]],
+    [
+      "claude",
+      ["--remote-control=Orkest", "--dangerously-skip-permissions"],
+      ["--remote-control=Orkest", "--dangerously-skip-permissions", "the coordinator prompt"],
+    ],
+    [
+      "agy",
+      ["--remote-control", "--dangerously-skip-permissions"],
+      [
+        "--remote-control",
+        "--dangerously-skip-permissions",
+        "--prompt-interactive",
+        "the coordinator prompt",
+      ],
+    ],
+    ["opencode", ["--auto"], ["--auto", "--prompt", "the coordinator prompt"]],
+  ])("passes launch options to %s before its prompt", (engine, flags, expected) => {
+    expect(coordinatorArguments(engine, "the coordinator prompt", flags)).toEqual(expected);
+  });
+});
 async function sandbox() {
   const dir = await mkdtemp(path.join(tmpdir(), "ork-cli-test-"));
   temporary.push(dir);

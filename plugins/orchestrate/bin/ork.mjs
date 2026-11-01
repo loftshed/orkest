@@ -35,6 +35,7 @@ import { cachedQuota, runTui } from "./stooges-tui.mjs";
 const COORDINATORS = new Set(["codex", "claude", "agy", "opencode"]);
 
 const HELP = `ork agy|codex|claude|opencode   (open a coordinator; enter your goal in the conversation)
+  --harness-arg=<argument>      (pass an argument to the coordinator; repeat as needed)
 ork rooms --help
 ork gate [--heavy] [--label <text>] -- <command>   (also: ork gate status|install|uninstall)
 ork label -- codex|claude|agy|opencode [arguments]   (one outer tmux footer for every harness)
@@ -305,6 +306,11 @@ function terminalCommand(script, argv) {
   });
 }
 
+export function coordinatorArguments(engine, prompt, harnessArgs = []) {
+  const promptFlag = { agy: "--prompt-interactive", opencode: "--prompt" }[engine];
+  return [...harnessArgs, ...(promptFlag ? [promptFlag, prompt] : [prompt])];
+}
+
 export async function main(argv = process.argv.slice(2), { stdout = process.stdout } = {}) {
   const engineShortcut = COORDINATORS.has(argv[0]) ? argv[0] : undefined;
   if (engineShortcut) argv = ["stooges", ...argv.slice(1)];
@@ -347,6 +353,7 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
       width: { type: "string" },
       cwd: { type: "string" },
       engine: { type: "string" },
+      "harness-arg": { type: "string", multiple: true },
       view: { type: "boolean" },
       "max-agents": { type: "string" },
       "max-depth": { type: "string" },
@@ -381,12 +388,18 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
     objective ||
     engineShortcut ||
     values.engine ||
+    values["harness-arg"]?.length ||
     values["max-agents"] ||
     values["max-depth"],
   );
   if (
     values["attach-room"] &&
-    (objective || engineShortcut || values.engine || values["max-agents"] || values["max-depth"])
+    (objective ||
+      engineShortcut ||
+      values.engine ||
+      values["harness-arg"]?.length ||
+      values["max-agents"] ||
+      values["max-depth"])
   )
     throw new Error(
       "An attached room keeps its coordinator and limits; steer it through its conversation",
@@ -455,8 +468,7 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
     if (isInteractive && room.swarm) {
       const command = room.conductor.engine;
       const prompt = coordinatorBrief(room);
-      const promptFlag = { agy: "--prompt-interactive", opencode: "--prompt" }[command];
-      const initial = promptFlag ? [promptFlag, prompt] : [prompt];
+      const initial = coordinatorArguments(command, prompt, values["harness-arg"]);
       process.exitCode = await terminalCommand(
         "agent_statusline_tmux.py",
         values["attach-room"]
