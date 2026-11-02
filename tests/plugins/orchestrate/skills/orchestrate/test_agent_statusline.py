@@ -42,6 +42,7 @@ class AgentStatuslineTests(unittest.TestCase):
             "cwd": str(self.home),
             "checkout": str(self.home),
             "repo": str(self.home / ".git"),
+            "repository": "project",
             "remotes": [],
             "startedAt": mailbox.stamp(),
             "lastSeenAt": mailbox.stamp(),
@@ -93,7 +94,8 @@ class AgentStatuslineTests(unittest.TestCase):
             payload={"session_id": "claude-123", "model": {"id": "opus-4"}, "effort": {"level": "high"}},
         )
         self.assertEqual(
-            line, "snorfle-opus-high-project-23 | opus-4 / high | stage : not set | goal : not set | task : not set\n"
+            line,
+            "snorfle-opus-high-project-23 | opus-4 / high | repo : project | stage : not set | goal : not set | task : not set\n",
         )
         line = self.run_status(
             "--plain",
@@ -103,7 +105,7 @@ class AgentStatuslineTests(unittest.TestCase):
         )
         self.assertEqual(
             line,
-            "snoobix-gemini-low-project-56 | gemini-pro / low | stage : not set | goal : not set | task : not set\n",
+            "snoobix-gemini-low-project-56 | gemini-pro / low | repo : project | stage : not set | goal : not set | task : not set\n",
         )
 
     def test_color_is_stable_and_no_color_is_respected(self):
@@ -273,6 +275,7 @@ class AgentStatuslineTests(unittest.TestCase):
         self.room(title="An overarching goal that is much longer than usual")
         line = self.run_status("--session", "claude-123", "--width", "80", "--plain").strip()
         self.assertLessEqual(len(line), 80)
+        self.assertIn("repo : ", line)
         self.assertIn("stage : ", line)
         self.assertIn("goal : ", line)
         self.assertIn("task : ", line)
@@ -344,6 +347,26 @@ class AgentStatuslineTests(unittest.TestCase):
         title.write_text(second)
         self.peer(second, "other-account", "codex", accountHome=str(self.home / "different-account"))
         self.assertEqual(self.run_status(*arguments, environment=environment), "")
+
+    def test_multiline_status_split(self):
+        line1 = self.run_status(
+            "--plain",
+            "--width",
+            "200",
+            "--line",
+            "1",
+            payload={"session_id": "claude-123", "model": {"id": "opus-4"}, "effort": {"level": "high"}},
+        )
+        self.assertEqual(line1, "snorfle-opus-high-project-23 | opus-4 / high | repo : project\n")
+        line2 = self.run_status(
+            "--plain",
+            "--width",
+            "200",
+            "--line",
+            "2",
+            payload={"session_id": "claude-123"},
+        )
+        self.assertEqual(line2, "stage : not set | goal : not set | task : not set\n")
 
 
 if __name__ == "__main__":

@@ -219,11 +219,14 @@ def identity(
     if manual and progress and progress["stale"]:
         health = "stale"
         stage = f"{stage or 'not set'} (stale)"
+    repo = text(peer.get("repository") or mailbox.repository_name(peer)) or "not set"
     return {
         "name": name,
         "color": COLORS[hashlib.sha256(session.encode()).digest()[0] % len(COLORS)],
         "model": model or recorded_model or text(peer.get("model")) or "—",
         "effort": effort or recorded_effort or text(peer.get("effort")) or "—",
+        "repo": repo,
+        "repository": repo,
         "goal": goal or "not set",
         "task": task or "not set",
         "stage": stage or "not set",
@@ -329,20 +332,50 @@ def shorten_name(value: str, width: int) -> str:
     return shorten(value, width - display_width(suffix)) + suffix
 
 
-def line_parts(item: dict[str, Any], width: int) -> list[tuple[str, str]]:
-    values = [item[key] for key in ("name", "model", "effort", "stage", "goal", "task")]
+def line_parts(item: dict[str, Any], width: int, line: int = 0) -> list[tuple[str, str]]:
+    if line == 1:
+        keys = ("name", "model", "effort", "repo")
+        minima_limits = (12, 5, 3, 4)
+        fixed = display_width(" |  /  | repo : ")
+    elif line == 2:
+        keys = ("stage", "goal", "task")
+        minima_limits = (4, 5, 5)
+        fixed = display_width("stage :  | goal :  | task : ")
+    else:
+        keys = ("name", "model", "effort", "repo", "stage", "goal", "task")
+        minima_limits = (10, 4, 3, 3, 4, 4, 4)
+        fixed = display_width(" |  /  | repo :  | stage :  | goal :  | task : ")
+
+    values = [item[key] for key in keys]
     sizes = [display_width(value) for value in values]
-    minima = [min(size, minimum) for size, minimum in zip(sizes, (12, 5, 3, 4, 5, 5), strict=True)]
-    # Reserve room for all labels, then share the remaining width across the six values.
-    fixed = display_width(" |  /  | stage :  | goal :  | task : ")
+    minima = [min(size, minimum) for size, minimum in zip(sizes, minima_limits, strict=True)]
     while sum(sizes) + fixed > width and any(size > minimum for size, minimum in zip(sizes, minima, strict=True)):
         index = max(range(len(sizes)), key=lambda i: sizes[i] - minima[i])
         sizes[index] -= 1
-    name = shorten_name(values[0], sizes[0])
-    model, effort, stage, goal, task = [shorten(value, size) for value, size in zip(values[1:], sizes[1:], strict=True)]
-    parts = [("name", name), ("separator", " | "), ("model", model), ("separator", " / "), ("effort", effort)]
-    for key, value in (("stage", stage), ("goal", goal), ("task", task)):
-        parts.extend([("separator", " | "), ("label", f"{key} : "), (key, value)])
+
+    if line == 2:
+        stage, goal, task = [shorten(value, size) for value, size in zip(values, sizes, strict=True)]
+        parts = [
+            ("label", "stage : "),
+            ("stage", stage),
+            ("separator", " | "),
+            ("label", "goal : "),
+            ("goal", goal),
+            ("separator", " | "),
+            ("label", "task : "),
+            ("task", task),
+        ]
+    else:
+        name = shorten_name(values[0], sizes[0])
+        model, effort, repo = [shorten(value, size) for value, size in zip(values[1:4], sizes[1:4], strict=True)]
+        parts = [("name", name), ("separator", " | "), ("model", model), ("separator", " / "), ("effort", effort)]
+        if line == 1:
+            parts.extend([("separator", " | "), ("label", "repo : "), ("repo", repo)])
+        else:
+            stage, goal, task = [shorten(value, size) for value, size in zip(values[4:], sizes[4:], strict=True)]
+            for key, value in (("repo", repo), ("stage", stage), ("goal", goal), ("task", task)):
+                parts.extend([("separator", " | "), ("label", f"{key} : "), (key, value)])
+
     fitted = []
     for key, value in parts:
         if width <= 0:
@@ -352,8 +385,8 @@ def line_parts(item: dict[str, Any], width: int) -> list[tuple[str, str]]:
     return fitted
 
 
-def format_line(item: dict[str, Any], width: int) -> tuple[str, str]:
-    parts = line_parts(item, width)
+def format_line(item: dict[str, Any], width: int, line: int = 0) -> tuple[str, str]:
+    parts = line_parts(item, width, line=line)
     return parts[0][1], "".join(value for _, value in parts[1:])
 
 
@@ -376,34 +409,35 @@ def field_colors(item: dict[str, Any]) -> dict[str, int | None]:
         "name": PALETTE[item["color"]],
         "model": 117,
         "effort": 180,
+        "repo": None,
         "separator": 245,
         "stage": stage_color,
     }
 
 
-def tmux_line(item: dict[str, Any], width: int) -> str:
+def tmux_line(item: dict[str, Any], width: int, line: int = 0) -> str:
     """Left-align padded text on the normal background, with color in the remaining space."""
     colored = not os.environ.get("NO_COLOR")
     background = PALETTE[item["color"]]
     style = "align=left,bg=default,fg=default" + (f",fill=colour{background}" if colored else "")
     colors = field_colors(item)
     output = [f"#[{style}]   "]
-    for key, value in line_parts(item, width - 6):
-        weight = "bold" if key in {"name", "model", "effort", "stage", "task"} else "nobold"
+    for key, value in line_parts(item, width - 6, line=line):
+        weight = "bold" if key in {"name", "model", "effort", "repo", "stage", "task"} else "nobold"
         foreground = f"colour{colors[key]}" if colors.get(key) is not None else "default"
         part_style = f"fg={foreground},{weight}" if colored else weight
         output.append(f"#[{part_style}]{value.replace('#', '##')}")
     return "".join(output) + "#[fg=default,nobold]   "
 
 
-def ansi_line(item: dict[str, Any], width: int) -> str:
+def ansi_line(item: dict[str, Any], width: int, line: int = 0) -> str:
     """Use foreground colors for text and paint only the unused space after its padding."""
-    parts = line_parts(item, width - 6)
+    parts = line_parts(item, width - 6, line=line)
     colors = field_colors(item)
     output = ["\033[0m   "]
     for key, value in parts:
         foreground = f"38;5;{colors[key]}" if colors.get(key) is not None else "39"
-        weight = "1" if key in {"name", "model", "effort", "stage", "task"} else "22"
+        weight = "1" if key in {"name", "model", "effort", "repo", "stage", "task"} else "22"
         output.append(f"\033[{foreground};{weight}m{value}\033[0m")
     output.append("   ")
     remaining = max(0, width - 6 - sum(display_width(value) for _, value in parts))
@@ -429,6 +463,7 @@ def main() -> int:
         "--native-status", action="store_true", help="native UI callback: bind the outer footer when wrapped"
     )
     parser.add_argument("--width", type=int, help="maximum terminal width")
+    parser.add_argument("--line", type=int, choices=(1, 2), default=0, help="line number for multi-line footers")
     output = parser.add_mutually_exclusive_group()
     output.add_argument("--json", action="store_true", help="emit fields and formatted line as JSON")
     output.add_argument("--plain", action="store_true", help="omit ANSI colors")
@@ -461,11 +496,18 @@ def main() -> int:
         return 0  # In a wrapped terminal the native integration only supplies identity to the outer footer.
     if not session or not (item := identity(session, args.harness, payload)):
         if args.tmux:
-            print(
-                "#[align=left,bold]Orkest: agent identity appears after the session registers"
-                if args.codex_pane or args.terminal_pane
-                else "Orkest: waiting for agent"
-            )
+            if args.line == 2:
+                print(
+                    "#[align=left,nobold]Orkest: task and progress appear after the session registers"
+                    if args.codex_pane or args.terminal_pane
+                    else "Orkest: waiting for agent"
+                )
+            else:
+                print(
+                    "#[align=left,bold]Orkest: agent identity appears after the session registers"
+                    if args.codex_pane or args.terminal_pane
+                    else "Orkest: waiting for agent"
+                )
         return 0
     payload_width = payload.get("terminal_width") if isinstance(payload, dict) else None
     width = (
@@ -473,15 +515,15 @@ def main() -> int:
         or (payload_width if type(payload_width) is int else None)
         or shutil.get_terminal_size((80, 24)).columns
     )
-    label, details = format_line(item, max(32, min(width, 1000)))
+    label, details = format_line(item, max(32, min(width, 1000)), line=args.line)
     if args.json:
         print(json.dumps({**item, "label": label, "details": details}))
     elif args.tmux:
-        print(tmux_line(item, max(32, min(width, 1000))))
+        print(tmux_line(item, max(32, min(width, 1000)), line=args.line))
     elif args.plain or os.environ.get("NO_COLOR"):
         print(label + details)
     else:
-        print(ansi_line(item, max(32, min(width, 1000))))
+        print(ansi_line(item, max(32, min(width, 1000)), line=args.line))
     return 0
 
 

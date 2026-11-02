@@ -31,15 +31,23 @@ def main(arguments: list[str]) -> int:
     room = None
     cwd = None
     attach = False
+    lines = 1
+    while arguments and arguments[0] == "--lines":
+        if len(arguments) > 1 and arguments[1] in ("1", "2"):
+            lines = int(arguments[1])
+            arguments = arguments[2:]
+        else:
+            break
     if arguments[:1] in (["--room"], ["--attach-room"]):
         parser = argparse.ArgumentParser(description="Open an Orkest coordinator and swarm view")
         source = parser.add_mutually_exclusive_group(required=True)
         source.add_argument("--room")
         source.add_argument("--attach-room")
         parser.add_argument("--cwd")
+        parser.add_argument("--lines", type=int, choices=(1, 2), default=lines)
         parser.add_argument("command", nargs=argparse.REMAINDER)
         args = parser.parse_args(arguments)
-        room, cwd, attach = args.room or args.attach_room, args.cwd, bool(args.attach_room)
+        room, cwd, attach, lines = args.room or args.attach_room, args.cwd, bool(args.attach_room), args.lines
         arguments = args.command
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         print("ork label needs an interactive terminal", file=sys.stderr)
@@ -146,12 +154,16 @@ def main(arguments: list[str]) -> int:
     # A literal %0 in a status format is parsed by strftime. Expand it from an option instead.
     pane = "#{@orkest_coordinator_pane}" if room else "#{pane_id}"
     status = f"#({invocation} {source} {pane} --width #{{client_width}} --tmux)"
+    status_0 = f"#({invocation} {source} {pane} --width #{{client_width}} --tmux --line 1)"
+    status_1 = f"#({invocation} {source} {pane} --width #{{client_width}} --tmux --line 2)"
     options = (
         ("@orkest_coordinator_pane", coordinator_pane),
+        *(("status", "2") if lines == 2 else ()),
         ("status-position", "bottom"),
         ("status-interval", "3"),
         ("status-style", "fg=default,bg=default"),
-        ("status-format[0]", status),
+        ("status-format[0]", status_0 if lines == 2 else status),
+        *(("status-format[1]", status_1) if lines == 2 else ()),
     )
     for name, value in options:
         result = subprocess.run([*base, "set-option", "-t", session, name, value], env=environment, check=False)

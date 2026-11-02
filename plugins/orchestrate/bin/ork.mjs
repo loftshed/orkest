@@ -38,7 +38,7 @@ const HELP = `ork agy|codex|claude|opencode   (open a coordinator; enter your go
   --harness-arg=<argument>      (pass an argument to the coordinator; repeat as needed)
 ork rooms --help
 ork gate [--heavy] [--label <text>] -- <command>   (also: ork gate status|install|uninstall)
-ork label -- codex|claude|agy|opencode [arguments]   (one outer tmux footer for every harness)
+ork label [--lines 1|2] -- codex|claude|agy|opencode [arguments]   (outer tmux footer for every harness)
 ork progress --session ID --goal TEXT --task TEXT --stage working
 ork name [--model <model>] [--effort <level>] [--harness <harness>]
 ork routes [--archetype <name>] [--json] [--width 120]
