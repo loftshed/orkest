@@ -149,7 +149,8 @@ class TerminalTests(unittest.TestCase):
             text=True,
         )
         self.assertEqual(
-            output, "snorfle-test-high-footer-aa | — / — | stage : not set | goal : not set | task : not set\n"
+            output,
+            f"snorfle-test-high-footer-aa | — / — | repo : {self.home.name} | stage : not set | goal : not set | task : not set\n",
         )
         self.assertIsNone(self.footer("claude"))
 

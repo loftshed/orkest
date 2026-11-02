@@ -32,7 +32,7 @@ Codex requires one-time approval for command hooks: review them in Codex `/hooks
 
 ## Agent status in terminal footers
 
-Orkest can show each registered session's agent name, model, reasoning effort, task stage, team goal,
+Orkest can show each registered session's agent name, model, reasoning effort, repository, task stage, team goal,
 and individual task in its terminal footer. Text is left-aligned on the terminal's normal background,
 with three spaces of padding and a colored band filling the remaining space to its right. The color
 is stable for that session; `NO_COLOR` turns color off. Long fields are shortened to fit. Missing work
@@ -50,7 +50,8 @@ ork label -- opencode
 ```
 
 The wrapper needs `tmux` on `PATH`. Each launch gets a private server with the Orkest bar on the
-lowest row, below the harness's prompt and built-in footer. Arguments pass through to the harness.
+lowest row, below the harness's prompt and built-in footer. Pass `--lines 2` before `--` to split
+identity and repository from task progress across two rows. Arguments pass through to the harness.
 `plaude` is also supported and retains its own account wrapper. Detaching keeps the session running
 and prints a reattach command.
 
