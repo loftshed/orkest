@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.44.0
+
+- feat(orchestrate): display repository in terminal footer and tmux bar
+
 ## 0.43.0
 
 - feat(orchestrate): support coordinator launch arguments and retire old skill paths
