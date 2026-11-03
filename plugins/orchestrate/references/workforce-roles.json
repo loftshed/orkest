@@ -1,0 +1,74 @@
+{
+  "planner": {
+    "id": "planner",
+    "label": "planner",
+    "aliases": ["architect", "coordinator"],
+    "defaultKind": "investigation",
+    "archetype": "architecture-conductor",
+    "defaultStage": "planning",
+    "guidance": "Decompose objectives, resolve ambiguity, sequence dependent tasks, and define verification criteria."
+  },
+  "scout": {
+    "id": "scout",
+    "label": "scout",
+    "aliases": ["investigator", "explorer", "researcher"],
+    "defaultKind": "investigation",
+    "archetype": "architecture-conductor",
+    "defaultStage": "working",
+    "guidance": "Explore the codebase and documentation read-only to gather grounded file and line evidence."
+  },
+  "debugger": {
+    "id": "debugger",
+    "label": "debugger",
+    "aliases": ["troubleshooter", "diagnostician"],
+    "defaultKind": "investigation",
+    "archetype": "debug-invariants",
+    "defaultStage": "working",
+    "guidance": "Reproduce failures, isolate root-cause invariants, and explain causal chains before proposing fixes."
+  },
+  "builder": {
+    "id": "builder",
+    "label": "builder",
+    "aliases": ["implementer", "coder", "refactorer"],
+    "defaultKind": "implementation",
+    "archetype": "structural-refactor",
+    "defaultStage": "working",
+    "guidance": "Implement or refactor bounded code changes while preserving module invariants and passing focused checks."
+  },
+  "ui-designer": {
+    "id": "ui-designer",
+    "label": "ui-designer",
+    "aliases": ["frontend", "ux"],
+    "defaultKind": "implementation",
+    "archetype": "ui-design-system",
+    "defaultStage": "working",
+    "guidance": "Build or refine user interface layouts, visual hierarchy, responsiveness, and accessibility."
+  },
+  "sweeper": {
+    "id": "sweeper",
+    "label": "sweeper",
+    "aliases": ["mechanical", "migrator"],
+    "defaultKind": "implementation",
+    "archetype": "mechanical-sweep",
+    "defaultStage": "working",
+    "guidance": "Apply a decided, repeatable transformation across bounded files with automated checks."
+  },
+  "reviewer": {
+    "id": "reviewer",
+    "label": "reviewer",
+    "aliases": ["auditor", "critic", "challenger"],
+    "defaultKind": "investigation",
+    "archetype": "independent-review",
+    "defaultStage": "review",
+    "guidance": "Adversarially challenge diffs and plans against requirements to uncover defects and unchecked assumptions."
+  },
+  "verifier": {
+    "id": "verifier",
+    "label": "verifier",
+    "aliases": ["tester", "qa"],
+    "defaultKind": "investigation",
+    "archetype": "debug-invariants",
+    "defaultStage": "testing",
+    "guidance": "Write or run focused checks, exercise edge cases and invariants, and report pass/fail evidence."
+  }
+}

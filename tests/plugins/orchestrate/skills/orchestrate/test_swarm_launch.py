@@ -86,13 +86,32 @@ class SwarmLaunchTests(unittest.TestCase):
             binary.write_text(
                 "#!" + sys.executable + "\n"
                 "import json, os, re, subprocess, sys\nfrom pathlib import Path\n"
-                "room = re.search(r'Room: ([^\\n]+)', sys.argv[-1]).group(1)\n"
-                "subprocess.run(['node', " + repr(str(CLI)) + ", 'rooms', 'bind', '--room', room, "
-                "'--member', 'conductor', '--engine', "
-                + repr(engine)
-                + ", '--session', '11111111-2222-4333-8444-555555555555'], "
-                "check=True, stdout=subprocess.DEVNULL)\n"
-                "sys.stdout.write('\\033]2;11111111-2222-4333-8444-555555555555\\007')\n"
+                "room = os.environ.get('ORKEST_SWARM_ROOM') or re.search(r'Room: ([^\\n]+)', sys.argv[-1]).group(1)\n"
+                + (
+                    "hook_out = json.loads(subprocess.check_output(["
+                    + repr(sys.executable)
+                    + ", "
+                    + repr(str(SCRIPTS / "peer_mailbox.py"))
+                    + ", 'hook', '--harness', "
+                    + repr(harness)
+                    + "], input=json.dumps({'hook_event_name': 'UserPromptSubmit', 'session_id': "
+                    + repr(peer["session"])
+                    + ", 'cwd': "
+                    + repr(str(home))
+                    + "}), text=True))\n"
+                    "prompt = hook_out['hookSpecificOutput']['additionalContext']\n"
+                    "flags = sys.argv[1:]\n"
+                    if shortcut
+                    else "subprocess.run(['node', "
+                    + repr(str(CLI))
+                    + ", 'rooms', 'bind', '--room', room, '--member', 'conductor', '--engine', "
+                    + repr(engine)
+                    + ", '--session', '11111111-2222-4333-8444-555555555555'], "
+                    "check=True, stdout=subprocess.DEVNULL)\n"
+                    "prompt = sys.argv[-1]\n"
+                    "flags = sys.argv[1:-1]\n"
+                )
+                + "sys.stdout.write('\\033]2;11111111-2222-4333-8444-555555555555\\007')\n"
                 + (
                     ""
                     if engine == "codex"
@@ -114,7 +133,7 @@ class SwarmLaunchTests(unittest.TestCase):
                 "launch_file = Path(" + repr(str(launched)) + ")\n"
                 "launch_temp = launch_file.with_suffix('.tmp')\n"
                 "launch_temp.write_text(json.dumps({'room': room, 'pid': os.getpid(), "
-                "'socket': os.environ['TMUX'].split(',')[0], 'prompt': sys.argv[-1], 'flags': sys.argv[1:-1]}))\n"
+                "'socket': os.environ['TMUX'].split(',')[0], 'prompt': prompt, 'flags': flags}))\n"
                 "launch_temp.replace(launch_file)\n"
                 "while True:\n"
                 "    value = os.read(0, 4096)\n"
@@ -175,6 +194,7 @@ class SwarmLaunchTests(unittest.TestCase):
                 tmux = ["tmux", "-S", info["socket"]]
                 if shortcut:
                     self.assertEqual(command("show", "--room", info["room"])["objective"], "")
+                    self.assertIn("If the user has already supplied their goal", info["prompt"])
                 else:
                     self.assertIn("Overall objective: " + objective, info["prompt"])
                 self.assertEqual(

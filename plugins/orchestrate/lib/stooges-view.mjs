@@ -1,3 +1,4 @@
+import path from "node:path";
 import { stripVTControlCharacters } from "node:util";
 
 import { renderLine } from "../../monitor/lib/render.mjs";
@@ -321,21 +322,24 @@ export function renderTable(
   ];
 }
 
+const ACTIVE_STATUSES = new Set(["running", "working", "planning", "testing", "review"]);
+const ERROR_STATUSES = new Set(["blocked", "failed", "rejected", "session unavailable"]);
+
 function toneForStatus(status) {
-  if (status === "completed") return "green";
-  if (status === "running") return "cyan";
-  if (status === "blocked" || status === "failed") return "red";
-  if (status === "queued") return "yellow";
+  if (status === "completed" || status === "reported complete") return "green";
+  if (ACTIVE_STATUSES.has(status)) return "cyan";
+  if (ERROR_STATUSES.has(status)) return "red";
+  if (status === "queued" || status === "reserved") return "yellow";
   return "dim";
 }
 
 function statusGlyph(agent, now, tier) {
   const glyphs = glyphSet(tier);
-  if (agent.status === "running" && tier === "unicode")
-    return SPINNER[Math.floor(now / 200) % SPINNER.length];
-  if (agent.status === "running") return glyphs.running;
-  if (agent.status === "blocked" || agent.status === "failed") return glyphs.blocked;
-  if (agent.status === "completed") return glyphs.completed;
+  const isActive = ACTIVE_STATUSES.has(agent.status);
+  if (isActive && tier === "unicode") return SPINNER[Math.floor(now / 200) % SPINNER.length];
+  if (isActive) return glyphs.running;
+  if (ERROR_STATUSES.has(agent.status)) return glyphs.blocked;
+  if (agent.status === "completed" || agent.status === "reported complete") return glyphs.completed;
   return glyphs.idle;
 }
 
@@ -396,18 +400,58 @@ function rangeLabel(start, end, total) {
   return total === 0 ? "0 agents" : `${start + 1}–${end} of ${total} agents`;
 }
 
+function agentFolder(member, room) {
+  return plain(member?.progress?.cwd || member?.cwd || member?.session?.cwd || room?.cwd || "");
+}
+
+function shortFolder(folderPath) {
+  const cleaned = plain(folderPath).trim();
+  if (!cleaned) return "workspace";
+  return path.basename(cleaned) || cleaned;
+}
+
+function joinCardGrid(cards, columns, cardWidth, gap = "  ") {
+  if (columns <= 1 || cards.length <= 1) return cards.flat();
+  const rows = [];
+  for (let index = 0; index < cards.length; index += columns) {
+    const pair = cards.slice(index, index + columns);
+    if (pair.length === 1) {
+      rows.push(...pair[0]);
+      continue;
+    }
+    const height = Math.max(...pair.map((card) => card.length));
+    for (let lineIndex = 0; lineIndex < height; lineIndex++) {
+      const left = fitStyled(pair[0][lineIndex] || "", cardWidth);
+      const right = fitStyled(pair[1][lineIndex] || "", cardWidth);
+      rows.push(`${left}${gap}${right}`);
+    }
+  }
+  return rows;
+}
+
 function treeRoom(room) {
   if (!room.swarm) return room;
-  const agents = [];
+  const treeAgents = [];
   const visit = (parent, prefix = "") => {
     const children = room.agents.filter((agent) => (agent.parent || "conductor") === parent);
     for (const [index, agent] of children.entries()) {
       const isLast = index === children.length - 1;
-      agents.push({ ...agent, treePrefix: prefix + (isLast ? "└─ " : "├─ ") });
+      treeAgents.push({
+        ...agent,
+        cwd: agentFolder(agent, room) || undefined,
+        treePrefix: prefix + (isLast ? "└─ " : "├─ "),
+      });
       visit(agent.id, prefix + (isLast ? " ".repeat(3) : "│  "));
     }
   };
   visit("conductor");
+  const groups = new Map();
+  for (const agent of treeAgents) {
+    const folder = agentFolder(agent, room);
+    if (!groups.has(folder)) groups.set(folder, []);
+    groups.get(folder).push(agent);
+  }
+  const agents = groups.values().toArray().flat();
   return { ...room, agents };
 }
 
@@ -427,7 +471,7 @@ export class StoogesView {
   }
 
   pageSizeFor() {
-    if (this.room.swarm) return Math.min(9, Math.max(1, Math.floor((this.height - 10) / 3)));
+    if (this.room.swarm) return Math.min(9, Math.max(2, Math.floor((this.height - 10) / 4) * 2));
     const questions = Math.min(4, this.room.agents.filter((agent) => agent.question).length);
     const bodyRows = Math.max(1, this.height - 18 - questions);
     return Math.min(9, bodyRows);
@@ -438,7 +482,7 @@ export class StoogesView {
   }
 
   get needsAnimation() {
-    return this.room.agents.some((agent) => agent.status === "running");
+    return this.room.agents.some((agent) => ACTIVE_STATUSES.has(agent.status));
   }
 
   setRoom(room) {
@@ -725,46 +769,91 @@ export class StoogesView {
   }
 
   renderSwarm(width) {
+    const now = this.now();
     const room = this.room;
-    const lead = room.conductor;
+    const lead = room.conductor || {};
     const size = this.pageSizeFor();
     const pages = Math.max(1, Math.ceil(room.agents.length / size));
     this.page = Math.min(this.page, pages - 1);
     const selected = room.agents.slice(this.page * size, (this.page + 1) * size);
     const phase = (member) => (member.paused ? "new launches paused" : member.status || "unknown");
+    const roleOf = (member) => plain(member?.progress?.role || member?.workforceRole || "").trim();
     const model = (member) => {
       const data = member.progress || member;
       const modelName = member.resolvedModel || data.model || member.engine || "default model";
       const effort = member.resolvedEffort || data.effort;
       return `${modelName}${effort && effort !== "—" ? ` / ${effort}` : ""}`;
     };
-    const lines = [
-      ansi(`Swarm · ${plain(room.title)}`, "bold cyan", this.color),
-      plain(lead.name || "Coordinator"),
-      plain(`${model(lead)} | ${phase(lead)}`),
+    const contentWidth = Math.max(1, width - 2);
+    const leadFolder = agentFolder(lead, room);
+    const leadRole = roleOf(lead);
+    const leadRoleBadge = leadRole ? ` [${leadRole}]` : "";
+    const leadLines = [
+      `${plain(lead.name || "Coordinator")}${leadRoleBadge} · folder: ${shortFolder(leadFolder)}`,
+      `${model(lead)} | ${phase(lead)}`,
       plain(lead.progress?.task || room.objective || "Tell the coordinator what you want done"),
-      "",
     ];
-    for (const [index, agent] of selected.entries()) {
-      let branch = agent.treePrefix;
-      if (this.tier === "ascii")
-        branch = branch
-          .replaceAll("└", "`")
-          .replaceAll("├", "+")
-          .replaceAll("─", "-")
-          .replaceAll("│", "|");
-      lines.push(
-        ansi(
-          `${branch}${index + 1} ${plain(agent.name || agent.id)}${agent.role === "lead" ? " (lead)" : ""}`,
-          `${toneForStatus(agent.status)}${agent.id === this.focusId ? " bold" : ""}`,
-          this.color,
-        ),
-        plain(`   ${agent.progress?.task || agent.objective || "Awaiting assignment"}`),
-        plain(`   ${model(agent)} | ${phase(agent)}`),
-      );
-    }
-    if (room.agents.length === 0)
+    const lines = [
+      ...this.panel(
+        `Swarm · ${plain(room.title)}`,
+        leadLines,
+        contentWidth,
+        `${room.agents.length}/${room.swarm.maxAgents} slots`,
+      ),
+    ];
+    if (room.agents.length === 0) {
       lines.push("The coordinator will add agents as work is assigned.");
+    } else {
+      const folderGroups = new Map();
+      for (const [offset, agent] of selected.entries()) {
+        const folder = agentFolder(agent, room);
+        if (!folderGroups.has(folder)) folderGroups.set(folder, []);
+        folderGroups.get(folder).push({ agent, index: offset });
+      }
+      const gap = "  ";
+      for (const [folder, entries] of folderGroups) {
+        const countLabel = `${entries.length} ${entries.length === 1 ? "agent" : "agents"}`;
+        const folderLabel = folder
+          ? `Folder · ${shortFolder(folder)} · ${countLabel} · ${folder}`
+          : `Folder · workspace · ${countLabel}`;
+        lines.push(ansi(folderLabel, "bold cyan", this.color));
+        const columns = contentWidth >= 100 && entries.length > 1 ? 2 : 1;
+        const cardWidth =
+          columns === 2 ? Math.max(24, Math.floor((contentWidth - gap.length) / 2)) : contentWidth;
+        const cards = entries.map(({ agent, index }) => {
+          let branch = agent.treePrefix || "";
+          if (this.tier === "ascii")
+            branch = branch
+              .replaceAll("└", "`")
+              .replaceAll("├", "+")
+              .replaceAll("─", "-")
+              .replaceAll("│", "|");
+          const wfRole = roleOf(agent);
+          const roleBadge = wfRole ? ` [${wfRole}]` : "";
+          const isFocused = agent.id === this.focusId;
+          const isPinned = agent.id === this.pinnedId;
+          let stateBadge = "";
+          if (isPinned) stateBadge = "PIN ";
+          else if (isFocused) stateBadge = "FOCUS ";
+          const parentBadge =
+            agent.parent && agent.parent !== "conductor" ? ` ↳ ${plain(agent.parent)}` : "";
+          const cardTitle = `${branch}${index + 1} ${plain(agent.name || agent.id)}${agent.role === "lead" ? " (lead)" : ""}${roleBadge}`;
+          const cardRight = `${stateBadge}${shortFolder(folder)}${parentBadge}`;
+          const taskText = plain(agent.progress?.task || agent.objective || "Awaiting assignment");
+          const statusLine = ansi(
+            `${statusGlyph(agent, now, this.tier)}${roleBadge} ${model(agent)} | ${phase(agent)}`,
+            `${toneForStatus(agent.status)}${isFocused ? " bold" : ""}`,
+            this.color,
+          );
+          return frame(cardTitle, [taskText, statusLine], cardWidth, {
+            glyphs: glyphSet(this.tier),
+            color: this.color,
+            right: cardRight,
+          });
+        });
+        lines.push(...joinCardGrid(cards, columns, cardWidth, gap));
+      }
+    }
     const focused = room.agents.find((agent) => agent.id === (this.pinnedId || this.focusId));
     const detail = focused?.output?.at(-1);
     if (detail && lines.length < this.height - 4) lines.push(plain(detail));

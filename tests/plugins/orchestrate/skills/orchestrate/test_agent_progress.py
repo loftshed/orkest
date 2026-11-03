@@ -260,6 +260,28 @@ class ProgressTests(unittest.TestCase):
                 self.assertIn("footer progress is stale", str(reminded))
                 self.assertEqual(progress.reminder(self.base, mailbox.load(mailbox.peer_path(self.base, session))), "")
 
+    def test_workforce_roles_normalize_aliases_persist_across_updates_and_clear(self):
+        reported = progress.report(
+            self.base,
+            self.peer,
+            goal="Ship swarm cards",
+            task="Explore statusline",
+            stage="planning",
+            role="investigator",
+        )
+        self.assertEqual(reported["role"], "scout")
+        self.assertEqual(progress.read(self.base, self.peer)["role"], "scout")
+
+        updated = progress.report(self.base, self.peer, goal=None, task=None, stage="working")
+        self.assertEqual(updated["role"], "scout")
+
+        switched = progress.report(self.base, self.peer, goal=None, task=None, stage="working", role="implementer")
+        self.assertEqual(switched["role"], "builder")
+
+        cleared = progress.report(self.base, self.peer, goal=None, task=None, stage="testing", role="none")
+        self.assertNotIn("role", cleared)
+        self.assertIsNone(progress.read(self.base, self.peer).get("role"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -30,7 +30,8 @@ def project(cwd: str, member: dict[str, Any], task: dict[str, Any]) -> dict[str,
     binding = member["dispatch"]
     if task.get("schema") != "agent-executor.task.v1" or task.get("task_id") != binding["taskId"]:
         raise ValueError("Task identity changed")
-    if Path(task["repository"]).resolve(strict=True) != Path(cwd).resolve(strict=True):
+    expected_cwd = member.get("cwd") if isinstance(member.get("cwd"), str) and member["cwd"] else cwd
+    if Path(task["repository"]).resolve(strict=True) != Path(expected_cwd).resolve(strict=True):
         raise ValueError("Task identity changed")
     matches = [run for run in task["runs"] if isinstance(run, dict) and run.get("request_id") == binding["requestId"]]
     if len(matches) != 1:

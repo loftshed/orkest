@@ -31,7 +31,7 @@ def main(arguments: list[str]) -> int:
     room = None
     cwd = None
     attach = False
-    lines = 1
+    lines = 2
     while arguments and arguments[0] == "--lines":
         if len(arguments) > 1 and arguments[1] in ("1", "2"):
             lines = int(arguments[1])
@@ -109,6 +109,8 @@ def main(arguments: list[str]) -> int:
     environment.pop("TMUX_PANE", None)
     environment["ORKEST_TERMINAL_SERVER"] = socket
     environment["ORKEST_TERMINAL_HARNESS"] = harness
+    if room:
+        environment["ORKEST_SWARM_ROOM"] = room
     columns, rows = shutil.get_terminal_size((80, 24))
     create = subprocess.run(
         [
@@ -158,12 +160,12 @@ def main(arguments: list[str]) -> int:
     status_1 = f"#({invocation} {source} {pane} --width #{{client_width}} --tmux --line 2)"
     options = (
         ("@orkest_coordinator_pane", coordinator_pane),
-        *(("status", "2") if lines == 2 else ()),
+        *([("status", "2")] if lines == 2 else []),
         ("status-position", "bottom"),
         ("status-interval", "3"),
         ("status-style", "fg=default,bg=default"),
         ("status-format[0]", status_0 if lines == 2 else status),
-        *(("status-format[1]", status_1) if lines == 2 else ()),
+        *([("status-format[1]", status_1)] if lines == 2 else []),
     )
     for name, value in options:
         result = subprocess.run([*base, "set-option", "-t", session, name, value], env=environment, check=False)

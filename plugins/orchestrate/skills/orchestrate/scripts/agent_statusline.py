@@ -84,7 +84,7 @@ def bound_rooms(base: Path, peer: dict[str, Any]) -> list[tuple[dict[str, Any], 
                     and binding.get("engine") == engine
                     and binding.get("machine") == socket.gethostname()
                     and isinstance(binding.get("cwd"), str)
-                    and Path(binding["cwd"]).resolve() == cwd
+                    and Path(binding["cwd"]).resolve() in {cwd, checkout}
                 ):
                     found.append((room, member))
         except (OSError, RuntimeError, TypeError, ValueError):
@@ -220,6 +220,10 @@ def identity(
         health = "stale"
         stage = f"{stage or 'not set'} (stale)"
     repo = text(peer.get("repository") or mailbox.repository_name(peer)) or "not set"
+    checkout = str(Path(peer.get("checkout") or peer["cwd"]).resolve())
+    role = (progress.get("role") if progress else None) or (
+        rooms[0][1].get("workforceRole") if len(rooms) == 1 else None
+    )
     return {
         "name": name,
         "color": COLORS[hashlib.sha256(session.encode()).digest()[0] % len(COLORS)],
@@ -227,6 +231,8 @@ def identity(
         "effort": effort or recorded_effort or text(peer.get("effort")) or "—",
         "repo": repo,
         "repository": repo,
+        "cwd": checkout,
+        **({"role": role} if role else {}),
         "goal": goal or "not set",
         "task": task or "not set",
         "stage": stage or "not set",

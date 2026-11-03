@@ -33,6 +33,17 @@ describe("coordinator launch arguments", () => {
   ])("passes launch options to %s before its prompt", (engine, flags, expected) => {
     expect(coordinatorArguments(engine, "the coordinator prompt", flags)).toEqual(expected);
   });
+
+  it("omits prompt arguments when launching a coordinator for first-message hook delivery", () => {
+    expect(
+      coordinatorArguments("agy", "", ["--remote-control", "--dangerously-skip-permissions"]),
+    ).toEqual(["--remote-control", "--dangerously-skip-permissions"]);
+    expect(coordinatorArguments("claude", "", ["--permission-mode", "auto"])).toEqual([
+      "--permission-mode",
+      "auto",
+    ]);
+    expect(coordinatorArguments("codex", "")).toEqual([]);
+  });
 });
 async function sandbox() {
   const dir = await mkdtemp(path.join(tmpdir(), "ork-cli-test-"));

@@ -24,11 +24,17 @@ def snapshot(room: dict, base: Path) -> dict:
         harness = {"agy": "gemini"}.get(binding["engine"], binding["engine"])
         try:
             peer = mailbox.load(mailbox.peer_path(base, session))
+            expected_cwd = Path(binding.get("cwd") or member.get("cwd") or room["cwd"]).resolve()
+            peer_cwd = (
+                Path(peer.get("checkout") or peer["cwd"]).resolve()
+                if isinstance(peer, dict) and (peer.get("checkout") or peer.get("cwd"))
+                else None
+            )
             if (
                 not mailbox.valid_peer(peer)
                 or not mailbox.is_live(peer)
                 or binding.get("machine") != socket.gethostname()
-                or Path(peer.get("checkout") or peer["cwd"]).resolve() != Path(room["cwd"]).resolve()
+                or (peer_cwd != expected_cwd and peer_cwd != Path(room["cwd"]).resolve())
             ):
                 continue
             item = agent_statusline.identity(session, harness, base=base)

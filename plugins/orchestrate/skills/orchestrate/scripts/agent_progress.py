@@ -21,6 +21,21 @@ SCHEMA = "orchestrate.progress.v1"
 STAGES = ("planning", "working", "testing", "review", "blocked", "complete")
 STALE_AFTER = dt.timedelta(minutes=30)
 REMIND_AFTER = dt.timedelta(minutes=5)
+ROLES_PATH = Path(__file__).resolve().parents[3] / "references" / "workforce-roles.json"
+ROLES_DATA = json.loads(ROLES_PATH.read_text(encoding="utf-8"))
+ROLES = tuple(ROLES_DATA.keys())
+ROLE_ALIASES = {alias: role_id for role_id, info in ROLES_DATA.items() for alias in (role_id, *info.get("aliases", ()))}
+
+
+def normalize_role(value: str | None) -> str | None:
+    if value is None:
+        return None
+    cleaned = value.strip().lower()
+    if cleaned in {"", "none", "clear"}:
+        return ""
+    if cleaned not in ROLE_ALIASES:
+        raise mailbox.MailboxError(f"progress role must be one of {', '.join(ROLES)} (or 'none' to clear)")
+    return ROLE_ALIASES[cleaned]
 
 
 def record_path(base: Path, session: str) -> Path:
@@ -50,6 +65,7 @@ def read(base: Path, peer: dict[str, Any]) -> dict[str, Any] | None:
             or row.get("accountHome") != peer.get("accountHome")
             or row.get("checkout") != str(Path(peer.get("checkout") or peer["cwd"]).resolve())
             or row.get("stage") not in STAGES
+            or (row.get("role") is not None and row.get("role") not in ROLES)
             or not mailbox.valid_stamp(row.get("updatedAt"))
             or any(
                 not isinstance(row.get(key), str) or not row[key].strip() or len(row[key]) > 160
@@ -66,9 +82,16 @@ def read(base: Path, peer: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def report(
-    base: Path, peer: dict[str, Any], *, goal: str | None, task: str | None, stage: str | None
+    base: Path,
+    peer: dict[str, Any],
+    *,
+    goal: str | None,
+    task: str | None,
+    stage: str | None,
+    role: str | None = None,
 ) -> dict[str, Any]:
     path = record_path(base, peer["session"])
+    normalized_role = normalize_role(role)
     with mailbox.locked(path):
         previous = read(base, peer) or {}
         context = work_context(mailbox_work.assigned(base, peer))
@@ -80,6 +103,7 @@ def report(
             key: value if value is not None else previous.get(key)
             for key, value in (("goal", goal), ("task", task), ("stage", stage))
         }
+        effective_role = previous.get("role") if normalized_role is None else (normalized_role or None)
         for key in ("goal", "task"):
             value = fields[key]
             if not isinstance(value, str) or not value.strip() or len(value) > 160:
@@ -98,6 +122,7 @@ def report(
             "checkout": str(Path(peer.get("checkout") or peer["cwd"]).resolve()),
             "workContext": context,
             **fields,
+            **({"role": effective_role} if effective_role else {}),
             "updatedAt": mailbox.stamp(),
         }
         mailbox.write(path, row)
@@ -158,6 +183,10 @@ def main() -> int:
     parser.add_argument("--goal")
     parser.add_argument("--task")
     parser.add_argument("--stage", choices=STAGES)
+    parser.add_argument(
+        "--role",
+        help="preset workforce role (e.g. planner, scout, builder, reviewer, verifier, debugger, ui-designer, sweeper)",
+    )
     args = parser.parse_args()
     try:
         base = mailbox.root()
@@ -166,8 +195,11 @@ def main() -> int:
         peer = mailbox.load(mailbox.peer_path(base, args.session))
         if not mailbox.valid_peer(peer) or mailbox.is_run_peer(peer):
             raise mailbox.MailboxError("register this interactive session with the peer mailbox first")
-        result = report(base, peer, goal=args.goal, task=args.task, stage=args.stage)
-        print(json.dumps({key: result[key] for key in ("goal", "task", "stage", "updatedAt")}))
+        result = report(base, peer, goal=args.goal, task=args.task, stage=args.stage, role=args.role)
+        out = {key: result[key] for key in ("goal", "task", "stage", "updatedAt")}
+        if "role" in result:
+            out["role"] = result["role"]
+        print(json.dumps(out))
         return 0
     except (mailbox.MailboxError, OSError) as error:
         print(f"Orkest progress: {error}", file=sys.stderr)

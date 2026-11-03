@@ -28,7 +28,7 @@ import {
   StoogesView,
   wrapText,
 } from "../lib/stooges-view.mjs";
-import { coordinatorBrief } from "../lib/swarm.mjs";
+import { coordinatorBrief, writeCoordinatorBrief } from "../lib/swarm.mjs";
 import { roomsCommand } from "./rooms.mjs";
 import { cachedQuota, runTui } from "./stooges-tui.mjs";
 
@@ -37,17 +37,18 @@ const COORDINATORS = new Set(["codex", "claude", "agy", "opencode"]);
 const HELP = `ork agy|codex|claude|opencode   (open a coordinator; enter your goal in the conversation)
   --harness-arg=<argument>      (pass an argument to the coordinator; repeat as needed)
 ork rooms --help
+ork setup [--dry-run] [--trust-codex-hooks]   (install mailbox, hooks and shell wrapper shortcuts)
 ork gate [--heavy] [--label <text>] -- <command>   (also: ork gate status|install|uninstall)
 ork label [--lines 1|2] -- codex|claude|agy|opencode [arguments]   (outer tmux footer for every harness)
-ork progress --session ID --goal TEXT --task TEXT --stage working
+ork progress --session ID --goal TEXT --task TEXT --stage working [--role ROLE]
 ork name [--model <model>] [--effort <level>] [--harness <harness>]
 ork routes [--archetype <name>] [--json] [--width 120]
 ork quota [--line|--json] [--refresh]
 ork telemetry [--runs-dir <directory>] [--json] [--width 120]
 ork stooges ["objective"] [--engine codex|claude|agy|opencode] [--max-agents 12] [--max-depth 3]
-ork stooges [--team "claude:haiku*2,agy:flash*2,codex:luna:max"]
+ork stooges [--team "claude:haiku*2@scout,agy:flash*2@builder,codex:luna:max@reviewer"]
 ork stooges --preset scout-swarm|bug-court|patch-race|heavy-trifecta
-ork stooges spawn --attach-room <id> --team <team>
+ork stooges spawn --attach-room <id> --team <team> [--role <role>]
 ork stooges --attach-room <id> [--view|--print|--json]
 ork stooges --fixture <room.json> [--print|--json] [--width 120]
 
@@ -307,6 +308,7 @@ function terminalCommand(script, argv) {
 }
 
 export function coordinatorArguments(engine, prompt, harnessArgs = []) {
+  if (!prompt) return [...harnessArgs];
   const promptFlag = { agy: "--prompt-interactive", opencode: "--prompt" }[engine];
   return [...harnessArgs, ...(promptFlag ? [promptFlag, prompt] : [prompt])];
 }
@@ -314,6 +316,10 @@ export function coordinatorArguments(engine, prompt, harnessArgs = []) {
 export async function main(argv = process.argv.slice(2), { stdout = process.stdout } = {}) {
   const engineShortcut = COORDINATORS.has(argv[0]) ? argv[0] : undefined;
   if (engineShortcut) argv = ["stooges", ...argv.slice(1)];
+  if (argv[0] === "setup") {
+    process.exitCode = await terminalCommand("install_mailbox.py", argv.slice(1));
+    return;
+  }
   if (argv[0] === "progress") {
     process.exitCode = await terminalCommand("agent_progress.py", argv.slice(1));
     return;
@@ -353,7 +359,10 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
       width: { type: "string" },
       cwd: { type: "string" },
       engine: { type: "string" },
+      role: { type: "string" },
       "harness-arg": { type: "string", multiple: true },
+      "dangerously-skip-permissions": { type: "boolean" },
+      "remote-control": { type: "boolean" },
       view: { type: "boolean" },
       "max-agents": { type: "string" },
       "max-depth": { type: "string" },
@@ -380,6 +389,11 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
   if (!COORDINATORS.has(engine)) throw new Error("Unsupported coordinator engine");
   const maxAgents = Number(values["max-agents"] || 12);
   const maxDepth = Number(values["max-depth"] || 3);
+  const harnessArgs = [
+    ...(values["harness-arg"] || []),
+    ...(values["dangerously-skip-permissions"] ? ["--dangerously-skip-permissions"] : []),
+    ...(values["remote-control"] ? ["--remote-control"] : []),
+  ];
   const isInteractive = Boolean(
     stdout.isTTY && !values.print && !values.json && !values.view && !values.fixture && !isSpawning,
   );
@@ -388,7 +402,7 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
     objective ||
     engineShortcut ||
     values.engine ||
-    values["harness-arg"]?.length ||
+    harnessArgs.length > 0 ||
     values["max-agents"] ||
     values["max-depth"],
   );
@@ -397,7 +411,7 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
     (objective ||
       engineShortcut ||
       values.engine ||
-      values["harness-arg"]?.length ||
+      harnessArgs.length > 0 ||
       values["max-agents"] ||
       values["max-depth"])
   )
@@ -444,7 +458,7 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
         room = await updateRoom(
           room.id,
           (current) => {
-            addMembers(current, members);
+            addMembers(current, members, { workforceRole: values.role });
             return current;
           },
           { root },
@@ -467,8 +481,9 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
     }
     if (isInteractive && room.swarm) {
       const command = room.conductor.engine;
-      const prompt = coordinatorBrief(room);
-      const initial = coordinatorArguments(command, prompt, values["harness-arg"]);
+      await writeCoordinatorBrief(room, { root });
+      const prompt = room.objective || command === "opencode" ? coordinatorBrief(room) : "";
+      const initial = coordinatorArguments(command, prompt, harnessArgs);
       process.exitCode = await terminalCommand(
         "agent_statusline_tmux.py",
         values["attach-room"]

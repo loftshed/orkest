@@ -6,7 +6,15 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
-import { addMembers, createRoom, mailboxRoot, readRoom, updateRoom } from "./stooges-room.mjs";
+import {
+  addMembers,
+  createRoom,
+  mailboxRoot,
+  normalizeWorkforceRole,
+  readRoom,
+  updateRoom,
+  workforceRoleInfo,
+} from "./stooges-room.mjs";
 import { requireActiveBranch } from "./swarm.mjs";
 
 const execute = promisify(execFile);
@@ -133,8 +141,19 @@ export async function newRoom(
   return room;
 }
 
-export async function growRoom(id, members, root = mailboxRoot(), parent = "conductor") {
-  return updateRoom(id, (room) => addMembers(room, members, { parent }), { root });
+export async function growRoom(
+  id,
+  members,
+  root = mailboxRoot(),
+  parent = "conductor",
+  options = {},
+) {
+  const cwd = options.cwd ? await realpath(options.cwd) : undefined;
+  return updateRoom(
+    id,
+    (room) => addMembers(room, members, { parent, workforceRole: options.workforceRole, cwd }),
+    { root },
+  );
 }
 
 function memberOf(room, id) {
@@ -144,9 +163,14 @@ function memberOf(room, id) {
 }
 
 /** An explicit binding is a session reference, never permission to prompt that session. */
-export async function bindSession(id, memberId, { session, engine, root = mailboxRoot() }) {
+export async function bindSession(
+  id,
+  memberId,
+  { session, engine, cwd, workforceRole, root = mailboxRoot() },
+) {
   if (!session || !["claude", "codex", "agy", "opencode"].includes(engine))
     throw new Error("Session binding requires a session ID and supported engine");
+  const resolvedCwd = cwd ? await realpath(cwd) : undefined;
   return updateRoom(
     id,
     (room) => {
@@ -157,7 +181,18 @@ export async function bindSession(id, memberId, { session, engine, root = mailbo
         throw new Error(
           "This lead already has a native session; continue supervising that session",
         );
-      member.session = { id: session, engine, machine: hostname(), cwd: room.cwd };
+      if (resolvedCwd) member.cwd = resolvedCwd;
+      if (workforceRole !== undefined) {
+        const normalized = normalizeWorkforceRole(workforceRole);
+        if (normalized) member.workforceRole = normalized;
+        else delete member.workforceRole;
+      }
+      member.session = {
+        id: session,
+        engine,
+        machine: hostname(),
+        cwd: resolvedCwd || member.cwd || room.cwd,
+      };
       return room;
     },
     { root },
@@ -172,14 +207,20 @@ export async function dispatchMember(id, memberId, options = {}) {
   if (task.schema !== "agent-executor.task.v1" || typeof task.task_id !== "string")
     throw new Error("Unsupported coordinator task");
   const room = await readRoom(id, root);
-  if ((await realpath(task.repository)) !== (await realpath(room.cwd)))
+  const targetMember =
+    memberId === "conductor" ? room.conductor : room.agents.find((agent) => agent.id === memberId);
+  const resolvedMemberCwd = options.cwd
+    ? await realpath(options.cwd)
+    : await realpath(targetMember?.cwd || room.cwd);
+  if ((await realpath(task.repository)) !== resolvedMemberCwd)
     throw new Error("Task repository differs from room checkout");
   // A room under a team only runs that team's tasks, so a superseded lead cannot dodge the fence here.
   if (room.authority && task.authority?.team !== room.authority)
     throw new Error(
       `Task is not under the room's team ${room.authority}; init it with --authority`,
     );
-  const kind = options.kind || "investigation";
+  const effectiveRole = options.workforceRole ?? targetMember?.workforceRole;
+  const kind = options.kind || workforceRoleInfo(effectiveRole)?.defaultKind || "investigation";
   if (!["implementation", "investigation", "consultation", "challenge"].includes(kind))
     throw new Error("Unsupported dispatch kind");
   const transport = options.transport || "executor";
@@ -202,6 +243,12 @@ export async function dispatchMember(id, memberId, options = {}) {
       if (member.role === "lead")
         throw new Error("A subswarm lead uses native supervision, not worker dispatch");
       if (!member.dispatch) requireActiveBranch(current, memberId);
+      if (options.cwd) member.cwd = resolvedMemberCwd;
+      if (options.workforceRole !== undefined) {
+        const normalized = normalizeWorkforceRole(options.workforceRole);
+        if (normalized) member.workforceRole = normalized;
+        else delete member.workforceRole;
+      }
       if (member.dispatch) {
         for (const key of ["taskDir", "taskId", "kind", "transport", "billingMode", "packet"])
           if (member.dispatch[key] !== intent[key])
@@ -331,7 +378,12 @@ export async function observeRoom(
     const directories = new Set(members.map((member) => member.dispatch.taskDir));
     const snapshot = await roomTasks({
       cwd: room.cwd,
-      members: members.map(({ id, engine, dispatch }) => ({ id, engine, dispatch })),
+      members: members.map(({ id, engine, dispatch, cwd }) => ({
+        id,
+        engine,
+        dispatch,
+        ...(cwd && { cwd }),
+      })),
       tasks: Object.fromEntries([...tasks].filter(([directory]) => directories.has(directory))),
       errors: Object.fromEntries(
         [...taskErrors].filter(([directory]) => directories.has(directory)),
@@ -395,6 +447,8 @@ export async function observeRoom(
       if (snapshot) {
         member.progress = snapshot;
         member.name = snapshot.name;
+        if (snapshot.role) member.workforceRole = snapshot.role;
+        if (snapshot.cwd) member.cwd = snapshot.cwd;
         if (!member.dispatch)
           member.status = snapshot.stage === "complete" ? "reported complete" : snapshot.stage;
       } else if (member.session && !member.dispatch) member.status = "session unavailable";
@@ -439,13 +493,13 @@ export async function recoverRoom(id, options = {}) {
   const roomCwd = directories.size > 0 ? await realpath(room.cwd) : null;
   for (const directory of directories) {
     const task = await run(["show", "--task-dir", directory]);
-    if (
-      (await realpath(task.repository)) !== roomCwd ||
-      room.agents.some(
-        (member) =>
-          member.dispatch?.taskDir === directory && member.dispatch.taskId !== task.task_id,
-      )
-    )
+    const taskRepo = await realpath(task.repository);
+    const matchingMembers = room.agents.filter((member) => member.dispatch?.taskDir === directory);
+    const memberCwds = await Promise.all(
+      matchingMembers.map((member) => (member.cwd ? realpath(member.cwd) : Promise.resolve(null))),
+    );
+    const isValidRepo = taskRepo === roomCwd || memberCwds.includes(taskRepo);
+    if (!isValidRepo || matchingMembers.some((member) => member.dispatch.taskId !== task.task_id))
       throw new Error("Task identity changed; refusing to recover a different task");
   }
   for (const directory of directories)
