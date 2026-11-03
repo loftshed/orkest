@@ -262,8 +262,9 @@ class InstallMailboxTests(unittest.TestCase):
         self.assertTrue(installer.install_shell_wrappers(self.base, ork_cli))
         wrapper = self.base / ".config/agent-executor/orkest.sh"
         self.assertTrue(wrapper.is_file())
-        self.assertIn("command ork label -- agy --dangerously-skip-permissions --remote-control", wrapper.read_text())
-        self.assertIn("command ork agy --dangerously-skip-permissions --remote-control", wrapper.read_text())
+        self.assertIn('command ork label -- agy --dangerously-skip-permissions "$@"', wrapper.read_text())
+        self.assertIn('command ork agy --dangerously-skip-permissions "$@"', wrapper.read_text())
+        self.assertNotIn("--remote-control", wrapper.read_text())
         self.assertEqual((self.base / ".local/bin/ork").resolve(), ork_cli.resolve())
         self.assertIn(installer.MANAGED_ZSHRC_BLOCK, zshrc.read_text())
         self.assertIn("export EXAMPLE=1\n", zshrc.read_text())

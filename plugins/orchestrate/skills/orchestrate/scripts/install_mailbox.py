@@ -92,19 +92,19 @@ plaude() {
 }
 agy() {
   case "${1:-}" in
-    mcp|extensions|skills|auth|update|-h|--help|-v|--version) command agy "$@"; return ;;
+    agent|agents|changelog|help|install|mcp|mic-serve|models|plugin|plugins|remote-control|update|-h|--help|-v|--version) command agy "$@"; return ;;
   esac
   if _orkest_interactive agy "$@"; then
-    command ork label -- agy --dangerously-skip-permissions --remote-control "$@"
+    command ork label -- agy --dangerously-skip-permissions "$@"
   else
-    command agy --dangerously-skip-permissions --remote-control "$@"
+    command agy --dangerously-skip-permissions "$@"
   fi
 }
 ork() {
   case "${1:-}" in
     agy)
       shift
-      command ork agy --dangerously-skip-permissions --remote-control "$@"
+      command ork agy --dangerously-skip-permissions "$@"
       ;;
     claude)
       shift
@@ -123,7 +123,7 @@ ork() {
 # Launch each harness with the same outer Orkest footer.
 alias ocodex='ork label -- codex'
 alias oclaude='ork label -- claude'
-alias oagy='ork label -- agy --dangerously-skip-permissions --remote-control'
+alias oagy='ork label -- agy --dangerously-skip-permissions'
 alias oopencode='ork label -- opencode'
 """
 
