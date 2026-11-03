@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.45.0
+
+- fix(orchestrate): drop per-session --remote-control from agy shell wrappers
+- feat(orchestrate): add folder-grouped swarm cards, workforce roles, 2-line status bar, and automatic shell setup
+
 ## 0.44.0
 
 - feat(orchestrate): display repository in terminal footer and tmux bar
