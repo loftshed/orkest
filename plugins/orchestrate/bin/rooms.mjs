@@ -13,20 +13,21 @@ import {
   recoverRoom,
 } from "../lib/rooms.mjs";
 import { loadPresets, mailboxRoot, parseTeam, updateRoom } from "../lib/stooges-room.mjs";
-import { pauseBranch, reserveLead } from "../lib/swarm.mjs";
+import { assignWorkforceRole, pauseBranch, reserveLead } from "../lib/swarm.mjs";
 
 export const ROOMS_HELP = `ork rooms list [--json]
 ork rooms show --room ID [--json]
 ork rooms create --team TEAM [--group GROUP] [--title TITLE] [--cwd PATH] [--id ID] [--authority TEAM_ID]
-ork rooms add --room ID --team TEAM [--parent conductor|MEMBER]
-ork rooms lead --room ID --member ID --objective TEXT   (reserves a native subswarm lead)
+ork rooms add --room ID --team TEAM [--parent conductor|MEMBER] [--role ROLE] [--cwd PATH]
+ork rooms lead --room ID --member ID --objective TEXT [--role ROLE] [--cwd PATH]   (reserves a native subswarm lead)
+ork rooms role --room ID [--member ID|conductor] --role ROLE [--cwd PATH]   (assign or switch workforce role)
 ork rooms objective --room ID --objective TEXT
 ork rooms pause|resume --room ID [--member conductor|MEMBER]   (gates new launches)
 ork rooms init-task --task-spec FILE --task-dir DIR (--host codex|claude|agy|opencode|other | --authority TEAM_ID)
 ork rooms dispatch --room ID --member ID --task-dir DIR [--kind investigation|implementation|consultation|challenge]
-                   [--transport executor|native] [--packet FILE] [--request-id ID]
+                   [--transport executor|native] [--packet FILE] [--request-id ID] [--role ROLE] [--cwd PATH]
 ork rooms launch --room ID --plan FILE
-ork rooms bind --room ID --member ID|conductor --session ID --engine ENGINE
+ork rooms bind --room ID --member ID|conductor --session ID --engine ENGINE [--role ROLE] [--cwd PATH]
 ork rooms recover --room ID
 
 A room or task under a team (--authority) is fenced: init-task, dispatch, launch and recover also need
@@ -74,6 +75,7 @@ export async function roomsCommand(
           "lead-generation",
           "parent",
           "objective",
+          "role",
         ].map((name) => [name, { type: "string" }]),
       ),
     },
@@ -130,7 +132,10 @@ export async function roomsCommand(
       break;
     }
     case "add": {
-      result = await growRoom(requireValue("room"), await team(), root, values.parent);
+      result = await growRoom(requireValue("room"), await team(), root, values.parent, {
+        workforceRole: values.role,
+        cwd: values.cwd,
+      });
 
       break;
     }
@@ -139,7 +144,16 @@ export async function roomsCommand(
         requireValue("room"),
         requireValue("member"),
         requireValue("objective"),
-        { root },
+        { root, workforceRole: values.role, cwd: values.cwd },
+      );
+      break;
+    }
+    case "role": {
+      result = await assignWorkforceRole(
+        requireValue("room"),
+        values.member || "conductor",
+        requireValue("role"),
+        { root, cwd: values.cwd },
       );
       break;
     }
@@ -196,6 +210,8 @@ export async function roomsCommand(
         packet: values.packet,
         requestId: values["request-id"],
         billingMode: values["billing-mode"],
+        workforceRole: values.role,
+        cwd: values.cwd,
         ...lead,
       });
 
@@ -216,6 +232,8 @@ export async function roomsCommand(
         root,
         session: requireValue("session"),
         engine: requireValue("engine"),
+        workforceRole: values.role,
+        cwd: values.cwd,
       });
 
       break;

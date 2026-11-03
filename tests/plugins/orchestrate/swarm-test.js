@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -259,4 +259,57 @@ it("records a conversation's objective and pauses through the public room comman
   });
   await roomsCommand(["resume", "--room", room.id], { root, stdout });
   expect((await readRoom(room.id, root)).conductor.paused).toBe(false);
+});
+
+it("assigns preset workforce roles, groups agent cards by working folder, and projects on-the-fly role updates", async () => {
+  const { root, room } = await fixture();
+  const tempA = await mkdtemp(path.join(tmpdir(), "ork-wt-a-"));
+  const tempB = await mkdtemp(path.join(tmpdir(), "ork-wt-b-"));
+  const worktreeA = await realpath(tempA);
+  const worktreeB = await realpath(tempB);
+  directories.push(worktreeA, worktreeB);
+  const stdout = { write() {} };
+
+  await growRoom(room.id, parseTeam("claude:haiku*2@scout"), root, "conductor", {
+    cwd: worktreeA,
+  });
+  await growRoom(room.id, parseTeam("agy:flash@implementer"), root, "conductor", {
+    cwd: worktreeB,
+  });
+  await roomsCommand(
+    ["role", "--room", room.id, "--member", "haiku-2", "--role", "reviewer", "--cwd", worktreeB],
+    { root, stdout },
+  );
+
+  const saved = await readRoom(room.id, root);
+  expect(saved.agents.map((agent) => [agent.id, agent.workforceRole, agent.cwd])).toEqual([
+    ["haiku-1", "scout", worktreeA],
+    ["haiku-2", "reviewer", worktreeB],
+    ["flash-1", "builder", worktreeB],
+  ]);
+
+  const observed = await observeRoom(room.id, {
+    root,
+    progress: async () => ({
+      "haiku-1": {
+        name: "snorfle-haiku-low-wt-a-11",
+        model: "haiku",
+        effort: "low",
+        stage: "working",
+        task: "Map API endpoints",
+        role: "debugger",
+        cwd: worktreeA,
+        statusHealth: "fresh",
+      },
+    }),
+  });
+  expect(observed.agents[0].workforceRole).toBe("debugger");
+
+  const view = new StoogesView(observed, { height: 34, tier: "unicode" });
+  const output = view.render(110).join("\n");
+  expect(output).toContain(`Folder · ${path.basename(worktreeA)} · 1 agent`);
+  expect(output).toContain(`Folder · ${path.basename(worktreeB)} · 2 agents`);
+  expect(output).toContain("snorfle-haiku-low-wt-a-11 [debugger]");
+  expect(output).toContain("haiku-2 [reviewer]");
+  expect(output).toContain("flash-1 [builder]");
 });

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -8,6 +9,30 @@ export const ROOM_SCHEMA = "agent-executor.room.v1";
 const ID = /^[\w-]{1,80}$/u;
 const ENGINES = new Set(["claude", "agy", "codex", "opencode"]);
 const EFFORTS = new Set(["low", "medium", "high", "xhigh", "max", "ultra"]);
+
+export const WORKFORCE_ROLES = JSON.parse(
+  readFileSync(new URL("../references/workforce-roles.json", import.meta.url), "utf8"),
+);
+const ROLE_ALIASES = new Map(
+  Object.values(WORKFORCE_ROLES).flatMap((role) => [
+    [role.id, role.id],
+    ...(role.aliases || []).map((alias) => [alias, role.id]),
+  ]),
+);
+
+export function normalizeWorkforceRole(value) {
+  if (value === undefined || value === null) return;
+  if (typeof value !== "string") throw new Error("Invalid workforce role");
+  const key = value.trim().toLowerCase();
+  const resolved = ROLE_ALIASES.get(key);
+  if (!resolved) throw new Error(`Invalid workforce role: ${value}`);
+  return resolved;
+}
+
+export function workforceRoleInfo(value) {
+  const id = normalizeWorkforceRole(value);
+  return id ? WORKFORCE_ROLES[id] : undefined;
+}
 
 export function mailboxRoot(env = process.env) {
   const expand = (value) => value.replace(/^~(?=\/|$)/u, () => homedir());
@@ -35,9 +60,14 @@ export function parseTeam(text) {
   if (typeof text !== "string" || !text.trim()) throw new Error("A nonempty team is required");
   const members = [];
   for (const raw of text.split(",")) {
-    const match = /^(claude|agy|codex|opencode):([^*,\s]+?)(?:\*(\d+))?$/u.exec(raw.trim());
-    if (!match) throw new Error(`Invalid team member: ${raw}`);
-    const [, engine, selection, copies = "1"] = match;
+    const match =
+      /^(claude|agy|codex|opencode):([^*@,\s]+?)(?:@([A-Za-z0-9_-]+))?(?:\*(\d+))?(?:@([A-Za-z0-9_-]+))?$/u.exec(
+        raw.trim(),
+      );
+    if (!match || (match[3] && match[5])) throw new Error(`Invalid team member: ${raw}`);
+    const [, engine, selection, roleBefore, copies = "1", roleAfter] = match;
+    const workforceRole =
+      roleBefore || roleAfter ? normalizeWorkforceRole(roleBefore || roleAfter) : undefined;
     const count = Number(copies);
     if (count < 1 || count > 64 || members.length + count > 64)
       throw new Error("A room supports 1–64 members");
@@ -51,7 +81,13 @@ export function parseTeam(text) {
     if (engine === "agy" && ["flash", "pro"].includes(tier))
       model = tier === "flash" ? "gemini:fast" : "gemini:pro";
     for (let i = 0; i < count; i++)
-      members.push({ engine, model, ...(effort && { effort }), label: tier });
+      members.push({
+        engine,
+        model,
+        ...(effort && { effort }),
+        ...(workforceRole && { workforceRole }),
+        label: tier,
+      });
   }
   return members;
 }
@@ -130,6 +166,13 @@ export function validateRoom(room) {
   }
   for (const member of [room.conductor, ...room.agents]) {
     if (!member) continue;
+    if (member.workforceRole !== undefined)
+      member.workforceRole = normalizeWorkforceRole(member.workforceRole);
+    if (
+      member.cwd !== undefined &&
+      (typeof member.cwd !== "string" || !path.isAbsolute(member.cwd))
+    )
+      throw new Error("Member working folder must be an absolute path");
     if (
       member.session &&
       (typeof member.session.id !== "string" ||
@@ -153,14 +196,28 @@ export function validateRoom(room) {
   return room;
 }
 
-export function addMembers(room, members, { parent = "conductor" } = {}) {
+export function addMembers(room, members, { parent = "conductor", workforceRole, cwd } = {}) {
   if (room.agents.length + members.length > 64)
     throw new Error("A room supports at most 64 members");
+  const defaultRole = workforceRole ? normalizeWorkforceRole(workforceRole) : undefined;
+  const defaultCwd = cwd ? path.resolve(cwd) : undefined;
   for (const member of members) {
     let index = 1;
     const stem = member.label.replaceAll(/[^\w-]/gu, "-").slice(0, 60);
     while (room.agents.some((agent) => agent.id === `${stem}-${index}`)) index++;
-    room.agents.push({ ...member, id: `${stem}-${index}`, parent, status: "queued", output: [] });
+    const resolvedRole = member.workforceRole
+      ? normalizeWorkforceRole(member.workforceRole)
+      : defaultRole;
+    const resolvedCwd = member.cwd ? path.resolve(member.cwd) : defaultCwd;
+    room.agents.push({
+      ...member,
+      ...(resolvedRole && { workforceRole: resolvedRole }),
+      ...(resolvedCwd && { cwd: resolvedCwd }),
+      id: `${stem}-${index}`,
+      parent,
+      status: "queued",
+      output: [],
+    });
   }
   return room;
 }

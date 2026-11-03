@@ -1,18 +1,18 @@
 {
   "scout-swarm": {
-    "team": "claude:haiku*2,agy:flash*2,codex:luna:max",
+    "team": "claude:haiku*2@scout,agy:flash*2@scout,codex:luna:max@scout",
     "description": "Five scouts across three providers"
   },
   "bug-court": {
-    "team": "claude:sonnet,agy:pro,codex:sol:high",
+    "team": "claude:sonnet@reviewer,agy:pro@reviewer,codex:sol:high@reviewer",
     "description": "Three independent reviewers"
   },
   "patch-race": {
-    "team": "claude:sonnet,codex:luna:max,agy:flash",
+    "team": "claude:sonnet@builder,codex:luna:max@builder,agy:flash@builder",
     "description": "Three candidate workers; assign separate worktrees for edits"
   },
   "heavy-trifecta": {
-    "team": "claude:opus,agy:pro,codex:astra:high",
+    "team": "claude:opus@planner,agy:pro@debugger,codex:astra:high@builder",
     "description": "Three deep reasoning workers"
   }
 }

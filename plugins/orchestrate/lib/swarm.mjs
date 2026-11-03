@@ -1,8 +1,14 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, realpath, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { mailboxRoot, updateRoom } from "./stooges-room.mjs";
+import {
+  mailboxRoot,
+  normalizeWorkforceRole,
+  updateRoom,
+  WORKFORCE_ROLES,
+  workforceRoleInfo,
+} from "./stooges-room.mjs";
 
 const plugin = fileURLToPath(new URL("../", import.meta.url));
 
@@ -25,20 +31,23 @@ export function requireActiveBranch(room, id) {
 export function coordinatorBrief(room, memberId = "conductor") {
   const member = swarmMember(room, memberId);
   const objective = member.objective || room.objective || "Ask the user what outcome they want.";
+  const roleInfo = workforceRoleInfo(member.workforceRole);
+  const workingFolder = member.cwd || room.cwd;
+  const roleList = Object.keys(WORKFORCE_ROLES).join(", ");
   return `You are the ${memberId === "conductor" ? "root coordinator" : "subswarm lead"} of an Orkest swarm.
 
 Room: ${room.id}
 Your member ID: ${memberId}
 Parent: ${member.parent || "user"}
 Repository: ${room.cwd}
+Working folder: ${workingFolder}${roleInfo ? `\nWorkforce role: ${roleInfo.id} — ${roleInfo.guidance}` : ""}
 Overall objective: ${room.objective || "Awaiting the user's objective"}
 Your assignment: ${objective}
 ${
   !room.objective && memberId === "conductor"
     ? `
-Ask the user for their goal in this conversation. Wait for it before creating work assignments or
-starting workers. When they supply it, record it with ork rooms objective --room ${room.id}
---objective 'their goal', then organize the work.
+If the user has already supplied their goal in this conversation, record it with ork rooms objective --room ${room.id}
+--objective 'their goal', then organize the work. Otherwise, ask the user for their goal and wait for it before creating work assignments or starting workers.
 `
     : ""
 }
@@ -54,6 +63,8 @@ native supervision contract. Use ${path.join(plugin, "bin/ork.mjs")} through nod
 Bind your actual native session with ork rooms bind --room ${room.id} --member ${memberId}
 --engine ${member.engine} --session YOUR_ACTUAL_SESSION_ID. Never guess a session ID.
 Keep ork progress current with the overall objective, your current task, and actual stage.
+Preset workforce roles (${roleList}) can be assigned with @role in --team, ork rooms role --room ${room.id}
+--member MEMBER --role ROLE, or assumed on the fly with ork progress --session YOUR_ACTUAL_SESSION_ID --role ROLE.
 
 You own planning, assignment, resolving conflicts, and reviewing results for your branch. Keep the
 conversation available while workers run. Prefer bounded, useful tasks over spawning a preset team
@@ -91,10 +102,35 @@ executor runs you own, then collect their results. Never stop another user's ter
 `;
 }
 
-export async function reserveLead(id, memberId, objective, { root = mailboxRoot() } = {}) {
+export async function writeCoordinatorBrief(room, { root = mailboxRoot() } = {}) {
+  const directory = path.join(root, "swarm-briefs", room.id);
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  const target = path.join(directory, "conductor.md");
+  await writeFile(target, coordinatorBrief(room, "conductor"), { mode: 0o600 });
+  return target;
+}
+
+async function resolveCwd(cwd) {
+  if (cwd === undefined) return;
+  try {
+    return await realpath(cwd);
+  } catch {
+    return path.resolve(cwd);
+  }
+}
+
+export async function reserveLead(
+  id,
+  memberId,
+  objective,
+  { root = mailboxRoot(), workforceRole, cwd } = {},
+) {
   if (typeof objective !== "string" || !objective.trim() || objective.length > 12_000)
     throw new Error("A lead needs an objective of 1–12000 characters");
   if (memberId === "conductor") throw new Error("The root coordinator is already a lead");
+  const normalizedRole =
+    workforceRole === undefined ? undefined : normalizeWorkforceRole(workforceRole);
+  const normalizedCwd = await resolveCwd(cwd);
   let isNew = false;
   const room = await updateRoom(
     id,
@@ -115,6 +151,8 @@ export async function reserveLead(id, memberId, objective, { root = mailboxRoot(
       isNew = member.role !== "lead";
       member.role = "lead";
       member.objective = objective;
+      if (normalizedRole) member.workforceRole = normalizedRole;
+      if (normalizedCwd) member.cwd = normalizedCwd;
       member.status = "reserved";
       return current;
     },
@@ -155,6 +193,27 @@ export async function pauseBranch(id, memberId, paused, { root = mailboxRoot() }
     id,
     (room) => {
       swarmMember(room, memberId).paused = paused;
+      return room;
+    },
+    { root },
+  );
+}
+
+export async function assignWorkforceRole(id, memberId, role, { root = mailboxRoot(), cwd } = {}) {
+  if (role === undefined && cwd === undefined)
+    throw new Error("Supply a workforce --role or --cwd to update the member");
+  const isClearingRole =
+    typeof role === "string" && ["", "none", "clear"].includes(role.trim().toLowerCase());
+  const normalizedRole =
+    role === undefined || isClearingRole ? undefined : normalizeWorkforceRole(role);
+  const normalizedCwd = await resolveCwd(cwd);
+  return updateRoom(
+    id,
+    (room) => {
+      const member = swarmMember(room, memberId);
+      if (isClearingRole) delete member.workforceRole;
+      else if (normalizedRole) member.workforceRole = normalizedRole;
+      if (normalizedCwd) member.cwd = normalizedCwd;
       return room;
     },
     { root },

@@ -18,6 +18,7 @@ import os
 import re
 import secrets
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -2866,6 +2867,71 @@ def succession_notice(base: Path, me: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def swarm_coordinator_context(base: Path, me: dict[str, Any], event: str, *, mid_turn: bool = False) -> str:
+    """Auto-bind the root swarm coordinator and deliver its brief on the first user message."""
+    room_id = os.environ.get("ORKEST_SWARM_ROOM", "").strip()
+    if (
+        not room_id
+        or not re.fullmatch(r"[\w-]{1,80}", room_id, flags=re.ASCII)
+        or me.get("delegatedRun")
+        or is_run_peer(me)
+    ):
+        return ""
+    room = load(base / "rooms" / f"{room_id}.json")
+    if not isinstance(room, dict) or not room.get("swarm"):
+        return ""
+    engine = "agy" if me["harness"] == "gemini" else me["harness"]
+    conductor = room.get("conductor") or {}
+    if conductor.get("engine") != engine:
+        return ""
+    bound_session = (conductor.get("session") or {}).get("id")
+    if bound_session and bound_session != me["session"]:
+        return ""
+    if not bound_session:
+        cli = Path(__file__).resolve().parents[3] / "bin" / "ork.mjs"
+        env = {**os.environ, "AGENT_EXECUTOR_HOME": str(base.parent)}
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            subprocess.run(
+                [
+                    shutil.which("node") or "node",
+                    str(cli),
+                    "rooms",
+                    "bind",
+                    "--room",
+                    room_id,
+                    "--member",
+                    "conductor",
+                    "--engine",
+                    engine,
+                    "--session",
+                    me["session"],
+                ],
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                check=False,
+            )
+        rebound = load(base / "rooms" / f"{room_id}.json")
+        if isinstance(rebound, dict):
+            room = rebound
+            bound_session = ((room.get("conductor") or {}).get("session") or {}).get("id")
+        if bound_session and bound_session != me["session"]:
+            return ""
+    if (event == "UserPromptSubmit" or (event == "PreInvocation" and not mid_turn)) and me.get(
+        "swarmBriefed"
+    ) != room_id:
+        annotate(base, me["session"], swarmBriefed=room_id)
+        if not room.get("objective"):
+            brief_file = base / "swarm-briefs" / room_id / "conductor.md"
+            with contextlib.suppress(OSError):
+                if brief_file.is_file():
+                    return (
+                        brief_file.read_text(encoding="utf-8").replace("YOUR_ACTUAL_SESSION_ID", me["session"]).strip()
+                    )
+    return ""
+
+
 def hook(
     payload: dict[str, Any],
     *,
@@ -2976,6 +3042,11 @@ def hook(
     import mailbox_channels
 
     route_hint = wake_route_hint(base, me) if event == "SessionStart" else ""
+    swarm_brief = (
+        swarm_coordinator_context(base, me, event, mid_turn=mid_turn)
+        if event in {"SessionStart", "UserPromptSubmit"} or (gemini and event == "PreInvocation" and not mid_turn)
+        else ""
+    )
     progress_hint = ""
     help_hint = ""
     if event in {"SessionStart", "UserPromptSubmit"} or (gemini and event == "PreInvocation" and not mid_turn):
@@ -3011,6 +3082,7 @@ def hook(
     hint = "\n".join(
         value
         for value in (
+            swarm_brief,
             cleared_notice,
             team_notice,
             identity_hint,

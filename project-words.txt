@@ -90,3 +90,8 @@ zorpnik
 zuzzlek
 zwibble
 tcsetwinsize
+refactorer
+oagy
+oclaude
+ocodex
+oopencode

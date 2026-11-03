@@ -248,6 +248,30 @@ class InstallMailboxTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exactly four"):
             installer.mailbox_hook_updates({"data": [{"hooks": hooks}]}, self.script, self.path)
 
+    def test_shell_wrappers_generate_orkest_sh_and_wire_zshrc_idempotently(self):
+        ork_cli = self.base / "bin/ork.mjs"
+        ork_cli.parent.mkdir(parents=True)
+        ork_cli.write_text("#!/usr/bin/env node\n")
+        zshrc = self.base / ".zshrc"
+        zshrc.write_text("export EXAMPLE=1\n")
+
+        self.assertTrue(installer.install_shell_wrappers(self.base, ork_cli, dry_run=True))
+        self.assertFalse((self.base / ".config/agent-executor/orkest.sh").exists())
+        self.assertEqual(zshrc.read_text(), "export EXAMPLE=1\n")
+
+        self.assertTrue(installer.install_shell_wrappers(self.base, ork_cli))
+        wrapper = self.base / ".config/agent-executor/orkest.sh"
+        self.assertTrue(wrapper.is_file())
+        self.assertIn("command ork label -- agy --dangerously-skip-permissions --remote-control", wrapper.read_text())
+        self.assertIn("command ork agy --dangerously-skip-permissions --remote-control", wrapper.read_text())
+        self.assertEqual((self.base / ".local/bin/ork").resolve(), ork_cli.resolve())
+        self.assertIn(installer.MANAGED_ZSHRC_BLOCK, zshrc.read_text())
+        self.assertIn("export EXAMPLE=1\n", zshrc.read_text())
+
+        before_zshrc = zshrc.read_bytes()
+        self.assertFalse(installer.install_shell_wrappers(self.base, ork_cli))
+        self.assertEqual(zshrc.read_bytes(), before_zshrc)
+
 
 if __name__ == "__main__":
     unittest.main()
