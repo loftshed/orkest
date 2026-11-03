@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.46.0
+
+- feat(orchestrate): add /swarm slash command and ork swarm view toggle
+
 ## 0.45.0
 
 - fix(orchestrate): drop per-session --remote-control from agy shell wrappers
