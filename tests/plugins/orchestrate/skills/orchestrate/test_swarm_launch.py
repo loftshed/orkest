@@ -68,7 +68,7 @@ class SwarmLaunchTests(unittest.TestCase):
 
     def check_conversation(self, engine, harness, *, shortcut=False):
         with tempfile.TemporaryDirectory(prefix="ork-swarm-launch-") as temporary:
-            home = Path(temporary)
+            home = Path(temporary).resolve()
             base = home / "mailbox-v1"
             binary = home / engine
             launched = home / "launched.json"
@@ -210,6 +210,23 @@ class SwarmLaunchTests(unittest.TestCase):
                 wait_for(lambda output: b"Swarm" in output and b"Plan the swarm" in output, master)
                 panes = subprocess.check_output([*tmux, "list-panes", "-F", "#{pane_id}"], text=True).splitlines()
                 self.assertEqual(panes, ["%0", "%1"])
+                if shortcut:
+                    import agent_statusline_tmux
+
+                    closed = agent_statusline_tmux.toggle_swarm_view(
+                        "toggle", socket=Path(info["socket"]).name, room=info["room"], base=base
+                    )
+                    self.assertEqual(closed["status"], "closed")
+                    self.assertEqual(
+                        subprocess.check_output([*tmux, "list-panes", "-F", "#{pane_id}"], text=True).splitlines(),
+                        ["%0"],
+                    )
+                    reopened = agent_statusline_tmux.toggle_swarm_view(
+                        "toggle", socket=Path(info["socket"]).name, room=info["room"], base=base
+                    )
+                    self.assertEqual(reopened["status"], "opened")
+                    panes = subprocess.check_output([*tmux, "list-panes", "-F", "#{pane_id}"], text=True).splitlines()
+                    self.assertEqual(len(panes), 2)
                 os.write(master, b"Redirect the investigation\n")
                 wait_for(lambda _: received.exists() and received.read_text() == "Redirect the investigation\n", master)
                 self.assertEqual(received.read_text(), "Redirect the investigation\n")
@@ -218,7 +235,7 @@ class SwarmLaunchTests(unittest.TestCase):
                 command("lead", "--room", room, "--member", "host-default-1", "--objective", "Investigate cache")
                 command("add", "--room", room, "--parent", "host-default-1", "--team", "agy:flash")
                 wait_for(lambda output: b"host-default-1" in output and b"flash-1" in output, master)
-                subprocess.run([*tmux, "select-pane", "-t", "%1"], check=True)
+                subprocess.run([*tmux, "select-pane", "-t", panes[-1]], check=True)
                 progress.report(base, peer, goal="Repair cache", task="Inspect cache recovery", stage="testing")
                 wait_for(
                     lambda output: b"task : Inspect cache recovery" in output,

@@ -2411,13 +2411,15 @@ def detect_harness(payload: dict[str, Any] | None = None) -> str:
 _TRANSCRIPT_TAIL_BYTES = 256 * 1024
 _MODEL_SET_STDOUT = re.compile(r"<local-command-stdout>Set model to (?:`([^`]+)`|([^\n<(]+))")
 _WAKE_NOTICE_ID = re.compile(r"Local peer mailbox notification \(([A-Za-z0-9._-]+)\)")
+_SWARM_SLASH_CMD = re.compile(r"^\s*/(?:orchestrate:)?swarm(?:\s+(toggle|open|close))?\s*$", re.IGNORECASE)
+_SWARM_TAG_CMD = re.compile(r"\[orkest-swarm-command(?::\s*(toggle|open|close)?)?\]", re.IGNORECASE)
 
 
-def wake_notice_id(payload: dict[str, Any], session: str, account: str | None = None) -> str | None:
-    """Message id from a `Local peer mailbox notification (<id>)` turn trigger, if this turn started from one."""
+def latest_user_prompt(payload: dict[str, Any], session: str, account: str | None = None) -> str | None:
+    """Return the user's latest prompt text from the hook payload or session transcript tail."""
     for key in ("prompt", "userMessage", "query"):
-        if isinstance(value := payload.get(key), str) and (match := _WAKE_NOTICE_ID.search(value)):
-            return match.group(1)
+        if isinstance(value := payload.get(key), str) and value.strip():
+            return value
     raw_path = payload.get("transcript_path") or payload.get("transcriptPath")
     path = Path(raw_path).expanduser() if isinstance(raw_path, str) and raw_path.strip() else None
     if path is None and session:
@@ -2451,12 +2453,18 @@ def wake_notice_id(payload: dict[str, Any], session: str, account: str | None = 
             content = entry.get("content")
             if not isinstance(content, str) and isinstance(entry.get("message"), dict):
                 content = entry["message"].get("content")
-            if isinstance(content, str) and (match := _WAKE_NOTICE_ID.search(content)):
-                return match.group(1)
+            if isinstance(content, str):
+                return content
             return None
         if kind in {"SYSTEM_MESSAGE", "PLANNER_RESPONSE", "assistant"}:
             return None
     return None
+
+
+def wake_notice_id(payload: dict[str, Any], session: str, account: str | None = None) -> str | None:
+    """Message id from a `Local peer mailbox notification (<id>)` turn trigger, if this turn started from one."""
+    prompt = latest_user_prompt(payload, session, account)
+    return match.group(1) if prompt and (match := _WAKE_NOTICE_ID.search(prompt)) else None
 
 
 def transcript_model(payload: dict[str, Any]) -> str | None:
@@ -2932,6 +2940,47 @@ def swarm_coordinator_context(base: Path, me: dict[str, Any], event: str, *, mid
     return ""
 
 
+def swarm_command_context(
+    base: Path, me: dict[str, Any], payload: dict[str, Any], event: str, *, mid_turn: bool = False
+) -> str:
+    """Toggle the Orkest Swarm View split pane when the user submits `/swarm`."""
+    if not (event == "UserPromptSubmit" or (event == "PreInvocation" and not mid_turn)):
+        return ""
+    prompt = latest_user_prompt(payload, me["session"], me.get("accountHome"))
+    if not prompt:
+        return ""
+    cleaned = re.sub(r"</?USER_REQUEST>", "", prompt).strip()
+    match = _SWARM_SLASH_CMD.match(cleaned) or _SWARM_TAG_CMD.search(cleaned)
+    if not match:
+        return ""
+    action = (match.group(1) or "toggle").lower()
+    import agent_statusline_tmux
+
+    with contextlib.suppress(Exception):
+        outcome = agent_statusline_tmux.toggle_swarm_view(
+            action,
+            socket=me.get("terminalServer"),
+            session_id=me["session"],
+            harness=me["harness"],
+            cwd=me["cwd"],
+            base=base,
+        )
+        status = outcome.get("status", "unavailable").replace("_", " ")
+        room = outcome.get("room")
+        room_note = f" (room {room})" if room else ""
+        if outcome.get("status") in {"opened", "closed", "already_open", "already_closed"}:
+            return (
+                f"Orkest Swarm View pane is now {status}{room_note} (toggled automatically by the `/swarm` turn hook). "
+                "Confirm this to the user in one short line and do not call any tools."
+            )
+        reason = outcome.get("reason") or "no enclosing Orkest tmux terminal"
+        return (
+            f"Orkest Swarm View pane could not be toggled automatically ({reason}). "
+            "Let the user know in one short line that `/swarm` requires an Orkest-wrapped terminal session."
+        )
+    return ""
+
+
 def hook(
     payload: dict[str, Any],
     *,
@@ -2991,6 +3040,9 @@ def hook(
         effort=runtime_effort(harness, payload),
     )
     me = mark_delegated(base, me)
+    terminal_server = os.environ.get("ORKEST_TERMINAL_SERVER", "").strip()
+    if re.fullmatch(r"orkest-label-[0-9a-f]{12}", terminal_server) and me.get("terminalServer") != terminal_server:
+        me = annotate(base, session, terminalServer=terminal_server) or me
     # How the last turn ended: wake recovery must not set a conversation going that its own user stopped.
     if gemini and event == "Stop" and payload.get("terminationReason"):
         me = annotate(base, session, lastStopReason=str(payload["terminationReason"])) or me
@@ -3047,6 +3099,7 @@ def hook(
         if event in {"SessionStart", "UserPromptSubmit"} or (gemini and event == "PreInvocation" and not mid_turn)
         else ""
     )
+    swarm_toggle = swarm_command_context(base, me, payload, event, mid_turn=mid_turn)
     progress_hint = ""
     help_hint = ""
     if event in {"SessionStart", "UserPromptSubmit"} or (gemini and event == "PreInvocation" and not mid_turn):
@@ -3082,6 +3135,7 @@ def hook(
     hint = "\n".join(
         value
         for value in (
+            swarm_toggle,
             swarm_brief,
             cleared_notice,
             team_notice,

@@ -36,6 +36,7 @@ const COORDINATORS = new Set(["codex", "claude", "agy", "opencode"]);
 
 const HELP = `ork agy|codex|claude|opencode   (open a coordinator; enter your goal in the conversation)
   --harness-arg=<argument>      (pass an argument to the coordinator; repeat as needed)
+ork swarm [toggle|open|close]   (open or close the live Swarm View split pane)
 ork rooms --help
 ork setup [--dry-run] [--trust-codex-hooks]   (install mailbox, hooks and shell wrapper shortcuts)
 ork gate [--heavy] [--label <text>] -- <command>   (also: ork gate status|install|uninstall)
@@ -330,6 +331,16 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
   }
   if (argv[0] === "label") {
     process.exitCode = await terminalCommand("agent_statusline_tmux.py", argv.slice(1));
+    return;
+  }
+  if (argv[0] === "swarm") {
+    const rest = argv.slice(1);
+    const action = ["toggle", "open", "close"].includes(rest[0]) ? rest.shift() : "toggle";
+    process.exitCode = await terminalCommand("agent_statusline_tmux.py", [
+      "--toggle-swarm",
+      action,
+      ...rest,
+    ]);
     return;
   }
   if (argv[0] === "rooms") return roomsCommand(argv.slice(1), { stdout });
