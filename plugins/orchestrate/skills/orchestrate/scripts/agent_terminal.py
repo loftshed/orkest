@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -46,6 +47,8 @@ def bind(session: str, harness: str | None, payload: dict[str, Any]) -> bool:
                     if k in {"id", "display_name", "effort", "level"} and isinstance(v, str)
                 }
         server, pane = target
+        with contextlib.suppress(Exception):
+            mailbox.annotate(mailbox.root(), session, terminalServer=server)
         binding = json.dumps({"session": session, "harness": harness, "payload": fields})
         subprocess.run(
             [

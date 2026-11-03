@@ -252,6 +252,8 @@ class InstallMailboxTests(unittest.TestCase):
         ork_cli = self.base / "bin/ork.mjs"
         ork_cli.parent.mkdir(parents=True)
         ork_cli.write_text("#!/usr/bin/env node\n")
+        (self.base / ".claude").mkdir()
+        (self.base / ".codex").mkdir()
         zshrc = self.base / ".zshrc"
         zshrc.write_text("export EXAMPLE=1\n")
 
@@ -266,12 +268,42 @@ class InstallMailboxTests(unittest.TestCase):
         self.assertIn('command ork agy --dangerously-skip-permissions "$@"', wrapper.read_text())
         self.assertNotIn("--remote-control", wrapper.read_text())
         self.assertEqual((self.base / ".local/bin/ork").resolve(), ork_cli.resolve())
+        self.assertTrue((self.base / ".claude/commands/swarm.md").is_file())
+        self.assertTrue((self.base / ".agents/skills/swarm/SKILL.md").is_file())
+        self.assertEqual((self.base / ".codex/skills/swarm").resolve(), (self.base / ".agents/skills/swarm").resolve())
         self.assertIn(installer.MANAGED_ZSHRC_BLOCK, zshrc.read_text())
         self.assertIn("export EXAMPLE=1\n", zshrc.read_text())
 
         before_zshrc = zshrc.read_bytes()
         self.assertFalse(installer.install_shell_wrappers(self.base, ork_cli))
         self.assertEqual(zshrc.read_bytes(), before_zshrc)
+
+    def test_swarm_command_context_toggles_swarm_view_on_slash_command(self):
+        from unittest.mock import patch
+
+        import peer_mailbox as mailbox
+
+        me = {"session": "11111111-2222-4333-8444-555555555555", "harness": "claude", "cwd": str(self.base)}
+        with patch(
+            "agent_statusline_tmux.toggle_swarm_view",
+            return_value={"status": "opened", "room": "room-123", "socket": "orkest-label-abcdef012345"},
+        ) as mocked:
+            out = mailbox.swarm_command_context(self.base, me, {"prompt": "/swarm"}, "UserPromptSubmit", mid_turn=False)
+            self.assertIn("now opened (room room-123)", out)
+            mocked.assert_called_once()
+        with patch(
+            "agent_statusline_tmux.toggle_swarm_view",
+            return_value={"status": "closed", "room": "room-123", "socket": "orkest-label-abcdef012345"},
+        ) as mocked:
+            out = mailbox.swarm_command_context(
+                self.base,
+                me,
+                {"prompt": "[orkest-swarm-command: close]\nIf the `/swarm` turn hook..."},
+                "UserPromptSubmit",
+                mid_turn=False,
+            )
+            self.assertIn("now closed (room room-123)", out)
+            self.assertEqual(mocked.call_args.args[0], "close")
 
 
 if __name__ == "__main__":

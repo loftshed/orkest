@@ -75,7 +75,10 @@ _claude_mode_flag() {
   done
 }
 claude() {
-  if _orkest_interactive claude "$@" && [[ ${1:-} != (mcp|plugin|auth|update|install|doctor|setup-token|agents) ]]; then
+  case "${1:-}" in
+    agents|attach|auth|auto-mode|doctor|gateway|import|install|logs|mcp|plugin|plugins|purge|remote-control|respawn|rm|setup-token|stop|kill|ultrareview|update|upgrade|-h|--help|-v|--version) command claude "$@"; return ;;
+  esac
+  if _orkest_interactive claude "$@"; then
     local -a reply; _claude_mode_flag "$@"
     command ork label -- claude "${reply[@]}" "$@"
   else
@@ -83,7 +86,10 @@ claude() {
   fi
 }
 plaude() {
-  if _orkest_interactive plaude "$@" && [[ ${1:-} != (mcp|plugin|auth|update|install|doctor|setup-token|agents) ]]; then
+  case "${1:-}" in
+    agents|attach|auth|auto-mode|doctor|gateway|import|install|logs|mcp|plugin|plugins|purge|remote-control|respawn|rm|setup-token|stop|kill|ultrareview|update|upgrade|-h|--help|-v|--version) command plaude "$@"; return ;;
+  esac
+  if _orkest_interactive plaude "$@"; then
     local -a reply; _claude_mode_flag "$@"
     command ork label -- plaude "${reply[@]}" "$@"
   else
@@ -186,6 +192,69 @@ def install_shell_wrappers(home: Path, ork_cli: Path | None = None, *, dry_run: 
             zshrc.write_text(updated, encoding="utf-8")
             print(f"✓ shell wrapper source block: {zshrc}")
         changed = True
+
+    swarm_command_text = (
+        "---\n"
+        "description: Toggle (open or close) the live Orkest Swarm View split pane in this terminal\n"
+        'argument-hint: "[toggle|open|close]"\n'
+        "---\n\n"
+        "[orkest-swarm-command: $ARGUMENTS]\n"
+        "If the `/swarm` turn hook already opened or closed the Orkest Swarm View pane, confirm the result in one "
+        "short line and do not call any tools. Otherwise run `ork swarm $ARGUMENTS` and report the result in one "
+        "short line.\n"
+    )
+    for claude_dir in [home / ".claude", *sorted(home.glob(".claude-*"))]:
+        if not claude_dir.is_dir():
+            continue
+        cmd_file = claude_dir / "commands/swarm.md"
+        if not cmd_file.is_file() or cmd_file.read_text(encoding="utf-8") != swarm_command_text:
+            if dry_run:
+                print(f"would install /swarm command: {cmd_file}")
+            else:
+                cmd_file.parent.mkdir(parents=True, exist_ok=True)
+                configuration.write_private(cmd_file, swarm_command_text)
+                print(f"✓ /swarm command: {cmd_file}")
+            changed = True
+
+    swarm_skill_text = (
+        "---\n"
+        "name: swarm\n"
+        "description: Toggle (open or close) the live Orkest Swarm View split pane in the current terminal when the user types /swarm.\n"
+        "---\n\n"
+        "[orkest-swarm-command]\n"
+        "If the `/swarm` turn hook already opened or closed the Orkest Swarm View pane, confirm the result in one "
+        "short line and do not call any tools. Otherwise run `ork swarm` (`ork swarm open` or `ork swarm close`) "
+        "and report the result in one short line.\n"
+    )
+    swarm_hub = home / ".agents/skills/swarm"
+    swarm_skill_file = swarm_hub / "SKILL.md"
+    if not swarm_skill_file.is_file() or swarm_skill_file.read_text(encoding="utf-8") != swarm_skill_text:
+        if dry_run:
+            print(f"would install /swarm skill: {swarm_skill_file}")
+        else:
+            swarm_hub.mkdir(parents=True, exist_ok=True)
+            configuration.write_private(swarm_skill_file, swarm_skill_text)
+            print(f"✓ /swarm skill: {swarm_skill_file}")
+        changed = True
+    for skill_parent in (
+        home / ".codex/skills",
+        home / ".gemini/config/skills",
+        home / ".gemini/antigravity/skills",
+        home / ".config/opencode/skills",
+    ):
+        if not skill_parent.parent.is_dir():
+            continue
+        skill_link = skill_parent / "swarm"
+        if not (skill_link.is_symlink() and skill_link.resolve() == swarm_hub.resolve()):
+            if dry_run:
+                print(f"would link /swarm skill: {skill_link} -> {swarm_hub}")
+            else:
+                skill_parent.mkdir(parents=True, exist_ok=True)
+                if skill_link.exists() or skill_link.is_symlink():
+                    skill_link.rename(skill_link.with_name(f"{skill_link.name}.mailbox-bak.{time.time_ns()}"))
+                skill_link.symlink_to(swarm_hub)
+                print(f"✓ /swarm skill linked: {skill_link} -> {swarm_hub}")
+            changed = True
     return changed
 
 
