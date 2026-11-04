@@ -1,4 +1,5 @@
 # Dependencies and tool state
+node_modules
 node_modules/
 .ruff_cache/
 .venv/
@@ -20,5 +21,5 @@ docs/mailbox-feedback/reports/
 !.vscode/extensions.json
 !.vscode/settings.json
 *.swp
-.claude/.cc-writes/
+**/.claude/.cc-writes/
 **/.claude/**/*.local.*

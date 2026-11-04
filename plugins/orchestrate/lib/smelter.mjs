@@ -1,3 +1,15 @@
+/**
+ * @module smelter
+ *
+ * The Smelter (`ork smelter`): Automated disposable worktree verification,
+ * cross-vendor cold review, and merge queue.
+ *
+ * Pipeline stages:
+ * 1. Rebase & Scope Audit (`classifyBlastRadius`: `low` | `medium` | `high`)
+ * 2. Serialized Heavy Gate (`ork gate --heavy`)
+ * 3. Cross-Vendor Cold Review (`run_agent.py consult --intent review`)
+ * 4. Smelt & Prune (fast-forward local merge or PR creation + worktree removal)
+ */
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
@@ -84,15 +96,38 @@ export function classifyBlastRadius(changedPaths) {
   return "medium";
 }
 
+const REVIEWER_PREFERENCE = {
+  agy: ["claude", "codex", "opencode", "agy"],
+  claude: ["codex", "agy", "opencode", "claude"],
+  codex: ["claude", "agy", "opencode", "codex"],
+  opencode: ["claude", "codex", "agy", "opencode"],
+};
+
+export function isEngineInstalled(engine, env = process.env) {
+  const pathDirs = String(env?.PATH || "")
+    .split(path.delimiter)
+    .filter(Boolean);
+  return pathDirs.some((dir) => existsSync(path.join(dir, engine)));
+}
+
 /**
- * Selects a cross-vendor engine for independent cold review.
+ * Selects a cross-vendor engine for independent cold review, preferring an
+ * installed cross-vendor harness and falling back to available harnesses when
+ * a machine only has a subset installed.
  */
-export function selectColdReviewerEngine(workerEngine) {
+export function selectColdReviewerEngine(workerEngine, options = {}) {
   const normalized = String(workerEngine ?? "")
     .trim()
     .toLowerCase();
-  if (normalized === "claude") return "codex";
-  return "claude";
+  const candidates = REVIEWER_PREFERENCE[normalized] || REVIEWER_PREFERENCE.codex;
+  if (Array.isArray(options?.availableEngines)) {
+    const available = new Set(options.availableEngines.map((item) => String(item).toLowerCase()));
+    return candidates.find((engine) => available.has(engine)) || candidates[0];
+  }
+  if (typeof options?.hasEngine === "function") {
+    return candidates.find((engine) => options.hasEngine(engine)) || candidates[0];
+  }
+  return candidates.find((engine) => isEngineInstalled(engine, options?.env)) || candidates[0];
 }
 
 export function isPathAllowed(changedPath, allowPaths) {

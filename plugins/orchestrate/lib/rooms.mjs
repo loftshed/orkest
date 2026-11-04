@@ -1087,6 +1087,8 @@ export async function interactiveProgress(room, root = mailboxRoot()) {
       stage: stage || "not set",
       statusHealth: health,
       reportedAt: progress ? progress.updatedAt : null,
+      lastSeenAt: peer.lastSeenAt || null,
+      startedAt: peer.startedAt || null,
     };
   }
   return result;

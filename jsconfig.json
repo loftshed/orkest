@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "target": "ES2024",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "checkJs": false,
+    "allowSyntheticDefaultImports": true,
+    "resolveJsonModule": true,
+    "baseUrl": "."
+  },
+  "include": [
+    "plugins/**/*.mjs",
+    "plugins/**/*.js",
+    "scripts/**/*.mjs",
+    "scripts/**/*.js",
+    "tests/**/*.js"
+  ],
+  "exclude": ["node_modules", "**/node_modules", ".git"]
+}

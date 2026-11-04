@@ -293,6 +293,97 @@ describe("tui-box primitives and HordeView unification", () => {
     expect(rendered).toContain("80% left");
   });
 
+  it("renders all configured quota accounts and splits Antigravity pools onto separate lines", () => {
+    const room = fixture();
+    room.accounts = [
+      {
+        id: "claude-work",
+        short: "CW",
+        provider: "claude",
+        windows: [
+          { id: "5h", label: "5-hour", remainingPct: 89 },
+          { id: "week", label: "weekly", remainingPct: 48 },
+        ],
+      },
+      {
+        id: "claude-personal",
+        short: "CP",
+        provider: "claude",
+        windows: [
+          { id: "5h", label: "5-hour", remainingPct: 100 },
+          { id: "week", label: "weekly", remainingPct: 86 },
+        ],
+      },
+      {
+        id: "codex",
+        short: "CX",
+        provider: "codex",
+        credits: { hasCredits: true, unlimited: false, balance: 45_916 },
+        windows: [{ id: "weekly", label: "weekly", remainingPct: 0 }],
+      },
+      {
+        id: "antigravity",
+        short: "AG",
+        provider: "antigravity",
+        windows: [
+          { id: "gemini-weekly", label: "Gemini weekly", remainingPct: 77, pool: "gemini" },
+          { id: "gemini-5h", label: "Gemini 5-hour", remainingPct: 86, pool: "gemini" },
+          {
+            id: "claude-gpt-weekly",
+            label: "Claude & GPT weekly",
+            remainingPct: 10,
+            pool: "claude-gpt",
+          },
+          {
+            id: "claude-gpt-5h",
+            label: "Claude & GPT 5-hour",
+            remainingPct: 100,
+            pool: "claude-gpt",
+          },
+        ],
+      },
+    ];
+    const rendered = new StoogesView(room, { now: () => 1000, height: 32 }).render(90).join("\n");
+    expect(rendered).toContain("CW ");
+    expect(rendered).toContain("5h 89% · wk 48%");
+    expect(rendered).toContain("CP ");
+    expect(rendered).toContain("5h 100% · wk 86%");
+    expect(rendered).toContain("45,916 cr");
+    expect(rendered).toContain("Gemini · wk 77% · 5h 86%");
+    expect(rendered).toContain("Claude/GPT · wk 10% · 5h 100%");
+  });
+
+  it("collapses unfocused completed agents to 1-line rows and cycles hide/expand with c", () => {
+    const room = fixture("claude:haiku*3");
+    room.agents[0].status = "completed";
+    room.agents[0].objective = "First task done";
+    room.agents[1].status = "completed";
+    room.agents[1].objective = "Second task done";
+    room.agents[2].status = "running";
+    room.agents[2].objective = "Third task working";
+    room.agents[2].observedAt = new Date(980_000).toISOString();
+
+    const view = new StoogesView(room, { now: () => 1_000_000, height: 28, tier: "unicode" });
+    const collapsed = view.render(90).join("\n");
+    // Focused agent (haiku-1) stays expanded; unfocused completed agent (haiku-2) is a 1-line row
+    expect(collapsed).toContain("┌ 1 haiku-1");
+    expect(collapsed).toContain("├─ ✓ 2 haiku-2");
+    expect(collapsed).toContain("Second task done");
+    expect(collapsed).toContain("┌ 3 haiku-3");
+    expect(collapsed).toContain("step 2/4 · live");
+
+    // Press c -> hidden mode
+    view.handleInput("c");
+    const hidden = view.render(90).join("\n");
+    expect(hidden).not.toContain("2 haiku-2");
+    expect(hidden).toContain("1 completed hidden (press c to expand)");
+
+    // Press c -> expanded mode
+    view.handleInput("c");
+    const expanded = view.render(90).join("\n");
+    expect(expanded).toContain("┌ 2 haiku-2");
+  });
+
   it("renders outer tree rails, contrasting headers, and wt:<slug> badges for disposable worktrees in swarm view", () => {
     const room = fixture("agy:pro@ui-designer,claude:haiku@reviewer");
     room.title = "Worktree grouping";

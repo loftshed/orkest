@@ -1,3 +1,12 @@
+/**
+ * @module radar
+ *
+ * Model Release Radar (`ork radar`): Compares live model catalogs from
+ * supported harnesses (`claude`, `codex`, `agy`, `opencode`) against
+ * `models-seen.json` and external scoreboard priors (`benchmarks.prior.json`),
+ * and surfaces `DEGRADED` silent-nerf warnings from `telemetry.py` when a
+ * model's 14-day rolling pass rate drops >=15% below its all-time baseline.
+ */
 import { execFile } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
@@ -16,6 +25,20 @@ const TELEMETRY_SCRIPT_PATH = path.resolve(
   import.meta.dirname,
   "../skills/orchestrate/scripts/telemetry.py",
 );
+
+const SUPPORTED_HARNESSES = ["claude", "codex", "agy", "opencode"];
+
+export const RADAR_HELP = `ork radar [status|diff|priors] [--json] [--priors <path>] [--runs-dir <dir>]
+`;
+
+export function detectInstalledEngines(env = process.env) {
+  const pathDirs = String(env?.PATH || "")
+    .split(path.delimiter)
+    .filter(Boolean);
+  return SUPPORTED_HARNESSES.filter((engine) =>
+    pathDirs.some((dir) => existsSync(path.join(dir, engine))),
+  );
+}
 
 function mapModelArray(items) {
   return items
@@ -249,6 +272,12 @@ function formatRadarText(subcommand, report) {
 
 export async function radarCli(argv = [], options = {}) {
   const args = argv[0] === "radar" ? argv.slice(1) : [...argv];
+  if (args.includes("--help") || args.includes("-h") || args[0] === "help") {
+    if (options.stdout && typeof options.stdout.write === "function") {
+      options.stdout.write(RADAR_HELP);
+    }
+    return { data: null, exitCode: 0, stdout: RADAR_HELP };
+  }
   let subcommand = "status";
   if (args[0] && !args[0].startsWith("-")) {
     subcommand = args.shift();
@@ -259,6 +288,7 @@ export async function radarCli(argv = [], options = {}) {
   const { values } = parseArgs({
     args,
     options: {
+      help: { short: "h", type: "boolean" },
       json: { type: "boolean" },
       "live-catalog": { type: "string" },
       priors: { type: "string" },
@@ -283,9 +313,11 @@ export async function radarCli(argv = [], options = {}) {
 
   const diff = diffCatalogAgainstSeen(liveCatalog, seenCatalog, priors, { telemetry });
   const archetypes = buildArchetypePriors(priors);
+  const installedEngines = options.installedEngines || detectInstalledEngines(options.env);
   const report = {
     archetypes,
     diff,
+    installedEngines,
     priors,
     schema: "orkest.radar.v1",
     subcommand,
@@ -304,3 +336,5 @@ export async function radarCli(argv = [], options = {}) {
     stdout: output,
   };
 }
+
+export const radarCommand = radarCli;

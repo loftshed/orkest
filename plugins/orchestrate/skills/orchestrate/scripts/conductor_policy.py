@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+
 @functools.cache
 def _sibling_module(name: str) -> Any:
     path = Path(__file__).with_name(name + ".py")

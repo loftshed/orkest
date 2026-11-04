@@ -13,7 +13,6 @@ import importlib.util
 import json
 import math
 import os
-import queue
 import re
 import shlex
 import shutil
@@ -183,7 +182,6 @@ def bundled_module(name: str) -> Any:
     spec.loader.exec_module(module)
     module._runner_module = sys.modules.get(__name__) or _RUNNER_PROXY  # type: ignore[attr-defined]
     return module
-
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -502,7 +500,6 @@ RUNNER_ARCHIVED_ATTEMPT_PATTERN = _WORKSPACE_AUDIT_MOD.RUNNER_ARCHIVED_ATTEMPT_P
 RUNNER_VERIFICATION_OUTPUT_PATTERN = _WORKSPACE_AUDIT_MOD.RUNNER_VERIFICATION_OUTPUT_PATTERN
 is_runner_out_dir_file = _WORKSPACE_AUDIT_MOD.is_runner_out_dir_file
 collect_scratch_artifacts = _WORKSPACE_AUDIT_MOD.collect_scratch_artifacts
-
 
 
 _REPORT_CONTRACT_MOD = bundled_module("report_contract")

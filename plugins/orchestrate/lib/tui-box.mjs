@@ -1,3 +1,12 @@
+/**
+ * @module tui-box
+ *
+ * Low-level terminal ANSI styling, Unicode grapheme width measurement
+ * (`cellWidth`, `displayWidth`, `fit`, `fitStyled`, `wrapText`), and framed
+ * box/table rendering primitives (`renderPanel`, `renderTable`) shared across
+ * `HordeView` (`ork horde`), `ork routes`, `ork telemetry`, `ork foundry`, and
+ * `ork smelter`.
+ */
 import { stripVTControlCharacters } from "node:util";
 
 const segments = new Intl.Segmenter(undefined, { granularity: "grapheme" });
@@ -78,15 +87,23 @@ export function glyphSet(tier = glyphTier()) {
   return GLYPHS[Object.hasOwn(GLYPHS, tier) ? tier : "unicode"];
 }
 
+const ASCII_PRINTABLE = /^[ -~]*$/u;
+
 // Provider output is data. Strip terminal controls before adding our own ANSI styling.
 export function plain(value) {
-  return stripVTControlCharacters(String(value ?? "")).replaceAll(
-    /[\p{Cc}\p{Cf}]/gu,
-    (character) => (character === "\u{200C}" || character === "\u{200D}" ? character : " "),
+  const str = String(value ?? "");
+  if (ASCII_PRINTABLE.test(str)) return str;
+  return stripVTControlCharacters(str).replaceAll(/[\p{Cc}\p{Cf}]/gu, (character) =>
+    character === "\u{200C}" || character === "\u{200D}" ? character : " ",
   );
 }
 
 export function cellWidth(grapheme) {
+  if (grapheme.length === 1) {
+    const code = grapheme.codePointAt(0);
+    if (code >= 32 && code < 768) return 1;
+    if (code >= 9472 && code <= 10_495) return 1;
+  }
   if (
     /[\u{1F1E6}-\u{1F1FF}]/u.test(grapheme) ||
     /\p{Extended_Pictographic}/u.test(grapheme) ||
@@ -134,17 +151,24 @@ export function cellWidth(grapheme) {
 }
 
 export function displayWidth(value) {
-  return [...segments.segment(plain(value))].reduce(
-    (sum, { segment }) => sum + cellWidth(segment),
-    0,
-  );
+  const cleaned = plain(value);
+  if (ASCII_PRINTABLE.test(cleaned)) return cleaned.length;
+  let sum = 0;
+  for (const { segment } of segments.segment(cleaned)) {
+    sum += cellWidth(segment);
+  }
+  return sum;
 }
 
 export function fit(value, width) {
   width = Math.max(0, Math.floor(width));
+  const cleaned = plain(value);
+  if (ASCII_PRINTABLE.test(cleaned)) {
+    return cleaned.length >= width ? cleaned.slice(0, width) : cleaned.padEnd(width, " ");
+  }
   let text = "";
   let used = 0;
-  const graphemes = segments.segment(plain(value));
+  const graphemes = segments.segment(cleaned);
   for (const { segment } of graphemes) {
     const size = cellWidth(segment);
     if (used + size > width) break;
@@ -224,7 +248,14 @@ export function fitStyled(value, width) {
       isStyled = !token.startsWith(`${ESC}[0m`);
       continue;
     }
-    const graphemes = segments.segment(plain(token));
+    const cleaned = plain(token);
+    if (ASCII_PRINTABLE.test(cleaned)) {
+      const take = Math.max(0, Math.min(cleaned.length, width - used));
+      output += cleaned.slice(0, take);
+      used += take;
+      continue;
+    }
+    const graphemes = segments.segment(cleaned);
     for (const { segment } of graphemes) {
       const size = cellWidth(segment);
       if (!(used + size <= width)) {
