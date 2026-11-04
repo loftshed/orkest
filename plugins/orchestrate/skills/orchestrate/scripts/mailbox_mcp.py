@@ -352,6 +352,20 @@ SESSION_INPUT = {
 }
 
 
+_STR = {"type": "string"}
+_BOOL = {"type": "boolean"}
+_INT = {"type": "integer"}
+_NULL = {"type": "null"}
+_NULLABLE_STR = {"anyOf": [_STR, _NULL]}
+_NULLABLE_INT = {"anyOf": [_INT, _NULL]}
+_STR_ARRAY = {"type": "array", "items": _STR}
+_PAGE_OUTPUT = {"has_more": _BOOL, "next_offset": _NULLABLE_INT}
+
+
+def _str_props(*keys: str) -> dict[str, Any]:
+    return dict.fromkeys(keys, _STR)
+
+
 def object_schema(properties: dict[str, Any], required: list[str] | None = None) -> dict[str, Any]:
     return {
         "type": "object",
@@ -361,12 +375,13 @@ def object_schema(properties: dict[str, Any], required: list[str] | None = None)
     }
 
 
+WORK_PEER_OUTPUT = object_schema(_str_props("session", "name", "harness"))
 TASK_OUTPUT = object_schema(
     {
-        "owner": object_schema({key: {"type": "string"} for key in ("session", "name", "harness")}),
+        "owner": WORK_PEER_OUTPUT,
         "task": {"type": "string", "maxLength": 200},
-        "checkout": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-        "branch": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "checkout": _NULLABLE_STR,
+        "branch": _NULLABLE_STR,
         "updatedAt": {"type": "string", "format": "date-time"},
         "status": {"type": "string", "enum": list(tasks.STATUSES)},
         "ownerPresent": {"type": "boolean", "description": "Presence only; absence does not transfer ownership."},
@@ -377,63 +392,48 @@ TASK_OUTPUT = object_schema(
     },
     ["owner", "task", "checkout", "branch", "updatedAt", "status", "ownerPresent"],
 )
-
-WORK_PEER_OUTPUT = object_schema({key: {"type": "string"} for key in ("session", "name", "harness")})
 WORK_INTERACTIVE_OUTPUT = object_schema(
     {
-        "id": {"type": "string"},
+        "id": _STR,
         "source": {"type": "string", "enum": ["interactive"]},
         "readOnly": {"type": "boolean", "enum": [False]},
         **{key: {"type": "string", "maxLength": maximum} for key, maximum in work.LIMITS.items()},
-        "dependencies": {"type": "array", "items": {"type": "string"}},
+        "dependencies": _STR_ARRAY,
         "creator": WORK_PEER_OUTPUT,
         "integrator": WORK_PEER_OUTPUT,
-        "owner": {"anyOf": [WORK_PEER_OUTPUT, {"type": "null"}]},
+        "owner": {"anyOf": [WORK_PEER_OUTPUT, _NULL]},
         "revision": {"type": "integer", "minimum": 1},
         "state": {"type": "string", "enum": list(work.STATES)},
         "createdAt": {"type": "string", "format": "date-time"},
         "updatedAt": {"type": "string", "format": "date-time"},
-        "ready": {"type": "boolean"},
-        "unmetDependencies": {"type": "array", "items": {"type": "string"}},
-        "ownerPresent": {"type": "boolean"},
-        "integratorPresent": {"type": "boolean"},
-        "recoveryNeeded": {
-            "anyOf": [{"type": "string", "enum": ["owner_absent", "integrator_absent"]}, {"type": "null"}]
-        },
-        "transfer": {"anyOf": [WORK_PEER_OUTPUT, {"type": "null"}]},
+        "ready": _BOOL,
+        "unmetDependencies": _STR_ARRAY,
+        "ownerPresent": _BOOL,
+        "integratorPresent": _BOOL,
+        "recoveryNeeded": {"anyOf": [{"type": "string", "enum": ["owner_absent", "integrator_absent"]}, _NULL]},
+        "transfer": {"anyOf": [WORK_PEER_OUTPUT, _NULL]},
         "recovery": {
             "anyOf": [
-                object_schema(
-                    {
-                        "previousOwner": WORK_PEER_OUTPUT,
-                        "revision": {"type": "integer"},
-                        "note": {"type": "string"},
-                        "at": {"type": "string"},
-                    }
-                ),
-                {"type": "null"},
+                object_schema({"previousOwner": WORK_PEER_OUTPUT, "revision": _INT, **_str_props("note", "at")}),
+                _NULL,
             ]
         },
     }
 )
 WORK_SOURCE_OUTPUT = object_schema(
     {
-        "id": {"type": "string"},
+        "id": _STR,
         "source": {"type": "string", "enum": ["coordinator", "legacy-note"]},
         "readOnly": {"type": "boolean", "enum": [True]},
-        **{key: {"type": "string"} for key in ("title", "state", "updatedAt", "next", "evidence", "blocker")},
-        "owner": {"anyOf": [WORK_PEER_OUTPUT, {"type": "null"}]},
-        "integrator": {"anyOf": [WORK_PEER_OUTPUT, {"type": "null"}]},
+        **_str_props("title", "state", "updatedAt", "next", "evidence", "blocker"),
+        "owner": {"anyOf": [WORK_PEER_OUTPUT, _NULL]},
+        "integrator": {"anyOf": [WORK_PEER_OUTPUT, _NULL]},
         "ready": {"type": "boolean", "enum": [False]},
-        "recoveryNeeded": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "recoveryNeeded": _NULLABLE_STR,
         "route": object_schema(
-            {
-                "kind": {"type": "string", "enum": ["coordinator", "legacy-note"]},
-                "command": {"type": "array", "items": {"type": "string"}},
-            }
+            {"kind": {"type": "string", "enum": ["coordinator", "legacy-note"]}, "command": _STR_ARRAY}
         ),
-        "checkout": {"type": "string"},
-        "done": {"type": "string"},
+        **_str_props("checkout", "done"),
     },
     [
         "id",
@@ -453,56 +453,38 @@ WORK_SOURCE_OUTPUT = object_schema(
     ],
 )
 WORK_ITEM_OUTPUT = {"anyOf": [WORK_INTERACTIVE_OUTPUT, WORK_SOURCE_OUTPUT]}
-
 STATUS_AGENT_OUTPUT = object_schema(
-    {key: {"type": "string"} for key in ("session", "name", "harness", "state", "presence", "focus", "lastSeenAt")}
+    _str_props("session", "name", "harness", "state", "presence", "focus", "lastSeenAt")
 )
 STATUS_ITEM_OUTPUT = object_schema(
     {
-        **{
-            key: {"type": "string"}
-            for key in (
-                "id",
-                "title",
-                "source",
-                "updatedAt",
-                "state",
-                "next",
-                "blocker",
-                "evidence",
-                "verification",
-                "done",
-                "note",
-            )
-        },
-        **{key: {"anyOf": [{"type": "string"}, {"type": "null"}]} for key in ("owner", "integrator", "recoveryNeeded")},
-        "ready": {"type": "boolean"},
+        **_str_props(
+            "id",
+            "title",
+            "source",
+            "updatedAt",
+            "state",
+            "next",
+            "blocker",
+            "evidence",
+            "verification",
+            "done",
+            "note",
+        ),
+        **dict.fromkeys(("owner", "integrator", "recoveryNeeded"), _NULLABLE_STR),
+        "ready": _BOOL,
     }
 )
-
-
 MESSAGE_OUTPUT = object_schema(
-    {
-        "id": {"type": "string"},
-        "from": {"type": "string"},
-        "harness": {"type": "string"},
-        "sentAt": {"type": "string"},
-        "replyTo": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-        "channel": {"type": "string"},
-        "postId": {"type": "string"},
-        "text": {
-            "type": "string",
-        },
-    },
+    {**_str_props("id", "from", "harness", "sentAt", "channel", "postId", "text"), "replyTo": _NULLABLE_STR},
     ["id", "from", "harness", "sentAt", "replyTo"],
 )
 MAIL_OUTPUT = object_schema(
     {
         "status": {"type": "string", "enum": ["messages", "empty", "timed_out"]},
         "messages": {"type": "array", "items": MESSAGE_OUTPUT},
-        "has_more": {"type": "boolean"},
-        "next_offset": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
-        "notice": {"type": "string"},
+        **_PAGE_OUTPUT,
+        "notice": _STR,
     },
     ["status", "messages", "has_more", "next_offset"],
 )
@@ -511,90 +493,64 @@ OUTPUTS = {
         {
             "items": {"type": "array", "items": {"anyOf": [WORK_ITEM_OUTPUT, STATUS_ITEM_OUTPUT]}},
             "agents": {"type": "array", "items": STATUS_AGENT_OUTPUT},
-            "cursor": {"type": "string"},
+            "cursor": _STR,
             "status": {"type": "string", "enum": ["snapshot"]},
-            "observedAt": {"type": "string"},
-            "total_count": {"type": "integer"},
-            "has_more": {"type": "boolean"},
-            "next_offset": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+            "observedAt": _STR,
+            "total_count": _INT,
+            **_PAGE_OUTPUT,
         },
         ["items", "has_more", "next_offset"],
     ),
-    "work": object_schema({"item": WORK_INTERACTIVE_OUTPUT, "replayed": {"type": "boolean"}}),
-    "tasks": object_schema(
-        {
-            "tasks": {"type": "array", "items": TASK_OUTPUT},
-            "has_more": {"type": "boolean"},
-            "next_offset": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
-        }
-    ),
-    "register": object_schema({"session": {"type": "string"}}, ["session"]),
+    "work": object_schema({"item": WORK_INTERACTIVE_OUTPUT, "replayed": _BOOL}),
+    "tasks": object_schema({"tasks": {"type": "array", "items": TASK_OUTPUT}, **_PAGE_OUTPUT}),
+    "register": object_schema({"session": _STR}, ["session"]),
     "peers": object_schema(
         {
             "peers": {
                 "type": "array",
                 "items": object_schema(
-                    {
-                        key: {"type": "string"}
-                        for key in (
-                            "name",
-                            "displayName",
-                            "displayLabel",
-                            "harnessLabel",
-                            "model",
-                            "modelSource",
-                            "repositoryName",
-                            "repo",
-                            "checkout",
-                            "session",
-                            "harness",
-                            "account",
-                            "state",
-                            "cwd",
-                            "branch",
-                            "focus",
-                            "nativeAddress",
-                            "nativeTool",
-                            "channels",
-                        )
-                    }
+                    _str_props(
+                        "name",
+                        "displayName",
+                        "displayLabel",
+                        "harnessLabel",
+                        "model",
+                        "modelSource",
+                        "repositoryName",
+                        "repo",
+                        "checkout",
+                        "session",
+                        "harness",
+                        "account",
+                        "state",
+                        "cwd",
+                        "branch",
+                        "focus",
+                        "nativeAddress",
+                        "nativeTool",
+                        "channels",
+                    )
                 ),
             },
-            "total_count": {"type": "integer"},
-            "has_more": {"type": "boolean"},
-            "next_offset": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+            "total_count": _INT,
+            **_PAGE_OUTPUT,
         }
     ),
     "inbox": MAIL_OUTPUT,
     "wait": MAIL_OUTPUT,
-    # A direct send returns id/to/toState/toHarness; a channel post returns postId/channel/recipients.
     "send": object_schema(
         {
-            "id": {"type": "string"},
-            "to": {"type": "string"},
-            "toState": {"type": "string"},
-            "toHarness": {"type": "string"},
+            **_str_props("id", "to", "toState", "toHarness", "postId", "channel"),
             "wake": {"type": "object"},
-            "postId": {"type": "string"},
-            "channel": {"type": "string"},
-            "wakeRequested": {"type": "boolean"},
-            "delivered": {"type": "integer"},
+            "wakeRequested": _BOOL,
+            "delivered": _INT,
             "recipients": {"type": "array", "items": {"type": "object"}},
         },
         [],
     ),
-    "focus": object_schema(
-        {
-            "status": {"type": "string"},
-            "focus": {"type": "string"},
-            "channels": {"type": "array", "items": {"type": "string"}},
-        },
-        ["status", "focus"],
-    ),
-    "ack": object_schema({"acknowledged": {"type": "array", "items": {"type": "string"}}}),
-    "feedback": object_schema(
-        {"id": {"type": "string"}, "status": {"type": "string"}, "occurrences": {"type": "integer"}}
-    ),
+    "focus": object_schema({**_str_props("status", "focus"), "channels": _STR_ARRAY}, ["status", "focus"]),
+    "ack": object_schema({"acknowledged": _STR_ARRAY}),
+    "feedback": object_schema({**_str_props("id", "status"), "occurrences": _INT}),
 }
 for tool in TOOLS:
     name = tool["name"]

@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from codex_socket import CodexSocket, ControlError
+from mailbox_store import claude_session_dirs
 
 TURN_END_GRACE_SEC = 0.5
 TURN_END_POLL_SEC = 0.05
@@ -171,7 +172,6 @@ def wake_opencode(target: dict, message_id: str, *, base: Path | None = None) ->
 
 AGY_SERVICE = "exa.language_server_pb.LanguageServerService"
 AGY_BUSY = {"CASCADE_RUN_STATUS_RUNNING", "CASCADE_RUN_STATUS_BUSY"}
-AGY_MARKER_TTL = MARKER_TTL  # the earlier, Antigravity-only name
 LOOPBACK_ADDRESS = r"(localhost|127\.0\.0\.1):\d{1,5}"
 
 
@@ -312,27 +312,6 @@ def wake_gemini(target: dict, message_id: str, *, base: Path | None = None) -> d
         marker.unlink(missing_ok=True)
         raise
     return {"status": "scheduled", "reason": "idle Antigravity wake admitted to its native queue"}
-
-
-def claude_session_dirs(target: dict | None = None) -> list[Path]:
-    """Where Claude Code session records live, the recipient's own profile first."""
-    home = Path.home()
-    dirs: list[Path] = []
-    own = (target or {}).get("accountHome")
-    if isinstance(own, str) and own:
-        dirs.append(Path(own).expanduser() / "sessions")
-    env_dir = os.environ.get("CLAUDE_CONFIG_DIR")
-    if env_dir:
-        dirs.append(Path(env_dir).expanduser() / "sessions")
-    dirs.append(home / ".claude/sessions")
-    dirs.extend(sorted(p / "sessions" for p in home.glob(".claude-*") if p.is_dir()))
-    seen: set[Path] = set()
-    unique: list[Path] = []
-    for directory in dirs:
-        if directory not in seen and directory.is_dir():
-            seen.add(directory)
-            unique.append(directory)
-    return unique
 
 
 def claude_uds_send(sock_path: str, peer_token: str, session_id: str, text: str) -> None:

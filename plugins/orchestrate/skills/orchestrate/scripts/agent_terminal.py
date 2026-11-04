@@ -57,9 +57,6 @@ def bind(session: str, harness: str | None, payload: dict[str, Any]) -> bool:
             annotations["herdrPaneId"] = pane_id
             if workspace_id:
                 annotations["herdrWorkspaceId"] = workspace_id
-            herdr_socket = os.environ.get("HERDR_SOCKET_PATH", "").strip()
-            if herdr_socket:
-                annotations["herdrSocket"] = herdr_socket
         if annotations:
             with contextlib.suppress(Exception):
                 mailbox.annotate(mailbox.root(), session, **annotations)
