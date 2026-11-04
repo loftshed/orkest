@@ -1,6 +1,6 @@
 import path from "node:path";
 
-import { renderLine } from "../../monitor/lib/render.mjs";
+import { renderLine, timeLeft } from "../../monitor/lib/render.mjs";
 import { coalesceMessages, resolveMemberWorktree } from "./stooges-room.mjs";
 import {
   displayWidth,
@@ -125,6 +125,36 @@ function compactWindowLabel(rawLabel) {
     .trim();
 }
 
+function isLongQuotaWindow(w, totalWindows = 2) {
+  if (!w || !Number.isFinite(w.resetsAt)) return false;
+  if (totalWindows === 1) return true;
+  if (w.kind === "weekly" || (Number.isFinite(w.windowMins) && w.windowMins >= 1440)) return true;
+  if (/\b5-?h/iu.test(w.label || w.id || "")) return false;
+  return /\b(?:wk|week|daily|day|month)/iu.test(w.label || w.id || "");
+}
+
+function formatWindowResetItem(w, totalWindows = 2, now = Date.now()) {
+  if (!isLongQuotaWindow(w, totalWindows)) return "";
+  const date = new Date(w.resetsAt);
+  if (Number.isNaN(date.getTime())) return "";
+  const day = date.toLocaleDateString("en-US", { weekday: "short" }) || "";
+  if (!day) return "";
+  const left = timeLeft(w.resetsAt, now);
+  if (!left || left === "now") return `now (${day})`;
+  return `in ${left} (${day})`;
+}
+
+function formatGroupResetSuffix(windows, now = Date.now()) {
+  const items = [];
+  const list = windows || [];
+  for (const w of list) {
+    if (!Number.isFinite(w?.remainingPct)) continue;
+    const item = formatWindowResetItem(w, list.length, now);
+    if (item && !items.includes(item)) items.push(item);
+  }
+  return items.length > 0 ? ` · resets ${items.join(" / ")}` : "";
+}
+
 function summarizeAccountWindows(windows) {
   return windows
     .map((w) => {
@@ -152,13 +182,15 @@ function summarizePoolWindows(group) {
   return prefix ? `${prefix} · ${metrics}` : metrics;
 }
 
-function quotaRows(accounts, width, tier, color) {
+function quotaRows(accounts, width, tier, color, now = Date.now()) {
   const rows = [];
   const accountList = accounts || [];
   for (const account of accountList) {
     const windows = Array.isArray(account.windows) ? account.windows : [];
     const short = plain(account.short || account.id || "?");
     const creditSuffix = formatCreditSuffix(account);
+    const refNow =
+      Number.isFinite(account.fetchedAt) && now < 1_000_000_000_000 ? account.fetchedAt : now;
     if (windows.length === 0) {
       rows.push(plain(`${short} ${renderLine([account]) || "quota unavailable"}${creditSuffix}`));
       continue;
@@ -169,7 +201,9 @@ function quotaRows(accounts, width, tier, color) {
         ? Math.max(0, Math.min(100, window.remainingPct))
         : undefined;
       const label = plain(`${short} ${window.label || window.id || "quota"}`);
-      const suffix = pct === undefined ? "unavailable" : `${Math.round(pct)}% left${creditSuffix}`;
+      const resetSuffix = pct === undefined ? "" : formatGroupResetSuffix(windows, refNow);
+      const suffix =
+        pct === undefined ? "unavailable" : `${Math.round(pct)}% left${creditSuffix}${resetSuffix}`;
       const barWidth = Math.max(
         3,
         Math.min(14, width - displayWidth(label) - displayWidth(suffix) - 2),
@@ -194,7 +228,8 @@ function quotaRows(accounts, width, tier, color) {
         const minPct =
           measured.length > 0 ? Math.min(100, ...measured.map((w) => w.remainingPct)) : undefined;
         const pct = minPct === undefined ? undefined : Math.max(0, minPct);
-        const summary = `${summarizePoolWindows(group)}${creditSuffix}`;
+        const resetSuffix = formatGroupResetSuffix(group, refNow);
+        const summary = `${summarizePoolWindows(group)}${creditSuffix}${resetSuffix}`;
         const barWidth = Math.max(
           4,
           Math.min(10, width - displayWidth(short) - displayWidth(summary) - 2),
@@ -215,10 +250,11 @@ function quotaRows(accounts, width, tier, color) {
     const minPct =
       measured.length > 0 ? Math.min(100, ...measured.map((w) => w.remainingPct)) : undefined;
     const pct = minPct === undefined ? undefined : Math.max(0, minPct);
+    const resetSuffix = formatGroupResetSuffix(windows, refNow);
     const summary =
       windows.length === 1
-        ? `${plain(windows[0].label || windows[0].id || "quota")} ${pct === undefined ? "unavailable" : `${Math.round(pct)}% left`}${creditSuffix}`
-        : `${summarizeAccountWindows(windows)}${creditSuffix}`;
+        ? `${plain(windows[0].label || windows[0].id || "quota")} ${pct === undefined ? "unavailable" : `${Math.round(pct)}% left`}${creditSuffix}${resetSuffix}`
+        : `${summarizeAccountWindows(windows)}${creditSuffix}${resetSuffix}`;
     const barWidth = Math.max(
       4,
       Math.min(10, width - displayWidth(short) - displayWidth(summary) - 2),
@@ -577,7 +613,7 @@ export class StoogesView {
   quotaLines(width) {
     if (this.room.quotaError) return [`Quota unavailable: ${plain(this.room.quotaError)}`];
     const accounts = this.room.accounts || [];
-    return quotaRows(accounts, Math.max(10, width - 4), this.tier, this.color);
+    return quotaRows(accounts, Math.max(10, width - 4), this.tier, this.color, this.now());
   }
 
   folderHeaderLine(folder, count, innerWidth) {

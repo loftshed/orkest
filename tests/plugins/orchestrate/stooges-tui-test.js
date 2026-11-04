@@ -301,8 +301,22 @@ describe("tui-box primitives and HordeView unification", () => {
         short: "CW",
         provider: "claude",
         windows: [
-          { id: "5h", label: "5-hour", remainingPct: 89 },
-          { id: "week", label: "weekly", remainingPct: 48 },
+          { id: "5h", label: "5-hour", remainingPct: 89, resetsAt: 1_793_766_600_000 },
+          {
+            id: "week",
+            label: "weekly",
+            kind: "weekly",
+            remainingPct: 48,
+            resetsAt: 1_794_013_200_000,
+          },
+          {
+            id: "week-fable",
+            label: "Fable weekly",
+            kind: "weekly",
+            remainingPct: 97,
+            resetsAt: 1_794_013_200_000,
+            scope: "Fable",
+          },
         ],
       },
       {
@@ -319,14 +333,29 @@ describe("tui-box primitives and HordeView unification", () => {
         short: "CX",
         provider: "codex",
         credits: { hasCredits: true, unlimited: false, balance: 45_916 },
-        windows: [{ id: "weekly", label: "weekly", remainingPct: 0 }],
+        windows: [
+          {
+            id: "weekly",
+            label: "weekly",
+            kind: "weekly",
+            remainingPct: 0,
+            resetsAt: 1_794_013_200_000,
+          },
+        ],
       },
       {
         id: "antigravity",
         short: "AG",
         provider: "antigravity",
         windows: [
-          { id: "gemini-weekly", label: "Gemini weekly", remainingPct: 77, pool: "gemini" },
+          {
+            id: "gemini-weekly",
+            label: "Gemini weekly",
+            kind: "weekly",
+            remainingPct: 77,
+            resetsAt: 1_794_013_200_000,
+            pool: "gemini",
+          },
           { id: "gemini-5h", label: "Gemini 5-hour", remainingPct: 86, pool: "gemini" },
           {
             id: "claude-gpt-weekly",
@@ -343,13 +372,15 @@ describe("tui-box primitives and HordeView unification", () => {
         ],
       },
     ];
-    const rendered = new StoogesView(room, { now: () => 1000, height: 32 }).render(90).join("\n");
+    const nowMs = 1_793_754_000_000;
+    const resetDay = new Date(1_794_013_200_000).toLocaleDateString("en-US", { weekday: "short" });
+    const rendered = new StoogesView(room, { now: () => nowMs, height: 32 }).render(90).join("\n");
     expect(rendered).toContain("CW ");
-    expect(rendered).toContain("5h 89% · wk 48%");
+    expect(rendered).toContain(`5h 89% · wk 48% · Fable wk 97% · resets in 3d (${resetDay})`);
     expect(rendered).toContain("CP ");
     expect(rendered).toContain("5h 100% · wk 86%");
-    expect(rendered).toContain("45,916 cr");
-    expect(rendered).toContain("Gemini · wk 77% · 5h 86%");
+    expect(rendered).toContain(`weekly 0% left · 45,916 cr · resets in 3d (${resetDay})`);
+    expect(rendered).toContain(`Gemini · wk 77% · 5h 86% · resets in 3d (${resetDay})`);
     expect(rendered).toContain("Claude/GPT · wk 10% · 5h 100%");
   });
 

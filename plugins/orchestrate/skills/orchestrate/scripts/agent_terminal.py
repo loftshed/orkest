@@ -57,9 +57,34 @@ def bind(session: str, harness: str | None, payload: dict[str, Any]) -> bool:
             annotations["herdrPaneId"] = pane_id
             if workspace_id:
                 annotations["herdrWorkspaceId"] = workspace_id
+        base = mailbox.root()
         if annotations:
             with contextlib.suppress(Exception):
-                mailbox.annotate(mailbox.root(), session, **annotations)
+                mailbox.annotate(base, session, **annotations)
+        matched_room_id = ""
+        with contextlib.suppress(Exception):
+            import agent_statusline_tmux
+
+            peer_data = mailbox.load(mailbox.peer_path(base, session))
+            aliases = (
+                peer_data.get("aliases")
+                if isinstance(peer_data, dict) and isinstance(peer_data.get("aliases"), list)
+                else None
+            )
+            matched = agent_statusline_tmux.find_session_swarm_room(base, session, harness=harness, aliases=aliases)
+            if isinstance(matched, dict) and isinstance(matched.get("id"), str):
+                matched_room_id = matched["id"]
+        if herdr and matched_room_id:
+            with contextlib.suppress(Exception):
+                import agent_statusline_tmux
+
+                pane_id, workspace_id = herdr
+                agent_statusline_tmux._update_room_metadata(
+                    base,
+                    matched_room_id,
+                    herdrCoordinatorPaneId=pane_id,
+                    **({"herdrWorkspaceId": workspace_id} if workspace_id else {}),
+                )
         if not target:
             return True
         # Only display metadata crosses into the pane; never retain the native session payload.
@@ -99,6 +124,22 @@ def bind(session: str, harness: str | None, payload: dict[str, Any]) -> bool:
             timeout=2,
             check=True,
         )
+        if matched_room_id:
+            with contextlib.suppress(OSError, subprocess.SubprocessError):
+                existing_room = subprocess.run(
+                    ["tmux", "-L", server, "show-option", "-t", "orkest", "-v", "@orkest_room"],
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                    check=False,
+                ).stdout.strip()
+                if not existing_room:
+                    subprocess.run(
+                        ["tmux", "-L", server, "set-option", "-t", "orkest", "@orkest_room", matched_room_id],
+                        capture_output=True,
+                        timeout=2,
+                        check=False,
+                    )
         return True
     except (mailbox.MailboxError, OSError, subprocess.SubprocessError):
         return False

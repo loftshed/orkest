@@ -519,6 +519,134 @@ class HerdrSwarmLaunchTests(unittest.TestCase):
                     os.waitpid(pid, 0)
                 os.close(master)
 
+    def test_extract_resumed_session_id_across_harnesses(self):
+        import agent_statusline_tmux
+
+        sid = "11111111-2222-4333-8444-555555555555"
+        self.assertEqual(
+            agent_statusline_tmux.extract_resumed_session_id(["claude", "--resume", sid]),
+            sid,
+        )
+        self.assertEqual(
+            agent_statusline_tmux.extract_resumed_session_id(["plaude", "-r", sid]),
+            sid,
+        )
+        self.assertEqual(
+            agent_statusline_tmux.extract_resumed_session_id(["claude", f"--session-id={sid}"]),
+            sid,
+        )
+        self.assertEqual(
+            agent_statusline_tmux.extract_resumed_session_id(["codex", "resume", sid]),
+            sid,
+        )
+        self.assertEqual(
+            agent_statusline_tmux.extract_resumed_session_id(["agy", "--conversation", sid]),
+            sid,
+        )
+        self.assertEqual(
+            agent_statusline_tmux.extract_resumed_session_id(["opencode", "-s", sid]),
+            sid,
+        )
+        self.assertIsNone(agent_statusline_tmux.extract_resumed_session_id(["claude", "--resume"]))
+        self.assertIsNone(agent_statusline_tmux.extract_resumed_session_id(["codex", "resume", "--last"]))
+
+    def test_resumed_session_reconnects_to_previous_swarm_room_and_history(self):
+        import agent_statusline_tmux
+        import mailbox_hooks
+
+        with tempfile.TemporaryDirectory(prefix="ork-swarm-resume-") as temporary:
+            home = Path(temporary).resolve()
+            base = home / "mailbox-v1"
+            (base / "rooms").mkdir(parents=True, exist_ok=True)
+            session_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+            host = socket.gethostname()
+
+            older_room = {
+                "schema": "agent-executor.room.v1",
+                "id": "room-older",
+                "title": "Older Horde",
+                "cwd": str(home),
+                "machine": host,
+                "swarm": {"maxAgents": 16, "maxDepth": 4},
+                "objective": "Ship older feature",
+                "updatedAt": 1000,
+                "conductor": {
+                    "engine": "claude",
+                    "role": "lead",
+                    "status": "active",
+                    "session": {"id": session_id, "engine": "claude", "machine": host, "cwd": str(home)},
+                },
+                "agents": [],
+            }
+            newer_room = {
+                "schema": "agent-executor.room.v1",
+                "id": "room-newer",
+                "title": "Active Horde",
+                "cwd": str(home),
+                "machine": host,
+                "swarm": {"maxAgents": 16, "maxDepth": 4},
+                "objective": "Ship wave 65",
+                "updatedAt": 2000,
+                "conductor": {
+                    "engine": "claude",
+                    "role": "lead",
+                    "status": "active",
+                    "session": {"id": session_id, "engine": "claude", "machine": host, "cwd": str(home)},
+                },
+                "agents": [
+                    {"id": "w1", "role": "worker", "engine": "claude", "status": "running"},
+                    {"id": "w2", "role": "worker", "engine": "codex", "status": "completed"},
+                ],
+            }
+            mailbox.write(base / "rooms" / "room-older.json", older_room)
+            mailbox.write(base / "rooms" / "room-newer.json", newer_room)
+
+            matched = agent_statusline_tmux.find_session_swarm_room(base, session_id, harness="claude", cwd=str(home))
+            self.assertIsNotNone(matched)
+            self.assertEqual(matched["id"], "room-newer")
+            self.assertEqual(matched["_matchedMemberId"], "conductor")
+
+            me = mailbox.register(
+                base,
+                session=session_id,
+                harness="claude",
+                cwd=str(home),
+                pid=os.getpid(),
+                account=str(home),
+            )
+            old_env = os.environ.get("ORKEST_SWARM_ROOM")
+            try:
+                os.environ.pop("ORKEST_SWARM_ROOM", None)
+                summary = mailbox_hooks.swarm_coordinator_context(base, me, "UserPromptSubmit")
+                self.assertIn("Reconnected to swarm room room-newer (Active Horde)", summary)
+                self.assertIn("Objective: Ship wave 65.", summary)
+                self.assertIn("2 total (1 active, 1 completed, 0 blocked/failed)", summary)
+
+                # Subsequent turns in the same process/terminal do not repeat the reconnection banner
+                me_reloaded = mailbox.load(mailbox.peer_path(base, session_id))
+                second = mailbox_hooks.swarm_coordinator_context(base, me_reloaded, "UserPromptSubmit")
+                self.assertEqual(second, "")
+
+                # A /clear handover session with aliases inherits and rebinds the swarm room
+                cleared_sid = "ffffffff-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+                cleared_me = mailbox.register(
+                    base,
+                    session=cleared_sid,
+                    harness="claude",
+                    cwd=str(home),
+                    pid=os.getpid() + 1,
+                    account=str(home),
+                )
+                cleared_me = mailbox.annotate(base, cleared_sid, aliases=[session_id], clearedFrom=session_id)
+                cleared_summary = mailbox_hooks.swarm_coordinator_context(base, cleared_me, "SessionStart")
+                self.assertIn("Reconnected to swarm room room-newer (Active Horde)", cleared_summary)
+                updated_room = mailbox.load(base / "rooms" / "room-newer.json")
+                self.assertEqual(updated_room["conductor"]["session"]["id"], cleared_sid)
+                self.assertIn(session_id, updated_room["conductor"]["previousSessions"])
+            finally:
+                if old_env is not None:
+                    os.environ["ORKEST_SWARM_ROOM"] = old_env
+
 
 if __name__ == "__main__":
     unittest.main()
