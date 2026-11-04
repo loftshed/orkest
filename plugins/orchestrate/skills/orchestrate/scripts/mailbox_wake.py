@@ -127,7 +127,7 @@ def wake_codex(target: dict, message_id: str, *, base: Path | None = None) -> di
 
 
 def wake_opencode(target: dict, message_id: str, *, base: Path | None = None) -> dict:
-    if not re.fullmatch(r"ses_[A-Za-z0-9]+", target["session"]):
+    if not re.fullmatch(r"ses_[A-Za-z0-9_-]+", target["session"]):
         return {"status": "unavailable", "reason": "peer has no native OpenCode session id"}
     queued = subprocess.run(
         ["opencode", "api", "GET", f"/api/session/{target['session']}/inbox"],
@@ -441,10 +441,32 @@ def refused_before_admission(error: BaseException) -> bool:
     return isinstance(error, BEFORE_ADMISSION) or isinstance(getattr(error, "reason", None), BEFORE_ADMISSION)
 
 
+def reconcile_runtime_state(base: Path | None, peer: dict[str, Any]) -> dict[str, Any]:
+    """Reconcile stale peer state='busy' against live harness state before skipping idle wakes."""
+    if peer.get("state") == "busy" and peer.get("harness") == "claude":
+        matched = claude_record(peer)
+        record = matched[1] if isinstance(matched, tuple) and len(matched) >= 2 else matched
+        if isinstance(record, dict) and record.get("status") == "idle":
+            peer["state"] = "idle"
+            if base is not None and isinstance(peer.get("session"), str):
+                import peer_mailbox as mailbox
+
+                with contextlib.suppress(Exception):
+                    mailbox.annotate(base, peer["session"], state="idle")
+    return peer
+
+
 def wake_terminal_pane(base: Path, target: dict[str, Any], message: dict[str, Any]) -> dict[str, Any] | None:
     """Terminal-level PTY wake fallback (Herdr pane or Orkest tmux pane) when native harness control is unavailable."""
+    if target.get("isSubagent") or target.get("delegatedRun"):
+        return None
     if target.get("state", "idle") != "idle":
         return None
+    if target.get("harness") == "claude":
+        matched = claude_record(target)
+        record = matched[1] if isinstance(matched, tuple) and len(matched) >= 2 else matched
+        if isinstance(record, dict) and record.get("status") == "waiting":
+            return None
     message_id = str(message.get("id") or "")
     prompt_text = notification(message_id)
     herdr_pane_id = target.get("herdrPaneId")
@@ -501,6 +523,16 @@ def wake_terminal_pane(base: Path, target: dict[str, Any], message: dict[str, An
                     if len(parts) >= 3:
                         pane_id, pane_session, pane_dead = parts[0].strip(), parts[1].strip(), parts[2].strip()
                         if pane_dead == "0" and pane_session == target.get("session") and pane_id:
+                            mode_check = subprocess.run(
+                                ["tmux", "-L", server, "display-message", "-p", "-t", pane_id, "#{pane_in_mode}"],
+                                capture_output=True,
+                                text=True,
+                                timeout=2,
+                                check=False,
+                            )
+                            pane_in_mode = (getattr(mode_check, "stdout", "") or "").strip() or "0"
+                            if pane_in_mode != "0":
+                                return None
                             send_text = subprocess.run(
                                 ["tmux", "-L", server, "send-keys", "-t", pane_id, "-l", prompt_text],
                                 capture_output=True,
@@ -534,6 +566,7 @@ def wake(target: dict, message_id: str, *, base: Path | None = None, retry: bool
     peer = {**stored, **target}
     if stored.get("state") and stored.get("state") != "idle":
         peer["state"] = stored["state"]
+    reconcile_runtime_state(base, peer)
     try:
         # Serialize queue inspection and admission across senders, without holding inbox locks.
         with mailbox.locked(base / "wakes" / mailbox.session_key(target["session"]) / "admission.json"):
@@ -624,7 +657,7 @@ def wake_health(target: dict, *, base: Path | None = None) -> dict:
             return health("codex-daemon", False, f"no Codex daemon control socket under {codex_home(peer)}")
         return health("codex-daemon", True, "Codex daemon control socket present; thread loading is checked on send")
     if harness == "opencode":
-        native = bool(re.fullmatch(r"ses_[A-Za-z0-9]+", peer["session"]))
+        native = bool(re.fullmatch(r"ses_[A-Za-z0-9_-]+", peer["session"]))
         return health(
             "opencode-queue", native, "native OpenCode session" if native else "no native OpenCode session id"
         )

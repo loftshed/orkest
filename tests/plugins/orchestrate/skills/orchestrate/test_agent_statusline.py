@@ -95,7 +95,7 @@ class AgentStatuslineTests(unittest.TestCase):
         )
         self.assertEqual(
             line,
-            "snorfle-opus-high-project-23 | opus-4 / high | repo : project | stage : not set | goal : not set | task : not set\n",
+            "snorfle | opus-4 / high | repo : project | stage : not set | goal : not set | task : not set\n",
         )
         line = self.run_status(
             "--plain",
@@ -105,13 +105,62 @@ class AgentStatuslineTests(unittest.TestCase):
         )
         self.assertEqual(
             line,
-            "snoobix-gemini-low-project-56 | gemini-pro / low | repo : project | stage : not set | goal : not set | task : not set\n",
+            "snoobix | gemini-pro / low | repo : project | stage : not set | goal : not set | task : not set\n",
+        )
+        deduped = self.run_status(
+            "--plain",
+            "--width",
+            "200",
+            payload={
+                "conversation_id": "gemini-456",
+                "model": {
+                    "id": "Gemini 4 Argon (Medium)",
+                    "display_name": "Gemini 4 Argon (Medium)",
+                    "effort": "medium",
+                },
+            },
+        )
+        self.assertEqual(
+            deduped,
+            "snoobix | Gemini 4 Argon / medium | repo : project | stage : not set | goal : not set | task : not set\n",
+        )
+        self.peer("gemini-456", "snoobix-gemini-4-argon-medium-project-56", "gemini", model="gemini-4-argon-medium")
+        fields = self.fields("gemini-456")
+        self.assertEqual(
+            (fields["name"], fields["fullName"], fields["model"], fields["effort"]),
+            ("snoobix", "snoobix-gemini-4-argon-medium-project-56", "gemini-4-argon", "medium"),
         )
 
     def test_color_is_stable_and_no_color_is_respected(self):
         colored = self.run_status("--width", "200", payload={"session_id": "claude-123"})
-        self.assertRegex(colored, r"^\x1b\[0m   \x1b\[38;5;[0-9]+;1m(snorfle-opus-high-project-23)\x1b\[0m")
-        self.assertRegex(colored, r"   \x1b\[48;5;[0-9]+m( +)\x1b\[0m\n$")
+        self.assertRegex(
+            colored,
+            r"^\x1b\[0m\x1b\[48;5;[0-9]+;38;5;232;1m 󰚩 \x1b\[0m \x1b\[38;5;[0-9]+;1m(snorfle)\x1b\[0m",
+        )
+        self.assertRegex(colored, r"   \n$")
+        self.assertNotIn("\x1b[48;5;", colored[28:])
+        unicode_colored = self.run_status(
+            "--width",
+            "200",
+            payload={"session_id": "claude-123"},
+            environment={**self.environment, "ORK_GLYPHS": "unicode"},
+        )
+        self.assertRegex(
+            unicode_colored,
+            r"^\x1b\[0m\x1b\[48;5;[0-9]+m  \x1b\[0m \x1b\[38;5;[0-9]+;1m(snorfle)\x1b\[0m",
+        )
+        tmux_colored = self.run_status("--width", "200", "--tmux", payload={"session_id": "claude-123"})
+        self.assertRegex(
+            tmux_colored,
+            r"^#\[align=left,bg=default,fg=default\]#\[bg=colour[0-9]+,fg=colour232,bold\] 󰚩 #\[bg=default,fg=default\] #\[fg=colour[0-9]+,bold\]",
+        )
+        self.assertNotIn("fill=colour", tmux_colored)
+        tmux_line2 = self.run_status("--width", "200", "--tmux", "--line", "2", payload={"session_id": "claude-123"})
+        self.assertRegex(
+            tmux_line2,
+            r"^#\[align=left,bg=default,fg=default\]#\[fg=colour[0-9]+\] 󰓾 #\[fg=default\] ",
+        )
+        self.assertNotIn("bg=colour", tmux_line2)
         self.assertEqual(colored, self.run_status("--width", "200", payload={"session_id": "claude-123"}))
         self.assertNotIn(
             "\x1b",
@@ -124,8 +173,8 @@ class AgentStatuslineTests(unittest.TestCase):
         )
         fields = self.fields()
         self.assertEqual(
-            (fields["name"], fields["model"], fields["effort"], fields["task"], fields["stage"]),
-            ("snorfle-opus-max-project-23", "opus", "max", "Review docs", "not set"),
+            (fields["name"], fields["fullName"], fields["model"], fields["effort"], fields["task"], fields["stage"]),
+            ("snorfle", "snorfle-opus-max-project-23", "opus", "max", "Review docs", "not set"),
         )
 
     def test_codex_uses_its_own_runtime_model_and_effort_from_its_account(self):
@@ -279,7 +328,7 @@ class AgentStatuslineTests(unittest.TestCase):
         self.assertIn("stage : ", line)
         self.assertIn("goal : ", line)
         self.assertIn("task : ", line)
-        self.assertIn("-23", line)
+        self.assertTrue(line.startswith("snorfle | "))
         self.assertNotIn("\x1b", line)
         narrow = self.run_status("--session", "claude-123", "--width", "32", "--plain").strip()
         self.assertLessEqual(len(narrow), 32)
@@ -300,7 +349,7 @@ class AgentStatuslineTests(unittest.TestCase):
     def test_pane_matching_requires_exactly_one_live_codex_peer(self):
         self.peer("codex-789", "blip-gpt-high-project-89", "codex", os.getpid())
         line = self.run_status("--pane-pid", str(os.getpid()), "--harness", "codex", "--plain", "--width", "200")
-        self.assertTrue(line.startswith("blip-gpt-high-project-89 | "))
+        self.assertTrue(line.startswith("blip | "))
         self.peer("codex-999", "zog-gpt-low-project-99", "codex", os.getpid())
         self.assertEqual(self.run_status("--pane-pid", str(os.getpid()), "--harness", "codex", "--plain"), "")
 
@@ -332,13 +381,11 @@ class AgentStatuslineTests(unittest.TestCase):
             "200",
         )
         title.write_text(first[:29] + "...")
-        self.assertEqual(
-            json.loads(self.run_status(*arguments, environment=environment))["name"], "blip-gpt-high-project-8e"
-        )
+        first_fields = json.loads(self.run_status(*arguments, environment=environment))
+        self.assertEqual((first_fields["name"], first_fields["fullName"]), ("blip", "blip-gpt-high-project-8e"))
         title.write_text(second)
-        self.assertEqual(
-            json.loads(self.run_status(*arguments, environment=environment))["name"], "zog-gpt-low-project-66"
-        )
+        second_fields = json.loads(self.run_status(*arguments, environment=environment))
+        self.assertEqual((second_fields["name"], second_fields["fullName"]), ("zog", "zog-gpt-low-project-66"))
         title.write_text(first[:29] + "...")
         self.peer(first[:29] + "0000000", "conflicting-peer", "codex", accountHome=str(self.home))
         self.assertEqual(self.run_status(*arguments, environment=environment), "")
@@ -357,7 +404,7 @@ class AgentStatuslineTests(unittest.TestCase):
             "1",
             payload={"session_id": "claude-123", "model": {"id": "opus-4"}, "effort": {"level": "high"}},
         )
-        self.assertEqual(line1, "snorfle-opus-high-project-23 | opus-4 / high | repo : project\n")
+        self.assertEqual(line1, "snorfle | opus-4 / high | repo : project\n")
         line2 = self.run_status(
             "--plain",
             "--width",

@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -30,8 +31,9 @@ from mailbox_store import (
 _TRANSCRIPT_TAIL_BYTES = 256 * 1024
 _MODEL_SET_STDOUT = re.compile(r"<local-command-stdout>Set model to (?:`([^`]+)`|([^\n<(]+))")
 _WAKE_NOTICE_ID = re.compile(r"Local peer mailbox notification \(([A-Za-z0-9._-]+)\)")
-_SWARM_SLASH_CMD = re.compile(r"^\s*/(?:orchestrate:)?swarm(?:\s+(toggle|open|close))?\s*$", re.IGNORECASE)
+_SWARM_SLASH_CMD = re.compile(r"^\s*/(?:orchestrate:)?(?:swarm|horde)(?:\s+(toggle|open|close))?\s*$", re.IGNORECASE)
 _SWARM_TAG_CMD = re.compile(r"\[orkest-swarm-command(?::\s*(toggle|open|close)?)?\]", re.IGNORECASE)
+_AGY_SUBAGENT_SENDER = re.compile(r"<SYSTEM_MESSAGE>\s*\[Message\][^\n]*?\bsender=([A-Za-z0-9_.:-]+)")
 
 ANTIGRAVITY_NO_CONTINUE = {
     "USER_CANCELED",
@@ -143,6 +145,72 @@ def transcript_model(payload: dict[str, Any]) -> str | None:
     return None
 
 
+def _agy_subagent_info(transcript_path: str | None) -> tuple[bool, str | None]:
+    """Detect an Antigravity subagent from the opening JSONL entries of its transcript."""
+    if not isinstance(transcript_path, str) or not transcript_path.strip():
+        return False, None
+    path = Path(transcript_path).expanduser()
+    if not path.is_file():
+        return False, None
+    sender_uuid: str | None = None
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for _, line in zip(range(12), handle, strict=False):
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("source") == "USER_EXPLICIT":
+                    return False, None
+                if sender_uuid is None and entry.get("type") == "SYSTEM_MESSAGE":
+                    content = entry.get("content")
+                    if not isinstance(content, str) and isinstance(entry.get("message"), dict):
+                        content = entry["message"].get("content")
+                    if isinstance(content, str) and (match := _AGY_SUBAGENT_SENDER.search(content)):
+                        sender_uuid = match.group(1)
+    except OSError:
+        return False, None
+    if sender_uuid:
+        return True, sender_uuid
+    return False, None
+
+
+def _codex_sqlite_settings(account: str | None, session: str) -> tuple[str | None, str | None]:
+    """Read (model, reasoning_effort) for a Codex thread from the newest state_*.sqlite in account_home."""
+    if not isinstance(account, str) or not account.strip():
+        return None, None
+    account_path = Path(account).expanduser()
+    if not account_path.is_dir():
+        return None, None
+    try:
+        databases = sorted(
+            account_path.glob("state_*.sqlite"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )[:8]
+    except OSError:
+        return None, None
+    for db_path in databases:
+        try:
+            with contextlib.closing(
+                sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True, timeout=0.05)
+            ) as connection:
+                row = connection.execute(
+                    "SELECT model, reasoning_effort FROM threads WHERE id = ?",
+                    (session,),
+                ).fetchone()
+                if row:
+                    model = str(row[0]).strip() if isinstance(row[0], str) and str(row[0]).strip() else None
+                    effort = str(row[1]).strip() if isinstance(row[1], str) and str(row[1]).strip() else None
+                    if model or effort:
+                        return model, effort
+        except (OSError, sqlite3.Error, ValueError):
+            continue
+    return None, None
+
+
 def end_session(base: Path, session: str, *, reason: str, pid: int | None) -> None:
     # Serialize a normal exit with background disappearance detection. /clear registers its successor
     # and takes other peer locks, so keep its existing pairing path outside this lock.
@@ -175,6 +243,10 @@ def _end_session(base: Path, session: str, *, reason: str, pid: int | None) -> N
                     and moment - dt.datetime.fromisoformat(waiting["awaitingClear"]) <= CLEAR_PAIRING
                 ):
                     notice = _MB.adopt_cleared(base, waiting)
+                    waiting = _MB.load(peer_path(base, waiting["session"])) or waiting
+                    swarm_notice = _MB.swarm_coordinator_context(base, waiting, "SessionStart")
+                    if swarm_notice:
+                        notice = f"{notice}\n\n{swarm_notice}" if notice else swarm_notice
                     if notice:
                         _MB.notify(base, waiting, notice)
                     break
@@ -211,6 +283,25 @@ def adopt_cleared(base: Path, me: dict[str, Any]) -> str:
         _MB.annotate(base, me["session"], awaitingClear=_MB.stamp())
         return ""
     _, path, old = max(stashed, key=lambda item: item[0])
+    temp_name = me.get("name") if old.get("person") and old.get("person") != me.get("person") else None
+    names = [old["session"], old.get("name"), *old.get("aliases", [])]
+    adopted_aliases = [name for name in dict.fromkeys(names) if isinstance(name, str) and name != temp_name][-8:]
+    focus = me.get("focus") or old.get("focus")
+    if old.get("person") and old.get("person") != me.get("person"):
+        _MB.annotate(base, me["session"], person=old["person"])
+        refreshed = _MB.register(base, session=me["session"], harness=me["harness"], cwd=me["cwd"])
+        me.update(refreshed)
+    annotated = _MB.annotate(
+        base,
+        me["session"],
+        aliases=adopted_aliases,
+        clearedFrom=old["session"],
+        awaitingClear=None,
+        **({"focus": focus} if focus else {}),
+        **({"channels": old["channels"]} if old.get("channels") else {}),
+    )
+    if isinstance(annotated, dict):
+        me.update(annotated)
     carried, orphaned, replied = [], 0, _MB.replied_to(base, old["session"])
     for message in _MB.messages(base, old["session"], unread_only=False):
         sent = dt.datetime.fromisoformat(message["sentAt"])
@@ -236,17 +327,52 @@ def adopt_cleared(base: Path, me: dict[str, Any]) -> str:
             _MB.write(inbox_dir(base, me["session"]) / f"{message['id']}.json", message)
             (inbox_dir(base, old["session"]) / f"{message['id']}.json").unlink(missing_ok=True)
             carried.append(message)
-    names = [old["session"], old.get("name"), *old.get("aliases", [])]
-    _MB.annotate(
-        base,
-        me["session"],
-        aliases=[name for name in dict.fromkeys(names) if isinstance(name, str)][-8:],
-        clearedFrom=old["session"],
-        awaitingClear=None,
-        **({"person": old["person"]} if old.get("person") else {}),
-        **({"channels": old["channels"]} if old.get("channels") else {}),
-    )
-    me = _MB.register(base, session=me["session"], harness=me["harness"], cwd=me["cwd"])
+    old_progress_path = base / "progress" / f"{session_key(old['session'])}.json"
+    new_progress_path = base / "progress" / f"{session_key(me['session'])}.json"
+    if old_progress_path.is_file() and not new_progress_path.exists():
+        with contextlib.suppress(OSError, ValueError), locked(new_progress_path):
+            if not new_progress_path.exists():
+                old_progress = _MB.load(old_progress_path)
+                if isinstance(old_progress, dict):
+                    _MB.write(new_progress_path, {**old_progress, "session": me["session"]})
+    board_path = base / "work" / "board.json"
+    if board_path.is_file():
+        with contextlib.suppress(OSError, ValueError), locked(board_path):
+            board = _MB.load(board_path)
+            raw_items = board.get("items") if isinstance(board, dict) else None
+            item_list = (
+                raw_items
+                if isinstance(raw_items, list)
+                else (list(raw_items.values()) if isinstance(raw_items, dict) else [])
+            )
+            if item_list:
+                board_changed = False
+                for item in item_list:
+                    if not isinstance(item, dict):
+                        continue
+                    for role_key in ("creator", "integrator", "owner", "transfer"):
+                        role_obj = item.get(role_key)
+                        if isinstance(role_obj, str) and role_obj == old["session"]:
+                            item[role_key] = me["session"]
+                            board_changed = True
+                        elif isinstance(role_obj, dict):
+                            if role_obj.get("session") == old["session"]:
+                                role_obj["session"] = me["session"]
+                                if me.get("name"):
+                                    role_obj["name"] = str(me["name"])[:120]
+                                board_changed = True
+                            for sub_key in ("to", "from"):
+                                sub_val = role_obj.get(sub_key)
+                                if isinstance(sub_val, str) and sub_val == old["session"]:
+                                    role_obj[sub_key] = me["session"]
+                                    board_changed = True
+                                elif isinstance(sub_val, dict) and sub_val.get("session") == old["session"]:
+                                    sub_val["session"] = me["session"]
+                                    if me.get("name"):
+                                        sub_val["name"] = str(me["name"])[:120]
+                                    board_changed = True
+                if board_changed:
+                    _MB.write(board_path, board)
     _MB.notify_senders(
         base,
         carried,
@@ -480,9 +606,11 @@ def _format_swarm_reconnection_summary(room: dict[str, Any], room_id: str, membe
     )
 
 
-def swarm_coordinator_context(base: Path, me: dict[str, Any], event: str, *, mid_turn: bool = False) -> str:
+def swarm_coordinator_context(
+    base: Path, me: dict[str, Any], event: str = "SessionStart", *, mid_turn: bool = False
+) -> str:
     """Auto-bind the root swarm coordinator (or reconnect a resumed coordinator/lead) and deliver its brief."""
-    if me.get("delegatedRun") or _MB.is_run_peer(me):
+    if me.get("isSubagent") or me.get("delegatedRun") or _MB.is_run_peer(me):
         return ""
     is_turn_start = event in {"SessionStart", "UserPromptSubmit"} or (event == "PreInvocation" and not mid_turn)
     room_id = os.environ.get("ORKEST_SWARM_ROOM", "").strip()
@@ -639,6 +767,8 @@ def swarm_command_context(
     base: Path, me: dict[str, Any], payload: dict[str, Any], event: str, *, mid_turn: bool = False
 ) -> str:
     """Toggle the Orkest Swarm View split pane when the user submits `/swarm`."""
+    if me.get("isSubagent") or me.get("delegatedRun") or _MB.is_run_peer(me):
+        return ""
     if not (event == "UserPromptSubmit" or (event == "PreInvocation" and not mid_turn)):
         return ""
     prompt = _MB.latest_user_prompt(payload, me["session"], me.get("accountHome"))
@@ -711,6 +841,8 @@ def hook(
     state = {"SessionStart": "idle", "UserPromptSubmit": "busy", "PreInvocation": "busy", "Stop": "idle"}.get(event)
     if state is None:
         return None
+    raw_transcript = payload.get("transcript_path") or payload.get("transcriptPath")
+    account_home_dir = _MB.account_home(harness, raw_transcript)
     runtime_model = payload.get("model") or payload.get("modelName")
     if isinstance(runtime_model, dict):
         runtime_model = runtime_model.get("id")
@@ -718,7 +850,34 @@ def hook(
         runtime_model = None
     if not (isinstance(runtime_model, str) and runtime_model.strip()):
         runtime_model = _MB.transcript_model(payload)
+    runtime_effort_val = _MB.runtime_effort(harness, payload)
+    if harness == "codex" and (not runtime_model or not runtime_effort_val):
+        db_model, db_effort = _codex_sqlite_settings(account_home_dir, session)
+        if not runtime_model and db_model:
+            runtime_model = db_model
+        if not runtime_effort_val and db_effort:
+            runtime_effort_val = db_effort
     previous = _MB.load(peer_path(base, session))
+    effective_transcript = raw_transcript if isinstance(raw_transcript, str) and raw_transcript.strip() else None
+    if gemini and not effective_transcript and session:
+        home_dir = (
+            Path(account_home_dir).expanduser()
+            if isinstance(account_home_dir, str) and account_home_dir
+            else Path.home() / ".gemini"
+        )
+        candidate_transcript = home_dir / "antigravity-cli/brain" / session / ".system_generated/logs/transcript.jsonl"
+        if candidate_transcript.is_file():
+            effective_transcript = str(candidate_transcript)
+    if gemini:
+        if valid_peer(previous) and previous.get("isSubagent") and previous.get("parentSession"):
+            is_subagent, parent_session = True, str(previous["parentSession"])
+        else:
+            is_subagent, parent_session = _agy_subagent_info(effective_transcript)
+            if not is_subagent and valid_peer(previous) and previous.get("isSubagent"):
+                is_subagent = True
+                parent_session = parent_session or previous.get("parentSession")
+    else:
+        is_subagent, parent_session = False, None
     # Antigravity runs PreInvocation before every model step, tool results included; only the first starts a turn.
     mid_turn = event == "PreInvocation" and valid_peer(previous) and previous.get("state") == "busy"
     me = _MB.register(
@@ -731,23 +890,33 @@ def hook(
         cwd_source="hook",
         model=runtime_model if isinstance(runtime_model, str) and runtime_model.strip() else None,
         model_source="runtime",
-        account=_MB.account_home(harness, payload.get("transcript_path") or payload.get("transcriptPath")),
-        effort=_MB.runtime_effort(harness, payload),
+        account=account_home_dir,
+        effort=runtime_effort_val,
     )
     me = _MB.mark_delegated(base, me)
-    terminal_server = os.environ.get("ORKEST_TERMINAL_SERVER", "").strip()
-    if re.fullmatch(r"orkest-label-[0-9a-f]{12}", terminal_server) and me.get("terminalServer") != terminal_server:
-        me = _MB.annotate(base, session, terminalServer=terminal_server) or me
-    if os.environ.get("HERDR_ENV") == "1":
-        herdr_pane = os.environ.get("HERDR_PANE_ID", "").strip()
-        herdr_workspace = os.environ.get("HERDR_WORKSPACE_ID", "").strip()
-        herdr_fields: dict[str, Any] = {}
-        if herdr_pane and me.get("herdrPaneId") != herdr_pane:
-            herdr_fields["herdrPaneId"] = herdr_pane
-        if herdr_workspace and me.get("herdrWorkspaceId") != herdr_workspace:
-            herdr_fields["herdrWorkspaceId"] = herdr_workspace
-        if herdr_fields:
-            me = _MB.annotate(base, session, **herdr_fields) or me
+    if is_subagent:
+        subagent_fields: dict[str, Any] = {"isSubagent": True}
+        if parent_session:
+            subagent_fields["parentSession"] = parent_session
+        for k in ("terminalServer", "herdrPaneId", "herdrWorkspaceId"):
+            if me.get(k) is not None or (valid_peer(previous) and previous.get(k) is not None):
+                subagent_fields[k] = None
+        if any(me.get(k) != v for k, v in subagent_fields.items()):
+            me = _MB.annotate(base, session, **subagent_fields) or me
+    if not is_subagent and not me.get("isSubagent") and not me.get("delegatedRun"):
+        terminal_server = os.environ.get("ORKEST_TERMINAL_SERVER", "").strip()
+        if re.fullmatch(r"orkest-label-[0-9a-f]{12}", terminal_server) and me.get("terminalServer") != terminal_server:
+            me = _MB.annotate(base, session, terminalServer=terminal_server) or me
+        if os.environ.get("HERDR_ENV") == "1":
+            herdr_pane = os.environ.get("HERDR_PANE_ID", "").strip()
+            herdr_workspace = os.environ.get("HERDR_WORKSPACE_ID", "").strip()
+            herdr_fields: dict[str, Any] = {}
+            if herdr_pane and me.get("herdrPaneId") != herdr_pane:
+                herdr_fields["herdrPaneId"] = herdr_pane
+            if herdr_workspace and me.get("herdrWorkspaceId") != herdr_workspace:
+                herdr_fields["herdrWorkspaceId"] = herdr_workspace
+            if herdr_fields:
+                me = _MB.annotate(base, session, **herdr_fields) or me
     # How the last turn ended: wake recovery must not set a conversation going that its own user stopped.
     if gemini and event == "Stop" and payload.get("terminationReason"):
         me = _MB.annotate(base, session, lastStopReason=str(payload["terminationReason"])) or me
@@ -757,6 +926,11 @@ def hook(
     if event == "SessionStart" and payload.get("source") == "clear" and not me.get("delegatedRun"):
         cleared_notice = _MB.adopt_cleared(base, me)
         me = _MB.load(peer_path(base, session)) or me
+    if not me.get("isSubagent") and event in {"SessionStart", "UserPromptSubmit", "PreInvocation", "Stop"}:
+        with contextlib.suppress(Exception):
+            import mailbox_work as _WORK
+
+            _WORK.renew_leases(base, me, force=False)
     team_notice = (
         _MB.succession_notice(base, me)
         if event in {"SessionStart", "UserPromptSubmit", "PreInvocation", "Stop"}
@@ -800,16 +974,30 @@ def hook(
         return {}
     import mailbox_channels
 
-    route_hint = _MB.wake_route_hint(base, me) if event == "SessionStart" else ""
-    swarm_brief = (
-        _MB.swarm_coordinator_context(base, me, event, mid_turn=mid_turn)
-        if event in {"SessionStart", "UserPromptSubmit"} or (gemini and event == "PreInvocation" and not mid_turn)
+    route_hint = (
+        _MB.wake_route_hint(base, me)
+        if event == "SessionStart" and not is_subagent and not me.get("isSubagent")
         else ""
     )
-    swarm_toggle = _MB.swarm_command_context(base, me, payload, event, mid_turn=mid_turn)
+    swarm_brief = (
+        _MB.swarm_coordinator_context(base, me, event, mid_turn=mid_turn)
+        if not is_subagent
+        and not me.get("isSubagent")
+        and (event in {"SessionStart", "UserPromptSubmit"} or (gemini and event == "PreInvocation" and not mid_turn))
+        else ""
+    )
+    swarm_toggle = (
+        _MB.swarm_command_context(base, me, payload, event, mid_turn=mid_turn)
+        if not is_subagent and not me.get("isSubagent")
+        else ""
+    )
     progress_hint = ""
     help_hint = ""
-    if event in {"SessionStart", "UserPromptSubmit"} or (gemini and event == "PreInvocation" and not mid_turn):
+    if (
+        not is_subagent
+        and not me.get("isSubagent")
+        and (event in {"SessionStart", "UserPromptSubmit"} or (gemini and event == "PreInvocation" and not mid_turn))
+    ):
         import agent_progress
         import mailbox_work
 
@@ -860,7 +1048,7 @@ def hook(
     if hint:
         context = hint + ("\n\n" + context if context else "")
     if event == "Stop":
-        if not delivered and not team_notice:  # a hint alone never keeps a turn going
+        if not delivered:  # a hint or notice alone never keeps a turn going
             return {} if gemini else None
         _MB.feedback_module().observe(
             base,

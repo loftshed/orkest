@@ -6,8 +6,20 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import {
+  focusAgentPane,
+  notifyHerdrTransitions,
+  runHordeTui,
+  runStoogesTui,
+} from "../../../plugins/orchestrate/bin/horde-tui.mjs";
+import * as hordeTuiModule from "../../../plugins/orchestrate/bin/horde-tui.mjs";
 import { runTui } from "../../../plugins/orchestrate/bin/stooges-tui.mjs";
-import { HordeView } from "../../../plugins/orchestrate/lib/horde-view.mjs";
+import * as stoogesTuiModule from "../../../plugins/orchestrate/bin/stooges-tui.mjs";
+import * as factoryModule from "../../../plugins/orchestrate/lib/factory.mjs";
+import * as foundryModule from "../../../plugins/orchestrate/lib/foundry.mjs";
+import * as hordeRoomModule from "../../../plugins/orchestrate/lib/horde-room.mjs";
+import { HordeView, normalizeAgent } from "../../../plugins/orchestrate/lib/horde-view.mjs";
+import * as hordeViewModule from "../../../plugins/orchestrate/lib/horde-view.mjs";
 import {
   addMembers,
   createRoom,
@@ -17,7 +29,13 @@ import {
   updateRoom,
   validateRoom,
 } from "../../../plugins/orchestrate/lib/stooges-room.mjs";
-import { StoogesView } from "../../../plugins/orchestrate/lib/stooges-view.mjs";
+import * as stoogesRoomModule from "../../../plugins/orchestrate/lib/stooges-room.mjs";
+import {
+  normalizeModelAndEffort,
+  shortAgentName,
+  StoogesView,
+} from "../../../plugins/orchestrate/lib/stooges-view.mjs";
+import * as stoogesViewModule from "../../../plugins/orchestrate/lib/stooges-view.mjs";
 import {
   ANSI,
   cellWidth,
@@ -161,17 +179,15 @@ describe("tui-box primitives and HordeView unification", () => {
   it("uses two card columns on a wide terminal and stacked cards when narrow", () => {
     const view = new HordeView(fixture(), { now: () => 2000 });
     const wide = view.render(120);
-    expect(wide.some((line) => line.includes("1 haiku-1") && line.includes("2 flash-1"))).toBe(
-      true,
-    );
+    expect(wide.some((line) => line.includes("1 luna-1") && line.includes("2 flash-1"))).toBe(true);
     expect(wide.some((line) => line.includes("? help"))).toBe(true);
     const narrow = view.render(70);
-    expect(narrow.some((line) => line.includes("1 haiku-1") && line.includes("2 flash-1"))).toBe(
+    expect(narrow.some((line) => line.includes("1 luna-1") && line.includes("2 flash-1"))).toBe(
       false,
     );
-    expect(narrow.join("\n")).toContain("1 haiku-1");
+    expect(narrow.join("\n")).toContain("1 luna-1");
     expect(narrow.join("\n")).toContain("2 flash-1");
-    expect(narrow.join("\n")).toContain("3 luna-1");
+    expect(narrow.join("\n")).toContain("3 haiku-1");
     expect(narrow.join("\n")).toContain("3/64 slots · page 1/1");
   });
 
@@ -183,7 +199,7 @@ describe("tui-box primitives and HordeView unification", () => {
     view.handleInput("1");
     expect(view.render(90).join("\n")).toContain("PIN ");
     const changed = structuredClone(room);
-    changed.agents[1].output.push("Branch selected");
+    changed.agents[2].output.push("Branch selected");
     view.setRoom(changed);
     expect(view.render(90).join("\n")).toContain("Branch selected");
     view.handleInput("2");
@@ -198,28 +214,28 @@ describe("tui-box primitives and HordeView unification", () => {
     view.handleInput("n");
     view.handleInput("3");
     const rendered = view.render(80).join("\n");
-    expect(view.focusId).toBe("haiku-12");
-    expect(rendered).toContain("3 haiku-12");
+    expect(view.focusId).toBe("haiku-1");
+    expect(rendered).toContain("3 haiku-1");
     expect(rendered).toContain("page 2/2");
   });
 
   it("keeps focus, detail and navigation visible on a short terminal", () => {
     const room = fixture("claude:haiku*9");
-    room.agents[8].output = ["Ninth agent result"];
+    room.agents[0].output = ["First agent result"];
     const view = new StoogesView(room, { height: 18 });
     view.render(80);
     for (let index = 0; index < 8; index++) view.handleInput("\u{1B}[B");
     const lines = view.render(80);
     expect(lines.length).toBeLessThanOrEqual(18);
-    expect(lines.join("\n")).toContain("haiku-9");
+    expect(lines.join("\n")).toContain("haiku-1");
     expect(lines.join("\n")).toContain("FOCUS ");
-    expect(lines.join("\n")).toContain("Ninth agent result");
+    expect(lines.join("\n")).toContain("First agent result");
     expect(lines.join("\n")).toContain("q close view");
   });
 
   it("fits Unicode and strips injected terminal controls", () => {
     const room = fixture();
-    room.agents[0].output = ["\u{1B}[2J界界 👩‍💻 safe\u{7}"];
+    room.agents[2].output = ["\u{1B}[2J界界 👩‍💻 safe\u{7}"];
     const lines = new StoogesView(room).render(32);
     expect(lines.every((line) => displayWidth(line) <= 32)).toBe(true);
     expect(lines.join("\n")).toContain("safe");
@@ -228,7 +244,8 @@ describe("tui-box primitives and HordeView unification", () => {
 
   it("frames responsive layouts within terminal width and uses tone-colored ANSI safely", () => {
     const room = fixture();
-    room.agents[0].output = ["\u{1B}[31munsafe\u{1B}[0m 👩‍💻 界\nnext line"];
+    room.agents[2].status = "running";
+    room.agents[2].output = ["\u{1B}[31munsafe\u{1B}[0m 👩‍💻 界\nnext line"];
     const view = new StoogesView(room, { now: () => 2000, height: 28, color: true });
     for (const width of [40, 47, 48, 63, 64, 79, 80, 120]) {
       const lines = view.render(width);
@@ -246,10 +263,62 @@ describe("tui-box primitives and HordeView unification", () => {
     expect(glyphTier({ TERM: "xterm-256color" })).toBe("ascii");
     expect(progressBar(0.125, 4, "unicode")).toBe("▌░░░");
     expect(displayWidth("\u{F0000}")).toBe(1);
+    expect(displayWidth("\u{E0A0}")).toBe(1);
+    expect(displayWidth("󰚩")).toBe(1);
     expect(wrapText("界", 1)).toEqual(["?"]);
     const ascii = new StoogesView(fixture(), { height: 24, tier: "ascii" }).render(40);
     expect(ascii.join("\n")).toContain("+ Swarm · sample-room");
     expect(ascii.every((line) => displayWidth(line) <= 40)).toBe(true);
+    const nerd = new StoogesView(fixture(), { height: 24, tier: "nerd" }).render(80);
+    expect(nerd.join("\n")).toContain("╭ Swarm · sample-room");
+    expect(nerd.join("\n")).toContain("󰔛");
+    expect(nerd.join("\n")).toContain("󰀪");
+    expect(nerd.every((line) => displayWidth(line) <= 80)).toBe(true);
+  });
+
+  it("displays short Martian names and deduplicates model effort suffixes in HordeView", () => {
+    expect(shortAgentName({ id: "haiku-1" })).toBe("haiku-1");
+    expect(shortAgentName({ id: "builder-67-statusline-nerdfont" })).toBe(
+      "builder-67-statusline-nerdfont",
+    );
+    expect(shortAgentName({ name: "builder-67-statusline-nerdfont" })).toBe(
+      "builder-67-statusline-nerdfont",
+    );
+    expect(shortAgentName({ name: "gribble-gemini-4-argon-medium-orkest-1f" })).toBe("gribble");
+    expect(shortAgentName({ id: "flash-1", name: "gribble-gemini-4-argon-medium-orkest-1f" })).toBe(
+      "gribble",
+    );
+    expect(normalizeModelAndEffort("Gemini 4 Argon (Medium)", "medium")).toEqual({
+      model: "Gemini 4 Argon",
+      effort: "medium",
+    });
+    expect(normalizeModelAndEffort("gemini-4-argon-medium", "—")).toEqual({
+      model: "gemini-4-argon",
+      effort: "medium",
+    });
+    expect(normalizeModelAndEffort("gpt-oss-120b-medium", "")).toEqual({
+      model: "gpt-oss-120b",
+      effort: "medium",
+    });
+
+    const room = fixture("claude:haiku,agy:flash");
+    room.conductor.name = "gribble-gemini-4-argon-medium-orkest-1f";
+    room.conductor.resolvedModel = "Gemini 4 Argon (Medium)";
+    room.conductor.resolvedEffort = "medium";
+    room.agents[0].status = "completed";
+    room.agents[0].name = "snorfle-opus-high-orkest-23";
+    room.agents[1].status = "running";
+    room.agents[1].name = "snoobix-gemini-4-argon-medium-orkest-56";
+    room.agents[1].resolvedModel = "gemini-4-argon-medium";
+    room.agents[1].resolvedEffort = "—";
+    const rendered = new StoogesView(room, { height: 28, tier: "nerd" }).render(90).join("\n");
+    expect(rendered).toContain("gribble · folder:");
+    expect(rendered).not.toContain("gribble-gemini-4-argon-medium-orkest-1f");
+    expect(rendered).toContain("Gemini 4 Argon / medium");
+    expect(rendered).not.toContain("(Medium) / medium");
+    expect(rendered).toContain("1 snoobix");
+    expect(rendered).toContain("gemini-4-argon / medium");
+    expect(rendered).toContain("󰄬 2 snorfle");
   });
 
   it("renders an empty room, key help and a coalesced log overlay", () => {
@@ -396,23 +465,43 @@ describe("tui-box primitives and HordeView unification", () => {
 
     const view = new StoogesView(room, { now: () => 1_000_000, height: 28, tier: "unicode" });
     const collapsed = view.render(90).join("\n");
-    // Focused agent (haiku-1) stays expanded; unfocused completed agent (haiku-2) is a 1-line row
-    expect(collapsed).toContain("┌ 1 haiku-1");
+    // Most recent running agent (haiku-3) is #1 and focused; older completed agents (haiku-2, haiku-1) collapse below it
+    expect(collapsed).toContain("┌ 1 haiku-3");
+    expect(collapsed).toContain("step 2/4 · live");
     expect(collapsed).toContain("├─ ✓ 2 haiku-2");
     expect(collapsed).toContain("Second task done");
-    expect(collapsed).toContain("┌ 3 haiku-3");
-    expect(collapsed).toContain("step 2/4 · live");
+    expect(collapsed).toContain("└─ ✓ 3 haiku-1");
+    expect(collapsed).toContain("First task done");
 
     // Press c -> hidden mode
     view.handleInput("c");
     const hidden = view.render(90).join("\n");
     expect(hidden).not.toContain("2 haiku-2");
-    expect(hidden).toContain("1 completed hidden (press c to expand)");
+    expect(hidden).not.toContain("3 haiku-1");
+    expect(hidden).toContain("2 completed hidden (press c to expand)");
 
     // Press c -> expanded mode
     view.handleInput("c");
     const expanded = view.render(90).join("\n");
     expect(expanded).toContain("┌ 2 haiku-2");
+    expect(expanded).toContain("┌ 3 haiku-1");
+  });
+
+  it("orders agents from most recent to least recent so new agents push old ones off the bottom", () => {
+    const room = fixture("claude:haiku*2");
+    room.agents[0].status = "completed";
+    room.agents[0].observedAt = "2026-11-04T02:00:00Z";
+    room.agents[1].status = "completed";
+    room.agents[1].observedAt = "2026-11-04T03:00:00Z";
+    const view = new StoogesView(room, { height: 24, tier: "unicode" });
+    expect(view.room.agents.map((agent) => agent.id)).toEqual(["haiku-2", "haiku-1"]);
+    expect(view.focusId).toBe("haiku-2");
+
+    const updated = structuredClone(room);
+    addMembers(updated, parseTeam("agy:pro"));
+    view.setRoom(updated);
+    expect(view.room.agents.map((agent) => agent.id)).toEqual(["pro-1", "haiku-2", "haiku-1"]);
+    expect(view.focusId).toBe("pro-1");
   });
 
   it("renders outer tree rails, contrasting headers, and wt:<slug> badges for disposable worktrees in swarm view", () => {
@@ -421,15 +510,15 @@ describe("tui-box primitives and HordeView unification", () => {
     room.cwd = "/workspace/orkest";
     room.conductor = { engine: "agy", role: "lead", status: "working" };
     room.swarm = { maxAgents: 6, maxDepth: 3 };
-    room.agents[0].cwd = "/cache/worktrees/orkest/wt-50";
-    room.agents[0].worktree = {
+    room.agents[0].cwd = "/workspace/orkest";
+    room.agents[1].cwd = "/cache/worktrees/orkest/wt-50";
+    room.agents[1].worktree = {
       path: "/cache/worktrees/orkest/wt-50",
       branch: "feat/wt-50",
       disposable: true,
       parentCwd: "/workspace/orkest",
       slug: "wt-50",
     };
-    room.agents[1].cwd = "/workspace/orkest";
 
     const unicodeLines = new StoogesView(room, { height: 28, tier: "unicode", color: true }).render(
       90,
@@ -443,9 +532,9 @@ describe("tui-box primitives and HordeView unification", () => {
 
     const asciiText = new StoogesView(room, { height: 28, tier: "ascii" }).render(85).join("\n");
     expect(asciiText).toContain("| orkest · 2 agents · /workspace/orkest");
-    expect(asciiText).toContain("| + 1 pro-1");
+    expect(asciiText).toContain("| + 1 haiku-1");
     expect(asciiText).toContain("+-|Awaiting assignment");
-    expect(asciiText).toContain("| + 2 haiku-1");
+    expect(asciiText).toContain("| + 2 pro-1");
     expect(asciiText).toContain("`-|Awaiting assignment");
     expect(asciiText).toContain("wt:wt-50");
   });
@@ -660,5 +749,191 @@ describe("terminal lifecycle", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("supports o-key pane focus, focusAgentPane, notifyHerdrTransitions, and primary module shim parity", async () => {
+    expect(stoogesRoomModule.createRoom).toBe(hordeRoomModule.createRoom);
+    expect(stoogesRoomModule.WORKFORCE_ROLES).toBe(hordeRoomModule.WORKFORCE_ROLES);
+    expect(stoogesViewModule.HordeView).toBe(hordeViewModule.HordeView);
+    expect(stoogesTuiModule.runHordeTui).toBe(hordeTuiModule.runHordeTui);
+    expect(runStoogesTui).toBe(runHordeTui);
+    expect(runTui).toBe(runHordeTui);
+    expect(factoryModule.foundryCommand).toBe(foundryModule.foundryCommand);
+    expect(factoryModule.runSmelterPass).toBe(foundryModule.runSmelterPass);
+    expect(foundryModule.runFoundryPass).toBe(foundryModule.runSmelterPass);
+    expect(typeof foundryModule.resolveWorktreeGitDir).toBe("function");
+
+    const normalized = normalizeAgent(
+      { id: "a1", progress: { herdrPaneId: "herdr-pane-9", paneId: "%9" } },
+      { cwd: "/workspace" },
+    );
+    expect(normalized.herdrPaneId).toBe("herdr-pane-9");
+    expect(normalized.paneId).toBe("%9");
+
+    const room = fixture("claude:haiku,agy:flash");
+    room.agents[0].herdrPaneId = "pane-haiku-1";
+    room.agents[1].paneId = "%42";
+    const focusedCalls = [];
+    const view = new HordeView(room, {
+      height: 24,
+      tier: "unicode",
+      onFocusPane: (agent) => {
+        focusedCalls.push(agent);
+      },
+    });
+    expect(view.render(80).join("\n")).toContain("o open");
+    expect(view.handleKey("o")).toBe(true);
+    expect(view.lastFocusedAgentId).toBe(view.focusId);
+    expect(focusedCalls).toHaveLength(1);
+    expect(focusedCalls[0].paneId).toBe("%42");
+
+    view.handleKey("\u{1B}[B");
+    expect(view.handleKey("o")).toBe(true);
+    expect(focusedCalls).toHaveLength(2);
+    expect(focusedCalls[1].herdrPaneId).toBe("pane-haiku-1");
+
+    const execCalls = [];
+    const mockExec = (cmd, args) => {
+      execCalls.push([cmd, args]);
+    };
+    await focusAgentPane({ id: "a1", herdrPaneId: "hp-1", paneId: "%1" }, { exec: mockExec });
+    await focusAgentPane({ id: "a2", paneId: "%2" }, { exec: mockExec });
+    expect(
+      await focusAgentPane({ id: "a-bad-1", herdrPaneId: "-malicious-flag" }, { exec: mockExec }),
+    ).toBe(false);
+    expect(await focusAgentPane({ id: "a-bad-2", paneId: "bad\npane" }, { exec: mockExec })).toBe(
+      false,
+    );
+    expect(
+      await focusAgentPane(
+        { id: "a3", herdrPaneId: "hp-err" },
+        {
+          exec: () => {
+            throw new Error("herdr unavailable");
+          },
+        },
+      ),
+    ).toBe(false);
+    expect(
+      await focusAgentPane(
+        { id: "a4", herdrPaneId: "hp-cb-err" },
+        {
+          exec: (_cmd, _args, cb) => {
+            cb(new Error("command failed"));
+          },
+        },
+      ),
+    ).toBe(false);
+    expect(execCalls).toEqual([
+      ["herdr", ["pane", "focus", "--pane", "hp-1"]],
+      ["tmux", ["select-pane", "-t", "%2"]],
+    ]);
+
+    const notificationCalls = [];
+    const notificationExec = (cmd, args) => {
+      notificationCalls.push([cmd, args]);
+    };
+
+    // Initial startup seed (prevAgents = null) records existing blocked/complete states without notifying:
+    const seededSet = new Set();
+    expect(
+      notifyHerdrTransitions(
+        null,
+        [{ id: "a1", person: "gribble", stage: "blocked", summary: "Already blocked" }],
+        seededSet,
+        { env: { HERDR_PANE_ID: "hp-1" }, exec: notificationExec },
+      ),
+    ).toBe(false);
+    expect(seededSet.has("a1:blocked:Already blocked")).toBe(true);
+    expect(notificationCalls).toHaveLength(0);
+
+    const seededCompleteSet = new Set();
+    expect(
+      notifyHerdrTransitions(
+        null,
+        [{ id: "a1", person: "gribble", stage: "completed", summary: "Already done" }],
+        seededCompleteSet,
+        { env: { HERDR_PANE_ID: "hp-1" }, exec: notificationExec },
+      ),
+    ).toBe(false);
+    expect(seededCompleteSet.has("room:all-complete")).toBe(true);
+    expect(notificationCalls).toHaveLength(0);
+
+    // Empty/missing previous stage does not count as active for all-complete transition:
+    const emptyStageSet = new Set();
+    expect(
+      notifyHerdrTransitions(
+        [{ id: "a1", person: "gribble", stage: "", summary: "" }],
+        [{ id: "a1", person: "gribble", stage: "completed", summary: "Done" }],
+        emptyStageSet,
+        { env: { HERDR_PANE_ID: "hp-1" }, exec: notificationExec },
+      ),
+    ).toBe(false);
+    expect(notificationCalls).toHaveLength(0);
+
+    const notifiedSet = new Set();
+    const prev = [
+      { id: "a1", person: "gribble", stage: "working", summary: "Writing tests" },
+      { id: "a2", person: "snoobix", stage: "working", summary: "Refactoring" },
+    ];
+    const nextBlocked = [
+      { id: "a1", person: "gribble", stage: "blocked", summary: "Need confirmation" },
+      { id: "a2", person: "snoobix", stage: "working", summary: "Refactoring" },
+    ];
+    // No-op when Herdr env vars are absent:
+    notifyHerdrTransitions(prev, nextBlocked, notifiedSet, { env: {}, exec: notificationExec });
+    expect(notificationCalls).toHaveLength(0);
+
+    // Fires edge-triggered blocked notification when HERDR_PANE_ID is present:
+    notifyHerdrTransitions(prev, nextBlocked, notifiedSet, {
+      env: { HERDR_PANE_ID: "hp-1" },
+      exec: notificationExec,
+    });
+    expect(notificationCalls).toEqual([
+      [
+        "herdr",
+        [
+          "notification",
+          "show",
+          "Orkest: gribble blocked",
+          "--body",
+          "Need confirmation",
+          "--sound",
+          "request",
+        ],
+      ],
+    ]);
+    expect(notifiedSet.has("a1:blocked:Need confirmation")).toBe(true);
+
+    // Deduplicated on repeated poll with same state:
+    notifyHerdrTransitions(prev, nextBlocked, notifiedSet, {
+      env: { HERDR_PANE_ID: "hp-1" },
+      exec: notificationExec,
+    });
+    expect(notificationCalls).toHaveLength(1);
+
+    // Fires all-complete notification when all agents finish after at least one was active:
+    const nextDone = [
+      { id: "a1", person: "gribble", stage: "completed", summary: "Done" },
+      { id: "a2", person: "snoobix", stage: "completed", summary: "Done" },
+    ];
+    notifyHerdrTransitions(nextBlocked, nextDone, notifiedSet, {
+      env: { HERDR_SOCKET: "/tmp/herdr.sock" },
+      exec: notificationExec,
+    });
+    expect(notificationCalls).toHaveLength(2);
+    expect(notificationCalls[1]).toEqual([
+      "herdr",
+      [
+        "notification",
+        "show",
+        "Orkest: Horde complete",
+        "--body",
+        "All 2 agents finished.",
+        "--sound",
+        "done",
+      ],
+    ]);
+    expect(notifiedSet.has("room:all-complete")).toBe(true);
   });
 });

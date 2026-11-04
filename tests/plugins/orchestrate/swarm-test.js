@@ -241,11 +241,11 @@ it("projects current session status and nesting without treating a lead report a
   });
   const view = new StoogesView(observed, { height: 30, tier: "unicode" });
   const output = view.render(85).join("\n");
-  expect(output).toContain("│ ┌ 1 example-gpt-test-high-cache-aa (lead)");
-  expect(output).toContain("├─│Investigate");
-  expect(output).toContain("│  │ ┌ 2 flash-1");
-  expect(output).toContain("│  └─│Awaiting assignment");
-  expect(output).toContain("│ ┌ 3 haiku-1");
+  expect(output).toContain("│ ┌ 1 haiku-1");
+  expect(output).toContain("├─│Awaiting assignment");
+  expect(output).toContain("│ ┌ 2 example (lead)");
+  expect(output).toContain("└─│Investigate");
+  expect(output).toContain("│ ┌ 3 flash-1");
   expect(output).toContain("└─│Awaiting assignment");
   expect(output).toContain("runtime-model / high | reported complete");
   const absent = await observeRoom(room.id, { root, progress: async () => ({}) });
@@ -317,15 +317,15 @@ it("assigns preset workforce roles, groups agent cards by working folder, and pr
   const output = view.render(110).join("\n");
   expect(output).toContain(`│ ${path.basename(worktreeA)} · 1 agent · ${worktreeA}`);
   expect(output).toContain(`│ ${path.basename(worktreeB)} · 2 agents · ${worktreeB}`);
-  expect(output).toContain("│ ┌ 1 snorfle-haiku-low-wt-a-11");
+  expect(output).toContain("│ ┌ 1 flash-1");
+  expect(output).toContain("├─│Awaiting assignment");
+  expect(output).toContain("[builder] gemini:fast | queued");
+  expect(output).toContain("│ ┌ 2 haiku-2");
+  expect(output).toContain("└─│Awaiting assignment");
+  expect(output).toContain("[reviewer] haiku | queued");
+  expect(output).toContain("│ ┌ 3 snorfle");
   expect(output).toContain("└─│Map API endpoints");
   expect(output).toContain("[debugger] haiku / low | working");
-  expect(output).toContain("│ ┌ 2 haiku-2");
-  expect(output).toContain("├─│Awaiting assignment");
-  expect(output).toContain("[reviewer] haiku | queued");
-  expect(output).toContain("│ ┌ 3 flash-1");
-  expect(output).toContain("└─│Awaiting assignment");
-  expect(output).toContain("[builder] gemini:fast | queued");
 });
 
 it("groups disposable git worktrees under their parent folder, renders wt:<slug> badges, and promotes them with worktree-keep", async () => {
@@ -393,7 +393,8 @@ it("groups disposable git worktrees under their parent folder, renders wt:<slug>
   expect(output).toContain(`│ ${path.basename(room.cwd)} · 2 agents · ${room.cwd}`);
   expect(output).toContain(`│ ${path.basename(persistentDir)} · 1 agent · ${persistentDir}`);
   expect(output).not.toContain(`wt-50 · 1 agent`);
-  expect(output).toContain("FOCUS wt:wt-50");
+  expect(output).toContain(`FOCUS ${path.basename(persistentDir)}`);
+  expect(output).toContain("wt:wt-50");
 
   const stdout = { write() {} };
   await roomsCommand(["worktree-keep", "--room", room.id, "--member", "pro-1"], { root, stdout });

@@ -78,7 +78,9 @@ HOST_SESSION_ENV = re.compile(
     r"^(CLAUDECODE|CLAUDE_CODE_(?!OAUTH_TOKEN$|USE_BEDROCK$|USE_VERTEX$).*|CLAUDE_CONFIG_DIR|CLAUDE_PID|AI_AGENT"
     r"|CODEX_SANDBOX|CODEX_SANDBOX_.*|CODEX_THREAD_ID|CODEX_MANAGED_BY_NPM|CODEX_CI"
     r"|OPENCODE|OPENCODE_SESSION|OPENCODE_SESSION_ID"
-    r"|ANTIGRAVITY|ANTIGRAVITY_.*|GEMINI_CLI)$"
+    r"|ANTIGRAVITY|ANTIGRAVITY_.*|GEMINI_CLI"
+    r"|ORKEST_SWARM_ROOM|ORKEST_TERMINAL_SERVER|ORKEST_TERMINAL_HARNESS"
+    r"|TMUX|TMUX_PANE|HERDR_ENV|HERDR_PANE_ID|HERDR_WORKSPACE_ID)$"
 )
 # Provider error messages that mean the account is out of quota or credits, not that the task failed.
 # They are matched only against provider error channels (stderr, structured CLI error fields), never
@@ -187,7 +189,7 @@ def bundled_module(name: str) -> Any:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=__doc__,
-        epilog="Subcommands: consult, mailbox, events, steer, listen, probe, stooges, models, routes, families, "
+        epilog="Subcommands: consult, mailbox, events, steer, listen, probe, horde, stooges, models, routes, families, "
         "quota, doctor, prune, init (run `<subcommand> --help`). "
         "Peer communication: mailbox peers lists task/model/harness labels; mailbox focus sets your actual "
         "task and optional verified model/host metadata. mailbox send --to SESSION --message TEXT sends; "
@@ -256,7 +258,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--effort", help="Catalog-validated Codex effort or AGY model-slug effort")
     parser.add_argument(
         "--billing-mode",
-        choices=("unknown", "subscription", "api"),
+        choices=("unknown", "subscription", "personal_subscription", "api"),
         default="unknown",
         help="Declared billing context; never inferred from credentials",
     )
@@ -863,6 +865,7 @@ resolve_family_selector = _MODEL_ROUTING_MOD.resolve_family_selector
 note_selector_advance = _MODEL_ROUTING_MOD.note_selector_advance
 resume_pinned_model = _MODEL_ROUTING_MOD.resume_pinned_model
 MODEL_PREFLIGHT = _MODEL_ROUTING_MOD.MODEL_PREFLIGHT
+split_opencode_model = _MODEL_ROUTING_MOD.split_opencode_model
 select_live_model = _MODEL_ROUTING_MOD.select_live_model
 executor_preflight = _MODEL_ROUTING_MOD.executor_preflight
 
@@ -986,9 +989,12 @@ def build_executor_command(
 
     ver_str = executor_version or get_cached_cli_version(executable, executor_environment("opencode"))
     major = opencode_major_version(ver_str)
+    base_model, inline_variant = split_opencode_model("opencode", model)
+    assert base_model is not None
+    effective_variant = variant or inline_variant
     if major >= 2:
-        effective_model = f"{model}#{variant}" if variant else model
-        command = [executable, "run"]
+        effective_model = f"{base_model}#{effective_variant}" if effective_variant else base_model
+        command = [executable, "run", "--standalone"]
         if session_id:
             command += ["--session", session_id]
         elif continue_last:
@@ -1014,9 +1020,9 @@ def build_executor_command(
         command += ["--continue"]
     command += [
         "--model",
-        model,
+        base_model,
         "--variant",
-        variant or DEFAULT_OPENCODE_VARIANT,
+        effective_variant or DEFAULT_OPENCODE_VARIANT,
         "--pure",
         "--agent",
         "build",
@@ -1047,7 +1053,8 @@ def validated_run_options(
     if args.resume_result and not args.session:
         raise RunnerError("--resume-result requires an exact --session", 4)
     if args.engine == "opencode":
-        variant = variant or DEFAULT_OPENCODE_VARIANT
+        args.model, inline_variant = split_opencode_model("opencode", getattr(args, "model", None))
+        variant = variant or inline_variant or getattr(args, "effort", None) or DEFAULT_OPENCODE_VARIANT
     elif variant:
         raise RunnerError("--variant is only valid with --engine opencode", 4)
     if args.heartbeat_seconds < 0:
@@ -1155,17 +1162,22 @@ def detect_conductor_model(repo: Path) -> str | None:
                 break
             pid = int(line)
         if ancestors:
-            matches = [
+            candidates = [
                 peer
                 for peer in mailbox.peers(base, prune_dead=False)
-                if not peer.get("sharedProcess")
+                if not peer.get("isSubagent")
+                and not peer.get("delegatedRun")
                 and peer.get("pid") in ancestors
                 and mailbox.same_project(target_ws, peer)
                 and isinstance(peer.get("model"), str)
                 and peer["model"].strip()
             ]
-            if len(matches) == 1:
-                return matches[0]["model"].strip()
+            non_shared = [peer for peer in candidates if not peer.get("sharedProcess")]
+            if len(non_shared) == 1:
+                return non_shared[0]["model"].strip()
+            if candidates:
+                newest = max(candidates, key=lambda item: str(item.get("lastSeenAt") or item.get("startedAt") or ""))
+                return newest["model"].strip()
     return None
 
 
@@ -1897,16 +1909,17 @@ def main() -> int:
     argv = sys.argv[1:]
     if argv and argv[0] == "probe":
         return probe_main(argv[1:])
-    if argv and argv[0] == "stooges":
+    if argv and argv[0] in {"horde", "stooges"}:
+        subcmd = argv[0]
         plugin_root = Path(__file__).resolve().parents[3]
-        command = ["node", str(plugin_root / "bin" / "ork.mjs"), "stooges", *argv[1:]]
+        command = ["node", str(plugin_root / "bin" / "ork.mjs"), subcmd, *argv[1:]]
         try:
             return subprocess.run(command, check=False).returncode
         except FileNotFoundError:
-            print("run_agent.py stooges requires Node.js (`node`) on PATH.", file=sys.stderr)
+            print(f"run_agent.py {subcmd} requires Node.js (`node`) on PATH.", file=sys.stderr)
             return 127
         except OSError as exc:
-            print(f"run_agent.py stooges could not start Node.js: {exc}", file=sys.stderr)
+            print(f"run_agent.py {subcmd} could not start Node.js: {exc}", file=sys.stderr)
             return 126
     if argv and argv[0] == "messages":
         print("run_agent.py messages was removed; use run_agent.py mailbox.", file=sys.stderr)

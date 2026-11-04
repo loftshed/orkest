@@ -26,17 +26,17 @@ direction or stop a branch of the work.
 You can also pass a goal or set team limits at launch:
 
 ```sh
-ork stooges "Find out why the cache goes stale and prepare a tested fix"
+ork horde "Find out why the cache goes stale and prepare a tested fix"
 ork claude --max-agents 8 --max-depth 2
 ```
 
-`ork stooges` uses Codex by default. The short commands choose the coordinator's harness; they don't
-require every worker to use the same one. Existing CLI accounts, model defaults and permissions
-stay in effect.
+`ork horde` (`ork stooges` is a supported alias) uses Codex by default. The short commands choose the
+coordinator's harness; they don't require every worker to use the same one. Existing CLI accounts,
+model defaults and permissions stay in effect.
 
 ### The conversation and the tree
 
-Stooges is the terminal workspace for the conversation and swarm view. A team might look like this:
+Horde is the terminal workspace for the conversation and swarm view. A team might look like this:
 
 ```text
 Coordinator: fix the stale cache
@@ -53,7 +53,7 @@ idle doesn't mean its task passed review.
 
 - **Ctrl-b, then Tab** switches between the conversation and tree.
 - **Ctrl-b, then d** detaches and prints the command to reconnect.
-- `ork stooges --attach-room ROOM_ID` reconnects to the same coordinator.
+- `ork horde --attach-room ROOM_ID` reconnects to the same coordinator.
 - Add `--view` to inspect the tree without joining the conversation. Closing a view leaves work running.
 
 See [the swarm guide](plugins/orchestrate/skills/orchestrate/references/swarm.md) for assignment,

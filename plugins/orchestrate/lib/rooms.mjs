@@ -6,7 +6,6 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
-import { cacheHome } from "./runtime-paths.mjs";
 import {
   addMembers,
   createRoom,
@@ -19,7 +18,7 @@ import {
   updateRoom,
   WORKFORCE_ROLES,
   workforceRoleInfo,
-} from "./stooges-room.mjs";
+} from "./horde-room.mjs";
 
 const execute = promisify(execFile);
 const plugin = fileURLToPath(new URL("../", import.meta.url));
@@ -749,7 +748,8 @@ export async function dispatchMember(id, memberId, options = {}) {
     "--background",
     ...leadArgs(options),
   ];
-  if (member.effort) args.push("--effort", member.effort);
+  if (member.effort)
+    args.push(member.engine === "opencode" ? "--variant" : "--effort", member.effort);
   if (binding.packet) args.push("--packet", binding.packet);
   let result;
   try {
@@ -893,21 +893,64 @@ export async function observeRoom(
       member.output = [error.message];
     }
   }
-  if (room.swarm) {
-    const snapshots = await progress(room, root);
-    for (const member of [room.conductor, ...room.agents]) {
-      if (!member) continue;
-      const key = member === room.conductor ? "conductor" : member.id;
-      const snapshot = snapshots[key];
-      if (snapshot) {
-        member.progress = snapshot;
-        member.name = snapshot.name;
-        if (snapshot.role) member.workforceRole = snapshot.role;
-        if (snapshot.cwd && (!member.worktree?.path || snapshot.cwd !== member.worktree.parentCwd))
-          member.cwd = snapshot.cwd;
-        if (!member.dispatch)
-          member.status = snapshot.stage === "complete" ? "reported complete" : snapshot.stage;
-      } else if (member.session && !member.dispatch) member.status = "session unavailable";
+  const snapshots = room.swarm ? await progress(room, root) : {};
+  for (const member of [room.conductor, ...room.agents]) {
+    if (!member) continue;
+    const key = member === room.conductor ? "conductor" : member.id;
+    const snapshot = snapshots[key];
+    const sessionId = member.session?.id || member.mailboxSession || member.id;
+    const peerKey = sessionId ? sessionKey(sessionId) : null;
+    const peer =
+      !snapshot && peerKey
+        ? await readOptionalJson(path.join(root, "peers", `${peerKey}.json`), 64 * 1024)
+        : null;
+    const herdrPaneId = snapshot?.herdrPaneId || peer?.herdrPaneId || member.herdrPaneId;
+    const paneId = snapshot?.paneId || peer?.paneId || member.paneId;
+    if (herdrPaneId) member.herdrPaneId = herdrPaneId;
+    if (paneId) member.paneId = paneId;
+    if (!room.swarm) continue;
+    if (snapshot) {
+      const previousProgress = member.progress;
+      let resolvedTask = member.objective || snapshot.task;
+      if (snapshot.task && snapshot.task !== "not set") {
+        resolvedTask = snapshot.task;
+      } else if (previousProgress?.task && previousProgress.task !== "not set") {
+        resolvedTask = previousProgress.task;
+      }
+      let resolvedStage = snapshot.stage;
+      if (snapshot.stage && snapshot.stage !== "not set") {
+        resolvedStage = snapshot.stage;
+      } else if (previousProgress?.stage && previousProgress.stage !== "not set") {
+        resolvedStage = previousProgress.stage;
+      }
+      member.progress = {
+        ...previousProgress,
+        ...snapshot,
+        task: resolvedTask,
+        stage: resolvedStage,
+      };
+      member.name = snapshot.name;
+      if (snapshot.role) member.workforceRole = snapshot.role;
+      if (snapshot.cwd && (!member.worktree?.path || snapshot.cwd !== member.worktree.parentCwd))
+        member.cwd = snapshot.cwd;
+      const isTerminalMember = ["completed", "reported complete", "cancelled", "rejected"].includes(
+        member.status,
+      );
+      if (
+        !member.dispatch &&
+        member.progress.stage &&
+        member.progress.stage !== "not set" &&
+        (!isTerminalMember || snapshot.reportedAt || member.progress.stage === "working")
+      ) {
+        member.status =
+          member.progress.stage === "complete" ? "reported complete" : member.progress.stage;
+      }
+    } else if (
+      member.session &&
+      !member.dispatch &&
+      !["completed", "reported complete", "cancelled", "rejected"].includes(member.status)
+    ) {
+      member.status = "session unavailable";
     }
   }
   return refreshMemberWorktrees(room);
@@ -982,43 +1025,40 @@ function repositoryName(peer) {
   return base === ".git" ? path.basename(path.dirname(raw)) : base;
 }
 
-async function readProgressRecord(root, key, peer, peerCwd, currentHost) {
-  const candidates = [
-    path.join(root, "progress", `${key}.json`),
-    path.join(path.dirname(root), "progress-v1", `${key}.json`),
-    path.join(cacheHome(), "progress-v1", `${key}.json`),
-  ];
-  for (const candidate of candidates) {
-    const row = await readOptionalJson(candidate, 8192);
-    if (!row) continue;
-    if (
-      row.schema !== "orchestrate.progress.v1" ||
-      row.session !== peer.session ||
-      row.harness !== peer.harness ||
-      row.machine !== currentHost ||
-      (row.accountHome ?? undefined) !== (peer.accountHome ?? undefined) ||
-      row.checkout !== peerCwd ||
-      !PROGRESS_STAGES.has(row.stage) ||
-      (row.role !== undefined && row.role !== null && !Object.hasOwn(WORKFORCE_ROLES, row.role)) ||
-      typeof row.goal !== "string" ||
-      !row.goal.trim() ||
-      row.goal.length > 160 ||
-      typeof row.task !== "string" ||
-      !row.task.trim() ||
-      row.task.length > 160
-    ) {
-      continue;
-    }
-    const updatedMs = parseStampMs(row.updatedAt);
-    if (!Number.isFinite(updatedMs)) continue;
-    const ageMs = Date.now() - updatedMs;
-    if (ageMs < -5 * 60 * 1000) continue;
-    return {
-      ...row,
-      stale: row.stage !== "complete" && ageMs > PROGRESS_STALE_AFTER_MS,
-    };
+function sessionProgressPath(root, sessionId) {
+  return path.join(root, "progress", `${sessionId}.json`);
+}
+
+async function readProgressRecord(root, sessionId, peer, peerCwd, currentHost) {
+  if (!sessionId) return null;
+  const row = await readOptionalJson(sessionProgressPath(root, sessionId), 8192);
+  if (
+    !row ||
+    row.schema !== "orchestrate.progress.v1" ||
+    row.session !== peer.session ||
+    row.harness !== peer.harness ||
+    row.machine !== currentHost ||
+    (row.accountHome ?? undefined) !== (peer.accountHome ?? undefined) ||
+    row.checkout !== peerCwd ||
+    !PROGRESS_STAGES.has(row.stage) ||
+    (row.role !== undefined && row.role !== null && !Object.hasOwn(WORKFORCE_ROLES, row.role)) ||
+    typeof row.goal !== "string" ||
+    !row.goal.trim() ||
+    row.goal.length > 160 ||
+    typeof row.task !== "string" ||
+    !row.task.trim() ||
+    row.task.length > 160
+  ) {
+    return null;
   }
-  return null;
+  const updatedMs = parseStampMs(row.updatedAt);
+  if (!Number.isFinite(updatedMs)) return null;
+  const ageMs = Date.now() - updatedMs;
+  if (ageMs < -5 * 60 * 1000) return null;
+  return {
+    ...row,
+    stale: row.stage !== "complete" && ageMs > PROGRESS_STALE_AFTER_MS,
+  };
 }
 
 export async function interactiveProgress(room, root = mailboxRoot()) {
@@ -1065,14 +1105,44 @@ export async function interactiveProgress(room, root = mailboxRoot()) {
       goal = cleanLine(progress.goal);
       isManual = true;
     }
+    const existingTask = cleanLine(
+      member.progress?.task && member.progress.task !== "not set"
+        ? member.progress.task
+        : member.objective,
+    );
+    const fallbackStatus =
+      member.status === "reported complete" ? "complete" : cleanLine(member.status);
+    let existingStage = "";
+    if (member.progress?.stage && member.progress.stage !== "not set") {
+      existingStage = cleanLine(member.progress.stage);
+    } else if (
+      !["not set", "queued", "idle", "awaiting session", "session unavailable", "unknown"].includes(
+        fallbackStatus,
+      )
+    ) {
+      existingStage = fallbackStatus;
+    }
     let task;
     let stage = "";
     if (progress) {
-      task = cleanLine(progress.task);
-      stage = progress.stage;
+      task = cleanLine(progress.task) || existingTask;
+      stage = progress.stage || existingStage;
       isManual = true;
     } else {
-      task = cleanLine(peer.focus);
+      task = cleanLine(peer.focus) || existingTask;
+      if (peer.state === "busy") {
+        stage = "working";
+      } else if (
+        member.id !== "conductor" &&
+        peer.state === "idle" &&
+        typeof peer.lastStopReason === "string" &&
+        peer.lastStopReason.trim() &&
+        (!existingStage || existingStage === "working")
+      ) {
+        stage = "complete";
+      } else if (existingStage) {
+        stage = existingStage;
+      }
     }
     let health = goal && task && stage ? "fresh" : "missing";
     if (isManual && progress?.stale) {
@@ -1081,6 +1151,8 @@ export async function interactiveProgress(room, root = mailboxRoot()) {
     }
     const repo = cleanLine(peer.repository || repositoryName(peer)) || "not set";
     const role = progress?.role || member.workforceRole;
+    const herdrPaneId = cleanLine(peer.herdrPaneId || member.herdrPaneId);
+    const paneId = cleanLine(peer.paneId || member.paneId);
     const color =
       STATUS_COLORS[createHash("sha256").update(binding.id).digest()[0] % STATUS_COLORS.length];
     result[member.id] = {
@@ -1092,6 +1164,8 @@ export async function interactiveProgress(room, root = mailboxRoot()) {
       repository: repo,
       cwd: peerCwd,
       ...(role && { role }),
+      ...(herdrPaneId && { herdrPaneId }),
+      ...(paneId && { paneId }),
       goal: goal || "not set",
       task: task || "not set",
       stage: stage || "not set",

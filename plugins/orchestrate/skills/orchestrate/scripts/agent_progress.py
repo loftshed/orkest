@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import hashlib
 import json
@@ -21,7 +22,7 @@ SCHEMA = "orchestrate.progress.v1"
 STAGES = ("planning", "working", "testing", "review", "blocked", "complete")
 STALE_AFTER = dt.timedelta(minutes=30)
 REMIND_AFTER = dt.timedelta(minutes=5)
-ROLES_PATH = Path(__file__).resolve().parents[3] / "references" / "workforce-roles.json"
+ROLES_PATH = Path(__file__).resolve().parents[1] / "references" / "workforce-roles.json"
 ROLES_DATA = json.loads(ROLES_PATH.read_text(encoding="utf-8"))
 ROLES = tuple(ROLES_DATA.keys())
 ROLE_ALIASES = {alias: role_id for role_id, info in ROLES_DATA.items() for alias in (role_id, *info.get("aliases", ()))}
@@ -126,6 +127,8 @@ def report(
             "updatedAt": mailbox.stamp(),
         }
         mailbox.write(path, row)
+    with contextlib.suppress(Exception):
+        mailbox_work.renew_leases(base, peer)
     return row
 
 

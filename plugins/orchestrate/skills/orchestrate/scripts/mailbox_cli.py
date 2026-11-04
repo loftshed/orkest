@@ -274,6 +274,13 @@ def build_parser() -> argparse.ArgumentParser:
                 sub.add_argument(f"--{field}")
             sub.add_argument("--next", dest="next_step", help="concrete next step")
             sub.add_argument("--dependencies", nargs="+", help="accepted prerequisite item ids")
+            sub.add_argument("--lease-ttl", type=int, dest="lease_ttl", help="claim lease TTL in seconds (60-7200)")
+            sub.add_argument("--handoff", help="structured handoff packet as JSON object")
+            sub.add_argument("--files-touched", nargs="+", dest="files_touched", help="handoff files touched")
+            sub.add_argument("--decisions-made", nargs="+", dest="decisions_made", help="handoff decisions made")
+            sub.add_argument("--remaining-steps", nargs="+", dest="remaining_steps", help="handoff remaining steps")
+            sub.add_argument("--blockers", nargs="+", dest="handoff_blockers", help="handoff blockers")
+            sub.add_argument("--verify-cmd", dest="verification_command_run", help="handoff verification command run")
         if name == "hook":
             sub.add_argument("--event", help="lifecycle event, for hosts whose payload does not name it")
         if name == "send":
@@ -377,7 +384,7 @@ def main(argv: list[str] | None = None) -> int:
             person = _MB.pick_martian(secrets.token_hex(8), _MB.taken_persons(base, ""))
             effort = args.effort or _MB.runtime_effort(harness)
             tag = secrets.token_hex(1)
-            if getattr(args, "short", False):
+            if args.short:
                 print(short_agent_name(person, repository_name(here), tag))
             else:
                 print(readable_name(person, repository_name(here), args.model, effort, tag))
@@ -466,9 +473,30 @@ def main(argv: list[str] | None = None) -> int:
                         "verification",
                         "note",
                         "successor",
+                        "lease_ttl",
                     )
                     if getattr(args, key) is not None
                 }
+                handoff_payload: dict[str, Any] = {}
+                if args.handoff is not None:
+                    try:
+                        parsed_handoff = json.loads(args.handoff)
+                    except ValueError as error:
+                        raise MailboxError("work --handoff must be valid JSON") from error
+                    if not isinstance(parsed_handoff, dict):
+                        raise MailboxError("work --handoff must be a JSON object")
+                    handoff_payload.update(parsed_handoff)
+                for value, field_name in (
+                    (args.files_touched, "files_touched"),
+                    (args.decisions_made, "decisions_made"),
+                    (args.remaining_steps, "remaining_steps"),
+                    (args.handoff_blockers, "blockers"),
+                    (args.verification_command_run, "verification_command_run"),
+                ):
+                    if value is not None:
+                        handoff_payload[field_name] = value
+                if handoff_payload:
+                    fields["handoff"] = handoff_payload
                 output = mailbox_work.mutate(base, me, action=args.work_action, **fields)
             if args.format != "json":
                 print(_MB.render_work(output))

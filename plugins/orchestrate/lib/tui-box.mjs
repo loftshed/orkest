@@ -103,14 +103,16 @@ export function cellWidth(grapheme) {
     const code = grapheme.codePointAt(0);
     if (code >= 32 && code < 768) return 1;
     if (code >= 9472 && code <= 10_495) return 1;
+    if (code >= 57_344 && code <= 63_743) return 1;
   }
+  const cp = grapheme.codePointAt(0);
+  if ((cp >= 57_344 && cp <= 63_743) || (cp >= 983_040 && cp <= 1_114_111)) return 1;
   if (
     /[\u{1F1E6}-\u{1F1FF}]/u.test(grapheme) ||
     /\p{Extended_Pictographic}/u.test(grapheme) ||
     /[\u{FE0F}\u{20E3}]/u.test(grapheme)
   )
     return 2;
-  const cp = grapheme.codePointAt(0);
   if (
     cp >= 4352 &&
     (cp <= 4447 ||

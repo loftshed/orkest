@@ -8,9 +8,7 @@ import { parseArgs, promisify } from "node:util";
 
 import { jsonView, renderLine, renderReport, shouldUseColor } from "../../monitor/lib/render.mjs";
 import { getAccounts } from "../../monitor/lib/store.mjs";
-import { factoryCommand } from "../lib/factory.mjs";
-import { coordinatorBrief, newRoom, observeRoom, writeCoordinatorBrief } from "../lib/rooms.mjs";
-import { configPath } from "../lib/runtime-paths.mjs";
+import { foundryCommand } from "../lib/foundry.mjs";
 import {
   addMembers,
   createRoom,
@@ -20,18 +18,20 @@ import {
   readRoom,
   updateRoom,
   validateRoom,
-} from "../lib/stooges-room.mjs";
+} from "../lib/horde-room.mjs";
 import {
   glyphSet,
   glyphTier,
+  HordeView,
   progressBar,
   renderPanel,
   renderTable,
-  StoogesView,
   wrapText,
-} from "../lib/stooges-view.mjs";
+} from "../lib/horde-view.mjs";
+import { coordinatorBrief, newRoom, observeRoom, writeCoordinatorBrief } from "../lib/rooms.mjs";
+import { configPath } from "../lib/runtime-paths.mjs";
+import { cachedQuota, runHordeTui } from "./horde-tui.mjs";
 import { roomsCommand } from "./rooms.mjs";
-import { cachedQuota, runTui } from "./stooges-tui.mjs";
 
 const COORDINATORS = new Set(["codex", "claude", "agy", "opencode"]);
 
@@ -39,12 +39,18 @@ const HELP = `ork agy|codex|claude|opencode   (open a coordinator; enter your go
   --harness-arg=<argument>      (pass an argument to the coordinator; repeat as needed)
 ork horde ["objective"] [--engine codex|claude|agy|opencode] [--max-agents 12] [--max-depth 3]
 ork horde [toggle|open|close]   (open or close the live Horde / Swarm View split pane)
+ork horde [--team "claude:haiku*2@scout,agy:flash*2@builder,codex:luna:max@reviewer"]
+ork horde --preset scout-swarm|bug-court|patch-race|heavy-trifecta
+ork horde spawn --attach-room <id> --team <team> [--role <role>]
+ork horde --attach-room <id> [--view|--print|--json]
+ork horde --fixture <room.json> [--print|--json] [--width 120]
 ork hall --help                 (manage swarm rooms, members, leads, roles, and dispatches)
 ork foundry [status|run|groom] [--dry-run] [--json]
 ork smelter [status|run] [--dry-run] [--json]
 ork radar [--line|--json] [--refresh]
 ork gate [--heavy] [--label <text>] -- <command>   (also: ork gate status|install|uninstall)
 ork swarm [toggle|open|close]   (alias for ork horde toggle|open|close)
+ork stooges [arguments]         (alias for ork horde)
 ork factory [status|run|groom] [--dry-run] [--json]   (alias for ork foundry)
 ork rooms --help                (alias for ork hall)
 ork setup [--dry-run] [--trust-codex-hooks]   (install mailbox, hooks and shell wrapper shortcuts)
@@ -54,18 +60,12 @@ ork name [--model <model>] [--effort <level>] [--harness <harness>] [--short]
 ork routes [--archetype <name>] [--json] [--width 120]
 ork quota [--line|--json] [--refresh]
 ork telemetry [--runs-dir <directory>] [--json] [--width 120]
-ork stooges ["objective"] [--engine codex|claude|agy|opencode] [--max-agents 12] [--max-depth 3]
-ork stooges [--team "claude:haiku*2@scout,agy:flash*2@builder,codex:luna:max@reviewer"]
-ork stooges --preset scout-swarm|bug-court|patch-race|heavy-trifecta
-ork stooges spawn --attach-room <id> --team <team> [--role <role>]
-ork stooges --attach-room <id> [--view|--print|--json]
-ork stooges --fixture <room.json> [--print|--json] [--width 120]
 
 Interactive Horde / Stooges opens a coordinator conversation alongside its swarm tree (default: Codex).
 --attach-room reconnects; --view only observes. Subswarm leads use native subagents.
 New members are queued for the coordinator to assign; --print and --json never launch models.
 Use --cwd to choose the room's repository. Closing the view leaves workers running.
-1–9 focus an agent; p pins its detail; n advances the page; q exits the display.
+1–9 focus an agent; o opens its Herdr/tmux pane; p pins its detail; n advances the page; q exits the display.
 ? opens key help; g opens the coalesced room log. Set ORK_GLYPHS=ascii|unicode|nerd to choose a glyph tier.
 `;
 
@@ -420,7 +420,7 @@ export function coordinatorArguments(engine, prompt, harnessArgs = []) {
 
 export async function main(argv = process.argv.slice(2), { stdout = process.stdout } = {}) {
   const engineShortcut = COORDINATORS.has(argv[0]) ? argv[0] : undefined;
-  if (engineShortcut) argv = ["stooges", ...argv.slice(1)];
+  if (engineShortcut) argv = ["horde", ...argv.slice(1)];
   if (argv[0] === "setup") {
     process.exitCode = await terminalCommand("install_mailbox.py", argv.slice(1));
     return;
@@ -450,15 +450,8 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
     ]);
     return;
   }
-  if (argv[0] === "factory") return factoryCommand(argv.slice(1), { stdout });
-  if (argv[0] === "foundry") {
-    return optionalModuleCommand(
-      "../lib/foundry.mjs",
-      "foundryCommand",
-      argv.slice(1),
-      { stdout },
-      (args, ctx) => factoryCommand(args, ctx),
-    );
+  if (argv[0] === "foundry" || argv[0] === "factory") {
+    return foundryCommand(argv.slice(1), { stdout });
   }
   if (argv[0] === "smelter") {
     return optionalModuleCommand(
@@ -530,8 +523,8 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
     stdout.write(HELP);
     return;
   }
-  if (!["stooges", "horde"].includes(positionals[0]))
-    throw new Error("Expected ork horde, ork stooges, or ork stooges spawn; use --help");
+  if (!["horde", "stooges"].includes(positionals[0]))
+    throw new Error("Expected ork horde, ork stooges, or ork horde spawn; use --help");
   if (values.team && values.preset) throw new Error("Choose --team or --preset");
   if (values.json && values.print) throw new Error("Choose --json or --print");
   const width = Number(values.width || stdout.columns || 100);
@@ -664,12 +657,12 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
   if (values.json) stdout.write(`${JSON.stringify(room, null, 2)}\n`);
   else if (values.print || !stdout.isTTY)
     stdout.write(
-      `${new StoogesView(room, { color: shouldUseColor(stdout), tier: glyphTier() })
+      `${new HordeView(room, { color: shouldUseColor(stdout), tier: glyphTier() })
         .render(width)
         .map((line) => line.trimEnd())
         .join("\n")}\n`,
     );
-  else await runTui(load, { output: stdout, quota: !values.fixture });
+  else await runHordeTui(load, { output: stdout, quota: !values.fixture });
   return room;
 }
 

@@ -1,9 +1,10 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { hostname, tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { roomsCommand } from "../../../plugins/orchestrate/bin/rooms.mjs";
+import { parseTeam, readRoom, updateRoom } from "../../../plugins/orchestrate/lib/horde-room.mjs";
 import {
   dispatchMember,
   growRoom,
@@ -12,7 +13,6 @@ import {
   observeRoom,
   recoverRoom,
 } from "../../../plugins/orchestrate/lib/rooms.mjs";
-import { parseTeam, readRoom, updateRoom } from "../../../plugins/orchestrate/lib/stooges-room.mjs";
 
 const directories = [];
 async function directory() {
@@ -412,5 +412,68 @@ describe("room CLI", () => {
     output = "";
     await roomsCommand(["list", "--json"], { stdout, root });
     expect(JSON.parse(output).rooms.map((room) => room.id)).toEqual(["new"]);
+  });
+
+  it("propagates herdrPaneId and paneId onto observed agents and ignores legacy progress-v1 paths", async () => {
+    const rawRoot = await directory();
+    const root = await realpath(rawRoot);
+    const rawCwd = await directory();
+    const cwd = await realpath(rawCwd);
+    const room = await newRoom(parseTeam("claude:haiku"), {
+      id: "room-herdr",
+      cwd,
+      root,
+    });
+    const sessionKey = "worker-session-1";
+    await mkdir(path.join(root, "peers"), { recursive: true });
+    await mkdir(path.join(path.dirname(root), "progress-v1"), { recursive: true });
+    const nowIso = new Date().toISOString();
+    await writeFile(
+      path.join(root, "peers", `${sessionKey}.json`),
+      JSON.stringify({
+        schema: "agent-executor.peer.v1",
+        session: sessionKey,
+        name: "gribble-claude-haiku-orkest-11",
+        harness: "claude",
+        cwd,
+        pid: process.pid,
+        herdrPaneId: "herdr-pane-42",
+        paneId: "%42",
+        startedAt: nowIso,
+        lastSeenAt: nowIso,
+      }),
+    );
+    await writeFile(
+      path.join(path.dirname(root), "progress-v1", `${sessionKey}.json`),
+      JSON.stringify({
+        schema: "orchestrate.progress.v1",
+        session: sessionKey,
+        harness: "claude",
+        machine: hostname(),
+        checkout: cwd,
+        goal: "Legacy goal",
+        task: "Legacy task should be ignored",
+        stage: "blocked",
+        updatedAt: nowIso,
+      }),
+    );
+    await updateRoom(
+      room.id,
+      (current) => {
+        current.agents[0].session = {
+          id: sessionKey,
+          engine: "claude",
+          machine: hostname(),
+          cwd,
+        };
+        return current;
+      },
+      { root },
+    );
+
+    const observed = await observeRoom(room.id, { root });
+    expect(observed.agents[0].herdrPaneId).toBe("herdr-pane-42");
+    expect(observed.agents[0].paneId).toBe("%42");
+    expect(observed.agents[0].progress.task).not.toBe("Legacy task should be ignored");
   });
 });

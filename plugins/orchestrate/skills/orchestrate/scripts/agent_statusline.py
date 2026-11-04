@@ -30,6 +30,10 @@ PALETTE = {31: 203, 32: 114, 33: 221, 34: 111, 35: 176, 36: 80}
 MAX_ROOMS = 1024
 MAX_ROOM_BYTES = 1024 * 1024
 MAX_TASK_BYTES = 4 * 1024 * 1024
+EFFORT_LEVELS = frozenset({"minimal", "low", "medium", "high", "xhigh", "max", "ultra"})
+_TRAILING_EFFORT_RE = re.compile(r"^(.*\S)(?:\s*\(([a-z]+)\)|\s*\[([a-z]+)\]|-([a-z]+))$", re.IGNORECASE)
+NERD_AGENT_GLYPH = "󰚩"
+NERD_TASK_GLYPH = "󰓾"
 
 
 def text(value: Any) -> str:
@@ -37,6 +41,35 @@ def text(value: Any) -> str:
     if not isinstance(value, str):
         return ""
     return " ".join("".join(char if char.isprintable() else " " for char in value).split())[:240]
+
+
+def short_display_name(name: str, person: Any = None) -> str:
+    """Return the agent's short Martian given name before the first dash."""
+    cleaned_name = text(name)
+    cleaned_person = text(person)
+    if cleaned_person and (
+        not cleaned_name or cleaned_name == cleaned_person or cleaned_name.startswith(f"{cleaned_person}-")
+    ):
+        return cleaned_person
+    return cleaned_name.split("-", 1)[0] if cleaned_name else ""
+
+
+def normalize_model_and_effort(model: str, effort: str) -> tuple[str, str]:
+    """Strip duplicate effort suffixes from model display names or IDs and backfill missing effort."""
+    cleaned_model = text(model)
+    cleaned_effort = text(effort)
+    if cleaned_model and cleaned_model != "—" and (match := _TRAILING_EFFORT_RE.match(cleaned_model)):
+        inferred = (match.group(2) or match.group(3) or match.group(4) or "").lower()
+        if inferred in EFFORT_LEVELS:
+            cleaned_model = match.group(1).strip()
+            if not cleaned_effort or cleaned_effort == "—":
+                cleaned_effort = inferred
+    return (cleaned_model or "—", cleaned_effort or "—")
+
+
+def use_nerd_glyphs() -> bool:
+    """Return True when Nerd Font status bar badges are enabled."""
+    return os.environ.get("ORK_GLYPHS", "nerd").strip().lower() == "nerd"
 
 
 def session_from(payload: Any) -> str | None:
@@ -224,11 +257,15 @@ def identity(
     role = (progress.get("role") if progress else None) or (
         rooms[0][1].get("workforceRole") if len(rooms) == 1 else None
     )
+    raw_model = model or recorded_model or text(peer.get("model")) or "—"
+    raw_effort = effort or recorded_effort or text(peer.get("effort")) or "—"
+    normalized_model, normalized_effort = normalize_model_and_effort(raw_model, raw_effort)
     return {
-        "name": name,
+        "name": short_display_name(name, peer.get("person")),
+        "fullName": name,
         "color": COLORS[hashlib.sha256(session.encode()).digest()[0] % len(COLORS)],
-        "model": model or recorded_model or text(peer.get("model")) or "—",
-        "effort": effort or recorded_effort or text(peer.get("effort")) or "—",
+        "model": normalized_model,
+        "effort": normalized_effort,
         "repo": repo,
         "repository": repo,
         "cwd": checkout,
@@ -422,13 +459,23 @@ def field_colors(item: dict[str, Any]) -> dict[str, int | None]:
 
 
 def tmux_line(item: dict[str, Any], width: int, line: int = 0) -> str:
-    """Left-align padded text on the normal background, with color in the remaining space."""
+    """Left-align padded text on the normal background, with a small color square or Nerd Font badge on the left."""
     colored = not os.environ.get("NO_COLOR")
+    nerd = use_nerd_glyphs()
     background = PALETTE[item["color"]]
-    style = "align=left,bg=default,fg=default" + (f",fill=colour{background}" if colored else "")
     colors = field_colors(item)
-    output = [f"#[{style}]   "]
-    for key, value in line_parts(item, width - 6, line=line):
+    if nerd and colored:
+        swatch = (
+            f"#[bg=colour{background},fg=colour232,bold] {NERD_AGENT_GLYPH} #[bg=default,fg=default] "
+            if line != 2
+            else f"#[fg=colour{background}] {NERD_TASK_GLYPH} #[fg=default] "
+        )
+        pad_width = 7
+    else:
+        swatch = f"#[bg=colour{background}]  #[bg=default] " if colored and line != 2 else "   "
+        pad_width = 6
+    output = [f"#[align=left,bg=default,fg=default]{swatch}"]
+    for key, value in line_parts(item, width - pad_width, line=line):
         weight = "bold" if key in {"name", "model", "effort", "repo", "stage", "task"} else "nobold"
         foreground = f"colour{colors[key]}" if colors.get(key) is not None else "default"
         part_style = f"fg={foreground},{weight}" if colored else weight
@@ -437,18 +484,25 @@ def tmux_line(item: dict[str, Any], width: int, line: int = 0) -> str:
 
 
 def ansi_line(item: dict[str, Any], width: int, line: int = 0) -> str:
-    """Use foreground colors for text and paint only the unused space after its padding."""
-    parts = line_parts(item, width - 6, line=line)
+    """Use foreground colors for text and a small color square or Nerd Font badge on the left."""
+    nerd = use_nerd_glyphs()
+    pad_width = 7 if nerd else 6
+    parts = line_parts(item, width - pad_width, line=line)
     colors = field_colors(item)
-    output = ["\033[0m   "]
+    if nerd:
+        swatch = (
+            f"\033[0m\033[48;5;{PALETTE[item['color']]};38;5;232;1m {NERD_AGENT_GLYPH} \033[0m "
+            if line != 2
+            else f"\033[0m\033[38;5;{PALETTE[item['color']]}m {NERD_TASK_GLYPH} \033[0m "
+        )
+    else:
+        swatch = f"\033[0m\033[48;5;{PALETTE[item['color']]}m  \033[0m " if line != 2 else "\033[0m   "
+    output = [swatch]
     for key, value in parts:
         foreground = f"38;5;{colors[key]}" if colors.get(key) is not None else "39"
         weight = "1" if key in {"name", "model", "effort", "repo", "stage", "task"} else "22"
         output.append(f"\033[{foreground};{weight}m{value}\033[0m")
     output.append("   ")
-    remaining = max(0, width - 6 - sum(display_width(value) for _, value in parts))
-    if remaining:
-        output.append(f"\033[48;5;{PALETTE[item['color']]}m{' ' * remaining}\033[0m")
     return "".join(output)
 
 
@@ -498,7 +552,13 @@ def main() -> int:
             session = session_from(payload)
         except (ValueError, OSError):
             return 0
-    if args.native_status and session and not args.tmux and agent_terminal.bind(session, args.harness, payload):
+    if (
+        args.native_status
+        and session
+        and not args.tmux
+        and agent_terminal.bind(session, args.harness, payload)
+        and agent_terminal.context(args.harness)
+    ):
         return 0  # In a wrapped terminal the native integration only supplies identity to the outer footer.
     if not session or not (item := identity(session, args.harness, payload)):
         if args.tmux:

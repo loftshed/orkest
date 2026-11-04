@@ -1,6 +1,8 @@
 import { execFile } from "node:child_process";
+import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { Plugin } from "@opencode/plugin/tui";
 import { createEffect, createSignal, onCleanup, Show } from "solid-js";
@@ -45,15 +47,25 @@ function parseIdentity(output: string): Identity | null {
   }
 }
 
-const defaultScript = path.join(
-  homedir(),
-  ".agents/skills/orchestrate/scripts/agent_statusline.py",
-);
+function resolveDefaultScript(): string {
+  const homeCandidate = path.join(
+    homedir(),
+    ".agents/skills/orchestrate/scripts/agent_statusline.py",
+  );
+  if (existsSync(homeCandidate)) return homeCandidate;
+  const colocated = path.resolve(
+    path.dirname(fileURLToPath(import.meta.url)),
+    "../../skills/orchestrate/scripts/agent_statusline.py",
+  );
+  return existsSync(colocated) ? colocated : homeCandidate;
+}
+
+const defaultScript = resolveDefaultScript();
 
 function Label(props: { sessionID?: string; plainColor: string; script: string }) {
   const [item, setItem] = createSignal<Identity | null>(null);
   const [columns, setColumns] = createSignal(0);
-  const terminal = Boolean(process.env.ORKEST_TERMINAL_SERVER);
+  const terminal = Boolean(process.env.ORKEST_TERMINAL_SERVER || process.env.HERDR_ENV === "1");
 
   createEffect(() => {
     const session = props.sessionID;
@@ -67,26 +79,22 @@ function Label(props: { sessionID?: string; plainColor: string; script: string }
     const refresh = () => {
       if (running) return;
       running = true;
-      child = execFile(
-        "python3",
-        [
-          props.script,
-          "--native-status",
-          "--session",
-          session,
-          "--harness",
-          "opencode",
-          "--width",
-          String(width),
-          "--json",
-        ],
-        { timeout: 2000 },
-        (error, output) => {
-          running = false;
-          child = undefined;
-          if (active) setItem(error ? null : parseIdentity(output));
-        },
-      );
+      const args = [
+        props.script,
+        ...(terminal ? ["--native-status"] : []),
+        "--session",
+        session,
+        "--harness",
+        "opencode",
+        "--width",
+        String(Math.max(width, 32)),
+        "--json",
+      ];
+      child = execFile("python3", args, { timeout: 2000 }, (error, output) => {
+        running = false;
+        child = undefined;
+        if (active) setItem(error ? null : parseIdentity(output));
+      });
     };
     refresh();
     const timer = setInterval(refresh, 3000);
@@ -118,8 +126,14 @@ function Label(props: { sessionID?: string; plainColor: string; script: string }
       <Show when={item()}>
         {(identity) => (
           <>
+            <box
+              width={2}
+              height={1}
+              flexShrink={0}
+              backgroundColor={process.env.NO_COLOR ? undefined : colors[identity().color]}
+            />
             <text fg={props.plainColor} wrapMode="none" flexShrink={0}>
-              {"   "}
+              {" "}
               <span
                 style={{ fg: process.env.NO_COLOR ? props.plainColor : colors[identity().color] }}
               >
@@ -128,11 +142,6 @@ function Label(props: { sessionID?: string; plainColor: string; script: string }
               {identity().details}
               {"   "}
             </text>
-            <box
-              height={1}
-              flexGrow={1}
-              backgroundColor={process.env.NO_COLOR ? undefined : colors[identity().color]}
-            />
           </>
         )}
       </Show>

@@ -448,6 +448,145 @@ class WorkTests(unittest.TestCase):
         self.assertIn(help_item["id"], hint)
         self.assertIn("Add focused serializer edge-case test", hint)
 
+    def test_lease_ttl_heartbeat_renewal_and_cas_safe_reclaim(self):
+        import datetime as dt
+
+        import agent_progress
+
+        item = self.create()
+        claimed = self.change(item, self.worker, "claim", lease_ttl=120)
+        self.assertEqual(claimed["leaseTtlSeconds"], 120)
+        self.assertIsNotNone(claimed["leaseExpiresAt"])
+        self.assertFalse(claimed["leaseExpired"])
+        self.assertIsNone(claimed["recoveryNeeded"])
+
+        # While lease is active and owner is live, another worker cannot claim/reclaim.
+        with self.assertRaisesRegex(mailbox.MailboxError, "already claimed"):
+            self.change(claimed, self.other, "reclaim")
+
+        # Heartbeat via agent_progress.report extends leaseExpiresAt.
+        later = mailbox.now() + dt.timedelta(seconds=60)
+        with patch.object(mailbox, "now", return_value=later):
+            agent_progress.report(self.base, self.worker, goal="Export", task="Repair export", stage="working")
+        renewed = self.read(claimed)
+        self.assertGreater(
+            mailbox.parse_stamp(renewed["leaseExpiresAt"]),
+            mailbox.parse_stamp(claimed["leaseExpiresAt"]),
+        )
+
+        # Advance past lease expiration while owner process is still present.
+        expired_now = mailbox.parse_stamp(renewed["leaseExpiresAt"]) + dt.timedelta(seconds=10)
+        with patch.object(mailbox, "now", return_value=expired_now):
+            expired_view = self.read(renewed)
+            self.assertTrue(expired_view["leaseExpired"])
+            self.assertEqual(expired_view["recoveryNeeded"], "lease_expired")
+
+            reclaimed = self.change(renewed, self.other, "reclaim", lease_ttl=300)
+            self.assertEqual(reclaimed["owner"]["session"], "other")
+            self.assertEqual(reclaimed["leaseTtlSeconds"], 300)
+            self.assertFalse(reclaimed["leaseExpired"])
+            self.assertEqual(reclaimed["recovery"]["previousOwner"]["session"], "worker")
+            self.assertEqual(reclaimed["recovery"]["reason"], "lease_expired")
+
+            # Zombie previous owner attempting late write with old revision fails CAS with revision conflict.
+            with self.assertRaisesRegex(mailbox.MailboxError, "work revision conflict: current revision"):
+                self.change(renewed, self.worker, "checkpoint", next_step="Late zombie write")
+            # Even with updated revision, previous owner is fenced by owner check.
+            with self.assertRaisesRegex(mailbox.MailboxError, "current owner"):
+                self.change(reclaimed, self.worker, "checkpoint", next_step="Zombie with fresh revision")
+
+    def test_clear_session_alias_resolution_and_handoff_packets_via_cli(self):
+        import contextlib
+        import io
+
+        item = self.create()
+        claimed = self.change(item, self.worker, "claim")
+
+        # Simulate /clear creating a successor session with clearedFrom / aliases pointing to "worker".
+        cleared = self.peer("worker-after-clear")
+        cleared["clearedFrom"] = "worker"
+        cleared["aliases"] = ["worker"]
+        mailbox.write(mailbox.peer_path(self.base, cleared["session"]), cleared)
+        mailbox.unregister(self.base, "worker")
+
+        # Presence and assignment checks resolve through clearedFrom / aliases.
+        viewed = self.read(claimed)
+        self.assertTrue(viewed["ownerPresent"])
+        self.assertIsNone(viewed["recoveryNeeded"])
+        self.assertEqual([a["id"] for a in work.assigned(self.base, cleared)], [item["id"]])
+        self.assertTrue(work.shares_active_work(self.base, self.lead, cleared))
+
+        # Mutating from the post-/clear session rebinds owner identity and merges structured handoff packets.
+        checkpointed = self.change(
+            claimed,
+            cleared,
+            "checkpoint",
+            next_step="Run verifier",
+            handoff={
+                "files_touched": ["plugins/orchestrate/skills/orchestrate/scripts/mailbox_work.py"],
+                "decisions_made": ["Use CAS revision bump on lease reclaim"],
+                "remaining_steps": ["Add CLI tests"],
+                "blockers": [],
+                "verification_command_run": "pytest -n 2",
+            },
+        )
+        self.assertEqual(checkpointed["owner"]["session"], "worker-after-clear")
+        self.assertEqual(
+            checkpointed["handoff"],
+            {
+                "files_touched": ["plugins/orchestrate/skills/orchestrate/scripts/mailbox_work.py"],
+                "decisions_made": ["Use CAS revision bump on lease reclaim"],
+                "remaining_steps": ["Add CLI tests"],
+                "blockers": [],
+                "verification_command_run": "pytest -n 2",
+            },
+        )
+
+        # CLI flags (--files-touched, --remaining-steps, --verify-cmd) merge into existing handoff on submit.
+        with (
+            patch.object(mailbox, "root", return_value=self.base),
+            patch.object(mailbox, "caller", return_value=cleared),
+        ):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = mailbox.main(
+                    [
+                        "work",
+                        "submit",
+                        "--session",
+                        cleared["session"],
+                        "--harness",
+                        "codex",
+                        "--format",
+                        "json",
+                        "--item",
+                        item["id"],
+                        "--revision",
+                        str(checkpointed["revision"]),
+                        "--evidence",
+                        "commit 123456",
+                        "--verification",
+                        "All unit tests pass",
+                        "--remaining-steps",
+                        "Ready for integrator",
+                        "--verify-cmd",
+                        "pytest tests/plugins/orchestrate/skills/orchestrate/test_mailbox_work.py -n 2",
+                    ]
+                )
+            self.assertEqual(rc, 0)
+            submitted = json.loads(out.getvalue())["item"]
+        self.assertEqual(submitted["state"], "review")
+        self.assertIsNone(submitted["leaseExpiresAt"])
+        self.assertEqual(
+            submitted["handoff"]["files_touched"],
+            ["plugins/orchestrate/skills/orchestrate/scripts/mailbox_work.py"],
+        )
+        self.assertEqual(submitted["handoff"]["remaining_steps"], ["Ready for integrator"])
+        self.assertEqual(
+            submitted["handoff"]["verification_command_run"],
+            "pytest tests/plugins/orchestrate/skills/orchestrate/test_mailbox_work.py -n 2",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

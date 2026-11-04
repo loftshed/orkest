@@ -206,7 +206,7 @@ def normalize_usage(
                 )
                 cost = part.get("cost")
                 if (
-                    isinstance(cost, (int, float))
+                    isinstance(cost, int | float)
                     and not isinstance(cost, bool)
                     and math.isfinite(cost)
                     and cost >= 0
@@ -270,7 +270,7 @@ def normalize_usage(
                     "output": count(raw.get("output_tokens")),
                 }
             cost = finals[-1].get("total_cost_usd")
-            if isinstance(cost, (int, float)) and not isinstance(cost, bool) and math.isfinite(cost) and cost >= 0:
+            if isinstance(cost, int | float) and not isinstance(cost, bool) and math.isfinite(cost) and cost >= 0:
                 result["native_cost_usd"] = cost
         result["gaps"].append("per_request_context_sizes_not_reported")
     elif engine == "agy":
