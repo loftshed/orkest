@@ -1,3 +1,4 @@
+# cspell:words herdr
 """Project-scoped peer mailbox: agent sessions in any harness exchange messages within one project.
 
 Store: `<agent-executor cache>/mailbox-v1/`, local files only. `peers/<session>.json` is presence,
@@ -48,6 +49,7 @@ UNKNOWN_PID_TTL = dt.timedelta(hours=2)
 # An idle session whose process hosts other sessions too (one daemon, many conversations) counts as live this long
 # after it was last seen; the running process says nothing about it.
 SHARED_PROCESS_IDLE_TTL = dt.timedelta(hours=3)
+SHARED_PROCESS_BUSY_TTL = dt.timedelta(minutes=30)
 HARNESSES = ("claude", "codex", "opencode", "gemini", "unknown")
 # Process names a harness runs under, where they differ from its name: Antigravity's CLI process is agy.
 HARNESS_PROCESSES = {"gemini": ("agy", "antigravity", "gemini")}
@@ -148,14 +150,19 @@ def feedback_request(base: Path, peer: dict[str, Any]) -> str:
     return ""
 
 
+@cache
+def _runtime_paths() -> Any:
+    path = Path(__file__).with_name("runtime_paths.py")
+    spec = importlib.util.spec_from_file_location("orchestrate_runtime_paths", path)
+    if spec is None or spec.loader is None:
+        raise MailboxError("cannot load runtime_paths")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def root() -> Path:
-    home = os.environ.get("AGENT_EXECUTOR_HOME")
-    if home:
-        base = Path(home).expanduser()
-    else:
-        cache = os.environ.get("XDG_CACHE_HOME")
-        base = (Path(cache).expanduser() if cache else Path.home() / ".cache") / "agent-executor"
-    return base / "mailbox-v1"
+    return _runtime_paths().cache_home() / "mailbox-v1"
 
 
 def now() -> dt.datetime:
@@ -349,6 +356,55 @@ def readable_name(person: str, repo: str, model: str | None, effort: str | None,
         level = ""
     parts = [person, slug, level, re.sub(r"[^a-z0-9.]+", "-", repo.lower()).strip("-."), tag]
     return "-".join(part for part in parts if part)[:128]
+
+
+def short_agent_name(person: str, repo_slug: str, session_id: str) -> str:
+    """A deterministic Herdr-compatible short agent slug matching ^[a-z][a-z0-9_-]{0,31}$.
+    Format: <person>-<repo>-<hex2> up to 32 characters, always preserving the trailing hex
+    session suffix and cleanly truncating the middle repo slug if necessary."""
+    tag = session_tag(session_id)
+    suffix = f"-{tag}"
+    max_len = 32
+
+    # Clean person: lowercase, replace invalid characters with '-'
+    clean_person = re.sub(r"[^a-z0-9_-]+", "-", (person or "").lower()).strip("-_")
+    if not clean_person or not clean_person[0].islower() or not clean_person[0].isalpha():
+        clean_person = f"a-{clean_person}" if clean_person else "agent"
+        clean_person = re.sub(r"[^a-z0-9_-]+", "-", clean_person).strip("-_")
+
+    # Clean repo: lowercase, replace dots and invalid characters with '-'
+    clean_repo = re.sub(r"[^a-z0-9_-]+", "-", (repo_slug or "").lower()).strip("-_")
+
+    # Budget before the -<tag> suffix
+    avail = max_len - len(suffix)  # 29 chars
+    if clean_repo:
+        if len(clean_person) > 20:
+            clean_person = clean_person[:20].rstrip("-_")
+        repo_budget = avail - len(clean_person) - 1
+        if repo_budget > 0 and len(clean_repo) > repo_budget:
+            clean_repo = clean_repo[:repo_budget].rstrip("-_")
+        if clean_repo and repo_budget > 0:
+            slug = f"{clean_person}-{clean_repo}{suffix}"
+        else:
+            slug = f"{clean_person[:avail].rstrip('-_')}{suffix}"
+    else:
+        if len(clean_person) > avail:
+            clean_person = clean_person[:avail].rstrip("-_")
+        slug = f"{clean_person}{suffix}"
+
+    assert re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", slug), f"Invalid short agent name: {slug!r}"
+    return slug
+
+
+def session_identity(peer_or_base: Any, session: str | None = None) -> dict[str, Any]:
+    """Identity record containing name and Herdr-compatible shortName."""
+    peer = (
+        dict(peer_or_base) if isinstance(peer_or_base, dict) else (load(peer_path(peer_or_base, session or "")) or {})
+    )
+    if "shortName" not in peer:
+        person = peer.get("person") or (peer.get("name", "").split("-", 1)[0] if peer.get("name") else "agent")
+        peer["shortName"] = short_agent_name(person, repository_name(peer), peer.get("session") or session or "")
+    return peer
 
 
 def runtime_effort(harness: str, payload: dict[str, Any] | None = None) -> str | None:
@@ -845,9 +901,12 @@ def is_live(peer: dict[str, Any], moment: dt.datetime | None = None) -> bool:
             return True  # the session's own process is still running: present however long it has been idle
     if moment - seen > MAX_AGE:
         return False
-    if alive and peer.get("sharedProcess") and peer.get("state") == "idle":
-        # Mid-turn sessions stay; an idle one is judged by its own activity and registers again on its next turn.
-        return moment - seen <= SHARED_PROCESS_IDLE_TTL
+    if alive and peer.get("sharedProcess"):
+        if peer.get("state") == "idle":
+            # Mid-turn sessions stay; an idle one is judged by its own activity and registers again on its next turn.
+            return moment - seen <= SHARED_PROCESS_IDLE_TTL
+        if peer.get("state") == "busy":
+            return moment - seen <= SHARED_PROCESS_BUSY_TTL
     return alive if alive is not None else moment - seen <= UNKNOWN_PID_TTL
 
 
@@ -1249,6 +1308,9 @@ def register(
                 peer.get("effort"),
                 session_tag(session, peer.get("nativeName"), peer.get("nativeNameSource")),
             )
+        repo = repository_name(peer)
+        person = peer.get("person") or (peer["name"].split("-", 1)[0] if peer.get("name") else "agent")
+        peer["shortName"] = short_agent_name(person, repo, session)
         if previous_name and previous_name != peer["name"]:
             # Earlier names keep resolving, so mail addressed before a model or effort change still arrives.
             peer["aliases"] = [*(alias for alias in peer.get("aliases", []) if alias != previous_name), previous_name][
@@ -1743,9 +1805,11 @@ def send(
         write(inbox_dir(base, target["session"]) / f"{message['id']}.json", message)
         result = delivery_result(message, target)
         if wake:
-            result["wake"] = (
-                unrelated_wake_result() if quiet_unrelated else delivery_wake(base, target, message["id"], scope)
-            )
+            if quiet_unrelated:
+                result["wake"] = unrelated_wake_result()
+                remember_wake(base, target, message["id"], result["wake"])
+            else:
+                result["wake"] = delivery_wake(base, target, message["id"], scope)
         return result
     if not isinstance(idempotency_key, str) or not re.fullmatch(CLIENT_ID, idempotency_key):
         raise MailboxError("idempotencyKey must be 1-80 letters, digits, underscores or hyphens")
@@ -1805,6 +1869,7 @@ def send(
         if wake:
             if message.get("unrelatedTask"):
                 result["wake"] = unrelated_wake_result()
+                remember_wake(base, target, message["id"], result["wake"])
             elif entry.get("wakeAttempted"):
                 result["wake"] = {
                     "status": "uncertain",
@@ -1829,6 +1894,26 @@ def unrelated_wake_result() -> dict[str, str]:
     }
 
 
+def shares_swarm_room(base: Path, first: dict[str, Any], second: dict[str, Any]) -> bool:
+    """Whether two peers are bound to the same Orkest room."""
+    pair = {first.get("session"), second.get("session")} - {None}
+    if len(pair) < 2:
+        return False
+    with contextlib.suppress(OSError):
+        for path in (base / "rooms").glob("*.json"):
+            room = load(path)
+            if not isinstance(room, dict) or not isinstance(room.get("agents"), list):
+                continue
+            members = {
+                binding.get("id")
+                for member in [room.get("conductor"), *room["agents"]]
+                if isinstance(member, dict) and isinstance(binding := member.get("session"), dict)
+            }
+            if pair <= members:
+                return True
+    return False
+
+
 def unrelated_task(
     base: Path,
     sender: dict[str, Any],
@@ -1843,7 +1928,12 @@ def unrelated_task(
     if any(
         message.get("from", {}).get("session") == target.get("session")
         for message in iter_messages(base, sender["session"], unread_only=False)
+    ) or any(
+        message.get("from", {}).get("session") == sender.get("session") and message.get("readAt")
+        for message in iter_messages(base, target["session"], unread_only=False)
     ):
+        return False
+    if shares_swarm_room(base, sender, target):
         return False
     import mailbox_channels
     import mailbox_work
@@ -1862,7 +1952,7 @@ def unrelated_task(
         return sender_focus.lower() != target_focus.lower()
     if mailbox_work.assigned(base, target):
         return True
-    with contextlib.suppress(MailboxError, OSError, ValueError):
+    with contextlib.suppress(MailboxError, OSError, ValueError, AttributeError):
         import agent_progress
 
         target_progress = agent_progress.read(base, target)
@@ -2959,7 +3049,7 @@ def swarm_command_context(
     with contextlib.suppress(Exception):
         outcome = agent_statusline_tmux.toggle_swarm_view(
             action,
-            socket=me.get("terminalServer"),
+            socket=None if os.environ.get("HERDR_ENV") == "1" else me.get("terminalServer"),
             session_id=me["session"],
             harness=me["harness"],
             cwd=me["cwd"],
@@ -3043,6 +3133,19 @@ def hook(
     terminal_server = os.environ.get("ORKEST_TERMINAL_SERVER", "").strip()
     if re.fullmatch(r"orkest-label-[0-9a-f]{12}", terminal_server) and me.get("terminalServer") != terminal_server:
         me = annotate(base, session, terminalServer=terminal_server) or me
+    if os.environ.get("HERDR_ENV") == "1":
+        herdr_pane = os.environ.get("HERDR_PANE_ID", "").strip()
+        herdr_workspace = os.environ.get("HERDR_WORKSPACE_ID", "").strip()
+        herdr_socket = os.environ.get("HERDR_SOCKET_PATH", "").strip()
+        herdr_fields: dict[str, Any] = {}
+        if herdr_pane and me.get("herdrPaneId") != herdr_pane:
+            herdr_fields["herdrPaneId"] = herdr_pane
+        if herdr_workspace and me.get("herdrWorkspaceId") != herdr_workspace:
+            herdr_fields["herdrWorkspaceId"] = herdr_workspace
+        if herdr_socket and me.get("herdrSocket") != herdr_socket:
+            herdr_fields["herdrSocket"] = herdr_socket
+        if herdr_fields:
+            me = annotate(base, session, **herdr_fields) or me
     # How the last turn ended: wake recovery must not set a conversation going that its own user stopped.
     if gemini and event == "Stop" and payload.get("terminationReason"):
         me = annotate(base, session, lastStopReason=str(payload["terminationReason"])) or me
@@ -3472,6 +3575,7 @@ def main(argv: list[str] | None = None) -> int:
         "send",
         "ask",
         "inbox",
+        "receive",
         "wait",
         "ack",
         "history",
@@ -3496,6 +3600,9 @@ def main(argv: list[str] | None = None) -> int:
             sub.add_argument("--harness", choices=HARNESSES)
             sub.add_argument("--model", help="model the new session will run, e.g. opus-5.5 or claude-opus-5-5")
             sub.add_argument("--effort", help="its effort level; defaults to the current harness's")
+            sub.add_argument(
+                "--short", action="store_true", help="print Herdr-compatible short agent name (<= 32 chars)"
+            )
             continue
         sub.add_argument(
             "--session",
@@ -3507,6 +3614,7 @@ def main(argv: list[str] | None = None) -> int:
             "peers",
             "send",
             "inbox",
+            "receive",
             "wait",
             "history",
             "feedback-summary",
@@ -3572,22 +3680,30 @@ def main(argv: list[str] | None = None) -> int:
                 "--channel", help="post to this channel's members instead of one peer (also: all, worktree)"
             )
             sub.add_argument("--wake", action="store_true", help="for a channel post: wake idle members too")
-            sub.add_argument("--text", "--message", "--body", dest="text", required=True)
+            sub.add_argument("--text", "--body", "--message", dest="text", required=True)
             sub.add_argument("--kind", choices=("question", "reply", "update"))
             sub.add_argument("--id", help="caller ID for idempotent run-message delivery")
             sub.add_argument("--reply-to")
         if name == "ask":
             sub.add_argument("--to", default=os.environ.get("AGENT_MAILBOX_PEER"))
             sub.add_argument("--id", required=True)
-            sub.add_argument("--text", "--message", "--body", dest="text", required=True)
+            sub.add_argument("--text", "--body", "--message", dest="text", required=True)
             sub.add_argument("--timeout", type=float, default=300)
-        if name in {"inbox", "wait"}:
+        if name in {"inbox", "receive", "wait"}:
             sub.add_argument("--peek", action="store_true", help="leave the messages unread")
+            sub.add_argument("--reply-to")
+        if name in {"inbox", "receive"}:
+            sub.add_argument(
+                "--wait-seconds",
+                type=float,
+                default=0.0,
+                help="wait up to this many seconds for messages if none are immediately available",
+            )
         if name == "wait":
             sub.add_argument(
                 "--timeout", type=float, default=300, help="block locally for mail; no model polling (seconds)"
             )
-            sub.add_argument("--reply-to")
+            sub.add_argument("--wait-seconds", type=float, default=None, help="alias for --timeout")
         if name == "ack":
             sub.add_argument("ids", nargs="+")
         if name == "focus":
@@ -3639,7 +3755,11 @@ def main(argv: list[str] | None = None) -> int:
             harness = args.harness or "claude"
             person = pick_martian(secrets.token_hex(8), taken_persons(base, ""))
             effort = args.effort or runtime_effort(harness)
-            print(readable_name(person, repository_name(here), args.model, effort, secrets.token_hex(1)))
+            tag = secrets.token_hex(1)
+            if getattr(args, "short", False):
+                print(short_agent_name(person, repository_name(here), tag))
+            else:
+                print(readable_name(person, repository_name(here), args.model, effort, tag))
             return 0
         if args.action == "prune":
             output: Any = prune(base)
@@ -3818,19 +3938,38 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 if args.action == "ask":
                     output = wait(base, me["session"], timeout=args.timeout, reply_to=args.id)
-            elif args.action == "inbox":
-                output = {
-                    "messages": run_inbox(base, me["run"], me["role"])
+            elif args.action in {"inbox", "receive"}:
+                wait_seconds = getattr(args, "wait_seconds", 0.0)
+                msgs = (
+                    run_inbox(base, me["run"], me["role"])
                     if is_run_peer(me)
                     else take(base, me["session"], mark=not args.peek, scope=args.scope)
-                }
+                )
+                if not msgs and wait_seconds > 0:
+                    if not is_run_peer(me):
+                        register(base, session=me["session"], harness=me["harness"], cwd=me["cwd"], state="waiting")
+                    try:
+                        output = wait(
+                            base,
+                            me["session"],
+                            timeout=wait_seconds,
+                            reply_to=getattr(args, "reply_to", None),
+                            mark=not args.peek,
+                            scope=args.scope,
+                        )
+                    finally:
+                        if not is_run_peer(me):
+                            annotate(base, me["session"], state="busy")  # not if the session ended meanwhile
+                else:
+                    output = {"messages": msgs}
             elif args.action == "wait":
+                timeout = args.wait_seconds if getattr(args, "wait_seconds", None) is not None else args.timeout
                 register(base, session=me["session"], harness=me["harness"], cwd=me["cwd"], state="waiting")
                 try:
                     output = wait(
                         base,
                         me["session"],
-                        timeout=args.timeout,
+                        timeout=timeout,
                         reply_to=args.reply_to,
                         mark=not args.peek,
                         scope=args.scope,

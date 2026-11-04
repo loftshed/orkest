@@ -1,3 +1,4 @@
+# cspell:words herdr
 """Bind a visible native session to its private Orkest tmux pane, without changing presence."""
 
 from __future__ import annotations
@@ -28,12 +29,42 @@ def context(harness: str | None) -> tuple[str, str] | None:
     return server, pane
 
 
+def herdr_context(harness: str | None) -> tuple[str, str | None] | None:
+    if os.environ.get("HERDR_ENV") != "1":
+        return None
+    pane = os.environ.get("HERDR_PANE_ID", "").strip()
+    if not pane:
+        return None
+    expected_harness = os.environ.get("ORKEST_TERMINAL_HARNESS", "").strip()
+    if expected_harness and harness and harness != expected_harness:
+        return None
+    workspace = os.environ.get("HERDR_WORKSPACE_ID", "").strip() or None
+    return pane, workspace
+
+
 def bind(session: str, harness: str | None, payload: dict[str, Any]) -> bool:
     target = context(harness)
-    if not target:
+    herdr = herdr_context(harness)
+    if not target and not herdr:
         return False
     try:
         mailbox.session_key(session)
+        annotations: dict[str, Any] = {}
+        if target:
+            annotations["terminalServer"] = target[0]
+        if herdr:
+            pane_id, workspace_id = herdr
+            annotations["herdrPaneId"] = pane_id
+            if workspace_id:
+                annotations["herdrWorkspaceId"] = workspace_id
+            herdr_socket = os.environ.get("HERDR_SOCKET_PATH", "").strip()
+            if herdr_socket:
+                annotations["herdrSocket"] = herdr_socket
+        if annotations:
+            with contextlib.suppress(Exception):
+                mailbox.annotate(mailbox.root(), session, **annotations)
+        if not target:
+            return True
         # Only display metadata crosses into the pane; never retain the native session payload.
         fields = {}
         for key in ("model", "effort", "effortLevel", "reasoning_effort"):
@@ -47,8 +78,6 @@ def bind(session: str, harness: str | None, payload: dict[str, Any]) -> bool:
                     if k in {"id", "display_name", "effort", "level"} and isinstance(v, str)
                 }
         server, pane = target
-        with contextlib.suppress(Exception):
-            mailbox.annotate(mailbox.root(), session, terminalServer=server)
         binding = json.dumps({"session": session, "harness": harness, "payload": fields})
         subprocess.run(
             [

@@ -84,10 +84,11 @@ remains grouped; absent models remain explicitly unknown.
 python3 scripts/run_agent.py mailbox focus --session MY_ID --text 'Your actual responsibility'
 python3 scripts/run_agent.py mailbox peers --session MY_ID --format json
 python3 scripts/run_agent.py mailbox send --session MY_ID --to PEER_SESSION_ID --message 'Question'
+python3 scripts/run_agent.py mailbox receive --session MY_ID --wait-seconds 120
 python3 scripts/run_agent.py mailbox wait --session MY_ID --reply-to MESSAGE_ID --timeout 300
 ```
 
-Send/ask also accept `--text` or `--body`. Block locally for replies, rather than repeated model-driven
+Send/ask accept `--text`, `--body`, and `--message` as aliases. `receive` (or `inbox`) accepts `--wait-seconds <sec>` so that if no messages are immediately available, it waits locally before returning. Block locally for replies, rather than repeated model-driven
 inbox polling. For a reply that may take longer than a few minutes, run `mailbox wait` as a background
 command with a long timeout and end the turn ([completion.md](completion.md#waiting-for-a-reply-or-anything-else)). Use `--no-wake` for FYI/progress and avoid acknowledgement-only replies. A timeout is
 not a reply; accepted delivery is not evidence of receipt or consideration.
@@ -96,19 +97,19 @@ not a reply; accepted delivery is not evidence of receipt or consideration.
 
 The normal server is `scripts/mailbox_daemon.py`. `scripts/mailbox_mcp.py` remains a stdio fallback; the CLI is `run_agent.py mailbox …`.
 
-| Tool       | Does                                                                                                                              |
-| ---------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| `register` | Hookless HTTP callers register their absolute `cwd`, `harness`, optional native `pid`; returns a `session`.                       |
-| `peers`    | Live sessions in this project: name, harness, state (`idle`, `busy`, `waiting`), cwd, channels. Dead ones are pruned.             |
-| `send`     | `to` or `channel`, `text` (≤ 32 KiB), `replyTo?`; HTTP requires a stable `idempotencyKey` for retries.                            |
-| `inbox`    | Unread messages, oldest first. HTTP keeps them unread until `ack`; stdio/CLI mark returned mail read by default.                  |
-| `wait`     | Blocks up to `timeoutSeconds` (max 600) for a message, or for the reply to `replyTo`.                                             |
-| `ack`      | Marks message ids read.                                                                                                           |
-| `focus`    | One line on what this session is working on, shown to agents in the same project; `channels`/`leave` join or leave task channels. |
-| `tasks`    | Legacy session notes for older clients. Use `board` for shared work discovery.                                                    |
-| `board`    | Shared discovery of interactive work, coordinator tasks and legacy recovery notes.                                                |
-| `work`     | Create, claim, checkpoint, review or explicitly hand over a work item. Coordination only; no execution or user-approval grant.    |
-| `feedback` | Record a communication problem, your intent and what you needed instead. Writes locally; sends no message.                        |
+| Tool              | Does                                                                                                                                   |
+| ----------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `register`        | Hookless HTTP callers register their absolute `cwd`, `harness`, optional native `pid`; returns a `session`.                            |
+| `peers`           | Live sessions in this project: name, harness, state (`idle`, `busy`, `waiting`), cwd, channels. Dead ones are pruned.                  |
+| `send`            | `to` or `channel`, `text` (≤ 32 KiB), `replyTo?`; HTTP requires a stable `idempotencyKey` for retries. Accepts `--body`/`--message`.   |
+| `receive`/`inbox` | Unread messages, oldest first. CLI accepts `--wait-seconds <sec>`. HTTP keeps them unread until `ack`; stdio/CLI mark read by default. |
+| `wait`            | Blocks up to `timeoutSeconds` (max 600) for a message, or for the reply to `replyTo`.                                                  |
+| `ack`             | Marks message ids read.                                                                                                                |
+| `focus`           | One line on what this session is working on, shown to agents in the same project; `channels`/`leave` join or leave task channels.      |
+| `tasks`           | Legacy session notes for older clients. Use `board` for shared work discovery.                                                         |
+| `board`           | Shared discovery of interactive work, coordinator tasks and legacy recovery notes.                                                     |
+| `work`            | Create, claim, checkpoint, review or explicitly hand over a work item. Coordination only; no execution or user-approval grant.         |
+| `feedback`        | Record a communication problem, your intent and what you needed instead. Writes locally; sends no message.                             |
 
 ### MCP protocol and bounded responses
 

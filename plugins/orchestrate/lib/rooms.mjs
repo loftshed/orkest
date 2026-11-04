@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { readdir, readFile, realpath } from "node:fs/promises";
+import { readdir, readFile, realpath, writeFile } from "node:fs/promises";
 import { hostname } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,9 +9,12 @@ import { promisify } from "node:util";
 import {
   addMembers,
   createRoom,
+  detectWorktree,
   mailboxRoot,
   normalizeWorkforceRole,
   readRoom,
+  resolveMemberWorktree,
+  resolveWorktreeMarkerPath,
   updateRoom,
   workforceRoleInfo,
 } from "./stooges-room.mjs";
@@ -135,10 +138,14 @@ export async function newRoom(
   if (swarm) {
     room.swarm = swarm;
     room.objective = objective || "";
-    room.conductor = { engine, role: "lead", status: "awaiting session" };
+    room.conductor = {
+      engine,
+      role: "lead",
+      status: "awaiting session",
+      ...(room.conductor?.worktree && { worktree: room.conductor.worktree }),
+    };
   }
-  await updateRoom(id, () => room, { root, create: true });
-  return room;
+  return updateRoom(id, () => room, { root, create: true });
 }
 
 export async function growRoom(
@@ -192,6 +199,50 @@ export async function bindSession(
         engine,
         machine: hostname(),
         cwd: resolvedCwd || member.cwd || room.cwd,
+      };
+      return room;
+    },
+    { root },
+  );
+}
+
+/** Promote a disposable agent worktree to a persistent folder in both gitdir metadata and room state. */
+export async function keepWorktree(id, memberId = "conductor", { root = mailboxRoot(), cwd } = {}) {
+  const resolvedCwd = cwd ? await realpath(cwd) : undefined;
+  return updateRoom(
+    id,
+    async (room) => {
+      const member = memberOf(room, memberId);
+      if (resolvedCwd) member.cwd = resolvedCwd;
+      const targetCwd =
+        resolvedCwd ||
+        member.worktree?.path ||
+        member.progress?.cwd ||
+        member.cwd ||
+        member.session?.cwd ||
+        (member === room.conductor ? room.cwd : undefined);
+      const detected = detectWorktree(targetCwd, member.worktree, room.cwd);
+      const markerPath = resolveWorktreeMarkerPath(targetCwd);
+      if (markerPath) {
+        try {
+          const marker = JSON.parse(await readFile(markerPath, "utf8"));
+          if (marker && typeof marker === "object") {
+            marker.disposable = false;
+            await writeFile(markerPath, `${JSON.stringify(marker, null, 2)}\n`, { mode: 0o600 });
+          }
+        } catch {
+          // Worktree marker file is optional when promoting an in-memory worktree binding.
+        }
+      }
+      const base =
+        detected ||
+        member.worktree ||
+        (targetCwd ? { path: targetCwd, slug: path.basename(targetCwd) } : {});
+      member.worktree = {
+        ...base,
+        ...(targetCwd && !base.path && { path: targetCwd }),
+        ...(targetCwd && !base.slug && { slug: path.basename(targetCwd) }),
+        disposable: false,
       };
       return room;
     },
@@ -448,11 +499,21 @@ export async function observeRoom(
         member.progress = snapshot;
         member.name = snapshot.name;
         if (snapshot.role) member.workforceRole = snapshot.role;
-        if (snapshot.cwd) member.cwd = snapshot.cwd;
+        if (snapshot.cwd && (!member.worktree?.path || snapshot.cwd !== member.worktree.parentCwd))
+          member.cwd = snapshot.cwd;
         if (!member.dispatch)
           member.status = snapshot.stage === "complete" ? "reported complete" : snapshot.stage;
       } else if (member.session && !member.dispatch) member.status = "session unavailable";
     }
+  }
+  for (const member of [room.conductor, ...room.agents]) {
+    if (!member) continue;
+    const detected =
+      resolveMemberWorktree(member, room.cwd) ||
+      (member === room.conductor && !member.cwd
+        ? detectWorktree(room.cwd, member.worktree, room.cwd)
+        : undefined);
+    if (detected) member.worktree = detected;
   }
   return room;
 }

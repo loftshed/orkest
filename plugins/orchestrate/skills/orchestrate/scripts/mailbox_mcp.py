@@ -937,6 +937,23 @@ class Server:
         # Preserve the registered native PID, cwd, hook/run/delegation fields and project identity.
         return mailbox.annotate(self.base, session, lastSeenAt=mailbox.stamp(), state=state) or peer
 
+    def _capture_agy_control(self, session: str, harness: str | None) -> None:
+        if (
+            harness == "gemini"
+            and os.environ.get("ANTIGRAVITY_LS_ADDRESS")
+            and os.environ.get("ANTIGRAVITY_CSRF_TOKEN")
+        ):
+            with contextlib.suppress(Exception):
+                prev_conv = os.environ.get("ANTIGRAVITY_CONVERSATION_ID")
+                os.environ["ANTIGRAVITY_CONVERSATION_ID"] = session
+                try:
+                    mailbox.persist_agy_control(self.base, session, os.getpid())
+                finally:
+                    if prev_conv is None:
+                        os.environ.pop("ANTIGRAVITY_CONVERSATION_ID", None)
+                    else:
+                        os.environ["ANTIGRAVITY_CONVERSATION_ID"] = prev_conv
+
     def execute(
         self,
         name: str,
@@ -989,6 +1006,7 @@ class Server:
                     mailbox.annotate(self.base, session, **mailbox.model_fields(arguments["model"]))
                 if "harnessLabel" in arguments:
                     mailbox.annotate(self.base, session, **mailbox.harness_fields(arguments["harnessLabel"]))
+                self._capture_agy_control(session, harness)
                 peer = mailbox.load(mailbox.peer_path(self.base, session))
                 return ToolResponse(
                     f"registered as {session}; display: {mailbox.display_label(peer)}", {"session": session}
@@ -1008,6 +1026,7 @@ class Server:
                 mailbox.set_focus(self.base, session, arguments["focus"])
             if "harnessLabel" in arguments:
                 mailbox.annotate(self.base, session, **mailbox.harness_fields(arguments["harnessLabel"]))
+            self._capture_agy_control(session, harness)
             peer = mailbox.load(mailbox.peer_path(self.base, session))
             return ToolResponse(
                 f"registered as {session}; display: {mailbox.display_label(peer)}", {"session": session}
@@ -1015,6 +1034,7 @@ class Server:
 
         meta = {**meta, **({"sessionId": arguments["session"]} if "session" in arguments else {})}
         me = self.me(meta)
+        self._capture_agy_control(me["session"], me.get("harness") or self.harness)
         scope = arguments.get("scope", "project")
         limit = arguments.get("limit", PAGE_DEFAULT)
         offset = arguments.get("offset", 0)

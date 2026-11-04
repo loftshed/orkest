@@ -795,6 +795,145 @@ class MailboxWakeTests(unittest.TestCase):
             after = peer_mailbox.load(peer_mailbox.peer_path(base, "target"))
             self.assertEqual(after["state"], "busy")
 
+    def test_claude_session_in_shell_status_is_wakeable(self):
+        import hashlib
+        import os
+        import socket
+
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary) / "mailbox"
+            config_dir = Path(temporary) / "claude-config"
+            sessions_dir = config_dir / "sessions"
+            sessions_dir.mkdir(parents=True)
+            sender = peer_mailbox.register(base, session="sender", harness="gemini", cwd=str(SCRIPTS))
+            peer_mailbox.register(base, session="claude-shell", harness="claude", cwd=str(SCRIPTS), pid=os.getpid())
+            sock_path = Path(f"/tmp/cc-shell-test-{os.getpid()}.sock")
+            sock_path.unlink(missing_ok=True)
+            received: list[str] = []
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.bind(str(sock_path))
+            server.listen(4)
+            received_event = threading.Event()
+
+            def accept_loop():
+                while True:
+                    try:
+                        conn, _ = server.accept()
+                    except OSError:
+                        break
+                    with conn:
+                        received.append(conn.recv(8192).decode("utf-8"))
+                        received_event.set()
+
+            threading.Thread(target=accept_loop, daemon=True).start()
+            try:
+                canonical = os.path.abspath(str(sock_path))
+                digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+                peer_mailbox.write(
+                    sessions_dir / f"{os.getpid()}.{digest}.key",
+                    {"peerToken": "b" * 32, "pidDomain": "darwin"},
+                )
+                peer_mailbox.write(
+                    sessions_dir / f"{os.getpid()}.json",
+                    {
+                        "pid": os.getpid(),
+                        "sessionId": "claude-shell",
+                        "messagingSocketPath": str(sock_path),
+                        "status": "shell",
+                    },
+                )
+                with patch.dict("os.environ", {"CLAUDE_CONFIG_DIR": str(config_dir)}):
+                    sent = peer_mailbox.send(base, sender=sender, to="claude-shell", text="wake shell", wake=True)
+                self.assertEqual(sent["wake"]["status"], "scheduled")
+                self.assertTrue(received_event.wait(1.0))
+                self.assertEqual(len(received), 1)
+            finally:
+                server.close()
+                sock_path.unlink(missing_ok=True)
+
+    def test_wake_terminal_pane_falls_back_to_herdr_and_tmux_when_primary_adapter_unavailable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary) / "mailbox"
+            sender = peer_mailbox.register(base, session="sender", harness="codex", cwd=str(SCRIPTS))
+            target = peer_mailbox.register(
+                base, session="claude-pane", harness="claude", cwd=str(SCRIPTS), state="idle"
+            )
+            peer_mailbox.annotate(
+                base,
+                "claude-pane",
+                herdrPaneId="%42",
+                terminalServer="orkest-label-0123456789ab",
+            )
+            commands: list[list[str]] = []
+
+            def fake_herdr_run(cmd, **_kwargs):
+                commands.append(list(cmd))
+                if cmd[:3] == ["herdr", "agent", "get"]:
+                    return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({"state": "idle"}), stderr="")
+                if cmd[:3] == ["herdr", "agent", "prompt"]:
+                    return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+                return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
+
+            with (
+                patch.object(mailbox_wake, "claude_record", return_value=None),
+                patch.object(mailbox_wake.shutil, "which", side_effect=lambda name: f"/usr/bin/{name}"),
+                patch.object(mailbox_wake.subprocess, "run", side_effect=fake_herdr_run),
+            ):
+                sent = peer_mailbox.send(base, sender=sender, to="claude-pane", text="via herdr", wake=True)
+            self.assertEqual(
+                (sent["wake"]["status"], sent["wake"]["transport"], sent["wake"]["pane"], sent["wake"]["phase"]),
+                ("scheduled", "herdr-pane", "%42", "submitted"),
+            )
+            self.assertEqual(commands[0], ["herdr", "agent", "get", "%42"])
+            self.assertEqual(commands[1][:4], ["herdr", "agent", "prompt", "%42"])
+
+            # When Herdr is busy or unavailable, wake_terminal_pane falls back to Orkest tmux pane.
+            commands.clear()
+
+            def fake_tmux_run(cmd, **_kwargs):
+                commands.append(list(cmd))
+                if cmd[:3] == ["herdr", "agent", "get"]:
+                    return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({"state": "running"}), stderr="")
+                if "list-panes" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, stdout="%7\tclaude-pane\t0\n", stderr="")
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            with (
+                patch.object(mailbox_wake, "claude_record", return_value=None),
+                patch.object(mailbox_wake.shutil, "which", side_effect=lambda name: f"/usr/bin/{name}"),
+                patch.object(mailbox_wake.subprocess, "run", side_effect=fake_tmux_run),
+            ):
+                sent_tmux = peer_mailbox.send(base, sender=sender, to=target["name"], text="via tmux", wake=True)
+            self.assertEqual(
+                (
+                    sent_tmux["wake"]["status"],
+                    sent_tmux["wake"]["transport"],
+                    sent_tmux["wake"]["pane"],
+                    sent_tmux["wake"]["phase"],
+                ),
+                ("scheduled", "tmux-pane", "%7", "submitted"),
+            )
+            self.assertTrue(any("send-keys" in cmd and "-l" in cmd for cmd in commands))
+            self.assertTrue(any("send-keys" in cmd and cmd[-1] == "Enter" for cmd in commands))
+
+    def test_mcp_tool_call_automatically_persists_agy_control_for_gemini_sessions(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary) / "mailbox"
+            peer_mailbox.register(base, session="agy-mcp-session", harness="gemini", cwd=str(SCRIPTS))
+            server = mailbox_mcp.Server(base=base, stdio=False)
+            server.harness = "gemini"
+            env = {
+                "ANTIGRAVITY_LS_ADDRESS": "127.0.0.1:4666",
+                "ANTIGRAVITY_CSRF_TOKEN": "mcp-csrf-tok",
+            }
+            with patch.dict("os.environ", env, clear=False):
+                server.call("peers", {"session": "agy-mcp-session"}, {})
+            control = peer_mailbox.load(
+                base / "wakes" / peer_mailbox.session_key("agy-mcp-session") / "agy-control.json"
+            )
+            self.assertIsNotNone(control)
+            self.assertEqual((control["lsAddress"], control["csrfToken"]), ("127.0.0.1:4666", "mcp-csrf-tok"))
+
 
 if __name__ == "__main__":
     unittest.main()

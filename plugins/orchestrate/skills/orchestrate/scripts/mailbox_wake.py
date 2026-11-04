@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import time
 import urllib.request
 from pathlib import Path
+from typing import Any
 
 from codex_socket import CodexSocket, ControlError
 
@@ -417,7 +420,7 @@ def wake_claude(target: dict, message_id: str, *, base: Path | None = None, retr
     if retry and status == "waiting":
         # Possibly an approval prompt; an automatic retry waits for plain idle instead of submitting through it.
         return {"status": "queued", "reason": "waiting for input; a retry waits until the session is idle"}
-    if status not in {"idle", "waiting"}:
+    if status not in {"idle", "waiting", "shell"}:
         return {"status": "unavailable", "reason": f"Claude Code session is {status or 'unknown'}"}
     messaging = claude_messaging(sessions_dir, record)
     if isinstance(messaging, str):
@@ -459,6 +462,85 @@ def refused_before_admission(error: BaseException) -> bool:
     return isinstance(error, BEFORE_ADMISSION) or isinstance(getattr(error, "reason", None), BEFORE_ADMISSION)
 
 
+def wake_terminal_pane(base: Path, target: dict[str, Any], message: dict[str, Any]) -> dict[str, Any] | None:
+    """Terminal-level PTY wake fallback (Herdr pane or Orkest tmux pane) when native harness control is unavailable."""
+    if target.get("state", "idle") != "idle":
+        return None
+    message_id = str(message.get("id") or "")
+    prompt_text = notification(message_id)
+    herdr_pane_id = target.get("herdrPaneId")
+    if isinstance(herdr_pane_id, str) and herdr_pane_id.strip() and shutil.which("herdr"):
+        herdr_pane_id = herdr_pane_id.strip()
+        with contextlib.suppress(OSError, ValueError, subprocess.SubprocessError):
+            probe = subprocess.run(
+                ["herdr", "agent", "get", herdr_pane_id],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+            if getattr(probe, "returncode", 1) == 0:
+                info = json.loads(probe.stdout or "{}")
+                if isinstance(info, dict):
+                    agent_state = (
+                        info.get("state")
+                        or info.get("status")
+                        or (info.get("agent", {}).get("state") if isinstance(info.get("agent"), dict) else None)
+                    )
+                    if agent_state in {"idle", "done"}:
+                        sent = subprocess.run(
+                            ["herdr", "agent", "prompt", herdr_pane_id, prompt_text],
+                            capture_output=True,
+                            text=True,
+                            timeout=3,
+                            check=False,
+                        )
+                        if getattr(sent, "returncode", 0) == 0:
+                            return {"status": "scheduled", "transport": "herdr-pane", "pane": herdr_pane_id}
+    server = target.get("terminalServer")
+    if isinstance(server, str) and re.fullmatch(r"orkest-label-[0-9a-f]{12}", server) and shutil.which("tmux"):
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            listed = subprocess.run(
+                [
+                    "tmux",
+                    "-L",
+                    server,
+                    "list-panes",
+                    "-t",
+                    "orkest",
+                    "-F",
+                    "#{pane_id}\t#{@orkest_session}\t#{pane_dead}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+            if getattr(listed, "returncode", 1) == 0:
+                for line in (listed.stdout or "").splitlines():
+                    parts = line.split("\t")
+                    if len(parts) >= 3:
+                        pane_id, pane_session, pane_dead = parts[0].strip(), parts[1].strip(), parts[2].strip()
+                        if pane_dead == "0" and pane_session == target.get("session") and pane_id:
+                            send_text = subprocess.run(
+                                ["tmux", "-L", server, "send-keys", "-t", pane_id, "-l", prompt_text],
+                                capture_output=True,
+                                text=True,
+                                timeout=3,
+                                check=False,
+                            )
+                            send_enter = subprocess.run(
+                                ["tmux", "-L", server, "send-keys", "-t", pane_id, "Enter"],
+                                capture_output=True,
+                                text=True,
+                                timeout=3,
+                                check=False,
+                            )
+                            if getattr(send_text, "returncode", 0) == 0 and getattr(send_enter, "returncode", 0) == 0:
+                                return {"status": "scheduled", "transport": "tmux-pane", "pane": pane_id}
+    return None
+
+
 def wake(target: dict, message_id: str, *, base: Path | None = None, retry: bool = False) -> dict:
     """Try once to wake an idle recipient for unread mail. `retry` marks an automatic recovery attempt, which
     holds back wherever a first attempt may still submit (a Claude session waiting for input)."""
@@ -466,10 +548,14 @@ def wake(target: dict, message_id: str, *, base: Path | None = None, retry: bool
         return with_phase(
             {"status": "unsupported", "reason": "this harness has no mailbox wake adapter; message remains queued"}
         )
-    try:
-        import peer_mailbox as mailbox
+    import peer_mailbox as mailbox
 
-        base = base or mailbox.root()
+    base = base or mailbox.root()
+    stored = mailbox.load(mailbox.peer_path(base, target["session"])) or {}
+    peer = {**stored, **target}
+    if stored.get("state") and stored.get("state") != "idle":
+        peer["state"] = stored["state"]
+    try:
         # Serialize queue inspection and admission across senders, without holding inbox locks.
         with mailbox.locked(base / "wakes" / mailbox.session_key(target["session"]) / "admission.json"):
             if not unread(base, target, message_id):
@@ -478,9 +564,21 @@ def wake(target: dict, message_id: str, *, base: Path | None = None, retry: bool
                 target["harness"], wake_opencode
             )
             if adapter is wake_claude:
-                return with_phase(wake_claude(target, message_id, base=base, retry=retry))
-            return with_phase(adapter(target, message_id, base=base))
+                result = wake_claude(peer, message_id, base=base, retry=retry)
+            else:
+                result = adapter(peer, message_id, base=base)
+            if result.get("status") == "unavailable" and peer.get("state") == "idle":
+                msg = mailbox.load(mailbox.inbox_dir(base, target["session"]) / f"{message_id}.json") or {
+                    "id": message_id
+                }
+                if fallback := wake_terminal_pane(base, peer, msg):
+                    result = fallback
+            return with_phase(result)
     except (OSError, ValueError, KeyError, TypeError, ControlError, subprocess.SubprocessError) as error:
+        if refused_before_admission(error) and peer.get("state") == "idle":
+            msg = mailbox.load(mailbox.inbox_dir(base, target["session"]) / f"{message_id}.json") or {"id": message_id}
+            if fallback := wake_terminal_pane(base, peer, msg):
+                return with_phase(fallback)
         # Sending succeeded already. A missing/offline control endpoint must never lose the message.
         return with_phase(
             {

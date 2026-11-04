@@ -395,6 +395,22 @@ class ChannelTests(unittest.TestCase):
         self.assertEqual(stopped["decision"], "block")
         self.assertIn("Need retrieval schema", stopped["reason"])
 
+        # Explicit wake=True on a message with unrelatedTask=True is eligible at Stop, and swarm room members share work.
+        self.assertFalse(mailbox_channels.reads_at_stop({"unrelatedTask": True, "wake": False}))
+        self.assertTrue(mailbox_channels.reads_at_stop({"unrelatedTask": True, "wake": True}))
+        room_coord = self.peer("room-coord", channels=["coord"])
+        room_worker = self.peer("room-worker", channels=["worker"], state="busy")
+        peer_mailbox.write(
+            self.base / "rooms" / "room-1.json",
+            {
+                "schema": "agent-executor.room.v1",
+                "id": "room-1",
+                "conductor": {"session": {"id": "room-coord"}},
+                "agents": [{"session": {"id": "room-worker"}}],
+            },
+        )
+        self.assertFalse(peer_mailbox.unrelated_task(self.base, room_coord, room_worker))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -82,15 +82,32 @@ class PresenceTests(unittest.TestCase):
             self.base,
             "author",
             state="busy",
-            lastSeenAt=mailbox.stamp(mailbox.now() - dt.timedelta(hours=4)),
+            lastSeenAt=mailbox.stamp(mailbox.now() - dt.timedelta(minutes=20)),
         )
         presence.reconcile(self.base)
         self.assertIn("author", [p["session"] for p in mailbox.peers(self.base)])
         self.assertEqual(mailbox.incoming(self.base, "reader"), [])
-        mailbox.annotate(self.base, "author", state="idle")
+        mailbox.annotate(
+            self.base,
+            "author",
+            state="idle",
+            lastSeenAt=mailbox.stamp(mailbox.now() - dt.timedelta(hours=4)),
+        )
         presence.reconcile(self.base)
         self.assertIn("presence expired; a process exit is not confirmed", self.notice()["text"])
         self.assertEqual(mailbox.pid_alive(owner["pid"]), True)
+
+    def test_shared_host_busy_session_expires_after_busy_ttl(self):
+        self.peer("author")
+        mailbox.annotate(
+            self.base,
+            "author",
+            state="busy",
+            lastSeenAt=mailbox.stamp(mailbox.now() - mailbox.SHARED_PROCESS_BUSY_TTL - dt.timedelta(minutes=1)),
+        )
+        self.assertFalse(mailbox.is_live(mailbox.load(mailbox.peer_path(self.base, "author"))))
+        presence.reconcile(self.base)
+        self.assertNotIn("author", [p["session"] for p in mailbox.peers(self.base)])
 
     def test_read_unanswered_request_notifies_even_without_an_unfinished_task(self):
         mailbox.set_focus(self.base, "author", "Repair export", task_details={"status": "complete"})

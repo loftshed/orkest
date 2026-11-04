@@ -175,6 +175,17 @@ class ListenerTests(unittest.TestCase):
             self.assertEqual((peer["state"], peer["nativeSession"]), ("idle", "conv-type-init"))
             session.observe({"event": "init", "init": {"conversation_id": "conv-nested-init"}})
             self.assertEqual(session.native_session, "conv-nested-init")
+            session.busy = True
+            session.ready = False
+            session.observe({"type": "error", "message": "stream fault"})
+            self.assertFalse(session.busy)
+            self.assertTrue(session.ready)
+            self.assertEqual(mailbox.load(mailbox.peer_path(base, "agy-session-1"))["state"], "idle")
+            session.busy = True
+            session.observe({"event": "fatal", "message": "fatal stream fault"})
+            self.assertFalse(session.busy)
+            self.assertTrue(session.ready)
+            self.assertEqual(mailbox.load(mailbox.peer_path(base, "agy-session-1"))["state"], "idle")
 
 
 if __name__ == "__main__":

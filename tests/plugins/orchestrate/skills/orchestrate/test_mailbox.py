@@ -678,17 +678,26 @@ class MailboxTests(unittest.TestCase):
         pid = self.own_process()
         self.assertNotIn("sharedProcess", self.peer("conversation-done", "gemini", str(self.repository), pid=pid))
         self.peer("conversation-working", "gemini", str(self.repository), pid=pid)
+        self.peer("conversation-wedged", "gemini", str(self.repository), pid=pid)
         self.peer("conversation-recent", "gemini", str(self.repository), pid=pid)
-        quiet = MAILBOX.stamp(MAILBOX.now() - MAILBOX.SHARED_PROCESS_IDLE_TTL - dt.timedelta(minutes=1))
-        for session, state in (("conversation-done", "idle"), ("conversation-working", "busy")):
+        quiet_idle = MAILBOX.stamp(MAILBOX.now() - MAILBOX.SHARED_PROCESS_IDLE_TTL - dt.timedelta(minutes=1))
+        active_busy = MAILBOX.stamp(MAILBOX.now() - MAILBOX.SHARED_PROCESS_BUSY_TTL + dt.timedelta(minutes=5))
+        stale_busy = MAILBOX.stamp(MAILBOX.now() - MAILBOX.SHARED_PROCESS_BUSY_TTL - dt.timedelta(minutes=1))
+        for session, state, seen in (
+            ("conversation-done", "idle", quiet_idle),
+            ("conversation-working", "busy", active_busy),
+            ("conversation-wedged", "busy", stale_busy),
+        ):
             path = MAILBOX.peer_path(self.base, session)
             self.assertTrue(MAILBOX.load(path)["sharedProcess"])  # marked when a later session registered
-            MAILBOX.write(path, {**MAILBOX.load(path), "lastSeenAt": quiet, "state": state})
+            MAILBOX.write(path, {**MAILBOX.load(path), "lastSeenAt": seen, "state": state})
         listed = [peer["session"] for peer in MAILBOX.peers(self.base)]
         self.assertNotIn("conversation-done", listed)
+        self.assertNotIn("conversation-wedged", listed)
         self.assertIn("conversation-working", listed)
         self.assertIn("conversation-recent", listed)
         self.assertFalse(MAILBOX.peer_path(self.base, "conversation-done").exists())
+        self.assertFalse(MAILBOX.peer_path(self.base, "conversation-wedged").exists())
         self.peer("conversation-done", "gemini", str(self.repository), pid=pid)  # its next turn
         self.assertIn("conversation-done", [peer["session"] for peer in MAILBOX.peers(self.base)])
 

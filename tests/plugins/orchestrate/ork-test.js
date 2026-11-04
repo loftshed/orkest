@@ -6,6 +6,23 @@ import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { coordinatorArguments } from "../../../plugins/orchestrate/bin/ork.mjs";
+import {
+  extractIssueArchetype,
+  extractTaskSpec,
+  factoryCommand,
+  hasDisjointPaths,
+  matchIssuesToPools,
+  matchIssueToPool,
+  planBatch,
+  selectSparePool,
+  selectSparePools,
+} from "../../../plugins/orchestrate/lib/factory.mjs";
+import {
+  cacheHome,
+  configPath,
+  envFirst,
+} from "../../../plugins/orchestrate/lib/runtime-paths.mjs";
+import { mailboxRoot } from "../../../plugins/orchestrate/lib/stooges-room.mjs";
 
 const exec = promisify(execFile);
 const cli = path.resolve("plugins/orchestrate/bin/ork.mjs");
@@ -265,5 +282,408 @@ describe("ork command validation", () => {
       code: 1,
       stderr: expect.stringContaining("ork:"),
     });
+  });
+});
+
+describe("ork factory", () => {
+  const validSpecBody = [
+    "## Objective",
+    "Implement spare-token backlog execution.",
+    "",
+    "```json task-spec",
+    JSON.stringify(
+      {
+        acceptance_criteria: ["ork factory status lists spare pools."],
+        allow_paths: ["plugins/orchestrate/lib/factory.mjs"],
+        development_checks: ["vitest run tests/plugins/orchestrate/ork-test.js"],
+        objective: "Add ork factory subcommand",
+        plan: ["Parse embedded ```json task-spec blocks from issues"],
+        schema: "agent-executor.task-spec.v1",
+      },
+      null,
+      2,
+    ),
+    "```",
+  ].join("\n");
+
+  it("extracts valid task-spec blocks and rejects malformed or incomplete specs", () => {
+    const extracted = extractTaskSpec(validSpecBody);
+    expect(extracted).toMatchObject({
+      allow_paths: ["plugins/orchestrate/lib/factory.mjs"],
+      objective: "Add ork factory subcommand",
+      schema: "agent-executor.task-spec.v1",
+    });
+
+    const plainJsonBody = [
+      "```json",
+      JSON.stringify({
+        allow_paths: ["plugins/monitor/lib/analyze.mjs"],
+        development_checks: ["vitest run"],
+        objective: "Plain JSON block with schema",
+        schema: "agent-executor.task-spec.v1",
+      }),
+      "```",
+    ].join("\n");
+    expect(extractTaskSpec(plainJsonBody)).toMatchObject({
+      allow_paths: ["plugins/monitor/lib/analyze.mjs"],
+      objective: "Plain JSON block with schema",
+    });
+
+    expect(extractTaskSpec("No code block here")).toBeNull();
+    expect(
+      extractTaskSpec(
+        '```json\n{"objective":"Missing schema","allow_paths":["a"],"development_checks":["test"]}\n```',
+      ),
+    ).toBeNull();
+    expect(
+      extractTaskSpec('```json task-spec\n{"objective":"Missing checks","allow_paths":["a"]}\n```'),
+    ).toBeNull();
+  });
+
+  it("detects disjoint and overlapping relative allow_paths", () => {
+    expect(
+      hasDisjointPaths(
+        ["plugins/orchestrate/lib/factory.mjs"],
+        [["plugins/monitor/lib/analyze.mjs"], ["scripts/release.js"]],
+      ),
+    ).toBe(true);
+    expect(hasDisjointPaths(["a/b"], [["a/bc"]])).toBe(true);
+    expect(hasDisjointPaths(["a/b"], [["a/b/c.js"]])).toBe(false);
+    expect(hasDisjointPaths(["./a/b/c.js"], [["a/b/"]])).toBe(false);
+    expect(hasDisjointPaths([], [["a/b"]])).toBe(false);
+  });
+
+  it("selects available expiring or surplus pools while refusing credits, blocked, and unauthorized pools", () => {
+    const lanes = [
+      {
+        accountId: "codex-main",
+        availableNowPct: 80,
+        credits: { balance: 40, hasCredits: true, text: "40 cr" },
+        label: "Codex Credits",
+        poolId: "codex",
+        provider: "codex",
+        score: -250,
+        status: "credits",
+        surplusPts: 50,
+      },
+      {
+        accountId: "claude-work",
+        availableNowPct: 0,
+        label: "Claude Work",
+        poolId: "claude",
+        provider: "claude",
+        score: -1005,
+        status: "blocked",
+        surplusPts: 30,
+      },
+      {
+        accountId: "claude-personal",
+        availableNowPct: 90,
+        billing: "personal",
+        label: "Claude Personal",
+        poolId: "claude",
+        provider: "claude",
+        score: 40,
+        status: "available",
+        surplusPts: 40,
+      },
+      {
+        accountId: "agy-main",
+        availableNowPct: 75,
+        label: "Antigravity · Gemini",
+        pace: { surplus: 22 },
+        poolId: "gemini",
+        provider: "antigravity",
+        score: 22,
+        status: "available",
+      },
+      {
+        accountId: "codex-pro",
+        availableNowPct: 60,
+        burnPctPerHour: 12,
+        expiring: true,
+        label: "Codex Expiring",
+        pace: { surplus: 8 },
+        poolId: "codex",
+        provider: "codex",
+        score: 1012,
+        status: "available",
+      },
+    ];
+
+    const filtered = selectSparePools(lanes, { allowPersonal: false, minSurplusPts: 15 });
+    expect(filtered.map((pool) => pool.accountId)).toEqual(["codex-pro", "agy-main"]);
+    expect(selectSparePool(lanes, { allowPersonal: false, minSurplusPts: 15 })?.accountId).toBe(
+      "codex-pro",
+    );
+    expect(
+      selectSparePool(lanes, {
+        allowedPools: ["agy-main:gemini"],
+        allowPersonal: false,
+        minSurplusPts: 15,
+      })?.accountId,
+    ).toBe("agy-main");
+  });
+
+  it("matches archetypes and spreads multiple ready issues across distinct harnesses and models", () => {
+    const lanes = [
+      {
+        accountId: "claude-work",
+        availableNowPct: 85,
+        families: ["claude"],
+        label: "Claude Work",
+        pace: { surplus: 28 },
+        poolId: "claude",
+        provider: "claude",
+        route: "--engine claude",
+        score: 28,
+        status: "available",
+      },
+      {
+        accountId: "agy-work",
+        availableNowPct: 90,
+        families: ["gemini"],
+        label: "Antigravity Gemini",
+        pace: { surplus: 26 },
+        poolId: "gemini",
+        provider: "antigravity",
+        route: "--engine agy",
+        score: 26,
+        status: "available",
+      },
+      {
+        accountId: "codex-work",
+        availableNowPct: 80,
+        families: ["gpt"],
+        label: "Codex Work",
+        pace: { surplus: 30 },
+        poolId: "codex",
+        provider: "codex",
+        route: "--engine codex",
+        score: 30,
+        status: "available",
+      },
+    ];
+
+    const makeIssue = (number, allowPath, archetypeLabel, metadataArchetype) => ({
+      body: [
+        "```json task-spec",
+        JSON.stringify({
+          allow_paths: [allowPath],
+          development_checks: ["vitest run"],
+          ...(metadataArchetype && { metadata: { archetype: metadataArchetype } }),
+          objective: `Task for issue ${number}`,
+          schema: "agent-executor.task-spec.v1",
+        }),
+        "```",
+      ].join("\n"),
+      labels: ["agent:ready", ...(archetypeLabel ? [`archetype:${archetypeLabel}`] : [])],
+      number,
+      state: "open",
+      title: `Issue ${number}`,
+    });
+
+    const issues = [
+      makeIssue(101, "plugins/a/index.mjs", "structural-refactor"),
+      makeIssue(102, "plugins/b/index.mjs", "architecture-conductor"),
+      makeIssue(103, "plugins/c/index.mjs", null, "debug-invariants"),
+      // Overlapping path with 101 should be skipped in the same batch:
+      makeIssue(104, "plugins/a/index.mjs", "mechanical-sweep"),
+    ];
+
+    expect(extractIssueArchetype(issues[0])).toBe("structural-refactor");
+    expect(extractIssueArchetype(issues[2], extractTaskSpec(issues[2].body))).toBe(
+      "debug-invariants",
+    );
+
+    const singleMatch = matchIssueToPool([issues[1]], lanes);
+    expect(singleMatch?.selectedRoute).toMatchObject({
+      archetype: "architecture-conductor",
+      engine: "agy",
+      model: "gemini:pro",
+    });
+
+    const batch = matchIssuesToPools(issues, lanes);
+    expect(planBatch).toBe(matchIssuesToPools);
+    expect(batch).toHaveLength(3);
+    expect(batch.map((item) => item.issue.number)).toEqual([101, 102, 103]);
+
+    const engines = new Set(batch.map((item) => item.selectedRoute.engine));
+    const models = new Set(batch.map((item) => item.selectedRoute.model));
+    expect(engines).toEqual(new Set(["claude", "agy", "codex"]));
+    expect(models.size).toBe(3);
+
+    // Even when multiple builder issues share the same archetype, batch planning spreads across harnesses:
+    const homogeneousIssues = [
+      makeIssue(201, "plugins/one.mjs", "debug-invariants"),
+      makeIssue(202, "plugins/two.mjs", "debug-invariants"),
+      makeIssue(203, "plugins/three.mjs", "debug-invariants"),
+    ];
+    const spreadBatch = planBatch(homogeneousIssues, lanes);
+    expect(new Set(spreadBatch.map((item) => item.selectedRoute.engine))).toEqual(
+      new Set(["codex", "claude", "agy"]),
+    );
+  });
+
+  it("supports factoryCommand status --json, run --dry-run, and groom --dry-run with injected mocks", async () => {
+    const now = Date.now();
+    const mockAccounts = [
+      {
+        fetchedAt: now,
+        id: "codex-work",
+        label: "Codex Work",
+        ok: true,
+        pools: [{ families: ["gpt"], id: "codex", label: "Codex", windowIds: ["wk"] }],
+        provider: "codex",
+        route: "--engine codex",
+        windows: [
+          {
+            id: "wk",
+            label: "Weekly",
+            remainingPct: 85,
+            resetsAt: now + 3 * 24 * 3600 * 1000,
+            windowMins: 10_080,
+          },
+        ],
+      },
+    ];
+    const mockIssues = [
+      {
+        body: "Needs grooming into a task-spec.",
+        labels: [{ name: "agent:raw" }],
+        number: 55,
+        title: "Raw backlog item",
+      },
+      {
+        body: validSpecBody,
+        labels: [{ name: "agent:ready" }, { name: "archetype:debug-invariants" }],
+        number: 57,
+        title: "Ready factory item",
+      },
+    ];
+
+    const chunks = [];
+    const stdout = {
+      columns: 120,
+      isTTY: false,
+      write: (chunk) => {
+        chunks.push(chunk);
+      },
+    };
+
+    const status = await factoryCommand(["status", "--json"], {
+      execGhFn: async () => mockIssues,
+      getAccountsFn: async () => mockAccounts,
+      stdout,
+    });
+    expect(status.schema).toBe("ork.factory.status.v1");
+    expect(status.sparePools).toHaveLength(1);
+    expect(status.readyIssues).toHaveLength(1);
+    expect(status.rawIssues).toEqual([{ number: 55, title: "Raw backlog item" }]);
+    expect(status.nextMatch).toMatchObject({
+      archetype: "debug-invariants",
+      branch: "feat/issue-57",
+      issue: { number: 57, title: "Ready factory item" },
+      selectedRoute: { engine: "codex", model: "gpt:sol" },
+      worktreeSlug: "wt-issue-57",
+    });
+
+    chunks.length = 0;
+    const dryRun = await factoryCommand(["run", "--dry-run"], {
+      execGhFn: async () => mockIssues,
+      getAccountsFn: async () => mockAccounts,
+      stdout,
+    });
+    expect(dryRun).toMatchObject({
+      branch: "feat/issue-57",
+      dryRun: true,
+      matched: true,
+      verifyCommand: "vitest run tests/plugins/orchestrate/ork-test.js",
+      worktreeSlug: "wt-issue-57",
+    });
+    expect(chunks.join("")).toContain("wt-issue-57");
+    expect(chunks.join("")).toContain("feat/issue-57");
+
+    chunks.length = 0;
+    const groomDryRun = await factoryCommand(["groom", "--issue", "55", "--dry-run"], {
+      execGhFn: async () => mockIssues[0],
+      stdout,
+    });
+    expect(groomDryRun).toMatchObject({
+      dryRun: true,
+      issue: { number: 55, title: "Raw backlog item" },
+      schema: "ork.factory.groom.v1",
+    });
+    expect(chunks.join("")).toContain("run_agent.py consult --intent investigate --read");
+  });
+});
+
+describe("ork name", () => {
+  it("generates a full agent name by default", async () => {
+    const app = await sandbox();
+    const { stdout } = await app.run(["name"]);
+    expect(stdout.trim().length).toBeGreaterThan(0);
+    expect(stdout.trim()).toMatch(/^[a-z]+-[a-z0-9.-]+-[0-9a-f]{2}$/);
+  });
+
+  it("generates a Herdr-compatible short agent name with --short", async () => {
+    const app = await sandbox();
+    const { stdout } = await app.run(["name", "--short"]);
+    const shortName = stdout.trim();
+    expect(shortName.length).toBeLessThanOrEqual(32);
+    expect(shortName).toMatch(/^[a-z][a-z0-9_-]{0,31}$/);
+  });
+});
+
+describe("runtime-paths and mailboxRoot resolution", () => {
+  it("resolves ORCHESTRATE_* before AGENT_EXECUTOR_* and falls back to existing legacy directories", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "ork-runtime-paths-"));
+    temporary.push(dir);
+    const xdgCache = path.join(dir, "cache");
+    const xdgConfig = path.join(dir, "config");
+
+    expect(
+      envFirst("ORCHESTRATE_HOME", "AGENT_EXECUTOR_HOME", {
+        ORCHESTRATE_HOME: "/new/home",
+        AGENT_EXECUTOR_HOME: "/old/home",
+      }),
+    ).toBe("/new/home");
+    expect(
+      envFirst("ORCHESTRATE_HOME", "AGENT_EXECUTOR_HOME", {
+        ORCHESTRATE_HOME: "",
+        AGENT_EXECUTOR_HOME: "/old/home",
+      }),
+    ).toBe("/old/home");
+
+    expect(
+      mailboxRoot({
+        ORCHESTRATE_HOME: "/new/home",
+        AGENT_EXECUTOR_HOME: "/old/home",
+      }),
+    ).toBe(path.join("/new/home", "mailbox-v1"));
+    expect(mailboxRoot({ AGENT_EXECUTOR_HOME: "/old/home" })).toBe(
+      path.join("/old/home", "mailbox-v1"),
+    );
+
+    const env = { XDG_CACHE_HOME: xdgCache, XDG_CONFIG_HOME: xdgConfig };
+    expect(cacheHome(env)).toBe(path.join(xdgCache, "orchestrate"));
+    expect(mailboxRoot(env)).toBe(path.join(xdgCache, "orchestrate", "mailbox-v1"));
+    expect(configPath(env)).toBe(path.join(xdgConfig, "orchestrate", "config.json"));
+
+    await mkdir(path.join(xdgCache, "agent-executor"), { recursive: true });
+    await mkdir(path.join(xdgConfig, "agent-executor"), { recursive: true });
+    await writeFile(path.join(xdgConfig, "agent-executor", "config.json"), "{}");
+
+    expect(cacheHome(env)).toBe(path.join(xdgCache, "agent-executor"));
+    expect(mailboxRoot(env)).toBe(path.join(xdgCache, "agent-executor", "mailbox-v1"));
+    expect(configPath(env)).toBe(path.join(xdgConfig, "agent-executor", "config.json"));
+
+    await mkdir(path.join(xdgCache, "orchestrate"), { recursive: true });
+    await mkdir(path.join(xdgConfig, "orchestrate"), { recursive: true });
+    await writeFile(path.join(xdgConfig, "orchestrate", "config.json"), "{}");
+
+    expect(cacheHome(env)).toBe(path.join(xdgCache, "orchestrate"));
+    expect(mailboxRoot(env)).toBe(path.join(xdgCache, "orchestrate", "mailbox-v1"));
+    expect(configPath(env)).toBe(path.join(xdgConfig, "orchestrate", "config.json"));
   });
 });

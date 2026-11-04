@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
+
+import { cacheHome } from "./runtime-paths.mjs";
 
 export const ROOM_SCHEMA = "agent-executor.room.v1";
 const ID = /^[\w-]{1,80}$/u;
@@ -34,13 +35,121 @@ export function workforceRoleInfo(value) {
   return id ? WORKFORCE_ROLES[id] : undefined;
 }
 
+export function resolveWorktreeMarkerPath(cwd) {
+  if (typeof cwd !== "string" || !path.isAbsolute(cwd)) return;
+  try {
+    const dotGit = readFileSync(path.join(cwd, ".git"), "utf8");
+    const match = /^gitdir:\s*(.+)$/mu.exec(dotGit);
+    if (!match) return;
+    const gitDir = path.resolve(cwd, match[1].trim());
+    return path.join(gitDir, "orkest.json");
+  } catch {
+    return;
+  }
+}
+
+function alignCanonicalPath(candidate, reference) {
+  if (!candidate) return;
+  const resolved = path.resolve(candidate);
+  if (!reference || resolved === reference) return resolved;
+  try {
+    if (realpathSync(resolved) === realpathSync(reference)) return reference;
+  } catch {
+    // Keep the resolved path when either path does not exist on disk.
+  }
+  return resolved;
+}
+
+export function detectWorktree(cwd, existing, referenceCwd) {
+  const resolvedCwd =
+    typeof cwd === "string" && path.isAbsolute(cwd) ? path.resolve(cwd) : undefined;
+  const markerPath = resolveWorktreeMarkerPath(resolvedCwd);
+  if (markerPath) {
+    try {
+      const marker = JSON.parse(readFileSync(markerPath, "utf8"));
+      if (
+        marker &&
+        typeof marker === "object" &&
+        typeof marker.disposable === "boolean" &&
+        (marker.parentCwd === undefined ||
+          (typeof marker.parentCwd === "string" && path.isAbsolute(marker.parentCwd)))
+      ) {
+        const isSameTarget = !existing?.path || path.resolve(existing.path) === resolvedCwd;
+        const isDisposable =
+          Boolean(marker.disposable) && (!isSameTarget || existing?.disposable !== false);
+        const parentCwd = alignCanonicalPath(
+          marker.parentCwd || (isSameTarget ? existing?.parentCwd : undefined),
+          referenceCwd,
+        );
+        if (!isDisposable || parentCwd) {
+          const slug =
+            (typeof marker.slug === "string" && marker.slug.trim()) ||
+            (isSameTarget && typeof existing?.slug === "string" && existing.slug.trim()) ||
+            path.basename(resolvedCwd);
+          const branch =
+            (typeof marker.branch === "string" && marker.branch.trim()) ||
+            (isSameTarget ? existing?.branch : undefined);
+          return {
+            path: resolvedCwd,
+            ...(branch && { branch }),
+            disposable: isDisposable,
+            ...(parentCwd && { parentCwd }),
+            slug,
+          };
+        }
+      }
+    } catch {
+      // Ignore missing or unreadable orkest.json and fall back to existing metadata.
+    }
+  }
+  if (!existing || typeof existing !== "object" || typeof existing.disposable !== "boolean") return;
+  if (
+    existing.path &&
+    resolvedCwd &&
+    alignCanonicalPath(existing.path, resolvedCwd) !== resolvedCwd
+  ) {
+    return;
+  }
+  const wtPath = existing.path ? path.resolve(existing.path) : resolvedCwd;
+  const parentCwd = alignCanonicalPath(existing.parentCwd, referenceCwd);
+  const slug = existing.slug || (wtPath ? path.basename(wtPath) : undefined);
+  return {
+    ...(wtPath && { path: wtPath }),
+    ...(existing.branch && { branch: existing.branch }),
+    disposable: existing.disposable,
+    ...(parentCwd && { parentCwd }),
+    ...(slug && { slug }),
+  };
+}
+
+export function resolveMemberWorktree(member, roomCwd) {
+  if (!member || typeof member !== "object") return;
+  const existing = member.worktree;
+  const isMovedAway = Boolean(
+    existing?.path &&
+    member.cwd &&
+    alignCanonicalPath(member.cwd, existing.path) !== path.resolve(existing.path) &&
+    (!existing.parentCwd ||
+      alignCanonicalPath(member.cwd, existing.parentCwd) !== path.resolve(existing.parentCwd)),
+  );
+  const candidates = [
+    member.cwd,
+    member.session?.cwd,
+    member.progress?.cwd,
+    !isMovedAway && existing?.path,
+  ].filter((item) => typeof item === "string" && path.isAbsolute(item));
+  for (const candidate of candidates) {
+    if (!resolveWorktreeMarkerPath(candidate)) continue;
+    const detected = detectWorktree(candidate, isMovedAway ? undefined : existing, roomCwd);
+    if (detected) return detected;
+  }
+  if (!isMovedAway && existing && typeof existing === "object") {
+    return detectWorktree(existing.path || candidates[0], existing, roomCwd);
+  }
+}
+
 export function mailboxRoot(env = process.env) {
-  const expand = (value) => value.replace(/^~(?=\/|$)/u, () => homedir());
-  const cache = expand(env.XDG_CACHE_HOME || `${homedir()}/.cache`);
-  const base = env.AGENT_EXECUTOR_HOME
-    ? expand(env.AGENT_EXECUTOR_HOME)
-    : path.join(cache, "agent-executor");
-  return path.join(base, "mailbox-v1");
+  return path.join(cacheHome(env), "mailbox-v1");
 }
 
 export function roomPath(id, root = mailboxRoot()) {
@@ -174,6 +283,28 @@ export function validateRoom(room) {
     )
       throw new Error("Member working folder must be an absolute path");
     if (
+      member.worktree !== undefined &&
+      (!member.worktree ||
+        typeof member.worktree !== "object" ||
+        Array.isArray(member.worktree) ||
+        typeof member.worktree.disposable !== "boolean" ||
+        (member.worktree.path !== undefined &&
+          (typeof member.worktree.path !== "string" || !path.isAbsolute(member.worktree.path))) ||
+        (member.worktree.parentCwd !== undefined &&
+          (typeof member.worktree.parentCwd !== "string" ||
+            !path.isAbsolute(member.worktree.parentCwd))) ||
+        (member.worktree.branch !== undefined && typeof member.worktree.branch !== "string") ||
+        (member.worktree.slug !== undefined && typeof member.worktree.slug !== "string"))
+    )
+      throw new Error("Invalid member worktree metadata");
+    const detectedWorktree =
+      resolveMemberWorktree(member, room.cwd) ||
+      (member === room.conductor && !member.cwd
+        ? detectWorktree(room.cwd, member.worktree, room.cwd)
+        : undefined);
+    if (detectedWorktree) member.worktree = detectedWorktree;
+    else delete member.worktree;
+    if (
       member.session &&
       (typeof member.session.id !== "string" ||
         !member.session.id ||
@@ -209,10 +340,16 @@ export function addMembers(room, members, { parent = "conductor", workforceRole,
       ? normalizeWorkforceRole(member.workforceRole)
       : defaultRole;
     const resolvedCwd = member.cwd ? path.resolve(member.cwd) : defaultCwd;
+    const worktree = detectWorktree(
+      resolvedCwd || member.worktree?.path,
+      member.worktree,
+      room.cwd,
+    );
     room.agents.push({
       ...member,
       ...(resolvedRole && { workforceRole: resolvedRole }),
       ...(resolvedCwd && { cwd: resolvedCwd }),
+      ...(worktree && { worktree }),
       id: `${stem}-${index}`,
       parent,
       status: "queued",

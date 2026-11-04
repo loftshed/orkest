@@ -8,6 +8,7 @@ import { parseArgs, promisify } from "node:util";
 
 import { jsonView, renderLine, renderReport, shouldUseColor } from "../../monitor/lib/render.mjs";
 import { getAccounts } from "../../monitor/lib/store.mjs";
+import { factoryCommand } from "../lib/factory.mjs";
 import { newRoom, observeRoom } from "../lib/rooms.mjs";
 import {
   addMembers,
@@ -37,12 +38,13 @@ const COORDINATORS = new Set(["codex", "claude", "agy", "opencode"]);
 const HELP = `ork agy|codex|claude|opencode   (open a coordinator; enter your goal in the conversation)
   --harness-arg=<argument>      (pass an argument to the coordinator; repeat as needed)
 ork swarm [toggle|open|close]   (open or close the live Swarm View split pane)
+ork factory [status|run|groom] [--dry-run] [--json]
 ork rooms --help
 ork setup [--dry-run] [--trust-codex-hooks]   (install mailbox, hooks and shell wrapper shortcuts)
 ork gate [--heavy] [--label <text>] -- <command>   (also: ork gate status|install|uninstall)
 ork label [--lines 1|2] -- codex|claude|agy|opencode [arguments]   (outer tmux footer for every harness)
 ork progress --session ID --goal TEXT --task TEXT --stage working [--role ROLE]
-ork name [--model <model>] [--effort <level>] [--harness <harness>]
+ork name [--model <model>] [--effort <level>] [--harness <harness>] [--short]
 ork routes [--archetype <name>] [--json] [--width 120]
 ork quota [--line|--json] [--refresh]
 ork telemetry [--runs-dir <directory>] [--json] [--width 120]
@@ -343,6 +345,7 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
     ]);
     return;
   }
+  if (argv[0] === "factory") return factoryCommand(argv.slice(1), { stdout });
   if (argv[0] === "rooms") return roomsCommand(argv.slice(1), { stdout });
   if (argv[0] === "name") {
     // A readable session name for the current checkout: claude --name "$(ork name --model opus-5.5)".
