@@ -91,15 +91,6 @@ def resolve(family_name: str, tier: str | None, families: dict[str, dict[str, An
     raise SelectorError(f"no {family_name}:{tier} model in the live {family['engine']} catalog")
 
 
-def resolve_selector(selector: str, families: dict[str, dict[str, Any]], available: list[str]) -> str:
-    parts = selector.split(":")
-    if parts[0] == "latest" and len(parts) > 1:
-        parts = parts[1:]
-    if len(parts) > 2 or parts[0] not in families or (len(parts) == 2 and not parts[1].strip()):
-        raise SelectorError(f"Unsupported selector {selector!r}")
-    return resolve(parts[0], parts[1].strip() if len(parts) == 2 else None, families, available)
-
-
 def report(families: dict[str, dict[str, Any]], catalogs: dict[str, list[str]]) -> list[dict[str, Any]]:
     rows = []
     for name, family in families.items():
