@@ -22,12 +22,14 @@ from pathlib import Path
 import peer_mailbox as mailbox
 
 _RESUME_VALUE_FLAGS = frozenset({"--resume", "-r", "--session-id", "--conversation", "--session", "-s"})
+_NON_SESSION_FLAG_VALUES = frozenset({"last", "help", "read-only", "workspace-write", "danger-full-access"})
 
 
 def extract_resumed_session_id(command: list[str]) -> str | None:
     """Extract an explicit session/conversation ID from CLI resume arguments across all harnesses."""
     if not command:
         return None
+    prog = Path(command[0]).name.lower()
     tokens = list(command[1:])
     idx = 0
     saw_resume_subcommand = False
@@ -36,12 +38,14 @@ def extract_resumed_session_id(command: list[str]) -> str | None:
         if token == "--":
             break
         for flag in _RESUME_VALUE_FLAGS:
+            if flag == "-s" and prog == "codex":
+                continue
             if token == flag:
                 if idx + 1 < len(tokens):
                     candidate = tokens[idx + 1].strip()
                     if (
                         not candidate.startswith("-")
-                        and candidate.lower() not in {"last", "help"}
+                        and candidate.lower() not in _NON_SESSION_FLAG_VALUES
                         and re.fullmatch(r"[\w-]{1,80}", candidate, flags=re.ASCII)
                     ):
                         return candidate
@@ -51,7 +55,7 @@ def extract_resumed_session_id(command: list[str]) -> str | None:
                 if (
                     candidate
                     and not candidate.startswith("-")
-                    and candidate.lower() not in {"last", "help"}
+                    and candidate.lower() not in _NON_SESSION_FLAG_VALUES
                     and re.fullmatch(r"[\w-]{1,80}", candidate, flags=re.ASCII)
                 ):
                     return candidate
@@ -62,7 +66,7 @@ def extract_resumed_session_id(command: list[str]) -> str | None:
                 candidate = tokens[idx + 1].strip()
                 if (
                     not candidate.startswith("-")
-                    and candidate.lower() not in {"last", "help"}
+                    and candidate.lower() not in _NON_SESSION_FLAG_VALUES
                     and re.fullmatch(r"[\w-]{1,80}", candidate, flags=re.ASCII)
                 ):
                     return candidate
@@ -468,7 +472,7 @@ def _open_herdr_swarm_view(
         [
             shutil.which("node") or "node",
             str(cli),
-            "stooges",
+            "horde",
             "--attach-room",
             room,
             "--view",
@@ -497,7 +501,7 @@ def _find_herdr_peer(base: Path, session_id: str | None, pane_id: str) -> dict[s
     if session_id:
         with contextlib.suppress(Exception):
             peer = mailbox.load(mailbox.peer_path(base, session_id))
-            if isinstance(peer, dict):
+            if isinstance(peer, dict) and not peer.get("isSubagent") and not peer.get("delegatedRun"):
                 return peer
     if not pane_id:
         return None
@@ -506,6 +510,8 @@ def _find_herdr_peer(base: Path, session_id: str | None, pane_id: str) -> dict[s
         for path in sorted((base / "peers").glob("*.json")):
             peer = mailbox.load(path)
             if not isinstance(peer, dict) or not mailbox.valid_peer(peer):
+                continue
+            if peer.get("isSubagent") or peer.get("delegatedRun"):
                 continue
             if peer.get("herdrPaneId") != pane_id:
                 continue
@@ -552,7 +558,7 @@ def _ensure_bound_room(
     if not current_room:
         target_cwd = cwd or os.getcwd()
         created = subprocess.run(
-            [node, str(cli), "stooges", "--engine", engine, "--cwd", target_cwd, "--json"],
+            [node, str(cli), "horde", "--engine", engine, "--cwd", target_cwd, "--json"],
             env=environment,
             capture_output=True,
             text=True,
@@ -860,7 +866,7 @@ def toggle_swarm_view(
             "--",
             shutil.which("node") or "node",
             str(cli),
-            "stooges",
+            "horde",
             "--attach-room",
             current_room,
             "--view",
@@ -1180,7 +1186,7 @@ def main(arguments: list[str]) -> int:
                 "--",
                 shutil.which("node") or "node",
                 str(cli),
-                "stooges",
+                "horde",
                 "--attach-room",
                 room,
                 "--view",
@@ -1198,7 +1204,7 @@ def main(arguments: list[str]) -> int:
         [*base, "has-session", "-t", session], env=environment, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
     if still_running.returncode == 0:
-        reconnect = f"ork stooges --attach-room {room}" if room else f"tmux -L {socket} attach -t {session}"
+        reconnect = f"ork horde --attach-room {room}" if room else f"tmux -L {socket} attach -t {session}"
         print(f"Session detached. Reattach with: {reconnect}")
     return result.returncode
 

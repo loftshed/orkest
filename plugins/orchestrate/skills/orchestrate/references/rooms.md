@@ -6,24 +6,25 @@ billing policy, deadlines, scope and verification. The examples use `ork`; witho
 use `node <plugin-root>/bin/ork.mjs`.
 
 For an interactive coordinator that builds and supervises its own team, use
-[`ork stooges "objective"`](swarm.md). The commands below also work independently.
+[`ork horde "objective"`](swarm.md) (`ork stooges` and `ork hall` are supported aliases). The commands
+below also work independently.
 
 ## Create and dispatch
 
 ```sh
-ork rooms create --id cache-review --title "Cache review" \
+ork hall create --id cache-review --title "Cache review" \
   --cwd /absolute/project --team "claude:haiku,agy:flash,codex:luna:max"
-ork rooms init-task --task-spec /absolute/task-spec.json \
+ork hall init-task --task-spec /absolute/task-spec.json \
   --task-dir /absolute/tasks/cache-review --host claude
-ork rooms dispatch --room cache-review --member haiku-1 \
+ork hall dispatch --room cache-review --member haiku-1 \
   --task-dir /absolute/tasks/cache-review --kind investigation
 ```
 
 Members begin queued: creating a room never starts work. `dispatch` and `launch` may start billable
 work, so dispatch only once the [task specification](brief-template.md) says what you want done.
-Task directories live outside the repository. `ork stooges --preset bug-court` (or `scout-swarm`,
+Task directories live outside the repository. `ork horde --preset bug-court` (or `scout-swarm`,
 `heavy-trifecta`) opens a coordinator with a queued preset team. Add `--json` to create the roster
-without starting a conversation. `ork stooges --attach-room ID --view` shows a live view.
+without starting a conversation. `ork horde --attach-room ID --view` shows a live view.
 
 A room works in one checkout, and the runner's writer lease is exclusive per checkout, so a room runs
 one implementation at a time; other members run as investigation, consultation or challenge.

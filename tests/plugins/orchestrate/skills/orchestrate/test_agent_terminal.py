@@ -109,8 +109,8 @@ class TerminalTests(unittest.TestCase):
                 self.assertEqual(self.native_status(harness, session), "")
                 item = self.footer(harness)
                 self.assertEqual(
-                    (item["name"], item["model"], item["effort"]),
-                    ("snorfle-test-high-footer-aa", "runtime-model", "high"),
+                    (item["name"], item["fullName"], item["model"], item["effort"]),
+                    ("snorfle", "snorfle-test-high-footer-aa", "runtime-model", "high"),
                 )
 
     def test_binding_before_registration_does_not_create_presence(self):
@@ -118,7 +118,7 @@ class TerminalTests(unittest.TestCase):
         self.assertIsNone(self.footer("claude"))
         self.assertFalse(mailbox.peer_path(self.base, "not-registered").exists())
         self.peer("not-registered", "claude")
-        self.assertEqual(self.footer("claude")["name"], "snorfle-test-high-footer-aa")
+        self.assertEqual(self.footer("claude")["name"], "snorfle")
 
     def test_session_switches_and_late_cleanup_cannot_clear_the_new_session(self):
         for session in ("first", "second"):
@@ -126,7 +126,7 @@ class TerminalTests(unittest.TestCase):
             mailbox.annotate(self.base, session, name="agent-" + session)
             self.native_status("opencode", session)
         self.native_status("opencode", "first", clear=True)
-        self.assertEqual(self.footer("opencode")["name"], "agent-second")
+        self.assertEqual(self.footer("opencode")["fullName"], "agent-second")
         self.native_status("opencode", "second", clear=True)
         self.assertIsNone(self.footer("opencode"))
 
@@ -135,7 +135,7 @@ class TerminalTests(unittest.TestCase):
         self.native_status("claude", "main")
         self.peer("other", "gemini")
         self.native_status("gemini", "other", extra_environment={"ORKEST_TERMINAL_HARNESS": "claude"})
-        self.assertEqual(self.footer("claude")["name"], "snorfle-test-high-footer-aa")
+        self.assertEqual(self.footer("claude")["name"], "snorfle")
         self.native_status("claude", "other", extra_environment={"TMUX": "/tmp/another-server,1,0"})
         self.assertEqual(self.footer("claude")["model"], "runtime-model")
         self.assertIsNone(self.footer("gemini"))
@@ -161,7 +161,7 @@ class TerminalTests(unittest.TestCase):
         )
         self.assertEqual(
             output,
-            f"snorfle-test-high-footer-aa | — / — | repo : {self.home.name} | stage : not set | goal : not set | task : not set\n",
+            f"snorfle | — / — | repo : {self.home.name} | stage : not set | goal : not set | task : not set\n",
         )
         self.assertIsNone(self.footer("claude"))
 
@@ -184,8 +184,8 @@ class TerminalTests(unittest.TestCase):
             env={**self.native, "ORKEST_TERMINAL_HARNESS": "claude"},
             text=True,
         )
-        self.assertEqual(json.loads(output)["name"], "other-agent")
-        self.assertEqual(self.footer("claude")["name"], "snorfle-test-high-footer-aa")
+        self.assertEqual(json.loads(output)["name"], "other")
+        self.assertEqual(self.footer("claude")["name"], "snorfle")
 
     def test_all_four_launchers_render_the_same_outer_footer(self):
         for executable, harness in (
@@ -314,6 +314,88 @@ class TerminalTests(unittest.TestCase):
         self.assertEqual(stored["herdrWorkspaceId"], "w1")
         self.assertNotIn("herdrSocket", stored)
         self.assertNotIn("terminalServer", stored)
+
+    def test_herdr_bind_syncs_pane_metadata_and_refuses_subagents(self):
+        from unittest import mock
+
+        session = "herdr-sync-session"
+        self.peer(session, "claude")
+        peer_data = mailbox.load(mailbox.peer_path(self.base, session))
+        progress.report(self.base, peer_data, goal="Ship Herdr", task="Sync title", stage="working", role="Builder")
+        herdr_env = {
+            **self.environment,
+            "HERDR_ENV": "1",
+            "HERDR_PANE_ID": "w1:p9",
+            "HERDR_WORKSPACE_ID": "w1",
+            "ORKEST_TERMINAL_HARNESS": "claude",
+        }
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        old_environ = os.environ.copy()
+        try:
+            os.environ.clear()
+            os.environ.update(herdr_env)
+            with (
+                mock.patch.object(agent_terminal.shutil, "which", return_value="/usr/local/bin/herdr"),
+                mock.patch.object(agent_terminal.subprocess, "run", side_effect=fake_run),
+            ):
+                self.assertTrue(agent_terminal.bind(session, "claude", {"model": "claude-sonnet"}))
+                # Second bind with unchanged title does not re-run herdr pane report-metadata
+                self.assertTrue(agent_terminal.bind(session, "claude", {"model": "claude-sonnet"}))
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(
+                calls[0],
+                [
+                    "herdr",
+                    "pane",
+                    "report-metadata",
+                    "--source",
+                    "orkest",
+                    "--title",
+                    "snorfle · working",
+                    "--display-agent",
+                    "builder · claude-sonnet",
+                    "w1:p9",
+                ],
+            )
+            stored = mailbox.load(mailbox.peer_path(self.base, session))
+            self.assertEqual(stored["herdrSyncedTitle"], "snorfle · working|builder · claude-sonnet")
+
+            # In Herdr (without ORKEST_TERMINAL_SERVER), --native-status still emits the native statusline
+            herdr_status_out = subprocess.check_output(
+                [
+                    sys.executable,
+                    "-B",
+                    str(SCRIPTS / "agent_statusline.py"),
+                    "--native-status",
+                    "--session",
+                    session,
+                    "--harness",
+                    "claude",
+                    "--json",
+                    "--width",
+                    "120",
+                ],
+                env=herdr_env,
+                text=True,
+            )
+            self.assertEqual(json.loads(herdr_status_out)["name"], "snorfle")
+
+            # Subagent peer is refused by bind()
+            sub_session = "herdr-subagent"
+            self.peer(sub_session, "gemini")
+            mailbox.annotate(self.base, sub_session, isSubagent=True)
+            os.environ["ORKEST_TERMINAL_HARNESS"] = "gemini"
+            self.assertFalse(agent_terminal.bind(sub_session, "gemini", {"model": "gemini-pro"}))
+            sub_stored = mailbox.load(mailbox.peer_path(self.base, sub_session))
+            self.assertNotIn("herdrPaneId", sub_stored)
+        finally:
+            os.environ.clear()
+            os.environ.update(old_environ)
 
     def test_herdr_direct_launch_bypasses_nested_tmux(self):
         info = self.home / "herdr-claude.json"

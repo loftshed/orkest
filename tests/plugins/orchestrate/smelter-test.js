@@ -6,10 +6,12 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   bootstrapWorktreeInclude,
   DEFAULT_ROUTES,
+  enforceScopedVerifyCommand,
   factoryCommand,
   parseIssueDependencies,
   planBatch,
   poolSummary,
+  resolveFoundryStatePath,
   resolveTaskSpecPath,
 } from "../../../plugins/orchestrate/lib/factory.mjs";
 import {
@@ -281,6 +283,126 @@ describe("foundry re-exports and factory fixes", () => {
       await readFile(path.join(gitDir, "orkest", "task-spec.json"), "utf8"),
     );
     expect(writtenSpec.objective).toBe("Fix factory execution args");
+  });
+
+  it("enforces --maxWorkers=2 on vitest/jest verification commands and records foundry verification state", async () => {
+    expect(enforceScopedVerifyCommand("vitest run tests/plugins/orchestrate/smelter-test.js")).toBe(
+      "vitest run tests/plugins/orchestrate/smelter-test.js --maxWorkers=2",
+    );
+    expect(
+      enforceScopedVerifyCommand(
+        "vitest run tests/plugins/orchestrate/smelter-test.js --maxWorkers=4",
+      ),
+    ).toBe("vitest run tests/plugins/orchestrate/smelter-test.js --maxWorkers=4");
+    expect(enforceScopedVerifyCommand("jest tests/foo.test.js -w 2")).toBe(
+      "jest tests/foo.test.js -w 2",
+    );
+    expect(enforceScopedVerifyCommand("eslint tests/vitest-helper.js")).toBe(
+      "eslint tests/vitest-helper.js",
+    );
+    expect(enforceScopedVerifyCommand("pytest tests/ -n 2")).toBe("pytest tests/ -n 2");
+
+    const rootDir = await makeTempDir("ork-foundry-verify-");
+    const repoRoot = path.join(rootDir, "repo");
+    const worktreePath = path.join(rootDir, "wt-issue-72");
+    const gitDir = path.join(rootDir, "gitdir-wt-72");
+    await mkdir(repoRoot, { recursive: true });
+    await mkdir(worktreePath, { recursive: true });
+    await mkdir(gitDir, { recursive: true });
+    await writeFile(path.join(worktreePath, ".git"), `gitdir: ${gitDir}\n`);
+    await writeFile(
+      path.join(gitDir, "orkest.json"),
+      JSON.stringify({ branch: "feat/issue-72", disposable: true, issue: 72 }),
+    );
+
+    expect(resolveFoundryStatePath(worktreePath)).toBe(
+      path.join(gitDir, "orkest", "foundry-state.json"),
+    );
+
+    const now = Date.now();
+    const mockAccounts = [
+      {
+        fetchedAt: now,
+        id: "codex-work",
+        label: "Codex Work",
+        ok: true,
+        pools: [{ families: ["gpt"], id: "codex", label: "Codex", windowIds: ["wk"] }],
+        provider: "codex",
+        route: "--engine codex",
+        windows: [
+          {
+            id: "wk",
+            label: "Weekly",
+            remainingPct: 85,
+            resetsAt: now + 3 * 24 * 3600 * 1000,
+            windowMins: 10_080,
+          },
+        ],
+      },
+    ];
+    const mockIssues = [
+      {
+        body: [
+          "```json task-spec",
+          JSON.stringify({
+            allow_paths: ["plugins/orchestrate/lib/factory.mjs"],
+            development_checks: ["vitest run tests/plugins/orchestrate/smelter-test.js"],
+            objective: "Verify foundry gate",
+            schema: "agent-executor.task-spec.v1",
+          }),
+          "```",
+        ].join("\n"),
+        labels: [{ name: "agent:ready" }],
+        number: 72,
+        title: "Scoped foundry verification",
+      },
+    ];
+
+    const verifyCalls = [];
+    const stdout = { columns: 120, isTTY: false, write: () => {} };
+    const failedResult = await foundryRun(
+      [
+        "--verify",
+        "vitest run tests/plugins/orchestrate/smelter-test.js",
+        "--acceptance",
+        "Scoped Vitest check passes with maxWorkers=2",
+        "--json",
+      ],
+      {
+        cwd: repoRoot,
+        execAgentFn: async () => ({ status: "COMPLETE" }),
+        execGhFn: async () => mockIssues,
+        execVerifyFn: async (cmd, ctx) => {
+          verifyCalls.push({ cmd, ctx });
+          return { exitCode: 1, ok: false, output: "1 test failed" };
+        },
+        getAccountsFn: async () => mockAccounts,
+        provisionWorktreeFn: async () => worktreePath,
+        stdout,
+      },
+    );
+
+    expect(verifyCalls).toEqual([
+      {
+        cmd: "vitest run tests/plugins/orchestrate/smelter-test.js --maxWorkers=2",
+        ctx: { cwd: worktreePath, issue: 72 },
+      },
+    ]);
+    expect(failedResult.verification).toMatchObject({
+      acceptanceCriteria: ["Scoped Vitest check passes with maxWorkers=2"],
+      command: "vitest run tests/plugins/orchestrate/smelter-test.js --maxWorkers=2",
+      exitCode: 1,
+      ok: false,
+      status: "failed",
+    });
+
+    const savedState = JSON.parse(await readFile(resolveFoundryStatePath(worktreePath), "utf8"));
+    expect(savedState).toMatchObject({
+      acceptanceCriteria: ["Scoped Vitest check passes with maxWorkers=2"],
+      schema: "ork.foundry.state.v1",
+      status: "verification_failed",
+      verifyCommand: "vitest run tests/plugins/orchestrate/smelter-test.js --maxWorkers=2",
+    });
   });
 });
 

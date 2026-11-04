@@ -17,8 +17,8 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
 import { shouldUseColor } from "../../monitor/lib/render.mjs";
-import { resolveWorktreeMarkerPath } from "./stooges-room.mjs";
-import { glyphSet, glyphTier, renderPanel, renderTable } from "./stooges-view.mjs";
+import { resolveWorktreeMarkerPath } from "./horde-room.mjs";
+import { glyphSet, glyphTier, renderPanel, renderTable } from "./horde-view.mjs";
 
 const scriptsDir = fileURLToPath(new URL("../skills/orchestrate/scripts/", import.meta.url));
 

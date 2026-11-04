@@ -199,7 +199,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         help="Claude account profile for --engine claude; choosing a profile chooses its billing",
     )
-    parser.add_argument("--billing-mode", choices=("unknown", "subscription", "api"), default="unknown")
+    parser.add_argument(
+        "--billing-mode",
+        choices=("unknown", "subscription", "personal_subscription", "api"),
+        default="unknown",
+    )
     parser.add_argument("--ignore-quota", action="store_true", help="Ask even when monitor reports the pool exhausted")
     parser.add_argument(
         "--allow-credits",
@@ -489,9 +493,11 @@ def resolve_route(args: argparse.Namespace, previous: dict[str, Any] | None) -> 
         raise _error(f"unknown --route {route_name!r}; configured: {', '.join(sorted(routes))}")
     engine = args.engine
     if args.model and not engine:
+        base_model, _ = runner.split_opencode_model(None, args.model)
+        assert base_model is not None
         families = runner.load_model_families()
-        parsed = runner.families_module().parse_selector(args.model, families)
-        engine = families[parsed[0]]["engine"] if parsed else runner.native_engine_for(args.model)
+        parsed = runner.families_module().parse_selector(base_model, families)
+        engine = families[parsed[0]]["engine"] if parsed else runner.native_engine_for(base_model)
         if engine is None:
             raise _error(f"cannot tell which engine runs {args.model!r}; pass --engine")
     namespace = argparse.Namespace(
@@ -776,18 +782,21 @@ def consult_command(
             command.append(f"--print={prompt_path.read_text(encoding='utf-8')}")
         return command
     version = executor_version or runner.get_cached_cli_version(executable, runner.executor_environment("opencode"))
+    base_model, inline_variant = runner.split_opencode_model("opencode", model)
+    assert base_model is not None
+    effective_variant = variant or inline_variant
     command = [executable, "run"]
     if session_id:
         command += ["--session", session_id]
     if runner.opencode_major_version(version) >= 2:
         # A private server honors this run's configuration; the shared service would ignore it.
-        command += ["--standalone", "--model", f"{model}#{variant}" if variant else model]
+        command += ["--standalone", "--model", f"{base_model}#{effective_variant}" if effective_variant else base_model]
     else:
         command += [
             "--model",
-            model,
+            base_model,
             "--variant",
-            variant or runner.DEFAULT_OPENCODE_VARIANT,
+            effective_variant or runner.DEFAULT_OPENCODE_VARIANT,
             "--pure",
             "--dir",
             str(workspace),
@@ -986,8 +995,9 @@ def preflight(request: dict[str, Any]) -> tuple[str, str, str, str, dict[str, An
     runner = _runner()
     support = runner.bundled_module("execution_support")
     engine = request["engine"]
+    requested_model, inline_variant = runner.split_opencode_model(engine, request["model"])
     executable, version, _available, model, selection, catalog = runner.executor_preflight(
-        engine, request["model"], refresh=request.get("refresh_models", False)
+        engine, requested_model, refresh=request.get("refresh_models", False)
     )
     try:
         effort = support.bind_effort(engine, model, request.get("effort"), catalog)
@@ -995,7 +1005,7 @@ def preflight(request: dict[str, Any]) -> tuple[str, str, str, str, dict[str, An
         raise _error(str(exc)) from exc
     variant = request.get("variant")
     if engine == "opencode":
-        variant = variant or runner.DEFAULT_OPENCODE_VARIANT
+        variant = variant or inline_variant or request.get("effort") or runner.DEFAULT_OPENCODE_VARIANT
     elif variant:
         raise _error("--variant is only valid with --engine opencode")
     return executable, version, model, selection, catalog, effort, variant
@@ -1198,6 +1208,14 @@ def _perform(
                     raise _error(str(exc), EXIT_LEASE_HELD) from exc
             stdout_handle = stack.enter_context(runner.open_private_binary(stdout_path))
             stderr_handle = stack.enter_context(runner.open_private_binary(stderr_path))
+            credits_watch = (
+                runner.CodexCreditsWatch(
+                    environment,
+                    lambda: runner.executor_session_so_far("codex", stdout_path, log_path) or session_id,
+                )
+                if engine == "codex" and not request.get("allow_credits", False)
+                else None
+            )
             process = subprocess.Popen(
                 command,
                 cwd=workspace,
@@ -1206,14 +1224,6 @@ def _perform(
                 stdout=stdout_handle,
                 stderr=stderr_handle,
                 start_new_session=True,
-            )
-            credits_watch = (
-                runner.CodexCreditsWatch(
-                    environment,
-                    lambda: runner.executor_session_so_far("codex", stdout_path, log_path) or session_id,
-                )
-                if engine == "codex" and not request.get("allow_credits", False)
-                else None
             )
             with runner.forward_termination_signals(process):
                 timed_out = runner.wait_with_heartbeats(

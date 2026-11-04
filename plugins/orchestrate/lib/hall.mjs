@@ -6,5 +6,5 @@
  * branches, disposable worktree metadata (`ork hall worktree-keep`), and
  * direct Node.js observation of peer/progress/task JSON state.
  */
+export * from "./horde-room.mjs";
 export * from "./rooms.mjs";
-export * from "./stooges-room.mjs";

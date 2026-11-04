@@ -84,10 +84,11 @@ def parse(value: Any) -> dt.datetime | None:
         return None
 
 
-def eligible(peer: dict[str, Any]) -> tuple[bool, str]:
+def eligible(peer: dict[str, Any], *, base: Path | None = None) -> tuple[bool, str]:
     """Whether a retry may go out now: strictly idle, and its last turn did not end in a parking stop."""
     if (reason := peer.get("lastStopReason")) in PARKED:
         return False, f"its last turn ended with {reason}; waiting for its user's next prompt"
+    mailbox_wake.reconcile_runtime_state(base, peer)
     if peer.get("state") != "idle":
         return False, f"recipient is {peer.get('state') or 'in an unknown state'}"
     return True, ""
@@ -148,7 +149,7 @@ def reconcile_one(
                 if messages_changed:
                     mailbox.write(path, intent)
                 return None
-        ready, reason = eligible(peer)
+        ready, reason = eligible(peer, base=base)
         if not ready:
             # Not an attempt: check again later without spending the attempt budget.
             intent.update(state="pending", nextAt=later(moment, BACKOFF[0]), lastReason=reason)

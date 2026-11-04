@@ -76,6 +76,8 @@ def bind_effort(engine: str, model: str, requested: str | None, catalog: dict[st
         if requested not in ("low", "medium", "high", "xhigh", "max"):
             raise ContractError("Claude effort must be one of low, medium, high, xhigh, max")
         result.update(bound=requested, binding="claude --effort")
+    elif engine == "opencode" and requested is not None:
+        result.update(bound=requested, binding="opencode_variant")
     elif requested is not None:
         raise ContractError("--effort is supported for Codex, AGY and Claude; use --variant for OpenCode")
     return result

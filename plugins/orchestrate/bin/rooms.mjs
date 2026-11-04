@@ -1,6 +1,7 @@
 import path from "node:path";
 import { parseArgs } from "node:util";
 
+import { loadPresets, mailboxRoot, parseTeam, updateRoom } from "../lib/horde-room.mjs";
 import {
   assignWorkforceRole,
   bindSession,
@@ -16,7 +17,6 @@ import {
   recoverRoom,
   reserveLead,
 } from "../lib/rooms.mjs";
-import { loadPresets, mailboxRoot, parseTeam, updateRoom } from "../lib/stooges-room.mjs";
 
 export const ROOMS_HELP = `ork rooms list [--json]
 ork rooms show --room ID [--json]

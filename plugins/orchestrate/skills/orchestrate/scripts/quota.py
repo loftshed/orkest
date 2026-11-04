@@ -116,48 +116,76 @@ def assess(lane: dict[str, Any]) -> str:
         # Old data saying there is room may hide a pool that has since moved onto credits.
         return "unknown"
     usable = lane.get("availableNowPct")
-    if usable is None or not isinstance(usable, (int, float)) or isinstance(usable, bool):
+    if usable is None or not isinstance(usable, int | float) or isinstance(usable, bool):
         return "unknown"
     if usable < LOW_USABLE_PCT:
         return "low"
     return "available"
 
 
-def _match_claude_lane(lanes: list[dict[str, Any]], claude_config_dir: str | Path | None) -> dict[str, Any]:
+def _lane_haystack(lane: dict[str, Any]) -> str:
+    return " ".join(str(lane.get(k) or "") for k in ("accountId", "label", "billing", "name")).lower()
+
+
+def _prefer_claude_pool(candidates: list[dict[str, Any]], model: str | None) -> dict[str, Any]:
+    target_pool = "fable" if model and "fable" in model.lower() else "all"
+    for lane in candidates:
+        if lane.get("poolId") == target_pool:
+            return lane
+    return candidates[0]
+
+
+def _match_claude_lane(
+    lanes: list[dict[str, Any]],
+    claude_config_dir: str | Path | None = None,
+    *,
+    model: str | None = None,
+) -> dict[str, Any]:
     # executor_environment("claude") strips inherited CLAUDE_CONFIG_DIR unless --claude-config-dir is passed.
     effective = str(claude_config_dir) if claude_config_dir else None
     if len(lanes) > 1:
         if effective:
             name = Path(effective).name.lower()
-            for lane in lanes:
-                if (
-                    lane.get("config_dir")
-                    and Path(str(lane["config_dir"])).expanduser() == Path(effective).expanduser()
-                ):
-                    return lane
+            exact = [
+                lane
+                for lane in lanes
+                if lane.get("config_dir") and Path(str(lane["config_dir"])).expanduser() == Path(effective).expanduser()
+            ]
+            if exact:
+                return _prefer_claude_pool(exact, model)
             is_personal = "personal" in name or "plaude" in name
             is_work = "work" in name or name == ".claude"
             profile_name = name.lstrip(".")
             short_profile = profile_name.removeprefix("claude-")
+            matched: list[dict[str, Any]] = []
             for lane in lanes:
-                haystack = " ".join(str(lane.get(k) or "") for k in ("accountId", "label", "billing", "name")).lower()
-                if is_personal and ("personal" in haystack or "plaude" in haystack):
-                    return lane
-                if is_work and not is_personal and ("work" in haystack or "personal" not in haystack):
-                    return lane
+                haystack = _lane_haystack(lane)
                 if (
-                    profile_name
-                    and profile_name != "claude"
-                    and (profile_name in haystack or (short_profile and short_profile in haystack))
+                    (is_personal and ("personal" in haystack or "plaude" in haystack))
+                    or (is_work and not is_personal and ("work" in haystack or "personal" not in haystack))
+                    or (
+                        profile_name
+                        and profile_name != "claude"
+                        and (profile_name in haystack or (short_profile and short_profile in haystack))
+                    )
                 ):
-                    return lane
+                    matched.append(lane)
+            if matched:
+                first_account = matched[0].get("accountId")
+                same_account = [lane for lane in matched if lane.get("accountId") == first_account]
+                return _prefer_claude_pool(same_account or matched, model)
         else:
             # Unset CLAUDE_CONFIG_DIR runs against Claude Code's default profile (~/.claude), not personal.
-            for lane in lanes:
-                haystack = " ".join(str(lane.get(k) or "") for k in ("accountId", "label", "billing", "name")).lower()
-                if "personal" not in haystack and "plaude" not in haystack:
-                    return lane
-    return lanes[0]
+            non_personal = [
+                lane
+                for lane in lanes
+                if "personal" not in _lane_haystack(lane) and "plaude" not in _lane_haystack(lane)
+            ]
+            if non_personal:
+                first_account = non_personal[0].get("accountId")
+                same_account = [lane for lane in non_personal if lane.get("accountId") == first_account]
+                return _prefer_claude_pool(same_account or non_personal, model)
+    return _prefer_claude_pool(lanes, model)
 
 
 def check(
@@ -183,7 +211,7 @@ def check(
         ]
         detail = failed[0].get("advice") if failed else f"monitor has no pool for {engine} {model}"
         return {"status": "unknown", "detail": detail}
-    lane = _match_claude_lane(lanes, claude_config_dir) if engine == "claude" else lanes[0]
+    lane = _match_claude_lane(lanes, claude_config_dir, model=model) if engine == "claude" else lanes[0]
     return {"status": assess(lane), **summary(lane)}
 
 
@@ -431,14 +459,17 @@ def access_records(
     observed_at = dt.datetime.now(dt.UTC).isoformat()
     records = []
     for profile in registry.get("profiles", []):
+        profile_engine = profile.get("engine")
         for model in profile.get("model_ids", []):
             engine = (
-                "codex"
+                profile_engine
+                if profile_engine in DISPATCHABLE
+                else "codex"
                 if model.startswith("gpt")
                 else "agy"
                 if model.startswith("gemini")
                 else "claude"
-                if model.startswith("claude")
+                if model.startswith("claude") or model in {"opus", "sonnet", "haiku", "fable"}
                 else None
             )
             if engine is None or (engine not in DISPATCHABLE and engine != host):

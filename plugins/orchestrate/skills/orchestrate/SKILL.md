@@ -157,7 +157,7 @@ and conventions, decisions to preserve, failed attempts and evidence pointers (t
 would change it. Never send secrets, credentials or unrelated private files; the brief goes to the
 model provider. Read [references/coordinator.md](references/coordinator.md) for consultation,
 correction, Pointdexter evidence checks, or recovery across turns, and
-[references/rooms.md](references/rooms.md) to run a team of members (`ork rooms`, swarm presets).
+[references/rooms.md](references/rooms.md) to run a team of members (`ork hall` / `ork rooms`, swarm presets).
 When the user appoints a lead for a team, follow
 [coordinator.md#team-lead-and-succession](references/coordinator.md#team-lead-and-succession): pass
 your `--lead-session`/`--lead-generation`, hand over before you stop or run out of quota, and as a
@@ -330,12 +330,12 @@ identify the conductor's edits, and run checks affected by those edits. "Almost 
 the acceptance criteria. Scope or history violations require rejection and do not permit resuming
 that run; inspect any proposed changes independently before deciding what can be retained.
 
-## Command a Stooges swarm
+## Command a Horde swarm
 
-Use `run_agent.py stooges "objective"` or `node <plugin-root>/bin/ork.mjs stooges "objective"`
-to open a coordinator conversation beside its live swarm tree. The default coordinator is Codex;
-`--engine claude|agy|opencode` selects another installed harness with its configured account and
-permissions. Interactive launch requires Node.js and tmux on `PATH`.
+Use `run_agent.py horde "objective"` or `node <plugin-root>/bin/ork.mjs horde "objective"`
+(`stooges` remains a supported alias) to open a coordinator conversation beside its live swarm tree.
+The default coordinator is Codex; `--engine claude|agy|opencode` selects another installed harness
+with its configured account and permissions. Interactive launch requires Node.js and tmux on `PATH`.
 
 Read [references/swarm.md](references/swarm.md) when coordinating one. Native leads can organize
 subswarms within one room's shared agent and depth limits. Leaf work retains the coordinator's
@@ -344,21 +344,22 @@ worker jobs. Native leads stay in their parent's harness; workers can use other 
 
 ```bash
 # Start a coordinator with a queued custom team or preset.
-python3 <skill-directory>/scripts/run_agent.py stooges --team 'claude:haiku*2,agy:flash*2,codex:luna:max'
-node plugins/orchestrate/bin/ork.mjs stooges --preset scout-swarm
+python3 <skill-directory>/scripts/run_agent.py horde --team 'claude:haiku*2,agy:flash*2,codex:luna:max'
+node plugins/orchestrate/bin/ork.mjs horde --preset scout-swarm
 
 # Observe an existing room without starting or rejoining a conversation.
-node plugins/orchestrate/bin/ork.mjs stooges --attach-room ROOM_ID --view
-python3 <skill-directory>/scripts/run_agent.py stooges spawn --attach-room ROOM_ID --team 'codex:luna:max'
+node plugins/orchestrate/bin/ork.mjs horde --attach-room ROOM_ID --view
+python3 <skill-directory>/scripts/run_agent.py horde spawn --attach-room ROOM_ID --team 'codex:luna:max'
 
 # Offline fixture inspection and formatting
-node plugins/orchestrate/bin/ork.mjs stooges --fixture /path/to/room.json --print --width 120
+node plugins/orchestrate/bin/ork.mjs horde --fixture /path/to/room.json --print --width 120
 ```
 
 `--json` outputs room JSON, `--print` renders one frame, and `--fixture` reads saved state offline.
 None starts models. Rooms use `agent-executor.room.v1` under `<agent-executor cache>/mailbox-v1/rooms/`.
 `--attach-room ID` reconnects to a live coordinator; add `--view` to observe only. Closing a view
-does not cancel workers. Use `ork rooms add --parent MEMBER` to place workers beneath a native lead.
+does not cancel workers. Use `ork hall add --parent MEMBER` (`ork rooms` is a supported alias) to
+place workers beneath a native lead.
 
 ## Probe a candidate patch
 

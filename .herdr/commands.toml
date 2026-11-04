@@ -1,0 +1,41 @@
+# Orkest Command Palette & Shortcuts for Herdr
+
+[[commands]]
+id = "orkest.toggle-horde-view"
+title = "Toggle Horde View"
+description = "Open or close the live Orkest Horde View split pane in the current terminal"
+command = "ork horde toggle"
+type = "shell"
+key = "prefix+alt+h"
+width = "40%"
+height = "100%"
+
+[[commands]]
+id = "orkest.quota-radar"
+title = "Quota Radar"
+description = "Inspect subscription quota pools, model release radar, and 14-day rolling telemetry"
+command = "ork radar"
+type = "popup"
+key = "prefix+alt+r"
+width = "85%"
+height = "80%"
+
+[[commands]]
+id = "orkest.smelter-audit"
+title = "Smelter Audit"
+description = "Run the 4-stage worktree verification, cold-review, and merge queue audit"
+command = "ork smelter status"
+type = "popup"
+key = "prefix+alt+s"
+width = "85%"
+height = "80%"
+
+[[commands]]
+id = "orkest.foundry-status"
+title = "Foundry Status"
+description = "Show spare-token issue harvester status, active worktree dispatches, and evaluation gates"
+command = "ork foundry status"
+type = "popup"
+key = "prefix+alt+f"
+width = "85%"
+height = "80%"

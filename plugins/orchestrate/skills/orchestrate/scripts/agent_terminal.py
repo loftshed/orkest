@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -49,15 +50,62 @@ def bind(session: str, harness: str | None, payload: dict[str, Any]) -> bool:
         return False
     try:
         mailbox.session_key(session)
+        base = mailbox.root()
+        peer_data: dict[str, Any] | None = None
+        with contextlib.suppress(Exception):
+            loaded = mailbox.load(mailbox.peer_path(base, session))
+            if isinstance(loaded, dict):
+                peer_data = loaded
+        if isinstance(peer_data, dict) and (peer_data.get("isSubagent") or peer_data.get("delegatedRun")):
+            return False
         annotations: dict[str, Any] = {}
-        if target:
+        if target and (not isinstance(peer_data, dict) or peer_data.get("terminalServer") != target[0]):
             annotations["terminalServer"] = target[0]
         if herdr:
             pane_id, workspace_id = herdr
-            annotations["herdrPaneId"] = pane_id
-            if workspace_id:
+            if not isinstance(peer_data, dict) or peer_data.get("herdrPaneId") != pane_id:
+                annotations["herdrPaneId"] = pane_id
+            if workspace_id and (not isinstance(peer_data, dict) or peer_data.get("herdrWorkspaceId") != workspace_id):
                 annotations["herdrWorkspaceId"] = workspace_id
-        base = mailbox.root()
+            if isinstance(peer_data, dict):
+                person = peer_data.get("person")
+                raw_name = peer_data.get("name")
+                short_name = (
+                    raw_name.split("-", 1)[0].strip()
+                    if isinstance(raw_name, str) and raw_name.strip()
+                    else (person.strip() if isinstance(person, str) and person.strip() else "")
+                )
+                stage = ""
+                role = ""
+                with contextlib.suppress(Exception):
+                    import agent_progress
+
+                    progress = agent_progress.read(base, peer_data)
+                    if isinstance(progress, dict):
+                        stage = str(progress.get("stage") or "").strip()
+                        role = str(progress.get("role") or "").strip()
+                title = f"{short_name} · {stage}" if short_name and stage else short_name
+                raw_model = peer_data.get("model") or payload.get("model")
+                if isinstance(raw_model, dict):
+                    raw_model = raw_model.get("display_name") or raw_model.get("id") or ""
+                model_str = str(raw_model or "").strip()
+                display_agent = " · ".join(part for part in (role, model_str) if part)
+                sync_key = f"{title}|{display_agent}" if display_agent else title
+                if title and peer_data.get("herdrSyncedTitle") != sync_key and shutil.which("herdr"):
+                    cmd = ["herdr", "pane", "report-metadata", "--source", "orkest", "--title", title]
+                    if display_agent:
+                        cmd.extend(["--display-agent", display_agent])
+                    cmd.append(pane_id)
+                    with contextlib.suppress(OSError, subprocess.SubprocessError):
+                        res = subprocess.run(
+                            cmd,
+                            capture_output=True,
+                            text=True,
+                            timeout=0.5,
+                            check=False,
+                        )
+                        if getattr(res, "returncode", 1) == 0:
+                            annotations["herdrSyncedTitle"] = sync_key
         if annotations:
             with contextlib.suppress(Exception):
                 mailbox.annotate(base, session, **annotations)
@@ -65,7 +113,6 @@ def bind(session: str, harness: str | None, payload: dict[str, Any]) -> bool:
         with contextlib.suppress(Exception):
             import agent_statusline_tmux
 
-            peer_data = mailbox.load(mailbox.peer_path(base, session))
             aliases = (
                 peer_data.get("aliases")
                 if isinstance(peer_data, dict) and isinstance(peer_data.get("aliases"), list)

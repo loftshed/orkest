@@ -5,7 +5,7 @@ Cross-harness consultation, bounded task delegation, project-scoped peer messagi
 - **Native-first routing:** Every hosted frontier model runs through its vendor's own CLI (`codex` for GPT, `agy` for Gemini, `claude` for Claude Code); `opencode` is used only for open-weight models on OpenRouter (sending a hosted model to `opencode` exits 17). Within the same harness and account, agents use their host's built-in subagent and messaging tools; `orchestrate` and `peer-mailbox` cross harness or account/billing boundaries.
 - **Bounded execution:** Delegated runs hold a POSIX worktree lease, enforce allowed file scopes, verify that Git history (`HEAD`, branch, reflog, stash) is untouched by the worker, check live quota via [`monitor`](../monitor/README.md), and run deterministic verification gates outside the model after handoff.
 
-Requires Python 3.11+, Node.js 22+ (for `ork` and `stooges`), `git`, and at least one installed and authenticated harness CLI.
+Requires Python 3.11+, Node.js 22+ (for `ork` and `horde`), `git`, and at least one installed and authenticated harness CLI.
 
 ## Install
 
@@ -87,10 +87,10 @@ work item has the same title. A session without a matching mailbox record has no
 For example, after creating a room with a descriptive `--title`, bind the interactive conductor:
 
 ```sh
-ork rooms bind --room ROOM_ID --member conductor --engine codex --session SESSION_ID
+ork hall bind --room ROOM_ID --member conductor --engine codex --session SESSION_ID
 ```
 
-Bind other members using their member IDs and engines. See [rooms](skills/orchestrate/references/rooms.md)
+Bind other members using their member IDs and engines (`ork rooms` is a supported alias for `ork hall`). See [rooms](skills/orchestrate/references/rooms.md)
 and the [workboard](skills/orchestrate/references/workboard.md) for creating rooms, binding sessions,
 and recording work. The footer only reads these records; it does not create assignments or advance
 task stages.
@@ -157,7 +157,7 @@ python3 <scripts>/run_agent.py routes                         # effective role -
 python3 <scripts>/run_agent.py families                       # live resolution of family selectors (gpt:sol, gemini:fast, claude:best, …)
 python3 <scripts>/run_agent.py models --engine codex --match sol  # query cached/live CLI model catalog (always filter with --match)
 python3 <scripts>/run_agent.py quota                          # live quota per route from monitor, plus OpenRouter credit balance
-node <checkout>/plugins/orchestrate/bin/ork.mjs --help        # rooms, stooges TUI, routes, quota, telemetry, and session naming
+node <checkout>/plugins/orchestrate/bin/ork.mjs --help        # hall/rooms, horde/stooges TUI, foundry, smelter, radar, routes, quota, telemetry, and session naming
 ```
 
 Routes are configured in `~/.config/agent-executor/config.json` (`run_agent.py init` writes a starter file) overlaid on [`routes.default.json`](skills/orchestrate/references/routes.default.json). Model selectors (`family` or `family:tier` from [`families.json`](skills/orchestrate/references/families.json)) resolve against the live catalog so model upgrades do not require config edits. For task archetypes and route tiers, see [`archetype-rationale.md`](skills/orchestrate/references/archetype-rationale.md).
@@ -235,20 +235,21 @@ For persistent headless Claude or Antigravity workers that should wake automatic
 
 Details: [`skills/orchestrate/references/coordinator.md`](skills/orchestrate/references/coordinator.md).
 
-### Swarm rooms and Stooges TUI (`ork`)
+### Swarm rooms and Horde TUI (`ork`)
 
-`ork stooges` opens a coordinator conversation beside a live swarm tree. Give it an objective;
-the coordinator assigns workers and can appoint native subswarm leads. All branches share the
-room's agent and depth limits. Workers use the existing dispatch, evidence and review workflow.
+`ork horde` (`ork stooges` is a supported alias) opens a coordinator conversation beside a live
+swarm tree. Give it an objective; the coordinator assigns workers and can appoint native subswarm
+leads (`ork hall`, alias `ork rooms`). All branches share the room's agent and depth limits.
+Workers use the existing dispatch, evidence and review workflow.
 
 ```sh
 ork agy      # open Antigravity, then describe your goal in the conversation
 ork codex    # open Codex
 ork claude   # open Claude Code
-ork stooges "Investigate the cache failure and prepare a tested fix"
-ork stooges --engine claude --max-agents 8
-ork stooges --attach-room <room-id>
-ork stooges --attach-room <room-id> --view
+ork horde "Investigate the cache failure and prepare a tested fix"
+ork horde --engine claude --max-agents 8
+ork horde --attach-room <room-id>
+ork horde --attach-room <room-id> --view
 ```
 
 Codex is the default coordinator. Claude, Antigravity and OpenCode retain their configured accounts,

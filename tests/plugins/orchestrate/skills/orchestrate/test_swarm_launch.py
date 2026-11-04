@@ -288,7 +288,7 @@ class SwarmLaunchTests(unittest.TestCase):
                     refresh=lambda: subprocess.run([*tmux, "refresh-client", "-S"], check=True),
                 )
                 os.write(master, b"\x02d")
-                wait_for(lambda output: b"Reattach with: ork stooges --attach-room" in output, master)
+                wait_for(lambda output: b"Reattach with: ork horde --attach-room" in output, master)
                 _, reattached = launch(["--attach-room", room])
                 wait_for(
                     lambda output: b"Coordinator conversation ready" in output and b"flash-1" in output, reattached
@@ -463,7 +463,7 @@ class HerdrSwarmLaunchTests(unittest.TestCase):
                 )
                 self.assertEqual(len(state["runs"]), 1)
                 self.assertEqual(state["runs"][0]["pane"], "w1:p2")
-                self.assertIn(f"stooges --attach-room {room_id} --view", state["runs"][0]["command"])
+                self.assertIn(f"horde --attach-room {room_id} --view", state["runs"][0]["command"])
 
                 room_data = mailbox.load(base / "rooms" / f"{room_id}.json")
                 self.assertEqual(room_data["herdrViewPaneId"], "w1:p2")
@@ -646,6 +646,129 @@ class HerdrSwarmLaunchTests(unittest.TestCase):
             finally:
                 if old_env is not None:
                     os.environ["ORKEST_SWARM_ROOM"] = old_env
+
+    def test_extract_resumed_session_id_ignores_codex_sandbox_flag(self):
+        import agent_statusline_tmux
+
+        self.assertIsNone(
+            agent_statusline_tmux.extract_resumed_session_id(["codex", "-s", "workspace-write", "--model", "gpt-5.5"])
+        )
+        self.assertIsNone(agent_statusline_tmux.extract_resumed_session_id(["codex", "-s=read-only"]))
+        self.assertEqual(
+            agent_statusline_tmux.extract_resumed_session_id(["opencode", "-s", "ses_abc_123-xyz"]),
+            "ses_abc_123-xyz",
+        )
+
+    def test_find_herdr_peer_skips_subagents_and_delegated_runs(self):
+        import agent_statusline_tmux
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / "mailbox-v1"
+            parent = mailbox.register(
+                base,
+                session="parent-session-1111",
+                harness="gemini",
+                cwd=tmp,
+                pid=os.getpid(),
+            )
+            mailbox.annotate(base, parent["session"], herdrPaneId="w1:p1", lastSeenAt="2026-11-04T05:00:00Z")
+            child = mailbox.register(
+                base,
+                session="child-session-2222",
+                harness="gemini",
+                cwd=tmp,
+                pid=os.getpid(),
+            )
+            mailbox.annotate(
+                base,
+                child["session"],
+                herdrPaneId="w1:p1",
+                isSubagent=True,
+                lastSeenAt="2026-11-04T05:05:00Z",
+            )
+            found_via_subagent = agent_statusline_tmux._find_herdr_peer(base, "child-session-2222", "w1:p1")
+            self.assertIsNotNone(found_via_subagent)
+            self.assertEqual(found_via_subagent["session"], "parent-session-1111")
+            found = agent_statusline_tmux._find_herdr_peer(base, None, "w1:p1")
+            self.assertIsNotNone(found)
+            self.assertEqual(found["session"], "parent-session-1111")
+
+    def test_agy_subagent_detection_and_clear_handover_transfer(self):
+        import agent_progress
+        import mailbox_hooks
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            base = home / "mailbox-v1"
+            sub_transcript = home / "subagent.jsonl"
+            sub_transcript.write_text(
+                json.dumps(
+                    {
+                        "step_index": 0,
+                        "type": "SYSTEM_MESSAGE",
+                        "content": "<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-04T05:00:00Z sender=11111111-2222-3333-4444-555555555555 priority=HIGH content=Build feature",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            top_transcript = home / "toplevel.jsonl"
+            top_transcript.write_text(
+                json.dumps({"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "Hello"})
+                + "\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                mailbox_hooks._agy_subagent_info(str(sub_transcript)),
+                (True, "11111111-2222-3333-4444-555555555555"),
+            )
+            self.assertEqual(mailbox_hooks._agy_subagent_info(str(top_transcript)), (False, None))
+
+            # Verify adopt_cleared transfers focus, progress, and board.json references
+            old_sid = "old-session-aaaa-1111"
+            new_sid = "new-session-bbbb-2222"
+            old_peer = mailbox.register(base, session=old_sid, harness="claude", cwd=str(home), pid=os.getpid())
+            old_peer = mailbox.annotate(base, old_sid, focus="wave-70")
+
+            agent_progress.report(base, old_peer, goal="Fix clear", task="Transfer state", stage="working")
+            board_path = base / "work" / "board.json"
+            mailbox.write(
+                board_path,
+                {
+                    "schema": 1,
+                    "items": [
+                        {
+                            "id": "W1",
+                            "creator": {"session": old_sid, "name": old_peer["name"]},
+                            "integrator": {"session": old_sid, "name": old_peer["name"]},
+                            "owner": {"session": old_sid, "name": old_peer["name"]},
+                            "transfer": {"session": old_sid, "name": old_peer["name"]},
+                        }
+                    ],
+                },
+            )
+            mailbox_hooks._end_session(base, old_sid, pid=os.getpid(), reason="clear")
+            new_peer = mailbox.register(base, session=new_sid, harness="claude", cwd=str(home), pid=os.getpid())
+            temp_name = new_peer["name"]
+            notice = mailbox_hooks.adopt_cleared(base, new_peer)
+            self.assertIn(old_sid, notice)
+            adopted = mailbox.load(mailbox.peer_path(base, new_sid))
+            self.assertEqual(adopted.get("clearedFrom"), old_sid)
+            self.assertEqual(adopted.get("focus"), "wave-70")
+            self.assertEqual(adopted.get("person"), old_peer.get("person"))
+            if temp_name != adopted.get("name"):
+                self.assertNotIn(temp_name, adopted.get("aliases", []))
+            copied_progress = agent_progress.read(base, adopted)
+            self.assertIsNotNone(copied_progress)
+            self.assertEqual(copied_progress["session"], new_sid)
+            self.assertEqual(copied_progress["goal"], "Fix clear")
+            updated_board = mailbox.load(board_path)
+            item = updated_board["items"][0]
+            self.assertEqual(item["creator"]["session"], new_sid)
+            self.assertEqual(item["creator"]["name"], adopted["name"])
+            self.assertEqual(item["integrator"]["session"], new_sid)
+            self.assertEqual(item["owner"]["session"], new_sid)
+            self.assertEqual(item["transfer"]["session"], new_sid)
 
 
 if __name__ == "__main__":

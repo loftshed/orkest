@@ -712,6 +712,7 @@ def co_hosted(base: Path, peer: dict[str, Any]) -> list[dict[str, Any]]:
         and other.get("pid") == pid
         and other.get("pidBirth") == birth
         and owns(base, path, other)
+        and is_live(other)
     ]
 
 
@@ -1264,11 +1265,14 @@ def shares_swarm_room(base: Path, first: dict[str, Any], second: dict[str, Any])
             room = load(path)
             if not isinstance(room, dict) or not isinstance(room.get("agents"), list):
                 continue
-            members = {
-                binding.get("id")
-                for member in [room.get("conductor"), *room["agents"]]
-                if isinstance(member, dict) and isinstance(binding := member.get("session"), dict)
-            }
+            members: set[str] = set()
+            for member in [room.get("conductor"), *room["agents"]]:
+                if not isinstance(member, dict):
+                    continue
+                if isinstance(binding := member.get("session"), dict) and isinstance(binding.get("id"), str):
+                    members.add(binding["id"])
+                if isinstance(mailbox_session := member.get("mailboxSession"), str) and mailbox_session:
+                    members.add(mailbox_session)
             if pair <= members:
                 return True
     return False

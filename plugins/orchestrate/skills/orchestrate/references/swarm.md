@@ -1,10 +1,11 @@
 # Conversational swarms
 
-`ork stooges "objective"` opens a normal coordinator harness next to its live swarm tree.
+`ork horde "objective"` (`ork stooges` is a supported alias) opens a normal coordinator harness next
+to its live swarm tree.
 `ork agy`, `ork codex`, `ork claude` and `ork opencode` are shortcuts that let the user enter their
 goal in the coordinator conversation after launch.
-With no objective, ask the user what they want, then record it with `ork rooms objective --room ID
---objective TEXT`. The default harness is Codex; `--engine claude|agy|opencode` chooses another.
+With no objective, ask the user what they want, then record it with `ork hall objective --room ID
+--objective TEXT` (`ork rooms` is a supported alias). The default harness is Codex; `--engine claude|agy|opencode` chooses another.
 Existing authentication, permissions and model defaults remain in effect. Starting the conversation
 sends its brief to that harness. `--print`, `--json`, `--view` and fixture views never start models.
 
@@ -63,6 +64,6 @@ Never stop unrelated terminals or processes. Retrying a recorded dispatch remain
 paused so its existing result can be recovered without launching another run.
 
 Use **Ctrl-b Tab** to switch between conversation and tree, **Ctrl-b d** to detach, and
-`ork stooges --attach-room ID` to reconnect. `--view` opens only the live tree. Closing a view does not
+`ork horde --attach-room ID` to reconnect. `--view` opens only the live tree. Closing a view does not
 cancel workers. If the coordinator terminal has ended, `--view` still inspects the recorded work;
 the launcher does not silently start a replacement coordinator.

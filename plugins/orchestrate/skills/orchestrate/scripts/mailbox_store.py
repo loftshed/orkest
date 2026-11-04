@@ -336,7 +336,7 @@ def valid_message(message: dict[str, Any] | None) -> bool:
         and isinstance(message.get("from"), dict)
         and isinstance(message["from"].get("session"), str)
         and isinstance(message.get("to"), dict)
-        and all(isinstance(message.get(field), (str, type(None))) for field in ("clientId", "replyTo", "kind", "run"))
+        and all(isinstance(message.get(field), str | type(None)) for field in ("clientId", "replyTo", "kind", "run"))
     )
 
 

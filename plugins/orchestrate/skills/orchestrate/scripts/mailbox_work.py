@@ -1,11 +1,13 @@
 """Bounded, project-scoped coordination agreements for independently opened agents.
 
-Claims do not lease files or verify user permission. Read at work boundaries; this board never wakes
-agents or automatically reassigns work. An absent integrator needs an external recovery decision.
+Claims do not lock files or verify user permission. Read at work boundaries; this board never wakes
+agents. Expired claim leases allow explicit reclaim or recovery; an absent integrator needs an external
+recovery decision.
 """
 
 from __future__ import annotations
 
+import datetime as dt
 import hashlib
 import json
 import re
@@ -19,6 +21,14 @@ MAX_ITEMS = 1024
 STORE_BYTES = 4 * 1024 * 1024
 PAGE_BYTES = 12 * 1024
 HELP_BOARD_IDLE_SECONDS = 15 * 60
+DEFAULT_LEASE_TTL_SECONDS = 900
+MIN_LEASE_TTL_SECONDS = 60
+MAX_LEASE_TTL_SECONDS = 7200
+HANDOFF_LIST_FIELDS = ("files_touched", "decisions_made", "remaining_steps", "blockers")
+HANDOFF_TEXT_FIELD = "verification_command_run"
+HANDOFF_MAX_LIST_ITEMS = 10
+HANDOFF_MAX_ITEM_CHARS = 120
+HANDOFF_MAX_CMD_CHARS = 240
 LIMITS = {
     "title": 120,
     "scope": 240,
@@ -32,6 +42,7 @@ LIMITS = {
 ACTIONS = (
     "create",
     "claim",
+    "reclaim",
     "checkpoint",
     "submit",
     "accept",
@@ -121,11 +132,93 @@ def _external(item: Any) -> bool:
     return isinstance(item, str) and item.startswith(("coordinator-", "legacy-"))
 
 
+def _matches_session(peer: dict[str, Any] | None, session: str | None) -> bool:
+    if not isinstance(peer, dict) or not session:
+        return False
+    if peer.get("session") == session or peer.get("clearedFrom") == session:
+        return True
+    aliases = peer.get("aliases")
+    return isinstance(aliases, list) and session in aliases
+
+
+def _normalize_lease_ttl(lease_ttl: Any) -> int:
+    if lease_ttl is None:
+        return DEFAULT_LEASE_TTL_SECONDS
+    if isinstance(lease_ttl, bool) or not isinstance(lease_ttl, int):
+        raise mailbox.MailboxError("work lease_ttl must be an integer number of seconds")
+    return max(MIN_LEASE_TTL_SECONDS, min(MAX_LEASE_TTL_SECONDS, lease_ttl))
+
+
+def _lease_expiry(ttl_seconds: int) -> str:
+    return mailbox.stamp(mailbox.now() + dt.timedelta(seconds=ttl_seconds))
+
+
+def _lease_expired(record: dict[str, Any]) -> bool:
+    if record.get("state") not in {"claimed", "blocked"} or not record.get("owner"):
+        return False
+    expires_at = record.get("leaseExpiresAt")
+    if not expires_at or not mailbox.valid_stamp(expires_at):
+        return False
+    return mailbox.now() >= mailbox.parse_stamp(expires_at)
+
+
+def _normalize_handoff(handoff: Any, existing: dict[str, Any] | None = None) -> dict[str, Any]:
+    if not isinstance(handoff, dict):
+        raise mailbox.MailboxError("work handoff must be a JSON object")
+    allowed = set(HANDOFF_LIST_FIELDS) | {HANDOFF_TEXT_FIELD}
+    unknown = set(handoff.keys()) - allowed
+    if unknown:
+        raise mailbox.MailboxError(
+            "work handoff allows only files_touched, decisions_made, remaining_steps, blockers, verification_command_run"
+        )
+    merged: dict[str, Any] = {
+        "files_touched": [],
+        "decisions_made": [],
+        "remaining_steps": [],
+        "blockers": [],
+        "verification_command_run": "",
+    }
+    if isinstance(existing, dict):
+        for field in HANDOFF_LIST_FIELDS:
+            if isinstance(existing.get(field), list):
+                merged[field] = list(existing[field])
+        if isinstance(existing.get(HANDOFF_TEXT_FIELD), str):
+            merged[HANDOFF_TEXT_FIELD] = existing[HANDOFF_TEXT_FIELD]
+    for field in HANDOFF_LIST_FIELDS:
+        if field in handoff and handoff[field] is not None:
+            raw_list = handoff[field]
+            if not isinstance(raw_list, list) or len(raw_list) > HANDOFF_MAX_LIST_ITEMS:
+                raise mailbox.MailboxError(
+                    f"work handoff {field} must be a list of at most {HANDOFF_MAX_LIST_ITEMS} strings"
+                )
+            cleaned_list: list[str] = []
+            for entry in raw_list:
+                if not isinstance(entry, str):
+                    raise mailbox.MailboxError(f"work handoff {field} entries must be strings")
+                cleaned = " ".join(entry.split())
+                if not cleaned or len(cleaned) > HANDOFF_MAX_ITEM_CHARS:
+                    raise mailbox.MailboxError(
+                        f"work handoff {field} entries need 1-{HANDOFF_MAX_ITEM_CHARS} characters"
+                    )
+                cleaned_list.append(cleaned)
+            merged[field] = cleaned_list
+    if HANDOFF_TEXT_FIELD in handoff and handoff[HANDOFF_TEXT_FIELD] is not None:
+        raw_cmd = handoff[HANDOFF_TEXT_FIELD]
+        if not isinstance(raw_cmd, str):
+            raise mailbox.MailboxError(f"work handoff {HANDOFF_TEXT_FIELD} must be text")
+        cleaned_cmd = " ".join(raw_cmd.split())
+        if len(cleaned_cmd) > HANDOFF_MAX_CMD_CHARS:
+            raise mailbox.MailboxError(f"work handoff {HANDOFF_TEXT_FIELD} needs 0-{HANDOFF_MAX_CMD_CHARS} characters")
+        merged[HANDOFF_TEXT_FIELD] = cleaned_cmd
+    return merged
+
+
 def _present(
     base: Path,
     identity: dict[str, str] | None,
     project: dict[str, Any],
     presence: dict[str, tuple[dict[str, Any] | None, bool]] | None = None,
+    alias_peers: list[dict[str, Any]] | None = None,
 ) -> bool:
     if not identity:
         return False
@@ -133,7 +226,28 @@ def _present(
     session = identity["session"]
     if session not in presence:
         peer = mailbox.load(mailbox.peer_path(base, session))
-        presence[session] = (peer, bool(mailbox.valid_peer(peer) and mailbox.is_live(peer)))
+        alive = bool(mailbox.valid_peer(peer) and mailbox.same_project(peer, project) and mailbox.is_live(peer))
+        if not alive:
+            if alias_peers is None:
+                peers_dir = base / "peers"
+                alias_peers = (
+                    [
+                        candidate
+                        for candidate_path in peers_dir.glob("*.json")
+                        if mailbox.valid_peer(candidate := mailbox.load(candidate_path))
+                    ]
+                    if peers_dir.is_dir()
+                    else []
+                )
+            for candidate in alias_peers:
+                if (
+                    _matches_session(candidate, session)
+                    and mailbox.same_project(candidate, project)
+                    and mailbox.is_live(candidate)
+                ):
+                    peer, alive = candidate, True
+                    break
+        presence[session] = (peer, alive)
     peer, alive = presence[session]
     return bool(alive and mailbox.same_project(peer, project))
 
@@ -147,17 +261,24 @@ def _view(
     states: dict[str, str],
     record: dict[str, Any],
     presence: dict[str, tuple[dict[str, Any] | None, bool]] | None = None,
+    alias_peers: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     unmet = [item for item in record["dependencies"] if states.get(item) != "accepted"]
-    owner_present = _present(base, record["owner"], record["project"], presence)
-    integrator_present = _present(base, record["integrator"], record["project"], presence)
+    owner_present = _present(base, record["owner"], record["project"], presence, alias_peers)
+    integrator_present = _present(base, record["integrator"], record["project"], presence, alias_peers)
+    lease_expired = _lease_expired(record)
     recovery = None
     if record["state"] != "accepted":
         if not integrator_present:
             recovery = "integrator_absent"
         elif record["owner"] and not owner_present:
             recovery = "owner_absent"
+        elif record["owner"] and lease_expired:
+            recovery = "lease_expired"
     return {
+        "leaseTtlSeconds": None,
+        "leaseExpiresAt": None,
+        "handoff": None,
         **{key: value for key, value in record.items() if key not in {"project", "key", "fingerprint"}},
         "source": "interactive",
         "readOnly": False,
@@ -165,6 +286,7 @@ def _view(
         "unmetDependencies": unmet,
         "ownerPresent": owner_present,
         "integratorPresent": integrator_present,
+        "leaseExpired": lease_expired,
         "recoveryNeeded": recovery,
     }
 
@@ -184,7 +306,17 @@ def snapshot(base: Path, me: dict[str, Any], *, item: str | None = None) -> list
         )
     states = _states(board)
     presence: dict[str, tuple[dict[str, Any] | None, bool]] = {}
-    records = [_view(base, states, record, presence) for record in selected]
+    peers_dir = base / "peers"
+    alias_peers = (
+        [
+            candidate
+            for candidate_path in peers_dir.glob("*.json")
+            if mailbox.valid_peer(candidate := mailbox.load(candidate_path))
+        ]
+        if peers_dir.is_dir() and selected
+        else []
+    )
+    records = [_view(base, states, record, presence, alias_peers) for record in selected]
     # Other sources have their own writers. Never hold our lock while reading their snapshots.
     if item is None or _external(item):
         import mailbox_work_sources
@@ -207,11 +339,58 @@ def assigned(base: Path, me: dict[str, Any]) -> list[dict[str, Any]]:
         {"id": item["id"], "title": item["title"], "state": item["state"]}
         for item in board["items"]
         if isinstance(item["owner"], dict)
-        and item["owner"].get("session") == me["session"]
+        and _matches_session(me, item["owner"].get("session"))
         and item["state"] in {"claimed", "blocked", "review"}
         and isinstance(item["project"], dict)
         and mailbox.same_project(me, item["project"])
     ]
+
+
+def renew_leases(base: Path, me: dict[str, Any], *, force: bool = True) -> int:
+    """Extend active claim leases for items owned by this session (or its /clear predecessor)."""
+    path = base / "work" / "board.json"
+    if not path.exists():
+        return 0
+    try:
+        _project(me)
+    except mailbox.MailboxError:
+        return 0
+    renewed = 0
+    dirty = False
+    with mailbox.locked(path):
+        board = _read(path)
+        stamp = mailbox.stamp()
+        current_now = mailbox.now()
+        for record in board["items"]:
+            if (
+                record.get("state") in {"claimed", "blocked"}
+                and isinstance(record.get("owner"), dict)
+                and _matches_session(me, record["owner"].get("session"))
+                and isinstance(record.get("project"), dict)
+                and mailbox.same_project(me, record["project"])
+            ):
+                ttl = _normalize_lease_ttl(record.get("leaseTtlSeconds"))
+                owner_changed = me["session"] != record["owner"].get("session")
+                existing_exp = record.get("leaseExpiresAt")
+                needs_write = force or owner_changed or not isinstance(existing_exp, str)
+                if not needs_write and isinstance(existing_exp, str):
+                    try:
+                        remaining = (dt.datetime.fromisoformat(existing_exp) - current_now).total_seconds()
+                        needs_write = remaining <= ttl * 0.75
+                    except ValueError:
+                        needs_write = True
+                renewed += 1
+                if needs_write:
+                    record["leaseTtlSeconds"] = ttl
+                    record["leaseExpiresAt"] = _lease_expiry(ttl)
+                    if owner_changed:
+                        record["owner"] = _identity(me)
+                        record["revision"] = int(record.get("revision") or 1) + 1
+                        record["updatedAt"] = stamp
+                    dirty = True
+        if dirty:
+            mailbox.write(path, board)
+    return renewed
 
 
 def shares_active_work(base: Path, first: dict[str, Any], second: dict[str, Any]) -> bool:
@@ -235,8 +414,10 @@ def shares_active_work(base: Path, first: dict[str, Any], second: dict[str, Any]
             role.get("session")
             for key in ("creator", "integrator", "owner", "transfer")
             if isinstance(role := item.get(key), dict)
-        }
-        if pair <= participants:
+        } - {None}
+        if any(_matches_session(first, s) for s in participants) and any(
+            _matches_session(second, s) for s in participants
+        ):
             return True
     return False
 
@@ -374,6 +555,9 @@ def _create(
         "evidence": "",
         "verification": "",
         "note": "",
+        "leaseTtlSeconds": None,
+        "leaseExpiresAt": None,
+        "handoff": None,
         "transfer": None,
         "recovery": None,
         "createdAt": mailbox.stamp(),
@@ -384,8 +568,11 @@ def _create(
 
 
 def _require(record: dict[str, Any], me: dict[str, Any], role: str) -> None:
-    if not record.get(role) or record[role]["session"] != me["session"]:
+    holder = record.get(role)
+    if not holder or not _matches_session(me, holder.get("session")):
         raise mailbox.MailboxError(f"only this work item's current {role} can perform that action")
+    if me["session"] != holder["session"]:
+        record[role] = _identity(me)
 
 
 def _transition(
@@ -397,7 +584,12 @@ def _transition(
     revision: Any,
     details: dict[str, str],
     successor: Any,
+    *,
+    handoff: dict[str, Any] | None = None,
+    lease_ttl: int | None = None,
+    presence: dict[str, Any] | None = None,
 ) -> None:
+    presence = {} if presence is None else presence
     if type(revision) is not int or revision != record["revision"]:
         raise mailbox.MailboxError(
             f"work revision conflict: current revision {record['revision']}, state {record['state']}; read the item again"
@@ -408,26 +600,59 @@ def _transition(
         _require(record, me, "owner")
     if action in {"accept", "request_changes", "recover", "offer_transfer"}:
         _require(record, me, "integrator")
-    if action == "claim":
-        if record["state"] != "open" or record["owner"]:
-            raise mailbox.MailboxError("work is already claimed")
+    if action in {"claim", "reclaim"}:
         states = _states(board)
-        if _view(base, states, record)["unmetDependencies"]:
+        if _view(base, states, record, presence)["unmetDependencies"]:
             raise mailbox.MailboxError("work dependencies have not been accepted")
-        if not _present(base, record["integrator"], record["project"]):
+        if not _present(base, record["integrator"], record["project"], presence):
             raise mailbox.MailboxError("work integrator is absent; integrator reassignment is not supported")
-        record.update(owner=_identity(me), state="claimed", blocker="")
+        ttl = _normalize_lease_ttl(lease_ttl)
+        if record["state"] == "open" and not record["owner"]:
+            record.update(
+                owner=_identity(me),
+                state="claimed",
+                blocker="",
+                leaseTtlSeconds=ttl,
+                leaseExpiresAt=_lease_expiry(ttl),
+            )
+        elif record["state"] in {"claimed", "blocked"} and record["owner"]:
+            owner_present = _present(base, record["owner"], record["project"], presence)
+            expired = _lease_expired(record)
+            if owner_present and not expired:
+                raise mailbox.MailboxError("work is already claimed")
+            record["recovery"] = {
+                "previousOwner": record["owner"],
+                "reason": "lease_expired" if expired else "owner_absent",
+                "revision": record["revision"],
+                "at": mailbox.stamp(),
+            }
+            record.update(
+                owner=_identity(me),
+                state="claimed",
+                blocker="",
+                leaseTtlSeconds=ttl,
+                leaseExpiresAt=_lease_expiry(ttl),
+            )
+        else:
+            raise mailbox.MailboxError("work is already claimed")
     elif action == "checkpoint":
         if record["state"] not in {"claimed", "blocked"}:
             raise mailbox.MailboxError("checkpoint needs claimed or blocked work; submit freezes review evidence")
         record.update(details)
+        if handoff is not None:
+            record["handoff"] = _normalize_handoff(handoff, record.get("handoff"))
+        ttl = _normalize_lease_ttl(lease_ttl if lease_ttl is not None else record.get("leaseTtlSeconds"))
+        record["leaseTtlSeconds"] = ttl
+        record["leaseExpiresAt"] = _lease_expiry(ttl)
         record["state"] = "blocked" if record["blocker"] else "claimed"
     elif action == "submit":
         if record["state"] not in {"claimed", "blocked"}:
             raise mailbox.MailboxError("submit needs claimed or blocked work")
         for field in ("evidence", "verification"):
             _text(field, details.get(field), required=True)
-        record.update(details, state="review", blocker="")
+        if handoff is not None:
+            record["handoff"] = _normalize_handoff(handoff, record.get("handoff"))
+        record.update(details, state="review", blocker="", leaseExpiresAt=None)
     elif action in {"accept", "request_changes"}:
         if record["state"] != "review":
             raise mailbox.MailboxError("acceptance needs submitted work in review")
@@ -436,11 +661,21 @@ def _transition(
         record.update(details, state="accepted" if action == "accept" else "claimed")
         if action == "accept":
             record["transfer"] = None
+            record["leaseTtlSeconds"] = None
+            record["leaseExpiresAt"] = None
+        else:
+            ttl = _normalize_lease_ttl(record.get("leaseTtlSeconds"))
+            record["leaseTtlSeconds"] = ttl
+            record["leaseExpiresAt"] = _lease_expiry(ttl)
     elif action == "release":
-        record.update(details, owner=None, state="open", blocker="")
+        if handoff is not None:
+            record["handoff"] = _normalize_handoff(handoff, record.get("handoff"))
+        record.update(details, owner=None, state="open", blocker="", leaseTtlSeconds=None, leaseExpiresAt=None)
     elif action == "recover":
         _text("note", details.get("note"), required=True)
-        if not record["owner"] or _present(base, record["owner"], record["project"]):
+        if not record["owner"] or (
+            _present(base, record["owner"], record["project"], presence) and not _lease_expired(record)
+        ):
             raise mailbox.MailboxError("recovery needs an absent owner; absence alone does not prove execution stopped")
         record["recovery"] = {
             "previousOwner": record["owner"],
@@ -448,7 +683,7 @@ def _transition(
             "note": details["note"],
             "at": mailbox.stamp(),
         }
-        record.update(details, owner=None, state="open", blocker="")
+        record.update(details, owner=None, state="open", blocker="", leaseTtlSeconds=None, leaseExpiresAt=None)
     elif action == "offer_transfer":
         if not isinstance(successor, str) or not successor.strip():
             raise mailbox.MailboxError("offer_transfer needs an existing project peer as successor")
@@ -457,7 +692,7 @@ def _transition(
             raise mailbox.MailboxError("the successor is already this item's integrator")
         record.update(details, transfer=identity)
     elif action == "accept_transfer":
-        if not record["transfer"] or record["transfer"]["session"] != me["session"]:
+        if not record["transfer"] or not _matches_session(me, record["transfer"].get("session")):
             raise mailbox.MailboxError("no integrator handoff is offered to this session")
         record.update(integrator=_identity(me), transfer=None)
     record.update(revision=record["revision"] + 1, updatedAt=mailbox.stamp())
@@ -482,6 +717,8 @@ def mutate(
     verification: str | None = None,
     note: str | None = None,
     successor: str | None = None,
+    handoff: dict[str, Any] | None = None,
+    lease_ttl: int | None = None,
 ) -> dict[str, Any]:
     """Apply one revision-checked agreement. Errors never persist a partial transition."""
     if action not in ACTIONS:
@@ -508,6 +745,7 @@ def mutate(
     allowed = {
         "create": set(),
         "claim": set(),
+        "reclaim": set(),
         "checkpoint": {"next", "blocker", "evidence", "verification"},
         "submit": {"next", "evidence", "verification"},
         "accept": {"note"},
@@ -517,7 +755,12 @@ def mutate(
         "offer_transfer": {"note"},
         "accept_transfer": set(),
     }
-    if details.keys() - allowed[action] or (successor is not None and action != "offer_transfer"):
+    if (
+        details.keys() - allowed[action]
+        or (successor is not None and action != "offer_transfer")
+        or (handoff is not None and action not in {"checkpoint", "submit", "release"})
+        or (lease_ttl is not None and action not in {"claim", "reclaim", "checkpoint"})
+    ):
         raise mailbox.MailboxError(f"fields do not apply to work action {action}")
     if action == "create":
         if item is not None or revision is not None:
@@ -527,6 +770,7 @@ def mutate(
     path = base / "work" / "board.json"
     with mailbox.locked(path):
         board = _read(path)
+        presence: dict[str, Any] = {}
         if action == "create":
             record, replayed = _create(
                 base,
@@ -539,9 +783,21 @@ def mutate(
             )
         else:
             record, replayed = _find(board, me, item), False
-            _transition(base, board, me, record, action, revision, details, successor)
+            _transition(
+                base,
+                board,
+                me,
+                record,
+                action,
+                revision,
+                details,
+                successor,
+                handoff=handoff,
+                lease_ttl=lease_ttl,
+                presence=presence,
+            )
         states = _states(board)
-        result = {"item": _view(base, states, record), "replayed": replayed}
+        result = {"item": _view(base, states, record, presence), "replayed": replayed}
         # A later disappearance lengthens these derived fields without a write. Reserve that space now.
         bounded = {
             **result["item"],

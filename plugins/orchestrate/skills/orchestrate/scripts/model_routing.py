@@ -631,7 +631,7 @@ def cached_catalog_entry(
         or catalog.get("status") != "live"
         or catalog.get("executable") != executable
         or catalog.get("version") != version
-        or not isinstance(cached_at_epoch, (int, float))
+        or not isinstance(cached_at_epoch, int | float)
     ):
         return None
     age_seconds = max(0.0, time.time() - float(cached_at_epoch))
@@ -928,6 +928,14 @@ def preferred_model(engine: str) -> str:
     return (route or {}).get("model") or _attr("PREFERRED_MODELS", PREFERRED_MODELS)[engine]
 
 
+def split_opencode_model(engine: str | None, model: str | None) -> tuple[str | None, str | None]:
+    """Split an inline OpenCode `#<variant>` suffix from `model`, returning `(base_model, variant)`."""
+    if engine in (None, "opencode") and isinstance(model, str) and "#" in model:
+        base_model, inline_variant = model.split("#", 1)
+        return base_model, (inline_variant or None)
+    return model, None
+
+
 def select_live_model(
     engine: str,
     requested_model: str | None,
@@ -937,8 +945,10 @@ def select_live_model(
         detail = catalog.get("error") or catalog.get("status")
         exit_code = 13 if catalog.get("status") == "not_installed" else 11
         raise _runner_error(f"cannot retrieve live {engine} models: {detail}", exit_code)
+    requested_model, _ = split_opencode_model(engine, requested_model)
     available_models = [model["id"] for model in catalog.get("models", []) if not model.get("hidden", False)]
-    model = requested_model or _attr("preferred_model")(engine)
+    model, _ = split_opencode_model(engine, requested_model or _attr("preferred_model")(engine))
+    assert model is not None
     if model in available_models:
         reason = "exact_user_request" if requested_model else "validated_preference"
         return model, reason
@@ -968,6 +978,7 @@ def executor_preflight(
     *,
     refresh: bool = False,
 ) -> tuple[str, str, list[str], str, str, dict[str, Any]]:
+    requested_model, _ = split_opencode_model(engine, requested_model)
     if requested_model:
         _attr("enforce_native_route")(engine, requested_model)
     catalog = _attr("discover_engine_catalog")(engine, refresh=refresh)
@@ -1015,20 +1026,27 @@ def resolve_route(args: argparse.Namespace) -> argparse.Namespace:
                     route = alt
                     break
     if args.model and not args.engine and not args.route:
+        base_model, _ = split_opencode_model(None, args.model)
         families = _attr("load_model_families")()
-        parsed = _attr("families_module")().parse_selector(args.model, families)
+        parsed = _attr("families_module")().parse_selector(base_model, families)
         if parsed:
             args.engine = families[parsed[0]]["engine"]
     args.engine = args.engine or (route or {}).get("engine") or _attr("DEFAULT_ENGINE", DEFAULT_ENGINE)
     route = route or module.engine_default(args.engine, routes)
+    route_variant = None
     if route and route.get("engine") == args.engine:
         if args.model is None and args.route:
             args.model = route.get("model")
-        model = args.model or route.get("model")
-        if args.effort is None and route.get("effort") and model == route.get("model"):
+        model, _ = split_opencode_model(args.engine, args.model or route.get("model"))
+        route_model, _ = split_opencode_model(args.engine, route.get("model"))
+        if args.effort is None and route.get("effort") and model == route_model:
             args.effort = route["effort"]
-        if getattr(args, "variant", None) is None and route.get("variant") and args.engine == "opencode":
-            args.variant = route["variant"]
+        route_variant = route.get("variant")
+    if args.engine == "opencode":
+        args.model, inline_variant = split_opencode_model("opencode", args.model)
+        args.variant = (
+            getattr(args, "variant", None) or inline_variant or getattr(args, "effort", None) or route_variant
+        )
     args.resolved_route = args.route
     return args
 
