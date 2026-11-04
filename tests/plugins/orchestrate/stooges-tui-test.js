@@ -936,4 +936,266 @@ describe("terminal lifecycle", () => {
     ]);
     expect(notifiedSet.has("room:all-complete")).toBe(true);
   });
+
+  it("renders redesigned orchestrator card, collapsible inline quota, and running services footer", async () => {
+    const room = fixture("claude:haiku,agy:flash");
+    room.title = "Swarm View Upgrade";
+    room.conductor = {
+      ...room.conductor,
+      name: "gribble-gemini-4-argon-medium-orkest-1f",
+      engine: "agy",
+      branch: "feat/swarm-view",
+      herdrPaneId: "pane-lead-1",
+      status: "running",
+      progress: {
+        name: "gribble-gemini-4-argon-medium-orkest-1f",
+        model: "Gemini 4 Argon (Medium)",
+        effort: "—",
+        goal: "Ship Swarm View v2",
+        task: "Coordinating slice 2A",
+        reportedAt: new Date(10_000).toISOString(),
+      },
+    };
+    room.accounts = [
+      {
+        id: "codex",
+        short: "C",
+        windows: [
+          { id: "five_hour", label: "5h", remainingPct: 92 },
+          { id: "weekly", label: "wk", remainingPct: 81 },
+        ],
+      },
+      {
+        id: "claude",
+        short: "K",
+        windows: [{ id: "weekly", label: "wk", remainingPct: 64 }],
+      },
+    ];
+    room.services = [
+      {
+        kind: "port",
+        port: 3004,
+        pid: 4242,
+        name: "vite",
+        worktree: "wt:slice-2a",
+        owner: "haiku-1",
+        uptime: "04:12",
+      },
+      {
+        kind: "docker",
+        port: 5432,
+        name: "orkest-postgres-1",
+        image: "postgres:16",
+        worktree: "orkest",
+        uptime: "12 minutes",
+      },
+    ];
+    expect(() => validateRoom(structuredClone(room))).not.toThrow();
+
+    const view = new HordeView(room, {
+      height: 34,
+      tier: "unicode",
+      now: () => 20_000,
+    });
+    const expandedText = view.render(100).join("\n");
+    expect(expandedText).toContain(
+      "Orchestrator: gribble · folder: orkest (feat/swarm-view) · agy · pane-lead-1",
+    );
+    expect(expandedText).toContain("Ship Swarm View v2 — Coordinating slice 2A");
+    expect(expandedText).toContain("u collapse");
+    expect(expandedText).toContain("Services");
+    expect(expandedText).toContain("2 running · :3004 :5432 · v collapse");
+    expect(expandedText).toContain(":3004  vite (pid 4242) · wt:slice-2a · by haiku-1 · up 04:12");
+    expect(expandedText).toContain(":5432  docker postgres:16 · orkest · up 12 minutes");
+    expect(expandedText).toContain("· u quota · v services");
+
+    // Toggle quota to collapsed 1-line inline bar with 'u':
+    expect(view.handleKey("u")).toBe(true);
+    expect(view.quotaMode).toBe("collapsed");
+    const collapsedText = view.render(100).join("\n");
+    expect(collapsedText).toContain("Quota [u]");
+    expect(collapsedText).toContain("C 92%·81%");
+    expect(collapsedText).toContain("K 64%");
+    expect(collapsedText).not.toContain("u collapse");
+
+    // Toggle back to expanded with 'u':
+    expect(view.handleKey("u")).toBe(true);
+    expect(view.quotaMode).toBe("expanded");
+
+    // Toggle services to collapsed 1-line inline bar with 'v':
+    expect(view.handleKey("v")).toEqual({
+      type: "services-toggle",
+      servicesMode: "collapsed",
+    });
+    expect(view.servicesMode).toBe("collapsed");
+    const collapsedServicesText = view.render(100).join("\n");
+    expect(collapsedServicesText).toContain("Services [v]");
+    expect(collapsedServicesText).toContain(
+      "2 running · :3004 vite (wt:slice-2a) · :5432 docker postgres:16 (orkest)",
+    );
+    expect(collapsedServicesText).not.toContain("v collapse");
+
+    // Toggle services back to expanded with 'v':
+    expect(view.handleKey("v")).toEqual({
+      type: "services-toggle",
+      servicesMode: "expanded",
+    });
+    expect(view.servicesMode).toBe("expanded");
+
+    // Render Update [U] notifier banner and trigger pull-update with Shift+U ('U'):
+    view.setRoom({
+      ...room,
+      update: { available: true, commitsBehind: 3, remoteSha: "a1b2c3d4" },
+    });
+    const updateAvailableText = view.render(100).join("\n");
+    expect(updateAvailableText).toContain(
+      "Update [U]  ↑ 3 new commits on origin/main · press U to pull & update",
+    );
+    expect(updateAvailableText).toContain("· U update");
+    expect(view.handleKey("U")).toEqual({ type: "pull-update" });
+    // Lowercase 'u' still toggles quotaMode:
+    expect(view.handleKey("u")).toBe(true);
+    expect(view.quotaMode).toBe("collapsed");
+    expect(view.handleKey("u")).toBe(true);
+    expect(view.quotaMode).toBe("expanded");
+
+    // Verify repo-denied account filtering in horde-tui:
+    const sampleAccounts = [
+      { id: "claude", provider: "claude", label: "Claude Work", short: "K" },
+      { id: "plaude", provider: "claude", label: "Claude Personal", short: "P" },
+      { id: "codex", provider: "codex", label: "Codex", short: "C" },
+      { id: "antigravity", provider: "antigravity", label: "Gemini", short: "G" },
+    ];
+    expect(
+      hordeTuiModule.filterAccountsByRepoPolicy(sampleAccounts, ["claude-work"]).map((a) => a.id),
+    ).toEqual(["plaude", "codex", "antigravity"]);
+    expect(
+      hordeTuiModule
+        .filterAccountsByRepoPolicy(sampleAccounts, ["plaude", "codex"])
+        .map((a) => a.id),
+    ).toEqual(["claude", "antigravity"]);
+
+    // Test probeRoomServices & cachedServices with mocked lsof, ps, and docker ps output
+    // (including internal agy / codex IPC ephemeral ports that must be filtered out):
+    const probeRoom = {
+      id: "room-svc-probe",
+      cwd: "/Users/dev/orkest",
+      conductor: { id: "conductor", name: "gribble", pid: 9000 },
+      agents: [
+        {
+          id: "worker-1",
+          name: "snoobix",
+          pid: 9100,
+          worktree: {
+            disposable: true,
+            path: "/Users/dev/orkest/.worktrees/wt-ui",
+            slug: "wt-ui",
+          },
+        },
+      ],
+    };
+    const mockExec = (cmd, args, cb) => {
+      if (cmd === "lsof" && args.includes("-sTCP:LISTEN")) {
+        cb(
+          null,
+          [
+            "p9105",
+            "c node",
+            "n127.0.0.1:4173",
+            "p9000",
+            "c agy",
+            "n127.0.0.1:58406",
+            "p9100",
+            "c codex",
+            "n127.0.0.1:60693",
+            "p9999",
+            "c python",
+            "n*:8000",
+            "",
+          ].join("\n"),
+        );
+        return;
+      }
+      if (cmd === "ps") {
+        cb(
+          null,
+          [
+            " 9105  9100 02:15 node /Users/dev/orkest/node_modules/.bin/vite --port 4173",
+            " 9000     1 15:00 agy --workspace /Users/dev/orkest",
+            " 9100  9000 12:00 codex --full-auto",
+            " 9999     1 10:00 python -m http.server",
+            "",
+          ].join("\n"),
+        );
+        return;
+      }
+      if (cmd === "lsof" && args.includes("cwd")) {
+        cb(
+          null,
+          [
+            "p9105",
+            "n/Users/dev/orkest/.worktrees/wt-ui",
+            "p9000",
+            "n/Users/dev/orkest",
+            "p9100",
+            "n/Users/dev/orkest/.worktrees/wt-ui",
+            "p9999",
+            "n/tmp/unrelated",
+            "",
+          ].join("\n"),
+        );
+        return;
+      }
+      if (cmd === "docker") {
+        cb(
+          null,
+          `${JSON.stringify({
+            Names: "orkest-redis-1",
+            Image: "redis:7-alpine",
+            Ports: "0.0.0.0:6379->6379/tcp",
+            Labels:
+              "com.docker.compose.project=orkest,com.docker.compose.project.working_dir=/Users/dev/orkest",
+            RunningFor: "5 minutes ago",
+          })}\n`,
+        );
+        return;
+      }
+      cb(null, "");
+    };
+    const services = await hordeTuiModule.cachedServices(probeRoom, {
+      exec: mockExec,
+      now: () => 1000,
+      force: true,
+    });
+    expect(services).toEqual([
+      {
+        kind: "port",
+        port: 4173,
+        pid: 9105,
+        name: "vite",
+        cwd: "/Users/dev/orkest/.worktrees/wt-ui",
+        worktree: "wt:wt-ui",
+        owner: "snoobix",
+        uptime: "02:15",
+      },
+      {
+        kind: "docker",
+        name: "orkest-redis-1",
+        image: "redis:7-alpine",
+        port: 6379,
+        ports: "0.0.0.0:6379->6379/tcp",
+        cwd: "/Users/dev/orkest",
+        worktree: "orkest",
+        uptime: "5 minutes",
+      },
+    ]);
+    const cached = await hordeTuiModule.cachedServices(probeRoom, {
+      exec: () => {
+        throw new Error("should use cache");
+      },
+      now: () => 2000,
+      ttlMs: 60_000,
+    });
+    expect(cached).toHaveLength(2);
+  });
 });

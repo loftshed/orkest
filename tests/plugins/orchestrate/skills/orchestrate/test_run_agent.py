@@ -3582,13 +3582,14 @@ class ProcessAndResumeRegressionTests(unittest.TestCase):
         self.assertIsNone(RUNNER.classify_model_availability_failure("SyntaxError: unexpected token", None))
         self.assertIsNone(RUNNER.classify_model_availability_failure("test suite failed with exit code 1", "failed"))
 
-    def test_prune_state_removes_stale_unlocked_worktree_locks_and_mailbox_run_files(self) -> None:
+    def test_prune_state_preserves_worktree_lock_inodes_and_removes_stale_mailbox_run_files(self) -> None:
         with tempfile.TemporaryDirectory(prefix="agent-prune-") as directory:
             cache = Path(directory)
             locks_dir = cache / "worktree-locks-v1"
             locks_dir.mkdir(parents=True)
             stale_lock = locks_dir / "deadbeef.lock"
             stale_lock.write_text("", encoding="utf-8")
+            stale_lock_ino = stale_lock.stat().st_ino
             active_lock = locks_dir / "active.lock"
             active_lock.write_text("", encoding="utf-8")
 
@@ -3614,13 +3615,61 @@ class ProcessAndResumeRegressionTests(unittest.TestCase):
                     RUNNER.fcntl.flock(held_handle.fileno(), RUNNER.fcntl.LOCK_EX | RUNNER.fcntl.LOCK_NB)
                 summary = RUNNER.prune_state(3600)
 
-            self.assertEqual(summary["locks"], 1)
-            self.assertFalse(stale_lock.exists())
+            self.assertEqual(summary["locks"], 0)
+            self.assertTrue(stale_lock.exists())
+            self.assertEqual(stale_lock.stat().st_ino, stale_lock_ino)
             self.assertTrue(active_lock.exists())
             self.assertEqual(summary["mailbox"], 2)
             self.assertFalse(stale_peer.exists())
             self.assertFalse(stale_mb_lock.exists())
             self.assertTrue(keep_listener.exists())
+
+    def test_prune_state_and_prune_main_clean_locks_coordinator_locks_and_invoke_mailbox_prune(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent-prune-locks-") as directory:
+            cache = Path(directory)
+            locks_dir = cache / "locks"
+            coord_locks_dir = cache / "coordinator-locks"
+            locks_dir.mkdir(parents=True)
+            coord_locks_dir.mkdir(parents=True)
+
+            dead_pid_lock = locks_dir / "dead-worker.lock"
+            dead_pid_lock.write_text(json.dumps({"pid": 99999999}), encoding="utf-8")
+            live_pid_lock = locks_dir / "live-worker.lock"
+            live_pid_lock.write_text(json.dumps({"pid": os.getpid()}), encoding="utf-8")
+            recent_lock = coord_locks_dir / "recent-coord.lock"
+            recent_lock.write_text("", encoding="utf-8")
+            stale_coord_lock = coord_locks_dir / "stale-coord.lock"
+            stale_coord_lock.write_text("99999998\n", encoding="utf-8")
+
+            old_time = time.time() - 7200
+            for item in (dead_pid_lock, live_pid_lock, stale_coord_lock):
+                os.utime(item, (old_time, old_time))
+            recent_time = time.time() - 300  # 5 minutes old (< 15m grace window)
+            os.utime(recent_lock, (recent_time, recent_time))
+
+            mailbox = RUNNER.bundled_module("peer_mailbox")
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "AGENT_EXECUTOR_HOME": str(cache),
+                        "ORCHESTRATE_CONDUCTOR_MODEL": "claude-opus-4-6",
+                    },
+                ),
+                mock.patch.object(mailbox, "prune") as mocked_mb_prune,
+            ):
+                self.assertEqual(RUNNER.detect_conductor_model(self.repository.path), "claude-opus-4-6")
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    rc = RUNNER.prune_main(["--older-than", "1m"])
+                self.assertEqual(rc, 0)
+                summary = json.loads(out.getvalue())
+                self.assertEqual(summary["locks"], 2)
+                self.assertFalse(dead_pid_lock.exists())
+                self.assertFalse(stale_coord_lock.exists())
+                self.assertTrue(live_pid_lock.exists())
+                self.assertTrue(recent_lock.exists())
+                mocked_mb_prune.assert_called_once()
 
     def test_upward_delegation_widens_scope_and_preserves_read_only_runs(self) -> None:
         code, result, out_dir, _, _ = self.run_main(
@@ -3688,3 +3737,80 @@ class ProcessAndResumeRegressionTests(unittest.TestCase):
         self.assertEqual(code_ro, 0)
         self.assertEqual(result_ro["allowed_paths"], [])
         self.assertEqual(result_ro["scope_owner"], "conductor")
+
+    def test_repo_policy_denylist_blocks_disallowed_harnesses_and_profiles(self) -> None:
+        repo_policy = RUNNER.bundled_module("repo_policy")
+        policy_cfg = {
+            "repo_policies": [
+                {
+                    "path": str(self.repository.path),
+                    "deny": ["claude-work", "opencode"],
+                }
+            ]
+        }
+        resolved = repo_policy.resolve_repo_policy(self.repository.path, config=policy_cfg)
+        self.assertEqual(resolved["deny"], ["claude-work", "opencode"])
+        self.assertEqual(resolved["allowed_harnesses"], ["codex", "agy", "plaude"])
+
+        # Default/work claude is blocked
+        allowed_default, reason_default, _ = repo_policy.check_execution_allowed(
+            self.repository.path, "claude", None, config=policy_cfg
+        )
+        self.assertFalse(allowed_default)
+        self.assertIn("claude-work", reason_default or "")
+        self.assertIn("plaude", reason_default or "")
+
+        # Explicit ~/.claude work profile is blocked
+        allowed_work, reason_work, _ = repo_policy.check_execution_allowed(
+            self.repository.path, "claude", "~/.claude", config=policy_cfg
+        )
+        self.assertFalse(allowed_work)
+        self.assertIn("claude-work", reason_work or "")
+
+        # Personal ~/.claude-personal (plaude) profile is allowed!
+        allowed_plaude, reason_plaude, auto_dir = repo_policy.check_execution_allowed(
+            self.repository.path, "claude", "~/.claude-personal", config=policy_cfg
+        )
+        self.assertTrue(allowed_plaude)
+        self.assertIsNone(reason_plaude)
+        self.assertEqual(auto_dir, Path("~/.claude-personal").expanduser())
+
+        # agy and codex are allowed; opencode is blocked
+        self.assertTrue(repo_policy.check_execution_allowed(self.repository.path, "agy", config=policy_cfg)[0])
+        self.assertTrue(repo_policy.check_execution_allowed(self.repository.path, "codex", config=policy_cfg)[0])
+        allowed_oc, reason_oc, _ = repo_policy.check_execution_allowed(
+            self.repository.path, "opencode", config=policy_cfg
+        )
+        self.assertFalse(allowed_oc)
+        self.assertIn("opencode", reason_oc or "")
+
+        # End-to-end enforcement in run_agent.py via .orkest/policy.json
+        policy_file = self.repository.path / ".orkest" / "policy.json"
+        policy_file.parent.mkdir(parents=True, exist_ok=True)
+        policy_file.write_text(json.dumps({"deny": ["claude-work", "opencode"]}), encoding="utf-8")
+        try:
+            with self.assertRaisesRegex(RUNNER.RunnerError, "claude-work"):
+                self.run_main(engine="claude", model="sonnet", no_change=True, expect_changes=False, allow_path=None)
+
+            with self.assertRaisesRegex(RUNNER.RunnerError, "opencode"):
+                self.run_main(
+                    engine="opencode",
+                    model="openrouter/z-ai/glm-5.3-flash",
+                    no_change=True,
+                    expect_changes=False,
+                    allow_path=None,
+                )
+
+            # Passing --claude-config-dir ~/.claude-personal succeeds!
+            code_ok, result_ok, _, _, _ = self.run_main(
+                engine="claude",
+                model="sonnet",
+                no_change=True,
+                expect_changes=False,
+                allow_path=None,
+                extra_args=["--claude-config-dir", str(self.external_path / ".claude-personal")],
+            )
+            self.assertEqual(code_ok, 0)
+            self.assertEqual(result_ok["status"], "completed")
+        finally:
+            RUNNER.shutil.rmtree(policy_file.parent, ignore_errors=True)

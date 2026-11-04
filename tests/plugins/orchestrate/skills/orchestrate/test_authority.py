@@ -395,6 +395,23 @@ class AuthorityTests(unittest.TestCase):
             )
         self.assertIn("cannot read the checkout state", refused)
 
+    def test_cache_dir_uses_runtime_paths_orchestrate_home_and_legacy_fallback(self) -> None:
+        orchestrate_home = self.fixture.external_path / "orch-home"
+        legacy_home = self.fixture.external_path / "legacy-home"
+        with mock.patch.dict(
+            os.environ,
+            {"ORCHESTRATE_HOME": str(orchestrate_home), "AGENT_EXECUTOR_HOME": str(legacy_home)},
+            clear=False,
+        ):
+            self.assertEqual(AUTHORITY.cache_dir(), orchestrate_home)
+        with mock.patch.dict(
+            os.environ,
+            {"AGENT_EXECUTOR_HOME": str(legacy_home)},
+            clear=False,
+        ):
+            os.environ.pop("ORCHESTRATE_HOME", None)
+            self.assertEqual(AUTHORITY.cache_dir(), legacy_home)
+
 
 if __name__ == "__main__":
     unittest.main()

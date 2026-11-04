@@ -11,20 +11,104 @@
  * 4. Smelt & Prune (fast-forward local merge or PR creation + worktree removal)
  */
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
 import { shouldUseColor } from "../../monitor/lib/render.mjs";
+import { readFoundryState, resolveFoundryStatePath, writeFoundryState } from "./foundry.mjs";
 import { resolveWorktreeMarkerPath } from "./horde-room.mjs";
 import { glyphSet, glyphTier, renderPanel, renderTable } from "./horde-view.mjs";
 
 const scriptsDir = fileURLToPath(new URL("../skills/orchestrate/scripts/", import.meta.url));
 
+export const COLD_REVIEW_QUESTION =
+  "Deterministic linters, formatters, and test suites (ork gate --heavy) have already passed on this diff. Review the changes and report ONLY concrete correctness bugs, security vulnerabilities, concurrency/race conditions, or scope violations under FINDINGS. Do not report stylistic preferences or speculative refactors; write 'none' under FINDINGS if no concrete defects exist.";
+
 export const SMELTER_HELP = `ork smelter status [--json] [--target <branch>] [--width 120]
-ork smelter run [--worktree <slug|path>] [--strategy local|pr] [--target <branch>] [--dry-run] [--skip-review] [--json]
+ork smelter run [--worktree <slug|path>] [--strategy local|pr] [--target <branch>] [--approve-high-blast] [--dry-run] [--skip-review] [--json]
 `;
+
+export function alignCanonicalPath(targetPath) {
+  if (!targetPath || typeof targetPath !== "string") return "";
+  const resolved = path.resolve(targetPath);
+  try {
+    return realpathSync(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
+export function parseColdReviewFindings(reviewOutput) {
+  if (reviewOutput == null) {
+    return { findings: "Cold review output missing FINDINGS section", passed: false };
+  }
+  let parsed = null;
+  if (typeof reviewOutput === "object") {
+    parsed = reviewOutput;
+  } else if (typeof reviewOutput === "string") {
+    const trimmed = reviewOutput.trim();
+    if (!trimmed) {
+      return { findings: "Cold review output missing FINDINGS section", passed: false };
+    }
+    if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+      try {
+        parsed = JSON.parse(trimmed);
+      } catch {
+        parsed = null;
+      }
+    }
+  }
+  let rawFindings =
+    parsed?.sections?.FINDINGS ??
+    parsed?.sections?.findings ??
+    parsed?.FINDINGS ??
+    parsed?.findings ??
+    null;
+  if (rawFindings === null && typeof reviewOutput === "string") {
+    const sectionMatch =
+      /(?:^|\r?\n)\s*(?:#+\s*)?FINDINGS\s*:?[ \t]*\r?\n([\s\S]*?)(?=\r?\n\s*(?:#+\s*[A-Z_]+|[A-Z_]{3,}\s*:)|$)/iu.exec(
+        reviewOutput,
+      );
+    if (sectionMatch) {
+      rawFindings = sectionMatch[1];
+    } else {
+      const inlineMatch = /(?:^|\r?\n)\s*(?:#+\s*)?FINDINGS\s*:\s*([^\r\n]+)/iu.exec(reviewOutput);
+      if (inlineMatch) rawFindings = inlineMatch[1];
+    }
+  }
+  if (typeof rawFindings === "string") {
+    const cleaned = rawFindings
+      .trim()
+      .replaceAll(/^(?:[-*•]\s*)+/gu, "")
+      .trim();
+    if (!cleaned) {
+      return { findings: "Cold review output missing FINDINGS section", passed: false };
+    }
+    if (
+      /^(?:none|no\s+(?:concrete\s+|actionable\s+)?(?:findings|defects|issues)(?:\s+found)?\.?|n\/a|nil|-)$/iu.test(
+        cleaned,
+      )
+    ) {
+      if (parsed && (parsed.passed === false || parsed.ok === false)) {
+        return {
+          findings: String(parsed.error || parsed.summary || "Review requested changes").trim(),
+          passed: false,
+        };
+      }
+      return { findings: "none", passed: true };
+    }
+    return { findings: rawFindings.trim(), passed: false };
+  }
+  if (parsed && (parsed.passed === false || parsed.ok === false)) {
+    return {
+      findings: String(parsed.error || parsed.summary || "Review requested changes").trim(),
+      passed: false,
+    };
+  }
+  return { findings: "Cold review output missing FINDINGS section", passed: false };
+}
 
 function normalizeRelativePath(rawPath) {
   if (typeof rawPath !== "string") return "";
@@ -131,6 +215,21 @@ export function selectColdReviewerEngine(workerEngine, options = {}) {
   return candidates.find((engine) => isEngineInstalled(engine, options?.env)) || candidates[0];
 }
 
+export function getBranchDiffFiles(
+  worktreePath,
+  targetBranch = "main",
+  { branch = "HEAD", execFileSyncFn = execFileSync } = {},
+) {
+  const diffOut = String(
+    execFileSyncFn("git", ["diff", "--name-only", "--no-renames", `${targetBranch}...${branch}`], {
+      cwd: worktreePath,
+      encoding: "utf8",
+      maxBuffer: 32 * 1024 * 1024,
+    }) ?? "",
+  );
+  return diffOut.split(/\r?\n/u).map(normalizeRelativePath).filter(Boolean);
+}
+
 export function isPathAllowed(changedPath, allowPaths) {
   if (!Array.isArray(allowPaths) || allowPaths.length === 0) return true;
   const candidate = normalizeRelativePath(changedPath);
@@ -215,8 +314,34 @@ function loadWorktreeMetadata(worktreePath, explicitMarkerPath = null) {
       break;
     }
   }
-  return { gitDir, marker, markerPath, taskSpec, taskSpecPath };
+  const foundryStatePath = resolveFoundryStatePath(worktreePath);
+  const foundryState = readFoundryState(worktreePath);
+  return { foundryState, foundryStatePath, gitDir, marker, markerPath, taskSpec, taskSpecPath };
 }
+
+function resolveGitSha(cwd, ref, execFileSyncFn = execFileSync) {
+  try {
+    const out = String(
+      execFileSyncFn("git", ["rev-parse", ref], {
+        cwd,
+        encoding: "utf8",
+      }) ?? "",
+    ).trim();
+    return out || null;
+  } catch {
+    return null;
+  }
+}
+
+const SKIPPED_SMELTER_STATES = new Set([
+  "abandoned",
+  "merged",
+  "needs_human",
+  "pr_opened",
+  "scope_violated",
+  "verification_failed",
+  "worker_failed",
+]);
 
 /**
  * Inspects `git worktree list --porcelain` and each worktree's `<gitdir>/orkest.json`
@@ -224,9 +349,15 @@ function loadWorktreeMetadata(worktreePath, explicitMarkerPath = null) {
  */
 export function discoverSmeltableWorktrees(
   repoRoot = process.cwd(),
-  { execFileSyncFn = execFileSync, includeKeep = false, targetBranch = "main" } = {},
+  {
+    execFileSyncFn = execFileSync,
+    includeAllStates = false,
+    includeKeep = false,
+    targetBranch = "main",
+  } = {},
 ) {
   const resolvedRoot = path.resolve(repoRoot);
+  const canonicalRoot = alignCanonicalPath(resolvedRoot);
   const porcelain = String(
     execFileSyncFn("git", ["worktree", "list", "--porcelain"], {
       cwd: resolvedRoot,
@@ -235,14 +366,41 @@ export function discoverSmeltableWorktrees(
   );
   const rawEntries = parsePorcelainWorktrees(porcelain);
   const smeltable = [];
+  let cachedTargetHeadSha;
 
   for (const entry of rawEntries) {
     const worktreePath = path.resolve(entry.worktree);
-    if (worktreePath === resolvedRoot) continue;
-    const { gitDir, marker, markerPath, taskSpec, taskSpecPath } =
+    if (alignCanonicalPath(worktreePath) === canonicalRoot) continue;
+    const { foundryState, foundryStatePath, gitDir, marker, markerPath, taskSpec, taskSpecPath } =
       loadWorktreeMetadata(worktreePath);
     if (!marker || typeof marker !== "object") continue;
     if (!includeKeep && marker.disposable === false) continue;
+
+    if (!includeAllStates && foundryState && typeof foundryState.status === "string") {
+      if (SKIPPED_SMELTER_STATES.has(foundryState.status)) {
+        continue;
+      }
+      if (foundryState.status === "rebase_conflict") {
+        const conflictOn = foundryState.rebase?.conflictOn;
+        const currentWorktreeSha =
+          entry.head || resolveGitSha(worktreePath, "HEAD", execFileSyncFn);
+        if (cachedTargetHeadSha === undefined) {
+          cachedTargetHeadSha =
+            resolveGitSha(worktreePath, targetBranch, execFileSyncFn) ||
+            resolveGitSha(resolvedRoot, targetBranch, execFileSyncFn);
+        }
+        if (
+          conflictOn &&
+          conflictOn.worktreeHeadSha &&
+          conflictOn.worktreeHeadSha === currentWorktreeSha &&
+          (!conflictOn.targetHeadSha ||
+            !cachedTargetHeadSha ||
+            conflictOn.targetHeadSha === cachedTargetHeadSha)
+        ) {
+          continue;
+        }
+      }
+    }
 
     let commitsAhead;
     try {
@@ -266,6 +424,8 @@ export function discoverSmeltableWorktrees(
       commitsAhead,
       disposable: marker.disposable !== false,
       engine: marker.engine || taskSpec?.engine || null,
+      foundryState,
+      foundryStatePath,
       gitDir,
       head: entry.head || null,
       issue: marker.issue ?? taskSpec?.issue ?? null,
@@ -324,10 +484,34 @@ export async function smeltWorktree(worktree, options = {}) {
   }
   const isDryRun = Boolean(options.dryRun || options["dry-run"]);
   const shouldSkipReview = Boolean(options.skipReview || options["skip-review"]);
+  const shouldApproveHighBlast = Boolean(options.approveHighBlast || options["approve-high-blast"]);
   const repoRoot = path.resolve(
     options.repoRoot || options.cwd || worktreeObj.parentCwd || marker.parentCwd || process.cwd(),
   );
   const execFileSyncFn = options.execFileSync || options.execFileSyncFn || execFileSync;
+
+  const canPersistState =
+    !isDryRun &&
+    (options.persistState === true ||
+      Boolean(
+        loadedMeta.markerPath ||
+        loadedMeta.foundryState ||
+        existsSync(loadedMeta.gitDir) ||
+        existsSync(worktreePath),
+      ));
+  const recordState = (patch) => {
+    if (!canPersistState) return null;
+    try {
+      return writeFoundryState(worktreePath, {
+        issue: worktreeObj.issue ?? marker.issue ?? taskSpec?.issue ?? null,
+        targetBranch,
+        ...patch,
+      });
+    } catch {
+      return null;
+    }
+  };
+
   let resolvedHeadBranch = null;
   if (
     !options.branch &&
@@ -401,7 +585,11 @@ export async function smeltWorktree(worktree, options = {}) {
     changedPaths = worktreeObj.changedPaths.map(normalizeRelativePath).filter(Boolean);
   } else {
     const diffOut = String(
-      runCmd("git", ["diff", "--name-only", `${targetBranch}...HEAD`], worktreePath) ?? "",
+      runCmd(
+        "git",
+        ["diff", "--name-only", "--no-renames", `${targetBranch}...HEAD`],
+        worktreePath,
+      ) ?? "",
     );
     changedPaths = diffOut.split(/\r?\n/u).map(normalizeRelativePath).filter(Boolean);
   }
@@ -409,6 +597,10 @@ export async function smeltWorktree(worktree, options = {}) {
   if (Array.isArray(allowPaths) && allowPaths.length > 0) {
     const violations = changedPaths.filter((filePath) => !isPathAllowed(filePath, allowPaths));
     if (violations.length > 0) {
+      recordState({
+        scopeViolations: violations,
+        status: "scope_violated",
+      });
       throw new Error(
         `Scope audit failed: files outside allow_paths (${allowPaths.join(", ")}): ${violations.join(", ")}`,
       );
@@ -425,6 +617,20 @@ export async function smeltWorktree(worktree, options = {}) {
       } catch {
         /* Ignore abort error if rebase had not started. */
       }
+      const worktreeHeadSha =
+        worktreeObj.head || resolveGitSha(worktreePath, "HEAD", execFileSyncFn);
+      const targetHeadSha =
+        resolveGitSha(worktreePath, targetBranch, execFileSyncFn) ||
+        resolveGitSha(repoRoot, targetBranch, execFileSyncFn);
+      recordState({
+        rebase: {
+          conflictOn: {
+            targetHeadSha,
+            worktreeHeadSha,
+          },
+        },
+        status: "rebase_conflict",
+      });
       throw error;
     }
   }
@@ -449,30 +655,31 @@ export async function smeltWorktree(worktree, options = {}) {
       status: "dry-run",
       verifyCommand,
     };
-  } else if (gateRunner) {
-    const gateOutput = await gateRunner({
-      args: gateArgs,
-      command: ["ork", ...gateArgs],
-      verifyArgs,
-      verifyCommand,
-      worktreePath,
-    });
-    stage2 = {
-      command: ["ork", ...gateArgs],
-      output: gateOutput ?? null,
-      skipped: false,
-      status: "passed",
-      verifyCommand,
-    };
   } else {
-    const gateOutput = runCmd("ork", gateArgs, worktreePath);
-    stage2 = {
-      command: ["ork", ...gateArgs],
-      output: gateOutput ?? null,
-      skipped: false,
-      status: "passed",
-      verifyCommand,
-    };
+    try {
+      const gateOutput = gateRunner
+        ? await gateRunner({
+            args: gateArgs,
+            command: ["ork", ...gateArgs],
+            verifyArgs,
+            verifyCommand,
+            worktreePath,
+          })
+        : runCmd("ork", gateArgs, worktreePath);
+      stage2 = {
+        command: ["ork", ...gateArgs],
+        output: gateOutput ?? null,
+        skipped: false,
+        status: "passed",
+        verifyCommand,
+      };
+    } catch (error) {
+      recordState({
+        gateError: error?.message || String(error),
+        status: "gate_failed",
+      });
+      throw error;
+    }
   }
 
   // Stage 3: Cross-Vendor Cold Review
@@ -483,46 +690,144 @@ export async function smeltWorktree(worktree, options = {}) {
     "review",
     "--engine",
     reviewerEngine,
+    "--transport",
+    "executor",
+    "--format",
+    "json",
     "--read",
     worktreePath,
     "--diff",
     targetBranch,
+    "--question",
+    COLD_REVIEW_QUESTION,
   ];
   let stage3;
   if (isDryRun || shouldSkipReview) {
     stage3 = {
       args: consultArgs,
+      findings: "none",
       reviewerEngine,
       skipped: true,
       status: isDryRun ? "dry-run" : "skipped",
       workerEngine,
     };
-  } else if (reviewRunner) {
-    const reviewOutput = await reviewRunner({
-      args: consultArgs,
-      reviewerEngine,
-      targetBranch,
-      workerEngine,
-      worktreePath,
-    });
+  } else {
+    const runAgentScript = path.join(scriptsDir, "run_agent.py");
+    const reviewOutput = reviewRunner
+      ? await reviewRunner({
+          args: consultArgs,
+          reviewerEngine,
+          targetBranch,
+          workerEngine,
+          worktreePath,
+        })
+      : runCmd("python3", [runAgentScript, ...consultArgs], worktreePath);
+    const parsedReview = parseColdReviewFindings(reviewOutput);
+    if (!parsedReview.passed) {
+      stage3 = {
+        args: consultArgs,
+        findings: parsedReview.findings,
+        output: reviewOutput ?? null,
+        reviewerEngine,
+        skipped: false,
+        status: "changes_requested",
+        workerEngine,
+      };
+      recordState({
+        findings: parsedReview.findings,
+        reviewerEngine,
+        status: "review_changes_requested",
+      });
+      return {
+        allowPaths: allowPaths ?? [],
+        blastRadius,
+        branch,
+        changedPaths,
+        commands,
+        disposable: isDisposable,
+        dryRun: isDryRun,
+        findings: parsedReview.findings,
+        ok: false,
+        pruned: false,
+        reviewerEngine,
+        schema: "ork.smelter.run.v1",
+        skipReview: shouldSkipReview,
+        stages: {
+          coldReview: stage3,
+          heavyGate: stage2,
+          rebaseAndScope: stage1,
+          smeltAndPrune: {
+            branch,
+            disposable: isDisposable,
+            operations: [],
+            pruned: false,
+            skipped: true,
+            status: "skipped",
+            strategy,
+            targetBranch,
+          },
+        },
+        status: "review_changes_requested",
+        strategy,
+        targetBranch,
+        verifyCommand,
+        workerEngine,
+        worktreePath,
+        worktreeSlug: worktreeObj.slug || path.basename(worktreePath),
+      };
+    }
     stage3 = {
       args: consultArgs,
+      findings: parsedReview.findings,
       output: reviewOutput ?? null,
       reviewerEngine,
       skipped: false,
       status: "passed",
       workerEngine,
     };
-  } else {
-    const runAgentScript = path.join(scriptsDir, "run_agent.py");
-    const reviewOutput = runCmd("python3", [runAgentScript, ...consultArgs], worktreePath);
-    stage3 = {
-      args: consultArgs,
-      output: reviewOutput ?? null,
+  }
+
+  if (!isDryRun && blastRadius === "high" && strategy === "local" && !shouldApproveHighBlast) {
+    recordState({
+      blastRadius,
+      status: "awaiting_human_approval",
+    });
+    return {
+      allowPaths: allowPaths ?? [],
+      awaitingApproval: true,
+      blastRadius,
+      branch,
+      changedPaths,
+      commands,
+      disposable: isDisposable,
+      dryRun: isDryRun,
+      ok: false,
+      pruned: false,
       reviewerEngine,
-      skipped: false,
-      status: "passed",
+      schema: "ork.smelter.run.v1",
+      skipReview: shouldSkipReview,
+      stages: {
+        coldReview: stage3,
+        heavyGate: stage2,
+        rebaseAndScope: stage1,
+        smeltAndPrune: {
+          branch,
+          disposable: isDisposable,
+          operations: [],
+          pruned: false,
+          skipped: true,
+          status: "awaiting_human_approval",
+          strategy,
+          targetBranch,
+        },
+      },
+      status: "awaiting_human_approval",
+      strategy,
+      targetBranch,
+      verifyCommand,
       workerEngine,
+      worktreePath,
+      worktreeSlug: worktreeObj.slug || path.basename(worktreePath),
     };
   }
 
@@ -558,6 +863,7 @@ export async function smeltWorktree(worktree, options = {}) {
         );
       }
       runCmd("git", ["merge", "--ff-only", branch], repoRoot);
+      recordState({ status: "merged" });
       if (isDisposable) {
         runCmd("git", ["worktree", "remove", worktreePath], repoRoot);
         runCmd("git", ["branch", "-d", branch], repoRoot);
@@ -582,6 +888,7 @@ export async function smeltWorktree(worktree, options = {}) {
     if (!isDryRun) {
       runCmd("git", ["push", "-u", "origin", branch], worktreePath);
       prOutput = runCmd("gh", prArgs, worktreePath);
+      recordState({ status: "pr_opened" });
     }
     stage4 = {
       branch,
@@ -595,6 +902,7 @@ export async function smeltWorktree(worktree, options = {}) {
     };
   }
 
+  const finalSmeltStatus = strategy === "local" ? "merged" : "pr_opened";
   return {
     allowPaths: allowPaths ?? [],
     blastRadius,
@@ -614,6 +922,7 @@ export async function smeltWorktree(worktree, options = {}) {
       rebaseAndScope: stage1,
       smeltAndPrune: stage4,
     },
+    status: isDryRun ? "dry-run" : finalSmeltStatus,
     strategy,
     targetBranch,
     verifyCommand,
@@ -668,6 +977,7 @@ export async function smelterCli(
     allowPositionals: true,
     args: argv,
     options: {
+      "approve-high-blast": { type: "boolean" },
       "dry-run": { type: "boolean" },
       help: { short: "h", type: "boolean" },
       json: { type: "boolean" },
@@ -711,6 +1021,7 @@ export async function smelterCli(
         commitsAhead: wt.commitsAhead,
         disposable: wt.disposable,
         engine: wt.engine,
+        foundryState: wt.foundryState ?? null,
         issue: wt.issue,
         path: wt.path,
         slug: wt.slug,
@@ -734,10 +1045,12 @@ export async function smelterCli(
   if (values.worktree) {
     const requested = values.worktree.trim();
     const resolvedRequested = path.resolve(cwd, requested);
+    const canonicalRequested = alignCanonicalPath(resolvedRequested);
     selected = discovered.filter(
       (wt) =>
         wt.slug === requested ||
         wt.path === resolvedRequested ||
+        alignCanonicalPath(wt.path) === canonicalRequested ||
         path.basename(wt.path) === requested,
     );
     if (selected.length === 0 && existsSync(resolvedRequested)) {
@@ -760,6 +1073,7 @@ export async function smelterCli(
   const results = [];
   for (const wt of selected) {
     const res = await smeltWorktree(wt, {
+      approveHighBlast: Boolean(values["approve-high-blast"]),
       cwd,
       dryRun: Boolean(values["dry-run"]),
       execFileSyncFn,
@@ -772,26 +1086,39 @@ export async function smelterCli(
     results.push(res);
   }
 
+  const hasHalted = results.some((r) => r.ok === false);
   const payload =
     results.length === 1
-      ? { ...results[0], results }
+      ? { ...results[0], ok: results[0].ok !== false, results }
       : {
           dryRun: Boolean(values["dry-run"]),
+          ok: !hasHalted,
           results,
           schema: "ork.smelter.run.v1",
           targetBranch,
         };
 
+  if (hasHalted) {
+    process.exitCode = 1;
+  }
+
   if (values.json) {
     stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
   } else {
-    for (const res of results) {
-      stdout.write(
-        `${res.dryRun ? "Dry-run smelted" : "Smelted"} ${res.worktreeSlug} (${res.branch} -> ${res.targetBranch}, blast=${res.blastRadius}, reviewer=${res.reviewerEngine})\n`,
-      );
+    for (const item of results) {
+      if (item.ok === false) {
+        stdout.write(
+          `Halted ${item.taskId || item.worktreeSlug || item.branch} (${item.status})\n`,
+        );
+      } else {
+        stdout.write(
+          `${item.dryRun ? "Dry-run smelted" : "Smelted"} ${item.worktreeSlug} (${item.branch} -> ${item.targetBranch}, blast=${item.blastRadius}, reviewer=${item.reviewerEngine})\n`,
+        );
+      }
     }
   }
   return payload;
 }
 
 export const smelterCommand = smelterCli;
+export const runSmeltCli = smelterCli;

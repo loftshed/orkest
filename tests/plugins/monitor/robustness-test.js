@@ -103,3 +103,32 @@ test("bad arguments get a message and exit 2, not a stack trace or silent stale 
   expect(badAge.status).toBe(2);
   expect(badAge.stderr).toMatch(/--max-age must be a number of seconds/);
 });
+
+test("codex rpc ignores null JSON lines and antigravity rejects non-object JSON payloads", async () => {
+  const nullLineCodex = script(
+    "codex-null-line",
+    String.raw`#!/usr/bin/env node
+const out = (m) => process.stdout.write(JSON.stringify(m) + "\n");
+require("readline").createInterface({ input: process.stdin }).on("line", (line) => {
+  const m = JSON.parse(line);
+  if (m.id === 1) {
+    out(null);
+    out({ id: 1, result: {} });
+  }
+  if (m.id === 2) {
+    out(null);
+    out({ id: 2, result: { rateLimitsByLimitId: { codex: { limitId: "codex", planType: "pro",
+      primary: { usedPercent: 10, windowDurationMins: 10080, resetsAt: Math.floor(Date.now() / 1000) + 86400 } } } } });
+  }
+});
+`,
+  );
+  const { fetchCodex } = await import("../../../plugins/monitor/lib/providers/codex.mjs");
+  const codexResult = await fetchCodex({ command: nullLineCodex });
+  expect(codexResult.windows[0].remainingPct).toBe(90);
+
+  const nullAgy = script("agy-null", '#!/bin/sh\necho "null"\n');
+  const { fetchAntigravity } =
+    await import("../../../plugins/monitor/lib/providers/antigravity.mjs");
+  await expect(fetchAntigravity({ command: nullAgy })).rejects.toThrow(/non-object JSON payload/);
+});

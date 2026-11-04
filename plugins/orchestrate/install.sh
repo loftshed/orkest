@@ -8,7 +8,7 @@
 # ~/.agents/skills/orchestrate points at this checkout; each harness's skills directory points at the
 # hub, so moving the checkout means re-running
 # this script once. A real directory where a link belongs (an old hand-copied install) is moved to
-# ~/.local/share/agent-executor/backups, never deleted. Harnesses that load skills from a Claude plugin
+# ~/.local/share/orchestrate/backups, never deleted. Harnesses that load skills from a Claude plugin
 # instead can skip the links with --no-claude.
 set -eu
 
@@ -16,7 +16,7 @@ repo="$(cd "$(dirname "$0")" && pwd -P)"
 skill="$repo/skills/orchestrate"
 hub="$HOME/.agents/skills/orchestrate"
 legacy_hub="$HOME/.agents/skills/agent-executor"
-backups="${XDG_DATA_HOME:-$HOME/.local/share}/agent-executor/backups"
+backups="${XDG_DATA_HOME:-$HOME/.local/share}/orchestrate/backups"
 dry_run=0
 with_claude=1
 trust_hooks=0
@@ -74,12 +74,19 @@ retire_legacy_skills() {
     "$HOME/.codex/skills/agent-executor" \
     "$HOME/.config/opencode/skills/agent-executor" \
     "$HOME/.gemini/config/skills/agent-executor" \
-    "$HOME/.gemini/antigravity/skills/agent-executor"; do
+    "$HOME/.gemini/antigravity/skills/agent-executor" \
+    "${XDG_DATA_HOME:-$HOME/.local/share}/agent-executor"; do
     case "$place" in
       "$HOME/.claude/skills/"*|"$HOME/.claude-personal/skills/"*) [ "$with_claude" = 1 ] || continue ;;
     esac
     retire_legacy "$place"
   done
+  if [ "$with_claude" = 1 ]; then
+    for claude_dir in "$HOME"/.claude-*; do
+      [ -d "$claude_dir" ] || continue
+      retire_legacy "$claude_dir/skills/agent-executor"
+    done
+  fi
 }
 
 link "$skill" "$hub"
@@ -107,9 +114,12 @@ if [ "$dry_run" = 1 ]; then
   exit 0
 fi
 
-config="${AGENT_EXECUTOR_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/agent-executor/config.json}"
+config="${ORCHESTRATE_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/orchestrate/config.json}"
+legacy_config="${AGENT_EXECUTOR_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/agent-executor/config.json}"
 if [ -f "$config" ]; then
   echo "• route config exists: $config"
+elif [ -f "$legacy_config" ]; then
+  echo "• route config exists: $legacy_config"
 else
   python3 "$skill/scripts/run_agent.py" init
 fi

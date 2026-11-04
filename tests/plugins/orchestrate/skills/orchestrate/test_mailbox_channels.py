@@ -411,6 +411,23 @@ class ChannelTests(unittest.TestCase):
         )
         self.assertFalse(peer_mailbox.unrelated_task(self.base, room_coord, room_worker))
 
+    def test_direct_messages_with_wake_false_do_not_extend_turns_at_stop(self):
+        sender = self.peer("sender", channels=["graph"])
+        recipient = self.peer("recipient", harness="claude", channels=["graph"], state="busy")
+        payload = {"session_id": "recipient", "cwd": str(self.repo)}
+        peer_mailbox.send(self.base, sender=sender, to=recipient["name"], text="FYI progress update", wake=False)
+        (stored,) = peer_mailbox.incoming(self.base, "recipient")
+        self.assertIs(stored.get("wake"), False)
+        self.assertFalse(mailbox_channels.reads_at_stop(stored))
+        with patch.object(peer_mailbox, "harness_pid", return_value=os.getpid()):
+            stopped = peer_mailbox.hook({**payload, "hook_event_name": "Stop"}, harness="claude", base=self.base)
+            self.assertIsNone(stopped)
+            self.assertEqual(self.inbox("recipient"), ["FYI progress update"])
+            started = peer_mailbox.hook(
+                {**payload, "hook_event_name": "UserPromptSubmit"}, harness="claude", base=self.base
+            )
+            self.assertIn("FYI progress update", started["hookSpecificOutput"]["additionalContext"])
+
 
 if __name__ == "__main__":
     unittest.main()

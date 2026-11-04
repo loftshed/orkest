@@ -420,10 +420,11 @@ class HerdrSwarmLaunchTests(unittest.TestCase):
                 "PATH": str(home) + os.pathsep + os.environ["PATH"],
                 "TERM": "xterm-256color",
                 "HERDR_ENV": "1",
+                "ORKEST_TEST_ALLOW_HERDR": "1",
                 "HERDR_PANE_ID": "w1:p1",
                 "HERDR_WORKSPACE_ID": "w1",
             }
-            for key in ("ORKEST_TERMINAL_SERVER", "ORKEST_TERMINAL_HARNESS", "TMUX", "TMUX_PANE"):
+            for key in ("ORKEST_SWARM_ROOM", "ORKEST_TERMINAL_SERVER", "ORKEST_TERMINAL_HARNESS", "TMUX", "TMUX_PANE"):
                 environment.pop(key, None)
             pid, master = pty.fork()
             if pid == 0:
@@ -769,6 +770,187 @@ class HerdrSwarmLaunchTests(unittest.TestCase):
             self.assertEqual(item["integrator"]["session"], new_sid)
             self.assertEqual(item["owner"]["session"], new_sid)
             self.assertEqual(item["transfer"]["session"], new_sid)
+
+    def test_swarm_next_digest_advisor_deduplicates_and_auto_recovers(self):
+        import mailbox_hooks
+
+        with tempfile.TemporaryDirectory(prefix="ork-swarm-advisor-") as tmp:
+            home = Path(tmp).resolve()
+            base = home / "mailbox-v1"
+            (base / "rooms").mkdir(parents=True, exist_ok=True)
+            session_id = "conductor-session-1234"
+            host = socket.gethostname()
+
+            task_dir = home / "task-w1"
+            (task_dir / "runs" / "r1" / "artifacts").mkdir(parents=True, exist_ok=True)
+            result_path = task_dir / "runs" / "r1" / "artifacts" / "result.json"
+            task_state = {
+                "schema": "agent-executor.task.v1",
+                "task_id": "t1",
+                "repository": str(home),
+                "host": "claude",
+                "status": "active",
+                "runs": [
+                    {
+                        "run_id": "r1",
+                        "request_id": "req-1",
+                        "kind": "implementation",
+                        "status": "finished",
+                        "runner_status": "completed",
+                        "engine": "codex",
+                        "model": "gpt-5.6-sol",
+                        "result_path": str(result_path),
+                    }
+                ],
+                "decisions": [],
+            }
+            mailbox.write(task_dir / "task.json", task_state)
+
+            room = {
+                "schema": "agent-executor.room.v1",
+                "id": "room-advisor",
+                "title": "Advisor Room",
+                "cwd": str(home),
+                "machine": host,
+                "swarm": {"maxAgents": 8, "maxDepth": 3},
+                "objective": "Ship advisor",
+                "updatedAt": 3000,
+                "conductor": {
+                    "engine": "claude",
+                    "role": "lead",
+                    "status": "active",
+                    "session": {"id": session_id, "engine": "claude", "machine": host, "cwd": str(home)},
+                },
+                "agents": [
+                    {
+                        "id": "w1",
+                        "role": "worker",
+                        "engine": "codex",
+                        "status": "review",
+                        "dispatch": {"taskDir": str(task_dir), "runId": "r1"},
+                    }
+                ],
+            }
+            mailbox.write(base / "rooms" / "room-advisor.json", room)
+
+            me = mailbox.register(
+                base,
+                session=session_id,
+                harness="claude",
+                cwd=str(home),
+                pid=os.getpid(),
+                account=str(home),
+            )
+            old_env = os.environ.get("ORKEST_SWARM_ROOM")
+            try:
+                os.environ["ORKEST_SWARM_ROOM"] = "room-advisor"
+                # Turn 1: Initial reconnection banner
+                first = mailbox_hooks.swarm_coordinator_context(base, me, "UserPromptSubmit")
+                self.assertIn("Reconnected to swarm room room-advisor", first)
+
+                # Turn 2: Emits Swarm next step advisor for reviewable run r1
+                me2 = mailbox.load(mailbox.peer_path(base, session_id))
+                second = mailbox_hooks.swarm_coordinator_context(base, me2, "UserPromptSubmit")
+                self.assertIn("Swarm next step (room room-advisor", second)
+                self.assertIn("[review] w1 finished run r1", second)
+
+                # Turn 3 with unchanged state: deduplicated by swarmNextDigest -> returns ""
+                me3 = mailbox.load(mailbox.peer_path(base, session_id))
+                third = mailbox_hooks.swarm_coordinator_context(base, me3, "UserPromptSubmit")
+                self.assertEqual(third, "")
+
+                # Add a queued agent -> digest changes -> advisor fires again
+                room["agents"].append({"id": "w2", "role": "worker", "engine": "claude", "status": "queued"})
+                mailbox.write(base / "rooms" / "room-advisor.json", room)
+                me4 = mailbox.load(mailbox.peer_path(base, session_id))
+                fourth = mailbox_hooks.swarm_coordinator_context(base, me4, "UserPromptSubmit")
+                self.assertIn("Swarm next step (room room-advisor", fourth)
+            finally:
+                if old_env is not None:
+                    os.environ["ORKEST_SWARM_ROOM"] = old_env
+                else:
+                    os.environ.pop("ORKEST_SWARM_ROOM", None)
+
+    def test_side_command_hook_blocks_claude_prompt_and_stop_skips_turn_extended_spam(self):
+        import mailbox_hooks
+
+        with tempfile.TemporaryDirectory(prefix="ork-side-hook-") as tmp:
+            home = Path(tmp).resolve()
+            base = home / "mailbox-v1"
+            session_id = "claude-main-session-1"
+            mailbox.register(
+                base,
+                session=session_id,
+                harness="claude",
+                cwd=str(home),
+                pid=os.getpid(),
+                account=str(home),
+            )
+            payload = {
+                "session_id": session_id,
+                "cwd": str(home),
+                "hook_event_name": "UserPromptSubmit",
+                "prompt": "/side --dry-run ask: why does token refresh retry twice?",
+            }
+            out = mailbox_hooks.hook(payload, harness="claude", event="UserPromptSubmit", base=base)
+            self.assertIsNotNone(out)
+            self.assertEqual(out.get("decision"), "block")
+            self.assertIn("Would investigate side mission", out.get("reason", ""))
+
+            # Parent session inbox must remain completely untouched
+            inbox_files = list(mailbox.inbox_dir(base, session_id).glob("*.json"))
+            self.assertEqual(inbox_files, [])
+
+            # Repeated Stop deliveries must deduplicate into at most 1 turn_extended feedback report
+            mailbox.register(
+                base,
+                session=session_id,
+                harness="claude",
+                cwd=str(home),
+                pid=os.getpid(),
+                state="busy",
+                account=str(home),
+            )
+            sender = mailbox.register(
+                base,
+                session="peer-sender-2",
+                harness="codex",
+                cwd=str(home),
+                pid=os.getpid(),
+                account=str(home),
+            )
+            mailbox.send(
+                base,
+                sender=sender,
+                to=session_id,
+                text="Quick update from peer 1",
+                scope="cross-project",
+            )
+            stop_out = mailbox_hooks.hook(
+                {"session_id": session_id, "cwd": str(home), "hook_event_name": "Stop"},
+                harness="claude",
+                event="Stop",
+                base=base,
+            )
+            self.assertIsNotNone(stop_out)
+            self.assertEqual(stop_out.get("decision"), "block")
+            mailbox.send(
+                base,
+                sender=sender,
+                to=session_id,
+                text="Another longer update from peer 2",
+                scope="cross-project",
+            )
+            stop_out_2 = mailbox_hooks.hook(
+                {"session_id": session_id, "cwd": str(home), "hook_event_name": "Stop"},
+                harness="claude",
+                event="Stop",
+                base=base,
+            )
+            self.assertIsNotNone(stop_out_2)
+            fb_dir = mailbox.feedback_module().directory(base)
+            feedback_files = list(fb_dir.glob("*.json")) if fb_dir and fb_dir.exists() else []
+            self.assertEqual(len(feedback_files), 1)
 
 
 if __name__ == "__main__":

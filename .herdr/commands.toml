@@ -39,3 +39,53 @@ type = "popup"
 key = "prefix+alt+f"
 width = "85%"
 height = "80%"
+
+[[commands]]
+id = "orkest.next-step"
+title = "Next Step"
+description = "Determine and execute the next safe autonomous step across worktrees, Smelter, and Foundry"
+command = "ork next"
+type = "popup"
+key = "prefix+alt+n"
+width = "85%"
+height = "80%"
+
+[[commands]]
+id = "orkest.side-mission"
+title = "Side Mission"
+description = "Inspect or launch background side-mission worktrees on spare subscription quota"
+command = "ork side status"
+type = "popup"
+key = "prefix+alt+m"
+width = "85%"
+height = "80%"
+
+[[commands]]
+id = "orkest.cleanup-state"
+title = "Cleanup Legacy State"
+description = "Audit and prune stale rooms, orphaned worktrees, and legacy runtime caches"
+command = "ork cleanup"
+type = "popup"
+key = "prefix+alt+c"
+width = "85%"
+height = "80%"
+
+[[commands]]
+id = "orkest.policy"
+title = "Execution Policy"
+description = "View or update harness and pool allow/deny policies for Orkest"
+command = "ork policy"
+type = "popup"
+key = "prefix+alt+p"
+width = "85%"
+height = "80%"
+
+[[commands]]
+id = "orkest.update"
+title = "Update Orkest"
+description = "Check for and apply Orkest updates"
+command = "ork update"
+type = "popup"
+key = "prefix+alt+u"
+width = "85%"
+height = "80%"

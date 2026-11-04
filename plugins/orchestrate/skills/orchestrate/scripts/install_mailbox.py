@@ -21,18 +21,379 @@ import mailbox_configuration as configuration
 import mailbox_daemon
 import mailbox_mcp
 import peer_mailbox as mailbox
+import runtime_paths
 from check_mailbox import RpcClient, check, initialize_codex
 
 EVENTS = ("SessionStart", "UserPromptSubmit", "Stop", "SessionEnd")
+CLAUDE_EVENTS = (*EVENTS, "SubagentStart", "SubagentStop")
 AGY_EVENTS = ("SessionStart", "PreInvocation", "Stop")
 TOOLS = tuple(sorted(mailbox_mcp.TOOL_NAMES))
+DEFAULT_KEEP_BACKUPS = 1
+DAEMON_RUNTIME_GRACE_SECONDS = 15 * 60
 MANAGED_ZSHRC_START = "# >>> orkest (managed) >>>"
 MANAGED_ZSHRC_END = "# <<< orkest (managed) <<<"
 MANAGED_ZSHRC_BLOCK = (
     f"{MANAGED_ZSHRC_START}\n"
-    '[ -f "$HOME/.config/agent-executor/orkest.sh" ] && . "$HOME/.config/agent-executor/orkest.sh"\n'
+    'if [ -f "$HOME/.config/orchestrate/orkest.sh" ]; then\n'
+    '  . "$HOME/.config/orchestrate/orkest.sh"\n'
+    'elif [ -f "$HOME/.config/agent-executor/orkest.sh" ]; then\n'
+    '  . "$HOME/.config/agent-executor/orkest.sh"\n'
+    "fi\n"
     f"{MANAGED_ZSHRC_END}\n"
 )
+
+SWARM_COMMAND_TEXT = (
+    "---\n"
+    "description: Toggle (open or close) the live Orkest Swarm View split pane in this terminal\n"
+    'argument-hint: "[toggle|open|close]"\n'
+    "---\n\n"
+    "[orkest-swarm-command: $ARGUMENTS]\n"
+    "If the `/swarm` turn hook already opened or closed the Orkest Swarm View pane, confirm the result in one "
+    "short line and do not call any tools. Otherwise run `ork swarm $ARGUMENTS` and report the result in one "
+    "short line.\n"
+)
+
+SWARM_SKILL_TEXT = (
+    "---\n"
+    "name: swarm\n"
+    "description: Toggle (open or close) the live Orkest Swarm View split pane in the current terminal when the user types /swarm.\n"
+    "metadata:\n"
+    "  version: 0.50.0\n"
+    "---\n\n"
+    "[orkest-swarm-command]\n"
+    "If the `/swarm` turn hook already opened or closed the Orkest Swarm View pane, confirm the result in one "
+    "short line and do not call any tools. Otherwise run `ork swarm` (`ork swarm open` or `ork swarm close`) "
+    "and report the result in one short line.\n"
+)
+
+CLEANUP_COMMAND_TEXT = (
+    "---\n"
+    "description: Audit, prune, and migrate legacy Orkest / agent-executor state, worktrees, and backups\n"
+    'argument-hint: "[status|run] [--dry-run] [--migrate-legacy]"\n'
+    "---\n\n"
+    "[orkest-cleanup-command: $ARGUMENTS]\n"
+    "Run `ork cleanup $ARGUMENTS` (use `ork cleanup status --json` first if you want to preview before mutating, "
+    "or `ork cleanup run --migrate-legacy` when the user asks to clean up and migrate legacy paths) and report "
+    "the reclaimed artifacts, worktrees, backups, and legacy path migration status concisely.\n"
+)
+
+CLEANUP_SKILL_TEXT = (
+    "---\n"
+    "name: cleanup\n"
+    "description: Audit, prune, and migrate legacy Orkest and agent-executor caches, disposable worktrees, staged daemon runtimes, and configuration backups when the user types /cleanup or asks to clean up old Orkest versions.\n"
+    "metadata:\n"
+    "  version: 0.50.0\n"
+    "---\n\n"
+    "[orkest-cleanup-command]\n"
+    "Run `ork cleanup status --json` to inspect reclaimable Orkest state, or `ork cleanup run [--migrate-legacy] --json` "
+    "to prune stale runs, disposable worktrees, staged daemon runtimes, and backups (and optionally migrate legacy "
+    "`~/.cache/agent-executor` and `~/.config/agent-executor` paths).\n"
+)
+
+SIDE_SKILL_TEXT = (
+    "---\n"
+    "name: side\n"
+    'description: Dispatch or park a side mission from the current tab without derailing the active task or cluttering the main conversation context. Triggers on "/side", "ork side", "side:", or "!side".\n'
+    "metadata:\n"
+    "  version: 0.50.0\n"
+    "---\n\n"
+    "[orkest-side-command]\n"
+    "When the `/side` turn hook has already dispatched or parked this side mission, confirm the result in one short line "
+    "and do not call any tools. Otherwise run `ork side <idea>` (`--execute`, `--investigate`, `--later`, or `--issue`) "
+    "and report the result in one short line.\n"
+)
+
+UPDATE_SKILL_TEXT = (
+    "---\n"
+    "name: update\n"
+    "description: Check for and apply fast-forward Orkest repository updates, re-run mailbox installation, and migrate legacy agent-executor state when the user runs /update or ork update.\n"
+    "metadata:\n"
+    "  version: 0.50.0\n"
+    "---\n\n"
+    "[orkest-update-command]\n"
+    "Run `ork update` (`ork update check`, `ork update status`, `ork update enable`, or `ork update disable`) "
+    "and report the update status concisely.\n"
+)
+
+
+def resolve_config_home(home: Path) -> Path:
+    if home.resolve() == Path.home().resolve():
+        return runtime_paths.config_home()
+    saved: dict[str, str | None] = {}
+    for key in (
+        "XDG_CONFIG_HOME",
+        "ORCHESTRATE_CONFIG_HOME",
+        "AGENT_EXECUTOR_CONFIG_HOME",
+        "ORCHESTRATE_CONFIG",
+        "AGENT_EXECUTOR_CONFIG",
+    ):
+        saved[key] = os.environ.pop(key, None)
+    os.environ["XDG_CONFIG_HOME"] = str(home / ".config")
+    try:
+        return runtime_paths.config_home()
+    finally:
+        for key, val in saved.items():
+            if val is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = val
+
+
+def _backup_sort_key(path: Path) -> tuple[int, int, str]:
+    suffix = path.name.rsplit(".mailbox-bak.", 1)[-1]
+    stamp = int(suffix) if suffix.isdigit() else 0
+    try:
+        mtime_ns = path.lstat().st_mtime_ns
+    except OSError:
+        mtime_ns = 0
+    return (stamp, mtime_ns, path.name)
+
+
+def rotate_backups(target: Path, *, keep_backups: int = DEFAULT_KEEP_BACKUPS, dry_run: bool = False) -> list[Path]:
+    """Retain only the newest `keep_backups` `.mailbox-bak.*` siblings for `target`."""
+    keep = max(0, int(keep_backups))
+    parent = target.parent
+    if not parent.is_dir():
+        return []
+    prefix = f"{target.name}.mailbox-bak."
+    candidates = [entry for entry in parent.iterdir() if entry.name.startswith(prefix)]
+    candidates.sort(key=_backup_sort_key, reverse=True)
+    stale = candidates[keep:]
+    removed: list[Path] = []
+    for item in stale:
+        removed.append(item)
+        if not dry_run:
+            if item.is_dir() and not item.is_symlink():
+                shutil.rmtree(item, ignore_errors=True)
+            else:
+                item.unlink(missing_ok=True)
+    return removed
+
+
+def prune_daemon_runtimes(
+    base: Path | None = None,
+    *,
+    grace_seconds: float = DAEMON_RUNTIME_GRACE_SECONDS,
+    dry_run: bool = False,
+) -> list[Path]:
+    """Prune inactive staged daemon runtime directories in mailbox-daemon-v1/runtimes/*,
+    keeping state.json['runtimeRevision'] plus any runtime modified within the grace window."""
+    base = base or mailbox.root()
+    daemon_dirs: list[Path] = []
+    for candidate in (base.parent / "mailbox-daemon-v1", base / "mailbox-daemon-v1", base):
+        if (candidate / "runtimes").is_dir() and candidate not in daemon_dirs:
+            daemon_dirs.append(candidate)
+    now = time.time()
+    current_rev = ""
+    try:
+        current_rev = str(mailbox_daemon.runtime_revision() or "")
+    except Exception:
+        current_rev = ""
+    pruned: list[Path] = []
+    for daemon_dir in daemon_dirs:
+        active_rev = ""
+        state_path = daemon_dir / "state.json"
+        if state_path.is_file():
+            try:
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                if isinstance(state, dict):
+                    active_rev = str(state.get("runtimeRevision") or "")
+            except (OSError, ValueError):
+                active_rev = ""
+        runtimes_dir = daemon_dir / "runtimes"
+        if not runtimes_dir.is_dir():
+            continue
+        for entry in sorted(runtimes_dir.iterdir()):
+            if not entry.is_dir() and not entry.is_symlink():
+                continue
+            if entry.name and entry.name in {active_rev, current_rev}:
+                continue
+            try:
+                mtime = entry.stat().st_mtime
+            except OSError:
+                continue
+            if (now - mtime) < grace_seconds:
+                continue
+            pruned.append(entry)
+            if not dry_run:
+                if entry.is_dir() and not entry.is_symlink():
+                    shutil.rmtree(entry, ignore_errors=True)
+                else:
+                    entry.unlink(missing_ok=True)
+    return pruned
+
+
+def remove_legacy_skill_links(home: Path, *, dry_run: bool = False) -> list[Path]:
+    """Remove legacy `agent-executor` skill links across harnesses when refreshing."""
+    removed: list[Path] = []
+    skill_parents = [
+        home / ".agents/skills",
+        home / ".codex/skills",
+        home / ".gemini/config/skills",
+        home / ".gemini/antigravity/skills",
+        home / ".config/opencode/skills",
+        home / ".claude/skills",
+        *(p / "skills" for p in sorted(home.glob(".claude-*")) if p.is_dir()),
+    ]
+    for parent in skill_parents:
+        legacy_link = parent / "agent-executor"
+        if not (legacy_link.is_symlink() or legacy_link.exists()):
+            continue
+        removed.append(legacy_link)
+        if dry_run:
+            print(f"would remove legacy agent-executor skill link: {legacy_link}")
+        else:
+            if legacy_link.is_dir() and not legacy_link.is_symlink():
+                shutil.rmtree(legacy_link, ignore_errors=True)
+            else:
+                legacy_link.unlink(missing_ok=True)
+            print(f"✓ removed legacy skill link: {legacy_link}")
+    return removed
+
+
+def _install_claude_command(home: Path, name: str, content: str, *, dry_run: bool = False) -> bool:
+    changed = False
+    for claude_dir in [home / ".claude", *sorted(home.glob(".claude-*"))]:
+        if not claude_dir.is_dir():
+            continue
+        cmd_file = claude_dir / f"commands/{name}.md"
+        if not cmd_file.is_file() or cmd_file.read_text(encoding="utf-8") != content:
+            if dry_run:
+                print(f"would install /{name} command: {cmd_file}")
+            else:
+                cmd_file.parent.mkdir(parents=True, exist_ok=True)
+                configuration.write_private(cmd_file, content)
+                print(f"✓ /{name} command: {cmd_file}")
+            changed = True
+    return changed
+
+
+def _install_cross_harness_skill(home: Path, name: str, content: str, *, dry_run: bool = False) -> bool:
+    changed = False
+    skill_hub = home / f".agents/skills/{name}"
+    skill_file = skill_hub / "SKILL.md"
+    if not skill_file.is_file() or skill_file.read_text(encoding="utf-8") != content:
+        if dry_run:
+            print(f"would install /{name} skill: {skill_file}")
+        else:
+            skill_hub.mkdir(parents=True, exist_ok=True)
+            configuration.write_private(skill_file, content)
+            print(f"✓ /{name} skill: {skill_file}")
+        changed = True
+    duplicate_parents = (
+        home / ".claude/skills",
+        *(p / "skills" for p in sorted(home.glob(".claude-*")) if p.is_dir()),
+        home / ".gemini/antigravity/skills",
+    )
+    for dup_parent in duplicate_parents:
+        dup_link = dup_parent / name
+        if dup_link.is_symlink() or dup_link.exists():
+            if dry_run:
+                print(f"would remove duplicate /{name} skill link: {dup_link}")
+            else:
+                if dup_link.is_dir() and not dup_link.is_symlink():
+                    shutil.rmtree(dup_link, ignore_errors=True)
+                else:
+                    dup_link.unlink(missing_ok=True)
+                print(f"✓ removed duplicate /{name} skill link: {dup_link}")
+            changed = True
+    skill_parents = (
+        home / ".codex/skills",
+        home / ".gemini/config/skills",
+        home / ".config/opencode/skills",
+    )
+    for skill_parent in skill_parents:
+        if not skill_parent.parent.is_dir():
+            continue
+        skill_link = skill_parent / name
+        if not (skill_link.is_symlink() and skill_link.resolve() == skill_hub.resolve()):
+            if dry_run:
+                print(f"would link /{name} skill: {skill_link} -> {skill_hub}")
+            else:
+                skill_parent.mkdir(parents=True, exist_ok=True)
+                if skill_link.exists() or skill_link.is_symlink():
+                    skill_link.rename(skill_link.with_name(f"{skill_link.name}.mailbox-bak.{time.time_ns()}"))
+                    rotate_backups(skill_link)
+                skill_link.symlink_to(skill_hub)
+                print(f"✓ /{name} skill linked: {skill_link} -> {skill_hub}")
+            changed = True
+    return changed
+
+
+def _candidate_plugin_roots(plugin_root: Path | None = None, ork_cli: Path | None = None) -> list[Path]:
+    roots: list[Path] = []
+    if plugin_root is not None:
+        roots.append(plugin_root)
+    if ork_cli is not None:
+        roots.append(ork_cli.parent.parent)
+    roots.append(Path(__file__).resolve().parents[3])
+    unique: list[Path] = []
+    for root in roots:
+        if root not in unique:
+            unique.append(root)
+    return unique
+
+
+def install_swarm_command(home: Path, *, dry_run: bool = False) -> bool:
+    return _install_claude_command(home, "swarm", SWARM_COMMAND_TEXT, dry_run=dry_run)
+
+
+def install_swarm_skill(home: Path, *, dry_run: bool = False) -> bool:
+    return _install_cross_harness_skill(home, "swarm", SWARM_SKILL_TEXT, dry_run=dry_run)
+
+
+def install_cleanup_command(home: Path, *, dry_run: bool = False) -> bool:
+    return _install_claude_command(home, "cleanup", CLEANUP_COMMAND_TEXT, dry_run=dry_run)
+
+
+def install_cleanup_skill(home: Path, *, dry_run: bool = False) -> bool:
+    return _install_cross_harness_skill(home, "cleanup", CLEANUP_SKILL_TEXT, dry_run=dry_run)
+
+
+def install_side_command(
+    home: Path, *, plugin_root: Path | None = None, ork_cli: Path | None = None, dry_run: bool = False
+) -> bool:
+    for root in _candidate_plugin_roots(plugin_root, ork_cli):
+        side_cmd = root / "commands/side.md"
+        if side_cmd.is_file():
+            return _install_claude_command(home, "side", side_cmd.read_text(encoding="utf-8"), dry_run=dry_run)
+    return False
+
+
+def install_side_skill(
+    home: Path, *, plugin_root: Path | None = None, ork_cli: Path | None = None, dry_run: bool = False
+) -> bool:
+    for root in _candidate_plugin_roots(plugin_root, ork_cli):
+        side_skill = root / "skills/side/SKILL.md"
+        if side_skill.is_file():
+            return _install_cross_harness_skill(home, "side", side_skill.read_text(encoding="utf-8"), dry_run=dry_run)
+        if (root / "commands/side.md").is_file():
+            return _install_cross_harness_skill(home, "side", SIDE_SKILL_TEXT, dry_run=dry_run)
+    return False
+
+
+def install_update_command(
+    home: Path, *, plugin_root: Path | None = None, ork_cli: Path | None = None, dry_run: bool = False
+) -> bool:
+    for root in _candidate_plugin_roots(plugin_root, ork_cli):
+        update_cmd = root / "commands/update.md"
+        if update_cmd.is_file():
+            return _install_claude_command(home, "update", update_cmd.read_text(encoding="utf-8"), dry_run=dry_run)
+    return False
+
+
+def install_update_skill(
+    home: Path, *, plugin_root: Path | None = None, ork_cli: Path | None = None, dry_run: bool = False
+) -> bool:
+    for root in _candidate_plugin_roots(plugin_root, ork_cli):
+        update_skill = root / "skills/update/SKILL.md"
+        if update_skill.is_file():
+            return _install_cross_harness_skill(
+                home, "update", update_skill.read_text(encoding="utf-8"), dry_run=dry_run
+            )
+        if (root / "commands/update.md").is_file():
+            return _install_cross_harness_skill(home, "update", UPDATE_SKILL_TEXT, dry_run=dry_run)
+    return False
 
 
 def shell_wrapper_script() -> str:
@@ -134,8 +495,79 @@ alias oopencode='ork label -- opencode'
 """
 
 
+def sync_installed_runtimes_and_caches(home: Path, ork_cli: Path | None = None, *, dry_run: bool = False) -> bool:
+    """Propagate local plugin changes to ~/.local/share/monitor and installed Claude/Codex plugin caches."""
+    changed = False
+    ork_cli = ork_cli or (Path(__file__).resolve().parents[3] / "bin/ork.mjs")
+    plugins_dir = ork_cli.resolve().parents[2]
+    if plugins_dir.name != "plugins":
+        return False
+
+    monitor_src = plugins_dir / "monitor"
+    monitor_runtime = home / ".local/share/monitor"
+    if monitor_src.is_dir() and monitor_runtime.is_dir():
+        if dry_run:
+            print(f"would sync monitor runtime: {monitor_runtime}")
+        else:
+            for item_name in ("bin", "lib", "package.json"):
+                src_item = monitor_src / item_name
+                dst_item = monitor_runtime / item_name
+                if not src_item.exists():
+                    continue
+                if src_item.is_dir():
+                    shutil.copytree(src_item, dst_item, dirs_exist_ok=True)
+                else:
+                    shutil.copy2(src_item, dst_item)
+            print(f"✓ monitor runtime synced: {monitor_runtime}")
+        changed = True
+
+    cache_roots = [
+        home / ".claude/plugins/cache/orkest",
+        *(p / "plugins/cache/orkest" for p in sorted(home.glob(".claude-*")) if p.is_dir()),
+        home / ".codex/plugins/cache/orkest",
+    ]
+    seen_real_caches: set[Path] = set()
+    for cache_root in cache_roots:
+        if not cache_root.is_dir():
+            continue
+        real_cache = cache_root.resolve()
+        if real_cache in seen_real_caches:
+            continue
+        seen_real_caches.add(real_cache)
+        for plugin_name in ("orchestrate", "monitor"):
+            src_plugin = plugins_dir / plugin_name
+            plugin_cache_dir = real_cache / plugin_name
+            if not src_plugin.is_dir() or not plugin_cache_dir.is_dir():
+                continue
+            manifest = src_plugin / ".claude-plugin/plugin.json"
+            version = ""
+            if manifest.is_file():
+                try:
+                    version = str(json.loads(manifest.read_text(encoding="utf-8")).get("version") or "")
+                except (OSError, ValueError):
+                    version = ""
+            target_dirs = [d for d in sorted(plugin_cache_dir.iterdir()) if d.is_dir()]
+            if version and (plugin_cache_dir / version) not in target_dirs:
+                target_dirs.append(plugin_cache_dir / version)
+            if not target_dirs:
+                continue
+            target_dir = target_dirs[-1]
+            if dry_run:
+                print(f"would sync cached plugin {plugin_name}: {target_dir}")
+            else:
+                shutil.copytree(
+                    src_plugin,
+                    target_dir,
+                    dirs_exist_ok=True,
+                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+                )
+                print(f"✓ cached plugin synced ({plugin_name}): {target_dir}")
+            changed = True
+    return changed
+
+
 def install_shell_wrappers(home: Path, ork_cli: Path | None = None, *, dry_run: bool = False) -> bool:
-    """Write ~/.config/agent-executor/orkest.sh, link ~/.local/bin/ork, and wire ~/.zshrc."""
+    """Write ~/.config/orchestrate/orkest.sh (with legacy fallback), link ~/.local/bin/ork, and wire ~/.zshrc."""
     changed = False
     ork_cli = ork_cli or (Path(__file__).resolve().parents[3] / "bin/ork.mjs")
     bin_link = home / ".local/bin/ork"
@@ -146,11 +578,13 @@ def install_shell_wrappers(home: Path, ork_cli: Path | None = None, *, dry_run: 
             bin_link.parent.mkdir(parents=True, exist_ok=True)
             if bin_link.exists() or bin_link.is_symlink():
                 bin_link.rename(bin_link.with_name(f"{bin_link.name}.mailbox-bak.{time.time_ns()}"))
+                rotate_backups(bin_link)
             bin_link.symlink_to(ork_cli)
             print(f"✓ ork CLI linked: {bin_link} -> {ork_cli}")
         changed = True
 
-    wrapper_file = home / ".config/agent-executor/orkest.sh"
+    config_dir = resolve_config_home(home)
+    wrapper_file = config_dir / "orkest.sh"
     script_text = shell_wrapper_script()
     if not wrapper_file.is_file() or wrapper_file.read_text(encoding="utf-8") != script_text:
         if dry_run:
@@ -193,68 +627,26 @@ def install_shell_wrappers(home: Path, ork_cli: Path | None = None, *, dry_run: 
             print(f"✓ shell wrapper source block: {zshrc}")
         changed = True
 
-    swarm_command_text = (
-        "---\n"
-        "description: Toggle (open or close) the live Orkest Swarm View split pane in this terminal\n"
-        'argument-hint: "[toggle|open|close]"\n'
-        "---\n\n"
-        "[orkest-swarm-command: $ARGUMENTS]\n"
-        "If the `/swarm` turn hook already opened or closed the Orkest Swarm View pane, confirm the result in one "
-        "short line and do not call any tools. Otherwise run `ork swarm $ARGUMENTS` and report the result in one "
-        "short line.\n"
-    )
-    for claude_dir in [home / ".claude", *sorted(home.glob(".claude-*"))]:
-        if not claude_dir.is_dir():
-            continue
-        cmd_file = claude_dir / "commands/swarm.md"
-        if not cmd_file.is_file() or cmd_file.read_text(encoding="utf-8") != swarm_command_text:
-            if dry_run:
-                print(f"would install /swarm command: {cmd_file}")
-            else:
-                cmd_file.parent.mkdir(parents=True, exist_ok=True)
-                configuration.write_private(cmd_file, swarm_command_text)
-                print(f"✓ /swarm command: {cmd_file}")
-            changed = True
-
-    swarm_skill_text = (
-        "---\n"
-        "name: swarm\n"
-        "description: Toggle (open or close) the live Orkest Swarm View split pane in the current terminal when the user types /swarm.\n"
-        "---\n\n"
-        "[orkest-swarm-command]\n"
-        "If the `/swarm` turn hook already opened or closed the Orkest Swarm View pane, confirm the result in one "
-        "short line and do not call any tools. Otherwise run `ork swarm` (`ork swarm open` or `ork swarm close`) "
-        "and report the result in one short line.\n"
-    )
-    swarm_hub = home / ".agents/skills/swarm"
-    swarm_skill_file = swarm_hub / "SKILL.md"
-    if not swarm_skill_file.is_file() or swarm_skill_file.read_text(encoding="utf-8") != swarm_skill_text:
-        if dry_run:
-            print(f"would install /swarm skill: {swarm_skill_file}")
-        else:
-            swarm_hub.mkdir(parents=True, exist_ok=True)
-            configuration.write_private(swarm_skill_file, swarm_skill_text)
-            print(f"✓ /swarm skill: {swarm_skill_file}")
+    if remove_legacy_skill_links(home, dry_run=dry_run):
         changed = True
-    for skill_parent in (
-        home / ".codex/skills",
-        home / ".gemini/config/skills",
-        home / ".gemini/antigravity/skills",
-        home / ".config/opencode/skills",
-    ):
-        if not skill_parent.parent.is_dir():
-            continue
-        skill_link = skill_parent / "swarm"
-        if not (skill_link.is_symlink() and skill_link.resolve() == swarm_hub.resolve()):
-            if dry_run:
-                print(f"would link /swarm skill: {skill_link} -> {swarm_hub}")
-            else:
-                skill_parent.mkdir(parents=True, exist_ok=True)
-                if skill_link.exists() or skill_link.is_symlink():
-                    skill_link.rename(skill_link.with_name(f"{skill_link.name}.mailbox-bak.{time.time_ns()}"))
-                skill_link.symlink_to(swarm_hub)
-                print(f"✓ /swarm skill linked: {skill_link} -> {swarm_hub}")
-            changed = True
+    if install_swarm_command(home, dry_run=dry_run):
+        changed = True
+    if install_swarm_skill(home, dry_run=dry_run):
+        changed = True
+    if install_cleanup_command(home, dry_run=dry_run):
+        changed = True
+    if install_cleanup_skill(home, dry_run=dry_run):
+        changed = True
+    if install_side_command(home, ork_cli=ork_cli, dry_run=dry_run):
+        changed = True
+    if install_side_skill(home, ork_cli=ork_cli, dry_run=dry_run):
+        changed = True
+    if install_update_command(home, ork_cli=ork_cli, dry_run=dry_run):
+        changed = True
+    if install_update_skill(home, ork_cli=ork_cli, dry_run=dry_run):
+        changed = True
+    if install_agy_statusline(home / ".gemini/antigravity-cli/settings.json", dry_run=dry_run):
+        changed = True
     return changed
 
 
@@ -400,7 +792,8 @@ def configuration_status(
                 command = shlex.join(
                     ["python3", str(expected.with_name("peer_mailbox.py")), "hook", "--harness", harness]
                 )
-                for event in EVENTS:
+                expected_events = CLAUDE_EVENTS if harness == "claude" else EVENTS
+                for event in expected_events:
                     if not any(
                         entry.get("command") == command
                         for group in hooks.get(event, [])
@@ -413,8 +806,9 @@ def configuration_status(
     return result
 
 
-def backup(path: Path) -> None:
+def backup(path: Path, *, keep_backups: int = DEFAULT_KEEP_BACKUPS) -> None:
     configuration.backup(path)
+    rotate_backups(path, keep_backups=keep_backups)
 
 
 def ensure_hub(hub: Path, skill: Path, *, dry_run: bool = False) -> None:
@@ -426,11 +820,38 @@ def ensure_hub(hub: Path, skill: Path, *, dry_run: bool = False) -> None:
     hub.parent.mkdir(parents=True, exist_ok=True)
     if hub.exists() or hub.is_symlink():
         hub.rename(hub.with_name(f"{hub.name}.mailbox-bak.{time.time_ns()}"))
+        rotate_backups(hub)
     hub.symlink_to(skill, target_is_directory=True)
 
 
 def agy_command(script: Path, event: str) -> str:
     return shlex.join(["python3", str(script), "hook", "--harness", "gemini", "--event", event])
+
+
+def install_agy_statusline(path: Path, *, dry_run: bool = False) -> bool:
+    """Keep Antigravity's Orkest statusLine glued to the bottom of the panel without default-bar padding."""
+    if not path.is_file():
+        return False
+    try:
+        settings = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    status_line = settings.get("statusLine")
+    if not isinstance(status_line, dict):
+        return False
+    cmd = status_line.get("command")
+    if not isinstance(cmd, str) or "agent_statusline.py" not in cmd:
+        return False
+    if status_line.get("stack_with_default") is False:
+        return False
+    if dry_run:
+        print(f"would disable stack_with_default on Antigravity statusLine: {path}")
+        return True
+    status_line["stack_with_default"] = False
+    backup(path)
+    configuration.write_private(path, json.dumps(settings, indent=2) + "\n")
+    print(f"✓ Antigravity statusLine glued to bottom (stack_with_default=false): {path}")
+    return True
 
 
 def install_agy_hooks(path: Path, script: Path, *, dry_run: bool = False) -> bool:
@@ -458,7 +879,8 @@ def install_hooks(path: Path, script: Path, harness: str, *, dry_run: bool = Fal
     before = json.dumps(settings, sort_keys=True)
     command = shlex.join(["python3", str(script), "hook", "--harness", harness])
     hooks = settings.setdefault("hooks", {})
-    for event in EVENTS:
+    target_events = CLAUDE_EVENTS if harness == "claude" else EVENTS
+    for event in target_events:
         groups = hooks.setdefault(event, [])
         entries = [
             hook
@@ -840,7 +1262,9 @@ def install(
         )
 
     install_shell_wrappers(home, dry_run=dry_run)
+    sync_installed_runtimes_and_caches(home, dry_run=dry_run)
     install_login_startup(home, mailbox.root(), hub / "mailbox_daemon.py", stdio=stdio, dry_run=dry_run)
+    prune_daemon_runtimes(mailbox.root(), dry_run=dry_run)
     if not dry_run:
         mailbox_daemon.set_mode(mailbox.root(), "stdio" if stdio else "http")
     if verify and not dry_run:

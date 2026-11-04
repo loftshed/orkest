@@ -296,6 +296,15 @@ class CoordinatorTests(unittest.TestCase):
             },
         )
         self.environment.start()
+        for key in (
+            "HERDR_ENV",
+            "HERDR_PANE_ID",
+            "HERDR_WORKSPACE_ID",
+            "ORKEST_TERMINAL_SERVER",
+            "ORKEST_SWARM_ROOM",
+            "ORKEST_TEST_ALLOW_HERDR",
+        ):
+            os.environ.pop(key, None)
         self.assertEqual(self.call("init", "--task-spec", str(self.spec_path), "--host", "claude")[0], 0)
 
     def tearDown(self):
@@ -1009,6 +1018,83 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(result["scope_owner"], "worker")
         self.assertEqual(result["scope_hints"], ["allowed"])
         self.assertEqual(result["scope_violations"], [])
+
+    def test_background_completion_event_auto_settles_coordinator_task(self):
+        code, run = self.start("bg-auto-settle", "implementation", "--background")
+        self.assertEqual(code, 0, run)
+        self.assertEqual(run["status"], "active")
+        result_path = Path(run["result_path"])
+        event_path = Path(run["event_path"])
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            state = COORDINATOR.load(self.directory)
+            latest = state["runs"][-1]
+            if latest["status"] == "finished" and event_path.is_file():
+                break
+            time.sleep(0.05)
+        state = COORDINATOR.load(self.directory)
+        latest = state["runs"][-1]
+        self.assertTrue(result_path.is_file())
+        self.assertTrue(event_path.is_file())
+        self.assertEqual(latest["status"], "finished")
+        self.assertEqual(latest["runner_status"], "completed")
+        event_data = json.loads(event_path.read_text(encoding="utf-8"))
+        self.assertEqual(event_data.get("task_dir"), str(self.directory.resolve()))
+
+    def test_subagent_start_and_stop_hooks_register_and_complete_native_subagent(self):
+        hooks = RUNNER.bundled_module("mailbox_hooks")
+        base = self.fixture.external_path / "mailbox-subagents"
+        parent_sid = "claude-lead-session-100"
+        MAILBOX.register(
+            base,
+            session=parent_sid,
+            harness="claude",
+            cwd=str(self.fixture.repository.path),
+            pid=os.getpid(),
+        )
+        start_out = hooks.hook(
+            {
+                "session_id": parent_sid,
+                "cwd": str(self.fixture.repository.path),
+                "hook_event_name": "SubagentStart",
+                "agent_id": "agent_abc_123456",
+                "agent_type": "Explore",
+                "model": "claude-haiku-4-5",
+            },
+            harness="claude",
+            event="SubagentStart",
+            base=base,
+        )
+        self.assertEqual(start_out, {})
+        sub_sid = "subagent-agent_abc_123456"
+        sub_peer = MAILBOX.load(MAILBOX.peer_path(base, sub_sid))
+        self.assertIsNotNone(sub_peer)
+        self.assertTrue(sub_peer.get("isSubagent"))
+        self.assertEqual(sub_peer.get("parentSession"), parent_sid)
+        self.assertEqual(sub_peer.get("focus"), "native Explore")
+        prog_path = base / "progress" / f"{MAILBOX.session_key(sub_sid)}.json"
+        self.assertTrue(prog_path.is_file())
+        prog_data = MAILBOX.load(prog_path)
+        self.assertEqual(prog_data.get("stage"), "working")
+        self.assertEqual(prog_data.get("goal"), "Native Explore")
+
+        stop_out = hooks.hook(
+            {
+                "session_id": parent_sid,
+                "cwd": str(self.fixture.repository.path),
+                "hook_event_name": "SubagentStop",
+                "agent_id": "agent_abc_123456",
+                "agent_type": "Explore",
+            },
+            harness="claude",
+            event="SubagentStop",
+            base=base,
+        )
+        self.assertEqual(stop_out, {})
+        prog_after = MAILBOX.load(prog_path)
+        self.assertEqual(prog_after.get("stage"), "complete")
+        sub_peer_after = MAILBOX.load(MAILBOX.peer_path(base, sub_sid))
+        self.assertIsNone(sub_peer_after)
 
 
 if __name__ == "__main__":

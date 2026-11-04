@@ -15,14 +15,27 @@ import {
   resolveTaskSpecPath,
 } from "../../../plugins/orchestrate/lib/factory.mjs";
 import {
+  collectActiveWorktreeAllowPaths,
+  countCommitsAhead,
+  FOUNDRY_STATE_SCHEMA,
   foundryCli,
   foundryGroom,
   foundryRun,
   foundryStatus,
+  isLaneDeniedByPolicy,
+  loadFactoryPolicy,
+  readFoundryState,
+  selectSparePools,
+  writeFoundryState,
 } from "../../../plugins/orchestrate/lib/foundry.mjs";
 import {
+  alignCanonicalPath,
   classifyBlastRadius,
+  COLD_REVIEW_QUESTION,
   discoverSmeltableWorktrees,
+  getBranchDiffFiles,
+  parseColdReviewFindings,
+  runSmeltCli,
   selectColdReviewerEngine,
   smelterCli,
   smeltWorktree,
@@ -37,6 +50,7 @@ async function makeTempDir(prefix = "ork-smelter-test-") {
 }
 
 afterEach(async () => {
+  process.exitCode = 0;
   await Promise.all(temporary.splice(0).map((dir) => rm(dir, { force: true, recursive: true })));
 });
 
@@ -399,10 +413,187 @@ describe("foundry re-exports and factory fixes", () => {
     const savedState = JSON.parse(await readFile(resolveFoundryStatePath(worktreePath), "utf8"));
     expect(savedState).toMatchObject({
       acceptanceCriteria: ["Scoped Vitest check passes with maxWorkers=2"],
-      schema: "ork.foundry.state.v1",
+      attemptCount: 1,
+      maxAttempts: 2,
+      schema: FOUNDRY_STATE_SCHEMA,
       status: "verification_failed",
       verifyCommand: "vitest run tests/plugins/orchestrate/smelter-test.js --maxWorkers=2",
     });
+  });
+
+  it("passes --question in foundry groom and guards against 0-commit or failed builder runs", async () => {
+    const rootDir = await makeTempDir("ork-foundry-groom-zero-");
+    const repoRoot = path.join(rootDir, "repo");
+    const worktreePath = path.join(rootDir, "wt-issue-88");
+    const gitDir = path.join(rootDir, "gitdir-wt-88");
+    await mkdir(repoRoot, { recursive: true });
+    await mkdir(worktreePath, { recursive: true });
+    await mkdir(gitDir, { recursive: true });
+    await writeFile(path.join(worktreePath, ".git"), `gitdir: ${gitDir}\n`);
+    await writeFile(
+      path.join(gitDir, "orkest.json"),
+      JSON.stringify({ branch: "feat/issue-88", disposable: true, issue: 88 }),
+    );
+
+    const mockIssues = [
+      {
+        body: [
+          "```json task-spec",
+          JSON.stringify({
+            allow_paths: ["plugins/orchestrate/lib/foundry.mjs"],
+            development_checks: ["vitest run tests/plugins/orchestrate/smelter-test.js"],
+            objective: "Guard 0-commit builder runs",
+            schema: "agent-executor.task-spec.v1",
+          }),
+          "```",
+        ].join("\n"),
+        labels: [{ name: "agent:ready" }],
+        number: 88,
+        title: "Guard 0-commit builder",
+      },
+    ];
+
+    const stdout = { columns: 120, isTTY: false, write: () => {} };
+    let groomConsultArgs = null;
+    const groomRes = await foundryGroom(["--issue", "88", "--json"], {
+      cwd: repoRoot,
+      execAgentFn: async (args) => {
+        groomConsultArgs = args;
+        return mockIssues[0].body;
+      },
+      execGhFn: async () => mockIssues[0],
+      stdout,
+    });
+    expect(groomRes.command).toContain("run_agent.py consult --intent investigate --read");
+    expect(groomConsultArgs).toContain("--question");
+    expect(groomConsultArgs).not.toContain("--prompt");
+
+    const now = Date.now();
+    const mockAccounts = [
+      {
+        fetchedAt: now,
+        id: "codex-work",
+        label: "Codex Work",
+        ok: true,
+        pools: [{ families: ["gpt"], id: "codex", label: "Codex", windowIds: ["wk"] }],
+        provider: "codex",
+        route: "--engine codex",
+        windows: [
+          {
+            id: "wk",
+            label: "Weekly",
+            remainingPct: 85,
+            resetsAt: now + 3 * 24 * 3600 * 1000,
+            windowMins: 10_080,
+          },
+        ],
+      },
+    ];
+
+    let wasVerifyCalled = false;
+    const zeroCommitRes = await foundryRun(["--json"], {
+      countCommitsAheadFn: async () => 0,
+      cwd: repoRoot,
+      execAgentFn: async () => ({
+        result_path: "/tmp/res-88.json",
+        session_id: "session-88",
+        status: "completed",
+      }),
+      execGhFn: async () => mockIssues,
+      execVerifyFn: async () => {
+        wasVerifyCalled = true;
+        return { exitCode: 0, ok: true, output: "pass" };
+      },
+      getAccountsFn: async () => mockAccounts,
+      provisionWorktreeFn: async () => worktreePath,
+      stdout,
+    });
+
+    expect(wasVerifyCalled).toBe(false);
+    expect(zeroCommitRes.status).toBe("worker_failed");
+    const stateAfterZero = readFoundryState(worktreePath);
+    expect(stateAfterZero).toMatchObject({
+      attemptCount: 1,
+      commitsAhead: 0,
+      lastRun: {
+        engine: "codex",
+        resultPath: "/tmp/res-88.json",
+        sessionId: "session-88",
+        status: "completed",
+      },
+      maxAttempts: 2,
+      schema: FOUNDRY_STATE_SCHEMA,
+      status: "worker_failed",
+    });
+
+    // When the builder leaves uncommitted working-tree changes and verifyCommand passes,
+    // Foundry stages and commits those verified changes on the worktree branch:
+    const hostGitCalls = [];
+    const dirtyVerifiedRes = await foundryRun(["--json"], {
+      cwd: repoRoot,
+      execAgentFn: async () => ({
+        result_path: "/tmp/res-88-dirty.json",
+        session_id: "session-88-dirty",
+        status: "completed",
+      }),
+      execFileSyncFn: (cmd, args) => {
+        hostGitCalls.push([cmd, ...args]);
+        if (cmd === "git" && args[0] === "status" && args[1] === "--porcelain") {
+          return " M plugins/orchestrate/lib/foundry.mjs\n";
+        }
+        if (cmd === "git" && args[0] === "rev-list") {
+          const hasCommitted = hostGitCalls.some((c) => c[0] === "git" && c[1] === "commit");
+          return hasCommitted ? "1\n" : "0\n";
+        }
+        if (cmd === "git" && args[0] === "rev-parse" && args[1] === "HEAD") {
+          return "abcdef1234567\n";
+        }
+        return "";
+      },
+      execGhFn: async () => mockIssues,
+      execVerifyFn: async () => {
+        wasVerifyCalled = true;
+        return { exitCode: 0, ok: true, output: "all checks passed" };
+      },
+      getAccountsFn: async () => mockAccounts,
+      provisionWorktreeFn: async () => worktreePath,
+      stdout,
+    });
+    expect(wasVerifyCalled).toBe(true);
+    expect(dirtyVerifiedRes.status).toBe("verified");
+    expect(dirtyVerifiedRes.commitsAhead).toBe(1);
+    expect(dirtyVerifiedRes.verification.committedByHost).toBe(true);
+    expect(hostGitCalls).toContainEqual(["git", "add", "-A"]);
+    expect(hostGitCalls).toContainEqual(["git", "commit", "-m", "feat(foundry): resolve #88"]);
+    expect(readFoundryState(worktreePath)).toMatchObject({
+      commitsAhead: 1,
+      headSha: "abcdef1234567",
+      status: "verified",
+    });
+
+    // Also test collectActiveWorktreeAllowPaths and countCommitsAhead helper:
+    const porcelain = [
+      `worktree ${repoRoot}`,
+      "HEAD 1111111",
+      "branch refs/heads/main",
+      "",
+      `worktree ${worktreePath}`,
+      "HEAD 2222222",
+      "branch refs/heads/feat/issue-88",
+      "",
+    ].join("\n");
+    const activePaths = collectActiveWorktreeAllowPaths(repoRoot, {
+      execFileSyncFn: (cmd, args) => {
+        if (cmd === "git" && args[0] === "worktree") return porcelain;
+        return "";
+      },
+    });
+    expect(activePaths).toEqual([["plugins/orchestrate/lib/foundry.mjs"]]);
+    expect(
+      countCommitsAhead(worktreePath, "main", {
+        execFileSyncFn: () => "3\n",
+      }),
+    ).toEqual({ commitsAhead: 3, resolved: true });
   });
 });
 
@@ -567,7 +758,7 @@ describe("ork smelter", () => {
     // Only git status and git diff run during dry-run:
     expect(recordedCmds.map((c) => [c.cmd, ...c.args])).toEqual([
       ["git", "status", "--porcelain"],
-      ["git", "diff", "--name-only", "main...HEAD"],
+      ["git", "diff", "--name-only", "--no-renames", "main...HEAD"],
     ]);
 
     recordedCmds.length = 0;
@@ -581,7 +772,7 @@ describe("ork smelter", () => {
       },
       reviewRunner: async (info) => {
         reviewCalls.push(info);
-        return "review passed";
+        return "FINDINGS:\nnone";
       },
       strategy: "local",
       targetBranch: "main",
@@ -598,14 +789,20 @@ describe("ork smelter", () => {
       "review",
       "--engine",
       "codex",
+      "--transport",
+      "executor",
+      "--format",
+      "json",
       "--read",
       worktreePath,
       "--diff",
       "main",
+      "--question",
+      COLD_REVIEW_QUESTION,
     ]);
     expect(recordedCmds.map((c) => [c.cmd, ...c.args])).toEqual([
       ["git", "status", "--porcelain"],
-      ["git", "diff", "--name-only", "main...HEAD"],
+      ["git", "diff", "--name-only", "--no-renames", "main...HEAD"],
       ["git", "rebase", "main"],
       ["git", "merge", "--ff-only", "feat/issue-63"],
       ["git", "worktree", "remove", worktreePath],
@@ -625,7 +822,7 @@ describe("ork smelter", () => {
     expect(keepRes.pruned).toBe(false);
     expect(recordedCmds.map((c) => [c.cmd, ...c.args])).toEqual([
       ["git", "status", "--porcelain"],
-      ["git", "diff", "--name-only", "main...HEAD"],
+      ["git", "diff", "--name-only", "--no-renames", "main...HEAD"],
       ["git", "rebase", "main"],
       ["ork", "gate", "--heavy", "--", "./scripts/check.sh"],
       ["git", "merge", "--ff-only", "feat/issue-63"],
@@ -759,5 +956,439 @@ describe("ork smelter", () => {
     expect(result.stages.smeltAndPrune.operations).toEqual([
       ["git", "merge", "--ff-only", path.basename(unmarkedDir)],
     ]);
+  });
+
+  it("parses cold review FINDINGS and filters discoverSmeltableWorktrees by foundryState and canonical path", async () => {
+    expect(parseColdReviewFindings(null)).toEqual({
+      findings: "Cold review output missing FINDINGS section",
+      passed: false,
+    });
+    expect(parseColdReviewFindings("unstructured text without findings header")).toEqual({
+      findings: "Cold review output missing FINDINGS section",
+      passed: false,
+    });
+    expect(parseColdReviewFindings({ sections: { FINDINGS: "None" } })).toEqual({
+      findings: "none",
+      passed: true,
+    });
+    expect(
+      parseColdReviewFindings(
+        JSON.stringify({
+          sections: {
+            FINDINGS: "- Bug in smelter.mjs:42\n- Missing test in smelter-test.js",
+          },
+        }),
+      ),
+    ).toEqual({
+      findings: "- Bug in smelter.mjs:42\n- Missing test in smelter-test.js",
+      passed: false,
+    });
+
+    const rootDir = await makeTempDir("ork-smelter-states-");
+    const repoRoot = path.join(rootDir, "repo");
+    const wtVerified = path.join(rootDir, "wt-verified");
+    const wtFailedVerify = path.join(rootDir, "wt-failed-verify");
+    const wtRebaseConflict = path.join(rootDir, "wt-rebase-conflict");
+
+    for (const [wtPath, slug, issue, statePatch] of [
+      [wtVerified, "wt-verified", 101, { status: "verified" }],
+      [wtFailedVerify, "wt-failed-verify", 102, { status: "verification_failed" }],
+      [
+        wtRebaseConflict,
+        "wt-rebase-conflict",
+        103,
+        {
+          rebase: {
+            conflictOn: {
+              targetHeadSha: "main-sha-1",
+              worktreeHeadSha: "wt-103-sha",
+            },
+          },
+          status: "rebase_conflict",
+        },
+      ],
+    ]) {
+      const gitDir = path.join(rootDir, `gitdir-${issue}`);
+      await mkdir(wtPath, { recursive: true });
+      await mkdir(path.join(gitDir, "orkest"), { recursive: true });
+      await writeFile(path.join(wtPath, ".git"), `gitdir: ${gitDir}\n`);
+      await writeFile(
+        path.join(gitDir, "orkest.json"),
+        JSON.stringify({
+          branch: `feat/issue-${issue}`,
+          disposable: true,
+          engine: "codex",
+          issue,
+          parentCwd: repoRoot,
+          slug,
+        }),
+      );
+      writeFoundryState(wtPath, statePatch);
+    }
+    await mkdir(repoRoot, { recursive: true });
+
+    expect(alignCanonicalPath(repoRoot)).toBe(alignCanonicalPath(path.join(repoRoot, ".")));
+
+    const porcelain = [
+      `worktree ${repoRoot}`,
+      "HEAD main-sha-1",
+      "branch refs/heads/main",
+      "",
+      `worktree ${wtVerified}`,
+      "HEAD wt-101-sha",
+      "branch refs/heads/feat/issue-101",
+      "",
+      `worktree ${wtFailedVerify}`,
+      "HEAD wt-102-sha",
+      "branch refs/heads/feat/issue-102",
+      "",
+      `worktree ${wtRebaseConflict}`,
+      "HEAD wt-103-sha",
+      "branch refs/heads/feat/issue-103",
+      "",
+    ].join("\n");
+
+    let currentMainSha = "main-sha-1";
+    const execMock = (cmd, args) => {
+      if (cmd === "git" && args[0] === "worktree") return porcelain;
+      if (cmd === "git" && args[0] === "rev-list") return "1\n";
+      if (cmd === "git" && args[0] === "rev-parse") return `${currentMainSha}\n`;
+      return "";
+    };
+
+    const filtered = discoverSmeltableWorktrees(repoRoot, { execFileSyncFn: execMock });
+    expect(filtered.map((wt) => wt.slug)).toEqual(["wt-verified"]);
+
+    // When target branch advances to a new SHA, rebase_conflict worktree becomes eligible again:
+    currentMainSha = "main-sha-2";
+    const afterTargetAdvance = discoverSmeltableWorktrees(repoRoot, { execFileSyncFn: execMock });
+    expect(afterTargetAdvance.map((wt) => wt.slug)).toEqual(["wt-verified", "wt-rebase-conflict"]);
+
+    // includeAllStates returns all worktrees regardless of status:
+    const allStates = discoverSmeltableWorktrees(repoRoot, {
+      execFileSyncFn: execMock,
+      includeAllStates: true,
+    });
+    expect(allStates.map((wt) => wt.slug)).toEqual([
+      "wt-verified",
+      "wt-failed-verify",
+      "wt-rebase-conflict",
+    ]);
+  });
+
+  it("persists ork.foundry.state.v2 across smeltWorktree failure, review-change, and high-blast approval gates", async () => {
+    const rootDir = await makeTempDir("ork-smelter-v2-");
+    const repoRoot = path.join(rootDir, "repo");
+    const wtPath = path.join(rootDir, "wt-99");
+    const gitDir = path.join(rootDir, "gitdir-99");
+    await mkdir(repoRoot, { recursive: true });
+    await mkdir(wtPath, { recursive: true });
+    await mkdir(path.join(gitDir, "orkest"), { recursive: true });
+    await writeFile(path.join(wtPath, ".git"), `gitdir: ${gitDir}\n`);
+    await writeFile(
+      path.join(gitDir, "orkest.json"),
+      JSON.stringify({
+        branch: "feat/issue-99",
+        disposable: false,
+        engine: "codex",
+        issue: 99,
+        parentCwd: repoRoot,
+        slug: "wt-99",
+      }),
+    );
+
+    const baseWt = {
+      allowPaths: ["plugins/orchestrate/"],
+      branch: "feat/issue-99",
+      disposable: false,
+      engine: "codex",
+      head: "wt-head-99",
+      issue: 99,
+      parentCwd: repoRoot,
+      path: wtPath,
+      slug: "wt-99",
+      verifyCommand: "./scripts/check.sh",
+    };
+
+    // 1. Scope violation persists scope_violated:
+    await expect(
+      smeltWorktree(baseWt, {
+        changedPaths: ["README.md"],
+        execFileSyncFn: () => "",
+      }),
+    ).rejects.toThrow(/Scope audit failed/u);
+    expect(readFoundryState(wtPath)).toMatchObject({
+      schema: FOUNDRY_STATE_SCHEMA,
+      scopeViolations: ["README.md"],
+      status: "scope_violated",
+    });
+
+    // 2. Rebase conflict persists rebase_conflict with SHA pins:
+    await expect(
+      smeltWorktree(baseWt, {
+        changedPaths: ["plugins/orchestrate/lib/smelter.mjs"],
+        execFileSyncFn: (cmd, args) => {
+          if (cmd === "git" && args[0] === "rebase" && args[1] === "main") {
+            throw new Error("CONFLICT (content): Merge conflict");
+          }
+          if (cmd === "git" && args[0] === "rev-parse" && args[1] === "main") {
+            return "target-sha-99\n";
+          }
+          return "";
+        },
+      }),
+    ).rejects.toThrow(/Merge conflict/u);
+    expect(readFoundryState(wtPath)).toMatchObject({
+      rebase: {
+        conflictOn: {
+          targetHeadSha: "target-sha-99",
+          worktreeHeadSha: "wt-head-99",
+        },
+      },
+      schema: FOUNDRY_STATE_SCHEMA,
+      status: "rebase_conflict",
+    });
+
+    // 3. Heavy gate failure persists gate_failed:
+    await expect(
+      smeltWorktree(baseWt, {
+        changedPaths: ["plugins/orchestrate/lib/smelter.mjs"],
+        execFileSyncFn: () => "",
+        gateRunner: async () => {
+          throw new Error("Heavy gate failed");
+        },
+      }),
+    ).rejects.toThrow(/Heavy gate failed/u);
+    expect(readFoundryState(wtPath)).toMatchObject({
+      schema: FOUNDRY_STATE_SCHEMA,
+      status: "gate_failed",
+    });
+
+    // 4. Cold review findings persist review_changes_requested and skip Stage 4:
+    const reviewFailRes = await smeltWorktree(baseWt, {
+      changedPaths: ["plugins/orchestrate/lib/smelter.mjs"],
+      execFileSyncFn: () => "",
+      gateRunner: async () => "ok",
+      reviewRunner: async () => ({
+        sections: {
+          FINDINGS: "- Missing error guard on line 50",
+        },
+      }),
+    });
+    expect(reviewFailRes.ok).toBe(false);
+    expect(reviewFailRes.status).toBe("review_changes_requested");
+    expect(reviewFailRes.findings).toBe("- Missing error guard on line 50");
+    expect(reviewFailRes.stages.smeltAndPrune.status).toBe("skipped");
+    expect(readFoundryState(wtPath)).toMatchObject({
+      findings: "- Missing error guard on line 50",
+      schema: FOUNDRY_STATE_SCHEMA,
+      status: "review_changes_requested",
+    });
+
+    // 5. High blast radius local merge pauses with awaiting_human_approval until approveHighBlast is set:
+    const highBlastRes = await smeltWorktree(baseWt, {
+      changedPaths: ["plugins/orchestrate/bin/ork.mjs"],
+      execFileSyncFn: () => "",
+      gateRunner: async () => "ok",
+      reviewRunner: async () => ({ sections: { FINDINGS: "None" } }),
+      strategy: "local",
+    });
+    expect(highBlastRes.ok).toBe(false);
+    expect(highBlastRes.awaitingApproval).toBe(true);
+    expect(highBlastRes.status).toBe("awaiting_human_approval");
+    expect(readFoundryState(wtPath)).toMatchObject({
+      blastRadius: "high",
+      schema: FOUNDRY_STATE_SCHEMA,
+      status: "awaiting_human_approval",
+    });
+
+    // 6. With approveHighBlast: true, high blast radius merges and records status: "merged":
+    const approvedRes = await smeltWorktree(baseWt, {
+      approveHighBlast: true,
+      changedPaths: ["plugins/orchestrate/bin/ork.mjs"],
+      execFileSyncFn: () => "",
+      gateRunner: async () => "ok",
+      reviewRunner: async () => ({ sections: { FINDINGS: "None" } }),
+      strategy: "local",
+    });
+    expect(approvedRes.ok).toBe(true);
+    expect(approvedRes.status).toBe("merged");
+    expect(readFoundryState(wtPath)).toMatchObject({
+      schema: FOUNDRY_STATE_SCHEMA,
+      status: "merged",
+    });
+  });
+
+  it("passes --no-renames in getBranchDiffFiles to catch out-of-scope renames, reports Halted with exitCode 1 in runSmeltCli, and enforces policy.deny in selectSparePools", async () => {
+    const diffCalls = [];
+    const diffFiles = getBranchDiffFiles("/tmp/wt-rename", "main", {
+      execFileSyncFn: (cmd, args) => {
+        diffCalls.push([cmd, ...args]);
+        return "out-of-scope/secret.txt\nplugins/orchestrate/lib/smelter.mjs\n";
+      },
+    });
+    expect(diffCalls).toEqual([["git", "diff", "--name-only", "--no-renames", "main...HEAD"]]);
+    expect(diffFiles).toEqual(["out-of-scope/secret.txt", "plugins/orchestrate/lib/smelter.mjs"]);
+
+    await expect(
+      smeltWorktree(
+        {
+          allowPaths: ["plugins/orchestrate/lib/smelter.mjs"],
+          branch: "feat/issue-rename",
+          disposable: false,
+          engine: "codex",
+          path: "/tmp/wt-rename",
+          slug: "wt-rename",
+        },
+        {
+          execFileSyncFn: (cmd, args) => {
+            if (cmd === "git" && args[0] === "status") return "";
+            if (cmd === "git" && args[0] === "diff") {
+              expect(args).toContain("--no-renames");
+              return "out-of-scope/secret.txt\nplugins/orchestrate/lib/smelter.mjs\n";
+            }
+            return "";
+          },
+        },
+      ),
+    ).rejects.toThrow(/Scope audit failed.*out-of-scope\/secret\.txt/u);
+
+    // runSmeltCli prints "Halted ..." and sets process.exitCode = 1 when ok: false
+    const rootDir = await makeTempDir("ork-smelter-halted-");
+    const repoRoot = path.join(rootDir, "repo");
+    const wtPath = path.join(rootDir, "wt-halted");
+    const gitDir = path.join(rootDir, "gitdir-halted");
+    await mkdir(repoRoot, { recursive: true });
+    await mkdir(wtPath, { recursive: true });
+    await mkdir(path.join(gitDir, "orkest"), { recursive: true });
+    await writeFile(path.join(wtPath, ".git"), `gitdir: ${gitDir}\n`);
+    await writeFile(
+      path.join(gitDir, "orkest.json"),
+      JSON.stringify({
+        branch: "feat/issue-halted",
+        disposable: false,
+        engine: "codex",
+        issue: 77,
+        parentCwd: repoRoot,
+        slug: "wt-halted",
+      }),
+    );
+
+    const porcelain = [
+      `worktree ${repoRoot}`,
+      "HEAD 1111111",
+      "branch refs/heads/main",
+      "",
+      `worktree ${wtPath}`,
+      "HEAD 2222222",
+      "branch refs/heads/feat/issue-halted",
+      "",
+    ].join("\n");
+
+    const chunks = [];
+    const stdout = {
+      columns: 120,
+      isTTY: false,
+      write: (chunk) => {
+        chunks.push(chunk);
+      },
+    };
+    process.exitCode = 0;
+    const haltedPayload = await runSmeltCli(["run", "--worktree", "wt-halted"], {
+      cwd: repoRoot,
+      execFileSyncFn: (cmd, args) => {
+        if (cmd === "git" && args[0] === "worktree") return porcelain;
+        if (cmd === "git" && args[0] === "rev-list") return "1\n";
+        if (cmd === "git" && args[0] === "status") return "";
+        if (cmd === "git" && args[0] === "diff") return "plugins/orchestrate/lib/smelter.mjs\n";
+        return "";
+      },
+      gateRunner: async () => "ok",
+      reviewRunner: async () => ({ sections: { FINDINGS: "- Bug found on line 10" } }),
+      stdout,
+    });
+    expect(haltedPayload.ok).toBe(false);
+    expect(process.exitCode).toBe(1);
+    expect(chunks.join("")).toContain("Halted wt-halted (review_changes_requested)");
+    expect(chunks.join("")).not.toContain("Smelted wt-halted");
+
+    // selectSparePools with policy.deny filters out claude-work while keeping plaude, agy, and codex:
+    const lanes = [
+      {
+        accountId: "claude-work",
+        availableNowPct: 80,
+        billing: "work",
+        families: ["claude"],
+        label: "Claude Work",
+        pace: { surplus: 35 },
+        poolId: "claude",
+        provider: "claude",
+        route: "--engine claude",
+        score: 35,
+        status: "available",
+      },
+      {
+        accountId: "claude-personal",
+        availableNowPct: 85,
+        billing: "personal",
+        families: ["claude"],
+        label: "Plaude Personal",
+        pace: { surplus: 30 },
+        personal: true,
+        poolId: "claude",
+        provider: "claude",
+        route: "plaude",
+        score: 30,
+        status: "available",
+      },
+      {
+        accountId: "agy-work",
+        availableNowPct: 90,
+        billing: "work",
+        families: ["gemini"],
+        label: "Antigravity",
+        pace: { surplus: 28 },
+        poolId: "gemini",
+        provider: "antigravity",
+        route: "--engine agy",
+        score: 28,
+        status: "available",
+      },
+      {
+        accountId: "codex-work",
+        availableNowPct: 75,
+        billing: "work",
+        families: ["gpt"],
+        label: "Codex Work",
+        pace: { surplus: 25 },
+        poolId: "codex",
+        provider: "codex",
+        route: "--engine codex",
+        score: 25,
+        status: "available",
+      },
+    ];
+
+    expect(isLaneDeniedByPolicy(lanes[0], ["claude-work"])).toBe(true);
+    expect(isLaneDeniedByPolicy(lanes[1], ["claude-work"])).toBe(false);
+    expect(isLaneDeniedByPolicy(lanes[1], ["plaude"])).toBe(true);
+    expect(isLaneDeniedByPolicy(lanes[0], ["claude-all"])).toBe(true);
+    expect(isLaneDeniedByPolicy(lanes[1], ["claude-all"])).toBe(true);
+
+    const spareAfterDeny = selectSparePools(lanes, { deny: ["claude-work"] });
+    expect(spareAfterDeny.map((p) => p.accountId)).toEqual([
+      "claude-personal",
+      "agy-work",
+      "codex-work",
+    ]);
+
+    // loadFactoryPolicy merges .orkest/policy.json deny entries:
+    await mkdir(path.join(repoRoot, ".orkest"), { recursive: true });
+    await writeFile(
+      path.join(repoRoot, ".orkest", "policy.json"),
+      JSON.stringify({ deny: ["claude-work", "opencode"] }),
+    );
+    const loadedPolicy = await loadFactoryPolicy(repoRoot);
+    expect(loadedPolicy.deny).toEqual(expect.arrayContaining(["claude-work", "opencode"]));
   });
 });

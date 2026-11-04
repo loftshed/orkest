@@ -476,4 +476,110 @@ describe("room CLI", () => {
     expect(observed.agents[0].paneId).toBe("%42");
     expect(observed.agents[0].progress.task).not.toBe("Legacy task should be ignored");
   });
+
+  it("auto-discovers live unbound native peers in the room checkout without mutating persisted room json", async () => {
+    const rawRoot = await directory();
+    const root = await realpath(rawRoot);
+    const rawCwd = await directory();
+    const cwd = await realpath(rawCwd);
+    const room = await newRoom(parseTeam("claude:haiku"), {
+      id: "room-native-auto",
+      cwd,
+      root,
+      title: "Upgrade Swarm View",
+    });
+    const otherRoom = await newRoom(parseTeam("codex:luna"), {
+      id: "room-other",
+      cwd,
+      root,
+    });
+    await mkdir(path.join(root, "peers"), { recursive: true });
+    await mkdir(path.join(root, "progress"), { recursive: true });
+    const nowIso = new Date().toISOString();
+
+    // Bind another room's agent to ensure observeRoom skips sessions claimed by other rooms:
+    await updateRoom(
+      otherRoom.id,
+      (current) => {
+        current.agents[0].session = {
+          id: "claimed-by-other-room",
+          engine: "codex",
+          machine: hostname(),
+          cwd,
+        };
+        return current;
+      },
+      { root },
+    );
+
+    // Unbound native peer 1: started after room creation with an active progress record
+    await writeFile(
+      path.join(root, "peers", "native-sub-1.json"),
+      JSON.stringify({
+        schema: "agent-executor.peer.v1",
+        session: "native-sub-1",
+        name: "gribble-gemini-3-flash-orkest-ab",
+        shortName: "gribble",
+        harness: "gemini",
+        model: "gemini-3.8-flash-high",
+        effort: "high",
+        state: "busy",
+        cwd,
+        pid: process.pid,
+        branch: "feat/swarm-view",
+        herdrPaneId: "herdr-pane-77",
+        startedAt: nowIso,
+        lastSeenAt: nowIso,
+      }),
+    );
+    await writeFile(
+      path.join(root, "progress", "native-sub-1.json"),
+      JSON.stringify({
+        schema: "orchestrate.progress.v1",
+        session: "native-sub-1",
+        harness: "gemini",
+        machine: hostname(),
+        checkout: cwd,
+        role: "scout",
+        goal: "Upgrade Swarm View",
+        task: "Auditing native subagent discovery",
+        stage: "working",
+        updatedAt: nowIso,
+      }),
+    );
+
+    // Unbound native peer 2: claimed by other room (must be excluded)
+    await writeFile(
+      path.join(root, "peers", "claimed-by-other-room.json"),
+      JSON.stringify({
+        schema: "agent-executor.peer.v1",
+        session: "claimed-by-other-room",
+        name: "other-codex-orkest-cc",
+        harness: "codex",
+        state: "busy",
+        cwd,
+        pid: process.pid,
+        startedAt: nowIso,
+        lastSeenAt: nowIso,
+      }),
+    );
+
+    const observed = await observeRoom(room.id, { root });
+    const nativeAgent = observed.agents.find((agent) => agent.native === true);
+    expect(nativeAgent).toBeDefined();
+    expect(nativeAgent.id).toBe("gribble");
+    expect(nativeAgent.engine).toBe("agy");
+    expect(nativeAgent.workforceRole).toBe("scout");
+    expect(nativeAgent.status).toBe("running");
+    expect(nativeAgent.branch).toBe("feat/swarm-view");
+    expect(nativeAgent.herdrPaneId).toBe("herdr-pane-77");
+    expect(nativeAgent.progress.task).toBe("Auditing native subagent discovery");
+    expect(observed.agents.some((agent) => agent.nativeSession === "claimed-by-other-room")).toBe(
+      false,
+    );
+
+    // Persisted room on disk remains untouched (only 1 declared agent):
+    const onDisk = await readRoom(room.id, root);
+    expect(onDisk.agents).toHaveLength(1);
+  });
 });

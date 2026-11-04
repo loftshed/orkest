@@ -202,7 +202,7 @@ def load(directory: Path) -> dict[str, Any]:
     return state
 
 
-def import_result(run: dict[str, Any], state: dict[str, Any]) -> bool:
+def import_result(run: dict[str, Any], state: dict[str, Any], *, skip_event_publish: bool = False) -> bool:
     path = Path(run["result_path"])
     if not path.is_file():
         return False
@@ -223,7 +223,7 @@ def import_result(run: dict[str, Any], state: dict[str, Any]) -> bool:
     if result.get("native_event_id"):
         run["native_event_id"] = result["native_event_id"]
     POLICY.settle(state, run, result)
-    if run.get("event_path") and not Path(run["event_path"]).exists():
+    if not skip_event_publish and run.get("event_path") and not Path(run["event_path"]).exists():
         RUNNER.publish_completion_event(
             result=result,
             result_path=path,
@@ -234,10 +234,12 @@ def import_result(run: dict[str, Any], state: dict[str, Any]) -> bool:
     return True
 
 
-def recover(directory: Path, state: dict[str, Any]) -> dict[str, Any]:
+def recover(directory: Path, state: dict[str, Any], *, skip_event_publish: bool = False) -> dict[str, Any]:
     for run in state["runs"]:
         # import_result runs only for runs that may still be live.
-        if run["status"] in {"dispatching", "uncertain", "active", "reserved"} and not import_result(run, state):
+        if run["status"] in {"dispatching", "uncertain", "active", "reserved"} and not import_result(
+            run, state, skip_event_publish=skip_event_publish
+        ):
             if run.get("transport") == "native" and not run.get("process_identity"):
                 ready = directory / "runs" / run["run_id"] / "ready.json"
                 if ready.is_file():
@@ -251,6 +253,23 @@ def recover(directory: Path, state: dict[str, Any]) -> dict[str, Any]:
             )
     save(directory, state)
     return state
+
+
+def auto_recover_task(directory: Path, *, skip_event_publish: bool = False) -> dict[str, Any] | None:
+    """Attempt to acquire the coordinator task lease and settle any newly finished runs."""
+    resolved = directory.expanduser().resolve()
+    if not (resolved / "task.json").is_file():
+        return None
+    deadline = time.monotonic() + 0.5
+    while True:
+        try:
+            with SUPPORT.workspace_lease(resolved, RUNNER.default_agent_cache_dir() / "coordinator-locks"):
+                state = load(resolved)
+                return recover(resolved, state, skip_event_publish=skip_event_publish)
+        except Exception:
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.01)
 
 
 def initialize(args: argparse.Namespace) -> dict[str, Any]:

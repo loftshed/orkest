@@ -28,6 +28,7 @@ export function normalizeWorkforceRole(value) {
   if (value === undefined || value === null) return;
   if (typeof value !== "string") throw new Error("Invalid workforce role");
   const key = value.trim().toLowerCase();
+  if (key === "native") return "native";
   const resolved = ROLE_ALIASES.get(key);
   if (!resolved) throw new Error(`Invalid workforce role: ${value}`);
   return resolved;
@@ -347,6 +348,17 @@ export function validateRoom(room) {
     )
       throw new Error("Invalid member dispatch binding");
   }
+  if (
+    room.services !== undefined &&
+    (!Array.isArray(room.services) ||
+      room.services.some((svc) => !svc || typeof svc !== "object" || Array.isArray(svc)))
+  )
+    throw new Error("Invalid room services metadata");
+  if (
+    room.update !== undefined &&
+    (!room.update || typeof room.update !== "object" || Array.isArray(room.update))
+  )
+    throw new Error("Invalid room update metadata");
   return refreshMemberWorktrees(room);
 }
 

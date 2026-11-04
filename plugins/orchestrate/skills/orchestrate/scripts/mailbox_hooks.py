@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
+import hashlib
 import importlib.util
 import json
 import os
 import re
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -33,6 +35,9 @@ _MODEL_SET_STDOUT = re.compile(r"<local-command-stdout>Set model to (?:`([^`]+)`
 _WAKE_NOTICE_ID = re.compile(r"Local peer mailbox notification \(([A-Za-z0-9._-]+)\)")
 _SWARM_SLASH_CMD = re.compile(r"^\s*/(?:orchestrate:)?(?:swarm|horde)(?:\s+(toggle|open|close))?\s*$", re.IGNORECASE)
 _SWARM_TAG_CMD = re.compile(r"\[orkest-swarm-command(?::\s*(toggle|open|close)?)?\]", re.IGNORECASE)
+_SIDE_SLASH_CMD = re.compile(r"^\s*/(?:orchestrate:)?side(?:\s+(.*))?\s*$", re.IGNORECASE | re.DOTALL)
+_SIDE_TAG_CMD = re.compile(r"\[orkest-side-command:\s*(.*?)\]", re.IGNORECASE | re.DOTALL)
+_SIDE_PREFIX_CMD = re.compile(r"^\s*(?:!side\s+|side:\s*)(.+?)\s*$", re.IGNORECASE | re.DOTALL)
 _AGY_SUBAGENT_SENDER = re.compile(r"<SYSTEM_MESSAGE>\s*\[Message\][^\n]*?\bsender=([A-Za-z0-9_.:-]+)")
 
 ANTIGRAVITY_NO_CONTINUE = {
@@ -575,6 +580,175 @@ def succession_notice(base: Path, me: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _swarm_next_advisor(
+    base: Path,
+    me: dict[str, Any],
+    room: dict[str, Any],
+    room_id: str,
+    member_id: str,
+) -> str:
+    """Compute canonical swarmNextDigest over actionable room items and emit a compact advisor when changed."""
+    fresh_room = _MB.load(base / "rooms" / f"{room_id}.json")
+    if isinstance(fresh_room, dict):
+        room = fresh_room
+    agents = [a for a in (room.get("agents") or []) if isinstance(a, dict)]
+    if member_id != "conductor":
+        scoped = [a for a in agents if a.get("parent") == member_id]
+        if scoped:
+            agents = scoped
+
+    respond_items: list[str] = []
+    expired_lease_items: list[str] = []
+    review_items: list[str] = []
+    failed_items: list[str] = []
+    smelt_items: list[str] = []
+    queued_items: list[str] = []
+    advisor_lines: list[str] = []
+
+    for agent in agents:
+        agent_id = str(agent.get("id") or "worker")
+        status_lower = str(agent.get("status") or "").lower()
+        dispatch = agent.get("dispatch") if isinstance(agent.get("dispatch"), dict) else None
+        task_dir_raw = dispatch.get("taskDir") if dispatch else None
+        task_data: dict[str, Any] | None = None
+
+        if isinstance(task_dir_raw, str) and task_dir_raw.strip():
+            task_dir = Path(task_dir_raw).expanduser()
+            task_file = task_dir / "task.json"
+            if task_file.is_file():
+                loaded_task = _MB.load(task_file)
+                if isinstance(loaded_task, dict):
+                    task_data = loaded_task
+                    runs = [r for r in (task_data.get("runs") or []) if isinstance(r, dict)]
+                    needs_recover = any(
+                        r.get("status") in {"dispatching", "uncertain", "active", "reserved"}
+                        and isinstance(r.get("result_path"), str)
+                        and Path(r["result_path"]).is_file()
+                        for r in runs
+                    )
+                    if needs_recover:
+                        with contextlib.suppress(Exception):
+                            import coordinator as _coord
+
+                            recovered = _coord.auto_recover_task(task_dir)
+                            if isinstance(recovered, dict):
+                                task_data = recovered
+                            else:
+                                reloaded = _MB.load(task_file)
+                                if isinstance(reloaded, dict):
+                                    task_data = reloaded
+
+        if isinstance(task_data, dict):
+            runs = [r for r in (task_data.get("runs") or []) if isinstance(r, dict)]
+            decided_run_ids = {
+                str(d.get("run_id"))
+                for d in (task_data.get("decisions") or [])
+                if isinstance(d, dict) and d.get("run_id") and d.get("decision")
+            }
+            for run in runs:
+                run_id = str(run.get("run_id") or "")
+                conductor_peer = (
+                    (run.get("mailbox") or {}).get("conductor") if isinstance(run.get("mailbox"), dict) else None
+                )
+                if isinstance(conductor_peer, str) and conductor_peer:
+                    c_inbox = inbox_dir(base, conductor_peer)
+                    if c_inbox.is_dir():
+                        unread = [
+                            p
+                            for p in c_inbox.glob("*.json")
+                            if isinstance(m := _MB.load(p), dict) and not m.get("readAt")
+                        ]
+                        if unread:
+                            respond_items.append(f"respond:{agent_id}:{run_id}:{len(unread)}")
+                            advisor_lines.append(
+                                f"- [respond] {agent_id} ({run_id}) has {len(unread)} unread worker message(s) waiting."
+                            )
+            if runs:
+                latest_run = runs[-1]
+                run_id = str(latest_run.get("run_id") or "")
+                run_status = str(latest_run.get("status") or "")
+                runner_status = latest_run.get("runner_status")
+                if run_status == "finished" and run_id not in decided_run_ids:
+                    if runner_status in {None, "completed"}:
+                        review_items.append(f"review:{agent_id}:{run_id}")
+                        advisor_lines.append(
+                            f"- [review] {agent_id} finished run {run_id}; review with `coordinator.py review --task-dir {task_dir_raw} --run-id {run_id} --decision accept`."
+                        )
+                    else:
+                        failed_items.append(f"failed:{agent_id}:{run_id}:{runner_status}")
+                        advisor_lines.append(
+                            f"- [failed] {agent_id} run {run_id} ended with {runner_status}; inspect artifacts in {task_dir_raw}."
+                        )
+                elif run_status == "uncertain" and run_id not in decided_run_ids:
+                    failed_items.append(f"failed:{agent_id}:{run_id}:uncertain")
+                    advisor_lines.append(
+                        f"- [failed] {agent_id} run {run_id} is uncertain; run `coordinator.py recover --task-dir {task_dir_raw}`."
+                    )
+
+        if agent.get("dispatchError"):
+            failed_items.append(f"failed:{agent_id}:dispatch_error")
+            advisor_lines.append(f"- [failed] {agent_id} dispatch error: {agent.get('dispatchError')}")
+
+        wt = agent.get("worktree") if isinstance(agent.get("worktree"), dict) else None
+        if wt and wt.get("branch") and status_lower in {"completed", "complete", "done"}:
+            branch = str(wt.get("branch"))
+            smelt_items.append(f"smelt:{agent_id}:{branch}")
+            advisor_lines.append(
+                f"- [smelt] {agent_id} worktree branch `{branch}` is ready to smelt (`ork smelter run`)."
+            )
+
+        if status_lower == "queued" and not dispatch and not agent.get("session"):
+            queued_items.append(f"dispatch_queued:{agent_id}")
+            advisor_lines.append(f"- [dispatch_queued] {agent_id} is queued and ready to dispatch.")
+
+    # Check expired workboard leases
+    with contextlib.suppress(Exception):
+        board = _MB.load(base / "work" / "board.json") or _MB.load(base / "workboard.json")
+        if isinstance(board, dict) and isinstance(board.get("items"), list):
+            import succession
+
+            now_dt = _MB.now()
+            for item in board["items"]:
+                if not isinstance(item, dict) or item.get("status") != "claimed":
+                    continue
+                lease_raw = item.get("leaseExpiresAt") or (item.get("lease") or {}).get("expiresAt")
+                lease_exp = succession.parse_time(lease_raw)
+                if lease_exp is not None and lease_exp < now_dt:
+                    item_id = str(item.get("id") or "")
+                    expired_lease_items.append(f"expired_leases:{item_id}")
+                    advisor_lines.append(f"- [expired_leases] Workboard item {item_id} has an expired claim lease.")
+
+    all_actions = [
+        *respond_items,
+        *expired_lease_items,
+        *review_items,
+        *failed_items,
+        *smelt_items,
+        *queued_items,
+    ]
+    if not all_actions:
+        if me.get("swarmNextDigest") is not None or me.get("swarmNextTurns"):
+            _MB.annotate(base, me["session"], swarmNextDigest=None, swarmNextTurns=0)
+        return ""
+
+    digest = hashlib.sha256("|".join(all_actions).encode("utf-8")).hexdigest()[:16]
+    has_blocker = bool(respond_items or expired_lease_items or failed_items)
+    prev_digest = me.get("swarmNextDigest")
+    turns_since = int(me.get("swarmNextTurns") or 0) + 1
+
+    if digest == prev_digest:
+        if has_blocker and turns_since >= 5:
+            _MB.annotate(base, me["session"], swarmNextDigest=digest, swarmNextTurns=0)
+        else:
+            _MB.annotate(base, me["session"], swarmNextTurns=turns_since)
+            return ""
+    else:
+        _MB.annotate(base, me["session"], swarmNextDigest=digest, swarmNextTurns=0)
+
+    top_lines = advisor_lines[:2]
+    return f"Swarm next step (room {room_id}, digest {digest}):\n" + "\n".join(top_lines)
+
+
 def _format_swarm_reconnection_summary(room: dict[str, Any], room_id: str, member_id: str) -> str:
     title = str(room.get("title") or room_id).strip()
     role_label = "root swarm coordinator (conductor)" if member_id == "conductor" else f"subswarm lead ({member_id})"
@@ -604,6 +778,56 @@ def _format_swarm_reconnection_summary(room: dict[str, Any], room_id: str, membe
         f"Horde members: {counts}. "
         f"Run `ork rooms status --room {room_id}` to inspect your swarm or `/swarm` to toggle the Swarm View."
     )
+
+
+def _herdr_active() -> bool:
+    """Return True if Herdr environment integration is active and not suppressed by pytest or unittest."""
+    if os.environ.get("HERDR_ENV") != "1":
+        return False
+    return not (
+        (os.environ.get("PYTEST_CURRENT_TEST") or "unittest" in sys.modules)
+        and os.environ.get("ORKEST_TEST_ALLOW_HERDR") != "1"
+    )
+
+
+def _maybe_trigger_auto_update(base: Path, me: dict[str, Any], event: str) -> None:
+    """Spawn a detached background auto-update check on SessionStart at most once every 30 minutes."""
+    if event != "SessionStart":
+        return
+    if me.get("isSubagent") or me.get("delegatedRun") or _MB.is_run_peer(me):
+        return
+    if os.environ.get("PYTEST_CURRENT_TEST") and os.environ.get("ORKEST_TEST_AUTO_UPDATE") != "1":
+        return
+    state_file = base.parent / "auto-update-v1.json"
+    with contextlib.suppress(Exception):
+        if state_file.is_file():
+            now_ts = dt.datetime.now(dt.UTC).timestamp()
+            if (now_ts - state_file.stat().st_mtime) < 1800:
+                return
+            state_data = _MB.load(state_file)
+            if isinstance(state_data, dict):
+                raw_checked = (
+                    state_data.get("lastCheckedAt") or state_data.get("checkedAt") or state_data.get("checked_at")
+                )
+                if isinstance(raw_checked, int | float):
+                    ts = raw_checked / 1000.0 if raw_checked > 1e11 else float(raw_checked)
+                    if (now_ts - ts) < 1800:
+                        return
+                elif isinstance(raw_checked, str) and raw_checked.strip():
+                    import succession
+
+                    parsed = succession.parse_time(raw_checked)
+                    if parsed is not None and (_MB.now() - parsed).total_seconds() < 1800:
+                        return
+        cli = Path(__file__).resolve().parents[3] / "bin" / "ork.mjs"
+        node_bin = shutil.which("node") or "node"
+        subprocess.Popen(
+            [node_bin, str(cli), "update", "run", "--auto", "--quiet"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
 
 
 def swarm_coordinator_context(
@@ -640,15 +864,9 @@ def swarm_coordinator_context(
         instance_key = f"{room_id}:{me.get('terminalServer') or me.get('herdrPaneId') or me.get('pid') or ''}"
         if me.get("swarmAutoReconnected") != instance_key:
             _MB.annotate(base, me["session"], swarmAutoReconnected=instance_key, swarmBriefed=room_id)
-            if (
-                me.get("terminalServer")
-                or os.environ.get("ORKEST_TERMINAL_SERVER")
-                or os.environ.get("HERDR_ENV") == "1"
-            ):
+            if me.get("terminalServer") or os.environ.get("ORKEST_TERMINAL_SERVER") or _herdr_active():
                 server_sock = (
-                    None
-                    if os.environ.get("HERDR_ENV") == "1"
-                    else (me.get("terminalServer") or os.environ.get("ORKEST_TERMINAL_SERVER"))
+                    None if _herdr_active() else (me.get("terminalServer") or os.environ.get("ORKEST_TERMINAL_SERVER"))
                 )
                 with contextlib.suppress(Exception):
                     agent_statusline_tmux.toggle_swarm_view(
@@ -661,7 +879,7 @@ def swarm_coordinator_context(
                         base=base,
                     )
             return _format_swarm_reconnection_summary(room, room_id, member_id)
-        return ""
+        return _swarm_next_advisor(base, me, room, room_id, member_id) if is_turn_start else ""
 
     if not re.fullmatch(r"[\w-]{1,80}", room_id, flags=re.ASCII):
         return ""
@@ -696,7 +914,7 @@ def swarm_coordinator_context(
                     if is_turn_start and me.get("swarmAutoReconnected") != instance_key:
                         _MB.annotate(base, me["session"], swarmAutoReconnected=instance_key, swarmBriefed=room_id)
                         return _format_swarm_reconnection_summary(room, room_id, member_id)
-                    return ""
+                    return _swarm_next_advisor(base, me, room, room_id, member_id) if is_turn_start else ""
         return ""
 
     if bound_session and bound_session != me["session"] and bound_session in candidate_ids:
@@ -760,6 +978,74 @@ def swarm_coordinator_context(
     ):
         _MB.annotate(base, me["session"], swarmAutoReconnected=instance_key)
         return _format_swarm_reconnection_summary(room, room_id, "conductor")
+    return _swarm_next_advisor(base, me, room, room_id, "conductor") if is_turn_start else ""
+
+
+def side_command_context(
+    base: Path, me: dict[str, Any], payload: dict[str, Any], event: str, *, mid_turn: bool = False
+) -> str:
+    """Intercept `/side`, `[orkest-side-command: ...]`, `!side`, or `side:` on turn start and dispatch via side.mjs."""
+    if me.get("isSubagent") or me.get("delegatedRun") or _MB.is_run_peer(me):
+        return ""
+    if not (event == "UserPromptSubmit" or (event == "PreInvocation" and not mid_turn)):
+        return ""
+    prompt = _MB.latest_user_prompt(payload, me["session"], me.get("accountHome"))
+    if not prompt:
+        return ""
+    cleaned = re.sub(r"</?USER_REQUEST>", "", prompt).strip()
+    match = _SIDE_TAG_CMD.search(cleaned) or _SIDE_SLASH_CMD.match(cleaned) or _SIDE_PREFIX_CMD.match(cleaned)
+    if not match:
+        return ""
+    raw_args = (match.group(1) or "").strip()
+    if not raw_args:
+        return (
+            "[orkest-side-dispatched] Usage: `/side [--later|--issue|--investigate] <idea>`. "
+            "Let the user know in one short line and do not call any tools."
+        )
+    try:
+        parsed_tokens = shlex.split(raw_args)
+    except ValueError:
+        parsed_tokens = [raw_args]
+    side_script = Path(__file__).resolve().parents[3] / "lib" / "side.mjs"
+    node_bin = shutil.which("node") or "node"
+    cwd = str(me.get("cwd") or os.getcwd())
+    cmd = [
+        node_bin,
+        str(side_script),
+        *parsed_tokens,
+        "--session",
+        str(me["session"]),
+        "--harness",
+        str(me["harness"]),
+        "--cwd",
+        cwd,
+        "--json",
+    ]
+    room_env = os.environ.get("ORKEST_SWARM_ROOM", "").strip()
+    if room_env and "--room" not in parsed_tokens:
+        cmd.extend(["--room", room_env])
+    env = {**os.environ, "ORCHESTRATE_MAILBOX_DIR": str(base)}
+    with contextlib.suppress(Exception):
+        proc = subprocess.run(
+            cmd,
+            cwd=cwd,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        out = (proc.stdout or "").strip()
+        if out:
+            data = json.loads(out)
+            if isinstance(data, dict):
+                if data.get("status") == "error":
+                    return f"[orkest-side-dispatched] Side mission error: {data.get('error')}. Report this in one line and do not call any tools."
+                summary = str(data.get("summary") or "").strip()
+                if summary:
+                    if event == "UserPromptSubmit" and me.get("harness") != "gemini":
+                        return summary
+                    return f"[orkest-side-dispatched] {summary} Confirm this to the user in one short line and do not call any tools."
     return ""
 
 
@@ -838,6 +1124,54 @@ def hook(
     if event == "SessionEnd":
         _MB.end_session(base, session, reason=str(payload.get("reason") or ""), pid=_MB.harness_pid(harness))
         return None
+    if event == "SubagentStart":
+        raw_agent_id = payload.get("agent_id") or payload.get("subagent_id")
+        if isinstance(raw_agent_id, str) and raw_agent_id.strip():
+            sub_sid = re.sub(r"[^A-Za-z0-9_.-]+", "-", f"subagent-{raw_agent_id.strip()}")[:80]
+            agent_type = str(payload.get("agent_type") or payload.get("subagent_type") or "subagent").strip()[:60]
+            sub_model = payload.get("model") or payload.get("modelName")
+            if isinstance(sub_model, dict):
+                sub_model = sub_model.get("id")
+            if isinstance(sub_model, str) and sub_model.strip().lower() == "auto":
+                sub_model = None
+            if not (isinstance(sub_model, str) and sub_model.strip()):
+                sub_model = _MB.transcript_model(payload)
+            _MB.register(
+                base,
+                session=sub_sid,
+                harness=harness,
+                cwd=cwd,
+                pid=_MB.harness_pid(harness),
+                state="busy",
+                cwd_source="hook",
+                model=sub_model if isinstance(sub_model, str) and sub_model.strip() else None,
+                model_source="runtime",
+            )
+            _MB.annotate(base, sub_sid, isSubagent=True, parentSession=session, focus=f"native {agent_type}")
+            _MB.write(
+                base / "progress" / f"{session_key(sub_sid)}.json",
+                {
+                    "session": sub_sid,
+                    "role": "builder",
+                    "stage": "working",
+                    "goal": f"Native {agent_type}",
+                    "task": f"Running {agent_type} subagent ({raw_agent_id.strip()[:12]})",
+                    "updatedAt": _MB.stamp(),
+                },
+            )
+        return {}
+    if event == "SubagentStop":
+        raw_agent_id = payload.get("agent_id") or payload.get("subagent_id")
+        if isinstance(raw_agent_id, str) and raw_agent_id.strip():
+            sub_sid = re.sub(r"[^A-Za-z0-9_.-]+", "-", f"subagent-{raw_agent_id.strip()}")[:80]
+            prog_path = base / "progress" / f"{session_key(sub_sid)}.json"
+            existing_prog = _MB.load(prog_path)
+            if isinstance(existing_prog, dict):
+                existing_prog["stage"] = "complete"
+                existing_prog["updatedAt"] = _MB.stamp()
+                _MB.write(prog_path, existing_prog)
+            _MB.end_session(base, sub_sid, reason="completed", pid=_MB.harness_pid(harness))
+        return {}
     state = {"SessionStart": "idle", "UserPromptSubmit": "busy", "PreInvocation": "busy", "Stop": "idle"}.get(event)
     if state is None:
         return None
@@ -907,7 +1241,7 @@ def hook(
         terminal_server = os.environ.get("ORKEST_TERMINAL_SERVER", "").strip()
         if re.fullmatch(r"orkest-label-[0-9a-f]{12}", terminal_server) and me.get("terminalServer") != terminal_server:
             me = _MB.annotate(base, session, terminalServer=terminal_server) or me
-        if os.environ.get("HERDR_ENV") == "1":
+        if _herdr_active():
             herdr_pane = os.environ.get("HERDR_PANE_ID", "").strip()
             herdr_workspace = os.environ.get("HERDR_WORKSPACE_ID", "").strip()
             herdr_fields: dict[str, Any] = {}
@@ -917,6 +1251,8 @@ def hook(
                 herdr_fields["herdrWorkspaceId"] = herdr_workspace
             if herdr_fields:
                 me = _MB.annotate(base, session, **herdr_fields) or me
+    if event == "SessionStart":
+        _maybe_trigger_auto_update(base, me, event)
     # How the last turn ended: wake recovery must not set a conversation going that its own user stopped.
     if gemini and event == "Stop" and payload.get("terminationReason"):
         me = _MB.annotate(base, session, lastStopReason=str(payload["terminationReason"])) or me
@@ -991,6 +1327,14 @@ def hook(
         if not is_subagent and not me.get("isSubagent")
         else ""
     )
+    side_notice = (
+        getattr(_MB, "side_command_context", side_command_context)(base, me, payload, event, mid_turn=mid_turn)
+        if not is_subagent and not me.get("isSubagent")
+        else ""
+    )
+    if side_notice and event == "UserPromptSubmit" and not gemini:
+        _MB.annotate(base, session, state="idle")
+        return {"decision": "block", "reason": side_notice}
     progress_hint = ""
     help_hint = ""
     if (
@@ -1032,6 +1376,7 @@ def hook(
     hint = "\n".join(
         value
         for value in (
+            side_notice,
             swarm_toggle,
             swarm_brief,
             cleared_notice,
@@ -1050,6 +1395,7 @@ def hook(
     if event == "Stop":
         if not delivered:  # a hint or notice alone never keeps a turn going
             return {} if gemini else None
+        # New mail arrived during the turn: keep going instead of leaving it unread until the user returns.
         _MB.feedback_module().observe(
             base,
             me,
@@ -1059,11 +1405,10 @@ def hook(
             message_ids=[message["id"] for message in delivered],
             measurements={
                 "messageCount": len(delivered),
-                "messageBytes": sum(len(m["text"].encode()) for m in delivered),
+                "messageBytes": sum(len(message["text"].encode()) for message in delivered),
             },
             repeat=False,
         )
-        # New mail arrived during the turn: keep going instead of leaving it unread until the user returns.
         _MB.annotate(base, session, state="busy")
         decision = "continue" if gemini else "block"
         return {"decision": decision, "reason": f"Peer messages arrived while you worked:\n\n{context}"}

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -356,6 +357,20 @@ def run_completion_hook(hook: Path, event_path: Path, event: dict[str, Any]) -> 
     return {"kind": "hook", "status": "sent", "path": str(hook)}
 
 
+def _coordinator_task_dir_for_result(result_path: Path) -> Path | None:
+    """Return the enclosing coordinator task directory if result_path is `<task_dir>/runs/<run_id>/artifacts/result.json`."""
+    try:
+        resolved = result_path.expanduser().resolve()
+    except OSError:
+        return None
+    if len(resolved.parents) < 4:
+        return None
+    if resolved.parent.name != "artifacts" or resolved.parents[2].name != "runs":
+        return None
+    task_dir = resolved.parents[3]
+    return task_dir if (task_dir / "task.json").is_file() else None
+
+
 def publish_completion_event(
     *,
     result: dict[str, Any],
@@ -368,6 +383,7 @@ def publish_completion_event(
     repository_value = result.get("repository")
     repository = str(Path(str(repository_value)).expanduser().resolve()) if repository_value else None
     mailbox = result.get("mailbox") or {}
+    task_dir = _coordinator_task_dir_for_result(result_path)
     event = {
         "schema": COMPLETION_EVENT_SCHEMA,
         "event_id": event_path.stem,
@@ -391,6 +407,11 @@ def publish_completion_event(
         "deliveries": [],
         **(extra or {}),
     }
+    if task_dir is not None:
+        event.setdefault("task_dir", str(task_dir))
+        with contextlib.suppress(Exception):
+            coordinator = _runner().bundled_module("coordinator")
+            coordinator.auto_recover_task(task_dir, skip_event_publish=True)
     _write_json_atomic(event_path, event)
 
     deliveries: list[dict[str, Any]] = []

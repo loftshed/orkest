@@ -195,7 +195,8 @@ class InstallMailboxTests(unittest.TestCase):
         self.assertEqual(self.path.read_text(), '{"model":"example"}\n')
         installer.install_hooks(self.path, self.script, "claude")
         self.assertEqual(
-            set(json.loads(self.path.read_text())["hooks"]), {"SessionStart", "SessionEnd", "Stop", "UserPromptSubmit"}
+            set(json.loads(self.path.read_text())["hooks"]),
+            {"SessionStart", "SessionEnd", "Stop", "UserPromptSubmit", "SubagentStart", "SubagentStop"},
         )
 
     def test_wait_timeout_preserves_comments_and_unrelated_configuration(self):
@@ -253,30 +254,123 @@ class InstallMailboxTests(unittest.TestCase):
         ork_cli.parent.mkdir(parents=True)
         ork_cli.write_text("#!/usr/bin/env node\n")
         (self.base / ".claude").mkdir()
-        (self.base / ".codex").mkdir()
+        (self.base / ".codex/skills").mkdir(parents=True)
+        legacy_skill = self.base / ".codex/skills/agent-executor"
+        legacy_skill.mkdir(parents=True)
         zshrc = self.base / ".zshrc"
         zshrc.write_text("export EXAMPLE=1\n")
 
         self.assertTrue(installer.install_shell_wrappers(self.base, ork_cli, dry_run=True))
-        self.assertFalse((self.base / ".config/agent-executor/orkest.sh").exists())
+        self.assertFalse((self.base / ".config/orchestrate/orkest.sh").exists())
+        self.assertTrue(legacy_skill.exists())
         self.assertEqual(zshrc.read_text(), "export EXAMPLE=1\n")
 
         self.assertTrue(installer.install_shell_wrappers(self.base, ork_cli))
-        wrapper = self.base / ".config/agent-executor/orkest.sh"
+        wrapper = self.base / ".config/orchestrate/orkest.sh"
         self.assertTrue(wrapper.is_file())
+        self.assertFalse(legacy_skill.exists())
         self.assertIn('command ork label -- agy --dangerously-skip-permissions "$@"', wrapper.read_text())
         self.assertIn('command ork agy --dangerously-skip-permissions "$@"', wrapper.read_text())
         self.assertNotIn("--remote-control", wrapper.read_text())
         self.assertEqual((self.base / ".local/bin/ork").resolve(), ork_cli.resolve())
         self.assertTrue((self.base / ".claude/commands/swarm.md").is_file())
+        self.assertTrue((self.base / ".claude/commands/cleanup.md").is_file())
         self.assertTrue((self.base / ".agents/skills/swarm/SKILL.md").is_file())
+        self.assertTrue((self.base / ".agents/skills/cleanup/SKILL.md").is_file())
         self.assertEqual((self.base / ".codex/skills/swarm").resolve(), (self.base / ".agents/skills/swarm").resolve())
+        self.assertEqual(
+            (self.base / ".codex/skills/cleanup").resolve(), (self.base / ".agents/skills/cleanup").resolve()
+        )
         self.assertIn(installer.MANAGED_ZSHRC_BLOCK, zshrc.read_text())
         self.assertIn("export EXAMPLE=1\n", zshrc.read_text())
 
         before_zshrc = zshrc.read_bytes()
         self.assertFalse(installer.install_shell_wrappers(self.base, ork_cli))
         self.assertEqual(zshrc.read_bytes(), before_zshrc)
+
+    def test_side_command_and_skill_registration_when_present_in_plugin_root(self):
+        plugin_root = self.base / "plugin-root"
+        ork_cli = plugin_root / "bin/ork.mjs"
+        ork_cli.parent.mkdir(parents=True)
+        ork_cli.write_text("#!/usr/bin/env node\n")
+        (plugin_root / "commands").mkdir(parents=True)
+        (plugin_root / "commands/side.md").write_text("---\ndescription: Toggle side view\n---\n")
+        (plugin_root / "commands/update.md").write_text("---\ndescription: Update Orkest\n---\n")
+
+        (self.base / ".claude/skills/side").mkdir(parents=True, exist_ok=True)
+        (self.base / ".claude-work/skills/side").mkdir(parents=True, exist_ok=True)
+        (self.base / ".gemini/antigravity/skills/side").mkdir(parents=True, exist_ok=True)
+        (self.base / ".codex/skills").mkdir(parents=True, exist_ok=True)
+        (self.base / ".gemini/config/skills").mkdir(parents=True, exist_ok=True)
+        (self.base / ".config/opencode/skills").mkdir(parents=True, exist_ok=True)
+
+        self.assertTrue(installer.install_shell_wrappers(self.base, ork_cli))
+        self.assertTrue((self.base / ".claude/commands/side.md").is_file())
+        self.assertTrue((self.base / ".claude-work/commands/side.md").is_file())
+        self.assertTrue((self.base / ".claude/commands/update.md").is_file())
+        self.assertTrue((self.base / ".claude-work/commands/update.md").is_file())
+        hub_side = (self.base / ".agents/skills/side").resolve()
+        hub_update = (self.base / ".agents/skills/update").resolve()
+        self.assertTrue((hub_side / "SKILL.md").is_file())
+        self.assertTrue((hub_update / "SKILL.md").is_file())
+        for dup_link in (
+            self.base / ".claude/skills/side",
+            self.base / ".claude-work/skills/side",
+            self.base / ".gemini/antigravity/skills/side",
+            self.base / ".claude/skills/update",
+            self.base / ".claude-work/skills/update",
+            self.base / ".gemini/antigravity/skills/update",
+        ):
+            self.assertFalse(dup_link.exists() or dup_link.is_symlink(), f"expected duplicate removed at {dup_link}")
+        for skill_link in (
+            self.base / ".codex/skills/side",
+            self.base / ".gemini/config/skills/side",
+            self.base / ".config/opencode/skills/side",
+        ):
+            self.assertTrue(skill_link.is_symlink(), f"expected symlink at {skill_link}")
+            self.assertEqual(skill_link.resolve(), hub_side)
+        for update_link in (
+            self.base / ".codex/skills/update",
+            self.base / ".gemini/config/skills/update",
+            self.base / ".config/opencode/skills/update",
+        ):
+            self.assertTrue(update_link.is_symlink(), f"expected symlink at {update_link}")
+            self.assertEqual(update_link.resolve(), hub_update)
+
+    def test_backup_rotation_keeps_newest_and_prunes_inactive_daemon_runtimes(self):
+        import os
+        import time
+
+        target = self.base / "settings.json"
+        for idx in range(3):
+            target.write_text(f'{{"rev": {idx}}}\n')
+            installer.backup(target, keep_backups=1)
+        backups = list(self.base.glob("settings.json.mailbox-bak.*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_text(), '{"rev": 2}\n')
+
+        mailbox_root = self.base / "cache/mailbox-v1"
+        daemon_dir = self.base / "cache/mailbox-daemon-v1"
+        runtimes_dir = daemon_dir / "runtimes"
+        active_rt = runtimes_dir / "rev-active"
+        recent_rt = runtimes_dir / "rev-recent"
+        stale_rt = runtimes_dir / "rev-stale"
+        for rt in (active_rt, recent_rt, stale_rt):
+            rt.mkdir(parents=True)
+            (rt / "mailbox_daemon.py").write_text("# daemon\n")
+        (daemon_dir / "state.json").write_text(json.dumps({"runtimeRevision": "rev-active"}))
+        old_mtime = time.time() - 3600
+        os.utime(stale_rt, (old_mtime, old_mtime))
+
+        pruned_dry = installer.prune_daemon_runtimes(mailbox_root, grace_seconds=900, dry_run=True)
+        self.assertEqual(pruned_dry, [stale_rt])
+        self.assertTrue(stale_rt.exists())
+
+        pruned = installer.prune_daemon_runtimes(mailbox_root, grace_seconds=900, dry_run=False)
+        self.assertEqual(pruned, [stale_rt])
+        self.assertFalse(stale_rt.exists())
+        self.assertTrue(active_rt.exists())
+        self.assertTrue(recent_rt.exists())
 
     def test_swarm_command_context_toggles_swarm_view_on_slash_command(self):
         from unittest.mock import patch

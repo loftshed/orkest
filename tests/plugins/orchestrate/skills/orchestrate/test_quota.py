@@ -205,6 +205,14 @@ class CheckTests(unittest.TestCase):
         missing_pct["lanes"][3]["availableNowPct"] = None
         self.assertEqual(QUOTA.check("agy", "gemini-3.8-flash-medium", missing_pct)["status"], "unknown")
         self.assertIn("quota is exhausted", QUOTA.blocked_message("claude", "opus", work_result, missing_pct))
+        # Exact configDir on monitor accounts is preserved by pool_lanes and matched by _match_claude_lane.
+        with_config_dirs = view()
+        with_config_dirs["accounts"][0]["configDir"] = "~/.claude-work-custom"
+        with_config_dirs["accounts"][1]["configDir"] = "~/.claude-personal-custom"
+        custom_work = QUOTA.check("claude", "opus", with_config_dirs, claude_config_dir="~/.claude-work-custom")
+        self.assertEqual((custom_work["accountId"], custom_work["status"]), ("claude-work", "blocked"))
+        custom_personal = QUOTA.check("claude", "opus", with_config_dirs, claude_config_dir="~/.claude-personal-custom")
+        self.assertEqual((custom_personal["accountId"], custom_personal["status"]), ("claude-personal", "available"))
 
 
 class RecommendTests(unittest.TestCase):

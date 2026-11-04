@@ -128,14 +128,15 @@ def check() -> dict[str, Any]:
         raise RuntimeError(f"messaging needs setup: {missing}; run doctor --repair-messaging")
     import mailbox_daemon
     import peer_mailbox
+    import runtime_paths
 
     if mailbox_daemon.get_mode(peer_mailbox.root()) == "http":
         return check_http()
     scripts = Path(__file__).resolve().parent
     # Retain evidence; never prune the user's real peer store or send to their active sessions.
-    evidence = Path.home() / ".cache/agent-executor/checks" / f"mailbox-{uuid.uuid4().hex}"
+    evidence = runtime_paths.cache_home() / "checks" / f"mailbox-{uuid.uuid4().hex}"
     evidence.mkdir(parents=True)
-    env = {**os.environ, "AGENT_EXECUTOR_HOME": str(evidence)}
+    env = runtime_paths.set_home_env({**os.environ}, evidence)
     env.pop("CLAUDE_CODE_SESSION_ID", None)
     env.pop("CLAUDE_PID", None)
     clients: dict[str, RpcClient] = {}
@@ -164,6 +165,7 @@ def check() -> dict[str, Any]:
                 }
                 # Native MCP process environments are filtered; explicitly point the test server at
                 # this isolated store instead of relying on the app-server's inherited environment.
+                overrides["mcp_servers.peer-mailbox.env.ORCHESTRATE_HOME"] = str(evidence)
                 overrides["mcp_servers.peer-mailbox.env.AGENT_EXECUTOR_HOME"] = str(evidence)
                 overrides.update({f"plugins.{key}.enabled": False for key in installed.get("plugins", {})})
                 thread = native.request("thread/start", {"cwd": os.getcwd(), "ephemeral": True, "config": overrides})
@@ -244,8 +246,9 @@ def check_http() -> dict[str, Any]:
 
     import mailbox_daemon
     import peer_mailbox
+    import runtime_paths
 
-    evidence = Path.home() / ".cache/agent-executor/checks" / ("mailbox-http-" + uuid.uuid4().hex)
+    evidence = runtime_paths.cache_home() / "checks" / ("mailbox-http-" + uuid.uuid4().hex)
     evidence.mkdir(parents=True, mode=0o700)
     base = evidence / "mailbox-v1"
     state = mailbox_daemon.ensure_running(base)
@@ -288,8 +291,8 @@ def check_http() -> dict[str, Any]:
                         "Content-Type": "application/json",
                         "Accept": "application/json, text/event-stream",
                         "MCP-Protocol-Version": "2026-07-28",
-                        "Mcp-Method": "tools/call",
                         "Mcp-Name": tool,
+                        "Mcp-Method": "tools/call",
                     },
                 )
                 response = connection.getresponse()
@@ -305,7 +308,10 @@ def check_http() -> dict[str, Any]:
 
     try:
         if shutil.which("codex"):
-            env = {**os.environ, "AGENT_EXECUTOR_HOME": str(evidence), "AGENT_MAILBOX_CHECK_AUTH": "Bearer " + token}
+            env = runtime_paths.set_home_env(
+                {**os.environ, "AGENT_MAILBOX_CHECK_AUTH": "Bearer " + token},
+                evidence,
+            )
             native = RpcClient(["codex", "app-server", "--stdio"], env)
             initialize_codex(native)
             installed_path = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "config.toml"

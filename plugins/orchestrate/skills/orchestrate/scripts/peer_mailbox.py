@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
+import fcntl
 import hashlib
 import importlib.util
 import math
 import os
 import re
 import shlex
+import shutil
 import subprocess  # noqa: F401 -- re-exported for callers/tests patching peer_mailbox.subprocess
 import sys
 import threading
@@ -673,7 +675,7 @@ def register(
                 session_tag(session, peer.get("nativeName"), peer.get("nativeNameSource")),
             )
         repo = repository_name(peer)
-        person = peer.get("person") or (peer["name"].split("-", 1)[0] if peer.get("name") else "agent")
+        person = peer.get("person") or peer.get("harness") or "agent"
         peer["shortName"] = short_agent_name(person, repo, session)
         if previous_name and previous_name != peer["name"]:
             # Earlier names keep resolving, so mail addressed before a model or effort change still arrives.
@@ -849,9 +851,12 @@ def taken_persons(base: Path, session: str) -> set[str]:
 def _peer_aliases(peer: dict[str, Any]) -> set[str]:
     aliases = {peer["name"], peer["session"]}
     aliases.update(alias for alias in peer.get("aliases", []) if isinstance(alias, str))
-    if isinstance(peer.get("person"), str):
+    if isinstance(peer.get("person"), str) and peer["person"]:
+        aliases.add(peer["person"])
         # person-repo stays the same across model and effort changes: the stable address.
         aliases.add(readable_name(peer["person"], repository_name(peer), None, None))
+    if isinstance(peer.get("shortName"), str) and peer["shortName"]:
+        aliases.add(peer["shortName"])
     if peer.get("nativeName"):
         aliases.add(str(peer["nativeName"]))
     with contextlib.suppress(Exception):
@@ -1046,7 +1051,7 @@ def send(
     kind: str | None = None,
     client_id: str | None = None,
     scope: str = "project",
-    wake: bool = False,
+    wake: bool | None = None,
     idempotency_key: str | None = None,
     native_unreachable: str | None = None,
     channel: str | None = None,
@@ -1144,6 +1149,7 @@ def send(
         )
 
     quiet_unrelated = not channel and unrelated_task(base, sender, target, reply_to=reply_to, scope=scope)
+    effective_wake = (not channel) if wake is None else bool(wake)
     message = {
         "schema": MAIL_SCHEMA,
         "id": message_id(),
@@ -1154,6 +1160,7 @@ def send(
         "sentAt": stamp(),
         "readAt": None,
         "scope": scope,
+        "wake": effective_wake,
     }
     if native_only:
         message["nativeUnreachable"] = " ".join(native_unreachable.split())
@@ -1179,7 +1186,7 @@ def send(
         "text": text,
         "replyTo": reply_to,
         "scope": scope,
-        "wake": wake,
+        "wake": bool(wake),
         "caller": {key: sender.get(key) for key in ("session", "harness", "cwd", "repo", "remotes", "run")},
         **({"channel": channel, "postId": post_id} if channel else {}),
     }
@@ -1661,6 +1668,124 @@ def wait(
             time.sleep(min(poll, remaining))
 
 
+LOCK_GRACE_SECONDS = 900.0
+
+
+def _unlink_stale_lock(lock_file: Path, *, min_age_seconds: float = LOCK_GRACE_SECONDS) -> bool:
+    """Unlink a lock file only after a grace window and only while holding a non-blocking exclusive flock."""
+    if lock_file.parent.name == "worktree-locks-v1" or lock_file.name == "cleanup.lock":
+        return False
+    try:
+        if time.time() - lock_file.stat().st_mtime <= min_age_seconds:
+            return False
+        descriptor = os.open(lock_file, os.O_RDWR)
+    except OSError:
+        return False
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return False
+        try:
+            fd_stat = os.fstat(descriptor)
+            if time.time() - fd_stat.st_mtime <= min_age_seconds:
+                return False
+            if lock_file.stat().st_ino != fd_stat.st_ino:
+                return False
+            lock_file.unlink(missing_ok=True)
+            return True
+        except OSError:
+            return False
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(descriptor)
+
+
+def _room_has_live_member(base: Path, room: dict[str, Any]) -> bool:
+    members = [room.get("conductor"), *(room.get("agents") if isinstance(room.get("agents"), list) else [])]
+    for member in members:
+        if not isinstance(member, dict):
+            continue
+        session = member.get("session")
+        if isinstance(session, dict) and isinstance(session.get("id"), str) and live_session(base, session["id"]):
+            return True
+        if isinstance(member.get("mailboxSession"), str) and live_session(base, member["mailboxSession"]):
+            return True
+        pid = member.get("pid")
+        if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 and pid_alive(pid):
+            return True
+        run_id = member.get("runId") or member.get("run_id")
+        if isinstance(run_id, str) and (
+            live_session(base, f"run-{run_id}-worker") or live_session(base, f"run-{run_id}-conductor")
+        ):
+            return True
+    return False
+
+
+def _prune_rooms_and_briefs(base: Path, cutoff: dt.datetime) -> None:
+    max_age_seconds = MAX_AGE.total_seconds()
+    for room_path in (base / "rooms").glob("*.json"):
+        with contextlib.suppress(OSError):
+            if time.time() - room_path.stat().st_mtime <= max_age_seconds:
+                continue
+            room = load(room_path)
+            if isinstance(room, dict) and _room_has_live_member(base, room):
+                continue
+            room_path.unlink(missing_ok=True)
+            _unlink_stale_lock(room_path.with_suffix(".lock"))
+    brief_roots = [base / "swarm-briefs"]
+    if (base / "rooms").exists():
+        brief_roots.append(base.parent / "swarm-briefs")
+    for brief_root in brief_roots:
+        for brief_dir in brief_root.glob("*"):
+            with contextlib.suppress(OSError):
+                if (
+                    brief_dir.is_dir()
+                    and not (base / "rooms" / f"{brief_dir.name}.json").exists()
+                    and time.time() - brief_dir.stat().st_mtime > max_age_seconds
+                ):
+                    shutil.rmtree(brief_dir, ignore_errors=True)
+    for progress_path in (base / "progress").glob("*.json"):
+        with contextlib.suppress(OSError):
+            peer_file = base / "peers" / progress_path.name
+            peer = load(peer_file)
+            if valid_peer(peer) and is_live(peer):
+                continue
+            progress = load(progress_path)
+            session = progress.get("session") if isinstance(progress, dict) else None
+            if isinstance(session, str) and live_session(base, session):
+                continue
+            expired_mtime = time.time() - progress_path.stat().st_mtime > max_age_seconds
+            updated_at = progress.get("updatedAt") if isinstance(progress, dict) else None
+            try:
+                expired_stamp = bool(updated_at and parse_stamp(str(updated_at)) < cutoff)
+            except ValueError:
+                expired_stamp = False
+            if expired_mtime or expired_stamp:
+                progress_path.unlink(missing_ok=True)
+                _unlink_stale_lock(progress_path.with_suffix(".lock"))
+    board_path = base / "work" / "board.json"
+    if board_path.exists():
+        with contextlib.suppress(OSError, MailboxError), locked(board_path):
+            board = load(board_path)
+            if isinstance(board, dict) and isinstance(board.get("items"), list):
+                board_old = time.time() - board_path.stat().st_mtime > max_age_seconds
+                kept = []
+                for item in board["items"]:
+                    if not isinstance(item, dict) or item.get("status") not in {"accepted", "abandoned"}:
+                        kept.append(item)
+                        continue
+                    stamp_str = item.get("updatedAt") or item.get("createdAt")
+                    try:
+                        item_expired = parse_stamp(str(stamp_str)) < cutoff if stamp_str else board_old
+                    except ValueError:
+                        item_expired = True
+                    if not item_expired:
+                        kept.append(item)
+                if len(kept) != len(board["items"]):
+                    write(board_path, {**board, "items": kept})
+
+
 def prune(base: Path) -> dict[str, int]:
     removed = {"peers": 0, "messages": 0}
     moment = now()
@@ -1712,11 +1837,11 @@ def prune(base: Path) -> dict[str, int]:
             expired = True
         if expired:
             path.unlink(missing_ok=True)
-            path.with_suffix(".lock").unlink(missing_ok=True)
+            _unlink_stale_lock(path.with_suffix(".lock"))
             removed["messages"] += 1
     for lock_file in [*(base / "peers").glob("*.lock"), *(base / "inbox").glob("*/*.lock")]:
         if not lock_file.with_suffix(".json").exists():
-            lock_file.unlink(missing_ok=True)
+            _unlink_stale_lock(lock_file)
     for inbox_sub in (base / "inbox").glob("*"):
         if (
             inbox_sub.is_dir()
@@ -1724,9 +1849,10 @@ def prune(base: Path) -> dict[str, int]:
             and not any(inbox_sub.glob("*.json"))
         ):
             for lock_file in inbox_sub.glob("*.lock"):
-                lock_file.unlink(missing_ok=True)
-            with contextlib.suppress(OSError):
-                inbox_sub.rmdir()
+                _unlink_stale_lock(lock_file)
+            if not any(inbox_sub.iterdir()):
+                with contextlib.suppress(OSError):
+                    inbox_sub.rmdir()
     for wake_sub in (base / "wakes").glob("*"):
         with contextlib.suppress(OSError):
             if (
@@ -1738,9 +1864,8 @@ def prune(base: Path) -> dict[str, int]:
                     item.unlink(missing_ok=True)
                 wake_sub.rmdir()
     for lock_file in (base / "locks").glob("*.lock"):
-        with contextlib.suppress(OSError):
-            if time.time() - lock_file.stat().st_mtime > MAX_AGE.total_seconds():
-                lock_file.unlink(missing_ok=True)
+        _unlink_stale_lock(lock_file, min_age_seconds=MAX_AGE.total_seconds())
+    _prune_rooms_and_briefs(base, cutoff)
     prune_send_journals(base)
     import mailbox_channels
 

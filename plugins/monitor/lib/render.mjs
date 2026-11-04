@@ -75,7 +75,7 @@ export function renderReport(
 ) {
   const c = painter(color);
   const out = [];
-  const oldest = Math.min(...accounts.map((a) => a.fetchedAt ?? now));
+  const oldest = accounts.length > 0 ? Math.min(...accounts.map((a) => a.fetchedAt ?? now)) : now;
   const status = refreshing
     ? c("cyan", "refreshing…")
     : c("dim", `data ${formatDuration(now - oldest)} old`);
@@ -219,6 +219,7 @@ export function jsonView(accounts, now = Date.now()) {
       provider: a.provider,
       plan: a.plan ?? null,
       billing: a.billing ?? null,
+      configDir: a.configDir ?? null,
       credits: creditBalance(a),
       ok: a.ok !== false,
       error: a.ok === false ? a.error : null,

@@ -13,20 +13,34 @@ function windowKind(mins) {
 }
 
 /** Normalises the `account/rateLimits/read` result from `codex app-server`. */
-export function parseCodexRateLimits(result) {
-  const byId =
-    result.rateLimitsByLimitId ??
-    (result.rateLimits ? { [result.rateLimits.limitId ?? "codex"]: result.rateLimits } : {});
+export function parseCodexRateLimits(result = {}) {
+  if (!result || typeof result !== "object") {
+    throw new Error("codex reported no rate-limit windows (not signed in with ChatGPT?)");
+  }
+  let byId = {};
+  if (result.rateLimitsByLimitId && typeof result.rateLimitsByLimitId === "object") {
+    byId = result.rateLimitsByLimitId;
+  } else if (result.rateLimits && typeof result.rateLimits === "object") {
+    byId = { [result.rateLimits.limitId ?? "codex"]: result.rateLimits };
+  }
   const windows = [];
   const pools = [];
   const notes = [];
   let plan;
   let credits = null;
   for (const [limitId, limit] of Object.entries(byId)) {
+    if (!limit || typeof limit !== "object") continue;
     plan ??= limit.planType;
     const windowIds = [];
     for (const w of [limit.primary, limit.secondary]) {
-      if (!w) continue;
+      if (
+        !w ||
+        typeof w !== "object" ||
+        typeof w.usedPercent !== "number" ||
+        !Number.isFinite(w.usedPercent)
+      ) {
+        continue;
+      }
       const { kind, label } = windowKind(w.windowDurationMins);
       const id = limitId === "codex" ? kind : `${limitId}-${kind}`;
       windows.push({
@@ -134,7 +148,7 @@ function rpcRateLimits(bin, env, timeoutMs) {
           continue;
         }
         // The server can send its own requests (with a method) whose ids overlap ours; only answers count.
-        if ("method" in msg) continue;
+        if (!msg || typeof msg !== "object" || "method" in msg) continue;
         if (msg.id === 1) {
           if (msg.error) return finish(reject, new Error(`codex initialize: ${msg.error.message}`));
           send({ method: "initialized" });

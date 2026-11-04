@@ -798,17 +798,16 @@ export async function dispatchMember(id, memberId, options = {}) {
 }
 
 /** Read task snapshots through the coordinator. A terminal's idle state is never a verdict. */
-export async function observeRoom(
-  idOrRoom,
-  {
+export async function observeRoom(idOrRoom, options = {}) {
+  const {
     root = mailboxRoot(),
     run = coordinator,
     authority = authorityShow,
     tasks = new Map(),
     authorities = new Map(),
     progress = interactiveProgress,
-  } = {},
-) {
+    discoverNativePeers,
+  } = options;
   const room = typeof idOrRoom === "string" ? await readRoom(idOrRoom, root) : idOrRoom;
   if (room.authority) {
     if (!authorities.has(room.authority))
@@ -908,6 +907,13 @@ export async function observeRoom(
     const paneId = snapshot?.paneId || peer?.paneId || member.paneId;
     if (herdrPaneId) member.herdrPaneId = herdrPaneId;
     if (paneId) member.paneId = paneId;
+    const pid = snapshot?.pid || peer?.pid || member.pid;
+    const branch = snapshot?.branch || peer?.branch || member.branch;
+    const herdrWorkspaceId =
+      snapshot?.herdrWorkspaceId || peer?.herdrWorkspaceId || member.herdrWorkspaceId;
+    if (Number.isSafeInteger(pid) && pid > 0) member.pid = pid;
+    if (branch) member.branch = cleanLine(branch);
+    if (herdrWorkspaceId) member.herdrWorkspaceId = cleanLine(herdrWorkspaceId);
     if (!room.swarm) continue;
     if (snapshot) {
       const previousProgress = member.progress;
@@ -930,6 +936,7 @@ export async function observeRoom(
         stage: resolvedStage,
       };
       member.name = snapshot.name;
+      if (snapshot.person) member.person = snapshot.person;
       if (snapshot.role) member.workforceRole = snapshot.role;
       if (snapshot.cwd && (!member.worktree?.path || snapshot.cwd !== member.worktree.parentCwd))
         member.cwd = snapshot.cwd;
@@ -953,7 +960,164 @@ export async function observeRoom(
       member.status = "session unavailable";
     }
   }
+  const shouldDiscoverNative =
+    discoverNativePeers === true ||
+    (discoverNativePeers !== false &&
+      Boolean(room.swarm && room.cwd) &&
+      progress === interactiveProgress &&
+      (typeof idOrRoom === "string" ||
+        options.root !== undefined ||
+        Boolean(room.conductor?.session) ||
+        room.agents.some((agent) => agent.session || agent.mailboxSession)));
+  if (shouldDiscoverNative) {
+    await appendNativePeers(room, snapshots, root);
+  }
   return refreshMemberWorktrees(room);
+}
+
+async function appendNativePeers(room, snapshots, root) {
+  const roomCwd = await resolveCwd(room.cwd);
+  if (!roomCwd) return;
+  const currentHost = hostname();
+  const boundSessions = new Set();
+  const collectRoomSessions = (targetRoom) => {
+    for (const member of [targetRoom?.conductor, ...(targetRoom?.agents || [])]) {
+      if (!member) continue;
+      if (member.session?.id) boundSessions.add(member.session.id);
+      if (member.mailboxSession) boundSessions.add(member.mailboxSession);
+      if (member.nativeSession) boundSessions.add(member.nativeSession);
+    }
+  };
+  collectRoomSessions(room);
+  let roomEntries;
+  try {
+    roomEntries = await readdir(path.join(root, "rooms"));
+  } catch {
+    roomEntries = [];
+  }
+  for (const entry of roomEntries) {
+    if (!entry.endsWith(".json") || entry === `${room.id}.json`) continue;
+    const otherRoom = await readOptionalJson(path.join(root, "rooms", entry), 512 * 1024);
+    if (otherRoom) collectRoomSessions(otherRoom);
+  }
+  const existingIds = new Set(["conductor", ...room.agents.map((agent) => agent.id)]);
+  const conductorPid = snapshots?.conductor?.pid || room.conductor?.pid;
+  const conductorWorkspace =
+    snapshots?.conductor?.herdrWorkspaceId || room.conductor?.herdrWorkspaceId;
+  const roomCreatedMs = parseStampMs(room.createdAt);
+  let rawPeerEntries;
+  try {
+    rawPeerEntries = await readdir(path.join(root, "peers"));
+  } catch {
+    rawPeerEntries = [];
+  }
+  const peerFiles = rawPeerEntries
+    .filter((entry) => entry.endsWith(".json"))
+    .sort((left, right) => left.localeCompare(right));
+  for (const entry of peerFiles) {
+    if (room.agents.length >= (room.swarm?.maxAgents || 64)) break;
+    const peer = await readOptionalJson(path.join(root, "peers", entry), 64 * 1024);
+    if (
+      !isValidPeer(peer) ||
+      !isPeerLive(peer) ||
+      peer.run ||
+      peer.session.startsWith("run-") ||
+      (peer.machine && peer.machine !== currentHost) ||
+      boundSessions.has(peer.session)
+    ) {
+      continue;
+    }
+    const peerCwd = await resolveCwd(peer.checkout || peer.cwd);
+    if (!peerCwd || (peerCwd !== roomCwd && !peerCwd.startsWith(`${roomCwd}${path.sep}`))) continue;
+    const isSameSharedProcess =
+      peer.sharedProcess === true && Boolean(conductorPid) && peer.pid === conductorPid;
+    const isSameWorkspace = Boolean(
+      peer.herdrWorkspaceId && conductorWorkspace && peer.herdrWorkspaceId === conductorWorkspace,
+    );
+    const peerStartedMs = parseStampMs(peer.startedAt);
+    const hasStartedSinceRoom =
+      Number.isFinite(roomCreatedMs) &&
+      Number.isFinite(peerStartedMs) &&
+      peerStartedMs >= roomCreatedMs - 60_000;
+    if (!(isSameSharedProcess || isSameWorkspace || hasStartedSinceRoom)) continue;
+    const key = sessionKey(peer.session);
+    const progressRecord = key
+      ? await readProgressRecord(root, key, peer, peerCwd, currentHost)
+      : null;
+    if (!progressRecord && peer.state !== "busy" && !peer.isSubagent) continue;
+    const person = cleanLine(peer.person);
+    const rawBase =
+      cleanLine(peer.person || peer.shortName || peer.session.slice(0, 8))
+        .toLowerCase()
+        .replaceAll(/[^\w-]/gu, "-")
+        .replaceAll(/^-+|-+$/gu, "")
+        .slice(0, 48) || "native";
+    let id = rawBase;
+    let index = 2;
+    while (existingIds.has(id)) {
+      id = `${rawBase}-${index}`;
+      index++;
+    }
+    existingIds.add(id);
+    boundSessions.add(peer.session);
+    const engine = peer.harness === "gemini" ? "agy" : peer.harness;
+    const stage = progressRecord?.stage || (peer.state === "busy" ? "working" : "idle");
+    let status = "idle";
+    if (progressRecord?.stage === "complete") {
+      status = "reported complete";
+    } else if (progressRecord?.stage === "blocked") {
+      status = "blocked";
+    } else if (peer.state === "busy") {
+      status = "running";
+    }
+    const taskText = cleanLine(progressRecord?.task || peer.focus || "Native agent session");
+    const goalText = cleanLine(
+      progressRecord?.goal || (room.title && room.title !== room.id ? room.title : "") || "not set",
+    );
+    const herdrPaneId = cleanLine(peer.herdrPaneId);
+    const paneId = cleanLine(peer.paneId);
+    const branch = cleanLine(peer.branch);
+    room.agents.push({
+      id,
+      name: cleanLine(peer.name),
+      ...(person && { person }),
+      engine,
+      model: cleanLine(peer.model) || engine,
+      ...(peer.effort && { effort: cleanLine(peer.effort) }),
+      role: "worker",
+      workforceRole: progressRecord?.role || "native",
+      native: true,
+      nativeSession: peer.session,
+      parent: "conductor",
+      cwd: peerCwd,
+      ...(Number.isSafeInteger(peer.pid) && peer.pid > 0 && { pid: peer.pid }),
+      ...(branch && { branch }),
+      ...(herdrPaneId && { herdrPaneId }),
+      ...(paneId && { paneId }),
+      observedAt: progressRecord?.updatedAt || peer.lastSeenAt || peer.startedAt,
+      status,
+      objective: taskText,
+      output: [taskText].filter(Boolean),
+      progress: {
+        name: cleanLine(peer.name),
+        ...(person && { person }),
+        model: cleanLine(peer.model) || "—",
+        effort: cleanLine(peer.effort) || "—",
+        cwd: peerCwd,
+        ...(progressRecord?.role && { role: progressRecord.role }),
+        ...(Number.isSafeInteger(peer.pid) && peer.pid > 0 && { pid: peer.pid }),
+        ...(branch && { branch }),
+        ...(herdrPaneId && { herdrPaneId }),
+        ...(paneId && { paneId }),
+        goal: goalText,
+        task: taskText,
+        stage,
+        reportedAt: progressRecord?.updatedAt || null,
+        lastSeenAt: peer.lastSeenAt || null,
+        startedAt: peer.startedAt || null,
+      },
+    });
+  }
 }
 
 function sessionKey(session) {
@@ -978,6 +1142,7 @@ function cleanLine(value) {
 }
 
 function parseStampMs(value) {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
   if (typeof value !== "string" || !value) return NaN;
   return Date.parse(value);
 }
@@ -1153,10 +1318,14 @@ export async function interactiveProgress(room, root = mailboxRoot()) {
     const role = progress?.role || member.workforceRole;
     const herdrPaneId = cleanLine(peer.herdrPaneId || member.herdrPaneId);
     const paneId = cleanLine(peer.paneId || member.paneId);
+    const branch = cleanLine(peer.branch || member.branch);
+    const herdrWorkspaceId = cleanLine(peer.herdrWorkspaceId || member.herdrWorkspaceId);
+    const person = cleanLine(peer.person);
     const color =
       STATUS_COLORS[createHash("sha256").update(binding.id).digest()[0] % STATUS_COLORS.length];
     result[member.id] = {
       name,
+      ...(person && { person }),
       color,
       model: cleanLine(peer.model) || "—",
       effort: cleanLine(peer.effort) || "—",
@@ -1164,6 +1333,9 @@ export async function interactiveProgress(room, root = mailboxRoot()) {
       repository: repo,
       cwd: peerCwd,
       ...(role && { role }),
+      ...(Number.isSafeInteger(peer.pid) && peer.pid > 0 && { pid: peer.pid }),
+      ...(branch && { branch }),
+      ...(herdrWorkspaceId && { herdrWorkspaceId }),
       ...(herdrPaneId && { herdrPaneId }),
       ...(paneId && { paneId }),
       goal: goal || "not set",

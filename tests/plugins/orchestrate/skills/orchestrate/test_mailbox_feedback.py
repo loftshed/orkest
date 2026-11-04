@@ -414,3 +414,40 @@ class MailboxFeedbackTests(unittest.TestCase):
             MAILBOX.wait(self.base, self.peer["session"], timeout=0.01, reply_to="abc-123456")
             self.assertEqual(self.reports(), [])
             self.assertEqual(len(list((self.base.parent / "mailbox-feedback-v1").glob("feedback-*.json"))), 1)
+
+    def test_diagnostics_deduplicate_across_volatile_measurements_and_message_ids(self):
+        FEEDBACK.observe(
+            self.base,
+            self.peer,
+            code="turn_extended",
+            category="interruption",
+            operation="hook",
+            message_ids=["0001-aaaaaa"],
+            measurements={"messageCount": 1, "messageBytes": 15},
+        )
+        FEEDBACK.observe(
+            self.base,
+            self.peer,
+            code="turn_extended",
+            category="interruption",
+            operation="hook",
+            message_ids=["0002-bbbbbb"],
+            measurements={"messageCount": 3, "messageBytes": 128},
+        )
+        reports = self.reports()
+        self.assertEqual(len(reports), 1)
+        self.assertEqual(reports[0]["code"], "turn_extended")
+        self.assertEqual(reports[0]["occurrences"], 2)
+        self.assertEqual(reports[0]["messageIds"], ["0002-bbbbbb"])
+        self.assertEqual(reports[0]["measurements"], {"messageCount": 3, "messageBytes": 128})
+
+    def test_orchestrate_feedback_dir_and_config_env_vars_are_honored(self):
+        orch_collector = self.directory / "orch-collector"
+        with mock.patch.dict(os.environ, {"ORCHESTRATE_FEEDBACK_DIR": str(orch_collector)}):
+            self.assertEqual(FEEDBACK.directory(self.base), orch_collector)
+        config = self.directory / "orch-config.json"
+        config.write_text(json.dumps({"mailbox_feedback": {"directory": str(orch_collector)}}))
+        with mock.patch.dict(os.environ, {"ORCHESTRATE_CONFIG": str(config)}):
+            os.environ.pop("AGENT_EXECUTOR_FEEDBACK_DIR", None)
+            os.environ.pop("ORCHESTRATE_FEEDBACK_DIR", None)
+            self.assertEqual(FEEDBACK.directory(self.base), orch_collector)

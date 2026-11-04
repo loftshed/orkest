@@ -268,6 +268,13 @@ def _discover_socket(
         )
         if probe.returncode == 0:
             return candidate
+    if (
+        (os.environ.get("PYTEST_CURRENT_TEST") or "unittest" in sys.modules)
+        and os.environ.get("ORKEST_TEST_ALLOW_TMUX") != "1"
+        and not socket
+        and not os.environ.get("ORKEST_TERMINAL_SERVER", "").strip()
+    ):
+        return None
     if session_id:
         uid = os.getuid()
         for root_dir in (Path(f"/tmp/tmux-{uid}"), Path(f"/private/tmp/tmux-{uid}")):
@@ -297,7 +304,15 @@ def _discover_socket(
 
 
 def _herdr_active(socket: str | None = None) -> bool:
-    return not socket and os.environ.get("HERDR_ENV") == "1" and bool(os.environ.get("HERDR_PANE_ID", "").strip())
+    if socket or os.environ.get("HERDR_ENV") != "1" or not bool(os.environ.get("HERDR_PANE_ID", "").strip()):
+        return False
+    if (os.environ.get("PYTEST_CURRENT_TEST") or "unittest" in sys.modules) and os.environ.get(
+        "ORKEST_TEST_ALLOW_HERDR"
+    ) != "1":
+        herdr_bin = shutil.which("herdr") or ""
+        if not any(marker in herdr_bin for marker in ("/tmp/", "/var/folders/", "pytest")):
+            return False
+    return True
 
 
 def _room_path(base: Path, room_id: str) -> Path:
@@ -1171,6 +1186,18 @@ def main(arguments: list[str]) -> int:
         [sys.executable, str(Path(__file__).resolve()), "--toggle-swarm", "toggle", "--socket", socket]
     )
     subprocess.run([*base, "bind-key", "-n", "M-s", "run-shell", "-b", toggle_cmd], env=environment, check=False)
+    subprocess.run(
+        [
+            *base,
+            "set-hook",
+            "-t",
+            session,
+            "pane-exited",
+            f"if-shell -F '#{{==:#{{hook_pane}},{coordinator_pane}}}' 'kill-session -t {session}'",
+        ],
+        env=environment,
+        check=False,
+    )
 
     if room:
         cli = Path(__file__).resolve().parents[3] / "bin" / "ork.mjs"

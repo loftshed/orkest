@@ -60,11 +60,7 @@ def now() -> str:
 
 
 def cache_dir() -> Path:
-    home = os.environ.get("AGENT_EXECUTOR_HOME")
-    if home:
-        return Path(home).expanduser()
-    root = os.environ.get("XDG_CACHE_HOME")
-    return (Path(root).expanduser() if root else Path.home() / ".cache") / "agent-executor"
+    return module("runtime_paths").cache_home()
 
 
 def team_dir(team: str) -> Path:
