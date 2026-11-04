@@ -84,10 +84,6 @@ class PeerRecordIdentityTests(unittest.TestCase):
         self.assertTrue(peer["name"].startswith(peer["person"]))
         self.assertTrue(peer["shortName"].startswith(peer["person"]))
 
-        identity = mailbox.session_identity(peer)
-        self.assertEqual(identity["shortName"], peer["shortName"])
-        self.assertEqual(identity["name"], peer["name"])
-
 
 class MailboxCliDxTests(unittest.TestCase):
     def setUp(self):
@@ -263,6 +259,28 @@ class PeerMailboxRootTests(unittest.TestCase):
             preferred.mkdir(parents=True, exist_ok=True)
             self.assertEqual(runtime_paths.cache_home(), preferred)
             self.assertEqual(mailbox.root(), preferred / "mailbox-v1")
+
+
+class MailboxModuleDecompositionTests(unittest.TestCase):
+    def test_extracted_modules_reexport_cleanly_through_peer_mailbox(self) -> None:
+        import mailbox_cli
+        import mailbox_hooks
+        import mailbox_store
+
+        for symbol in ("locked", "load", "write", "base_dir", "peer_path", "inbox_dir", "short_agent_name"):
+            self.assertIs(getattr(mailbox, symbol), getattr(mailbox_store, symbol))
+        for symbol in (
+            "adopt_cleared",
+            "offer_cleared_lead",
+            "succession_notice",
+            "swarm_coordinator_context",
+            "swarm_command_context",
+            "hook",
+        ):
+            self.assertIs(getattr(mailbox, symbol), getattr(mailbox_hooks, symbol))
+        for symbol in ("session_arg", "caller", "table", "render_work", "build_parser"):
+            self.assertIs(getattr(mailbox, symbol), getattr(mailbox_cli, symbol))
+        self.assertFalse(hasattr(mailbox, "session_identity"))
 
 
 if __name__ == "__main__":

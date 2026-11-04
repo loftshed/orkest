@@ -121,7 +121,7 @@ def post(
             raise mailbox.MailboxError("idempotencyKey must be 1-80 letters, digits, underscores or hyphens")
         digest = hashlib.sha256(idempotency_key.encode()).hexdigest()
         operation = base / "channel-ops" / mailbox.session_key(sender["session"]) / f"{digest}.json"
-    with mailbox.locked(operation) if operation else _unlocked():
+    with mailbox.locked(operation) if operation else contextlib.nullcontext():
         entry = None
         if operation and operation.exists():
             entry = mailbox.load(operation)
@@ -245,14 +245,6 @@ def prune_operations(base: Path) -> None:
                         "expiredAt": mailbox.stamp(),
                     },
                 )
-
-
-class _unlocked:
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_exc):
-        return False
 
 
 def visible(post: dict[str, Any] | None, reader: dict[str, Any]) -> bool:

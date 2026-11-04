@@ -312,7 +312,7 @@ class TerminalTests(unittest.TestCase):
         stored = mailbox.load(mailbox.peer_path(self.base, session))
         self.assertEqual(stored["herdrPaneId"], "w1:p4")
         self.assertEqual(stored["herdrWorkspaceId"], "w1")
-        self.assertEqual(stored["herdrSocket"], "/tmp/herdr-test.sock")
+        self.assertNotIn("herdrSocket", stored)
         self.assertNotIn("terminalServer", stored)
 
     def test_herdr_direct_launch_bypasses_nested_tmux(self):
