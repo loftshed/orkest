@@ -60,12 +60,22 @@ def _default_agent_cache_dir() -> Path:
     runner = _runner()
     if runner is not None and hasattr(runner, "default_agent_cache_dir"):
         return runner.default_agent_cache_dir()
-    home = os.environ.get("AGENT_EXECUTOR_HOME")
+    if runner is not None and hasattr(runner, "bundled_module"):
+        return runner.bundled_module("runtime_paths").cache_home()
+    import importlib.util
+
+    path = Path(__file__).with_name("runtime_paths.py")
+    spec = importlib.util.spec_from_file_location("agent_executor_runtime_paths", path)
+    if spec is not None and spec.loader is not None:
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.cache_home()
+    home = os.environ.get("ORCHESTRATE_HOME") or os.environ.get("AGENT_EXECUTOR_HOME")
     if home:
         return Path(home).expanduser()
     configured_root = os.environ.get("XDG_CACHE_HOME")
     cache_root = Path(configured_root).expanduser() if configured_root else Path.home() / ".cache"
-    return cache_root / "agent-executor"
+    return cache_root / "orchestrate"
 
 
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:

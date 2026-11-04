@@ -96,14 +96,7 @@ def native(host: str, engine: str, model_id: str) -> bool:
     selector = RUNNER.families_module().parse_selector(model_id, families)
     if selector:
         return host == families[selector[0]]["engine"]
-    leaf = model_id.rsplit("/", 1)[-1].lower()
-    return any(
-        (
-            host == "codex" and bool(re.match(r"(?:gpt-\d|codex)", leaf)),
-            host == "agy" and leaf.startswith("gemini"),
-            host == "claude" and (leaf.startswith("claude") or leaf in {"opus", "sonnet", "haiku", "fable"}),
-        )
-    )
+    return host == RUNNER.native_engine_for(model_id)
 
 
 def exact_model(engine: str, model_id: str) -> str:
