@@ -52,6 +52,48 @@ class SwarmStatusTests(unittest.TestCase):
             room["cwd"] = str(home / "another-checkout")
             self.assertEqual(swarm_status.snapshot(room, base), {})
 
+    def test_update_room_metadata_acquires_node_directory_lock_and_explicit_room_overrides_tmux_option(self):
+        from unittest import mock
+
+        import agent_statusline_tmux
+
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            base = home / "mailbox-v1"
+            room_path = base / "rooms" / "room-explicit.json"
+            room_path.parent.mkdir(parents=True, exist_ok=True)
+            room_path.write_text(json.dumps({"roomId": "room-explicit", "name": "Explicit Room"}))
+
+            with agent_statusline_tmux._node_room_lock(room_path):
+                self.assertTrue(Path(f"{room_path}.lock").is_dir())
+            self.assertFalse(Path(f"{room_path}.lock").exists())
+
+            updated = agent_statusline_tmux._update_room_metadata(base, "room-explicit", updatedByPython="yes")
+            self.assertIsNotNone(updated)
+            self.assertFalse(Path(f"{room_path}.lock").exists())
+            self.assertEqual(mailbox.load(room_path).get("updatedByPython"), "yes")
+
+            def fake_run(cmd, **_kwargs):
+                if "@orkest_coordinator_pane" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, stdout="%0\n", stderr="")
+                if "@orkest_room" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, stdout="stale-room-from-tmux\n", stderr="")
+                if "list-panes" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, stdout="%0\n", stderr="")
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            with (
+                mock.patch.object(agent_statusline_tmux, "_herdr_active", return_value=False),
+                mock.patch.object(agent_statusline_tmux.shutil, "which", return_value="/usr/bin/tmux"),
+                mock.patch.object(agent_statusline_tmux, "_discover_socket", return_value="orkest-test-sock"),
+                mock.patch.object(agent_statusline_tmux.subprocess, "run", side_effect=fake_run),
+            ):
+                result = agent_statusline_tmux.toggle_swarm_view("close", room="room-explicit", base=base)
+                self.assertEqual(
+                    result,
+                    {"status": "already_closed", "room": "room-explicit", "socket": "orkest-test-sock"},
+                )
+
 
 @unittest.skipUnless(shutil.which("tmux") and shutil.which("node"), "interactive launch requires tmux and Node")
 class SwarmLaunchTests(unittest.TestCase):

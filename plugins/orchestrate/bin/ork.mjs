@@ -9,7 +9,8 @@ import { parseArgs, promisify } from "node:util";
 import { jsonView, renderLine, renderReport, shouldUseColor } from "../../monitor/lib/render.mjs";
 import { getAccounts } from "../../monitor/lib/store.mjs";
 import { factoryCommand } from "../lib/factory.mjs";
-import { newRoom, observeRoom } from "../lib/rooms.mjs";
+import { coordinatorBrief, newRoom, observeRoom, writeCoordinatorBrief } from "../lib/rooms.mjs";
+import { configPath } from "../lib/runtime-paths.mjs";
 import {
   addMembers,
   createRoom,
@@ -29,7 +30,6 @@ import {
   StoogesView,
   wrapText,
 } from "../lib/stooges-view.mjs";
-import { coordinatorBrief, writeCoordinatorBrief } from "../lib/swarm.mjs";
 import { roomsCommand } from "./rooms.mjs";
 import { cachedQuota, runTui } from "./stooges-tui.mjs";
 
@@ -37,11 +37,17 @@ const COORDINATORS = new Set(["codex", "claude", "agy", "opencode"]);
 
 const HELP = `ork agy|codex|claude|opencode   (open a coordinator; enter your goal in the conversation)
   --harness-arg=<argument>      (pass an argument to the coordinator; repeat as needed)
-ork swarm [toggle|open|close]   (open or close the live Swarm View split pane)
-ork factory [status|run|groom] [--dry-run] [--json]
-ork rooms --help
-ork setup [--dry-run] [--trust-codex-hooks]   (install mailbox, hooks and shell wrapper shortcuts)
+ork horde ["objective"] [--engine codex|claude|agy|opencode] [--max-agents 12] [--max-depth 3]
+ork horde [toggle|open|close]   (open or close the live Horde / Swarm View split pane)
+ork hall --help                 (manage swarm rooms, members, leads, roles, and dispatches)
+ork foundry [status|run|groom] [--dry-run] [--json]
+ork smelter [status|run] [--dry-run] [--json]
+ork radar [--line|--json] [--refresh]
 ork gate [--heavy] [--label <text>] -- <command>   (also: ork gate status|install|uninstall)
+ork swarm [toggle|open|close]   (alias for ork horde toggle|open|close)
+ork factory [status|run|groom] [--dry-run] [--json]   (alias for ork foundry)
+ork rooms --help                (alias for ork hall)
+ork setup [--dry-run] [--trust-codex-hooks]   (install mailbox, hooks and shell wrapper shortcuts)
 ork label [--lines 1|2] -- codex|claude|agy|opencode [arguments]   (outer tmux footer for every harness)
 ork progress --session ID --goal TEXT --task TEXT --stage working [--role ROLE]
 ork name [--model <model>] [--effort <level>] [--harness <harness>] [--short]
@@ -55,7 +61,7 @@ ork stooges spawn --attach-room <id> --team <team> [--role <role>]
 ork stooges --attach-room <id> [--view|--print|--json]
 ork stooges --fixture <room.json> [--print|--json] [--width 120]
 
-Interactive Stooges opens a coordinator conversation alongside its swarm tree (default: Codex).
+Interactive Horde / Stooges opens a coordinator conversation alongside its swarm tree (default: Codex).
 --attach-room reconnects; --view only observes. Subswarm leads use native subagents.
 New members are queued for the coordinator to assign; --print and --json never launch models.
 Use --cwd to choose the room's repository. Closing the view leaves workers running.
@@ -65,6 +71,14 @@ Use --cwd to choose the room's repository. Closing the view leaves workers runni
 
 const execute = promisify(execFile);
 const scripts = fileURLToPath(new URL("../skills/orchestrate/scripts/", import.meta.url));
+const defaultRoutesUrl = new URL(
+  "../skills/orchestrate/references/routes.default.json",
+  import.meta.url,
+);
+const defaultFamiliesUrl = new URL(
+  "../skills/orchestrate/references/families.json",
+  import.meta.url,
+);
 const ARCHETYPES = [
   "debug-invariants",
   "structural-refactor",
@@ -73,23 +87,99 @@ const ARCHETYPES = [
   "mechanical-sweep",
   "independent-review",
 ];
-// Reuse effective route/family loading, including user overrides, without resolving live models.
-const ROUTES_QUERY = `import json, sys
-sys.path.insert(0, sys.argv[1])
-import routes, families
-effective = routes.load_routes()
-definitions = families.load_families(routes.load_config())
-rows = []
-for archetype in json.loads(sys.argv[2]):
-    candidates = routes.route_candidates(archetype, effective)
-    for candidate in candidates:
-        family, _, tier = candidate['model'].removeprefix('latest:').partition(':')
-        definition = definitions.get(family, {})
-        tier = tier or definition.get('default_tier', '')
-        candidate['tier_strengths'] = definition.get('tier_strengths', {}).get(tier, [])
-    rows.append({'archetype': archetype, 'candidates': candidates})
-print(json.dumps({'schema': 'ork.routes.v1', 'routes': rows}))
-`;
+
+async function loadRoutesData(selected) {
+  try {
+    const [defaultRoutesRaw, defaultFamiliesRaw] = await Promise.all([
+      readFile(defaultRoutesUrl, "utf8"),
+      readFile(defaultFamiliesUrl, "utf8"),
+    ]);
+    const defaultRoutes = JSON.parse(defaultRoutesRaw);
+    const defaultFamilies = JSON.parse(defaultFamiliesRaw);
+    const cfgPath = configPath();
+    let config = {};
+    try {
+      const cfgRaw = await readFile(cfgPath, "utf8");
+      const parsed = JSON.parse(cfgRaw);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error(`${cfgPath}: config must be a JSON object`);
+      }
+      config = parsed;
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+    const effective = { ...defaultRoutes.routes };
+    const routeOverrides = config.routes || {};
+    for (const [role, route] of Object.entries(routeOverrides)) {
+      if (!route || typeof route !== "object" || Array.isArray(route) || !route.engine) {
+        throw new Error(`${cfgPath}: route ${role} needs at least an engine`);
+      }
+      effective[role] = { ...route };
+    }
+    const definitions = { ...defaultFamilies.families };
+    const familyOverrides = config.families ?? {};
+    if (
+      typeof familyOverrides !== "object" ||
+      familyOverrides === null ||
+      Array.isArray(familyOverrides)
+    ) {
+      throw new Error("`families` in the config must be an object of family name -> rules");
+    }
+    for (const [name, family] of Object.entries(familyOverrides)) {
+      if (
+        !family ||
+        typeof family !== "object" ||
+        Array.isArray(family) ||
+        !family.engine ||
+        !family.tiers ||
+        typeof family.tiers !== "object" ||
+        Array.isArray(family.tiers)
+      ) {
+        throw new Error(`family ${name} in the config needs an engine and a tiers object`);
+      }
+      definitions[name] = family;
+    }
+    const rows = selected.map((archetype) => {
+      const route = effective[archetype];
+      if (!route || typeof route !== "object" || !route.engine || !route.model) {
+        throw new Error(`route ${archetype} needs an engine and model`);
+      }
+      const alternates = route.alternates ?? [];
+      if (
+        !Array.isArray(alternates) ||
+        alternates.some(
+          (candidate) =>
+            !candidate || typeof candidate !== "object" || !candidate.engine || !candidate.model,
+        )
+      ) {
+        throw new Error(`route ${archetype} alternates must be an array of engine/model objects`);
+      }
+      const primary = Object.fromEntries(
+        Object.entries(route).filter(([key]) => key !== "alternates"),
+      );
+      const candidates = [primary, ...alternates.map((candidate) => ({ ...candidate }))].map(
+        (candidate) => {
+          const stripped = String(candidate.model).replace(/^latest:/u, "");
+          const colonIndex = stripped.indexOf(":");
+          const family = colonIndex === -1 ? stripped : stripped.slice(0, colonIndex);
+          const rawTier = colonIndex === -1 ? "" : stripped.slice(colonIndex + 1);
+          const definition = definitions[family] || {};
+          const tier = rawTier || definition.default_tier || "";
+          return {
+            ...candidate,
+            tier_strengths: definition.tier_strengths?.[tier] || [],
+          };
+        },
+      );
+      return { archetype, candidates };
+    });
+    return { schema: "ork.routes.v1", routes: rows };
+  } catch (error) {
+    throw new Error(`Could not read local routing data: ${error.message}`, {
+      cause: error,
+    });
+  }
+}
 
 async function pythonJson(args) {
   try {
@@ -271,7 +361,7 @@ async function summaryCommand(argv, stdout) {
     if (values.archetype && !ARCHETYPES.includes(values.archetype))
       throw new Error(`Unknown task archetype: ${values.archetype}`);
     const selected = values.archetype ? [values.archetype] : ARCHETYPES;
-    data = await pythonJson(["-c", ROUTES_QUERY, scripts, JSON.stringify(selected)]);
+    data = await loadRoutesData(selected);
   } else {
     const args = [path.join(scripts, "telemetry.py"), "summarize"];
     if (values["runs-dir"]) args.push("--runs-dir", values["runs-dir"]);
@@ -284,6 +374,18 @@ async function summaryCommand(argv, stdout) {
   else output = telemetryTable(data, width, { color: shouldUseColor(stdout), tier: glyphTier() });
   stdout.write(`${output}\n`);
   return data;
+}
+
+async function optionalModuleCommand(moduleRelPath, exportName, argv, context, fallback) {
+  let mod;
+  try {
+    mod = await import(new URL(moduleRelPath, import.meta.url));
+  } catch (error) {
+    if (error.code !== "ERR_MODULE_NOT_FOUND") throw error;
+  }
+  const handler = mod?.[exportName] || mod?.default;
+  if (typeof handler === "function") return handler(argv, context);
+  return fallback(argv, context);
 }
 
 /** Runs a terminal command, passing signals on and returning its exit code. */
@@ -335,7 +437,10 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
     process.exitCode = await terminalCommand("agent_statusline_tmux.py", argv.slice(1));
     return;
   }
-  if (argv[0] === "swarm") {
+  if (
+    argv[0] === "swarm" ||
+    (argv[0] === "horde" && ["toggle", "open", "close"].includes(argv[1]))
+  ) {
     const rest = argv.slice(1);
     const action = ["toggle", "open", "close"].includes(rest[0]) ? rest.shift() : "toggle";
     process.exitCode = await terminalCommand("agent_statusline_tmux.py", [
@@ -346,7 +451,46 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
     return;
   }
   if (argv[0] === "factory") return factoryCommand(argv.slice(1), { stdout });
-  if (argv[0] === "rooms") return roomsCommand(argv.slice(1), { stdout });
+  if (argv[0] === "foundry") {
+    return optionalModuleCommand(
+      "../lib/foundry.mjs",
+      "foundryCommand",
+      argv.slice(1),
+      { stdout },
+      (args, ctx) => factoryCommand(args, ctx),
+    );
+  }
+  if (argv[0] === "smelter") {
+    return optionalModuleCommand(
+      "../lib/smelter.mjs",
+      "smelterCommand",
+      argv.slice(1),
+      { stdout },
+      (args, { stdout: out }) => {
+        if (args.includes("--help") || args.includes("-h")) {
+          out.write(HELP);
+          return;
+        }
+        const payload = {
+          schema: "ork.smelter.status.v1",
+          status: "idle",
+          action: args[0] || "status",
+        };
+        out.write(`${JSON.stringify(payload, null, 2)}\n`);
+        return payload;
+      },
+    );
+  }
+  if (argv[0] === "radar") {
+    return optionalModuleCommand(
+      "../lib/radar.mjs",
+      "radarCommand",
+      argv.slice(1),
+      { stdout },
+      (args, { stdout: out }) => summaryCommand(["quota", ...args], out),
+    );
+  }
+  if (argv[0] === "rooms" || argv[0] === "hall") return roomsCommand(argv.slice(1), { stdout });
   if (argv[0] === "name") {
     // A readable session name for the current checkout: claude --name "$(ork name --model opus-5.5)".
     const script = fileURLToPath(
@@ -386,8 +530,8 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
     stdout.write(HELP);
     return;
   }
-  if (positionals[0] !== "stooges")
-    throw new Error("Expected ork stooges or ork stooges spawn; use --help");
+  if (!["stooges", "horde"].includes(positionals[0]))
+    throw new Error("Expected ork horde, ork stooges, or ork stooges spawn; use --help");
   if (values.team && values.preset) throw new Error("Choose --team or --preset");
   if (values.json && values.print) throw new Error("Choose --json or --print");
   const width = Number(values.width || stdout.columns || 100);
