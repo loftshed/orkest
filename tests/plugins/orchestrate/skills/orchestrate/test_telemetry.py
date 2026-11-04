@@ -104,16 +104,111 @@ class TelemetrySummaryTests(unittest.TestCase):
                     "model": "gpt-6-sol",
                     "effort": "high",
                     "runs": 4,
+                    "quality_runs": 4,
                     "accepted_runs": 3,
                     "first_pass_runs": 2,
                     "first_pass_rate": 0.5,
                     "accepted_rate": 0.75,
                     "wilson_lb_95": 0.300642,
+                    "rolling_14d_runs": 4,
+                    "rolling_14d_success_rate": 0.75,
+                    "rolling_14d_wilson_lower_bound": 0.300642,
+                    "degraded": False,
+                    "degradation_drop": 0.0,
                     "median_duration_ms": 2500.0,
                     "requested_models": ["gpt:sol"],
                 }
             ],
         )
+
+    def test_non_quality_outcomes_do_not_penalize_wilson_lower_bound_or_accepted_rate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runs = Path(temporary)
+            for idx in range(4):
+                self.write_result(
+                    runs,
+                    f"good-{idx}",
+                    {
+                        "task_archetype": "debug-invariants",
+                        "engine": "codex",
+                        "model": "gpt-6-sol",
+                        "effort": "high",
+                        "status": "COMPLETE",
+                    },
+                )
+            for idx, non_quality in enumerate(("dry_run", "preflight_failed", "provider_quota_exhausted")):
+                self.write_result(
+                    runs,
+                    f"non-quality-{idx}",
+                    {
+                        "task_archetype": "debug-invariants",
+                        "engine": "codex",
+                        "model": "gpt-6-sol",
+                        "effort": "high",
+                        "status": non_quality,
+                    },
+                )
+            summary = TELEMETRY.summarize_runs(runs)
+
+        group = summary["groups"][0]
+        self.assertEqual(group["runs"], 7)
+        self.assertEqual(group["quality_runs"], 4)
+        self.assertEqual(group["accepted_runs"], 4)
+        self.assertEqual(group["accepted_rate"], 1.0)
+        self.assertAlmostEqual(group["wilson_lb_95"], round(TELEMETRY.wilson_lower_bound(4, 4), 6))
+
+    def test_rolling_14d_window_flags_silent_nerf_degradation_and_demotes_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runs = Path(temporary)
+            # 15 historical runs (30 days ago) all succeeded -> baseline high
+            for idx in range(15):
+                self.write_result(
+                    runs,
+                    f"hist-{idx}",
+                    {
+                        "task_archetype": "debug-invariants",
+                        "engine": "codex",
+                        "model": "gpt-6-sol",
+                        "requested_model": "gpt:sol",
+                        "effort": "high",
+                        "status": "COMPLETE",
+                        "completed_at": "2026-10-01T12:00:00Z",
+                    },
+                )
+            # 5 recent runs (within 14 days of 2026-11-04) with only 2 successes (40%)
+            for idx in range(5):
+                self.write_result(
+                    runs,
+                    f"recent-{idx}",
+                    {
+                        "task_archetype": "debug-invariants",
+                        "engine": "codex",
+                        "model": "gpt-6-sol",
+                        "requested_model": "gpt:sol",
+                        "effort": "high",
+                        "status": "COMPLETE" if idx < 2 else "FAILED",
+                        "completed_at": "2026-11-01T12:00:00Z",
+                    },
+                )
+            summary = TELEMETRY.summarize_runs(runs, now="2026-11-04T00:00:00Z")
+
+        group = summary["groups"][0]
+        self.assertEqual(group["quality_runs"], 20)
+        self.assertEqual(group["accepted_runs"], 17)
+        self.assertEqual(group["accepted_rate"], 0.85)
+        self.assertEqual(group["rolling_14d_runs"], 5)
+        self.assertEqual(group["rolling_14d_success_rate"], 0.4)
+        self.assertTrue(group["degraded"])
+        self.assertEqual(group["degradation_drop"], 0.45)
+
+        candidates = [
+            {"engine": "codex", "model": "gpt:sol", "effort": "high", "quota_pace": "available"},
+            {"engine": "claude", "model": "claude:frontier", "effort": "high", "quota_pace": "available"},
+        ]
+        ranked = TELEMETRY.rank_candidates_by_telemetry(candidates, "debug-invariants", summary=summary)
+        self.assertEqual([c["model"] for c in ranked], ["claude:frontier", "gpt:sol"])
+        self.assertTrue(ranked[1]["degraded"])
+        self.assertEqual(ranked[1]["telemetry_status"], "degraded")
 
     def test_small_samples_get_a_lower_wilson_bound_than_larger_successful_samples(self) -> None:
         one_of_one = TELEMETRY.wilson_lower_bound(1, 1)
@@ -143,11 +238,17 @@ class TelemetrySummaryTests(unittest.TestCase):
                 "model": "unspecified",
                 "effort": "unspecified",
                 "runs": 1,
+                "quality_runs": 1,
                 "accepted_runs": 0,
                 "first_pass_runs": 0,
                 "first_pass_rate": 0.0,
                 "accepted_rate": 0.0,
                 "wilson_lb_95": 0.0,
+                "rolling_14d_runs": 1,
+                "rolling_14d_success_rate": 0.0,
+                "rolling_14d_wilson_lower_bound": 0.0,
+                "degraded": False,
+                "degradation_drop": 0.0,
                 "median_duration_ms": None,
                 "requested_models": [],
             },
@@ -321,6 +422,7 @@ class TaskArchetypeRouteTests(unittest.TestCase):
             "architecture-conductor",
             "mechanical-sweep",
             "independent-review",
+            "web-research",
         }
         self.assertTrue(existing.issubset(routes))
         self.assertTrue(archetypes.issubset(routes))

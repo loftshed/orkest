@@ -1,0 +1,126 @@
+{
+  "schema": "orkest.benchmarks.prior.v1",
+  "updated_at": "2026-11-04",
+  "models": {
+    "claude-opus-5-5": {
+      "engine": "claude",
+      "family": "claude:frontier",
+      "swe_bench_verified": 0.794,
+      "livecodebench": 0.812,
+      "aider_polyglot": 0.848,
+      "composite_prior": 0.818,
+      "strengths": [
+        "structural-refactor",
+        "debug-invariants",
+        "independent-review",
+        "architecture-conductor"
+      ],
+      "updated_at": "2026-11-04"
+    },
+    "claude-sonnet-5-5": {
+      "engine": "claude",
+      "family": "claude:balanced",
+      "swe_bench_verified": 0.742,
+      "livecodebench": 0.768,
+      "aider_polyglot": 0.804,
+      "composite_prior": 0.7713,
+      "strengths": ["structural-refactor", "ui-design-system", "web-research"],
+      "updated_at": "2026-11-04"
+    },
+    "claude-haiku-4-5": {
+      "engine": "claude",
+      "family": "claude:fast",
+      "swe_bench_verified": 0.618,
+      "livecodebench": 0.645,
+      "aider_polyglot": 0.682,
+      "composite_prior": 0.6483,
+      "strengths": ["mechanical-sweep"],
+      "updated_at": "2026-11-04"
+    },
+    "gpt-6-astra": {
+      "engine": "codex",
+      "family": "gpt:astra",
+      "swe_bench_verified": 0.802,
+      "livecodebench": 0.846,
+      "aider_polyglot": 0.865,
+      "composite_prior": 0.8377,
+      "strengths": ["ui-design-system", "debug-invariants", "structural-refactor"],
+      "updated_at": "2026-11-04"
+    },
+    "gpt-6-sol": {
+      "engine": "codex",
+      "family": "gpt:sol",
+      "swe_bench_verified": 0.788,
+      "livecodebench": 0.834,
+      "aider_polyglot": 0.852,
+      "composite_prior": 0.8247,
+      "strengths": [
+        "debug-invariants",
+        "independent-review",
+        "structural-refactor",
+        "web-research"
+      ],
+      "updated_at": "2026-11-04"
+    },
+    "gpt-6-luna": {
+      "engine": "codex",
+      "family": "gpt:luna",
+      "swe_bench_verified": 0.715,
+      "livecodebench": 0.754,
+      "aider_polyglot": 0.776,
+      "composite_prior": 0.7483,
+      "strengths": ["mechanical-sweep", "debug-invariants"],
+      "updated_at": "2026-11-04"
+    },
+    "gemini-4-argon-high": {
+      "engine": "agy",
+      "family": "gemini:pro",
+      "swe_bench_verified": 0.764,
+      "livecodebench": 0.798,
+      "aider_polyglot": 0.816,
+      "composite_prior": 0.7927,
+      "strengths": ["architecture-conductor", "web-research", "ui-design-system"],
+      "updated_at": "2026-11-04"
+    },
+    "gemini-4-argon-medium": {
+      "engine": "agy",
+      "family": "gemini:argon",
+      "swe_bench_verified": 0.728,
+      "livecodebench": 0.762,
+      "aider_polyglot": 0.784,
+      "composite_prior": 0.758,
+      "strengths": ["architecture-conductor", "mechanical-sweep"],
+      "updated_at": "2026-11-04"
+    },
+    "gemini-3.8-flash-high": {
+      "engine": "agy",
+      "family": "gemini:flash-high",
+      "swe_bench_verified": 0.692,
+      "livecodebench": 0.734,
+      "aider_polyglot": 0.748,
+      "composite_prior": 0.7247,
+      "strengths": ["mechanical-sweep", "independent-review"],
+      "updated_at": "2026-11-04"
+    },
+    "openrouter/z-ai/glm-5.3-flash": {
+      "engine": "opencode",
+      "family": "glm:flash",
+      "swe_bench_verified": 0.668,
+      "livecodebench": 0.702,
+      "aider_polyglot": 0.718,
+      "composite_prior": 0.696,
+      "strengths": ["mechanical-sweep"],
+      "updated_at": "2026-11-04"
+    },
+    "openrouter/deepseek/deepseek-v4-flash": {
+      "engine": "opencode",
+      "family": "deepseek:flash",
+      "swe_bench_verified": 0.684,
+      "livecodebench": 0.726,
+      "aider_polyglot": 0.742,
+      "composite_prior": 0.7173,
+      "strengths": ["mechanical-sweep", "debug-invariants"],
+      "updated_at": "2026-11-04"
+    }
+  }
+}

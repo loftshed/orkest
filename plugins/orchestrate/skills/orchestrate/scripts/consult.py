@@ -190,6 +190,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=f"Role from the route config that fills in engine, model and effort (default: {DEFAULT_ROUTE})",
     )
     parser.add_argument(
+        "--web",
+        action="store_true",
+        help="Enable web search and fetch tools so the consultant can verify external facts and cite URLs",
+    )
+    parser.add_argument(
         "--claude-config-dir",
         type=Path,
         help="Claude account profile for --engine claude; choosing a profile chooses its billing",
@@ -303,13 +308,19 @@ def capture_diff(repository: Path, ref: str) -> dict[str, Any]:
 def _intent_rules(request: dict[str, Any]) -> list[str]:
     intent = request["intent"]
     repository = request.get("read")
+    web = bool(request.get("web") or request.get("route") == "web-research")
+    web_rule = (
+        " You may search the web for external documentation, release notes, and benchmarks; cite URLs for external facts."
+        if web
+        else ""
+    )
     if intent == "question":
         return [
             "You are a trusted specialist consultant brought in for your sharp judgment on one focused question for a "
             "colleague agent. Take a clear, rigorous stance—your candid analysis and honest flagging of uncertainty "
             "are equally valued. You have no permission to edit files, run commands with side effects, publish "
             "anything, or take actions: answer from the question, context and attachments below. Do not ask the "
-            "caller to run anything for you.",
+            f"caller to run anything for you.{web_rule}",
         ]
     # Only Codex gets a read-only shell. Claude Code has file tools only, and Antigravity's headless plan
     # mode denies a command and then ends the turn with no answer, so the prompt must not invite one.
@@ -322,12 +333,12 @@ def _intent_rules(request: dict[str, Any]) -> list[str]:
         return [
             f"You are a trusted root-cause specialist investigating why something happens in the repository at {repository}. {access} "
             "You cannot change anything and must not try. Trust your diagnostic instincts, follow the evidence wherever "
-            "it leads, revise hypotheses as you go, and distinguish what you observed from what you infer.",
+            f"it leads, revise hypotheses as you go, and distinguish what you observed from what you infer.{web_rule}",
         ]
     return [
         f"You are a trusted senior reviewer examining a change in the repository at {repository}. {access} "
         "You cannot change anything and must not try: report findings, do not fix them. "
-        "Bring a constructive, rigorous eye—judge correctness first, then safety and clarity; cite the file and line for every finding.",
+        f"Bring a constructive, rigorous eye—judge correctness first, then safety and clarity; cite the file and line for every finding.{web_rule}",
     ]
 
 
@@ -577,6 +588,12 @@ def build_request(args: argparse.Namespace) -> dict[str, Any]:
         "created_at": runner.utc_now(),
         "intent": intent,
         "read": repository,
+        "web": bool(
+            getattr(args, "web", False)
+            or getattr(args, "route", None) == "web-research"
+            or route.get("route") == "web-research"
+            or (previous and previous.get("web"))
+        ),
         "question": question,
         "context": context,
         "change": change,
@@ -668,6 +685,7 @@ def consult_command(
     variant: str | None,
     workspace: Path,
     reading: bool,
+    web: bool = False,
     session_id: str | None,
     timeout: str,
     prompt_path: Path,
@@ -693,6 +711,8 @@ def consult_command(
             "-c",
             "features.apps=false",
         ]
+        if web:
+            command.append("--search")
         mcp_names = codex_mcp_server_names(workspace)
         if mcp_names:
             entries = ",".join(f"{json.dumps(name)}={{enabled=false}}" for name in mcp_names)
@@ -702,7 +722,14 @@ def consult_command(
         command += ["--model", model, "--json", "--output-last-message", str(final_output_path), "-"]
         return command
     if engine == "claude":
-        tools = "Read,Grep,Glob" if reading else ""
+        if reading and web:
+            tools = "Read,Grep,Glob,WebSearch,WebFetch"
+        elif reading:
+            tools = "Read,Grep,Glob"
+        elif web:
+            tools = "WebSearch,WebFetch"
+        else:
+            tools = ""
         command = [
             executable,
             "-p",
@@ -881,6 +908,7 @@ def base_result(request: dict[str, Any], *, started_at: str) -> dict[str, Any]:
         "kind": "consultation",
         "intent": request["intent"],
         "read": request.get("read"),
+        "web": bool(request.get("web") or request.get("route") == "web-research"),
         "diff_ref": change["ref"] if change else None,
         "transport": request["transport"],
         "host": request["host"],
@@ -1074,6 +1102,7 @@ def _perform(
         variant=variant,
         workspace=workspace,
         reading=reading,
+        web=bool(request.get("web") or request.get("route") == "web-research"),
         session_id=session_id,
         timeout=request["timeout"],
         prompt_path=prompt_path,
