@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.47.0
+
+- feat(orchestrate): add factory CLI, Herdr backend, and swarm TUI
+
 ## 0.46.0
 
 - feat(orchestrate): add /swarm slash command and ork swarm view toggle
