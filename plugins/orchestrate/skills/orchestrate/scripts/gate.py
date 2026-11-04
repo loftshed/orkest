@@ -120,13 +120,29 @@ def targets(args: list[str], values: set[str]) -> list[str]:
 
 
 def strip_prefixes(words: list[str]) -> list[str]:
-    """Drop variable assignments and wrappers such as time, nice, env or timeout that run the rest."""
+    """Drop variable assignments and wrappers such as time, nice, env, corepack, direnv exec or timeout."""
     while words:
         name = Path(words[0]).name
         if name == "command" and words[1:2] in (["-v"], ["-V"]):
             return []  # looks a command up without running it
         if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", words[0]):
             words = words[1:]
+        elif name == "corepack":
+            words = words[1:]
+            while words and words[0].startswith("-"):
+                if words[0] == "--":
+                    words = words[1:]
+                    break
+                words = words[1:]
+        elif name == "direnv" and words[1:2] == ["exec"]:
+            words = words[2:]
+            while words and words[0].startswith("-"):
+                if words[0] == "--":
+                    words = words[1:]
+                    break
+                words = words[1:]
+            if words:
+                words = words[1:]  # the directory
         elif name in {"time", "nohup", "caffeinate", "command", "exec", "env", "nice", "timeout", "gtimeout"}:
             words = words[1:]
             while words and (words[0].startswith("-") or (name == "env" and "=" in words[0])):

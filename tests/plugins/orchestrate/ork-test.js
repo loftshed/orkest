@@ -130,7 +130,7 @@ describe("ork routes", () => {
     }
   });
 
-  it("lists the six task archetypes with ordered candidates and tier strengths", async () => {
+  it("lists the seven task archetypes with ordered candidates and tier strengths", async () => {
     const app = await sandbox();
     const result = JSON.parse((await app.run(["routes", "--json"])).stdout);
     expect(result.schema).toBe("ork.routes.v1");
@@ -143,6 +143,7 @@ describe("ork routes", () => {
       "mechanical-sweep",
       "structural-refactor",
       "ui-design-system",
+      "web-research",
     ]);
     for (const route of result.routes) {
       expect(route.candidates.length).toBeGreaterThan(0);
@@ -832,14 +833,19 @@ describe("hall, rooms, and unified subcommands", () => {
     expect(worker.runId).toBe("run-1");
   });
 
-  it("exposes horde, hall, foundry, smelter, radar, and gate in HELP and dispatches hall/smelter/radar", async () => {
+  it("exposes horde, hall, next, foundry, smelter, side, cleanup, policy, update, radar, and gate in HELP and dispatches subcommands", async () => {
     const app = await sandbox();
     const help = await app.run(["--help"]);
     for (const subcommand of [
       "ork horde",
       "ork hall",
+      "ork next",
       "ork foundry",
       "ork smelter",
+      "ork side",
+      "ork cleanup",
+      "ork policy",
+      "ork update",
       "ork radar",
       "ork gate",
     ]) {
@@ -848,6 +854,9 @@ describe("hall, rooms, and unified subcommands", () => {
 
     const hallOut = await app.run(["hall", "list", "--json"]);
     expect(JSON.parse(hallOut.stdout)).toEqual({ rooms: [], errors: [] });
+
+    const nextHelp = await app.run(["next", "--help"]);
+    expect(nextHelp.stdout).toContain("ork next");
 
     const smelterHelp = await app.run(["smelter", "--help"]);
     expect(smelterHelp.stdout).toContain("ork smelter");

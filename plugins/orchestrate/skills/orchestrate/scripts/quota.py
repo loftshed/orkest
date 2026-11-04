@@ -39,7 +39,7 @@ def monitor_command() -> str | None:
     return str(fallback) if os.access(fallback, os.X_OK) else None
 
 
-def snapshot(timeout: float = 60) -> dict[str, Any] | None:
+def snapshot(timeout: float = 95) -> dict[str, Any] | None:
     """Current monitor view, or None when monitor is missing or fails. Unknown quota is never zero."""
     command = monitor_command()
     if not command:
@@ -53,7 +53,7 @@ def snapshot(timeout: float = 60) -> dict[str, Any] | None:
             env={**os.environ, "NO_COLOR": "1"},
             check=False,
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.SubprocessError):
         return None
     if completed.returncode != 0:
         return None
@@ -104,7 +104,20 @@ def pool_lanes(engine: str, model: str, view: dict[str, Any]) -> list[dict[str, 
             match = [lane for lane in own if lane.get("poolId") and lane["poolId"] in model.lower()]
             match = match or [lane for lane in own if lane.get("poolId") in ("codex", "all")] or own
         if match:
-            chosen.append({**match[0], "billing": accounts[account_id].get("billing")})
+            account = accounts.get(account_id, {})
+            config_dir = (
+                account.get("configDir")
+                or account.get("config_dir")
+                or match[0].get("configDir")
+                or match[0].get("config_dir")
+            )
+            chosen.append(
+                {
+                    **match[0],
+                    "billing": account.get("billing"),
+                    **({"configDir": config_dir} if config_dir is not None else {}),
+                }
+            )
     return chosen
 
 
@@ -149,7 +162,9 @@ def _match_claude_lane(
             exact = [
                 lane
                 for lane in lanes
-                if lane.get("config_dir") and Path(str(lane["config_dir"])).expanduser() == Path(effective).expanduser()
+                if (lane.get("config_dir") or lane.get("configDir"))
+                and Path(str(lane.get("config_dir") or lane.get("configDir"))).expanduser()
+                == Path(effective).expanduser()
             ]
             if exact:
                 return _prefer_claude_pool(exact, model)

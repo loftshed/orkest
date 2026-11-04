@@ -22,23 +22,16 @@ claude plugin install orchestrate@orkest --scope user
 <checkout>/plugins/orchestrate/install.sh --no-claude
 ```
 
-`install.sh` points `~/.agents/skills/orchestrate` at `<checkout>`, links each detected harness's `skills/` directory to that hub, initializes `~/.config/agent-executor/config.json` if missing, installs the `peer-mailbox` MCP registration and turn hooks, and runs `doctor`.
-
-After the mailbox checks pass, the installer moves old `agent-executor` skill paths to its backup directory. Close sessions that still use those paths before running it; route settings and mailbox data keep their existing locations.
+`install.sh` points `~/.agents/skills/orchestrate` at `<checkout>`, links each detected harness's `skills/` directory to that hub, initializes `~/.config/orchestrate/config.json` if missing, installs the `peer-mailbox` MCP registration and turn hooks, and runs `doctor`. To migrate existing `~/.config/agent-executor` and `~/.cache/agent-executor` directories into `~/.config/orchestrate` and `~/.cache/orchestrate` with compatibility symlinks, run `ork cleanup run --migrate-legacy`.
 
 Codex requires one-time approval for command hooks: review them in Codex `/hooks`, or pass `--trust-codex-hooks` to `install.sh` (which trusts only the four reviewed mailbox hook commands).
 
-`<checkout>/plugins/orchestrate/uninstall.sh` removes the skill symlinks while leaving `~/.config/agent-executor`, `~/.cache/agent-executor`, and backups in `~/.local/share/agent-executor/backups` untouched.
+`<checkout>/plugins/orchestrate/uninstall.sh` removes the skill symlinks while leaving `~/.config/orchestrate`, `~/.cache/orchestrate`, and backups untouched.
 
 ## Agent status in terminal footers
 
-Orkest can show each registered session's agent name, model, reasoning effort, repository, task stage, team goal,
-and individual task in its terminal footer. Text is left-aligned on the terminal's normal background,
-with three spaces of padding and a colored band filling the remaining space to its right. The color
-is stable for that session; `NO_COLOR` turns color off. Long fields are shortened to fit. Missing work
-details say `not set`.
-Codex model and effort are read from its local session database when available; harness-provided
-values and mailbox records supply the other displays.
+Orkest can display each session's agent name, model, reasoning effort, repository, task stage, team goal,
+and current task in a persistent terminal footer (`NO_COLOR` disables color).
 
 Use the same outer tmux footer for every harness:
 
@@ -49,51 +42,25 @@ ork label -- agy
 ork label -- opencode
 ```
 
-The wrapper needs `tmux` on `PATH`. Each launch gets a private server with the Orkest bar on the
-lowest row, below the harness's prompt and built-in footer. Pass `--lines 2` before `--` to split
-identity and repository from task progress across two rows. Arguments pass through to the harness.
-`plaude` is also supported and retains its own account wrapper. Detaching keeps the session running
-and prints a reattach command.
+Pass `--lines 2` before `--` to split identity and repository from task progress across two rows.
+Arguments after `--` pass through to the harness. Detaching (`Ctrl-b d`) leaves the session running
+and prints the reattach command.
 
-Codex supplies its visible thread ID through its terminal title. Configure the native adapters below
-for Claude Code, Antigravity and OpenCode. Inside `ork label`, those adapters silently bind the visible
-session to its pane instead of drawing another Orkest bar. Switching conversations updates the binding;
-process ancestry is not used to choose among sessions sharing a background server. Outside the wrapper,
-the adapters retain their native in-app display. Updates can take three seconds.
-
-At the start of substantive work, agents can report all three work fields in one command:
+Agents update their displayed goal, task, and stage (`planning`, `working`, `testing`, `review`, `blocked`, `complete`) with:
 
 ```sh
 ork progress --session SESSION_ID --goal 'Ship the feature' --task 'Fix the parser' --stage working
 ork progress --session SESSION_ID --stage testing
 ```
 
-Stages are `planning`, `working`, `testing`, `review`, `blocked` and `complete`. Later updates preserve
-omitted fields; passing only the session confirms unchanged work. Update when the assignment or stage
-changes and before the final response. Reports older than 30 minutes are marked stale unless explicitly
-complete. An idle agent is never automatically marked complete. Turn hooks remind Claude Code, Codex
-and Antigravity at session entry and about missing, mismatched or stale reports, at most once every five
-minutes during user turns. They do not extend turns or wake agents. OpenCode uses the same command but
-currently needs the agent to update it without those turn-hook reminders.
-
-Reports describe the display; they do not claim work, verify completion or change the workboard.
-An explicitly bound room supplies the goal, and workboard or coordinator records supply the task and
-state when present. A matching report can show `planning`, `working` or `testing` while an item is claimed;
-it cannot override blocked or review state. Otherwise the report supplies the work fields, with legacy
-focus notes as a fallback. Multiple assignments remain explicit. Context from another checkout or
-account is ignored. Changed assignments require a fresh report of all three fields, even if a new
-work item has the same title. A session without a matching mailbox record has no label.
-
-For example, after creating a room with a descriptive `--title`, bind the interactive conductor:
+To bind an interactive coordinator or worker session to a swarm room:
 
 ```sh
 ork hall bind --room ROOM_ID --member conductor --engine codex --session SESSION_ID
 ```
 
-Bind other members using their member IDs and engines (`ork rooms` is a supported alias for `ork hall`). See [rooms](skills/orchestrate/references/rooms.md)
-and the [workboard](skills/orchestrate/references/workboard.md) for creating rooms, binding sessions,
-and recording work. The footer only reads these records; it does not create assignments or advance
-task stages.
+See [rooms](skills/orchestrate/references/rooms.md) and [workboard](skills/orchestrate/references/workboard.md)
+for creating rooms, binding sessions, and tracking shared work.
 
 ### Claude Code and Antigravity
 
@@ -135,17 +102,11 @@ mkdir -p ~/.config/opencode/plugins
 ln -s "$PWD/plugins/orchestrate/opencode/agent-statusline" ~/.config/opencode/plugins/orkest-agent-statusline
 ```
 
-The label appears once the session has registered with the peer mailbox. OpenCode does not currently
-register sessions through this footer; a session must register with Orkest separately. The footer
-does not change an agent's presence. Updates can take up to three seconds. Inside `ork label`, the plugin
-only reports which session is visible; the shared tmux bar is the lowest row. Without the wrapper,
-OpenCode places its native line immediately above the prompt.
+The label appears once the OpenCode session registers with the peer mailbox.
 
 ### Codex
 
-No native adapter setup is needed for Codex. The wrapper sets that pane's terminal title to the native
-thread ID. Thread names and Codex's own status line stay unchanged. A fresh session shows its agent
-identity after registering with the mailbox.
+No adapter setup is needed for Codex; `ork label -- codex` reads the active thread automatically.
 
 ## Inspect routes, models, and health
 
@@ -160,7 +121,7 @@ python3 <scripts>/run_agent.py quota                          # live quota per r
 node <checkout>/plugins/orchestrate/bin/ork.mjs --help        # hall/rooms, horde/stooges TUI, foundry, smelter, radar, routes, quota, telemetry, and session naming
 ```
 
-Routes are configured in `~/.config/agent-executor/config.json` (`run_agent.py init` writes a starter file) overlaid on [`routes.default.json`](skills/orchestrate/references/routes.default.json). Model selectors (`family` or `family:tier` from [`families.json`](skills/orchestrate/references/families.json)) resolve against the live catalog so model upgrades do not require config edits. For task archetypes and route tiers, see [`archetype-rationale.md`](skills/orchestrate/references/archetype-rationale.md).
+Routes are configured in `~/.config/orchestrate/config.json` (`run_agent.py init` writes a starter file) overlaid on [`routes.default.json`](skills/orchestrate/references/routes.default.json). Model selectors (`family` or `family:tier` from [`families.json`](skills/orchestrate/references/families.json)) resolve against the live catalog so model upgrades do not require config edits. For task archetypes and route tiers, see [`archetype-rationale.md`](skills/orchestrate/references/archetype-rationale.md).
 
 ## Ask one question (`consult`)
 
@@ -215,7 +176,7 @@ Details: [`skills/orchestrate/references/runner.md`](skills/orchestrate/referenc
 
 ### Peer mailbox (`peer-mailbox`)
 
-Live sessions across harnesses (or across separate accounts of the same harness, such as `~/.claude` and `~/.claude-personal`) discover each other and exchange messages within a project through one authenticated loopback HTTP MCP daemon (`mailbox_daemon.py`), backed by `~/.cache/agent-executor/mailbox-v1/`:
+Live sessions across harnesses (or across separate accounts of the same harness, such as `~/.claude` and `~/.claude-personal`) discover each other and exchange messages within a project through one authenticated loopback HTTP MCP daemon (`mailbox_daemon.py`), backed by `~/.cache/orchestrate/mailbox-v1/`:
 
 ```sh
 python3 <scripts>/run_agent.py mailbox focus --session <id> --harness codex --text 'Working on API validation'
@@ -231,7 +192,7 @@ For persistent headless Claude or Antigravity workers that should wake automatic
 
 `coordinator.py` manages multi-step task directories with invocation allowances, wall-clock deadlines, native-bridge guards, and captures evidence before review (`capture`, `verify-evidence`).
 
-`authority.py` gives a multi-agent team one accountable lead with a compare-and-swap generation fence (`appoint`, `offer`, `takeover`, `accept`, `show`). `authority.py propose --session <id> --harness <harness>` inspects `monitor`'s quota pools (`accountId:poolId`) and account `billing` contexts (`work` or `personal`) to propose a deputy on an independent account and reserve both pools from worker routing. When appointed with `--standing-takeover STATUSES:SECONDS` (for example `blocked,credits:900`), the deputy can run `takeover --standing` once fresh `monitor` data shows the lead's pool is in one of those statuses, the lead has been inactive for that duration, no team task has a recently updated live run, no handover is already offered, and—on `credits`—the lead's process is gone.
+`authority.py` gives a multi-agent team one accountable lead with a compare-and-swap generation fence (`appoint`, `offer`, `takeover`, `accept`, `show`) and can propose a deputy on an independent quota pool (`authority.py propose`) so leadership can hand over cleanly if the lead's account hits a quota window limit.
 
 Details: [`skills/orchestrate/references/coordinator.md`](skills/orchestrate/references/coordinator.md).
 

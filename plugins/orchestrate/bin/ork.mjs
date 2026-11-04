@@ -45,8 +45,13 @@ ork horde spawn --attach-room <id> --team <team> [--role <role>]
 ork horde --attach-room <id> [--view|--print|--json]
 ork horde --fixture <room.json> [--print|--json] [--width 120]
 ork hall --help                 (manage swarm rooms, members, leads, roles, and dispatches)
+ork next [step|status|settle|loop] [--room <id>] [--approve <slug>] [--dry-run] [--json]
 ork foundry [status|run|groom] [--dry-run] [--json]
 ork smelter [status|run] [--dry-run] [--json]
+ork side [run|status] [--prompt <text>] [--issue <n>] [--dry-run] [--json]
+ork cleanup [status|run] [--dry-run] [--json]
+ork policy [status|set|allow|deny|reset] [--json]
+ork update [--check|--apply] [--json]
 ork radar [--line|--json] [--refresh]
 ork gate [--heavy] [--label <text>] -- <command>   (also: ork gate status|install|uninstall)
 ork swarm [toggle|open|close]   (alias for ork horde toggle|open|close)
@@ -86,6 +91,7 @@ const ARCHETYPES = [
   "architecture-conductor",
   "mechanical-sweep",
   "independent-review",
+  "web-research",
 ];
 
 async function loadRoutesData(selected) {
@@ -383,7 +389,9 @@ async function optionalModuleCommand(moduleRelPath, exportName, argv, context, f
   } catch (error) {
     if (error.code !== "ERR_MODULE_NOT_FOUND") throw error;
   }
-  const handler = mod?.[exportName] || mod?.default;
+  const names = Array.isArray(exportName) ? exportName : [exportName];
+  const handler =
+    names.map((name) => mod?.[name]).find((fn) => typeof fn === "function") || mod?.default;
   if (typeof handler === "function") return handler(argv, context);
   return fallback(argv, context);
 }
@@ -449,6 +457,111 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
       ...rest,
     ]);
     return;
+  }
+  if (argv[0] === "next") {
+    return optionalModuleCommand(
+      "../lib/next.mjs",
+      "nextCommand",
+      argv.slice(1),
+      { stdout },
+      (args, { stdout: out }) => {
+        if (args.includes("--help") || args.includes("-h")) {
+          out.write(HELP);
+          return;
+        }
+        const payload = {
+          action: args[0] || "step",
+          schema: "ork.next.v1",
+          status: "noop",
+        };
+        out.write(`${JSON.stringify(payload, null, 2)}\n`);
+        return payload;
+      },
+    );
+  }
+  if (argv[0] === "cleanup") {
+    return optionalModuleCommand(
+      "../lib/cleanup.mjs",
+      "cleanupCommand",
+      argv.slice(1),
+      { stdout },
+      (args, { stdout: out }) => {
+        if (args.includes("--help") || args.includes("-h")) {
+          out.write(HELP);
+          return;
+        }
+        const payload = {
+          action: args[0] || "status",
+          schema: "ork.cleanup.v1",
+          status: "clean",
+        };
+        out.write(`${JSON.stringify(payload, null, 2)}\n`);
+        return payload;
+      },
+    );
+  }
+  if (argv[0] === "side" || argv[0] === "side-mission") {
+    return optionalModuleCommand(
+      "../lib/side.mjs",
+      "sideCommand",
+      argv.slice(1),
+      { stdout },
+      (args, { stdout: out }) => {
+        if (args.includes("--help") || args.includes("-h")) {
+          out.write(HELP);
+          return;
+        }
+        const payload = {
+          action: args[0] || "status",
+          schema: "ork.side.v1",
+          status: "idle",
+        };
+        out.write(`${JSON.stringify(payload, null, 2)}\n`);
+        return payload;
+      },
+    );
+  }
+  if (argv[0] === "policy") {
+    return optionalModuleCommand(
+      "../lib/policy.mjs",
+      ["policyCli", "runPolicyCli", "policyCommand"],
+      argv.slice(1),
+      { stdout },
+      (args, { stdout: out }) => {
+        if (args.includes("--help") || args.includes("-h")) {
+          out.write(HELP);
+          return;
+        }
+        const payload = {
+          action: args[0] || "status",
+          deny: [],
+          schema: "ork.policy.v1",
+        };
+        out.write(`${JSON.stringify(payload, null, 2)}\n`);
+        return payload;
+      },
+    );
+  }
+  if (argv[0] === "update") {
+    return optionalModuleCommand(
+      "../lib/update.mjs",
+      ["updateCli", "runUpdateCli", "updateCommand"],
+      argv.slice(1),
+      { stdout },
+      (args, { stdout: out }) => {
+        if (args.includes("--help") || args.includes("-h")) {
+          out.write(HELP);
+          return;
+        }
+        const payload = {
+          action: args[0] || "check",
+          schema: "ork.update.v1",
+          status: "up-to-date",
+        };
+        out.write(`${JSON.stringify(payload, null, 2)}\n`);
+        return payload;
+      },
+    );
   }
   if (argv[0] === "foundry" || argv[0] === "factory") {
     return foundryCommand(argv.slice(1), { stdout });

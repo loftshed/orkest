@@ -1,3 +1,7 @@
+import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { createInterface } from "node:readline";
 
 import { jsonView } from "./render.mjs";
@@ -36,6 +40,11 @@ const TOOLS = [
           type: "string",
           enum: ["any", "claude", "gpt", "gemini"],
           description: "Model family filter.",
+        },
+        cwd: {
+          type: "string",
+          description:
+            "Optional repository working directory to enforce per-repo harness/account denylist policies.",
         },
         refresh: { type: "boolean", description: "Bypass cache and query providers now." },
       },
@@ -146,6 +155,103 @@ export function summarizeLanes(lanes) {
     .join("\n");
 }
 
+const DENY_ALIASES = {
+  claude: "claude-work",
+  "claude-work": "claude-work",
+  claude_work: "claude-work",
+  "work-claude": "claude-work",
+  plaude: "plaude",
+  "claude-personal": "plaude",
+  claude_personal: "plaude",
+  "personal-claude": "plaude",
+  "claude-all": "claude-all",
+  claude_all: "claude-all",
+  "all-claude": "claude-all",
+  codex: "codex",
+  openai: "codex",
+  agy: "agy",
+  gemini: "agy",
+  antigravity: "agy",
+  opencode: "opencode",
+  openrouter: "opencode",
+};
+
+function readRepoDeniedHarnesses(cwd) {
+  const targetDir = path.resolve(cwd || process.cwd());
+  let repoRoot = targetDir;
+  const gitTop = spawnSync("git", ["-C", targetDir, "rev-parse", "--show-toplevel"], {
+    encoding: "utf8",
+    timeout: 2000,
+  });
+  if (gitTop.status === 0 && gitTop.stdout?.trim()) {
+    try {
+      repoRoot = fs.realpathSync(gitTop.stdout.trim());
+    } catch {
+      repoRoot = path.resolve(gitTop.stdout.trim());
+    }
+  }
+  const denied = new Set();
+  const addTokens = (list) => {
+    if (!Array.isArray(list)) return;
+    for (const raw of list) {
+      const key = String(raw ?? "")
+        .trim()
+        .toLowerCase();
+      if (key) denied.add(DENY_ALIASES[key] || key);
+    }
+  };
+  const localPolicyPath = path.join(repoRoot, ".orkest", "policy.json");
+  if (fs.existsSync(localPolicyPath)) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(localPolicyPath, "utf8"));
+      addTokens(parsed?.deniedHarnesses ?? parsed?.deny);
+    } catch {
+      // Ignore malformed local policy
+    }
+  }
+  const home = process.env.HOME || os.homedir();
+  const xdgConfig = process.env.XDG_CONFIG_HOME || path.join(home, ".config");
+  for (const rel of ["orchestrate/config.json", "agent-executor/config.json"]) {
+    const cfgPath = path.join(xdgConfig, rel);
+    if (!fs.existsSync(cfgPath)) continue;
+    try {
+      const cfg = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
+      const map = cfg?.repoPolicies;
+      if (map && typeof map === "object") {
+        for (const [pattern, rule] of Object.entries(map)) {
+          if (pattern === repoRoot || pattern === path.basename(repoRoot)) {
+            addTokens(rule?.deniedHarnesses ?? rule?.deny);
+          }
+        }
+      }
+      break;
+    } catch {
+      // Ignore malformed config
+    }
+  }
+  return denied;
+}
+
+function isLaneAllowedByPolicy(lane, accountsById, denied) {
+  if (!denied || denied.size === 0) return true;
+  const acct = accountsById[lane.accountId];
+  const provider = acct?.provider || "";
+  if (provider === "codex" && denied.has("codex")) return false;
+  if (provider === "antigravity" && denied.has("agy")) return false;
+  if (provider === "claude") {
+    if (denied.has("claude-all")) return false;
+    const billing = acct?.billing || "";
+    const isPersonal =
+      billing === "personal" ||
+      lane.accountId === "plaude" ||
+      lane.accountId.includes("personal") ||
+      (lane.route && lane.route.includes("plaude"));
+    if (isPersonal && denied.has("plaude")) return false;
+    if (!isPersonal && denied.has("claude-work")) return false;
+  }
+  return true;
+}
+
 async function callTool(name, rawArgs) {
   const args = rawArgs && typeof rawArgs === "object" ? rawArgs : {};
   const accounts = await getAccounts({ force: args.refresh === true });
@@ -155,8 +261,12 @@ async function callTool(name, rawArgs) {
   }
   if (name === "recommend") {
     const family = args.family && args.family !== "any" ? args.family : null;
-    const lanes = family ? view.lanes.filter((l) => l.families.includes(family)) : view.lanes;
-    if (lanes.length === 0) return `No configured account serves the ${family} family.`;
+    const denied = readRepoDeniedHarnesses(args.cwd);
+    const accountsById = Object.fromEntries(view.accounts.map((a) => [a.id, a]));
+    const familyLanes = family ? view.lanes.filter((l) => l.families.includes(family)) : view.lanes;
+    const lanes = familyLanes.filter((l) => isLaneAllowedByPolicy(l, accountsById, denied));
+    if (lanes.length === 0)
+      return `No configured account serves the ${family ?? "requested"} family.`;
     const best = lanes.find((l) => l.status === "available" || l.status === "credits");
     const head = best
       ? `Best right now: ${best.label}${best.route ? ` (use: ${best.route})` : ""}. ${best.advice}.`

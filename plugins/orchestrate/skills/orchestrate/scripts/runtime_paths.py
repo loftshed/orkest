@@ -35,11 +35,31 @@ def cache_home(env: Mapping[str, str] | None = None, home: Path | None = None) -
     base_home = home if home is not None else Path.home()
     xdg = source.get("XDG_CACHE_HOME")
     cache_root = _expand(xdg, base_home) if xdg else base_home / ".cache"
-    preferred = cache_root / "orchestrate"
+    primary = cache_root / "orchestrate"
     legacy = cache_root / "agent-executor"
-    if not preferred.exists() and legacy.exists():
+    if primary.exists():
+        return primary
+    if legacy.exists():
         return legacy
-    return preferred
+    return primary
+
+
+def config_home(env: Mapping[str, str] | None = None, home: Path | None = None) -> Path:
+    """Resolve the orchestrate config directory, falling back to an existing legacy agent-executor config dir."""
+    source = os.environ if env is None else env
+    explicit = env_first("ORCHESTRATE_CONFIG", "AGENT_EXECUTOR_CONFIG", env=source)
+    if explicit:
+        return _expand(explicit, home).parent
+    base_home = home if home is not None else Path.home()
+    xdg = source.get("XDG_CONFIG_HOME")
+    config_root = _expand(xdg, base_home) if xdg else base_home / ".config"
+    primary = config_root / "orchestrate"
+    legacy = config_root / "agent-executor"
+    if (primary / "config.json").exists() or primary.exists():
+        return primary
+    if (legacy / "config.json").exists() or legacy.exists():
+        return legacy
+    return primary
 
 
 def config_path(env: Mapping[str, str] | None = None, home: Path | None = None) -> Path:
@@ -51,8 +71,23 @@ def config_path(env: Mapping[str, str] | None = None, home: Path | None = None) 
     base_home = home if home is not None else Path.home()
     xdg = source.get("XDG_CONFIG_HOME")
     config_root = _expand(xdg, base_home) if xdg else base_home / ".config"
-    preferred = config_root / "orchestrate" / "config.json"
+    primary = config_root / "orchestrate" / "config.json"
     legacy = config_root / "agent-executor" / "config.json"
-    if not preferred.exists() and legacy.exists():
+    if primary.exists():
+        return primary
+    if legacy.exists():
         return legacy
-    return preferred
+    return primary
+
+
+def set_home_env(env: dict[str, str] | None, path: str | Path) -> dict[str, str]:
+    """Set both ORCHESTRATE_HOME and AGENT_EXECUTOR_HOME on an environment dict so all subprocesses agree."""
+    resolved = str(path)
+    if env is not None and isinstance(env, dict):
+        env["ORCHESTRATE_HOME"] = resolved
+        env["AGENT_EXECUTOR_HOME"] = resolved
+        return env
+    target = dict(os.environ if env is None else env)
+    target["ORCHESTRATE_HOME"] = resolved
+    target["AGENT_EXECUTOR_HOME"] = resolved
+    return target

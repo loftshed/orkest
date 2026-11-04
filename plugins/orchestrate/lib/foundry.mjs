@@ -8,9 +8,16 @@
  * bounded worker runs.
  */
 import { execFile, execFileSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync } from "node:fs";
+import {
+  cpSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs, promisify } from "node:util";
@@ -20,7 +27,7 @@ import { shouldUseColor } from "../../monitor/lib/render.mjs";
 import { getAccounts } from "../../monitor/lib/store.mjs";
 import { resolveWorktreeMarkerPath } from "./horde-room.mjs";
 import { glyphSet, glyphTier, renderPanel, renderTable, wrapText } from "./horde-view.mjs";
-import { configPath } from "./runtime-paths.mjs";
+import { cacheHome, configPath, envFirst } from "./runtime-paths.mjs";
 
 const execute = promisify(execFile);
 const scriptsDir = fileURLToPath(new URL("../skills/orchestrate/scripts/", import.meta.url));
@@ -29,6 +36,7 @@ const defaultRoutesUrl = new URL(
   import.meta.url,
 );
 const TASK_SPEC_SCHEMA = "agent-executor.task-spec.v1";
+export const FOUNDRY_STATE_SCHEMA = "ork.foundry.state.v2";
 
 export function loadDefaultRoutes() {
   let baseRoutes;
@@ -39,7 +47,7 @@ export function loadDefaultRoutes() {
   }
   const merged = structuredClone(baseRoutes);
   try {
-    const userConfig = JSON.parse(readFileSync(configPath("config.json"), "utf8"));
+    const userConfig = JSON.parse(readFileSync(configPath(), "utf8"));
     if (userConfig?.routes && typeof userConfig.routes === "object") {
       for (const [role, route] of Object.entries(userConfig.routes)) {
         if (route && typeof route === "object" && route.engine) {
@@ -243,6 +251,66 @@ function matchesAllowedPools(lane, allowedPools) {
   );
 }
 
+function doesDenyTokenMatchLane(token, { accountId, engine, isPersonal, poolId }) {
+  switch (token) {
+    case "opencode": {
+      return engine === "opencode";
+    }
+    case "codex": {
+      return engine === "codex";
+    }
+    case "agy":
+    case "gemini":
+    case "antigravity": {
+      return engine === "agy";
+    }
+    case "claude-all": {
+      return engine === "claude";
+    }
+    case "claude-work":
+    case "claude": {
+      return engine === "claude" && !isPersonal;
+    }
+    case "plaude":
+    case "claude-personal": {
+      return engine === "claude" && isPersonal;
+    }
+    default: {
+      return (
+        Boolean(accountId && token === accountId) ||
+        Boolean(poolId && token === poolId) ||
+        Boolean(accountId && poolId && token === `${accountId}:${poolId}`)
+      );
+    }
+  }
+}
+
+export function isLaneDeniedByPolicy(lane, denyList = []) {
+  if (!lane || typeof lane !== "object" || !Array.isArray(denyList) || denyList.length === 0) {
+    return false;
+  }
+  const tokens = denyList
+    .map((item) =>
+      String(item ?? "")
+        .trim()
+        .toLowerCase(),
+    )
+    .filter(Boolean);
+  if (tokens.length === 0) return false;
+  const info = {
+    accountId: String(lane.accountId ?? "")
+      .trim()
+      .toLowerCase(),
+    engine: laneEngine(lane),
+    isPersonal: isPersonalLane(lane),
+    poolId: String(lane.poolId ?? "")
+      .trim()
+      .toLowerCase(),
+  };
+  const uniqueTokens = [...new Set(tokens)];
+  return uniqueTokens.some((token) => doesDenyTokenMatchLane(token, info));
+}
+
 function laneSurplusPts(lane) {
   if (typeof lane.surplusPts === "number" && Number.isFinite(lane.surplusPts)) {
     return lane.surplusPts;
@@ -336,7 +404,10 @@ export function selectSparePools(lanes, policy = {}) {
       (Array.isArray(policy.allowedBilling) &&
         !policy.allowedBilling.includes(lane.billing ?? "work")) ||
       (policy.allowPersonal === false && isPersonalLane(lane)) ||
-      (Array.isArray(policy.allowedPools) && !matchesAllowedPools(lane, policy.allowedPools))
+      (Array.isArray(policy.allowedPools) && !matchesAllowedPools(lane, policy.allowedPools)) ||
+      (Array.isArray(policy.deny) &&
+        policy.deny.length > 0 &&
+        isLaneDeniedByPolicy(lane, policy.deny))
     ) {
       continue;
     }
@@ -800,6 +871,162 @@ export function resolveFoundryStatePath(worktreePath) {
   return path.join(resolveWorktreeGitDir(worktreePath), "orkest", "foundry-state.json");
 }
 
+export function readFoundryState(worktreePath) {
+  if (!worktreePath) return null;
+  const statePath = resolveFoundryStatePath(worktreePath);
+  if (!existsSync(statePath)) return null;
+  try {
+    return JSON.parse(readFileSync(statePath, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+export function writeFoundryState(worktreePath, statePatch = {}) {
+  const resolvedWorktree = path.resolve(worktreePath);
+  const statePath = resolveFoundryStatePath(resolvedWorktree);
+  const existing = readFoundryState(resolvedWorktree) || {};
+  const nowIso = new Date().toISOString();
+  const merged = {
+    ...existing,
+    ...statePatch,
+    attemptCount: statePatch.attemptCount ?? existing.attemptCount ?? 1,
+    maxAttempts: statePatch.maxAttempts ?? existing.maxAttempts ?? 2,
+    schema: FOUNDRY_STATE_SCHEMA,
+    targetBranch: statePatch.targetBranch ?? existing.targetBranch ?? "main",
+    updatedAt: statePatch.updatedAt || nowIso,
+    worktreePath: resolvedWorktree,
+    worktreeSlug:
+      statePatch.worktreeSlug ?? existing.worktreeSlug ?? path.basename(resolvedWorktree),
+  };
+  mkdirSync(path.dirname(statePath), { recursive: true });
+  writeFileSync(statePath, `${JSON.stringify(merged, null, 2)}\n`);
+  return merged;
+}
+
+export function countCommitsAhead(
+  worktreePath,
+  targetBranch = "main",
+  { execFileSyncFn = execFileSync } = {},
+) {
+  try {
+    const out = String(
+      execFileSyncFn("git", ["rev-list", "--count", `${targetBranch}..HEAD`], {
+        cwd: worktreePath,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      }) ?? "",
+    ).trim();
+    const parsed = Number(out);
+    if (Number.isSafeInteger(parsed) && parsed >= 0) {
+      return { commitsAhead: parsed, resolved: true };
+    }
+  } catch {
+    /* Non-git or uninitialized mock worktree directory. */
+  }
+  return { commitsAhead: 0, resolved: false };
+}
+
+export function hasWorktreeDirtyChanges(worktreePath, { execFileSyncFn = execFileSync } = {}) {
+  try {
+    const out = String(
+      execFileSyncFn("git", ["status", "--porcelain"], {
+        cwd: worktreePath,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      }) ?? "",
+    ).trim();
+    return { isDirty: out.length > 0, resolved: true, statusText: out };
+  } catch {
+    return { isDirty: false, resolved: false, statusText: "" };
+  }
+}
+
+export function commitVerifiedWorktreeChanges(
+  worktreePath,
+  issueNumber,
+  { execFileSyncFn = execFileSync } = {},
+) {
+  const message = issueNumber
+    ? `feat(foundry): resolve #${issueNumber}`
+    : "feat(foundry): apply verified builder changes";
+  execFileSyncFn("git", ["add", "-A"], {
+    cwd: worktreePath,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  execFileSyncFn("git", ["commit", "-m", message], {
+    cwd: worktreePath,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  return { committed: true, message };
+}
+
+export function resolveWorktreeHeadSha(worktreePath, { execFileSyncFn = execFileSync } = {}) {
+  try {
+    const out = String(
+      execFileSyncFn("git", ["rev-parse", "HEAD"], {
+        cwd: worktreePath,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      }) ?? "",
+    ).trim();
+    return /^[0-9a-f]{7,40}$/iu.test(out) ? out : null;
+  } catch {
+    return null;
+  }
+}
+
+export function collectActiveWorktreeAllowPaths(
+  repoRoot = process.cwd(),
+  { execFileSyncFn = execFileSync } = {},
+) {
+  const resolvedRoot = path.resolve(repoRoot);
+  let porcelain;
+  try {
+    porcelain = String(
+      execFileSyncFn("git", ["worktree", "list", "--porcelain"], {
+        cwd: resolvedRoot,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      }) ?? "",
+    );
+  } catch {
+    return [];
+  }
+  const activeAllowPaths = [];
+  for (const rawLine of porcelain.split(/\r?\n/u)) {
+    const line = rawLine.trim();
+    if (!line.startsWith("worktree ")) continue;
+    const wtPath = path.resolve(line.slice("worktree ".length).trim());
+    if (wtPath === resolvedRoot) continue;
+    const gitDir = resolveWorktreeGitDir(wtPath);
+    const markerFile = resolveWorktreeMarkerPath(wtPath) || path.join(gitDir, "orkest.json");
+    if (!existsSync(markerFile)) continue;
+    let marker;
+    try {
+      marker = JSON.parse(readFileSync(markerFile, "utf8"));
+    } catch {
+      marker = null;
+    }
+    if (!marker || marker.disposable === false) continue;
+    const state = readFoundryState(wtPath);
+    if (state?.status && ["merged", "abandoned"].includes(state.status)) continue;
+    const specFile = resolveTaskSpecPath(wtPath);
+    if (!existsSync(specFile)) continue;
+    try {
+      const spec = JSON.parse(readFileSync(specFile, "utf8"));
+      if (Array.isArray(spec?.allow_paths) && spec.allow_paths.length > 0) {
+        activeAllowPaths.push(spec.allow_paths);
+      }
+    } catch {
+      /* Ignore unreadable task-spec in worktree. */
+    }
+  }
+  return activeAllowPaths;
+}
+
 async function defaultExecVerify(command, { cwd = process.cwd() } = {}) {
   try {
     const { stderr = "", stdout = "" } = await execute("/bin/sh", ["-c", command], {
@@ -822,17 +1049,35 @@ async function defaultExecVerify(command, { cwd = process.cwd() } = {}) {
   }
 }
 
-async function loadFactoryPolicy() {
-  const configHome =
-    process.env.AGENT_EXECUTOR_HOME || path.join(homedir(), ".config", "agent-executor");
-  const policyPath =
-    process.env.AGENT_EXECUTOR_FACTORY_CONFIG || path.join(configHome, "factory.json");
+export async function loadFactoryPolicy(repoRoot = process.cwd()) {
+  const explicitPolicy = envFirst("ORCHESTRATE_FACTORY_CONFIG", "AGENT_EXECUTOR_FACTORY_CONFIG");
+  const configDir = path.dirname(configPath());
+  const policyPath = explicitPolicy || path.join(configDir, "factory.json");
+  let basePolicy = {};
   try {
-    return JSON.parse(await readFile(policyPath, "utf8"));
+    basePolicy = JSON.parse(await readFile(policyPath, "utf8"));
   } catch (error) {
-    if (error.code === "ENOENT") return {};
-    throw error;
+    if (error.code !== "ENOENT") throw error;
   }
+  if (repoRoot) {
+    const repoPolicyPath = path.join(path.resolve(repoRoot), ".orkest", "policy.json");
+    try {
+      const repoPolicy = JSON.parse(await readFile(repoPolicyPath, "utf8"));
+      if (Array.isArray(repoPolicy?.deny) && repoPolicy.deny.length > 0) {
+        const mergedDeny = [
+          ...(Array.isArray(basePolicy.deny) ? basePolicy.deny : []),
+          ...repoPolicy.deny,
+        ];
+        basePolicy = {
+          ...basePolicy,
+          deny: [...new Set(mergedDeny)],
+        };
+      }
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+  }
+  return basePolicy;
 }
 
 async function defaultExecGh(args, { cwd = process.cwd() } = {}) {
@@ -861,7 +1106,7 @@ async function defaultExecAgent(args, { cwd = process.cwd() } = {}) {
 async function provisionDisposableWorktree(cwd, worktreeSlug, branch, issueNumber, engine = null) {
   const resolvedCwd = path.resolve(cwd);
   const repoName = path.basename(resolvedCwd);
-  const worktreeBase = path.join(homedir(), ".cache", "agent-executor", "worktrees", repoName);
+  const worktreeBase = path.join(cacheHome(), "worktrees", repoName);
   const worktreePath = path.join(worktreeBase, worktreeSlug);
   if (existsSync(worktreePath)) {
     throw new Error(`Disposable worktree path already exists: ${worktreePath}`);
@@ -1003,15 +1248,18 @@ function serializeMatch(match) {
 export async function foundryCommand(
   argv = [],
   {
-    activeAllowPaths = [],
+    activeAllowPaths,
+    countCommitsAheadFn,
     cwd = process.cwd(),
     execAgentFn = defaultExecAgent,
+    execFileSyncFn,
     execGhFn = defaultExecGh,
     execVerifyFn,
     getAccountsFn = getAccounts,
     policy: policyOverride,
     provisionWorktreeFn = provisionDisposableWorktree,
     stdout = process.stdout,
+    targetBranch = "main",
   } = {},
 ) {
   const { positionals, values } = parseArgs({
@@ -1059,7 +1307,7 @@ export async function foundryCommand(
       "",
       'Produce a validated ```json task-spec block with schema "agent-executor.task-spec.v1", objective, allow_paths, development_checks, and acceptance_criteria.',
     ].join("\n");
-    const consultArgs = ["consult", "--intent", "investigate", "--read", cwd, "--prompt", prompt];
+    const consultArgs = ["consult", "--intent", "investigate", "--read", cwd, "--question", prompt];
     const commandString = `run_agent.py consult --intent investigate --read ${cwd} --issue ${issue.number}`;
     if (values["dry-run"]) {
       const payload = {
@@ -1091,7 +1339,9 @@ export async function foundryCommand(
     return payload;
   }
 
-  const filePolicy = await loadFactoryPolicy();
+  const effectiveActiveAllowPaths =
+    activeAllowPaths ?? collectActiveWorktreeAllowPaths(cwd, { execFileSyncFn });
+  const filePolicy = await loadFactoryPolicy(cwd);
   const openIssues = await fetchOpenIssues(execGhFn, values.repo, cwd);
   const policy = { ...filePolicy, openIssues, ...policyOverride };
   const accounts = await getAccountsFn();
@@ -1109,7 +1359,7 @@ export async function foundryCommand(
           allowPaths: spec?.allow_paths ?? [],
           archetype: extractIssueArchetype(issue, spec),
           blockedBy,
-          disjoint: spec ? hasDisjointPaths(spec.allow_paths, activeAllowPaths) : false,
+          disjoint: spec ? hasDisjointPaths(spec.allow_paths, effectiveActiveAllowPaths) : false,
           number: issue.number,
           taskSpec: spec,
           title: issue.title,
@@ -1122,7 +1372,7 @@ export async function foundryCommand(
         number: issue.number,
         title: issue.title,
       }));
-    const batch = matchIssuesToPools(openIssues, lanes, activeAllowPaths, policy);
+    const batch = matchIssuesToPools(openIssues, lanes, effectiveActiveAllowPaths, policy);
     const match = batch[0] ?? null;
     const statusPayload = {
       nextMatch: match ? serializeMatch(match) : null,
@@ -1154,7 +1404,7 @@ export async function foundryCommand(
     candidateIssues = openIssues.filter((issue) => Number(issue.number) === requestedNumber);
   }
 
-  const batch = matchIssuesToPools(candidateIssues, lanes, activeAllowPaths, policy);
+  const batch = matchIssuesToPools(candidateIssues, lanes, effectiveActiveAllowPaths, policy);
   const match = batch[0] ?? null;
   if (!match) {
     const emptyPayload = {
@@ -1191,14 +1441,7 @@ export async function foundryCommand(
     : [];
 
   const repoName = path.basename(path.resolve(cwd));
-  const plannedWorktreePath = path.join(
-    homedir(),
-    ".cache",
-    "agent-executor",
-    "worktrees",
-    repoName,
-    match.worktreeSlug,
-  );
+  const plannedWorktreePath = path.join(cacheHome(), "worktrees", repoName, match.worktreeSlug);
   const runPayload = {
     acceptanceCriteria,
     allowPaths: match.allowPaths,
@@ -1265,61 +1508,142 @@ export async function foundryCommand(
   if (match.selectedRoute.effort) agentArgs.push("--effort", match.selectedRoute.effort);
   const agentResult = await execAgentFn(agentArgs, { cwd: worktreePath });
 
-  const normalizedVerifyCommand = enforceScopedVerifyCommand(match.verifyCommand);
-  let rawVerifyResult;
-  if (typeof execVerifyFn === "function") {
-    rawVerifyResult = await execVerifyFn(normalizedVerifyCommand, {
-      cwd: worktreePath,
-      issue: match.issue.number,
-    });
-  } else if (execAgentFn === defaultExecAgent) {
-    rawVerifyResult = await defaultExecVerify(normalizedVerifyCommand, {
-      cwd: worktreePath,
-      issue: match.issue.number,
-    });
+  const rawAgentStatus = String(
+    agentResult?.status ?? (agentResult?.ok === false ? "failed" : "completed"),
+  )
+    .trim()
+    .toLowerCase();
+  const didBuilderSucceed =
+    (rawAgentStatus === "completed" || rawAgentStatus === "complete") && agentResult?.ok !== false;
+
+  let commitsAhead;
+  if (typeof agentResult?.commitsAhead === "number") {
+    commitsAhead = agentResult.commitsAhead;
+  } else if (typeof countCommitsAheadFn === "function") {
+    commitsAhead = Number(await countCommitsAheadFn(worktreePath, targetBranch));
   } else {
-    rawVerifyResult = { exitCode: 0, ok: true, output: "" };
+    const counted = countCommitsAhead(worktreePath, targetBranch, { execFileSyncFn });
+    if (counted.resolved) {
+      commitsAhead = counted.commitsAhead;
+    } else if (execAgentFn === defaultExecAgent || typeof execFileSyncFn === "function") {
+      commitsAhead = 0;
+    } else {
+      commitsAhead = didBuilderSucceed ? 1 : 0;
+    }
   }
-  let verifyExitCode = 0;
-  if (typeof rawVerifyResult?.exitCode === "number") {
-    verifyExitCode = rawVerifyResult.exitCode;
-  } else if (rawVerifyResult?.ok === false) {
-    verifyExitCode = 1;
+
+  const dirtyCheck =
+    typeof agentResult?.dirty === "boolean"
+      ? { isDirty: agentResult.dirty, resolved: true }
+      : hasWorktreeDirtyChanges(worktreePath, { execFileSyncFn });
+  const isDirtyWorktree = dirtyCheck.isDirty;
+  const hasWorktreeChanges = commitsAhead > 0 || isDirtyWorktree;
+
+  const normalizedVerifyCommand = enforceScopedVerifyCommand(match.verifyCommand);
+  const nowIso = new Date().toISOString();
+  let verification;
+  let finalStatus;
+
+  if (!didBuilderSucceed || !hasWorktreeChanges) {
+    finalStatus = "worker_failed";
+    verification = {
+      acceptanceCriteria,
+      command: normalizedVerifyCommand,
+      exitCode: null,
+      ok: false,
+      output: "",
+      reason: didBuilderSucceed
+        ? "Builder produced 0 commits and no working-tree changes"
+        : `Builder exited with status ${rawAgentStatus}`,
+      status: "skipped",
+      verifiedAt: nowIso,
+    };
+  } else {
+    let wasHostCommitted = false;
+    let rawVerifyResult;
+    if (typeof execVerifyFn === "function") {
+      rawVerifyResult = await execVerifyFn(normalizedVerifyCommand, {
+        cwd: worktreePath,
+        issue: match.issue.number,
+      });
+    } else if (execAgentFn === defaultExecAgent) {
+      rawVerifyResult = await defaultExecVerify(normalizedVerifyCommand, {
+        cwd: worktreePath,
+        issue: match.issue.number,
+      });
+    } else {
+      rawVerifyResult = { exitCode: 0, ok: true, output: "" };
+    }
+    let verifyExitCode = 0;
+    if (typeof rawVerifyResult?.exitCode === "number") {
+      verifyExitCode = rawVerifyResult.exitCode;
+    } else if (rawVerifyResult?.ok === false) {
+      verifyExitCode = 1;
+    }
+    const isVerifyOk =
+      typeof rawVerifyResult?.ok === "boolean" ? rawVerifyResult.ok : verifyExitCode === 0;
+    if (isVerifyOk && isDirtyWorktree) {
+      try {
+        commitVerifiedWorktreeChanges(worktreePath, match.issue.number, { execFileSyncFn });
+        wasHostCommitted = true;
+        const recounted = countCommitsAhead(worktreePath, targetBranch, { execFileSyncFn });
+        commitsAhead = recounted.resolved ? recounted.commitsAhead : Math.max(1, commitsAhead);
+      } catch {
+        commitsAhead = Math.max(1, commitsAhead);
+      }
+    }
+    finalStatus = isVerifyOk ? "verified" : "verification_failed";
+    verification = {
+      acceptanceCriteria,
+      command: normalizedVerifyCommand,
+      committedByHost: wasHostCommitted,
+      exitCode: verifyExitCode,
+      ok: isVerifyOk,
+      output: typeof rawVerifyResult?.output === "string" ? rawVerifyResult.output : "",
+      status: isVerifyOk ? "passed" : "failed",
+      verifiedAt: nowIso,
+    };
   }
-  const verifyOk =
-    typeof rawVerifyResult?.ok === "boolean" ? rawVerifyResult.ok : verifyExitCode === 0;
-  const verification = {
-    acceptanceCriteria,
-    command: normalizedVerifyCommand,
-    exitCode: verifyExitCode,
-    ok: verifyOk,
-    output: typeof rawVerifyResult?.output === "string" ? rawVerifyResult.output : "",
-    status: verifyOk ? "passed" : "failed",
-    verifiedAt: new Date().toISOString(),
-  };
+
+  const headSha =
+    agentResult?.headSha ??
+    agentResult?.head_sha ??
+    resolveWorktreeHeadSha(worktreePath, { execFileSyncFn });
   const foundryStateFile = resolveFoundryStatePath(worktreePath);
-  const foundryState = {
+  const foundryState = writeFoundryState(worktreePath, {
     acceptanceCriteria,
+    attemptCount: 1,
     branch: match.branch,
+    commitsAhead,
+    headSha,
     issue: { number: match.issue.number, title: match.issue.title },
-    schema: "ork.foundry.state.v1",
-    status: verifyOk ? "verified" : "verification_failed",
+    lastRun: {
+      engine: match.selectedRoute.engine,
+      model: match.selectedRoute.model,
+      resultPath: agentResult?.result_path ?? agentResult?.resultPath ?? null,
+      sessionId: agentResult?.session_id ?? agentResult?.sessionId ?? null,
+      status: rawAgentStatus,
+    },
+    maxAttempts: 2,
+    status: finalStatus,
+    targetBranch,
     updatedAt: verification.verifiedAt,
     verification,
     verifyCommand: normalizedVerifyCommand,
     worktreePath,
     worktreeSlug: match.worktreeSlug,
-  };
-  await mkdir(path.dirname(foundryStateFile), { recursive: true });
-  await writeFile(foundryStateFile, `${JSON.stringify(foundryState, null, 2)}\n`);
+  });
 
   const executedPayload = {
     ...runPayload,
     agentArgs,
     agentResult,
+    commitsAhead,
     executed: true,
+    foundryState,
     foundryStateFile,
     specFile,
+    status: finalStatus,
     verification,
     verifyCommand: normalizedVerifyCommand,
     worktreePath,

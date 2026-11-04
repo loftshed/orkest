@@ -1114,7 +1114,7 @@ def validated_run_options(
 
 def detect_conductor_model(repo: Path) -> str | None:
     """Best-effort detection of the calling conductor's model from the environment or peer mailbox."""
-    raw_env = os.environ.get("AGENT_EXECUTOR_CONDUCTOR_MODEL")
+    raw_env = os.environ.get("ORCHESTRATE_CONDUCTOR_MODEL") or os.environ.get("AGENT_EXECUTOR_CONDUCTOR_MODEL")
     if isinstance(raw_env, str) and raw_env.strip():
         return raw_env.strip()
     with contextlib.suppress(Exception):
@@ -1461,17 +1461,55 @@ def publish_uncaught_completion_failure(error: Exception, exit_code: int) -> Non
 
 
 AUTO_PRUNE_SECONDS = 30 * 24 * 60 * 60
+LOCK_GRACE_SECONDS = 15 * 60
 
 
 def _tree_size(path: Path) -> int:
     return sum(item.stat().st_size for item in path.rglob("*") if item.is_file()) if path.is_dir() else 0
 
 
+def _pid_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def _lock_has_live_pid(lock_path: Path) -> bool:
+    try:
+        raw = lock_path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return False
+    if not raw:
+        return False
+    pids: list[int] = []
+    if raw.isdigit():
+        pids.append(int(raw))
+    elif raw.startswith("{"):
+        with contextlib.suppress(ValueError, TypeError):
+            payload = json.loads(raw)
+            if isinstance(payload, dict):
+                for key in ("pid", "holder_pid", "owner_pid"):
+                    val = payload.get(key)
+                    if isinstance(val, int) and not isinstance(val, bool):
+                        pids.append(val)
+                    elif isinstance(val, str) and val.strip().isdigit():
+                        pids.append(int(val.strip()))
+    return any(_pid_is_alive(pid) for pid in pids)
+
+
 def prune_state(older_than_seconds: float, *, dry_run: bool = False) -> dict[str, Any]:
     """Remove runner state older than the cutoff. Unacknowledged completion events, and the job
     directories they point to, are always kept: they are results nobody has reviewed yet."""
     cache = default_agent_cache_dir()
-    cutoff = time.time() - older_than_seconds
+    now = time.time()
+    cutoff = now - older_than_seconds
+    lock_cutoff = min(cutoff, now - LOCK_GRACE_SECONDS)
     removed = {"events": 0, "jobs": 0, "runs": 0, "consults": 0, "locks": 0, "mailbox": 0, "bytes": 0}
     protected: set[Path] = set()
     job_roots = (cache / "jobs-v1", cache / "consults-v1")
@@ -1503,20 +1541,26 @@ def prune_state(older_than_seconds: float, *, dry_run: bool = False) -> dict[str
             removed["bytes"] += _tree_size(entry)
             if not dry_run:
                 shutil.rmtree(entry, ignore_errors=True)
-    lock_dir = cache / "worktree-locks-v1"
-    if lock_dir.is_dir():
+    # Never unlink persistent flock targets in worktree-locks-v1; only prune locks and coordinator-locks.
+    for lock_dir in (cache / "locks", cache / "coordinator-locks"):
+        if not lock_dir.is_dir():
+            continue
         for lock_path in sorted(lock_dir.glob("*.lock")):
+            if lock_path.name == "cleanup.lock":
+                continue
             try:
                 stat = lock_path.stat()
             except OSError:
                 continue
-            if stat.st_mtime > cutoff:
+            if stat.st_mtime > lock_cutoff:
                 continue
             try:
                 with lock_path.open("a+b") as handle:
                     if fcntl is not None:
                         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                     try:
+                        if _lock_has_live_pid(lock_path):
+                            continue
                         removed["locks"] += 1
                         removed["bytes"] += stat.st_size
                         if not dry_run:
@@ -1580,9 +1624,13 @@ def prune_main(argv: list[str] | None = None) -> int:
     parser.add_argument("--older-than", default="14d", help="Age cutoff such as 14d, 12h (default 14d)")
     parser.add_argument("--dry-run", action="store_true", help="Report what would be removed")
     args = parser.parse_args(argv)
-    print(
-        json.dumps(prune_state(parse_duration(args.older_than, option="--older-than"), dry_run=args.dry_run), indent=2)
-    )
+    older_than = parse_duration(args.older_than, option="--older-than")
+    summary = prune_state(older_than, dry_run=args.dry_run)
+    if not args.dry_run:
+        with contextlib.suppress(OSError, ValueError, RunnerError):
+            mailbox = bundled_module("peer_mailbox")
+            mailbox.prune(mailbox.root())
+    print(json.dumps(summary, indent=2))
     return 0
 
 
@@ -1632,6 +1680,21 @@ def decide_transport(args: argparse.Namespace, host: str | None) -> str:
     return "native" if host == args.engine and not executor_boundary else "executor"
 
 
+def enforce_repo_policy(
+    cwd: Path | str,
+    engine: str,
+    claude_config_dir: Path | str | None = None,
+) -> Path | None:
+    allowed, reason, auto_claude_dir = bundled_module("repo_policy").check_execution_allowed(
+        cwd,
+        engine,
+        claude_config_dir,
+    )
+    if not allowed:
+        raise RunnerError(reason or f"Harness {engine!r} is denied by repository policy", 2)
+    return auto_claude_dir
+
+
 def native_handoff(args: argparse.Namespace, host: str) -> int:
     if args.job_dir or args.notify or args.completion_hook or args.steer_dir:
         raise RunnerError("job, notification, and steering options require executor transport", 4)
@@ -1641,6 +1704,9 @@ def native_handoff(args: argparse.Namespace, host: str) -> int:
     repo = git_root(cwd)
     if cwd != repo:
         raise RunnerError(f"--cwd must be the Git repository root: {repo}", 4)
+    auto_claude_dir = enforce_repo_policy(repo, args.engine, getattr(args, "claude_config_dir", None))
+    if auto_claude_dir is not None and getattr(args, "claude_config_dir", None) is None:
+        args.claude_config_dir = auto_claude_dir
     brief, task_spec = resolve_execution_brief(args, repo=repo)
     _, add_dirs, allowed, tracked, enforced, _, _ = validated_run_options(args, task_spec=task_spec)
     brief, task_spec, allowed, enforced, scope_info = apply_upward_delegation_policy(
@@ -1932,7 +1998,14 @@ def main() -> int:
         return steer_main(argv[1:])
     if argv and argv[0] == "consult":
         auto_prune()
-        return bundled_module("consult").main(argv[1:])
+        consult_mod = bundled_module("consult")
+        if not any(flag in argv[1:] for flag in ("-h", "--help")):
+            c_args = consult_mod.parse_args(argv[1:])
+            if not c_args.request:
+                c_req = consult_mod.build_request(c_args)
+                target_cwd = Path(c_req["read"]) if c_req.get("read") else Path.cwd()
+                enforce_repo_policy(target_cwd, c_req["engine"], c_req.get("claude_config_dir"))
+        return consult_mod.main(argv[1:])
     if argv and argv[0] == "models":
         return models_main(argv[1:])
     if argv and argv[0] == "events":
@@ -2006,6 +2079,11 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
         raise RunnerError("--job-dir requires --detach", 4)
     if (args.notify or args.completion_hook) and not (args.detach or args.completion_event):
         raise RunnerError("--notify and --completion-hook are only valid with --detach", 4)
+    cwd_initial = args.cwd.expanduser().resolve()
+    if cwd_initial.is_dir():
+        auto_claude_dir = enforce_repo_policy(cwd_initial, args.engine, getattr(args, "claude_config_dir", None))
+        if auto_claude_dir is not None and getattr(args, "claude_config_dir", None) is None:
+            args.claude_config_dir = auto_claude_dir
     if args.detach:
         return launch_detached(args)
     completion_event_path = normalize_completion_event_path(args.completion_event) if args.completion_event else None

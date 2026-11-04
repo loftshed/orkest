@@ -43,15 +43,25 @@ def text(value: Any) -> str:
     return " ".join("".join(char if char.isprintable() else " " for char in value).split())[:240]
 
 
-def short_display_name(name: str, person: Any = None) -> str:
-    """Return the agent's short Martian given name before the first dash."""
+def short_display_name(name: str, person: Any = None, repo: Any = None) -> str:
+    """Return the agent's short Martian given name before the first dash, preserving hyphenated repo fallback names."""
     cleaned_name = text(name)
     cleaned_person = text(person)
     if cleaned_person and (
         not cleaned_name or cleaned_name == cleaned_person or cleaned_name.startswith(f"{cleaned_person}-")
     ):
         return cleaned_person
-    return cleaned_name.split("-", 1)[0] if cleaned_name else ""
+    if not cleaned_name:
+        return ""
+    if ":" in cleaned_name:
+        return re.sub(r"-[0-9a-f]{2}$", "", cleaned_name, flags=re.IGNORECASE)
+    cleaned_repo = text(repo)
+    if cleaned_repo and (cleaned_name == cleaned_repo or cleaned_name.startswith(f"{cleaned_repo}-")):
+        return cleaned_repo
+    parts = cleaned_name.split("-")
+    if len(parts) >= 4 and re.fullmatch(r"[0-9a-f]{2}", parts[-1], flags=re.IGNORECASE):
+        return parts[0]
+    return re.sub(r"-[0-9a-f]{2}$", "", cleaned_name, flags=re.IGNORECASE)
 
 
 def normalize_model_and_effort(model: str, effort: str) -> tuple[str, str]:
@@ -261,7 +271,7 @@ def identity(
     raw_effort = effort or recorded_effort or text(peer.get("effort")) or "—"
     normalized_model, normalized_effort = normalize_model_and_effort(raw_model, raw_effort)
     return {
-        "name": short_display_name(name, peer.get("person")),
+        "name": short_display_name(name, peer.get("person"), repo),
         "fullName": name,
         "color": COLORS[hashlib.sha256(session.encode()).digest()[0] % len(COLORS)],
         "model": normalized_model,
@@ -502,8 +512,43 @@ def ansi_line(item: dict[str, Any], width: int, line: int = 0) -> str:
         foreground = f"38;5;{colors[key]}" if colors.get(key) is not None else "39"
         weight = "1" if key in {"name", "model", "effort", "repo", "stage", "task"} else "22"
         output.append(f"\033[{foreground};{weight}m{value}\033[0m")
-    output.append("   ")
     return "".join(output)
+
+
+def parent_tty_columns() -> int | None:
+    """Resolve the controlling terminal width from process ancestry when stdio are pipes."""
+    pid = os.getppid()
+    seen: set[int] = set()
+    while pid > 1 and pid not in seen and len(seen) < 8:
+        seen.add(pid)
+        try:
+            out = subprocess.run(
+                ["ps", "-o", "ppid=,tty=", "-p", str(pid)],
+                capture_output=True,
+                text=True,
+                timeout=0.5,
+                check=False,
+            ).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            return None
+        parts = out.split()
+        if len(parts) < 2 or not parts[0].isdigit():
+            return None
+        ppid, tty = int(parts[0]), parts[1]
+        if tty and tty != "??":
+            dev_path = f"/dev/{tty}" if not tty.startswith("/dev/") else tty
+            try:
+                fd = os.open(dev_path, os.O_RDONLY | os.O_NOCTTY)
+                try:
+                    cols = os.get_terminal_size(fd).columns
+                    if cols > 0:
+                        return max(32, cols - 2)
+                finally:
+                    os.close(fd)
+            except OSError:
+                pass
+        pid = ppid
+    return None
 
 
 def main() -> int:
@@ -579,6 +624,7 @@ def main() -> int:
     width = (
         args.width
         or (payload_width if type(payload_width) is int else None)
+        or (parent_tty_columns() if not sys.stdout.isatty() else None)
         or shutil.get_terminal_size((80, 24)).columns
     )
     label, details = format_line(item, max(32, min(width, 1000)), line=args.line)

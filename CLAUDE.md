@@ -19,6 +19,11 @@ node scripts/release.js plan   # what the next release would publish
 
 Both scripts call `./node_modules/.bin` directly, so they work without pnpm on PATH. Single steps: `corepack pnpm validate`, `lint`, `lint:fix`, `format`, `format:check`, `markdownlint`, `spell`.
 
+## Workflow
+
+- **Issue-board driven delivery:** Track work as detailed, self-contained issues on the board (`gh issue` / the shared Orkest workboard) rather than accumulating unrelated changes into a single large branch.
+- **Lead delegation & small PRs:** Assign a lead Orkest agent to monitor the board, delegate bounded issues to workers in isolated worktrees, and merge focused pull requests per issue.
+
 ## Rules for changes
 
 - **Never edit a plugin version.** Write conventional commit subjects (`feat(monitor): …`, `fix: …`, `refactor!: …`); CI releases on `main` and writes every version, changelog heading and tag. Notes under `## Unreleased` in a plugin's `CHANGELOG.md` replace the generated ones. Details: [docs/releases.md](docs/releases.md).

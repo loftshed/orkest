@@ -14,7 +14,7 @@ const WINDOW_MINS = { "5h": 300, weekly: 10_080 };
 // Sonnet, GPT-OSS"); the group name "Claude and GPT models" alone would overstate them. GPT-OSS is its own
 // family: open-weight models, not the GPT models Codex serves, so "gpt" keeps meaning Codex.
 function families(group) {
-  const text = (group.description || group.name).toLowerCase();
+  const text = String(group?.description || group?.name || "").toLowerCase();
   const found = ["gemini", "claude"].filter((f) => text.includes(f));
   if (text.includes("gpt-oss")) found.push("gpt-oss");
   if (/gpt(?!-oss)/.test(text)) found.push("gpt");
@@ -22,9 +22,10 @@ function families(group) {
 }
 
 function shortGroupName(name) {
-  if (/^gemini/i.test(name)) return "Gemini";
-  if (/claude.*gpt/i.test(name)) return "Claude & GPT";
-  return name.replace(/\s+models?$/i, "");
+  const raw = String(name ?? "");
+  if (/^gemini/i.test(raw)) return "Gemini";
+  if (/claude.*gpt/i.test(raw)) return "Claude & GPT";
+  return raw.replace(/\s+models?$/i, "");
 }
 
 /** Normalises `agy -p /usage --output-format json` (Antigravity CLI 1.1.11+). */
@@ -38,14 +39,23 @@ export function parseAntigravityUsage(payload) {
   const windows = [];
   const pools = [];
   for (const group of groups) {
+    if (!group || typeof group !== "object") continue;
     const poolId = slug(shortGroupName(group.name));
     const label = shortGroupName(group.name);
     const windowIds = [];
-    const buckets = group.buckets ?? [];
+    const buckets = Array.isArray(group.buckets) ? group.buckets : [];
     for (const bucket of buckets) {
+      if (!bucket || typeof bucket !== "object") continue;
       const kind = bucket.window ?? bucket.id;
+      if (
+        !kind ||
+        typeof bucket.remaining_fraction !== "number" ||
+        !Number.isFinite(bucket.remaining_fraction)
+      ) {
+        continue;
+      }
       const id = `${poolId}-${kind}`;
-      const remainingPct = Math.round((bucket.remaining_fraction ?? 0) * 1000) / 10;
+      const remainingPct = Math.round(bucket.remaining_fraction * 1000) / 10;
       windows.push({
         id,
         label: `${label} ${kind === "5h" ? "5-hour" : kind}`,
@@ -58,9 +68,14 @@ export function parseAntigravityUsage(payload) {
       });
       windowIds.push(id);
     }
-    const models = (group.description ?? "").replace(/^Models within this group:\s*/i, "");
+    const models = String(group.description ?? "").replace(/^Models within this group:\s*/i, "");
     if (windowIds.length > 0)
       pools.push({ id: poolId, label, families: families(group), models, windowIds });
+  }
+  if (windows.length === 0) {
+    throw new Error(
+      `agy /usage returned no quota windows: ${String(payload?.response ?? "").slice(0, 160)}`,
+    );
   }
   return { windows, pools, notes: [] };
 }
@@ -81,10 +96,16 @@ async function runUsage(bin, account) {
 export async function fetchAntigravity(account) {
   const bin = resolveBinary("agy", account.command);
   let payload = await runUsage(bin, account);
+  if (!payload || typeof payload !== "object") {
+    throw new Error("agy /usage returned a non-object JSON payload");
+  }
   // agy occasionally answers status ERROR with no detail and succeeds a moment later; retry once.
   if (payload.status && payload.status !== "SUCCESS") {
     await sleep(1500);
     payload = await runUsage(bin, account);
+    if (!payload || typeof payload !== "object") {
+      throw new Error("agy /usage returned a non-object JSON payload");
+    }
   }
   if (payload.status && payload.status !== "SUCCESS") {
     const detail = String(payload.error || payload.response || "no detail")

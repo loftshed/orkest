@@ -9,16 +9,24 @@ import hashlib
 import json
 import os
 import re
+import sys
 import tempfile
 import threading
 from pathlib import Path
 from typing import Any
+
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+
+import runtime_paths  # noqa: E402
 
 SCHEMA = "agent-executor.mailbox-feedback.v1"
 CATEGORIES = ("routing", "context", "delivery", "interruption", "efficiency", "other")
 OPERATIONS = ("peers", "send", "ask", "inbox", "wait", "ack", "focus", "hook", "other")
 TEXT_LIMIT = 800
 MESSAGE_ID = r"[0-9a-f]+-[0-9a-f]{6}"
+VOLATILE_DIGEST_KEYS = frozenset({"messageIds", "measurements"})
 REQUEST = (
     "If a mailbox problem hindered your work, report it once with the feedback tool: what you intended, "
     "what went wrong, and what you needed instead. Keep it short; omit task contents, source code and secrets. "
@@ -33,26 +41,37 @@ class FeedbackError(ValueError):
 
 
 def _default_mailbox_base() -> Path:
-    cache = os.environ.get("XDG_CACHE_HOME")
-    root = (Path(cache).expanduser() if cache else Path.home() / ".cache") / "agent-executor"
-    return root / "mailbox-v1"
+    env = {key: value for key, value in os.environ.items() if key not in {"ORCHESTRATE_HOME", "AGENT_EXECUTOR_HOME"}}
+    return runtime_paths.cache_home(env=env) / "mailbox-v1"
 
 
 def _uses_default_store(base: Path) -> bool:
-    if os.environ.get("AGENT_EXECUTOR_HOME"):
+    if runtime_paths.env_first("ORCHESTRATE_HOME", "AGENT_EXECUTOR_HOME"):
         return False
     try:
-        return base.expanduser().resolve() == _default_mailbox_base().resolve()
+        resolved = base.expanduser().resolve()
+        default_base = _default_mailbox_base().resolve()
+        if resolved == default_base:
+            return True
+        cache = os.environ.get("XDG_CACHE_HOME")
+        cache_root = Path(cache).expanduser() if cache else Path.home() / ".cache"
+        return resolved in {
+            (cache_root / "orchestrate" / "mailbox-v1").resolve(),
+            (cache_root / "agent-executor" / "mailbox-v1").resolve(),
+        }
     except OSError:
         return False
 
 
 def directory(base: Path) -> Path | None:
     """An explicit local destination, otherwise beside this mailbox's cache. No project-specific default."""
-    explicit = os.environ.get("AGENT_EXECUTOR_FEEDBACK_DIR")
-    if explicit is None and ("AGENT_EXECUTOR_CONFIG" in os.environ or _uses_default_store(base)):
-        config_root = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))).expanduser()
-        config = Path(os.environ.get("AGENT_EXECUTOR_CONFIG", str(config_root / "agent-executor" / "config.json")))
+    if "ORCHESTRATE_FEEDBACK_DIR" in os.environ:
+        explicit: Any = os.environ.get("ORCHESTRATE_FEEDBACK_DIR")
+    else:
+        explicit = os.environ.get("AGENT_EXECUTOR_FEEDBACK_DIR")
+    has_explicit_config = "ORCHESTRATE_CONFIG" in os.environ or "AGENT_EXECUTOR_CONFIG" in os.environ
+    if explicit is None and (has_explicit_config or _uses_default_store(base)):
+        config = runtime_paths.config_path()
         try:
             settings = json.loads(config.expanduser().read_text(encoding="utf-8"))
         except FileNotFoundError:
@@ -75,8 +94,16 @@ def directory(base: Path) -> Path | None:
     return destination
 
 
+def _canonical_digest_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: item for key, item in value.items() if key not in VOLATILE_DIGEST_KEYS}
+    return value
+
+
 def digest(value: Any) -> str:
-    encoded = json.dumps(value, sort_keys=True, ensure_ascii=True, separators=(",", ":")).encode()
+    encoded = json.dumps(
+        _canonical_digest_value(value), sort_keys=True, ensure_ascii=True, separators=(",", ":")
+    ).encode()
     return hashlib.sha256(encoded).hexdigest()[:24]
 
 

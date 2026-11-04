@@ -246,6 +246,7 @@ export async function getAccounts({ maxAgeSeconds, force = false, config = loadC
     route: account.route,
     routes: account.routes ?? {},
     billing: account.billing ?? null,
+    configDir: account.configDir ?? null,
     resetAnnouncements: account.resetAnnouncements ?? [],
   }));
 }

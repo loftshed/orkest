@@ -498,3 +498,70 @@ test("the legacy Codex response supplies credits without attributing them to unr
   });
   expect(renderLine([{ ...account, ...other }], NOW)).toBe("CX ☠5d");
 });
+
+test("renderReport and jsonView handle empty account lists and preserve configDir", () => {
+  const emptyReport = renderReport([], { now: NOW });
+  expect(emptyReport).toContain("data now old");
+  expect(emptyReport).not.toContain("Infinity");
+
+  const [work, personal] = sampleAccounts();
+  const view = jsonView(
+    [
+      { ...work, configDir: "~/.claude" },
+      { ...personal, configDir: "~/.claude-personal" },
+    ],
+    NOW,
+  );
+  expect(view.accounts[0].configDir).toBe("~/.claude");
+  expect(view.accounts[1].configDir).toBe("~/.claude-personal");
+});
+
+test("parseAntigravityUsage and parseCodexRateLimits guard null/malformed group and window entries", () => {
+  const agy = parseAntigravityUsage({
+    command: {
+      data: {
+        groups: [
+          null,
+          {
+            name: null,
+            description: null,
+            buckets: [
+              null,
+              { window: "5h", remaining_fraction: null },
+              { window: "weekly", remaining_fraction: 0.5, reset_time: "2026-09-26T00:44:52Z" },
+            ],
+          },
+        ],
+      },
+    },
+  });
+  expect(agy.windows).toHaveLength(1);
+  expect(agy.windows[0].remainingPct).toBe(50);
+  expect(agy.pools[0].families).toStrictEqual([]);
+
+  expect(() =>
+    parseAntigravityUsage({
+      command: {
+        data: {
+          groups: [
+            { name: "Gemini models", buckets: [{ window: "5h", remaining_fraction: null }] },
+          ],
+        },
+      },
+    }),
+  ).toThrow(/returned no quota windows/);
+
+  expect(() => parseCodexRateLimits(null)).toThrow(/no rate-limit windows/);
+  const codex = parseCodexRateLimits({
+    rateLimitsByLimitId: {
+      bad: null,
+      codex: {
+        limitId: "codex",
+        primary: { usedPercent: null, windowDurationMins: 10_080 },
+        secondary: { usedPercent: 20, windowDurationMins: 300, resetsAt: 1_790_370_000 },
+      },
+    },
+  });
+  expect(codex.windows).toHaveLength(1);
+  expect(codex.windows[0].remainingPct).toBe(80);
+});

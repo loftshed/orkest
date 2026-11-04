@@ -1,83 +1,163 @@
 # Orkest
 
-Orkest is a local tool for coordinating coding agents. You talk to one coordinator, tell it what
-you want done, and let it organize the work across a team. It can assign individual workers or
-give a larger piece to a lead that puts together its own subswarm.
+Run Claude Code, Codex, Antigravity, and OpenCode together on one codebase without losing track of
+who's doing what, burning the wrong account's quota, or stepping on each other's files.
 
-The coordinator runs in Codex, Claude Code, Antigravity or OpenCode. You keep using that harness's
-conversation and tools, with a live view of the swarm beside it. Orkest adds shared work tracking,
-cross-harness delegation, terminal status and quota monitoring.
+You work in your normal harness CLI. Orkest sits beside it: a live swarm tree for native subagents
+and cross-harness workers, isolated git worktrees for side tasks and background jobs, per-repo
+account guardrails, live subscription quota tracking, and a shared test gate so parallel agents
+don't thrash your machine.
 
-## Start a swarm
-
-After [installing](#install), run one of these from the repository you want to work in:
-
-```sh
-ork agy
-ork codex
-ork claude
-ork opencode
+```text
+ ┌ Swarm · Fix stale cache invalidation                    2 active · 1✓ · 3/12 slots ┐
+ │Orchestrator: atlas · folder: payments-api (feat/cache-ttl) · claude                │
+ │⠼ claude-opus-4-6 / high | working · step 2/4 · live                                │
+ │Coordinate cache invalidation fix and review worker patches                         │
+ └────────────────────────────────────────────────────────────────────────────────────┘
+ Quota [u]  CW 84%·62%  ·  CX 71%  ·  AG Gemini 91%
+ │ payments-api · 3 agents · ~/src/payments-api
+ │ ┌ 1 birch (lead)                                                 FOCUS wt:ttl-race ┐
+ ├─│Patch TTL race in Redis store and add regression test                             │
+ │ │⠼ [builder] gpt-6-astra / high | working · step 2/4 · live                        │
+ │ └──────────────────────────────────────────────────────────────────────────────────┘
+ │  │ ┌ 2 cedar                                                 payments-api ↳ birch  ┐
+ │  └─│Cold-review eviction ordering diff against main                                │
+ │    │⠼ [reviewer] gemini-3.1-pro / high | review · step 4/4 · live                  │
+ │    └───────────────────────────────────────────────────────────────────────────────┘
+ └─ ✓ 3 maple [scout] · payments-api · Trace stale read path across worker replicas
+ Services [v]  2 running · :5173 vite (payments-api) · :5432 docker postgres:16
 ```
 
-Enter your goal in the conversation when it opens. The coordinator asks what you want done before
-starting workers. Keep talking to it as the work progresses, including when you want to change
-direction or stop a branch of the work.
+## Quick start
 
-You can also pass a goal or set team limits at launch:
+From any repository:
+
+```sh
+ork claude     # or: ork codex, ork agy, ork opencode
+```
+
+That opens your harness with Orkest's status footer and room tracking attached. Inside any session,
+toggle the live Swarm View split pane with `/swarm` (or `ork swarm`).
+
+You can also kick off a swarm with an initial objective or team preset:
 
 ```sh
 ork horde "Find out why the cache goes stale and prepare a tested fix"
-ork claude --max-agents 8 --max-depth 2
+ork horde --preset bug-court "Race condition in session refresh"
 ```
 
-`ork horde` (`ork stooges` is a supported alias) uses Codex by default. The short commands choose the
-coordinator's harness; they don't require every worker to use the same one. Existing CLI accounts,
-model defaults and permissions stay in effect.
+## Everyday workflows
 
-### The conversation and the tree
+### Live Swarm View (`/swarm`)
 
-Horde is the terminal workspace for the conversation and swarm view. A team might look like this:
+Run `/swarm` inside a session (or `ork horde --attach-room <id> --view` from another terminal) to
+open the live tree beside your conversation:
 
-```text
-Coordinator: fix the stale cache
-├─ Investigation lead
-│  ├─ Trace invalidation
-│  └─ Reproduce the failure
-├─ Implementation worker
-└─ Reviewer
+- Watch native subagents (`Agent`, `invoke_subagent`) and delegated cross-harness workers update in
+  real time, grouped by folder and disposable worktree (`wt:<slug>`).
+- Press `1`–`9` or `↑`/`↓` to select an agent, `o` to jump straight to its Herdr or tmux pane, `c`
+  to collapse or hide finished agents, and `g` for the room log.
+- Press `u` to expand live quota windows across accounts, `v` to inspect running dev servers,
+  ports, and Docker containers tied to the workspace, and `U` to pull Orkest updates when notified.
+
+### Side missions from the same tab (`/side` / `ork side`)
+
+When you notice an unrelated bug or have a tangential question mid-session, fire it off without
+derailing your main agent's context window or dirtying the active checkout:
+
+```sh
+# Spin up an isolated worktree (.worktrees/wt-side-*) and a background worker
+/side "fix the off-by-one error in pagination"
+
+# Run a read-only background scout (triggered by --investigate, ask:, or a trailing ?)
+/side "why does token refresh retry twice?"
+
+# Park a note on the project workboard for later (0 tokens, 0 background processes)
+/side --later "flatten the retry helper after this PR lands"
+
+# File a GitHub issue labeled for the background factory
+/side --issue "support dark mode in the status modal"
 ```
 
-The tree shows who's working on each part, the model and effort, and the recorded task and stage.
-The coordinator collects results, resolves conflicts and checks the combined work. An agent going
-idle doesn't mean its task passed review.
+Every `/side` run executes outside your current conversation and tracks its status in the Swarm
+View and `ork next` without interrupting your active turn.
 
-- **Ctrl-b, then Tab** switches between the conversation and tree.
-- **Ctrl-b, then d** detaches and prints the command to reconnect.
-- `ork horde --attach-room ROOM_ID` reconnects to the same coordinator.
-- Add `--view` to inspect the tree without joining the conversation. Closing a view leaves work running.
+### Second opinions & autonomous worktrees (`consult`, `foundry`, `smelter`, `ork next`)
 
-See [the swarm guide](plugins/orchestrate/skills/orchestrate/references/swarm.md) for assignment,
-supervision and recovery, and [room commands](plugins/orchestrate/skills/orchestrate/references/rooms.md)
-for the controls behind the conversation.
+Keep same-vendor subagents on their native tools, and use Orkest when you want a different frontier
+model or an isolated worktree pipeline:
 
-## The rest of the toolkit
+- **`consult` — read-only second opinions:** Ask another model to review a branch or investigate a
+  bug in its engine's no-write sandbox without handing over file ownership.
 
-- **Delegate across harnesses.** Ask another model a question, get an independent review, or hand
-  off a task with a defined scope and checks. Agents in the same harness use its native tools;
-  Orkest's runner handles work across harnesses.
-- **Share the work.** A project-scoped mailbox and workboard record messages, ownership, blockers,
-  evidence and acceptance. Existing sessions can coordinate without relying on you to carry
-  messages between terminals.
-- **See what each terminal is doing.** The optional footer shows the agent's name, model, effort,
-  stage, overall goal and current task. `ork label -- codex` opens a single agent with the same
-  footer used by a swarm. [Footer setup](plugins/orchestrate/README.md#agent-status-in-terminal-footers)
-  covers all four harnesses.
-- **Keep track of quota.** Monitor shows remaining allowance, reset times and credit balances across
-  configured accounts. Run `monitor` for the terminal view or use its MCP tools and desktop interfaces.
-- **Keep heavy checks from competing.** `ork gate` coordinates test, lint and build runs on the
-  same machine and saves logs for heavy or failed runs.
+  ```sh
+  python3 ~/.agents/skills/orchestrate/scripts/run_agent.py consult --intent review \
+    --read . --diff origin/main \
+    --question "Any race conditions or missed edge cases?" --model gpt:sol
+  ```
 
-The repository ships two plugins. Their guides cover the detailed commands and configuration:
+- **`ork foundry` — spare-quota issue factory:** Picks up ready GitHub issues (`Depends on #N`
+  aware) when [`monitor`](plugins/monitor/README.md) shows surplus subscription quota that would
+  otherwise expire at rollover, provisions disposable `.worktrees/` checkouts, and dispatches
+  bounded workers.
+- **`ork smelter` — verification & cold-review merge queue:** Rebases finished worktrees, audits
+  changed file scope and blast radius, runs the heavy test gate, gets a cross-vendor cold review,
+  and fast-forwards or opens a PR.
+- **`ork next` — closed-loop reconciler:** Steps or loops through housekeeping, smelter merges,
+  bounded self-repair on failed checks, and fresh foundry dispatches, stopping with exit code `4`
+  only when a high-blast-radius change or conflict needs your sign-off.
+
+  ```sh
+  ork next status
+  ork next step
+  ork smelter run --strategy local
+  ```
+
+### Per-repo harness guardrails (`ork policy`)
+
+Keep work accounts off personal repos and unapproved models off work repos. Policy rules live in
+your local config (or `.orkest/policy.json`) and block disallowed dispatches before a CLI is ever
+spawned:
+
+```sh
+ork policy deny claude-work      # e.g. on a personal repo, never bill the work profile
+ork policy deny opencode         # e.g. on a work repo, block open-weight OpenRouter routes
+ork policy show
+```
+
+### Quota monitoring (`monitor`) & shared test gates (`ork gate`)
+
+- **`monitor` (`ork quota`):** Reads remaining 5-hour and weekly quota windows, reset times, and
+  credit balances from your installed CLIs (`claude`, `codex`, `agy`) with zero token cost. Includes
+  a terminal view (`monitor`, `monitor watch`), a macOS menu bar app, a KDE Plasma widget, and an
+  MCP server (`get_usage`, `recommend`) so coordinators route work to the account with the most
+  headroom.
+- **`ork gate`:** Serializes test suites, builds, and typechecks across concurrent agents on the
+  same machine. Focused runs share two lightweight slots; `--heavy` waits for an exclusive lock,
+  caps Jest/Vitest workers at 2, runs at `nice 10`, and saves full failure logs so no agent reruns
+  a whole suite just to read output that scrolled away.
+
+  ```sh
+  ork gate -- ./node_modules/.bin/vitest run tests/cache-test.js
+  ork gate --heavy -- pnpm test
+  ```
+
+### Auto-updates & cleanup (`ork update`, `/cleanup`)
+
+Orkest runs directly from your local git checkout—no build step or npm publish required:
+
+```sh
+ork update                       # fast-forward clean main, refresh hooks, migrate legacy paths
+ork cleanup status               # preview stale worktrees, locks, backups, and old runtimes
+ork cleanup run --migrate-legacy # prune expired artifacts and atomically migrate legacy dirs
+```
+
+You can also run `/update` or `/cleanup` directly from your chat prompt, or press `U` in the Swarm
+View when an update notification appears.
+
+## Plugins
+
+The repository ships two plugins. Their READMEs cover full CLI flags, routing tables, and setup:
 
 | Plugin                                         | Version | What it does                                                       |
 | ---------------------------------------------- | ------- | ------------------------------------------------------------------ |
@@ -86,75 +166,36 @@ The repository ships two plugins. Their guides cover the detailed commands and c
 
 ## Install
 
-You need Git, Node.js 22.18+, Python 3.11+, tmux, and an installed, authenticated CLI for each
-harness you want to use. The orchestration scripts require a POSIX environment. Monitor's menu bar
-app is macOS-specific.
-
-For a fresh install:
+Requires Git, Node.js 22.18+, Python 3.11+, `tmux`, and at least one installed, authenticated
+harness CLI (`claude`, `codex`, `agy`, or `opencode`).
 
 ```sh
 mkdir -p ~/src
 git clone https://github.com/loftshed/orkest.git ~/src/orkest
 cd ~/src/orkest
 
+# Install orchestrate skills, peer-mailbox MCP server, hooks, and the ork CLI
 ./plugins/orchestrate/install.sh
-
-# Add the ork launcher. Skip the ln command if you already have one.
 mkdir -p ~/.local/bin
-ln -s "$PWD/plugins/orchestrate/bin/ork.mjs" ~/.local/bin/ork
-export PATH="$HOME/.local/bin:$PATH"
-```
+ln -sf "$PWD/plugins/orchestrate/bin/ork.mjs" ~/.local/bin/ork
 
-Keep `~/.local/bin` on your shell's `PATH`. The installer links the Orchestrate skill into detected
-harnesses, sets up the peer mailbox and runs a health check. It doesn't create the `ork` launcher yet,
-which is why the symlink is a separate step. No npm installation is needed to run the tools.
-
-The installer supports `--dry-run`. Codex asks you to review its mailbox hooks once through `/hooks`.
-Claude Code, Antigravity and OpenCode also need their
-[status-line adapters](plugins/orchestrate/README.md#agent-status-in-terminal-footers) configured
-for the outer footer. See the [installation guide](plugins/orchestrate/README.md#install) for details.
-
-To add quota monitoring from the same checkout:
-
-```sh
+# Install monitor CLI, MCP server, and macOS menu bar app (pass --no-app for CLI only)
 ./plugins/monitor/install.sh
 monitor mcp-install
-monitor
 ```
 
-On macOS, this also installs the menu bar app; use `--no-app` for the CLI only. The
-[Monitor guide](plugins/monitor/README.md#install) covers account profiles, plugin installation and
-desktop setup.
+Make sure `~/.local/bin` is on your `PATH`. Run `ork setup --trust-codex-hooks` (or approve `/hooks`
+once in Codex) to enable turn hooks, and see
+[terminal footer setup](plugins/orchestrate/README.md#agent-status-in-terminal-footers) if you want
+the status bar outside `ork` launches.
 
-## Where things stand
-
-The conversational swarm workflow is experimental. Launching, status updates and reconnection have
-been tested with fixture agents. A complete model-driven swarm still needs end-to-end validation.
-
-- A room currently uses one checkout and serializes worker edits. Read-only workers can run together.
-- Subswarm leads use their parent's native harness. Workers can use other supported harnesses.
-- The default limits are 12 member slots and 3 levels below the root coordinator. These limit the
-  team's size and depth, not tokens or spending.
-- Pausing a branch blocks new launches. Active work needs a separate interruption or cancellation
-  through its coordinator.
-
-### Troubleshooting
-
-If `ork` isn't found, check the launcher and `PATH` from the install steps. You can also run it
-directly with `node ~/src/orkest/plugins/orchestrate/bin/ork.mjs codex`.
-
-For missing agents or mailbox setup problems, run:
+To verify your setup at any time:
 
 ```sh
 python3 ~/.agents/skills/orchestrate/scripts/run_agent.py doctor --check-messaging
 ```
 
-Footer fields marked `not set` mean the session hasn't recorded that context yet. The footer reads
-work records and progress reports; it doesn't guess a task or declare it complete.
-
 ## Development
-
-Use Corepack to run the project's pinned pnpm version.
 
 ```sh
 corepack pnpm install
@@ -163,9 +204,7 @@ ork gate --heavy -- ./scripts/test.sh
 node scripts/release.js plan
 ```
 
-Use focused tests while editing. Tests live under `tests/`, mirroring the code they cover. The full
-checks above use the shared gate so they don't compete with another agent's heavy run.
-
-See [CLAUDE.md](CLAUDE.md) for repository conventions and [docs/README.md](docs/README.md) for design
-records. [Release automation](docs/releases.md) writes plugin versions from conventional commits;
-don't update versions by hand.
+Run focused tests while editing (`./node_modules/.bin/vitest run <test-file>` or
+`python3 -m unittest <test-file>`), and use `ork gate --heavy` once at the end. See
+[CLAUDE.md](CLAUDE.md) for repository conventions and [docs/releases.md](docs/releases.md) for
+conventional-commit release automation.

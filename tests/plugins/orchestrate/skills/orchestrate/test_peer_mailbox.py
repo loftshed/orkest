@@ -260,6 +260,129 @@ class PeerMailboxRootTests(unittest.TestCase):
             self.assertEqual(runtime_paths.cache_home(), preferred)
             self.assertEqual(mailbox.root(), preferred / "mailbox-v1")
 
+    def test_runtime_paths_config_home_and_set_home_env(self) -> None:
+        xdg = self.root / "xdg-config"
+        primary = xdg / "orchestrate"
+        legacy = xdg / "agent-executor"
+        with patch.dict(os.environ, {"XDG_CONFIG_HOME": str(xdg)}, clear=True):
+            self.assertEqual(runtime_paths.config_home(), primary)
+            legacy.mkdir(parents=True, exist_ok=True)
+            (legacy / "config.json").write_text("{}")
+            self.assertEqual(runtime_paths.config_home(), legacy)
+            self.assertEqual(runtime_paths.config_path(), legacy / "config.json")
+            primary.mkdir(parents=True, exist_ok=True)
+            (primary / "config.json").write_text("{}")
+            self.assertEqual(runtime_paths.config_home(), primary)
+            self.assertEqual(runtime_paths.config_path(), primary / "config.json")
+        env: dict[str, str] = {}
+        returned = runtime_paths.set_home_env(env, self.root / "custom-home")
+        self.assertIs(returned, env)
+        self.assertEqual(env["ORCHESTRATE_HOME"], str(self.root / "custom-home"))
+        self.assertEqual(env["AGENT_EXECUTOR_HOME"], str(self.root / "custom-home"))
+
+
+class PeerAliasAndPruneSafetyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.base = self.root / "mailbox-v1"
+        self.cwd = str(self.root / "project")
+        subprocess.run(["git", "init", "-q", self.cwd], check=True)
+
+    def test_resolve_accepts_bare_person_alias(self) -> None:
+        sender = mailbox.register(
+            self.base, session="00000000-0000-0000-0000-000000000001", harness="codex", cwd=self.cwd, pid=os.getpid()
+        )
+        target = mailbox.register(
+            self.base, session="00000000-0000-0000-0000-000000000002", harness="claude", cwd=self.cwd, pid=os.getpid()
+        )
+        resolved = mailbox.resolve(self.base, target["person"], sender=sender)
+        self.assertEqual(resolved["session"], target["session"])
+
+    def test_prune_respects_lock_grace_window_and_active_flock_and_prunes_rooms_briefs_progress_and_board(self) -> None:
+        import fcntl
+
+        peers_dir = self.base / "peers"
+        peers_dir.mkdir(parents=True, exist_ok=True)
+        fresh_lock = peers_dir / "fresh-orphan.lock"
+        fresh_lock.write_text("")
+        held_old_lock = peers_dir / "held-orphan.lock"
+        held_old_lock.write_text("")
+        free_old_lock = peers_dir / "free-orphan.lock"
+        free_old_lock.write_text("")
+        old_time = time.time() - (mailbox.MAX_AGE.total_seconds() + 3600)
+        os.utime(held_old_lock, (old_time, old_time))
+        os.utime(free_old_lock, (old_time, old_time))
+
+        # Stale room, orphaned brief, stale progress, and terminal workboard item
+        dead_room = self.base / "rooms" / "dead-room.json"
+        mailbox.write(
+            dead_room,
+            {
+                "schema": "agent-executor.room.v1",
+                "id": "dead-room",
+                "conductor": {"session": {"id": "dead-session"}},
+                "agents": [],
+            },
+        )
+        os.utime(dead_room, (old_time, old_time))
+
+        live_peer = mailbox.register(
+            self.base, session="00000000-0000-0000-0000-000000000099", harness="codex", cwd=self.cwd, pid=os.getpid()
+        )
+        live_room = self.base / "rooms" / "live-room.json"
+        mailbox.write(
+            live_room,
+            {
+                "schema": "agent-executor.room.v1",
+                "id": "live-room",
+                "conductor": {"session": {"id": live_peer["session"]}},
+                "agents": [],
+            },
+        )
+        os.utime(live_room, (old_time, old_time))
+
+        orphan_brief = self.base.parent / "swarm-briefs" / "dead-room"
+        orphan_brief.mkdir(parents=True, exist_ok=True)
+        (orphan_brief / "brief.md").write_text("old brief")
+        os.utime(orphan_brief, (old_time, old_time))
+
+        stale_progress = self.base / "progress" / "dead-peer.json"
+        old_stamp = mailbox.stamp(mailbox.now() - mailbox.MAX_AGE * 2)
+        mailbox.write(stale_progress, {"session": "dead-peer", "stage": "complete", "updatedAt": old_stamp})
+        os.utime(stale_progress, (old_time, old_time))
+
+        board_path = self.base / "work" / "board.json"
+        mailbox.write(
+            board_path,
+            {
+                "schema": "agent-executor.workboard.v1",
+                "items": [
+                    {"id": "old-done", "status": "accepted", "updatedAt": old_stamp},
+                    {"id": "old-abandoned", "status": "abandoned", "updatedAt": old_stamp},
+                    {"id": "active-open", "status": "open", "updatedAt": old_stamp},
+                ],
+            },
+        )
+
+        fd = os.open(held_old_lock, os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            mailbox.prune(self.base)
+            self.assertTrue(fresh_lock.exists(), "fresh lock within 15m grace window must not be unlinked")
+            self.assertTrue(held_old_lock.exists(), "actively held lock must not be unlinked")
+            self.assertFalse(free_old_lock.exists(), "stale unlocked lock should be unlinked")
+        finally:
+            os.close(fd)
+
+        self.assertFalse(dead_room.exists())
+        self.assertTrue(live_room.exists())
+        self.assertFalse(orphan_brief.exists())
+        self.assertFalse(stale_progress.exists())
+        board = mailbox.load(board_path)
+        self.assertEqual([item["id"] for item in board["items"]], ["active-open"])
+
 
 class MailboxModuleDecompositionTests(unittest.TestCase):
     def test_extracted_modules_reexport_cleanly_through_peer_mailbox(self) -> None:

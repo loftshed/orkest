@@ -54,6 +54,18 @@ def store_id(base: Path) -> str:
     return hashlib.sha256(str(base.resolve()).encode()).hexdigest()
 
 
+def valid_store_ids(base: Path) -> set[str]:
+    resolved = base.resolve()
+    ids = {hashlib.sha256(str(resolved).encode()).hexdigest()}
+    if resolved.parent.name == "orchestrate":
+        legacy_parent = resolved.parent.parent / "agent-executor"
+        with contextlib.suppress(OSError):
+            if legacy_parent.is_symlink() and legacy_parent.resolve() == resolved.parent:
+                legacy_base = legacy_parent / resolved.name
+                ids.add(hashlib.sha256(str(legacy_base).encode()).hexdigest())
+    return ids
+
+
 @functools.cache
 def runtime_revision() -> str:
     digest = hashlib.sha256()
@@ -130,7 +142,7 @@ def load_state(base: Path) -> dict[str, Any] | None:
     value = mailbox.load(path)
     if (
         not value
-        or value.get("storeId") != store_id(base)
+        or value.get("storeId") not in valid_store_ids(base)
         or not isinstance(value.get("instance"), str)
         or type(value.get("pid")) is not int
     ):
@@ -718,7 +730,11 @@ def owned_state(base: Path, *, timeout: float = 1) -> dict[str, Any] | None:
     if not token:
         return None
     live = check_daemon(state["url"], token, timeout=timeout)
-    if live and all(live.get(key) == state.get(key) for key in ("pid", "instance", "storeId", "url")):
+    if (
+        live
+        and all(live.get(key) == state.get(key) for key in ("pid", "instance", "url"))
+        and live.get("storeId") in valid_store_ids(base)
+    ):
         return live
     return None
 

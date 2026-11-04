@@ -42,6 +42,10 @@ HEAVY = [
     "pnpm --filter @app/web run lint",
     "npm --prefix packages/web test",
     "npm -w @app/web run build",
+    "corepack pnpm test",
+    "corepack pnpm check",
+    "direnv exec . pytest",
+    "direnv exec . corepack pnpm test",
 ]
 NOT_HEAVY = [
     "npm test -- src/a.test.ts",
@@ -49,6 +53,10 @@ NOT_HEAVY = [
     "yarn --cwd packages/web test src/a.test.ts",
     "yarn workspace @app/web test src/a.test.ts",
     "pnpm --filter @app/web test src/a.test.ts",
+    "corepack pnpm test src/a.test.ts",
+    "direnv exec . pytest tests/test_a.py",
+    "ork gate --heavy -- corepack pnpm test",
+    "ork gate --heavy -- direnv exec . pytest",
     "./node_modules/.bin/vitest run src/x.test.tsx",
     "vitest related src/a.ts",
     "yarn jest src/a",
@@ -112,6 +120,9 @@ class ClassificationTests(unittest.TestCase):
             ["yarn", "lint"],
             ["yarn", "--cwd", "packages/web", "test", "src/a.test.ts"],
             ["pnpm", "--filter", "@app/web", "test", "src/a.test.ts"],
+            ["corepack", "pnpm", "test"],
+            ["corepack", "pnpm", "check"],
+            ["direnv", "exec", ".", "pytest"],
         ):
             self.assertTrue(GATE.runnable(command), command)
         for command in (
