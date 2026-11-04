@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.49.0
+
+- feat(orchestrate): reconnect resumed sessions to swarm rooms and show quota reset countdown
+
 ## 0.48.0
 
 - fix(orchestrate): address cold review findings across smelter, foundry, radar, runner, mailbox, and horde TUI
