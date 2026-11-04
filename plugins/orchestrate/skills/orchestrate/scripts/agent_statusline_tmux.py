@@ -13,12 +13,204 @@ import re
 import secrets
 import shlex
 import shutil
+import socket as stdlib_socket
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 import peer_mailbox as mailbox
+
+_RESUME_VALUE_FLAGS = frozenset({"--resume", "-r", "--session-id", "--conversation", "--session", "-s"})
+
+
+def extract_resumed_session_id(command: list[str]) -> str | None:
+    """Extract an explicit session/conversation ID from CLI resume arguments across all harnesses."""
+    if not command:
+        return None
+    tokens = list(command[1:])
+    idx = 0
+    saw_resume_subcommand = False
+    while idx < len(tokens):
+        token = tokens[idx]
+        if token == "--":
+            break
+        for flag in _RESUME_VALUE_FLAGS:
+            if token == flag:
+                if idx + 1 < len(tokens):
+                    candidate = tokens[idx + 1].strip()
+                    if (
+                        not candidate.startswith("-")
+                        and candidate.lower() not in {"last", "help"}
+                        and re.fullmatch(r"[\w-]{1,80}", candidate, flags=re.ASCII)
+                    ):
+                        return candidate
+                break
+            if token.startswith(f"{flag}="):
+                candidate = token.split("=", 1)[1].strip()
+                if (
+                    candidate
+                    and not candidate.startswith("-")
+                    and candidate.lower() not in {"last", "help"}
+                    and re.fullmatch(r"[\w-]{1,80}", candidate, flags=re.ASCII)
+                ):
+                    return candidate
+                break
+        if token == "resume" and not saw_resume_subcommand:
+            saw_resume_subcommand = True
+            if idx + 1 < len(tokens):
+                candidate = tokens[idx + 1].strip()
+                if (
+                    not candidate.startswith("-")
+                    and candidate.lower() not in {"last", "help"}
+                    and re.fullmatch(r"[\w-]{1,80}", candidate, flags=re.ASCII)
+                ):
+                    return candidate
+        idx += 1
+    return None
+
+
+def find_session_swarm_room(
+    base: Path,
+    session_id: str,
+    *,
+    harness: str | None = None,
+    cwd: str | None = None,
+    aliases: list[str] | tuple[str, ...] | None = None,
+) -> dict[str, object] | None:
+    """Find the most recently updated swarm room where this session (or its alias) was in control (conductor or lead)."""
+    candidates = {
+        item.strip()
+        for item in [session_id, *(aliases or ())]
+        if isinstance(item, str) and item.strip() and re.fullmatch(r"[\w-]{1,80}", item.strip(), flags=re.ASCII)
+    }
+    if not candidates:
+        return None
+    expected_engine = {"gemini": "agy", "agy": "agy", "claude": "claude", "codex": "codex", "opencode": "opencode"}.get(
+        harness or ""
+    )
+    resolved_cwd: Path | None = None
+    if cwd:
+        with contextlib.suppress(OSError):
+            resolved_cwd = Path(cwd).resolve()
+    host = stdlib_socket.gethostname()
+    best_room: dict[str, object] | None = None
+    best_score: tuple[int, int, float, int, str] = (-1, -1, -1.0, -1, "")
+    with contextlib.suppress(OSError):
+        for path in sorted((base / "rooms").glob("*.json")):
+            room = mailbox.load(path)
+            if (
+                not isinstance(room, dict)
+                or room.get("schema") != "agent-executor.room.v1"
+                or room.get("id") != path.stem
+                or not room.get("swarm")
+            ):
+                continue
+            room_machine = room.get("machine")
+            if isinstance(room_machine, str) and room_machine and room_machine != host:
+                continue
+            matched_member: str | None = None
+            matched_session: str | None = None
+            is_conductor = 0
+            exact_primary = 0
+            conductor = room.get("conductor")
+            if isinstance(conductor, dict):
+                c_engine = conductor.get("engine")
+                c_session = conductor.get("session")
+                bound_id = c_session.get("id") if isinstance(c_session, dict) else None
+                mailbox_sid = (
+                    conductor.get("mailboxSession") if isinstance(conductor.get("mailboxSession"), str) else None
+                )
+                for sid in (bound_id, mailbox_sid):
+                    if (
+                        isinstance(sid, str)
+                        and sid in candidates
+                        and (not expected_engine or c_engine == expected_engine)
+                    ):
+                        matched_member = "conductor"
+                        matched_session = sid
+                        is_conductor = 1
+                        exact_primary = 1 if sid == session_id else 0
+                        break
+            if not matched_member and isinstance(room.get("agents"), list):
+                for agent in room["agents"]:
+                    if not isinstance(agent, dict) or agent.get("role") != "lead":
+                        continue
+                    a_engine = agent.get("engine")
+                    a_session = agent.get("session")
+                    bound_id = a_session.get("id") if isinstance(a_session, dict) else None
+                    mailbox_sid = agent.get("mailboxSession") if isinstance(agent.get("mailboxSession"), str) else None
+                    for sid in (bound_id, mailbox_sid):
+                        if (
+                            isinstance(sid, str)
+                            and sid in candidates
+                            and (not expected_engine or a_engine == expected_engine)
+                        ):
+                            matched_member = str(agent.get("id") or "")
+                            matched_session = sid
+                            is_conductor = 0
+                            exact_primary = 1 if sid == session_id else 0
+                            break
+                    if matched_member:
+                        break
+            if not matched_member or not matched_session:
+                continue
+            same_cwd = 0
+            if resolved_cwd and isinstance(room.get("cwd"), str):
+                with contextlib.suppress(OSError):
+                    if Path(room["cwd"]).resolve() == resolved_cwd:
+                        same_cwd = 1
+            updated_raw = room.get("updatedAt")
+            updated_at = float(updated_raw) if isinstance(updated_raw, int | float) else 0.0
+            room_id = str(room["id"])
+            score = (exact_primary, is_conductor, updated_at, same_cwd, room_id)
+            if score >= best_score:
+                best_score = score
+                best_room = {
+                    **room,
+                    "_matchedMemberId": matched_member,
+                    "_matchedSessionId": matched_session,
+                }
+    return best_room
+
+
+def rebind_session_swarm_room(
+    base: Path,
+    room_id: str,
+    member_id: str,
+    new_session_id: str,
+) -> dict[str, object] | None:
+    """Update a swarm coordinator or lead member's bound session ID after a `/clear` handover."""
+    try:
+        target = _room_path(base, room_id)
+    except ValueError:
+        return None
+    with contextlib.suppress(OSError), mailbox.locked(target), _node_room_lock(target):
+        data = mailbox.load(target)
+        if not isinstance(data, dict):
+            return None
+        member = data.get("conductor") if member_id == "conductor" else None
+        if member is None and isinstance(data.get("agents"), list):
+            for agent in data["agents"]:
+                if isinstance(agent, dict) and agent.get("id") == member_id:
+                    member = agent
+                    break
+        if not isinstance(member, dict):
+            return None
+        session_obj = member.get("session")
+        if isinstance(session_obj, dict):
+            old_id = session_obj.get("id")
+            if isinstance(old_id, str) and old_id and old_id != new_session_id:
+                prev = member.get("previousSessions")
+                history = [item for item in prev if isinstance(item, str)] if isinstance(prev, list) else []
+                if old_id not in history:
+                    history.append(old_id)
+                member["previousSessions"] = history[-16:]
+            session_obj["id"] = new_session_id
+        data["updatedAt"] = int(time.time() * 1000)
+        mailbox.write(target, data)
+        return data
+    return None
 
 
 def swarm_socket(room: str) -> str:
@@ -54,6 +246,10 @@ def _discover_socket(
             ):
                 candidates.append(recorded)
     env_room = room or os.environ.get("ORKEST_SWARM_ROOM", "").strip()
+    if not env_room and session_id:
+        matched = find_session_swarm_room(base, session_id)
+        if isinstance(matched, dict) and isinstance(matched.get("id"), str):
+            env_room = matched["id"]
     if env_room and re.fullmatch(r"[\w-]{1,80}", env_room, flags=re.ASCII):
         with contextlib.suppress(ValueError):
             room_sock = swarm_socket(env_room)
@@ -346,6 +542,7 @@ def _ensure_bound_room(
     harness: str | None,
     cwd: str | None,
     environment: dict[str, str],
+    base: Path | None = None,
 ) -> tuple[str | None, str | None]:
     cli = Path(__file__).resolve().parents[3] / "bin" / "ork.mjs"
     node = shutil.which("node") or "node"
@@ -365,26 +562,44 @@ def _ensure_bound_room(
             return None, created.stderr.strip() or "could not create swarm room"
         current_room = json.loads(created.stdout)["id"]
     if session_id and current_room:
-        subprocess.run(
-            [
-                node,
-                str(cli),
-                "rooms",
-                "bind",
-                "--room",
-                current_room,
-                "--member",
-                "conductor",
-                "--engine",
-                engine,
-                "--session",
-                session_id,
-            ],
-            env=environment,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
+        already_bound = False
+        if base is not None:
+            with contextlib.suppress(ValueError):
+                existing = mailbox.load(_room_path(base, current_room))
+                if isinstance(existing, dict):
+                    conductor = existing.get("conductor")
+                    if isinstance(conductor, dict) and isinstance(conductor.get("session"), dict):
+                        already_bound = bool(conductor["session"].get("id"))
+                    if not already_bound and isinstance(existing.get("agents"), list):
+                        for agent in existing["agents"]:
+                            if (
+                                isinstance(agent, dict)
+                                and isinstance(agent.get("session"), dict)
+                                and agent["session"].get("id") == session_id
+                            ):
+                                already_bound = True
+                                break
+        if not already_bound:
+            subprocess.run(
+                [
+                    node,
+                    str(cli),
+                    "rooms",
+                    "bind",
+                    "--room",
+                    current_room,
+                    "--member",
+                    "conductor",
+                    "--engine",
+                    engine,
+                    "--session",
+                    session_id,
+                ],
+                env=environment,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
     return current_room, None
 
 
@@ -411,6 +626,11 @@ def _toggle_herdr_swarm_view(
     if not harness:
         harness = os.environ.get("ORKEST_TERMINAL_HARNESS", "").strip() or None
     current_room = (room or os.environ.get("ORKEST_SWARM_ROOM", "")).strip()
+    if not current_room and session_id:
+        aliases = peer.get("aliases") if isinstance(peer, dict) and isinstance(peer.get("aliases"), list) else None
+        matched = find_session_swarm_room(base, session_id, harness=harness, cwd=cwd, aliases=aliases)
+        if isinstance(matched, dict) and isinstance(matched.get("id"), str):
+            current_room = matched["id"]
     if not current_room and isinstance(peer, dict) and mailbox.valid_peer(peer):
         import agent_statusline
 
@@ -429,6 +649,7 @@ def _toggle_herdr_swarm_view(
         harness=harness,
         cwd=cwd,
         environment=environment,
+        base=base,
     )
     if not resolved_room:
         return {"status": "error", "reason": room_error or "could not create swarm room"}
@@ -596,6 +817,11 @@ def toggle_swarm_view(
             harness = peer.get("harness")
         if isinstance(peer, dict) and not cwd:
             cwd = peer.get("cwd")
+    if not current_room and session_id:
+        aliases = peer.get("aliases") if isinstance(peer, dict) and isinstance(peer.get("aliases"), list) else None
+        matched = find_session_swarm_room(base, session_id, harness=harness, cwd=cwd, aliases=aliases)
+        if isinstance(matched, dict) and isinstance(matched.get("id"), str):
+            current_room = matched["id"]
     if not current_room and isinstance(peer, dict) and mailbox.valid_peer(peer):
         import agent_statusline
 
@@ -608,6 +834,7 @@ def toggle_swarm_view(
         harness=harness,
         cwd=cwd,
         environment=environment,
+        base=base,
     )
     if not resolved_room:
         return {"status": "error", "reason": room_error or "could not create swarm room"}
@@ -745,6 +972,21 @@ def main(arguments: list[str]) -> int:
         if not shutil.which(command[0]):
             print(f"{command[0]} is not installed on PATH", file=sys.stderr)
             return 2
+        if not room:
+            resumed_session = extract_resumed_session_id(command)
+            if resumed_session:
+                base_dir = mailbox.root()
+                peer_data = None
+                with contextlib.suppress(Exception):
+                    peer_data = mailbox.load(mailbox.peer_path(base_dir, resumed_session))
+                aliases = (
+                    peer_data.get("aliases")
+                    if isinstance(peer_data, dict) and isinstance(peer_data.get("aliases"), list)
+                    else None
+                )
+                matched = find_session_swarm_room(base_dir, resumed_session, harness=harness, cwd=cwd, aliases=aliases)
+                if isinstance(matched, dict) and isinstance(matched.get("id"), str):
+                    room = matched["id"]
         if Path(command[0]).name == "codex":
             # The TUI knows the visible conversation even when agents share a daemon.
             # This changes only the private pane title, not Codex's thread name or status line.
@@ -818,6 +1060,42 @@ def main(arguments: list[str]) -> int:
     # A private server must not inherit the enclosing tmux client's socket.
     environment.pop("TMUX", None)
     environment.pop("TMUX_PANE", None)
+    if room:
+        existing_session = subprocess.run(
+            [*base, "has-session", "-t", session],
+            env=environment,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if existing_session.returncode == 0:
+            existing_pane = subprocess.run(
+                [*base, "show-option", "-t", session, "-v", "@orkest_coordinator_pane"],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            ).stdout.strip()
+            existing_live = ""
+            if re.fullmatch(r"%\d+", existing_pane):
+                existing_live = subprocess.run(
+                    [*base, "display-message", "-p", "-t", existing_pane, "#{pane_id}:#{pane_dead}"],
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                ).stdout.strip()
+            if existing_live == f"{existing_pane}:0":
+                socket = f"orkest-label-{secrets.token_hex(6)}"
+                base = [tmux, "-L", socket]
+            else:
+                subprocess.run(
+                    [*base, "kill-session", "-t", session],
+                    env=environment,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
     environment["ORKEST_TERMINAL_SERVER"] = socket
     environment["ORKEST_TERMINAL_HARNESS"] = harness
     if room:

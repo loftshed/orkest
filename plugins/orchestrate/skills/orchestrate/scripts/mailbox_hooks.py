@@ -449,26 +449,136 @@ def succession_notice(base: Path, me: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _format_swarm_reconnection_summary(room: dict[str, Any], room_id: str, member_id: str) -> str:
+    title = str(room.get("title") or room_id).strip()
+    role_label = "root swarm coordinator (conductor)" if member_id == "conductor" else f"subswarm lead ({member_id})"
+    objective = str(room.get("objective") or "").strip()
+    if member_id != "conductor" and isinstance(room.get("agents"), list):
+        for agent in room["agents"]:
+            if isinstance(agent, dict) and agent.get("id") == member_id and isinstance(agent.get("objective"), str):
+                if agent["objective"].strip():
+                    objective = agent["objective"].strip()
+                break
+    agents = [a for a in (room.get("agents") or []) if isinstance(a, dict)]
+    active = sum(
+        1
+        for a in agents
+        if str(a.get("status") or "").lower()
+        in {"running", "active", "working", "planning", "testing", "review", "claimed", "reserved", "spawned"}
+    )
+    completed = sum(
+        1 for a in agents if str(a.get("status") or "").lower() in {"completed", "complete", "done", "merged"}
+    )
+    blocked = sum(1 for a in agents if str(a.get("status") or "").lower() in {"blocked", "failed", "rejected", "error"})
+    title_part = f" ({title})" if title and title != room_id else ""
+    obj_part = f" Objective: {objective}." if objective else ""
+    counts = f"{len(agents)} total ({active} active, {completed} completed, {blocked} blocked/failed)"
+    return (
+        f"Reconnected to swarm room {room_id}{title_part} as {role_label}.{obj_part} "
+        f"Horde members: {counts}. "
+        f"Run `ork rooms status --room {room_id}` to inspect your swarm or `/swarm` to toggle the Swarm View."
+    )
+
+
 def swarm_coordinator_context(base: Path, me: dict[str, Any], event: str, *, mid_turn: bool = False) -> str:
-    """Auto-bind the root swarm coordinator and deliver its brief on the first user message."""
+    """Auto-bind the root swarm coordinator (or reconnect a resumed coordinator/lead) and deliver its brief."""
+    if me.get("delegatedRun") or _MB.is_run_peer(me):
+        return ""
+    is_turn_start = event in {"SessionStart", "UserPromptSubmit"} or (event == "PreInvocation" and not mid_turn)
     room_id = os.environ.get("ORKEST_SWARM_ROOM", "").strip()
-    if (
-        not room_id
-        or not re.fullmatch(r"[\w-]{1,80}", room_id, flags=re.ASCII)
-        or me.get("delegatedRun")
-        or _MB.is_run_peer(me)
-    ):
+    if not room_id:
+        if not is_turn_start:
+            return ""
+        import agent_statusline_tmux
+
+        aliases = me.get("aliases") if isinstance(me.get("aliases"), list) else None
+        matched = agent_statusline_tmux.find_session_swarm_room(
+            base,
+            me["session"],
+            harness=me["harness"],
+            cwd=me.get("cwd"),
+            aliases=aliases,
+        )
+        if not isinstance(matched, dict) or not isinstance(matched.get("id"), str):
+            return ""
+        room_id = matched["id"]
+        member_id = str(matched.get("_matchedMemberId") or "conductor")
+        matched_session = str(matched.get("_matchedSessionId") or me["session"])
+        room: dict[str, Any] = matched
+        if matched_session != me["session"]:
+            rebound = agent_statusline_tmux.rebind_session_swarm_room(base, room_id, member_id, me["session"])
+            if isinstance(rebound, dict):
+                room = rebound
+        instance_key = f"{room_id}:{me.get('terminalServer') or me.get('herdrPaneId') or me.get('pid') or ''}"
+        if me.get("swarmAutoReconnected") != instance_key:
+            _MB.annotate(base, me["session"], swarmAutoReconnected=instance_key, swarmBriefed=room_id)
+            if (
+                me.get("terminalServer")
+                or os.environ.get("ORKEST_TERMINAL_SERVER")
+                or os.environ.get("HERDR_ENV") == "1"
+            ):
+                server_sock = (
+                    None
+                    if os.environ.get("HERDR_ENV") == "1"
+                    else (me.get("terminalServer") or os.environ.get("ORKEST_TERMINAL_SERVER"))
+                )
+                with contextlib.suppress(Exception):
+                    agent_statusline_tmux.toggle_swarm_view(
+                        "open",
+                        socket=server_sock,
+                        room=room_id,
+                        session_id=me["session"],
+                        harness=me["harness"],
+                        cwd=me.get("cwd"),
+                        base=base,
+                    )
+            return _format_swarm_reconnection_summary(room, room_id, member_id)
         return ""
-    room = _MB.load(base / "rooms" / f"{room_id}.json")
-    if not isinstance(room, dict) or not room.get("swarm"):
+
+    if not re.fullmatch(r"[\w-]{1,80}", room_id, flags=re.ASCII):
         return ""
+    loaded_room = _MB.load(base / "rooms" / f"{room_id}.json")
+    if not isinstance(loaded_room, dict) or not loaded_room.get("swarm"):
+        return ""
+    room = loaded_room
     engine = "agy" if me["harness"] == "gemini" else me["harness"]
     conductor = room.get("conductor") or {}
-    if conductor.get("engine") != engine:
-        return ""
+    aliases_list = me.get("aliases") if isinstance(me.get("aliases"), list) else []
+    candidate_ids = {me["session"], *(item for item in aliases_list if isinstance(item, str))}
     bound_session = (conductor.get("session") or {}).get("id")
-    if bound_session and bound_session != me["session"]:
+    if conductor.get("engine") != engine or (bound_session and bound_session not in candidate_ids):
+        if isinstance(room.get("agents"), list):
+            for agent in room["agents"]:
+                if not isinstance(agent, dict) or agent.get("role") != "lead" or agent.get("engine") != engine:
+                    continue
+                lead_sid = (agent.get("session") or {}).get("id") if isinstance(agent.get("session"), dict) else None
+                if isinstance(lead_sid, str) and lead_sid in candidate_ids:
+                    member_id = str(agent.get("id") or "")
+                    if lead_sid != me["session"] and member_id:
+                        import agent_statusline_tmux
+
+                        rebound = agent_statusline_tmux.rebind_session_swarm_room(
+                            base, room_id, member_id, me["session"]
+                        )
+                        if isinstance(rebound, dict):
+                            room = rebound
+                    instance_key = (
+                        f"{room_id}:{me.get('terminalServer') or me.get('herdrPaneId') or me.get('pid') or ''}"
+                    )
+                    if is_turn_start and me.get("swarmAutoReconnected") != instance_key:
+                        _MB.annotate(base, me["session"], swarmAutoReconnected=instance_key, swarmBriefed=room_id)
+                        return _format_swarm_reconnection_summary(room, room_id, member_id)
+                    return ""
         return ""
+
+    if bound_session and bound_session != me["session"] and bound_session in candidate_ids:
+        import agent_statusline_tmux
+
+        rebound = agent_statusline_tmux.rebind_session_swarm_room(base, room_id, "conductor", me["session"])
+        if isinstance(rebound, dict):
+            room = rebound
+            bound_session = me["session"]
+    was_already_bound = bool(bound_session)
     if not bound_session:
         cli = Path(__file__).resolve().parents[3] / "bin" / "ork.mjs"
         env = {**os.environ, "AGENT_EXECUTOR_HOME": str(base.parent)}
@@ -500,17 +610,28 @@ def swarm_coordinator_context(base: Path, me: dict[str, Any], event: str, *, mid
             bound_session = ((room.get("conductor") or {}).get("session") or {}).get("id")
         if bound_session and bound_session != me["session"]:
             return ""
+    instance_key = f"{room_id}:{me.get('terminalServer') or me.get('herdrPaneId') or me.get('pid') or ''}"
     if (event == "UserPromptSubmit" or (event == "PreInvocation" and not mid_turn)) and me.get(
         "swarmBriefed"
     ) != room_id:
-        _MB.annotate(base, me["session"], swarmBriefed=room_id)
-        if not room.get("objective"):
+        _MB.annotate(base, me["session"], swarmBriefed=room_id, swarmAutoReconnected=instance_key)
+        if not room.get("objective") and not room.get("agents"):
             brief_file = base / "swarm-briefs" / room_id / "conductor.md"
             with contextlib.suppress(OSError):
                 if brief_file.is_file():
                     return (
                         brief_file.read_text(encoding="utf-8").replace("YOUR_ACTUAL_SESSION_ID", me["session"]).strip()
                     )
+        else:
+            return _format_swarm_reconnection_summary(room, room_id, "conductor")
+    elif (
+        was_already_bound
+        and (room.get("objective") or room.get("agents"))
+        and is_turn_start
+        and me.get("swarmAutoReconnected") != instance_key
+    ):
+        _MB.annotate(base, me["session"], swarmAutoReconnected=instance_key)
+        return _format_swarm_reconnection_summary(room, room_id, "conductor")
     return ""
 
 
