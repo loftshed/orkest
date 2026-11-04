@@ -148,6 +148,21 @@ export function resolveMemberWorktree(member, roomCwd) {
   }
 }
 
+export function refreshMemberWorktrees(room) {
+  if (!room || typeof room !== "object") return room;
+  for (const member of [room.conductor, ...(Array.isArray(room.agents) ? room.agents : [])]) {
+    if (!member) continue;
+    const detectedWorktree =
+      resolveMemberWorktree(member, room.cwd) ||
+      (member === room.conductor && !member.cwd
+        ? detectWorktree(room.cwd, member.worktree, room.cwd)
+        : undefined);
+    if (detectedWorktree) member.worktree = detectedWorktree;
+    else delete member.worktree;
+  }
+  return room;
+}
+
 export function mailboxRoot(env = process.env) {
   return path.join(cacheHome(env), "mailbox-v1");
 }
@@ -297,13 +312,6 @@ export function validateRoom(room) {
         (member.worktree.slug !== undefined && typeof member.worktree.slug !== "string"))
     )
       throw new Error("Invalid member worktree metadata");
-    const detectedWorktree =
-      resolveMemberWorktree(member, room.cwd) ||
-      (member === room.conductor && !member.cwd
-        ? detectWorktree(room.cwd, member.worktree, room.cwd)
-        : undefined);
-    if (detectedWorktree) member.worktree = detectedWorktree;
-    else delete member.worktree;
     if (
       member.session &&
       (typeof member.session.id !== "string" ||
@@ -324,7 +332,7 @@ export function validateRoom(room) {
     )
       throw new Error("Invalid member dispatch binding");
   }
-  return room;
+  return refreshMemberWorktrees(room);
 }
 
 export function addMembers(room, members, { parent = "conductor", workforceRole, cwd } = {}) {
@@ -361,8 +369,15 @@ export function addMembers(room, members, { parent = "conductor", workforceRole,
 
 export function createRoom(
   members,
-  { id = randomUUID(), cwd = process.cwd(), now = Date.now() } = {},
+  {
+    id = randomUUID(),
+    cwd = process.cwd(),
+    now = Date.now(),
+    swarm = { maxAgents: 64, maxDepth: 8 },
+    engine,
+  } = {},
 ) {
+  const conductorEngine = engine || members?.[0]?.engine || "codex";
   const room = addMembers(
     {
       schema: ROOM_SCHEMA,
@@ -370,7 +385,8 @@ export function createRoom(
       cwd: path.resolve(cwd),
       createdAt: now,
       updatedAt: now,
-      conductor: { status: "idle" },
+      swarm,
+      conductor: { engine: conductorEngine, status: "idle" },
       agents: [],
       messages: [],
       accounts: [],

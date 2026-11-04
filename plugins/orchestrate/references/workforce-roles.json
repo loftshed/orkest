@@ -11,11 +11,20 @@
   "scout": {
     "id": "scout",
     "label": "scout",
-    "aliases": ["investigator", "explorer", "researcher"],
+    "aliases": ["investigator", "explorer"],
     "defaultKind": "investigation",
     "archetype": "architecture-conductor",
     "defaultStage": "working",
     "guidance": "Explore the codebase and documentation read-only to gather grounded file and line evidence."
+  },
+  "researcher": {
+    "id": "researcher",
+    "label": "researcher",
+    "aliases": ["web-researcher", "analyst"],
+    "defaultKind": "investigation",
+    "archetype": "web-research",
+    "defaultStage": "working",
+    "guidance": "Search external documentation, release notes, benchmarks, and prior art on the web with grounded URL citations."
   },
   "debugger": {
     "id": "debugger",

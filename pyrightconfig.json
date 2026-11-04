@@ -1,0 +1,12 @@
+{
+  "include": [
+    "plugins/orchestrate/skills/orchestrate/scripts",
+    "tests/plugins/orchestrate/skills/orchestrate"
+  ],
+  "extraPaths": [
+    "plugins/orchestrate/skills/orchestrate/scripts",
+    "tests/plugins/orchestrate/skills/orchestrate"
+  ],
+  "pythonVersion": "3.12",
+  "typeCheckingMode": "basic"
+}

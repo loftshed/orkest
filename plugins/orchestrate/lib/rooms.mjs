@@ -1,11 +1,12 @@
 import { execFile } from "node:child_process";
-import { randomUUID } from "node:crypto";
-import { readdir, readFile, realpath, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdir, readdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { hostname } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
+import { cacheHome } from "./runtime-paths.mjs";
 import {
   addMembers,
   createRoom,
@@ -13,14 +14,15 @@ import {
   mailboxRoot,
   normalizeWorkforceRole,
   readRoom,
-  resolveMemberWorktree,
+  refreshMemberWorktrees,
   resolveWorktreeMarkerPath,
   updateRoom,
+  WORKFORCE_ROLES,
   workforceRoleInfo,
 } from "./stooges-room.mjs";
-import { requireActiveBranch } from "./swarm.mjs";
 
 const execute = promisify(execFile);
+const plugin = fileURLToPath(new URL("../", import.meta.url));
 const coordinatorPath = fileURLToPath(
   new URL("../skills/orchestrate/scripts/coordinator.py", import.meta.url),
 );
@@ -28,21 +30,307 @@ const authorityPath = fileURLToPath(
   new URL("../skills/orchestrate/scripts/authority.py", import.meta.url),
 );
 
+const RUN_FIELDS = [
+  "run_id",
+  "request_id",
+  "status",
+  "runner_status",
+  "engine",
+  "transport",
+  "result_path",
+  "mailbox",
+  "model",
+  "effort",
+  "native_handle",
+  "recovery",
+];
+const TASK_STATES = {
+  reserved: "reserved",
+  active: "running",
+  finished: "review",
+  cancelled: "cancelled",
+};
+const TASK_VERDICTS = {
+  accept: "completed",
+  supported: "completed",
+  reject: "rejected",
+  takeover: "blocked",
+};
+const PROGRESS_STAGES = new Set([
+  "planning",
+  "working",
+  "testing",
+  "review",
+  "blocked",
+  "complete",
+]);
+const STATUS_COLORS = [31, 32, 33, 34, 35, 36];
+const SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/u;
+const MAX_PEER_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+const UNKNOWN_PID_TTL_MS = 2 * 60 * 60 * 1000;
+const SHARED_PROCESS_IDLE_TTL_MS = 3 * 60 * 60 * 1000;
+const SHARED_PROCESS_BUSY_TTL_MS = 30 * 60 * 1000;
+const PROGRESS_STALE_AFTER_MS = 30 * 60 * 1000;
+
+function isPlainObject(value) {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+async function readOptionalJson(filePath, maxBytes = 4 * 1024 * 1024) {
+  try {
+    const info = await stat(filePath);
+    if (!info.isFile() || info.size > maxBytes) return null;
+    const parsed = JSON.parse(await readFile(filePath, "utf8"));
+    return isPlainObject(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+async function resolveCwd(cwd) {
+  if (cwd === undefined) return;
+  try {
+    return await realpath(cwd);
+  } catch {
+    return path.resolve(cwd);
+  }
+}
+
+export function memberOf(room, id = "conductor") {
+  const member = id === "conductor" ? room.conductor : room.agents.find((agent) => agent.id === id);
+  if (!member) throw new Error(`Unknown member: ${id}`);
+  return member;
+}
+
+export { memberOf as swarmMember };
+
+export function requireActiveBranch(room, id) {
+  for (let current = id; current;) {
+    const member = memberOf(room, current);
+    if (member.paused)
+      throw new Error(`Swarm branch ${current} is paused; resume it before launching work`);
+    current = current === "conductor" ? null : member.parent || "conductor";
+  }
+}
+
+/** One room owns the hierarchy and its limits. A native lead is not an audited worker. */
+export function coordinatorBrief(room, memberId = "conductor") {
+  const member = memberOf(room, memberId);
+  const objective = member.objective || room.objective || "Ask the user what outcome they want.";
+  const roleInfo = workforceRoleInfo(member.workforceRole);
+  const workingFolder = member.cwd || room.cwd;
+  const roleList = Object.keys(WORKFORCE_ROLES).join(", ");
+  return `You are the ${memberId === "conductor" ? "root coordinator" : "subswarm lead"} of an Orkest swarm.
+
+Room: ${room.id}
+Your member ID: ${memberId}
+Parent: ${member.parent || "user"}
+Repository: ${room.cwd}
+Working folder: ${workingFolder}${roleInfo ? `\nWorkforce role: ${roleInfo.id} — ${roleInfo.guidance}` : ""}
+Overall objective: ${room.objective || "Awaiting the user's objective"}
+Your assignment: ${objective}
+${
+  !room.objective && memberId === "conductor"
+    ? `
+If the user has already supplied their goal in this conversation, record it with ork rooms objective --room ${room.id}
+--objective 'their goal', then organize the work. Otherwise, ask the user for their goal and wait for it before creating work assignments or starting workers.
+`
+    : ""
+}
+
+Read repository instructions first. Use programmatic tools before computer use. Use computer use only
+for work that requires a graphical interface or when the user explicitly requests it. Preserve this
+rule in every delegated brief. The objective authorizes relevant delegation, not unrelated work,
+publication, billing changes, or takeover of another session.
+
+Read ${path.join(plugin, "skills/orchestrate/references/swarm.md")} now. It describes the commands and
+native supervision contract. Use ${path.join(plugin, "bin/ork.mjs")} through node if ork is not on PATH.
+
+Bind your actual native session with ork rooms bind --room ${room.id} --member ${memberId}
+--engine ${member.engine} --session YOUR_ACTUAL_SESSION_ID. Never guess a session ID.
+Keep ork progress current with the overall objective, your current task, and actual stage.
+Preset workforce roles (${roleList}) can be assigned with @role in --team, ork rooms role --room ${room.id}
+--member MEMBER --role ROLE, or assumed on the fly with ork progress --session YOUR_ACTUAL_SESSION_ID --role ROLE.
+
+You own planning, assignment, resolving conflicts, and reviewing results for your branch. Keep the
+conversation available while workers run. Prefer bounded, useful tasks over spawning a preset team
+without work. Check native tools and the live model catalog and quota before choosing workers.
+Existing peer presence does not make a peer available; do not commandeer unrelated sessions.
+
+All descendants belong to this SAME room. Add workers with --parent ${memberId}. The room has
+${room.swarm.maxAgents} member slots shared by all branches and a maximum depth of ${room.swarm.maxDepth}.
+These are roster limits, not hard spending caps. Task deadlines and invocation allowances still apply.
+Never create a new room or dispatch outside this room to evade its limits.
+
+For a substantial independent branch, add a member using your own engine, then use ork rooms lead
+--room ${room.id} --member MEMBER --objective 'bounded outcome'. It reserves a native lead and returns
+its brief. Spawn it ONCE only for native_handoff, using your native subagent tool. Bind the actual
+native session ID; if the tool returns only a handle, supervise that handle and let the child bind
+its own session. Never use a tool handle or nickname as a guessed session ID.
+Use inherited model settings unless an explicit, supported model choice is authorized. Leads may
+repeat this within the shared room limits. Never launch a peer CLI inside an audited worker job.
+
+Leaf work uses ork rooms init-task and dispatch, which preserve the existing runner's scope, leases,
+deadlines, evidence and review. Native workers use --transport native and your native supervision
+tools; other harnesses use executor transport. Use background dispatch and return to the user while
+work runs. Do not hold a writer lease as a lead while waiting for children to edit that checkout.
+Resolve write ownership before work begins; independent concurrent edits need separate worktrees
+and explicit integration ownership. For this room, mutating worker runs remain serialized.
+
+Read results, recover finished runs and verify acceptance before declaring success. A lead's idle or
+reported complete status is not acceptance. Use the existing workboard for native lead assignments
+and review; do not duplicate coordinator tasks there. Report blockers to your parent through native
+messaging. A root coordinator reports the combined verified outcome to the user.
+
+When the user redirects or pauses a branch, stop new dispatch with ork rooms pause. This does not
+interrupt active work: use native interruption for native handles and coordinator cancellation for
+executor runs you own, then collect their results. Never stop another user's terminal or process.
+`;
+}
+
+export async function writeCoordinatorBrief(room, { root = mailboxRoot() } = {}) {
+  const directory = path.join(root, "swarm-briefs", room.id);
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  const target = path.join(directory, "conductor.md");
+  await writeFile(target, coordinatorBrief(room, "conductor"), { mode: 0o600 });
+  return target;
+}
+
+export async function reserveLead(
+  id,
+  memberId,
+  objective,
+  { root = mailboxRoot(), workforceRole, cwd } = {},
+) {
+  if (typeof objective !== "string" || !objective.trim() || objective.length > 12_000)
+    throw new Error("A lead needs an objective of 1–12000 characters");
+  if (memberId === "conductor") throw new Error("The root coordinator is already a lead");
+  const normalizedRole =
+    workforceRole === undefined ? undefined : normalizeWorkforceRole(workforceRole);
+  const normalizedCwd = await resolveCwd(cwd);
+  let isNew = false;
+  const room = await updateRoom(
+    id,
+    (current) => {
+      if (!current.swarm) throw new Error("Native leads require a conversational swarm room");
+      requireActiveBranch(current, memberId);
+      const member = memberOf(current, memberId);
+      const parent = memberOf(current, member.parent || "conductor");
+      if (member.engine !== parent.engine)
+        throw new Error(
+          "Subswarm leads use their parent's native harness; cross-harness agents are workers",
+        );
+      if (member.dispatch) throw new Error("An audited worker cannot become a lead");
+      if (member.role === "lead" && member.objective !== objective)
+        throw new Error(
+          "A lead already has an assignment; use its native conversation to redirect it",
+        );
+      isNew = member.role !== "lead";
+      member.role = "lead";
+      member.objective = objective;
+      if (normalizedRole) member.workforceRole = normalizedRole;
+      if (normalizedCwd) member.cwd = normalizedCwd;
+      member.status = "reserved";
+      return current;
+    },
+    { root },
+  );
+  const member = memberOf(room, memberId);
+  const directory = path.join(root, "swarm-briefs", room.id);
+  let briefPath = path.join(directory, `${memberId}.md`);
+  const brief = coordinatorBrief(room, memberId);
+  try {
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    await writeFile(briefPath, brief, { mode: 0o600 });
+  } catch {
+    // The inline brief still delivers this reservation if its optional file cannot be saved.
+    briefPath = null;
+  }
+  let status = isNew ? "native_handoff" : "pending_attachment";
+  let next = isNew
+    ? "Spawn once through your native tools, then bind its actual session before any retry."
+    : "An earlier reservation has no attached session. Recover its outcome through native tools; do not spawn again.";
+  if (member.session) {
+    status = "attached";
+    next = "Continue supervising the existing native session; do not spawn again.";
+  }
+  return {
+    status,
+    member: memberId,
+    engine: member.engine,
+    session: member.session || null,
+    briefPath,
+    brief,
+    next,
+  };
+}
+
+export async function pauseBranch(
+  id,
+  memberId = "conductor",
+  isPaused = true,
+  { root = mailboxRoot() } = {},
+) {
+  return updateRoom(
+    id,
+    (room) => {
+      memberOf(room, memberId).paused = isPaused;
+      return room;
+    },
+    { root },
+  );
+}
+
+export async function resumeBranch(id, memberId = "conductor", options = {}) {
+  return pauseBranch(id, memberId, false, options);
+}
+
+export async function assignWorkforceRole(id, memberId, role, { root = mailboxRoot(), cwd } = {}) {
+  if (role === undefined && cwd === undefined)
+    throw new Error("Supply a workforce --role or --cwd to update the member");
+  const isClearingRole =
+    typeof role === "string" && ["", "none", "clear"].includes(role.trim().toLowerCase());
+  const normalizedRole =
+    role === undefined || isClearingRole ? undefined : normalizeWorkforceRole(role);
+  const normalizedCwd = await resolveCwd(cwd);
+  return updateRoom(
+    id,
+    (room) => {
+      const member = memberOf(room, memberId);
+      if (isClearingRole) delete member.workforceRole;
+      else if (normalizedRole) member.workforceRole = normalizedRole;
+      if (normalizedCwd) member.cwd = normalizedCwd;
+      return room;
+    },
+    { root },
+  );
+}
+
+const authorityCache = new Map();
+const AUTHORITY_TTL_MS = 5000;
+
 /** The team's current lead and generation; the authority record is written only by authority.py. */
 export async function authorityShow(team) {
+  const now = Date.now();
+  const cached = authorityCache.get(team);
+  if (cached && now - cached.fetchedAt < AUTHORITY_TTL_MS) {
+    return cached.value;
+  }
   try {
     const { stdout } = await execute("python3", [authorityPath, "show", "--team", team], {
       maxBuffer: 8 * 1024 * 1024,
       timeout: 30_000,
     });
     const { authority } = JSON.parse(stdout);
-    return {
+    const value = {
       team,
       generation: authority.generation,
       status: authority.status,
       lead: authority.lead,
       offer: authority.offer?.to,
     };
+    authorityCache.set(team, { fetchedAt: now, value });
+    return value;
   } catch (error) {
     return { team, error: error.stderr?.trim() || error.message };
   }
@@ -71,27 +359,143 @@ export async function coordinator(args) {
   }
 }
 
-async function roomTasks(requests) {
-  const script = fileURLToPath(
-    new URL("../skills/orchestrate/scripts/room_tasks.py", import.meta.url),
-  );
-  return new Promise((resolve, reject) => {
-    const child = execFile(
-      "python3",
-      [script],
-      { maxBuffer: 16 * 1024 * 1024, timeout: 30_000 },
-      (error, stdout, stderr) => {
-        if (error) return reject(new Error(stderr?.trim() || error.message, { cause: error }));
-        try {
-          resolve(JSON.parse(stdout));
-        } catch (parseError) {
-          reject(parseError);
-        }
-      },
-    );
-    child.stdin.on("error", () => {});
-    child.stdin.end(JSON.stringify(requests));
+function compactTask(task) {
+  if (!isPlainObject(task)) throw new Error("expected JSON object");
+  if (task.schema !== "agent-executor.task.v1") throw new Error("unsupported task schema");
+  const { runs, decisions } = task;
+  if (!Array.isArray(runs) || !Array.isArray(decisions))
+    throw new Error("Task runs and decisions must be lists");
+  const result = {};
+  for (const key of ["schema", "task_id", "repository", "updated_at", "authority"]) {
+    if (Object.hasOwn(task, key)) result[key] = task[key];
+  }
+  if (isPlainObject(task.task_spec)) {
+    result.task_spec = { objective: task.task_spec.objective };
+  }
+  result.runs = runs.filter(isPlainObject).map((run) => {
+    const picked = {};
+    for (const field of RUN_FIELDS) {
+      if (Object.hasOwn(run, field)) picked[field] = run[field];
+    }
+    return picked;
   });
+  result.decisions = decisions.filter(isPlainObject).map((decision) => {
+    const picked = {};
+    for (const field of ["run_id", "decision"]) {
+      if (Object.hasOwn(decision, field)) picked[field] = decision[field];
+    }
+    return picked;
+  });
+  return result;
+}
+
+async function loadCompactedTask(directory) {
+  const resolvedDir = await realpath(directory);
+  const raw = JSON.parse(await readFile(path.join(resolvedDir, "task.json"), "utf8"));
+  if (!isPlainObject(raw)) throw new Error("expected JSON object");
+  if (!raw.authority) {
+    const authority = await readOptionalJson(path.join(resolvedDir, "authority.json"));
+    if (authority) raw.authority = authority;
+  }
+  if (Array.isArray(raw.runs)) {
+    const topReady = await readOptionalJson(path.join(resolvedDir, "ready.json"));
+    for (const run of raw.runs) {
+      if (
+        !isPlainObject(run) ||
+        typeof run.run_id !== "string" ||
+        !run.run_id ||
+        run.transport !== "native" ||
+        run.process_identity
+      )
+        continue;
+      const ready =
+        (await readOptionalJson(path.join(resolvedDir, "runs", run.run_id, "ready.json"))) ||
+        (topReady?.run_id === run.run_id ? topReady : null);
+      if (ready?.run_id !== run.run_id) {
+        continue;
+      }
+
+      if (ready.pid !== undefined) run.pid = ready.pid;
+      if (ready.process_identity !== undefined) run.process_identity = ready.process_identity;
+    }
+  }
+  return compactTask(raw);
+}
+
+async function projectMemberTask(cwd, member, task) {
+  const binding = member.dispatch;
+  if (
+    !isPlainObject(task) ||
+    task.schema !== "agent-executor.task.v1" ||
+    task.task_id !== binding.taskId ||
+    typeof task.repository !== "string"
+  )
+    throw new Error("Task identity changed");
+  const expectedCwd = typeof member.cwd === "string" && member.cwd ? member.cwd : cwd;
+  const [resolvedRepo, resolvedExpected] = await Promise.all([
+    realpath(task.repository),
+    realpath(expectedCwd),
+  ]);
+  if (resolvedRepo !== resolvedExpected) throw new Error("Task identity changed");
+  if (!Array.isArray(task.runs) || !Array.isArray(task.decisions))
+    throw new Error("Task runs and decisions must be lists");
+  const matches = task.runs.filter(
+    (run) => isPlainObject(run) && run.request_id === binding.requestId,
+  );
+  if (matches.length !== 1)
+    throw new Error("Dispatch has no unique recorded run; retry the same dispatch to recover");
+  const run = matches[0];
+  if (typeof run.run_id !== "string" || !run.run_id) throw new Error("Run identity changed");
+  if (binding.runId && run.run_id !== binding.runId) throw new Error("Run identity changed");
+  if (run.engine !== member.engine || run.transport !== binding.transport)
+    throw new Error("Run executor differs from room member");
+  const decisions = task.decisions.filter(
+    (decision) => isPlainObject(decision) && decision.run_id === run.run_id,
+  );
+  const verdict = (decisions.length > 0 ? decisions.at(-1).decision : null) || "pending";
+  let state = TASK_STATES[run.status] || "unknown";
+  if (run.runner_status && run.runner_status !== "completed") state = "failed";
+  state = TASK_VERDICTS[verdict] || state;
+  const spec = isPlainObject(task.task_spec) ? task.task_spec : null;
+  return {
+    run,
+    status: state,
+    verdict,
+    observedAt: task.updated_at,
+    objective: spec ? spec.objective : null,
+  };
+}
+
+async function roomTasks(request) {
+  const tasks = { ...request.tasks };
+  const errors = { ...request.errors };
+  const members = {};
+  for (const member of request.members) {
+    const directory = member.dispatch.taskDir;
+    if (!Object.hasOwn(tasks, directory) && !Object.hasOwn(errors, directory)) {
+      try {
+        tasks[directory] = await loadCompactedTask(directory);
+      } catch (error) {
+        errors[directory] = error.message;
+      }
+    } else if (Object.hasOwn(tasks, directory)) {
+      try {
+        tasks[directory] = compactTask(tasks[directory]);
+      } catch (error) {
+        delete tasks[directory];
+        errors[directory] = error.message;
+      }
+    }
+    try {
+      if (Object.hasOwn(errors, directory)) throw new Error(errors[directory]);
+      members[member.id] = {
+        projection: await projectMemberTask(request.cwd, member, tasks[directory]),
+      };
+    } catch (error) {
+      members[member.id] = { error: error.message };
+    }
+  }
+  return { tasks, members };
 }
 
 export async function listRooms(root = mailboxRoot()) {
@@ -124,13 +528,19 @@ export async function newRoom(
     group,
     title,
     authority,
-    swarm,
+    swarm = { maxAgents: 64, maxDepth: 8 },
     objective,
     engine,
     root = mailboxRoot(),
   } = {},
 ) {
-  const room = createRoom(members, { id, cwd: await realpath(cwd || process.cwd()) });
+  const conductorEngine = engine || members?.[0]?.engine || "codex";
+  const room = createRoom(members, {
+    id,
+    cwd: await realpath(cwd || process.cwd()),
+    swarm,
+    engine: conductorEngine,
+  });
   room.group = group || path.basename(room.cwd);
   room.title = title || room.id;
   room.machine = hostname();
@@ -139,7 +549,7 @@ export async function newRoom(
     room.swarm = swarm;
     room.objective = objective || "";
     room.conductor = {
-      engine,
+      engine: conductorEngine,
       role: "lead",
       status: "awaiting session",
       ...(room.conductor?.worktree && { worktree: room.conductor.worktree }),
@@ -161,12 +571,6 @@ export async function growRoom(
     (room) => addMembers(room, members, { parent, workforceRole: options.workforceRole, cwd }),
     { root },
   );
-}
-
-function memberOf(room, id) {
-  const member = id === "conductor" ? room.conductor : room.agents.find((agent) => agent.id === id);
-  if (!member) throw new Error(`Unknown member: ${id}`);
-  return member;
 }
 
 /** An explicit binding is a session reference, never permission to prompt that session. */
@@ -451,7 +855,6 @@ export async function observeRoom(
       if (dispatched.length === 1) {
         projections.set(dispatched[0].id, { error: error.message });
       } else {
-        // Isolate oversized or otherwise unreadable tasks if a batch cannot be projected.
         for (const member of dispatched) {
           try {
             await project([member]);
@@ -493,6 +896,7 @@ export async function observeRoom(
   if (room.swarm) {
     const snapshots = await progress(room, root);
     for (const member of [room.conductor, ...room.agents]) {
+      if (!member) continue;
       const key = member === room.conductor ? "conductor" : member.id;
       const snapshot = snapshots[key];
       if (snapshot) {
@@ -506,43 +910,198 @@ export async function observeRoom(
       } else if (member.session && !member.dispatch) member.status = "session unavailable";
     }
   }
-  for (const member of [room.conductor, ...room.agents]) {
-    if (!member) continue;
-    const detected =
-      resolveMemberWorktree(member, room.cwd) ||
-      (member === room.conductor && !member.cwd
-        ? detectWorktree(room.cwd, member.worktree, room.cwd)
-        : undefined);
-    if (detected) member.worktree = detected;
-  }
-  return room;
+  return refreshMemberWorktrees(room);
 }
 
-async function interactiveProgress(room, root) {
-  if (
-    [room.conductor, ...room.agents].every((member) => !(member?.session || member?.mailboxSession))
-  )
-    return {};
-  const script = fileURLToPath(
-    new URL("../skills/orchestrate/scripts/swarm_status.py", import.meta.url),
+function sessionKey(session) {
+  if (typeof session !== "string" || !SESSION_ID_RE.test(session)) return null;
+  const key = session.replaceAll(":", "%3A");
+  if (session === session.toLowerCase() && key.length <= 128) return key;
+  const digest = createHash("sha1").update(session).digest("hex").slice(0, 10);
+  return `${key.slice(0, 128)}~${digest}`;
+}
+
+function cleanLine(value) {
+  if (typeof value !== "string") return "";
+  return [...value]
+    .map((char) => {
+      const code = char.codePointAt(0);
+      return code >= 32 && code !== 127 ? char : " ";
+    })
+    .join("")
+    .trim()
+    .replaceAll(/\s+/gu, " ")
+    .slice(0, 240);
+}
+
+function parseStampMs(value) {
+  if (typeof value !== "string" || !value) return NaN;
+  return Date.parse(value);
+}
+
+function pidAlive(pid) {
+  if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 0) return null;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === "EPERM";
+  }
+}
+
+function isValidPeer(peer) {
+  return (
+    isPlainObject(peer) &&
+    peer.schema === "agent-executor.peer.v1" &&
+    typeof peer.session === "string" &&
+    typeof peer.name === "string" &&
+    typeof peer.harness === "string" &&
+    typeof peer.cwd === "string" &&
+    Number.isFinite(parseStampMs(peer.startedAt)) &&
+    Number.isFinite(parseStampMs(peer.lastSeenAt))
   );
-  return new Promise((resolve) => {
-    const child = execFile(
-      "python3",
-      [script],
-      { timeout: 5000, maxBuffer: 1024 * 1024 },
-      (error, stdout) => {
-        if (error) return resolve({});
-        try {
-          resolve(JSON.parse(stdout));
-        } catch {
-          resolve({});
-        }
-      },
-    );
-    child.stdin.on("error", () => {});
-    child.stdin.end(JSON.stringify({ room, root }));
-  });
+}
+
+function isPeerLive(peer, nowMs = Date.now()) {
+  const seenMs = parseStampMs(peer.lastSeenAt || peer.startedAt);
+  if (!Number.isFinite(seenMs)) return false;
+  const alive = pidAlive(peer.pid);
+  if (alive === false) return false;
+  const ageMs = nowMs - seenMs;
+  if (ageMs > MAX_PEER_AGE_MS) return false;
+  if (alive && peer.sharedProcess) {
+    if (peer.state === "idle") return ageMs <= SHARED_PROCESS_IDLE_TTL_MS;
+    if (peer.state === "busy") return ageMs <= SHARED_PROCESS_BUSY_TTL_MS;
+  }
+  return alive ?? ageMs <= UNKNOWN_PID_TTL_MS;
+}
+
+function repositoryName(peer) {
+  const raw = peer.repo || peer.checkout || peer.cwd || "";
+  const base = path.basename(raw);
+  return base === ".git" ? path.basename(path.dirname(raw)) : base;
+}
+
+async function readProgressRecord(root, key, peer, peerCwd, currentHost) {
+  const candidates = [
+    path.join(root, "progress", `${key}.json`),
+    path.join(path.dirname(root), "progress-v1", `${key}.json`),
+    path.join(cacheHome(), "progress-v1", `${key}.json`),
+  ];
+  for (const candidate of candidates) {
+    const row = await readOptionalJson(candidate, 8192);
+    if (!row) continue;
+    if (
+      row.schema !== "orchestrate.progress.v1" ||
+      row.session !== peer.session ||
+      row.harness !== peer.harness ||
+      row.machine !== currentHost ||
+      (row.accountHome ?? undefined) !== (peer.accountHome ?? undefined) ||
+      row.checkout !== peerCwd ||
+      !PROGRESS_STAGES.has(row.stage) ||
+      (row.role !== undefined && row.role !== null && !Object.hasOwn(WORKFORCE_ROLES, row.role)) ||
+      typeof row.goal !== "string" ||
+      !row.goal.trim() ||
+      row.goal.length > 160 ||
+      typeof row.task !== "string" ||
+      !row.task.trim() ||
+      row.task.length > 160
+    ) {
+      continue;
+    }
+    const updatedMs = parseStampMs(row.updatedAt);
+    if (!Number.isFinite(updatedMs)) continue;
+    const ageMs = Date.now() - updatedMs;
+    if (ageMs < -5 * 60 * 1000) continue;
+    return {
+      ...row,
+      stale: row.stage !== "complete" && ageMs > PROGRESS_STALE_AFTER_MS,
+    };
+  }
+  return null;
+}
+
+export async function interactiveProgress(room, root = mailboxRoot()) {
+  const members = [
+    ...(room.conductor ? [{ ...room.conductor, id: "conductor" }] : []),
+    ...(Array.isArray(room.agents) ? room.agents : []),
+  ];
+  if (members.every((member) => !(member?.session || member?.mailboxSession))) return {};
+  const currentHost = hostname();
+  const roomCwd = room.cwd ? await resolveCwd(room.cwd) : "";
+  const result = {};
+  for (const member of members) {
+    let binding = member.session;
+    if (!binding && member.mailboxSession) {
+      binding = {
+        id: member.mailboxSession,
+        engine: member.engine,
+        machine: room.machine,
+      };
+    }
+    if (
+      !binding ||
+      typeof binding.id !== "string" ||
+      !binding.id ||
+      binding.machine !== currentHost
+    )
+      continue;
+    const key = sessionKey(binding.id);
+    if (!key) continue;
+    const expectedHarness = binding.engine === "agy" ? "gemini" : binding.engine;
+    const peer = await readOptionalJson(path.join(root, "peers", `${key}.json`), 64 * 1024);
+    if (!isValidPeer(peer) || peer.session !== binding.id) continue;
+    if (expectedHarness && peer.harness !== expectedHarness) continue;
+    if (!isPeerLive(peer)) continue;
+    const expectedCwd = await resolveCwd(binding.cwd || member.cwd || room.cwd);
+    const peerCwd = await resolveCwd(peer.checkout || peer.cwd);
+    if (!peerCwd || (peerCwd !== expectedCwd && peerCwd !== roomCwd)) continue;
+    const name = peer.name;
+    if (!name || cleanLine(name) !== name) continue;
+    const progress = await readProgressRecord(root, key, peer, peerCwd, currentHost);
+    let goal = room.title && room.title !== room.id ? cleanLine(room.title) : "";
+    let isManual = false;
+    if (!goal && progress) {
+      goal = cleanLine(progress.goal);
+      isManual = true;
+    }
+    let task;
+    let stage = "";
+    if (progress) {
+      task = cleanLine(progress.task);
+      stage = progress.stage;
+      isManual = true;
+    } else {
+      task = cleanLine(peer.focus);
+    }
+    let health = goal && task && stage ? "fresh" : "missing";
+    if (isManual && progress?.stale) {
+      health = "stale";
+      stage = `${stage || "not set"} (stale)`;
+    }
+    const repo = cleanLine(peer.repository || repositoryName(peer)) || "not set";
+    const role = progress?.role || member.workforceRole;
+    const color =
+      STATUS_COLORS[createHash("sha256").update(binding.id).digest()[0] % STATUS_COLORS.length];
+    result[member.id] = {
+      name,
+      color,
+      model: cleanLine(peer.model) || "—",
+      effort: cleanLine(peer.effort) || "—",
+      repo,
+      repository: repo,
+      cwd: peerCwd,
+      ...(role && { role }),
+      goal: goal || "not set",
+      task: task || "not set",
+      stage: stage || "not set",
+      statusHealth: health,
+      reportedAt: progress ? progress.updatedAt : null,
+      lastSeenAt: peer.lastSeenAt || null,
+      startedAt: peer.startedAt || null,
+    };
+  }
+  return result;
 }
 
 export async function recoverRoom(id, options = {}) {

@@ -1529,7 +1529,7 @@ else:
         self.assertEqual(second["cache"]["status"], "hit")
         self.assertEqual(refreshed["cache"]["status"], "refreshed")
         self.assertEqual(count_path.read_text(encoding="utf-8").splitlines(), ["agy", "agy"])
-        cache_path = cache_root / "agent-executor" / "models-v1.json"
+        cache_path = cache_root / "orchestrate" / "models-v1.json"
         self.assertEqual(stat.S_IMODE(cache_path.stat().st_mode), 0o600)
 
     def test_requested_model_miss_refreshes_a_cached_catalog_once(self) -> None:
@@ -2877,7 +2877,7 @@ class SteerTests(unittest.TestCase):
             )[-1]
 
     def test_codex_steer_resumes_the_same_session_under_the_same_contract(self) -> None:
-        cache = self.external_path / "steer-cache" / "agent-executor"
+        cache = self.external_path / "steer-cache" / "orchestrate"
         key = hashlib.sha256(os.fsencode(str(self.repository.path.resolve()))).hexdigest()
         job = self.launch(
             extra_env={"FAKE_RESUME_SLEEP": "1.5", "FAKE_LEASE_PROBE": str(cache / "worktree-locks-v1" / f"{key}.lock")}
@@ -3025,7 +3025,7 @@ class SteerTests(unittest.TestCase):
         self.assertIn(f"--session codex-thread-1 --resume-result {job['result_path']}", str(error))
 
     def test_refuses_a_job_whose_runner_cannot_be_found(self) -> None:
-        cache = self.external_path / "steer-cache" / "agent-executor"
+        cache = self.external_path / "steer-cache" / "orchestrate"
         dead = subprocess.Popen([sys.executable, "-c", "pass"])
         dead.wait()
         cases = {

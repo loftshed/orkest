@@ -2,6 +2,7 @@ import path from "node:path";
 import { parseArgs } from "node:util";
 
 import {
+  assignWorkforceRole,
   bindSession,
   coordinator,
   dispatchMember,
@@ -10,11 +11,12 @@ import {
   listRooms,
   newRoom,
   observeRoom,
+  pauseBranch,
   readLaunchPlan,
   recoverRoom,
+  reserveLead,
 } from "../lib/rooms.mjs";
 import { loadPresets, mailboxRoot, parseTeam, updateRoom } from "../lib/stooges-room.mjs";
-import { assignWorkforceRole, pauseBranch, reserveLead } from "../lib/swarm.mjs";
 
 export const ROOMS_HELP = `ork rooms list [--json]
 ork rooms show --room ID [--json]
@@ -130,6 +132,7 @@ export async function roomsCommand(
         group: values.group,
         title: values.title,
         authority: values.authority,
+        swarm: { maxAgents: 64, maxDepth: 8 },
       });
 
       break;

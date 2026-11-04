@@ -104,6 +104,9 @@ class ClassificationTests(unittest.TestCase):
 
     def test_the_gate_runs_repository_check_scripts_but_nothing_arbitrary(self):
         for command in (
+            ["./scripts/test.sh"],
+            ["./scripts/check.sh"],
+            ["scripts/test.sh"],
             ["bash", "scripts/test.sh"],
             ["node", "scripts/check.js"],
             ["yarn", "lint"],
@@ -111,7 +114,13 @@ class ClassificationTests(unittest.TestCase):
             ["pnpm", "--filter", "@app/web", "test", "src/a.test.ts"],
         ):
             self.assertTrue(GATE.runnable(command), command)
-        for command in (["bash", "-c", "rm -rf x"], ["sh", "deploy.sh"], ["rm", "-rf", "x"], ["node", "-e", "1"]):
+        for command in (
+            ["bash", "-c", "rm -rf x"],
+            ["sh", "deploy.sh"],
+            ["./scripts/deploy.sh"],
+            ["rm", "-rf", "x"],
+            ["node", "-e", "1"],
+        ):
             self.assertFalse(GATE.runnable(command), command)
 
 

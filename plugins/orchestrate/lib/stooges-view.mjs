@@ -1,347 +1,94 @@
 import path from "node:path";
-import { stripVTControlCharacters } from "node:util";
 
 import { renderLine } from "../../monitor/lib/render.mjs";
 import { coalesceMessages, resolveMemberWorktree } from "./stooges-room.mjs";
+import {
+  displayWidth,
+  fit,
+  fitStyled,
+  frame,
+  glyphSet,
+  glyphTier,
+  plain,
+  progressBar,
+  SPINNER,
+  tone,
+  wrapText,
+} from "./tui-box.mjs";
 
-const segments = new Intl.Segmenter(undefined, { granularity: "grapheme" });
-const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-const ESC = String.fromCodePoint(27);
-const ANSI_SGR_PATTERN = new RegExp(String.raw`${ESC}\[[0-9;]*m|[^${ESC}]+`, "gu");
-const COLORS = {
-  cyan: "36",
-  green: "32",
-  yellow: "33",
-  red: "31",
-  dim: "2",
-  bold: "1",
-  inverse: "7",
-  headerBg: "48;5;236;97;1",
-  folderHeader: "48;5;24;97;1",
-};
-
-const GLYPHS = {
-  ascii: {
-    topLeft: "+",
-    topRight: "+",
-    bottomLeft: "+",
-    bottomRight: "+",
-    horizontal: "-",
-    vertical: "|",
-    separator: "-",
-    filled: "#",
-    empty: ".",
-    running: ">",
-    blocked: "!",
-    completed: "+",
-    idle: "-",
-  },
-  unicode: {
-    topLeft: "┌",
-    topRight: "┐",
-    bottomLeft: "└",
-    bottomRight: "┘",
-    horizontal: "─",
-    vertical: "│",
-    separator: "┄",
-    filled: "█",
-    empty: "░",
-    running: SPINNER[0],
-    blocked: "⚠",
-    completed: "✓",
-    idle: "·",
-  },
-  nerd: {
-    topLeft: "╭",
-    topRight: "╮",
-    bottomLeft: "╰",
-    bottomRight: "╯",
-    horizontal: "─",
-    vertical: "│",
-    separator: "┄",
-    filled: "█",
-    empty: "░",
-    running: "󰔛",
-    blocked: "󰀪",
-    completed: "󰄬",
-    idle: "󰘓",
-  },
-};
-
-/** Use explicit Nerd Font selection; otherwise stay with Unicode or an ASCII-safe locale. */
-export function glyphTier(env = process.env) {
-  const requested = env.ORK_GLYPHS?.toLowerCase();
-  if (Object.hasOwn(GLYPHS, requested)) return requested;
-  const locale = String(env.LC_ALL || env.LC_CTYPE || env.LANG || "").toLowerCase();
-  if (env.TERM === "dumb" || !/(?:utf-?8|utf8)/u.test(locale)) return "ascii";
-  return "unicode";
-}
-
-export function glyphSet(tier = glyphTier()) {
-  return GLYPHS[Object.hasOwn(GLYPHS, tier) ? tier : "unicode"];
-}
-
-// Provider output is data. Strip terminal controls before adding our own ANSI styling.
-export function plain(value) {
-  return stripVTControlCharacters(String(value ?? "")).replaceAll(
-    /[\p{Cc}\p{Cf}]/gu,
-    (character) => (character === "\u{200C}" || character === "\u{200D}" ? character : " "),
-  );
-}
-
-function cellWidth(grapheme) {
-  if (
-    /[\u{1F1E6}-\u{1F1FF}]/u.test(grapheme) ||
-    /\p{Extended_Pictographic}/u.test(grapheme) ||
-    /[\u{FE0F}\u{20E3}]/u.test(grapheme)
-  )
-    return 2;
-  const cp = grapheme.codePointAt(0);
-  if (
-    cp >= 4352 &&
-    (cp <= 4447 ||
-      (cp >= 11_904 && cp <= 12_663) ||
-      (cp >= 12_864 && cp <= 12_895) ||
-      (cp >= 13_312 && cp <= 19_823) ||
-      (cp >= 19_968 && cp <= 20_367) ||
-      (cp >= 20_880 && cp <= 21_471) ||
-      (cp >= 21_472 && cp <= 23_199) ||
-      (cp >= 23_552 && cp <= 25_919) ||
-      (cp >= 25_920 && cp <= 26_047) ||
-      (cp >= 26_112 && cp <= 26_143) ||
-      (cp >= 26_144 && cp <= 26_527) ||
-      (cp >= 26_528 && cp <= 26_559) ||
-      (cp >= 26_560 && cp <= 27_103) ||
-      (cp >= 27_136 && cp <= 27_167) ||
-      (cp >= 27_200 && cp <= 27_231) ||
-      (cp >= 27_264 && cp <= 27_295) ||
-      (cp >= 27_328 && cp <= 27_423) ||
-      (cp >= 27_456 && cp <= 27_487) ||
-      (cp >= 27_520 && cp <= 27_583) ||
-      (cp >= 27_616 && cp <= 28_671) ||
-      (cp >= 28_672 && cp <= 30_719) ||
-      (cp >= 30_720 && cp <= 30_783) ||
-      (cp >= 30_784 && cp <= 31_967) ||
-      (cp >= 31_968 && cp <= 32_767) ||
-      (cp >= 32_768 && cp <= 33_583) ||
-      (cp >= 33_584 && cp <= 34_047) ||
-      (cp >= 34_048 && cp <= 34_815) ||
-      (cp >= 44_032 && cp <= 55_203) ||
-      (cp >= 63_744 && cp <= 64_255) ||
-      (cp >= 65_040 && cp <= 65_135) ||
-      (cp >= 65_281 && cp <= 65_376) ||
-      (cp >= 131_072 && cp <= 262_141))
-  )
-    return 2;
-  return /^\p{Mark}+$/u.test(grapheme) ? 0 : 1;
-}
-
-export function displayWidth(value) {
-  return [...segments.segment(plain(value))].reduce(
-    (sum, { segment }) => sum + cellWidth(segment),
-    0,
-  );
-}
-
-export function fit(value, width) {
-  width = Math.max(0, Math.floor(width));
-  let text = "";
-  let used = 0;
-  const graphemes = segments.segment(plain(value));
-  for (const { segment } of graphemes) {
-    const size = cellWidth(segment);
-    if (used + size > width) break;
-    text += segment;
-    used += size;
-  }
-  return text + " ".repeat(width - used);
-}
-
-export function wrapText(value, width) {
-  width = Math.max(1, Math.floor(width));
-  const output = [];
-  let line = "";
-  const tokens = plain(value).match(/\s*\S+/gu) || [];
-  for (const token of tokens) {
-    const candidate = line + token;
-    if (line && displayWidth(candidate) > width) {
-      output.push(line.trimEnd());
-      line = "";
-    }
-    let word = line ? token : token.trimStart();
-    const graphemes = segments.segment(word);
-    for (const { segment } of graphemes) {
-      if (cellWidth(segment) > width) {
-        if (line) output.push(line);
-        output.push("?");
-        line = "";
-        continue;
-      }
-      if (line && displayWidth(line + segment) > width) {
-        output.push(line);
-        line = "";
-      }
-      line += segment;
-    }
-  }
-  if (line || output.length === 0) output.push(line);
-  return output;
-}
-
-export function progressBar(value, width, tier = glyphTier()) {
-  const glyphs = glyphSet(tier);
-  width = Math.max(0, Math.floor(width));
-  const ratio = Math.max(0, Math.min(1, Number(value) || 0));
-  const eighths = Math.round(ratio * width * 8);
-  const full = Math.floor(eighths / 8);
-  if (tier === "ascii") {
-    const cells = Math.round(eighths / 8);
-    return glyphs.filled.repeat(cells) + glyphs.empty.repeat(width - cells);
-  }
-  const partial = eighths % 8;
-  const fraction = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"][partial];
-  const empty = Math.max(0, width - full - Number(Boolean(fraction)));
-  return glyphs.filled.repeat(full) + fraction + glyphs.empty.repeat(empty);
-}
-
-function ansi(value, tone, color) {
-  const text = plain(value);
-  const codes = String(tone)
-    .split(/\s+/u)
-    .map((name) => COLORS[name])
-    .filter(Boolean);
-  if (!color || codes.length === 0) return text;
-  return `\u{1B}[${codes.join(";")}m${text}\u{1B}[0m`;
-}
-
-function fitStyled(value, width) {
-  width = Math.max(0, Math.floor(width));
-  const source = String(value ?? "");
-  const tokens = source.match(ANSI_SGR_PATTERN) || [];
-  let output = "";
-  let used = 0;
-  let isStyled = false;
-  for (const token of tokens) {
-    if (token.startsWith(`${ESC}[`)) {
-      output += token;
-      isStyled = !token.startsWith(`${ESC}[0m`);
-      continue;
-    }
-    const graphemes = segments.segment(plain(token));
-    for (const { segment } of graphemes) {
-      const size = cellWidth(segment);
-      if (!(used + size <= width)) {
-        continue;
-      }
-
-      output += segment;
-      used += size;
-    }
-  }
-  if (used < width) output += " ".repeat(width - used);
-  if (isStyled) output += "\u{1B}[0m";
-  return output;
-}
-
-function frame(
-  title,
-  lines,
-  width,
-  { glyphs = glyphSet(), color = false, right = "", headerTone } = {},
-) {
-  width = Math.max(1, Math.floor(width));
-  if (width < 4) return [title, ...lines].map((line) => fit(line, width));
-  const inside = width - 2;
-  const cleanTitle = ` ${plain(title)} `;
-  const cleanRight = right ? ` ${plain(right)} ` : "";
-  const availableTitle = Math.max(0, inside - displayWidth(cleanRight));
-  const heading = fit(cleanTitle, availableTitle);
-  const tail = fit(cleanRight, inside - displayWidth(heading));
-  const topContent = heading + tail;
-  const topRemaining = Math.max(0, inside - displayWidth(topContent));
-  let top;
-  if (color && headerTone) {
-    const titlePill = fit(cleanTitle, Math.min(displayWidth(cleanTitle), availableTitle));
-    const middleSpace = " ".repeat(Math.max(0, availableTitle - displayWidth(titlePill)));
-    const styledTail = ansi(tail, tail.trim() ? headerTone : "cyan", color);
-    top = `${ansi(glyphs.topLeft, "cyan", color)}${ansi(titlePill, headerTone, color)}${ansi(middleSpace, "cyan", color)}${styledTail}${ansi(glyphs.horizontal.repeat(topRemaining) + glyphs.topRight, "cyan", color)}`;
-  } else {
-    top = ansi(
-      glyphs.topLeft + topContent + glyphs.horizontal.repeat(topRemaining) + glyphs.topRight,
-      "cyan",
-      color,
-    );
-  }
-  return [
-    top,
-    ...lines.map(
-      (line) =>
-        `${ansi(glyphs.vertical, "cyan", color)}${fitStyled(line, inside)}${ansi(glyphs.vertical, "cyan", color)}`,
-    ),
-    ansi(
-      `${glyphs.bottomLeft}${glyphs.horizontal.repeat(inside)}${glyphs.bottomRight}`,
-      "cyan",
-      color,
-    ),
-  ];
-}
-
-/** Shared framed panel for interactive and non-interactive terminal output. */
-export function renderPanel(title, lines, width, options = {}) {
-  const margin = Math.min(1, Math.floor((Math.max(1, width) - 1) / 2));
-  const panelWidth = Math.max(1, Math.floor(width) - margin * 2);
-  return frame(title, lines.map(plain), panelWidth, options).map(
-    (line) => `${" ".repeat(margin)}${line}`,
-  );
-}
-
-/** Fit weighted cells into a fixed width, keeping separators inside the available space. */
-export function renderTable(
-  headers,
-  rows,
-  width,
-  { weights = [], tier = glyphTier(), rowDetails = [], rowStyle } = {},
-) {
-  width = Math.max(headers.length, Math.floor(width));
-  const separator = ` ${glyphSet(tier).vertical} `;
-  const separatorWidth = displayWidth(separator) * Math.max(0, headers.length - 1);
-  const cellWidthTotal = Math.max(headers.length, width - separatorWidth);
-  const ratios = headers.map((_, index) => Math.max(0.1, Number(weights[index]) || 1));
-  const ratioTotal = ratios.reduce((sum, ratio) => sum + ratio, 0);
-  const widths = ratios.map((ratio) =>
-    Math.max(1, Math.floor((cellWidthTotal * ratio) / ratioTotal)),
-  );
-  let remaining = cellWidthTotal - widths.reduce((sum, cell) => sum + cell, 0);
-  for (let index = 0; remaining > 0; index = (index + 1) % widths.length, remaining--)
-    widths[index]++;
-  while (widths.reduce((sum, cell) => sum + cell, 0) + separatorWidth > width) {
-    const index = widths.indexOf(Math.max(...widths));
-    if (widths[index] <= 1) break;
-    widths[index]--;
-  }
-  const renderRow = (row) => row.map((cell, index) => fit(cell, widths[index])).join(separator);
-  const renderedRows = rows.flatMap((row, rowIndex) => {
-    const cells = row.map((cell, index) => wrapText(cell, widths[index]));
-    const height = Math.max(1, ...cells.map((lines) => lines.length));
-    const lines = Array.from({ length: height }, (_, line) =>
-      cells.map((cellLines, index) => fit(cellLines[line] || "", widths[index])).join(separator),
-    );
-    const detail = rowDetails[rowIndex];
-    if (detail) lines.push(...wrapText(detail, width));
-    return lines.map((line) => (rowStyle ? rowStyle(line, rowIndex) : line));
-  });
-  return [
-    renderRow(headers),
-    widths.map((cell) => glyphSet(tier).separator.repeat(cell)).join(separator),
-    ...renderedRows,
-  ];
-}
+export {
+  ANSI,
+  cellWidth,
+  displayWidth,
+  fit,
+  fitStyled,
+  frame,
+  GLYPHS,
+  glyphSet,
+  glyphTier,
+  plain,
+  progressBar,
+  renderPanel,
+  renderTable,
+  SPINNER,
+  tone,
+  wrapText,
+} from "./tui-box.mjs";
 
 const ACTIVE_STATUSES = new Set(["running", "working", "planning", "testing", "review"]);
+const COMPLETED_STATUSES = new Set(["completed", "reported complete"]);
+const COMPLETED_MODES = ["collapsed", "hidden", "expanded"];
 const ERROR_STATUSES = new Set(["blocked", "failed", "rejected", "session unavailable"]);
+const STAGE_STEPS = {
+  planning: "1/4",
+  running: "2/4",
+  working: "2/4",
+  testing: "3/4",
+  review: "4/4",
+};
+
+function progressSuffix(member, now) {
+  if (!member || member.paused) return "";
+  const parts = [];
+  const step = STAGE_STEPS[member.status];
+  if (step) parts.push(`step ${step}`);
+  if (ACTIVE_STATUSES.has(member.status)) {
+    const timestamps = [
+      member?.progress?.reportedAt,
+      member?.progress?.lastSeenAt,
+      member?.observedAt,
+    ]
+      .map((val) => (val ? Date.parse(val) : NaN))
+      .filter((ms) => Number.isFinite(ms) && ms > 0);
+    const stamp = timestamps.length > 0 ? Math.max(...timestamps) : NaN;
+    if (Number.isFinite(stamp) && now >= stamp) {
+      const ageSec = Math.floor((now - stamp) / 1000);
+      if (ageSec <= 45) parts.push("live");
+      else if (ageSec < 300) parts.push(`${Math.max(1, Math.floor(ageSec / 60))}m ago`);
+      else if (ageSec < 3600) parts.push(`quiet ${Math.floor(ageSec / 60)}m`);
+      else parts.push(`quiet ${Math.floor(ageSec / 3600)}h`);
+    }
+  }
+  return parts.length > 0 ? ` · ${parts.join(" · ")}` : "";
+}
+
+function swarmActivityBadge(room, maxAgents, tier, innerWidth = 80) {
+  const agents = room?.agents || [];
+  const base = `${agents.length}/${maxAgents} slots`;
+  if (agents.length === 0 || innerWidth < 64) return base;
+  const activeCount = agents.filter((a) => ACTIVE_STATUSES.has(a.status)).length;
+  const doneCount = agents.filter((a) => COMPLETED_STATUSES.has(a.status)).length;
+  const blockedCount = agents.filter((a) => ERROR_STATUSES.has(a.status)).length;
+  const check = glyphSet(tier).completed;
+  const parts = [];
+  if (activeCount > 0) parts.push(`${activeCount} active`);
+  if (blockedCount > 0) parts.push(`${blockedCount} blocked`);
+  if (doneCount > 0) parts.push(`${doneCount}${check}`);
+  return parts.length > 0 ? `${parts.join(" · ")} · ${base}` : base;
+}
 
 function toneForStatus(status) {
-  if (status === "completed" || status === "reported complete") return "green";
+  if (COMPLETED_STATUSES.has(status)) return "green";
   if (ACTIVE_STATUSES.has(status)) return "cyan";
   if (ERROR_STATUSES.has(status)) return "red";
   if (status === "queued" || status === "reserved") return "yellow";
@@ -358,23 +105,51 @@ function statusGlyph(agent, now, tier) {
   return glyphs.idle;
 }
 
-function statusLabel(agent, now, tier) {
-  const elapsed = Number.isFinite(agent.startedAt)
-    ? ` ${Math.max(0, Math.floor((now - agent.startedAt) / 1000))}s`
-    : "";
-  return `${statusGlyph(agent, now, tier)} ${agent.status || "unknown"}${elapsed}`;
+function formatCreditSuffix(account) {
+  const credits = account?.credits;
+  if (!credits) return "";
+  if (credits.unlimited) return " · unlimited cr";
+  if (credits.hasCredits && Number.isFinite(credits.balance) && credits.balance > 0) {
+    return ` · ${Math.round(credits.balance).toLocaleString("en-US")} cr`;
+  }
+  return "";
 }
 
-function outputLines(agent) {
-  const output = Array.isArray(agent?.output)
-    ? agent.output
-    : [agent?.output || "Waiting for output"];
-  const lines = output.flatMap((line) =>
-    String(line ?? "")
-      .split(/\r?\n/u)
-      .map(plain),
-  );
-  return lines.length > 0 ? lines : ["Waiting for output"];
+function compactWindowLabel(rawLabel) {
+  const text = plain(rawLabel || "quota").trim();
+  return text
+    .replaceAll(/\bClaude\s*&\s*GPT\b/giu, "Claude/GPT")
+    .replaceAll(/\b5-hour\b/giu, "5h")
+    .replaceAll(/\bweekly\b/giu, "wk")
+    .replaceAll(/\s+/gu, " ")
+    .trim();
+}
+
+function summarizeAccountWindows(windows) {
+  return windows
+    .map((w) => {
+      const label = compactWindowLabel(w.label || w.id || "quota");
+      const pct = Number.isFinite(w.remainingPct)
+        ? `${Math.round(Math.max(0, Math.min(100, w.remainingPct)))}%`
+        : "unavailable";
+      return `${label} ${pct}`;
+    })
+    .join(" · ");
+}
+
+function summarizePoolWindows(group) {
+  const firstLabel = compactWindowLabel(group[0]?.label || group[0]?.id);
+  const prefix = firstLabel.replace(/\s+(?:5h|wk)$/iu, "").trim();
+  const metrics = group
+    .map((w) => {
+      const pct = Number.isFinite(w.remainingPct)
+        ? `${Math.round(Math.max(0, Math.min(100, w.remainingPct)))}%`
+        : "?";
+      const kind = /\b5-?h/iu.test(w.label || w.id || "") ? "5h" : "wk";
+      return `${kind} ${pct}`;
+    })
+    .join(" · ");
+  return prefix ? `${prefix} · ${metrics}` : metrics;
 }
 
 function quotaRows(accounts, width, tier, color) {
@@ -382,40 +157,83 @@ function quotaRows(accounts, width, tier, color) {
   const accountList = accounts || [];
   for (const account of accountList) {
     const windows = Array.isArray(account.windows) ? account.windows : [];
-    const short = account.short || account.id || "?";
+    const short = plain(account.short || account.id || "?");
+    const creditSuffix = formatCreditSuffix(account);
     if (windows.length === 0) {
-      rows.push(plain(`${short} ${renderLine([account]) || "quota unavailable"}`));
+      rows.push(plain(`${short} ${renderLine([account]) || "quota unavailable"}${creditSuffix}`));
       continue;
     }
-    const displayedWindows = windows.slice(0, 3);
-    for (const window of displayedWindows) {
+    if (windows.length === 1 && accountList.length === 1) {
+      const [window] = windows;
       const pct = Number.isFinite(window.remainingPct)
         ? Math.max(0, Math.min(100, window.remainingPct))
         : undefined;
       const label = plain(`${short} ${window.label || window.id || "quota"}`);
-      const suffixWidth = pct === undefined ? 12 : displayWidth(`${Math.round(pct)}% left`) + 1;
-      const barWidth = Math.max(3, Math.min(18, width - displayWidth(label) - suffixWidth - 1));
+      const suffix = pct === undefined ? "unavailable" : `${Math.round(pct)}% left${creditSuffix}`;
+      const barWidth = Math.max(
+        3,
+        Math.min(14, width - displayWidth(label) - displayWidth(suffix) - 2),
+      );
       rows.push(
         pct === undefined
-          ? `${label} unavailable`
-          : `${label} ${ansi(progressBar(pct / 100, barWidth, tier), pct <= 10 ? "red" : "green", color)} ${Math.round(pct)}% left`,
+          ? `${label} ${suffix}`
+          : `${label} ${tone(progressBar(pct / 100, barWidth, tier), pct <= 10 ? "red" : "green", color)} ${suffix}`,
       );
+      continue;
     }
+    const hasPools = windows.some((w) => typeof w.pool === "string" && w.pool.trim());
+    if (hasPools) {
+      const poolGroups = new Map();
+      for (const w of windows) {
+        const poolKey = plain(w.pool || "default").trim();
+        if (!poolGroups.has(poolKey)) poolGroups.set(poolKey, []);
+        poolGroups.get(poolKey).push(w);
+      }
+      for (const [, group] of poolGroups) {
+        const measured = group.filter((w) => Number.isFinite(w.remainingPct));
+        const minPct =
+          measured.length > 0 ? Math.min(100, ...measured.map((w) => w.remainingPct)) : undefined;
+        const pct = minPct === undefined ? undefined : Math.max(0, minPct);
+        const summary = `${summarizePoolWindows(group)}${creditSuffix}`;
+        const barWidth = Math.max(
+          4,
+          Math.min(10, width - displayWidth(short) - displayWidth(summary) - 2),
+        );
+        rows.push(
+          pct === undefined
+            ? `${short} ${summary}`
+            : `${short} ${tone(progressBar(pct / 100, barWidth, tier), pct <= 10 ? "red" : "green", color)} ${summary}`,
+        );
+      }
+      continue;
+    }
+    const primaryCandidates = windows.filter((w) => !w.scope && Number.isFinite(w.remainingPct));
+    const measured =
+      primaryCandidates.length > 0
+        ? primaryCandidates
+        : windows.filter((w) => Number.isFinite(w.remainingPct));
+    const minPct =
+      measured.length > 0 ? Math.min(100, ...measured.map((w) => w.remainingPct)) : undefined;
+    const pct = minPct === undefined ? undefined : Math.max(0, minPct);
+    const summary =
+      windows.length === 1
+        ? `${plain(windows[0].label || windows[0].id || "quota")} ${pct === undefined ? "unavailable" : `${Math.round(pct)}% left`}${creditSuffix}`
+        : `${summarizeAccountWindows(windows)}${creditSuffix}`;
+    const barWidth = Math.max(
+      4,
+      Math.min(10, width - displayWidth(short) - displayWidth(summary) - 2),
+    );
+    rows.push(
+      pct === undefined
+        ? `${short} ${summary}`
+        : `${short} ${tone(progressBar(pct / 100, barWidth, tier), pct <= 10 ? "red" : "green", color)} ${summary}`,
+    );
   }
   return rows.length > 0 ? rows : ["Quota unavailable"];
 }
 
-function statusCounts(agents) {
-  const counts = { completed: 0, running: 0, blocked: 0, failed: 0, queued: 0, other: 0 };
-  for (const agent of agents) counts[counts[agent.status] === undefined ? "other" : agent.status]++;
-  return counts;
-}
-
-function rangeLabel(start, end, total) {
-  return total === 0 ? "0 agents" : `${start + 1}–${end} of ${total} agents`;
-}
-
 function memberWorktree(member, room) {
+  if (member && Object.hasOwn(member, "_cachedWorktree")) return member._cachedWorktree;
   return resolveMemberWorktree(member, room?.cwd);
 }
 
@@ -513,22 +331,34 @@ function joinCardGrid(cards, columns, cardWidth, gap = "  ") {
 }
 
 function treeRoom(room) {
-  if (!room.swarm) return room;
+  const swarm = room.swarm || { maxAgents: 64, maxDepth: 8 };
   const treeAgents = [];
-  const visit = (parent, prefix = "") => {
+  const visited = new Set();
+  const visit = (parent) => {
     const children = room.agents.filter((agent) => (agent.parent || "conductor") === parent);
-    for (const [index, agent] of children.entries()) {
-      const isLast = index === children.length - 1;
-      const worktree = memberWorktree(agent, room);
+    for (const agent of children) {
+      if (visited.has(agent.id)) continue;
+      visited.add(agent.id);
+      const worktree = resolveMemberWorktree(agent, room?.cwd);
       treeAgents.push({
         ...agent,
+        _cachedWorktree: worktree,
         ...(worktree && { worktree }),
-        treePrefix: prefix + (isLast ? "└─ " : "├─ "),
       });
-      visit(agent.id, prefix + (isLast ? " ".repeat(3) : "│  "));
+      visit(agent.id);
     }
   };
   visit("conductor");
+  for (const agent of room.agents) {
+    if (visited.has(agent.id)) continue;
+    visited.add(agent.id);
+    const worktree = resolveMemberWorktree(agent, room?.cwd);
+    treeAgents.push({
+      ...agent,
+      _cachedWorktree: worktree,
+      ...(worktree && { worktree }),
+    });
+  }
   const groups = new Map();
   for (const agent of treeAgents) {
     const folder = agentFolder(agent, room);
@@ -536,29 +366,61 @@ function treeRoom(room) {
     groups.get(folder).push(agent);
   }
   const agents = groups.values().toArray().flat();
-  return { ...room, agents };
+  const conductor = room.conductor
+    ? { ...room.conductor, _cachedWorktree: resolveMemberWorktree(room.conductor, room?.cwd) }
+    : room.conductor;
+  return { ...room, swarm, conductor, agents };
 }
 
 /** pi-tui compatible component: render(width): string[], handleInput(data), invalidate(). */
 export class StoogesView {
-  constructor(room, { now = Date.now, height = 32, color = false, tier = glyphTier() } = {}) {
+  constructor(
+    room,
+    {
+      now = Date.now,
+      height = 32,
+      color = false,
+      tier = glyphTier(),
+      completedMode = "collapsed",
+    } = {},
+  ) {
     this.room = treeRoom(room);
     this.now = now;
     this.height = height;
     this.color = color;
     this.tier = tier;
-    this.focusId = room.agents[0]?.id;
+    this.completedMode = COMPLETED_MODES.includes(completedMode) ? completedMode : "collapsed";
+    this.focusId = this.room.agents[0]?.id;
     this.pinnedId = undefined;
     this.page = 0;
     this.overlay = undefined;
     this.logOffset = 0;
   }
 
+  quotaRowLimit() {
+    if (!this.room.accounts?.length && !this.room.quotaError) return 0;
+    let rowCount = 0;
+    const accounts = this.room.accounts || [];
+    for (const account of accounts) {
+      const windows = Array.isArray(account?.windows) ? account.windows : [];
+      const pools = new Set(
+        windows.map((w) => (typeof w?.pool === "string" ? w.pool.trim() : "")).filter(Boolean),
+      );
+      rowCount += Math.max(1, pools.size);
+    }
+    const total = Math.max(1, rowCount);
+    return this.height < 20 ? Math.min(2, total) : Math.min(8, Math.max(2, total));
+  }
+
   pageSizeFor() {
-    if (this.room.swarm) return Math.min(9, Math.max(2, Math.floor((this.height - 10) / 4) * 2));
-    const questions = Math.min(4, this.room.agents.filter((agent) => agent.question).length);
-    const bodyRows = Math.max(1, this.height - 18 - questions);
-    return Math.min(9, bodyRows);
+    const extraQuotaRows = Math.max(0, this.quotaRowLimit() - 2);
+    const base = Math.min(9, Math.max(2, Math.floor((this.height - 10 - extraQuotaRows) / 4) * 2));
+    if (this.completedMode === "expanded" || this.height < 24) return base;
+    const completedCount = (this.room?.agents || []).filter((agent) =>
+      COMPLETED_STATUSES.has(agent.status),
+    ).length;
+    if (completedCount <= 1) return base;
+    return Math.min(16, Math.max(base, base + completedCount - 1));
   }
 
   get pageSize() {
@@ -566,14 +428,20 @@ export class StoogesView {
   }
 
   get needsAnimation() {
-    return this.room.agents.some((agent) => ACTIVE_STATUSES.has(agent.status));
+    return (
+      this.tier === "unicode" && this.room.agents.some((agent) => ACTIVE_STATUSES.has(agent.status))
+    );
   }
 
   setRoom(room) {
     this.room = treeRoom(room);
-    if (room.agents.every((agent) => agent.id !== this.focusId)) this.focusId = room.agents[0]?.id;
-    if (room.agents.every((agent) => agent.id !== this.pinnedId)) this.pinnedId = undefined;
-    this.page = Math.min(this.page, Math.max(0, Math.ceil(room.agents.length / this.pageSize) - 1));
+    if (this.room.agents.every((agent) => agent.id !== this.focusId))
+      this.focusId = this.room.agents[0]?.id;
+    if (this.room.agents.every((agent) => agent.id !== this.pinnedId)) this.pinnedId = undefined;
+    this.page = Math.min(
+      this.page,
+      Math.max(0, Math.ceil(this.room.agents.length / this.pageSize) - 1),
+    );
   }
 
   marginLines(lines, width) {
@@ -608,12 +476,10 @@ export class StoogesView {
         }
         case "\u{1B}[A":
         case "p": {
-          {
-            this.logOffset = Math.max(0, this.logOffset - 1);
-            // No default
-          }
+          this.logOffset = Math.max(0, this.logOffset - 1);
           break;
         }
+        // No default
       }
       return;
     }
@@ -632,6 +498,16 @@ export class StoogesView {
       if (agent) this.focusId = agent.id;
     } else
       switch (key) {
+        case "c": {
+          const nextIndex =
+            (COMPLETED_MODES.indexOf(this.completedMode) + 1) % COMPLETED_MODES.length;
+          this.completedMode = COMPLETED_MODES[nextIndex];
+          this.page = Math.min(
+            this.page,
+            Math.max(0, Math.ceil(this.room.agents.length / this.pageSize) - 1),
+          );
+          break;
+        }
         case "p": {
           this.pinnedId = this.pinnedId === this.focusId ? undefined : this.focusId;
           break;
@@ -675,6 +551,7 @@ export class StoogesView {
     if (this.overlay === "help") {
       rows = [
         "↑/↓ or 1–9  Select agent",
+        "c           Cycle completed agents (collapse / hide / expand)",
         "n           Next page",
         "p           Pin or unpin focused output",
         "g           Open coalesced room log",
@@ -703,86 +580,14 @@ export class StoogesView {
     return quotaRows(accounts, Math.max(10, width - 4), this.tier, this.color);
   }
 
-  agentRows(width, now, pageSize) {
-    const room = this.room;
-    const start = this.page * pageSize;
-    const visible = room.agents.slice(start, start + pageSize);
-    const focused = this.focusId;
-    const isCompact = width < 48;
-    const isMedium = width < 64;
-    const isStandard = width < 80;
-    let headers;
-    let weights;
-    let rows;
-    let selectedIndex;
-    if (isCompact) {
-      headers = ["#", "Agent / status"];
-      weights = [0.15, 0.85];
-      rows = visible.map((agent, index) => [
-        String(index + 1),
-        `${agent.id} · ${agent.status || "unknown"}`,
-      ]);
-    } else if (isMedium) {
-      headers = ["#", "Agent", "Status"];
-      weights = [0.1, 0.52, 0.38];
-      rows = visible.map((agent, index) => [
-        String(index + 1),
-        agent.id,
-        statusLabel(agent, now, this.tier),
-      ]);
-    } else if (isStandard) {
-      headers = ["#", "Agent", "Model", "Status"];
-      weights = [0.07, 0.27, 0.36, 0.3];
-      rows = visible.map((agent, index) => [
-        String(index + 1),
-        agent.id,
-        `${agent.engine} · ${agent.model}`,
-        statusLabel(agent, now, this.tier),
-      ]);
-    } else {
-      headers = ["#", "Agent", "Engine / model", "Status", "Elapsed"];
-      weights = [0.05, 0.2, 0.35, 0.28, 0.12];
-      rows = visible.map((agent, index) => [
-        String(index + 1),
-        agent.id,
-        `${agent.engine} · ${agent.model}`,
-        statusLabel(agent, now, this.tier),
-        Number.isFinite(agent.startedAt)
-          ? `${Math.max(0, Math.floor((now - agent.startedAt) / 1000))}s`
-          : "—",
-      ]);
-    }
-    const tableWidth = Math.max(headers.length, width - 2);
-    const selectedAgentIndex = visible.findIndex((agent) => agent.id === focused);
-    const table = renderTable(headers, rows, tableWidth, {
-      weights,
-      tier: this.tier,
-      rowDetails: visible.map((agent) => (agent.question ? `? ${plain(agent.question)}` : "")),
-      rowStyle: (line, index) => {
-        const tone = toneForStatus(visible[index]?.status);
-        const isSelected = index === selectedAgentIndex;
-        return ansi(line, `${tone}${isSelected ? " inverse" : ""}`, this.color);
-      },
-    });
-    const headerRows = table.slice(0, 2);
-    selectedIndex = selectedAgentIndex;
-    const panelRows = [
-      ...headerRows.map((line) => ansi(line, "bold", this.color)),
-      ...table.slice(2),
-    ];
-    if (room.agents.length === 0) panelRows.push("No agents queued for this room");
-    const end = Math.min(room.agents.length, start + pageSize);
-    const range = rangeLabel(start, end, room.agents.length);
-    const rangeFooter =
-      room.agents.length > 0 ? `Rows ${start + 1}–${end}/${room.agents.length}` : "Rows 0/0";
-    return {
-      lines: panelRows,
-      range,
-      rangeFooter,
-      visible,
-      selectedIndex,
-      columnCount: headers.length,
-    };
+  folderHeaderLine(folder, count, innerWidth) {
+    const countLabel = `${count} ${count === 1 ? "agent" : "agents"}`;
+    const folderLabel = folder
+      ? `${shortFolder(folder)} · ${countLabel} · ${folder}`
+      : `workspace · ${countLabel}`;
+    const rail = toAsciiTree("│ ", this.tier);
+    const bannerWidth = Math.max(1, innerWidth - displayWidth(rail));
+    return `${tone(rail, "cyan", this.color)}${tone(fit(folderLabel, bannerWidth), "folderHeader", this.color)}`;
   }
 
   render(width) {
@@ -793,71 +598,7 @@ export class StoogesView {
         this.panel("ork", ["Resize terminal to at least 8 rows"], width),
         width,
       );
-    if (this.room.swarm) return this.renderSwarm(width);
 
-    const now = this.now();
-    const room = this.room;
-    const pageSize = this.pageSizeFor();
-    const pageCount = Math.max(1, Math.ceil(room.agents.length / pageSize));
-    this.page = Math.min(this.page, pageCount - 1);
-    const counts = statusCounts(room.agents);
-    const done = counts.completed;
-    const total = room.agents.length;
-    const title = `ork · ${room.id}`;
-    const headerWidth = Math.max(1, width - 2);
-    const barWidth = Math.max(4, Math.min(18, headerWidth - 40));
-    const header = this.panel(
-      title,
-      [
-        `Conductor ${plain(room.conductor?.status || "unknown")} · ${total} agents`,
-        `${done}/${total} complete ${progressBar(total ? done / total : 0, barWidth, this.tier)}`,
-      ],
-      headerWidth,
-      "[?] help",
-    );
-    const quotaLines = this.quotaLines(headerWidth);
-    let quotaLimit = 4;
-    if (this.height < 32) quotaLimit = 2;
-    if (this.height < 24) quotaLimit = 1;
-    const quota = this.panel("Quota", quotaLines.slice(0, quotaLimit), headerWidth);
-    const agentTable = this.agentRows(headerWidth, now, pageSize);
-    const pageLabel = `Showing ${agentTable.range} · page ${this.page + 1}/${pageCount}`;
-    const agents = this.panel("Agents", agentTable.lines, headerWidth, pageLabel);
-    const agent = room.agents.find((item) => item.id === (this.pinnedId || this.focusId));
-    const detailLines = Math.max(
-      1,
-      Math.min(this.height - header.length - quota.length - agents.length - 3, 4),
-    );
-    const outputCount = Math.max(0, detailLines - 1 - Number(Boolean(agent?.question)));
-    const detailBody = agent
-      ? [
-          plain(`${agent.engine} · ${agent.model} · ${statusLabel(agent, now, this.tier)}`),
-          ...(agent.question ? [`Question: ${plain(agent.question)}`] : []),
-          ...(outputCount > 0 ? outputLines(agent).slice(-outputCount) : []),
-        ]
-      : ["Select an agent to view output"];
-    const detail = this.panel(
-      `${this.pinnedId ? "Pinned" : "Focus"} · ${agent?.id || "none"}`,
-      detailBody.slice(0, detailLines),
-      headerWidth,
-      "[g] logs",
-    );
-    const messages = coalesceMessages(room.messages)
-      .slice(-1)
-      .map(
-        (message) =>
-          `${plain(message.from)}: ${plain(message.text)}${message.count > 1 ? ` (×${message.count})` : ""}`,
-      );
-    const footer =
-      width < 48
-        ? `${agentTable.rangeFooter} · n page · q quit`
-        : `${agentTable.rangeFooter} · ↑↓ · # select · n · p · ? · g · q quit`;
-    const all = [...header, ...quota, ...agents, ...detail, footer];
-    if (this.height >= 28) all.push(...messages);
-    return this.marginLines(all, width);
-  }
-
-  renderSwarm(width) {
     const now = this.now();
     const room = this.room;
     const lead = room.conductor || {};
@@ -873,27 +614,42 @@ export class StoogesView {
       const effort = member.resolvedEffort || data.effort;
       return `${modelName}${effort && effort !== "—" ? ` / ${effort}` : ""}`;
     };
-    const contentWidth = Math.max(1, width - 2);
+    const innerWidth = Math.max(1, width - 2);
     const leadFolder = agentFolder(lead, room);
     const leadRole = roleOf(lead);
     const leadRoleBadge = leadRole ? ` [${leadRole}]` : "";
     const leadLines = [
       `${plain(lead.name || "Coordinator")}${leadRoleBadge} · folder: ${shortFolder(leadFolder)}`,
-      `${model(lead)} | ${phase(lead)}`,
+      `${statusGlyph(lead, now, this.tier)} ${model(lead)} | ${phase(lead)}${progressSuffix(lead, now)}`,
       plain(lead.progress?.task || room.objective || "Tell the coordinator what you want done"),
     ];
+    const maxAgents = room.swarm?.maxAgents ?? 64;
     const lines = [
       ...this.panel(
-        `Swarm · ${plain(room.title)}`,
+        `Swarm · ${plain(room.title || room.id)}`,
         leadLines,
-        contentWidth,
-        `${room.agents.length}/${room.swarm.maxAgents} slots`,
+        innerWidth,
+        swarmActivityBadge(room, maxAgents, this.tier, innerWidth),
         "headerBg",
       ),
     ];
+    if (room.accounts?.length || room.quotaError) {
+      const quotaLimit = this.quotaRowLimit();
+      lines.push(
+        ...this.panel("Quota", this.quotaLines(innerWidth).slice(0, quotaLimit), innerWidth),
+      );
+    }
     if (room.agents.length === 0) {
       lines.push("The coordinator will add agents as work is assigned.");
     } else {
+      const parentIds = new Set(
+        room.agents.map((agent) => agent.parent).filter((p) => p && p !== "conductor"),
+      );
+      const isCollapsibleCompleted = (agent) =>
+        COMPLETED_STATUSES.has(agent.status) &&
+        agent.id !== this.focusId &&
+        agent.id !== this.pinnedId &&
+        !parentIds.has(agent.id);
       const folderGroups = new Map();
       for (const [offset, agent] of selected.entries()) {
         const folder = agentFolder(agent, room);
@@ -901,35 +657,53 @@ export class StoogesView {
         folderGroups.get(folder).push({ agent, index: offset });
       }
       const gap = "  ";
-      for (const [folder, entries] of folderGroups) {
-        const countLabel = `${entries.length} ${entries.length === 1 ? "agent" : "agents"}`;
-        const folderLabel = folder
-          ? `${shortFolder(folder)} · ${countLabel} · ${folder}`
-          : `workspace · ${countLabel}`;
-        lines.push(ansi(fit(folderLabel, contentWidth), "folderHeader", this.color));
-        const columns = contentWidth >= 100 && entries.length > 1 ? 2 : 1;
+      for (const [folder, rawEntries] of folderGroups) {
+        lines.push(this.folderHeaderLine(folder, rawEntries.length, innerWidth));
+        const hiddenCompletedCount =
+          this.completedMode === "hidden"
+            ? rawEntries.filter(({ agent }) => isCollapsibleCompleted(agent)).length
+            : 0;
+        const entries =
+          this.completedMode === "hidden"
+            ? rawEntries.filter(({ agent }) => !isCollapsibleCompleted(agent))
+            : rawEntries;
+        const hasCollapsedRows =
+          this.completedMode === "collapsed" &&
+          entries.some(({ agent }) => isCollapsibleCompleted(agent));
+        const columns = !hasCollapsedRows && innerWidth >= 100 && entries.length > 1 ? 2 : 1;
         const cardWidth =
-          columns === 2 ? Math.max(24, Math.floor((contentWidth - gap.length) / 2)) : contentWidth;
+          columns === 2 ? Math.max(24, Math.floor((innerWidth - gap.length) / 2)) : innerWidth;
         const rails = folderTreeRails(entries, this.tier, columns);
         const cards = entries.map(({ agent, index }, entryIndex) => {
           const { topPrefix, midPrefix, tailPrefix } = rails[entryIndex];
-          const prefixWidth = displayWidth(midPrefix);
+          const prefix =
+            hiddenCompletedCount > 0 && entryIndex === entries.length - 1
+              ? toAsciiTree(midPrefix.replace("└─", "├─"), this.tier)
+              : midPrefix;
+          const prefixWidth = displayWidth(prefix);
           const boxWidth = Math.max(4, cardWidth - prefixWidth);
           const wfRole = roleOf(agent);
           const roleBadge = wfRole ? ` [${wfRole}]` : "";
           const isFocused = agent.id === this.focusId;
           const isPinned = agent.id === this.pinnedId;
+          const locationBadge = worktreeBadge(agent, room) || shortFolder(folder);
+          const taskText = plain(agent.progress?.task || agent.objective || "Awaiting assignment");
+          if (this.completedMode === "collapsed" && isCollapsibleCompleted(agent)) {
+            const glyph = statusGlyph(agent, now, this.tier);
+            const titlePart = ` ${glyph} ${index + 1} ${plain(agent.name || agent.id)}${roleBadge} · ${locationBadge} · `;
+            const taskPart = fit(taskText, Math.max(1, boxWidth - displayWidth(titlePart)));
+            const compactRow = `${tone(titlePart, "green", this.color)}${tone(taskPart, "dim", this.color)}`;
+            return [`${tone(prefix, "cyan", this.color)}${fitStyled(compactRow, boxWidth)}`];
+          }
           let stateBadge = "";
           if (isPinned) stateBadge = "PIN ";
           else if (isFocused) stateBadge = "FOCUS ";
           const parentBadge =
             agent.parent && agent.parent !== "conductor" ? ` ↳ ${plain(agent.parent)}` : "";
           const cardTitle = `${index + 1} ${plain(agent.name || agent.id)}${agent.role === "lead" ? " (lead)" : ""}`;
-          const locationBadge = worktreeBadge(agent, room) || shortFolder(folder);
           const cardRight = `${stateBadge}${locationBadge}${parentBadge}`;
-          const taskText = plain(agent.progress?.task || agent.objective || "Awaiting assignment");
-          const statusLine = ansi(
-            `${statusGlyph(agent, now, this.tier)}${roleBadge} ${model(agent)} | ${phase(agent)}`,
+          const statusLine = tone(
+            `${statusGlyph(agent, now, this.tier)}${roleBadge} ${model(agent)} | ${phase(agent)}${progressSuffix(agent, now)}`,
             `${toneForStatus(agent.status)}${isFocused ? " bold" : ""}`,
             this.color,
           );
@@ -941,24 +715,42 @@ export class StoogesView {
           });
           const midIndex = Math.max(1, Math.floor((box.length - 1) / 2));
           return box.map((line, lineIndex) => {
-            let prefix = tailPrefix;
-            if (lineIndex < midIndex) prefix = topPrefix;
-            else if (lineIndex === midIndex) prefix = midPrefix;
-            return `${ansi(prefix, "cyan", this.color)}${line}`;
+            let linePrefix = tailPrefix;
+            if (lineIndex < midIndex) linePrefix = topPrefix;
+            else if (lineIndex === midIndex) linePrefix = prefix;
+            return `${tone(linePrefix, "cyan", this.color)}${line}`;
           });
         });
         lines.push(...joinCardGrid(cards, columns, cardWidth, gap));
+        if (hiddenCompletedCount === 0) continue;
+        const summaryPrefix = toAsciiTree("└─", this.tier);
+        const glyph = glyphSet(this.tier).completed;
+        const summaryText = ` ${glyph} ${hiddenCompletedCount} completed hidden (press c to expand)`;
+        const summaryWidth = Math.max(1, innerWidth - displayWidth(summaryPrefix));
+        const fittedSummary = fit(summaryText, summaryWidth);
+        lines.push(
+          `${tone(summaryPrefix, "cyan", this.color)}${tone(fittedSummary, "dim", this.color)}`,
+        );
       }
     }
     const focused = room.agents.find((agent) => agent.id === (this.pinnedId || this.focusId));
-    const detail = focused?.output?.at(-1);
-    if (detail && lines.length < this.height - 4) lines.push(plain(detail));
+    const rawDetail = focused?.output?.at(-1);
+    const detail = rawDetail ? plain(rawDetail) : "";
+    const focusedTask = focused ? plain(focused.progress?.task || focused.objective || "") : "";
+    if (detail && (this.pinnedId || detail !== focusedTask) && lines.length < this.height - 4) {
+      const tag = this.pinnedId ? "pinned" : "detail";
+      const prefix = `${tag} (${plain(focused.name || focused.id)}): `;
+      const detailBudget = Math.max(1, innerWidth - displayWidth(prefix));
+      lines.push(`${tone(prefix, "dim", this.color)}${fit(detail, detailBudget)}`);
+    }
     while (lines.length < this.height - 3) lines.push("");
     lines.push(
-      `${room.agents.length}/${room.swarm.maxAgents} slots · page ${this.page + 1}/${pages}`,
-      "↑↓ select · n page · ? help · q close view",
+      `${room.agents.length}/${maxAgents} slots · page ${this.page + 1}/${pages}`,
+      "↑↓ select · c completed · n page · ? help · q close view",
       "Ctrl-b Tab: switch pane · Ctrl-b d: detach",
     );
     return this.marginLines(lines, width);
   }
 }
+
+export { StoogesView as HordeView };

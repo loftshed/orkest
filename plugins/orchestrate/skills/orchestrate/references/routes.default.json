@@ -78,6 +78,14 @@
         { "engine": "claude", "model": "claude:frontier", "effort": "high" },
         { "engine": "agy", "model": "gemini:flash-high" }
       ]
+    },
+    "web-research": {
+      "engine": "agy",
+      "model": "gemini:pro",
+      "alternates": [
+        { "engine": "claude", "model": "claude:balanced", "effort": "high" },
+        { "engine": "codex", "model": "gpt:sol", "effort": "high" }
+      ]
     }
   }
 }

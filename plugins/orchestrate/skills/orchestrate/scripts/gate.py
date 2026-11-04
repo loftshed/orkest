@@ -716,6 +716,14 @@ def runnable(command: list[str]) -> bool:
     bare = strip_prefixes(command)
     if len(bare) > 1 and Path(bare[0]).name in {"node", "bun", "deno", *SHELLS} and not bare[1].startswith("-"):
         return bool(SCRIPT.search(Path(bare[1]).stem))  # a repository's own test or lint script
+    if (
+        bare
+        and not bare[0].startswith("-")
+        and ("/" in bare[0] or Path(bare[0]).suffix in {".sh", ".js", ".mjs", ".py"})
+    ):
+        return bool(
+            SCRIPT.search(Path(bare[0]).stem)
+        )  # direct invocation such as ./scripts/test.sh or ./scripts/check.sh
     return False
 
 

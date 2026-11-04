@@ -94,23 +94,17 @@ def record(base: Path, peer: dict[str, Any]) -> None:
                 text += f" Read mailbox tasks for session {peer['session']} and verify the checkout before continuing."
             text += " This notice does not transfer ownership."
             deliveries.append(
-                {
-                    "schema": mailbox.MAIL_SCHEMA,
-                    "id": mailbox.message_id(),
-                    "from": {
-                        **(mailbox.sender_address(peer) if same_project else {}),
-                        **mailbox.MAILBOX_SENDER,
-                    },
-                    "to": {"session": recipient["session"], "name": recipient["name"]},
-                    "text": text,
-                    "replyTo": pending[-1] if pending else None,
-                    "sentAt": mailbox.stamp(),
-                    "readAt": None,
-                    "scope": "project" if same_project else "cross-project",
-                    "kind": "notice",
-                    "presenceNotice": True,
-                    "wake": False,
-                }
+                mailbox.notify(
+                    base,
+                    recipient,
+                    text,
+                    reply_to=pending[-1] if pending else None,
+                    sender=peer if same_project else None,
+                    scope="project" if same_project else "cross-project",
+                    deliver=False,
+                    presenceNotice=True,
+                    wake=False,
+                )
             )
         mailbox.write(path, {"source": observed, "observedAt": mailbox.stamp(), "deliveries": deliveries})
 
@@ -140,10 +134,7 @@ def deliver(base: Path) -> None:
                         or not mailbox.allowed_message(target, message, "project")
                     ):
                         continue
-                    destination = mailbox.inbox_dir(base, target["session"]) / f"{message['id']}.json"
-                    with mailbox.locked(destination):
-                        if not destination.exists():
-                            mailbox.write(destination, message)
+                    mailbox.notify(base, target, message["text"], message=message)
                 event["deliveries"] = []
             mailbox.write(path, event)
 

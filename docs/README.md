@@ -1,7 +1,8 @@
 # Documentation
 
-Repository-wide operational guides and design records:
+Repository-wide architecture maps, operational guides, and design records:
 
+- **[ARCHITECTURE.md](ARCHITECTURE.md)** — Complete command glossary (`ork horde`, `ork hall`, `ork foundry`, `ork smelter`, `ork radar`, `ork gate`), deep-module map across Node.js and Python, and IDE IntelliSense setup (`jsconfig.json` / `pyrightconfig.json`).
 - **[releases.md](releases.md)** — How conventional commits on `main` drive automatic per-plugin version bumps, changelogs, tags, and GitHub releases via `scripts/release.js`.
 - **Peer mailbox design records:**
   - **[mailbox-daemon-plan.md](mailbox-daemon-plan.md)** — Service contract and architecture for the shared loopback HTTP MCP mailbox daemon (`mailbox_daemon.py`).

@@ -1,10 +1,11 @@
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { hostname, tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 
+import { HALL_HELP, hallCommand } from "../../../plugins/orchestrate/bin/hall.mjs";
 import { coordinatorArguments } from "../../../plugins/orchestrate/bin/ork.mjs";
 import {
   extractIssueArchetype,
@@ -17,12 +18,21 @@ import {
   selectSparePool,
   selectSparePools,
 } from "../../../plugins/orchestrate/lib/factory.mjs";
+import * as hallModule from "../../../plugins/orchestrate/lib/hall.mjs";
+import * as roomsModule from "../../../plugins/orchestrate/lib/rooms.mjs";
 import {
   cacheHome,
   configPath,
   envFirst,
 } from "../../../plugins/orchestrate/lib/runtime-paths.mjs";
-import { mailboxRoot } from "../../../plugins/orchestrate/lib/stooges-room.mjs";
+import {
+  createRoom,
+  mailboxRoot,
+  parseTeam,
+  refreshMemberWorktrees,
+  updateRoom,
+} from "../../../plugins/orchestrate/lib/stooges-room.mjs";
+import * as swarmModule from "../../../plugins/orchestrate/lib/swarm.mjs";
 
 const exec = promisify(execFile);
 const cli = path.resolve("plugins/orchestrate/bin/ork.mjs");
@@ -685,5 +695,164 @@ describe("runtime-paths and mailboxRoot resolution", () => {
     expect(cacheHome(env)).toBe(path.join(xdgCache, "orchestrate"));
     expect(mailboxRoot(env)).toBe(path.join(xdgCache, "orchestrate", "mailbox-v1"));
     expect(configPath(env)).toBe(path.join(xdgConfig, "orchestrate", "config.json"));
+  });
+});
+
+describe("hall, rooms, and unified subcommands", () => {
+  it("consolidates swarm.mjs and hall.mjs exports and defaults createRoom swarm/conductor settings", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "ork-hall-unit-"));
+    temporary.push(dir);
+
+    expect(swarmModule.observeRoom).toBe(roomsModule.observeRoom);
+    expect(swarmModule.coordinatorBrief).toBe(roomsModule.coordinatorBrief);
+    expect(swarmModule.resumeBranch).toBe(roomsModule.resumeBranch);
+    expect(hallModule.observeRoom).toBe(roomsModule.observeRoom);
+    expect(hallModule.createRoom).toBe(createRoom);
+    expect(typeof hallCommand).toBe("function");
+    expect(HALL_HELP).toContain("rooms");
+
+    const room = createRoom(parseTeam("claude:haiku"), {
+      id: "room-unit",
+      cwd: dir,
+    });
+    expect(room.swarm).toEqual({ maxAgents: 64, maxDepth: 8 });
+    expect(room.conductor.engine).toBe("claude");
+
+    const sub = path.join(dir, "sub");
+    const fakeGitDir = path.join(dir, "gitdir-sub");
+    await mkdir(sub, { recursive: true });
+    await mkdir(fakeGitDir, { recursive: true });
+    await writeFile(path.join(sub, ".git"), `gitdir: ${fakeGitDir}\n`);
+    await writeFile(
+      path.join(fakeGitDir, "orkest.json"),
+      JSON.stringify({ disposable: true, parentCwd: dir, slug: "wt-sub", branch: "feat/sub" }),
+    );
+    room.agents[0].cwd = sub;
+    refreshMemberWorktrees(room);
+    expect(room.agents[0].worktree).toMatchObject({
+      disposable: true,
+      path: path.resolve(sub),
+      slug: "wt-sub",
+    });
+  });
+
+  it("reads task and progress files in observeRoom without spawning Python subprocesses", async () => {
+    const rawDir = await mkdtemp(path.join(tmpdir(), "ork-observe-node-"));
+    const dir = await realpath(rawDir);
+    temporary.push(dir);
+    const root = path.join(dir, "mailbox-v1");
+    const taskDir = path.join(dir, "task-1");
+    await mkdir(taskDir, { recursive: true });
+    const nowIso = new Date().toISOString();
+    await writeFile(
+      path.join(taskDir, "task.json"),
+      JSON.stringify({
+        schema: "agent-executor.task.v1",
+        task_id: "task-1",
+        repository: dir,
+        runs: [
+          {
+            request_id: "req-1",
+            run_id: "run-1",
+            engine: "codex",
+            transport: "executor",
+            status: "active",
+            last_activity: "Inspecting hall module",
+          },
+        ],
+        decisions: [],
+        updated_at: nowIso,
+      }),
+    );
+
+    const sessionKey = "lead-session-1";
+    await mkdir(path.join(root, "peers"), { recursive: true });
+    await mkdir(path.join(root, "progress"), { recursive: true });
+    await writeFile(
+      path.join(root, "peers", `${sessionKey}.json`),
+      JSON.stringify({
+        schema: "agent-executor.peer.v1",
+        session: sessionKey,
+        name: "lead-agent",
+        harness: "codex",
+        cwd: dir,
+        pid: process.pid,
+        startedAt: nowIso,
+        lastSeenAt: nowIso,
+      }),
+    );
+    await writeFile(
+      path.join(root, "progress", `${sessionKey}.json`),
+      JSON.stringify({
+        schema: "orchestrate.progress.v1",
+        session: sessionKey,
+        harness: "codex",
+        machine: hostname(),
+        checkout: dir,
+        goal: "Unify Hall",
+        task: "Replace Python readers",
+        stage: "testing",
+        files: ["plugins/orchestrate/lib/rooms.mjs"],
+        updatedAt: nowIso,
+      }),
+    );
+
+    const room = await roomsModule.newRoom(parseTeam("codex:luna"), {
+      id: "room-node",
+      cwd: dir,
+      root,
+    });
+    await updateRoom(
+      room.id,
+      (current) => {
+        current.conductor.session = {
+          id: sessionKey,
+          engine: "codex",
+          machine: hostname(),
+          cwd: dir,
+        };
+        current.agents[0].dispatch = {
+          taskDir,
+          taskId: "task-1",
+          requestId: "req-1",
+          runId: "run-1",
+          transport: "executor",
+        };
+        return current;
+      },
+      { root },
+    );
+
+    const observed = await roomsModule.observeRoom(room.id, { root });
+    expect(observed.conductor.progress.goal).toBe("Unify Hall");
+    expect(observed.conductor.progress.task).toBe("Replace Python readers");
+    expect(observed.conductor.status).toBe("testing");
+    const worker = observed.agents[0];
+    expect(worker.status).toBe("running");
+    expect(worker.runId).toBe("run-1");
+  });
+
+  it("exposes horde, hall, foundry, smelter, radar, and gate in HELP and dispatches hall/smelter/radar", async () => {
+    const app = await sandbox();
+    const help = await app.run(["--help"]);
+    for (const subcommand of [
+      "ork horde",
+      "ork hall",
+      "ork foundry",
+      "ork smelter",
+      "ork radar",
+      "ork gate",
+    ]) {
+      expect(help.stdout).toContain(subcommand);
+    }
+
+    const hallOut = await app.run(["hall", "list", "--json"]);
+    expect(JSON.parse(hallOut.stdout)).toEqual({ rooms: [], errors: [] });
+
+    const smelterHelp = await app.run(["smelter", "--help"]);
+    expect(smelterHelp.stdout).toContain("ork smelter");
+
+    const radarHelp = await app.run(["radar", "--help"]);
+    expect(radarHelp.stdout).toContain("ork radar");
   });
 });

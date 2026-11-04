@@ -1,4 +1,5 @@
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
+import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -8,105 +9,42 @@ import { parseArgs, promisify } from "node:util";
 import { buildLanes } from "../../monitor/lib/analyze.mjs";
 import { shouldUseColor } from "../../monitor/lib/render.mjs";
 import { getAccounts } from "../../monitor/lib/store.mjs";
+import { configPath } from "./runtime-paths.mjs";
+import { resolveWorktreeMarkerPath } from "./stooges-room.mjs";
 import { glyphSet, glyphTier, renderPanel, renderTable, wrapText } from "./stooges-view.mjs";
 
 const execute = promisify(execFile);
 const scriptsDir = fileURLToPath(new URL("../skills/orchestrate/scripts/", import.meta.url));
+const defaultRoutesUrl = new URL(
+  "../skills/orchestrate/references/routes.default.json",
+  import.meta.url,
+);
 const TASK_SPEC_SCHEMA = "agent-executor.task-spec.v1";
 
-export const DEFAULT_ROUTES = {
-  "architecture-conductor": {
-    alternates: [
-      { effort: "high", engine: "claude", model: "claude:frontier" },
-      { effort: "high", engine: "codex", model: "gpt:sol" },
-    ],
-    engine: "agy",
-    model: "gemini:pro",
-  },
-  claude: {
-    alternates: [
-      { effort: "high", engine: "claude", model: "claude:frontier" },
-      { effort: "high", engine: "claude", model: "claude:balanced" },
-      { effort: "medium", engine: "claude", model: "claude:fast" },
-    ],
-    effort: "high",
-    engine: "claude",
-    model: "claude:best",
-  },
-  consultation: {
-    effort: "high",
-    engine: "codex",
-    model: "gpt:sol",
-  },
-  "debug-invariants": {
-    alternates: [
-      { effort: "high", engine: "claude", model: "claude:frontier" },
-      { effort: "max", engine: "codex", model: "gpt:luna" },
-    ],
-    effort: "high",
-    engine: "codex",
-    model: "gpt:sol",
-  },
-  gemini: {
-    alternates: [
-      { engine: "agy", model: "gemini:flash-high" },
-      { engine: "agy", model: "gemini:pro" },
-    ],
-    engine: "agy",
-    model: "gemini:fast",
-  },
-  implementation: {
-    alternates: [
-      { effort: "high", engine: "codex", model: "gpt:sol" },
-      { effort: "high", engine: "codex", model: "gpt:astra" },
-    ],
-    effort: "max",
-    engine: "codex",
-    model: "gpt:luna",
-  },
-  "independent-review": {
-    alternates: [
-      { effort: "high", engine: "claude", model: "claude:frontier" },
-      { engine: "agy", model: "gemini:flash-high" },
-    ],
-    effort: "high",
-    engine: "codex",
-    model: "gpt:sol",
-  },
-  "mechanical-sweep": {
-    alternates: [
-      { engine: "agy", model: "gemini:flash-high" },
-      { effort: "medium", engine: "codex", model: "gpt:luna" },
-    ],
-    effort: "medium",
-    engine: "claude",
-    model: "claude:fast",
-  },
-  opencode: {
-    alternates: [{ engine: "opencode", model: "deepseek:flash" }],
-    engine: "opencode",
-    model: "glm:flash",
-    variant: "high",
-  },
-  "structural-refactor": {
-    alternates: [
-      { effort: "high", engine: "codex", model: "gpt:sol" },
-      { effort: "high", engine: "claude", model: "claude:balanced" },
-    ],
-    effort: "high",
-    engine: "claude",
-    model: "claude:frontier",
-  },
-  "ui-design-system": {
-    alternates: [
-      { effort: "high", engine: "claude", model: "claude:frontier" },
-      { effort: "high", engine: "claude", model: "claude:balanced" },
-    ],
-    effort: "high",
-    engine: "codex",
-    model: "gpt:astra",
-  },
-};
+export function loadDefaultRoutes() {
+  let baseRoutes;
+  try {
+    baseRoutes = JSON.parse(readFileSync(defaultRoutesUrl, "utf8")).routes || {};
+  } catch {
+    baseRoutes = {};
+  }
+  const merged = structuredClone(baseRoutes);
+  try {
+    const userConfig = JSON.parse(readFileSync(configPath("config.json"), "utf8"));
+    if (userConfig?.routes && typeof userConfig.routes === "object") {
+      for (const [role, route] of Object.entries(userConfig.routes)) {
+        if (route && typeof route === "object" && route.engine) {
+          merged[role] = { ...merged[role], ...route };
+        }
+      }
+    }
+  } catch {
+    /* Keep default routes when user config is absent or unreadable. */
+  }
+  return merged;
+}
+
+export const DEFAULT_ROUTES = loadDefaultRoutes();
 
 const ENGINE_FALLBACK_ROLES = {
   agy: "gemini",
@@ -186,6 +124,26 @@ export function extractTaskSpec(issueBody) {
     }
   }
   return null;
+}
+
+/**
+ * Parses `Depends on #<n>` and `Blocked by #<n>` declarations (case-insensitive)
+ * from an issue body and returns unique referenced issue numbers.
+ */
+export function parseIssueDependencies(issueBody) {
+  if (typeof issueBody !== "string" || issueBody.trim().length === 0) return [];
+  const clausePattern =
+    /\b(?:depends\s+on|blocked\s+by)\s*:?\s*(#[0-9]+(?:\s*(?:,|and|&)?\s*#[0-9]+)*)/giu;
+  const issueRefPattern = /#([0-9]+)/gu;
+  const seen = new Set();
+  for (const clauseMatch of issueBody.matchAll(clausePattern)) {
+    const refsChunk = clauseMatch[1] || "";
+    for (const refMatch of refsChunk.matchAll(issueRefPattern)) {
+      const num = Number(refMatch[1]);
+      if (Number.isSafeInteger(num) && num > 0) seen.add(num);
+    }
+  }
+  return [...seen];
 }
 
 function normalizeRelativePath(rawPath) {
@@ -303,6 +261,27 @@ function laneFamilies(lane) {
 }
 
 /**
+ * Normalizes a spare-pool object into its serialized summary representation.
+ */
+export function poolSummary(pool) {
+  if (!pool || typeof pool !== "object") return null;
+  return {
+    accountId: pool.accountId,
+    availableNowPct: pool.availableNowPct ?? 100,
+    effort: pool.effort ?? null,
+    engine: pool.engine,
+    expiring: pool.expiring,
+    label: pool.label,
+    model: pool.model ?? null,
+    poolId: pool.poolId,
+    route: pool.route ?? null,
+    score: pool.score,
+    status: pool.status,
+    surplusPts: pool.surplusPts,
+  };
+}
+
+/**
  * Filters and orders all eligible spare-token pools from buildLanes(accounts).
  * Strictly refuses credits, blocked, error, lowRoom, and unauthorized pools.
  */
@@ -408,8 +387,8 @@ export function extractIssueArchetype(issue, taskSpec = null) {
   return null;
 }
 
-function routeCandidatesForRole(role, routesConfig = DEFAULT_ROUTES) {
-  const effectiveRoutes = { ...DEFAULT_ROUTES, ...routesConfig };
+function routeCandidatesForRole(role, routesConfig = loadDefaultRoutes()) {
+  const effectiveRoutes = { ...loadDefaultRoutes(), ...routesConfig };
   const route = effectiveRoutes[role];
   if (!route || typeof route !== "object") return [];
   const primary = {
@@ -489,16 +468,61 @@ function buildPoolRouteOptions(pool, archetype, routesConfig) {
   return options;
 }
 
+function computeBlockedBy(issue, openIssueNumbers, closedIssueNumbers) {
+  const deps = parseIssueDependencies(issue?.body);
+  if (deps.length === 0) return [];
+  return deps.filter((dep) => {
+    if (closedIssueNumbers.has(dep)) return false;
+    if (openIssueNumbers.size > 0) return openIssueNumbers.has(dep);
+    return true;
+  });
+}
+
+function buildIssueStateSets(issues, policy = {}) {
+  const sourceIssues = Array.isArray(policy.openIssues) ? policy.openIssues : issues;
+  const openIssueNumbers = new Set();
+  const closedIssueNumbers = new Set();
+
+  if (Array.isArray(sourceIssues)) {
+    for (const item of sourceIssues) {
+      const num = Number(item?.number);
+      if (!Number.isSafeInteger(num) || num <= 0) continue;
+      const state = String(item?.state ?? "open").toLowerCase();
+      if (state === "closed") closedIssueNumbers.add(num);
+      else openIssueNumbers.add(num);
+    }
+  }
+  if (Array.isArray(policy.openIssueNumbers)) {
+    for (const num of policy.openIssueNumbers) openIssueNumbers.add(Number(num));
+  }
+  if (Array.isArray(policy.closedIssueNumbers)) {
+    for (const num of policy.closedIssueNumbers) {
+      const parsed = Number(num);
+      closedIssueNumbers.add(parsed);
+      openIssueNumbers.delete(parsed);
+    }
+  }
+  return { closedIssueNumbers, openIssueNumbers };
+}
+
 /**
  * Matches multiple open agent:ready issues across eligible spare-token pools,
  * honoring archetype route preferences while spreading work across distinct
  * harnesses, pools, and models so parallel workers do not drain a single provider.
  */
 export function matchIssuesToPools(issues, lanes, activeAllowPaths = [], policy = {}) {
-  const sparePools = selectSparePools(lanes, policy);
-  if (sparePools.length === 0 || !Array.isArray(issues)) return [];
+  if (!Array.isArray(issues)) return [];
+  const { closedIssueNumbers, openIssueNumbers } = buildIssueStateSets(issues, policy);
+  for (const issue of issues) {
+    if (issue && typeof issue === "object") {
+      issue.blockedBy = computeBlockedBy(issue, openIssueNumbers, closedIssueNumbers);
+    }
+  }
 
-  const routesConfig = policy.routes || DEFAULT_ROUTES;
+  const sparePools = selectSparePools(lanes, policy);
+  if (sparePools.length === 0) return [];
+
+  const routesConfig = policy.routes || loadDefaultRoutes();
   const runningAllowPaths = [...flattenActivePaths(activeAllowPaths)];
   const usedHarnesses = new Map();
   const usedPools = new Map();
@@ -507,6 +531,7 @@ export function matchIssuesToPools(issues, lanes, activeAllowPaths = [], policy 
 
   for (const issue of issues) {
     if (!isReadyCandidate(issue)) continue;
+    if (Array.isArray(issue.blockedBy) && issue.blockedBy.length > 0) continue;
     const taskSpec = extractTaskSpec(issue.body);
     if (!taskSpec || !hasDisjointPaths(taskSpec.allow_paths, runningAllowPaths)) continue;
 
@@ -558,6 +583,8 @@ export function matchIssuesToPools(issues, lanes, activeAllowPaths = [], policy 
     const number = issue.number;
     const verifyCommand =
       taskSpec.verify_command || taskSpec.development_checks?.[0] || "corepack pnpm test";
+    const effectiveArchetype =
+      archetype || ENGINE_FALLBACK_ROLES[option.engine] || "implementation";
     const selectedRoute = {
       ...(archetype && { archetype }),
       effort: option.effort,
@@ -569,6 +596,7 @@ export function matchIssuesToPools(issues, lanes, activeAllowPaths = [], policy 
       allowPaths: taskSpec.allow_paths,
       archetype,
       branch: `feat/issue-${number}`,
+      classification: { archetype: effectiveArchetype },
       issue,
       pool: {
         ...pool,
@@ -595,6 +623,146 @@ export const planBatch = matchIssuesToPools;
  */
 export function matchIssueToPool(issues, lanes, activeAllowPaths = [], policy = {}) {
   return matchIssuesToPools(issues, lanes, activeAllowPaths, policy)[0] ?? null;
+}
+
+function globToRegExp(globPattern) {
+  let regexStr = "^";
+  for (let i = 0; i < globPattern.length; i += 1) {
+    const ch = globPattern[i];
+    if (ch === "*") {
+      if (globPattern[i + 1] === "*") {
+        regexStr += ".*";
+        i += 1;
+      } else {
+        regexStr += "[^/]*";
+      }
+    } else if (ch === "?") {
+      regexStr += "[^/]";
+    } else if (".+^${}()|[]\\".includes(ch)) {
+      regexStr += `\\${ch}`;
+    } else {
+      regexStr += ch;
+    }
+  }
+  regexStr += "$";
+  return new RegExp(regexStr, "u");
+}
+
+function listRelativeFilesRecursive(rootDir, currentRel = "") {
+  const absDir = currentRel ? path.join(rootDir, currentRel) : rootDir;
+  let entries;
+  try {
+    entries = readdirSync(absDir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const files = [];
+  for (const entry of entries) {
+    if (entry.name === ".git" || entry.name === "node_modules") continue;
+    const relPath = currentRel ? `${currentRel}/${entry.name}` : entry.name;
+    if (entry.isDirectory()) {
+      files.push(...listRelativeFilesRecursive(rootDir, relPath));
+    } else if (entry.isFile() || entry.isSymbolicLink()) {
+      files.push(relPath);
+    }
+  }
+  return files;
+}
+
+function resolveTrackedFilesSet(repoRoot) {
+  try {
+    const out = execFileSync("git", ["ls-files"], {
+      cwd: repoRoot,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return new Set(
+      out
+        .split(/\r?\n/u)
+        .map((line) => normalizeRelativePath(line))
+        .filter(Boolean),
+    );
+  } catch {
+    return new Set();
+  }
+}
+
+/**
+ * Copies untracked local files matching `<repoRoot>/.worktreeinclude` patterns
+ * from `repoRoot` into `worktreePath`.
+ */
+export function bootstrapWorktreeInclude(repoRoot, worktreePath) {
+  if (!repoRoot || !worktreePath) return [];
+  const resolvedRoot = path.resolve(repoRoot);
+  const resolvedWorktree = path.resolve(worktreePath);
+  const includeFile = path.join(resolvedRoot, ".worktreeinclude");
+  if (!existsSync(includeFile)) return [];
+
+  const rawLines = readFileSync(includeFile, "utf8").split(/\r?\n/u);
+  const patterns = rawLines
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith("#"))
+    .map((line) => normalizeRelativePath(line))
+    .filter((pattern) => Boolean(pattern) && !pattern.startsWith(".."));
+  if (patterns.length === 0) return [];
+
+  const trackedSet = resolveTrackedFilesSet(resolvedRoot);
+  const candidateFiles = new Set();
+  let allFiles = null;
+
+  for (const pattern of patterns) {
+    if (/[*?[\]]/u.test(pattern)) {
+      allFiles ??= listRelativeFilesRecursive(resolvedRoot);
+      const matcher = globToRegExp(pattern);
+      for (const relFile of allFiles) {
+        if (matcher.test(relFile) && !trackedSet.has(relFile)) {
+          candidateFiles.add(relFile);
+        }
+      }
+      continue;
+    }
+
+    const sourcePath = path.join(resolvedRoot, pattern);
+    if (!existsSync(sourcePath)) continue;
+    try {
+      const stat = statSync(sourcePath);
+      if (stat.isDirectory()) {
+        for (const relFile of listRelativeFilesRecursive(resolvedRoot, pattern)) {
+          if (!trackedSet.has(relFile)) candidateFiles.add(relFile);
+        }
+      } else if (!trackedSet.has(pattern)) {
+        candidateFiles.add(pattern);
+      }
+    } catch {
+      /* Ignore unreadable candidate paths. */
+    }
+  }
+
+  const sortedFiles = [...candidateFiles].sort((a, b) => a.localeCompare(b));
+  const copied = [];
+  for (const relFile of sortedFiles) {
+    if (relFile.startsWith("..")) continue;
+    const src = path.join(resolvedRoot, relFile);
+    const dest = path.join(resolvedWorktree, relFile);
+    if (
+      path.relative(resolvedRoot, src).startsWith("..") ||
+      path.relative(resolvedWorktree, dest).startsWith("..")
+    ) {
+      continue;
+    }
+    mkdirSync(path.dirname(dest), { recursive: true });
+    cpSync(src, dest, { force: true, recursive: true });
+    copied.push(relFile);
+  }
+  return copied;
+}
+
+export function resolveTaskSpecPath(worktreePath) {
+  const markerPath = resolveWorktreeMarkerPath(worktreePath);
+  const gitDir = markerPath
+    ? path.dirname(markerPath)
+    : path.join(path.resolve(worktreePath), ".git");
+  return path.join(gitDir, "orkest", "task-spec.json");
 }
 
 async function loadFactoryPolicy() {
@@ -633,13 +801,17 @@ async function defaultExecAgent(args, { cwd = process.cwd() } = {}) {
   }
 }
 
-async function provisionDisposableWorktree(cwd, worktreeSlug, branch, issueNumber) {
-  const repoName = path.basename(path.resolve(cwd));
+async function provisionDisposableWorktree(cwd, worktreeSlug, branch, issueNumber, engine = null) {
+  const resolvedCwd = path.resolve(cwd);
+  const repoName = path.basename(resolvedCwd);
   const worktreeBase = path.join(homedir(), ".cache", "agent-executor", "worktrees", repoName);
   const worktreePath = path.join(worktreeBase, worktreeSlug);
+  if (existsSync(worktreePath)) {
+    throw new Error(`Disposable worktree path already exists: ${worktreePath}`);
+  }
   await mkdir(worktreeBase, { recursive: true });
-  await execute("git", ["worktree", "add", "-B", branch, worktreePath, "HEAD"], {
-    cwd,
+  await execute("git", ["worktree", "add", "-b", branch, worktreePath, "HEAD"], {
+    cwd: resolvedCwd,
     timeout: 30_000,
   });
   const { stdout: gitDirRaw } = await execute("git", ["rev-parse", "--git-dir"], {
@@ -654,7 +826,10 @@ async function provisionDisposableWorktree(cwd, worktreeSlug, branch, issueNumbe
         branch,
         createdAt: new Date().toISOString(),
         disposable: true,
+        ...(engine && { engine }),
         issue: issueNumber,
+        parentCwd: resolvedCwd,
+        slug: worktreeSlug,
       },
       null,
       2,
@@ -685,7 +860,9 @@ function renderStatusPanel(statusData, width, options = {}) {
     statusData.readyIssues.length > 0
       ? statusData.readyIssues.map((issue) => {
           let specStatus = "invalid spec";
-          if (issue.validSpec) {
+          if (Array.isArray(issue.blockedBy) && issue.blockedBy.length > 0) {
+            specStatus = `blocked (#${issue.blockedBy.join(", #")})`;
+          } else if (issue.validSpec) {
             specStatus = issue.disjoint ? "ready (disjoint)" : "collision";
           }
           return [`#${issue.number}`, issue.title, specStatus, issue.allowPaths.join(", ") || "--"];
@@ -757,19 +934,9 @@ function serializeMatch(match) {
     allowPaths: match.allowPaths,
     archetype: match.archetype,
     branch: match.branch,
+    classification: match.classification,
     issue: { number: match.issue.number, title: match.issue.title },
-    pool: {
-      accountId: match.pool.accountId,
-      effort: match.pool.effort ?? null,
-      engine: match.pool.engine,
-      expiring: match.pool.expiring,
-      label: match.pool.label,
-      model: match.pool.model,
-      poolId: match.pool.poolId,
-      route: match.pool.route ?? null,
-      score: match.pool.score,
-      surplusPts: match.pool.surplusPts,
-    },
+    pool: poolSummary(match.pool),
     selectedRoute: match.selectedRoute,
     verifyCommand: match.verifyCommand,
     worktreeSlug: match.worktreeSlug,
@@ -865,20 +1032,23 @@ export async function factoryCommand(
   }
 
   const filePolicy = await loadFactoryPolicy();
-  const policy = { ...filePolicy, ...policyOverride };
+  const openIssues = await fetchOpenIssues(execGhFn, values.repo, cwd);
+  const policy = { ...filePolicy, openIssues, ...policyOverride };
   const accounts = await getAccountsFn();
   const lanes = buildLanes(accounts);
   const sparePools = selectSparePools(lanes, policy);
-  const openIssues = await fetchOpenIssues(execGhFn, values.repo, cwd);
 
   if (action === "status") {
+    const { closedIssueNumbers, openIssueNumbers } = buildIssueStateSets(openIssues, policy);
     const readyIssues = openIssues
       .filter((issue) => hasIssueLabel(issue, "agent:ready"))
       .map((issue) => {
         const spec = extractTaskSpec(issue.body);
+        const blockedBy = computeBlockedBy(issue, openIssueNumbers, closedIssueNumbers);
         return {
           allowPaths: spec?.allow_paths ?? [],
           archetype: extractIssueArchetype(issue, spec),
+          blockedBy,
           disjoint: spec ? hasDisjointPaths(spec.allow_paths, activeAllowPaths) : false,
           number: issue.number,
           taskSpec: spec,
@@ -900,18 +1070,7 @@ export async function factoryCommand(
       rawIssues,
       readyIssues,
       schema: "ork.factory.status.v1",
-      sparePools: sparePools.map((pool) => ({
-        accountId: pool.accountId,
-        availableNowPct: pool.availableNowPct ?? 100,
-        engine: pool.engine,
-        expiring: pool.expiring,
-        label: pool.label,
-        poolId: pool.poolId,
-        route: pool.route ?? null,
-        score: pool.score,
-        status: pool.status,
-        surplusPts: pool.surplusPts,
-      })),
+      sparePools: sparePools.map(poolSummary),
     };
     if (values.json) {
       stdout.write(`${JSON.stringify(statusPayload, null, 2)}\n`);
@@ -967,22 +1126,12 @@ export async function factoryCommand(
     archetype: match.archetype,
     batch: batch.map(serializeMatch),
     branch: match.branch,
+    classification: match.classification,
     dryRun: Boolean(values["dry-run"]),
     issue: { number: match.issue.number, title: match.issue.title },
     matched: true,
     once: Boolean(values.once),
-    pool: {
-      accountId: match.pool.accountId,
-      effort: match.pool.effort ?? null,
-      engine: match.pool.engine,
-      expiring: match.pool.expiring,
-      label: match.pool.label,
-      model: match.pool.model,
-      poolId: match.pool.poolId,
-      route: match.pool.route ?? null,
-      score: match.pool.score,
-      surplusPts: match.pool.surplusPts,
-    },
+    pool: poolSummary(match.pool),
     schema: "ork.factory.run.v1",
     selectedRoute: match.selectedRoute,
     taskSpec: match.taskSpec,
@@ -1014,28 +1163,34 @@ export async function factoryCommand(
     match.worktreeSlug,
     match.branch,
     match.issue.number,
+    match.selectedRoute?.engine || null,
   );
-  const specFile = path.join(worktreePath, ".orkest-task-spec.json");
+  bootstrapWorktreeInclude(cwd, worktreePath);
+  const specFile = resolveTaskSpecPath(worktreePath);
+  await mkdir(path.dirname(specFile), { recursive: true });
   await writeFile(specFile, `${JSON.stringify(match.taskSpec, null, 2)}\n`);
+  const routeArchetype = match.classification?.archetype || match.archetype;
   const agentArgs = [
-    "run",
     "--cwd",
     worktreePath,
     "--task-spec",
     specFile,
+    ...(routeArchetype ? ["--route", routeArchetype] : []),
     "--engine",
     match.selectedRoute.engine,
     "--model",
     match.selectedRoute.model,
-    "--verify",
+    "--verify-command",
     match.verifyCommand,
   ];
   if (match.selectedRoute.effort) agentArgs.push("--effort", match.selectedRoute.effort);
   const agentResult = await execAgentFn(agentArgs, { cwd: worktreePath });
   const executedPayload = {
     ...runPayload,
+    agentArgs,
     agentResult,
     executed: true,
+    specFile,
     worktreePath,
   };
   if (values.json) {
@@ -1046,4 +1201,48 @@ export async function factoryCommand(
     );
   }
   return executedPayload;
+}
+
+export const factoryCli = factoryCommand;
+
+export async function factoryStatus(argvOrOptions = [], maybeOptions = {}) {
+  if (Array.isArray(argvOrOptions)) {
+    const args = argvOrOptions[0] === "status" ? argvOrOptions : ["status", ...argvOrOptions];
+    return factoryCommand(args, maybeOptions);
+  }
+  const options = argvOrOptions || {};
+  const args = ["status"];
+  if (options.json) args.push("--json");
+  if (options.repo) args.push("--repo", String(options.repo));
+  if (options.width) args.push("--width", String(options.width));
+  return factoryCommand(args, options);
+}
+
+export async function factoryGroom(argvOrOptions = [], maybeOptions = {}) {
+  if (Array.isArray(argvOrOptions)) {
+    const args = argvOrOptions[0] === "groom" ? argvOrOptions : ["groom", ...argvOrOptions];
+    return factoryCommand(args, maybeOptions);
+  }
+  const options = argvOrOptions || {};
+  const args = ["groom"];
+  if (options.issue !== undefined) args.push("--issue", String(options.issue));
+  if (options.dryRun || options["dry-run"]) args.push("--dry-run");
+  if (options.repo) args.push("--repo", String(options.repo));
+  if (options.json) args.push("--json");
+  return factoryCommand(args, options);
+}
+
+export async function factoryRun(argvOrOptions = [], maybeOptions = {}) {
+  if (Array.isArray(argvOrOptions)) {
+    const args = argvOrOptions[0] === "run" ? argvOrOptions : ["run", ...argvOrOptions];
+    return factoryCommand(args, maybeOptions);
+  }
+  const options = argvOrOptions || {};
+  const args = ["run"];
+  if (options.dryRun || options["dry-run"]) args.push("--dry-run");
+  if (options.once) args.push("--once");
+  if (options.issue !== undefined) args.push("--issue", String(options.issue));
+  if (options.repo) args.push("--repo", String(options.repo));
+  if (options.json) args.push("--json");
+  return factoryCommand(args, options);
 }

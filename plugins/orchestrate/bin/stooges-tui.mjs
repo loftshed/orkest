@@ -52,13 +52,18 @@ export async function cachedQuota() {
     if (error.code !== "ENOENT") throw error;
   }
   const entries = snapshot.accounts || {};
-  const configured = config?.accounts || Object.values(entries);
-  const accounts = configured.map((account) => ({
-    ...entries[account.id],
-    id: account.id,
-    label: account.label || account.id,
-    short: account.short || account.id.slice(0, 2).toUpperCase(),
-  }));
+  const configured =
+    config?.accounts ||
+    Object.entries(entries).map(([id, entry]) => ({ ...entry, id: entry?.id || id }));
+  const accounts = configured.map((account) => {
+    const id = String(account?.id || "account");
+    return {
+      ...entries[id],
+      id,
+      label: account?.label || id,
+      short: account?.short || id.slice(0, 2).toUpperCase(),
+    };
+  });
   Object.assign(quotaCache, {
     snapshotPath,
     snapshotMtimeMs,
@@ -87,7 +92,7 @@ export async function runTui(
   let isInputResumed = false;
   let isAlternateScreen = false;
   let isCursorHidden = false;
-  let lastFrame = "";
+  let lastLines = [];
   let terminalError;
   let timer;
   let refreshTimer;
@@ -123,15 +128,24 @@ export async function runTui(
       view.height = height();
       const lines = view.render(width());
       if (errorText && lines.length > 0) lines[lines.length - 1] = fit(errorText, width());
-      // Erase each line and the remaining tail without flashing a cleared screen.
-      const frame = lines
-        .slice(0, Math.max(1, view.height))
-        .map((line) => `\u{1B}[2K${line}`)
-        .join("\r\n");
-      const nextFrame = `\u{1B}[H${frame}\u{1B}[J`;
-      if (nextFrame !== lastFrame) {
-        output.write(nextFrame);
-        lastFrame = nextFrame;
+      const visible = lines.slice(0, Math.max(1, view.height));
+      // Overwrite in place (\x1b[K clears trailing cells after drawing) inside synchronized output
+      // (\x1b[?2026h ... \x1b[?2026l), updating only changed rows to prevent background-bar flicker.
+      if (lastLines.length === visible.length) {
+        const patches = [];
+        for (const [index, line] of visible.entries()) {
+          if (line !== lastLines[index]) {
+            patches.push(`\u{1B}[${index + 1};1H${line}\u{1B}[K`);
+          }
+        }
+        if (patches.length > 0) {
+          output.write(`\u{1B}[?2026h${patches.join("")}\u{1B}[?2026l`);
+          lastLines = visible;
+        }
+      } else {
+        const frame = visible.map((line) => `${line}\u{1B}[K`).join("\r\n");
+        output.write(`\u{1B}[?2026h\u{1B}[H${frame}\u{1B}[J\u{1B}[?2026l`);
+        lastLines = visible;
       }
     } catch (error) {
       terminalError = error;
@@ -172,7 +186,7 @@ export async function runTui(
         terminalError ??= error;
       }
     }
-    lastFrame = "";
+    lastLines = [];
     resolveExit?.();
   };
   const keypress = (text, key) => {
@@ -180,12 +194,11 @@ export async function runTui(
     if (text === "q" || (key?.ctrl && key.name === "c")) cleanup();
     else {
       view.handleInput(value);
-      lastFrame = "";
       paint();
     }
   };
   const onResize = () => {
-    lastFrame = "";
+    lastLines = [];
     paint();
   };
   try {

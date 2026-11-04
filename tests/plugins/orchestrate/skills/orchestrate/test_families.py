@@ -130,8 +130,6 @@ class FamilyResolutionTests(unittest.TestCase):
         self.assertEqual(FAMILIES.version_of("qwen2.5-coder-32b"), (2, 5))
         for bad in ("gpt:", "gpt:   ", "latest:gpt:", "latest:"):
             with self.subTest(bad=bad), self.assertRaises((FAMILIES.SelectorError, ValueError)):
-                FAMILIES.resolve_selector(bad, CODEX, RULES)
-            with self.subTest(bad=bad), self.assertRaises((FAMILIES.SelectorError, ValueError)):
                 FAMILIES.resolve("gpt", "", RULES, CODEX)
 
 

@@ -11,17 +11,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-ARCHETYPE_ROLES = frozenset(
-    {
-        "debug-invariants",
-        "structural-refactor",
-        "ui-design-system",
-        "architecture-conductor",
-        "mechanical-sweep",
-        "independent-review",
-    }
-)
-
 
 @functools.cache
 def _sibling_module(name: str) -> Any:
@@ -33,6 +22,29 @@ def _sibling_module(name: str) -> Any:
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def _archetype_roles(route_config: dict[str, Any] | None = None) -> frozenset[str]:
+    routes_mod = _sibling_module("routes")
+    if route_config is not None:
+        raw = route_config
+    else:
+        try:
+            raw = routes_mod.load_routes()
+        except (OSError, ValueError):
+            raw = json.loads(routes_mod.DEFAULTS_PATH.read_text(encoding="utf-8"))
+    mapping = raw.get("routes", raw) if isinstance(raw, dict) and isinstance(raw.get("routes"), dict) else raw
+    if not isinstance(mapping, dict):
+        return frozenset()
+    base_roles = set(getattr(routes_mod, "ENGINE_DEFAULT_ORDER", ()))
+    return frozenset(
+        role
+        for role, spec in mapping.items()
+        if isinstance(spec, dict) and ("alternates" in spec or role not in base_roles)
+    )
+
+
+ARCHETYPE_ROLES = _archetype_roles()
 
 
 def _quota_order(candidate: dict[str, Any]) -> tuple:
@@ -299,7 +311,7 @@ def recommend(
     access = packet.get("access")
     if not isinstance(access, list):
         raise ValueError("profile recommendation requires observed access records")
-    if role in ARCHETYPE_ROLES:
+    if role in ARCHETYPE_ROLES or role in _archetype_roles(route_config):
         routed = _recommend_archetype(
             {**packet, "role": role},
             registry,
