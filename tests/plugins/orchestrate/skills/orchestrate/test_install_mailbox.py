@@ -399,6 +399,101 @@ class InstallMailboxTests(unittest.TestCase):
             self.assertIn("now closed (room room-123)", out)
             self.assertEqual(mocked.call_args.args[0], "close")
 
+    def test_hook_intercepts_bare_swarm_with_zero_tokens_and_allows_goal(self):
+        from unittest.mock import patch
+
+        import peer_mailbox as mailbox
+
+        claude_sid = "11111111-2222-4333-8444-555555555555"
+        agy_sid = "66666666-7777-4888-8999-aaaaaaaaaaaa"
+        with patch(
+            "agent_statusline_tmux.toggle_swarm_view",
+            return_value={"status": "opened", "room": "room-777", "socket": "orkest-label-abcdef012345"},
+        ) as mocked:
+            # 1. Bare /swarm in Claude Code / Codex blocks the turn before calling the model (0 tokens).
+            claude_res = mailbox.hook(
+                {
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": claude_sid,
+                    "cwd": str(self.base),
+                    "prompt": "/swarm",
+                },
+                harness="claude",
+                base=self.base,
+            )
+            self.assertEqual(
+                claude_res,
+                {"decision": "block", "reason": "Orkest Swarm View pane is now opened (room room-777)."},
+            )
+            self.assertEqual(mailbox.load(mailbox.peer_path(self.base, claude_sid))["state"], "idle")
+
+            # 2. Bare /horde in Antigravity (PreInvocation with lastUserInput) terminates before model call.
+            agy_res = mailbox.hook(
+                {
+                    "conversationId": agy_sid,
+                    "invocationNum": 1,
+                    "workspacePaths": [str(self.base)],
+                    "lastUserInput": "/horde",
+                },
+                harness="gemini",
+                base=self.base,
+            )
+            self.assertEqual(
+                agy_res,
+                {
+                    "injectSteps": [
+                        {
+                            "systemMessage": {
+                                "systemMessage": "",
+                                "metadata": {"user_markdown": "Orkest Swarm View pane is now opened (room room-777)."},
+                            }
+                        }
+                    ],
+                    "terminationBehavior": "terminate",
+                },
+            )
+            self.assertEqual(mailbox.load(mailbox.peer_path(self.base, agy_sid))["state"], "idle")
+
+            # 3. /swarm <goal> opens the pane AND proceeds into the model turn with the goal context.
+            mocked.reset_mock()
+            goal_res = mailbox.hook(
+                {
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": claude_sid,
+                    "cwd": str(self.base),
+                    "prompt": "/swarm build the auth module",
+                },
+                harness="claude",
+                base=self.base,
+            )
+            self.assertEqual(mocked.call_args.args[0], "open")
+            self.assertIn("hookSpecificOutput", goal_res)
+            self.assertIn(
+                "Proceed with the user's swarm objective: build the auth module",
+                goal_res["hookSpecificOutput"]["additionalContext"],
+            )
+
+    def test_install_herdr_integration_configures_ctrl_alt_s_shortcut(self):
+        import json
+
+        herdr_dir = self.base / ".config/herdr"
+        herdr_dir.mkdir(parents=True, exist_ok=True)
+        cfg = herdr_dir / "config.toml"
+        cfg.write_text("onboarding = false\n", encoding="utf-8")
+        plugins_json = herdr_dir / "plugins.json"
+        plugins_json.write_text("[]\n", encoding="utf-8")
+
+        changed = installer.install_herdr_integration(self.base)
+        self.assertTrue(changed)
+        cfg_text = cfg.read_text(encoding="utf-8")
+        self.assertIn('key = "ctrl+alt+s"', cfg_text)
+        self.assertIn('command = "orkest.swarms.toggle"', cfg_text)
+        entries = json.loads(plugins_json.read_text(encoding="utf-8"))
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["plugin_id"], "orkest.swarms")
+        action_ids = {a["id"] for a in entries[0]["actions"]}
+        self.assertIn("toggle", action_ids)
+
 
 if __name__ == "__main__":
     unittest.main()

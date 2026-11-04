@@ -1,0 +1,66 @@
+id = "orkest.swarms"
+name = "Orkest Swarms"
+version = "0.50.0"
+min_herdr_version = "0.9.5"
+description = "Group, inspect, and manage Orkest swarms"
+platforms = ["macos", "linux"]
+
+[[actions]]
+id = "toggle"
+title = "Toggle Orkest Swarm View"
+description = "Open or close the Orkest Swarm View split pane"
+contexts = ["global", "workspace", "tab", "pane"]
+command = [
+  "python3",
+  "plugins/orchestrate/skills/orchestrate/scripts/agent_statusline_tmux.py",
+  "--toggle-swarm",
+  "toggle",
+]
+
+[[actions]]
+id = "open"
+title = "Open Orkest Swarm View"
+description = "Open the Orkest Swarm View in a right-side split pane"
+contexts = ["global", "workspace", "tab", "pane"]
+command = [
+  "python3",
+  "plugins/orchestrate/skills/orchestrate/scripts/agent_statusline_tmux.py",
+  "--toggle-swarm",
+  "open",
+]
+
+[[actions]]
+id = "close"
+title = "Close Orkest Swarm View"
+description = "Close the Orkest Swarm View split pane in the current workspace"
+contexts = ["global", "workspace", "tab", "pane"]
+command = [
+  "python3",
+  "plugins/orchestrate/skills/orchestrate/scripts/agent_statusline_tmux.py",
+  "--toggle-swarm",
+  "close",
+]
+
+[[actions]]
+id = "overview"
+title = "Open Orkest Swarms"
+description = "Open the Orkest Swarm View in a right-side split pane"
+contexts = ["workspace"]
+command = [
+  "python3",
+  "plugins/orchestrate/skills/orchestrate/scripts/agent_statusline_tmux.py",
+  "--toggle-swarm",
+  "open",
+]
+
+[[panes]]
+id = "room"
+title = "Orkest Swarm"
+placement = "split"
+command = ["node", "plugins/orchestrate/bin/ork.mjs", "horde", "--view"]
+
+[[panes]]
+id = "overview"
+title = "Orkest Swarms"
+placement = "tab"
+command = ["node", "plugins/orchestrate/bin/ork.mjs", "horde", "--view"]

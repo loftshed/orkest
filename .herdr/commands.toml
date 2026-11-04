@@ -2,11 +2,11 @@
 
 [[commands]]
 id = "orkest.toggle-horde-view"
-title = "Toggle Horde View"
-description = "Open or close the live Orkest Horde View split pane in the current terminal"
-command = "ork horde toggle"
+title = "Toggle Swarm View"
+description = "Open or close the live Orkest Swarm View split pane in the current terminal"
+command = "ork swarm toggle"
 type = "shell"
-key = "prefix+alt+h"
+key = "ctrl+alt+s"
 width = "40%"
 height = "100%"
 

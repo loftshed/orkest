@@ -33,8 +33,8 @@ from mailbox_store import (
 _TRANSCRIPT_TAIL_BYTES = 256 * 1024
 _MODEL_SET_STDOUT = re.compile(r"<local-command-stdout>Set model to (?:`([^`]+)`|([^\n<(]+))")
 _WAKE_NOTICE_ID = re.compile(r"Local peer mailbox notification \(([A-Za-z0-9._-]+)\)")
-_SWARM_SLASH_CMD = re.compile(r"^\s*/(?:orchestrate:)?(?:swarm|horde)(?:\s+(toggle|open|close))?\s*$", re.IGNORECASE)
-_SWARM_TAG_CMD = re.compile(r"\[orkest-swarm-command(?::\s*(toggle|open|close)?)?\]", re.IGNORECASE)
+_SWARM_SLASH_CMD = re.compile(r"^\s*/(?:orchestrate:)?(?:swarm|horde)(?:\s+(.*?))?\s*$", re.IGNORECASE | re.DOTALL)
+_SWARM_TAG_CMD = re.compile(r"\[orkest-swarm-command(?::\s*(.*?))?\]", re.IGNORECASE | re.DOTALL)
 _SIDE_SLASH_CMD = re.compile(r"^\s*/(?:orchestrate:)?side(?:\s+(.*))?\s*$", re.IGNORECASE | re.DOTALL)
 _SIDE_TAG_CMD = re.compile(r"\[orkest-side-command:\s*(.*?)\]", re.IGNORECASE | re.DOTALL)
 _SIDE_PREFIX_CMD = re.compile(r"^\s*(?:!side\s+|side:\s*)(.+?)\s*$", re.IGNORECASE | re.DOTALL)
@@ -57,7 +57,7 @@ MAILBOX_SENDER = {"session": "mailbox", "name": "mailbox", "harness": "unknown"}
 
 def latest_user_prompt(payload: dict[str, Any], session: str, account: str | None = None) -> str | None:
     """Return the user's latest prompt text from the hook payload or session transcript tail."""
-    for key in ("prompt", "userMessage", "query"):
+    for key in ("lastUserInput", "prompt", "userMessage", "query"):
         if isinstance(value := payload.get(key), str) and value.strip():
             return value
     raw_path = payload.get("transcript_path") or payload.get("transcriptPath")
@@ -1040,10 +1040,16 @@ def side_command_context(
             data = json.loads(out)
             if isinstance(data, dict):
                 if data.get("status") == "error":
+                    if (event == "UserPromptSubmit" and me.get("harness") != "gemini") or (
+                        event == "PreInvocation" and not mid_turn
+                    ):
+                        return f"Side mission error: {data.get('error')}"
                     return f"[orkest-side-dispatched] Side mission error: {data.get('error')}. Report this in one line and do not call any tools."
                 summary = str(data.get("summary") or "").strip()
                 if summary:
-                    if event == "UserPromptSubmit" and me.get("harness") != "gemini":
+                    if (event == "UserPromptSubmit" and me.get("harness") != "gemini") or (
+                        event == "PreInvocation" and not mid_turn
+                    ):
                         return summary
                     return f"[orkest-side-dispatched] {summary} Confirm this to the user in one short line and do not call any tools."
     return ""
@@ -1052,7 +1058,7 @@ def side_command_context(
 def swarm_command_context(
     base: Path, me: dict[str, Any], payload: dict[str, Any], event: str, *, mid_turn: bool = False
 ) -> str:
-    """Toggle the Orkest Swarm View split pane when the user submits `/swarm`."""
+    """Toggle or open the Orkest Swarm View split pane when the user submits `/swarm` or `/horde`."""
     if me.get("isSubagent") or me.get("delegatedRun") or _MB.is_run_peer(me):
         return ""
     if not (event == "UserPromptSubmit" or (event == "PreInvocation" and not mid_turn)):
@@ -1064,7 +1070,13 @@ def swarm_command_context(
     match = _SWARM_SLASH_CMD.match(cleaned) or _SWARM_TAG_CMD.search(cleaned)
     if not match:
         return ""
-    action = (match.group(1) or "toggle").lower()
+    raw_arg = (match.group(1) or "").strip()
+    if raw_arg.lower() in {"", "toggle", "open", "close"}:
+        action = (raw_arg or "toggle").lower()
+        goal = ""
+    else:
+        action = "open"
+        goal = raw_arg
     import agent_statusline_tmux
 
     with contextlib.suppress(Exception):
@@ -1080,14 +1092,21 @@ def swarm_command_context(
         room = outcome.get("room")
         room_note = f" (room {room})" if room else ""
         if outcome.get("status") in {"opened", "closed", "already_open", "already_closed"}:
-            return (
-                f"Orkest Swarm View pane is now {status}{room_note} (toggled automatically by the `/swarm` turn hook). "
-                "Confirm this to the user in one short line and do not call any tools."
-            )
+            if goal:
+                return (
+                    f"[orkest-swarm-goal] Orkest Swarm View pane is now {status}{room_note}. "
+                    f"Proceed with the user's swarm objective: {goal}"
+                )
+            return f"Orkest Swarm View pane is now {status}{room_note}."
         reason = outcome.get("reason") or "no enclosing Orkest tmux terminal"
+        if goal:
+            return (
+                f"[orkest-swarm-goal] Orkest Swarm View pane could not be opened automatically ({reason}). "
+                f"Proceed with the user's swarm objective: {goal}"
+            )
         return (
             f"Orkest Swarm View pane could not be toggled automatically ({reason}). "
-            "Let the user know in one short line that `/swarm` requires an Orkest-wrapped terminal session."
+            "Use Ctrl+Option+S in Herdr or an Orkest-wrapped terminal session."
         )
     return ""
 
@@ -1315,13 +1334,6 @@ def hook(
         if event == "SessionStart" and not is_subagent and not me.get("isSubagent")
         else ""
     )
-    swarm_brief = (
-        _MB.swarm_coordinator_context(base, me, event, mid_turn=mid_turn)
-        if not is_subagent
-        and not me.get("isSubagent")
-        and (event in {"SessionStart", "UserPromptSubmit"} or (gemini and event == "PreInvocation" and not mid_turn))
-        else ""
-    )
     swarm_toggle = (
         _MB.swarm_command_context(base, me, payload, event, mid_turn=mid_turn)
         if not is_subagent and not me.get("isSubagent")
@@ -1332,9 +1344,32 @@ def hook(
         if not is_subagent and not me.get("isSubagent")
         else ""
     )
-    if side_notice and event == "UserPromptSubmit" and not gemini:
-        _MB.annotate(base, session, state="idle")
-        return {"decision": "block", "reason": side_notice}
+    is_swarm_goal = swarm_toggle.startswith("[orkest-swarm-goal] ")
+    intercept_notice = side_notice or ("" if is_swarm_goal else swarm_toggle)
+    if intercept_notice and not mid_turn:
+        if event == "UserPromptSubmit" and not gemini:
+            _MB.annotate(base, session, state="idle")
+            return {"decision": "block", "reason": intercept_notice}
+        if gemini and event == "PreInvocation":
+            _MB.annotate(base, session, state="idle")
+            return {
+                "injectSteps": [
+                    {
+                        "systemMessage": {
+                            "systemMessage": "",
+                            "metadata": {"user_markdown": intercept_notice},
+                        }
+                    }
+                ],
+                "terminationBehavior": "terminate",
+            }
+    swarm_brief = (
+        _MB.swarm_coordinator_context(base, me, event, mid_turn=mid_turn)
+        if not is_subagent
+        and not me.get("isSubagent")
+        and (event in {"SessionStart", "UserPromptSubmit"} or (gemini and event == "PreInvocation" and not mid_turn))
+        else ""
+    )
     progress_hint = ""
     help_hint = ""
     if (
