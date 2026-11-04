@@ -268,16 +268,27 @@ def summarize_runs(
             for value in quality_values
             if (ts := _run_timestamp(value)) is not None and (now_ts - ts) <= WINDOW_14D_SECONDS
         ]
+        quality_prior = [
+            value
+            for value in quality_values
+            if (ts := _run_timestamp(value)) is None or (now_ts - ts) > WINDOW_14D_SECONDS
+        ]
+        prior_accepted_rate = (
+            round(sum(_accepted(value) for value in quality_prior) / len(quality_prior), 6)
+            if quality_prior
+            else accepted_rate
+        )
         rolling_14d_runs = len(quality_14d)
         rolling_14d_accepted = sum(_accepted(value) for value in quality_14d)
         rolling_14d_rate = round(rolling_14d_accepted / rolling_14d_runs, 6) if rolling_14d_runs > 0 else None
         rolling_14d_bound = wilson_lower_bound(rolling_14d_accepted, rolling_14d_runs)
         raw_drop = (accepted_rate - rolling_14d_rate) if rolling_14d_rate is not None else 0.0
+        prior_drop = (prior_accepted_rate - rolling_14d_rate) if rolling_14d_rate is not None else 0.0
         degradation_drop = round(raw_drop, 4)
         degraded = bool(
             rolling_14d_runs >= DEGRADATION_MIN_QUALITY_RUNS
             and rolling_14d_rate is not None
-            and raw_drop >= DEGRADATION_MIN_DROP
+            and max(raw_drop, prior_drop) >= DEGRADATION_MIN_DROP
         )
 
         rows.append(
@@ -416,7 +427,11 @@ def rank_candidates_by_telemetry(
         if best["wilson_lb_95"] - current["wilson_lb_95"] > min_wilson_delta:
             ranked[healthy_slots[start]], ranked[healthy_slots[best_offset]] = best, current
     if any(candidate.get("degraded") for candidate in ranked):
-        ranked = [c for c in ranked if not c.get("degraded")] + [c for c in ranked if c.get("degraded")]
+        avail_healthy = [c for c in ranked if c.get("quota_pace") == "available" and not c.get("degraded")]
+        avail_degraded = [c for c in ranked if c.get("quota_pace") == "available" and c.get("degraded")]
+        other_healthy = [c for c in ranked if c.get("quota_pace") != "available" and not c.get("degraded")]
+        other_degraded = [c for c in ranked if c.get("quota_pace") != "available" and c.get("degraded")]
+        ranked = avail_healthy + avail_degraded + other_healthy + other_degraded
     for candidate in ranked:
         candidate.pop("_telemetry_original_index", None)
     return ranked

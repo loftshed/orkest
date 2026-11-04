@@ -22,7 +22,12 @@ const defaultRoutesUrl = new URL(
 const TASK_SPEC_SCHEMA = "agent-executor.task-spec.v1";
 
 export function loadDefaultRoutes() {
-  const baseRoutes = JSON.parse(readFileSync(defaultRoutesUrl, "utf8")).routes || {};
+  let baseRoutes;
+  try {
+    baseRoutes = JSON.parse(readFileSync(defaultRoutesUrl, "utf8")).routes || {};
+  } catch {
+    baseRoutes = {};
+  }
   const merged = structuredClone(baseRoutes);
   try {
     const userConfig = JSON.parse(readFileSync(configPath("config.json"), "utf8"));
@@ -698,7 +703,7 @@ export function bootstrapWorktreeInclude(repoRoot, worktreePath) {
     .map((line) => line.trim())
     .filter((line) => line.length > 0 && !line.startsWith("#"))
     .map((line) => normalizeRelativePath(line))
-    .filter(Boolean);
+    .filter((pattern) => Boolean(pattern) && !pattern.startsWith(".."));
   if (patterns.length === 0) return [];
 
   const trackedSet = resolveTrackedFilesSet(resolvedRoot);
@@ -736,8 +741,15 @@ export function bootstrapWorktreeInclude(repoRoot, worktreePath) {
   const sortedFiles = [...candidateFiles].sort((a, b) => a.localeCompare(b));
   const copied = [];
   for (const relFile of sortedFiles) {
+    if (relFile.startsWith("..")) continue;
     const src = path.join(resolvedRoot, relFile);
     const dest = path.join(resolvedWorktree, relFile);
+    if (
+      path.relative(resolvedRoot, src).startsWith("..") ||
+      path.relative(resolvedWorktree, dest).startsWith("..")
+    ) {
+      continue;
+    }
     mkdirSync(path.dirname(dest), { recursive: true });
     cpSync(src, dest, { force: true, recursive: true });
     copied.push(relFile);
@@ -789,13 +801,16 @@ async function defaultExecAgent(args, { cwd = process.cwd() } = {}) {
   }
 }
 
-async function provisionDisposableWorktree(cwd, worktreeSlug, branch, issueNumber) {
+async function provisionDisposableWorktree(cwd, worktreeSlug, branch, issueNumber, engine = null) {
   const resolvedCwd = path.resolve(cwd);
   const repoName = path.basename(resolvedCwd);
   const worktreeBase = path.join(homedir(), ".cache", "agent-executor", "worktrees", repoName);
   const worktreePath = path.join(worktreeBase, worktreeSlug);
+  if (existsSync(worktreePath)) {
+    throw new Error(`Disposable worktree path already exists: ${worktreePath}`);
+  }
   await mkdir(worktreeBase, { recursive: true });
-  await execute("git", ["worktree", "add", "-B", branch, worktreePath, "HEAD"], {
+  await execute("git", ["worktree", "add", "-b", branch, worktreePath, "HEAD"], {
     cwd: resolvedCwd,
     timeout: 30_000,
   });
@@ -811,6 +826,7 @@ async function provisionDisposableWorktree(cwd, worktreeSlug, branch, issueNumbe
         branch,
         createdAt: new Date().toISOString(),
         disposable: true,
+        ...(engine && { engine }),
         issue: issueNumber,
         parentCwd: resolvedCwd,
         slug: worktreeSlug,
@@ -819,7 +835,6 @@ async function provisionDisposableWorktree(cwd, worktreeSlug, branch, issueNumbe
       2,
     )}\n`,
   );
-  bootstrapWorktreeInclude(resolvedCwd, worktreePath);
   return worktreePath;
 }
 
@@ -1148,6 +1163,7 @@ export async function factoryCommand(
     match.worktreeSlug,
     match.branch,
     match.issue.number,
+    match.selectedRoute?.engine || null,
   );
   bootstrapWorktreeInclude(cwd, worktreePath);
   const specFile = resolveTaskSpecPath(worktreePath);

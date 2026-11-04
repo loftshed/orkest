@@ -621,4 +621,21 @@ describe("ork smelter", () => {
     expect(runPayload.dryRun).toBe(true);
     expect(runPayload.reviewerEngine).toBe("claude");
   });
+
+  it("falls back to installed harnesses in selectColdReviewerEngine and protects unmarked worktrees", async () => {
+    expect(selectColdReviewerEngine("codex", { availableEngines: ["agy", "codex"] })).toBe("agy");
+    expect(selectColdReviewerEngine("antigravity", { availableEngines: ["codex"] })).toBe("codex");
+    expect(selectColdReviewerEngine("claude", { availableEngines: ["claude"] })).toBe("claude");
+
+    const unmarkedDir = await makeTempDir("ork-unmarked-wt-");
+    const result = await smeltWorktree(unmarkedDir, {
+      changedPaths: ["docs/README.md"],
+      dryRun: true,
+      execFileSyncFn: () => "",
+    });
+    expect(result.disposable).toBe(false);
+    expect(result.stages.smeltAndPrune.operations).toEqual([
+      ["git", "merge", "--ff-only", path.basename(unmarkedDir)],
+    ]);
+  });
 });

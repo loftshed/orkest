@@ -333,9 +333,12 @@ function joinCardGrid(cards, columns, cardWidth, gap = "  ") {
 function treeRoom(room) {
   const swarm = room.swarm || { maxAgents: 64, maxDepth: 8 };
   const treeAgents = [];
+  const visited = new Set();
   const visit = (parent) => {
     const children = room.agents.filter((agent) => (agent.parent || "conductor") === parent);
     for (const agent of children) {
+      if (visited.has(agent.id)) continue;
+      visited.add(agent.id);
       const worktree = resolveMemberWorktree(agent, room?.cwd);
       treeAgents.push({
         ...agent,
@@ -346,6 +349,16 @@ function treeRoom(room) {
     }
   };
   visit("conductor");
+  for (const agent of room.agents) {
+    if (visited.has(agent.id)) continue;
+    visited.add(agent.id);
+    const worktree = resolveMemberWorktree(agent, room?.cwd);
+    treeAgents.push({
+      ...agent,
+      _cachedWorktree: worktree,
+      ...(worktree && { worktree }),
+    });
+  }
   const groups = new Map();
   for (const agent of treeAgents) {
     const folder = agentFolder(agent, room);
@@ -721,8 +734,15 @@ export class StoogesView {
       }
     }
     const focused = room.agents.find((agent) => agent.id === (this.pinnedId || this.focusId));
-    const detail = focused?.output?.at(-1);
-    if (detail && lines.length < this.height - 4) lines.push(plain(detail));
+    const rawDetail = focused?.output?.at(-1);
+    const detail = rawDetail ? plain(rawDetail) : "";
+    const focusedTask = focused ? plain(focused.progress?.task || focused.objective || "") : "";
+    if (detail && (this.pinnedId || detail !== focusedTask) && lines.length < this.height - 4) {
+      const tag = this.pinnedId ? "pinned" : "detail";
+      const prefix = `${tag} (${plain(focused.name || focused.id)}): `;
+      const detailBudget = Math.max(1, innerWidth - displayWidth(prefix));
+      lines.push(`${tone(prefix, "dim", this.color)}${fit(detail, detailBudget)}`);
+    }
     while (lines.length < this.height - 3) lines.push("");
     lines.push(
       `${room.agents.length}/${maxAgents} slots · page ${this.page + 1}/${pages}`,

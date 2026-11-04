@@ -1009,6 +1009,11 @@ def resolve_route(args: argparse.Namespace) -> argparse.Namespace:
         route = routes[args.route]
         if args.engine and args.engine != route["engine"]:
             route = None  # an explicit engine overrides the route entirely
+        elif not args.engine and not args.model and route.get("engine") and not shutil.which(route["engine"]):
+            for alt in route.get("alternates") or ():
+                if isinstance(alt, dict) and alt.get("engine") and shutil.which(str(alt["engine"])):
+                    route = alt
+                    break
     if args.model and not args.engine and not args.route:
         families = _attr("load_model_families")()
         parsed = _attr("families_module")().parse_selector(args.model, families)

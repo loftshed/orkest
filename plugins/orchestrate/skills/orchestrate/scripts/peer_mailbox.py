@@ -1974,6 +1974,7 @@ def main(argv: list[str] | None = None) -> int:
     return mailbox_cli.main(argv)
 
 
+sys.modules.setdefault("peer_mailbox", sys.modules[__name__])
 register_facade(sys.modules[__name__])
 
 

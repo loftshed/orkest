@@ -741,6 +741,8 @@ def consult_command(
             tools,
             "--strict-mcp-config",
         ]
+        if web:
+            command += ["--allowedTools", "WebSearch,WebFetch"]
         if effort is not None:
             command += ["--effort", effort]
         if session_id:
@@ -795,7 +797,13 @@ def consult_command(
 
 
 def consult_environment(
-    engine: str, workspace: Path, claude_config_dir: str | None, session_id: str | None, *, reading: bool
+    engine: str,
+    workspace: Path,
+    claude_config_dir: str | None,
+    session_id: str | None,
+    *,
+    reading: bool,
+    web: bool = False,
 ) -> dict[str, str]:
     environment = _runner().executor_environment(engine, workspace, claude_config_dir, session_id=session_id)
     if engine == "opencode":
@@ -806,6 +814,10 @@ def consult_environment(
         if not reading:
             tools.update(dict.fromkeys(OPENCODE_READ_TOOLS, False))
         permission = {"edit": "deny", "bash": "deny", "webfetch": "deny", "external_directory": "deny"}
+        if web:
+            tools["webfetch"] = True
+            tools["websearch"] = True
+            permission["webfetch"] = "allow"
         environment["OPENCODE_PERMISSION"] = json.dumps(permission)
         environment["OPENCODE_CONFIG_CONTENT"] = json.dumps(
             {"tools": tools, "permission": permission, "mcp": {}, "share": "disabled", "autoupdate": False}
@@ -1158,7 +1170,12 @@ def _perform(
         )
 
     environment = consult_environment(
-        engine, workspace, request.get("claude_config_dir"), session_id or new_session_id, reading=reading
+        engine,
+        workspace,
+        request.get("claude_config_dir"),
+        session_id or new_session_id,
+        reading=reading,
+        web=bool(request.get("web") or request.get("route") == "web-research"),
     )
     stdin_path: Path | None = prompt_path if engine in ("codex", "claude") else None
     if agy_stdin:

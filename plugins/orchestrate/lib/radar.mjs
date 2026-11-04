@@ -115,6 +115,7 @@ export function diffCatalogAgainstSeen(
   const newModels = [];
   const models = [];
   const alerts = [];
+  const alertedGroups = new Set();
 
   for (const entry of liveEntries) {
     const { id } = entry;
@@ -134,6 +135,7 @@ export function diffCatalogAgainstSeen(
     const health = degradedGroup ? "degraded" : "healthy";
     const degradationDrop = degradedGroup ? degradedGroup.degradation_drop : 0;
     if (degradedGroup) {
+      alertedGroups.add(degradedGroup);
       alerts.push({
         archetype: degradedGroup.task_archetype,
         degradation_drop: degradationDrop,
@@ -158,7 +160,7 @@ export function diffCatalogAgainstSeen(
   }
 
   for (const group of telemetryGroups) {
-    if (!group || group.degraded !== true) continue;
+    if (!group || group.degraded !== true || alertedGroups.has(group)) continue;
     const hasAlert = alerts.some(
       (alert) => alert.model === group.model && alert.archetype === group.task_archetype,
     );
@@ -290,16 +292,38 @@ export async function radarCli(argv = [], options = {}) {
     options: {
       help: { short: "h", type: "boolean" },
       json: { type: "boolean" },
+      line: { type: "boolean" },
       "live-catalog": { type: "string" },
       priors: { type: "string" },
+      refresh: { type: "boolean" },
       "runs-dir": { type: "string" },
       "seen-catalog": { type: "string" },
     },
   });
 
   const priors = options.priors || loadBenchmarkPriors(values.priors || options.priorsPath);
-  const telemetry =
-    options.telemetry || (await summarizeTelemetry(values["runs-dir"] || options.runsDir));
+  let telemetry = options.telemetry;
+  if (!telemetry) {
+    if (subcommand === "priors") {
+      telemetry = {
+        groups: [],
+        runs: 0,
+        schema: "agent-executor.telemetry.v1",
+        skipped_results: 0,
+      };
+    } else {
+      try {
+        telemetry = await summarizeTelemetry(values["runs-dir"] || options.runsDir);
+      } catch {
+        telemetry = {
+          groups: [],
+          runs: 0,
+          schema: "agent-executor.telemetry.v1",
+          skipped_results: 0,
+        };
+      }
+    }
+  }
   const liveCatalog =
     options.liveCatalog ??
     (values["live-catalog"]

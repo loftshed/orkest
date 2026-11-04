@@ -306,21 +306,31 @@ export async function assignWorkforceRole(id, memberId, role, { root = mailboxRo
   );
 }
 
+const authorityCache = new Map();
+const AUTHORITY_TTL_MS = 5000;
+
 /** The team's current lead and generation; the authority record is written only by authority.py. */
 export async function authorityShow(team) {
+  const now = Date.now();
+  const cached = authorityCache.get(team);
+  if (cached && now - cached.fetchedAt < AUTHORITY_TTL_MS) {
+    return cached.value;
+  }
   try {
     const { stdout } = await execute("python3", [authorityPath, "show", "--team", team], {
       maxBuffer: 8 * 1024 * 1024,
       timeout: 30_000,
     });
     const { authority } = JSON.parse(stdout);
-    return {
+    const value = {
       team,
       generation: authority.generation,
       status: authority.status,
       lead: authority.lead,
       offer: authority.offer?.to,
     };
+    authorityCache.set(team, { fetchedAt: now, value });
+    return value;
   } catch (error) {
     return { team, error: error.stderr?.trim() || error.message };
   }

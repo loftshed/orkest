@@ -131,12 +131,14 @@ def _node_room_lock(path: Path):
                     if time.time() - lock_dir.stat().st_mtime > 15.0:
                         stale = True
             if stale:
+                stale_dir = lock_dir.with_name(f"{lock_dir.name}.stale.{os.getpid()}.{time.monotonic_ns()}")
                 with contextlib.suppress(OSError):
-                    owner_file.unlink(missing_ok=True)
-                    lock_dir.rmdir()
+                    os.replace(lock_dir, stale_dir)
+                    (stale_dir / "owner").unlink(missing_ok=True)
+                    stale_dir.rmdir()
                 continue
             if time.monotonic() >= deadline:
-                break
+                raise OSError(f"Room is locked: {path}") from None
             time.sleep(0.025)
     try:
         yield

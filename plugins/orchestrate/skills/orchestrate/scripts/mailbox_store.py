@@ -142,14 +142,17 @@ class MailboxError(ValueError):
 
 _FACADES: list[Any] = []
 _ORIGINALS: dict[str, Any] = {}
+_MODULE_ORIGINALS: dict[int, dict[str, Any]] = {}
 
 
 def register_facade(module: Any) -> None:
     if module not in _FACADES:
         _FACADES.append(module)
+    mod_originals = _MODULE_ORIGINALS.setdefault(id(module), {})
     for name, value in vars(module).items():
         if not name.startswith("__"):
             _ORIGINALS.setdefault(name, value)
+            mod_originals.setdefault(name, value)
 
 
 class _MailboxProxy:
@@ -158,7 +161,8 @@ class _MailboxProxy:
         orig = _ORIGINALS.get(name, sentinel)
         for module in reversed(_FACADES):
             val = getattr(module, name, sentinel)
-            if val is not sentinel and val is not orig:
+            mod_orig = _MODULE_ORIGINALS.get(id(module), {}).get(name, orig)
+            if val is not sentinel and val is not mod_orig:
                 return val
         if orig is not sentinel:
             return orig

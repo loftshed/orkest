@@ -905,13 +905,17 @@ def wait_for_steer_response(
     read_json = _attr("read_json_file")
     finished_fn = _attr("steer_job_finished")
     alive_fn = _attr("runner_process_alive")
+    iteration = 0
+    alive = True
     while True:
         if response_path.exists():
             return read_json(response_path)
         state = read_json(job_dir / STEER_STATE_NAME)
         finished = finished_fn(job, state)
-        alive = alive_fn(job.get("pid"), str(job.get("completion_event_path")))
         expired = time.monotonic() >= deadline
+        if iteration % 5 == 0 or expired or finished or not request_path.exists():
+            alive = alive_fn(job.get("pid"), str(job.get("completion_event_path")))
+        iteration += 1
         if request_path.exists():
             if not (expired or finished or not alive):
                 time.sleep(0.2)

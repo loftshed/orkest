@@ -52,13 +52,18 @@ export async function cachedQuota() {
     if (error.code !== "ENOENT") throw error;
   }
   const entries = snapshot.accounts || {};
-  const configured = config?.accounts || Object.values(entries);
-  const accounts = configured.map((account) => ({
-    ...entries[account.id],
-    id: account.id,
-    label: account.label || account.id,
-    short: account.short || account.id.slice(0, 2).toUpperCase(),
-  }));
+  const configured =
+    config?.accounts ||
+    Object.entries(entries).map(([id, entry]) => ({ ...entry, id: entry?.id || id }));
+  const accounts = configured.map((account) => {
+    const id = String(account?.id || "account");
+    return {
+      ...entries[id],
+      id,
+      label: account?.label || id,
+      short: account?.short || id.slice(0, 2).toUpperCase(),
+    };
+  });
   Object.assign(quotaCache, {
     snapshotPath,
     snapshotMtimeMs,
@@ -189,7 +194,6 @@ export async function runTui(
     if (text === "q" || (key?.ctrl && key.name === "c")) cleanup();
     else {
       view.handleInput(value);
-      lastLines = [];
       paint();
     }
   };

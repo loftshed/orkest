@@ -116,9 +116,10 @@ export function isEngineInstalled(engine, env = process.env) {
  * a machine only has a subset installed.
  */
 export function selectColdReviewerEngine(workerEngine, options = {}) {
-  const normalized = String(workerEngine ?? "")
+  const raw = String(workerEngine ?? "")
     .trim()
     .toLowerCase();
+  const normalized = raw === "antigravity" ? "agy" : raw;
   const candidates = REVIEWER_PREFERENCE[normalized] || REVIEWER_PREFERENCE.codex;
   if (Array.isArray(options?.availableEngines)) {
     const available = new Set(options.availableEngines.map((item) => String(item).toLowerCase()));
@@ -312,6 +313,7 @@ export async function smeltWorktree(worktree, options = {}) {
       : { ...worktree };
   const worktreePath = path.resolve(worktreeObj.worktreePath || worktreeObj.path || process.cwd());
   const loadedMeta = loadWorktreeMetadata(worktreePath, worktreeObj.markerPath);
+  const hasMarker = Boolean(worktreeObj.marker || loadedMeta.marker);
   const marker = worktreeObj.marker ?? loadedMeta.marker ?? {};
   const taskSpec = worktreeObj.taskSpec ?? loadedMeta.taskSpec ?? null;
 
@@ -325,9 +327,33 @@ export async function smeltWorktree(worktree, options = {}) {
   const repoRoot = path.resolve(
     options.repoRoot || options.cwd || worktreeObj.parentCwd || marker.parentCwd || process.cwd(),
   );
+  const execFileSyncFn = options.execFileSync || options.execFileSyncFn || execFileSync;
+  let resolvedHeadBranch = null;
+  if (
+    !options.branch &&
+    !worktreeObj.branch &&
+    !marker.branch &&
+    existsSync(path.join(worktreePath, ".git"))
+  ) {
+    try {
+      const headRef = String(
+        execFileSyncFn("git", ["rev-parse", "--abbrev-ref", "HEAD"], {
+          cwd: worktreePath,
+          encoding: "utf8",
+        }) ?? "",
+      ).trim();
+      if (headRef && headRef !== "HEAD") resolvedHeadBranch = headRef;
+    } catch {
+      /* Ignore git lookup errors on non-git or mocked paths. */
+    }
+  }
   const branch =
-    options.branch || worktreeObj.branch || marker.branch || path.basename(worktreePath);
-  let isDisposable = marker.disposable !== false;
+    options.branch ||
+    worktreeObj.branch ||
+    marker.branch ||
+    resolvedHeadBranch ||
+    path.basename(worktreePath);
+  let isDisposable = hasMarker && marker.disposable !== false;
   if (options.disposable !== undefined) {
     isDisposable = Boolean(options.disposable);
   } else if (worktreeObj.disposable !== undefined) {
@@ -350,7 +376,6 @@ export async function smeltWorktree(worktree, options = {}) {
     taskSpec?.engine ||
     "codex";
 
-  const execFileSyncFn = options.execFileSync || options.execFileSyncFn || execFileSync;
   const gateRunner = options.gateRunner || options.runGateFn || null;
   const reviewRunner =
     options.reviewRunner || options.consultRunner || options.runConsultFn || null;
@@ -358,7 +383,7 @@ export async function smeltWorktree(worktree, options = {}) {
   const commands = [];
   const runCmd = (cmd, args, cwd = worktreePath) => {
     commands.push({ args, cmd, cwd });
-    return execFileSyncFn(cmd, args, { cwd, encoding: "utf8" });
+    return execFileSyncFn(cmd, args, { cwd, encoding: "utf8", maxBuffer: 32 * 1024 * 1024 });
   };
 
   // Stage 1: Rebase & Scope Audit
@@ -392,7 +417,16 @@ export async function smeltWorktree(worktree, options = {}) {
 
   const blastRadius = classifyBlastRadius(changedPaths);
   if (!isDryRun) {
-    runCmd("git", ["rebase", targetBranch], worktreePath);
+    try {
+      runCmd("git", ["rebase", targetBranch], worktreePath);
+    } catch (error) {
+      try {
+        execFileSyncFn("git", ["rebase", "--abort"], { cwd: worktreePath, encoding: "utf8" });
+      } catch {
+        /* Ignore abort error if rebase had not started. */
+      }
+      throw error;
+    }
   }
   const stage1 = {
     allowPaths: allowPaths ?? [],
@@ -505,6 +539,24 @@ export async function smeltWorktree(worktree, options = {}) {
         : []),
     ];
     if (!isDryRun) {
+      let currentRepoBranch = "";
+      if (existsSync(path.join(repoRoot, ".git"))) {
+        try {
+          currentRepoBranch = String(
+            execFileSyncFn("git", ["rev-parse", "--abbrev-ref", "HEAD"], {
+              cwd: repoRoot,
+              encoding: "utf8",
+            }) ?? "",
+          ).trim();
+        } catch {
+          currentRepoBranch = "";
+        }
+      }
+      if (currentRepoBranch && currentRepoBranch !== "HEAD" && currentRepoBranch !== targetBranch) {
+        throw new Error(
+          `Cannot fast-forward merge into ${repoRoot}: checked out branch is ${currentRepoBranch}, expected ${targetBranch}`,
+        );
+      }
       runCmd("git", ["merge", "--ff-only", branch], repoRoot);
       if (isDisposable) {
         runCmd("git", ["worktree", "remove", worktreePath], repoRoot);

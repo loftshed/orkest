@@ -256,9 +256,11 @@ export function fitStyled(value, width) {
       continue;
     }
     const graphemes = segments.segment(cleaned);
+    let hasOverflowed = false;
     for (const { segment } of graphemes) {
       const size = cellWidth(segment);
-      if (!(used + size <= width)) {
+      if (hasOverflowed || !(used + size <= width)) {
+        hasOverflowed = true;
         continue;
       }
 
