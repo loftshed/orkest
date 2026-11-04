@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.50.0
+
+- feat(orchestrate): horde/foundry convergence, Herdr integration, cross-harness fixes & workboard leases (#73)
+
 ## 0.49.0
 
 - feat(orchestrate): reconnect resumed sessions to swarm rooms and show quota reset countdown
