@@ -15,6 +15,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import peer_mailbox as mailbox
@@ -105,22 +106,64 @@ def _room_path(base: Path, room_id: str) -> Path:
     return base / "rooms" / f"{room_id}.json"
 
 
+@contextlib.contextmanager
+def _node_room_lock(path: Path):
+    lock_dir = Path(f"{path}.lock")
+    lock_dir.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    owner_file = lock_dir / "owner"
+    deadline = time.monotonic() + 3.0
+    acquired = False
+    while True:
+        try:
+            lock_dir.mkdir(mode=0o700)
+            acquired = True
+            with contextlib.suppress(OSError):
+                owner_file.write_text(f"{os.getpid()}\n", encoding="utf-8")
+            break
+        except FileExistsError:
+            stale = False
+            with contextlib.suppress(OSError, ValueError):
+                owner_pid = int(owner_file.read_text(encoding="utf-8").strip())
+                if owner_pid > 0 and mailbox.pid_alive(owner_pid) is False:
+                    stale = True
+            if not stale:
+                with contextlib.suppress(OSError):
+                    if time.time() - lock_dir.stat().st_mtime > 15.0:
+                        stale = True
+            if stale:
+                with contextlib.suppress(OSError):
+                    owner_file.unlink(missing_ok=True)
+                    lock_dir.rmdir()
+                continue
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.025)
+    try:
+        yield
+    finally:
+        if acquired:
+            with contextlib.suppress(OSError):
+                owner_file.unlink(missing_ok=True)
+                lock_dir.rmdir()
+
+
 def _update_room_metadata(base: Path, room_id: str, **fields: str | None) -> dict[str, object] | None:
     try:
         path = _room_path(base, room_id)
     except ValueError:
         return None
-    data = mailbox.load(path)
-    if not isinstance(data, dict):
-        return None
-    for key, value in fields.items():
-        if value is None:
-            data.pop(key, None)
-        else:
-            data[key] = value
-    with contextlib.suppress(OSError):
+    with contextlib.suppress(OSError), mailbox.locked(path), _node_room_lock(path):
+        data = mailbox.load(path)
+        if not isinstance(data, dict):
+            return None
+        for key, value in fields.items():
+            if value is None:
+                data.pop(key, None)
+            else:
+                data[key] = value
         mailbox.write(path, data)
-    return data
+        return data
+    return None
 
 
 def _extract_herdr_pane_id(raw_stdout: str) -> str | None:
@@ -294,6 +337,55 @@ def _find_herdr_room(base: Path, pane_id: str) -> str:
     return best_id
 
 
+def _ensure_bound_room(
+    *,
+    current_room: str,
+    session_id: str | None,
+    harness: str | None,
+    cwd: str | None,
+    environment: dict[str, str],
+) -> tuple[str | None, str | None]:
+    cli = Path(__file__).resolve().parents[3] / "bin" / "ork.mjs"
+    node = shutil.which("node") or "node"
+    engine = {"gemini": "agy", "agy": "agy", "claude": "claude", "codex": "codex", "opencode": "opencode"}.get(
+        harness or "", "codex"
+    )
+    if not current_room:
+        target_cwd = cwd or os.getcwd()
+        created = subprocess.run(
+            [node, str(cli), "stooges", "--engine", engine, "--cwd", target_cwd, "--json"],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if created.returncode != 0:
+            return None, created.stderr.strip() or "could not create swarm room"
+        current_room = json.loads(created.stdout)["id"]
+    if session_id and current_room:
+        subprocess.run(
+            [
+                node,
+                str(cli),
+                "rooms",
+                "bind",
+                "--room",
+                current_room,
+                "--member",
+                "conductor",
+                "--engine",
+                engine,
+                "--session",
+                session_id,
+            ],
+            env=environment,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    return current_room, None
+
+
 def _toggle_herdr_swarm_view(
     action: str,
     *,
@@ -329,43 +421,16 @@ def _toggle_herdr_swarm_view(
     environment.pop("TMUX", None)
     environment.pop("TMUX_PANE", None)
     environment["AGENT_EXECUTOR_HOME"] = str(base.parent)
-    cli = Path(__file__).resolve().parents[3] / "bin" / "ork.mjs"
-    engine = {"gemini": "agy", "agy": "agy", "claude": "claude", "codex": "codex", "opencode": "opencode"}.get(
-        harness or "", "codex"
+    resolved_room, room_error = _ensure_bound_room(
+        current_room=current_room,
+        session_id=session_id,
+        harness=harness,
+        cwd=cwd,
+        environment=environment,
     )
-    if not current_room:
-        target_cwd = cwd or os.getcwd()
-        created = subprocess.run(
-            [shutil.which("node") or "node", str(cli), "stooges", "--engine", engine, "--cwd", target_cwd, "--json"],
-            env=environment,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if created.returncode != 0:
-            return {"status": "error", "reason": created.stderr.strip() or "could not create swarm room"}
-        current_room = json.loads(created.stdout)["id"]
-    if session_id and current_room:
-        subprocess.run(
-            [
-                shutil.which("node") or "node",
-                str(cli),
-                "rooms",
-                "bind",
-                "--room",
-                current_room,
-                "--member",
-                "conductor",
-                "--engine",
-                engine,
-                "--session",
-                session_id,
-            ],
-            env=environment,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
+    if not resolved_room:
+        return {"status": "error", "reason": room_error or "could not create swarm room"}
+    current_room = resolved_room
     room_data = None
     with contextlib.suppress(ValueError):
         room_data = mailbox.load(_room_path(base, current_room))
@@ -470,16 +535,13 @@ def toggle_swarm_view(
         ).stdout.strip()
         or "%0"
     )
-    current_room = (
-        subprocess.run(
-            [*tmux_cmd, "show-option", "-t", "orkest", "-v", "@orkest_room"],
-            capture_output=True,
-            text=True,
-            check=False,
-        ).stdout.strip()
-        or room
-        or os.environ.get("ORKEST_SWARM_ROOM", "").strip()
-    )
+    tmux_room = subprocess.run(
+        [*tmux_cmd, "show-option", "-t", "orkest", "-v", "@orkest_room"],
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout.strip()
+    current_room = (room or "").strip() or tmux_room or os.environ.get("ORKEST_SWARM_ROOM", "").strip()
     panes_out = subprocess.run(
         [*tmux_cmd, "list-panes", "-t", "orkest", "-F", "#{pane_id}"],
         capture_output=True,
@@ -538,42 +600,16 @@ def toggle_swarm_view(
         bound = agent_statusline.bound_rooms(base, peer)
         if bound:
             current_room = bound[0][0]["id"]
-    engine = {"gemini": "agy", "agy": "agy", "claude": "claude", "codex": "codex", "opencode": "opencode"}.get(
-        harness or "", "codex"
+    resolved_room, room_error = _ensure_bound_room(
+        current_room=current_room,
+        session_id=session_id,
+        harness=harness,
+        cwd=cwd,
+        environment=environment,
     )
-    if not current_room:
-        target_cwd = cwd or os.getcwd()
-        created = subprocess.run(
-            [shutil.which("node") or "node", str(cli), "stooges", "--engine", engine, "--cwd", target_cwd, "--json"],
-            env=environment,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if created.returncode != 0:
-            return {"status": "error", "reason": created.stderr.strip() or "could not create swarm room"}
-        current_room = json.loads(created.stdout)["id"]
-    if session_id and current_room:
-        subprocess.run(
-            [
-                shutil.which("node") or "node",
-                str(cli),
-                "rooms",
-                "bind",
-                "--room",
-                current_room,
-                "--member",
-                "conductor",
-                "--engine",
-                engine,
-                "--session",
-                session_id,
-            ],
-            env=environment,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
+    if not resolved_room:
+        return {"status": "error", "reason": room_error or "could not create swarm room"}
+    current_room = resolved_room
     subprocess.run(
         [*tmux_cmd, "set-option", "-t", "orkest", "@orkest_room", current_room], env=environment, check=False
     )
