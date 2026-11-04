@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.48.0
+
+- fix(orchestrate): address cold review findings across smelter, foundry, radar, runner, mailbox, and horde TUI
+- feat(horde): add 2-line AG quota pools, completed agent collapse/hide, liveness indicators & flicker-free delta paint
+- refactor(orchestrate): extract model_routing, workspace_audit, job_steering and remove calibration (#61)
+- feat(orchestrate): consolidate Hall modules, eliminate 1s Python TUI subprocesses, and unify terminal seam (#60)
+- refactor(orchestrate): decompose peer_mailbox into store, hooks, and cli (#62)
+- feat(orchestrate): add model radar, 14d silent-nerf telemetry, and web-research (#64)
+- feat(orchestrate): slim factory into foundry and add smelter pipeline (#63)
+- feat(tui): extract tui-box primitives and unify HordeView card tree (#59)
+
 ## 0.47.0
 
 - feat(orchestrate): add factory CLI, Herdr backend, and swarm TUI
