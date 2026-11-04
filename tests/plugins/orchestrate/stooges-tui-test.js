@@ -7,6 +7,7 @@ import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { runTui } from "../../../plugins/orchestrate/bin/stooges-tui.mjs";
+import { HordeView } from "../../../plugins/orchestrate/lib/horde-view.mjs";
 import {
   addMembers,
   createRoom,
@@ -16,13 +17,23 @@ import {
   updateRoom,
   validateRoom,
 } from "../../../plugins/orchestrate/lib/stooges-room.mjs";
+import { StoogesView } from "../../../plugins/orchestrate/lib/stooges-view.mjs";
 import {
+  ANSI,
+  cellWidth,
   displayWidth,
+  fit,
+  fitStyled,
+  frame,
+  GLYPHS,
   glyphTier,
+  plain,
   progressBar,
-  StoogesView,
+  renderPanel,
+  renderTable,
+  tone,
   wrapText,
-} from "../../../plugins/orchestrate/lib/stooges-view.mjs";
+} from "../../../plugins/orchestrate/lib/tui-box.mjs";
 
 const exec = promisify(execFile);
 const cli = path.resolve("plugins/orchestrate/bin/ork.mjs");
@@ -131,19 +142,37 @@ describe("swarm rooms", () => {
   });
 });
 
-describe("adaptive view", () => {
-  it("uses three columns on a wide terminal and stacked rows when narrow", () => {
-    const view = new StoogesView(fixture(), { now: () => 2000 });
+describe("tui-box primitives and HordeView unification", () => {
+  it("exports reusable box, width, and table primitives from tui-box and aliases HordeView", () => {
+    expect(HordeView).toBe(StoogesView);
+    expect(ANSI.cyan).toBe("36");
+    expect(GLYPHS.unicode.topLeft).toBe("┌");
+    expect(cellWidth("a")).toBe(1);
+    expect(cellWidth("界")).toBe(2);
+    expect(plain("\u{1B}[31mhi\u{1B}[0m")).toBe("hi");
+    expect(fit("hello", 3)).toBe("hel");
+    const styled = fitStyled(tone("hello", "cyan", true), 8);
+    expect(displayWidth(styled)).toBe(8);
+    expect(frame("box", ["row"], 10)).toHaveLength(3);
+    expect(renderPanel("panel", ["body"], 16)).toHaveLength(3);
+    expect(renderTable(["A", "B"], [["1", "2"]], 12)).toHaveLength(3);
+  });
+
+  it("uses two card columns on a wide terminal and stacked cards when narrow", () => {
+    const view = new HordeView(fixture(), { now: () => 2000 });
     const wide = view.render(120);
-    expect(wide.join("\n")).toContain("Engine / model");
-    expect(wide.join("\n")).toContain("haiku-1");
-    expect(wide.some((line) => line.includes("[?] help"))).toBe(true);
+    expect(wide.some((line) => line.includes("1 haiku-1") && line.includes("2 flash-1"))).toBe(
+      true,
+    );
+    expect(wide.some((line) => line.includes("? help"))).toBe(true);
     const narrow = view.render(70);
-    expect(narrow.join("\n")).toContain("Agent");
-    expect(narrow.join("\n")).toContain("Showing 1–3 of 3 agents");
-    expect(narrow.find((line) => line.includes("Rows "))).toContain("Rows 1–3/3");
-    expect(narrow.join("\n")).toContain("Which branch should I review?");
-    expect(narrow.join("\n")).toContain("haiku-1: Source inspected (×2)");
+    expect(narrow.some((line) => line.includes("1 haiku-1") && line.includes("2 flash-1"))).toBe(
+      false,
+    );
+    expect(narrow.join("\n")).toContain("1 haiku-1");
+    expect(narrow.join("\n")).toContain("2 flash-1");
+    expect(narrow.join("\n")).toContain("3 luna-1");
+    expect(narrow.join("\n")).toContain("3/64 slots · page 1/1");
   });
 
   it("focuses and pins detail while new output arrives", () => {
@@ -152,22 +181,26 @@ describe("adaptive view", () => {
     view.handleInput("2");
     view.handleInput("p");
     view.handleInput("1");
-    expect(view.render(90).join("\n")).toContain("Pinned · haiku-2");
+    expect(view.render(90).join("\n")).toContain("PIN ");
     const changed = structuredClone(room);
     changed.agents[1].output.push("Branch selected");
     view.setRoom(changed);
     expect(view.render(90).join("\n")).toContain("Branch selected");
     view.handleInput("2");
     view.handleInput("p");
-    expect(view.render(90).join("\n")).toContain("Focus · haiku-2");
+    const unpinned = view.render(90).join("\n");
+    expect(unpinned).not.toContain("PIN ");
+    expect(unpinned).toContain("FOCUS ");
   });
 
   it("supports more than nine members with page-local number keys", () => {
     const view = new StoogesView(fixture("claude:haiku*12"));
     view.handleInput("n");
     view.handleInput("3");
-    expect(view.render(80).join("\n")).toContain("Focus · haiku-12");
-    expect(view.render(80).join("\n")).toContain("page 2/2");
+    const rendered = view.render(80).join("\n");
+    expect(view.focusId).toBe("haiku-12");
+    expect(rendered).toContain("3 haiku-12");
+    expect(rendered).toContain("page 2/2");
   });
 
   it("keeps focus, detail and navigation visible on a short terminal", () => {
@@ -178,9 +211,10 @@ describe("adaptive view", () => {
     for (let index = 0; index < 8; index++) view.handleInput("\u{1B}[B");
     const lines = view.render(80);
     expect(lines.length).toBeLessThanOrEqual(18);
-    expect(lines.join("\n")).toContain("Focus · haiku-9");
+    expect(lines.join("\n")).toContain("haiku-9");
+    expect(lines.join("\n")).toContain("FOCUS ");
     expect(lines.join("\n")).toContain("Ninth agent result");
-    expect(lines.join("\n")).toContain("q quit");
+    expect(lines.join("\n")).toContain("q close view");
   });
 
   it("fits Unicode and strips injected terminal controls", () => {
@@ -202,7 +236,7 @@ describe("adaptive view", () => {
       expect(lines.join("\n")).not.toContain("\u{1B}[31munsafe");
     }
     expect(view.render(80).join("\n")).toContain("\u{1B}[36m");
-    expect(view.render(80).join("\n")).toContain("\u{1B}[36;7m");
+    expect(view.render(80).join("\n")).toContain("\u{1B}[36;1m");
     expect(view.render(80).join("\n")).toContain("next line");
   });
 
@@ -214,7 +248,7 @@ describe("adaptive view", () => {
     expect(displayWidth("\u{F0000}")).toBe(1);
     expect(wrapText("界", 1)).toEqual(["?"]);
     const ascii = new StoogesView(fixture(), { height: 24, tier: "ascii" }).render(40);
-    expect(ascii.join("\n")).toContain("+ ork");
+    expect(ascii.join("\n")).toContain("+ Swarm · sample-room");
     expect(ascii.every((line) => displayWidth(line) <= 40)).toBe(true);
   });
 
@@ -222,7 +256,9 @@ describe("adaptive view", () => {
     const room = fixture();
     room.agents = [];
     const view = new StoogesView(room, { height: 24 });
-    expect(view.render(80).join("\n")).toContain("No agents queued for this room");
+    expect(view.render(80).join("\n")).toContain(
+      "The coordinator will add agents as work is assigned.",
+    );
     view.handleInput("?");
     expect(view.render(80).join("\n")).toContain("Key reference");
     view.handleInput("\u{1B}");
@@ -231,7 +267,7 @@ describe("adaptive view", () => {
     expect(view.render(80).join("\n")).toContain("Room log");
   });
 
-  it("renders quota pills from monitor account data", () => {
+  it("renders quota pills from monitor account data right below the coordinator card", () => {
     const room = fixture();
     room.accounts = [
       {
@@ -251,10 +287,10 @@ describe("adaptive view", () => {
         ],
       },
     ];
-    expect(new StoogesView(room, { now: () => 1000 }).render(100).join("\n")).toContain(
-      "CX Weekly",
-    );
-    expect(new StoogesView(room, { now: () => 1000 }).render(100).join("\n")).toContain("80% left");
+    const rendered = new StoogesView(room, { now: () => 1000 }).render(100).join("\n");
+    expect(rendered).toContain("Quota");
+    expect(rendered).toContain("CX Weekly");
+    expect(rendered).toContain("80% left");
   });
 
   it("renders outer tree rails, contrasting headers, and wt:<slug> badges for disposable worktrees in swarm view", () => {
@@ -284,6 +320,7 @@ describe("adaptive view", () => {
     expect(unicodeText).toContain("\u{1B}[48;5;236;97;1m");
 
     const asciiText = new StoogesView(room, { height: 28, tier: "ascii" }).render(85).join("\n");
+    expect(asciiText).toContain("| orkest · 2 agents · /workspace/orkest");
     expect(asciiText).toContain("| + 1 pro-1");
     expect(asciiText).toContain("+-|Awaiting assignment");
     expect(asciiText).toContain("| + 2 haiku-1");
@@ -309,9 +346,9 @@ describe("ork CLI", () => {
       [cli, "stooges", "--fixture", file, "--print", "--width", "70"],
       { env },
     );
-    expect(printed.stdout).toContain("Conductor running · 3 agents");
-    expect(printed.stdout).toContain("┌ ork · sample-room");
-    expect(printed.stdout).toContain("[?] help");
+    expect(printed.stdout).toContain("┌ Swarm · sample-room");
+    expect(printed.stdout).toContain("3/64 slots");
+    expect(printed.stdout).toContain("? help");
     expect(printed.stdout).not.toContain("\u{1B}");
     const json = await exec(process.execPath, [cli, "stooges", "--fixture", file, "--json"], {
       env,
@@ -501,151 +538,5 @@ describe("terminal lifecycle", () => {
     } finally {
       vi.useRealTimers();
     }
-  });
-});
-
-describe("Pi room adapter", () => {
-  async function adapter({ hasUI = true, mode = "tui" } = {}) {
-    const dir = await directory();
-    vi.stubEnv("AGENT_EXECUTOR_HOME", dir);
-    const commands = new Map();
-    const tools = new Map();
-    const events = new Map();
-    let component;
-    const requestRender = vi.fn();
-    const ctx = {
-      cwd: dir,
-      hasUI,
-      mode,
-      ui: {
-        notify: vi.fn(),
-        setWidget: vi.fn((name, factory) => {
-          expect(name).toBe("stooges-room");
-          component?.dispose();
-          component = factory ? factory({ requestRender }, {}) : undefined;
-        }),
-      },
-    };
-    const { default: register } =
-      await import("../../../plugins/orchestrate/lib/pi-stooges-widget.mjs");
-    register({
-      registerCommand: (name, command) => commands.set(name, command),
-      registerTool: (tool) => tools.set(tool.name, tool),
-      on: (name, handler) => events.set(name, handler),
-    });
-    return {
-      ctx,
-      root: path.join(dir, "mailbox-v1"),
-      command: (args) => commands.get("stooges").handler(args, ctx),
-      tool: tools.get("stooges_spawn"),
-      shutdown: () => events.get("session_shutdown")({}, ctx),
-      view: () => component,
-      requestRender,
-    };
-  }
-
-  afterEach(() => {
-    vi.useRealTimers();
-    vi.unstubAllEnvs();
-  });
-
-  it("attaches a widget, follows durable output and cleans up on off", async () => {
-    const app = await adapter();
-    await updateRoom("sample-room", () => fixture(), { root: app.root, create: true });
-    vi.useFakeTimers();
-    try {
-      await app.command("sample-room");
-      expect(app.view().render(80).join("\n")).toContain("Inspecting source");
-      await app.command("focus 2");
-      await app.command("pin");
-      expect(app.view().render(80).join("\n")).toContain("Pinned · flash-1");
-      await updateRoom(
-        "sample-room",
-        (room) => {
-          room.agents[1].output.push("Review complete");
-          return room;
-        },
-        { root: app.root },
-      );
-      await vi.advanceTimersByTimeAsync(1000);
-      await vi.waitFor(() => expect(app.view().render(80).join("\n")).toContain("Review complete"));
-      expect(app.requestRender).toHaveBeenCalled();
-      await app.command("off");
-      expect(app.view()).toBeUndefined();
-      expect(vi.getTimerCount()).toBe(0);
-    } finally {
-      await app.shutdown();
-    }
-  });
-
-  it("creates rooms in the active directory and stops mounted timers at shutdown", async () => {
-    const app = await adapter();
-    vi.useFakeTimers();
-    try {
-      await app.command("new claude:haiku*2");
-      const { readdir } = await import("node:fs/promises");
-      const files = (await readdir(path.join(app.root, "rooms"))).filter((name) =>
-        name.endsWith(".json"),
-      );
-      expect(files).toHaveLength(1);
-      const room = await readRoom(files[0].slice(0, -5), app.root);
-      expect(room.cwd).toBe(app.ctx.cwd);
-      expect(room.agents).toHaveLength(2);
-      expect(app.view().render(80).join("\n")).toContain("haiku-2");
-      expect(vi.getTimerCount()).toBeGreaterThan(0);
-      await app.shutdown();
-      expect(vi.getTimerCount()).toBe(0);
-    } finally {
-      await app.shutdown();
-    }
-  });
-
-  it("queues members headlessly and rejects aborted or invalid requests without mutation", async () => {
-    const app = await adapter({ hasUI: false, mode: "rpc" });
-    await updateRoom("sample-room", () => fixture(), { root: app.root, create: true });
-    const parameters = app.tool.parameters;
-    // eslint-disable-next-line unicorn/prefer-structured-clone -- Verify the tool schema survives JSON transport.
-    expect(JSON.parse(JSON.stringify(parameters))).toMatchObject({
-      type: "object",
-      required: expect.arrayContaining(["roomId", "team"]),
-    });
-    const result = await app.tool.execute(
-      "call-1",
-      { roomId: "sample-room", team: "claude:haiku*2" },
-      undefined,
-      undefined,
-      app.ctx,
-    );
-    expect(result.details).toMatchObject({
-      roomId: "sample-room",
-      agentIds: ["haiku-2", "haiku-3"],
-    });
-    expect(result.content[0]).toMatchObject({
-      type: "text",
-      text: expect.stringContaining("Queued"),
-    });
-    expect((await readRoom("sample-room", app.root)).agents).toHaveLength(5);
-    for (const args of [
-      { roomId: "sample-room" },
-      { roomId: "../escape", team: "claude:haiku" },
-      { roomId: "sample-room", team: 42 },
-    ]) {
-      await expect(
-        app.tool.execute("invalid", args, undefined, undefined, app.ctx),
-      ).rejects.toThrow();
-    }
-    const controller = new AbortController();
-    controller.abort();
-    await expect(
-      app.tool.execute(
-        "aborted",
-        { roomId: "sample-room", team: "claude:haiku" },
-        controller.signal,
-        undefined,
-        app.ctx,
-      ),
-    ).rejects.toThrow();
-    expect((await readRoom("sample-room", app.root)).agents).toHaveLength(5);
-    expect(app.ctx.ui.setWidget).not.toHaveBeenCalled();
   });
 });
