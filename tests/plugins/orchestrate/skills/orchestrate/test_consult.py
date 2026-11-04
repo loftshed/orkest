@@ -17,6 +17,8 @@ from pathlib import Path
 from unittest import mock
 
 SKILL_DIR = Path(__file__).resolve().parents[5] / "plugins" / "orchestrate" / "skills" / "orchestrate"
+if str(SKILL_DIR / "scripts") not in sys.path:
+    sys.path.insert(0, str(SKILL_DIR / "scripts"))
 SCRIPT = SKILL_DIR / "scripts" / "run_agent.py"
 # Never query real subscription accounts through monitor, and use the bundled routes only.
 os.environ["MONITOR_BIN"] = str(Path(__file__).parent / "no-monitor")
@@ -795,6 +797,55 @@ class ConsultTests(unittest.TestCase):
             self.assertNotIn(leaked, filtered)
         self.assertEqual(filtered.get("CODEX_HOME"), str(codex_home))
         del exec_env
+
+    def test_web_flag_and_web_research_route_enable_search_tools_and_url_citations(self) -> None:
+        code, result, _summary = self.consult(
+            "--question",
+            "What changed in the latest release?",
+            "--model",
+            "opus",
+            "--web",
+            "--transport",
+            "executor",
+        )
+        self.assertEqual(code, 0, result.get("error"))
+        self.assertTrue(result["web"])
+        capture = self.capture()
+        argv = capture["argv"]
+        self.assertEqual(argv[argv.index("--tools") + 1], "WebSearch,WebFetch")
+        self.assertIn("cite URLs for external facts", capture["stdin"])
+
+        env = self.environment(FAKE_RESPONSE=FINDINGS)
+        code, result, _summary = self.consult(
+            "--question",
+            "Compare repo against upstream docs",
+            "--read",
+            str(self.repository),
+            "--model",
+            "opus",
+            "--web",
+            "--transport",
+            "executor",
+            env=env,
+        )
+        self.assertEqual(code, 0, result.get("error"))
+        argv = self.capture()["argv"]
+        self.assertEqual(argv[argv.index("--tools") + 1], "Read,Grep,Glob,WebSearch,WebFetch")
+
+        code, result, _summary = self.consult(
+            "--question",
+            "Check latest benchmark results",
+            "--model",
+            "gpt-5.6-sol",
+            "--route",
+            "web-research",
+            "--transport",
+            "executor",
+        )
+        self.assertEqual(code, 0, result.get("error"))
+        self.assertTrue(result["web"])
+        self.assertIn("--search", self.capture()["argv"])
+        self.assertIn("cite URLs for external facts", self.capture()["stdin"])
 
 
 if __name__ == "__main__":
