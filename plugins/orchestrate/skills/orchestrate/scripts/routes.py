@@ -1,13 +1,15 @@
 """Role-based routes: which engine, model and effort a role (implementation, consultation, ...) uses.
 
-Defaults live in references/routes.default.json; the user's ~/.config/agent-executor/config.json (or
-$AGENT_EXECUTOR_CONFIG) overrides any route. The code holds no model IDs of its own.
+Defaults live in references/routes.default.json; the user's ~/.config/orchestrate/config.json (or
+$ORCHESTRATE_CONFIG, with legacy ~/.config/agent-executor/config.json / $AGENT_EXECUTOR_CONFIG fallback)
+overrides any route. The code holds no model IDs of its own.
 """
 
 from __future__ import annotations
 
+import functools
+import importlib.util
 import json
-import os
 from pathlib import Path
 from typing import Any
 
@@ -15,12 +17,19 @@ DEFAULTS_PATH = Path(__file__).resolve().parent.parent / "references" / "routes.
 ENGINE_DEFAULT_ORDER = ("implementation", "gemini", "claude", "opencode", "consultation")
 
 
+@functools.cache
+def _runtime_paths() -> Any:
+    path = Path(__file__).with_name("runtime_paths.py")
+    spec = importlib.util.spec_from_file_location("orchestrate_runtime_paths", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("cannot load runtime_paths")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def config_path() -> Path:
-    explicit = os.environ.get("AGENT_EXECUTOR_CONFIG")
-    if explicit:
-        return Path(explicit).expanduser()
-    root = os.environ.get("XDG_CONFIG_HOME")
-    return (Path(root).expanduser() if root else Path.home() / ".config") / "agent-executor" / "config.json"
+    return _runtime_paths().config_path()
 
 
 def load_config() -> dict[str, Any]:

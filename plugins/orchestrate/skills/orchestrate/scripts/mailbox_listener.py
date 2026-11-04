@@ -50,8 +50,13 @@ class StreamingSession:
         self.native_session: str | None = None
 
     def observe(self, event: dict) -> None:
+        kind = event.get("type") or event.get("event")
+        errored = (
+            kind in {"error", "fatal"}
+            or event.get("type") in {"error", "fatal"}
+            or event.get("event") in {"error", "fatal"}
+        )
         if self.engine == "agy":
-            kind = event.get("type") or event.get("event")
             initialized = kind == "init"
             finished = kind == "result"
             inner = event.get(kind) if isinstance(kind, str) else None
@@ -67,11 +72,11 @@ class StreamingSession:
             native = event.get("session_id")
         if native:
             self.native_session = native
-        if initialized or finished:
+        if initialized or finished or errored:
             self.ready = True
-        if finished:
+        if finished or errored:
             self.busy = False
-        if initialized or finished:
+        if initialized or finished or errored:
             self.presence()
 
     def presence(self) -> None:

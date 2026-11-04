@@ -1,3 +1,4 @@
+# cspell:words herdr
 """A wrapped terminal follows its visible native session without guessing from shared processes."""
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from pathlib import Path
 SCRIPTS = Path(__file__).resolve().parents[5] / "plugins/orchestrate/skills/orchestrate/scripts"
 sys.path.insert(0, str(SCRIPTS))
 import agent_progress as progress  # noqa: E402
+import agent_terminal  # noqa: E402
 import peer_mailbox as mailbox  # noqa: E402
 
 
@@ -38,7 +40,16 @@ class TerminalTests(unittest.TestCase):
         self.addCleanup(lambda: subprocess.run([*self.tmux, "kill-server"], capture_output=True, check=False))
         socket = subprocess.check_output([*self.tmux, "display-message", "-p", "#{socket_path}"], text=True).strip()
         self.environment = {**os.environ, "AGENT_EXECUTOR_HOME": str(self.home)}
-        for key in ("ORKEST_TERMINAL_SERVER", "ORKEST_TERMINAL_HARNESS", "TMUX", "TMUX_PANE"):
+        for key in (
+            "ORKEST_TERMINAL_SERVER",
+            "ORKEST_TERMINAL_HARNESS",
+            "TMUX",
+            "TMUX_PANE",
+            "HERDR_ENV",
+            "HERDR_PANE_ID",
+            "HERDR_WORKSPACE_ID",
+            "HERDR_SOCKET_PATH",
+        ):
             self.environment.pop(key, None)
         self.native = {
             **self.environment,
@@ -276,6 +287,104 @@ class TerminalTests(unittest.TestCase):
                         os.kill(pid, signal.SIGTERM)
                         os.waitpid(pid, 0)
                     os.close(master)
+
+    def test_herdr_context_and_bind_annotate_peer_without_tmux(self):
+        session = "herdr-session"
+        self.peer(session, "claude")
+        herdr_env = {
+            **self.environment,
+            "HERDR_ENV": "1",
+            "HERDR_PANE_ID": "w1:p4",
+            "HERDR_WORKSPACE_ID": "w1",
+            "HERDR_SOCKET_PATH": "/tmp/herdr-test.sock",
+            "ORKEST_TERMINAL_HARNESS": "claude",
+        }
+        old_environ = os.environ.copy()
+        try:
+            os.environ.clear()
+            os.environ.update(herdr_env)
+            self.assertEqual(agent_terminal.herdr_context("claude"), ("w1:p4", "w1"))
+            self.assertIsNone(agent_terminal.herdr_context("gemini"))
+            self.assertTrue(agent_terminal.bind(session, "claude", {"model": "claude-sonnet"}))
+        finally:
+            os.environ.clear()
+            os.environ.update(old_environ)
+        stored = mailbox.load(mailbox.peer_path(self.base, session))
+        self.assertEqual(stored["herdrPaneId"], "w1:p4")
+        self.assertEqual(stored["herdrWorkspaceId"], "w1")
+        self.assertEqual(stored["herdrSocket"], "/tmp/herdr-test.sock")
+        self.assertNotIn("terminalServer", stored)
+
+    def test_herdr_direct_launch_bypasses_nested_tmux(self):
+        info = self.home / "herdr-claude.json"
+        binary = self.home / "claude"
+        binary.write_text(
+            "#!" + sys.executable + "\n"
+            "import json, os, sys\nfrom pathlib import Path\n"
+            "Path(" + repr(str(info)) + ").write_text(json.dumps({"
+            "'tmux': os.environ.get('TMUX'), "
+            "'server': os.environ.get('ORKEST_TERMINAL_SERVER'), "
+            "'harness': os.environ.get('ORKEST_TERMINAL_HARNESS'), "
+            "'herdr_pane': os.environ.get('HERDR_PANE_ID'), "
+            "'args': sys.argv[1:]"
+            "}))\n"
+            "print('Herdr direct launch ready', flush=True)\n"
+        )
+        binary.chmod(0o755)
+        environment = {
+            **self.environment,
+            "HERDR_ENV": "1",
+            "HERDR_PANE_ID": "w1:p1",
+            "HERDR_WORKSPACE_ID": "w1",
+            "TERM": "xterm-256color",
+        }
+        pid, master = pty.fork()
+        if pid == 0:
+            termios.tcsetwinsize(0, (30, 120))
+            os.execvpe(
+                "node",
+                [
+                    "node",
+                    str(SCRIPTS.parents[2] / "bin/ork.mjs"),
+                    "label",
+                    "--",
+                    str(binary),
+                    "--model",
+                    "fixture-model",
+                ],
+                environment,
+            )
+        output = b""
+        try:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                if select.select([master], [], [], 0.1)[0]:
+                    try:
+                        chunk = os.read(master, 65536)
+                        if not chunk:
+                            break
+                        output += chunk
+                    except OSError:
+                        break
+                if info.exists():
+                    break
+            self.assertTrue(info.exists(), f"Direct launch did not write info: {output!r}")
+            launched = json.loads(info.read_text())
+            self.assertIsNone(launched["tmux"])
+            self.assertIsNone(launched["server"])
+            self.assertEqual(launched["harness"], "claude")
+            self.assertEqual(launched["herdr_pane"], "w1:p1")
+            self.assertEqual(launched["args"], ["--model", "fixture-model"])
+        finally:
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                if os.waitpid(pid, os.WNOHANG)[0]:
+                    break
+                time.sleep(0.05)
+            else:
+                os.kill(pid, signal.SIGTERM)
+                os.waitpid(pid, 0)
+            os.close(master)
 
 
 if __name__ == "__main__":

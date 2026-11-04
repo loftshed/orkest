@@ -102,6 +102,9 @@ describe("swarm rooms", () => {
     const room = fixture();
     room.agents[0].id = undefined;
     expect(() => validateRoom(room)).toThrow("Invalid or duplicate");
+    const invalidWorktree = fixture();
+    invalidWorktree.agents[0].worktree = { disposable: "yes" };
+    expect(() => validateRoom(invalidWorktree)).toThrow("Invalid member worktree metadata");
   });
 
   it("rejects a stored room whose identity differs from its filename", async () => {
@@ -252,6 +255,40 @@ describe("adaptive view", () => {
       "CX Weekly",
     );
     expect(new StoogesView(room, { now: () => 1000 }).render(100).join("\n")).toContain("80% left");
+  });
+
+  it("renders outer tree rails, contrasting headers, and wt:<slug> badges for disposable worktrees in swarm view", () => {
+    const room = fixture("agy:pro@ui-designer,claude:haiku@reviewer");
+    room.title = "Worktree grouping";
+    room.cwd = "/workspace/orkest";
+    room.conductor = { engine: "agy", role: "lead", status: "working" };
+    room.swarm = { maxAgents: 6, maxDepth: 3 };
+    room.agents[0].cwd = "/cache/worktrees/orkest/wt-50";
+    room.agents[0].worktree = {
+      path: "/cache/worktrees/orkest/wt-50",
+      branch: "feat/wt-50",
+      disposable: true,
+      parentCwd: "/workspace/orkest",
+      slug: "wt-50",
+    };
+    room.agents[1].cwd = "/workspace/orkest";
+
+    const unicodeLines = new StoogesView(room, { height: 28, tier: "unicode", color: true }).render(
+      90,
+    );
+    expect(unicodeLines.every((line) => displayWidth(line) <= 90)).toBe(true);
+    const unicodeText = unicodeLines.join("\n");
+    expect(unicodeText).toContain("orkest · 2 agents · /workspace/orkest");
+    expect(unicodeText).toContain("FOCUS wt:wt-50");
+    expect(unicodeText).toContain("\u{1B}[48;5;24;97;1m");
+    expect(unicodeText).toContain("\u{1B}[48;5;236;97;1m");
+
+    const asciiText = new StoogesView(room, { height: 28, tier: "ascii" }).render(85).join("\n");
+    expect(asciiText).toContain("| + 1 pro-1");
+    expect(asciiText).toContain("+-|Awaiting assignment");
+    expect(asciiText).toContain("| + 2 haiku-1");
+    expect(asciiText).toContain("`-|Awaiting assignment");
+    expect(asciiText).toContain("wt:wt-50");
   });
 });
 

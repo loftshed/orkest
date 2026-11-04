@@ -1,3 +1,4 @@
+# cspell:words herdr
 """A real Stooges terminal launches once, shows live work, and reconnects without another agent."""
 
 from __future__ import annotations
@@ -149,6 +150,8 @@ class SwarmLaunchTests(unittest.TestCase):
                 "CODEX_HOME": str(home),
                 "MONITOR_CACHE_DIR": str(home / "monitor"),
             }
+            for key in ("HERDR_ENV", "HERDR_PANE_ID", "HERDR_WORKSPACE_ID", "HERDR_SOCKET_PATH"):
+                environment.pop(key, None)
             clients = []
 
             def launch(arguments, command="stooges"):
@@ -270,6 +273,209 @@ class SwarmLaunchTests(unittest.TestCase):
                         os.kill(pid, signal.SIGTERM)
                         os.waitpid(pid, 0)
                     os.close(master)
+
+
+@unittest.skipUnless(shutil.which("node"), "Herdr swarm launch requires Node")
+class HerdrSwarmLaunchTests(unittest.TestCase):
+    def _write_fake_herdr(self, home: Path, state_file: Path) -> Path:
+        state_file.write_text(
+            json.dumps(
+                {
+                    "next_id": 2,
+                    "panes": ["w1:p1", "w1:p99"],
+                    "calls": [],
+                    "runs": [],
+                }
+            )
+        )
+        herdr_bin = home / "herdr"
+        herdr_bin.write_text(
+            "#!" + sys.executable + "\n"
+            "import json, sys\nfrom pathlib import Path\n"
+            "state_path = Path(" + repr(str(state_file)) + ")\n"
+            "state = json.loads(state_path.read_text())\n"
+            "args = sys.argv[1:]\n"
+            "state['calls'].append(args)\n"
+            "if args[:2] == ['pane', 'split']:\n"
+            "    pane_id = f\"w1:p{state['next_id']}\"\n"
+            "    state['next_id'] += 1\n"
+            "    state['panes'].append(pane_id)\n"
+            "    state_path.write_text(json.dumps(state))\n"
+            "    print(json.dumps({'ok': True, 'result': {'pane': {'pane_id': pane_id}}}))\n"
+            "elif args[:2] == ['pane', 'run']:\n"
+            "    state['runs'].append({'pane': args[2], 'command': args[3]})\n"
+            "    state_path.write_text(json.dumps(state))\n"
+            "    print(json.dumps({'ok': True}))\n"
+            "elif args[:2] == ['pane', 'list']:\n"
+            "    state_path.write_text(json.dumps(state))\n"
+            "    print(json.dumps({'ok': True, 'result': {'panes': [{'pane_id': p} for p in state['panes']]}}))\n"
+            "elif args[:2] == ['pane', 'current']:\n"
+            "    target = args[args.index('--pane') + 1] if '--pane' in args else 'w1:p1'\n"
+            "    state_path.write_text(json.dumps(state))\n"
+            "    if target not in state['panes']:\n"
+            "        sys.exit(1)\n"
+            "    print(json.dumps({'ok': True, 'result': {'pane': {'pane_id': target}}}))\n"
+            "elif args[:2] == ['pane', 'close']:\n"
+            "    target = args[args.index('--pane') + 1] if '--pane' in args else args[2]\n"
+            "    if target in state['panes']:\n"
+            "        state['panes'].remove(target)\n"
+            "    state_path.write_text(json.dumps(state))\n"
+            "    print(json.dumps({'ok': True}))\n"
+            "else:\n"
+            "    state_path.write_text(json.dumps(state))\n"
+            "    print(json.dumps({'ok': True}))\n"
+        )
+        herdr_bin.chmod(0o755)
+        return herdr_bin
+
+    def test_herdr_launch_and_toggle_swarm_view(self):
+        import agent_statusline_tmux
+
+        with tempfile.TemporaryDirectory(prefix="ork-herdr-swarm-") as temporary:
+            home = Path(temporary).resolve()
+            base = home / "mailbox-v1"
+            state_file = home / "herdr-state.json"
+            self._write_fake_herdr(home, state_file)
+            launched = home / "launched.json"
+            binary = home / "claude"
+            session_id = "22222222-3333-4444-8555-666666666666"
+            mailbox.register(
+                base,
+                session=session_id,
+                harness="claude",
+                cwd=str(home),
+                pid=os.getpid(),
+                account=str(home),
+            )
+            binary.write_text(
+                "#!" + sys.executable + "\n"
+                "import json, os, subprocess, sys\nfrom pathlib import Path\n"
+                "hook_out = json.loads(subprocess.check_output(["
+                + repr(sys.executable)
+                + ", "
+                + repr(str(SCRIPTS / "peer_mailbox.py"))
+                + ", 'hook', '--harness', 'claude'], input=json.dumps({"
+                "'hook_event_name': 'UserPromptSubmit', 'session_id': "
+                + repr(session_id)
+                + ", 'cwd': "
+                + repr(str(home))
+                + "}), text=True))\n"
+                "Path(" + repr(str(launched)) + ").write_text(json.dumps({"
+                "'room': os.environ.get('ORKEST_SWARM_ROOM'), "
+                "'tmux': os.environ.get('TMUX'), "
+                "'server': os.environ.get('ORKEST_TERMINAL_SERVER'), "
+                "'harness': os.environ.get('ORKEST_TERMINAL_HARNESS'), "
+                "'herdr_pane': os.environ.get('HERDR_PANE_ID'), "
+                "'flags': sys.argv[1:], "
+                "'prompt': hook_out['hookSpecificOutput']['additionalContext']"
+                "}))\n"
+                "print('Herdr coordinator ready', flush=True)\n"
+            )
+            binary.chmod(0o755)
+            environment = {
+                **os.environ,
+                "AGENT_EXECUTOR_HOME": str(home),
+                "PATH": str(home) + os.pathsep + os.environ["PATH"],
+                "TERM": "xterm-256color",
+                "HERDR_ENV": "1",
+                "HERDR_PANE_ID": "w1:p1",
+                "HERDR_WORKSPACE_ID": "w1",
+            }
+            for key in ("ORKEST_TERMINAL_SERVER", "ORKEST_TERMINAL_HARNESS", "TMUX", "TMUX_PANE"):
+                environment.pop(key, None)
+            pid, master = pty.fork()
+            if pid == 0:
+                termios.tcsetwinsize(0, (34, 160))
+                os.execvpe("node", ["node", str(CLI), "claude", "--cwd", str(home)], environment)
+            try:
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    if select.select([master], [], [], 0.05)[0]:
+                        try:
+                            if not os.read(master, 65536):
+                                break
+                        except OSError:
+                            break
+                    if launched.exists():
+                        break
+                self.assertTrue(launched.exists(), "Herdr coordinator did not launch")
+                info = json.loads(launched.read_text())
+                room_id = info["room"]
+                self.assertIsNotNone(room_id)
+                self.assertIsNone(info["tmux"])
+                self.assertIsNone(info["server"])
+                self.assertEqual(info["harness"], "claude")
+                self.assertEqual(info["herdr_pane"], "w1:p1")
+
+                peer_record = mailbox.load(mailbox.peer_path(base, session_id))
+                self.assertEqual(peer_record["herdrPaneId"], "w1:p1")
+                self.assertEqual(peer_record["herdrWorkspaceId"], "w1")
+
+                state = json.loads(state_file.read_text())
+                self.assertIn("w1:p2", state["panes"])
+                self.assertTrue(
+                    any(
+                        call[:2] == ["pane", "split"] and "--no-focus" in call and "--direction" in call
+                        for call in state["calls"]
+                    )
+                )
+                self.assertEqual(len(state["runs"]), 1)
+                self.assertEqual(state["runs"][0]["pane"], "w1:p2")
+                self.assertIn(f"stooges --attach-room {room_id} --view", state["runs"][0]["command"])
+
+                room_data = mailbox.load(base / "rooms" / f"{room_id}.json")
+                self.assertEqual(room_data["herdrViewPaneId"], "w1:p2")
+                self.assertEqual(room_data["herdrCoordinatorPaneId"], "w1:p1")
+
+                old_environ = os.environ.copy()
+                try:
+                    os.environ.clear()
+                    os.environ.update(environment)
+                    already_open = agent_statusline_tmux.toggle_swarm_view("open", base=base)
+                    self.assertEqual(
+                        already_open,
+                        {"status": "already_open", "room": room_id, "backend": "herdr", "pane": "w1:p2"},
+                    )
+
+                    closed = agent_statusline_tmux.toggle_swarm_view("toggle", base=base)
+                    self.assertEqual(
+                        closed,
+                        {"status": "closed", "room": room_id, "backend": "herdr", "pane": "w1:p2"},
+                    )
+                    state = json.loads(state_file.read_text())
+                    self.assertNotIn("w1:p2", state["panes"])
+                    self.assertIn("w1:p99", state["panes"])
+                    room_data = mailbox.load(base / "rooms" / f"{room_id}.json")
+                    self.assertNotIn("herdrViewPaneId", room_data)
+
+                    already_closed = agent_statusline_tmux.toggle_swarm_view("close", base=base)
+                    self.assertEqual(
+                        already_closed,
+                        {"status": "already_closed", "room": room_id, "backend": "herdr"},
+                    )
+                    state = json.loads(state_file.read_text())
+                    self.assertIn("w1:p99", state["panes"])
+
+                    reopened = agent_statusline_tmux.toggle_swarm_view("toggle", base=base)
+                    self.assertEqual(
+                        reopened,
+                        {"status": "opened", "room": room_id, "backend": "herdr", "pane": "w1:p3"},
+                    )
+                    room_data = mailbox.load(base / "rooms" / f"{room_id}.json")
+                    self.assertEqual(room_data["herdrViewPaneId"], "w1:p3")
+                finally:
+                    os.environ.clear()
+                    os.environ.update(old_environ)
+            finally:
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    if os.waitpid(pid, os.WNOHANG)[0]:
+                        break
+                    time.sleep(0.05)
+                else:
+                    os.kill(pid, signal.SIGTERM)
+                    os.waitpid(pid, 0)
+                os.close(master)
 
 
 if __name__ == "__main__":

@@ -95,3 +95,4 @@ oagy
 oclaude
 ocodex
 oopencode
+herdr

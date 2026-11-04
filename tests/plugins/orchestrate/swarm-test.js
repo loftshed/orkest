@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11,11 +11,16 @@ import {
   bindSession,
   dispatchMember,
   growRoom,
+  keepWorktree,
   newRoom,
   observeRoom,
 } from "../../../plugins/orchestrate/lib/rooms.mjs";
 import { parseTeam, readRoom, updateRoom } from "../../../plugins/orchestrate/lib/stooges-room.mjs";
-import { StoogesView } from "../../../plugins/orchestrate/lib/stooges-view.mjs";
+import {
+  agentFolder,
+  StoogesView,
+  worktreeBadge,
+} from "../../../plugins/orchestrate/lib/stooges-view.mjs";
 import { pauseBranch, reserveLead } from "../../../plugins/orchestrate/lib/swarm.mjs";
 
 const execute = promisify(execFile);
@@ -236,9 +241,12 @@ it("projects current session status and nesting without treating a lead report a
   });
   const view = new StoogesView(observed, { height: 30, tier: "unicode" });
   const output = view.render(85).join("\n");
-  expect(output).toContain("├─ 1 example-gpt-test-high-cache-aa (lead)");
-  expect(output).toContain("│  └─ 2 flash-1");
-  expect(output).toContain("└─ 3 haiku-1");
+  expect(output).toContain("│ ┌ 1 example-gpt-test-high-cache-aa (lead)");
+  expect(output).toContain("├─│Investigate");
+  expect(output).toContain("│  │ ┌ 2 flash-1");
+  expect(output).toContain("│  └─│Awaiting assignment");
+  expect(output).toContain("│ ┌ 3 haiku-1");
+  expect(output).toContain("└─│Awaiting assignment");
   expect(output).toContain("runtime-model / high | reported complete");
   const absent = await observeRoom(room.id, { root, progress: async () => ({}) });
   expect(absent.agents[0].status).toBe("session unavailable");
@@ -307,9 +315,121 @@ it("assigns preset workforce roles, groups agent cards by working folder, and pr
 
   const view = new StoogesView(observed, { height: 34, tier: "unicode" });
   const output = view.render(110).join("\n");
-  expect(output).toContain(`Folder · ${path.basename(worktreeA)} · 1 agent`);
-  expect(output).toContain(`Folder · ${path.basename(worktreeB)} · 2 agents`);
-  expect(output).toContain("snorfle-haiku-low-wt-a-11 [debugger]");
-  expect(output).toContain("haiku-2 [reviewer]");
-  expect(output).toContain("flash-1 [builder]");
+  expect(output).toContain(`${path.basename(worktreeA)} · 1 agent · ${worktreeA}`);
+  expect(output).toContain(`${path.basename(worktreeB)} · 2 agents · ${worktreeB}`);
+  expect(output).toContain("│ ┌ 1 snorfle-haiku-low-wt-a-11");
+  expect(output).toContain("└─│Map API endpoints");
+  expect(output).toContain("[debugger] haiku / low | working");
+  expect(output).toContain("│ ┌ 2 haiku-2");
+  expect(output).toContain("├─│Awaiting assignment");
+  expect(output).toContain("[reviewer] haiku | queued");
+  expect(output).toContain("│ ┌ 3 flash-1");
+  expect(output).toContain("└─│Awaiting assignment");
+  expect(output).toContain("[builder] gemini:fast | queued");
+});
+
+it("groups disposable git worktrees under their parent folder, renders wt:<slug> badges, and promotes them with worktree-keep", async () => {
+  const { root, room } = await fixture();
+  const gitWorktreeDir = path.join(room.cwd, ".git", "worktrees", "wt-50");
+  await mkdir(gitWorktreeDir, { recursive: true });
+  const tempDisposable = await mkdtemp(path.join(tmpdir(), "ork-disposable-"));
+  const disposableDir = path.join(await realpath(tempDisposable), "wt-50");
+  await mkdir(disposableDir, { recursive: true });
+  const tempPersistent = await mkdtemp(path.join(tmpdir(), "ork-persistent-"));
+  const persistentDir = await realpath(tempPersistent);
+  directories.push(tempDisposable, persistentDir);
+
+  const markerPath = path.join(gitWorktreeDir, "orkest.json");
+  await writeFile(path.join(disposableDir, ".git"), `gitdir: ${gitWorktreeDir}\n`);
+  await writeFile(
+    markerPath,
+    JSON.stringify(
+      {
+        schema: "orkest.worktree.v1",
+        disposable: true,
+        parentCwd: room.cwd,
+        roomId: room.id,
+        slug: "wt-50",
+        branch: "feat/issue-50",
+      },
+      null,
+      2,
+    ),
+  );
+
+  await growRoom(room.id, parseTeam("agy:pro@ui-designer"), root, "conductor", {
+    cwd: disposableDir,
+  });
+  await growRoom(room.id, parseTeam("claude:haiku@scout"), root, "conductor", {
+    cwd: room.cwd,
+  });
+  await growRoom(room.id, parseTeam("codex:luna@reviewer"), root, "conductor", {
+    cwd: persistentDir,
+  });
+
+  const saved = await readRoom(room.id, root);
+  expect(saved.agents[0].worktree).toEqual({
+    path: disposableDir,
+    branch: "feat/issue-50",
+    disposable: true,
+    parentCwd: room.cwd,
+    slug: "wt-50",
+  });
+  expect(saved.agents[1].worktree).toBeUndefined();
+  expect(saved.agents[2].worktree).toBeUndefined();
+
+  expect(agentFolder(saved.agents[0], saved)).toBe(room.cwd);
+  expect(worktreeBadge(saved.agents[0], saved)).toBe("wt:wt-50");
+  expect(agentFolder(saved.agents[2], saved)).toBe(persistentDir);
+  expect(worktreeBadge(saved.agents[2], saved)).toBe("");
+
+  const view = new StoogesView(saved, { height: 36, tier: "unicode", color: true });
+  const coloredOutput = view.render(110).join("\n");
+  expect(coloredOutput).toContain("\u{1B}[48;5;24;97;1m");
+  expect(coloredOutput).toContain("\u{1B}[48;5;236;97;1m");
+
+  const plainView = new StoogesView(saved, { height: 36, tier: "unicode" });
+  const output = plainView.render(140).join("\n");
+  expect(output).toContain(`${path.basename(room.cwd)} · 2 agents · ${room.cwd}`);
+  expect(output).toContain(`${path.basename(persistentDir)} · 1 agent · ${persistentDir}`);
+  expect(output).not.toContain(`wt-50 · 1 agent`);
+  expect(output).toContain("FOCUS wt:wt-50");
+
+  const stdout = { write() {} };
+  await roomsCommand(["worktree-keep", "--room", room.id, "--member", "pro-1"], { root, stdout });
+
+  const markerAfterKeep = JSON.parse(await readFile(markerPath, "utf8"));
+  expect(markerAfterKeep.disposable).toBe(false);
+
+  const promotedRoom = await observeRoom(room.id, { root });
+  expect(promotedRoom.agents[0].worktree).toMatchObject({
+    path: disposableDir,
+    disposable: false,
+    parentCwd: room.cwd,
+    slug: "wt-50",
+  });
+  expect(agentFolder(promotedRoom.agents[0], promotedRoom)).toBe(disposableDir);
+  expect(worktreeBadge(promotedRoom.agents[0], promotedRoom)).toBe("");
+
+  const promotedOutput = new StoogesView(promotedRoom, { height: 36, tier: "unicode" })
+    .render(140)
+    .join("\n");
+  expect(promotedOutput).toContain(`wt-50 · 1 agent · ${disposableDir}`);
+  expect(promotedOutput).toContain(`${path.basename(room.cwd)} · 1 agent · ${room.cwd}`);
+
+  await updateRoom(
+    room.id,
+    (current) => {
+      current.agents[1].worktree = {
+        path: disposableDir,
+        disposable: true,
+        parentCwd: room.cwd,
+        slug: "wt-inline",
+      };
+      return current;
+    },
+    { root },
+  );
+  await keepWorktree(room.id, "haiku-1", { root });
+  expect((await readRoom(room.id, root)).agents[1].worktree.disposable).toBe(false);
 });

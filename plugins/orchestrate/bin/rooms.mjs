@@ -6,6 +6,7 @@ import {
   coordinator,
   dispatchMember,
   growRoom,
+  keepWorktree,
   listRooms,
   newRoom,
   observeRoom,
@@ -19,15 +20,16 @@ export const ROOMS_HELP = `ork rooms list [--json]
 ork rooms show --room ID [--json]
 ork rooms create --team TEAM [--group GROUP] [--title TITLE] [--cwd PATH] [--id ID] [--authority TEAM_ID]
 ork rooms add --room ID --team TEAM [--parent conductor|MEMBER] [--role ROLE] [--cwd PATH]
-ork rooms lead --room ID --member ID --objective TEXT [--role ROLE] [--cwd PATH]   (reserves a native subswarm lead)
-ork rooms role --room ID [--member ID|conductor] --role ROLE [--cwd PATH]   (assign or switch workforce role)
+ork rooms lead --room ID --member ID --objective TEXT [--role ROLE] [--cwd PATH] [--keep-worktree]   (reserves a native subswarm lead)
+ork rooms role --room ID [--member ID|conductor] --role ROLE [--cwd PATH] [--keep-worktree]   (assign or switch workforce role)
+ork rooms worktree-keep --room ID --member ID|conductor [--cwd PATH]   (promote a disposable worktree to persistent)
 ork rooms objective --room ID --objective TEXT
 ork rooms pause|resume --room ID [--member conductor|MEMBER]   (gates new launches)
 ork rooms init-task --task-spec FILE --task-dir DIR (--host codex|claude|agy|opencode|other | --authority TEAM_ID)
 ork rooms dispatch --room ID --member ID --task-dir DIR [--kind investigation|implementation|consultation|challenge]
                    [--transport executor|native] [--packet FILE] [--request-id ID] [--role ROLE] [--cwd PATH]
 ork rooms launch --room ID --plan FILE
-ork rooms bind --room ID --member ID|conductor --session ID --engine ENGINE [--role ROLE] [--cwd PATH]
+ork rooms bind --room ID --member ID|conductor --session ID --engine ENGINE [--role ROLE] [--cwd PATH] [--keep-worktree]
 ork rooms recover --room ID
 
 A room or task under a team (--authority) is fenced: init-task, dispatch, launch and recover also need
@@ -49,6 +51,7 @@ export async function roomsCommand(
     options: {
       help: { type: "boolean" },
       json: { type: "boolean" },
+      "keep-worktree": { type: "boolean" },
       ...Object.fromEntries(
         [
           "room",
@@ -140,21 +143,36 @@ export async function roomsCommand(
       break;
     }
     case "lead": {
-      result = await reserveLead(
-        requireValue("room"),
-        requireValue("member"),
-        requireValue("objective"),
-        { root, workforceRole: values.role, cwd: values.cwd },
-      );
+      const roomId = requireValue("room");
+      const memberId = requireValue("member");
+      result = await reserveLead(roomId, memberId, requireValue("objective"), {
+        root,
+        workforceRole: values.role,
+        cwd: values.cwd,
+      });
+      if (values["keep-worktree"]) await keepWorktree(roomId, memberId, { root, cwd: values.cwd });
       break;
     }
     case "role": {
-      result = await assignWorkforceRole(
-        requireValue("room"),
-        values.member || "conductor",
-        requireValue("role"),
-        { root, cwd: values.cwd },
-      );
+      const roomId = requireValue("room");
+      const memberId = values.member || "conductor";
+      if (!values["keep-worktree"] || values.role !== undefined || values.cwd !== undefined) {
+        result = await assignWorkforceRole(
+          roomId,
+          memberId,
+          values["keep-worktree"] ? values.role : requireValue("role"),
+          { root, cwd: values.cwd },
+        );
+      }
+      if (values["keep-worktree"])
+        result = await keepWorktree(roomId, memberId, { root, cwd: values.cwd });
+      break;
+    }
+    case "worktree-keep": {
+      result = await keepWorktree(requireValue("room"), requireValue("member"), {
+        root,
+        cwd: values.cwd,
+      });
       break;
     }
     case "objective": {
@@ -228,13 +246,17 @@ export async function roomsCommand(
       break;
     }
     case "bind": {
-      result = await bindSession(requireValue("room"), requireValue("member"), {
+      const roomId = requireValue("room");
+      const memberId = requireValue("member");
+      result = await bindSession(roomId, memberId, {
         root,
         session: requireValue("session"),
         engine: requireValue("engine"),
         workforceRole: values.role,
         cwd: values.cwd,
       });
+      if (values["keep-worktree"])
+        result = await keepWorktree(roomId, memberId, { root, cwd: values.cwd });
 
       break;
     }

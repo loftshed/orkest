@@ -2,7 +2,7 @@ import path from "node:path";
 import { stripVTControlCharacters } from "node:util";
 
 import { renderLine } from "../../monitor/lib/render.mjs";
-import { coalesceMessages } from "./stooges-room.mjs";
+import { coalesceMessages, resolveMemberWorktree } from "./stooges-room.mjs";
 
 const segments = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -16,6 +16,8 @@ const COLORS = {
   dim: "2",
   bold: "1",
   inverse: "7",
+  headerBg: "48;5;236;97;1",
+  folderHeader: "48;5;24;97;1",
 };
 
 const GLYPHS = {
@@ -241,7 +243,12 @@ function fitStyled(value, width) {
   return output;
 }
 
-function frame(title, lines, width, { glyphs = glyphSet(), color = false, right = "" } = {}) {
+function frame(
+  title,
+  lines,
+  width,
+  { glyphs = glyphSet(), color = false, right = "", headerTone } = {},
+) {
   width = Math.max(1, Math.floor(width));
   if (width < 4) return [title, ...lines].map((line) => fit(line, width));
   const inside = width - 2;
@@ -252,11 +259,19 @@ function frame(title, lines, width, { glyphs = glyphSet(), color = false, right 
   const tail = fit(cleanRight, inside - displayWidth(heading));
   const topContent = heading + tail;
   const topRemaining = Math.max(0, inside - displayWidth(topContent));
-  const top = ansi(
-    glyphs.topLeft + topContent + glyphs.horizontal.repeat(topRemaining) + glyphs.topRight,
-    "cyan",
-    color,
-  );
+  let top;
+  if (color && headerTone) {
+    const titlePill = fit(cleanTitle, Math.min(displayWidth(cleanTitle), availableTitle));
+    const middleSpace = " ".repeat(Math.max(0, availableTitle - displayWidth(titlePill)));
+    const styledTail = ansi(tail, tail.trim() ? headerTone : "cyan", color);
+    top = `${ansi(glyphs.topLeft, "cyan", color)}${ansi(titlePill, headerTone, color)}${ansi(middleSpace, "cyan", color)}${styledTail}${ansi(glyphs.horizontal.repeat(topRemaining) + glyphs.topRight, "cyan", color)}`;
+  } else {
+    top = ansi(
+      glyphs.topLeft + topContent + glyphs.horizontal.repeat(topRemaining) + glyphs.topRight,
+      "cyan",
+      color,
+    );
+  }
   return [
     top,
     ...lines.map(
@@ -400,14 +415,82 @@ function rangeLabel(start, end, total) {
   return total === 0 ? "0 agents" : `${start + 1}–${end} of ${total} agents`;
 }
 
-function agentFolder(member, room) {
-  return plain(member?.progress?.cwd || member?.cwd || member?.session?.cwd || room?.cwd || "");
+function memberWorktree(member, room) {
+  return resolveMemberWorktree(member, room?.cwd);
+}
+
+export function agentFolder(member, room) {
+  const worktree = memberWorktree(member, room);
+  if (worktree?.disposable === true) {
+    const parentFolder = worktree.parentCwd || room?.cwd;
+    if (parentFolder) return plain(parentFolder);
+  }
+  return plain(
+    member?.progress?.cwd ||
+      member?.cwd ||
+      member?.session?.cwd ||
+      worktree?.path ||
+      room?.cwd ||
+      "",
+  );
 }
 
 function shortFolder(folderPath) {
   const cleaned = plain(folderPath).trim();
   if (!cleaned) return "workspace";
   return path.basename(cleaned) || cleaned;
+}
+
+export function worktreeBadge(member, room) {
+  const worktree = memberWorktree(member, room);
+  if (worktree?.disposable !== true) return "";
+  const target =
+    worktree.slug || worktree.path || member?.progress?.cwd || member?.cwd || member?.session?.cwd;
+  return `wt:${shortFolder(target)}`;
+}
+
+function toAsciiTree(text, tier) {
+  if (tier !== "ascii") return text;
+  return text.replaceAll("└", "`").replaceAll("├", "+").replaceAll("─", "-").replaceAll("│", "|");
+}
+
+function folderTreeRails(entries, tier, columns = 1) {
+  const inGroup = new Set(entries.map(({ agent }) => agent.id));
+  const groupParent = (agent) =>
+    agent.parent && agent.parent !== "conductor" && inGroup.has(agent.parent)
+      ? agent.parent
+      : "conductor";
+  const isLastSibling = (agent) => {
+    const parent = groupParent(agent);
+    for (let index = entries.length - 1; index >= 0; index--) {
+      if (groupParent(entries[index].agent) === parent) return entries[index].agent.id === agent.id;
+    }
+    return true;
+  };
+  return entries.map(({ agent }, entryIndex) => {
+    const ancestors = [];
+    let cursor = groupParent(agent);
+    while (cursor !== "conductor") {
+      const parentEntry = entries.find((item) => item.agent.id === cursor);
+      if (!parentEntry) break;
+      ancestors.unshift(parentEntry.agent);
+      cursor = groupParent(parentEntry.agent);
+    }
+    let indent = ancestors
+      .map((ancestor) => (isLastSibling(ancestor) ? " ".repeat(3) : "│  "))
+      .join("");
+    if (agent.parent && agent.parent !== "conductor" && !inGroup.has(agent.parent)) {
+      indent += " ".repeat(3);
+    }
+    const isBottomOfColumn = columns > 1 && entryIndex + columns >= entries.length;
+    const isLast = isLastSibling(agent);
+    const hasRailBelow = !isLast && !isBottomOfColumn;
+    return {
+      topPrefix: toAsciiTree(`${indent}│ `, tier),
+      midPrefix: toAsciiTree(`${indent}${isLast ? "└─" : "├─"}`, tier),
+      tailPrefix: toAsciiTree(`${indent}${hasRailBelow ? "│ " : "  "}`, tier),
+    };
+  });
 }
 
 function joinCardGrid(cards, columns, cardWidth, gap = "  ") {
@@ -436,9 +519,10 @@ function treeRoom(room) {
     const children = room.agents.filter((agent) => (agent.parent || "conductor") === parent);
     for (const [index, agent] of children.entries()) {
       const isLast = index === children.length - 1;
+      const worktree = memberWorktree(agent, room);
       treeAgents.push({
         ...agent,
-        cwd: agentFolder(agent, room) || undefined,
+        ...(worktree && { worktree }),
         treePrefix: prefix + (isLast ? "└─ " : "├─ "),
       });
       visit(agent.id, prefix + (isLast ? " ".repeat(3) : "│  "));
@@ -572,8 +656,13 @@ export class StoogesView {
       }
   }
 
-  panel(title, body, width, right = "") {
-    return frame(title, body, width, { glyphs: glyphSet(this.tier), color: this.color, right });
+  panel(title, body, width, right = "", headerTone) {
+    return frame(title, body, width, {
+      glyphs: glyphSet(this.tier),
+      color: this.color,
+      right,
+      headerTone,
+    });
   }
 
   overlayLines(width) {
@@ -799,6 +888,7 @@ export class StoogesView {
         leadLines,
         contentWidth,
         `${room.agents.length}/${room.swarm.maxAgents} slots`,
+        "headerBg",
       ),
     ];
     if (room.agents.length === 0) {
@@ -814,20 +904,17 @@ export class StoogesView {
       for (const [folder, entries] of folderGroups) {
         const countLabel = `${entries.length} ${entries.length === 1 ? "agent" : "agents"}`;
         const folderLabel = folder
-          ? `Folder · ${shortFolder(folder)} · ${countLabel} · ${folder}`
-          : `Folder · workspace · ${countLabel}`;
-        lines.push(ansi(folderLabel, "bold cyan", this.color));
+          ? `${shortFolder(folder)} · ${countLabel} · ${folder}`
+          : `workspace · ${countLabel}`;
+        lines.push(ansi(fit(folderLabel, contentWidth), "folderHeader", this.color));
         const columns = contentWidth >= 100 && entries.length > 1 ? 2 : 1;
         const cardWidth =
           columns === 2 ? Math.max(24, Math.floor((contentWidth - gap.length) / 2)) : contentWidth;
-        const cards = entries.map(({ agent, index }) => {
-          let branch = agent.treePrefix || "";
-          if (this.tier === "ascii")
-            branch = branch
-              .replaceAll("└", "`")
-              .replaceAll("├", "+")
-              .replaceAll("─", "-")
-              .replaceAll("│", "|");
+        const rails = folderTreeRails(entries, this.tier, columns);
+        const cards = entries.map(({ agent, index }, entryIndex) => {
+          const { topPrefix, midPrefix, tailPrefix } = rails[entryIndex];
+          const prefixWidth = displayWidth(midPrefix);
+          const boxWidth = Math.max(4, cardWidth - prefixWidth);
           const wfRole = roleOf(agent);
           const roleBadge = wfRole ? ` [${wfRole}]` : "";
           const isFocused = agent.id === this.focusId;
@@ -837,18 +924,27 @@ export class StoogesView {
           else if (isFocused) stateBadge = "FOCUS ";
           const parentBadge =
             agent.parent && agent.parent !== "conductor" ? ` ↳ ${plain(agent.parent)}` : "";
-          const cardTitle = `${branch}${index + 1} ${plain(agent.name || agent.id)}${agent.role === "lead" ? " (lead)" : ""}${roleBadge}`;
-          const cardRight = `${stateBadge}${shortFolder(folder)}${parentBadge}`;
+          const cardTitle = `${index + 1} ${plain(agent.name || agent.id)}${agent.role === "lead" ? " (lead)" : ""}`;
+          const locationBadge = worktreeBadge(agent, room) || shortFolder(folder);
+          const cardRight = `${stateBadge}${locationBadge}${parentBadge}`;
           const taskText = plain(agent.progress?.task || agent.objective || "Awaiting assignment");
           const statusLine = ansi(
             `${statusGlyph(agent, now, this.tier)}${roleBadge} ${model(agent)} | ${phase(agent)}`,
             `${toneForStatus(agent.status)}${isFocused ? " bold" : ""}`,
             this.color,
           );
-          return frame(cardTitle, [taskText, statusLine], cardWidth, {
+          const box = frame(cardTitle, [taskText, statusLine], boxWidth, {
             glyphs: glyphSet(this.tier),
             color: this.color,
             right: cardRight,
+            headerTone: "headerBg",
+          });
+          const midIndex = Math.max(1, Math.floor((box.length - 1) / 2));
+          return box.map((line, lineIndex) => {
+            let prefix = tailPrefix;
+            if (lineIndex < midIndex) prefix = topPrefix;
+            else if (lineIndex === midIndex) prefix = midPrefix;
+            return `${ansi(prefix, "cyan", this.color)}${line}`;
           });
         });
         lines.push(...joinCardGrid(cards, columns, cardWidth, gap));

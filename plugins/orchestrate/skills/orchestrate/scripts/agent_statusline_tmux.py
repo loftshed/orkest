@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# cspell:words herdr
 """Launch a terminal harness with an Orkest status line in a private tmux session."""
 
 from __future__ import annotations
@@ -94,6 +95,339 @@ def _discover_socket(
     return None
 
 
+def _herdr_active(socket: str | None = None) -> bool:
+    return not socket and os.environ.get("HERDR_ENV") == "1" and bool(os.environ.get("HERDR_PANE_ID", "").strip())
+
+
+def _room_path(base: Path, room_id: str) -> Path:
+    if not re.fullmatch(r"[\w-]{1,80}", room_id, flags=re.ASCII):
+        raise ValueError("Invalid swarm room ID")
+    return base / "rooms" / f"{room_id}.json"
+
+
+def _update_room_metadata(base: Path, room_id: str, **fields: str | None) -> dict[str, object] | None:
+    try:
+        path = _room_path(base, room_id)
+    except ValueError:
+        return None
+    data = mailbox.load(path)
+    if not isinstance(data, dict):
+        return None
+    for key, value in fields.items():
+        if value is None:
+            data.pop(key, None)
+        else:
+            data[key] = value
+    with contextlib.suppress(OSError):
+        mailbox.write(path, data)
+    return data
+
+
+def _extract_herdr_pane_id(raw_stdout: str) -> str | None:
+    try:
+        data = json.loads(raw_stdout)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    result = data.get("result")
+    if isinstance(result, dict):
+        pane = result.get("pane")
+        if isinstance(pane, dict) and isinstance(pane.get("pane_id"), str) and pane["pane_id"]:
+            return pane["pane_id"]
+        if isinstance(result.get("pane_id"), str) and result["pane_id"]:
+            return result["pane_id"]
+    pane = data.get("pane")
+    if isinstance(pane, dict) and isinstance(pane.get("pane_id"), str) and pane["pane_id"]:
+        return pane["pane_id"]
+    if isinstance(data.get("pane_id"), str) and data["pane_id"]:
+        return data["pane_id"]
+    return None
+
+
+def _herdr_pane_live(
+    herdr: str,
+    pane_id: str,
+    *,
+    workspace_id: str | None = None,
+    env: dict[str, str] | None = None,
+) -> bool:
+    if not isinstance(pane_id, str) or not pane_id.strip():
+        return False
+    list_cmd = [herdr, "pane", "list", *(["--workspace", workspace_id] if workspace_id else [])]
+    listed = subprocess.run(list_cmd, env=env, capture_output=True, text=True, check=False)
+    if listed.returncode == 0 and listed.stdout.strip():
+        try:
+            payload = json.loads(listed.stdout)
+        except ValueError:
+            payload = None
+        panes = None
+        if isinstance(payload, list):
+            panes = payload
+        elif isinstance(payload, dict):
+            result = payload.get("result")
+            if isinstance(result, dict) and isinstance(result.get("panes"), list):
+                panes = result["panes"]
+            elif isinstance(result, list):
+                panes = result
+            elif isinstance(payload.get("panes"), list):
+                panes = payload["panes"]
+        if isinstance(panes, list):
+            ids = {
+                item if isinstance(item, str) else (item.get("pane_id") or item.get("id"))
+                for item in panes
+                if isinstance(item, str | dict)
+            }
+            return pane_id in ids
+    current = subprocess.run(
+        [herdr, "pane", "current", "--pane", pane_id],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return current.returncode == 0
+
+
+def _open_herdr_swarm_view(
+    herdr: str,
+    *,
+    room: str,
+    cwd: str | None,
+    coordinator_pane: str,
+    workspace_id: str | None,
+    environment: dict[str, str],
+    base: Path,
+) -> str | None:
+    target_cwd = cwd or os.getcwd()
+    split = subprocess.run(
+        [
+            herdr,
+            "pane",
+            "split",
+            "--current",
+            "--direction",
+            "right",
+            "--cwd",
+            target_cwd,
+            "--no-focus",
+        ],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if split.returncode != 0:
+        return None
+    view_pane_id = _extract_herdr_pane_id(split.stdout)
+    if not view_pane_id:
+        return None
+    cli = Path(__file__).resolve().parents[3] / "bin" / "ork.mjs"
+    view_cmd = shlex.join(
+        [
+            shutil.which("node") or "node",
+            str(cli),
+            "stooges",
+            "--attach-room",
+            room,
+            "--view",
+        ]
+    )
+    run_proc = subprocess.run(
+        [herdr, "pane", "run", view_pane_id, view_cmd],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if run_proc.returncode != 0:
+        return None
+    _update_room_metadata(
+        base,
+        room,
+        herdrViewPaneId=view_pane_id,
+        herdrCoordinatorPaneId=coordinator_pane,
+        **({"herdrWorkspaceId": workspace_id} if workspace_id else {}),
+    )
+    return view_pane_id
+
+
+def _find_herdr_peer(base: Path, session_id: str | None, pane_id: str) -> dict[str, object] | None:
+    if session_id:
+        with contextlib.suppress(Exception):
+            peer = mailbox.load(mailbox.peer_path(base, session_id))
+            if isinstance(peer, dict):
+                return peer
+    if not pane_id:
+        return None
+    best: dict[str, object] | None = None
+    with contextlib.suppress(OSError):
+        for path in sorted((base / "peers").glob("*.json")):
+            peer = mailbox.load(path)
+            if not isinstance(peer, dict) or not mailbox.valid_peer(peer):
+                continue
+            if peer.get("herdrPaneId") != pane_id:
+                continue
+            if best is None or str(peer.get("lastSeenAt", "")) >= str(best.get("lastSeenAt", "")):
+                best = peer
+    return best
+
+
+def _find_herdr_room(base: Path, pane_id: str) -> str:
+    if not pane_id:
+        return ""
+    best_id = ""
+    best_updated = -1
+    with contextlib.suppress(OSError):
+        for path in sorted((base / "rooms").glob("*.json")):
+            room = mailbox.load(path)
+            if not isinstance(room, dict) or room.get("herdrCoordinatorPaneId") != pane_id:
+                continue
+            room_id = room.get("id")
+            if not isinstance(room_id, str) or not room_id:
+                continue
+            updated = room.get("updatedAt")
+            score = updated if isinstance(updated, int | float) else 0
+            if score >= best_updated:
+                best_updated = score
+                best_id = room_id
+    return best_id
+
+
+def _toggle_herdr_swarm_view(
+    action: str,
+    *,
+    herdr: str,
+    room: str | None = None,
+    session_id: str | None = None,
+    harness: str | None = None,
+    cwd: str | None = None,
+    base: Path,
+) -> dict[str, str]:
+    coordinator_pane = os.environ.get("HERDR_PANE_ID", "").strip()
+    workspace_id = os.environ.get("HERDR_WORKSPACE_ID", "").strip() or None
+    peer = _find_herdr_peer(base, session_id, coordinator_pane)
+    if isinstance(peer, dict):
+        if not session_id and isinstance(peer.get("session"), str):
+            session_id = peer["session"]
+        if not harness and isinstance(peer.get("harness"), str):
+            harness = peer["harness"]
+        if not cwd and isinstance(peer.get("cwd"), str):
+            cwd = peer["cwd"]
+    if not harness:
+        harness = os.environ.get("ORKEST_TERMINAL_HARNESS", "").strip() or None
+    current_room = (room or os.environ.get("ORKEST_SWARM_ROOM", "")).strip()
+    if not current_room and isinstance(peer, dict) and mailbox.valid_peer(peer):
+        import agent_statusline
+
+        bound = agent_statusline.bound_rooms(base, peer)
+        if bound:
+            current_room = bound[0][0]["id"]
+    if not current_room and coordinator_pane:
+        current_room = _find_herdr_room(base, coordinator_pane)
+    environment = dict(os.environ)
+    environment.pop("TMUX", None)
+    environment.pop("TMUX_PANE", None)
+    environment["AGENT_EXECUTOR_HOME"] = str(base.parent)
+    cli = Path(__file__).resolve().parents[3] / "bin" / "ork.mjs"
+    engine = {"gemini": "agy", "agy": "agy", "claude": "claude", "codex": "codex", "opencode": "opencode"}.get(
+        harness or "", "codex"
+    )
+    if not current_room:
+        target_cwd = cwd or os.getcwd()
+        created = subprocess.run(
+            [shutil.which("node") or "node", str(cli), "stooges", "--engine", engine, "--cwd", target_cwd, "--json"],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if created.returncode != 0:
+            return {"status": "error", "reason": created.stderr.strip() or "could not create swarm room"}
+        current_room = json.loads(created.stdout)["id"]
+    if session_id and current_room:
+        subprocess.run(
+            [
+                shutil.which("node") or "node",
+                str(cli),
+                "rooms",
+                "bind",
+                "--room",
+                current_room,
+                "--member",
+                "conductor",
+                "--engine",
+                engine,
+                "--session",
+                session_id,
+            ],
+            env=environment,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    room_data = None
+    with contextlib.suppress(ValueError):
+        room_data = mailbox.load(_room_path(base, current_room))
+    recorded_view_pane = (
+        room_data.get("herdrViewPaneId")
+        if isinstance(room_data, dict) and isinstance(room_data.get("herdrViewPaneId"), str)
+        else None
+    )
+    if recorded_view_pane == coordinator_pane:
+        recorded_view_pane = None
+    effective_workspace = workspace_id or (
+        room_data.get("herdrWorkspaceId")
+        if isinstance(room_data, dict) and isinstance(room_data.get("herdrWorkspaceId"), str)
+        else None
+    )
+    view_live = bool(
+        recorded_view_pane
+        and _herdr_pane_live(herdr, recorded_view_pane, workspace_id=effective_workspace, env=environment)
+    )
+    if view_live and recorded_view_pane and action in ("toggle", "close"):
+        closed = subprocess.run(
+            [herdr, "pane", "close", "--pane", recorded_view_pane],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if closed.returncode != 0:
+            subprocess.run(
+                [herdr, "pane", "close", recorded_view_pane],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        _update_room_metadata(base, current_room, herdrViewPaneId=None)
+        return {"status": "closed", "room": current_room, "backend": "herdr", "pane": recorded_view_pane}
+    if not view_live and action == "close":
+        if recorded_view_pane:
+            _update_room_metadata(base, current_room, herdrViewPaneId=None)
+        return {"status": "already_closed", "room": current_room, "backend": "herdr"}
+    if view_live and recorded_view_pane and action == "open":
+        return {"status": "already_open", "room": current_room, "backend": "herdr", "pane": recorded_view_pane}
+    pane_id = _open_herdr_swarm_view(
+        herdr,
+        room=current_room,
+        cwd=cwd,
+        coordinator_pane=coordinator_pane,
+        workspace_id=effective_workspace,
+        environment=environment,
+        base=base,
+    )
+    if not pane_id:
+        return {
+            "status": "error",
+            "reason": "could not split Herdr pane for swarm view",
+            "room": current_room,
+            "backend": "herdr",
+        }
+    return {"status": "opened", "room": current_room, "backend": "herdr", "pane": pane_id}
+
+
 def toggle_swarm_view(
     action: str = "toggle",
     *,
@@ -104,13 +438,25 @@ def toggle_swarm_view(
     cwd: str | None = None,
     base: Path | None = None,
 ) -> dict[str, str]:
-    """Open, close, or toggle the live Swarm View split pane in an Orkest tmux session."""
+    """Open, close, or toggle the live Swarm View split pane in an Orkest tmux or Herdr session."""
     if action not in ("toggle", "open", "close"):
         raise ValueError(f"Unsupported swarm view action: {action}")
+    base = base or mailbox.root()
+    if _herdr_active(socket):
+        herdr = shutil.which("herdr")
+        if herdr:
+            return _toggle_herdr_swarm_view(
+                action,
+                herdr=herdr,
+                room=room,
+                session_id=session_id,
+                harness=harness,
+                cwd=cwd,
+                base=base,
+            )
     tmux = shutil.which("tmux")
     if not tmux:
         return {"status": "unavailable", "reason": "tmux is not installed on PATH"}
-    base = base or mailbox.root()
     resolved_socket = _discover_socket(socket=socket, room=room, session_id=session_id, base=base)
     if not resolved_socket:
         return {"status": "unavailable", "reason": "no active Orkest tmux session found for this terminal"}
@@ -321,6 +667,81 @@ def main(arguments: list[str]) -> int:
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         print("ork label needs an interactive terminal", file=sys.stderr)
         return 2
+    if attach and _herdr_active() and room:
+        herdr = shutil.which("herdr")
+        room_data = None
+        with contextlib.suppress(ValueError):
+            room_data = mailbox.load(_room_path(mailbox.root(), room))
+        coord_pane = (
+            room_data.get("herdrCoordinatorPaneId")
+            if isinstance(room_data, dict) and isinstance(room_data.get("herdrCoordinatorPaneId"), str)
+            else None
+        )
+        workspace_id = os.environ.get("HERDR_WORKSPACE_ID", "").strip() or (
+            room_data.get("herdrWorkspaceId")
+            if isinstance(room_data, dict) and isinstance(room_data.get("herdrWorkspaceId"), str)
+            else None
+        )
+        if herdr and coord_pane and _herdr_pane_live(herdr, coord_pane, workspace_id=workspace_id):
+            return subprocess.run([herdr, "pane", "focus", "--pane", coord_pane], check=False).returncode
+        if not shutil.which("tmux"):
+            print(
+                "This swarm has no live coordinator terminal. Use --view to inspect its recorded work.", file=sys.stderr
+            )
+            return 2
+    if not attach:
+        command = arguments[1:] if arguments[:1] == ["--"] else arguments
+        if not command or command == ["--help"]:
+            print("Usage: ork label -- codex|claude|plaude|agy|opencode [arguments]")
+            return 0 if command else 2
+        harness = {
+            "codex": "codex",
+            "claude": "claude",
+            "plaude": "claude",
+            "agy": "gemini",
+            "opencode": "opencode",
+        }.get(Path(command[0]).name)
+        if not harness:
+            print("ork label supports codex, claude, plaude, agy and opencode", file=sys.stderr)
+            return 2
+        if not shutil.which(command[0]):
+            print(f"{command[0]} is not installed on PATH", file=sys.stderr)
+            return 2
+        if Path(command[0]).name == "codex":
+            # The TUI knows the visible conversation even when agents share a daemon.
+            # This changes only the private pane title, not Codex's thread name or status line.
+            command = [command[0], "-c", 'tui.terminal_title=["session-id"]', *command[1:]]
+        if _herdr_active():
+            environment = dict(os.environ)
+            environment["ORKEST_TERMINAL_HARNESS"] = harness
+            if room:
+                environment["ORKEST_SWARM_ROOM"] = room
+                coordinator_pane = os.environ.get("HERDR_PANE_ID", "").strip()
+                workspace_id = os.environ.get("HERDR_WORKSPACE_ID", "").strip() or None
+                base_dir = mailbox.root()
+                _update_room_metadata(
+                    base_dir,
+                    room,
+                    herdrCoordinatorPaneId=coordinator_pane,
+                    **({"herdrWorkspaceId": workspace_id} if workspace_id else {}),
+                )
+                herdr = shutil.which("herdr")
+                if herdr:
+                    view_pane = _open_herdr_swarm_view(
+                        herdr,
+                        room=room,
+                        cwd=cwd,
+                        coordinator_pane=coordinator_pane,
+                        workspace_id=workspace_id,
+                        environment=environment,
+                        base=base_dir,
+                    )
+                    if not view_pane:
+                        print(
+                            "Swarm view could not open; the coordinator terminal is still available.",
+                            file=sys.stderr,
+                        )
+            return subprocess.run(command, env=environment, cwd=cwd or None, check=False).returncode
     tmux = shutil.which("tmux")
     if not tmux:
         print("ork label needs tmux on PATH", file=sys.stderr)
@@ -355,23 +776,6 @@ def main(arguments: list[str]) -> int:
         environment.pop("TMUX", None)
         environment.pop("TMUX_PANE", None)
         return subprocess.run([*base, "attach-session", "-t", session], env=environment, check=False).returncode
-    command = arguments[1:] if arguments[:1] == ["--"] else arguments
-    if not command or command == ["--help"]:
-        print("Usage: ork label -- codex|claude|plaude|agy|opencode [arguments]")
-        return 0 if command else 2
-    harness = {"codex": "codex", "claude": "claude", "plaude": "claude", "agy": "gemini", "opencode": "opencode"}.get(
-        Path(command[0]).name
-    )
-    if not harness:
-        print("ork label supports codex, claude, plaude, agy and opencode", file=sys.stderr)
-        return 2
-    if not shutil.which(command[0]):
-        print(f"{command[0]} is not installed on PATH", file=sys.stderr)
-        return 2
-    if Path(command[0]).name == "codex":
-        # The TUI knows the visible conversation even when agents share a daemon.
-        # This changes only the private pane title, not Codex's thread name or status line.
-        command = [command[0], "-c", 'tui.terminal_title=["session-id"]', *command[1:]]
     environment = dict(os.environ)
     # A private server must not inherit the enclosing tmux client's socket.
     environment.pop("TMUX", None)
