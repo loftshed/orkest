@@ -154,11 +154,43 @@ export default Plugin.define({
   setup(context) {
     const script =
       typeof context.options.script === "string" ? context.options.script : defaultScript;
-    return context.ui.slot({
+    const tmuxScript = path.join(path.dirname(script), "agent_statusline_tmux.py");
+    const cmdApi = (
+      context as unknown as {
+        command?: { register?: (cb: () => unknown[]) => (() => void) | void };
+      }
+    ).command;
+    const unregisterCmd = cmdApi?.register?.(() => [
+      {
+        title: "Toggle Orkest Swarm View",
+        value: "orkest.swarm.toggle",
+        description: "Open or close the Orkest Swarm View split pane",
+        category: "Orkest",
+        keybind: "ctrl+alt+s",
+        slash: {
+          name: "swarm",
+          aliases: ["horde"],
+        },
+        onSelect(dialog?: { clear?: () => void }) {
+          dialog?.clear?.();
+          execFile(
+            "python3",
+            [tmuxScript, "--toggle-swarm", "toggle", "--harness", "opencode"],
+            { timeout: 5000 },
+            () => {},
+          );
+        },
+      },
+    ]);
+    const unregisterSlot = context.ui.slot({
       append: "session.composer.top",
       render: (props) => (
         <Label sessionID={props.sessionID} plainColor={context.theme.text.base} script={script} />
       ),
     });
+    return () => {
+      if (typeof unregisterCmd === "function") unregisterCmd();
+      if (typeof unregisterSlot === "function") unregisterSlot();
+    };
   },
 });

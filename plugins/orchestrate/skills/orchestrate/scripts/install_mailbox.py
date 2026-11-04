@@ -44,19 +44,30 @@ MANAGED_ZSHRC_BLOCK = (
 
 SWARM_COMMAND_TEXT = (
     "---\n"
-    "description: Toggle (open or close) the live Orkest Swarm View split pane in this terminal\n"
-    'argument-hint: "[toggle|open|close]"\n'
+    "description: Toggle the Orkest Swarm View split pane or launch a swarm for a goal (/swarm [toggle|open|close|<goal>])\n"
+    'argument-hint: "[toggle|open|close|<goal>]"\n'
     "---\n\n"
     "[orkest-swarm-command: $ARGUMENTS]\n"
-    "If the `/swarm` turn hook already opened or closed the Orkest Swarm View pane, confirm the result in one "
-    "short line and do not call any tools. Otherwise run `ork swarm $ARGUMENTS` and report the result in one "
-    "short line.\n"
+    "If the `/swarm` turn hook already opened or closed the Orkest Swarm View pane (or if no goal was given), "
+    "confirm the result in one short line and do not call any tools. If a goal was given, coordinate the swarm "
+    "for `$ARGUMENTS`.\n"
+)
+
+HORDE_COMMAND_TEXT = (
+    "---\n"
+    "description: Toggle the Orkest Swarm View split pane or launch a swarm for a goal (/horde [toggle|open|close|<goal>])\n"
+    'argument-hint: "[toggle|open|close|<goal>]"\n'
+    "---\n\n"
+    "[orkest-swarm-command: $ARGUMENTS]\n"
+    "If the `/horde` turn hook already opened or closed the Orkest Swarm View pane (or if no goal was given), "
+    "confirm the result in one short line and do not call any tools. If a goal was given, coordinate the swarm "
+    "for `$ARGUMENTS`.\n"
 )
 
 SWARM_SKILL_TEXT = (
     "---\n"
     "name: swarm\n"
-    "description: Toggle (open or close) the live Orkest Swarm View split pane in the current terminal when the user types /swarm.\n"
+    "description: Toggle (open or close) the live Orkest Swarm View split pane in the current terminal when the user types /swarm or /horde.\n"
     "metadata:\n"
     "  version: 0.50.0\n"
     "---\n\n"
@@ -335,7 +346,159 @@ def _candidate_plugin_roots(plugin_root: Path | None = None, ork_cli: Path | Non
 
 
 def install_swarm_command(home: Path, *, dry_run: bool = False) -> bool:
-    return _install_claude_command(home, "swarm", SWARM_COMMAND_TEXT, dry_run=dry_run)
+    changed = _install_claude_command(home, "swarm", SWARM_COMMAND_TEXT, dry_run=dry_run)
+    if _install_claude_command(home, "horde", HORDE_COMMAND_TEXT, dry_run=dry_run):
+        changed = True
+    return changed
+
+
+def install_herdr_integration(home: Path, ork_cli: Path | None = None, *, dry_run: bool = False) -> bool:
+    """Configure Ctrl+Option+S (ctrl+alt+s) and orkest.swarms plugin actions in Herdr when ~/.config/herdr exists."""
+    herdr_dir = home / ".config/herdr"
+    if not herdr_dir.is_dir():
+        return False
+    changed = False
+    config_file = herdr_dir / "config.toml"
+    existing_cfg = config_file.read_text(encoding="utf-8") if config_file.is_file() else ""
+    shortcut_block = (
+        "\n[[keys.command]]\n"
+        'key = "ctrl+alt+s"\n'
+        'type = "plugin_action"\n'
+        'command = "orkest.swarms.toggle"\n'
+        'description = "toggle Orkest Swarm View"\n'
+    )
+    if "orkest.swarms.toggle" not in existing_cfg and '"ctrl+alt+s"' not in existing_cfg:
+        updated_cfg = existing_cfg.rstrip() + ("\n" if existing_cfg.strip() else "") + shortcut_block
+        if dry_run:
+            print(f"would add ctrl+alt+s Orkest Swarm View shortcut to: {config_file}")
+        else:
+            if config_file.exists():
+                backup(config_file)
+            config_file.write_text(updated_cfg, encoding="utf-8")
+            print(f"✓ Herdr ctrl+alt+s shortcut: {config_file}")
+        changed = True
+
+    ork_cli = ork_cli or (Path(__file__).resolve().parents[3] / "bin/ork.mjs")
+    repo_root = ork_cli.resolve().parents[3]
+    manifest_file = repo_root / "herdr-plugin.toml"
+    plugins_file = herdr_dir / "plugins.json"
+    if manifest_file.is_file() and plugins_file.is_file():
+        try:
+            plugins_data = json.loads(plugins_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            plugins_data = None
+        if isinstance(plugins_data, list):
+            desired_entry = {
+                "plugin_id": "orkest.swarms",
+                "name": "Orkest Swarms",
+                "version": "0.50.0",
+                "min_herdr_version": "0.9.5",
+                "description": "Group, inspect, and manage Orkest swarms",
+                "manifest_path": str(manifest_file),
+                "plugin_root": str(repo_root),
+                "enabled": True,
+                "platforms": ["macos", "linux"],
+                "actions": [
+                    {
+                        "id": "close",
+                        "title": "Close Orkest Swarm View",
+                        "description": "Close the Orkest Swarm View split pane in the current workspace",
+                        "contexts": ["global", "workspace", "tab", "pane"],
+                        "command": [
+                            "python3",
+                            "plugins/orchestrate/skills/orchestrate/scripts/agent_statusline_tmux.py",
+                            "--toggle-swarm",
+                            "close",
+                        ],
+                    },
+                    {
+                        "id": "open",
+                        "title": "Open Orkest Swarm View",
+                        "description": "Open the Orkest Swarm View in a right-side split pane",
+                        "contexts": ["global", "workspace", "tab", "pane"],
+                        "command": [
+                            "python3",
+                            "plugins/orchestrate/skills/orchestrate/scripts/agent_statusline_tmux.py",
+                            "--toggle-swarm",
+                            "open",
+                        ],
+                    },
+                    {
+                        "id": "overview",
+                        "title": "Open Orkest Swarms",
+                        "description": "Open the Orkest Swarm View in a right-side split pane",
+                        "contexts": ["workspace"],
+                        "command": [
+                            "python3",
+                            "plugins/orchestrate/skills/orchestrate/scripts/agent_statusline_tmux.py",
+                            "--toggle-swarm",
+                            "open",
+                        ],
+                    },
+                    {
+                        "id": "toggle",
+                        "title": "Toggle Orkest Swarm View",
+                        "description": "Open or close the Orkest Swarm View split pane",
+                        "contexts": ["global", "workspace", "tab", "pane"],
+                        "command": [
+                            "python3",
+                            "plugins/orchestrate/skills/orchestrate/scripts/agent_statusline_tmux.py",
+                            "--toggle-swarm",
+                            "toggle",
+                        ],
+                    },
+                ],
+                "panes": [
+                    {
+                        "id": "overview",
+                        "title": "Orkest Swarms",
+                        "placement": "tab",
+                        "command": ["node", "plugins/orchestrate/bin/ork.mjs", "horde", "--view"],
+                    },
+                    {
+                        "id": "room",
+                        "title": "Orkest Swarm",
+                        "placement": "split",
+                        "command": ["node", "plugins/orchestrate/bin/ork.mjs", "horde", "--view"],
+                    },
+                ],
+                "source": {"kind": "local"},
+            }
+            replaced = False
+            needs_write = False
+            for idx, item in enumerate(plugins_data):
+                if isinstance(item, dict) and item.get("plugin_id") == "orkest.swarms":
+                    replaced = True
+                    if item != desired_entry:
+                        plugins_data[idx] = desired_entry
+                        needs_write = True
+                    break
+            if not replaced:
+                plugins_data.append(desired_entry)
+                needs_write = True
+            if needs_write:
+                if dry_run:
+                    print(f"would update orkest.swarms Herdr plugin in: {plugins_file}")
+                else:
+                    plugins_file.write_text(json.dumps(plugins_data, indent=2) + "\n", encoding="utf-8")
+                    print(f"✓ Herdr orkest.swarms plugin updated: {plugins_file}")
+                changed = True
+
+    if (
+        changed
+        and not dry_run
+        and not os.environ.get("PYTEST_CURRENT_TEST")
+        and "unittest" not in sys.modules
+        and (herdr_bin := shutil.which("herdr"))
+    ):
+        subprocess.run(
+            [herdr_bin, "server", "reload-config"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+            check=False,
+        )
+    return changed
 
 
 def install_swarm_skill(home: Path, *, dry_run: bool = False) -> bool:
@@ -646,6 +809,8 @@ def install_shell_wrappers(home: Path, ork_cli: Path | None = None, *, dry_run: 
     if install_update_skill(home, ork_cli=ork_cli, dry_run=dry_run):
         changed = True
     if install_agy_statusline(home / ".gemini/antigravity-cli/settings.json", dry_run=dry_run):
+        changed = True
+    if install_herdr_integration(home, ork_cli=ork_cli, dry_run=dry_run):
         changed = True
     return changed
 

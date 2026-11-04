@@ -303,8 +303,45 @@ def _discover_socket(
     return None
 
 
+def _resolve_herdr_context() -> tuple[str, str | None, str | None]:
+    """Return (pane_id, workspace_id, focused_cwd) from Herdr env or HERDR_PLUGIN_CONTEXT_JSON."""
+    ctx: dict[str, object] = {}
+    raw_ctx = os.environ.get("HERDR_PLUGIN_CONTEXT_JSON", "").strip()
+    if raw_ctx:
+        with contextlib.suppress(ValueError, TypeError):
+            parsed = json.loads(raw_ctx)
+            if isinstance(parsed, dict):
+                ctx = parsed
+    pane_id = (
+        os.environ.get("HERDR_PANE_ID", "").strip()
+        or str(ctx.get("focused_pane_id") or "").strip()
+        or os.environ.get("HERDR_ACTIVE_PANE_ID", "").strip()
+    )
+    workspace_id = (
+        os.environ.get("HERDR_WORKSPACE_ID", "").strip()
+        or str(ctx.get("workspace_id") or "").strip()
+        or os.environ.get("HERDR_ACTIVE_WORKSPACE_ID", "").strip()
+        or None
+    )
+    worktree = ctx.get("worktree")
+    worktree_path = (
+        worktree if isinstance(worktree, str) else (worktree.get("path") if isinstance(worktree, dict) else None)
+    )
+    focused_cwd = (
+        str(ctx.get("focused_pane_cwd") or "").strip()
+        or os.environ.get("HERDR_ACTIVE_PANE_CWD", "").strip()
+        or (str(worktree_path).strip() if isinstance(worktree_path, str) else "")
+        or str(ctx.get("workspace_cwd") or "").strip()
+        or None
+    )
+    return pane_id, workspace_id, focused_cwd
+
+
 def _herdr_active(socket: str | None = None) -> bool:
-    if socket or os.environ.get("HERDR_ENV") != "1" or not bool(os.environ.get("HERDR_PANE_ID", "").strip()):
+    if socket or os.environ.get("HERDR_ENV") != "1":
+        return False
+    pane_id, workspace_id, _ = _resolve_herdr_context()
+    if not (pane_id or workspace_id or os.environ.get("HERDR_PLUGIN_ID", "").strip()):
         return False
     if (os.environ.get("PYTEST_CURRENT_TEST") or "unittest" in sys.modules) and os.environ.get(
         "ORKEST_TEST_ALLOW_HERDR"
@@ -460,6 +497,7 @@ def _open_herdr_swarm_view(
     base: Path,
 ) -> str | None:
     target_cwd = cwd or os.getcwd()
+    split_env = {**environment, "HERDR_PANE_ID": coordinator_pane} if coordinator_pane else environment
     split = subprocess.run(
         [
             herdr,
@@ -472,7 +510,7 @@ def _open_herdr_swarm_view(
             target_cwd,
             "--no-focus",
         ],
-        env=environment,
+        env=split_env,
         capture_output=True,
         text=True,
         check=False,
@@ -543,7 +581,9 @@ def _find_herdr_room(base: Path, pane_id: str) -> str:
     with contextlib.suppress(OSError):
         for path in sorted((base / "rooms").glob("*.json")):
             room = mailbox.load(path)
-            if not isinstance(room, dict) or room.get("herdrCoordinatorPaneId") != pane_id:
+            if not isinstance(room, dict) or (
+                room.get("herdrCoordinatorPaneId") != pane_id and room.get("herdrViewPaneId") != pane_id
+            ):
                 continue
             room_id = room.get("id")
             if not isinstance(room_id, str) or not room_id:
@@ -634,8 +674,9 @@ def _toggle_herdr_swarm_view(
     cwd: str | None = None,
     base: Path,
 ) -> dict[str, str]:
-    coordinator_pane = os.environ.get("HERDR_PANE_ID", "").strip()
-    workspace_id = os.environ.get("HERDR_WORKSPACE_ID", "").strip() or None
+    coordinator_pane, workspace_id, context_cwd = _resolve_herdr_context()
+    if not cwd and context_cwd:
+        cwd = context_cwd
     peer = _find_herdr_peer(base, session_id, coordinator_pane)
     if isinstance(peer, dict):
         if not session_id and isinstance(peer.get("session"), str):
@@ -683,8 +724,16 @@ def _toggle_herdr_swarm_view(
         if isinstance(room_data, dict) and isinstance(room_data.get("herdrViewPaneId"), str)
         else None
     )
+    recorded_coord_pane = (
+        room_data.get("herdrCoordinatorPaneId")
+        if isinstance(room_data, dict) and isinstance(room_data.get("herdrCoordinatorPaneId"), str)
+        else None
+    )
     if recorded_view_pane == coordinator_pane:
-        recorded_view_pane = None
+        if recorded_coord_pane and recorded_coord_pane != coordinator_pane:
+            coordinator_pane = recorded_coord_pane
+        else:
+            recorded_view_pane = None
     effective_workspace = workspace_id or (
         room_data.get("herdrWorkspaceId")
         if isinstance(room_data, dict) and isinstance(room_data.get("herdrWorkspaceId"), str)
@@ -1186,6 +1235,7 @@ def main(arguments: list[str]) -> int:
         [sys.executable, str(Path(__file__).resolve()), "--toggle-swarm", "toggle", "--socket", socket]
     )
     subprocess.run([*base, "bind-key", "-n", "M-s", "run-shell", "-b", toggle_cmd], env=environment, check=False)
+    subprocess.run([*base, "bind-key", "-n", "C-M-s", "run-shell", "-b", toggle_cmd], env=environment, check=False)
     subprocess.run(
         [
             *base,

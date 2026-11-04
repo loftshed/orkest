@@ -1,7 +1,7 @@
 ---
-description: Toggle (open or close) the live Orkest Swarm View split pane in this terminal
-argument-hint: "[toggle|open|close]"
+description: Toggle the Orkest Swarm View split pane or launch a swarm for a goal (/swarm [toggle|open|close|<goal>])
+argument-hint: "[toggle|open|close|<goal>]"
 ---
 
 [orkest-swarm-command: $ARGUMENTS]
-If the `/swarm` turn hook already opened or closed the Orkest Swarm View pane, confirm the result in one short line and do not call any tools. Otherwise run `ork swarm $ARGUMENTS` (or `ork horde toggle` / `ork horde $ARGUMENTS`) and report the result in one short line.
+If the `/swarm` turn hook already opened or closed the Orkest Swarm View pane (or if no goal was given), confirm the result in one short line and do not call any tools. If a goal was given, coordinate the swarm for `$ARGUMENTS`.

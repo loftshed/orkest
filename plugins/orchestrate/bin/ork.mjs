@@ -682,8 +682,11 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
     throw new Error(
       "An attached room keeps its coordinator and limits; steer it through its conversation",
     );
-  if (values.view && !values["attach-room"] && !values.fixture)
-    throw new Error("--view requires --attach-room or --fixture");
+  if (values.view && !values["attach-room"] && !values.fixture) {
+    const envRoom = process.env.ORKEST_SWARM_ROOM?.trim();
+    if (envRoom) values["attach-room"] = envRoom;
+    else throw new Error("--view requires --attach-room or --fixture");
+  }
   if (isSpawning && !values["attach-room"]) throw new Error("spawn requires --attach-room");
   if (
     values.fixture &&
