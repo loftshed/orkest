@@ -539,10 +539,17 @@ def dispatch(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
         }
     else:
         spec = dict(state["task_spec"])
-    if kind in READ_ONLY_KINDS and args.verify_command:
-        raise CoordinationError(
-            "read-only dispatches use evidence in the report; omit implementation verification commands"
+    if kind in READ_ONLY_KINDS:
+        spec.update(
+            scope_owner="conductor",
+            allow_paths=[],
+            track_paths=[],
+            effective_scope=[],
         )
+        if args.verify_command:
+            raise CoordinationError(
+                "read-only dispatches use evidence in the report; omit implementation verification commands"
+            )
     # Follow-up agents need the earlier findings, including failed approaches.
     prior_reports = [
         "Prior " + run["kind"] + " result: " + run["result_path"]

@@ -640,13 +640,23 @@ class CoordinatorTests(unittest.TestCase):
 
     def test_consultant_keeps_original_context_and_prior_results(self):
         state = COORDINATOR.load(self.directory)
+        state["task_spec"]["scope_owner"] = "worker"
+        state["task_spec"]["allow_paths"] = ["."]
+        state["task_spec"]["effective_scope"] = ["."]
         state["task_spec"]["context_packet"] = {"decisions": ["Keep the public API"], "evidence": ["Original trace"]}
         COORDINATOR.save(self.directory, state)
         with mock.patch.dict(os.environ, {"FAKE_NO_CHANGE": "1"}):
             _, investigation = self.start("explore", "investigation")
             code, run = self.start("consult", "consultation", "--packet", str(self.packet))
         self.assertEqual((code, run["runner_status"]), (0, "completed"))
+        inv_spec = json.loads((Path(investigation["result_path"]).parent.parent / "task-spec.json").read_text())
+        self.assertEqual(inv_spec["scope_owner"], "conductor")
+        self.assertEqual(inv_spec["allow_paths"], [])
+        self.assertEqual(RUNNER.brief_renderer_module().validate_spec(inv_spec)["effective_scope"], [])
         spec = json.loads((Path(run["result_path"]).parent.parent / "task-spec.json").read_text())
+        self.assertEqual(spec["scope_owner"], "conductor")
+        self.assertEqual(spec["allow_paths"], [])
+        self.assertEqual(RUNNER.brief_renderer_module().validate_spec(spec)["effective_scope"], [])
         self.assertEqual(spec["context_packet"]["decisions"][0], "Keep the public API")
         self.assertEqual(
             spec["context_packet"]["evidence"],

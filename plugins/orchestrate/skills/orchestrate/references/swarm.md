@@ -13,11 +13,38 @@ The coordinator owns the outcome, assignments, conflict resolution and final ver
 available to the user while children work. Use native supervision for agents in your harness and
 the orchestrate runner for other harnesses. Do not silently change accounts or billing contexts.
 
+## Route each action
+
+Your context holds the user's intent and architectural decisions; spend it on that rather than
+raw file reads, tracing, or test output:
+
+1. **Follow-up on existing work: continue with the owning worker session.** When a worker
+   leaves a gap, failing check, or review follow-up, send it back to the session that holds the file
+   context. Native subagent: message or resume it. Audited executor run: dispatch at most one
+   `coordinator.py dispatch --kind correction` with reviewed evidence; a second gap or a scope/history
+   violation requires a new bounded task or explicit conductor takeover. Do not repair worker output
+   in-session while a worker session can continue, and do not spawn a cold worker for the same slice.
+2. **Sustained exploration, edits you cannot state upfront, or test/build runs: delegate and yield.**
+   When your next read depends on a previous read that itself depended on a read, you are tracing:
+   stop and dispatch a `@scout` or `@debugger`. After attaching and establishing supervision or
+   background execution, give the user a concise status and end your turn.
+3. **Bounded decisions and inspections: handle in-session.** Read to decide, never to
+   produce: inspect a worker's `result.json` or diff, run `git status` or `git diff`, read a file the
+   user named, or apply a surgical fix only when you can state the diff before opening the file and no
+   worker session or lease owns that path. If opening the file turns into figuring out what to change,
+   stop and delegate.
+
+Never edit the checkout while a worker holds its writer lease. Do not list, grep, tail, `wc`, or
+`stat` subagent transcripts, scratch files, or task directories to check whether a worker is alive:
+rely on completion notifications, native status tools, the "Swarm next step" advisor at your next
+turn, or `ork rooms show --room ID`.
+
 ## Appoint the current conversation
 
 When the user appoints this conversation as coordinator, run `ork hall promote --session NATIVE_ID`.
 Add `--objective TEXT` when they supplied a goal. This adopts the running conversation without
-restarting it or losing its chat. The command returns the room ID and refreshes its terminal label.
+restarting it or losing its chat. The command writes and returns the coordinator brief, returns the
+room ID, and refreshes its terminal label.
 Use `--room ID` to adopt a specific room; a different bound coordinator must use the leadership
 handoff workflow instead. Repeating promotion preserves the room's members and existing objective.
 
@@ -33,6 +60,10 @@ handoff workflow instead. Repeating promotion preserves the room's members and e
    use [rooms init-task and dispatch](rooms.md). Native models use `--transport native`: spawn once,
    attach the exact native handle, supervise it, and complete the receipt through the coordinator.
    Cross-harness dispatch runs in the background. Recover finished runs and review their evidence.
+   When implementation files are not yet localized, dispatch a read-only `@scout` (`--kind investigation`)
+   on that task directory first and recover its finished run before dispatching the builder (`--kind implementation`)
+   on the same task directory—finished investigation results are automatically appended to the builder's
+   `context_packet.evidence`—or grant `scope_owner: "worker"` when repository-wide write scope is authorized.
 4. For a substantial branch, add a member in your own harness and run `ork rooms lead --room ID
 --member MEMBER --objective TEXT`. Read its returned brief and use your native subagent tool once.
    Inherit model settings unless a supported explicit choice is authorized. Immediately bind the

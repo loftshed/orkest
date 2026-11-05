@@ -1071,6 +1071,56 @@ class HerdrSwarmLaunchTests(unittest.TestCase):
                 me4 = mailbox.load(mailbox.peer_path(base, session_id))
                 fourth = mailbox_hooks.swarm_coordinator_context(base, me4, "UserPromptSubmit")
                 self.assertIn("Swarm next step (room room-advisor", fourth)
+
+                # If conductor.md was missing on Turn 1 and is written later, the next turn delivers it
+                # without repeating the reconnection summary that Turn 1 already emitted
+                brief_dir = base / "swarm-briefs" / "room-advisor"
+                brief_dir.mkdir(parents=True, exist_ok=True)
+                (brief_dir / "conductor.md").write_text(
+                    "Coordinator brief for YOUR_ACTUAL_SESSION_ID\nRoute every action:",
+                    encoding="utf-8",
+                )
+                me5 = mailbox.load(mailbox.peer_path(base, session_id))
+                fifth = mailbox_hooks.swarm_coordinator_context(base, me5, "UserPromptSubmit")
+                self.assertIn("Coordinator brief for conductor-session-1234", fifth)
+                self.assertIn("Route every action:", fifth)
+                self.assertNotIn("Reconnected to swarm room room-advisor", fifth)
+
+                # Unbound room with objective and conductor.md: SessionStart followed by UserPromptSubmit
+                # marks swarmBriefed on SessionStart so the CLI-launched brief is not double-delivered
+                unbound_room = {
+                    "id": "room-cli-brief",
+                    "title": "CLI brief room",
+                    "objective": "Ship feature once",
+                    "cwd": str(home),
+                    "swarm": {"maxAgents": 12, "maxDepth": 3},
+                    "conductor": {"engine": "claude", "role": "lead"},
+                    "agents": [],
+                }
+                mailbox.write(base / "rooms" / "room-cli-brief.json", unbound_room)
+                cli_brief_dir = base / "swarm-briefs" / "room-cli-brief"
+                cli_brief_dir.mkdir(parents=True, exist_ok=True)
+                (cli_brief_dir / "conductor.md").write_text(
+                    "Coordinator brief for YOUR_ACTUAL_SESSION_ID\nRoute every action:",
+                    encoding="utf-8",
+                )
+                cli_session = "conductor-cli-launch-1"
+                cli_me = mailbox.register(
+                    base,
+                    session=cli_session,
+                    harness="claude",
+                    cwd=str(home),
+                    pid=os.getpid(),
+                    account=str(home),
+                )
+                os.environ["ORKEST_SWARM_ROOM"] = "room-cli-brief"
+                start_out = mailbox_hooks.swarm_coordinator_context(base, cli_me, "SessionStart")
+                self.assertEqual(start_out, "")
+                cli_me2 = mailbox.load(mailbox.peer_path(base, cli_session))
+                self.assertEqual(cli_me2.get("swarmBriefed"), "room-cli-brief")
+                prompt_out = mailbox_hooks.swarm_coordinator_context(base, cli_me2, "UserPromptSubmit")
+                self.assertNotIn("Coordinator brief for", prompt_out)
+                self.assertEqual(prompt_out, "")
             finally:
                 if old_env is not None:
                     os.environ["ORKEST_SWARM_ROOM"] = old_env

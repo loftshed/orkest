@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import { createRoom, mailboxRoot, readRoom, updateRoom } from "./horde-room.mjs";
-import { isPeerLive } from "./rooms.mjs";
+import { coordinatorBrief, isPeerLive, writeCoordinatorBrief } from "./rooms.mjs";
 
 const execute = promisify(execFile);
 const statusline = fileURLToPath(
@@ -210,11 +210,29 @@ export async function promoteSession(
     if (previous || !error.message.startsWith("Room already exists:")) throw error;
     promoted = await updateRoom(roomId, promote, { root });
   }
+  let briefPath;
+  const brief = coordinatorBrief(promoted, "conductor")
+    .split("YOUR_ACTUAL_SESSION_ID")
+    .join(peer.session)
+    .trim();
+  try {
+    briefPath = await writeCoordinatorBrief(promoted, { root });
+  } catch {
+    briefPath = null;
+  }
   let nativeMetadata;
   try {
     nativeMetadata = await refresh({ peer, room: promoted, root, env });
   } catch (error) {
     nativeMetadata = { attempted: true, error: error.message };
   }
-  return { status: "promoted", room: promoted, session: peer.session, engine, nativeMetadata };
+  return {
+    status: "promoted",
+    room: promoted,
+    session: peer.session,
+    engine,
+    briefPath,
+    brief,
+    nativeMetadata,
+  };
 }

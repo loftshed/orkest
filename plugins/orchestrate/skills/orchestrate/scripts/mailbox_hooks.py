@@ -777,8 +777,39 @@ def _format_swarm_reconnection_summary(room: dict[str, Any], room_id: str, membe
     return (
         f"Reconnected to swarm room {room_id}{title_part} as {role_label}.{obj_part} "
         f"Horde members: {counts}. "
-        f"Run `ork rooms status --room {room_id}` to inspect your swarm or `/swarm` to toggle the Swarm View."
+        f"Run `ork rooms show --room {room_id}` to inspect your swarm or `/swarm` to toggle the Swarm View."
     )
+
+
+def _deliver_swarm_brief_or_summary(
+    base: Path,
+    me: dict[str, Any],
+    room: dict[str, Any],
+    room_id: str,
+    member_id: str,
+    instance_key: str,
+    *,
+    allow_brief: bool = True,
+) -> str:
+    """Deliver the member's swarm brief on first briefing (only recording swarmBriefed after a read) or reconnect summary."""
+    has_state = bool(room.get("objective") or room.get("agents"))
+    already_reconnected = me.get("swarmAutoReconnected") == instance_key
+    if allow_brief and me.get("swarmBriefed") != room_id:
+        brief_file = base / "swarm-briefs" / room_id / f"{member_id}.md"
+        with contextlib.suppress(OSError):
+            if brief_file.is_file():
+                brief_text = (
+                    brief_file.read_text(encoding="utf-8").replace("YOUR_ACTUAL_SESSION_ID", me["session"]).strip()
+                )
+                if brief_text:
+                    _MB.annotate(base, me["session"], swarmBriefed=room_id, swarmAutoReconnected=instance_key)
+                    if has_state and not already_reconnected:
+                        return f"{brief_text}\n\n{_format_swarm_reconnection_summary(room, room_id, member_id)}"
+                    return brief_text
+    if has_state and not already_reconnected:
+        _MB.annotate(base, me["session"], swarmAutoReconnected=instance_key)
+        return _format_swarm_reconnection_summary(room, room_id, member_id)
+    return ""
 
 
 def _herdr_active() -> bool:
@@ -863,23 +894,31 @@ def swarm_coordinator_context(
             if isinstance(rebound, dict):
                 room = rebound
         instance_key = f"{room_id}:{me.get('terminalServer') or me.get('herdrPaneId') or me.get('pid') or ''}"
-        if me.get("swarmAutoReconnected") != instance_key:
-            _MB.annotate(base, me["session"], swarmAutoReconnected=instance_key, swarmBriefed=room_id)
-            if me.get("terminalServer") or os.environ.get("ORKEST_TERMINAL_SERVER") or _herdr_active():
-                server_sock = (
-                    None if _herdr_active() else (me.get("terminalServer") or os.environ.get("ORKEST_TERMINAL_SERVER"))
+        toggled_view = False
+        if me.get("swarmAutoReconnected") != instance_key and (
+            me.get("terminalServer") or os.environ.get("ORKEST_TERMINAL_SERVER") or _herdr_active()
+        ):
+            server_sock = (
+                None if _herdr_active() else (me.get("terminalServer") or os.environ.get("ORKEST_TERMINAL_SERVER"))
+            )
+            with contextlib.suppress(Exception):
+                agent_statusline_tmux.toggle_swarm_view(
+                    "open",
+                    socket=server_sock,
+                    room=room_id,
+                    session_id=me["session"],
+                    harness=me["harness"],
+                    cwd=me.get("cwd"),
+                    base=base,
                 )
-                with contextlib.suppress(Exception):
-                    agent_statusline_tmux.toggle_swarm_view(
-                        "open",
-                        socket=server_sock,
-                        room=room_id,
-                        session_id=me["session"],
-                        harness=me["harness"],
-                        cwd=me.get("cwd"),
-                        base=base,
-                    )
-            return _format_swarm_reconnection_summary(room, room_id, member_id)
+                toggled_view = True
+        delivered = _deliver_swarm_brief_or_summary(
+            base, me, room, room_id, member_id, instance_key, allow_brief=is_turn_start
+        )
+        if toggled_view and not delivered and me.get("swarmAutoReconnected") != instance_key:
+            _MB.annotate(base, me["session"], swarmAutoReconnected=instance_key)
+        if delivered:
+            return delivered
         return _swarm_next_advisor(base, me, room, room_id, member_id) if is_turn_start else ""
 
     if not re.fullmatch(r"[\w-]{1,80}", room_id, flags=re.ASCII):
@@ -912,9 +951,12 @@ def swarm_coordinator_context(
                     instance_key = (
                         f"{room_id}:{me.get('terminalServer') or me.get('herdrPaneId') or me.get('pid') or ''}"
                     )
-                    if is_turn_start and me.get("swarmAutoReconnected") != instance_key:
-                        _MB.annotate(base, me["session"], swarmAutoReconnected=instance_key, swarmBriefed=room_id)
-                        return _format_swarm_reconnection_summary(room, room_id, member_id)
+                    if is_turn_start:
+                        delivered = _deliver_swarm_brief_or_summary(
+                            base, me, room, room_id, member_id, instance_key, allow_brief=True
+                        )
+                        if delivered:
+                            return delivered
                     return _swarm_next_advisor(base, me, room, room_id, member_id) if is_turn_start else ""
         return ""
 
@@ -958,27 +1000,24 @@ def swarm_coordinator_context(
         if bound_session and bound_session != me["session"]:
             return ""
     instance_key = f"{room_id}:{me.get('terminalServer') or me.get('herdrPaneId') or me.get('pid') or ''}"
-    if (event == "UserPromptSubmit" or (event == "PreInvocation" and not mid_turn)) and me.get(
-        "swarmBriefed"
-    ) != room_id:
+    is_prompt_turn = event == "UserPromptSubmit" or (event == "PreInvocation" and not mid_turn)
+    cli_launched_with_brief = not was_already_bound and bool(str(room.get("objective") or "").strip())
+    if cli_launched_with_brief and me.get("swarmBriefed") != room_id:
         _MB.annotate(base, me["session"], swarmBriefed=room_id, swarmAutoReconnected=instance_key)
-        if not room.get("objective") and not room.get("agents"):
-            brief_file = base / "swarm-briefs" / room_id / "conductor.md"
-            with contextlib.suppress(OSError):
-                if brief_file.is_file():
-                    return (
-                        brief_file.read_text(encoding="utf-8").replace("YOUR_ACTUAL_SESSION_ID", me["session"]).strip()
-                    )
-        else:
-            return _format_swarm_reconnection_summary(room, room_id, "conductor")
-    elif (
-        was_already_bound
-        and (room.get("objective") or room.get("agents"))
-        and is_turn_start
-        and me.get("swarmAutoReconnected") != instance_key
-    ):
-        _MB.annotate(base, me["session"], swarmAutoReconnected=instance_key)
-        return _format_swarm_reconnection_summary(room, room_id, "conductor")
+        me["swarmBriefed"] = room_id
+        me["swarmAutoReconnected"] = instance_key
+    if is_prompt_turn or (was_already_bound and is_turn_start):
+        delivered = _deliver_swarm_brief_or_summary(
+            base,
+            me,
+            room,
+            room_id,
+            "conductor",
+            instance_key,
+            allow_brief=is_prompt_turn and not cli_launched_with_brief,
+        )
+        if delivered:
+            return delivered
     return _swarm_next_advisor(base, me, room, room_id, "conductor") if is_turn_start else ""
 
 

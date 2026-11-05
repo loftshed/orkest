@@ -143,15 +143,26 @@ do not treat presence as verified progress or completion.
 | The owner lacks one fact, diagnosis or perspective                               | `consult` narrowly and keep ownership                                           |
 | The problem needs exploration before a solution or hypothesis is known           | `consult --intent investigate --read`; let the investigator choose its approach |
 
+Those rows describe a **solo session** that owns the work directly. A **swarm coordinator or subswarm
+lead** (`ORKEST_SWARM_ROOM` is set or this conversation was promoted with `ork hall promote`) owns
+intent, constraints, assignments, conflict resolution, and acceptance—not sustained exploration or
+implementation. It reads to decide, delegates to produce, routes follow-ups back to the worker session
+that holds the file context (native continuation or one audited `--kind correction`), never edits a
+checkout while a worker holds its writer lease, and ends its turn while workers run. For a swarm
+coordinator, the "Finish it here" rule applies only when no worker session holds the files, no lease is
+active, and the diff can be stated before opening the file; see [references/swarm.md](references/swarm.md).
+
 Delegate substantial, self-contained work so you can advance other authorized parts while it runs.
 Prepare integration, check evidence, or finish independent work instead of waiting when useful work
-is available. Wait only when the next useful action depends on the worker, and keep its leased
+is available (in a conversational swarm, yield your turn after dispatch so you stay responsive to the
+user). Wait only when the next useful action depends on the worker, and keep its leased
 worktree frozen. Batch related moves or structural refactors and run scoped checks (lint, types,
 imports, and narrowly affected tests) during iteration; reserve full test or visual suites for one
 combined integration checkpoint rather than running them between every move. Run that checkpoint
 through `ork gate --heavy -- <command>` so it waits for other agents' heavy runs on the machine.
 
-Before implementation delegation, state the objective, exact scope, acceptance criteria, versions
+Before implementation delegation, state the objective, scope (exact paths, a scout's localized paths,
+or `scope_owner: "worker"` when repository-wide write scope is authorized), acceptance criteria, versions
 and conventions, decisions to preserve, failed attempts and evidence pointers (the task-spec
 `context_packet` holds the last four). For consultation, state the decision needed and what evidence
 would change it. Never send secrets, credentials or unrelated private files; the brief goes to the
@@ -294,7 +305,7 @@ never blocks OpenCode.
 
 ## Run
 
-1. Record `git status --short`, branch and `HEAD`. Plan completely.
+1. Record `git status --short`, branch and `HEAD`. Define the objective, constraints, and acceptance criteria; when the scope is not yet known or in a conversational swarm, discover implementation scope through a read-only scout or delegate file selection with `scope_owner: "worker"` when repository-wide write scope is authorized.
 2. Write a task spec per [references/brief-template.md](references/brief-template.md), outside the repo. Frame the objective with a confidence-boosting specialist role suited to the experiment or task (affirming why the agent's judgment fits the problem while making clear that evidence-backed `BLOCKED` reporting is valued just as highly as completion).
 3. Launch:
 
@@ -317,18 +328,23 @@ never blocks OpenCode.
    For read-only runs, read `scratch.artifacts` as usable output; do not rerun the model just to
    reproduce a report. A `scope_violation` whose entries are all `scratch-escape:` means only the
    scratch boundary was breached, and any other entry is a source mutation to investigate.
-5. If review finds a gap, prefer finishing a small, understood fix yourself after the worker has
-   stopped. Use the guidance below to choose local completion or one focused worker correction.
-   Never repeat an unchanged failed prompt.
+5. If review finds a gap in a solo session, prefer finishing a small, understood fix yourself after the
+   worker has stopped; in a conversational swarm, route follow-ups back to the owning worker session
+   (native continuation or one audited `--kind correction`) unless no worker session can continue and
+   the diff can be stated before opening the file. Use the guidance below to choose local completion or
+   one focused worker correction. Never repeat an unchanged failed prompt.
 6. Acknowledge the event (`events --ack <id>`) only after review.
 
 ## Finish small gaps locally
 
-Default to conductor completion when the remaining fix is understood, within the authorized scope,
-and faster to make and verify than to brief, wait for, and review another worker turn. Examples
-include formatting, a missing assertion with a known expected result, or a small source change whose
-behavior is already established. A worker getting most of the task done is useful; it does not need
-to make every final edit.
+In a solo session, default to conductor completion when the remaining fix is understood, within the
+authorized scope, and faster to make and verify than to brief, wait for, and review another worker
+turn. Examples include formatting, a missing assertion with a known expected result, or a small source
+change whose behavior is already established. A worker getting most of the task done is useful; it does
+not need to make every final edit. In a conversational swarm (`ORKEST_SWARM_ROOM` or a promoted
+coordinator), prefer continuing the worker session that already holds the file context (native resume
+or one audited `--kind correction`), and make an in-session edit only when no worker session or lease
+holds the files and you can state the diff before opening the file.
 
 Send one focused correction only when substantial work or investigation remains and the worker's
 context makes it better placed to finish. Resume the same session and route with `--session <id>
