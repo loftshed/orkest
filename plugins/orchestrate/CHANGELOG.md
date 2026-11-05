@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.58.0
+
+- feat(orchestrate): use plain top card border in Herdr and move slot badge to folder row (#95)
+
 ## 0.57.0
 
 - feat(orchestrate): show swarm title in Herdr pane header and add active task shimmer (#94)
