@@ -567,6 +567,9 @@ def main() -> int:
     parser.add_argument(
         "--native-status", action="store_true", help="native UI callback: bind the outer footer when wrapped"
     )
+    parser.add_argument(
+        "--refresh-terminal", action="store_true", help="republish native terminal metadata after restoring its layout"
+    )
     parser.add_argument("--width", type=int, help="maximum terminal width")
     parser.add_argument("--line", type=int, choices=(1, 2), default=0, help="line number for multi-line footers")
     output = parser.add_mutually_exclusive_group()
@@ -574,6 +577,8 @@ def main() -> int:
     output.add_argument("--plain", action="store_true", help="omit ANSI colors")
     output.add_argument("--tmux", action="store_true", help="emit a tmux-formatted line")
     args = parser.parse_args()
+    if args.refresh_terminal and not args.native_status:
+        parser.error("--refresh-terminal requires --native-status")
     if args.clear_terminal:
         agent_terminal.clear(args.clear_terminal, args.harness)
         return 0
@@ -601,7 +606,7 @@ def main() -> int:
         args.native_status
         and session
         and not args.tmux
-        and agent_terminal.bind(session, args.harness, payload)
+        and agent_terminal.bind(session, args.harness, payload, force=args.refresh_terminal)
         and agent_terminal.context(args.harness)
     ):
         return 0  # In a wrapped terminal the native integration only supplies identity to the outer footer.

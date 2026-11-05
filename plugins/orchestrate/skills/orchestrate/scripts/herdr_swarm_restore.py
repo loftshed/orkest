@@ -152,6 +152,7 @@ def command(cli: Path, room: str, state: Path, env: dict[str, str] | None = None
         [
             "env",
             f"ORKEST_HERDR_VIEW_STATE={state}",
+            *([f"AGENT_EXECUTOR_HOME={source['AGENT_EXECUTOR_HOME']}"] if source.get("AGENT_EXECUTOR_HOME") else []),
             shutil.which("node", path=source.get("PATH")) or "node",
             str(cli),
             "horde",

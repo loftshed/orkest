@@ -81,6 +81,7 @@ def find_session_swarm_room(
     harness: str | None = None,
     cwd: str | None = None,
     aliases: list[str] | tuple[str, ...] | None = None,
+    only_room: str | None = None,
 ) -> dict[str, object] | None:
     """Find the most recently updated swarm room where this session (or its alias) was in control (conductor or lead)."""
     candidates = {
@@ -109,6 +110,8 @@ def find_session_swarm_room(
                 or room.get("id") != path.stem
                 or not room.get("swarm")
             ):
+                continue
+            if only_room is not None and room.get("id") != only_room:
                 continue
             room_machine = room.get("machine")
             if isinstance(room_machine, str) and room_machine and room_machine != host:
@@ -522,6 +525,83 @@ def _open_herdr_swarm_view(
         )
 
 
+def _reuse_herdr_swarm_view_unlocked(
+    api: object,
+    *,
+    room: str,
+    cwd: str | None,
+    coordinator_pane: str,
+    workspace_id: str | None,
+    environment: dict[str, str],
+    base: Path,
+) -> tuple[bool, str | None]:
+    """Hand one verified view pane to a new room in the same Herdr tab."""
+    import herdr_swarm_restore as restoration
+
+    panes = api.panes()
+    coordinator = next((pane for pane in panes if pane["pane_id"] == coordinator_pane), None)
+    if not coordinator:
+        return False, None
+    cli = Path(__file__).resolve().parents[3] / "bin" / "ork.mjs"
+    candidates = []
+    for path in sorted(restoration.state_directory(base.parent, environment).glob("*.json")):
+        record = restoration.load(path)
+        if not record or record.get("schema") != restoration.SCHEMA or record.get("room") == room:
+            continue
+        if (
+            record.get("endpoint") != restoration.endpoint(environment)
+            or record.get("host") != stdlib_socket.gethostname()
+            or record.get("cli") != str(cli.resolve())
+            or path.with_suffix(".closed").exists()
+        ):
+            continue
+        old_room_id = record.get("room")
+        if not isinstance(old_room_id, str):
+            continue
+        old_room = restoration.load(_room_path(base, old_room_id))
+        if not old_room or old_room.get("herdrCoordinatorPaneId") != coordinator_pane:
+            continue
+        if old_room.get("herdrWorkspaceId") and old_room["herdrWorkspaceId"] != workspace_id:
+            continue
+        if cwd and Path(str(old_room.get("cwd", ""))).resolve() != Path(cwd).resolve():
+            continue
+        owned = restoration.locate(record, panes)
+        if not owned or old_room.get("herdrViewPaneId") != owned["pane_id"]:
+            continue
+        if coordinator.get("tab_id") and owned.get("tab_id") and coordinator["tab_id"] != owned["tab_id"]:
+            continue
+        if not restoration.view_process(api.processes(owned["pane_id"]), cli, old_room_id):
+            continue
+        candidates.append((path, record, owned["pane_id"], old_room_id))
+    if not candidates:
+        return False, None
+    if len(candidates) != 1:
+        return True, None
+    old_state, _record, pane_id, old_room_id = candidates[0]
+    api.call("pane", "send-keys", pane_id, "q")
+    deadline = time.monotonic() + 5
+    while not restoration.idle_shell(api.processes(pane_id)):
+        if time.monotonic() >= deadline:
+            return True, None
+        time.sleep(0.1)
+    old_state.with_suffix(".closed").touch(mode=0o600)
+    old_state.with_suffix(".pending").unlink(missing_ok=True)
+    new_state = restoration.prepare(base.parent, room, pane_id, cli, environment, api)
+    outcomes = restoration.restore(base.parent, environment, api, locked=True, only_room=room)
+    if not outcomes or outcomes[0]["status"] not in ("restored", "submitted", "already_running", "launch_pending"):
+        new_state.with_suffix(".closed").touch(mode=0o600)
+        return True, None
+    _update_room_metadata(base, old_room_id, herdrViewPaneId=None)
+    _update_room_metadata(
+        base,
+        room,
+        herdrViewPaneId=pane_id,
+        herdrCoordinatorPaneId=coordinator_pane,
+        **({"herdrWorkspaceId": workspace_id} if workspace_id else {}),
+    )
+    return True, pane_id
+
+
 def _open_herdr_swarm_view_unlocked(
     herdr: str,
     *,
@@ -532,6 +612,23 @@ def _open_herdr_swarm_view_unlocked(
     environment: dict[str, str],
     base: Path,
 ) -> str | None:
+    import herdr_swarm_restore as restoration
+
+    api = restoration.Herdr(herdr, environment)
+    try:
+        found, reused = _reuse_herdr_swarm_view_unlocked(
+            api,
+            room=room,
+            cwd=cwd,
+            coordinator_pane=coordinator_pane,
+            workspace_id=workspace_id,
+            environment=environment,
+            base=base,
+        )
+        if found:
+            return reused
+    except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired):
+        return None
     target_cwd = cwd or os.getcwd()
     split_env = {**environment, "HERDR_PANE_ID": coordinator_pane} if coordinator_pane else environment
     split = subprocess.run(
@@ -557,9 +654,6 @@ def _open_herdr_swarm_view_unlocked(
     if not view_pane_id:
         return None
     cli = Path(__file__).resolve().parents[3] / "bin" / "ork.mjs"
-    import herdr_swarm_restore as restoration
-
-    api = restoration.Herdr(herdr, environment)
     try:
         state_path = restoration.prepare(base.parent, room, view_pane_id, cli, environment, api)
     except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired):
@@ -759,7 +853,8 @@ def _toggle_herdr_swarm_view_unlocked(
         bound = agent_statusline.bound_rooms(base, peer)
         if bound:
             current_room = bound[0][0]["id"]
-    if not current_room and coordinator_pane:
+    # Pane IDs survive new conversations; they cannot identify a known session's room.
+    if not current_room and coordinator_pane and not session_id:
         current_room = _find_herdr_room(base, coordinator_pane)
     environment = dict(os.environ)
     environment.pop("TMUX", None)
@@ -1158,6 +1253,7 @@ def main(arguments: list[str]) -> int:
                 "This swarm has no live coordinator terminal. Use --view to inspect its recorded work.", file=sys.stderr
             )
             return 2
+    herdr_active = _herdr_active()
     if not attach:
         command = arguments[1:] if arguments[:1] == ["--"] else arguments
         if not command or command == ["--help"]:
@@ -1195,7 +1291,7 @@ def main(arguments: list[str]) -> int:
             # The TUI knows the visible conversation even when agents share a daemon.
             # This changes only the private pane title, not Codex's thread name or status line.
             command = [command[0], "-c", 'tui.terminal_title=["session-id"]', *command[1:]]
-        if _herdr_active():
+        if herdr_active:
             environment = dict(os.environ)
             environment["ORKEST_TERMINAL_HARNESS"] = harness
             if room:
@@ -1225,7 +1321,7 @@ def main(arguments: list[str]) -> int:
                             "Swarm view could not open; the coordinator terminal is still available.",
                             file=sys.stderr,
                         )
-            return subprocess.run(command, env=environment, cwd=cwd or None, check=False).returncode
+            # Herdr keeps tabs at the top; tmux draws the footer inside the pane.
     tmux = shutil.which("tmux")
     if not tmux:
         print("ork label needs tmux on PATH", file=sys.stderr)
@@ -1302,6 +1398,9 @@ def main(arguments: list[str]) -> int:
                 )
     environment["ORKEST_TERMINAL_SERVER"] = socket
     environment["ORKEST_TERMINAL_HARNESS"] = harness
+    if herdr_active:
+        # The host-visible tmux process otherwise hides the agent from Herdr.
+        environment["HERDR_AGENT"] = "agy" if harness == "gemini" else harness
     if room:
         environment["ORKEST_SWARM_ROOM"] = room
     columns, rows = shutil.get_terminal_size((80, 24))
@@ -1365,9 +1464,8 @@ def main(arguments: list[str]) -> int:
         if result.returncode:
             print(f"Label setup failed. Reattach with: tmux -L {socket} attach -t {session}", file=sys.stderr)
             return result.returncode
-    toggle_cmd = shlex.join(
-        [sys.executable, str(Path(__file__).resolve()), "--toggle-swarm", "toggle", "--socket", socket]
-    )
+    toggle_args = ["--room", room] if herdr_active and room else ["--socket", socket]
+    toggle_cmd = shlex.join([sys.executable, str(Path(__file__).resolve()), "--toggle-swarm", "toggle", *toggle_args])
     subprocess.run([*base, "bind-key", "-n", "M-s", "run-shell", "-b", toggle_cmd], env=environment, check=False)
     subprocess.run([*base, "bind-key", "-n", "C-M-s", "run-shell", "-b", toggle_cmd], env=environment, check=False)
     subprocess.run(
@@ -1382,33 +1480,42 @@ def main(arguments: list[str]) -> int:
         env=environment,
         check=False,
     )
-
-    if room:
-        cli = Path(__file__).resolve().parents[3] / "bin" / "ork.mjs"
-        subprocess.run([*base, "set-option", "-t", session, "@orkest_room", room], env=environment, check=True)
-        split = subprocess.run(
-            [
-                *base,
-                "split-window",
-                "-t",
-                coordinator_pane,
-                "-d",
-                *(["-h", "-l", "40%"] if columns >= 120 else ["-v", "-l", "40%"]),
-                "--",
-                shutil.which("node") or "node",
-                str(cli),
-                "horde",
-                "--attach-room",
-                room,
-                "--view",
-            ],
+    if herdr_active:
+        # Set this only after the first client attaches: setting it on the
+        # detached new session would destroy the session before launch.
+        subprocess.run(
+            [*base, "set-hook", "-t", session, "client-attached", "set-option -t orkest destroy-unattached on"],
             env=environment,
             check=False,
         )
-        if split.returncode:
-            print("Swarm view could not open; the coordinator terminal is still available.", file=sys.stderr)
-        subprocess.run([*base, "bind-key", "Tab", "select-pane", "-t", ":.+"], env=environment, check=True)
-        subprocess.run([*base, "select-pane", "-t", coordinator_pane], env=environment, check=False)
+
+    if room:
+        subprocess.run([*base, "set-option", "-t", session, "@orkest_room", room], env=environment, check=True)
+        if not herdr_active:
+            cli = Path(__file__).resolve().parents[3] / "bin" / "ork.mjs"
+            split = subprocess.run(
+                [
+                    *base,
+                    "split-window",
+                    "-t",
+                    coordinator_pane,
+                    "-d",
+                    *(["-h", "-l", "40%"] if columns >= 120 else ["-v", "-l", "40%"]),
+                    "--",
+                    shutil.which("node") or "node",
+                    str(cli),
+                    "horde",
+                    "--attach-room",
+                    room,
+                    "--view",
+                ],
+                env=environment,
+                check=False,
+            )
+            if split.returncode:
+                print("Swarm view could not open; the coordinator terminal is still available.", file=sys.stderr)
+            subprocess.run([*base, "bind-key", "Tab", "select-pane", "-t", ":.+"], env=environment, check=True)
+            subprocess.run([*base, "select-pane", "-t", coordinator_pane], env=environment, check=False)
 
     result = subprocess.run([*base, "attach-session", "-t", session], env=environment, check=False)
     still_running = subprocess.run(
