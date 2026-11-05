@@ -197,6 +197,9 @@ python3 ~/.agents/skills/orchestrate/scripts/run_agent.py doctor --check-messagi
 
 ## Development
 
+Use a current Corepack release with pnpm 12 support. If Corepack reports a missing
+`pnpm.cjs`, update Corepack on a supported Node.js version. CI pins Corepack 0.36.0.
+
 ```sh
 corepack pnpm install
 ork gate --heavy -- ./scripts/check.sh

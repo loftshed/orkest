@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import sqlite3
 import subprocess
@@ -137,7 +138,10 @@ class AgentStatuslineTests(unittest.TestCase):
             colored,
             r"^\x1b\[0m\x1b\[48;5;[0-9]+;38;5;232;1m 󰚩 \x1b\[0m \x1b\[38;5;[0-9]+;1m(snorfle)\x1b\[0m",
         )
-        self.assertRegex(colored, r"   \n$")
+        self.assertEqual(
+            re.sub(r"\x1b\[[0-9;]*m", "", colored),
+            " 󰚩  snorfle | — / — | repo : project | stage : not set | goal : not set | task : not set\n",
+        )
         self.assertNotIn("\x1b[48;5;", colored[28:])
         unicode_colored = self.run_status(
             "--width",
