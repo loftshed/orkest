@@ -17,8 +17,10 @@ import {
   recoverRoom,
   reserveLead,
 } from "../lib/rooms.mjs";
+import { promoteSession } from "../lib/session-promotion.mjs";
 
 export const ROOMS_HELP = `ork rooms list [--json]
+ork hall promote [--session ID] [--room ID] [--objective TEXT] [--cwd PATH]   (adopt this live conversation as coordinator)
 ork rooms show --room ID [--json]
 ork rooms create --team TEAM [--group GROUP] [--title TITLE] [--cwd PATH] [--id ID] [--authority TEAM_ID]
 ork rooms add --room ID --team TEAM [--parent conductor|MEMBER] [--role ROLE] [--cwd PATH]
@@ -45,7 +47,13 @@ Task specs and task directories use the existing coordinator contract.
 
 export async function roomsCommand(
   argv,
-  { stdout = process.stdout, root = mailboxRoot(), run = coordinator } = {},
+  {
+    stdout = process.stdout,
+    env = process.env,
+    root = mailboxRoot(env),
+    run = coordinator,
+    refreshTerminal,
+  } = {},
 ) {
   const { positionals, values } = parseArgs({
     args: argv,
@@ -109,6 +117,19 @@ export async function roomsCommand(
     : [];
   let result;
   switch (action) {
+    case "promote": {
+      result = await promoteSession(
+        {
+          session: values.session,
+          room: values.room,
+          objective: values.objective,
+          cwd: values.cwd,
+          engine: values.engine,
+        },
+        { root, env, ...(refreshTerminal && { refresh: refreshTerminal }) },
+      );
+      break;
+    }
     case "list": {
       const listing = await listRooms(root);
       const tasks = new Map();
