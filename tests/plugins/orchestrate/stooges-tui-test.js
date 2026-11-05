@@ -195,11 +195,11 @@ describe("tui-box primitives and HordeView unification", () => {
     ];
     let rendered = plain(new HordeView(room).render(120).join("\n"));
     expect(rendered).toContain("supervisor-model");
-    expect(rendered).toContain("[consultant] worker-model (requested) / high");
+    expect(rendered).toContain("[consultant] \u{EC82} worker-model (requested) / high");
     room.agents[0].model = "confirmed-worker";
     room.agents[0].modelSource = "observed";
     rendered = plain(new HordeView(room).render(120).join("\n"));
-    expect(rendered).toContain("[consultant] confirmed-worker / high");
+    expect(rendered).toContain("[consultant] \u{EC82} confirmed-worker / high");
     expect(rendered).not.toContain("(requested)");
   });
 
@@ -207,7 +207,7 @@ describe("tui-box primitives and HordeView unification", () => {
     const view = new HordeView(fixture(), { now: () => 2000 });
     const wide = view.render(120);
     expect(wide.some((line) => line.includes("1 luna-1") && line.includes("2 flash-1"))).toBe(true);
-    expect(wide.some((line) => line.includes("? help"))).toBe(true);
+    expect(wide.some((line) => line.includes(" Shortcuts "))).toBe(true);
     const narrow = view.render(70);
     expect(narrow.some((line) => line.includes("1 luna-1") && line.includes("2 flash-1"))).toBe(
       false,
@@ -233,7 +233,7 @@ describe("tui-box primitives and HordeView unification", () => {
     view.handleInput("p");
     const unpinned = view.render(90).join("\n");
     expect(unpinned).not.toContain("PIN ");
-    expect(unpinned).toContain("FOCUS ");
+    expect(unpinned).toContain("▸ ");
   });
 
   it("supports more than nine members with page-local number keys", () => {
@@ -257,9 +257,9 @@ describe("tui-box primitives and HordeView unification", () => {
     const lines = view.render(80);
     expect(lines.length).toBeLessThanOrEqual(18);
     expect(lines.join("\n")).toContain("haiku-1");
-    expect(lines.join("\n")).toContain("FOCUS ");
+    expect(lines.join("\n")).toContain("▸ ");
     expect(lines.join("\n")).toContain("First agent result");
-    expect(lines.join("\n")).toContain("q close view");
+    expect(lines.join("\n")).not.toContain(" Close view ");
   });
 
   it("fits Unicode and strips injected terminal controls", () => {
@@ -353,16 +353,65 @@ describe("tui-box primitives and HordeView unification", () => {
   it("renders an empty room, key help and a coalesced log overlay", () => {
     const room = fixture();
     room.agents = [];
-    const view = new StoogesView(room, { height: 24 });
-    expect(view.render(80).join("\n")).toContain(
-      "The coordinator will add agents as work is assigned.",
+    const view = new StoogesView(room, { height: 24, color: true });
+    const emptyLines = view.render(80);
+    const emptyRowIndex = emptyLines.findIndex((line) =>
+      plain(line).includes("The coordinator will add agents as work is assigned."),
+    );
+    expect(emptyRowIndex).toBeGreaterThan(7);
+    expect(emptyRowIndex).toBeLessThan(18);
+    expect(emptyLines[emptyRowIndex]).toContain(
+      "\u{1B}[2mThe coordinator will add agents as work is assigned.\u{1B}[0m",
+    );
+    expect(plain(emptyLines[emptyRowIndex])).toMatch(
+      /^ {10,}The coordinator will add agents as work is assigned\. {10,}$/u,
     );
     view.handleInput("?");
-    expect(view.render(80).join("\n")).toContain("Key reference");
+    expect(view.render(80).join("\n")).toContain("Keyboard shortcuts");
     view.handleInput("\u{1B}");
     view.handleInput("g");
     expect(view.render(80).join("\n")).toContain("haiku-1: Source inspected (×2)");
     expect(view.render(80).join("\n")).toContain("Room log");
+  });
+
+  it("starts quota collapsed with each account's lowest remaining percentage on one row", () => {
+    const room = fixture();
+    room.accounts = [
+      { id: "codex", short: "C", windows: [{ remainingPct: 92 }, { remainingPct: 81 }] },
+      { id: "claude", short: "K", windows: [{ remainingPct: 64 }] },
+    ];
+    const view = new StoogesView(room, { tier: "unicode" });
+    const lines = view.render(100);
+    expect(view.quotaMode).toBe("collapsed");
+    expect(lines.filter((line) => line.includes("Quota"))).toHaveLength(0);
+    const summary = lines.find((line) => line.includes("C ━━━─ 81%"));
+    expect(summary).toContain("C ━━━─ 81%  K ━━━─ 64%");
+    expect(summary).toContain("▾");
+    expect(view.handleKey("u")).toBe(true);
+    expect(view.render(100).join("\n")).toContain("▾ Quota");
+  });
+
+  it("keeps Antigravity quota pools separate in the compact meter summary", () => {
+    const room = fixture();
+    room.accounts = [
+      {
+        id: "antigravity",
+        short: "AG",
+        provider: "antigravity",
+        windows: [
+          { pool: "gemini", remainingPct: 77 },
+          { pool: "gemini", remainingPct: 86 },
+          { pool: "claude-gpt", remainingPct: 10 },
+          { pool: "claude-gpt", remainingPct: 100 },
+        ],
+      },
+    ];
+    const lines = new StoogesView(room, { tier: "unicode" }).render(100);
+    const summary = lines.find((line) => line.includes("AG Gemini"));
+    expect(summary).toContain("AG Gemini ━━━─ 77%");
+    expect(summary).toContain("AG Claude/GPT ━─── 10%");
+    expect(summary).toContain("▾");
+    expect(lines.filter((line) => line.includes("Quota"))).toHaveLength(0);
   });
 
   it("renders quota pills from monitor account data right below the coordinator card", () => {
@@ -385,9 +434,11 @@ describe("tui-box primitives and HordeView unification", () => {
         ],
       },
     ];
-    const rendered = new StoogesView(room, { now: () => 1000 }).render(100).join("\n");
+    const rendered = new StoogesView(room, { now: () => 1000, quotaMode: "expanded" })
+      .render(100)
+      .join("\n");
     expect(rendered).toContain("Quota");
-    expect(rendered).toContain("CX Weekly");
+    expect(rendered).toContain("\u{EC81} Weekly");
     expect(rendered).toContain("80% left");
   });
 
@@ -472,7 +523,9 @@ describe("tui-box primitives and HordeView unification", () => {
     ];
     const nowMs = 1_793_754_000_000;
     const resetDay = new Date(1_794_013_200_000).toLocaleDateString("en-US", { weekday: "short" });
-    const rendered = new StoogesView(room, { now: () => nowMs, height: 32 }).render(90).join("\n");
+    const rendered = new StoogesView(room, { now: () => nowMs, height: 32, quotaMode: "expanded" })
+      .render(90)
+      .join("\n");
     expect(rendered).toContain("CW ");
     expect(rendered).toContain(`5h 89% · wk 48% · Fable wk 97% · resets in 3d (${resetDay})`);
     expect(rendered).toContain("CP ");
@@ -495,7 +548,7 @@ describe("tui-box primitives and HordeView unification", () => {
     const view = new StoogesView(room, { now: () => 1_000_000, height: 28, tier: "unicode" });
     const collapsed = view.render(90).join("\n");
     // Most recent running agent (haiku-3) is #1 and focused; older completed agents (haiku-2, haiku-1) collapse below it
-    expect(collapsed).toContain("┌ 1 haiku-3");
+    expect(collapsed).toContain("┌ ▸ 1 haiku-3");
     expect(collapsed).toContain("step 2/4 · live");
     expect(collapsed).toContain("├─ ✓ 2 haiku-2");
     expect(collapsed).toContain("Second task done");
@@ -560,11 +613,11 @@ describe("tui-box primitives and HordeView unification", () => {
     expect(rendered).toContain("1 active");
     expect(rendered).toContain("awaiting review");
     expect(rendered).toContain("idle · last reported working");
-    expect(rendered).not.toContain("┌ 1 haiku-2");
+    expect(rendered).not.toContain("┌ ▸ 1 haiku-2");
     expect(rendered).toMatch(/haiku[^\n]*\| idle/u);
     expect(view.needsAnimation).toBe(true);
     view.handleInput("1");
-    expect(view.render(100).join("\n")).toContain("┌ 1 haiku-2");
+    expect(view.render(100).join("\n")).toContain("┌ ▸ 1 haiku-2");
     room.agents[2].runtimeState = "stopped";
     view.setRoom(room);
     expect(view.needsAnimation).toBe(false);
@@ -589,13 +642,18 @@ describe("tui-box primitives and HordeView unification", () => {
     const room = fixture("claude:haiku,agy:flash");
     room.quotaError = "Quota unavailable";
     room.services = [{ kind: "port", port: 5017, name: "preview" }];
-    const lines = new StoogesView(room, { height: 40, tier: "unicode" }).render(90);
+    const lines = new StoogesView(room, {
+      height: 40,
+      tier: "unicode",
+      quotaMode: "expanded",
+    }).render(90);
     const serviceIndex = lines.findIndex((line) => line.includes("Services"));
+    const slotsIndex = lines.findIndex((line) => line.includes("slots · page"));
+    const lastCardJunction = lines.findLastIndex((line) => line.startsWith(" └─┤"));
     expect(lines[0][1]).toBe("┌");
     expect(lines.find((line) => line.includes("Quota"))[1]).toBe("├");
-    expect(lines[serviceIndex][1]).toBe("├");
-    expect(lines[serviceIndex + 2][1]).toBe("└");
-    expect(lines.slice(1, serviceIndex + 2).every((line) => "│├".includes(line[1]))).toBe(true);
+    expect(lines.slice(1, lastCardJunction).every((line) => "│├".includes(line[1]))).toBe(true);
+    expect(serviceIndex).toBe(slotsIndex + 1);
     expect(lines.join("\n")).toContain("├─┤Awaiting assignment");
     expect(lines.every((line) => displayWidth(line) <= 90)).toBe(true);
   });
@@ -619,8 +677,11 @@ describe("tui-box primitives and HordeView unification", () => {
         width,
       );
       const start = lines.findIndex((line) => line.includes("project · 1 agent"));
-      const end = lines.findIndex((line) => line.includes("Services"));
+      const end = lines.findIndex((line) => line.includes("haiku-2"));
+      const slotsIndex = lines.findIndex((line) => line.includes("slots · page"));
+      const serviceIndex = lines.findIndex((line) => line.includes("Services"));
       expect(lines.slice(start, end).every((line) => "│├".includes(line[1]))).toBe(true);
+      expect(serviceIndex).toBe(slotsIndex + 1);
       expect(lines.find((line) => line.includes("long-audit"))).toContain(" · 1 agent");
       expect(lines.every((line) => displayWidth(line) <= width)).toBe(true);
       expect(lines.find((line) => line.includes("haiku-2"))).toContain("↳ supervisor");
@@ -638,7 +699,7 @@ describe("tui-box primitives and HordeView unification", () => {
     const rendered = new StoogesView(room, { height: 32, tier: "unicode" }).render(90).join("\n");
     expect(rendered).toContain("sample-project · 3 agents");
     expect(rendered.match(/sample-project/gu)).toHaveLength(1);
-    expect(rendered).toContain("FOCUS ");
+    expect(rendered).toContain("▸ ");
     expect(rendered).toContain("codex");
     expect(rendered).toContain("claude");
   });
@@ -665,13 +726,13 @@ describe("tui-box primitives and HordeView unification", () => {
     expect(unicodeLines.every((line) => displayWidth(line) <= 90)).toBe(true);
     const unicodeText = unicodeLines.join("\n");
     expect(plain(unicodeText)).toContain("orkest · 2 agents");
-    expect(unicodeText).toContain("FOCUS wt:wt-50");
-    expect(unicodeText).not.toContain("\u{1B}[48;5;24;97;1m");
-    expect(unicodeText).toContain("\u{1B}[7;1m");
+    expect(unicodeText).toContain("wt:wt-50");
+    expect(unicodeText).not.toContain("\u{1B}[44;97;1m");
+    expect(unicodeText).toContain("\u{1B}[48;5;237;97;1m");
 
     const asciiText = new StoogesView(room, { height: 28, tier: "ascii" }).render(85).join("\n");
     expect(asciiText).toContain("| orkest · 2 agents");
-    expect(asciiText).toContain("| + 1 haiku-1");
+    expect(asciiText).toContain("| + > 1 haiku-1");
     expect(asciiText).toContain("+-+Awaiting assignment");
     expect(asciiText).toContain("| + 2 pro-1");
     expect(asciiText).toContain("`-+Awaiting assignment");
@@ -698,7 +759,7 @@ describe("ork CLI", () => {
     );
     expect(printed.stdout).toContain("┌ Swarm · sample-room");
     expect(printed.stdout).toContain("3/64 slots");
-    expect(printed.stdout).toContain("? help");
+    expect(printed.stdout).toContain(" Shortcuts");
     expect(printed.stdout).not.toContain("\u{1B}");
     const json = await exec(process.execPath, [cli, "stooges", "--fixture", file, "--json"], {
       env,
@@ -797,7 +858,7 @@ describe("terminal lifecycle", () => {
       await vi.advanceTimersByTimeAsync(0);
       expect(input.isRaw).toBe(true);
       expect(output.write.mock.calls.flat().join("")).toContain("\u{1B}[?1049h\u{1B}[?25l");
-      input.emit("keypress", "q", { name: "q" });
+      input.emit("data", "q");
       await running;
       expect(input.isRaw).toBe(wasRaw);
       expect(input.pause).toHaveBeenCalledOnce();
@@ -813,7 +874,7 @@ describe("terminal lifecycle", () => {
       expect(output.write).toHaveBeenCalledTimes(frames);
       expect(load).toHaveBeenCalledTimes(loads);
     } finally {
-      input.emit("keypress", "q", { name: "q" });
+      input.emit("data", "q");
       await running;
       vi.useRealTimers();
     }
@@ -850,12 +911,12 @@ describe("terminal lifecycle", () => {
       output.columns = 90;
       output.emit("resize");
       expect(output.write).toHaveBeenCalledTimes(initialWrites + 1);
-      input.emit("keypress", "q", { name: "q" });
+      input.emit("data", "q");
       await running;
       expect(input.setRawMode).toHaveBeenLastCalledWith(false);
       expect(output.listenerCount("resize")).toBe(0);
     } finally {
-      input.emit("keypress", "q", { name: "q" });
+      input.emit("data", "q");
       await running;
       vi.useRealTimers();
     }
@@ -920,7 +981,7 @@ describe("terminal lifecycle", () => {
         focusedCalls.push(agent);
       },
     });
-    expect(view.render(80).join("\n")).toContain("o open");
+    expect(view.render(80).join("\n")).toContain(" Open terminal ");
     expect(view.handleKey("o")).toBe(true);
     expect(view.lastFocusedAgentId).toBe(view.focusId);
     expect(focusedCalls).toHaveLength(1);
@@ -1134,26 +1195,29 @@ describe("terminal lifecycle", () => {
     const view = new HordeView(room, {
       height: 34,
       tier: "unicode",
+      quotaMode: "expanded",
       now: () => 20_000,
     });
     const expandedText = view.render(100).join("\n");
     expect(expandedText).toContain("Orchestrator: gribble (feat/swarm-view) · agy · pane-lead-1");
     expect(expandedText).toContain("Ship Swarm View v2 — Coordinating slice 2A");
-    expect(expandedText).toContain("u collapse");
-    expect(expandedText).toContain("Services");
-    expect(expandedText).toContain("2 running · :3004 :5432 · v collapse");
-    expect(expandedText).toContain(":3004  vite (pid 4242) · wt:slice-2a · by haiku-1 · up 04:12");
-    expect(expandedText).toContain(":5432  docker postgres:16 · orkest · up 12 minutes");
-    expect(expandedText).toContain("· u quota · v services");
+    expect(expandedText).toContain("▾ Quota");
+    expect(expandedText).toContain("▾ Services");
+    expect(expandedText).toContain("2 running · localhost :3004 :5432");
+    expect(expandedText).toMatch(
+      /:3004 {2}vite \(pid 4242\) · wt:slice-2a · by haiku-1 +up 04:12/u,
+    );
+    expect(expandedText).toMatch(/:5432 {2}docker postgres:16 · orkest +up 12 minutes/u);
+    expect(expandedText).toContain(" Log ");
+    expect(expandedText).toContain(" Shortcuts ");
 
     // Toggle quota to collapsed 1-line inline bar with 'u':
     expect(view.handleKey("u")).toBe(true);
     expect(view.quotaMode).toBe("collapsed");
     const collapsedText = view.render(100).join("\n");
-    expect(collapsedText).toContain("Quota [u]");
-    expect(collapsedText).toContain("C 92%·81%");
-    expect(collapsedText).toContain("K 64%");
-    expect(collapsedText).not.toContain("u collapse");
+    expect(collapsedText).toContain("C ━━━─ 81%");
+    expect(collapsedText).toContain("K ━━━─ 64%");
+    expect(collapsedText.split("\n").filter((line) => line.includes("Quota"))).toHaveLength(0);
 
     // Toggle back to expanded with 'u':
     expect(view.handleKey("u")).toBe(true);
@@ -1166,11 +1230,11 @@ describe("terminal lifecycle", () => {
     });
     expect(view.servicesMode).toBe("collapsed");
     const collapsedServicesText = view.render(100).join("\n");
-    expect(collapsedServicesText).toContain("Services [v]");
+    expect(collapsedServicesText).toContain("▸ Services");
     expect(collapsedServicesText).toContain(
-      "2 running · :3004 vite (wt:slice-2a) · :5432 docker postgres:16 (orkest)",
+      "2 running · localhost :3004 vite (wt:slice-2a) · :5432 docker postgres:16 (orkest)",
     );
-    expect(collapsedServicesText).not.toContain("v collapse");
+    expect(collapsedServicesText).not.toContain("pid 4242");
 
     // Toggle services back to expanded with 'v':
     expect(view.handleKey("v")).toEqual({
@@ -1179,16 +1243,16 @@ describe("terminal lifecycle", () => {
     });
     expect(view.servicesMode).toBe("expanded");
 
-    // Render Update [U] notifier banner and trigger pull-update with Shift+U ('U'):
+    // Render the clickable update banner and retain the Shift+U shortcut:
     view.setRoom({
       ...room,
       update: { available: true, commitsBehind: 3, remoteSha: "a1b2c3d4" },
     });
     const updateAvailableText = view.render(100).join("\n");
     expect(updateAvailableText).toContain(
-      "Update [U]  ↑ 3 new commits on origin/main · press U to pull & update",
+      "Update  ↑ 3 new commits on origin/main · click to update",
     );
-    expect(updateAvailableText).toContain("· U update");
+    expect(updateAvailableText).toContain(" Update ");
     expect(view.handleKey("U")).toEqual({ type: "pull-update" });
     // Lowercase 'u' still toggles quotaMode:
     expect(view.handleKey("u")).toBe(true);

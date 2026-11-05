@@ -1,7 +1,8 @@
+// cspell:words wubbit klorgis zibber fnordel gribnox tumblex blorkin drazzle pifflet vorgle nibblex
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
-import { hostname } from "node:os";
+import { mkdir, open, readdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
+import { homedir, hostname } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -905,10 +906,19 @@ export async function observeRoom(idOrRoom, options = {}) {
     const snapshot = snapshots[key];
     const sessionId = member.session?.id || member.mailboxSession || member.id;
     const peerKey = sessionId ? sessionKey(sessionId) : null;
-    const peer =
-      !snapshot && peerKey
-        ? await readOptionalJson(path.join(root, "peers", `${peerKey}.json`), 64 * 1024)
-        : null;
+    const peer = peerKey
+      ? await readOptionalJson(path.join(root, "peers", `${peerKey}.json`), 64 * 1024)
+      : null;
+    if (member !== room.conductor && peer?.session === sessionId && peer.accountHome) {
+      member.activitySource = {
+        engine: member.engine,
+        session: sessionId,
+        accountHome: peer.accountHome,
+        parentSession: peer.parentSession || room.conductor?.session?.id,
+        cwd: member.cwd || room.cwd,
+        startedAt: peer.startedAt || snapshot?.startedAt,
+      };
+    }
     const herdrPaneId = snapshot?.herdrPaneId || peer?.herdrPaneId || member.herdrPaneId;
     const paneId = snapshot?.paneId || peer?.paneId || member.paneId;
     if (herdrPaneId) member.herdrPaneId = herdrPaneId;
@@ -1125,6 +1135,11 @@ async function appendNativePeers(room, snapshots, root) {
     if (!peerCwd || (peerCwd !== roomCwd && !peerCwd.startsWith(`${roomCwd}${path.sep}`))) continue;
     const isSameSharedProcess =
       peer.sharedProcess === true && Boolean(conductorPid) && peer.pid === conductorPid;
+    const isSameParentSession = Boolean(
+      peer.parentSession &&
+      room.conductor?.session?.id &&
+      peer.parentSession === room.conductor.session.id,
+    );
     const isSameWorkspace = Boolean(
       peer.herdrWorkspaceId && conductorWorkspace && peer.herdrWorkspaceId === conductorWorkspace,
     );
@@ -1133,12 +1148,18 @@ async function appendNativePeers(room, snapshots, root) {
       Number.isFinite(roomCreatedMs) &&
       Number.isFinite(peerStartedMs) &&
       peerStartedMs >= roomCreatedMs - 60_000;
-    if (!(isSameSharedProcess || isSameWorkspace || hasStartedSinceRoom)) continue;
+    if (!(isSameSharedProcess || isSameParentSession || isSameWorkspace || hasStartedSinceRoom)) {
+      continue;
+    }
     const key = sessionKey(peer.session);
     const progressRecord = key
       ? await readProgressRecord(root, key, peer, peerCwd, currentHost)
       : null;
     if (!progressRecord && peer.state !== "busy" && !peer.isSubagent) continue;
+    const subagentMeta =
+      peer.harness === "claude" && (peer.isSubagent || peer.session.startsWith("subagent-"))
+        ? await readClaudeSubagentInfo(peer, roomCwd, room)
+        : null;
     const person = cleanLine(peer.person);
     const rawBase =
       cleanLine(peer.person || peer.shortName || peer.session.slice(0, 8))
@@ -1155,51 +1176,73 @@ async function appendNativePeers(room, snapshots, root) {
     existingIds.add(id);
     boundSessions.add(peer.session);
     const engine = peer.harness === "gemini" ? "agy" : peer.harness;
-    const stage = progressRecord?.stage || (peer.state === "busy" ? "working" : "idle");
+    let stage = progressRecord?.stage || (peer.state === "busy" ? "working" : "idle");
+    if (subagentMeta?.finished) stage = "complete";
     let status = "idle";
-    if (progressRecord?.stage === "complete") {
+    if (stage === "complete") {
       status = "reported complete";
-    } else if (progressRecord?.stage === "blocked") {
+    } else if (stage === "blocked") {
       status = "blocked";
     } else if (peer.state === "busy") {
       status = "running";
     }
-    const taskText = cleanLine(progressRecord?.task || peer.focus || "Native agent session");
+    const resolvedModel = cleanLine(subagentMeta?.model || peer.model) || engine;
+    const rawTask = cleanLine(
+      subagentMeta?.description ||
+        peer.subagentDescription ||
+        progressRecord?.task ||
+        peer.focus ||
+        "Native agent session",
+    );
+    const taskText = rawTask;
     const goalText = cleanLine(
       progressRecord?.goal || (room.title && room.title !== room.id ? room.title : "") || "not set",
     );
     const herdrPaneId = cleanLine(peer.herdrPaneId);
     const paneId = cleanLine(peer.paneId);
     const branch = cleanLine(peer.branch);
+    const latestActivityIso = subagentMeta?.lastActivityIso || peer.lastSeenAt || null;
+    const observedAt =
+      latestActivityIso || progressRecord?.updatedAt || peer.lastSeenAt || peer.startedAt;
     room.agents.push({
       id,
       name: cleanLine(peer.name),
       ...(person && { person }),
       engine,
-      model: cleanLine(peer.model) || engine,
+      model: resolvedModel,
       ...(peer.effort && { effort: cleanLine(peer.effort) }),
       role: "worker",
-      workforceRole: progressRecord?.role || "native",
+      workforceRole: progressRecord?.role || (subagentMeta ? "builder" : "native"),
       native: true,
       nativeSession: peer.session,
+      activitySource: {
+        engine,
+        session: peer.session,
+        accountHome: peer.accountHome,
+        parentSession: peer.parentSession || room.conductor?.session?.id,
+        cwd: peerCwd,
+        startedAt: peer.startedAt,
+      },
       parent: "conductor",
       cwd: peerCwd,
       ...(Number.isSafeInteger(peer.pid) && peer.pid > 0 && { pid: peer.pid }),
       ...(branch && { branch }),
       ...(herdrPaneId && { herdrPaneId }),
       ...(paneId && { paneId }),
-      observedAt: progressRecord?.updatedAt || peer.lastSeenAt || peer.startedAt,
+      observedAt,
       status,
-      runtimeState: peer.state === "busy" ? "running" : "idle",
+      runtimeState: status === "running" ? "running" : "idle",
       objective: taskText,
       output: [taskText].filter(Boolean),
       progress: {
         name: cleanLine(peer.name),
         ...(person && { person }),
-        model: cleanLine(peer.model) || "—",
+        model: resolvedModel || "—",
         effort: cleanLine(peer.effort) || "—",
         cwd: peerCwd,
-        ...(progressRecord?.role && { role: progressRecord.role }),
+        ...((progressRecord?.role || subagentMeta) && {
+          role: progressRecord?.role || "builder",
+        }),
         ...(Number.isSafeInteger(peer.pid) && peer.pid > 0 && { pid: peer.pid }),
         ...(branch && { branch }),
         ...(herdrPaneId && { herdrPaneId }),
@@ -1207,11 +1250,244 @@ async function appendNativePeers(room, snapshots, root) {
         goal: goalText,
         task: taskText,
         stage,
-        reportedAt: progressRecord?.updatedAt || null,
-        lastSeenAt: peer.lastSeenAt || null,
+        reportedAt: latestActivityIso || progressRecord?.updatedAt || null,
+        lastSeenAt: latestActivityIso,
         startedAt: peer.startedAt || null,
       },
     });
+  }
+  await appendClaudeProjectSubagents(root, room, roomCwd, boundSessions, existingIds, conductorPid);
+}
+
+const SUBAGENT_MARTIAN_NAMES = [
+  "wubbit",
+  "klorgis",
+  "zibber",
+  "ploomix",
+  "fnordel",
+  "snorfle",
+  "gribnox",
+  "tumblex",
+  "quibble",
+  "miffkin",
+  "blorkin",
+  "skitter",
+  "drazzle",
+  "pifflet",
+  "vorgle",
+  "nibblex",
+];
+
+function pickSubagentMartianName(subSid, existingIds, conductorPerson) {
+  const digest = createHash("sha1").update(String(subSid)).digest();
+  const start = digest.readUInt32BE(0) % SUBAGENT_MARTIAN_NAMES.length;
+  for (let offset = 0; offset < SUBAGENT_MARTIAN_NAMES.length; offset++) {
+    const candidate = SUBAGENT_MARTIAN_NAMES[(start + offset) % SUBAGENT_MARTIAN_NAMES.length];
+    if (candidate !== conductorPerson && !existingIds.has(candidate)) {
+      return candidate;
+    }
+  }
+  return `subagent-${String(subSid)
+    .replace(/^subagent-/u, "")
+    .slice(0, 6)}`;
+}
+
+async function readTailText(filePath, maxBytes = 65_536) {
+  let handle;
+  try {
+    const info = await stat(filePath);
+    if (!info.isFile()) return null;
+    const length = Math.min(info.size, maxBytes);
+    const offset = Math.max(0, info.size - length);
+    handle = await open(filePath, "r");
+    const buffer = Buffer.alloc(length);
+    const { bytesRead } = await handle.read(buffer, 0, length, offset);
+    return {
+      text: buffer.toString("utf8", 0, bytesRead),
+      mtimeMs: info.mtimeMs,
+      birthtimeMs: info.birthtimeMs || info.ctimeMs || info.mtimeMs,
+    };
+  } catch {
+    return null;
+  } finally {
+    await handle?.close();
+  }
+}
+
+function claudeSubagentsDirs(accountHome, parentSession, cwds) {
+  if (!parentSession || !SESSION_ID_RE.test(parentSession)) return [];
+  const home = accountHome || process.env.CLAUDE_CONFIG_DIR || path.join(homedir(), ".claude");
+  const seen = new Set();
+  const dirs = [];
+  for (const rawCwd of cwds) {
+    if (typeof rawCwd !== "string" || !rawCwd.trim()) continue;
+    const slug = rawCwd.replaceAll(/[^A-Za-z0-9-]/gu, "-");
+    const candidate = path.join(home, "projects", slug, parentSession, "subagents");
+    if (seen.has(candidate)) continue;
+    seen.add(candidate);
+    dirs.push(candidate);
+  }
+  return dirs;
+}
+
+async function readClaudeSubagentFromDir(subagentsDir, agentId) {
+  const metaPath = path.join(subagentsDir, `agent-${agentId}.meta.json`);
+  const jsonlPath = path.join(subagentsDir, `agent-${agentId}.jsonl`);
+  const [meta, tail] = await Promise.all([
+    readOptionalJson(metaPath, 32 * 1024),
+    readTailText(jsonlPath),
+  ]);
+  if (!meta && !tail) return null;
+  let observedModel = "";
+  if (tail?.text) {
+    const matches = tail.text.matchAll(/"model"\s*:\s*"([^"]+)"/gu).toArray();
+    if (matches.length > 0) observedModel = matches.at(-1)[1];
+  }
+  const metaModel =
+    typeof meta?.model === "string" && meta.model.trim() && meta.model.trim() !== "auto"
+      ? meta.model.trim()
+      : "";
+  const description = typeof meta?.description === "string" ? cleanLine(meta.description) : "";
+  const lastActivityIso = Number.isFinite(tail?.mtimeMs)
+    ? new Date(tail.mtimeMs).toISOString()
+    : null;
+  const startedIso = Number.isFinite(tail?.birthtimeMs)
+    ? new Date(tail.birthtimeMs).toISOString()
+    : lastActivityIso;
+  return {
+    agentId,
+    description,
+    model: observedModel || metaModel,
+    finished: Boolean(meta?.finished),
+    lastActivityIso,
+    startedIso,
+    mtimeMs: tail?.mtimeMs ?? NaN,
+  };
+}
+
+async function readClaudeSubagentInfo(peer, roomCwd, room) {
+  const agentId = String(peer.session || "").replace(/^subagent-/u, "");
+  const parentSession = peer.parentSession || room.conductor?.session?.id;
+  if (!agentId || !parentSession) return null;
+  const dirs = claudeSubagentsDirs(peer.accountHome, parentSession, [
+    peer.checkout,
+    peer.cwd,
+    roomCwd,
+    room.cwd,
+  ]);
+  for (const dir of dirs) {
+    const info = await readClaudeSubagentFromDir(dir, agentId);
+    if (info) return info;
+  }
+  return null;
+}
+
+async function appendClaudeProjectSubagents(
+  root,
+  room,
+  roomCwd,
+  boundSessions,
+  existingIds,
+  conductorPid,
+) {
+  const parentSession = room.conductor?.session?.id;
+  if (!parentSession || (room.conductor?.engine && room.conductor.engine !== "claude")) return;
+  const roomCreatedMs = parseStampMs(room.createdAt);
+  const isConductorAlive = !conductorPid || pidAlive(conductorPid) !== false;
+  const dirs = claudeSubagentsDirs(undefined, parentSession, [roomCwd, room.cwd]);
+  for (const dir of dirs) {
+    let entries;
+    try {
+      entries = await readdir(dir);
+    } catch {
+      continue;
+    }
+    const metaFiles = entries
+      .filter((e) => /^agent-[A-Za-z0-9_-]+\.meta\.json$/u.test(e))
+      .sort((a, b) => a.localeCompare(b));
+    for (const file of metaFiles) {
+      if (room.agents.length >= (room.swarm?.maxAgents || 64)) return;
+      const agentId = file.replace(/^agent-/u, "").replace(/\.meta\.json$/u, "");
+      const subSid = `subagent-${agentId}`.slice(0, 80);
+      if (boundSessions.has(subSid)) continue;
+      const info = await readClaudeSubagentFromDir(dir, agentId);
+      if (!info) continue;
+      if (
+        Number.isFinite(roomCreatedMs) &&
+        Number.isFinite(info.mtimeMs) &&
+        info.mtimeMs < roomCreatedMs - 60_000
+      ) {
+        continue;
+      }
+      const key = sessionKey(subSid);
+      const savedProgress = key
+        ? await readOptionalJson(path.join(root, "progress", `${key}.json`), 64 * 1024)
+        : null;
+      const savedPrefix =
+        typeof savedProgress?.name === "string"
+          ? cleanLine(savedProgress.name.split("-", 1)[0]).toLowerCase()
+          : "";
+      const isFinished = info.finished || !isConductorAlive;
+      const status = isFinished ? "reported complete" : "running";
+      const stage = isFinished ? "complete" : "working";
+      const shortId =
+        savedPrefix && !existingIds.has(savedPrefix)
+          ? savedPrefix
+          : pickSubagentMartianName(subSid, existingIds, room.conductor?.person);
+      let id = shortId;
+      let index = 2;
+      while (existingIds.has(id)) {
+        id = `${shortId}-${index}`;
+        index++;
+      }
+      existingIds.add(id);
+      boundSessions.add(subSid);
+      const taskText =
+        info.description ||
+        (typeof savedProgress?.task === "string" ? cleanLine(savedProgress.task) : "") ||
+        `Running subagent (${agentId.slice(0, 12)})`;
+      const modelName = info.model || "claude";
+      room.agents.push({
+        id,
+        name: id,
+        person: id,
+        engine: "claude",
+        model: modelName,
+        role: "worker",
+        workforceRole: "builder",
+        native: true,
+        nativeSession: subSid,
+        activitySource: {
+          engine: "claude",
+          session: subSid,
+          accountHome: process.env.CLAUDE_CONFIG_DIR || path.join(homedir(), ".claude"),
+          parentSession,
+          cwd: roomCwd,
+          startedAt: info.startedIso,
+        },
+        parent: "conductor",
+        cwd: roomCwd,
+        observedAt: info.lastActivityIso || info.startedIso,
+        status,
+        runtimeState: isFinished ? "stopped" : "running",
+        objective: taskText,
+        output: [taskText],
+        progress: {
+          name: id,
+          person: id,
+          model: modelName,
+          effort: "—",
+          cwd: roomCwd,
+          role: "builder",
+          goal: room.title && room.title !== room.id ? cleanLine(room.title) : "Native subagent",
+          task: taskText,
+          stage,
+          reportedAt: info.lastActivityIso,
+          lastSeenAt: info.lastActivityIso,
+          startedAt: info.startedIso,
+        },
+      });
+    }
   }
 }
 
@@ -1265,7 +1541,7 @@ function isValidPeer(peer) {
   );
 }
 
-function isPeerLive(peer, nowMs = Date.now()) {
+export function isPeerLive(peer, nowMs = Date.now()) {
   const seenMs = parseStampMs(peer.lastSeenAt || peer.startedAt);
   if (!Number.isFinite(seenMs)) return false;
   const alive = pidAlive(peer.pid);
@@ -1355,10 +1631,20 @@ export async function interactiveProgress(room, root = mailboxRoot()) {
     if (!isPeerLive(peer)) continue;
     const expectedCwd = await resolveCwd(binding.cwd || member.cwd || room.cwd);
     const peerCwd = await resolveCwd(peer.checkout || peer.cwd);
-    if (!peerCwd || (peerCwd !== expectedCwd && peerCwd !== roomCwd)) continue;
+    const isBoundConductor =
+      member.id === "conductor" &&
+      (peer.swarmBriefed === room.id ||
+        Boolean(
+          peer.herdrWorkspaceId &&
+          room.herdrWorkspaceId &&
+          peer.herdrWorkspaceId === room.herdrWorkspaceId,
+        ));
+    if (!peerCwd || (!isBoundConductor && peerCwd !== expectedCwd && peerCwd !== roomCwd)) continue;
+    const effectiveCwd =
+      peerCwd === expectedCwd || peerCwd === roomCwd ? peerCwd : expectedCwd || roomCwd || peerCwd;
     const name = peer.name;
     if (!name || cleanLine(name) !== name) continue;
-    const progress = await readProgressRecord(root, key, peer, peerCwd, currentHost);
+    const progress = await readProgressRecord(root, key, peer, effectiveCwd, currentHost);
     let goal = room.title && room.title !== room.id ? cleanLine(room.title) : "";
     let isManual = false;
     if (!goal && progress) {
