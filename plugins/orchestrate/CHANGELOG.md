@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.55.0
+
+- feat(orchestrate): tighten coordinator delegation and brief delivery (#92)
+
 ## 0.54.1
 
 - test(orchestrate): compare Swarm View terminal captures (#90)
