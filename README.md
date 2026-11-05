@@ -189,6 +189,8 @@ once in Codex) to enable turn hooks, and see
 [terminal footer setup](plugins/orchestrate/README.md#agent-status-in-terminal-footers) if you want
 the status bar outside `ork` launches.
 
+For automatic swarm-view restoration after a Herdr restart, see [Herdr setup and upgrades](docs/herdr.md).
+
 To verify your setup at any time:
 
 ```sh

@@ -352,152 +352,161 @@ def install_swarm_command(home: Path, *, dry_run: bool = False) -> bool:
     return changed
 
 
-def install_herdr_integration(home: Path, ork_cli: Path | None = None, *, dry_run: bool = False) -> bool:
-    """Configure Ctrl+Option+S (ctrl+alt+s) and orkest.swarms plugin actions in Herdr when ~/.config/herdr exists."""
-    herdr_dir = home / ".config/herdr"
-    if not herdr_dir.is_dir():
-        return False
-    changed = False
-    config_file = herdr_dir / "config.toml"
-    existing_cfg = config_file.read_text(encoding="utf-8") if config_file.is_file() else ""
-    shortcut_block = (
-        "\n[[keys.command]]\n"
-        'key = "ctrl+alt+s"\n'
-        'type = "plugin_action"\n'
-        'command = "orkest.swarms.toggle"\n'
-        'description = "toggle Orkest Swarm View"\n'
+HERDR_PLUGIN_ID = "orkest.swarms"
+HERDR_SHORTCUT_BLOCK = (
+    "\n[[keys.command]]\n"
+    'key = "ctrl+alt+s"\n'
+    'type = "plugin_action"\n'
+    'command = "orkest.swarms.toggle"\n'
+    'description = "toggle Orkest Swarm View"\n'
+)
+
+
+def _herdr_source_root(ork_cli: Path | None) -> Path | None:
+    cli = ork_cli or (Path(__file__).resolve().parents[3] / "bin/ork.mjs")
+    return next((directory for directory in cli.resolve().parents if (directory / "herdr-plugin.toml").is_file()), None)
+
+
+def _herdr_binary() -> str | None:
+    return os.environ.get("HERDR_BIN_PATH") or shutil.which("herdr")
+
+
+def _herdr_config_file(home: Path) -> Path:
+    return Path(os.environ.get("HERDR_CONFIG_PATH") or home / ".config/herdr/config.toml").expanduser()
+
+
+def _herdr_command(herdr: str, arguments: list[str], home: Path) -> subprocess.CompletedProcess:
+    environment = {**os.environ, "HOME": str(home), "HERDR_CONFIG_PATH": str(_herdr_config_file(home))}
+    # Registry operations are local to this installation, never a remote pane/session socket.
+    environment.pop("HERDR_SOCKET_PATH", None)
+    process = subprocess.run(
+        [herdr, *arguments], env=environment, capture_output=True, text=True, timeout=15, check=False
     )
-    if "orkest.swarms.toggle" not in existing_cfg and '"ctrl+alt+s"' not in existing_cfg:
-        updated_cfg = existing_cfg.rstrip() + ("\n" if existing_cfg.strip() else "") + shortcut_block
-        if dry_run:
-            print(f"would add ctrl+alt+s Orkest Swarm View shortcut to: {config_file}")
-        else:
-            if config_file.exists():
-                backup(config_file)
-            config_file.write_text(updated_cfg, encoding="utf-8")
-            print(f"✓ Herdr ctrl+alt+s shortcut: {config_file}")
-        changed = True
-
-    ork_cli = ork_cli or (Path(__file__).resolve().parents[3] / "bin/ork.mjs")
-    repo_root = ork_cli.resolve().parents[3]
-    manifest_file = repo_root / "herdr-plugin.toml"
-    plugins_file = herdr_dir / "plugins.json"
-    if manifest_file.is_file() and plugins_file.is_file():
-        try:
-            plugins_data = json.loads(plugins_file.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            plugins_data = None
-        if isinstance(plugins_data, list):
-            desired_entry = {
-                "plugin_id": "orkest.swarms",
-                "name": "Orkest Swarms",
-                "version": "0.50.0",
-                "min_herdr_version": "0.9.5",
-                "description": "Group, inspect, and manage Orkest swarms",
-                "manifest_path": str(manifest_file),
-                "plugin_root": str(repo_root),
-                "enabled": True,
-                "platforms": ["macos", "linux"],
-                "actions": [
-                    {
-                        "id": "close",
-                        "title": "Close Orkest Swarm View",
-                        "description": "Close the Orkest Swarm View split pane in the current workspace",
-                        "contexts": ["global", "workspace", "tab", "pane"],
-                        "command": [
-                            "python3",
-                            "plugins/orchestrate/skills/orchestrate/scripts/agent_statusline_tmux.py",
-                            "--toggle-swarm",
-                            "close",
-                        ],
-                    },
-                    {
-                        "id": "open",
-                        "title": "Open Orkest Swarm View",
-                        "description": "Open the Orkest Swarm View in a right-side split pane",
-                        "contexts": ["global", "workspace", "tab", "pane"],
-                        "command": [
-                            "python3",
-                            "plugins/orchestrate/skills/orchestrate/scripts/agent_statusline_tmux.py",
-                            "--toggle-swarm",
-                            "open",
-                        ],
-                    },
-                    {
-                        "id": "overview",
-                        "title": "Open Orkest Swarms",
-                        "description": "Open the Orkest Swarm View in a right-side split pane",
-                        "contexts": ["workspace"],
-                        "command": [
-                            "python3",
-                            "plugins/orchestrate/skills/orchestrate/scripts/agent_statusline_tmux.py",
-                            "--toggle-swarm",
-                            "open",
-                        ],
-                    },
-                    {
-                        "id": "toggle",
-                        "title": "Toggle Orkest Swarm View",
-                        "description": "Open or close the Orkest Swarm View split pane",
-                        "contexts": ["global", "workspace", "tab", "pane"],
-                        "command": [
-                            "python3",
-                            "plugins/orchestrate/skills/orchestrate/scripts/agent_statusline_tmux.py",
-                            "--toggle-swarm",
-                            "toggle",
-                        ],
-                    },
-                ],
-                "panes": [
-                    {
-                        "id": "overview",
-                        "title": "Orkest Swarms",
-                        "placement": "tab",
-                        "command": ["node", "plugins/orchestrate/bin/ork.mjs", "horde", "--view"],
-                    },
-                    {
-                        "id": "room",
-                        "title": "Orkest Swarm",
-                        "placement": "split",
-                        "command": ["node", "plugins/orchestrate/bin/ork.mjs", "horde", "--view"],
-                    },
-                ],
-                "source": {"kind": "local"},
-            }
-            replaced = False
-            needs_write = False
-            for idx, item in enumerate(plugins_data):
-                if isinstance(item, dict) and item.get("plugin_id") == "orkest.swarms":
-                    replaced = True
-                    if item != desired_entry:
-                        plugins_data[idx] = desired_entry
-                        needs_write = True
-                    break
-            if not replaced:
-                plugins_data.append(desired_entry)
-                needs_write = True
-            if needs_write:
-                if dry_run:
-                    print(f"would update orkest.swarms Herdr plugin in: {plugins_file}")
-                else:
-                    plugins_file.write_text(json.dumps(plugins_data, indent=2) + "\n", encoding="utf-8")
-                    print(f"✓ Herdr orkest.swarms plugin updated: {plugins_file}")
-                changed = True
-
-    if (
-        changed
-        and not dry_run
-        and not os.environ.get("PYTEST_CURRENT_TEST")
-        and "unittest" not in sys.modules
-        and (herdr_bin := shutil.which("herdr"))
-    ):
-        subprocess.run(
-            [herdr_bin, "server", "reload-config"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=3,
-            check=False,
+    if process.returncode:
+        raise RuntimeError(
+            f"Herdr {' '.join(arguments[:2])} failed: {process.stderr.strip() or process.stdout.strip()}"
         )
+    return process
+
+
+def _herdr_registration(herdr: str, home: Path) -> dict | None:
+    process = _herdr_command(herdr, ["plugin", "list", "--plugin", HERDR_PLUGIN_ID, "--json"], home)
+    try:
+        response = json.loads(process.stdout)
+        entries = response["result"]["plugins"]
+        if not isinstance(entries, list):
+            raise ValueError("plugins must be an array")
+    except (KeyError, TypeError, ValueError) as error:
+        raise RuntimeError("Herdr returned an unreadable plugin list; registration was left unchanged") from error
+    return next(
+        (entry for entry in entries if isinstance(entry, dict) and entry.get("plugin_id") == HERDR_PLUGIN_ID), None
+    )
+
+
+def _owned_herdr_registration(registration: dict, source_root: Path) -> bool:
+    source = registration.get("source")
+    return (
+        isinstance(source, dict)
+        and source.get("kind") == "local"
+        and isinstance(registration.get("plugin_root"), str)
+        and Path(registration["plugin_root"]).resolve() == source_root.resolve()
+    )
+
+
+def _herdr_shortcut_available(config: str) -> bool:
+    try:
+        commands = tomllib.loads(config).get("keys", {}).get("command", [])
+    except (tomllib.TOMLDecodeError, AttributeError):
+        return False
+    if not isinstance(commands, list):
+        return False
+    return not any(
+        isinstance(command, dict)
+        and (str(command.get("key", "")).lower() == "ctrl+alt+s" or command.get("command") == "orkest.swarms.toggle")
+        for command in commands
+    )
+
+
+def install_herdr_integration(home: Path, ork_cli: Path | None = None, *, dry_run: bool = False) -> bool:
+    """Refresh the official local plugin registration without editing Herdr's private registry."""
+    herdr = _herdr_binary()
+    if not herdr:
+        return False
+    source_root = _herdr_source_root(ork_cli)
+    if source_root is None:
+        print("• Herdr integration skipped: install Orkest from its checkout to include herdr-plugin.toml")
+        return False
+    registration = _herdr_registration(herdr, home)
+    if registration is not None and not _owned_herdr_registration(registration, source_root):
+        print(
+            "• Herdr Orkest plugin belongs to another installation; its registration and shortcut were left unchanged"
+        )
+        return False
+    enabled = registration is None or registration.get("enabled", True)
+    if dry_run:
+        print(
+            f"would refresh Herdr {HERDR_PLUGIN_ID} registration from: {source_root} ({'enabled' if enabled else 'disabled'})"
+        )
+        return True
+    # Link re-reads the actual manifest, including newly added startup hooks. Herdr preserves config/state.
+    _herdr_command(herdr, ["plugin", "link", str(source_root), "--enabled" if enabled else "--disabled"], home)
+    print(f"✓ Herdr {HERDR_PLUGIN_ID} registration refreshed ({'enabled' if enabled else 'disabled'})")
+    config_file = _herdr_config_file(home)
+    existing_cfg = config_file.read_text(encoding="utf-8") if config_file.is_file() else ""
+    if enabled and _herdr_shortcut_available(existing_cfg):
+        config_file.parent.mkdir(parents=True, exist_ok=True)
+        if config_file.exists():
+            backup(config_file)
+        config_file.write_text(
+            existing_cfg.rstrip() + ("\n" if existing_cfg.strip() else "") + HERDR_SHORTCUT_BLOCK, encoding="utf-8"
+        )
+        print(f"✓ Herdr ctrl+alt+s shortcut: {config_file}")
+    cli = ork_cli or (Path(__file__).resolve().parents[3] / "bin/ork.mjs")
+    helper = cli.resolve().parent.parent / "skills/orchestrate/scripts/herdr_swarm_restore.py"
+    if enabled and os.environ.get("HERDR_ENV") == "1" and helper.is_file():
+        try:
+            adopted = subprocess.run(
+                [sys.executable, str(helper), "--adopt"],
+                env={**os.environ, "HOME": str(home), "HERDR_BIN_PATH": herdr},
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            if adopted.returncode:
+                print("• Herdr live swarm adoption could not complete; existing views were left running")
+            elif adopted.stdout.strip():
+                print(adopted.stdout.strip())
+        except (OSError, subprocess.SubprocessError):
+            print("• Herdr live swarm adoption unavailable; existing views were left running")
+    return True
+
+
+def uninstall_herdr_integration(home: Path, ork_cli: Path | None = None, *, dry_run: bool = False) -> bool:
+    """Unregister only this checkout's local plugin; retain Herdr and Orkest config/state."""
+    herdr = _herdr_binary()
+    source_root = _herdr_source_root(ork_cli)
+    if not herdr or source_root is None:
+        return False
+    registration = _herdr_registration(herdr, home)
+    if registration is not None and not _owned_herdr_registration(registration, source_root):
+        print("• Herdr Orkest plugin belongs to another installation; left unchanged")
+        return False
+    config_file = _herdr_config_file(home)
+    existing_cfg = config_file.read_text(encoding="utf-8") if config_file.is_file() else ""
+    updated_cfg = existing_cfg.replace(HERDR_SHORTCUT_BLOCK, "")
+    changed = registration is not None or updated_cfg != existing_cfg
+    if dry_run:
+        if changed:
+            print(f"would unregister this installation's Herdr {HERDR_PLUGIN_ID} plugin and managed shortcut")
+        return changed
+    if registration is not None:
+        _herdr_command(herdr, ["plugin", "unlink", HERDR_PLUGIN_ID], home)
+        print(f"✓ Herdr {HERDR_PLUGIN_ID} unregistered; config and state retained")
+    if updated_cfg != existing_cfg:
+        backup(config_file)
+        config_file.write_text(updated_cfg, encoding="utf-8")
+        print(f"✓ Herdr managed shortcut removed: {config_file}")
     return changed
 
 
@@ -1441,11 +1450,19 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
+        "--remove-herdr",
+        action="store_true",
+        help="remove only this installation's Herdr registration and managed shortcut",
+    )
+    parser.add_argument(
         "--trust-codex-hooks", action="store_true", help="explicitly trust only the four installed mailbox hooks"
     )
     parser.add_argument("--stdio", action="store_true", help="install using local stdio rather than the daemon")
     args = parser.parse_args(argv)
     try:
+        if args.remove_herdr:
+            uninstall_herdr_integration(Path.home(), dry_run=args.dry_run)
+            return 0
         install(dry_run=args.dry_run, trust_codex_hooks=args.trust_codex_hooks, stdio=args.stdio)
     except (ValueError, OSError, RuntimeError, subprocess.SubprocessError) as error:
         parser.exit(1, f"mailbox install: {error}\n")

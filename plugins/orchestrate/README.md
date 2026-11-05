@@ -26,7 +26,9 @@ claude plugin install orchestrate@orkest --scope user
 
 Codex requires one-time approval for command hooks: review them in Codex `/hooks`, or pass `--trust-codex-hooks` to `install.sh` (which trusts only the four reviewed mailbox hook commands).
 
-`<checkout>/plugins/orchestrate/uninstall.sh` removes the skill symlinks while leaving `~/.config/orchestrate`, `~/.cache/orchestrate`, and backups untouched.
+`<checkout>/plugins/orchestrate/uninstall.sh` removes this checkout's skill symlinks and Herdr
+registration while leaving configuration, saved state, backups, and other installations untouched.
+See [Herdr setup, upgrades, and swarm restoration](../../docs/herdr.md).
 
 ## Agent status in terminal footers
 

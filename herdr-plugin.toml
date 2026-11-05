@@ -5,6 +5,9 @@ min_herdr_version = "0.9.5"
 description = "Group, inspect, and manage Orkest swarms"
 platforms = ["macos", "linux"]
 
+[[startup]]
+command = ["python3", "plugins/orchestrate/skills/orchestrate/scripts/herdr_swarm_restore.py", "--restore"]
+
 [[actions]]
 id = "toggle"
 title = "Toggle Orkest Swarm View"

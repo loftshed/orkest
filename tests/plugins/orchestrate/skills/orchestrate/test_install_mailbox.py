@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SCRIPTS = Path(__file__).resolve().parents[5] / "plugins/orchestrate/skills/orchestrate/scripts"
 sys.path.insert(0, str(SCRIPTS))
@@ -19,6 +21,12 @@ class InstallMailboxTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.base = Path(self.temporary.name)
+        herdr_patch = mock.patch.object(installer, "_herdr_binary", return_value=None)
+        self.herdr_binary = herdr_patch.start()
+        self.addCleanup(herdr_patch.stop)
+        environment = mock.patch.dict(installer.os.environ, {"HERDR_ENV": "0", "HERDR_CONFIG_PATH": ""})
+        environment.start()
+        self.addCleanup(environment.stop)
         self.path = self.base / "settings.json"
         self.script = Path("/home/example/skill hub/peer_mailbox.py")
 
@@ -473,26 +481,188 @@ class InstallMailboxTests(unittest.TestCase):
                 goal_res["hookSpecificOutput"]["additionalContext"],
             )
 
-    def test_install_herdr_integration_configures_ctrl_alt_s_shortcut(self):
-        import json
+    def test_uninstall_shell_removes_only_links_resolving_to_its_own_checkout(self):
+        plugin = self.base / "checkout/plugins/orchestrate"
+        script = plugin / "uninstall.sh"
+        helper = plugin / "skills/orchestrate/scripts/install_mailbox.py"
+        helper.parent.mkdir(parents=True)
+        helper.write_text("import sys\nassert sys.argv[1:] == ['--remove-herdr']\n")
+        script.write_text((SCRIPTS.parents[2] / "uninstall.sh").read_text())
+        for foreign in (False, True):
+            with self.subTest(foreign=foreign):
+                home = self.base / ("foreign-home" if foreign else "owned-home")
+                target = self.base / "other-checkout/skills/orchestrate" if foreign else helper.parents[1]
+                target.mkdir(parents=True, exist_ok=True)
+                hub = home / ".agents/skills/orchestrate"
+                hub.parent.mkdir(parents=True)
+                hub.symlink_to(target, target_is_directory=True)
+                harness = home / ".codex/skills/orchestrate"
+                harness.parent.mkdir(parents=True)
+                harness.symlink_to(hub, target_is_directory=True)
+                direct = home / ".claude/skills/orchestrate"
+                direct.parent.mkdir(parents=True)
+                direct.symlink_to(target, target_is_directory=True)
+                real_directory = home / ".gemini/config/skills/orchestrate"
+                real_directory.mkdir(parents=True)
+                (real_directory / "keep.txt").write_text("keep")
+                result = subprocess.run(
+                    ["sh", str(script)],
+                    env={**installer.os.environ, "HOME": str(home)},
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                for link in (hub, harness, direct):
+                    self.assertEqual(link.is_symlink(), foreign, str(link))
+                self.assertEqual((real_directory / "keep.txt").read_text(), "keep")
 
-        herdr_dir = self.base / ".config/herdr"
-        herdr_dir.mkdir(parents=True, exist_ok=True)
-        cfg = herdr_dir / "config.toml"
-        cfg.write_text("onboarding = false\n", encoding="utf-8")
-        plugins_json = herdr_dir / "plugins.json"
-        plugins_json.write_text("[]\n", encoding="utf-8")
+    def herdr_source(self):
+        root = self.base / "source"
+        cli = root / "plugins/renamed-plugin/bin/ork.mjs"
+        cli.parent.mkdir(parents=True, exist_ok=True)
+        cli.write_text("// test CLI\n")
+        (root / "herdr-plugin.toml").write_text('id = "orkest.swarms"\n')
+        return root.resolve(), cli
 
-        changed = installer.install_herdr_integration(self.base)
-        self.assertTrue(changed)
-        cfg_text = cfg.read_text(encoding="utf-8")
-        self.assertIn('key = "ctrl+alt+s"', cfg_text)
-        self.assertIn('command = "orkest.swarms.toggle"', cfg_text)
-        entries = json.loads(plugins_json.read_text(encoding="utf-8"))
-        self.assertEqual(len(entries), 1)
-        self.assertEqual(entries[0]["plugin_id"], "orkest.swarms")
-        action_ids = {a["id"] for a in entries[0]["actions"]}
-        self.assertIn("toggle", action_ids)
+    def herdr_reply(self, entries):
+        return mock.Mock(returncode=0, stdout=json.dumps({"result": {"plugins": entries}}), stderr="")
+
+    def test_herdr_fresh_install_uses_official_registry_api_without_existing_private_registry(self):
+        root, cli = self.herdr_source()
+        self.herdr_binary.return_value = "herdr-test"
+        with mock.patch.object(
+            installer.subprocess, "run", side_effect=[self.herdr_reply([]), self.herdr_reply([])]
+        ) as run:
+            self.assertTrue(installer.install_herdr_integration(self.base, cli))
+        self.assertEqual(run.call_args_list[1].args[0], ["herdr-test", "plugin", "link", str(root), "--enabled"])
+        self.assertIn('command = "orkest.swarms.toggle"', (self.base / ".config/herdr/config.toml").read_text())
+        self.assertFalse((self.base / ".config/herdr/plugins.json").exists())
+
+    def test_herdr_refresh_preserves_disabled_registration_and_user_shortcut(self):
+        root, cli = self.herdr_source()
+        self.herdr_binary.return_value = "herdr-test"
+        config = self.base / ".config/herdr/config.toml"
+        config.parent.mkdir(parents=True)
+        original = "[[keys.command]]\nkey = 'ctrl+alt+s'\ncommand = 'my-action'\n"
+        config.write_text(original)
+        entry = {"plugin_id": "orkest.swarms", "plugin_root": str(root), "source": {"kind": "local"}, "enabled": False}
+        with mock.patch.object(
+            installer.subprocess, "run", side_effect=[self.herdr_reply([entry]), self.herdr_reply([])]
+        ) as run:
+            installer.install_herdr_integration(self.base, cli)
+        self.assertEqual(run.call_args_list[1].args[0][-1], "--disabled")
+        self.assertEqual(config.read_text(), original)
+
+    def test_herdr_enabled_refresh_preserves_existing_shortcut_and_reads_manifest_again(self):
+        root, cli = self.herdr_source()
+        self.herdr_binary.return_value = "herdr-test"
+        config = self.base / ".config/herdr/config.toml"
+        config.parent.mkdir(parents=True)
+        original = "[[keys.command]]\nkey = 'ctrl+alt+s'\ncommand = 'my-action'\n"
+        config.write_text(original)
+        entry = {"plugin_id": "orkest.swarms", "plugin_root": str(root), "source": {"kind": "local"}, "enabled": True}
+        with mock.patch.object(
+            installer.subprocess, "run", side_effect=[self.herdr_reply([entry]), self.herdr_reply([])]
+        ):
+            installer.install_herdr_integration(self.base, cli)
+        self.assertEqual(config.read_text(), original)
+
+    def test_herdr_dry_run_and_foreign_registration_do_not_mutate(self):
+        root, cli = self.herdr_source()
+        self.herdr_binary.return_value = "herdr-test"
+        with mock.patch.object(installer.subprocess, "run", return_value=self.herdr_reply([])) as run:
+            self.assertTrue(installer.install_herdr_integration(self.base, cli, dry_run=True))
+            self.assertEqual(run.call_count, 1)
+        self.assertFalse((self.base / ".config/herdr").exists())
+        entry = {
+            "plugin_id": "orkest.swarms",
+            "plugin_root": str(root / "another-install"),
+            "source": {"kind": "local"},
+        }
+        with mock.patch.object(installer.subprocess, "run", return_value=self.herdr_reply([entry])) as run:
+            self.assertFalse(installer.install_herdr_integration(self.base, cli))
+            self.assertFalse(installer.uninstall_herdr_integration(self.base, cli))
+            self.assertEqual(run.call_count, 2)
+
+    def test_herdr_uninstall_removes_only_owned_registration_and_exact_managed_shortcut(self):
+        root, cli = self.herdr_source()
+        self.herdr_binary.return_value = "herdr-test"
+        config = self.base / ".config/herdr/config.toml"
+        config.parent.mkdir(parents=True)
+        original = "onboarding = false\n"
+        config.write_text(original + installer.HERDR_SHORTCUT_BLOCK)
+        state = self.base / ".config/herdr/plugin-state"
+        state.write_text("keep")
+        entry = {"plugin_id": "orkest.swarms", "plugin_root": str(root), "source": {"kind": "local"}}
+        with mock.patch.object(
+            installer.subprocess, "run", side_effect=[self.herdr_reply([entry]), self.herdr_reply([])]
+        ) as run:
+            self.assertTrue(installer.uninstall_herdr_integration(self.base, cli))
+        self.assertEqual(run.call_args_list[1].args[0], ["herdr-test", "plugin", "unlink", "orkest.swarms"])
+        self.assertEqual(config.read_text(), original)
+        self.assertEqual(state.read_text(), "keep")
+
+    def test_herdr_respects_explicit_config_path(self):
+        _root, cli = self.herdr_source()
+        self.herdr_binary.return_value = "herdr-test"
+        config = self.base / "custom-herdr/config.toml"
+        with (
+            mock.patch.dict(installer.os.environ, {"HERDR_CONFIG_PATH": str(config)}),
+            mock.patch.object(
+                installer.subprocess, "run", side_effect=[self.herdr_reply([]), self.herdr_reply([])]
+            ) as run,
+        ):
+            installer.install_herdr_integration(self.base, cli)
+        self.assertIn('command = "orkest.swarms.toggle"', config.read_text())
+        self.assertEqual(run.call_args.kwargs["env"]["HERDR_CONFIG_PATH"], str(config))
+        self.assertFalse((self.base / ".config/herdr/config.toml").exists())
+
+    def test_herdr_update_adopts_live_views_only_for_enabled_registration(self):
+        root, cli = self.herdr_source()
+        helper = cli.parent.parent / "skills/orchestrate/scripts/herdr_swarm_restore.py"
+        helper.parent.mkdir(parents=True)
+        helper.write_text("# fake helper\n")
+        self.herdr_binary.return_value = "herdr-test"
+        for enabled in (True, False):
+            entry = {
+                "plugin_id": "orkest.swarms",
+                "plugin_root": str(root),
+                "source": {"kind": "local"},
+                "enabled": enabled,
+            }
+            replies = [self.herdr_reply([entry]), self.herdr_reply([])]
+            if enabled:
+                replies.append(mock.Mock(returncode=0, stdout='{"status":"adopted"}', stderr=""))
+            with (
+                mock.patch.dict(installer.os.environ, {"HERDR_ENV": "1"}),
+                mock.patch.object(installer.subprocess, "run", side_effect=replies) as run,
+            ):
+                self.assertTrue(installer.install_herdr_integration(self.base, cli))
+                self.assertEqual(run.call_count, 3 if enabled else 2)
+                if enabled:
+                    self.assertEqual(run.call_args.args[0][-1], "--adopt")
+                    self.assertEqual(run.call_args.kwargs["env"]["HERDR_BIN_PATH"], "herdr-test")
+
+    def test_herdr_unreadable_registry_is_left_unchanged(self):
+        _root, cli = self.herdr_source()
+        self.herdr_binary.return_value = "herdr-test"
+        with mock.patch.object(
+            installer.subprocess, "run", return_value=mock.Mock(returncode=0, stdout="not JSON", stderr="")
+        ):
+            with self.assertRaisesRegex(RuntimeError, "unreadable plugin list"):
+                installer.install_herdr_integration(self.base, cli)
+        self.assertFalse((self.base / ".config/herdr/config.toml").exists())
+
+    def test_herdr_registration_error_is_reported_without_writing_shortcut(self):
+        _root, cli = self.herdr_source()
+        self.herdr_binary.return_value = "herdr-test"
+        with mock.patch.object(
+            installer.subprocess, "run", return_value=mock.Mock(returncode=1, stderr="refused", stdout="")
+        ):
+            with self.assertRaisesRegex(RuntimeError, "refused"):
+                installer.install_herdr_integration(self.base, cli)
+        self.assertFalse((self.base / ".config/herdr/config.toml").exists())
 
 
 if __name__ == "__main__":

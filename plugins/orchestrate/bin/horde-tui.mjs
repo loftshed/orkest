@@ -7,6 +7,7 @@ import { pathToFileURL } from "node:url";
 
 import { shouldUseColor } from "../../monitor/lib/render.mjs";
 import { CACHE_DIR, CONFIG_PATH } from "../../monitor/lib/store.mjs";
+import { markHerdrViewClosed } from "../lib/herdr-view-state.mjs";
 import { createRoom, mailboxRoot, readRoom } from "../lib/horde-room.mjs";
 import { fit, HordeView, shortAgentName } from "../lib/horde-view.mjs";
 import { configHome } from "../lib/runtime-paths.mjs";
@@ -881,8 +882,13 @@ export async function runHordeTui(
   };
   const keypress = (text, key) => {
     const value = key?.sequence || text || "";
-    if (text === "q" || (key?.ctrl && key.name === "c")) cleanup();
-    else {
+    if (text === "q" || (key?.ctrl && key.name === "c")) {
+      void markHerdrViewClosed(initialRoom.id, env)
+        .catch((error) => {
+          terminalError ??= error;
+        })
+        .finally(cleanup);
+    } else {
       const action = view.handleInput(value);
       if (action && typeof action === "object" && action.type === "pull-update") {
         updateState = { available: false, status: "updating" };
