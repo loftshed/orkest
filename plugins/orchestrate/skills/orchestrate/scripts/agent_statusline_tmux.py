@@ -346,7 +346,7 @@ def _herdr_active(socket: str | None = None) -> bool:
     if (os.environ.get("PYTEST_CURRENT_TEST") or "unittest" in sys.modules) and os.environ.get(
         "ORKEST_TEST_ALLOW_HERDR"
     ) != "1":
-        herdr_bin = shutil.which("herdr") or ""
+        herdr_bin = os.environ.get("HERDR_BIN_PATH") or shutil.which("herdr") or ""
         if not any(marker in herdr_bin for marker in ("/tmp/", "/var/folders/", "pytest")):
             return False
     return True
@@ -496,6 +496,42 @@ def _open_herdr_swarm_view(
     environment: dict[str, str],
     base: Path,
 ) -> str | None:
+    import herdr_swarm_restore as restoration
+
+    api = restoration.Herdr(herdr, environment)
+    with restoration.operation_lock(base.parent, environment):
+        state_path = restoration.state_path(base.parent, room, environment)
+        record = restoration.load(state_path)
+        if record and record.get("schema") == restoration.SCHEMA:
+            try:
+                owned = restoration.locate(record, api.panes())
+                if owned:
+                    state_path.with_suffix(".closed").unlink(missing_ok=True)
+                    restoration.restore(base.parent, environment, api, locked=True, only_room=room)
+                    return owned["pane_id"]
+            except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired):
+                return None
+        return _open_herdr_swarm_view_unlocked(
+            herdr,
+            room=room,
+            cwd=cwd,
+            coordinator_pane=coordinator_pane,
+            workspace_id=workspace_id,
+            environment=environment,
+            base=base,
+        )
+
+
+def _open_herdr_swarm_view_unlocked(
+    herdr: str,
+    *,
+    room: str,
+    cwd: str | None,
+    coordinator_pane: str,
+    workspace_id: str | None,
+    environment: dict[str, str],
+    base: Path,
+) -> str | None:
     target_cwd = cwd or os.getcwd()
     split_env = {**environment, "HERDR_PANE_ID": coordinator_pane} if coordinator_pane else environment
     split = subprocess.run(
@@ -521,24 +557,22 @@ def _open_herdr_swarm_view(
     if not view_pane_id:
         return None
     cli = Path(__file__).resolve().parents[3] / "bin" / "ork.mjs"
-    view_cmd = shlex.join(
-        [
-            shutil.which("node") or "node",
-            str(cli),
-            "horde",
-            "--attach-room",
-            room,
-            "--view",
-        ]
-    )
-    run_proc = subprocess.run(
-        [herdr, "pane", "run", view_pane_id, view_cmd],
-        env=environment,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if run_proc.returncode != 0:
+    import herdr_swarm_restore as restoration
+
+    api = restoration.Herdr(herdr, environment)
+    try:
+        state_path = restoration.prepare(base.parent, room, view_pane_id, cli, environment, api)
+    except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired):
+        # This pane was created by this call; roll it back if ownership could not be recorded.
+        subprocess.run([herdr, "pane", "close", view_pane_id], env=environment, capture_output=True, check=False)
+        return None
+    try:
+        outcomes = restoration.restore(base.parent, environment, api, locked=True, only_room=room)
+    except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired):
+        outcomes = []
+    if not outcomes or outcomes[0]["status"] not in ("restored", "submitted", "already_running", "launch_pending"):
+        state_path.with_suffix(".closed").touch(mode=0o600)
+        subprocess.run([herdr, "pane", "close", view_pane_id], env=environment, capture_output=True, check=False)
         return None
     _update_room_metadata(
         base,
@@ -674,6 +708,30 @@ def _toggle_herdr_swarm_view(
     cwd: str | None = None,
     base: Path,
 ) -> dict[str, str]:
+    import herdr_swarm_restore as restoration
+
+    with restoration.operation_lock(base.parent, dict(os.environ)):
+        return _toggle_herdr_swarm_view_unlocked(
+            action,
+            herdr=herdr,
+            room=room,
+            session_id=session_id,
+            harness=harness,
+            cwd=cwd,
+            base=base,
+        )
+
+
+def _toggle_herdr_swarm_view_unlocked(
+    action: str,
+    *,
+    herdr: str,
+    room: str | None = None,
+    session_id: str | None = None,
+    harness: str | None = None,
+    cwd: str | None = None,
+    base: Path,
+) -> dict[str, str]:
     coordinator_pane, workspace_id, context_cwd = _resolve_herdr_context()
     if not cwd and context_cwd:
         cwd = context_cwd
@@ -739,6 +797,71 @@ def _toggle_herdr_swarm_view(
         if isinstance(room_data, dict) and isinstance(room_data.get("herdrWorkspaceId"), str)
         else None
     )
+    import herdr_swarm_restore as restoration
+
+    state_path = restoration.state_path(base.parent, current_room, environment)
+    record = restoration.load(state_path)
+    if record:
+        if (
+            record.get("schema") != restoration.SCHEMA
+            or record.get("endpoint") != restoration.endpoint(environment)
+            or record.get("host") != stdlib_socket.gethostname()
+            or record.get("room") != current_room
+        ):
+            return {
+                "status": "error",
+                "reason": "swarm pane ownership record does not match",
+                "room": current_room,
+                "backend": "herdr",
+            }
+        api = restoration.Herdr(herdr, environment)
+        try:
+            owned = restoration.locate(record, api.panes())
+            recorded_view_pane = owned["pane_id"] if owned else None
+            if owned:
+                info = api.processes(owned["pane_id"])
+                cli = Path(__file__).resolve().parents[3] / "bin" / "ork.mjs"
+                if not restoration.view_process(info, cli, current_room) and not restoration.idle_shell(info):
+                    return {
+                        "status": "error",
+                        "reason": "swarm pane is busy or ownership is unknown",
+                        "room": current_room,
+                        "backend": "herdr",
+                    }
+                if (
+                    action == "open" or (action == "toggle" and state_path.with_suffix(".closed").exists())
+                ) and restoration.idle_shell(info):
+                    state_path.with_suffix(".closed").unlink(missing_ok=True)
+                    outcomes = restoration.restore(base.parent, environment, api, locked=True, only_room=current_room)
+                    outcome = outcomes[0]["status"] if outcomes else "missing_pane"
+                    status = "error"
+                    if outcome == "restored":
+                        status = "opened"
+                    elif outcome == "submitted":
+                        status = "starting"
+                    if outcome == "launch_pending":
+                        return {
+                            "status": "error",
+                            "reason": "previous launch is unconfirmed; close the swarm view and open it again to retry",
+                            "room": current_room,
+                            "backend": "herdr",
+                        }
+                    return {"status": status, "room": current_room, "backend": "herdr", "pane": recorded_view_pane}
+        except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired):
+            return {
+                "status": "error",
+                "reason": "could not verify the swarm pane",
+                "room": current_room,
+                "backend": "herdr",
+            }
+    elif recorded_view_pane:
+        try:
+            api = restoration.Herdr(herdr, environment)
+            cli = Path(__file__).resolve().parents[3] / "bin" / "ork.mjs"
+            if not restoration.view_process(api.processes(recorded_view_pane), cli, current_room):
+                recorded_view_pane = None
+        except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired):
+            recorded_view_pane = None
     view_live = bool(
         recorded_view_pane
         and _herdr_pane_live(herdr, recorded_view_pane, workspace_id=effective_workspace, env=environment)
@@ -752,13 +875,22 @@ def _toggle_herdr_swarm_view(
             check=False,
         )
         if closed.returncode != 0:
-            subprocess.run(
+            closed = subprocess.run(
                 [herdr, "pane", "close", recorded_view_pane],
                 env=environment,
                 capture_output=True,
                 text=True,
                 check=False,
             )
+        if closed.returncode != 0:
+            return {
+                "status": "error",
+                "reason": "could not close the swarm pane",
+                "room": current_room,
+                "backend": "herdr",
+            }
+        if record:
+            state_path.with_suffix(".closed").touch(mode=0o600)
         _update_room_metadata(base, current_room, herdrViewPaneId=None)
         return {"status": "closed", "room": current_room, "backend": "herdr", "pane": recorded_view_pane}
     if not view_live and action == "close":
@@ -767,7 +899,7 @@ def _toggle_herdr_swarm_view(
         return {"status": "already_closed", "room": current_room, "backend": "herdr"}
     if view_live and recorded_view_pane and action == "open":
         return {"status": "already_open", "room": current_room, "backend": "herdr", "pane": recorded_view_pane}
-    pane_id = _open_herdr_swarm_view(
+    pane_id = _open_herdr_swarm_view_unlocked(
         herdr,
         room=current_room,
         cwd=cwd,
@@ -801,7 +933,7 @@ def toggle_swarm_view(
         raise ValueError(f"Unsupported swarm view action: {action}")
     base = base or mailbox.root()
     if _herdr_active(socket):
-        herdr = shutil.which("herdr")
+        herdr = os.environ.get("HERDR_BIN_PATH") or shutil.which("herdr")
         if herdr:
             return _toggle_herdr_swarm_view(
                 action,
@@ -1003,7 +1135,7 @@ def main(arguments: list[str]) -> int:
         print("ork label needs an interactive terminal", file=sys.stderr)
         return 2
     if attach and _herdr_active() and room:
-        herdr = shutil.which("herdr")
+        herdr = os.environ.get("HERDR_BIN_PATH") or shutil.which("herdr")
         room_data = None
         with contextlib.suppress(ValueError):
             room_data = mailbox.load(_room_path(mailbox.root(), room))
@@ -1075,7 +1207,7 @@ def main(arguments: list[str]) -> int:
                     herdrCoordinatorPaneId=coordinator_pane,
                     **({"herdrWorkspaceId": workspace_id} if workspace_id else {}),
                 )
-                herdr = shutil.which("herdr")
+                herdr = os.environ.get("HERDR_BIN_PATH") or shutil.which("herdr")
                 if herdr:
                     view_pane = _open_herdr_swarm_view(
                         herdr,

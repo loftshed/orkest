@@ -333,7 +333,7 @@ class HerdrSwarmLaunchTests(unittest.TestCase):
         herdr_bin = home / "herdr"
         herdr_bin.write_text(
             "#!" + sys.executable + "\n"
-            "import json, sys\nfrom pathlib import Path\n"
+            "import json, shlex, sys\nfrom pathlib import Path\n"
             "state_path = Path(" + repr(str(state_file)) + ")\n"
             "state = json.loads(state_path.read_text())\n"
             "args = sys.argv[1:]\n"
@@ -344,6 +344,19 @@ class HerdrSwarmLaunchTests(unittest.TestCase):
             "    state['panes'].append(pane_id)\n"
             "    state_path.write_text(json.dumps(state))\n"
             "    print(json.dumps({'ok': True, 'result': {'pane': {'pane_id': pane_id}}}))\n"
+            "elif args[:2] == ['pane', 'rename']:\n"
+            "    state.setdefault('labels', {})[args[2]] = args[3]\n"
+            "    state_path.write_text(json.dumps(state))\n"
+            "    print(json.dumps({'result': {'type': 'ok'}}))\n"
+            "elif args[:2] == ['api', 'snapshot']:\n"
+            "    panes = [{'pane_id': p, 'terminal_id': p, 'label': state.get('labels', {}).get(p)} for p in state['panes']]\n"
+            "    print(json.dumps({'result': {'snapshot': {'panes': panes}}}))\n"
+            "elif args[:2] == ['pane', 'process-info']:\n"
+            "    pane = args[args.index('--pane') + 1]\n"
+            "    run = next((r for r in reversed(state['runs']) if r['pane'] == pane), None)\n"
+            "    argv = shlex.split(run['command'])[2:] if run else ['zsh']\n"
+            "    info = {'shell_pid': 100, 'foreground_process_group_id': 100, 'foreground_processes': [{'pid': 200 if run else 100, 'name': 'node' if run else 'zsh', 'argv': argv}]}\n"
+            "    print(json.dumps({'result': {'process_info': info}}))\n"
             "elif args[:2] == ['pane', 'run']:\n"
             "    state['runs'].append({'pane': args[2], 'command': args[3]})\n"
             "    state_path.write_text(json.dumps(state))\n"
@@ -420,6 +433,7 @@ class HerdrSwarmLaunchTests(unittest.TestCase):
                 "PATH": str(home) + os.pathsep + os.environ["PATH"],
                 "TERM": "xterm-256color",
                 "HERDR_ENV": "1",
+                "HERDR_BIN_PATH": str(home / "herdr"),
                 "ORKEST_TEST_ALLOW_HERDR": "1",
                 "HERDR_PANE_ID": "w1:p1",
                 "HERDR_WORKSPACE_ID": "w1",
