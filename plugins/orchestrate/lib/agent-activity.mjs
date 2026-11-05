@@ -111,12 +111,7 @@ async function transcriptFile(source) {
     if (!session.startsWith("subagent-")) return path.join(project, `${session}.jsonl`);
     const id = session.slice("subagent-".length);
     if (!SESSION_ID.test(id) || !SESSION_ID.test(parentSession || "")) return "";
-    return path.join(
-      project,
-      parentSession,
-      "subagents",
-      `agent-${id}.jsonl`,
-    );
+    return path.join(project, parentSession, "subagents", `agent-${id}.jsonl`);
   }
   if (engine === "codex") return codexFile(source.accountHome, session, startedAt);
   return "";

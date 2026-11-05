@@ -183,7 +183,16 @@ describe("agent terminal preview", () => {
       await mkdir(path.dirname(codexFile), { recursive: true });
       await writeFile(
         claudeFile,
-        `${JSON.stringify({ type: "assistant", message: { content: [{ type: "thinking", thinking: "hidden" }, { type: "tool_use", name: "Read", input: { file_path: "/work/room/report.md" } }, { type: "text", text: "Review complete" }] } })}\n`,
+        `${JSON.stringify({
+          type: "assistant",
+          message: {
+            content: [
+              { type: "thinking", thinking: "hidden" },
+              { type: "tool_use", name: "Read", input: { file_path: "/work/room/report.md" } },
+              { type: "text", text: "Review complete" },
+            ],
+          },
+        })}\n`,
       );
       await writeFile(
         codexFile,

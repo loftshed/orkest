@@ -1,3 +1,4 @@
+// cspell:words wubbit klorgis zibber fnordel gribnox tumblex blorkin drazzle pifflet vorgle nibblex
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, open, readdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
