@@ -241,6 +241,7 @@ describe("terminal presentation components", () => {
       cwd: "/workspace/project",
       title: "Refine Orkest coordinator delegation",
       herdrViewPaneId: "w1:p2",
+      swarm: { maxAgents: 12, maxDepth: 8 },
       conductor: {
         name: "glorpax",
         engine: "agy",
@@ -251,15 +252,26 @@ describe("terminal presentation components", () => {
           task: "Inspecting Orkest swarm pane title and card header",
         },
       },
-      agents: [],
+      agents: [
+        {
+          id: "worker-1",
+          name: "snorfle",
+          engine: "claude",
+          model: "claude-fable-5-1",
+          cwd: "/workspace/project",
+          status: "running",
+          progress: { stage: "working", task: "Checking header layout" },
+        },
+      ],
     };
     const view = new HordeView(room, { color: true, tier: "nerd", now: () => 840 });
     expect(view.needsAnimation).toBe(true);
     const rendered = view.render(80);
-    expect(plain(rendered[0])).toContain("╭ Swarm ─");
-    expect(plain(rendered[0])).not.toContain("Refine Orkest coordinator delegation");
+    expect(plain(rendered[0])).toBe(` ╭${"─".repeat(76)}╮`);
+    expect(plain(rendered[0])).not.toContain("Swarm");
     expect(plain(rendered[3])).toContain("│ ⣷ Inspecting Orkest swarm pane title and card header");
     expect(rendered[3]).toContain("\u{1B}[38;5;149m⣷\u{1B}[0m");
     expect(rendered[3]).toContain("\u{1B}[38;5;150;1m");
+    expect(plain(rendered.join("\n"))).toContain("│ project · 1 active · 1/12 slots");
   });
 });

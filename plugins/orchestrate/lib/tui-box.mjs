@@ -310,25 +310,26 @@ export function frame(
   width = Math.max(1, Math.floor(width));
   if (width < 4) return [title, ...lines].map((line) => fit(line, width));
   const inside = width - 2;
-  const cleanTitle = ` ${plain(title)} `;
+  const cleanTitle = plain(title) ? ` ${plain(title)} ` : "";
   const cleanRight = right ? ` ${plain(right)} ` : "";
   const availableTitle = Math.max(0, inside - displayWidth(cleanRight));
-  const heading = fit(
-    cleanTitle,
-    Math.min(displayWidth(cleanTitle), Math.max(0, availableTitle - 1)),
-  );
+  const heading = cleanTitle
+    ? fit(cleanTitle, Math.min(displayWidth(cleanTitle), Math.max(0, availableTitle - 1)))
+    : "";
   const rule = glyphs.horizontal.repeat(Math.max(0, availableTitle - displayWidth(heading)));
-  const tail = fit(cleanRight, inside - displayWidth(heading) - displayWidth(rule));
+  const tail = cleanRight
+    ? fit(cleanRight, inside - displayWidth(heading) - displayWidth(rule))
+    : "";
   const topContent = heading + rule + tail;
   const topRemaining = Math.max(0, inside - displayWidth(topContent));
   let top;
-  if (color && headerTone) {
+  if (color && headerTone && (heading || tail.trim())) {
     const titlePill = heading;
     const middleSpace = glyphs.horizontal.repeat(
       Math.max(0, availableTitle - displayWidth(titlePill)),
     );
     const styledTail = tone(tail, tail.trim() ? headerTone : "border", color);
-    top = `${tone(glyphs.topLeft, "border", color)}${tone(titlePill, headerTone, color)}${tone(middleSpace, "border", color)}${styledTail}${tone(glyphs.horizontal.repeat(topRemaining) + glyphs.topRight, "border", color)}`;
+    top = `${tone(glyphs.topLeft, "border", color)}${titlePill ? tone(titlePill, headerTone, color) : ""}${tone(middleSpace, "border", color)}${styledTail}${tone(glyphs.horizontal.repeat(topRemaining) + glyphs.topRight, "border", color)}`;
   } else {
     top = tone(
       glyphs.topLeft + topContent + glyphs.horizontal.repeat(topRemaining) + glyphs.topRight,

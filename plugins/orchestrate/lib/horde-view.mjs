@@ -1344,10 +1344,10 @@ export class HordeView {
     });
   }
 
-  folderHeaderLine(folder, count, innerWidth) {
+  folderHeaderLine(folder, count, innerWidth, summary = "") {
     return sectionHeading(
       folder ? shortFolder(folder) : "workspace",
-      `${count} ${count === 1 ? "agent" : "agents"}`,
+      summary || `${count} ${count === 1 ? "agent" : "agents"}`,
       innerWidth,
       {
         prefix: toAsciiTree("│ ", this.tier),
@@ -1531,14 +1531,18 @@ export class HordeView {
     const hasHerdrPaneHeader = Boolean(
       this.inHerdr || room.herdrViewPaneId || room.herdrCoordinatorPaneId,
     );
+    const activityBadge = swarmActivityBadge(room, maxAgents, this.tier, innerWidth);
+    let topCardTitle = "";
+    if (!hasHerdrPaneHeader) {
+      topCardTitle =
+        room.title === "New swarm" ? "Swarm" : `Swarm · ${plain(room.title || room.id)}`;
+    }
     const lines = [
       ...this.panel(
-        hasHerdrPaneHeader || room.title === "New swarm"
-          ? "Swarm"
-          : `Swarm · ${plain(room.title || room.id)}`,
+        topCardTitle,
         leadLines,
         innerWidth,
-        swarmActivityBadge(room, maxAgents, this.tier, innerWidth),
+        hasHerdrPaneHeader ? "" : activityBadge,
         this.hovered === "current-session" ? "buttonHover" : "swarmHeading",
         hasAgentTree ? "start" : "",
       ),
@@ -1618,9 +1622,18 @@ export class HordeView {
         folderGroups.get(folder).push({ agent, index: offset });
       }
       const gap = "  ";
-      const lastFolder = folderGroups.keys().toArray().at(-1);
+      const folderKeys = folderGroups.keys().toArray();
+      const firstFolder = folderKeys[0];
+      const lastFolder = folderKeys.at(-1);
       for (const [folder, rawEntries] of folderGroups) {
-        lines.push(this.folderHeaderLine(folder, rawEntries.length, innerWidth));
+        let folderSummary = "";
+        if (hasHerdrPaneHeader && folder === firstFolder) {
+          folderSummary =
+            folderGroups.size === 1
+              ? activityBadge
+              : `${rawEntries.length} ${rawEntries.length === 1 ? "agent" : "agents"} · ${activityBadge}`;
+        }
+        lines.push(this.folderHeaderLine(folder, rawEntries.length, innerWidth, folderSummary));
         const hiddenCompletedCount =
           this.completedMode === "hidden"
             ? rawEntries.filter(({ agent }) => isCollapsibleCompleted(agent)).length
