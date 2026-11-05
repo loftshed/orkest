@@ -1,6 +1,6 @@
 ---
 name: orchestrate
-description: "Delegate bounded implementation or read-only consultation across provider boundaries using local Codex, Antigravity, Claude Code, or OpenCode. Validate model and effort, check live quota, preserve context, record usage and evidence, recover bounded corrections, and audit results. Use for explicitly requested external-agent work or cross-platform handoffs, for example 'ask GPT-5.6 Sol', 'have Gemini check this', 'try it with GLM', or one focused question to a stronger model ('get Opus's opinion on this', 'ask GPT whether X is safe') through `consult`. Always prefer the host harness's built-in tools for messaging or spawning agents within the same harness (GPT in Codex, Gemini in Gemini/Antigravity, Claude in Claude Code). Also use for requests to inspect Orkest agent or team status and follow their updates through the shared workboard. Do not trigger for ordinary coding or same-harness delegation."
+description: "Delegate bounded implementation or read-only consultation across provider boundaries using local Codex, Antigravity, Claude Code, or OpenCode. Validate model and effort, check live quota, preserve context, record usage and evidence, recover bounded corrections, and audit results. Use for explicitly requested external-agent work or cross-platform handoffs, for example 'ask GPT-5.6 Sol', 'have Gemini check this', 'try it with GLM', or one focused question to a stronger model ('get Opus's opinion on this', 'ask GPT whether X is safe') through `consult`. Always prefer the host harness's built-in tools for messaging or spawning agents within the same harness (GPT in Codex, Gemini in Gemini/Antigravity, Claude in Claude Code). Also use for requests to inspect Orkest agent or team status, follow their updates through the shared workboard, or promote the current conversation to coordinator ('you are the coordinator now'). Do not trigger for ordinary coding or same-harness delegation."
 metadata:
   version: 0.51.2
   requirements: Python 3.11+, POSIX file locking, git, and at least one installed/authenticated executor CLI (`codex`, `agy`, `claude`, or `opencode`).
@@ -85,7 +85,7 @@ Every hosted frontier model goes through its own vendor's harness, never through
 | --------------------------------------------------------------- | ------------------------------------------------------------------------ |
 | GPT (Astra, Sol, Terra, Luna, GPT-5.x/6)                        | `--engine codex`                                                         |
 | Gemini                                                          | `--engine agy`                                                           |
-| Claude (Opus, Sonnet, Haiku, Fable)                             | `--engine claude` (Claude Code; `--claude-config-dir` picks the profile) |
+| Claude (Opus, Sonnet, Haiku, Fable, Mythos `claude-mythos-5-1`) | `--engine claude` (Claude Code; `--claude-config-dir` picks the profile) |
 | GLM, DeepSeek, Qwen, Kimi, MiniMax and other open-weight models | `--engine opencode` (OpenRouter)                                         |
 
 The runner enforces this: `--engine opencode` with a Claude, GPT or Gemini model exits 17 and names
@@ -167,6 +167,18 @@ successor review `authority.py show` before you accept and before you edit. To s
 standing takeover", "Pick another deputy", "Don't appoint". When it refuses for an account without a
 context, ask "Is account A work or personal?" with "Personal", "Work" and "Leave it unset", record the
 answer with `authority.py set-billing`, and propose again. Never choose a context or an account yourself.
+
+## Adopt the current conversation as coordinator
+
+When the user says "you are the coordinator now" or asks to orchestrate from this existing chat,
+run `ork hall promote --session ACTUAL_NATIVE_SESSION_ID`. Pass `--objective 'their goal'` when
+an objective was supplied. Keep the current conversation; do not launch a replacement harness.
+Use the returned room ID for subsequent assignments and keep normal progress reports current.
+Promotion binds actual room leadership and refreshes terminal metadata; setting the workforce
+role alias `coordinator` only selects the planner specialism and does not appoint a room leader.
+Pass `--room ID` only for an explicitly chosen room. A room with another coordinator requires
+its leadership handoff workflow; never replace its binding or choose a historical room by recency.
+Team authority appointment and succession remain the separate workflow above.
 
 ## Ask one question: `consult`
 

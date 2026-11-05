@@ -13,6 +13,14 @@ The coordinator owns the outcome, assignments, conflict resolution and final ver
 available to the user while children work. Use native supervision for agents in your harness and
 the orchestrate runner for other harnesses. Do not silently change accounts or billing contexts.
 
+## Appoint the current conversation
+
+When the user appoints this conversation as coordinator, run `ork hall promote --session NATIVE_ID`.
+Add `--objective TEXT` when they supplied a goal. This adopts the running conversation without
+restarting it or losing its chat. The command returns the room ID and refreshes its terminal label.
+Use `--room ID` to adopt a specific room; a different bound coordinator must use the leadership
+handoff workflow instead. Repeating promotion preserves the room's members and existing objective.
+
 ## Assign work
 
 1. Read repository instructions and the orchestrate skill. Inspect native tools, live model catalogs,
@@ -51,6 +59,20 @@ completion, and cannot be replenished by creating another room. They bound the r
 model turns or spending. Native tools and shell access remain a cooperative execution contract.
 
 ## Steer and inspect
+
+Click another agent's card for a read-only live screen preview. Clicking **This chat** or the
+coordinator card returns to the current session's interactive chat. In Herdr,
+the view temporarily expands to show the preview on the left and agents on the right. **Agents**
+returns to the original split; **Open terminal** opens the real chat for typing. A preview shows
+the current screen, not guaranteed full chat history. Agents without a terminal show recorded activity.
+
+Quota starts with compact meters grouped into Work and Personal rows, each with its own accent.
+Unassigned accounts stay separate. Each pool shows its lowest remaining percentage; Antigravity's
+Claude/GPT and Gemini pools remain separate. Icons identify the provider: Claude is orange,
+Antigravity uses blue Google icons for both pools, and Codex is light gray. Icon mode omits AG and CX, and single-pool meters need no pool label.
+Click the quota chevron to expand or collapse the details. The bottom buttons open the log, **Shortcuts**,
+and other actions. Nerd Font icons are the default; `ORK_GLYPHS=unicode` or `ascii` selects a fallback.
+The **Shortcuts** menu lists keyboard controls, including `m` to toggle mouse capture for text selection.
 
 Talk to the root coordinator to change direction. It sends focused updates through native messaging
 to its leads. Each lead owns communication and review within its branch. Keep full agent identifiers
