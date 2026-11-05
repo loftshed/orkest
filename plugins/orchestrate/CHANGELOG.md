@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.57.0
+
+- feat(orchestrate): show swarm title in Herdr pane header and add active task shimmer (#94)
+
 ## 0.56.0
 
 - feat(orchestrate): add 1-space left padding inside swarm header and quota cards (#93)
