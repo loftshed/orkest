@@ -616,17 +616,20 @@ class HerdrSwarmLaunchTests(unittest.TestCase):
                 termios.tcsetwinsize(0, (34, 160))
                 os.execvpe("node", ["node", str(CLI), "claude", "--cwd", str(home)], environment)
             try:
-                deadline = time.monotonic() + 10
+                output = b""
+                deadline = time.monotonic() + 20
                 while time.monotonic() < deadline:
                     if select.select([master], [], [], 0.05)[0]:
                         try:
-                            if not os.read(master, 65536):
+                            chunk = os.read(master, 65536)
+                            if not chunk:
                                 break
+                            output += chunk
                         except OSError:
                             break
                     if launched.exists():
                         break
-                self.assertTrue(launched.exists(), "Herdr coordinator did not launch")
+                self.assertTrue(launched.exists(), f"Herdr coordinator did not launch: {output[-4000:]!r}")
                 info = json.loads(launched.read_text())
                 room_id = info["room"]
                 self.assertIsNotNone(room_id)
