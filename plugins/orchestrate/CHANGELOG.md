@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.59.0
+
+- feat(orchestrate): format Herdr folder activity summary with status icons and complete label (#96)
+
 ## 0.58.0
 
 - feat(orchestrate): use plain top card border in Herdr and move slot badge to folder row (#95)
