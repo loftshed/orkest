@@ -1281,6 +1281,12 @@ def hook(
     if event == "SessionStart" and payload.get("source") == "clear" and not me.get("delegatedRun"):
         cleared_notice = _MB.adopt_cleared(base, me)
         me = _MB.load(peer_path(base, session)) or me
+    if not is_subagent and not me.get("isSubagent") and not me.get("delegatedRun"):
+        with contextlib.suppress(Exception):
+            import agent_terminal
+
+            if _herdr_active() or agent_terminal.context(harness):
+                agent_terminal.bind(session, harness, payload, base=base, force=event == "SessionStart")
     if not me.get("isSubagent") and event in {"SessionStart", "UserPromptSubmit", "PreInvocation", "Stop"}:
         with contextlib.suppress(Exception):
             import mailbox_work as _WORK

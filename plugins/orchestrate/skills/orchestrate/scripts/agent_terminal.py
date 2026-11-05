@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import peer_mailbox as mailbox
+from herdr_swarm_restore import endpoint as herdr_endpoint
 
 
 def context(harness: str | None) -> tuple[str, str] | None:
@@ -43,14 +44,21 @@ def herdr_context(harness: str | None) -> tuple[str, str | None] | None:
     return pane, workspace
 
 
-def bind(session: str, harness: str | None, payload: dict[str, Any]) -> bool:
+def bind(
+    session: str,
+    harness: str | None,
+    payload: dict[str, Any],
+    *,
+    base: Path | None = None,
+    force: bool = False,
+) -> bool:
     target = context(harness)
     herdr = herdr_context(harness)
     if not target and not herdr:
         return False
     try:
         mailbox.session_key(session)
-        base = mailbox.root()
+        base = base or mailbox.root()
         peer_data: dict[str, Any] | None = None
         with contextlib.suppress(Exception):
             loaded = mailbox.load(mailbox.peer_path(base, session))
@@ -58,6 +66,44 @@ def bind(session: str, harness: str | None, payload: dict[str, Any]) -> bool:
                 peer_data = loaded
         if isinstance(peer_data, dict) and (peer_data.get("isSubagent") or peer_data.get("delegatedRun")):
             return False
+        matched_room_id = ""
+        structural_role = ""
+        is_exact_conductor = False
+        with contextlib.suppress(Exception):
+            import agent_statusline_tmux
+
+            peer_cwd = peer_data.get("checkout") or peer_data.get("cwd") if isinstance(peer_data, dict) else None
+            aliases = (
+                peer_data.get("aliases")
+                if isinstance(peer_data, dict) and isinstance(peer_data.get("aliases"), list)
+                else None
+            )
+            matched = agent_statusline_tmux.find_session_swarm_room(
+                base,
+                session,
+                harness=harness,
+                cwd=peer_cwd,
+                aliases=aliases,
+                only_room=os.environ.get("ORKEST_SWARM_ROOM") or None,
+            )
+            if isinstance(matched, dict) and isinstance(matched.get("id"), str):
+                member_id = matched.get("_matchedMemberId")
+                member = (
+                    matched.get("conductor")
+                    if member_id == "conductor"
+                    else next((agent for agent in matched.get("agents", []) if agent.get("id") == member_id), None)
+                )
+                binding = member.get("session") if isinstance(member, dict) else None
+                bound_cwd = (
+                    (binding.get("cwd") if isinstance(binding, dict) else None)
+                    or (member.get("cwd") if isinstance(member, dict) else None)
+                    or matched.get("cwd")
+                )
+                if not peer_cwd or not bound_cwd or Path(peer_cwd).resolve() == Path(bound_cwd).resolve():
+                    matched_room_id = matched["id"]
+                    if matched.get("_matchedSessionId") == session:
+                        is_exact_conductor = member_id == "conductor"
+                        structural_role = "Coordinator" if is_exact_conductor else "Lead"
         annotations: dict[str, Any] = {}
         if target and (not isinstance(peer_data, dict) or peer_data.get("terminalServer") != target[0]):
             annotations["terminalServer"] = target[0]
@@ -89,13 +135,24 @@ def bind(session: str, harness: str | None, payload: dict[str, Any]) -> bool:
                 if isinstance(raw_model, dict):
                     raw_model = raw_model.get("display_name") or raw_model.get("id") or ""
                 model_str = str(raw_model or "").strip()
-                display_agent = " · ".join(part for part in (role, model_str) if part)
+                roles = [structural_role]
+                if role.casefold() != structural_role.casefold():
+                    roles.append(role)
+                display_agent = " · ".join(part for part in (*roles, model_str) if part)
                 sync_key = f"{title}|{display_agent}" if display_agent else title
-                if title and peer_data.get("herdrSyncedTitle") != sync_key and shutil.which("herdr"):
-                    cmd = ["herdr", "pane", "report-metadata", "--source", "orkest", "--title", title]
+                sync_target = {"endpoint": herdr_endpoint(dict(os.environ)), "pane": pane_id}
+                if (
+                    title
+                    and (
+                        force
+                        or peer_data.get("herdrSyncedTitle") != sync_key
+                        or peer_data.get("herdrSyncedTarget") != sync_target
+                    )
+                    and shutil.which("herdr")
+                ):
+                    cmd = ["herdr", "pane", "report-metadata", pane_id, "--source", "orkest", "--title", title]
                     if display_agent:
                         cmd.extend(["--display-agent", display_agent])
-                    cmd.append(pane_id)
                     with contextlib.suppress(OSError, subprocess.SubprocessError):
                         res = subprocess.run(
                             cmd,
@@ -106,22 +163,11 @@ def bind(session: str, harness: str | None, payload: dict[str, Any]) -> bool:
                         )
                         if getattr(res, "returncode", 1) == 0:
                             annotations["herdrSyncedTitle"] = sync_key
+                            annotations["herdrSyncedTarget"] = sync_target
         if annotations:
             with contextlib.suppress(Exception):
                 mailbox.annotate(base, session, **annotations)
-        matched_room_id = ""
-        with contextlib.suppress(Exception):
-            import agent_statusline_tmux
-
-            aliases = (
-                peer_data.get("aliases")
-                if isinstance(peer_data, dict) and isinstance(peer_data.get("aliases"), list)
-                else None
-            )
-            matched = agent_statusline_tmux.find_session_swarm_room(base, session, harness=harness, aliases=aliases)
-            if isinstance(matched, dict) and isinstance(matched.get("id"), str):
-                matched_room_id = matched["id"]
-        if herdr and matched_room_id:
+        if herdr and matched_room_id and is_exact_conductor:
             with contextlib.suppress(Exception):
                 import agent_statusline_tmux
 

@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import contextlib
+import datetime as dt
+import io
 import json
 import os
 import pty
@@ -11,6 +14,7 @@ import secrets
 import select
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -19,12 +23,276 @@ import time
 import unittest
 import uuid
 from pathlib import Path
+from unittest import mock
 
 SCRIPTS = Path(__file__).resolve().parents[5] / "plugins/orchestrate/skills/orchestrate/scripts"
 sys.path.insert(0, str(SCRIPTS))
 import agent_progress as progress  # noqa: E402
+import agent_statusline  # noqa: E402
 import agent_terminal  # noqa: E402
+import mailbox_hooks  # noqa: E402
 import peer_mailbox as mailbox  # noqa: E402
+
+
+class HerdrMetadataTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="ork-herdr-metadata-")
+        self.addCleanup(temporary.cleanup)
+        self.home = Path(temporary.name).resolve()
+        self.base = self.home / "mailbox-v1"
+        environment = {
+            **os.environ,
+            "AGENT_EXECUTOR_HOME": str(self.home),
+            "CODEX_HOME": str(self.home),
+            "HERDR_ENV": "1",
+            "HERDR_PANE_ID": "w1:p1",
+            "HERDR_WORKSPACE_ID": "w1",
+            "HERDR_SOCKET_PATH": str(self.home / "server.sock"),
+            "ORKEST_TERMINAL_HARNESS": "codex",
+            "ORKEST_TEST_ALLOW_HERDR": "1",
+        }
+        for key in ("ORKEST_TERMINAL_SERVER", "TMUX", "TMUX_PANE", "ORKEST_SWARM_ROOM"):
+            environment.pop(key, None)
+        self.enterContext(mock.patch.dict(os.environ, environment, clear=True))
+        self.metadata = {}
+        self.reports = []
+        original_run = subprocess.run
+        original_which = shutil.which
+
+        def fake_run(command, **kwargs):
+            if command[:2] != ["herdr", "pane"]:
+                return original_run(command, **kwargs)
+            self.reports.append(command)
+            if command[2] != "report-metadata" or command[3].startswith("--"):
+                return subprocess.CompletedProcess(command, 2, stdout="", stderr="unknown option")
+            self.metadata[command[3]] = {
+                "title": command[command.index("--title") + 1],
+                "display_agent": command[command.index("--display-agent") + 1],
+            }
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        self.enterContext(mock.patch.object(agent_terminal.subprocess, "run", side_effect=fake_run))
+        self.enterContext(
+            mock.patch.object(
+                agent_terminal.shutil,
+                "which",
+                side_effect=lambda command: "/fake/herdr" if command == "herdr" else original_which(command),
+            )
+        )
+        self.enterContext(mock.patch.object(mailbox_hooks, "_maybe_trigger_auto_update"))
+        self.enterContext(mock.patch.object(mailbox, "harness_pid", return_value=os.getpid()))
+        self.session = "codex-resume-session-2222"
+        peer = mailbox.register(
+            self.base,
+            session=self.session,
+            harness="codex",
+            cwd=str(self.home),
+            model="fixture-model",
+            effort="medium",
+            account=str(self.home),
+            pid=os.getpid(),
+        )
+        peer = mailbox.annotate(
+            self.base, self.session, person="snorfle", name="snorfle-fixture-model-medium-project-aa"
+        )
+        progress.report(self.base, peer, goal="Inspect changes", task="Review current changes", stage="working")
+
+    def test_same_display_text_is_published_again_when_a_session_moves_to_another_pane(self):
+        self.assertTrue(agent_terminal.bind(self.session, "codex", {"model": "fixture-model"}))
+        os.environ["HERDR_PANE_ID"] = "w1:p2"
+        self.assertTrue(agent_terminal.bind(self.session, "codex", {"model": "fixture-model"}))
+        self.assertEqual(self.metadata.get("w1:p2"), {"title": "snorfle · working", "display_agent": "fixture-model"})
+
+    def test_codex_resume_hook_republishes_metadata_after_same_pane_restoration(self):
+        payload = {
+            "session_id": self.session,
+            "hook_event_name": "SessionStart",
+            "source": "resume",
+            "cwd": str(self.home),
+            "model": "fixture-model",
+            "effort": "medium",
+        }
+        mailbox.hook(payload, harness="codex", base=self.base)
+        self.assertEqual(self.metadata.get("w1:p1"), {"title": "snorfle · working", "display_agent": "fixture-model"})
+        self.metadata.clear()
+        mailbox.hook(payload, harness="codex", base=self.base)
+        self.assertEqual(self.metadata.get("w1:p1"), {"title": "snorfle · working", "display_agent": "fixture-model"})
+
+    def test_unchanged_turn_metadata_is_cached_for_the_same_endpoint_and_pane(self):
+        self.assertTrue(agent_terminal.bind(self.session, "codex", {"model": "fixture-model"}))
+        self.assertTrue(agent_terminal.bind(self.session, "codex", {"model": "fixture-model"}))
+        self.assertEqual(self.metadata["w1:p1"], {"title": "snorfle · working", "display_agent": "fixture-model"})
+        self.assertEqual(len(self.reports), 1)
+        stored = mailbox.load(mailbox.peer_path(self.base, self.session))
+        self.assertEqual(stored["herdrSyncedTarget"], {"endpoint": str(self.home / "server.sock"), "pane": "w1:p1"})
+
+    def test_another_endpoint_gets_the_same_session_metadata(self):
+        self.assertTrue(agent_terminal.bind(self.session, "codex", {"model": "fixture-model"}))
+        self.metadata.clear()
+        os.environ["HERDR_SOCKET_PATH"] = str(self.home / "another-server.sock")
+        self.assertTrue(agent_terminal.bind(self.session, "codex", {"model": "fixture-model"}))
+        self.assertEqual(self.metadata.get("w1:p1"), {"title": "snorfle · working", "display_agent": "fixture-model"})
+        self.assertEqual(len(self.reports), 2)
+
+    def test_subagent_hooks_leave_parent_pane_metadata_untouched(self):
+        payload = {
+            "session_id": self.session,
+            "hook_event_name": "SessionStart",
+            "source": "resume",
+            "cwd": str(self.home),
+            "model": "fixture-model",
+            "effort": "medium",
+        }
+        mailbox.annotate(self.base, self.session, isSubagent=True)
+        mailbox.hook(payload, harness="codex", base=self.base)
+        self.assertEqual(self.metadata, {})
+        mailbox.annotate(self.base, self.session, isSubagent=False)
+        mailbox.hook(payload, harness="codex", base=self.base)
+        self.assertEqual(self.metadata.get("w1:p1"), {"title": "snorfle · working", "display_agent": "fixture-model"})
+
+    def test_delegated_worker_hooks_leave_parent_pane_metadata_untouched(self):
+        with mock.patch.object(mailbox, "detect_harness", return_value="claude"):
+            run = mailbox.open_run(
+                self.base,
+                "metadata-worker",
+                worker_harness="codex",
+                repository=self.home,
+                result_path=self.home / "result.json",
+                deadline=(dt.datetime.now(dt.UTC) + dt.timedelta(minutes=5)).isoformat(),
+                worker_pid=os.getpid(),
+            )
+        os.environ["AGENT_MAILBOX_SESSION"] = run["worker"]
+        payload = {
+            "session_id": self.session,
+            "hook_event_name": "SessionStart",
+            "cwd": str(self.home),
+            "model": "fixture-model",
+            "effort": "medium",
+        }
+        mailbox.hook(payload, harness="codex", base=self.base)
+        self.assertEqual(self.metadata, {})
+        os.environ.pop("AGENT_MAILBOX_SESSION")
+        mailbox.hook(payload, harness="codex", base=self.base)
+        self.assertEqual(self.metadata.get("w1:p1"), {"title": "snorfle · working", "display_agent": "fixture-model"})
+
+    def test_refresh_cli_publishes_the_exact_rooms_coordinator_role_without_changing_workforce_role(self):
+        peer = mailbox.load(mailbox.peer_path(self.base, self.session))
+        progress.report(
+            self.base, peer, goal="Inspect changes", task="Review current changes", stage="working", role="builder"
+        )
+        room = {
+            "schema": "agent-executor.room.v1",
+            "id": "promoted-room",
+            "cwd": str(self.home),
+            "machine": socket.gethostname(),
+            "swarm": {"maxAgents": 16, "maxDepth": 4},
+            "updatedAt": 1000,
+            "conductor": {
+                "engine": "codex",
+                "role": "lead",
+                "session": {
+                    "id": self.session,
+                    "engine": "codex",
+                    "machine": socket.gethostname(),
+                    "cwd": str(self.home),
+                },
+            },
+            "agents": [],
+        }
+        mailbox.write(self.base / "rooms" / "promoted-room.json", room)
+        another = {**room, "id": "another-room", "updatedAt": 2000}
+        another_path = self.base / "rooms" / "another-room.json"
+        mailbox.write(another_path, another)
+        another_content = another_path.read_bytes()
+        os.environ["ORKEST_SWARM_ROOM"] = "promoted-room"
+        agent_terminal.bind(self.session, "codex", {})
+        self.metadata.clear()
+        argv = [
+            "agent_statusline.py",
+            "--native-status",
+            "--refresh-terminal",
+            "--session",
+            self.session,
+            "--harness",
+            "codex",
+            "--json",
+        ]
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(sys, "stdout", io.StringIO()):
+            self.assertEqual(agent_statusline.main(), 0)
+        self.assertEqual(
+            self.metadata.get("w1:p1"),
+            {"title": "snorfle · working", "display_agent": "Coordinator · builder · fixture-model"},
+        )
+        self.assertEqual(progress.read(self.base, peer)["role"], "builder")
+        self.assertEqual(another_path.read_bytes(), another_content)
+
+    def test_a_resume_alias_is_not_presented_as_an_exact_coordinator_binding(self):
+        mailbox.annotate(self.base, self.session, aliases=["previous-coordinator"])
+        room = {
+            "schema": "agent-executor.room.v1",
+            "id": "previous-room",
+            "cwd": str(self.home),
+            "machine": socket.gethostname(),
+            "swarm": {"maxAgents": 16, "maxDepth": 4},
+            "conductor": {
+                "engine": "codex",
+                "role": "lead",
+                "session": {"id": "previous-coordinator", "engine": "codex"},
+            },
+            "agents": [],
+        }
+        mailbox.write(self.base / "rooms" / "previous-room.json", room)
+        self.assertTrue(agent_terminal.bind(self.session, "codex", {}))
+        self.assertEqual(self.metadata.get("w1:p1"), {"title": "snorfle · working", "display_agent": "fixture-model"})
+
+    def test_a_top_level_lead_does_not_replace_the_root_coordinators_pane(self):
+        room = {
+            "schema": "agent-executor.room.v1",
+            "id": "parent-room",
+            "cwd": str(self.home),
+            "machine": socket.gethostname(),
+            "swarm": {"maxAgents": 16, "maxDepth": 4},
+            "conductor": {"engine": "codex", "session": {"id": "root-coordinator"}},
+            "herdrCoordinatorPaneId": "w1:p-root",
+            "agents": [
+                {
+                    "id": "subswarm-lead",
+                    "engine": "codex",
+                    "role": "lead",
+                    "session": {"id": self.session, "engine": "codex", "cwd": str(self.home)},
+                }
+            ],
+        }
+        room_path = self.base / "rooms" / "parent-room.json"
+        mailbox.write(room_path, room)
+        original = room_path.read_bytes()
+        self.assertTrue(agent_terminal.bind(self.session, "codex", {}))
+        self.assertEqual(
+            self.metadata.get("w1:p1"), {"title": "snorfle · working", "display_agent": "Lead · fixture-model"}
+        )
+        self.assertEqual(room_path.read_bytes(), original)
+
+    def test_a_binding_in_another_checkout_does_not_supply_role_or_room_metadata(self):
+        room = {
+            "schema": "agent-executor.room.v1",
+            "id": "another-checkout-room",
+            "cwd": str(self.home / "another-checkout"),
+            "machine": socket.gethostname(),
+            "swarm": {"maxAgents": 16, "maxDepth": 4},
+            "conductor": {
+                "engine": "codex",
+                "role": "lead",
+                "session": {"id": self.session, "engine": "codex", "cwd": str(self.home / "another-checkout")},
+            },
+            "herdrCoordinatorPaneId": "w2:p1",
+            "agents": [],
+        }
+        room_path = self.base / "rooms" / "another-checkout-room.json"
+        mailbox.write(room_path, room)
+        original = room_path.read_bytes()
+        self.assertTrue(agent_terminal.bind(self.session, "codex", {}))
+        self.assertEqual(self.metadata.get("w1:p1"), {"title": "snorfle · working", "display_agent": "fixture-model"})
+        self.assertEqual(room_path.read_bytes(), original)
 
 
 @unittest.skipUnless(shutil.which("tmux"), "native pane binding requires tmux")
@@ -184,7 +452,7 @@ class TerminalTests(unittest.TestCase):
             env={**self.native, "ORKEST_TERMINAL_HARNESS": "claude"},
             text=True,
         )
-        self.assertEqual(json.loads(output)["name"], "other")
+        self.assertEqual(json.loads(output)["name"], "other-agent")
         self.assertEqual(self.footer("claude")["name"], "snorfle")
 
     def test_all_four_launchers_render_the_same_outer_footer(self):
@@ -296,7 +564,7 @@ class TerminalTests(unittest.TestCase):
             "HERDR_ENV": "1",
             "HERDR_PANE_ID": "w1:p4",
             "HERDR_WORKSPACE_ID": "w1",
-            "HERDR_SOCKET_PATH": "/tmp/herdr-test.sock",
+            "HERDR_SOCKET_PATH": str(self.home / "herdr.sock"),
             "ORKEST_TERMINAL_HARNESS": "claude",
         }
         old_environ = os.environ.copy()
@@ -327,6 +595,7 @@ class TerminalTests(unittest.TestCase):
             "HERDR_ENV": "1",
             "HERDR_PANE_ID": "w1:p9",
             "HERDR_WORKSPACE_ID": "w1",
+            "HERDR_SOCKET_PATH": str(self.home / "herdr.sock"),
             "ORKEST_TERMINAL_HARNESS": "claude",
         }
         calls: list[list[str]] = []
@@ -353,13 +622,13 @@ class TerminalTests(unittest.TestCase):
                     "herdr",
                     "pane",
                     "report-metadata",
+                    "w1:p9",
                     "--source",
                     "orkest",
                     "--title",
                     "snorfle · working",
                     "--display-agent",
                     "builder · claude-sonnet",
-                    "w1:p9",
                 ],
             )
             stored = mailbox.load(mailbox.peer_path(self.base, session))
@@ -397,7 +666,7 @@ class TerminalTests(unittest.TestCase):
             os.environ.clear()
             os.environ.update(old_environ)
 
-    def test_herdr_direct_launch_bypasses_nested_tmux(self):
+    def test_herdr_launch_keeps_outer_footer(self):
         info = self.home / "herdr-claude.json"
         binary = self.home / "claude"
         binary.write_text(
@@ -407,10 +676,11 @@ class TerminalTests(unittest.TestCase):
             "'tmux': os.environ.get('TMUX'), "
             "'server': os.environ.get('ORKEST_TERMINAL_SERVER'), "
             "'harness': os.environ.get('ORKEST_TERMINAL_HARNESS'), "
+            "'agent_hint': os.environ.get('HERDR_AGENT'), "
             "'herdr_pane': os.environ.get('HERDR_PANE_ID'), "
             "'args': sys.argv[1:]"
             "}))\n"
-            "print('Herdr direct launch ready', flush=True)\n"
+            "print('Herdr wrapped launch ready', flush=True)\n"
         )
         binary.chmod(0o755)
         environment = {
@@ -450,11 +720,12 @@ class TerminalTests(unittest.TestCase):
                         break
                 if info.exists():
                     break
-            self.assertTrue(info.exists(), f"Direct launch did not write info: {output!r}")
+            self.assertTrue(info.exists(), f"Wrapped launch did not write info: {output!r}")
             launched = json.loads(info.read_text())
-            self.assertIsNone(launched["tmux"])
-            self.assertIsNone(launched["server"])
+            self.assertTrue(launched["tmux"])
+            self.assertRegex(launched["server"], r"^orkest-label-[0-9a-f]{12}$")
             self.assertEqual(launched["harness"], "claude")
+            self.assertEqual(launched["agent_hint"], "claude")
             self.assertEqual(launched["herdr_pane"], "w1:p1")
             self.assertEqual(launched["args"], ["--model", "fixture-model"])
         finally:
@@ -467,6 +738,85 @@ class TerminalTests(unittest.TestCase):
                 os.kill(pid, signal.SIGTERM)
                 os.waitpid(pid, 0)
             os.close(master)
+
+    def test_herdr_footer_is_configured_for_codex_and_antigravity(self):
+        for binary_name, harness, source_flag in (
+            ("codex", "codex", "--codex-pane"),
+            ("agy", "gemini", "--terminal-pane"),
+        ):
+            with self.subTest(harness=harness):
+                info = self.home / f"herdr-{binary_name}.json"
+                binary = self.home / binary_name
+                binary.write_text(
+                    "#!" + sys.executable + "\n"
+                    "import json, os, time\nfrom pathlib import Path\n"
+                    "Path(" + repr(str(info)) + ").write_text(json.dumps({"
+                    "'tmux': os.environ.get('TMUX'), "
+                    "'server': os.environ.get('ORKEST_TERMINAL_SERVER'), "
+                    "'harness': os.environ.get('ORKEST_TERMINAL_HARNESS'), "
+                    "'agent_hint': os.environ.get('HERDR_AGENT')"
+                    "}))\n"
+                    "time.sleep(10)\n"
+                )
+                binary.chmod(0o755)
+                environment = {
+                    **self.environment,
+                    "PATH": str(self.home) + os.pathsep + os.environ["PATH"],
+                    "HERDR_ENV": "1",
+                    "HERDR_PANE_ID": "w1:p1",
+                    "HERDR_WORKSPACE_ID": "w1",
+                    "TERM": "xterm-256color",
+                }
+                server = None
+                pid, master = pty.fork()
+                if pid == 0:
+                    termios.tcsetwinsize(0, (30, 120))
+                    os.execvpe(
+                        "node",
+                        ["node", str(SCRIPTS.parents[2] / "bin/ork.mjs"), "label", "--", str(binary)],
+                        environment,
+                    )
+                try:
+                    deadline = time.monotonic() + 10
+                    while time.monotonic() < deadline and not info.exists():
+                        if select.select([master], [], [], 0.1)[0]:
+                            with contextlib.suppress(OSError):
+                                os.read(master, 65536)
+                    self.assertTrue(info.exists(), f"{binary_name} did not start in the wrapped terminal")
+                    launched = json.loads(info.read_text())
+                    server = launched["server"]
+                    self.assertTrue(launched["tmux"])
+                    self.assertRegex(server, r"^orkest-label-[0-9a-f]{12}$")
+                    self.assertEqual(launched["harness"], harness)
+                    self.assertEqual(launched["agent_hint"], "agy" if harness == "gemini" else harness)
+                    options = ["tmux", "-L", server, "show-option", "-t", "orkest", "-v"]
+                    deadline = time.monotonic() + 3
+                    while time.monotonic() < deadline:
+                        format_result = subprocess.run(
+                            [*options, "status-format[0]"], capture_output=True, text=True, check=False
+                        )
+                        if format_result.returncode == 0 and "agent_statusline.py" in format_result.stdout:
+                            break
+                        time.sleep(0.05)
+                    self.assertIn("agent_statusline.py", format_result.stdout)
+                    self.assertIn(source_flag, format_result.stdout)
+                    self.assertEqual(subprocess.check_output([*options, "status"], text=True).strip(), "2")
+                    self.assertEqual(
+                        subprocess.check_output([*options, "status-position"], text=True).strip(), "bottom"
+                    )
+                    self.assertEqual(subprocess.check_output([*options, "destroy-unattached"], text=True).strip(), "on")
+                finally:
+                    if server:
+                        subprocess.run(["tmux", "-L", server, "kill-server"], capture_output=True, check=False)
+                    deadline = time.monotonic() + 3
+                    while time.monotonic() < deadline:
+                        if os.waitpid(pid, os.WNOHANG)[0]:
+                            break
+                        time.sleep(0.05)
+                    else:
+                        os.kill(pid, signal.SIGTERM)
+                        os.waitpid(pid, 0)
+                    os.close(master)
 
 
 if __name__ == "__main__":
