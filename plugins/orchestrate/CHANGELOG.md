@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.51.1
+
+- fix(orchestrate): wait for shell startup before opening swarm view
+
 ## 0.51.0
 
 - feat(orchestrate): restore owned Herdr swarm views after restart
