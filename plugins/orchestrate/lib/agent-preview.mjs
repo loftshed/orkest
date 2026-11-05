@@ -99,21 +99,35 @@ export function createAgentPreview({
     const tmuxPane = identifier(agent.paneId || agent.progress?.paneId);
     try {
       let text;
-      if (herdrPane) {
-        if (herdrPane === currentPane) throw new Error("The agent points to this preview pane");
-        text = await run(herdr, [
-          "pane",
-          "read",
-          herdrPane,
-          "--source",
-          "visible",
-          "--lines",
-          "200",
-        ]);
-      } else if (tmuxPane) {
-        const server = identifier(agent.terminalServer || agent.progress?.terminalServer);
-        const args = server ? ["-L", server] : [];
-        text = await run("tmux", [...args, "capture-pane", "-p", "-t", tmuxPane]);
+      let kind = herdrPane || tmuxPane ? "terminal" : "activity";
+      if (herdrPane || tmuxPane) {
+        if (herdrPane && herdrPane === currentPane) {
+          throw new Error("The agent points to this preview pane");
+        }
+        try {
+          if (herdrPane) {
+            text = await run(herdr, [
+              "pane",
+              "read",
+              herdrPane,
+              "--source",
+              "visible",
+              "--lines",
+              "200",
+            ]);
+          } else {
+            const server = identifier(agent.terminalServer || agent.progress?.terminalServer);
+            const args = server ? ["-L", server] : [];
+            text = await run("tmux", [...args, "capture-pane", "-p", "-t", tmuxPane]);
+          }
+        } catch (terminalError) {
+          const fallback =
+            (await readAgentActivity(agent)) ||
+            (Array.isArray(agent.output) ? agent.output.join("\n") : "");
+          if (!fallback) throw terminalError;
+          text = fallback;
+          kind = "activity";
+        }
       } else {
         text = await readAgentActivity(agent);
         if (!text) text = Array.isArray(agent.output) ? agent.output.join("\n") : "";
@@ -124,7 +138,7 @@ export function createAgentPreview({
         ...snapshot,
         text: terminalText(text),
         error: zoomError,
-        kind: herdrPane || tmuxPane ? "terminal" : "activity",
+        kind,
         loading: false,
       });
     } catch (error) {

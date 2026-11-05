@@ -216,7 +216,7 @@ function readRepoDeniedHarnesses(cwd) {
     if (!fs.existsSync(cfgPath)) continue;
     try {
       const cfg = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
-      const map = cfg?.repoPolicies;
+      const map = cfg?.repoPolicies || cfg?.repo_policies;
       if (map && typeof map === "object") {
         for (const [pattern, rule] of Object.entries(map)) {
           if (pattern === repoRoot || pattern === path.basename(repoRoot)) {

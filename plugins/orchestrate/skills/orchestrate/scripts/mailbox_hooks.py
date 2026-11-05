@@ -1,4 +1,3 @@
-# cspell:words herdr
 """Turn lifecycle hooks, /clear context adoption, team lead succession notices, and swarm context."""
 
 from __future__ import annotations

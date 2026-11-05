@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# cspell:words herdr
 """Launch a terminal harness with an Orkest status line in a private tmux session."""
 
 from __future__ import annotations

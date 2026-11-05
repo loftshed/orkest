@@ -1,4 +1,3 @@
-// cspell:words mysqld cclsp vtsls herdr
 import { execFile } from "node:child_process";
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";

@@ -1,4 +1,3 @@
-# cspell:words herdr
 """Bind a visible native session to its private Orkest tmux pane, without changing presence."""
 
 from __future__ import annotations

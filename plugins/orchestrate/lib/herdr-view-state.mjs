@@ -1,4 +1,3 @@
-// cspell:words herdr
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { randomUUID } from "node:crypto";

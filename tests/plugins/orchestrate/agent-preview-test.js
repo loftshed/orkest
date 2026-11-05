@@ -375,4 +375,102 @@ describe("agent terminal preview", () => {
     expect(isZoomed).toBe(false);
     expect(snapshots.at(-1)).toBe(null);
   });
+
+  it("formats structured sections from result.json, fallback stdout, messages, and worktree subagent transcripts", async () => {
+    const home = await mkdtemp(path.join(tmpdir(), "ork-activity-rich-"));
+    try {
+      const runDir = path.join(home, "run-1");
+      await mkdir(runDir, { recursive: true });
+      const resultPath = path.join(runDir, "result.json");
+      await writeFile(path.join(runDir, "final-output.txt"), "Live intermediate output\nStep 2");
+
+      const runningSummary = await readAgentActivity({
+        objective: "Audit preview plumbing",
+        resultPath,
+        messages: [{ to: "floomp", text: "Halfway through audit" }],
+      });
+      expect(runningSummary).toContain("Task: Audit preview plumbing");
+      expect(runningSummary).toContain("Messages to orchestrator:\n• Halfway through audit");
+      expect(runningSummary).toContain("Live output:\nLive intermediate output\nStep 2");
+
+      await writeFile(
+        resultPath,
+        JSON.stringify({
+          schema: "agent-executor.result.v2",
+          reported_outcome:
+            "All 5 preview root causes fixed.\n- Consultations enriched\n- Messages attached",
+          uncertainty: "None",
+          verification: { status: "passed" },
+        }),
+      );
+      const finishedSummary = await readAgentActivity({
+        objective: "Audit preview plumbing",
+        resultPath,
+      });
+      expect(finishedSummary).toContain(
+        "All 5 preview root causes fixed.\n- Consultations enriched\n- Messages attached",
+      );
+      expect(finishedSummary).toContain("Uncertainty: None");
+      expect(finishedSummary).toContain("Verification: passed");
+
+      const claudeHome = path.join(home, "claude");
+      const parentSlug = "-work-main-repo";
+      const subagentFile = path.join(
+        claudeHome,
+        "projects",
+        parentSlug,
+        "parent-sess-99",
+        "subagents",
+        "agent-sub99.jsonl",
+      );
+      await mkdir(path.dirname(subagentFile), { recursive: true });
+      await writeFile(
+        subagentFile,
+        `${JSON.stringify({
+          type: "assistant",
+          message: {
+            content: [
+              { type: "tool_use", name: "Bash", input: { command: "git status" } },
+              { type: "text", text: "Summary:\n- First item\n- Second item" },
+            ],
+          },
+        })}\n`,
+      );
+      const worktreeActivity = await readAgentActivity({
+        objective: "Run in worktree",
+        activitySource: {
+          engine: "claude",
+          session: "subagent-sub99",
+          agentId: "sub99",
+          parentSession: "parent-sess-99",
+          cwd: "/work/main-repo/.worktrees/wt-1",
+          parentCwd: "/work/main-repo",
+          accountHome: claudeHome,
+        },
+      });
+      expect(worktreeActivity).toContain("Task: Run in worktree");
+      expect(worktreeActivity).toContain("Recent activity:");
+      expect(worktreeActivity).toContain("Used Bash");
+      expect(worktreeActivity).toContain("Summary:\n- First item\n- Second item");
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("falls back to recorded activity when a finished agent's terminal pane is closed", async () => {
+    const { state, preview } = fixture({ readError: true });
+    const result = await preview.open({
+      id: "finished-worker",
+      herdrPaneId: "w1:p3",
+      objective: "Verify fallback",
+      answer: "Completed verification and reported back.",
+      output: ["Completed verification and reported back."],
+    });
+    expect(state.reads).toHaveLength(1);
+    expect(result.kind).toBe("activity");
+    expect(result.error).toBe("");
+    expect(result.text).toContain("Task: Verify fallback");
+    expect(result.text).toContain("Completed verification and reported back.");
+    await preview.close();
+  });
 });

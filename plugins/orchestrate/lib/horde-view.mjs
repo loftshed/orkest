@@ -1491,8 +1491,11 @@ export class HordeView {
       const t = plain(member?.progress?.task || "").trim();
       return t && t !== "not set" ? t : "";
     };
+    const leadIcon = this.tier === "nerd" ? "\u{F06A9} " : "";
     const leadTitle =
-      lead.name || lead.progress?.name ? `Orchestrator: ${shortAgentName(lead)}` : "Coordinator";
+      lead.name || lead.progress?.name
+        ? `${leadIcon}Orchestrator: ${shortAgentName(lead)}`
+        : `${leadIcon}Coordinator`;
     const leadBranch = plain(
       lead.branch || lead.progress?.branch || lead.worktree?.branch || "",
     ).trim();

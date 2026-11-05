@@ -1,4 +1,3 @@
-# cspell:words herdr
 """Project-scoped peer mailbox: agent sessions in any harness exchange messages within one project.
 
 Store: `<agent-executor cache>/mailbox-v1/`, local files only. `peers/<session>.json` is presence,
@@ -70,6 +69,7 @@ from mailbox_store import (  # noqa: E402, F401
     CLIENT_ID,
     HARNESS_PROCESSES,
     HARNESSES,
+    LEGACY_MARTIAN_NAMES,
     MAIL_SCHEMA,
     MARTIAN_NAMES,
     MAX_AGE,
@@ -105,11 +105,13 @@ from mailbox_store import (  # noqa: E402, F401
     detect_harness,
     display_label,
     display_name,
+    generate_martian,
     harness_fields,
     harness_name,
     harness_pid,
     inbox_dir,
     is_live,
+    is_martian_name,
     legacy_session_keys,
     load,
     locked,
@@ -656,13 +658,13 @@ def register(
         elif (
             peer.get("nativeName")
             and peer.get("nativeNameSource") != "derived"
-            and peer["nativeName"].split("-", 1)[0] in MARTIAN_NAMES
+            and is_martian_name(peer["nativeName"].split("-", 1)[0])
         ):
             peer["name"] = peer["nativeName"]  # chosen at launch, e.g. claude --name "$(ork name)"
             peer["person"] = peer["nativeName"].split("-", 1)[0]
         else:
             # Keep the stored field for older clients, but migrate human names on the next refresh.
-            if peer.get("person") not in MARTIAN_NAMES:
+            if not is_martian_name(peer.get("person")):
                 if isinstance(peer.get("person"), str):
                     old_short_name = readable_name(peer["person"], repository_name(peer), None, None)
                     peer["aliases"] = [*peer.get("aliases", []), old_short_name][-8:]

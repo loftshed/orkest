@@ -1,4 +1,3 @@
-# cspell:words herdr
 """A real Stooges terminal launches once, shows live work, and reconnects without another agent."""
 
 from __future__ import annotations

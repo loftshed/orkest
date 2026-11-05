@@ -47,6 +47,8 @@ session the old one's unread mail and the requests it read in the last day but n
 flagged `carried`, plus its names as addresses, its person and what it was working on. Senders are told
 that the conversation behind their message is gone. Mail sent over native `SendMessage` is not covered.
 
+<!-- cspell:ignore blipzor -->
+
 **Names.** A peer's name reads `martian-model-effort-repo-hex`, for example
 `blipzor-opus-5.5-xhigh-orkest-76`. Agents call each other by that whole name, in messages and to the
 user, never by the nickname alone; each session's hook tells it its own name. The nickname comes from
