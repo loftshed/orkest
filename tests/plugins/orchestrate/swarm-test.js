@@ -242,11 +242,11 @@ it("projects current session status and nesting without treating a lead report a
   const view = new StoogesView(observed, { height: 30, tier: "unicode" });
   const output = view.render(85).join("\n");
   expect(output).toContain("│ ┌ ▸ 1 haiku-1");
-  expect(output).toContain("├─┤Awaiting assignment");
+  expect(output).toContain("├─┤ Awaiting assignment");
   expect(output).toContain("│ ┌ 2 example (lead)");
-  expect(output).toContain("└─┤Investigate");
+  expect(output).toContain("└─┤ Investigate");
   expect(output).toContain("│ ┌ 3 flash-1");
-  expect(output).toContain("└─┤Awaiting assignment");
+  expect(output).toContain("└─┤ Awaiting assignment");
   expect(output).toContain("runtime-model / high | reported complete");
   const absent = await observeRoom(room.id, { root, progress: async () => ({}) });
   expect(absent.agents[0].status).toBe("session unavailable");
@@ -318,13 +318,13 @@ it("assigns preset workforce roles, groups agent cards by working folder, and pr
   expect(output).toContain(`│ ${path.basename(worktreeA)} · 1 agent`);
   expect(output).toContain(`│ ${path.basename(worktreeB)} · 2 agents`);
   expect(output).toContain("│ ┌ ▸ 1 flash-1");
-  expect(output).toContain("├─┤Awaiting assignment");
+  expect(output).toContain("├─┤ Awaiting assignment");
   expect(output).toContain("[builder] gemini:fast | queued");
   expect(output).toContain("│ ┌ 2 haiku-2");
-  expect(output).toContain("├─┤Awaiting assignment");
+  expect(output).toContain("├─┤ Awaiting assignment");
   expect(output).toContain("[reviewer] haiku | queued");
   expect(output).toContain("│ ┌ 3 snorfle");
-  expect(output).toContain("└─┤Map API endpoints");
+  expect(output).toMatch(/└─┤ [⣾⣽⣻⢿⡿⣟⣯⣷] Map API endpoints/u);
   expect(output).toContain("[debugger] haiku / low | working");
 });
 

@@ -654,7 +654,7 @@ describe("tui-box primitives and HordeView unification", () => {
     expect(lines.find((line) => line.includes("Quota"))[1]).toBe("├");
     expect(lines.slice(1, lastCardJunction).every((line) => "│├".includes(line[1]))).toBe(true);
     expect(serviceIndex).toBe(slotsIndex + 1);
-    expect(lines.join("\n")).toContain("├─┤Awaiting assignment");
+    expect(lines.join("\n")).toContain("├─┤ Awaiting assignment");
     expect(lines.every((line) => displayWidth(line) <= 90)).toBe(true);
   });
 
@@ -733,9 +733,9 @@ describe("tui-box primitives and HordeView unification", () => {
     const asciiText = new StoogesView(room, { height: 28, tier: "ascii" }).render(85).join("\n");
     expect(asciiText).toContain("| orkest · 2 agents");
     expect(asciiText).toContain("| + > 1 haiku-1");
-    expect(asciiText).toContain("+-+Awaiting assignment");
+    expect(asciiText).toContain("+-+ Awaiting assignment");
     expect(asciiText).toContain("| + 2 pro-1");
-    expect(asciiText).toContain("`-+Awaiting assignment");
+    expect(asciiText).toContain("`-+ > Awaiting assignment");
     expect(asciiText).toContain("wt:wt-50");
   });
 });
