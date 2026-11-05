@@ -316,6 +316,34 @@
         "1h": 20
       },
       "sources": ["https://platform.claude.com/docs/en/about-claude/pricing"]
+    },
+    "claude-mythos-5-1": {
+      "provider": "anthropic",
+      "rates_per_million": {
+        "fresh_input": 10,
+        "cache_read": 0.25,
+        "cache_write": null,
+        "output": 50
+      },
+      "cache_write_by_ttl": {
+        "5m": 12.5,
+        "1h": 20
+      },
+      "sources": ["https://platform.claude.com/docs/en/about-claude/pricing"]
+    },
+    "mythos": {
+      "provider": "anthropic",
+      "rates_per_million": {
+        "fresh_input": 10,
+        "cache_read": 0.25,
+        "cache_write": null,
+        "output": 50
+      },
+      "cache_write_by_ttl": {
+        "5m": 12.5,
+        "1h": 20
+      },
+      "sources": ["https://platform.claude.com/docs/en/about-claude/pricing"]
     }
   },
   "limitations": [

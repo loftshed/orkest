@@ -752,7 +752,7 @@ describe("room CLI", () => {
       id: "room-claude-subagents",
       cwd,
       root,
-      title: "ADA Upload Redesign",
+      title: "Swarm Dashboard Polish",
     });
     await updateRoom(
       room.id,
@@ -779,7 +779,7 @@ describe("room CLI", () => {
       JSON.stringify({
         schema: "agent-executor.peer.v1",
         session: "subagent-a22a04ba7fa8ef95e",
-        name: "ploomix-claude-opus-5-5-sender-da",
+        name: "ploomix-claude-opus-5-5-orkest-da",
         person: "ploomix",
         shortName: "ploomix",
         harness: "claude",
@@ -802,7 +802,7 @@ describe("room CLI", () => {
       JSON.stringify({
         agentType: "general-purpose",
         model: "claude-fable-5-1",
-        description: "Fable writes ADA wizard spec",
+        description: "Fable writes layout spec",
       }),
     );
     await writeFile(
@@ -816,7 +816,7 @@ describe("room CLI", () => {
       JSON.stringify({
         agentType: "general-purpose",
         model: "sonnet",
-        description: "Sonnet implements ADA Phase 1",
+        description: "Sonnet implements layout Phase 1",
         finished: true,
       }),
     );
@@ -833,7 +833,7 @@ describe("room CLI", () => {
       expect(activeSub).toBeDefined();
       expect(activeSub.model).toBe("claude-fable-5-1");
       expect(activeSub.status).toBe("running");
-      expect(activeSub.progress.task).toBe("Fable writes ADA wizard spec");
+      expect(activeSub.progress.task).toBe("Fable writes layout spec");
       // Timestamp refreshed from .jsonl mtime (much newer than 14m ago):
       expect(Date.parse(activeSub.observedAt)).toBeGreaterThan(Date.parse(staleIso));
 
@@ -843,7 +843,7 @@ describe("room CLI", () => {
       expect(completedSub).toBeDefined();
       expect(completedSub.model).toBe("claude-sonnet-5-5");
       expect(completedSub.status).toBe("reported complete");
-      expect(completedSub.progress.task).toBe("Sonnet implements ADA Phase 1");
+      expect(completedSub.progress.task).toBe("Sonnet implements layout Phase 1");
       expect(completedSub.id).not.toMatch(/^subagent-/u);
     } finally {
       if (prevConfigDir === undefined) {

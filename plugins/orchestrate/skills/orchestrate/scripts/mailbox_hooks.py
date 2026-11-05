@@ -12,6 +12,7 @@ import os
 import re
 import shlex
 import shutil
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -1146,16 +1147,37 @@ def hook(
     if event == "SubagentStart":
         raw_agent_id = payload.get("agent_id") or payload.get("subagent_id")
         if isinstance(raw_agent_id, str) and raw_agent_id.strip():
-            sub_sid = re.sub(r"[^A-Za-z0-9_.-]+", "-", f"subagent-{raw_agent_id.strip()}")[:80]
+            agent_id_clean = raw_agent_id.strip()
+            sub_sid = re.sub(r"[^A-Za-z0-9_.-]+", "-", f"subagent-{agent_id_clean}")[:80]
             agent_type = str(payload.get("agent_type") or payload.get("subagent_type") or "subagent").strip()[:60]
+            raw_transcript = payload.get("transcript_path") or payload.get("transcriptPath")
+            account_home_dir = _MB.account_home(harness, raw_transcript)
+            meta_data: dict[str, Any] = {}
+            sub_jsonl: Path | None = None
+            if isinstance(raw_transcript, str) and raw_transcript.strip():
+                subagents_dir = Path(raw_transcript).expanduser().with_suffix("") / "subagents"
+                meta_candidate = subagents_dir / f"agent-{agent_id_clean}.meta.json"
+                loaded_meta = _MB.load(meta_candidate)
+                if isinstance(loaded_meta, dict):
+                    meta_data = loaded_meta
+                jsonl_candidate = subagents_dir / f"agent-{agent_id_clean}.jsonl"
+                if jsonl_candidate.is_file():
+                    sub_jsonl = jsonl_candidate
             sub_model = payload.get("model") or payload.get("modelName")
             if isinstance(sub_model, dict):
                 sub_model = sub_model.get("id")
             if isinstance(sub_model, str) and sub_model.strip().lower() == "auto":
                 sub_model = None
+            if not (isinstance(sub_model, str) and sub_model.strip()) and sub_jsonl is not None:
+                sub_model = _MB.transcript_model({"transcript_path": str(sub_jsonl)})
+            if not (isinstance(sub_model, str) and sub_model.strip()):
+                meta_model = meta_data.get("model")
+                if isinstance(meta_model, str) and meta_model.strip() and meta_model.strip().lower() != "auto":
+                    sub_model = meta_model.strip()
             if not (isinstance(sub_model, str) and sub_model.strip()):
                 sub_model = _MB.transcript_model(payload)
-            _MB.register(
+            sub_desc = str(meta_data.get("description") or "").strip()[:160]
+            sub_peer = _MB.register(
                 base,
                 session=sub_sid,
                 harness=harness,
@@ -1165,16 +1187,29 @@ def hook(
                 cwd_source="hook",
                 model=sub_model if isinstance(sub_model, str) and sub_model.strip() else None,
                 model_source="runtime",
+                account=account_home_dir,
             )
-            _MB.annotate(base, sub_sid, isSubagent=True, parentSession=session, focus=f"native {agent_type}")
+            extra_annotations: dict[str, Any] = {
+                "isSubagent": True,
+                "parentSession": session,
+                "focus": f"native {agent_type}",
+            }
+            if sub_desc:
+                extra_annotations["subagentDescription"] = sub_desc
+            _MB.annotate(base, sub_sid, **extra_annotations)
             _MB.write(
                 base / "progress" / f"{session_key(sub_sid)}.json",
                 {
+                    "schema": "orchestrate.progress.v1",
                     "session": sub_sid,
+                    "harness": harness,
+                    "machine": socket.gethostname(),
+                    "accountHome": sub_peer.get("accountHome"),
+                    "checkout": sub_peer.get("checkout") or cwd,
                     "role": "builder",
                     "stage": "working",
                     "goal": f"Native {agent_type}",
-                    "task": f"Running {agent_type} subagent ({raw_agent_id.strip()[:12]})",
+                    "task": sub_desc or f"Running {agent_type} subagent ({agent_id_clean[:12]})",
                     "updatedAt": _MB.stamp(),
                 },
             )

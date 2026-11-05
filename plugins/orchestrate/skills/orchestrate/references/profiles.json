@@ -64,6 +64,14 @@
       "prompt_adjustment": "Batch independent reads and make targeted changes. Preserve native append-only history and opaque thinking blocks; allow adequate output."
     },
     {
+      "id": "mythos",
+      "selectors": ["claude:mythos"],
+      "model_ids": ["claude-mythos-5-1", "mythos"],
+      "roles": ["challenge", "hard_task"],
+      "effort_candidate": "medium",
+      "prompt_adjustment": "Batch independent reads and make targeted changes. Preserve native append-only history and opaque thinking blocks; allow adequate output."
+    },
+    {
       "id": "haiku",
       "selectors": ["claude:fast"],
       "model_ids": ["claude-haiku-4-5-20251001", "claude-haiku-4-5", "haiku"],

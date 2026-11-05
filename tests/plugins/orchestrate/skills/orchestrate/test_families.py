@@ -222,7 +222,7 @@ class CoordinatorSelectorTests(unittest.TestCase):
         self.assertTrue(COORDINATOR.native("codex", "opencode", "gpt:sol"))
         self.assertFalse(COORDINATOR.native("claude", "opencode", "deepseek"))
         self.assertTrue(COORDINATOR.native("claude", "opencode", "claude:best"))
-        for alias in ("opus", "sonnet", "haiku", "fable"):
+        for alias in ("opus", "sonnet", "haiku", "fable", "mythos", "claude-mythos-5-1"):
             self.assertTrue(COORDINATOR.native("claude", "claude", alias))
             self.assertFalse(COORDINATOR.native("codex", "claude", alias))
         # Explicit cross-harness first-party dispatches (e.g. Antigravity's Claude/GPT pool) are not native to the host.
@@ -253,6 +253,24 @@ class CoordinatorSelectorTests(unittest.TestCase):
     def test_a_profile_with_an_unknown_selector_is_rejected(self) -> None:
         with self.assertRaises(COORDINATOR.CoordinationError):
             COORDINATOR.resolve_profiles({"profiles": [{"id": "x", "selectors": ["mystery:tier"]}]})
+
+    def test_claude_shorthands_bare_tiers_and_engine_inference(self) -> None:
+        self.assertEqual(COORDINATOR.exact_model("claude", "frontier"), "fable")
+        self.assertEqual(COORDINATOR.exact_model("claude", "best"), "opus")
+        self.assertEqual(COORDINATOR.exact_model("claude", "balanced"), "sonnet")
+        self.assertEqual(COORDINATOR.exact_model("claude", "fast"), "haiku")
+        self.assertEqual(COORDINATOR.exact_model("claude", "mythos"), "claude-mythos-5-1")
+        self.assertEqual(COORDINATOR.exact_model("claude", "mythos-5.1"), "claude-mythos-5-1")
+        self.assertEqual(COORDINATOR.exact_model("claude", "fable-5.1"), "claude-fable-5-1")
+        self.assertEqual(COORDINATOR.exact_model("claude", "opus-5.5"), "claude-opus-5-5")
+        with mock.patch.object(COORDINATOR.RUNNER, "note_selector_advance"):
+            self.assertEqual(
+                COORDINATOR.RUNNER.select_live_model("codex", "sol", live(CODEX)),
+                ("gpt-6.1-sol", "family_latest"),
+            )
+        self.assertEqual(COORDINATOR.RUNNER.native_engine_for("mythos"), "claude")
+        self.assertEqual(COORDINATOR.RUNNER.native_engine_for("astra"), "codex")
+        self.assertEqual(COORDINATOR.RUNNER.native_engine_for("argon-high"), "agy")
 
 
 if __name__ == "__main__":

@@ -101,7 +101,14 @@ def native(host: str, engine: str, model_id: str) -> bool:
 
 def exact_model(engine: str, model_id: str) -> str:
     """A family selector (`gpt:sol`) becomes the live ID it resolves to now, so the run records what ran."""
-    if not RUNNER.families_module().parse_selector(model_id, RUNNER.load_model_families()):
+    if engine == "claude":
+        model_id = RUNNER.normalize_claude_model_id(model_id)
+    families = RUNNER.load_model_families()
+    if engine == "claude":
+        bare = RUNNER.parse_bare_tier_selector("claude", model_id, families)
+        if bare:
+            return str(families[bare[0]]["tiers"][bare[1]])
+    if not RUNNER.families_module().parse_selector(model_id, families):
         return model_id
     return RUNNER.select_live_model(engine, model_id, RUNNER.discover_engine_catalog(engine))[0]
 

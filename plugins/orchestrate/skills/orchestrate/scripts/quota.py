@@ -141,7 +141,8 @@ def _lane_haystack(lane: dict[str, Any]) -> str:
 
 
 def _prefer_claude_pool(candidates: list[dict[str, Any]], model: str | None) -> dict[str, Any]:
-    target_pool = "fable" if model and "fable" in model.lower() else "all"
+    lowered = model.lower() if model else ""
+    target_pool = "fable" if ("fable" in lowered or "mythos" in lowered) else "all"
     for lane in candidates:
         if lane.get("poolId") == target_pool:
             return lane
@@ -484,7 +485,7 @@ def access_records(
                 else "agy"
                 if model.startswith("gemini")
                 else "claude"
-                if model.startswith("claude") or model in {"opus", "sonnet", "haiku", "fable"}
+                if model.startswith("claude") or model in {"opus", "sonnet", "haiku", "fable", "mythos"}
                 else None
             )
             if engine is None or (engine not in DISPATCHABLE and engine != host):

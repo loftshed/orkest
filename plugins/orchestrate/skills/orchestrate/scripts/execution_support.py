@@ -143,6 +143,7 @@ SELECTOR_TIERS: dict[str, int] = {
     "claude:balanced": 2,
     "claude:best": 3,
     "claude:frontier": 4,
+    "claude:mythos": 4,
     "gpt:luna": 1,
     "gpt:terra": 2,
     "gpt:sol": 3,
@@ -174,7 +175,7 @@ def model_capability_tier(model: str | None) -> int | None:
         return SELECTOR_TIERS[normalized]
     leaf = normalized.rsplit("/", 1)[-1].split("[", 1)[0]
     words = {word for word in re.split(r"[^a-z0-9.]+", leaf) if word}
-    if "astra" in words or "fable" in words:
+    if "astra" in words or "fable" in words or "mythos" in words:
         return 4
     if (
         "opus" in words

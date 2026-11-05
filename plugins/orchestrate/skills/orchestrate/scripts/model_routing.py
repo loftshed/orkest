@@ -32,7 +32,16 @@ PREFERRED_MODELS = {
     "opencode": "glm:flash",
     "claude": "opus",
 }
-CLAUDE_MODEL_ALIASES = ("opus", "sonnet", "haiku", "fable")
+CLAUDE_MODEL_ALIASES = ("opus", "sonnet", "haiku", "fable", "claude-mythos-5-1")
+CLAUDE_MODEL_SHORTHANDS = {
+    "mythos": "claude-mythos-5-1",
+    "mythos-5-1": "claude-mythos-5-1",
+    "mythos-5": "claude-mythos-5",
+}
+_CLAUDE_VERSIONED_SHORTHAND = re.compile(
+    r"^(?:claude-)?(opus|sonnet|haiku|fable|mythos)-(\d+(?:[.-]\d+)*)(\[1m\])?$",
+    re.IGNORECASE,
+)
 CLAUDE_MODEL_ID = re.compile(r"^claude-[a-z0-9][a-z0-9.\-]*(\[1m\])?$")
 EXIT_ROUTE_NOT_ALLOWED = 17
 DEFAULT_CATALOG_MAX_AGE_SECONDS = 24 * 60 * 60
@@ -40,10 +49,49 @@ MODEL_CATALOG_SCHEMA = "agent-executor.models.v1"
 MODEL_CACHE_SCHEMA = "agent-executor.model-cache.v1"
 
 _NATIVE_FAMILIES = (
-    ("claude", {"anthropic"}, {"claude", "opus", "sonnet", "haiku", "fable"}),
-    ("codex", {"openai"}, {"gpt", "chatgpt", "codex"}),
-    ("agy", {"google", "google-ai-studio", "google-vertex", "vertex"}, {"gemini"}),
+    ("claude", {"anthropic"}, {"claude", "opus", "sonnet", "haiku", "fable", "mythos"}),
+    ("codex", {"openai"}, {"gpt", "chatgpt", "codex", "astra", "sol", "terra", "luna"}),
+    ("agy", {"google", "google-ai-studio", "google-vertex", "vertex"}, {"gemini", "argon"}),
 )
+_ENGINE_DEFAULT_FAMILY = {
+    "codex": "gpt",
+    "agy": "gemini",
+    "claude": "claude",
+}
+_BARE_TIER_ALIASES = {
+    ("agy", "flash"): ("gemini", "fast"),
+    ("agy", "flash-medium"): ("gemini", "fast"),
+    ("agy", "argon-medium"): ("gemini", "argon"),
+}
+
+
+def normalize_claude_model_id(model: str) -> str:
+    stripped = model.strip()
+    lowered = stripped.lower()
+    if lowered in CLAUDE_MODEL_SHORTHANDS:
+        return CLAUDE_MODEL_SHORTHANDS[lowered]
+    match = _CLAUDE_VERSIONED_SHORTHAND.match(stripped)
+    if match:
+        family, version, suffix = match.groups()
+        normalized_ver = version.replace(".", "-")
+        return f"claude-{family.lower()}-{normalized_ver}{(suffix or '').lower()}"
+    return stripped
+
+
+def parse_bare_tier_selector(
+    engine: str,
+    selector: str,
+    families: dict[str, dict[str, Any]],
+) -> tuple[str, str] | None:
+    lowered = selector.strip().lower()
+    alias = _BARE_TIER_ALIASES.get((engine, lowered))
+    if alias and alias[0] in families and alias[1] in families[alias[0]].get("tiers", {}):
+        return alias
+    default_family = _ENGINE_DEFAULT_FAMILY.get(engine)
+    if default_family and default_family in families and lowered in families[default_family].get("tiers", {}):
+        return default_family, lowered
+    return None
+
 
 # How each select_live_model() outcome was checked against the live catalog, for the result record.
 MODEL_PREFLIGHT = {
@@ -859,6 +907,10 @@ def resolve_family_selector(engine: str, selector: str, available_models: list[s
     module = _attr("families_module")()
     families = _attr("load_model_families")()
     parsed = module.parse_selector(selector, families)
+    is_bare_tier = False
+    if not parsed:
+        parsed = parse_bare_tier_selector(engine, selector, families)
+        is_bare_tier = parsed is not None
     if not parsed:
         return None
     name, tier = parsed
@@ -870,7 +922,8 @@ def resolve_family_selector(engine: str, selector: str, available_models: list[s
         model = module.resolve(name, tier, families, available_models)
     except module.SelectorError as error:
         raise _runner_error(str(error), 14) from error
-    _attr("note_selector_advance")(selector, model)
+    canonical_selector = f"{name}:{tier}" if is_bare_tier else selector
+    _attr("note_selector_advance")(canonical_selector, model)
     return model
 
 
@@ -949,6 +1002,8 @@ def select_live_model(
     available_models = [model["id"] for model in catalog.get("models", []) if not model.get("hidden", False)]
     model, _ = split_opencode_model(engine, requested_model or _attr("preferred_model")(engine))
     assert model is not None
+    if engine == "claude":
+        model = normalize_claude_model_id(model)
     if model in available_models:
         reason = "exact_user_request" if requested_model else "validated_preference"
         return model, reason
@@ -1031,6 +1086,13 @@ def resolve_route(args: argparse.Namespace) -> argparse.Namespace:
         parsed = _attr("families_module")().parse_selector(base_model, families)
         if parsed:
             args.engine = families[parsed[0]]["engine"]
+        elif base_model:
+            if base_model.lower().startswith(("openrouter/", "opencode/")):
+                args.engine = "opencode"
+            else:
+                inferred = _attr("native_engine_for")(base_model)
+                if inferred:
+                    args.engine = inferred
     args.engine = args.engine or (route or {}).get("engine") or _attr("DEFAULT_ENGINE", DEFAULT_ENGINE)
     route = route or module.engine_default(args.engine, routes)
     route_variant = None
