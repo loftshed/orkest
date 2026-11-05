@@ -1111,9 +1111,11 @@ export class HordeView {
   }
 
   quotaLines(width) {
-    if (this.room.quotaError) return [`Quota unavailable: ${plain(this.room.quotaError)}`];
+    if (this.room.quotaError) return [` Quota unavailable: ${plain(this.room.quotaError)}`];
     const accounts = this.room.accounts || [];
-    return quotaRows(accounts, Math.max(10, width - 4), this.tier, this.appearance, this.now());
+    return quotaRows(accounts, Math.max(10, width - 5), this.tier, this.appearance, this.now()).map(
+      (line) => ` ${line}`,
+    );
   }
 
   updateLine(innerWidth) {
@@ -1159,9 +1161,9 @@ export class HordeView {
   quotaSummaryLines(innerWidth) {
     const chevron = disclosure("", true, this.tier);
     const chevronWidth = displayWidth(chevron);
-    const stripWidth = Math.max(1, innerWidth - chevronWidth - 1);
+    const stripWidth = Math.max(1, innerWidth - chevronWidth - 2);
     const appendChevron = (line, isFirst) => {
-      const fitted = fitStyled(line, stripWidth);
+      const fitted = fitStyled(` ${line}`, stripWidth + 1);
       if (!isFirst) return `${fitted}${" ".repeat(chevronWidth + 1)}`;
       const mark = tone(
         chevron,
@@ -1490,6 +1492,7 @@ export class HordeView {
       leadLines = ["Coordinator session unavailable"];
       if (room.objective) leadLines.push(plain(room.objective));
     }
+    leadLines = leadLines.map((line) => ` ${line}`);
     const maxAgents = room.swarm?.maxAgents ?? 64;
     const hasAgentTree = room.agents.length > 0;
     const withRail = (line) =>
