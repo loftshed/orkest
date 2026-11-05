@@ -61,6 +61,27 @@ class RestoreTests(unittest.TestCase):
         with mock.patch.object(views.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")):
             self.assertEqual(api.call("pane", "run", "w1:p2", "node view.mjs"), {})
 
+    def test_new_pane_waits_for_shell_startup_before_launching_view(self):
+        idle = self.api.info.copy()
+        starting = {**idle, "foreground_processes": [{"pid": 101, "name": "shell startup"}]}
+        original = self.api.processes
+        inspections = iter([starting, starting, idle])
+
+        def inspect(pane):
+            return next(inspections, None) or original(pane)
+
+        with mock.patch.object(self.api, "processes", side_effect=inspect), mock.patch.object(views.time, "sleep"):
+            outcome = views.restore(self.base, self.env, self.api, shell_ready_timeout=10)
+        self.assertEqual(outcome, [{"room": "room-a", "status": "restored"}])
+        self.assertEqual(len(self.api.runs), 1)
+
+    def test_shell_startup_timeout_preserves_busy_pane(self):
+        self.api.info["foreground_processes"] = [{"pid": 300, "name": "editor"}]
+        with mock.patch.object(views.time, "monotonic", side_effect=[0, 11]):
+            outcome = views.restore(self.base, self.env, self.api, shell_ready_timeout=10)
+        self.assertEqual(outcome, [{"room": "room-a", "status": "busy_or_unknown"}])
+        self.assertEqual(self.api.runs, [])
+
     def test_snapshot_agents_are_not_counted_as_additional_panes(self):
         api = views.Herdr("herdr", self.env)
         snapshot = {"snapshot": {"panes": [self.api.pane], "agents": [self.api.pane]}}
