@@ -70,6 +70,11 @@ describe("adopting the running conversation", () => {
     });
     expect(result.room.herdrCoordinatorPaneId).toBe("w1:p2");
     expect(result.room.objective).toBe("Coordinate search work");
+    expect(result.brief).toContain("You are the root coordinator of an Orkest swarm.");
+    expect(result.brief).toContain("Route every action:");
+    expect(result.brief).toContain("live-session");
+    expect(result.briefPath).toBe(path.join(root, "swarm-briefs", result.room.id, "conductor.md"));
+    expect(await readFile(result.briefPath, "utf8")).toContain("Coordinate search work");
     expect(refreshed).toEqual([{ room: result.room.id, session: "live-session" }]);
     expect((await readRoom(result.room.id, root)).conductor.session.id).toBe("live-session");
     const presence = await readFile(path.join(root, "peers/live-session.json"), "utf8");

@@ -100,7 +100,9 @@ An explicit model/effort must match what the host actually sends to its tool.
 3. Wait through the native tool. At the task deadline, interrupt that exact tool using its native
    cancellation facility and collect its terminal result. The guard deliberately retains the lease
    until terminal evidence arrives; expiry alone cannot prove a native tool stopped. `next` returns
-   an `interrupt` action for an overdue active run. Do not leave native work unsupervised.
+   an `interrupt` action for an overdue active run. Do not leave native work unsupervised; a
+   background native task whose completion returns to you is supervised, so ending your turn while it
+   runs does not abandon it—check `next --task-dir` for an `interrupt` action when you next act.
 4. Save the actual five-heading report outside the worktree. Call `native-complete --run-id ID
 --packet receipt.json`. The receipt requires `native_handle`, the actual host `event_id`,
    `terminal: true`, `tool_status` (`completed` or an honest failure), and `report_path`.
@@ -167,10 +169,14 @@ and matching excerpts are not semantic proof. A worker cannot mint a receipt by 
 
 ## Review, correction, decisions, and acknowledgment
 
-Prefer conductor completion for a small, understood remaining fix within the authorized scope.
-Compare the cost of making and verifying it locally with briefing, waiting for, and reviewing another
-worker turn. A correction allowance is a limit, not a required step. Use a focused worker correction
-when substantial work remains and its context makes the worker better placed to finish.
+In a solo session, prefer conductor completion for a small, understood remaining fix within the
+authorized scope: compare the cost of making and verifying it locally with briefing, waiting for, and
+reviewing another worker turn. In a conversational swarm (`ORKEST_SWARM_ROOM` or a promoted
+coordinator), route follow-ups and repairs back to the worker session that holds the file context
+(native message/resume for native subagents, or one audited `dispatch --kind correction` for executor
+runs) and reserve conductor takeover for a second executor gap, a scope/history violation, or a fix you
+can state before opening the file when no worker session or lease owns the path. A correction allowance
+is a limit (at most one per audited task), not a required step.
 
 New tasks require the persisted host review ID. `review --run-id ID --decision supported --review-id
 ID` records supported advice. `dispatch --kind correction --request-id repair-1 --review-id ID`

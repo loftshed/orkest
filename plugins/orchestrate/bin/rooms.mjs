@@ -16,6 +16,7 @@ import {
   readLaunchPlan,
   recoverRoom,
   reserveLead,
+  writeCoordinatorBrief,
 } from "../lib/rooms.mjs";
 import { promoteSession } from "../lib/session-promotion.mjs";
 
@@ -211,6 +212,13 @@ export async function roomsCommand(
         },
         { root },
       );
+      if (result.swarm) {
+        try {
+          await writeCoordinatorBrief(result, { root });
+        } catch {
+          // Best-effort refresh of conductor.md after objective update.
+        }
+      }
       break;
     }
     case "pause":
