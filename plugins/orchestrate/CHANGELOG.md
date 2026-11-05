@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.54.1
+
+- test(orchestrate): compare Swarm View terminal captures (#90)
+
 ## 0.54.0
 
 - feat(orchestrate): support Mythos and tier shorthands across model routing (#91)
