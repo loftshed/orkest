@@ -69,7 +69,7 @@ PREFERRED_MODELS = {
 }
 # Claude Code has no model-list command. Its aliases resolve to the current model of each tier; exact
 # `claude-*` IDs are passed through and recorded as unverified.
-CLAUDE_MODEL_ALIASES = ("opus", "sonnet", "haiku", "fable")
+CLAUDE_MODEL_ALIASES = ("opus", "sonnet", "haiku", "fable", "claude-mythos-5-1")
 CLAUDE_MODEL_ID = re.compile(r"^claude-[a-z0-9][a-z0-9.\-]*(\[1m\])?$")
 # Host session state that must not leak into an executor: harness session IDs, control endpoints,
 # messaging tokens, and the host's account profile (an executor could otherwise act inside, or bill to,
@@ -858,6 +858,8 @@ def executor_environment(
 
 _NATIVE_FAMILIES = _MODEL_ROUTING_MOD._NATIVE_FAMILIES
 native_engine_for = _MODEL_ROUTING_MOD.native_engine_for
+normalize_claude_model_id = _MODEL_ROUTING_MOD.normalize_claude_model_id
+parse_bare_tier_selector = _MODEL_ROUTING_MOD.parse_bare_tier_selector
 enforce_native_route = _MODEL_ROUTING_MOD.enforce_native_route
 families_module = _MODEL_ROUTING_MOD.families_module
 load_model_families = _MODEL_ROUTING_MOD.load_model_families

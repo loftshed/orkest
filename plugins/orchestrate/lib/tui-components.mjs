@@ -29,9 +29,11 @@ const CONTROL_ICONS = Object.freeze({
 export function providerMark(provider, tier = "nerd") {
   if (tier !== "nerd") return "";
   const name = String(provider || "").toLowerCase();
-  if (/^(?:claude|anthropic)/u.test(name)) return "\u{EC82}";
-  if (/^(?:gemini|google|agy|antigravity)/u.test(name)) return "\u{E7F0}";
-  if (/^(?:gpt|codex|openai)/u.test(name)) return "\u{EC81}";
+  if (/^(?:claude|anthropic|opus|sonnet|haiku|fable|mythos)(?:$|[-_.:/\s\d])/u.test(name))
+    return "\u{EC82}";
+  if (/^(?:gemini|google|agy|antigravity|argon|flash)(?:$|[-_.:/\s\d])/u.test(name))
+    return "\u{E7F0}";
+  if (/^(?:gpt|codex|openai|astra|sol|terra|luna)(?:$|[-_.:/\s\d])/u.test(name)) return "\u{EC81}";
   return "";
 }
 

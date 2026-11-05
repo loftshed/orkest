@@ -44,7 +44,13 @@
     "claude": {
       "engine": "claude",
       "default_tier": "best",
-      "tiers": { "fast": "haiku", "balanced": "sonnet", "best": "opus", "frontier": "fable" },
+      "tiers": {
+        "fast": "haiku",
+        "balanced": "sonnet",
+        "best": "opus",
+        "frontier": "fable",
+        "mythos": "claude-mythos-5-1"
+      },
       "tier_strengths": {
         "fast": [
           "low-latency tasks",
@@ -59,7 +65,8 @@
           "visual understanding"
         ],
         "best": ["complex reasoning", "agentic coding", "knowledge work"],
-        "frontier": ["demanding reasoning", "long-running agentic coding", "multi-step research"]
+        "frontier": ["demanding reasoning", "long-running agentic coding", "multi-step research"],
+        "mythos": ["demanding reasoning", "long-running agentic coding", "multi-step research"]
       }
     },
     "deepseek": {

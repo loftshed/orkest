@@ -1601,7 +1601,14 @@ else:
         self.assertNotIn("codex-hidden", [model["id"] for model in codex["models"]])
         # Claude has no model-list command: the catalog offers tier aliases without invoking Claude.
         self.assertEqual(claude["status"], "live")
-        self.assertEqual([model["id"] for model in claude["models"]], ["opus", "sonnet", "haiku", "fable"])
+        self.assertEqual(
+            [model["id"] for model in claude["models"]],
+            ["opus", "sonnet", "haiku", "fable", "claude-mythos-5-1"],
+        )
+        self.assertEqual(
+            RUNNER.select_live_model("claude", "mythos", claude),
+            ("claude-mythos-5-1", "exact_user_request"),
+        )
         self.assertFalse(unsafe_call.exists())
 
     def test_catalog_filters_by_engine_and_model_substring(self) -> None:

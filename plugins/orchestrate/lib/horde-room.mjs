@@ -204,22 +204,49 @@ export function parseTeam(text) {
     const effort = parts.length > 1 && EFFORTS.has(parts.at(-1)) ? parts.pop() : undefined;
     const tier = parts.join(":");
     let model = tier;
-    if (engine === "codex" && ["luna", "sol", "terra", "astra"].includes(tier))
-      model = `gpt:${tier}`;
-    if (
+    const claudeTierMap = {
+      fast: "haiku",
+      balanced: "sonnet",
+      best: "opus",
+      frontier: "fable",
+      mythos: "claude-mythos-5-1",
+      "mythos-5-1": "claude-mythos-5-1",
+      "mythos-5.1": "claude-mythos-5-1",
+      "mythos-5": "claude-mythos-5",
+    };
+    if (engine === "claude") {
+      const loweredTier = tier.toLowerCase();
+      if (Object.hasOwn(claudeTierMap, loweredTier)) {
+        model = claudeTierMap[loweredTier];
+      } else if (/^(?:claude-)?(?:opus|sonnet|haiku|fable|mythos)-\d+(?:[.-]\d+)*$/iu.test(tier)) {
+        const prefixed = loweredTier.startsWith("claude-") ? loweredTier : `claude-${loweredTier}`;
+        model = prefixed.replaceAll(".", "-");
+      }
+    } else if (engine === "codex") {
+      if (["luna", "sol", "terra", "astra"].includes(tier)) {
+        model = `gpt:${tier}`;
+      } else if (/^\d+(?:\.\d+)?-(?:luna|sol|terra|astra)$/iu.test(tier)) {
+        model = `gpt-${tier.toLowerCase()}`;
+      }
+    } else if (
       engine === "agy" &&
       [
         "fast",
         "flash",
         "flash-low",
+        "flash-medium",
         "flash-high",
         "pro",
         "argon",
         "argon-low",
+        "argon-medium",
         "argon-high",
       ].includes(tier)
-    )
-      model = tier === "flash" ? "gemini:fast" : `gemini:${tier}`;
+    ) {
+      if (tier === "flash" || tier === "flash-medium") model = "gemini:fast";
+      else if (tier === "argon-medium") model = "gemini:argon";
+      else model = `gemini:${tier}`;
+    }
     for (let i = 0; i < count; i++)
       members.push({
         engine,
