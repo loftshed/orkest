@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.51.0
+
+- feat(orchestrate): restore owned Herdr swarm views after restart
+- feat(orchestrate): clarify swarm activity and consultation display
+- feat(orchestrate): zero-token /swarm & /horde hook intercept and Ctrl+Option+S shortcut
+- feat(orchestrate,monitor): add cleanup, side, update, policy, next & swarm TUI upgrades
+
 ## 0.50.0
 
 - feat(orchestrate): horde/foundry convergence, Herdr integration, cross-harness fixes & workboard leases (#73)

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.16.0
+
+- feat(orchestrate,monitor): add cleanup, side, update, policy, next & swarm TUI upgrades
+
 ## 0.15.0
 
 - feat(monitor): distinguish reset credits and weekly rollover changes (#30)

@@ -161,8 +161,8 @@ The repository ships two plugins. Their READMEs cover full CLI flags, routing ta
 
 | Plugin                                         | Version | What it does                                                       |
 | ---------------------------------------------- | ------- | ------------------------------------------------------------------ |
-| [`orchestrate`](plugins/orchestrate/README.md) | 0.50.0  | Coordinator conversations, swarms, delegation and shared work.     |
-| [`monitor`](plugins/monitor/README.md)         | 0.15.0  | Account quota, reset times, credit balances and spending guidance. |
+| [`orchestrate`](plugins/orchestrate/README.md) | 0.51.0  | Coordinator conversations, swarms, delegation and shared work.     |
+| [`monitor`](plugins/monitor/README.md)         | 0.16.0  | Account quota, reset times, credit balances and spending guidance. |
 
 ## Install
 
