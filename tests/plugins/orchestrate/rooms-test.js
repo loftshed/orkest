@@ -576,6 +576,7 @@ describe("room CLI", () => {
         name: "reviewer",
         harness: "claude",
         state: "idle",
+        accountHome: path.join(root, "claude-home"),
         cwd,
         pid: process.pid,
         startedAt: now,
@@ -589,6 +590,7 @@ describe("room CLI", () => {
         session,
         harness: "claude",
         machine: hostname(),
+        accountHome: path.join(root, "claude-home"),
         checkout: cwd,
         goal: "Inspect cache",
         task: "Review result",
@@ -609,6 +611,11 @@ describe("room CLI", () => {
       status: "review",
       runtimeState: "idle",
       progress: { stage: "review" },
+      activitySource: {
+        engine: "claude",
+        session,
+        accountHome: path.join(root, "claude-home"),
+      },
     });
   });
 
@@ -656,6 +663,7 @@ describe("room CLI", () => {
         name: "gribble-gemini-3-flash-orkest-ab",
         shortName: "gribble",
         harness: "gemini",
+        accountHome: path.join(root, "gemini-home"),
         model: "gemini-3.8-flash-high",
         effort: "high",
         state: "busy",
@@ -674,6 +682,7 @@ describe("room CLI", () => {
         session: "native-sub-1",
         harness: "gemini",
         machine: hostname(),
+        accountHome: path.join(root, "gemini-home"),
         checkout: cwd,
         role: "scout",
         goal: "Upgrade Swarm View",
@@ -709,6 +718,14 @@ describe("room CLI", () => {
     expect(nativeAgent.branch).toBe("feat/swarm-view");
     expect(nativeAgent.herdrPaneId).toBe("herdr-pane-77");
     expect(nativeAgent.progress.task).toBe("Auditing native subagent discovery");
+    expect(nativeAgent.activitySource).toEqual({
+      engine: "agy",
+      session: "native-sub-1",
+      accountHome: path.join(root, "gemini-home"),
+      parentSession: undefined,
+      cwd,
+      startedAt: nowIso,
+    });
     expect(observed.agents.some((agent) => agent.nativeSession === "claimed-by-other-room")).toBe(
       false,
     );
@@ -716,5 +733,124 @@ describe("room CLI", () => {
     // Persisted room on disk remains untouched (only 1 declared agent):
     const onDisk = await readRoom(room.id, root);
     expect(onDisk.agents).toHaveLength(1);
+  });
+
+  it("enriches active Claude Code background subagents from .meta.json/.jsonl and retains completed subagents", async () => {
+    const rawRoot = await directory();
+    const root = await realpath(rawRoot);
+    const rawCwd = await directory();
+    const cwd = await realpath(rawCwd);
+    const accountHome = await directory();
+    const parentSession = "aefa8a6b-23c2-42d9-b932-5205dcf251d2";
+    const slug = cwd.replaceAll(/[^A-Za-z0-9-]/gu, "-");
+    const subagentsDir = path.join(accountHome, "projects", slug, parentSession, "subagents");
+    await mkdir(subagentsDir, { recursive: true });
+    await mkdir(path.join(root, "peers"), { recursive: true });
+    await mkdir(path.join(root, "progress"), { recursive: true });
+
+    const room = await newRoom([], {
+      id: "room-claude-subagents",
+      cwd,
+      root,
+      title: "ADA Upload Redesign",
+    });
+    await updateRoom(
+      room.id,
+      (current) => {
+        current.conductor.name = "floomp";
+        current.conductor.person = "floomp";
+        current.conductor.engine = "claude";
+        current.conductor.model = "claude-opus-5-5";
+        current.conductor.session = {
+          id: parentSession,
+          engine: "claude",
+          machine: hostname(),
+          cwd,
+        };
+        return current;
+      },
+      { root },
+    );
+
+    const staleIso = new Date(Date.now() - 14 * 60_000).toISOString();
+    // Active subagent peer written by old SubagentStart (wrong parent model & focus, stale lastSeenAt)
+    await writeFile(
+      path.join(root, "peers", "subagent-a22a04ba7fa8ef95e.json"),
+      JSON.stringify({
+        schema: "agent-executor.peer.v1",
+        session: "subagent-a22a04ba7fa8ef95e",
+        name: "ploomix-claude-opus-5-5-sender-da",
+        person: "ploomix",
+        shortName: "ploomix",
+        harness: "claude",
+        model: "claude-opus-5-5",
+        state: "busy",
+        cwd,
+        checkout: cwd,
+        accountHome,
+        pid: process.pid,
+        sharedProcess: true,
+        isSubagent: true,
+        parentSession,
+        focus: "native general-purpose",
+        startedAt: staleIso,
+        lastSeenAt: staleIso,
+      }),
+    );
+    await writeFile(
+      path.join(subagentsDir, "agent-a22a04ba7fa8ef95e.meta.json"),
+      JSON.stringify({
+        agentType: "general-purpose",
+        model: "claude-fable-5-1",
+        description: "Fable writes ADA wizard spec",
+      }),
+    );
+    await writeFile(
+      path.join(subagentsDir, "agent-a22a04ba7fa8ef95e.jsonl"),
+      `${JSON.stringify({ message: { model: "claude-fable-5-1" } })}\n`,
+    );
+
+    // Completed subagent whose peer file was deleted by SubagentStop
+    await writeFile(
+      path.join(subagentsDir, "agent-a24fc1a93a67c7e27.meta.json"),
+      JSON.stringify({
+        agentType: "general-purpose",
+        model: "sonnet",
+        description: "Sonnet implements ADA Phase 1",
+        finished: true,
+      }),
+    );
+    await writeFile(
+      path.join(subagentsDir, "agent-a24fc1a93a67c7e27.jsonl"),
+      `${JSON.stringify({ message: { model: "claude-sonnet-5-5" } })}\n`,
+    );
+
+    const prevConfigDir = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = accountHome;
+    try {
+      const observed = await observeRoom(room.id, { root });
+      const activeSub = observed.agents.find((a) => a.id === "ploomix");
+      expect(activeSub).toBeDefined();
+      expect(activeSub.model).toBe("claude-fable-5-1");
+      expect(activeSub.status).toBe("running");
+      expect(activeSub.progress.task).toBe("Fable writes ADA wizard spec");
+      // Timestamp refreshed from .jsonl mtime (much newer than 14m ago):
+      expect(Date.parse(activeSub.observedAt)).toBeGreaterThan(Date.parse(staleIso));
+
+      const completedSub = observed.agents.find(
+        (a) => a.nativeSession === "subagent-a24fc1a93a67c7e27",
+      );
+      expect(completedSub).toBeDefined();
+      expect(completedSub.model).toBe("claude-sonnet-5-5");
+      expect(completedSub.status).toBe("reported complete");
+      expect(completedSub.progress.task).toBe("Sonnet implements ADA Phase 1");
+      expect(completedSub.id).not.toMatch(/^subagent-/u);
+    } finally {
+      if (prevConfigDir === undefined) {
+        delete process.env.CLAUDE_CONFIG_DIR;
+      } else {
+        process.env.CLAUDE_CONFIG_DIR = prevConfigDir;
+      }
+    }
   });
 });

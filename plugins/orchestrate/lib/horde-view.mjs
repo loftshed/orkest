@@ -18,12 +18,24 @@ import {
   glyphSet,
   glyphTier,
   plain,
-  progressBar,
   SPINNER,
   tone,
   wrapText,
 } from "./tui-box.mjs";
-import { sectionHeading, statusRow, treeCard } from "./tui-components.mjs";
+import {
+  actionBar,
+  colorProviderMarks,
+  disclosure,
+  hitTest,
+  lineGauge,
+  meterStrip,
+  providerMark,
+  quotaAccountLabel,
+  quotaAccountScope,
+  sectionHeading,
+  statusRow,
+  treeCard,
+} from "./tui-components.mjs";
 import { resolveTheme } from "./tui-theme.mjs";
 
 export {
@@ -266,17 +278,46 @@ function summarizePoolWindows(group) {
   return prefix ? `${prefix} · ${metrics}` : metrics;
 }
 
+function quotaExpandedLabel(account, tier, width = 80) {
+  const base = quotaAccountLabel(account, tier);
+  if (tier !== "nerd" || width < 72) return base;
+  const short = plain(account.short || account.id || "?").trim();
+  const accountScope = quotaAccountScope(account);
+  const brand = providerMark(account.provider, tier);
+  if (accountScope === "work") {
+    return [brand, "\u{F1AD} Work", short ? `· ${short}` : ""].filter(Boolean).join(" ");
+  }
+  if (accountScope === "personal") {
+    return [brand, "\u{F007} Personal", short ? `· ${short}` : ""].filter(Boolean).join(" ");
+  }
+  const provider = String(account.provider || "").toLowerCase();
+  if (/^(?:gpt|codex|openai)/u.test(provider)) {
+    return [brand, "\u{F007} Codex", short && short !== "CX" ? `· ${short}` : ""]
+      .filter(Boolean)
+      .join(" ");
+  }
+  if (/^(?:gemini|google|agy|antigravity)/u.test(provider)) {
+    return [brand, "\u{F007} Antigravity"].filter(Boolean).join(" ");
+  }
+  return base;
+}
+
 function quotaRows(accounts, width, tier, color, now = Date.now()) {
-  const rows = [];
+  const entries = [];
   const accountList = accounts || [];
   for (const account of accountList) {
     const windows = Array.isArray(account.windows) ? account.windows : [];
-    const short = plain(account.short || account.id || "?");
+    const short = quotaAccountLabel(account, tier);
+    const expandedShort = quotaExpandedLabel(account, tier, width);
     const creditSuffix = formatCreditSuffix(account);
     const refNow =
       Number.isFinite(account.fetchedAt) && now < 1_000_000_000_000 ? account.fetchedAt : now;
     if (windows.length === 0) {
-      rows.push(plain(`${short} ${renderLine([account]) || "quota unavailable"}${creditSuffix}`));
+      entries.push({
+        raw: plain(
+          `${expandedShort} ${renderLine([account]) || "quota unavailable"}${creditSuffix}`,
+        ),
+      });
       continue;
     }
     if (windows.length === 1 && accountList.length === 1) {
@@ -286,17 +327,9 @@ function quotaRows(accounts, width, tier, color, now = Date.now()) {
         : undefined;
       const label = plain(`${short} ${window.label || window.id || "quota"}`);
       const resetSuffix = pct === undefined ? "" : formatGroupResetSuffix(windows, refNow);
-      const suffix =
+      const summary =
         pct === undefined ? "unavailable" : `${Math.round(pct)}% left${creditSuffix}${resetSuffix}`;
-      const barWidth = Math.max(
-        3,
-        Math.min(14, width - displayWidth(label) - displayWidth(suffix) - 2),
-      );
-      rows.push(
-        pct === undefined
-          ? `${label} ${suffix}`
-          : `${label} ${tone(progressBar(pct / 100, barWidth, tier), pct <= 10 ? "error" : "success", color)} ${suffix}`,
-      );
+      entries.push({ label, pct, summary, maxBar: 14, minBar: 3 });
       continue;
     }
     const hasPools = windows.some((w) => typeof w.pool === "string" && w.pool.trim());
@@ -307,22 +340,14 @@ function quotaRows(accounts, width, tier, color, now = Date.now()) {
         if (!poolGroups.has(poolKey)) poolGroups.set(poolKey, []);
         poolGroups.get(poolKey).push(w);
       }
-      for (const [, group] of poolGroups) {
+      for (const group of poolGroups.values()) {
         const measured = group.filter((w) => Number.isFinite(w.remainingPct));
         const minPct =
           measured.length > 0 ? Math.min(100, ...measured.map((w) => w.remainingPct)) : undefined;
         const pct = minPct === undefined ? undefined : Math.max(0, minPct);
         const resetSuffix = formatGroupResetSuffix(group, refNow);
         const summary = `${summarizePoolWindows(group)}${creditSuffix}${resetSuffix}`;
-        const barWidth = Math.max(
-          4,
-          Math.min(10, width - displayWidth(short) - displayWidth(summary) - 2),
-        );
-        rows.push(
-          pct === undefined
-            ? `${short} ${summary}`
-            : `${short} ${tone(progressBar(pct / 100, barWidth, tier), pct <= 10 ? "error" : "success", color)} ${summary}`,
-        );
+        entries.push({ label: expandedShort, pct, summary, maxBar: 8, minBar: 4 });
       }
       continue;
     }
@@ -339,17 +364,32 @@ function quotaRows(accounts, width, tier, color, now = Date.now()) {
       windows.length === 1
         ? `${plain(windows[0].label || windows[0].id || "quota")} ${pct === undefined ? "unavailable" : `${Math.round(pct)}% left`}${creditSuffix}${resetSuffix}`
         : `${summarizeAccountWindows(windows)}${creditSuffix}${resetSuffix}`;
-    const barWidth = Math.max(
-      4,
-      Math.min(10, width - displayWidth(short) - displayWidth(summary) - 2),
-    );
-    rows.push(
-      pct === undefined
-        ? `${short} ${summary}`
-        : `${short} ${tone(progressBar(pct / 100, barWidth, tier), pct <= 10 ? "error" : "success", color)} ${summary}`,
-    );
+    entries.push({ label: expandedShort, pct, summary, maxBar: 8, minBar: 4 });
   }
-  return rows.length > 0 ? rows : ["Quota unavailable"];
+  if (entries.length === 0) return ["Quota unavailable"];
+  let labelCol = 0;
+  for (const entry of entries) {
+    if (entry.label) labelCol = Math.max(labelCol, displayWidth(entry.label));
+  }
+  const rows = [];
+  for (const entry of entries) {
+    if (entry.raw) {
+      rows.push(entry.raw);
+      continue;
+    }
+    const paddedLabel = entries.length > 1 ? fit(entry.label, labelCol) : entry.label;
+    if (entry.pct === undefined) {
+      rows.push(`${paddedLabel} ${entry.summary}`);
+      continue;
+    }
+    const barWidth = Math.max(
+      entry.minBar,
+      Math.min(entry.maxBar, width - displayWidth(paddedLabel) - displayWidth(entry.summary) - 2),
+    );
+    const gauge = lineGauge(entry.pct / 100, barWidth, { color, tier });
+    rows.push(`${paddedLabel} ${gauge} ${entry.summary}`);
+  }
+  return rows;
 }
 
 function memberWorktree(member, room) {
@@ -535,11 +575,12 @@ export class HordeView {
       height = 32,
       color = false,
       theme,
-      tier = glyphTier(),
+      tier = process.env.ORK_GLYPHS ? glyphTier() : "nerd",
       completedMode = "collapsed",
-      quotaMode = "expanded",
+      quotaMode = "collapsed",
       servicesMode = "expanded",
       onFocusPane,
+      onPreview,
     } = {},
   ) {
     this.room = treeRoom(room);
@@ -553,6 +594,7 @@ export class HordeView {
     this.quotaMode = QUOTA_MODES.has(quotaMode) ? quotaMode : "expanded";
     this.servicesMode = SERVICES_MODES.has(servicesMode) ? servicesMode : "expanded";
     this.onFocusPane = typeof onFocusPane === "function" ? onFocusPane : undefined;
+    this.onPreview = typeof onPreview === "function" ? onPreview : undefined;
     this.lastFocusedAgentId = undefined;
     this.focusId = this.room.agents[0]?.id;
     this.focusFollowsLatest = true;
@@ -561,11 +603,21 @@ export class HordeView {
     this.page = 0;
     this.overlay = undefined;
     this.logOffset = 0;
+    this.targets = [];
+    this.hovered = undefined;
+    this.mouseEnabled = true;
+    this.notice = "";
+    this.activityId = undefined;
+    this.preview = null;
+    this.previewWidth = 0;
+    this.previewOffset = 0;
+    this.previewLatestText = "";
   }
 
   quotaRowLimit() {
     if (!this.room.accounts?.length && !this.room.quotaError) return 0;
-    if (this.quotaMode === "collapsed") return 1;
+    if (this.quotaMode === "collapsed")
+      return this.quotaSummaryLines(Math.max(1, this.renderWidth - 4)).length;
     let rowCount = 0;
     const accounts = this.room.accounts || [];
     for (const account of accounts) {
@@ -598,8 +650,14 @@ export class HordeView {
   }
 
   pageSizeFor() {
+    const footerExtra = Math.max(
+      0,
+      this.controls(Math.max(1, this.renderWidth - 2)).lines.length - 1,
+    );
     const extraQuotaRows =
-      this.quotaMode === "collapsed" ? 0 : Math.max(0, this.quotaRowLimit() - 2);
+      this.quotaMode === "collapsed"
+        ? Math.max(0, this.quotaRowLimit())
+        : Math.max(0, this.quotaRowLimit() - 2);
     const serviceRows = this.serviceRowLimit();
     let servicePanelLines = 0;
     if (serviceRows > 0) {
@@ -610,8 +668,10 @@ export class HordeView {
       9,
       Math.max(
         2,
-        Math.floor((this.height - 10 - extraQuotaRows - servicePanelLines - updateBarLines) / 4) *
-          2,
+        Math.floor(
+          (this.height - 10 - extraQuotaRows - servicePanelLines - updateBarLines - footerExtra) /
+            4,
+        ) * 2,
       ),
     );
     const folderCount = new Set(this.room.agents.map((agent) => agentFolder(agent, this.room)))
@@ -619,9 +679,13 @@ export class HordeView {
     if (folderCount > 1 || this.renderWidth < 100) {
       let quotaLines = 0;
       if (this.room.accounts?.length || this.room.quotaError) {
-        quotaLines = this.quotaMode === "collapsed" ? 1 : Math.max(1, this.quotaRowLimit()) + 2;
+        quotaLines =
+          this.quotaMode === "collapsed"
+            ? this.quotaRowLimit() + 1
+            : Math.max(1, this.quotaRowLimit()) + 2;
       }
-      const available = this.height - 5 - quotaLines - servicePanelLines - updateBarLines - 3;
+      const available =
+        this.height - 5 - quotaLines - servicePanelLines - updateBarLines - 3 - footerExtra;
       const capacity = Math.max(
         1,
         Math.floor((available - (folderCount > 1 ? 0 : 1)) / (folderCount > 1 ? 5 : 4)),
@@ -646,7 +710,7 @@ export class HordeView {
     this.room = treeRoom(room);
     if (
       (this.focusFollowsLatest && !this.pinnedId && this.page === 0) ||
-      this.room.agents.every((agent) => agent.id !== this.focusId)
+      (this.focusId !== "conductor" && this.room.agents.every((agent) => agent.id !== this.focusId))
     ) {
       this.focusId = this.room.agents[0]?.id;
       this.hasExplicitFocus = false;
@@ -663,7 +727,10 @@ export class HordeView {
     const contentWidth = Math.max(1, width - margin * 2);
     return lines
       .slice(0, Math.max(0, this.height))
-      .map((line) => `${" ".repeat(margin)}${fitStyled(line, contentWidth)}`);
+      .map(
+        (line) =>
+          `${" ".repeat(margin)}${colorProviderMarks(fitStyled(line, contentWidth), this.appearance)}`,
+      );
   }
 
   invalidate() {
@@ -681,6 +748,7 @@ export class HordeView {
         case "?":
         case "g": {
           this.overlay = key === "?" ? "help" : "logs";
+          this.logOffset = 0;
           break;
         }
         case "\u{1B}[B":
@@ -701,10 +769,33 @@ export class HordeView {
       this.overlay = "help";
       return true;
     }
+    if (this.preview) {
+      if (key === "\u{1B}") return { type: "close-preview" };
+      if (key === "\u{1B}[5~" || key === "\u{1B}[6~") {
+        this.scrollPreview((key === "\u{1B}[5~" ? 1 : -1) * Math.max(1, this.height - 8));
+        return true;
+      }
+      if (key === "r") {
+        this.previewOffset = 0;
+        this.preview.text = this.previewLatestText;
+        return true;
+      }
+      if (key === "[" || key === "]") {
+        const agents = this.room.agents;
+        if (agents.length === 0) return false;
+        const index = agents.findIndex((agent) => agent.id === this.focusId);
+        this.focusId = agents[(index + (key === "]" ? 1 : -1) + agents.length) % agents.length].id;
+        return this.previewAgent();
+      }
+    }
     if (key === "g") {
       this.overlay = "logs";
       this.logOffset = 0;
       return true;
+    }
+    if (key === "0") {
+      this.focusId = "conductor";
+      return this.previewAgent();
     }
     if (/^[1-9]$/u.test(key)) {
       const selected = Number(key) - 1;
@@ -713,19 +804,34 @@ export class HordeView {
         this.focusId = agent.id;
         this.hasExplicitFocus = true;
         this.focusFollowsLatest = false;
-        return true;
+        return !this.preview || this.previewAgent();
       }
       return false;
     }
     switch (key) {
+      case "\r": {
+        return this.previewAgent();
+      }
       case "o": {
-        const selected = this.room.agents.find((agent) => agent.id === this.focusId);
+        const selected = this.selectedAgent();
         if (selected && (selected.herdrPaneId || selected.paneId)) {
           this.lastFocusedAgentId = selected.id;
           this.onFocusPane?.(selected);
           return true;
         }
+        if (selected) {
+          this.activityId = selected.id;
+          this.overlay = "activity";
+          return true;
+        }
         return false;
+      }
+      case "m": {
+        this.mouseEnabled = !this.mouseEnabled;
+        return { type: "mouse-toggle", enabled: this.mouseEnabled };
+      }
+      case "q": {
+        return { type: "close-view" };
       }
       case "c": {
         const nextIndex =
@@ -787,7 +893,7 @@ export class HordeView {
         this.hasExplicitFocus = true;
         this.page = Math.floor(index / this.pageSize);
         this.focusFollowsLatest = false;
-        return true;
+        return !this.preview || this.previewAgent();
       }
       default: {
         return false;
@@ -797,6 +903,151 @@ export class HordeView {
 
   handleInput(key) {
     return this.handleKey(key);
+  }
+
+  previewAgent() {
+    const agent = this.selectedAgent();
+    if (!agent) return false;
+    this.hasExplicitFocus = true;
+    this.focusFollowsLatest = false;
+    if (this.isCurrentAgent(agent)) {
+      this.onFocusPane?.(agent);
+      return true;
+    }
+    if (this.onPreview) this.onPreview(agent);
+    else
+      this.setPreview({
+        agentId: agent.id,
+        title: shortAgentName(agent),
+        text: (agent.output || []).join("\n"),
+        kind: "activity",
+        loading: false,
+      });
+    return true;
+  }
+
+  selectedAgent() {
+    if (this.focusId === "conductor")
+      return {
+        ...this.room.conductor,
+        id: "conductor",
+        ...(this.room.herdrCoordinatorPaneId && { herdrPaneId: this.room.herdrCoordinatorPaneId }),
+      };
+    return this.room.agents.find((agent) => agent.id === this.focusId);
+  }
+
+  isCurrentAgent(agent) {
+    const pane = this.room.herdrCoordinatorPaneId || this.room.conductor?.herdrPaneId;
+    if (pane) return agent.herdrPaneId === pane;
+    const session = this.room.conductor?.session?.id;
+    return Boolean(session && agent.session?.id === session && (agent.herdrPaneId || agent.paneId));
+  }
+
+  setPreview(snapshot) {
+    if (snapshot?.agentId !== this.preview?.agentId || snapshot?.loading) this.previewOffset = 0;
+    this.previewLatestText = snapshot?.text || "";
+    this.preview =
+      snapshot && this.previewOffset > 0 ? { ...snapshot, text: this.preview.text } : snapshot;
+  }
+
+  scrollPreview(delta) {
+    this.previewOffset = Math.max(0, this.previewOffset + delta);
+    if (this.previewOffset === 0 && this.preview) this.preview.text = this.previewLatestText;
+  }
+
+  handleMouse({ x, y, button, action }) {
+    if (action === "scroll-up" || action === "scroll-down") {
+      if (this.preview && x <= this.previewWidth) {
+        this.scrollPreview(action === "scroll-up" ? 3 : -3);
+        return true;
+      }
+      return this.handleKey(action === "scroll-up" ? "\u{1B}[A" : "\u{1B}[B");
+    }
+    const target = hitTest(this.targets, x, y);
+    this.hovered = target?.id;
+    if (action !== "press" || button !== 0 || !target) return false;
+    if (target.agentId) {
+      this.focusId = target.agentId;
+      this.hasExplicitFocus = true;
+      this.focusFollowsLatest = false;
+      return this.previewAgent();
+    }
+    return this.handleKey(target.key);
+  }
+
+  controls(width) {
+    if (this.overlay) {
+      return actionBar(
+        [
+          { id: "dismiss", label: "Back", key: "\u{1B}", hint: "Esc", primary: true },
+
+          { id: "scroll-up", label: "Up", key: "\u{1B}[A", hint: "↑" },
+          { id: "scroll-down", label: "Down", key: "\u{1B}[B", hint: "↓" },
+        ],
+        width,
+        { color: this.appearance, hovered: this.hovered, tier: this.tier },
+      );
+    }
+    const selected = this.selectedAgent();
+    const update = this.room.update || this.room.updateStatus;
+    return actionBar(
+      [
+        ...(!this.preview && (!selected || !this.isCurrentAgent(selected))
+          ? [
+              {
+                id: "preview",
+                label: "View chat",
+                key: "\r",
+                hint: "Enter",
+                primary: true,
+                disabled: !selected,
+              },
+            ]
+          : []),
+        ...(this.preview &&
+        (this.room.herdrCoordinatorPaneId ||
+          this.room.conductor?.herdrPaneId ||
+          this.room.conductor?.paneId)
+          ? [{ id: "return", label: "Return to chat", key: "0", primary: true }]
+          : []),
+        ...(this.preview ||
+        !selected ||
+        this.isCurrentAgent(selected) ||
+        (!selected.herdrPaneId && !selected.paneId)
+          ? []
+          : [
+              {
+                id: "open",
+                label: "Open terminal",
+                key: "o",
+              },
+            ]),
+        { id: "inactive", label: "Inactive", key: "c", active: this.completedMode === "expanded" },
+        ...(this.room.services?.length
+          ? [
+              {
+                id: "services",
+                label: "Services",
+                key: "v",
+                active: this.servicesMode === "expanded",
+              },
+            ]
+          : []),
+        ...(update?.available || update?.updateAvailable || update?.status === "error"
+          ? [{ id: "update", label: "Update", key: "U" }]
+          : []),
+        { id: "logs", label: "Log", key: "g" },
+        { id: "help", label: "Shortcuts", key: "?" },
+      ],
+      width,
+      { color: this.appearance, hovered: this.hovered, tier: this.tier },
+    );
+  }
+
+  addTargets(targets, row = 0, column = 1) {
+    this.targets.push(
+      ...targets.map((target) => ({ ...target, x: target.x + column, y: target.y + row })),
+    );
   }
 
   panel(title, body, width, right = "", headerTone, rail = "") {
@@ -813,7 +1064,7 @@ export class HordeView {
   }
 
   overlayLines(width) {
-    const title = this.overlay === "help" ? "Key reference" : "Room log";
+    let title = this.overlay === "help" ? "Keyboard shortcuts" : "Room log";
     const messages = coalesceMessages(this.room.messages).map(
       (message) =>
         `${plain(message.from)}: ${plain(message.text)}${message.count > 1 ? ` (×${message.count})` : ""}`,
@@ -822,7 +1073,12 @@ export class HordeView {
     if (this.overlay === "help") {
       rows = [
         "↑/↓ or 1–9  Select agent",
-        "o           Focus selected agent's Herdr or tmux pane",
+        "0           Return to the current session's live chat",
+        "Enter       Preview selected agent's screen without typing into it",
+        "PgUp/PgDn   Scroll the preview; r follows the latest screen",
+        "o           Open selected agent's interactive terminal",
+        "Mouse       Click an agent to preview its chat; click buttons for actions",
+        "m           Toggle mouse capture to select terminal text",
         "c           Cycle inactive agents (collapse / hide / expand)",
         "u           Expand or collapse quota view",
         "U           Pull available Orkest update",
@@ -833,20 +1089,25 @@ export class HordeView {
         "? or Esc    Close this reference",
         "q or Ctrl-C Quit the display; workers continue",
         "Glyphs      Set ORK_GLYPHS=ascii|unicode|nerd",
-        "Nerd tier   Requires a Nerd Font; selected explicitly",
+        "Icons       Nerd Font by default; unicode or ascii selects fallback",
       ];
+    } else if (this.overlay === "activity") {
+      const agent = this.room.agents.find((member) => member.id === this.activityId);
+      title = agent ? shortAgentName(agent) : "Agent activity";
+      rows = [
+        "No interactive chat attached.",
+        ...(agent?.output || []),
+        agent?.question || "",
+      ].filter(Boolean);
     } else {
       rows = messages.length > 0 ? messages : ["No room messages yet"];
     }
     const interior = Math.max(1, width - 6);
     const wrapped = rows.flatMap((line) => wrapText(line, interior));
-    if (this.overlay === "logs") {
-      const count = Math.max(1, this.height - 7);
-      const start = Math.max(0, Math.min(this.logOffset, wrapped.length - count));
-      const visible = wrapped.slice(start, start + count);
-      return this.panel(title, visible, width, "Esc close");
-    }
-    return this.panel(title, wrapped.slice(0, Math.max(1, this.height - 6)), width, "Esc close");
+    const count = Math.max(1, this.height - 7);
+    const start = Math.max(0, Math.min(this.logOffset, wrapped.length - count));
+    const visible = wrapped.slice(start, start + count);
+    return this.panel(title, visible, width);
   }
 
   quotaLines(width) {
@@ -857,7 +1118,7 @@ export class HordeView {
 
   updateLine(innerWidth) {
     const upd = this.room?.update || this.room?.updateStatus || {};
-    const labelText = "Update [U]";
+    const labelText = "Update";
     let badgeTone = "yellow bold";
     if (upd.status === "error") badgeTone = "red bold";
     else if (upd.status === "updated") badgeTone = "green bold";
@@ -882,68 +1143,119 @@ export class HordeView {
       }
       case "error": {
         const msg = plain(upd.message || upd.error || "fast-forward failed").trim();
-        text = `! Update failed: ${msg} · press U to retry`;
+        text = `! Update failed: ${msg} · click to retry`;
         break;
       }
       default: {
         text = upd.dirty
           ? `↑ ${count} new ${plural} on origin/main (working tree dirty)`
-          : `↑ ${count} new ${plural} on origin/main · press U to pull & update`;
+          : `↑ ${count} new ${plural} on origin/main · click to update`;
         break;
       }
     }
     return `${badge}  ${fit(text, budget)}`;
   }
 
-  inlineQuotaLine(innerWidth) {
-    const labelText = "Quota [u]";
-    const badge = tone(labelText, "running bold", this.appearance);
-    const budget = Math.max(1, innerWidth - displayWidth(`${labelText}  `));
+  quotaSummaryLines(innerWidth) {
+    const chevron = disclosure("", true, this.tier);
+    const chevronWidth = displayWidth(chevron);
+    const stripWidth = Math.max(1, innerWidth - chevronWidth - 1);
+    const appendChevron = (line, isFirst) => {
+      const fitted = fitStyled(line, stripWidth);
+      if (!isFirst) return `${fitted}${" ".repeat(chevronWidth + 1)}`;
+      const mark = tone(
+        chevron,
+        this.hovered === "quota-heading" ? "quotaHover" : "muted",
+        this.appearance,
+      );
+      return `${fitted} ${mark}`;
+    };
     if (this.room.quotaError) {
-      return `${badge}  ${fit(`unavailable: ${plain(this.room.quotaError)}`, budget)}`;
+      return [appendChevron(`unavailable: ${plain(this.room.quotaError)}`, true)];
     }
+    const rows = new Map([
+      ["work", []],
+      ["personal", []],
+      ["", []],
+    ]);
     const accounts = this.room.accounts || [];
-    const now = this.now();
-    const parts = accounts.map((account) => {
-      const short = plain(account.short || account.id || "?");
-      const windows = Array.isArray(account.windows) ? account.windows : [];
-      const refNow =
-        Number.isFinite(account.fetchedAt) && now < 1_000_000_000_000 ? account.fetchedAt : now;
-      if (Array.isArray(account.pools) && account.pools.length > 0) {
-        const rendered = plain(renderLine([account], refNow)).trim();
-        if (rendered) return rendered;
+    for (const account of accounts) {
+      const windows = account.windows || [];
+      const groups = new Map();
+      const pools = account.pools || [];
+      for (const pool of pools) {
+        groups.set(
+          pool.id,
+          windows.filter(
+            (window) => window.pool === pool.id || pool.windowIds?.includes(window.id),
+          ),
+        );
       }
-      if (windows.length === 0) return `${short} —`;
-      const hasPools = windows.some((w) => typeof w.pool === "string" && w.pool.trim());
-      if (hasPools) {
-        const poolGroups = new Map();
-        for (const w of windows) {
-          const poolKey = plain(w.pool || "default").trim();
-          if (!poolGroups.has(poolKey)) poolGroups.set(poolKey, []);
-          poolGroups.get(poolKey).push(w);
-        }
-        const poolParts = [];
-        for (const [, group] of poolGroups) {
-          const firstLabel = compactWindowLabel(group[0]?.label || group[0]?.id);
-          const prefix = firstLabel.replace(/\s+(?:5h|wk)$/iu, "").trim();
-          const percentages = group
-            .filter((w) => Number.isFinite(w.remainingPct))
-            .map((w) => `${Math.round(Math.max(0, Math.min(100, w.remainingPct)))}%`)
-            .join("/");
-          poolParts.push(prefix ? `${prefix} ${percentages || "—"}` : percentages || "—");
-        }
-        return `${short} ${poolParts.join(" · ")}`;
+      for (const window of windows) {
+        if (!window.pool || groups.has(window.pool)) continue;
+        groups.set(
+          window.pool,
+          windows.filter((item) => item.pool === window.pool),
+        );
       }
-      const primary = windows.filter((w) => !w.scope && Number.isFinite(w.remainingPct));
-      const measured =
-        primary.length > 0 ? primary : windows.filter((w) => Number.isFinite(w.remainingPct));
-      if (measured.length === 0) return `${short} unavailable`;
-      const percentages = measured
-        .map((w) => `${Math.round(Math.max(0, Math.min(100, w.remainingPct)))}%`)
-        .join("·");
-      return `${short} ${percentages}${formatCreditSuffix(account)}`;
-    });
-    return `${badge}  ${fit(parts.join("  ·  "), budget)}`;
+      if (account.provider === "antigravity") {
+        if (!groups.has("claude-gpt")) groups.set("claude-gpt", []);
+        if (!groups.has("gemini")) groups.set("gemini", []);
+      }
+      if (groups.size === 0) groups.set("", windows);
+      for (const [pool, group] of groups) {
+        let label = pool;
+        if (pool === "claude-gpt") label = "Claude/GPT";
+        else if (pool === "gemini") label = "Gemini";
+        if (groups.size === 1 && providerMark(account.provider, this.tier)) label = "";
+        const measured = group.filter((window) => Number.isFinite(window.remainingPct));
+        const scope = quotaAccountScope(account);
+        const brand = providerMark(account.provider, this.tier);
+        const accountLabel = scope
+          ? [
+              brand || (label ? account.provider : ""),
+              label || (brand ? "" : account.provider || account.short || account.id),
+            ]
+              .filter(Boolean)
+              .join(" ")
+          : [quotaAccountLabel(account, this.tier), label].filter(Boolean).join(" ");
+        rows.get(scope).push({
+          label: accountLabel,
+          remaining:
+            measured.length > 0
+              ? Math.min(...measured.map((window) => window.remainingPct))
+              : undefined,
+          detail: formatCreditSuffix(account).replace(/^ · /u, ""),
+        });
+      }
+    }
+    if (
+      (rows.get("work").length > 0 || rows.get("personal").length > 0) &&
+      rows.get("").length > 0
+    ) {
+      rows.get("personal").push(...rows.get(""));
+      rows.set("", []);
+    }
+    const rawLines = [];
+    for (const [scope, meters] of rows) {
+      if (meters.length === 0) continue;
+      const { icon: scopeIcon, accent } = {
+        work: { icon: "\u{F1AD}", accent: "quotaWork" },
+        personal: { icon: "\u{F007}", accent: "quotaPersonal" },
+        "": { icon: "", accent: "success" },
+      }[scope];
+      const icon = this.tier === "ascii" ? "" : scopeIcon;
+      rawLines.push(
+        ...meterStrip(icon, meters, stripWidth, {
+          color: this.appearance,
+          tier: this.tier,
+          hovered: this.hovered === "quota-heading" && rawLines.length === 0,
+          accent,
+        }),
+      );
+    }
+    if (rawLines.length === 0) return [appendChevron("", true)];
+    return rawLines.map((line, index) => appendChevron(line, index === 0));
   }
 
   serviceHeaderBadge() {
@@ -952,14 +1264,18 @@ export class HordeView {
     const ports = services
       .map((svc) => (svc?.port ? `:${svc.port}` : plain(svc?.ports || "").trim()))
       .filter(Boolean);
-    const portSummary = ports.length > 0 ? ` · ${ports.slice(0, 3).join(" ")}` : "";
+    const portSummary = ports.length > 0 ? ` · localhost ${ports.slice(0, 3).join(" ")}` : "";
     return `${services.length} running${portSummary}`;
   }
 
   inlineServicesLine(innerWidth) {
     const services = Array.isArray(this.room.services) ? this.room.services : [];
-    const labelText = "Services [v]";
-    const badge = tone(labelText, "running bold", this.appearance);
+    const labelText = disclosure("Services", false, this.tier);
+    const badge = tone(
+      labelText,
+      this.hovered === "services-heading" ? "buttonHover" : "running bold",
+      this.appearance,
+    );
     const budget = Math.max(1, innerWidth - displayWidth(`${labelText}  `));
     const items = services.map((svc) => {
       const isDocker = svc?.kind === "docker";
@@ -972,7 +1288,9 @@ export class HordeView {
       const folder = plain(svc?.worktree || (svc?.cwd ? shortFolder(svc.cwd) : "")).trim();
       return `${endpoint} ${label}${folder ? ` (${folder})` : ""}`;
     });
-    const summary = `${services.length} running${items.length > 0 ? ` · ${items.join(" · ")}` : ""}`;
+    const hasPort = services.some((svc) => svc?.port || plain(svc?.ports || "").trim());
+    const hostPrefix = hasPort ? "localhost " : "";
+    const summary = `${services.length} running${items.length > 0 ? ` · ${hostPrefix}${items.join(" · ")}` : ""}`;
     return `${badge}  ${fit(summary, budget)}`;
   }
 
@@ -997,9 +1315,13 @@ export class HordeView {
       const folder = plain(svc?.worktree || (svc?.cwd ? shortFolder(svc.cwd) : "")).trim();
       const owner = svc?.owner ? `by ${plain(svc.owner).trim()}` : "";
       const uptime = svc?.uptime ? `up ${plain(svc.uptime).trim()}` : "";
-      const meta = [label, folder, owner, uptime].filter(Boolean).join(" · ");
+      const meta = [label, folder, owner].filter(Boolean).join(" · ");
       const raw = `${glyph} ${endpoint}  ${meta}`;
-      return tone(fit(raw, rowWidth), isDocker ? "running" : "success", this.appearance);
+      const right = uptime ? fit(uptime, Math.min(displayWidth(uptime), rowWidth - 2)) : "";
+      const row = right
+        ? `${fit(raw, rowWidth - displayWidth(right) - 2)}  ${right}`
+        : fit(raw, rowWidth);
+      return tone(row, isDocker ? "running" : "success", this.appearance);
     });
   }
 
@@ -1017,9 +1339,79 @@ export class HordeView {
   }
 
   render(width) {
+    if (!this.preview || this.overlay) {
+      this.previewWidth = 0;
+      return this.renderSidebar(width);
+    }
+    const isSplit = width >= 96;
+    const sidebarWidth = isSplit ? Math.max(40, Math.floor(width * 0.38)) : 0;
+    const previewWidth = isSplit ? width - sidebarWidth - 1 : width;
+    const sidebar = isSplit ? this.renderSidebar(sidebarWidth) : [];
+    this.targets = isSplit
+      ? this.targets.map((target) => ({ ...target, x: target.x + previewWidth + 1 }))
+      : [];
+    this.previewWidth = previewWidth;
+    const preview = this.previewLines(previewWidth);
+    if (!isSplit) return preview;
+    return preview.map((line, index) => `${fitStyled(line, previewWidth)} ${sidebar[index] || ""}`);
+  }
+
+  previewLines(width) {
+    const preview = this.preview;
+    const controls = actionBar(
+      [
+        { id: "preview-back", label: "Agents", key: "\u{1B}", hint: "Esc", primary: true },
+        {
+          id: "preview-open",
+          label: "Open terminal",
+          key: "o",
+          disabled: preview.kind !== "terminal",
+        },
+        { id: "preview-follow", label: "Follow", key: "r", active: this.previewOffset === 0 },
+        { id: "preview-up", label: "Up", key: "\u{1B}[5~", hint: "PgUp" },
+        { id: "preview-down", label: "Down", key: "\u{1B}[6~", hint: "PgDn" },
+        { id: "preview-previous", label: "Prev", key: "[" },
+        { id: "preview-next", label: "Next", key: "]" },
+      ],
+      Math.max(1, width - 2),
+      { color: this.appearance, hovered: this.hovered, tier: this.tier },
+    );
+    const budget = Math.max(1, this.height - controls.lines.length - 3);
+    const rows = String(preview.text || "")
+      .split(/\r?\n/u)
+      .flatMap((line) => wrapText(plain(line), Math.max(1, width - 4)));
+    this.previewOffset = Math.min(this.previewOffset, Math.max(0, rows.length - budget));
+    const end = Math.max(0, rows.length - this.previewOffset);
+    const body = rows.slice(Math.max(0, end - budget), end);
+    while (body.length < budget) body.push("");
+    const heading = preview.kind === "terminal" ? "Live screen · read only" : "Recorded activity";
+    const state = preview.loading ? "Loading..." : preview.error || heading;
+    const lines = this.panel(
+      plain(preview.title || "Agent"),
+      [tone(state, preview.error ? "error" : "muted", this.appearance), ...body],
+      Math.max(1, width),
+    );
+    const contentHeight = Math.max(0, this.height - controls.lines.length);
+    lines.splice(contentHeight);
+    while (lines.length < contentHeight) lines.push("");
+    this.addTargets(controls.targets, lines.length);
+    return [...lines, ...controls.lines.map((line) => ` ${line}`)].slice(0, this.height);
+  }
+
+  renderSidebar(width) {
     width = Math.max(1, Math.floor(width) || 80);
     this.renderWidth = width;
-    if (this.overlay) return this.marginLines(this.overlayLines(Math.max(1, width - 2)), width);
+    this.targets = [];
+    if (this.overlay) {
+      const controls = this.controls(Math.max(1, width - 2));
+      const lines = this.overlayLines(Math.max(1, width - 2)).slice(
+        0,
+        Math.max(0, this.height - controls.lines.length),
+      );
+      while (lines.length < this.height - controls.lines.length) lines.push("");
+      this.addTargets(controls.targets, lines.length);
+      return this.marginLines([...lines, ...controls.lines], width);
+    }
     if (this.height < 8)
       return this.marginLines(
         this.panel("ork", ["Resize terminal to at least 8 rows"], width),
@@ -1047,7 +1439,10 @@ export class HordeView {
       const { model: modelName, effort } = normalizeModelAndEffort(rawModel, rawEffort);
       const provenance =
         member.consultation && member.modelSource === "requested" ? " (requested)" : "";
-      return `${modelName || "default model"}${provenance}${effort && effort !== "—" ? ` / ${effort}` : ""}`;
+      const brand =
+        providerMark(modelName, this.tier) ||
+        providerMark(member.engine || data.harness, this.tier);
+      return `${brand ? `${brand} ` : ""}${modelName || "default model"}${provenance}${effort && effort !== "—" ? ` / ${effort}` : ""}`;
     };
     const innerWidth = Math.max(1, width - 2);
     const leadFolder = agentFolder(lead, room);
@@ -1085,11 +1480,11 @@ export class HordeView {
       leadGoal !== leadTask &&
       leadGoal !== roomTitlePlain
         ? `${leadGoal} — ${leadTask}`
-        : leadTask || plain(room.objective || "Tell the coordinator what you want done");
+        : leadTask || plain(room.objective || "");
     let leadLines = [
       leadMetaParts.join(" · "),
       `${statusGlyph(lead, now, this.tier)} ${model(lead)} | ${phase(lead)}${progressSuffix(lead, now)}`,
-      leadMissionLine,
+      ...(leadMissionLine ? [leadMissionLine] : []),
     ];
     if (lead.status === "session unavailable" && room.agents.length > 0) {
       leadLines = ["Coordinator session unavailable"];
@@ -1101,39 +1496,78 @@ export class HordeView {
       hasAgentTree
         ? `${tone(toAsciiTree("│ ", this.tier), "border", this.appearance)}${line}`
         : line;
+    const hasQuota = Boolean(room.accounts?.length || room.quotaError);
+    const isQuotaDrawer = hasQuota && this.quotaMode === "collapsed";
     const lines = [
       ...this.panel(
         room.title === "New swarm" ? "Swarm" : `Swarm · ${plain(room.title || room.id)}`,
         leadLines,
         innerWidth,
         swarmActivityBadge(room, maxAgents, this.tier, innerWidth),
-        "selected",
+        this.hovered === "current-session" ? "buttonHover" : "swarmHeading",
         hasAgentTree ? "start" : "",
       ),
     ];
+    if (room.herdrCoordinatorPaneId || lead.herdrPaneId || lead.paneId)
+      this.addTargets([
+        {
+          id: "current-session",
+          agentId: "conductor",
+          x: 1,
+          y: 1,
+          width: innerWidth,
+          height: isQuotaDrawer ? lines.length - 1 : lines.length,
+        },
+      ]);
+    if (isQuotaDrawer) {
+      const glyphs = glyphSet(this.tier);
+      const leftTee = this.tier === "ascii" ? "+" : "├";
+      const rightTee = this.tier === "ascii" ? "+" : "┤";
+      const inside = Math.max(1, innerWidth - 2);
+      const hBar = glyphs.horizontal.repeat(Math.max(0, innerWidth - 2));
+      lines.pop();
+      lines.push(tone(`${leftTee}${hBar}${rightTee}`, "border", this.appearance));
+      const drawerRows = this.quotaSummaryLines(inside);
+      this.addTargets([
+        {
+          id: "quota-heading",
+          key: "u",
+          x: 1,
+          y: lines.length + 1,
+          width: innerWidth,
+          height: drawerRows.length,
+        },
+      ]);
+      const vBorder = tone(glyphs.vertical, "border", this.appearance);
+      for (const row of drawerRows) {
+        lines.push(`${vBorder}${fitStyled(row, inside)}${vBorder}`);
+      }
+      const bottomLeft = hasAgentTree ? leftTee : glyphs.bottomLeft;
+      lines.push(tone(`${bottomLeft}${hBar}${glyphs.bottomRight}`, "border", this.appearance));
+    }
     if (this.showUpdateBar()) {
+      this.addTargets([
+        { id: "update-bar", key: "U", x: 1, y: lines.length + 1, width: innerWidth, height: 1 },
+      ]);
       lines.push(withRail(this.updateLine(innerWidth - (hasAgentTree ? 2 : 0))));
     }
-    if (room.accounts?.length || room.quotaError) {
-      if (this.quotaMode === "collapsed") {
-        lines.push(withRail(this.inlineQuotaLine(innerWidth - (hasAgentTree ? 2 : 0))));
-      } else {
-        const quotaLimit = this.quotaRowLimit();
-        lines.push(
-          ...this.panel(
-            "Quota",
-            this.quotaLines(innerWidth).slice(0, quotaLimit),
-            innerWidth,
-            "u collapse",
-            undefined,
-            hasAgentTree ? "middle" : "",
-          ),
-        );
-      }
+    if (hasQuota && !isQuotaDrawer) {
+      this.addTargets([
+        { id: "quota-heading", key: "u", x: 1, y: lines.length + 1, width: innerWidth, height: 1 },
+      ]);
+      const quotaLimit = this.quotaRowLimit();
+      lines.push(
+        ...this.panel(
+          disclosure("Quota", true, this.tier),
+          this.quotaLines(innerWidth).slice(0, quotaLimit),
+          innerWidth,
+          "",
+          this.hovered === "quota-heading" ? "quotaHover" : undefined,
+          hasAgentTree ? "middle" : "",
+        ),
+      );
     }
-    if (room.agents.length === 0) {
-      lines.push("The coordinator will add agents as work is assigned.");
-    } else {
+    if (room.agents.length > 0) {
       const parentIds = new Set(
         room.agents.map((agent) => agent.parent).filter((p) => p && p !== "conductor"),
       );
@@ -1150,7 +1584,6 @@ export class HordeView {
       }
       const gap = "  ";
       const lastFolder = folderGroups.keys().toArray().at(-1);
-      const hasServices = this.serviceRowLimit() > 0;
       for (const [folder, rawEntries] of folderGroups) {
         lines.push(this.folderHeaderLine(folder, rawEntries.length, innerWidth));
         const hiddenCompletedCount =
@@ -1167,7 +1600,7 @@ export class HordeView {
         const columns = !hasCollapsedRows && innerWidth >= 100 && entries.length > 1 ? 2 : 1;
         const cardWidth =
           columns === 2 ? Math.max(24, Math.floor((innerWidth - gap.length) / 2)) : innerWidth;
-        const hasFollowingSection = folder !== lastFolder || hasServices;
+        const hasFollowingSection = folder !== lastFolder;
         const rails = folderTreeRails(entries, this.tier, columns, hasFollowingSection);
         const cards = entries.map(({ agent, index }, entryIndex) => {
           const { topPrefix, midPrefix, tailPrefix } = rails[entryIndex];
@@ -1178,7 +1611,11 @@ export class HordeView {
           const wfRole = roleOf(agent);
           const roleBadge = wfRole ? ` [${wfRole}]` : "";
           const isFocused = agent.id === this.focusId;
+          const isHovered = this.hovered === `agent:${agent.id}`;
+          const pointer = this.tier === "ascii" ? ">" : "▸";
+          const chevron = disclosure("", false, this.tier);
           const isPinned = agent.id === this.pinnedId;
+          const currentBadge = this.isCurrentAgent(agent) ? " · This chat" : "";
           const locationBadge = worktreeBadge(agent, room);
           const taskText =
             cleanProgressTask(agent) || plain(agent.objective || "Awaiting assignment");
@@ -1195,21 +1632,25 @@ export class HordeView {
               : "";
           if (this.completedMode === "collapsed" && isCollapsibleCompleted(agent)) {
             const glyph = statusGlyph(agent, now, this.tier);
-            const label = ` ${glyph} ${index + 1} ${displayAgentName}${parentBadge}${locationBadge ? ` · ${locationBadge}` : ""}${isFocused ? " · FOCUS " : ""} · ${model(agent)}${agent.consultation ? "" : ` · ${taskText}`}`;
+            const badge = ` ${isFocused ? pointer : glyph} ${index + 1} ${displayAgentName} `;
+            const label = `${currentBadge}${parentBadge}${locationBadge ? ` · ${locationBadge}` : ""} · ${model(agent)}${agent.consultation ? "" : ` · ${taskText}`}`;
             return [
               statusRow(label, phase(agent), cardWidth, {
                 prefix,
                 color: this.appearance,
                 style: toneForStatus(agent),
                 tier: this.tier,
+                badge,
+                badgeStyle: isFocused ? "agentSelected" : "button",
+                chevron,
+                hovered: isHovered,
               }),
             ];
           }
-          let stateBadge = "";
-          if (isPinned) stateBadge = "PIN ";
-          else if (isFocused) stateBadge = "FOCUS ";
-          const cardTitle = `${index + 1} ${displayAgentName}${agent.role === "lead" ? " (lead)" : ""}`;
-          const cardRight = `${stateBadge}${locationBadge}${parentBadge}`;
+          const stateBadge = isPinned ? "PIN " : "";
+          const cardTitle = `${isFocused ? `${pointer} ` : ""}${index + 1} ${displayAgentName}${agent.role === "lead" ? " (lead)" : ""}`;
+          const rightMeta = `${stateBadge}${locationBadge}${parentBadge}${currentBadge}`.trim();
+          const cardRight = rightMeta ? `${rightMeta} ${chevron}` : chevron;
           const statusLine = tone(
             `${statusGlyph(agent, now, this.tier)}${roleBadge} ${model(agent)} | ${phase(agent)}${progressSuffix(agent, now)}`,
             `${toneForStatus(agent)}${isFocused ? " bold" : ""}`,
@@ -1217,6 +1658,7 @@ export class HordeView {
           );
           return treeCard(cardTitle, [taskText, statusLine], cardWidth, {
             emphasized: isFocused || isPinned,
+            hovered: isHovered,
             topPrefix,
             midPrefix: prefix,
             tailPrefix,
@@ -1225,6 +1667,23 @@ export class HordeView {
             tier: this.tier,
           });
         });
+        let gridRow = lines.length;
+        for (let start = 0; start < cards.length; start += columns) {
+          const row = cards.slice(start, start + columns);
+          for (const [column, card] of row.entries()) {
+            this.addTargets([
+              {
+                id: `agent:${entries[start + column].agent.id}`,
+                agentId: entries[start + column].agent.id,
+                x: column * (cardWidth + gap.length) + 1,
+                y: gridRow + 1,
+                width: cardWidth,
+                height: card.length,
+              },
+            ]);
+          }
+          gridRow += Math.max(...row.map((card) => card.length));
+        }
         lines.push(...joinCardGrid(cards, columns, cardWidth, gap));
         if (hiddenCompletedCount === 0) continue;
         const summaryPrefix = toAsciiTree(hasFollowingSection ? "├─" : "└─", this.tier);
@@ -1238,19 +1697,19 @@ export class HordeView {
       }
     }
     const serviceLimit = this.serviceRowLimit();
+    const serviceBlock = [];
     if (serviceLimit > 0) {
       if (this.servicesMode === "collapsed") {
-        lines.push(withRail(this.inlineServicesLine(innerWidth - (hasAgentTree ? 2 : 0))));
+        serviceBlock.push(this.inlineServicesLine(innerWidth));
       } else {
-        const headerRight = [this.serviceHeaderBadge(), "v collapse"].filter(Boolean).join(" · ");
-        lines.push(
+        const headerRight = this.serviceHeaderBadge();
+        serviceBlock.push(
           ...this.panel(
-            "Services",
+            disclosure("Services", true, this.tier),
             this.serviceLines(innerWidth).slice(0, serviceLimit),
             innerWidth,
             headerRight,
-            undefined,
-            hasAgentTree ? "end" : "",
+            this.hovered === "services-heading" ? "buttonHover" : undefined,
           ),
         );
       }
@@ -1265,22 +1724,56 @@ export class HordeView {
       const detailBudget = Math.max(1, innerWidth - displayWidth(prefix));
       lines.push(`${tone(prefix, "muted", this.appearance)}${fit(detail, detailBudget)}`);
     }
-    while (lines.length < this.height - 3) lines.push("");
-    // Navigation is never sacrificed when content exceeds the terminal's row budget.
-    lines.splice(Math.max(0, this.height - 3));
-    const selectedAgent = room.agents.find((agent) => agent.id === this.focusId);
-    const openHint =
-      selectedAgent && (selectedAgent.herdrPaneId || selectedAgent.paneId) ? " · o open" : "";
-    const quotaHint = room.accounts?.length || room.quotaError ? " · u quota" : "";
-    const servicesHint = room.services?.length ? " · v services" : "";
-    const upd = room.update || room.updateStatus;
-    const updateHint =
-      upd?.available || upd?.updateAvailable || upd?.status === "error" ? " · U update" : "";
+    const controls = this.controls(innerWidth);
+    const footerHeight = controls.lines.length + 2;
+    const contentHeight = Math.max(0, this.height - footerHeight);
+    const mainHeight = Math.max(0, contentHeight - serviceBlock.length);
+    if (room.agents.length === 0) {
+      const emptyLines = [];
+      for (const line of wrapText(
+        "The coordinator will add agents as work is assigned.",
+        innerWidth,
+      )) {
+        const leftSpaces = Math.max(0, Math.floor((innerWidth - displayWidth(line)) / 2));
+        emptyLines.push(`${" ".repeat(leftSpaces)}${tone(line, "muted", this.appearance)}`);
+      }
+      const topPad = Math.max(0, Math.floor((mainHeight - lines.length - emptyLines.length) / 2));
+      for (let i = 0; i < topPad; i++) lines.push("");
+      lines.push(...emptyLines);
+    }
+    while (lines.length < mainHeight) lines.push("");
+    lines.splice(mainHeight);
+    this.targets = this.targets
+      .map((target) => ({
+        ...target,
+        height: Math.min(target.height, mainHeight - target.y + 1),
+      }))
+      .filter((target) => target.height > 0);
     lines.push(
-      `${room.agents.length}/${maxAgents} slots · page ${this.page + 1}/${pages}`,
-      `↑↓ select${openHint} · c inactive${quotaHint}${servicesHint}${updateHint} · n page · ? help · q close view`,
-      "Ctrl-b Tab: switch pane · Ctrl-b d: detach",
+      tone(
+        `${room.agents.length}/${maxAgents} slots · page ${this.page + 1}/${pages}`,
+        "muted",
+        this.appearance,
+      ),
     );
+    if (serviceBlock.length > 0 && contentHeight > mainHeight) {
+      this.addTargets([
+        {
+          id: "services-heading",
+          key: "v",
+          x: 1,
+          y: lines.length + 1,
+          width: innerWidth,
+          height: 1,
+        },
+      ]);
+      lines.push(...serviceBlock);
+    }
+    this.addTargets(controls.targets, lines.length);
+    const footerNotice =
+      this.notice || (this.mouseEnabled ? "" : "Mouse off — press m to re-enable mouse");
+    const footerNoticeTone = this.notice || this.mouseEnabled ? "muted" : "warning bold";
+    lines.push(...controls.lines, tone(footerNotice, footerNoticeTone, this.appearance));
     return this.marginLines(lines, width);
   }
 }

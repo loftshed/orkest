@@ -71,7 +71,7 @@ it.each(["q", "close"])("distinguishes deliberate q from terminal teardown: %s",
     pause() {},
     resume() {
       setImmediate(() => {
-        if (event === "q") input.emit("keypress", "q", { name: "q" });
+        if (event === "q") input.emit("data", "q");
         else input.emit("close");
       });
     },

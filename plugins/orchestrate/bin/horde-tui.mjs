@@ -2,15 +2,22 @@
 import { execFile } from "node:child_process";
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
-import { emitKeypressEvents } from "node:readline";
 import { pathToFileURL } from "node:url";
 
 import { shouldUseColor } from "../../monitor/lib/render.mjs";
 import { CACHE_DIR, CONFIG_PATH } from "../../monitor/lib/store.mjs";
+import { createAgentPreview } from "../lib/agent-preview.mjs";
 import { markHerdrViewClosed } from "../lib/herdr-view-state.mjs";
 import { createRoom, mailboxRoot, readRoom } from "../lib/horde-room.mjs";
 import { fit, HordeView, shortAgentName } from "../lib/horde-view.mjs";
 import { configHome } from "../lib/runtime-paths.mjs";
+import {
+  createTerminalInput,
+  MOUSE_DISABLE,
+  MOUSE_ENABLE,
+  TERMINAL_INPUT_DISABLE,
+  TERMINAL_INPUT_ENABLE,
+} from "../lib/tui-input.mjs";
 import { checkOrkestUpdate, runOrkestUpdate } from "../lib/update.mjs";
 
 const PANE_ID_RE = /^[A-Za-z0-9_.:%][A-Za-z0-9_.:%-]{0,63}$/u;
@@ -746,12 +753,29 @@ export async function runHordeTui(
   const notifiedSet = new Set();
   let prevAgents = toNotificationAgents(initialRoom);
   notifyHerdrTransitions(null, prevAgents, notifiedSet, { env, exec });
+  let isNavigationPending = false;
   const view = new HordeView(initialRoom, {
     height: output.rows || 32,
     color: shouldUseColor(output),
     theme,
     onFocusPane: (agent) => {
-      void focusAgentPane(agent, { exec });
+      if (isNavigationPending) return;
+      isNavigationPending = true;
+      view.notice = `Opening ${shortAgentName(agent)}...`;
+      void previewController
+        .close()
+        .then((snapshot) => !snapshot?.error && !isStopped && focusAgentPane(agent, { exec }))
+        .then((opened) => {
+          isNavigationPending = false;
+          if (isStopped) return;
+          view.notice = opened
+            ? `Opened ${shortAgentName(agent)}`
+            : "Could not open chat. Its terminal may have closed.";
+          paint();
+        });
+    },
+    onPreview: (agent) => {
+      void previewController.open(agent);
     },
   });
   let isBusy = false;
@@ -761,6 +785,7 @@ export async function runHordeTui(
   let isInputResumed = false;
   let isAlternateScreen = false;
   let isCursorHidden = false;
+  let isInputModeOwned = false;
   let lastLines = [];
   let terminalError;
   let timer;
@@ -802,6 +827,9 @@ export async function runHordeTui(
         }
       }
       view.setRoom(room);
+      const previewAgent = room.agents?.find((agent) => agent.id === view.preview?.agentId);
+      if (view.preview && !previewAgent) await previewController.close();
+      else await previewController.refresh(previewAgent);
       const nextAgents = toNotificationAgents(room);
       notifyHerdrTransitions(prevAgents, nextAgents, notifiedSet, { env, exec });
       prevAgents = nextAgents;
@@ -843,12 +871,22 @@ export async function runHordeTui(
       cleanup();
     }
   };
+  const previewController = createAgentPreview({
+    env,
+    exec,
+    onChange: (snapshot) => {
+      if (isStopped) return;
+      view.setPreview(snapshot);
+      paint();
+    },
+  });
   const cleanup = () => {
     if (isStopped) return;
     isStopped = true;
     clearInterval(timer);
     clearInterval(refreshTimer);
-    input.off("keypress", keypress);
+    input.off("data", onData);
+    terminalInput.dispose();
     input.off("end", cleanup);
     input.off("close", cleanup);
     process.off("SIGINT", cleanup);
@@ -871,7 +909,7 @@ export async function runHordeTui(
     if (isAlternateScreen || isCursorHidden) {
       try {
         output.write(
-          `${isCursorHidden ? "\u{1B}[?25h" : ""}${isAlternateScreen ? "\u{1B}[?1049l" : ""}`,
+          `${isInputModeOwned ? TERMINAL_INPUT_DISABLE : ""}${isCursorHidden ? "\u{1B}[?25h" : ""}${isAlternateScreen ? "\u{1B}[?1049l" : ""}`,
         );
       } catch (error) {
         terminalError ??= error;
@@ -880,16 +918,20 @@ export async function runHordeTui(
     lastLines = [];
     resolveExit?.();
   };
-  const keypress = (text, key) => {
-    const value = key?.sequence || text || "";
-    if (text === "q" || (key?.ctrl && key.name === "c")) {
+  const handleAction = (action) => {
+    if (action && typeof action === "object" && action.type === "close-view") {
       void markHerdrViewClosed(initialRoom.id, env)
         .catch((error) => {
           terminalError ??= error;
         })
         .finally(cleanup);
     } else {
-      const action = view.handleInput(value);
+      if (action && typeof action === "object" && action.type === "close-preview") {
+        void previewController.close();
+      }
+      if (action && typeof action === "object" && action.type === "mouse-toggle") {
+        output.write(action.enabled ? MOUSE_ENABLE : MOUSE_DISABLE);
+      }
       if (action && typeof action === "object" && action.type === "pull-update") {
         updateState = { available: false, status: "updating" };
         if (view.room) view.setRoom({ ...view.room, update: updateState });
@@ -925,12 +967,25 @@ export async function runHordeTui(
       paint();
     }
   };
+  const terminalInput = createTerminalInput({
+    onKey: (text, key) => {
+      const value = key?.sequence || text || "";
+      handleAction(
+        text === "q" || (key?.ctrl && key.name === "c")
+          ? { type: "close-view" }
+          : view.handleInput(value),
+      );
+    },
+    onMouse: (event) => {
+      if (view.mouseEnabled) handleAction(view.handleMouse(event));
+    },
+  });
+  const onData = (chunk) => terminalInput.write(chunk);
   const onResize = () => {
     lastLines = [];
     paint();
   };
   try {
-    emitKeypressEvents(input);
     input.setRawMode(true);
     isRawModeChanged = true;
     input.resume();
@@ -938,13 +993,15 @@ export async function runHordeTui(
     output.write("\u{1B}[?1049h\u{1B}[?25l");
     isAlternateScreen = true;
     isCursorHidden = true;
+    isInputModeOwned = true;
+    output.write(TERMINAL_INPUT_ENABLE);
     await new Promise((resolve) => {
       resolveExit = resolve;
       timer = setInterval(() => {
         if (view.needsAnimation) paint();
       }, 200);
       refreshTimer = setInterval(refresh, 1000);
-      input.on("keypress", keypress);
+      input.on("data", onData);
       input.on("end", cleanup);
       input.on("close", cleanup);
       process.on("SIGINT", cleanup);
@@ -956,6 +1013,8 @@ export async function runHordeTui(
     });
   } finally {
     cleanup();
+    const remainingPreview = await previewController.dispose();
+    if (remainingPreview?.error) terminalError ??= new Error(remainingPreview.error);
   }
   if (terminalError) throw terminalError;
 }
