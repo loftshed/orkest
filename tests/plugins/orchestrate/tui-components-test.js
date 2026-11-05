@@ -6,6 +6,7 @@ import {
   frame,
   GLYPHS,
   plain,
+  shimmerText,
   tone,
 } from "../../../plugins/orchestrate/lib/tui-box.mjs";
 import {
@@ -225,5 +226,40 @@ describe("terminal presentation components", () => {
       }
       expect([...seen].sort((a, b) => a - b)).toEqual([0, 1, 2, 3]);
     }
+  });
+
+  it("sweeps a shimmer highlight wave across active action text and prefixes active coordinator tasks with a Braille spinner", () => {
+    const color = { enabled: true, theme: DEFAULT_THEME };
+    const frameA = shimmerText("Inspecting Orkest swarm pane title", 840, color);
+    const frameB = shimmerText("Inspecting Orkest swarm pane title", 1440, color);
+    expect(plain(frameA)).toBe("Inspecting Orkest swarm pane title");
+    expect(frameA).toContain("\u{1B}[38;5;150;1m");
+    expect(frameA).not.toBe(frameB);
+
+    const room = {
+      id: "shimmer-room",
+      cwd: "/workspace/project",
+      title: "Refine Orkest coordinator delegation",
+      herdrViewPaneId: "w1:p2",
+      conductor: {
+        name: "glorpax",
+        engine: "agy",
+        model: "gemini-3.8-flash-high",
+        status: "working",
+        progress: {
+          stage: "working",
+          task: "Inspecting Orkest swarm pane title and card header",
+        },
+      },
+      agents: [],
+    };
+    const view = new HordeView(room, { color: true, tier: "nerd", now: () => 840 });
+    expect(view.needsAnimation).toBe(true);
+    const rendered = view.render(80);
+    expect(plain(rendered[0])).toContain("╭ Swarm ─");
+    expect(plain(rendered[0])).not.toContain("Refine Orkest coordinator delegation");
+    expect(plain(rendered[3])).toContain("│ ⣷ Inspecting Orkest swarm pane title and card header");
+    expect(rendered[3]).toContain("\u{1B}[38;5;149m⣷\u{1B}[0m");
+    expect(rendered[3]).toContain("\u{1B}[38;5;150;1m");
   });
 });

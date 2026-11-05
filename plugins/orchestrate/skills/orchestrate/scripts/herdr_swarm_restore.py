@@ -21,6 +21,24 @@ from typing import Any
 import runtime_paths
 
 SCHEMA = "orkest.herdr-view.v1"
+VALID_LABEL_PREFIXES = ("Orkest swarm ", "Orkest Swarm", "Swarm · ")
+
+
+def swarm_pane_label(base: Path, room: str) -> str:
+    room_data = load(base / "mailbox-v1" / "rooms" / f"{room}.json") or {}
+    conductor = room_data.get("conductor") if isinstance(room_data.get("conductor"), dict) else {}
+    progress = conductor.get("progress") if isinstance(conductor.get("progress"), dict) else {}
+    candidates = (room_data.get("title"), progress.get("goal"), room_data.get("objective"))
+    raw = next(
+        (
+            value.strip()
+            for value in candidates
+            if isinstance(value, str) and value.strip() and value.strip() not in {"New swarm", "not set", room}
+        ),
+        "",
+    )
+    cleaned = " ".join(raw.split())[:72]
+    return f"Swarm · {cleaned}" if cleaned else "Orkest Swarm"
 
 
 def endpoint(env: dict[str, str]) -> str:
@@ -127,7 +145,7 @@ def idle_shell(info: dict[str, Any]) -> bool:
 
 def prepare(base: Path, room: str, pane: str, cli: Path, env: dict[str, str], api: Herdr) -> Path:
     path = state_path(base, room, env)
-    label = "Orkest swarm " + uuid.uuid4().hex
+    label = swarm_pane_label(base, room)
     api.call("pane", "rename", pane, label)
     save(
         path,
@@ -164,10 +182,17 @@ def command(cli: Path, room: str, state: Path, env: dict[str, str] | None = None
 
 
 def locate(record: dict[str, Any], panes: list[dict[str, Any]]) -> dict[str, Any] | None:
-    if not isinstance(record.get("label"), str) or not record["label"].startswith("Orkest swarm "):
+    label = record.get("label")
+    if not isinstance(label, str) or not label.startswith(VALID_LABEL_PREFIXES):
         return None
-    matches = [pane for pane in panes if pane.get("label") == record.get("label")]
-    return matches[0] if len(matches) == 1 else None
+    matches = [pane for pane in panes if pane.get("label") == label]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1 and isinstance(record.get("pane"), str):
+        by_id = [pane for pane in matches if pane.get("pane_id") == record["pane"]]
+        if len(by_id) == 1:
+            return by_id[0]
+    return None
 
 
 def restore(

@@ -12,7 +12,7 @@ import { stripVTControlCharacters } from "node:util";
 import { DEFAULT_THEME } from "./tui-theme.mjs";
 
 const segments = new Intl.Segmenter(undefined, { granularity: "grapheme" });
-export const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+export const SPINNER = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
 const ESC = String.fromCodePoint(27);
 const ANSI_SGR_PATTERN = new RegExp(String.raw`${ESC}\[[0-9;]*m|[^${ESC}]+`, "gu");
 
@@ -229,6 +229,38 @@ export function tone(value, styleTone, color) {
     .filter(Boolean);
   if (!enabled || codes.length === 0) return text;
   return `\u{1B}[${codes.join(";")}m${text}\u{1B}[0m`;
+}
+
+/** Sweep a warm 5–6 character highlight wave across active action text. */
+export function shimmerText(value, now = Date.now(), color) {
+  const text = plain(value);
+  const enabled = typeof color === "object" ? color?.enabled : Boolean(color);
+  if (!enabled || !text) return text;
+  const graphemes = Array.from(segments.segment(text), (entry) => entry.segment);
+  const count = graphemes.length;
+  if (count === 0) return text;
+  const tick = Math.floor(Math.max(0, Number(now) || 0) / 120);
+  const period = count + 12;
+  const center = (tick % period) - 6;
+  let output = "";
+  let currentTone = "";
+  let buffer = "";
+  for (let index = 0; index < count; index++) {
+    const distance = Math.abs(index - center);
+    let nextTone = "shimmerBase";
+    if (distance <= 1) nextTone = "shimmerPeak";
+    else if (distance <= 2) nextTone = "shimmerMid";
+    else if (distance <= 3) nextTone = "shimmerEdge";
+    if (nextTone === currentTone) {
+      buffer += graphemes[index];
+    } else {
+      if (buffer) output += tone(buffer, currentTone, color);
+      currentTone = nextTone;
+      buffer = graphemes[index];
+    }
+  }
+  if (buffer) output += tone(buffer, currentTone, color);
+  return output;
 }
 
 export function fitStyled(value, width) {

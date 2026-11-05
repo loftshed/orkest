@@ -18,6 +18,7 @@ import {
   glyphSet,
   glyphTier,
   plain,
+  shimmerText,
   SPINNER,
   tone,
   wrapText,
@@ -52,6 +53,7 @@ export {
   progressBar,
   renderPanel,
   renderTable,
+  shimmerText,
   SPINNER,
   tone,
   wrapText,
@@ -579,6 +581,7 @@ export class HordeView {
       completedMode = "collapsed",
       quotaMode = "collapsed",
       servicesMode = "expanded",
+      inHerdr = false,
       onFocusPane,
       onPreview,
     } = {},
@@ -590,6 +593,7 @@ export class HordeView {
     this.color = color;
     this.appearance = { enabled: color, theme: resolveTheme(theme) };
     this.tier = tier;
+    this.inHerdr = Boolean(inHerdr);
     this.completedMode = COMPLETED_MODES.includes(completedMode) ? completedMode : "collapsed";
     this.quotaMode = QUOTA_MODES.has(quotaMode) ? quotaMode : "expanded";
     this.servicesMode = SERVICES_MODES.has(servicesMode) ? servicesMode : "expanded";
@@ -702,8 +706,21 @@ export class HordeView {
     return this.pageSizeFor();
   }
 
+  hasAnimatedLeadTask() {
+    const lead = this.room?.conductor;
+    if (!lead || !isExecuting(lead) || lead.status === "session unavailable") return false;
+    const task = plain(lead.progress?.task || "").trim();
+    const hasTask = Boolean(task && task !== "not set");
+    const hasObjective = Boolean(plain(this.room?.objective || "").trim());
+    return hasTask || hasObjective;
+  }
+
   get needsAnimation() {
-    return this.tier === "unicode" && this.room.agents.some(isExecuting);
+    const canAnimateAgents = this.tier === "unicode" || Boolean(this.appearance?.enabled);
+    return (
+      (canAnimateAgents && this.room.agents.some(isExecuting)) ||
+      (this.tier !== "ascii" && this.hasAnimatedLeadTask())
+    );
   }
 
   setRoom(room) {
@@ -1483,10 +1500,20 @@ export class HordeView {
       leadGoal !== roomTitlePlain
         ? `${leadGoal} — ${leadTask}`
         : leadTask || plain(room.objective || "");
+    const leadRunning = isExecuting(lead);
+    const missionBudget = Math.max(1, innerWidth - (leadRunning ? 5 : 3));
+    const fittedMission =
+      displayWidth(leadMissionLine) > missionBudget
+        ? fit(leadMissionLine, missionBudget)
+        : leadMissionLine;
+    const renderedMission =
+      leadMissionLine && leadRunning
+        ? `${tone(this.tier === "ascii" ? ">" : SPINNER[Math.floor(now / 120) % SPINNER.length], "shimmerSpinner", this.appearance)} ${shimmerText(fittedMission, now, this.appearance)}`
+        : fittedMission;
     let leadLines = [
       leadMetaParts.join(" · "),
       `${statusGlyph(lead, now, this.tier)} ${model(lead)} | ${phase(lead)}${progressSuffix(lead, now)}`,
-      ...(leadMissionLine ? [leadMissionLine] : []),
+      ...(leadMissionLine ? [renderedMission] : []),
     ];
     if (lead.status === "session unavailable" && room.agents.length > 0) {
       leadLines = ["Coordinator session unavailable"];
@@ -1501,9 +1528,14 @@ export class HordeView {
         : line;
     const hasQuota = Boolean(room.accounts?.length || room.quotaError);
     const isQuotaDrawer = hasQuota && this.quotaMode === "collapsed";
+    const hasHerdrPaneHeader = Boolean(
+      this.inHerdr || room.herdrViewPaneId || room.herdrCoordinatorPaneId,
+    );
     const lines = [
       ...this.panel(
-        room.title === "New swarm" ? "Swarm" : `Swarm · ${plain(room.title || room.id)}`,
+        hasHerdrPaneHeader || room.title === "New swarm"
+          ? "Swarm"
+          : `Swarm · ${plain(room.title || room.id)}`,
         leadLines,
         innerWidth,
         swarmActivityBadge(room, maxAgents, this.tier, innerWidth),
@@ -1654,12 +1686,18 @@ export class HordeView {
           const cardTitle = `${isFocused ? `${pointer} ` : ""}${index + 1} ${displayAgentName}${agent.role === "lead" ? " (lead)" : ""}`;
           const rightMeta = `${stateBadge}${locationBadge}${parentBadge}${currentBadge}`.trim();
           const cardRight = rightMeta ? `${rightMeta} ${chevron}` : chevron;
+          const cardBodyWidth = Math.max(1, cardWidth - displayWidth(prefix) - 2);
+          const fittedTaskText =
+            displayWidth(taskText) > cardBodyWidth ? fit(taskText, cardBodyWidth) : taskText;
+          const renderedTask = isExecuting(agent)
+            ? shimmerText(fittedTaskText, now, this.appearance)
+            : fittedTaskText;
           const statusLine = tone(
             `${statusGlyph(agent, now, this.tier)}${roleBadge} ${model(agent)} | ${phase(agent)}${progressSuffix(agent, now)}`,
             `${toneForStatus(agent)}${isFocused ? " bold" : ""}`,
             this.appearance,
           );
-          return treeCard(cardTitle, [taskText, statusLine], cardWidth, {
+          return treeCard(cardTitle, [renderedTask, statusLine], cardWidth, {
             emphasized: isFocused || isPinned,
             hovered: isHovered,
             topPrefix,

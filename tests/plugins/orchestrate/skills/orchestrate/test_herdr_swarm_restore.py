@@ -183,6 +183,22 @@ class RestoreTests(unittest.TestCase):
         )
         self.assertEqual(views.adopt(self.base, self.env, self.api, self.cli), [])
 
+    def test_prepare_uses_room_title_label_and_disambiguates_duplicate_labels_by_pane_id(self):
+        rooms = self.base / "mailbox-v1/rooms"
+        rooms.mkdir(parents=True, exist_ok=True)
+        (rooms / "room-a.json").write_text(
+            json.dumps({"id": "room-a", "title": "Refine Orkest coordinator delegation"})
+        )
+        views.prepare(self.base, "room-a", "w1:p2", self.cli, self.env, self.api)
+        record = views.load(self.state)
+        self.assertEqual(record["label"], "Swarm · Refine Orkest coordinator delegation")
+        self.assertEqual(self.api.pane["label"], "Swarm · Refine Orkest coordinator delegation")
+        duplicate_panes = [
+            {"pane_id": "w1:p9", "label": "Swarm · Refine Orkest coordinator delegation"},
+            {"pane_id": "w1:p2", "label": "Swarm · Refine Orkest coordinator delegation"},
+        ]
+        self.assertEqual(views.locate(record, duplicate_panes)["pane_id"], "w1:p2")
+
 
 if __name__ == "__main__":
     unittest.main()
