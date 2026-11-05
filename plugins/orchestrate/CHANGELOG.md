@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.54.0
+
+- feat(orchestrate): support Mythos and tier shorthands across model routing (#91)
+
 ## 0.53.0
 
 - feat(orchestrate): promote a live session to coordinator (#89)
