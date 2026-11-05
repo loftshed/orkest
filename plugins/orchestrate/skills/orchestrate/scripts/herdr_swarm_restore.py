@@ -170,7 +170,13 @@ def locate(record: dict[str, Any], panes: list[dict[str, Any]]) -> dict[str, Any
 
 
 def restore(
-    base: Path, env: dict[str, str], api: Herdr, *, locked: bool = False, only_room: str | None = None
+    base: Path,
+    env: dict[str, str],
+    api: Herdr,
+    *,
+    locked: bool = False,
+    only_room: str | None = None,
+    shell_ready_timeout: float = 0,
 ) -> list[dict[str, str]]:
     directory = state_directory(base, env)
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -195,6 +201,15 @@ def restore(
             if pane and not pane.get("restore_error") and isinstance(room, str):
                 try:
                     info = api.processes(pane["pane_id"])
+                    # Newly split shells may still be running profile hooks. Only explicit
+                    # new-pane launches wait; ordinary restores still skip busy panes.
+                    if shell_ready_timeout > 0:
+                        deadline = time.monotonic() + shell_ready_timeout
+                        while not idle_shell(info) and not view_process(info, Path(record["cli"]), room):
+                            if time.monotonic() >= deadline or path.with_suffix(".closed").exists():
+                                break
+                            time.sleep(0.1)
+                            info = api.processes(pane["pane_id"])
                 except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired):
                     outcomes.append({"room": room, "status": "inspection_failed"})
                     continue

@@ -567,7 +567,9 @@ def _open_herdr_swarm_view_unlocked(
         subprocess.run([herdr, "pane", "close", view_pane_id], env=environment, capture_output=True, check=False)
         return None
     try:
-        outcomes = restoration.restore(base.parent, environment, api, locked=True, only_room=room)
+        outcomes = restoration.restore(
+            base.parent, environment, api, locked=True, only_room=room, shell_ready_timeout=10
+        )
     except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired):
         outcomes = []
     if not outcomes or outcomes[0]["status"] not in ("restored", "submitted", "already_running", "launch_pending"):
