@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.51.2
+
+- fix(orchestrate): keep coordinator footer and reuse Herdr view (#85)
+
 ## 0.51.1
 
 - fix(orchestrate): wait for shell startup before opening swarm view
