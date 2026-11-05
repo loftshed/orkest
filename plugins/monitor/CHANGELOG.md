@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.17.0
+
+- feat(orchestrate): add alien-orc name generator, rich agent preview, and cspell cleanup (#97)
+
 ## 0.16.0
 
 - feat(orchestrate,monitor): add cleanup, side, update, policy, next & swarm TUI upgrades

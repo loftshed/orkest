@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.60.0
+
+- feat(orchestrate): add alien-orc name generator, rich agent preview, and cspell cleanup (#97)
+
 ## 0.59.0
 
 - feat(orchestrate): format Herdr folder activity summary with status icons and complete label (#96)
