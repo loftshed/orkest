@@ -552,6 +552,7 @@ class HerdrSwarmLaunchTests(unittest.TestCase):
         herdr_bin.chmod(0o755)
         return herdr_bin
 
+    @unittest.skipUnless(shutil.which("tmux"), "Herdr coordinator launch requires tmux")
     def test_herdr_launch_and_toggle_swarm_view(self):
         import agent_statusline_tmux
 
