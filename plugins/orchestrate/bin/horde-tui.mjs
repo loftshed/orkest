@@ -791,6 +791,7 @@ export async function runHordeTui(
   let timer;
   let refreshTimer;
   let resolveExit;
+  let closeViewPromise;
   let updateState = null;
   const wasRaw = Boolean(input.isRaw);
   const width = () => output.columns || 80;
@@ -918,13 +919,19 @@ export async function runHordeTui(
     lastLines = [];
     resolveExit?.();
   };
+  const closeView = async () => {
+    try {
+      await markHerdrViewClosed(initialRoom.id, env);
+    } catch (error) {
+      terminalError ??= error;
+    } finally {
+      cleanup();
+    }
+  };
   const handleAction = (action) => {
     if (action && typeof action === "object" && action.type === "close-view") {
-      void markHerdrViewClosed(initialRoom.id, env)
-        .catch((error) => {
-          terminalError ??= error;
-        })
-        .finally(cleanup);
+      if (closeViewPromise) return;
+      closeViewPromise = closeView();
     } else {
       if (action && typeof action === "object" && action.type === "close-preview") {
         void previewController.close();
@@ -1013,6 +1020,7 @@ export async function runHordeTui(
     });
   } finally {
     cleanup();
+    await closeViewPromise;
     const remainingPreview = await previewController.dispose();
     if (remainingPreview?.error) terminalError ??= new Error(remainingPreview.error);
   }

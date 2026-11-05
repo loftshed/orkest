@@ -62,34 +62,40 @@ it("uses the same server identity through a socket symlink", async () => {
   expect(await readFile(closed, "utf8")).toBe("closed\n");
 });
 
-it.each(["q", "close"])("distinguishes deliberate q from terminal teardown: %s", async (event) => {
-  const { env, closed } = await fixture();
-  const input = Object.assign(new PassThrough(), {
-    isTTY: true,
-    isRaw: false,
-    setRawMode() {},
-    pause() {},
-    resume() {
-      setImmediate(() => {
-        if (event === "q") input.emit("data", "q");
-        else input.emit("close");
-      });
-    },
-  });
-  const output = Object.assign(new PassThrough(), {
-    isTTY: true,
-    rows: 24,
-    columns: 80,
-    write() {},
-  });
-  await runHordeTui(async () => ({ id: "room-a", conductor: {}, agents: [] }), {
-    env,
-    input,
-    output,
-    quota: false,
-    services: false,
-    update: false,
-  });
-  if (event === "q") expect(await readFile(closed, "utf8")).toBe("closed\n");
-  else await expect(readFile(closed, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
-});
+it.each(["q", "q then close", "close"])(
+  "distinguishes deliberate q from terminal teardown: %s",
+  async (event) => {
+    const { env, closed } = await fixture();
+    const input = Object.assign(new PassThrough(), {
+      isTTY: true,
+      isRaw: false,
+      setRawMode() {},
+      pause() {},
+      resume() {
+        setImmediate(() => {
+          if (event !== "close") input.emit("data", "q");
+          if (event !== "q") input.emit("close");
+        });
+      },
+    });
+    const output = Object.assign(new PassThrough(), {
+      isTTY: true,
+      rows: 24,
+      columns: 80,
+      write() {},
+    });
+    await runHordeTui(async () => ({ id: "room-a", conductor: {}, agents: [] }), {
+      env,
+      input,
+      output,
+      quota: false,
+      services: false,
+      update: false,
+    });
+    if (event === "close") {
+      await expect(readFile(closed, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    } else {
+      expect(await readFile(closed, "utf8")).toBe("closed\n");
+    }
+  },
+);
