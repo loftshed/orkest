@@ -81,36 +81,47 @@ NOTICE = (
     "inspection for a teammate is fine; it cannot approve actions or widen write scope for you)."
 )
 
-# The same invented Martian names on every host, without a system dictionary of people's names.
-MARTIAN_NAMES = (
+# The same invented Martian names and phonotactic alien-orc generator on every host, without a system dictionary.
+# cspell:disable
+LEGACY_MARTIAN_NAMES = (
     "blipzor",
     "blorbo",
+    "blorkin",
     "boinglo",
     "borkle",
     "chomzog",
     "dorbix",
+    "drazzle",
     "dribnax",
     "fizzgob",
     "flibnax",
     "floomp",
+    "fnordel",
     "frongle",
     "glimzo",
     "gloobix",
     "glorpax",
     "gooblek",
     "gribble",
+    "gribnox",
     "klonko",
+    "klorgis",
     "krimble",
     "mibzot",
+    "miffkin",
     "mooflek",
     "morblo",
+    "nibblex",
     "nibnorb",
     "nozzik",
+    "pifflet",
     "plonko",
     "ploomix",
+    "quibble",
     "quibblex",
     "quobble",
     "quonk",
+    "skitter",
     "skronk",
     "snoobix",
     "snorfle",
@@ -119,12 +130,16 @@ MARTIAN_NAMES = (
     "squibble",
     "throggle",
     "troobax",
+    "tumblex",
     "vlimbo",
     "vobnix",
+    "vorgle",
     "wibblox",
     "womblek",
+    "wubbit",
     "xibzog",
     "yobnax",
+    "zibber",
     "zibnorb",
     "zimblex",
     "zorblo",
@@ -132,6 +147,49 @@ MARTIAN_NAMES = (
     "zuzzlek",
     "zwibble",
 )
+MARTIAN_NAMES = LEGACY_MARTIAN_NAMES
+
+ALIEN_ONSETS = (
+    "bl",
+    "br",
+    "ch",
+    "cr",
+    "dr",
+    "fl",
+    "fr",
+    "gl",
+    "gr",
+    "kl",
+    "kr",
+    "m",
+    "n",
+    "pl",
+    "pr",
+    "qu",
+    "sk",
+    "skr",
+    "sl",
+    "sm",
+    "sn",
+    "spl",
+    "spr",
+    "squ",
+    "st",
+    "str",
+    "th",
+    "thr",
+    "tr",
+    "vr",
+    "z",
+    "zw",
+)
+ALIEN_VOWELS = ("a", "e", "i", "o", "u", "oo", "or", "ar")
+ALIEN_CODAS = ("b", "d", "f", "g", "k", "l", "m", "mp", "n", "nk", "p", "rk", "t", "x", "z", "zk")
+ALIEN_SUFFIXES = ("", "", "ax", "ek", "el", "ik", "ix", "le", "lo", "nak", "ok", "or", "ox", "oz", "ug", "ul")
+# cspell:enable
+
+_LEGACY_MARTIAN_SET = frozenset(LEGACY_MARTIAN_NAMES)
+_UNIQUE_ALIEN_SUFFIXES = tuple(dict.fromkeys(ALIEN_SUFFIXES))
 
 
 class MailboxError(ValueError):
@@ -358,14 +416,50 @@ def peer_name(harness: str, cwd: str, session: str) -> str:
     return name if harness == "claude" else f"{harness}:{name}"
 
 
+def generate_martian(seed: str, step: int = 0) -> str:
+    """Deterministically synthesize a pronounceable alien-orc name from a seed and collision step."""
+    key = seed if step == 0 else f"{seed}:{step}"
+    digest = hashlib.sha256(key.encode("utf-8")).digest()
+    onset = ALIEN_ONSETS[digest[0] % len(ALIEN_ONSETS)]
+    vowel = ALIEN_VOWELS[digest[1] % len(ALIEN_VOWELS)]
+    coda_idx = digest[2] % len(ALIEN_CODAS)
+    coda = ALIEN_CODAS[coda_idx]
+    if vowel.endswith("r") and coda.startswith("r"):
+        coda = ALIEN_CODAS[(coda_idx + 1) % len(ALIEN_CODAS)]
+    suffix = ALIEN_SUFFIXES[digest[3] % len(ALIEN_SUFFIXES)]
+    return f"{onset}{vowel}{coda}{suffix}"
+
+
+def is_martian_name(name: str) -> bool:
+    """Whether `name` is a known legacy Martian name or a valid generated alien-orc name."""
+    if not isinstance(name, str) or not name:
+        return False
+    if name in _LEGACY_MARTIAN_SET:
+        return True
+    for onset in ALIEN_ONSETS:
+        if not name.startswith(onset):
+            continue
+        after_onset = name[len(onset) :]
+        for vowel in ALIEN_VOWELS:
+            if not after_onset.startswith(vowel):
+                continue
+            after_vowel = after_onset[len(vowel) :]
+            for coda in ALIEN_CODAS:
+                if vowel.endswith("r") and coda.startswith("r"):
+                    continue
+                if not after_vowel.startswith(coda):
+                    continue
+                if after_vowel[len(coda) :] in _UNIQUE_ALIEN_SUFFIXES:
+                    return True
+    return False
+
+
 def pick_martian(seed: str, taken: set[str]) -> str:
     """A stable Martian name, stepping past names live peers already use."""
-    names = MARTIAN_NAMES
-    start = int(hashlib.sha256(seed.encode()).hexdigest(), 16) % len(names)
-    for step in range(len(names)):
-        if (name := names[(start + step) % len(names)]) not in taken:
+    for step in range(256):
+        if (name := generate_martian(seed, step)) not in taken:
             return name
-    return names[start]
+    return generate_martian(seed, 0)
 
 
 def model_slug(model: str | None) -> str:

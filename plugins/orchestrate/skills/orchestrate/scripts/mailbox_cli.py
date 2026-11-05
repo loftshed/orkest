@@ -1,4 +1,3 @@
-# cspell:words herdr
 """CLI parser, formatting helpers, and entry point for the project-scoped peer mailbox."""
 
 from __future__ import annotations

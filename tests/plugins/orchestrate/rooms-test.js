@@ -853,4 +853,107 @@ describe("room CLI", () => {
       }
     }
   });
+
+  it("projects consultation answers and attaches agent mailbox messages during observeRoom", async () => {
+    const rawRoot = await directory();
+    const root = await realpath(rawRoot);
+    const rawCwd = await directory();
+    const cwd = await realpath(rawCwd);
+    await mkdir(path.join(root, "consultations", "conductor-sess"), { recursive: true });
+    await mkdir(path.join(root, "inbox", "conductor-sess"), { recursive: true });
+
+    const room = await newRoom([{ label: "worker", engine: "codex", model: "gpt-6-astra" }], {
+      id: "room-consult-messages",
+      cwd,
+      root,
+      title: "Consult & Messages",
+    });
+    const workerId = room.agents[0].id;
+    const nowIso = new Date().toISOString();
+    await updateRoom(
+      room.id,
+      (current) => {
+        current.conductor.name = "floomp";
+        current.conductor.person = "floomp";
+        current.conductor.session = {
+          id: "conductor-sess",
+          engine: "claude",
+          machine: hostname(),
+          cwd,
+        };
+        current.agents[0].mailboxSession = "worker-sess-1";
+        return current;
+      },
+      { root },
+    );
+
+    const consultResultPath = path.join(root, "consult-result.json");
+    await writeFile(
+      consultResultPath,
+      JSON.stringify({
+        schema: "agent-executor.consultation.v1",
+        status: "succeeded",
+        engine: "claude",
+        model: "claude-opus-5-5",
+        question: "Is the migration backward-compatible?",
+        answer: "Yes, legacy names remain valid.\nNew names decompose cleanly.",
+        uncertainty: "Low",
+      }),
+    );
+    await writeFile(
+      path.join(root, "consultations", "conductor-sess", "consult-1.json"),
+      JSON.stringify({
+        schema: "orchestrate.consultation-observation.v1",
+        id: "consult-1",
+        parent_session: "conductor-sess",
+        room_id: room.id,
+        machine: hostname(),
+        pid: process.pid,
+        runner_pid: process.pid,
+        deadline_ms: Date.now() + 60_000,
+        status: "succeeded",
+        engine: "claude",
+        model: "claude-opus-5-5",
+        task: "Is the migration backward-compatible?",
+        started_at: nowIso,
+        finished_at: nowIso,
+        result_path: consultResultPath,
+      }),
+    );
+
+    await writeFile(
+      path.join(root, "inbox", "conductor-sess", "msg-1.json"),
+      JSON.stringify({
+        id: "msg-1",
+        from: workerId,
+        fromSession: "worker-sess-1",
+        to: "floomp",
+        toSession: "conductor-sess",
+        text: "Schema audit completed with zero breaking changes.",
+        sentAt: nowIso,
+      }),
+    );
+
+    const observed = await observeRoom(room.id, { root });
+    const consultAgent = observed.agents.find((a) => a.consultation === true);
+    expect(consultAgent).toBeDefined();
+    expect(consultAgent.answer).toBe(
+      "Yes, legacy names remain valid.\nNew names decompose cleanly.",
+    );
+    expect(consultAgent.uncertainty).toBe("Low");
+    expect(consultAgent.output).toEqual([
+      "Yes, legacy names remain valid.",
+      "New names decompose cleanly.",
+      "Uncertainty: Low",
+    ]);
+
+    const worker = observed.agents.find((a) => a.id === workerId);
+    expect(worker.messages).toHaveLength(1);
+    expect(worker.messages[0]).toMatchObject({
+      from: workerId,
+      to: "floomp",
+      text: "Schema audit completed with zero breaking changes.",
+    });
+    expect(observed.messages).toHaveLength(1);
+  });
 });

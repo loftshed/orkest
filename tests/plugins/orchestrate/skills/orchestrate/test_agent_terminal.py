@@ -1,4 +1,3 @@
-# cspell:words herdr
 """A wrapped terminal follows its visible native session without guessing from shared processes."""
 
 from __future__ import annotations

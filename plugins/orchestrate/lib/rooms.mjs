@@ -1,4 +1,3 @@
-// cspell:words wubbit klorgis zibber fnordel gribnox tumblex blorkin drazzle pifflet vorgle nibblex
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, open, readdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
@@ -912,8 +911,28 @@ export async function observeRoom(idOrRoom, options = {}) {
       member.observedAt = observedAt ?? undefined;
       member.nativeHandle = record.native_handle;
       member.objective = objective ?? undefined;
+      const runResult = member.resultPath ? await readOptionalJson(member.resultPath) : null;
+      const reported =
+        typeof (runResult?.answer || runResult?.final_message || runResult?.reported_outcome) ===
+        "string"
+          ? (runResult.answer || runResult.final_message || runResult.reported_outcome).trim()
+          : "";
+      const uncertainty =
+        typeof runResult?.uncertainty === "string" ? runResult.uncertainty.trim() : "";
+      const runError = typeof runResult?.error === "string" ? runResult.error.trim() : "";
+      if (reported) member.answer = reported;
+      if (uncertainty) member.uncertainty = uncertainty;
+      if (runError) member.error = runError;
       member.output = [
         member.objective,
+        ...(reported
+          ? reported
+              .split(/\r?\n/u)
+              .map((line) => line.trim())
+              .filter(Boolean)
+          : []),
+        uncertainty && `Uncertainty: ${uncertainty}`,
+        runError && `Error: ${runError}`,
         `Coordinator observed: ${member.observedAt || "unknown"}`,
         record.recovery,
         member.dispatchError,
@@ -936,12 +955,16 @@ export async function observeRoom(idOrRoom, options = {}) {
       ? await readOptionalJson(path.join(root, "peers", `${peerKey}.json`), 64 * 1024)
       : null;
     if (member !== room.conductor && peer?.session === sessionId && peer.accountHome) {
+      const memberCwd = member.cwd || room.cwd;
+      const parentCwd = room.conductor?.cwd || room.cwd;
       member.activitySource = {
         engine: member.engine,
         session: sessionId,
         accountHome: peer.accountHome,
         parentSession: peer.parentSession || room.conductor?.session?.id,
-        cwd: member.cwd || room.cwd,
+        cwd: memberCwd,
+        ...(parentCwd && parentCwd !== memberCwd && { parentCwd }),
+        ...(room.cwd && room.cwd !== memberCwd && { roomCwd: room.cwd }),
         startedAt: peer.startedAt || snapshot?.startedAt,
       };
     }
@@ -1017,6 +1040,7 @@ export async function observeRoom(idOrRoom, options = {}) {
     await appendNativePeers(room, snapshots, root);
   }
   await appendConsultations(room, root);
+  await appendRoomMessages(room, root);
   return refreshMemberWorktrees(room);
 }
 
@@ -1077,6 +1101,26 @@ async function appendConsultations(room, root) {
             (member) => !(member.native && member.nativeSession === workerSession),
           );
         }
+        const answer =
+          isFinished && typeof (result.answer || result.final_message) === "string"
+            ? (result.answer || result.final_message).trim()
+            : "";
+        const uncertainty =
+          isFinished && typeof result.uncertainty === "string" ? result.uncertainty.trim() : "";
+        const errorText = isFinished && typeof result.error === "string" ? result.error.trim() : "";
+        const question =
+          (isFinished && typeof result.question === "string" && result.question.trim()) ||
+          job.task ||
+          "";
+        const output = [];
+        if (answer) {
+          for (const line of answer.split(/\r?\n/u)) {
+            if (line.trim()) output.push(line.trim());
+          }
+        }
+        if (uncertainty) output.push(`Uncertainty: ${uncertainty}`);
+        if (errorText) output.push(`Error: ${errorText}`);
+        if (output.length === 0 && job.task) output.push(job.task);
         room.agents.push({
           id: job.id,
           name: `${job.engine} consultation`,
@@ -1093,6 +1137,12 @@ async function appendConsultations(room, root) {
           runtimeState,
           nativeSession: workerSession || undefined,
           resultPath: job.result_path,
+          ...(answer && { answer }),
+          ...(uncertainty && { uncertainty }),
+          ...(errorText && { error: errorText }),
+          ...(question && { question }),
+          objective: job.task,
+          output,
           progress: {
             task: job.task,
             stage,
@@ -1103,6 +1153,136 @@ async function appendConsultations(room, root) {
       }
     }
   }
+}
+
+async function appendRoomMessages(room, root) {
+  let inboxDirs;
+  try {
+    inboxDirs = await readdir(path.join(root, "inbox"));
+  } catch {
+    return;
+  }
+  const minMs = Number.isFinite(parseStampMs(room.createdAt))
+    ? parseStampMs(room.createdAt) - 60_000
+    : -Infinity;
+  const agentMatchers = room.agents.map((agent) => {
+    const sessions = new Set(
+      [
+        agent.session?.id,
+        agent.nativeSession,
+        agent.mailboxSession,
+        agent.runId ? `run-${agent.runId}-worker` : "",
+      ].filter((val) => typeof val === "string" && val),
+    );
+    const names = new Set();
+    for (const candidate of [
+      agent.id,
+      agent.name,
+      agent.progress?.name,
+      agent.person,
+      agent.progress?.person,
+    ]) {
+      if (typeof candidate !== "string" || !candidate.trim()) continue;
+      const cleaned = candidate.trim();
+      names.add(cleaned);
+      const firstToken = cleaned.split("-", 1)[0];
+      if (firstToken && firstToken.length >= 3) names.add(firstToken);
+    }
+    return { agent, sessions, names, messages: [] };
+  });
+  const seenIds = new Set();
+  const discoveredRoomMessages = [];
+  inboxDirs.sort((a, b) => a.localeCompare(b));
+  for (const dirName of inboxDirs) {
+    const inboxPath = path.join(root, "inbox", dirName);
+    let files;
+    try {
+      files = await readdir(inboxPath);
+    } catch {
+      continue;
+    }
+    files.sort((a, b) => a.localeCompare(b));
+    for (const file of files) {
+      if (!file.endsWith(".json")) continue;
+      const msg = await readOptionalJson(path.join(inboxPath, file), 64 * 1024);
+      if (
+        (msg?.schema && msg.schema !== "agent-executor.mail.v1") ||
+        typeof msg?.text !== "string" ||
+        !msg.text.trim()
+      ) {
+        continue;
+      }
+      const sentMs = parseStampMs(msg.sentAt);
+      if (Number.isFinite(minMs) && Number.isFinite(sentMs) && sentMs < minMs) continue;
+      let fromSession = "";
+      if (typeof msg.from?.session === "string") {
+        fromSession = msg.from.session;
+      } else if (typeof msg.fromSession === "string") {
+        fromSession = msg.fromSession;
+      }
+      let fromName = "";
+      if (typeof msg.from?.name === "string") {
+        fromName = msg.from.name;
+      } else if (typeof msg.from === "string") {
+        fromName = msg.from;
+      }
+      const fromPrefix = fromName ? fromName.split("-", 1)[0] : "";
+      const matched = agentMatchers.find(
+        (m) =>
+          (fromSession && m.sessions.has(fromSession)) ||
+          (fromName && m.names.has(fromName)) ||
+          (fromPrefix && m.names.has(fromPrefix)) ||
+          (typeof msg.run === "string" &&
+            msg.run === m.agent.runId &&
+            fromSession.endsWith("-worker")),
+      );
+      if (!matched) continue;
+      const dedupeKey = msg.id || `${fromSession}:${msg.sentAt || ""}:${msg.text}`;
+      if (seenIds.has(dedupeKey)) continue;
+      seenIds.add(dedupeKey);
+      const fromLabel = cleanLine(
+        matched.agent.person ||
+          matched.agent.progress?.person ||
+          fromName ||
+          fromSession ||
+          matched.agent.name ||
+          matched.agent.id,
+      );
+      const toLabel = cleanLine(
+        msg.to?.name ||
+          msg.to?.session ||
+          (typeof msg.to === "string" ? msg.to : "") ||
+          "orchestrator",
+      );
+      const entry = {
+        from: fromLabel,
+        to: toLabel,
+        text: msg.text.trim(),
+        ...(typeof msg.sentAt === "string" && { sentAt: msg.sentAt }),
+        ...(typeof msg.kind === "string" && { kind: msg.kind }),
+        ...(typeof msg.channel === "string" && { channel: msg.channel }),
+      };
+      matched.messages.push(entry);
+      discoveredRoomMessages.push(entry);
+    }
+  }
+  const sortChronologically = (left, right) => {
+    const leftMs = parseStampMs(left.sentAt);
+    const rightMs = parseStampMs(right.sentAt);
+    if (Number.isFinite(leftMs) && Number.isFinite(rightMs) && leftMs !== rightMs) {
+      return leftMs - rightMs;
+    }
+    return 0;
+  };
+  for (const { agent, messages } of agentMatchers) {
+    if (messages.length === 0) continue;
+    messages.sort(sortChronologically);
+    agent.messages = messages;
+  }
+  if (discoveredRoomMessages.length === 0) return;
+  discoveredRoomMessages.sort(sortChronologically);
+  const existing = Array.isArray(room.messages) ? room.messages : [];
+  room.messages = [...existing, ...discoveredRoomMessages];
 }
 
 async function appendNativePeers(room, snapshots, root) {
@@ -1247,6 +1427,9 @@ async function appendNativePeers(room, snapshots, root) {
         accountHome: peer.accountHome,
         parentSession: peer.parentSession || room.conductor?.session?.id,
         cwd: peerCwd,
+        ...(room.conductor?.cwd &&
+          room.conductor.cwd !== peerCwd && { parentCwd: room.conductor.cwd }),
+        ...(roomCwd && roomCwd !== peerCwd && { roomCwd }),
         startedAt: peer.startedAt,
       },
       parent: "conductor",
@@ -1285,6 +1468,7 @@ async function appendNativePeers(room, snapshots, root) {
   await appendClaudeProjectSubagents(root, room, roomCwd, boundSessions, existingIds, conductorPid);
 }
 
+// cspell:disable
 const SUBAGENT_MARTIAN_NAMES = [
   "wubbit",
   "klorgis",
@@ -1304,7 +1488,100 @@ const SUBAGENT_MARTIAN_NAMES = [
   "nibblex",
 ];
 
+const ALIEN_ONSETS = [
+  "bl",
+  "br",
+  "ch",
+  "cr",
+  "dr",
+  "fl",
+  "fr",
+  "gl",
+  "gr",
+  "kl",
+  "kr",
+  "m",
+  "n",
+  "pl",
+  "pr",
+  "qu",
+  "sk",
+  "skr",
+  "sl",
+  "sm",
+  "sn",
+  "spl",
+  "spr",
+  "squ",
+  "st",
+  "str",
+  "th",
+  "thr",
+  "tr",
+  "vr",
+  "z",
+  "zw",
+];
+const ALIEN_VOWELS = ["a", "e", "i", "o", "u", "oo", "or", "ar"];
+const ALIEN_CODAS = [
+  "b",
+  "d",
+  "f",
+  "g",
+  "k",
+  "l",
+  "m",
+  "mp",
+  "n",
+  "nk",
+  "p",
+  "rk",
+  "t",
+  "x",
+  "z",
+  "zk",
+];
+const ALIEN_SUFFIXES = [
+  "",
+  "",
+  "ax",
+  "ek",
+  "el",
+  "ik",
+  "ix",
+  "le",
+  "lo",
+  "nak",
+  "ok",
+  "or",
+  "ox",
+  "oz",
+  "ug",
+  "ul",
+];
+// cspell:enable
+
+function generateSubagentMartian(seed, step = 0) {
+  const key = step === 0 ? String(seed) : `${seed}:${step}`;
+  const digest = createHash("sha256").update(key, "utf8").digest();
+  const onset = ALIEN_ONSETS[digest[0] % ALIEN_ONSETS.length];
+  const vowel = ALIEN_VOWELS[digest[1] % ALIEN_VOWELS.length];
+  const codaIdx = digest[2] % ALIEN_CODAS.length;
+  let coda = ALIEN_CODAS[codaIdx];
+  if (vowel.endsWith("r") && coda.startsWith("r")) {
+    coda = ALIEN_CODAS[(codaIdx + 1) % ALIEN_CODAS.length];
+  }
+  const suffix = ALIEN_SUFFIXES[digest[3] % ALIEN_SUFFIXES.length];
+  return `${onset}${vowel}${coda}${suffix}`;
+}
+
 function pickSubagentMartianName(subSid, existingIds, conductorPerson) {
+  for (let step = 0; step < 256; step++) {
+    const candidate = generateSubagentMartian(subSid, step);
+    if (candidate !== conductorPerson && !existingIds.has(candidate)) {
+      return candidate;
+    }
+  }
   const digest = createHash("sha1").update(String(subSid)).digest();
   const start = digest.readUInt32BE(0) % SUBAGENT_MARTIAN_NAMES.length;
   for (let offset = 0; offset < SUBAGENT_MARTIAN_NAMES.length; offset++) {

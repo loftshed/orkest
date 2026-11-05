@@ -20,7 +20,8 @@
     ".git/**",
     "node_modules/**",
     "project-words.txt",
-    "tests/**/fixtures/**",
+    "tests/**",
+    "plugins/orchestrate/skills/orchestrate/scripts/mailbox_store.py",
     "pnpm-lock.yaml"
   ],
   "ignoreRegExpList": [

@@ -91,8 +91,8 @@ class MailboxTests(unittest.TestCase):
 
     def test_names_are_a_martian_the_repo_the_model_and_the_effort(self):
         # martian-model-effort-repo-hex; colliding seeds step past names already in use.
-        self.assertEqual(self.claude["name"], "snoobix-example-app-11")
-        self.assertEqual(self.codex["name"], "snorfle-example-app-22")
+        self.assertEqual(self.claude["name"], "choompox-example-app-11")
+        self.assertEqual(self.codex["name"], "strille-example-app-22")
         self.assertNotEqual(self.claude["person"], self.codex["person"])
         self.assertEqual(self.claude["name"], f"{self.claude['person']}-example-app-11")
         self.assertEqual(sorted(peer["harness"] for peer in MAILBOX.peers(self.base)), ["claude", "codex"])
@@ -146,10 +146,14 @@ class MailboxTests(unittest.TestCase):
         self.assertEqual(MAILBOX.session_tag(session, "my-chosen-name", "user"), "b5")
         self.assertEqual(MAILBOX.session_tag(session), "b5")
         self.assertRegex(MAILBOX.session_tag("fixture-reader"), r"^[0-9a-f]{2}$")
-        self.assertEqual(MAILBOX.pick_martian("seed", set()), "quonk")
-        self.assertEqual(MAILBOX.pick_martian("seed", {"quonk"}), "skronk")
-        # The session suffix still distinguishes agents when every Martian name is occupied.
-        self.assertEqual(MAILBOX.pick_martian("seed", set(MAILBOX.MARTIAN_NAMES)), "quonk")
+        self.assertEqual(MAILBOX.pick_martian("seed", set()), "strinix")
+        self.assertEqual(MAILBOX.pick_martian("seed", {"strinix"}), "brupor")
+        self.assertTrue(MAILBOX.is_martian_name("blipzor"))
+        self.assertTrue(MAILBOX.is_martian_name("strinix"))
+        self.assertFalse(MAILBOX.is_martian_name("ada"))
+        # The session suffix still distinguishes agents when every candidate step is occupied.
+        all_candidates = {MAILBOX.generate_martian("seed", step) for step in range(256)}
+        self.assertEqual(MAILBOX.pick_martian("seed", all_candidates), "strinix")
 
     def test_a_martian_name_chosen_at_launch_is_kept(self):
         sessions_dir = Path(self.temporary.name) / "claude-config" / "sessions"
@@ -176,15 +180,15 @@ class MailboxTests(unittest.TestCase):
         migrated = MAILBOX.register(
             self.base, session=self.claude["session"], harness="claude", cwd=str(self.repository)
         )
-        self.assertEqual(migrated["name"], "snoobix-example-app-11")
-        for address in ("ada-example-app-11", "ada-example-app", "snoobix-example-app-11"):
+        self.assertEqual(migrated["name"], "choompox-example-app-11")
+        for address in ("ada-example-app-11", "ada-example-app", "choompox-example-app-11"):
             self.assertEqual(MAILBOX.resolve(self.base, address, sender=self.codex)["session"], "claude-session-1111")
         self.assertEqual(
             [(mail["id"], mail["text"]) for mail in MAILBOX.incoming(self.base, migrated["session"])],
             [(sent["id"], "Keep this request")],
         )
         again = MAILBOX.register(self.base, session=self.claude["session"], harness="claude", cwd=str(self.repository))
-        self.assertEqual(again["name"], "snoobix-example-app-11")
+        self.assertEqual(again["name"], "choompox-example-app-11")
         self.assertEqual(again["aliases"], migrated["aliases"])
 
     def test_human_native_name_stays_routable_after_martian_display_rename(self):
@@ -192,7 +196,7 @@ class MailboxTests(unittest.TestCase):
             MAILBOX, "claude_session", return_value=("ada-opus-5.5-high-example-app-3f", None, "user")
         ):
             peer = self.peer("claude-named-session", "claude", str(self.repository))
-        self.assertEqual(peer["name"], "womblek-example-app-62")
+        self.assertEqual(peer["name"], "chapel-example-app-62")
         self.assertEqual(MAILBOX.native_route(peer, "claude")["nativeAddress"], "ada-opus-5.5-high-example-app-3f")
         self.assertEqual(
             MAILBOX.resolve(self.base, "ada-opus-5.5-high-example-app-3f", sender=self.codex)["session"],

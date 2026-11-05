@@ -85,7 +85,7 @@ describe("terminal presentation components", () => {
       " \u{F007}  \u{EC82} ━━── 60%  \u{E7F0} Gemini ━━── 55%  \u{E7F0} Claude/GPT ──── 0%  \u{EC81} ━━━─ 80%",
     );
     const rendered = view.render(152).join("\n");
-    expect(plain(rendered)).toContain("│ Coordinator · folder: workspace");
+    expect(plain(rendered)).toContain("│ \u{F06A9} Coordinator · folder: workspace");
     expect(plain(rendered)).toContain("│ \u{F1AD}  \u{EC82} all ━━━─ 80%");
     expect(rendered).toContain("\u{1B}[38;5;173m\u{EC82}\u{1B}[0m");
     expect(rendered).toContain("\u{1B}[38;5;33m\u{E7F0}\u{1B}[0m");
