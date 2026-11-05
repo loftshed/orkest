@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.52.0
+
+- feat(orchestrate): show agent activity in Swarm View (#86)
+
 ## 0.51.2
 
 - fix(orchestrate): keep coordinator footer and reuse Herdr view (#85)
