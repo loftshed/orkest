@@ -250,6 +250,37 @@ class ConsultTests(unittest.TestCase):
     def capture(self) -> dict:
         return json.loads(self.capture_path.read_text(encoding="utf-8"))
 
+    def test_consultant_does_not_inherit_supervisor_mailbox_identity(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "AGENT_MAILBOX_SESSION": "supervisor-a",
+                "AGENT_MAILBOX_LISTENER_SESSION": "supervisor-a",
+                "AGENT_MAILBOX_PEER": "other-actor",
+            },
+        ):
+            environment = CONSULT.consult_environment("claude", self.repository, None, "worker-a", reading=True)
+        self.assertNotIn("AGENT_MAILBOX_SESSION", environment)
+        self.assertNotIn("AGENT_MAILBOX_LISTENER_SESSION", environment)
+        self.assertNotIn("AGENT_MAILBOX_PEER", environment)
+        self.assertEqual(environment["CLAUDE_CODE_SESSION_ID"], "worker-a")
+
+    def test_consultation_records_its_supervisor_and_result_for_swarm_discovery(self) -> None:
+        env = self.environment(AGENT_MAILBOX_SESSION="supervisor-a", ORKEST_SWARM_ROOM="room-a")
+        code, result, _ = self.consult("--question", "Why?", env=env)
+        self.assertEqual(code, 0)
+        records = list(
+            (Path(env["XDG_CACHE_HOME"]) / "orchestrate/mailbox-v1/consultations/supervisor-a").glob("*.json")
+        )
+        self.assertEqual(len(records), 1)
+        record = json.loads(records[0].read_text())
+        self.assertEqual(record["parent_session"], "supervisor-a")
+        self.assertEqual(record["room_id"], "room-a")
+        self.assertEqual(record["result_path"], result["result_path"])
+        self.assertEqual(record["model"], result["model"])
+        self.assertEqual(record["engine"], "codex")
+        self.assertGreater(record["pid"], 0)
+
     def test_default_route_asks_codex_read_only_and_returns_the_structured_answer(self) -> None:
         attachment = self.root / "lock.py"
         attachment.write_text("def lock():\n    ```not a fence```\n", encoding="utf-8")
@@ -512,7 +543,7 @@ class ConsultTests(unittest.TestCase):
         self.assertEqual(json.loads(summary)["status"], "dry_run")
 
     def test_detached_consultation_runs_the_resolved_model_and_publishes_an_event(self) -> None:
-        env = self.environment()
+        env = self.environment(AGENT_MAILBOX_SESSION="detached-supervisor")
         code, _result, summary = self.consult(
             "--question", "Why?", "--model", "gpt:luna", "--detach", "--notify", "none", env=env
         )
@@ -523,6 +554,7 @@ class ConsultTests(unittest.TestCase):
         self.assertEqual(
             (request["model"], request["requested_model"]), ("gpt-5.6-luna", "gpt:luna"), "resolved before detaching"
         )
+        self.assertEqual(request["parent_session"], "detached-supervisor")
         event_path = Path(lines["AGENT_EVENT"])
         result_path = Path(lines["AGENT_RESULT"])
         deadline = time.monotonic() + 30

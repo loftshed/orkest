@@ -809,6 +809,8 @@ export async function observeRoom(idOrRoom, options = {}) {
     discoverNativePeers,
   } = options;
   const room = typeof idOrRoom === "string" ? await readRoom(idOrRoom, root) : idOrRoom;
+  // Observations are rebuilt, including when callers reuse the same room object.
+  room.agents = room.agents.filter((member) => !member.consultation);
   if (room.authority) {
     if (!authorities.has(room.authority))
       authorities.set(room.authority, await authority(room.authority));
@@ -877,6 +879,9 @@ export async function observeRoom(idOrRoom, options = {}) {
       member.resolvedEffort = record.effort;
       member.verdict = verdict;
       member.status = status;
+      member.runtimeState =
+        { active: "running", finished: "stopped", cancelled: "stopped" }[record.status] ||
+        "unknown";
       member.observedAt = observedAt ?? undefined;
       member.nativeHandle = record.native_handle;
       member.objective = objective ?? undefined;
@@ -889,6 +894,7 @@ export async function observeRoom(idOrRoom, options = {}) {
       ].filter(Boolean);
     } catch (error) {
       member.status = "unknown";
+      member.runtimeState = "unknown";
       member.output = [error.message];
     }
   }
@@ -916,6 +922,7 @@ export async function observeRoom(idOrRoom, options = {}) {
     if (herdrWorkspaceId) member.herdrWorkspaceId = cleanLine(herdrWorkspaceId);
     if (!room.swarm) continue;
     if (snapshot) {
+      if (!member.dispatch && snapshot.runtimeState) member.runtimeState = snapshot.runtimeState;
       const previousProgress = member.progress;
       let resolvedTask = member.objective || snapshot.task;
       if (snapshot.task && snapshot.task !== "not set") {
@@ -958,6 +965,7 @@ export async function observeRoom(idOrRoom, options = {}) {
       !["completed", "reported complete", "cancelled", "rejected"].includes(member.status)
     ) {
       member.status = "session unavailable";
+      member.runtimeState = "unknown";
     }
   }
   const shouldDiscoverNative =
@@ -972,7 +980,93 @@ export async function observeRoom(idOrRoom, options = {}) {
   if (shouldDiscoverNative) {
     await appendNativePeers(room, snapshots, root);
   }
+  await appendConsultations(room, root);
   return refreshMemberWorktrees(room);
+}
+
+async function appendConsultations(room, root) {
+  const seen = new Set(room.agents.map((member) => member.id));
+  const parents = [room.conductor, ...room.agents];
+  for (const parent of parents) {
+    const sessions = new Set([parent?.session?.id, parent?.mailboxSession, parent?.nativeSession]);
+    for (const session of sessions) {
+      if (typeof session !== "string" || !SESSION_ID_RE.test(session)) continue;
+      const directory = path.join(root, "consultations", session);
+      let entries;
+      try {
+        entries = await readdir(directory);
+      } catch {
+        continue;
+      }
+      entries.sort((a, b) => a.localeCompare(b));
+      for (const entry of entries) {
+        if (!entry.endsWith(".json")) continue;
+        const job = await readOptionalJson(path.join(directory, entry));
+        if (
+          job?.schema !== "orchestrate.consultation-observation.v1" ||
+          job.parent_session !== session ||
+          (job.room_id && job.room_id !== room.id) ||
+          job.machine !== hostname() ||
+          typeof job.id !== "string" ||
+          seen.has(job.id) ||
+          !Number.isFinite(Date.parse(job.started_at)) ||
+          Date.parse(job.started_at) < parseStampMs(room.createdAt) ||
+          typeof job.result_path !== "string"
+        )
+          continue;
+        const result = await readOptionalJson(job.result_path);
+        const isFinished = result?.schema === "agent-executor.consultation.v1";
+        const isRunning =
+          !isFinished &&
+          pidAlive(job.pid) === true &&
+          pidAlive(job.runner_pid) === true &&
+          Number.isFinite(job.deadline_ms) &&
+          Date.now() < job.deadline_ms;
+        const observed =
+          isFinished && Array.isArray(result.model_observed)
+            ? result.model_observed.filter((model) => typeof model === "string" && model)
+            : [];
+        let status = isRunning ? "running" : "session unavailable";
+        let runtimeState = isRunning ? "running" : "unknown";
+        let stage = "working";
+        if (isFinished) {
+          status = result.status === "answered" ? "reported complete" : "failed";
+          runtimeState = "stopped";
+          stage = result.status === "answered" ? "complete" : "blocked";
+        }
+        const workerSession = (isFinished && result.session_id) || job.session_id;
+        if (workerSession) {
+          // Provider hooks may also publish this worker as an unbound interactive peer.
+          room.agents = room.agents.filter(
+            (member) => !(member.native && member.nativeSession === workerSession),
+          );
+        }
+        room.agents.push({
+          id: job.id,
+          name: `${job.engine} consultation`,
+          parent: parent === room.conductor ? "conductor" : parent.id,
+          consultation: true,
+          workforceRole: "consultant",
+          engine: job.engine,
+          model: observed.length > 0 ? observed.join(", ") : job.model,
+          requestedModel: job.model,
+          modelSource: observed.length > 0 ? "observed" : "requested",
+          effort: job.effort,
+          cwd: job.cwd || parent.cwd || room.cwd,
+          status,
+          runtimeState,
+          nativeSession: workerSession || undefined,
+          resultPath: job.result_path,
+          progress: {
+            task: job.task,
+            stage,
+            reportedAt: isFinished ? result.finished_at : job.started_at,
+          },
+        });
+        seen.add(job.id);
+      }
+    }
+  }
 }
 
 async function appendNativePeers(room, snapshots, root) {
@@ -1096,6 +1190,7 @@ async function appendNativePeers(room, snapshots, root) {
       ...(paneId && { paneId }),
       observedAt: progressRecord?.updatedAt || peer.lastSeenAt || peer.startedAt,
       status,
+      runtimeState: peer.state === "busy" ? "running" : "idle",
       objective: taskText,
       output: [taskText].filter(Boolean),
       progress: {
@@ -1342,6 +1437,7 @@ export async function interactiveProgress(room, root = mailboxRoot()) {
       task: task || "not set",
       stage: stage || "not set",
       statusHealth: health,
+      runtimeState: peer.state === "busy" ? "running" : "idle",
       reportedAt: progress ? progress.updatedAt : null,
       lastSeenAt: peer.lastSeenAt || null,
       startedAt: peer.startedAt || null,

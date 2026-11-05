@@ -176,6 +176,33 @@ describe("tui-box primitives and HordeView unification", () => {
     expect(renderTable(["A", "B"], [["1", "2"]], 12)).toHaveLength(3);
   });
 
+  it("labels a consultation model as requested until the provider confirms it", () => {
+    const room = fixture();
+    room.conductor.model = "supervisor-model";
+    room.agents = [
+      {
+        id: "consult-a",
+        engine: "claude",
+        model: "worker-model",
+        effort: "high",
+        consultation: true,
+        modelSource: "requested",
+        workforceRole: "consultant",
+        status: "running",
+        runtimeState: "running",
+        parent: "conductor",
+      },
+    ];
+    let rendered = plain(new HordeView(room).render(120).join("\n"));
+    expect(rendered).toContain("supervisor-model");
+    expect(rendered).toContain("[consultant] worker-model (requested) / high");
+    room.agents[0].model = "confirmed-worker";
+    room.agents[0].modelSource = "observed";
+    rendered = plain(new HordeView(room).render(120).join("\n"));
+    expect(rendered).toContain("[consultant] confirmed-worker / high");
+    expect(rendered).not.toContain("(requested)");
+  });
+
   it("uses two card columns on a wide terminal and stacked cards when narrow", () => {
     const view = new HordeView(fixture(), { now: () => 2000 });
     const wide = view.render(120);
@@ -211,12 +238,14 @@ describe("tui-box primitives and HordeView unification", () => {
 
   it("supports more than nine members with page-local number keys", () => {
     const view = new StoogesView(fixture("claude:haiku*12"));
+    view.render(80);
     view.handleInput("n");
-    view.handleInput("3");
+    view.handleInput("n");
+    view.handleInput("2");
     const rendered = view.render(80).join("\n");
     expect(view.focusId).toBe("haiku-1");
-    expect(rendered).toContain("3 haiku-1");
-    expect(rendered).toContain("page 2/2");
+    expect(rendered).toContain("2 haiku-1");
+    expect(rendered).toContain("page 3/3");
   });
 
   it("keeps focus, detail and navigation visible on a short terminal", () => {
@@ -312,7 +341,7 @@ describe("tui-box primitives and HordeView unification", () => {
     room.agents[1].resolvedModel = "gemini-4-argon-medium";
     room.agents[1].resolvedEffort = "—";
     const rendered = new StoogesView(room, { height: 28, tier: "nerd" }).render(90).join("\n");
-    expect(rendered).toContain("gribble · folder:");
+    expect(rendered).toContain("Orchestrator: gribble");
     expect(rendered).not.toContain("gribble-gemini-4-argon-medium-orkest-1f");
     expect(rendered).toContain("Gemini 4 Argon / medium");
     expect(rendered).not.toContain("(Medium) / medium");
@@ -478,7 +507,7 @@ describe("tui-box primitives and HordeView unification", () => {
     const hidden = view.render(90).join("\n");
     expect(hidden).not.toContain("2 haiku-2");
     expect(hidden).not.toContain("3 haiku-1");
-    expect(hidden).toContain("2 completed hidden (press c to expand)");
+    expect(hidden).toContain("2 inactive hidden (press c to expand)");
 
     // Press c -> expanded mode
     view.handleInput("c");
@@ -504,6 +533,116 @@ describe("tui-box primitives and HordeView unification", () => {
     expect(view.focusId).toBe("pro-1");
   });
 
+  it("counts execution separately from phase and collapses automatically selected idle history", () => {
+    const room = fixture("claude:haiku*3");
+    room.conductor.status = "completed";
+    Object.assign(room.agents[0], {
+      status: "review",
+      runtimeState: "stopped",
+      dispatch: { taskDir: "/tasks/finished" },
+      objective: "Finished extraction",
+      observedAt: "2026-11-04T12:00:00Z",
+    });
+    Object.assign(room.agents[1], {
+      status: "working",
+      runtimeState: "idle",
+      objective: "Old progress report",
+      observedAt: "2026-11-04T14:00:00Z",
+    });
+    Object.assign(room.agents[2], {
+      status: "review",
+      runtimeState: "running",
+      objective: "Inspect current result",
+      observedAt: "2026-11-04T13:00:00Z",
+    });
+    const view = new StoogesView(room, { height: 36, tier: "unicode" });
+    const rendered = view.render(100).join("\n");
+    expect(rendered).toContain("1 active");
+    expect(rendered).toContain("awaiting review");
+    expect(rendered).toContain("idle · last reported working");
+    expect(rendered).not.toContain("┌ 1 haiku-2");
+    expect(rendered).toMatch(/haiku[^\n]*\| idle/u);
+    expect(view.needsAnimation).toBe(true);
+    view.handleInput("1");
+    expect(view.render(100).join("\n")).toContain("┌ 1 haiku-2");
+    room.agents[2].runtimeState = "stopped";
+    view.setRoom(room);
+    expect(view.needsAnimation).toBe(false);
+    room.agents[2].status = "blocked";
+    room.agents[2].runtimeState = "idle";
+    view.setRoom(room);
+    const blocked = view.render(100).join("\n");
+    expect(blocked).toContain("1 blocked");
+    expect(blocked).toContain("┌ 2 haiku-3");
+  });
+
+  it("shows an idle native reviewer without implying an unaccepted executor result", () => {
+    const room = fixture();
+    room.agents = [room.agents[0]];
+    Object.assign(room.agents[0], { status: "review", runtimeState: "idle" });
+    const view = new StoogesView(room, { height: 32, completedMode: "expanded" });
+    expect(view.render(100).join("\n")).toContain("idle · last reported review");
+    expect(view.needsAnimation).toBe(false);
+  });
+
+  it("joins the coordinator, quota, cards and services with one continuous tree spine", () => {
+    const room = fixture("claude:haiku,agy:flash");
+    room.quotaError = "Quota unavailable";
+    room.services = [{ kind: "port", port: 5017, name: "preview" }];
+    const lines = new StoogesView(room, { height: 40, tier: "unicode" }).render(90);
+    const serviceIndex = lines.findIndex((line) => line.includes("Services"));
+    expect(lines[0][1]).toBe("┌");
+    expect(lines.find((line) => line.includes("Quota"))[1]).toBe("├");
+    expect(lines[serviceIndex][1]).toBe("├");
+    expect(lines[serviceIndex + 2][1]).toBe("└");
+    expect(lines.slice(1, serviceIndex + 2).every((line) => "│├".includes(line[1]))).toBe(true);
+    expect(lines.join("\n")).toContain("├─┤Awaiting assignment");
+    expect(lines.every((line) => displayWidth(line) <= 90)).toBe(true);
+  });
+
+  it("keeps the tree connected across worktree headings and collapsed children", () => {
+    const room = fixture("codex:luna,claude:haiku,claude:haiku");
+    room.cwd = "/workspace/project";
+    room.quotaError = "Quota unavailable";
+    room.services = [{ kind: "port", port: 5017, name: "preview" }];
+    const [parent, active, finished] = room.agents;
+    parent.name = "supervisor";
+    parent.cwd = room.cwd;
+    active.parent = parent.id;
+    active.cwd = "/worktrees/" + "long-audit-worktree-name-".repeat(4);
+    active.status = "running";
+    finished.parent = parent.id;
+    finished.cwd = "/worktrees/previous-audit";
+    finished.status = "reported complete";
+    for (const width of [70, 120]) {
+      const lines = new HordeView(room, { height: 60, tier: "unicode", color: false }).render(
+        width,
+      );
+      const start = lines.findIndex((line) => line.includes("project · 1 agent"));
+      const end = lines.findIndex((line) => line.includes("Services"));
+      expect(lines.slice(start, end).every((line) => "│├".includes(line[1]))).toBe(true);
+      expect(lines.find((line) => line.includes("long-audit"))).toContain(" · 1 agent");
+      expect(lines.every((line) => displayWidth(line) <= width)).toBe(true);
+      expect(lines.find((line) => line.includes("haiku-2"))).toContain("↳ supervisor");
+    }
+  });
+
+  it("shows repository context once across active and completed agent rows", () => {
+    const room = fixture("codex:luna,claude:haiku,agy:flash");
+    room.cwd = "/workspace/sample-project";
+    for (const [index, agent] of room.agents.entries()) {
+      agent.cwd = room.cwd;
+      agent.name = index === 0 ? "codex:sample-project" : "sample-project";
+      agent.status = index === 2 ? "completed" : "working";
+    }
+    const rendered = new StoogesView(room, { height: 32, tier: "unicode" }).render(90).join("\n");
+    expect(rendered).toContain("sample-project · 3 agents");
+    expect(rendered.match(/sample-project/gu)).toHaveLength(1);
+    expect(rendered).toContain("FOCUS ");
+    expect(rendered).toContain("codex");
+    expect(rendered).toContain("claude");
+  });
+
   it("renders outer tree rails, contrasting headers, and wt:<slug> badges for disposable worktrees in swarm view", () => {
     const room = fixture("agy:pro@ui-designer,claude:haiku@reviewer");
     room.title = "Worktree grouping";
@@ -525,17 +664,17 @@ describe("tui-box primitives and HordeView unification", () => {
     );
     expect(unicodeLines.every((line) => displayWidth(line) <= 90)).toBe(true);
     const unicodeText = unicodeLines.join("\n");
-    expect(unicodeText).toContain("orkest · 2 agents · /workspace/orkest");
+    expect(plain(unicodeText)).toContain("orkest · 2 agents");
     expect(unicodeText).toContain("FOCUS wt:wt-50");
-    expect(unicodeText).toContain("\u{1B}[48;5;24;97;1m");
-    expect(unicodeText).toContain("\u{1B}[48;5;236;97;1m");
+    expect(unicodeText).not.toContain("\u{1B}[48;5;24;97;1m");
+    expect(unicodeText).toContain("\u{1B}[7;1m");
 
     const asciiText = new StoogesView(room, { height: 28, tier: "ascii" }).render(85).join("\n");
-    expect(asciiText).toContain("| orkest · 2 agents · /workspace/orkest");
+    expect(asciiText).toContain("| orkest · 2 agents");
     expect(asciiText).toContain("| + 1 haiku-1");
-    expect(asciiText).toContain("+-|Awaiting assignment");
+    expect(asciiText).toContain("+-+Awaiting assignment");
     expect(asciiText).toContain("| + 2 pro-1");
-    expect(asciiText).toContain("`-|Awaiting assignment");
+    expect(asciiText).toContain("`-+Awaiting assignment");
     expect(asciiText).toContain("wt:wt-50");
   });
 });
@@ -998,9 +1137,7 @@ describe("terminal lifecycle", () => {
       now: () => 20_000,
     });
     const expandedText = view.render(100).join("\n");
-    expect(expandedText).toContain(
-      "Orchestrator: gribble · folder: orkest (feat/swarm-view) · agy · pane-lead-1",
-    );
+    expect(expandedText).toContain("Orchestrator: gribble (feat/swarm-view) · agy · pane-lead-1");
     expect(expandedText).toContain("Ship Swarm View v2 — Coordinating slice 2A");
     expect(expandedText).toContain("u collapse");
     expect(expandedText).toContain("Services");

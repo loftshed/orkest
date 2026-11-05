@@ -9,22 +9,14 @@
  */
 import { stripVTControlCharacters } from "node:util";
 
+import { DEFAULT_THEME } from "./tui-theme.mjs";
+
 const segments = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 export const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const ESC = String.fromCodePoint(27);
 const ANSI_SGR_PATTERN = new RegExp(String.raw`${ESC}\[[0-9;]*m|[^${ESC}]+`, "gu");
 
-export const ANSI = {
-  cyan: "36",
-  green: "32",
-  yellow: "33",
-  red: "31",
-  dim: "2",
-  bold: "1",
-  inverse: "7",
-  headerBg: "48;5;236;97;1",
-  folderHeader: "48;5;24;97;1",
-};
+export { DEFAULT_THEME as ANSI } from "./tui-theme.mjs";
 
 export const GLYPHS = {
   ascii: {
@@ -229,11 +221,13 @@ export function progressBar(value, width, tier = glyphTier()) {
 
 export function tone(value, styleTone, color) {
   const text = plain(value);
+  const enabled = typeof color === "object" ? color?.enabled : color;
+  const tokens = typeof color === "object" ? color?.theme || DEFAULT_THEME : DEFAULT_THEME;
   const codes = String(styleTone)
     .split(/\s+/u)
-    .map((name) => ANSI[name])
+    .map((name) => tokens[name])
     .filter(Boolean);
-  if (!color || codes.length === 0) return text;
+  if (!enabled || codes.length === 0) return text;
   return `\u{1B}[${codes.join(";")}m${text}\u{1B}[0m`;
 }
 
@@ -295,12 +289,12 @@ export function frame(
   if (color && headerTone) {
     const titlePill = fit(cleanTitle, Math.min(displayWidth(cleanTitle), availableTitle));
     const middleSpace = " ".repeat(Math.max(0, availableTitle - displayWidth(titlePill)));
-    const styledTail = tone(tail, tail.trim() ? headerTone : "cyan", color);
-    top = `${tone(glyphs.topLeft, "cyan", color)}${tone(titlePill, headerTone, color)}${tone(middleSpace, "cyan", color)}${styledTail}${tone(glyphs.horizontal.repeat(topRemaining) + glyphs.topRight, "cyan", color)}`;
+    const styledTail = tone(tail, tail.trim() ? headerTone : "border", color);
+    top = `${tone(glyphs.topLeft, "border", color)}${tone(titlePill, headerTone, color)}${tone(middleSpace, "border", color)}${styledTail}${tone(glyphs.horizontal.repeat(topRemaining) + glyphs.topRight, "border", color)}`;
   } else {
     top = tone(
       glyphs.topLeft + topContent + glyphs.horizontal.repeat(topRemaining) + glyphs.topRight,
-      "cyan",
+      "border",
       color,
     );
   }
@@ -308,11 +302,11 @@ export function frame(
     top,
     ...lines.map(
       (line) =>
-        `${tone(glyphs.vertical, "cyan", color)}${fitStyled(line, inside)}${tone(glyphs.vertical, "cyan", color)}`,
+        `${tone(glyphs.vertical, "border", color)}${fitStyled(line, inside)}${tone(glyphs.vertical, "border", color)}`,
     ),
     tone(
       `${glyphs.bottomLeft}${glyphs.horizontal.repeat(inside)}${glyphs.bottomRight}`,
-      "cyan",
+      "border",
       color,
     ),
   ];
