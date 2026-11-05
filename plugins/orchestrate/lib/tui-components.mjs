@@ -230,10 +230,10 @@ export function sectionHeading(
   label,
   detail,
   width,
-  { prefix = "", color = false, tier = "unicode" } = {},
+  { prefix = "", color = false, tier = "unicode", separator = " · " } = {},
 ) {
   const available = Math.max(0, width - displayWidth(prefix));
-  const suffix = detail ? ` · ${plain(detail)}` : "";
+  const suffix = detail ? `${separator}${plain(detail)}` : "";
   const nameWidth = Math.max(0, available - displayWidth(suffix));
   const name =
     displayWidth(label) > nameWidth ? elide(label, nameWidth, tier).trimEnd() : plain(label);

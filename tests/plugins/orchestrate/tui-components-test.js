@@ -263,6 +263,22 @@ describe("terminal presentation components", () => {
           status: "running",
           progress: { stage: "working", task: "Checking header layout" },
         },
+        {
+          id: "worker-2",
+          name: "alpha",
+          engine: "claude",
+          model: "claude-sonnet-5-5",
+          cwd: "/workspace/project",
+          status: "blocked",
+        },
+        {
+          id: "worker-3",
+          name: "beta",
+          engine: "claude",
+          model: "claude-haiku-4-5",
+          cwd: "/workspace/project",
+          status: "completed",
+        },
       ],
     };
     const view = new HordeView(room, { color: true, tier: "nerd", now: () => 840 });
@@ -273,7 +289,9 @@ describe("terminal presentation components", () => {
     expect(plain(rendered[3])).toContain("│ ⣷ Inspecting Orkest swarm pane title and card header");
     expect(rendered[3]).toContain("\u{1B}[38;5;149m⣷\u{1B}[0m");
     expect(rendered[3]).toContain("\u{1B}[38;5;150;1m");
-    expect(plain(rendered.join("\n"))).toContain("│ project · 1 active · 1/12 slots");
+    expect(plain(rendered.join("\n"))).toContain(
+      "│ project  ·  󰔛 1 active  ·  󰀪 1 blocked  ·  󰄬 1 complete",
+    );
     expect(plain(rendered.join("\n"))).toContain("└─┤ ⣷ Checking header layout");
     expect(plain(rendered.join("\n"))).toContain(" \u{F233} Services ");
     view.handleKey("v");

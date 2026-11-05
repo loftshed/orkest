@@ -182,6 +182,24 @@ function swarmActivityBadge(room, maxAgents, tier, innerWidth = 80) {
   return parts.length > 0 ? `${parts.join(" · ")} · ${base}` : base;
 }
 
+function folderActivitySummary(entries, tier) {
+  const agents = entries.map((entry) => entry.agent || entry);
+  const activeCount = agents.filter(isExecuting).length;
+  const blockedCount = agents.filter((a) => ERROR_STATUSES.has(a.status)).length;
+  const doneCount = agents.filter(
+    (a) => !isExecuting(a) && COMPLETED_STATUSES.has(a.status),
+  ).length;
+  const glyphs = glyphSet(tier);
+  const parts = [];
+  if (activeCount > 0) parts.push(`${glyphs.running} ${activeCount} active`);
+  if (blockedCount > 0) parts.push(`${glyphs.blocked} ${blockedCount} blocked`);
+  if (doneCount > 0) parts.push(`${glyphs.completed} ${doneCount} complete`);
+  if (parts.length === 0) {
+    return `${agents.length} ${agents.length === 1 ? "agent" : "agents"}`;
+  }
+  return parts.join("  ·  ");
+}
+
 function toneForStatus(member) {
   const { status } = member;
   if (isExecuting(member)) return "running";
@@ -1354,6 +1372,7 @@ export class HordeView {
         prefix: toAsciiTree("│ ", this.tier),
         color: this.appearance,
         tier: this.tier,
+        separator: summary ? "  ·  " : " · ",
       },
     );
   }
@@ -1623,17 +1642,11 @@ export class HordeView {
         folderGroups.get(folder).push({ agent, index: offset });
       }
       const gap = "  ";
-      const folderKeys = folderGroups.keys().toArray();
-      const firstFolder = folderKeys[0];
-      const lastFolder = folderKeys.at(-1);
+      const lastFolder = folderGroups.keys().toArray().at(-1);
       for (const [folder, rawEntries] of folderGroups) {
-        let folderSummary = "";
-        if (hasHerdrPaneHeader && folder === firstFolder) {
-          folderSummary =
-            folderGroups.size === 1
-              ? activityBadge
-              : `${rawEntries.length} ${rawEntries.length === 1 ? "agent" : "agents"} · ${activityBadge}`;
-        }
+        const folderSummary = hasHerdrPaneHeader
+          ? folderActivitySummary(rawEntries, this.tier)
+          : "";
         lines.push(this.folderHeaderLine(folder, rawEntries.length, innerWidth, folderSummary));
         const hiddenCompletedCount =
           this.completedMode === "hidden"
