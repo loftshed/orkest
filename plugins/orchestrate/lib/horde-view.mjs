@@ -1040,7 +1040,7 @@ export class HordeView {
               },
             ]),
         { id: "inactive", label: "Inactive", key: "c", active: this.completedMode === "expanded" },
-        ...(this.room.services?.length
+        ...(this.room.services?.length && this.servicesMode !== "collapsed"
           ? [
               {
                 id: "services",
@@ -1289,7 +1289,8 @@ export class HordeView {
 
   inlineServicesLine(innerWidth) {
     const services = Array.isArray(this.room.services) ? this.room.services : [];
-    const labelText = disclosure("Services", false, this.tier);
+    const labelText =
+      this.tier === "nerd" ? "\u{F233} Services" : disclosure("Services", false, this.tier);
     const badge = tone(
       labelText,
       this.hovered === "services-heading" ? "buttonHover" : "running bold",
@@ -1699,18 +1700,22 @@ export class HordeView {
           const cardTitle = `${isFocused ? `${pointer} ` : ""}${index + 1} ${displayAgentName}${agent.role === "lead" ? " (lead)" : ""}`;
           const rightMeta = `${stateBadge}${locationBadge}${parentBadge}${currentBadge}`.trim();
           const cardRight = rightMeta ? `${rightMeta} ${chevron}` : chevron;
-          const cardBodyWidth = Math.max(1, cardWidth - displayWidth(prefix) - 2);
+          const agentRunning = isExecuting(agent);
+          const cardBodyWidth = Math.max(
+            1,
+            cardWidth - displayWidth(prefix) - (agentRunning ? 5 : 3),
+          );
           const fittedTaskText =
             displayWidth(taskText) > cardBodyWidth ? fit(taskText, cardBodyWidth) : taskText;
-          const renderedTask = isExecuting(agent)
-            ? shimmerText(fittedTaskText, now, this.appearance)
+          const renderedTask = agentRunning
+            ? `${tone(this.tier === "ascii" ? ">" : SPINNER[Math.floor(now / 120) % SPINNER.length], "shimmerSpinner", this.appearance)} ${shimmerText(fittedTaskText, now, this.appearance)}`
             : fittedTaskText;
           const statusLine = tone(
             `${statusGlyph(agent, now, this.tier)}${roleBadge} ${model(agent)} | ${phase(agent)}${progressSuffix(agent, now)}`,
             `${toneForStatus(agent)}${isFocused ? " bold" : ""}`,
             this.appearance,
           );
-          return treeCard(cardTitle, [renderedTask, statusLine], cardWidth, {
+          return treeCard(cardTitle, [` ${renderedTask}`, ` ${statusLine}`], cardWidth, {
             emphasized: isFocused || isPinned,
             hovered: isHovered,
             topPrefix,

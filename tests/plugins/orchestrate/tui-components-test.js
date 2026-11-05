@@ -242,6 +242,7 @@ describe("terminal presentation components", () => {
       title: "Refine Orkest coordinator delegation",
       herdrViewPaneId: "w1:p2",
       swarm: { maxAgents: 12, maxDepth: 8 },
+      services: [{ kind: "port", port: 5017, name: "preview" }],
       conductor: {
         name: "glorpax",
         engine: "agy",
@@ -273,5 +274,13 @@ describe("terminal presentation components", () => {
     expect(rendered[3]).toContain("\u{1B}[38;5;149m⣷\u{1B}[0m");
     expect(rendered[3]).toContain("\u{1B}[38;5;150;1m");
     expect(plain(rendered.join("\n"))).toContain("│ project · 1 active · 1/12 slots");
+    expect(plain(rendered.join("\n"))).toContain("└─┤ ⣷ Checking header layout");
+    expect(plain(rendered.join("\n"))).toContain(" \u{F233} Services ");
+    view.handleKey("v");
+    const collapsedLines = view.render(80).map(plain);
+    expect(collapsedLines.join("\n")).toContain(
+      "\u{F233} Services  1 running · localhost :5017 preview",
+    );
+    expect(collapsedLines.find((line) => line.includes("View chat"))).not.toContain("Services");
   });
 });
