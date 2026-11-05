@@ -65,6 +65,85 @@ async function fixture() {
 }
 
 describe("room execution", () => {
+  it("projects consultations under their supervisor with independent model and lifecycle", async () => {
+    const { root, room } = await fixture();
+    room.conductor.session = { id: "supervisor-a", machine: hostname() };
+    room.conductor.model = "supervisor-model";
+    const dir = path.join(root, "consultations", "supervisor-a");
+    await mkdir(dir, { recursive: true });
+    const resultPath = path.join(root, "consult-result.json");
+    const record = {
+      schema: "orchestrate.consultation-observation.v1",
+      id: "consult-a",
+      parent_session: "supervisor-a",
+      room_id: room.id,
+      machine: hostname(),
+      pid: process.pid,
+      runner_pid: process.pid,
+      deadline_ms: Date.now() + 60_000,
+      engine: "claude",
+      model: "requested-worker-model",
+      effort: "high",
+      task: "Inspect the lifecycle",
+      started_at: new Date().toISOString(),
+      result_path: resultPath,
+    };
+    await writeFile(path.join(dir, "consult-a.json"), JSON.stringify(record));
+    const options = { root, progress: async () => new Map(), discoverNativePeers: false };
+    const observed = await observeRoom(room, options);
+    expect(observed.conductor.model).toBe("supervisor-model");
+    expect(observed.agents.at(-1)).toMatchObject({
+      id: "consult-a",
+      parent: "conductor",
+      consultation: true,
+      model: "requested-worker-model",
+      modelSource: "requested",
+      runtimeState: "running",
+    });
+    await writeFile(
+      path.join(dir, "consult-a.json"),
+      JSON.stringify({ ...record, deadline_ms: 1 }),
+    );
+    expect((await observeRoom(room, options)).agents.at(-1)).toMatchObject({
+      status: "session unavailable",
+      runtimeState: "unknown",
+    });
+    await writeFile(
+      resultPath,
+      JSON.stringify({
+        schema: "agent-executor.consultation.v1",
+        status: "answered",
+        model_observed: ["actual-worker-model"],
+        session_id: "worker-session",
+      }),
+    );
+    room.agents.push({
+      id: "hook-discovered-worker",
+      native: true,
+      nativeSession: "worker-session",
+      status: "idle",
+    });
+    const finished = await observeRoom(room, options);
+    expect(finished.agents.filter((agent) => agent.id === "consult-a")).toHaveLength(1);
+    expect(finished.agents.some((agent) => agent.id === "hook-discovered-worker")).toBe(false);
+    expect(finished.agents.at(-1)).toMatchObject({
+      model: "actual-worker-model",
+      modelSource: "observed",
+      requestedModel: "requested-worker-model",
+      status: "reported complete",
+      runtimeState: "stopped",
+      nativeSession: "worker-session",
+    });
+    const anotherSwarm = structuredClone(room);
+    anotherSwarm.id = "another-room";
+    expect((await observeRoom(anotherSwarm, options)).agents.some((a) => a.consultation)).toBe(
+      false,
+    );
+    const unrelated = structuredClone(room);
+    unrelated.conductor.session.id = "another-supervisor";
+    expect((await observeRoom(unrelated, options)).agents.some((a) => a.consultation)).toBe(false);
+  });
+
   it("creates and lists grouped rooms without dispatching, then preserves members when adding", async () => {
     const { root, room } = await fixture();
     await growRoom(room.id, parseTeam("agy:flash"), root);
@@ -107,7 +186,10 @@ describe("room execution", () => {
     await dispatchMember(room.id, "haiku-1", { root, taskDir, run });
     task.runs[0].status = "finished";
     task.runs[0].runner_status = "completed";
-    expect((await observeRoom(room.id, { root, run })).agents[0].status).toBe("review");
+    expect((await observeRoom(room.id, { root, run })).agents[0]).toMatchObject({
+      status: "review",
+      runtimeState: "stopped",
+    });
     task.decisions.push({ run_id: "run-1", decision: "supported" });
     expect((await observeRoom(room.id, { root, run })).agents[0].status).toBe("completed");
     task.decisions.length = 0;
@@ -118,7 +200,10 @@ describe("room execution", () => {
     task.decisions.push({ run_id: "run-1", decision: "takeover" });
     expect((await observeRoom(room.id, { root, run })).agents[0].status).toBe("blocked");
     task.task_id = "replacement";
-    expect((await observeRoom(room.id, { root, run })).agents[0].status).toBe("unknown");
+    expect((await observeRoom(room.id, { root, run })).agents[0]).toMatchObject({
+      status: "unknown",
+      runtimeState: "unknown",
+    });
   });
 
   it("reserves native work without inventing an interactive session", async () => {
@@ -475,6 +560,56 @@ describe("room CLI", () => {
     expect(observed.agents[0].herdrPaneId).toBe("herdr-pane-42");
     expect(observed.agents[0].paneId).toBe("%42");
     expect(observed.agents[0].progress.task).not.toBe("Legacy task should be ignored");
+  });
+
+  it("keeps an idle session separate from its saved review phase", async () => {
+    const { root, room, cwd } = await fixture();
+    const session = "idle-reviewer";
+    const now = new Date().toISOString();
+    await mkdir(path.join(root, "peers"), { recursive: true });
+    await mkdir(path.join(root, "progress"), { recursive: true });
+    await writeFile(
+      path.join(root, "peers", `${session}.json`),
+      JSON.stringify({
+        schema: "agent-executor.peer.v1",
+        session,
+        name: "reviewer",
+        harness: "claude",
+        state: "idle",
+        cwd,
+        pid: process.pid,
+        startedAt: now,
+        lastSeenAt: now,
+      }),
+    );
+    await writeFile(
+      path.join(root, "progress", `${session}.json`),
+      JSON.stringify({
+        schema: "orchestrate.progress.v1",
+        session,
+        harness: "claude",
+        machine: hostname(),
+        checkout: cwd,
+        goal: "Inspect cache",
+        task: "Review result",
+        stage: "review",
+        updatedAt: now,
+      }),
+    );
+    await updateRoom(
+      room.id,
+      (current) => {
+        current.agents[0].session = { id: session, engine: "claude", machine: hostname(), cwd };
+        return current;
+      },
+      { root },
+    );
+    const observed = await observeRoom(room.id, { root });
+    expect(observed.agents[0]).toMatchObject({
+      status: "review",
+      runtimeState: "idle",
+      progress: { stage: "review" },
+    });
   });
 
   it("auto-discovers live unbound native peers in the room checkout without mutating persisted room json", async () => {

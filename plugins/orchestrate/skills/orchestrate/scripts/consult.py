@@ -17,6 +17,7 @@ import importlib.util
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import threading
@@ -657,6 +658,36 @@ def prepare_consult_dir(requested: Path | None, repository: str | None = None) -
     return directory
 
 
+def record_consultation(
+    request: dict[str, Any], result: dict[str, Any], result_path: Path, pid: int, session_id: str | None
+) -> None:
+    """An observation index, not room membership or task acceptance. One writer per job."""
+    parent = request.get("parent_session")
+    if not isinstance(parent, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", parent):
+        return
+    directory = _runner().default_agent_cache_dir() / "mailbox-v1" / "consultations" / parent
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    record = {
+        "schema": "orchestrate.consultation-observation.v1",
+        "id": "consult-" + uuid.uuid4().hex,
+        "parent_session": parent,
+        "room_id": request.get("room_id"),
+        "machine": socket.gethostname(),
+        "pid": pid,
+        "runner_pid": os.getpid(),
+        "session_id": session_id,
+        "deadline_ms": int((time.time() + _runner().parse_duration(request["timeout"]) + 60) * 1000),
+        "engine": result["engine"],
+        "model": result["model"],
+        "effort": result["effort"].get("bound"),
+        "task": request["question"],
+        "cwd": request.get("read"),
+        "started_at": result["started_at"],
+        "result_path": str(result_path),
+    }
+    _runner().write_json_atomic(directory / (record["id"] + ".json"), record)
+
+
 def codex_mcp_server_names(workspace: Path) -> list[str]:
     """Configured Codex MCP server names across user and repository config files."""
     import tomllib
@@ -815,6 +846,9 @@ def consult_environment(
     web: bool = False,
 ) -> dict[str, str]:
     environment = _runner().executor_environment(engine, workspace, claude_config_dir, session_id=session_id)
+    # A standalone consultant must not inherit the supervising actor's mailbox identity.
+    for key in ("AGENT_MAILBOX_SESSION", "AGENT_MAILBOX_LISTENER_SESSION", "AGENT_MAILBOX_PEER"):
+        environment.pop(key, None)
     if engine == "opencode":
         # This configuration only reaches a private server (`run --standalone` on v2, `--pure` on v1); the
         # shared background service keeps the config it started with. Reading keeps glob, grep and read;
@@ -927,6 +961,8 @@ def base_result(request: dict[str, Any], *, started_at: str) -> dict[str, Any]:
         "schema": RESULT_SCHEMA,
         "runner_version": runner.RUNNER_VERSION,
         "kind": "consultation",
+        "parent_session": request.get("parent_session"),
+        "room_id": request.get("room_id"),
         "intent": request["intent"],
         "read": request.get("read"),
         "web": bool(request.get("web") or request.get("route") == "web-research"),
@@ -1225,6 +1261,9 @@ def _perform(
                 stderr=stderr_handle,
                 start_new_session=True,
             )
+            # Visibility must never strand a launched provider before its wait/termination handlers.
+            with contextlib.suppress(OSError):
+                record_consultation(request, result, result_path, process.pid, session_id or new_session_id)
             with runner.forward_termination_signals(process):
                 timed_out = runner.wait_with_heartbeats(
                     process,
@@ -1420,6 +1459,30 @@ def main(argv: list[str] | None = None) -> int:
     if (args.completion_event or args.notify) and not (args.detach or args.request):
         raise _error("--notify is only valid with --detach")
     request = build_request(args)
+    if "parent_session" not in request:
+        request["parent_session"] = next(
+            (
+                os.environ[key]
+                for key in (
+                    "AGENT_MAILBOX_SESSION",
+                    "CODEX_THREAD_ID",
+                    "CLAUDE_CODE_SESSION_ID",
+                    "ANTIGRAVITY_CONVERSATION_ID",
+                    "OPENCODE_SESSION_ID",
+                )
+                if os.environ.get(key)
+            ),
+            None,
+        )
+    if "room_id" not in request:
+        request["room_id"] = os.environ.get("ORKEST_SWARM_ROOM") or None
+        if not request["room_id"] and request.get("parent_session"):
+            with contextlib.suppress(OSError):
+                room = runner.bundled_module("agent_statusline_tmux").find_session_swarm_room(
+                    runner.default_agent_cache_dir() / "mailbox-v1", request["parent_session"]
+                )
+                if room:
+                    request["room_id"] = room["id"]
     if args.detach:
         return launch_detached(request, args)
     if request["transport"] == "native":

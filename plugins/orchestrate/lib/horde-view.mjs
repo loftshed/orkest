@@ -23,6 +23,8 @@ import {
   tone,
   wrapText,
 } from "./tui-box.mjs";
+import { sectionHeading, statusRow, treeCard } from "./tui-components.mjs";
+import { resolveTheme } from "./tui-theme.mjs";
 
 export {
   ANSI,
@@ -60,6 +62,32 @@ const SLOT_ID_PATTERN = /^[a-z0-9.]+-\d+$/iu;
 const SESSION_TAG_PATTERN = /^[0-9a-f]{2}$/iu;
 const EFFORT_LEVELS = new Set(["minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
 const TRAILING_EFFORT_PATTERN = /^(.*\S)(?:\s*\(([a-z]+)\)|\s*\[([a-z]+)\]|-([a-z]+))$/iu;
+
+function isExecuting(member) {
+  if (member.runtimeState) return member.runtimeState === "running";
+  if (member.dispatch && member.status === "review") return false;
+  return ACTIVE_STATUSES.has(member.status);
+}
+
+function isInactive(member) {
+  if (ERROR_STATUSES.has(member.status) && member.status !== "session unavailable") return false;
+  return (
+    !isExecuting(member) &&
+    (COMPLETED_STATUSES.has(member.status) ||
+      ["idle", "session unavailable"].includes(member.status) ||
+      ["idle", "stopped"].includes(member.runtimeState) ||
+      (member.dispatch && member.status === "review"))
+  );
+}
+
+function phaseLabel(member) {
+  if (member.paused) return "new launches paused";
+  if (member.dispatch && member.status === "review" && !isExecuting(member))
+    return "awaiting review";
+  if (member.runtimeState === "idle" && ACTIVE_STATUSES.has(member.status))
+    return `idle · last reported ${member.status}`;
+  return member.status || "unknown";
+}
 
 export function shortAgentName(member) {
   if (!member) return "";
@@ -99,7 +127,7 @@ export function normalizeModelAndEffort(modelName, effort) {
 }
 
 function progressSuffix(member, now) {
-  if (!member || member.paused) return "";
+  if (!member || member.paused || !isExecuting(member)) return "";
   const parts = [];
   const step = STAGE_STEPS[member.status];
   if (step) parts.push(`step ${step}`);
@@ -127,8 +155,10 @@ function swarmActivityBadge(room, maxAgents, tier, innerWidth = 80) {
   const agents = room?.agents || [];
   const base = `${agents.length}/${maxAgents} slots`;
   if (agents.length === 0 || innerWidth < 64) return base;
-  const activeCount = agents.filter((a) => ACTIVE_STATUSES.has(a.status)).length;
-  const doneCount = agents.filter((a) => COMPLETED_STATUSES.has(a.status)).length;
+  const activeCount = agents.filter(isExecuting).length;
+  const doneCount = agents.filter(
+    (a) => !isExecuting(a) && COMPLETED_STATUSES.has(a.status),
+  ).length;
   const blockedCount = agents.filter((a) => ERROR_STATUSES.has(a.status)).length;
   const check = glyphSet(tier).completed;
   const parts = [];
@@ -138,17 +168,20 @@ function swarmActivityBadge(room, maxAgents, tier, innerWidth = 80) {
   return parts.length > 0 ? `${parts.join(" · ")} · ${base}` : base;
 }
 
-function toneForStatus(status) {
-  if (COMPLETED_STATUSES.has(status)) return "green";
-  if (ACTIVE_STATUSES.has(status)) return "cyan";
-  if (ERROR_STATUSES.has(status)) return "red";
-  if (status === "queued" || status === "reserved") return "yellow";
-  return "dim";
+function toneForStatus(member) {
+  const { status } = member;
+  if (isExecuting(member)) return "running";
+  if (COMPLETED_STATUSES.has(status)) return "success";
+  if (status === "review") return "warning";
+  if (isInactive(member)) return "muted";
+  if (ERROR_STATUSES.has(status)) return "error";
+  if (status === "queued" || status === "reserved") return "warning";
+  return "muted";
 }
 
 function statusGlyph(agent, now, tier) {
   const glyphs = glyphSet(tier);
-  const isActive = ACTIVE_STATUSES.has(agent.status);
+  const isActive = isExecuting(agent);
   if (isActive && tier === "unicode") return SPINNER[Math.floor(now / 200) % SPINNER.length];
   if (isActive) return glyphs.running;
   if (ERROR_STATUSES.has(agent.status)) return glyphs.blocked;
@@ -262,7 +295,7 @@ function quotaRows(accounts, width, tier, color, now = Date.now()) {
       rows.push(
         pct === undefined
           ? `${label} ${suffix}`
-          : `${label} ${tone(progressBar(pct / 100, barWidth, tier), pct <= 10 ? "red" : "green", color)} ${suffix}`,
+          : `${label} ${tone(progressBar(pct / 100, barWidth, tier), pct <= 10 ? "error" : "success", color)} ${suffix}`,
       );
       continue;
     }
@@ -288,7 +321,7 @@ function quotaRows(accounts, width, tier, color, now = Date.now()) {
         rows.push(
           pct === undefined
             ? `${short} ${summary}`
-            : `${short} ${tone(progressBar(pct / 100, barWidth, tier), pct <= 10 ? "red" : "green", color)} ${summary}`,
+            : `${short} ${tone(progressBar(pct / 100, barWidth, tier), pct <= 10 ? "error" : "success", color)} ${summary}`,
         );
       }
       continue;
@@ -313,7 +346,7 @@ function quotaRows(accounts, width, tier, color, now = Date.now()) {
     rows.push(
       pct === undefined
         ? `${short} ${summary}`
-        : `${short} ${tone(progressBar(pct / 100, barWidth, tier), pct <= 10 ? "red" : "green", color)} ${summary}`,
+        : `${short} ${tone(progressBar(pct / 100, barWidth, tier), pct <= 10 ? "error" : "success", color)} ${summary}`,
     );
   }
   return rows.length > 0 ? rows : ["Quota unavailable"];
@@ -373,7 +406,7 @@ function toAsciiTree(text, tier) {
   return text.replaceAll("└", "`").replaceAll("├", "+").replaceAll("─", "-").replaceAll("│", "|");
 }
 
-function folderTreeRails(entries, tier, columns = 1) {
+function folderTreeRails(entries, tier, columns = 1, hasFollowingSection = false) {
   const inGroup = new Set(entries.map(({ agent }) => agent.id));
   const groupParent = (agent) =>
     agent.parent && agent.parent !== "conductor" && inGroup.has(agent.parent)
@@ -381,6 +414,7 @@ function folderTreeRails(entries, tier, columns = 1) {
       : "conductor";
   const isLastSibling = (agent) => {
     const parent = groupParent(agent);
+    if (parent === "conductor" && hasFollowingSection) return false;
     for (let index = entries.length - 1; index >= 0; index--) {
       if (groupParent(entries[index].agent) === parent) return entries[index].agent.id === agent.id;
     }
@@ -395,15 +429,12 @@ function folderTreeRails(entries, tier, columns = 1) {
       ancestors.unshift(parentEntry.agent);
       cursor = groupParent(parentEntry.agent);
     }
-    let indent = ancestors
+    const indent = ancestors
       .map((ancestor) => (isLastSibling(ancestor) ? " ".repeat(3) : "│  "))
       .join("");
-    if (agent.parent && agent.parent !== "conductor" && !inGroup.has(agent.parent)) {
-      indent += " ".repeat(3);
-    }
     const isBottomOfColumn = columns > 1 && entryIndex + columns >= entries.length;
     const isLast = isLastSibling(agent);
-    const hasRailBelow = !isLast && !isBottomOfColumn;
+    const hasRailBelow = !isLast && (!isBottomOfColumn || hasFollowingSection);
     return {
       topPrefix: toAsciiTree(`${indent}│ `, tier),
       midPrefix: toAsciiTree(`${indent}${isLast ? "└─" : "├─"}`, tier),
@@ -503,6 +534,7 @@ export class HordeView {
       now = Date.now,
       height = 32,
       color = false,
+      theme,
       tier = glyphTier(),
       completedMode = "collapsed",
       quotaMode = "expanded",
@@ -513,7 +545,9 @@ export class HordeView {
     this.room = treeRoom(room);
     this.now = now;
     this.height = height;
+    this.renderWidth = 80;
     this.color = color;
+    this.appearance = { enabled: color, theme: resolveTheme(theme) };
     this.tier = tier;
     this.completedMode = COMPLETED_MODES.includes(completedMode) ? completedMode : "collapsed";
     this.quotaMode = QUOTA_MODES.has(quotaMode) ? quotaMode : "expanded";
@@ -522,6 +556,7 @@ export class HordeView {
     this.lastFocusedAgentId = undefined;
     this.focusId = this.room.agents[0]?.id;
     this.focusFollowsLatest = true;
+    this.hasExplicitFocus = false;
     this.pinnedId = undefined;
     this.page = 0;
     this.overlay = undefined;
@@ -541,7 +576,8 @@ export class HordeView {
       rowCount += Math.max(1, pools.size);
     }
     const total = Math.max(1, rowCount);
-    return this.height < 20 ? Math.min(2, total) : Math.min(8, Math.max(2, total));
+    const budget = Math.max(2, Math.floor((this.height - 16) / 2));
+    return this.height < 20 ? Math.min(2, total) : Math.min(8, budget, Math.max(2, total));
   }
 
   serviceRowLimit() {
@@ -578,10 +614,22 @@ export class HordeView {
           2,
       ),
     );
+    const folderCount = new Set(this.room.agents.map((agent) => agentFolder(agent, this.room)))
+      .size;
+    if (folderCount > 1 || this.renderWidth < 100) {
+      let quotaLines = 0;
+      if (this.room.accounts?.length || this.room.quotaError) {
+        quotaLines = this.quotaMode === "collapsed" ? 1 : Math.max(1, this.quotaRowLimit()) + 2;
+      }
+      const available = this.height - 5 - quotaLines - servicePanelLines - updateBarLines - 3;
+      const capacity = Math.max(
+        1,
+        Math.floor((available - (folderCount > 1 ? 0 : 1)) / (folderCount > 1 ? 5 : 4)),
+      );
+      return Math.min(base, capacity);
+    }
     if (this.completedMode === "expanded" || this.height < 24) return base;
-    const completedCount = (this.room?.agents || []).filter((agent) =>
-      COMPLETED_STATUSES.has(agent.status),
-    ).length;
+    const completedCount = (this.room?.agents || []).filter(isInactive).length;
     if (completedCount <= 1) return base;
     return Math.min(16, Math.max(base, base + completedCount - 1));
   }
@@ -591,9 +639,7 @@ export class HordeView {
   }
 
   get needsAnimation() {
-    return (
-      this.tier === "unicode" && this.room.agents.some((agent) => ACTIVE_STATUSES.has(agent.status))
-    );
+    return this.tier === "unicode" && this.room.agents.some(isExecuting);
   }
 
   setRoom(room) {
@@ -603,6 +649,7 @@ export class HordeView {
       this.room.agents.every((agent) => agent.id !== this.focusId)
     ) {
       this.focusId = this.room.agents[0]?.id;
+      this.hasExplicitFocus = false;
     }
     if (this.room.agents.every((agent) => agent.id !== this.pinnedId)) this.pinnedId = undefined;
     this.page = Math.min(
@@ -664,7 +711,8 @@ export class HordeView {
       const agent = this.room.agents[this.page * this.pageSize + selected];
       if (agent) {
         this.focusId = agent.id;
-        this.focusFollowsLatest = this.page === 0 && this.focusId === this.room.agents[0]?.id;
+        this.hasExplicitFocus = true;
+        this.focusFollowsLatest = false;
         return true;
       }
       return false;
@@ -736,8 +784,9 @@ export class HordeView {
         const current = agents.findIndex((agent) => agent.id === this.focusId);
         const index = (current + direction + agents.length) % agents.length;
         this.focusId = agents[index].id;
+        this.hasExplicitFocus = true;
         this.page = Math.floor(index / this.pageSize);
-        this.focusFollowsLatest = this.page === 0 && this.focusId === this.room.agents[0]?.id;
+        this.focusFollowsLatest = false;
         return true;
       }
       default: {
@@ -750,10 +799,14 @@ export class HordeView {
     return this.handleKey(key);
   }
 
-  panel(title, body, width, right = "", headerTone) {
+  panel(title, body, width, right = "", headerTone, rail = "") {
+    const glyphs = { ...glyphSet(this.tier) };
+    const junction = this.tier === "ascii" ? "+" : "├";
+    if (rail === "middle" || rail === "end") glyphs.topLeft = junction;
+    if (rail === "start" || rail === "middle") glyphs.bottomLeft = junction;
     return frame(title, body, width, {
-      glyphs: glyphSet(this.tier),
-      color: this.color,
+      glyphs,
+      color: this.appearance,
       right,
       headerTone,
     });
@@ -770,7 +823,7 @@ export class HordeView {
       rows = [
         "↑/↓ or 1–9  Select agent",
         "o           Focus selected agent's Herdr or tmux pane",
-        "c           Cycle completed agents (collapse / hide / expand)",
+        "c           Cycle inactive agents (collapse / hide / expand)",
         "u           Expand or collapse quota view",
         "U           Pull available Orkest update",
         "v           Expand or collapse running services view",
@@ -799,7 +852,7 @@ export class HordeView {
   quotaLines(width) {
     if (this.room.quotaError) return [`Quota unavailable: ${plain(this.room.quotaError)}`];
     const accounts = this.room.accounts || [];
-    return quotaRows(accounts, Math.max(10, width - 4), this.tier, this.color, this.now());
+    return quotaRows(accounts, Math.max(10, width - 4), this.tier, this.appearance, this.now());
   }
 
   updateLine(innerWidth) {
@@ -808,7 +861,7 @@ export class HordeView {
     let badgeTone = "yellow bold";
     if (upd.status === "error") badgeTone = "red bold";
     else if (upd.status === "updated") badgeTone = "green bold";
-    const badge = tone(labelText, badgeTone, this.color);
+    const badge = tone(labelText, badgeTone, this.appearance);
     const budget = Math.max(1, innerWidth - displayWidth(`${labelText}  `));
     const count =
       Number.isFinite(upd.commitsBehind) && upd.commitsBehind > 0 ? upd.commitsBehind : 1;
@@ -844,7 +897,7 @@ export class HordeView {
 
   inlineQuotaLine(innerWidth) {
     const labelText = "Quota [u]";
-    const badge = tone(labelText, "cyan bold", this.color);
+    const badge = tone(labelText, "running bold", this.appearance);
     const budget = Math.max(1, innerWidth - displayWidth(`${labelText}  `));
     if (this.room.quotaError) {
       return `${badge}  ${fit(`unavailable: ${plain(this.room.quotaError)}`, budget)}`;
@@ -906,7 +959,7 @@ export class HordeView {
   inlineServicesLine(innerWidth) {
     const services = Array.isArray(this.room.services) ? this.room.services : [];
     const labelText = "Services [v]";
-    const badge = tone(labelText, "cyan bold", this.color);
+    const badge = tone(labelText, "running bold", this.appearance);
     const budget = Math.max(1, innerWidth - displayWidth(`${labelText}  `));
     const items = services.map((svc) => {
       const isDocker = svc?.kind === "docker";
@@ -946,22 +999,26 @@ export class HordeView {
       const uptime = svc?.uptime ? `up ${plain(svc.uptime).trim()}` : "";
       const meta = [label, folder, owner, uptime].filter(Boolean).join(" · ");
       const raw = `${glyph} ${endpoint}  ${meta}`;
-      return tone(fit(raw, rowWidth), isDocker ? "cyan" : "green", this.color);
+      return tone(fit(raw, rowWidth), isDocker ? "running" : "success", this.appearance);
     });
   }
 
   folderHeaderLine(folder, count, innerWidth) {
-    const countLabel = `${count} ${count === 1 ? "agent" : "agents"}`;
-    const folderLabel = folder
-      ? `${shortFolder(folder)} · ${countLabel} · ${folder}`
-      : `workspace · ${countLabel}`;
-    const rail = toAsciiTree("│ ", this.tier);
-    const bannerWidth = Math.max(1, innerWidth - displayWidth(rail));
-    return `${tone(rail, "cyan", this.color)}${tone(fit(folderLabel, bannerWidth), "folderHeader", this.color)}`;
+    return sectionHeading(
+      folder ? shortFolder(folder) : "workspace",
+      `${count} ${count === 1 ? "agent" : "agents"}`,
+      innerWidth,
+      {
+        prefix: toAsciiTree("│ ", this.tier),
+        color: this.appearance,
+        tier: this.tier,
+      },
+    );
   }
 
   render(width) {
     width = Math.max(1, Math.floor(width) || 80);
+    this.renderWidth = width;
     if (this.overlay) return this.marginLines(this.overlayLines(Math.max(1, width - 2)), width);
     if (this.height < 8)
       return this.marginLines(
@@ -976,7 +1033,7 @@ export class HordeView {
     const pages = Math.max(1, Math.ceil(room.agents.length / size));
     this.page = Math.min(this.page, pages - 1);
     const selected = room.agents.slice(this.page * size, (this.page + 1) * size);
-    const phase = (member) => (member.paused ? "new launches paused" : member.status || "unknown");
+    const phase = phaseLabel;
     const roleOf = (member) => plain(member?.progress?.role || member?.workforceRole || "").trim();
     const model = (member) => {
       const data = member.progress || member;
@@ -988,7 +1045,9 @@ export class HordeView {
         member.effort ||
         data.effort;
       const { model: modelName, effort } = normalizeModelAndEffort(rawModel, rawEffort);
-      return `${modelName || "default model"}${effort && effort !== "—" ? ` / ${effort}` : ""}`;
+      const provenance =
+        member.consultation && member.modelSource === "requested" ? " (requested)" : "";
+      return `${modelName || "default model"}${provenance}${effort && effort !== "—" ? ` / ${effort}` : ""}`;
     };
     const innerWidth = Math.max(1, width - 2);
     const leadFolder = agentFolder(lead, room);
@@ -1007,8 +1066,12 @@ export class HordeView {
     const leadPane = plain(
       lead.herdrPaneId || lead.paneId || lead.progress?.herdrPaneId || lead.progress?.paneId || "",
     ).trim();
+    const leadLocation =
+      room.agents.length === 0 || selected.every((agent) => agentFolder(agent, room) !== leadFolder)
+        ? ` · folder: ${shortFolder(leadFolder)}`
+        : "";
     const leadMetaParts = [
-      `${leadTitle}${leadRoleBadge} · folder: ${shortFolder(leadFolder)}${leadBranch ? ` (${leadBranch})` : ""}`,
+      `${leadTitle}${leadRoleBadge}${leadLocation}${leadBranch ? ` (${leadBranch})` : ""}`,
       ...(leadEngine ? [leadEngine] : []),
       ...(leadPane ? [leadPane] : []),
     ];
@@ -1023,27 +1086,37 @@ export class HordeView {
       leadGoal !== roomTitlePlain
         ? `${leadGoal} — ${leadTask}`
         : leadTask || plain(room.objective || "Tell the coordinator what you want done");
-    const leadLines = [
+    let leadLines = [
       leadMetaParts.join(" · "),
       `${statusGlyph(lead, now, this.tier)} ${model(lead)} | ${phase(lead)}${progressSuffix(lead, now)}`,
       leadMissionLine,
     ];
+    if (lead.status === "session unavailable" && room.agents.length > 0) {
+      leadLines = ["Coordinator session unavailable"];
+      if (room.objective) leadLines.push(plain(room.objective));
+    }
     const maxAgents = room.swarm?.maxAgents ?? 64;
+    const hasAgentTree = room.agents.length > 0;
+    const withRail = (line) =>
+      hasAgentTree
+        ? `${tone(toAsciiTree("│ ", this.tier), "border", this.appearance)}${line}`
+        : line;
     const lines = [
       ...this.panel(
-        `Swarm · ${plain(room.title || room.id)}`,
+        room.title === "New swarm" ? "Swarm" : `Swarm · ${plain(room.title || room.id)}`,
         leadLines,
         innerWidth,
         swarmActivityBadge(room, maxAgents, this.tier, innerWidth),
-        "headerBg",
+        "selected",
+        hasAgentTree ? "start" : "",
       ),
     ];
     if (this.showUpdateBar()) {
-      lines.push(this.updateLine(innerWidth));
+      lines.push(withRail(this.updateLine(innerWidth - (hasAgentTree ? 2 : 0))));
     }
     if (room.accounts?.length || room.quotaError) {
       if (this.quotaMode === "collapsed") {
-        lines.push(this.inlineQuotaLine(innerWidth));
+        lines.push(withRail(this.inlineQuotaLine(innerWidth - (hasAgentTree ? 2 : 0))));
       } else {
         const quotaLimit = this.quotaRowLimit();
         lines.push(
@@ -1052,6 +1125,8 @@ export class HordeView {
             this.quotaLines(innerWidth).slice(0, quotaLimit),
             innerWidth,
             "u collapse",
+            undefined,
+            hasAgentTree ? "middle" : "",
           ),
         );
       }
@@ -1063,8 +1138,8 @@ export class HordeView {
         room.agents.map((agent) => agent.parent).filter((p) => p && p !== "conductor"),
       );
       const isCollapsibleCompleted = (agent) =>
-        COMPLETED_STATUSES.has(agent.status) &&
-        agent.id !== this.focusId &&
+        isInactive(agent) &&
+        (agent.id !== this.focusId || !this.hasExplicitFocus) &&
         agent.id !== this.pinnedId &&
         !parentIds.has(agent.id);
       const folderGroups = new Map();
@@ -1074,6 +1149,8 @@ export class HordeView {
         folderGroups.get(folder).push({ agent, index: offset });
       }
       const gap = "  ";
+      const lastFolder = folderGroups.keys().toArray().at(-1);
+      const hasServices = this.serviceRowLimit() > 0;
       for (const [folder, rawEntries] of folderGroups) {
         lines.push(this.folderHeaderLine(folder, rawEntries.length, innerWidth));
         const hiddenCompletedCount =
@@ -1090,72 +1167,80 @@ export class HordeView {
         const columns = !hasCollapsedRows && innerWidth >= 100 && entries.length > 1 ? 2 : 1;
         const cardWidth =
           columns === 2 ? Math.max(24, Math.floor((innerWidth - gap.length) / 2)) : innerWidth;
-        const rails = folderTreeRails(entries, this.tier, columns);
+        const hasFollowingSection = folder !== lastFolder || hasServices;
+        const rails = folderTreeRails(entries, this.tier, columns, hasFollowingSection);
         const cards = entries.map(({ agent, index }, entryIndex) => {
           const { topPrefix, midPrefix, tailPrefix } = rails[entryIndex];
           const prefix =
             hiddenCompletedCount > 0 && entryIndex === entries.length - 1
               ? toAsciiTree(midPrefix.replace("└─", "├─"), this.tier)
               : midPrefix;
-          const prefixWidth = displayWidth(prefix);
-          const boxWidth = Math.max(4, cardWidth - prefixWidth);
           const wfRole = roleOf(agent);
           const roleBadge = wfRole ? ` [${wfRole}]` : "";
           const isFocused = agent.id === this.focusId;
           const isPinned = agent.id === this.pinnedId;
-          const locationBadge = worktreeBadge(agent, room) || shortFolder(folder);
+          const locationBadge = worktreeBadge(agent, room);
           const taskText =
             cleanProgressTask(agent) || plain(agent.objective || "Awaiting assignment");
-          const displayAgentName = shortAgentName(agent);
+          const rawAgentName = shortAgentName(agent);
+          const folderName = shortFolder(folder);
+          const displayAgentName =
+            rawAgentName === folderName || rawAgentName === `${agent.engine}:${folderName}`
+              ? plain(agent.engine || "agent")
+              : rawAgentName;
+          const parent = room.agents.find((member) => member.id === agent.parent);
+          const parentBadge =
+            agent.parent && agent.parent !== "conductor"
+              ? ` ↳ ${parent ? shortAgentName(parent) : plain(agent.parent)}`
+              : "";
           if (this.completedMode === "collapsed" && isCollapsibleCompleted(agent)) {
             const glyph = statusGlyph(agent, now, this.tier);
-            const titlePart = ` ${glyph} ${index + 1} ${displayAgentName}${roleBadge} · ${locationBadge} · `;
-            const taskPart = fit(taskText, Math.max(1, boxWidth - displayWidth(titlePart)));
-            const compactRow = `${tone(titlePart, "green", this.color)}${tone(taskPart, "dim", this.color)}`;
-            return [`${tone(prefix, "cyan", this.color)}${fitStyled(compactRow, boxWidth)}`];
+            const label = ` ${glyph} ${index + 1} ${displayAgentName}${parentBadge}${locationBadge ? ` · ${locationBadge}` : ""}${isFocused ? " · FOCUS " : ""} · ${model(agent)}${agent.consultation ? "" : ` · ${taskText}`}`;
+            return [
+              statusRow(label, phase(agent), cardWidth, {
+                prefix,
+                color: this.appearance,
+                style: toneForStatus(agent),
+                tier: this.tier,
+              }),
+            ];
           }
           let stateBadge = "";
           if (isPinned) stateBadge = "PIN ";
           else if (isFocused) stateBadge = "FOCUS ";
-          const parentBadge =
-            agent.parent && agent.parent !== "conductor" ? ` ↳ ${plain(agent.parent)}` : "";
           const cardTitle = `${index + 1} ${displayAgentName}${agent.role === "lead" ? " (lead)" : ""}`;
           const cardRight = `${stateBadge}${locationBadge}${parentBadge}`;
           const statusLine = tone(
             `${statusGlyph(agent, now, this.tier)}${roleBadge} ${model(agent)} | ${phase(agent)}${progressSuffix(agent, now)}`,
-            `${toneForStatus(agent.status)}${isFocused ? " bold" : ""}`,
-            this.color,
+            `${toneForStatus(agent)}${isFocused ? " bold" : ""}`,
+            this.appearance,
           );
-          const box = frame(cardTitle, [taskText, statusLine], boxWidth, {
-            glyphs: glyphSet(this.tier),
-            color: this.color,
+          return treeCard(cardTitle, [taskText, statusLine], cardWidth, {
+            emphasized: isFocused || isPinned,
+            topPrefix,
+            midPrefix: prefix,
+            tailPrefix,
             right: cardRight,
-            headerTone: "headerBg",
-          });
-          const midIndex = Math.max(1, Math.floor((box.length - 1) / 2));
-          return box.map((line, lineIndex) => {
-            let linePrefix = tailPrefix;
-            if (lineIndex < midIndex) linePrefix = topPrefix;
-            else if (lineIndex === midIndex) linePrefix = prefix;
-            return `${tone(linePrefix, "cyan", this.color)}${line}`;
+            color: this.appearance,
+            tier: this.tier,
           });
         });
         lines.push(...joinCardGrid(cards, columns, cardWidth, gap));
         if (hiddenCompletedCount === 0) continue;
-        const summaryPrefix = toAsciiTree("└─", this.tier);
+        const summaryPrefix = toAsciiTree(hasFollowingSection ? "├─" : "└─", this.tier);
         const glyph = glyphSet(this.tier).completed;
-        const summaryText = ` ${glyph} ${hiddenCompletedCount} completed hidden (press c to expand)`;
+        const summaryText = ` ${glyph} ${hiddenCompletedCount} inactive hidden (press c to expand)`;
         const summaryWidth = Math.max(1, innerWidth - displayWidth(summaryPrefix));
         const fittedSummary = fit(summaryText, summaryWidth);
         lines.push(
-          `${tone(summaryPrefix, "cyan", this.color)}${tone(fittedSummary, "dim", this.color)}`,
+          `${tone(summaryPrefix, "border", this.appearance)}${tone(fittedSummary, "muted", this.appearance)}`,
         );
       }
     }
     const serviceLimit = this.serviceRowLimit();
     if (serviceLimit > 0) {
       if (this.servicesMode === "collapsed") {
-        lines.push(this.inlineServicesLine(innerWidth));
+        lines.push(withRail(this.inlineServicesLine(innerWidth - (hasAgentTree ? 2 : 0))));
       } else {
         const headerRight = [this.serviceHeaderBadge(), "v collapse"].filter(Boolean).join(" · ");
         lines.push(
@@ -1164,6 +1249,8 @@ export class HordeView {
             this.serviceLines(innerWidth).slice(0, serviceLimit),
             innerWidth,
             headerRight,
+            undefined,
+            hasAgentTree ? "end" : "",
           ),
         );
       }
@@ -1176,9 +1263,11 @@ export class HordeView {
       const tag = this.pinnedId ? "pinned" : "detail";
       const prefix = `${tag} (${shortAgentName(focused)}): `;
       const detailBudget = Math.max(1, innerWidth - displayWidth(prefix));
-      lines.push(`${tone(prefix, "dim", this.color)}${fit(detail, detailBudget)}`);
+      lines.push(`${tone(prefix, "muted", this.appearance)}${fit(detail, detailBudget)}`);
     }
     while (lines.length < this.height - 3) lines.push("");
+    // Navigation is never sacrificed when content exceeds the terminal's row budget.
+    lines.splice(Math.max(0, this.height - 3));
     const selectedAgent = room.agents.find((agent) => agent.id === this.focusId);
     const openHint =
       selectedAgent && (selectedAgent.herdrPaneId || selectedAgent.paneId) ? " · o open" : "";
@@ -1189,7 +1278,7 @@ export class HordeView {
       upd?.available || upd?.updateAvailable || upd?.status === "error" ? " · U update" : "";
     lines.push(
       `${room.agents.length}/${maxAgents} slots · page ${this.page + 1}/${pages}`,
-      `↑↓ select${openHint} · c completed${quotaHint}${servicesHint}${updateHint} · n page · ? help · q close view`,
+      `↑↓ select${openHint} · c inactive${quotaHint}${servicesHint}${updateHint} · n page · ? help · q close view`,
       "Ctrl-b Tab: switch pane · Ctrl-b d: detach",
     );
     return this.marginLines(lines, width);

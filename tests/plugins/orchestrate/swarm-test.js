@@ -242,11 +242,11 @@ it("projects current session status and nesting without treating a lead report a
   const view = new StoogesView(observed, { height: 30, tier: "unicode" });
   const output = view.render(85).join("\n");
   expect(output).toContain("│ ┌ 1 haiku-1");
-  expect(output).toContain("├─│Awaiting assignment");
+  expect(output).toContain("├─┤Awaiting assignment");
   expect(output).toContain("│ ┌ 2 example (lead)");
-  expect(output).toContain("└─│Investigate");
+  expect(output).toContain("└─┤Investigate");
   expect(output).toContain("│ ┌ 3 flash-1");
-  expect(output).toContain("└─│Awaiting assignment");
+  expect(output).toContain("└─┤Awaiting assignment");
   expect(output).toContain("runtime-model / high | reported complete");
   const absent = await observeRoom(room.id, { root, progress: async () => ({}) });
   expect(absent.agents[0].status).toBe("session unavailable");
@@ -315,16 +315,16 @@ it("assigns preset workforce roles, groups agent cards by working folder, and pr
 
   const view = new StoogesView(observed, { height: 34, tier: "unicode" });
   const output = view.render(110).join("\n");
-  expect(output).toContain(`│ ${path.basename(worktreeA)} · 1 agent · ${worktreeA}`);
-  expect(output).toContain(`│ ${path.basename(worktreeB)} · 2 agents · ${worktreeB}`);
+  expect(output).toContain(`│ ${path.basename(worktreeA)} · 1 agent`);
+  expect(output).toContain(`│ ${path.basename(worktreeB)} · 2 agents`);
   expect(output).toContain("│ ┌ 1 flash-1");
-  expect(output).toContain("├─│Awaiting assignment");
+  expect(output).toContain("├─┤Awaiting assignment");
   expect(output).toContain("[builder] gemini:fast | queued");
   expect(output).toContain("│ ┌ 2 haiku-2");
-  expect(output).toContain("└─│Awaiting assignment");
+  expect(output).toContain("├─┤Awaiting assignment");
   expect(output).toContain("[reviewer] haiku | queued");
   expect(output).toContain("│ ┌ 3 snorfle");
-  expect(output).toContain("└─│Map API endpoints");
+  expect(output).toContain("└─┤Map API endpoints");
   expect(output).toContain("[debugger] haiku / low | working");
 });
 
@@ -385,15 +385,15 @@ it("groups disposable git worktrees under their parent folder, renders wt:<slug>
 
   const view = new StoogesView(saved, { height: 36, tier: "unicode", color: true });
   const coloredOutput = view.render(110).join("\n");
-  expect(coloredOutput).toContain("\u{1B}[48;5;24;97;1m");
-  expect(coloredOutput).toContain("\u{1B}[48;5;236;97;1m");
+  expect(coloredOutput).not.toContain("\u{1B}[48;5;24;97;1m");
+  expect(coloredOutput).toContain("\u{1B}[7;1m");
 
   const plainView = new StoogesView(saved, { height: 36, tier: "unicode" });
   const output = plainView.render(140).join("\n");
-  expect(output).toContain(`│ ${path.basename(room.cwd)} · 2 agents · ${room.cwd}`);
-  expect(output).toContain(`│ ${path.basename(persistentDir)} · 1 agent · ${persistentDir}`);
+  expect(output).toContain(`│ ${path.basename(room.cwd)} · 2 agents`);
+  expect(output).toContain(`│ ${path.basename(persistentDir)} · 1 agent`);
   expect(output).not.toContain(`wt-50 · 1 agent`);
-  expect(output).toContain(`FOCUS ${path.basename(persistentDir)}`);
+  expect(output).toContain("FOCUS ");
   expect(output).toContain("wt:wt-50");
 
   const stdout = { write() {} };
@@ -415,8 +415,8 @@ it("groups disposable git worktrees under their parent folder, renders wt:<slug>
   const promotedOutput = new StoogesView(promotedRoom, { height: 36, tier: "unicode" })
     .render(140)
     .join("\n");
-  expect(promotedOutput).toContain(`wt-50 · 1 agent · ${disposableDir}`);
-  expect(promotedOutput).toContain(`${path.basename(room.cwd)} · 1 agent · ${room.cwd}`);
+  expect(promotedOutput).toContain(`wt-50 · 1 agent`);
+  expect(promotedOutput).toContain(`${path.basename(room.cwd)} · 1 agent`);
 
   await updateRoom(
     room.id,

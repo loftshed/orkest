@@ -726,6 +726,7 @@ export async function runHordeTui(
     updateCheck = checkOrkestUpdate,
     updateRunner = runOrkestUpdate,
     env = process.env,
+    theme,
     exec = execFile,
   } = {},
 ) {
@@ -747,6 +748,7 @@ export async function runHordeTui(
   const view = new HordeView(initialRoom, {
     height: output.rows || 32,
     color: shouldUseColor(output),
+    theme,
     onFocusPane: (agent) => {
       void focusAgentPane(agent, { exec });
     },

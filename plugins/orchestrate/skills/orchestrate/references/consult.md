@@ -12,6 +12,11 @@ runner-owned verification; see [SKILL.md](../SKILL.md). Do not turn a question i
 ask it, and do not turn an answer into an authorization to act. Asking a live session of another
 harness, with its own context, is the peer mailbox, not a consultation.
 
+Executor consultations launched by a session in a swarm appear as separate consultant cards,
+including detached runs. Each card shows its own model and lifecycle; the model is marked
+`requested` until the provider reports it. Completion means an answer arrived, not that a
+coordinator accepted it. Earlier launches without a supervisor link are not backfilled.
+
 ## Intents
 
 | Intent               | Need                         | The consultant gets                                        | Reply headings                        |
