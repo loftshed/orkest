@@ -1,0 +1,64 @@
+# cspell:words libncurses
+name: Terminal visuals
+
+on:
+  pull_request:
+    paths:
+      - "plugins/orchestrate/**"
+      - "plugins/monitor/lib/**"
+      - "scripts/test-tui-visual.js"
+      - "scripts/lib/tui-visual.js"
+      - "tests/scripts/tui-visual-test.js"
+      - ".github/workflows/tui-visual.yml"
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: "Git reference to compare with the checked-out revision"
+        default: "main"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tui-visual-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - name: Build tmux 3.8
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libevent-dev libncurses-dev
+          curl --fail --location --silent --show-error \
+            https://github.com/tmux/tmux/releases/download/3.8/tmux-3.8.tar.gz \
+            --output "$RUNNER_TEMP/tmux-3.8.tar.gz"
+          echo 'e79c699c7e949dccd0a4a125e17b8d1261e311b16979dbc8eb34542f3966d82e  '"$RUNNER_TEMP/tmux-3.8.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/tmux-3.8.tar.gz" -C "$RUNNER_TEMP"
+          cd "$RUNNER_TEMP/tmux-3.8"
+          ./configure --prefix="$RUNNER_TEMP/tmux-install"
+          make -j2
+          make install
+          "$RUNNER_TEMP/tmux-install/bin/tmux" -V | grep --fixed-strings --line-regexp 'tmux 3.8'
+          echo "$RUNNER_TEMP/tmux-install/bin" >> "$GITHUB_PATH"
+      - name: Capture before and after
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.sha || inputs.base_ref || 'main' }}
+        run: node scripts/test-tui-visual.js --base-ref "$BASE_REF" --output artifacts/tui-visual
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: terminal-visual-comparison
+          path: artifacts/tui-visual
+          retention-days: 7
