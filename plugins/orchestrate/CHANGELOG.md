@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.53.0
+
+- feat(orchestrate): promote a live session to coordinator (#89)
+
 ## 0.52.0
 
 - feat(orchestrate): show agent activity in Swarm View (#86)
