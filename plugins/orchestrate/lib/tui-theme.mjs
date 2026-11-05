@@ -33,6 +33,11 @@ export const DEFAULT_THEME = Object.freeze({
   brandGoogle: "38;5;33",
   brandOpenAI: "37",
   swarmHeading: "48;5;237;97;1",
+  shimmerBase: "38;5;245",
+  shimmerEdge: "38;5;108",
+  shimmerMid: "38;5;107",
+  shimmerPeak: "38;5;150;1",
+  shimmerSpinner: "38;5;149",
   // Compatibility names used by existing command renderers.
   headerBg: "48;5;236;97;1",
   folderHeader: "1",

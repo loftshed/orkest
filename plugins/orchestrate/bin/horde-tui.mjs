@@ -7,7 +7,7 @@ import { pathToFileURL } from "node:url";
 import { shouldUseColor } from "../../monitor/lib/render.mjs";
 import { CACHE_DIR, CONFIG_PATH } from "../../monitor/lib/store.mjs";
 import { createAgentPreview } from "../lib/agent-preview.mjs";
-import { markHerdrViewClosed } from "../lib/herdr-view-state.mjs";
+import { markHerdrViewClosed, syncHerdrViewLabel } from "../lib/herdr-view-state.mjs";
 import { createRoom, mailboxRoot, readRoom } from "../lib/horde-room.mjs";
 import { fit, HordeView, shortAgentName } from "../lib/horde-view.mjs";
 import { configHome } from "../lib/runtime-paths.mjs";
@@ -758,6 +758,7 @@ export async function runHordeTui(
     height: output.rows || 32,
     color: shouldUseColor(output),
     theme,
+    inHerdr: Boolean(env?.HERDR_ENV === "1" || env?.ORKEST_HERDR_VIEW_STATE),
     onFocusPane: (agent) => {
       if (isNavigationPending) return;
       isNavigationPending = true;
@@ -828,6 +829,11 @@ export async function runHordeTui(
         }
       }
       view.setRoom(room);
+      try {
+        await syncHerdrViewLabel(room, { env, exec });
+      } catch {
+        // Pane title sync is best-effort and must never disrupt the TUI.
+      }
       const previewAgent = room.agents?.find((agent) => agent.id === view.preview?.agentId);
       if (view.preview && !previewAgent) await previewController.close();
       else await previewController.refresh(previewAgent);
@@ -1006,7 +1012,7 @@ export async function runHordeTui(
       resolveExit = resolve;
       timer = setInterval(() => {
         if (view.needsAnimation) paint();
-      }, 200);
+      }, 120);
       refreshTimer = setInterval(refresh, 1000);
       input.on("data", onData);
       input.on("end", cleanup);

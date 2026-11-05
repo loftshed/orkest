@@ -6,7 +6,11 @@ import { PassThrough } from "node:stream";
 import { afterEach, expect, it } from "vitest";
 
 import { runHordeTui } from "../../../plugins/orchestrate/bin/horde-tui.mjs";
-import { markHerdrViewClosed } from "../../../plugins/orchestrate/lib/herdr-view-state.mjs";
+import {
+  herdrSwarmPaneLabel,
+  markHerdrViewClosed,
+  syncHerdrViewLabel,
+} from "../../../plugins/orchestrate/lib/herdr-view-state.mjs";
 
 const directories = [];
 afterEach(async () => {
@@ -99,3 +103,37 @@ it.each(["q", "q then close", "close"])(
     }
   },
 );
+
+it("formats Herdr swarm pane labels and syncs live title changes to Herdr", async () => {
+  const { env, file } = await fixture();
+  const initialRecord = JSON.parse(await readFile(file, "utf8"));
+  await writeFile(
+    file,
+    JSON.stringify({
+      ...initialRecord,
+      pane: "w1:p2",
+      label: "Orkest Swarm",
+    }),
+  );
+  const calls = [];
+  const exec = (binary, args, _options, callback) => {
+    calls.push([binary, ...args]);
+    callback?.(null, "", "");
+  };
+  const room = {
+    id: "room-a",
+    title: "Refine Orkest coordinator delegation",
+    conductor: {},
+    agents: [],
+  };
+  expect(herdrSwarmPaneLabel(room)).toBe("Swarm · Refine Orkest coordinator delegation");
+  expect(await syncHerdrViewLabel(room, { env, exec })).toBe(true);
+  expect(calls).toEqual([
+    ["herdr", "pane", "rename", "w1:p2", "Swarm · Refine Orkest coordinator delegation"],
+  ]);
+  expect(JSON.parse(await readFile(file, "utf8")).label).toBe(
+    "Swarm · Refine Orkest coordinator delegation",
+  );
+  expect(await syncHerdrViewLabel(room, { env, exec })).toBe(false);
+  expect(calls).toHaveLength(1);
+});
