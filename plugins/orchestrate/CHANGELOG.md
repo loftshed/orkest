@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.56.0
+
+- feat(orchestrate): add 1-space left padding inside swarm header and quota cards (#93)
+
 ## 0.55.0
 
 - feat(orchestrate): tighten coordinator delegation and brief delivery (#92)
