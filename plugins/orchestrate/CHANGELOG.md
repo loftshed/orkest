@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.64.0
+
+- feat(orchestrate): migrate rooms domain to SQLite WAL store and Node bridge (#106)
+
 ## 0.63.0
 
 - feat(orchestrate): stream transcript activity via byte-offset cursors and OpenCode SQLite (#105)
