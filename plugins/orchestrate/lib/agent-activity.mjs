@@ -1,11 +1,27 @@
-import { open, readdir, readFile, stat } from "node:fs/promises";
+import { open, readdir, readFile, realpath, stat } from "node:fs/promises";
+import { homedir } from "node:os";
 import path from "node:path";
+import { Database } from "node:sqlite";
 
 const SESSION_ID = /^[A-Za-z0-9_-]{1,100}$/u;
 const MAX_BYTES = 2 * 1024 * 1024;
+const MAX_CHUNK_BYTES = 64 * 1024;
+const MAX_CURSORS = 64;
 const MAX_EVENTS = 24;
 const MAX_PINNED_TEXTS = 6;
 const MAX_RECENT_TOOLS = 16;
+const MAX_PENDING_BYTES = MAX_BYTES;
+const MAX_SENT_MESSAGES = 64;
+const TAB_BYTE = 9;
+const LINE_FEED_BYTE = 10;
+const CARRIAGE_RETURN_BYTE = 13;
+const SPACE_BYTE = 32;
+const OPEN_BRACE_BYTE = 123;
+const EMPTY_ACTIVITY = { eventsText: "", handback: "", sentMessages: [], commentary: [] };
+
+const activityCursors = new Map();
+const openCodeCursors = new Map();
+const activityLocks = new Map();
 
 async function tail(file) {
   let handle;
@@ -98,129 +114,433 @@ function toolLabel(name, args) {
   return `Used ${shortText(name)}${detail ? ` · ${detail}` : ""}`;
 }
 
-function parseTranscript(text, engine) {
-  const raw = [];
-  let handback = "";
-  const sentMessages = [];
-  for (const line of text.split("\n")) {
-    if (
-      !line ||
-      line.includes('"type":"api-request') ||
-      line.includes('"type": "api-request') ||
-      line.includes('"type":"attachment"')
-    ) {
-      continue;
-    }
-    let row;
-    try {
-      row = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    if (engine === "agy" && row.type === "PLANNER_RESPONSE") {
-      if (assistantText(row.content)) raw.push({ kind: "text", value: row.content });
-      const calls = row.tool_calls || [];
-      for (const call of calls) {
-        const parsedArgs = parseToolArgs(call.args);
-        if (call.name === "send_message" && assistantText(parsedArgs?.Message, 600)) {
-          sentMessages.push({
-            to: shortText(parsedArgs?.Recipient || ""),
-            text: assistantText(parsedArgs.Message, 600),
-          });
-          continue;
-        }
-        raw.push({ kind: "tool", value: toolLabel(call.name, call.args) });
-      }
-    } else if (engine === "claude" && row.type === "assistant") {
-      const content = row.message?.content || [];
-      for (const block of content) {
-        if (block.type === "text" && assistantText(block.text))
-          raw.push({ kind: "text", value: block.text });
-        if (block.type !== "tool_use") continue;
-        const parsedInput = parseToolArgs(block.input);
-        if (block.name === "SubagentHandback") {
-          const msg = assistantText(
-            parsedInput?.message || parsedInput?.content || parsedInput?.report || "",
-            1600,
-          );
-          if (msg) handback = msg;
-          continue;
-        }
-        if (
-          block.name === "SendMessage" &&
-          assistantText(parsedInput?.message || parsedInput?.content || "", 600)
-        ) {
-          sentMessages.push({
-            to: shortText(parsedInput?.to || parsedInput?.recipient || ""),
-            text: assistantText(parsedInput.message || parsedInput.content, 600),
-          });
-          continue;
-        }
-        raw.push({ kind: "tool", value: toolLabel(block.name, block.input) });
-      }
-    } else if (engine === "codex" && row.type === "response_item") {
-      const item = row.payload;
-      if (item?.type === "message" && item.role === "assistant") {
-        const content = item.content || [];
-        for (const block of content)
-          if (block.type === "output_text" && assistantText(block.text))
-            raw.push({ kind: "text", value: block.text });
-      } else if (item?.type === "function_call" || item?.type === "custom_tool_call") {
-        raw.push({ kind: "tool", value: toolLabel(item.name, item.arguments) });
-      }
-    }
+function createActivityState() {
+  return {
+    commentary: [],
+    handback: "",
+    lastEvent: null,
+    recentEvents: [],
+    recentTools: [],
+    sentMessageKeys: new Set(),
+    sentMessages: [],
+  };
+}
+
+function addActivityEvent(state, kind, value) {
+  const normalizedValue = kind === "text" ? assistantText(value, 1600) : value.slice(0, 400);
+  if (!normalizedValue) return;
+
+  const previous = state.lastEvent;
+  if (kind === "tool" && previous?.kind === "tool" && previous.baseValue === normalizedValue) {
+    previous.count++;
+    previous.value = `${previous.baseValue} (×${previous.count})`;
+    return;
   }
 
-  const collapsed = [];
-  for (const item of raw) {
-    const prev = collapsed.at(-1);
-    if (item.kind === "tool" && prev?.kind === "tool" && prev.baseValue === item.value) {
-      prev.count = (prev.count || 1) + 1;
-      prev.value = `${prev.baseValue} (×${prev.count})`;
-    } else {
-      collapsed.push(
-        item.kind === "tool" ? { ...item, baseValue: item.value, count: 1 } : { ...item },
-      );
-    }
+  const item =
+    kind === "tool"
+      ? { kind, value: normalizedValue, baseValue: normalizedValue, count: 1 }
+      : { kind, value: normalizedValue };
+  state.lastEvent = item;
+  state.recentEvents.push(item);
+  if (state.recentEvents.length > MAX_EVENTS) state.recentEvents.shift();
+  if (kind === "text") {
+    state.commentary.push(item);
+    if (state.commentary.length > MAX_PINNED_TEXTS) state.commentary.shift();
+  } else {
+    state.recentTools.push(item);
+    if (state.recentTools.length > MAX_RECENT_TOOLS) state.recentTools.shift();
   }
+}
 
-  const tailSlice = collapsed.slice(-MAX_EVENTS);
+function addSentMessage(state, to, rawText) {
+  const text = assistantText(rawText, 600);
+  if (!text || state.sentMessageKeys.has(text)) return;
+  state.sentMessageKeys.add(text);
+  state.sentMessages.push({ to: shortText(to || ""), text });
+  if (state.sentMessages.length <= MAX_SENT_MESSAGES) return;
+  const removed = state.sentMessages.shift();
+  state.sentMessageKeys.delete(removed.text);
+}
+
+function activitySummary(state) {
+  const tailSlice = state.recentEvents;
   const tailHasText = tailSlice.some((item) => item.kind === "text");
   let selected = tailSlice;
   if (tailHasText) {
-    const earlierTexts = collapsed
-      .slice(0, Math.max(0, collapsed.length - MAX_EVENTS))
-      .filter((item) => item.kind === "text")
-      .slice(-Math.max(0, MAX_PINNED_TEXTS - tailSlice.filter((i) => i.kind === "text").length));
+    const tailTexts = new Set(tailSlice.filter((item) => item.kind === "text"));
+    const textRoom = Math.max(
+      0,
+      MAX_PINNED_TEXTS - tailSlice.filter((item) => item.kind === "text").length,
+    );
+    const earlierTexts = textRoom
+      ? state.commentary.filter((item) => !tailTexts.has(item)).slice(-textRoom)
+      : [];
     if (earlierTexts.length > 0) {
       selected = [...earlierTexts, ...tailSlice.slice(-(MAX_EVENTS - earlierTexts.length))];
     }
   } else {
-    const allTexts = collapsed.filter((item) => item.kind === "text").slice(-MAX_PINNED_TEXTS);
-    const recentTools = collapsed.filter((item) => item.kind === "tool").slice(-MAX_RECENT_TOOLS);
-    selected = [...allTexts, ...recentTools];
+    selected = [...state.commentary, ...state.recentTools];
   }
 
   let lastTextIndex = -1;
-  for (let i = selected.length - 1; i >= 0; i--) {
-    if (selected[i].kind === "text") {
-      lastTextIndex = i;
+  for (let index = selected.length - 1; index >= 0; index--) {
+    if (selected[index].kind === "text") {
+      lastTextIndex = index;
       break;
     }
   }
   const eventsText = selected
-    .map((item, idx) =>
+    .map((item, index) =>
       item.kind === "text"
-        ? assistantText(item.value, idx === lastTextIndex ? 1600 : 400)
+        ? assistantText(item.value, index === lastTextIndex ? 1600 : 400)
         : item.value,
     )
     .filter(Boolean)
     .join("\n");
-  const textItems = collapsed.filter((item) => item.kind === "text").slice(-MAX_PINNED_TEXTS);
-  const commentary = textItems
-    .map((item, idx) => assistantText(item.value, idx === textItems.length - 1 ? 1600 : 400))
+  const commentary = state.commentary
+    .map((item, index) =>
+      assistantText(item.value, index === state.commentary.length - 1 ? 1600 : 400),
+    )
     .filter(Boolean);
-  return { eventsText, handback, sentMessages, commentary };
+  return {
+    eventsText,
+    handback: state.handback,
+    sentMessages: [...state.sentMessages],
+    commentary,
+  };
+}
+
+function parseTranscriptLine(state, line, engine) {
+  if (
+    !line ||
+    line.includes('"type":"api-request') ||
+    line.includes('"type": "api-request') ||
+    line.includes('"type":"attachment"')
+  ) {
+    return;
+  }
+
+  let row;
+  try {
+    row = JSON.parse(line);
+  } catch {
+    return;
+  }
+
+  if (engine === "agy" && row.type === "PLANNER_RESPONSE") {
+    if (assistantText(row.content)) addActivityEvent(state, "text", row.content);
+    const toolCalls = row.tool_calls || [];
+    for (const call of toolCalls) {
+      const parsedArgs = parseToolArgs(call.args);
+      if (call.name === "send_message" && assistantText(parsedArgs?.Message, 600)) {
+        addSentMessage(state, parsedArgs.Recipient, parsedArgs.Message);
+        continue;
+      }
+      addActivityEvent(state, "tool", toolLabel(call.name, call.args));
+    }
+  } else if (engine === "claude" && row.type === "assistant") {
+    const content = row.message?.content || [];
+    for (const block of content) {
+      if (block.type === "text" && assistantText(block.text)) {
+        addActivityEvent(state, "text", block.text);
+      }
+      if (block.type !== "tool_use") continue;
+      const parsedInput = parseToolArgs(block.input);
+      if (block.name === "SubagentHandback") {
+        const message = assistantText(
+          parsedInput?.message || parsedInput?.content || parsedInput?.report || "",
+          1600,
+        );
+        if (message) state.handback = message;
+        continue;
+      }
+      if (
+        block.name === "SendMessage" &&
+        assistantText(parsedInput?.message || parsedInput?.content || "", 600)
+      ) {
+        addSentMessage(
+          state,
+          parsedInput.to || parsedInput.recipient,
+          parsedInput.message || parsedInput.content,
+        );
+        continue;
+      }
+      addActivityEvent(state, "tool", toolLabel(block.name, block.input));
+    }
+  } else if (engine === "codex" && row.type === "response_item") {
+    const item = row.payload;
+    if (item?.type === "message" && item.role === "assistant") {
+      const content = item.content || [];
+      for (const block of content)
+        if (block.type === "output_text" && assistantText(block.text))
+          addActivityEvent(state, "text", block.text);
+    } else if (item?.type === "function_call" || item?.type === "custom_tool_call") {
+      addActivityEvent(state, "tool", toolLabel(item.name, item.arguments));
+    }
+  }
+}
+
+function consumeTranscriptBytes(cursor, bytes, engine) {
+  const previousReadOffset = cursor.readOffset;
+  const combinedStart = previousReadOffset - BigInt(cursor.pendingBytes.length);
+  const combined = Buffer.concat([cursor.pendingBytes, bytes]);
+  let lineStart = 0;
+
+  for (let index = 0; index < combined.length; index++) {
+    if (combined[index] !== LINE_FEED_BYTE) continue;
+    const lineEnd = BigInt(index + 1) + combinedStart;
+    if (cursor.discardUntilNewline) {
+      cursor.discardUntilNewline = false;
+    } else {
+      parseTranscriptLine(
+        cursor.parsed,
+        combined.subarray(lineStart, index).toString("utf8"),
+        engine,
+      );
+    }
+    cursor.byteOffset = lineEnd;
+    lineStart = index + 1;
+  }
+
+  const remaining = combined.subarray(lineStart);
+  if (cursor.discardUntilNewline) {
+    cursor.pendingBytes = Buffer.alloc(0);
+  } else if (remaining.length > MAX_PENDING_BYTES) {
+    cursor.discardUntilNewline = true;
+    cursor.pendingBytes = Buffer.alloc(0);
+  } else {
+    cursor.pendingBytes = Buffer.from(remaining);
+  }
+  cursor.readOffset += BigInt(bytes.length);
+  cursor.summary = activitySummary(cursor.parsed);
+}
+
+function createTranscriptCursor(info) {
+  const startOffset = info.size > BigInt(MAX_BYTES) ? info.size - BigInt(MAX_BYTES) : 0n;
+  const parsed = createActivityState();
+  return {
+    ino: info.ino,
+    size: info.size,
+    mtimeNs: info.mtimeNs,
+    byteOffset: startOffset,
+    readOffset: startOffset,
+    pendingBytes: Buffer.alloc(0),
+    discardUntilNewline: startOffset > 0n,
+    parsed,
+    summary: activitySummary(parsed),
+  };
+}
+
+function touchCursor(cache, key, cursor) {
+  cache.delete(key);
+  cache.set(key, cursor);
+  while (cache.size > MAX_CURSORS) cache.delete(cache.keys().next().value);
+}
+
+async function withActivityLock(key, operation) {
+  const previous = activityLocks.get(key) || Promise.resolve();
+  const { promise: current, resolve: release } = Promise.withResolvers();
+  activityLocks.set(key, current);
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (activityLocks.get(key) === current) activityLocks.delete(key);
+  }
+}
+
+function firstNonWhitespaceByte(chunk) {
+  for (const byte of chunk) {
+    if (
+      byte !== SPACE_BYTE &&
+      byte !== TAB_BYTE &&
+      byte !== CARRIAGE_RETURN_BYTE &&
+      byte !== LINE_FEED_BYTE
+    ) {
+      return byte;
+    }
+  }
+  return -1;
+}
+
+async function readTranscript(file, engine) {
+  let canonicalPath;
+  try {
+    canonicalPath = await realpath(file);
+  } catch {
+    return { ...EMPTY_ACTIVITY };
+  }
+  const key = `${canonicalPath}\0${engine}`;
+  return withActivityLock(key, async () => {
+    let pathInfo;
+    try {
+      pathInfo = await stat(canonicalPath, { bigint: true });
+      if (!pathInfo.isFile()) return { ...EMPTY_ACTIVITY };
+    } catch {
+      activityCursors.delete(key);
+      return { ...EMPTY_ACTIVITY };
+    }
+
+    let cursor = activityCursors.get(key);
+    if (
+      cursor &&
+      pathInfo.ino === cursor.ino &&
+      pathInfo.size === cursor.size &&
+      pathInfo.mtimeNs === cursor.mtimeNs
+    ) {
+      touchCursor(activityCursors, key, cursor);
+      return cursor.summary;
+    }
+
+    let handle;
+    try {
+      handle = await open(canonicalPath, "r");
+      const info = await handle.stat({ bigint: true });
+      if (!info.isFile()) return { ...EMPTY_ACTIVITY };
+
+      const isReset =
+        !cursor ||
+        info.ino !== cursor.ino ||
+        info.size < cursor.size ||
+        info.size < cursor.readOffset ||
+        (info.size === cursor.size && info.mtimeNs !== cursor.mtimeNs);
+      if (isReset) cursor = createTranscriptCursor(info);
+
+      if (info.size < cursor.readOffset) cursor = createTranscriptCursor(info);
+      let checkedLineBoundary =
+        cursor.readOffset === 0n || cursor.pendingBytes.length > 0 || cursor.discardUntilNewline;
+      while (cursor.readOffset < info.size) {
+        const remaining = info.size - cursor.readOffset;
+        const length = Number(
+          remaining > BigInt(MAX_CHUNK_BYTES) ? BigInt(MAX_CHUNK_BYTES) : remaining,
+        );
+        const buffer = Buffer.allocUnsafe(length);
+        const result = await handle.read(buffer, 0, length, cursor.readOffset);
+        if (result.bytesRead === 0) break;
+        const chunk = buffer.subarray(0, result.bytesRead);
+        if (!checkedLineBoundary) {
+          checkedLineBoundary = true;
+          const firstNonSpace = firstNonWhitespaceByte(chunk);
+          if (firstNonSpace !== -1 && firstNonSpace !== OPEN_BRACE_BYTE) {
+            cursor = createTranscriptCursor(info);
+            continue;
+          }
+        }
+        consumeTranscriptBytes(cursor, chunk, engine);
+      }
+      cursor.ino = info.ino;
+      cursor.size = info.size;
+      cursor.mtimeNs = info.mtimeNs;
+      touchCursor(activityCursors, key, cursor);
+      return cursor.summary;
+    } catch {
+      return { ...EMPTY_ACTIVITY };
+    } finally {
+      if (handle) {
+        try {
+          await handle.close();
+        } catch {
+          // Closing a failed transcript read is best effort.
+        }
+      }
+    }
+  });
+}
+
+function parseJsonObject(value) {
+  if (typeof value !== "string") return null;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function openCodeDbCandidates(source) {
+  if (typeof source.opencodeDbPath === "string" && source.opencodeDbPath.trim()) {
+    return [path.resolve(source.opencodeDbPath)];
+  }
+  const dataHomes = [
+    process.env.XDG_DATA_HOME,
+    source.accountHome ? path.join(source.accountHome, ".local", "share") : "",
+    path.join(homedir(), ".local", "share"),
+  ];
+  return [...new Set(dataHomes.filter((item) => item && path.isAbsolute(item)))].map((item) =>
+    path.join(item, "opencode", "opencode.db"),
+  );
+}
+
+async function openCodeDbPath(source) {
+  const candidates = openCodeDbCandidates(source);
+  for (const candidate of candidates) if (await fileExists(candidate)) return candidate;
+  return candidates[0] || "";
+}
+
+function addOpenCodeActivity(state, part) {
+  const data = parseJsonObject(part.data);
+  if (!data) return;
+  if (data.type === "text" && typeof data.text === "string") {
+    addActivityEvent(state, "text", data.text);
+  } else if (data.type === "tool") {
+    addActivityEvent(
+      state,
+      "tool",
+      toolLabel(data.tool, data.state?.input || { description: data.state?.title }),
+    );
+  }
+}
+
+async function readOpenCodeActivity(source) {
+  const session = source.session || "";
+  if (!SESSION_ID.test(session)) return { ...EMPTY_ACTIVITY };
+  const dbPath = await openCodeDbPath(source);
+  if (!dbPath) return { ...EMPTY_ACTIVITY };
+  const key = `${dbPath}\0${session}`;
+
+  let database;
+  try {
+    database = new Database(dbPath, { readOnly: true, timeout: 50 });
+    const version = database
+      .prepare(
+        "SELECT MAX(time_updated) AS time_updated FROM (SELECT time_updated FROM message WHERE session_id = ? UNION ALL SELECT time_updated FROM part WHERE session_id = ?)",
+      )
+      .get(session, session)?.time_updated;
+    const versionKey = version === null || version === undefined ? "" : String(version);
+    const cached = openCodeCursors.get(key);
+    if (cached?.version === versionKey) {
+      touchCursor(openCodeCursors, key, cached);
+      return cached.summary;
+    }
+
+    const assistantIds = new Set();
+    const messages = database
+      .prepare(
+        "SELECT id, data FROM message WHERE session_id = ? ORDER BY time_created ASC LIMIT 200",
+      )
+      .all(session);
+    for (const message of messages) {
+      if (parseJsonObject(message.data)?.role === "assistant") assistantIds.add(message.id);
+    }
+
+    const state = createActivityState();
+    const parts = database
+      .prepare(
+        "SELECT message_id, data FROM part WHERE session_id = ? ORDER BY time_created ASC, id ASC LIMIT 600",
+      )
+      .all(session);
+    for (const part of parts)
+      if (assistantIds.has(part.message_id)) addOpenCodeActivity(state, part);
+    const cursor = { version: versionKey, summary: activitySummary(state) };
+    touchCursor(openCodeCursors, key, cursor);
+    return cursor.summary;
+  } catch {
+    return { ...EMPTY_ACTIVITY };
+  } finally {
+    database?.close();
+  }
 }
 
 async function codexFile(home, session, startedAt) {
@@ -262,16 +582,20 @@ async function transcriptFile(source, home) {
     source.agentId || (session.startsWith("subagent-") ? session.slice("subagent-".length) : "");
   const effectiveSession = session || (subagentId ? `subagent-${subagentId}` : "");
   if (!SESSION_ID.test(effectiveSession) || !path.isAbsolute(accountHome)) return "";
-  if (engine === "agy")
-    return path.join(
+  if (engine === "agy") {
+    const logDirectory = path.join(
       accountHome,
       "antigravity-cli",
       "brain",
       effectiveSession,
       ".system_generated",
       "logs",
-      "transcript.jsonl",
     );
+    const fullTranscript = path.join(logDirectory, "transcript_full.jsonl");
+    return (await fileExists(fullTranscript))
+      ? fullTranscript
+      : path.join(logDirectory, "transcript.jsonl");
+  }
   if (engine === "claude") {
     const candidateCwds = [cwd, parentCwd, roomCwd].filter(
       (item) => typeof item === "string" && item.trim(),
@@ -341,14 +665,16 @@ async function readResultSummary(resultPath) {
 export async function readAgentActivity(agent) {
   if (!agent || typeof agent !== "object") return "";
   const source = agent.activitySource;
-  const [file, resultInfo] = await Promise.all([
-    source ? transcriptFile(source) : Promise.resolve(""),
+  const transcriptPromise = (async () => {
+    if (!source) return { ...EMPTY_ACTIVITY };
+    if (source.engine === "opencode") return readOpenCodeActivity(source);
+    const file = await transcriptFile(source);
+    return file ? readTranscript(file, source.engine) : { ...EMPTY_ACTIVITY };
+  })();
+  const [parsedTranscript, resultInfo] = await Promise.all([
+    transcriptPromise,
     agent.resultPath ? readResultSummary(agent.resultPath) : Promise.resolve(null),
   ]);
-  const parsedTranscript =
-    file && source
-      ? parseTranscript(await tail(file), source.engine)
-      : { eventsText: "", handback: "", sentMessages: [], commentary: [] };
   const transcriptEvents = parsedTranscript.eventsText;
   const commentary = parsedTranscript.commentary || [];
   const answer =
@@ -417,4 +743,9 @@ export async function readAgentActivity(agent) {
   if (liveOutput) sections.push(`Live output:\n${liveOutput}`);
   if (transcriptEvents) sections.push(`Recent activity:\n${transcriptEvents}`);
   return sections.join("\n\n");
+}
+
+export function resetActivityCursorCache() {
+  activityCursors.clear();
+  openCodeCursors.clear();
 }
