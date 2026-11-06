@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.68.0
+
+- refactor(orchestrate)!: remove legacy stooges aliases, shims, and naming (#118)
+
 ## 0.67.0
 
 - feat(orchestrate): replace bottom detail line with framed focus card (#117)
