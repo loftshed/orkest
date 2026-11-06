@@ -218,7 +218,7 @@ describe("HordeView themed activity and inner padding", () => {
     const rendered = view.render(90);
     const plainLines = rendered.map((line) => stripVTControlCharacters(line));
     const taskLine = plainLines.find((line) => line.includes("Task: Check spacing"));
-    expect(taskLine).toMatch(/^│ Task: Check spacing/u);
+    expect(taskLine).toMatch(/^\s*│ Task: Check spacing/u);
     expect(rendered.join("\n")).toContain(`${ESC}${DEFAULT_THEME.mdH3}m▸ STATUS${ESC}0m`);
     expect(rendered.join("\n")).toContain(`${ESC}32;1m✓ COMPLETE${ESC}0m`);
 

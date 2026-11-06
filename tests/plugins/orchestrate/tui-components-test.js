@@ -296,11 +296,14 @@ describe("terminal presentation components", () => {
       "│ project  ·  󰔛 1 active  ·  󰀪 1 blocked  ·  󰄬 1 complete",
     );
     expect(plain(rendered.join("\n"))).toContain("└─┤ ⣷ Checking header layout");
-    expect(plain(rendered.join("\n"))).toContain(" \u{F233} Services ");
+    expect(plain(rendered.join("\n"))).toContain(" \u{F078} \u{F233} Services ");
+    expect(rendered.map(plain).find((line) => line.includes("View chat"))).not.toContain(
+      "Services",
+    );
     view.handleKey("v");
     const collapsedLines = view.render(80).map(plain);
     expect(collapsedLines.join("\n")).toContain(
-      "\u{F233} Services  1 running · localhost :5017 preview",
+      "\u{F054} \u{F233} Services  1 running · localhost :5017 preview",
     );
     expect(collapsedLines.find((line) => line.includes("View chat"))).not.toContain("Services");
   });

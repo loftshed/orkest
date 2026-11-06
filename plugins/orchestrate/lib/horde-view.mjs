@@ -838,7 +838,10 @@ export class HordeView {
     if (serviceRows > 0) {
       servicePanelLines = this.servicesMode === "collapsed" ? 1 : serviceRows + 2;
     }
-    const updateBarLines = this.showUpdateBar() ? 1 : 0;
+    let updateBarLines = 0;
+    if (this.showUpdateBar() && this.height >= 14) {
+      updateBarLines = this.height < 18 ? 1 : 3;
+    }
     const base = Math.min(
       9,
       Math.max(
@@ -926,6 +929,7 @@ export class HordeView {
   }
 
   handleKey(key) {
+    this.notice = "";
     if (this.overlay) {
       switch (key) {
         case "\u{1B}":
@@ -958,7 +962,10 @@ export class HordeView {
       return true;
     }
     if (this.preview) {
-      if (key === "\u{1B}") return { type: "close-preview" };
+      if (key === "\u{1B}") {
+        this.setPreview(null);
+        return { type: "close-preview" };
+      }
       if (key === "\u{1B}[5~" || key === "\u{1B}[6~") {
         this.scrollPreview((key === "\u{1B}[5~" ? 1 : -1) * Math.max(1, this.height - 8));
         return true;
@@ -1158,7 +1165,7 @@ export class HordeView {
 
   handleMouse({ x, y, button, action }) {
     if (action === "scroll-up" || action === "scroll-down") {
-      if (this.preview && x <= this.previewWidth) {
+      if (this.preview) {
         this.scrollPreview(action === "scroll-up" ? 3 : -3);
         return true;
       }
@@ -1168,6 +1175,11 @@ export class HordeView {
     this.hovered = target?.id;
     if (action !== "press" || button !== 0 || !target) return false;
     if (target.agentId) {
+      this.notice = "";
+      if (this.preview && this.preview.agentId === target.agentId) {
+        this.setPreview(null);
+        return { type: "close-preview" };
+      }
       this.focusId = target.agentId;
       this.hasExplicitFocus = true;
       this.focusFollowsLatest = false;
@@ -1189,8 +1201,28 @@ export class HordeView {
         { color: this.appearance, hovered: this.hovered, tier: this.tier },
       );
     }
+    if (this.preview) {
+      return actionBar(
+        [
+          { id: "preview-back", label: "Back", key: "\u{1B}", hint: "Esc", primary: true },
+          {
+            id: "preview-open",
+            label: "Open terminal",
+            key: "o",
+            disabled: this.preview.kind !== "terminal",
+          },
+          { id: "preview-follow", label: "Follow", key: "r", active: this.previewFollow },
+          { id: "preview-up", label: "Up", key: "\u{1B}[5~", hint: "PgUp" },
+          { id: "preview-down", label: "Down", key: "\u{1B}[6~", hint: "PgDn" },
+          { id: "preview-previous", label: "Prev", key: "[" },
+          { id: "preview-next", label: "Next", key: "]" },
+        ],
+        width,
+        { color: this.appearance, hovered: this.hovered, tier: this.tier },
+      );
+    }
     const selected = this.selectedAgent();
-    const update = this.room.update || this.room.updateStatus;
+    const hasInactiveAgents = this.room.agents.some(isInactive);
     return actionBar(
       [
         ...(!this.preview && (!selected || !this.isCurrentAgent(selected))
@@ -1205,12 +1237,6 @@ export class HordeView {
               },
             ]
           : []),
-        ...(this.preview &&
-        (this.room.herdrCoordinatorPaneId ||
-          this.room.conductor?.herdrPaneId ||
-          this.room.conductor?.paneId)
-          ? [{ id: "return", label: "Return to chat", key: "0", primary: true }]
-          : []),
         ...(this.preview ||
         !selected ||
         this.isCurrentAgent(selected) ||
@@ -1223,19 +1249,15 @@ export class HordeView {
                 key: "o",
               },
             ]),
-        { id: "inactive", label: "Inactive", key: "c", active: this.completedMode === "expanded" },
-        ...(this.room.services?.length && this.servicesMode !== "collapsed"
+        ...(hasInactiveAgents
           ? [
               {
-                id: "services",
-                label: "Services",
-                key: "v",
-                active: this.servicesMode === "expanded",
+                id: "inactive",
+                label: "Inactive",
+                key: "c",
+                active: this.completedMode === "expanded",
               },
             ]
-          : []),
-        ...(update?.available || update?.updateAvailable || update?.status === "error"
-          ? [{ id: "update", label: "Update", key: "U" }]
           : []),
         { id: "logs", label: "Log", key: "g" },
         { id: "help", label: "Shortcuts", key: "?" },
@@ -1337,44 +1359,97 @@ export class HordeView {
     );
   }
 
-  updateLine(innerWidth) {
+  updateSummaryText() {
     const upd = this.room?.update || this.room?.updateStatus || {};
-    const labelText = "Update";
-    let badgeTone = "yellow bold";
-    if (upd.status === "error") badgeTone = "red bold";
-    else if (upd.status === "updated") badgeTone = "green bold";
-    const badge = tone(labelText, badgeTone, this.appearance);
-    const budget = Math.max(1, innerWidth - displayWidth(`${labelText}  `));
     const count =
       Number.isFinite(upd.commitsBehind) && upd.commitsBehind > 0 ? upd.commitsBehind : 1;
     const plural = count === 1 ? "commit" : "commits";
-    let text;
     switch (upd.status) {
       case "updating": {
-        text = "Pulling update from origin/main...";
-        break;
+        return "Pulling update from origin/main...";
       }
       case "updated": {
         const shortSha =
           plain(upd.toSha || upd.remoteSha || "")
             .trim()
             .slice(0, 7) || "latest";
-        text = `✓ Updated to ${shortSha} · hooks & skills refreshed`;
-        break;
+        return `✓ Updated to ${shortSha} · hooks & skills refreshed`;
       }
       case "error": {
         const msg = plain(upd.message || upd.error || "fast-forward failed").trim();
-        text = `! Update failed: ${msg} · click to retry`;
-        break;
+        return `! Update failed: ${msg} · click to retry`;
       }
       default: {
-        text = upd.dirty
+        return upd.dirty
           ? `↑ ${count} new ${plural} on origin/main (working tree dirty)`
           : `↑ ${count} new ${plural} on origin/main · click to update`;
+      }
+    }
+  }
+
+  updateLine(innerWidth) {
+    const upd = this.room?.update || this.room?.updateStatus || {};
+    const labelText = this.tier === "nerd" ? "\u{F021} Update" : "Update";
+    let badgeTone = "yellow bold";
+    switch (upd.status) {
+      case "error": {
+        badgeTone = "red bold";
+        break;
+      }
+      case "updated": {
+        badgeTone = "green bold";
+        break;
+      }
+      case "updating": {
+        {
+          badgeTone = "running bold";
+          // No default
+        }
         break;
       }
     }
-    return `${badge}  ${fit(text, budget)}`;
+    if (this.hovered === "update-bar") badgeTone = "buttonHover";
+    const badge = tone(labelText, badgeTone, this.appearance);
+    const budget = Math.max(1, innerWidth - displayWidth(`${labelText}  `));
+    return `${badge}  ${fit(this.updateSummaryText(), budget)}`;
+  }
+
+  updateBlockLines(innerWidth) {
+    if (!this.showUpdateBar() || this.height < 14) return [];
+    if (this.height < 18) return [this.updateLine(innerWidth)];
+    const upd = this.room?.update || this.room?.updateStatus || {};
+    let headerTone = "yellow bold";
+    let bodyTone = "warning";
+    let headerRight = upd.dirty ? "working tree dirty" : "Shift+U";
+    switch (upd.status) {
+      case "error": {
+        headerTone = "red bold";
+        bodyTone = "error";
+        headerRight = "retry · Shift+U";
+
+        break;
+      }
+      case "updated": {
+        headerTone = "green bold";
+        bodyTone = "success";
+        headerRight = "up to date";
+
+        break;
+      }
+      case "updating": {
+        headerTone = "running bold";
+        bodyTone = "running";
+        headerRight = "pulling...";
+
+        break;
+      }
+      // No default
+    }
+    if (this.hovered === "update-bar") headerTone = "buttonHover";
+    const title = this.tier === "nerd" ? "\u{F021} Update" : "Update";
+    const rowWidth = Math.max(1, innerWidth - 4);
+    const body = tone(` ${fit(this.updateSummaryText(), rowWidth)}`, bodyTone, this.appearance);
+    return this.panel(title, [body], innerWidth, headerRight, headerTone);
   }
 
   quotaSummaryLines(innerWidth) {
@@ -1498,8 +1573,8 @@ export class HordeView {
 
   inlineServicesLine(innerWidth) {
     const services = Array.isArray(this.room.services) ? this.room.services : [];
-    const labelText =
-      this.tier === "nerd" ? "\u{F233} Services" : disclosure("Services", false, this.tier);
+    const serviceTitle = this.tier === "nerd" ? "\u{F233} Services" : "Services";
+    const labelText = disclosure(serviceTitle, false, this.tier);
     const badge = tone(
       labelText,
       this.hovered === "services-heading" ? "buttonHover" : "running bold",
@@ -1639,44 +1714,14 @@ export class HordeView {
   }
 
   render(width) {
-    if (!this.preview || this.overlay) {
-      this.previewWidth = 0;
-      return this.renderSidebar(width);
-    }
-    const isSplit = width >= 96;
-    const sidebarWidth = isSplit ? Math.max(40, Math.floor(width * 0.38)) : 0;
-    const previewWidth = isSplit ? width - sidebarWidth - 1 : width;
-    const sidebar = isSplit ? this.renderSidebar(sidebarWidth) : [];
-    this.targets = isSplit
-      ? this.targets.map((target) => ({ ...target, x: target.x + previewWidth + 1 }))
-      : [];
-    this.previewWidth = previewWidth;
-    const preview = this.previewLines(previewWidth);
-    if (!isSplit) return preview;
-    return preview.map((line, index) => `${fitStyled(line, previewWidth)} ${sidebar[index] || ""}`);
+    this.previewWidth = this.preview && !this.overlay ? width : 0;
+    return this.renderSidebar(width);
   }
 
-  previewLines(width) {
+  previewPanelLines(width, height) {
     const preview = this.preview;
-    const controls = actionBar(
-      [
-        { id: "preview-back", label: "Agents", key: "\u{1B}", hint: "Esc", primary: true },
-        {
-          id: "preview-open",
-          label: "Open terminal",
-          key: "o",
-          disabled: preview.kind !== "terminal",
-        },
-        { id: "preview-follow", label: "Follow", key: "r", active: this.previewFollow },
-        { id: "preview-up", label: "Up", key: "\u{1B}[5~", hint: "PgUp" },
-        { id: "preview-down", label: "Down", key: "\u{1B}[6~", hint: "PgDn" },
-        { id: "preview-previous", label: "Prev", key: "[" },
-        { id: "preview-next", label: "Next", key: "]" },
-      ],
-      Math.max(1, width - 2),
-      { color: this.appearance, hovered: this.hovered, tier: this.tier },
-    );
-    const budget = Math.max(1, this.height - controls.lines.length - 3);
+    if (!preview || height <= 0) return [];
+    const budget = Math.max(1, height - 3);
     const pad = width >= 6 ? " " : "";
     const textWidth = Math.max(1, width - 2 - pad.length * 2);
     const rows =
@@ -1702,16 +1747,14 @@ export class HordeView {
     while (body.length < budget) body.push("");
     const heading = preview.kind === "terminal" ? "Live screen · read only" : "Recorded activity";
     const state = preview.loading ? "Loading..." : preview.error || heading;
-    const lines = this.panel(
+    const rightHint = width >= 44 ? "Esc back · [ ] switch" : "";
+    return this.panel(
       plain(preview.title || "Agent"),
       [`${pad}${tone(state, preview.error ? "error" : "muted", this.appearance)}`, ...body],
       Math.max(1, width),
-    );
-    const contentHeight = Math.max(0, this.height - controls.lines.length);
-    lines.splice(contentHeight);
-    while (lines.length < contentHeight) lines.push("");
-    this.addTargets(controls.targets, lines.length);
-    return [...lines, ...controls.lines.map((line) => ` ${line}`)].slice(0, this.height);
+      rightHint,
+      "mdSection",
+    ).slice(0, height);
   }
 
   renderSidebar(width) {
@@ -1831,10 +1874,6 @@ export class HordeView {
     leadLines = leadLines.map((line) => ` ${line}`);
     const maxAgents = room.swarm?.maxAgents ?? 64;
     const hasAgentTree = room.agents.length > 0;
-    const withRail = (line) =>
-      hasAgentTree
-        ? `${tone(toAsciiTree("│ ", this.tier), "border", this.appearance)}${line}`
-        : line;
     const hasQuota = Boolean(room.accounts?.length || room.quotaError);
     const isQuotaDrawer = hasQuota && this.quotaMode === "collapsed";
     const hasHerdrPaneHeader = Boolean(
@@ -1901,12 +1940,6 @@ export class HordeView {
       const bottomLeft = hasAgentTree ? leftTee : glyphs.bottomLeft;
       lines.push(tone(`${bottomLeft}${hBar}${glyphs.bottomRight}`, "border", this.appearance));
     }
-    if (this.showUpdateBar()) {
-      this.addTargets([
-        { id: "update-bar", key: "U", x: 1, y: lines.length + 1, width: innerWidth, height: 1 },
-      ]);
-      lines.push(withRail(this.updateLine(innerWidth - (hasAgentTree ? 2 : 0))));
-    }
     if (hasQuota && !isQuotaDrawer) {
       this.addTargets([
         { id: "quota-heading", key: "u", x: 1, y: lines.length + 1, width: innerWidth, height: 1 },
@@ -1928,11 +1961,17 @@ export class HordeView {
         room.agents.map((agent) => agent.parent).filter((p) => p && p !== "conductor"),
       );
       const isCollapsibleCompleted = (agent) => this.isCollapsibleCompleted(agent, parentIds);
+      const activePreviewAgentId = this.preview ? this.preview.agentId || this.focusId : "";
+      const previewSource = activePreviewAgentId
+        ? room.agents.filter((agent) => agent.id === activePreviewAgentId)
+        : [];
+      const visibleAgents = this.preview && previewSource.length > 0 ? previewSource : selected;
       const folderGroups = new Map();
-      for (const [offset, agent] of selected.entries()) {
+      for (const [offset, agent] of visibleAgents.entries()) {
+        const pageIndex = this.preview ? room.agents.findIndex((a) => a.id === agent.id) : offset;
         const folder = agentFolder(agent, room);
         if (!folderGroups.has(folder)) folderGroups.set(folder, []);
-        folderGroups.get(folder).push({ agent, index: offset });
+        folderGroups.get(folder).push({ agent, index: pageIndex >= 0 ? pageIndex : offset });
       }
       const gap = "  ";
       const lastFolder = folderGroups.keys().toArray().at(-1);
@@ -1942,17 +1981,19 @@ export class HordeView {
           : "";
         lines.push(this.folderHeaderLine(folder, rawEntries.length, innerWidth, folderSummary));
         const hiddenCompletedCount =
-          this.completedMode === "hidden"
+          !this.preview && this.completedMode === "hidden"
             ? rawEntries.filter(({ agent }) => isCollapsibleCompleted(agent)).length
             : 0;
         const entries =
-          this.completedMode === "hidden"
+          !this.preview && this.completedMode === "hidden"
             ? rawEntries.filter(({ agent }) => !isCollapsibleCompleted(agent))
             : rawEntries;
         const hasCollapsedRows =
+          !this.preview &&
           this.completedMode === "collapsed" &&
           entries.some(({ agent }) => isCollapsibleCompleted(agent));
-        const columns = !hasCollapsedRows && innerWidth >= 100 && entries.length > 1 ? 2 : 1;
+        const columns =
+          !this.preview && !hasCollapsedRows && innerWidth >= 100 && entries.length > 1 ? 2 : 1;
         const cardWidth =
           columns === 2 ? Math.max(24, Math.floor((innerWidth - gap.length) / 2)) : innerWidth;
         const hasFollowingSection = folder !== lastFolder;
@@ -1968,7 +2009,7 @@ export class HordeView {
           const isFocused = agent.id === this.focusId;
           const isHovered = this.hovered === `agent:${agent.id}`;
           const pointer = this.tier === "ascii" ? ">" : "▸";
-          const chevron = disclosure("", false, this.tier);
+          const chevron = disclosure("", Boolean(this.preview), this.tier);
           const isPinned = agent.id === this.pinnedId;
           const currentBadge = this.isCurrentAgent(agent) ? " · This chat" : "";
           const locationBadge = worktreeBadge(agent, room);
@@ -1985,7 +2026,11 @@ export class HordeView {
             agent.parent && agent.parent !== "conductor"
               ? ` ↳ ${parent ? shortAgentName(parent) : plain(agent.parent)}`
               : "";
-          if (this.completedMode === "collapsed" && isCollapsibleCompleted(agent)) {
+          if (
+            !this.preview &&
+            this.completedMode === "collapsed" &&
+            isCollapsibleCompleted(agent)
+          ) {
             const glyph = statusGlyph(agent, now, this.tier);
             const badge = ` ${isFocused ? pointer : glyph} ${index + 1} ${displayAgentName} `;
             const label = `${currentBadge}${parentBadge}${locationBadge ? ` · ${locationBadge}` : ""} · ${model(agent)}${agent.consultation ? "" : ` · ${taskText}`}`;
@@ -2051,26 +2096,39 @@ export class HordeView {
         }
         lines.push(...joinCardGrid(cards, columns, cardWidth, gap));
         if (hiddenCompletedCount === 0) continue;
+        const hiddenTargetId = `inactive-hidden:${folder}`;
+        this.addTargets([
+          {
+            id: hiddenTargetId,
+            key: "c",
+            x: 1,
+            y: lines.length + 1,
+            width: innerWidth,
+            height: 1,
+          },
+        ]);
         const summaryPrefix = toAsciiTree(hasFollowingSection ? "├─" : "└─", this.tier);
         const glyph = glyphSet(this.tier).completed;
         const summaryText = ` ${glyph} ${hiddenCompletedCount} inactive hidden (press c to expand)`;
         const summaryWidth = Math.max(1, innerWidth - displayWidth(summaryPrefix));
         const fittedSummary = fit(summaryText, summaryWidth);
+        const summaryTone = this.hovered === hiddenTargetId ? "buttonHover" : "muted";
         lines.push(
-          `${tone(summaryPrefix, "border", this.appearance)}${tone(fittedSummary, "muted", this.appearance)}`,
+          `${tone(summaryPrefix, "border", this.appearance)}${tone(fittedSummary, summaryTone, this.appearance)}`,
         );
       }
     }
-    const serviceLimit = this.serviceRowLimit();
+    const serviceLimit = this.preview ? 0 : this.serviceRowLimit();
     const serviceBlock = [];
     if (serviceLimit > 0) {
       if (this.servicesMode === "collapsed") {
         serviceBlock.push(this.inlineServicesLine(innerWidth));
       } else {
         const headerRight = this.serviceHeaderBadge();
+        const serviceTitle = this.tier === "nerd" ? "\u{F233} Services" : "Services";
         serviceBlock.push(
           ...this.panel(
-            disclosure("Services", true, this.tier),
+            disclosure(serviceTitle, true, this.tier),
             this.serviceLines(innerWidth).slice(0, serviceLimit),
             innerWidth,
             headerRight,
@@ -2079,32 +2137,48 @@ export class HordeView {
         );
       }
     }
+    const updateBlock = this.preview ? [] : this.updateBlockLines(innerWidth);
     const controls = this.controls(innerWidth);
     const footerHeight = controls.lines.length + 2;
     const contentHeight = Math.max(0, this.height - footerHeight);
-    const mainHeight = Math.max(0, contentHeight - serviceBlock.length);
-    const focused = room.agents.find((agent) => agent.id === (this.pinnedId || this.focusId));
-    const focusLines = this.focusCardLines(
-      focused,
-      innerWidth,
-      mainHeight - lines.length,
-      lines.length + 1,
-    );
-    if (focusLines.length > 0) {
-      lines.push(...focusLines);
-    }
-    if (room.agents.length === 0) {
-      const emptyLines = [];
-      for (const line of wrapText(
-        "The coordinator will add agents as work is assigned.",
-        innerWidth,
-      )) {
-        const leftSpaces = Math.max(0, Math.floor((innerWidth - displayWidth(line)) / 2));
-        emptyLines.push(`${" ".repeat(leftSpaces)}${tone(line, "muted", this.appearance)}`);
+    const mainHeight = Math.max(0, contentHeight - serviceBlock.length - updateBlock.length);
+    if (this.preview) {
+      const minPreviewHeight = Math.min(mainHeight, 6);
+      if (mainHeight - lines.length < minPreviewHeight) {
+        const keepTop = Math.max(0, mainHeight - minPreviewHeight);
+        lines.splice(keepTop);
+        this.targets = this.targets
+          .map((target) => ({
+            ...target,
+            height: Math.min(target.height, keepTop - target.y + 1),
+          }))
+          .filter((target) => target.height > 0);
       }
-      const topPad = Math.max(0, Math.floor((mainHeight - lines.length - emptyLines.length) / 2));
-      for (let i = 0; i < topPad; i++) lines.push("");
-      lines.push(...emptyLines);
+      lines.push(...this.previewPanelLines(innerWidth, Math.max(1, mainHeight - lines.length)));
+    } else {
+      const focused = room.agents.find((agent) => agent.id === (this.pinnedId || this.focusId));
+      const focusLines = this.focusCardLines(
+        focused,
+        innerWidth,
+        mainHeight - lines.length,
+        lines.length + 1,
+      );
+      if (focusLines.length > 0) {
+        lines.push(...focusLines);
+      }
+      if (room.agents.length === 0) {
+        const emptyLines = [];
+        for (const line of wrapText(
+          "The coordinator will add agents as work is assigned.",
+          innerWidth,
+        )) {
+          const leftSpaces = Math.max(0, Math.floor((innerWidth - displayWidth(line)) / 2));
+          emptyLines.push(`${" ".repeat(leftSpaces)}${tone(line, "muted", this.appearance)}`);
+        }
+        const topPad = Math.max(0, Math.floor((mainHeight - lines.length - emptyLines.length) / 2));
+        for (let i = 0; i < topPad; i++) lines.push("");
+        lines.push(...emptyLines);
+      }
     }
     while (lines.length < mainHeight) lines.push("");
     lines.splice(mainHeight);
@@ -2121,7 +2195,7 @@ export class HordeView {
         this.appearance,
       ),
     );
-    if (serviceBlock.length > 0 && contentHeight > mainHeight) {
+    if (serviceBlock.length > 0 && contentHeight - mainHeight >= serviceBlock.length) {
       this.addTargets([
         {
           id: "services-heading",
@@ -2133,6 +2207,22 @@ export class HordeView {
         },
       ]);
       lines.push(...serviceBlock);
+    }
+    if (
+      updateBlock.length > 0 &&
+      contentHeight - mainHeight >= serviceBlock.length + updateBlock.length
+    ) {
+      this.addTargets([
+        {
+          id: "update-bar",
+          key: "U",
+          x: 1,
+          y: lines.length + 1,
+          width: innerWidth,
+          height: updateBlock.length,
+        },
+      ]);
+      lines.push(...updateBlock);
     }
     this.addTargets(controls.targets, lines.length);
     const footerNotice =

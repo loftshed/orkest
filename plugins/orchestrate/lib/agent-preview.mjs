@@ -31,6 +31,7 @@ export function createAgentPreview({
   env = process.env,
   exec = execFile,
   onChange = () => {},
+  zoom = false,
 } = {}) {
   let active;
   let snapshot = null;
@@ -71,7 +72,7 @@ export function createAgentPreview({
   }
 
   function expand(token) {
-    if (!currentPane) return Promise.resolve();
+    if (!zoom || !currentPane) return Promise.resolve();
     return queueZoom(async () => {
       if (token !== generation || !active || isOwnedZoom) return;
       const response = JSON.parse(await run(herdr, ["pane", "layout", "--pane", currentPane]));

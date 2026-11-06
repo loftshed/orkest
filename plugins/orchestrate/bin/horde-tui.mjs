@@ -174,13 +174,16 @@ async function runExec(exec, command, args) {
 
 export async function focusAgentPane(agent, { exec = execFile } = {}) {
   if (!agent || typeof agent !== "object") return false;
-  const herdrPaneId = typeof agent.herdrPaneId === "string" ? agent.herdrPaneId.trim() : "";
+  const rawHerdrPaneId = agent.herdrPaneId || agent.progress?.herdrPaneId;
+  const herdrPaneId = typeof rawHerdrPaneId === "string" ? rawHerdrPaneId.trim() : "";
   if (herdrPaneId && PANE_ID_RE.test(herdrPaneId)) {
-    return runExec(exec, "herdr", ["pane", "focus", "--pane", herdrPaneId]);
+    return runExec(exec, "herdr", ["agent", "focus", herdrPaneId]);
   }
-  const paneId = typeof agent.paneId === "string" ? agent.paneId.trim() : "";
+  const rawPaneId = agent.paneId || agent.progress?.paneId;
+  const paneId = typeof rawPaneId === "string" ? rawPaneId.trim() : "";
   if (paneId && PANE_ID_RE.test(paneId)) {
-    const server = typeof agent.terminalServer === "string" ? agent.terminalServer.trim() : "";
+    const rawServer = agent.terminalServer || agent.progress?.terminalServer;
+    const server = typeof rawServer === "string" ? rawServer.trim() : "";
     const tmuxArgs =
       server && PANE_ID_RE.test(server)
         ? ["-L", server, "select-pane", "-t", paneId]
