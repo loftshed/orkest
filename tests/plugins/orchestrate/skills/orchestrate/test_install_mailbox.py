@@ -664,6 +664,34 @@ class InstallMailboxTests(unittest.TestCase):
                 installer.install_herdr_integration(self.base, cli)
         self.assertFalse((self.base / ".config/herdr/config.toml").exists())
 
+    def test_orchestrate_skill_links_cover_installed_harnesses_and_skip_marketplace_claude_cache(self):
+        hub = self.base / ".agents/skills/orchestrate"
+        hub.mkdir(parents=True)
+        (hub / "SKILL.md").write_text("---\nname: orchestrate\n---\n")
+        for d in (
+            self.base / ".codex",
+            self.base / ".gemini/config",
+            self.base / ".config/opencode",
+            self.base / ".claude",
+            self.base / ".claude-work",
+            self.base / ".claude-plugin-managed/plugins/cache/orkest/orchestrate/0.66.0",
+        ):
+            d.mkdir(parents=True)
+        self.assertTrue(installer.install_orchestrate_skill_links(self.base, dry_run=True))
+        self.assertFalse((self.base / ".codex/skills/orchestrate").exists())
+        self.assertTrue(installer.install_orchestrate_skill_links(self.base))
+        for linked in (
+            self.base / ".codex/skills/orchestrate",
+            self.base / ".gemini/config/skills/orchestrate",
+            self.base / ".config/opencode/skills/orchestrate",
+            self.base / ".claude/skills/orchestrate",
+            self.base / ".claude-work/skills/orchestrate",
+        ):
+            self.assertTrue(linked.is_symlink(), str(linked))
+            self.assertEqual(linked.resolve(), hub.resolve())
+        self.assertFalse((self.base / ".claude-plugin-managed/skills/orchestrate").exists())
+        self.assertFalse(installer.install_orchestrate_skill_links(self.base))
+
 
 if __name__ == "__main__":
     unittest.main()
