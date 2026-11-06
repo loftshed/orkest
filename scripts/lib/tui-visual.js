@@ -86,6 +86,22 @@ export const VISUAL_CASES = Object.freeze([
     palette: "dark",
     tier: "nerd",
   },
+  {
+    name: "activity-dark-160",
+    scenario: "activity",
+    cols: 160,
+    rows: 40,
+    palette: "dark",
+    tier: "unicode",
+  },
+  {
+    name: "activity-light-100",
+    scenario: "activity",
+    cols: 100,
+    rows: 40,
+    palette: "light",
+    tier: "unicode",
+  },
 ]);
 
 export function syntheticRoom() {
@@ -245,6 +261,52 @@ export async function renderFixture(repo, spec) {
         kind: "terminal",
         loading: false,
         text: "User: Improve search result grouping.\n\nAssistant: I grouped related matches and kept keyboard navigation.\n\nChanged search grouping and empty states.\nRunning focused checks.\n\nAssistant: The checks passed. Ready for review.",
+      });
+
+      break;
+    }
+    case "activity": {
+      if (typeof view.setPreview !== "function")
+        return {
+          status: "unsupported",
+          reason: "This revision does not expose HordeView.setPreview",
+        };
+      view.focusId = "scout";
+      view.setPreview({
+        agentId: "scout",
+        title: "codex:search-audit-17",
+        kind: "activity",
+        loading: false,
+        text: [
+          "Task: Audit search grouping, keyboard navigation, and empty-state rendering across narrow viewports.",
+          "",
+          "Messages to orchestrator:",
+          "• [update] Checked clean HEAD `8dc70d7e` and reproduced layout shift below `740px`.",
+          "• [done] Confirmed keyboard navigation preserves focus across grouped sections.",
+          "",
+          "Response:",
+          "### STATUS",
+          "",
+          "COMPLETE",
+          "",
+          "Verified **3 reusable patterns** against `search/grouping.mjs` and `search/view.mjs`.",
+          "",
+          "### FILES CHANGED",
+          "",
+          "None. Read-only audit completed.",
+          "",
+          "### COMMANDS RUN",
+          "",
+          "Read-only Git history inspection; `rg`, `sed`, and focused `vitest` probes.",
+          "",
+          "### VERIFICATION",
+          "",
+          "- [x] Keyboard focus order preserved",
+          "- [x] Empty-state fallback verified",
+          "",
+          "Uncertainty: None",
+          "Verification: passed",
+        ].join("\n"),
       });
 
       break;

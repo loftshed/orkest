@@ -372,8 +372,10 @@ describe("tui-box primitives and HordeView unification", () => {
     expect(view.render(80).join("\n")).toContain("Keyboard shortcuts");
     view.handleInput("\u{1B}");
     view.handleInput("g");
-    expect(view.render(80).join("\n")).toContain("haiku-1: Source inspected (×2)");
-    expect(view.render(80).join("\n")).toContain("Room log");
+    const logFrame = view.render(80).join("\n");
+    expect(plain(logFrame)).toContain("haiku-1: Source inspected (×2)");
+    expect(logFrame).toContain("\u{1B}[36;1mhaiku-1:\u{1B}[0m Source inspected");
+    expect(plain(logFrame)).toContain("Room log");
   });
 
   it("starts quota collapsed with each account's lowest remaining percentage on one row", () => {
