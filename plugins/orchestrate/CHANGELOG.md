@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.71.0
+
+- feat(orchestrate): optional --timeout for room/coordinator dispatch, --time-budget for init-task (#122)
+
 ## 0.70.0
 
 - feat(orchestrate): add 5h/weekly meter toggle, color ork header, and fix activity truncations (#121)
