@@ -1252,6 +1252,11 @@ def hook(
                     "updatedAt": _MB.stamp(),
                 },
             )
+        if os.environ.get("ORKEST_READONLY_RUN") != "1":
+            with contextlib.suppress(Exception):
+                import repo_env
+
+                repo_env.bootstrap_worktree_env(cwd, overwrite=False)
         return {}
     if event == "SubagentStop":
         raw_agent_id = payload.get("agent_id") or payload.get("subagent_id")
@@ -1344,6 +1349,14 @@ def hook(
                 herdr_fields["herdrWorkspaceId"] = herdr_workspace
             if herdr_fields:
                 me = _MB.annotate(base, session, **herdr_fields) or me
+    if event == "SessionStart" or (gemini and event == "PreInvocation" and previous is None):
+        with contextlib.suppress(Exception):
+            import repo_env
+
+            if not me.get("delegatedRun") and os.environ.get("ORKEST_READONLY_RUN") != "1":
+                repo_env.bootstrap_worktree_env(cwd, overwrite=False)
+            if harness == "claude" and event == "SessionStart":
+                repo_env.export_claude_env_file(cwd)
     if event == "SessionStart":
         _maybe_trigger_auto_update(base, me, event)
     # How the last turn ended: wake recovery must not set a conversation going that its own user stopped.

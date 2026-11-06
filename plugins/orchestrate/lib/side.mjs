@@ -6,6 +6,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { listRawRooms, readRawRoom, updateRawRoom } from "./horde-room.mjs";
+import { bootstrapWorktreeInclude } from "./worktree-env.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -402,26 +403,7 @@ function provisionSideWorktree(repoRoot, shortId, runCmd) {
     }
   }
 
-  // Copy .worktreeinclude entries if present
-  const includeFile = path.join(repoRoot, ".worktreeinclude");
-  if (fs.existsSync(includeFile)) {
-    try {
-      const lines = fs
-        .readFileSync(includeFile, "utf8")
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .filter((line) => line && !line.startsWith("#"));
-      for (const rel of lines) {
-        const src = path.join(repoRoot, rel);
-        const dest = path.join(worktreePath, rel);
-        if (!fs.existsSync(src) || fs.existsSync(dest)) continue;
-        fs.mkdirSync(path.dirname(dest), { recursive: true });
-        fs.cpSync(src, dest, { recursive: true });
-      }
-    } catch {
-      // Best-effort .worktreeinclude copy
-    }
-  }
+  bootstrapWorktreeInclude(repoRoot, worktreePath, { overwrite: false });
 
   return { worktreePath, branch };
 }

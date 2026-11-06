@@ -254,6 +254,8 @@ def main() -> None:
     with support.workspace_lease(
         repository, runner.default_agent_cache_dir(), read_only=not (task["allow_paths"] or task["track_paths"])
     ) as lease:
+        if not run.get("resume_result") and (task["allow_paths"] or task["track_paths"]):
+            runner.bundled_module("repo_env").bootstrap_worktree_env(repository, overwrite=False)
         before, identity = runner.git_state(repository, task["track_paths"]), runner.git_identity(repository)
         if run.get("resume_result"):
             previous = json.loads(Path(run["resume_result"]).read_text())
