@@ -299,7 +299,7 @@ def initialize(args: argparse.Namespace) -> dict[str, Any]:
         )
     elif not host:
         raise CoordinationError("init needs --host, or --authority for a team's task")
-    duration = RUNNER.parse_duration(args.time_budget)
+    duration = RUNNER.parse_duration(args.time_budget, option="--time-budget")
     now = dt.datetime.now(dt.UTC)
     state = {
         "schema": SCHEMA,
@@ -478,6 +478,10 @@ def dispatch(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
         )
     if RUNNER.deadline_remaining(state["deadline"]) <= 0:
         raise CoordinationError("task deadline exhausted; conductor must investigate or replan")
+    if args.timeout is not None:
+        if args.transport == "native":
+            raise CoordinationError("--timeout limits the executor runner; a native run ends at the task deadline")
+        RUNNER.parse_duration(args.timeout)
     work = latest_work(state)
     kind = args.kind
     if kind == "implementation" and work:
@@ -563,6 +567,7 @@ def dispatch(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
     engine, model_id, effort, variant = args.engine, args.model, args.effort, args.variant
     verification = args.verify_command
     billing = args.billing_mode
+    timeout = args.timeout
     previous_result = None
     evidence_record = None
     if kind == "correction":
@@ -578,6 +583,9 @@ def dispatch(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
         effort, variant = previous_result.get("effort", {}).get("bound"), previous_result.get("variant")
         verification = previous_result.get("verification_commands", [])
         billing = previous_result.get("billing_mode", "unknown")
+        if timeout is None and args.transport != "native":
+            # The resumed session keeps the runner limit it was given; an explicit --timeout replaces it.
+            timeout = next((run.get("timeout") for run in state["runs"] if run["kind"] == "implementation"), None)
         if (
             any(value is not None for value in (args.engine, args.model, args.effort, args.variant))
             or args.verify_command
@@ -600,6 +608,14 @@ def dispatch(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
             "Conductor evidence: " + json.dumps(proof, ensure_ascii=True)
         ]
         spec["context_packet"] = context
+    if timeout is not None:
+        # Refused, never clamped: the runner would otherwise stop the worker earlier than the caller asked.
+        remaining = RUNNER.deadline_remaining(state["deadline"])
+        if RUNNER.parse_duration(timeout) > remaining:
+            raise CoordinationError(
+                f"{'--timeout' if args.timeout else 'inherited --timeout'} {timeout} exceeds the task's remaining "
+                f"{int(remaining)}s; init the task with a longer --time-budget or pass a shorter --timeout"
+            )
     if not engine or not model_id:
         raise CoordinationError("dispatch requires an exact --engine and --model")
     model_id = exact_model(engine, model_id)
@@ -680,6 +696,8 @@ def dispatch(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
     ]
     if conductor_model:
         command += ["--conductor-model", conductor_model]
+    if timeout:
+        command += ["--timeout", timeout]
     if effort:
         command += ["--effort", effort]
     if variant:
@@ -711,6 +729,7 @@ def dispatch(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
         "effort": effort,
         "variant": variant,
         "billing_mode": billing,
+        **({"timeout": timeout} if timeout else {}),
         "host": host,
         "generation": authority["generation"] if authority else None,
         "allow_credits": bool(args.allow_credits),
@@ -1052,6 +1071,13 @@ def main(argv: list[str] | None = None) -> int:
                 help="Calling conductor model ID or selector (auto-detected when omitted)",
             )
             sub.add_argument("--billing-mode", choices=("unknown", "subscription", "api"), default="unknown")
+            sub.add_argument(
+                "--timeout",
+                help=(
+                    "Executor runner limit such as 25m (default: the runner's 15m); must fit the task's remaining "
+                    "time. A correction inherits the implementation's value unless given its own"
+                ),
+            )
             sub.add_argument(
                 "--allow-credits",
                 action="store_true",

@@ -719,6 +719,9 @@ export async function dispatchMember(id, memberId, options = {}) {
   const transport = options.transport || "executor";
   if (!["executor", "native"].includes(transport))
     throw new Error("Unsupported dispatch transport");
+  // The coordinator validates the duration and checks it against the task deadline.
+  if (options.timeout !== undefined && (typeof options.timeout !== "string" || !options.timeout))
+    throw new Error("--timeout needs a duration such as 25m");
   const intent = {
     taskDir: directory,
     taskId: task.task_id,
@@ -727,6 +730,7 @@ export async function dispatchMember(id, memberId, options = {}) {
     transport,
     billingMode: options.billingMode || "unknown",
     ...(options.packet && { packet: await realpath(options.packet) }),
+    ...(options.timeout && { timeout: options.timeout }),
   };
   const saved = await updateRoom(
     id,
@@ -743,7 +747,15 @@ export async function dispatchMember(id, memberId, options = {}) {
         else delete member.workforceRole;
       }
       if (member.dispatch) {
-        for (const key of ["taskDir", "taskId", "kind", "transport", "billingMode", "packet"])
+        for (const key of [
+          "taskDir",
+          "taskId",
+          "kind",
+          "transport",
+          "billingMode",
+          "packet",
+          "timeout",
+        ])
           if (member.dispatch[key] !== intent[key])
             throw new Error(`Existing dispatch differs: ${key}`);
         if (options.requestId && options.requestId !== member.dispatch.requestId)
@@ -790,6 +802,7 @@ export async function dispatchMember(id, memberId, options = {}) {
   if (member.effort)
     args.push(member.engine === "opencode" ? "--variant" : "--effort", member.effort);
   if (binding.packet) args.push("--packet", binding.packet);
+  if (binding.timeout) args.push("--timeout", binding.timeout);
   let result;
   try {
     result = await run(args);

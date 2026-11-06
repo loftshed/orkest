@@ -492,9 +492,85 @@ describe("rooms under a team", () => {
     ]);
     expect((await observeRoom(room.id, { root, run, authority: lead })).lead.generation).toBe(3);
   });
+
+  it("passes an optional runner timeout to the coordinator and keeps it with the intent", async () => {
+    const { root, room, taskDir, run } = await fixture();
+    const calls = [];
+    const record = async (args) => {
+      calls.push(args);
+      return run(args);
+    };
+    await dispatchMember(room.id, "haiku-1", { root, taskDir, run: record });
+    expect(calls.find((args) => args[0] === "dispatch")).not.toContain("--timeout");
+    expect((await readRoom(room.id, root)).agents[0].dispatch).not.toHaveProperty("timeout");
+    await dispatchMember(room.id, "luna-1", { root, taskDir, run: record, timeout: "25m" });
+    const timed = calls.findLast((args) => args[0] === "dispatch");
+    expect(timed.slice(timed.indexOf("--timeout"), timed.indexOf("--timeout") + 2)).toEqual([
+      "--timeout",
+      "25m",
+    ]);
+    expect((await readRoom(room.id, root)).agents[1].dispatch.timeout).toBe("25m");
+    await expect(
+      dispatchMember(room.id, "luna-1", { root, taskDir, run: record, timeout: "30m" }),
+    ).rejects.toThrow("Existing dispatch differs: timeout");
+    await expect(
+      dispatchMember(room.id, "haiku-1", { root, taskDir, run: record, timeout: 1500 }),
+    ).rejects.toThrow("--timeout needs a duration");
+  });
 });
 
 describe("room CLI", () => {
+  it("passes --time-budget to init-task and --timeout to dispatch and launch", async () => {
+    const { root, room, taskDir, run } = await fixture();
+    const calls = [];
+    const record = async (args) => {
+      calls.push(args);
+      return args[0] === "init" ? { task_id: "task-a" } : run(args);
+    };
+    const stdout = { write: () => {} };
+    const init = [
+      "init-task",
+      "--task-spec",
+      path.join(taskDir, "spec.json"),
+      "--task-dir",
+      taskDir,
+    ];
+    await roomsCommand([...init, "--host", "claude"], { stdout, root, run: record });
+    await roomsCommand([...init, "--host", "claude", "--time-budget", "2h"], {
+      stdout,
+      root,
+      run: record,
+    });
+    const [plain, budgeted] = calls.filter((args) => args[0] === "init");
+    expect(plain).not.toContain("--time-budget");
+    expect(budgeted.slice(-2)).toEqual(["--time-budget", "2h"]);
+    await roomsCommand(
+      [
+        "dispatch",
+        "--room",
+        room.id,
+        "--member",
+        "haiku-1",
+        "--task-dir",
+        taskDir,
+        "--timeout",
+        "25m",
+      ],
+      { stdout, root, run: record },
+    );
+    const plan = path.join(taskDir, "plan.json");
+    await writeFile(plan, JSON.stringify({ members: [{ id: "luna-1", taskDir, timeout: "40m" }] }));
+    await roomsCommand(["launch", "--room", room.id, "--plan", plan], {
+      stdout,
+      root,
+      run: record,
+    });
+    const timeouts = calls
+      .filter((args) => args[0] === "dispatch")
+      .map((args) => args[args.indexOf("--timeout") + 1]);
+    expect(timeouts).toEqual(["25m", "40m"]);
+  });
+
   it("creates and lists rooms", async () => {
     const root = await directory();
     const cwd = await directory();

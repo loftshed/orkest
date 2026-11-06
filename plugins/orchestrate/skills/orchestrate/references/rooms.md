@@ -33,11 +33,24 @@ one implementation at a time; other members run as investigation, consultation o
 For a model native to the conductor, add `--transport native`: it returns a reservation for the
 conductor's own agent tools instead of starting a CLI session.
 
+An executor run stops after the runner's default 15 minutes. For a longer run, give the task enough
+time with `init-task --time-budget DURATION` (default `1h`), then pass `dispatch --timeout DURATION`
+(or `"timeout"` on a launch-plan member). The coordinator refuses a timeout longer than the task's
+remaining time instead of shortening it. A native dispatch takes no `--timeout`; it ends at the
+task deadline. See [coordinator.md](coordinator.md#initialize-and-dispatch).
+
+```sh
+ork hall init-task --task-spec /absolute/task-spec.json \
+  --task-dir /absolute/tasks/long-read --host claude --time-budget 2h
+ork hall dispatch --room cache-review --member flash-1 \
+  --task-dir /absolute/tasks/long-read --kind investigation --timeout 25m
+```
+
 Add members with `ork rooms add --room cache-review --team "agy:flash"`. Each member has one dispatch
 intent; add another member for another task. Retrying a dispatch reuses its stored request ID, even
-after a lost response. Changing its task, kind or transport is rejected. When the coordinator refuses
-a dispatch and records no run for it, nothing launched: the intent is cleared, the error stays on the
-member, and the member can be dispatched again.
+after a lost response. Changing its task, kind, transport or timeout is rejected. When the
+coordinator refuses a dispatch and records no run for it, nothing launched: the intent is cleared,
+the error stays on the member, and the member can be dispatched again.
 
 `ork rooms launch --room cache-review --plan /absolute/plan.json` dispatches a batch and stops at the
 first error; retry the same plan to recover recorded requests:
@@ -45,7 +58,8 @@ first error; retry the same plan to recover recorded requests:
 ```json
 {
   "members": [
-    { "id": "haiku-1", "taskDir": "/absolute/tasks/cache-review", "kind": "investigation" }
+    { "id": "haiku-1", "taskDir": "/absolute/tasks/cache-review", "kind": "investigation" },
+    { "id": "flash-1", "taskDir": "/absolute/tasks/long-read", "timeout": "25m" }
   ]
 }
 ```

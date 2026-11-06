@@ -96,6 +96,10 @@ agy slugs use their base model's tariff. It is not an invoice. See
   `billing_error`, `api_error_status: 429`; OpenCode `statusCode: 429`). Stdout content and tool output
   are never searched, so a task about quotas or rate limits cannot trip it. The same evidence decides
   `--retry-read-only` eligibility.
+- `--timeout` (default `15m`) bounds each executor attempt: the runner stops the executor 60 s after
+  it (`timed_out`, 12), and agy gets `--print-timeout` 90 s after it. `--deadline` only shortens that
+  wait. A coordinator dispatch passes `--timeout` only when given one; see
+  [coordinator.md](coordinator.md#initialize-and-dispatch).
 - After a nonzero executor exit the catalog is refreshed to record whether the model still exists.
   A possibly mutating run is never retried; `--retry-read-only <1-3>` retries only unchanged,
   empty-scope transient failures and keeps every attempt.

@@ -31,8 +31,10 @@ ork rooms worktree-keep --room ID --member ID|conductor [--cwd PATH]   (promote 
 ork rooms objective --room ID --objective TEXT
 ork rooms pause|resume --room ID [--member conductor|MEMBER]   (gates new launches)
 ork rooms init-task --task-spec FILE --task-dir DIR (--host codex|claude|agy|opencode|other | --authority TEAM_ID)
+                    [--time-budget DURATION]   (task deadline, default 1h)
 ork rooms dispatch --room ID --member ID --task-dir DIR [--kind investigation|implementation|consultation|challenge]
                    [--transport executor|native] [--packet FILE] [--request-id ID] [--role ROLE] [--cwd PATH]
+                   [--timeout DURATION]   (executor runner limit, default 15m; must fit the task deadline)
 ork rooms launch --room ID --plan FILE
 ork rooms bind --room ID --member ID|conductor --session ID --engine ENGINE [--role ROLE] [--cwd PATH] [--keep-worktree]
 ork rooms recover --room ID
@@ -42,7 +44,7 @@ A room or task under a team (--authority) is fenced: init-task, dispatch, launch
 
 create/add queue members. dispatch/launch use the coordinator and may start billable work.
 Native dispatch returns a reservation for the conductor's native tools.
-launch plan: {"members":[{"id":"haiku-1","taskDir":"/absolute/task","kind":"investigation"}]}
+launch plan: {"members":[{"id":"haiku-1","taskDir":"/absolute/task","kind":"investigation","timeout":"25m"}]}
 Task specs and task directories use the existing coordinator contract.
 `;
 
@@ -90,6 +92,8 @@ export async function roomsCommand(
           "parent",
           "objective",
           "role",
+          "time-budget",
+          "timeout",
         ].map((name) => [name, { type: "string" }]),
       ),
     },
@@ -246,6 +250,7 @@ export async function roomsCommand(
         ...(values.authority
           ? ["--authority", values.authority, ...leadArgs]
           : ["--host", requireValue("host")]),
+        ...(values["time-budget"] === undefined ? [] : ["--time-budget", values["time-budget"]]),
       ]);
 
       break;
@@ -262,6 +267,7 @@ export async function roomsCommand(
         billingMode: values["billing-mode"],
         workforceRole: values.role,
         cwd: values.cwd,
+        timeout: values.timeout,
         ...lead,
       });
 
