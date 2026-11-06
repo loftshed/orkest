@@ -5,7 +5,7 @@ Cross-harness consultation, bounded task delegation, project-scoped peer messagi
 - **Native-first routing:** Every hosted frontier model runs through its vendor's own CLI (`codex` for GPT, `agy` for Gemini, `claude` for Claude Code); `opencode` is used only for open-weight models on OpenRouter (sending a hosted model to `opencode` exits 17). Within the same harness and account, agents use their host's built-in subagent and messaging tools; `orchestrate` and `peer-mailbox` cross harness or account/billing boundaries.
 - **Bounded execution:** Delegated runs hold a POSIX worktree lease, enforce allowed file scopes, verify that Git history (`HEAD`, branch, reflog, stash) is untouched by the worker, check live quota via [`monitor`](../monitor/README.md), and run deterministic verification gates outside the model after handoff.
 
-Requires Python 3.11+, Node.js 22+ (for `ork` and `horde`), `git`, and at least one installed and authenticated harness CLI.
+Requires Python 3.11+, Node.js 26.13+ (Active LTS; for `ork` and `horde`), `git`, and at least one installed and authenticated harness CLI.
 
 ## Install
 
