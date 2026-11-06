@@ -527,19 +527,39 @@ function legacyRecord(root, file) {
   };
 }
 
+const ROOMS_APPLICATION_ID = 1_330_793_298;
+const MAX_ROOM_CAS_ATTEMPTS = 32;
+const ROOMS_MIGRATIONS = [
+  (connection) =>
+    connection.exec(`
+    CREATE TABLE rooms (
+      id TEXT PRIMARY KEY, cwd TEXT NOT NULL, updated_at INTEGER NOT NULL,
+      revision INTEGER NOT NULL DEFAULT 1, data TEXT NOT NULL CHECK (json_valid(data))
+    ) STRICT;
+    CREATE INDEX rooms_updated_at ON rooms (updated_at DESC);
+    CREATE INDEX rooms_cwd ON rooms (cwd);
+    CREATE TABLE legacy_room_imports (file TEXT PRIMARY KEY, digest TEXT NOT NULL) STRICT;
+  `),
+];
+
+function validLegacyRecords(root) {
+  const records = [];
+  for (const file of legacyFiles(root)) {
+    try {
+      records.push({ file, ...legacyRecord(root, file) });
+    } catch {
+      // Invalid legacy files stay discoverable so listRooms can report their errors.
+    }
+  }
+  return records;
+}
+
 /** Commit imports before archiving. The ledger makes interrupted archival safe to resume. */
 function syncLegacyRoomFiles(db, root) {
-  if (legacyFiles(root).length === 0) return;
+  const initialRecords = validLegacyRecords(root);
+  if (initialRecords.length === 0) return;
   withImmediateTransaction(db, () => {
-    for (const file of legacyFiles(root)) {
-      let record;
-      try {
-        record = legacyRecord(root, file);
-      } catch {
-        // Invalid legacy files stay discoverable so listRooms can report their errors.
-        continue;
-      }
-      const { room, digest, updatedAt } = record;
+    for (const { file, room, digest, updatedAt } of validLegacyRecords(root)) {
       if (
         db.tagStore.get`SELECT digest FROM legacy_room_imports WHERE file = ${file}`?.digest ===
         digest
@@ -554,25 +574,17 @@ function syncLegacyRoomFiles(db, root) {
     }
   });
   withImmediateTransaction(db, () => {
-    for (const file of legacyFiles(root)) {
-      let record;
-      try {
-        record = legacyRecord(root, file);
-      } catch {
-        continue;
-      }
+    for (const { file, source, digest } of validLegacyRecords(root)) {
       if (
         db.tagStore.get`SELECT digest FROM legacy_room_imports WHERE file = ${file}`?.digest !==
-        record.digest
+        digest
       )
         continue;
       const backup = path.join(root, "rooms.v1-backup");
       mkdirSync(backup, { recursive: true, mode: 0o700 });
       const destination = path.join(backup, file);
-      const target = existsSync(destination)
-        ? path.join(backup, `${file}.${record.digest}`)
-        : destination;
-      renameSync(record.source, target);
+      const target = existsSync(destination) ? path.join(backup, `${file}.${digest}`) : destination;
+      renameSync(source, target);
       chmodSync(target, 0o400);
     }
   });
@@ -582,19 +594,8 @@ function openRooms(root) {
   const db = openOrkestSqlite(roomsDbPath(root), { synchronous: "FULL" });
   try {
     migrateSchema(db, {
-      applicationId: 1_330_793_298,
-      migrations: [
-        (connection) =>
-          connection.exec(`
-          CREATE TABLE rooms (
-            id TEXT PRIMARY KEY, cwd TEXT NOT NULL, updated_at INTEGER NOT NULL,
-            revision INTEGER NOT NULL DEFAULT 1, data TEXT NOT NULL CHECK (json_valid(data))
-          ) STRICT;
-          CREATE INDEX rooms_updated_at ON rooms (updated_at DESC);
-          CREATE INDEX rooms_cwd ON rooms (cwd);
-          CREATE TABLE legacy_room_imports (file TEXT PRIMARY KEY, digest TEXT NOT NULL) STRICT;
-        `),
-      ],
+      applicationId: ROOMS_APPLICATION_ID,
+      migrations: ROOMS_MIGRATIONS,
     });
     syncLegacyRoomFiles(db, root);
     return db;
@@ -604,11 +605,32 @@ function openRooms(root) {
   }
 }
 
+function openRoomsForRead(root) {
+  const dbPath = roomsDbPath(root);
+  if (existsSync(dbPath) && validLegacyRecords(root).length === 0) {
+    const db = openOrkestSqlite(dbPath, { readOnly: true });
+    let isCurrent;
+    try {
+      using appQuery = db.prepare("PRAGMA application_id");
+      using versionQuery = db.prepare("PRAGMA user_version");
+      isCurrent =
+        appQuery.get().application_id === ROOMS_APPLICATION_ID &&
+        versionQuery.get().user_version === ROOMS_MIGRATIONS.length;
+    } catch (error) {
+      db.close();
+      throw error;
+    }
+    if (isCurrent) return db;
+    db.close();
+  }
+  return openRooms(root);
+}
+
 export function readRawRoom(id, root = mailboxRoot()) {
   roomPath(id, root);
   if (!existsSync(roomsDbPath(root)) && !existsSync(path.join(root, "rooms")))
     throw missingRoom(id);
-  using db = openRooms(root);
+  using db = openRoomsForRead(root);
   const row = db.tagStore.get`SELECT data FROM rooms WHERE id = ${id}`;
   if (!row) throw missingRoom(id);
   return JSON.parse(row.data);
@@ -616,7 +638,7 @@ export function readRawRoom(id, root = mailboxRoot()) {
 
 export function listRawRooms(root = mailboxRoot()) {
   if (!existsSync(roomsDbPath(root)) && !existsSync(path.join(root, "rooms"))) return [];
-  using db = openRooms(root);
+  using db = openRoomsForRead(root);
   return db.tagStore.all`SELECT data FROM rooms ORDER BY updated_at DESC, id ASC`.map((row) =>
     JSON.parse(row.data),
   );
@@ -792,11 +814,14 @@ export async function withRoomLock(file, update) {
 async function updateStoredRoom(
   id,
   update,
-  { root = mailboxRoot(), create = false } = {},
+  { root = mailboxRoot(), create = false, maxAttempts = MAX_ROOM_CAS_ATTEMPTS } = {},
   validate,
 ) {
   roomPath(id, root);
-  for (;;) {
+  if (!Number.isSafeInteger(maxAttempts) || maxAttempts < 1) {
+    throw new RangeError("maxAttempts must be a positive safe integer.");
+  }
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
     let row;
     {
       using db = openRooms(root);
@@ -820,7 +845,10 @@ async function updateStoredRoom(
       return result.changes === 1;
     });
     if (committed) return room;
+    const delayMs = Math.floor(Math.random() * Math.min(5 * 2 ** Math.min(attempt, 5), 100));
+    if (delayMs > 0) await sleep(delayMs);
   }
+  throw new Error(`Room update exceeded ${maxAttempts} concurrent retries: ${id}`);
 }
 
 export async function updateRoom(id, update, options) {

@@ -1202,4 +1202,39 @@ describe("SQLite room persistence", () => {
     expect(readRawRoom("raw", root).title).toBe("Fresh");
     expect(deleteRoom("raw", root)).toBe(true);
   });
+
+  it("allows concurrent WAL room reads during an active write and bounds optimistic CAS retries", async () => {
+    const root = await directory();
+    await mkdir(path.join(root, "rooms"), { recursive: true });
+    await writeFile(path.join(root, "rooms", "broken.json"), "{");
+    await updateRoom(
+      "active-room",
+      () => ({ ...createRoom([], { id: "active-room", cwd: root }), title: "Committed", count: 0 }),
+      { root, create: true },
+    );
+
+    using writer = openOrkestSqlite(roomsDbPath(root), { timeout: 50 });
+    writer.exec(
+      "BEGIN IMMEDIATE; UPDATE rooms SET data = json_set(data, '$.title', 'In-flight') WHERE id = 'active-room';",
+    );
+    try {
+      expect(readRawRoom("active-room", root).title).toBe("Committed");
+      expect(listRawRooms(root).map((room) => room.title)).toEqual(["Committed"]);
+    } finally {
+      writer.exec("ROLLBACK");
+    }
+
+    await expect(
+      updateRoom(
+        "active-room",
+        async (room) => {
+          using contender = openOrkestSqlite(roomsDbPath(root));
+          contender.exec("UPDATE rooms SET revision = revision + 1 WHERE id = 'active-room'");
+          room.count++;
+          return room;
+        },
+        { root, maxAttempts: 2 },
+      ),
+    ).rejects.toThrow("exceeded 2 concurrent retries: active-room");
+  });
 });

@@ -333,6 +333,64 @@ describe("agent activity streaming cursors", () => {
     verify.close();
   });
 
+  it("streams latest OpenCode parts past 600 parts and detects same-millisecond updates", async () => {
+    const dbPath = path.join(context.root, "opencode-long.db");
+    const session = "opencode-long-session";
+    createOpenCodeDb(dbPath, session);
+    const agent = {
+      activitySource: { engine: "opencode", session, opencodeDbPath: dbPath },
+    };
+
+    const database = new DatabaseSync(dbPath);
+    const insertMessage = database.prepare("INSERT INTO message VALUES (?, ?, ?, ?, ?)");
+    const insertPart = database.prepare("INSERT INTO part VALUES (?, ?, ?, ?, ?, ?)");
+    for (let index = 0; index < 210; index++) {
+      insertMessage.run(
+        `msg-${String(index).padStart(4, "0")}`,
+        session,
+        10 + index,
+        10 + index,
+        JSON.stringify({ role: "assistant" }),
+      );
+    }
+    const latestMessageId = "msg-0209";
+    for (let index = 0; index < 650; index++) {
+      insertPart.run(
+        `part-${String(index).padStart(4, "0")}`,
+        latestMessageId,
+        session,
+        1000 + index,
+        2000,
+        JSON.stringify({
+          type: "tool",
+          tool: "Bash",
+          state: { input: { description: `step-${index}` } },
+        }),
+      );
+    }
+    database.close();
+
+    const firstRead = await readAgentActivity(agent);
+    expect(firstRead).toContain("OpenCode is inspecting the report");
+    expect(firstRead).toContain("Used Bash · step-649");
+
+    const sameMillisecond = new DatabaseSync(dbPath);
+    sameMillisecond
+      .prepare("INSERT INTO part VALUES (?, ?, ?, ?, ?, ?)")
+      .run(
+        "part-0650",
+        latestMessageId,
+        session,
+        1650,
+        2000,
+        JSON.stringify({ type: "text", text: "Completed final step in same millisecond" }),
+      );
+    sameMillisecond.close();
+
+    const secondRead = await readAgentActivity(agent);
+    expect(secondRead).toContain("Completed final step in same millisecond");
+  });
+
   it("resolves OpenCode data from XDG_DATA_HOME and accountHome", async () => {
     const session = "opencode-path-session";
     const xdgDataHome = path.join(context.root, "xdg-data");

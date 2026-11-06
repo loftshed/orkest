@@ -601,10 +601,55 @@ class RoomStoreTests(unittest.TestCase):
                 self.assertEqual(child.stdout.readline().strip(), "ready")
                 self.assertTrue((base / "rooms.db-wal").exists())
                 self.assertEqual(room_store.read_room(base, "room")["title"], "WAL update")
-                self.assertEqual(room_store.read_room(base, "room")["conductor"]["session"]["id"], "new")
+                with mock.patch.object(
+                    room_store.subprocess, "run", side_effect=AssertionError("single-room cache miss")
+                ):
+                    self.assertEqual(room_store.read_room(base, "room")["conductor"]["session"]["id"], "new")
+                    self.assertIsNone(room_store.read_room(base, ".DS_Store"))
             finally:
                 _, errors = child.communicate("close", timeout=10)
                 self.assertEqual(child.returncode, 0, errors)
+
+    def test_single_room_lookup_uses_get_and_header_counter_invalidates_restored_mtime(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary) / "mailbox-v1"
+            room_store.put_room(base, {"id": "alpha", "agents": [], "title": "Initial"})
+            room_store.put_room(base, {"id": "beta", "agents": [], "title": "Other"})
+            room_store._CACHE.clear()
+
+            original_invoke = room_store._invoke
+            commands: list[tuple[str, str | None]] = []
+            with mock.patch.object(
+                room_store,
+                "_invoke",
+                side_effect=lambda b, cmd, rid=None, payload=None: (
+                    commands.append((cmd, rid)) or original_invoke(b, cmd, rid, payload)
+                ),
+            ):
+                self.assertEqual(room_store.read_room(base, "alpha")["title"], "Initial")
+                self.assertEqual(commands, [("get", "alpha")])
+
+            db_path = base / "rooms.db"
+            before = db_path.stat()
+            sqlite_module = (SCRIPTS.parents[2] / "lib/orkest-sqlite.mjs").as_uri()
+            subprocess.run(
+                [
+                    "node",
+                    "--input-type=module",
+                    "-e",
+                    (
+                        f"import {{ openOrkestSqlite }} from {json.dumps(sqlite_module)};"
+                        "using db = openOrkestSqlite(process.argv[1]);"
+                        "db.exec(\"UPDATE rooms SET data = json_set(data, '$.title', 'Updated!') WHERE id = 'alpha'\");"
+                        "db.exec('PRAGMA wal_checkpoint(TRUNCATE)');"
+                    ),
+                    str(db_path),
+                ],
+                check=True,
+                timeout=10,
+            )
+            os.utime(db_path, ns=(before.st_atime_ns, before.st_mtime_ns))
+            self.assertEqual(room_store.read_room(base, "alpha")["title"], "Updated!")
 
 
 if __name__ == "__main__":
