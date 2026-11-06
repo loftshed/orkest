@@ -1,6 +1,17 @@
+import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { readFileSync, realpathSync } from "node:fs";
-import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import {
+  link,
+  mkdir,
+  readdir,
+  readFile,
+  rename,
+  rm,
+  rmdir,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
@@ -467,11 +478,39 @@ function pidAlive(pid) {
   }
 }
 
+function processStarted(pid) {
+  try {
+    return (
+      execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], {
+        encoding: "utf8",
+        env: { ...process.env, TZ: "UTC", LC_ALL: "C" },
+        timeout: 2000,
+        stdio: ["ignore", "pipe", "ignore"],
+      }).trim() || undefined
+    );
+  } catch {
+    return;
+  }
+}
+
+function parseLockOwner(raw) {
+  try {
+    const value = JSON.parse(raw);
+    const owner = typeof value === "number" ? { pid: value } : value;
+    if (Number.isSafeInteger(owner?.pid) && owner.pid > 0) return owner;
+  } catch {
+    // An incomplete owner record gets the same grace period as a missing one.
+  }
+}
+
 async function isStaleRoomLock(lock) {
   try {
-    const rawOwner = await readFile(path.join(lock, "owner"), "utf8");
-    const owner = Math.trunc(Number(rawOwner.trim()));
-    if (Number.isSafeInteger(owner) && owner > 0) return !pidAlive(owner);
+    const owner = parseLockOwner(await readFile(path.join(lock, "owner"), "utf8"));
+    if (owner) {
+      if (!pidAlive(owner.pid)) return true;
+      const birth = owner.pidBirth && processStarted(owner.pid);
+      return Boolean(birth && birth !== owner.pidBirth);
+    }
   } catch {
     // Missing owner file while lock creator is still writing it; check lock age below.
   }
@@ -483,46 +522,123 @@ async function isStaleRoomLock(lock) {
   }
 }
 
-/** Atomic replacement under a bounded, exclusive lock prevents concurrent spawns losing members. */
-export async function updateRoom(id, update, { root = mailboxRoot(), create = false } = {}) {
-  const file = roomPath(id, root);
+async function removeEmptyLock(lock) {
+  try {
+    await rmdir(lock);
+  } catch (error) {
+    if (!["ENOENT", "ENOTEMPTY", "EEXIST"].includes(error.code)) throw error;
+  }
+}
+
+async function reapRoomLock(lock) {
+  // Recover an interrupted reaper without discarding the owner it had claimed.
+  const names = await readdir(lock);
+  for (const name of names) {
+    const match = /^owner\.(\d+)\.[\da-f-]+\.retired$/u.exec(name);
+    if (!match || pidAlive(Number(match[1]))) continue;
+    try {
+      await link(path.join(lock, name), path.join(lock, "owner"));
+      await rm(path.join(lock, name));
+    } catch (error) {
+      if (!["EEXIST", "ENOENT"].includes(error.code)) throw error;
+    }
+  }
+  if (!(await isStaleRoomLock(lock))) return;
+  const ownerFile = path.join(lock, "owner");
+  const retired = path.join(lock, `owner.${process.pid}.${randomUUID()}.retired`);
+  const previous = await stat(lock);
+  try {
+    // Keep the directory nonempty until the claimed owner has been checked again.
+    // A competing reaper may have observed an earlier acquisition at this path.
+    await rename(ownerFile, retired);
+  } catch (error) {
+    if (error.code === "ENOENT") await removeEmptyLock(lock);
+    return;
+  }
+  const owner = parseLockOwner(await readFile(retired, "utf8"));
+  const current = await stat(lock);
+  const birth = owner?.pidBirth && processStarted(owner.pid);
+  if (
+    current.ino !== previous.ino ||
+    current.dev !== previous.dev ||
+    (owner && pidAlive(owner.pid) && (!birth || birth === owner.pidBirth)) ||
+    (!owner && Date.now() - previous.mtimeMs <= 15_000)
+  ) {
+    await rename(retired, ownerFile);
+    return;
+  }
+  await rm(retired, { force: true });
+  await removeEmptyLock(lock);
+}
+
+/** Shared with Python's _node_room_lock; live legacy PID-only owners remain valid. */
+export async function withRoomLock(file, update) {
   await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
   const lock = `${file}.lock`;
   const deadline = Date.now() + 3000;
+  const owner = { pid: process.pid, token: randomUUID(), pidBirth: processStarted(process.pid) };
   for (;;) {
     try {
       await mkdir(lock);
-      await writeFile(path.join(lock, "owner"), `${process.pid}\n`);
+      try {
+        await writeFile(path.join(lock, "owner"), `${JSON.stringify(owner)}\n`, { flag: "wx" });
+      } catch (error) {
+        await removeEmptyLock(lock);
+        throw error;
+      }
       break;
     } catch (error) {
       if (error.code !== "EEXIST") throw error;
       if (await isStaleRoomLock(lock)) {
-        await rm(lock, { recursive: true, force: true });
-        continue;
+        try {
+          await reapRoomLock(lock);
+        } catch (error) {
+          if (error.code !== "ENOENT") throw error;
+        }
       }
-      if (Date.now() >= deadline) throw new Error(`Room is locked: ${id}`, { cause: error });
+      if (Date.now() >= deadline) throw new Error(`Room is locked: ${file}`, { cause: error });
       await sleep(25);
     }
   }
-  const temporary = `${file}.${randomUUID()}.tmp`;
   try {
-    let previous;
-    try {
-      previous = await readRoom(id, root);
-    } catch (error) {
-      if (!create || error.code !== "ENOENT") throw error;
-    }
-    if (create && previous) throw new Error(`Room already exists: ${id}`);
-    const room = validateRoom(await update(previous));
-    if (room.id !== id) throw new Error("Cannot change room identity");
-    room.updatedAt = Date.now();
-    await writeFile(temporary, `${JSON.stringify(room, null, 2)}\n`, { mode: 0o600, flag: "wx" });
-    await rename(temporary, file);
-    return room;
+    return await update();
   } finally {
-    await rm(temporary, { force: true });
-    await rm(lock, { recursive: true, force: true });
+    let current;
+    try {
+      current = parseLockOwner(await readFile(path.join(lock, "owner"), "utf8"));
+    } catch {
+      // A replaced acquisition is no longer ours to release.
+    }
+    if (current?.token === owner.token) {
+      await rm(path.join(lock, "owner"), { force: true });
+      await rmdir(lock);
+    }
   }
+}
+
+/** Atomic replacement under a bounded, exclusive lock prevents concurrent spawns losing members. */
+export async function updateRoom(id, update, { root = mailboxRoot(), create = false } = {}) {
+  const file = roomPath(id, root);
+  return withRoomLock(file, async () => {
+    const temporary = `${file}.${randomUUID()}.tmp`;
+    try {
+      let previous;
+      try {
+        previous = await readRoom(id, root);
+      } catch (error) {
+        if (!create || error.code !== "ENOENT") throw error;
+      }
+      if (create && previous) throw new Error(`Room already exists: ${id}`);
+      const room = validateRoom(await update(previous));
+      if (room.id !== id) throw new Error("Cannot change room identity");
+      room.updatedAt = Date.now();
+      await writeFile(temporary, `${JSON.stringify(room, null, 2)}\n`, { mode: 0o600, flag: "wx" });
+      await rename(temporary, file);
+      return room;
+    } finally {
+      await rm(temporary, { force: true });
+    }
+  });
 }
 
 export function coalesceMessages(messages = []) {

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import fcntl
 import json
 import math
 import os
@@ -85,7 +86,31 @@ def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
         runner.write_json_atomic(path, payload)
         return
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+    temporary = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(json.dumps(payload, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _merge_completion_event(event_path: Path, fields: dict[str, Any], *, initial: bool = False) -> dict[str, Any]:
+    """Merge under a persistent sidecar flock; acknowledgement can only advance once."""
+    event_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # Never unlink this file: every writer must lock the same inode across event replacements.
+    with Path(f"{event_path}.lock").open("a", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            current = read_completion_event(event_path) or {}
+            current.pop("event_path", None)
+            acknowledged_at = current.get("acknowledged_at")
+            payload = {**fields, **current} if initial else {**current, **fields}
+            if acknowledged_at is not None:
+                payload["acknowledged_at"] = acknowledged_at
+            _write_json_atomic(event_path, payload)
+            return payload
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
 
 
 def parse_events_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -412,7 +437,7 @@ def publish_completion_event(
         with contextlib.suppress(Exception):
             coordinator = _runner().bundled_module("coordinator")
             coordinator.auto_recover_task(task_dir, skip_event_publish=True)
-    _write_json_atomic(event_path, event)
+    event = _merge_completion_event(event_path, event, initial=True)
 
     deliveries: list[dict[str, Any]] = []
     if notification_mode == "desktop":
@@ -420,16 +445,7 @@ def publish_completion_event(
     if completion_hook is not None:
         deliveries.append(run_completion_hook(completion_hook, event_path, event))
 
-    # Preserve a very fast acknowledgement if a consumer races the notifier.
-    try:
-        current = json.loads(event_path.read_text(encoding="utf-8"))
-        if isinstance(current, dict):
-            event = current
-    except (OSError, json.JSONDecodeError):
-        pass
-    event["deliveries"] = deliveries
-    _write_json_atomic(event_path, event)
-    return event
+    return _merge_completion_event(event_path, {"deliveries": deliveries})
 
 
 def completion_events(
@@ -608,9 +624,7 @@ def wait_for_completion_events(
 
 def acknowledge_completion_event(event: dict[str, Any]) -> None:
     event_path = Path(str(event["event_path"]))
-    payload = {key: value for key, value in event.items() if key != "event_path"}
-    payload["acknowledged_at"] = _utc_now()
-    _write_json_atomic(event_path, payload)
+    _merge_completion_event(event_path, {"acknowledged_at": _utc_now()})
 
 
 def events_main(argv: list[str] | None = None) -> int:

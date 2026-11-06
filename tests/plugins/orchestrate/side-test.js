@@ -1,7 +1,9 @@
+import { spawn, spawnSync } from "node:child_process";
+import { once } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   checkRepoPolicyForSide,
@@ -257,6 +259,105 @@ describe("ork side (side missions)", () => {
       expect(updatedRoom.agents[0].isolatedInbox).toBe(true);
       expect(updatedRoom.agents[0].dispatch.runId).toBe("run-inv-1");
     });
+
+    it("validates an investigate spec through the real coordinator init", async () => {
+      expect(spawnSync("git", ["init", repoDir], { encoding: "utf8" }).status).toBe(0);
+      const result = await sideCommand(["--investigate", "--json", "trace the parser"], {
+        cwd: repoDir,
+        mailboxDir,
+        cacheDir,
+        shortId: "schema",
+        env: {
+          ...process.env,
+          ORCHESTRATE_HOME: cacheDir,
+          AGENT_EXECUTOR_HOME: cacheDir,
+          PYTHONDONTWRITEBYTECODE: "1",
+        },
+        runCommand: (cmd, args, opts) => {
+          if (args.includes("dispatch"))
+            return { status: 0, stdout: '{"run_id":"controlled-run"}', stderr: "" };
+          return spawnSync(cmd, args, { ...opts, encoding: "utf8" });
+        },
+      });
+      expect(result.status).toBe("dispatched");
+      const task = JSON.parse(
+        fs.readFileSync(path.join(cacheDir, "side-missions", "side-schema", "task.json"), "utf8"),
+      );
+      expect(task.task_spec.scope_owner).toBe("conductor");
+      expect(task.task_spec.effective_scope).toEqual([]);
+    });
+
+    it("preserves both registrations after two processes discover the same room snapshot", async () => {
+      const roomPath = path.join(mailboxDir, "rooms", "concurrent.json");
+      fs.writeFileSync(roomPath, JSON.stringify({ id: "concurrent", cwd: repoDir, agents: [] }));
+      const script = `
+        import fs from "node:fs";
+        import { sideCommand } from ${JSON.stringify(new URL("../../../plugins/orchestrate/lib/side.mjs", import.meta.url).href)};
+        const [cwd, mailboxDir, cacheDir, shortId] = process.argv.slice(1);
+        const result = await sideCommand(["--investigate", "--room", "concurrent", "--json", "trace " + shortId], {
+          cwd, mailboxDir, cacheDir, shortId,
+          runCommand: (cmd, args) => {
+            if (cmd === "git") return { status: 0, stdout: cwd, stderr: "" };
+            if (args.includes("dispatch")) {
+              fs.writeFileSync(cacheDir + "/ready-" + shortId, "ready");
+              const deadline = Date.now() + 5000;
+              while (!fs.existsSync(cacheDir + "/release")) {
+                if (Date.now() > deadline) throw new Error("barrier timed out");
+                Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+              }
+              return { status: 0, stdout: JSON.stringify({ run_id: shortId, engine: "codex", model: "test-model" }), stderr: "" };
+            }
+            return { status: 0, stdout: "{}", stderr: "" };
+          },
+        });
+        console.log(JSON.stringify(result));
+      `;
+      const children = ["first", "second"].map((id) => {
+        const child = spawn(process.execPath, [
+          "--input-type=module",
+          "-e",
+          script,
+          repoDir,
+          mailboxDir,
+          cacheDir,
+          id,
+        ]);
+        let output = "";
+        let errors = "";
+        child.stdout.on("data", (chunk) => {
+          output += chunk;
+        });
+        child.stderr.on("data", (chunk) => {
+          errors += chunk;
+        });
+        return { child, done: once(child, "close"), output: () => output, errors: () => errors };
+      });
+      try {
+        await vi.waitFor(
+          () => {
+            expect(
+              ["first", "second"].map((id) => fs.existsSync(path.join(cacheDir, `ready-${id}`))),
+            ).toEqual([true, true]);
+          },
+          { timeout: 5000 },
+        );
+      } finally {
+        fs.writeFileSync(path.join(cacheDir, "release"), "go");
+        await Promise.all(children.map(({ done }) => done));
+      }
+      for (const child of children) {
+        expect(child.child.exitCode, child.errors()).toBe(0);
+        expect(JSON.parse(child.output()).status).toBe("dispatched");
+      }
+      const room = JSON.parse(fs.readFileSync(roomPath, "utf8"));
+      expect(room.agents.map((agent) => agent.id).sort((a, b) => a.localeCompare(b))).toEqual([
+        "side-1",
+        "side-2",
+      ]);
+      expect(
+        room.agents.map((agent) => agent.dispatch.runId).sort((a, b) => a.localeCompare(b)),
+      ).toEqual(["first", "second"]);
+    }, 15_000);
 
     it("provisions an isolated git worktree, copies .worktreeinclude, and registers side-1 in execute mode", async () => {
       const roomPath = path.join(mailboxDir, "rooms", "room-beta.json");

@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
+import fcntl
 import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -297,6 +299,7 @@ class CoordinatorTests(unittest.TestCase):
         )
         self.environment.start()
         for key in (
+            "AGENT_MAILBOX_SESSION",
             "HERDR_ENV",
             "HERDR_PANE_ID",
             "HERDR_WORKSPACE_ID",
@@ -1105,6 +1108,115 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(prog_after.get("stage"), "complete")
         sub_peer_after = MAILBOX.load(MAILBOX.peer_path(base, sub_sid))
         self.assertIsNone(sub_peer_after)
+
+
+class CompletionEventConcurrencyTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.path = self.root / "event.json"
+        self.events = RUNNER.bundled_module("events_bus")
+
+    def publish(self, notification_mode="desktop"):
+        return self.events.publish_completion_event(
+            result={"status": "completed", "repository": str(self.root)},
+            result_path=self.root / "result.json",
+            event_path=self.path,
+            notification_mode=notification_mode,
+            completion_hook=None,
+        )
+
+    def test_stale_and_repeated_acknowledgements_preserve_deliveries_and_first_timestamp(self):
+        stale = None
+
+        def notify(event):
+            nonlocal stale
+            stale = self.events.read_completion_event(self.path)
+            # An external notifier can acquire the lock itself: publication released it.
+            with Path(f"{self.path}.lock").open("a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(lock, fcntl.LOCK_UN)
+            return {"kind": "desktop", "status": "sent"}
+
+        with mock.patch.object(self.events, "send_desktop_notification", side_effect=notify):
+            self.publish()
+        with mock.patch.object(self.events, "_utc_now", return_value="first-ack"):
+            self.events.acknowledge_completion_event(stale)
+        with mock.patch.object(self.events, "_utc_now", return_value="later-ack"):
+            self.events.acknowledge_completion_event(stale)
+        current = self.events.read_completion_event(self.path)
+        self.assertEqual(current["acknowledged_at"], "first-ack")
+        self.assertEqual(current["deliveries"], [{"kind": "desktop", "status": "sent"}])
+
+    def test_notification_result_write_serializes_with_acknowledgement(self):
+        writing = threading.Event()
+        release = threading.Event()
+        ack_started = threading.Event()
+        errors = []
+        original_write = self.events._write_json_atomic
+
+        def write(path, payload):
+            if threading.current_thread().name == "notifier" and payload.get("deliveries"):
+                writing.set()
+                if not release.wait(5):
+                    raise RuntimeError("notification write barrier timed out")
+            original_write(path, payload)
+
+        def run(action):
+            try:
+                action()
+            except BaseException as error:
+                errors.append(error)
+
+        def acknowledge():
+            stale = self.events.read_completion_event(self.path)
+            ack_started.set()
+            self.events.acknowledge_completion_event(stale)
+
+        with (
+            mock.patch.object(self.events, "_write_json_atomic", side_effect=write),
+            mock.patch.object(
+                self.events, "send_desktop_notification", return_value={"kind": "desktop", "status": "sent"}
+            ),
+        ):
+            notifier = threading.Thread(target=lambda: run(self.publish), name="notifier")
+            notifier.start()
+            acknowledger = None
+            try:
+                self.assertTrue(writing.wait(5), "notifier did not reach its final write")
+                with Path(f"{self.path}.lock").open("a") as lock:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acknowledger = threading.Thread(target=lambda: run(acknowledge))
+                acknowledger.start()
+                self.assertTrue(ack_started.wait(5), "acknowledger did not reach the barrier")
+            finally:
+                release.set()
+                notifier.join(5)
+                if acknowledger is not None:
+                    acknowledger.join(5)
+            self.assertFalse(notifier.is_alive())
+            self.assertFalse(acknowledger.is_alive())
+        self.assertEqual(errors, [])
+        current = self.events.read_completion_event(self.path)
+        self.assertIsNotNone(current["acknowledged_at"])
+        self.assertEqual(current["deliveries"], [{"kind": "desktop", "status": "sent"}])
+
+    def test_acknowledgement_during_notification_survives_a_late_result_and_republish(self):
+        def notify(event):
+            self.events.acknowledge_completion_event(self.events.read_completion_event(self.path))
+            return {"kind": "desktop", "status": "failed"}
+
+        with (
+            mock.patch.object(self.events, "_utc_now", return_value="first-ack"),
+            mock.patch.object(self.events, "send_desktop_notification", side_effect=notify),
+        ):
+            result = self.publish()
+        self.assertEqual(result["acknowledged_at"], "first-ack")
+        with mock.patch.object(self.events, "_utc_now", return_value="later"):
+            self.publish(notification_mode="none")
+        self.assertEqual(self.events.read_completion_event(self.path)["acknowledged_at"], "first-ack")
 
 
 if __name__ == "__main__":

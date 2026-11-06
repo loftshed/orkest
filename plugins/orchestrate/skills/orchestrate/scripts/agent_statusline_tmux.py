@@ -360,46 +360,96 @@ def _room_path(base: Path, room_id: str) -> Path:
     return base / "rooms" / f"{room_id}.json"
 
 
+def _room_lock_owner(owner_file: Path) -> dict | None:
+    try:
+        value = json.loads(owner_file.read_text(encoding="utf-8"))
+        owner = {"pid": value} if isinstance(value, int) else value
+        if isinstance(owner, dict) and type(owner.get("pid")) is int and owner["pid"] > 0:
+            return owner
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _room_lock_owner_live(owner: dict) -> bool:
+    # Unknown liveness or birth must not turn an old live lock into a stale one.
+    if mailbox.pid_alive(owner["pid"]) is False:
+        return False
+    birth = mailbox.process_started(owner["pid"]) if owner.get("pidBirth") else None
+    return not birth or birth == owner["pidBirth"]
+
+
+def _reap_room_lock(lock_dir: Path) -> None:
+    owner_file = lock_dir / "owner"
+    # A dead reaper may have left the owner under its retirement name.
+    for retired in lock_dir.glob("owner.*.retired"):
+        match = re.fullmatch(r"owner\.(\d+)\.[\da-f-]+\.retired", retired.name)
+        if match and mailbox.pid_alive(int(match[1])) is False:
+            with contextlib.suppress(FileExistsError, FileNotFoundError):
+                owner_file.hardlink_to(retired)
+                retired.unlink()
+    owner = _room_lock_owner(owner_file)
+    if owner is not None:
+        if _room_lock_owner_live(owner):
+            return
+    elif time.time() - lock_dir.stat().st_mtime <= 15.0:
+        return
+    retired = lock_dir / f"owner.{os.getpid()}.{secrets.token_hex(16)}.retired"
+    previous = lock_dir.stat()
+    try:
+        # Claim only the owner file. Recursive deletion could remove a new holder.
+        owner_file.rename(retired)
+    except FileNotFoundError:
+        with contextlib.suppress(OSError):
+            lock_dir.rmdir()
+        return
+    owner = _room_lock_owner(retired)
+    current = lock_dir.stat()
+    if (
+        (current.st_dev, current.st_ino) != (previous.st_dev, previous.st_ino)
+        or (owner is not None and _room_lock_owner_live(owner))
+        or (owner is None and time.time() - previous.st_mtime <= 15.0)
+    ):
+        retired.rename(owner_file)
+        return
+    retired.unlink()
+    with contextlib.suppress(OSError):
+        lock_dir.rmdir()
+
+
 @contextlib.contextmanager
 def _node_room_lock(path: Path):
+    """Share Node's mkdir/JSON owner protocol, including live legacy PID records."""
     lock_dir = Path(f"{path}.lock")
     lock_dir.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     owner_file = lock_dir / "owner"
     deadline = time.monotonic() + 3.0
-    acquired = False
+    token = secrets.token_hex(16)
+    owner = {"pid": os.getpid(), "token": token, "pidBirth": mailbox.process_started(os.getpid())}
     while True:
         try:
             lock_dir.mkdir(mode=0o700)
-            acquired = True
-            with contextlib.suppress(OSError):
-                owner_file.write_text(f"{os.getpid()}\n", encoding="utf-8")
-            break
         except FileExistsError:
-            stale = False
-            with contextlib.suppress(OSError, ValueError):
-                owner_pid = int(owner_file.read_text(encoding="utf-8").strip())
-                if owner_pid > 0 and mailbox.pid_alive(owner_pid) is False:
-                    stale = True
-            if not stale:
-                with contextlib.suppress(OSError):
-                    if time.time() - lock_dir.stat().st_mtime > 15.0:
-                        stale = True
-            if stale:
-                stale_dir = lock_dir.with_name(f"{lock_dir.name}.stale.{os.getpid()}.{time.monotonic_ns()}")
-                with contextlib.suppress(OSError):
-                    os.replace(lock_dir, stale_dir)
-                    (stale_dir / "owner").unlink(missing_ok=True)
-                    stale_dir.rmdir()
-                continue
+            with contextlib.suppress(OSError):
+                _reap_room_lock(lock_dir)
             if time.monotonic() >= deadline:
                 raise OSError(f"Room is locked: {path}") from None
             time.sleep(0.025)
+            continue
+        try:
+            owner_file.write_text(json.dumps(owner) + "\n", encoding="utf-8")
+        except OSError:
+            with contextlib.suppress(OSError):
+                lock_dir.rmdir()
+            raise
+        break
     try:
         yield
     finally:
-        if acquired:
+        current = _room_lock_owner(owner_file)
+        if current is not None and current.get("token") == token:
             with contextlib.suppress(OSError):
-                owner_file.unlink(missing_ok=True)
+                owner_file.unlink()
                 lock_dir.rmdir()
 
 

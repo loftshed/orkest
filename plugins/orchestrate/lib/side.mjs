@@ -5,6 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
+import { withRoomLock } from "./horde-room.mjs";
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const PLUGIN_ROOT = path.resolve(__dirname, "..");
@@ -334,67 +336,73 @@ function findTargetRoom(mailboxDir, { roomId, session, cwd }) {
  * `/swarm` and `ork next` track its live progress and completion without touching
  * the parent session's mailbox inbox.
  */
-function registerSideMemberInRoom(roomRecord, sideSpec) {
+async function registerSideMemberInRoom(roomRecord, sideSpec) {
   if (!roomRecord || !roomRecord.path || !roomRecord.data) {
     return { roomId: null, memberId: sideSpec.defaultMemberId };
   }
-  const room = roomRecord.data;
-  const agents = Array.isArray(room.agents) ? room.agents : [];
-  const existingSideNums = agents
-    .map((agent) => {
-      const match = String(agent?.id || "").match(/^side-(\d+)$/);
-      return match ? Number(match[1]) : 0;
-    })
-    .filter((n) => Number.isFinite(n) && n > 0);
-  const nextNum = existingSideNums.length > 0 ? Math.max(...existingSideNums) + 1 : 1;
-  const memberId = `side-${nextNum}`;
-  const nowIso = new Date().toISOString();
+  return withRoomLock(roomRecord.path, () => {
+    const room = JSON.parse(fs.readFileSync(roomRecord.path, "utf8"));
+    const agents = Array.isArray(room.agents) ? room.agents : [];
+    const existingSideNums = agents
+      .map((agent) => {
+        const match = String(agent?.id || "").match(/^side-(\d+)$/);
+        return match ? Number(match[1]) : 0;
+      })
+      .filter((n) => Number.isFinite(n) && n > 0);
+    const nextNum = existingSideNums.length > 0 ? Math.max(...existingSideNums) + 1 : 1;
+    const memberId = `side-${nextNum}`;
+    const nowIso = new Date().toISOString();
 
-  const memberEntry = {
-    id: memberId,
-    role: "side",
-    sideMode: sideSpec.mode,
-    sideId: sideSpec.sideId,
-    engine: sideSpec.engine || "auto",
-    model: sideSpec.model || null,
-    effort: sideSpec.effort || null,
-    status: "running",
-    mission: sideSpec.idea,
-    title: sideSpec.title,
-    isolatedInbox: true,
-    keepWorktree: Boolean(sideSpec.worktreePath),
-    createdAt: nowIso,
-    updatedAt: nowIso,
-  };
-
-  if (sideSpec.worktreePath) {
-    memberEntry.worktree = {
-      path: sideSpec.worktreePath,
-      branch: sideSpec.branch,
-    };
-  }
-
-  if (sideSpec.taskDir) {
-    memberEntry.dispatch = {
-      taskDir: sideSpec.taskDir,
-      runId: sideSpec.runId || null,
-      kind: sideSpec.kind,
+    const memberEntry = {
+      id: memberId,
+      role: "side",
+      sideMode: sideSpec.mode,
+      sideId: sideSpec.sideId,
+      engine: sideSpec.engine || "auto",
+      model: sideSpec.model || null,
+      effort: sideSpec.effort || null,
       status: "running",
-      startedAt: nowIso,
+      mission: sideSpec.idea,
+      title: sideSpec.title,
+      isolatedInbox: true,
+      keepWorktree: Boolean(sideSpec.worktreePath),
+      createdAt: nowIso,
+      updatedAt: nowIso,
     };
-  }
 
-  room.agents = [...agents, memberEntry];
-  room.updatedAt = nowIso;
+    if (sideSpec.worktreePath) {
+      memberEntry.worktree = {
+        path: sideSpec.worktreePath,
+        branch: sideSpec.branch,
+      };
+    }
 
-  const tmpPath = `${roomRecord.path}.${process.pid}.tmp`;
-  fs.writeFileSync(tmpPath, `${JSON.stringify(room, null, 2)}\n`, "utf8");
-  fs.renameSync(tmpPath, roomRecord.path);
+    if (sideSpec.taskDir) {
+      memberEntry.dispatch = {
+        taskDir: sideSpec.taskDir,
+        runId: sideSpec.runId || null,
+        kind: sideSpec.kind,
+        status: "running",
+        startedAt: nowIso,
+      };
+    }
 
-  return {
-    roomId: room.id || room.roomId || path.basename(roomRecord.path, ".json"),
-    memberId,
-  };
+    room.agents = [...agents, memberEntry];
+    room.updatedAt = nowIso;
+
+    const tmpPath = `${roomRecord.path}.${crypto.randomUUID()}.tmp`;
+    fs.writeFileSync(tmpPath, `${JSON.stringify(room, null, 2)}\n`, "utf8");
+    try {
+      fs.renameSync(tmpPath, roomRecord.path);
+    } finally {
+      fs.rmSync(tmpPath, { force: true });
+    }
+
+    return {
+      roomId: room.id || room.roomId || path.basename(roomRecord.path, ".json"),
+      memberId,
+    };
+  });
 }
 
 function provisionSideWorktree(repoRoot, shortId, runCmd) {
@@ -861,7 +869,7 @@ export async function sideCommand(argv = [], context = {}) {
             "Implement the requested side mission cleanly within the isolated worktree.",
             "Run focused verification for any touched files.",
           ],
-    scope_owner: classified.mode === "execute" ? "worker" : "coordinator",
+    scope_owner: classified.mode === "execute" ? "worker" : "conductor",
   };
   fs.writeFileSync(specPath, `${JSON.stringify(specPayload, null, 2)}\n`, "utf8");
 
@@ -935,7 +943,7 @@ export async function sideCommand(argv = [], context = {}) {
   const resolvedEngine = dispatchInfo.engine || options.engine || "auto";
   const resolvedModel = dispatchInfo.model || options.model || null;
 
-  const { roomId, memberId } = registerSideMemberInRoom(roomRecord, {
+  const { roomId, memberId } = await registerSideMemberInRoom(roomRecord, {
     defaultMemberId: sideId,
     mode: classified.mode,
     sideId,
