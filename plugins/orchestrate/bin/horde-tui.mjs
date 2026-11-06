@@ -17,7 +17,15 @@ import {
   TERMINAL_INPUT_DISABLE,
   TERMINAL_INPUT_ENABLE,
 } from "../lib/tui-input.mjs";
-import { checkOrkestUpdate, runOrkestUpdate } from "../lib/update.mjs";
+import {
+  checkOrkestUpdate,
+  getUpdateStatePath,
+  readLocalGitHeadSha,
+  resolveOrkestRepoRoot,
+  runOrkestUpdate,
+} from "../lib/update.mjs";
+
+export const UPDATE_SUCCESS_TTL_MS = 15_000;
 
 const PANE_ID_RE = /^[A-Za-z0-9_.:%][A-Za-z0-9_.:%-]{0,63}$/u;
 
@@ -47,8 +55,72 @@ const serviceCache = {
 
 const updateCache = {
   fetchedAt: 0,
+  statePath: "",
+  stateMtimeMs: -1,
+  sharedState: null,
   status: null,
 };
+
+function syncUpdateCacheAsCurrent(landedSha, stamp = Date.now()) {
+  updateCache.fetchedAt = stamp;
+  updateCache.status = {
+    available: false,
+    commitsBehind: 0,
+    localSha: landedSha || updateCache.status?.remoteSha || updateCache.status?.localSha,
+    remoteSha: landedSha || updateCache.status?.remoteSha,
+    dirty: false,
+    status: "up_to_date",
+  };
+}
+
+async function readSharedUpdateState(options = {}) {
+  const statePath = getUpdateStatePath(options);
+  try {
+    const info = await stat(statePath);
+    if (updateCache.statePath === statePath && updateCache.stateMtimeMs === info.mtimeMs) {
+      return updateCache.sharedState;
+    }
+    const parsed = JSON.parse(await readFile(statePath, "utf8"));
+    updateCache.statePath = statePath;
+    updateCache.stateMtimeMs = info.mtimeMs;
+    updateCache.sharedState = parsed;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+export function resolvePullUpdateOutcome(res, nowMs = Date.now()) {
+  if (res?.ok && res.updated) {
+    const landedSha = res.toSha || res.remoteSha || res.localSha;
+    syncUpdateCacheAsCurrent(landedSha, nowMs);
+    return {
+      updateState: {
+        available: false,
+        status: "updated",
+        toSha: landedSha,
+        commitsBehind: res.commitsBehind,
+        completedAt: nowMs,
+      },
+      notice: "",
+    };
+  }
+  if (res?.ok && res.status === "up_to_date") {
+    syncUpdateCacheAsCurrent(res.localSha || res.remoteSha, nowMs);
+    return {
+      updateState: null,
+      notice: "Orkest is already up to date.",
+    };
+  }
+  return {
+    updateState: {
+      available: false,
+      status: "error",
+      message: res?.error || res?.status || "Update failed",
+    },
+    notice: "",
+  };
+}
 
 async function runExecOutput(exec, command, args) {
   try {
@@ -702,12 +774,60 @@ export async function cachedUpdateStatus({
   force = false,
   checkFn = checkOrkestUpdate,
   exec = execFile,
+  env = process.env,
+  repoRoot,
+  cacheDir,
 } = {}) {
   const stamp = typeof now === "function" ? now() : now;
   if (!force && updateCache.status && stamp - updateCache.fetchedAt < ttlMs) {
-    return { ...updateCache.status };
+    if (!updateCache.status.available) {
+      return { ...updateCache.status };
+    }
+    const shouldCheckDisk =
+      repoRoot !== undefined || cacheDir !== undefined || checkFn === checkOrkestUpdate;
+    if (!shouldCheckDisk) {
+      return { ...updateCache.status };
+    }
+    const resolvedRoot =
+      repoRoot !== undefined || checkFn === checkOrkestUpdate
+        ? await resolveOrkestRepoRoot({ repoRoot, env })
+        : null;
+    const [localHead, sharedState] = await Promise.all([
+      resolvedRoot ? readLocalGitHeadSha(resolvedRoot) : null,
+      cacheDir !== undefined || checkFn === checkOrkestUpdate
+        ? readSharedUpdateState({ cacheDir, env })
+        : null,
+    ]);
+    const targetSha = updateCache.status.remoteSha;
+    const isTargetAlreadyLanded =
+      Boolean(targetSha) &&
+      (localHead === targetSha ||
+        sharedState?.toSha === targetSha ||
+        sharedState?.localSha === targetSha ||
+        (sharedState?.status === "up_to_date" && sharedState?.remoteSha === targetSha));
+    if (isTargetAlreadyLanded) {
+      syncUpdateCacheAsCurrent(targetSha, stamp);
+      return { ...updateCache.status };
+    }
+    if (localHead && updateCache.status.localSha && localHead !== updateCache.status.localSha) {
+      if (
+        sharedState?.toSha === localHead ||
+        (sharedState?.status === "up_to_date" && sharedState?.localSha === localHead)
+      ) {
+        syncUpdateCacheAsCurrent(localHead, stamp);
+        return { ...updateCache.status };
+      }
+    } else {
+      return { ...updateCache.status };
+    }
   }
-  const res = await checkFn({ exec });
+  const checkOptions = {
+    exec,
+    ...(repoRoot && { repoRoot }),
+    ...(cacheDir && { cacheDir }),
+    ...(env && env !== process.env && { env }),
+  };
+  const res = await checkFn(checkOptions);
   const status = {
     available: Boolean(res?.updateAvailable || res?.available),
     commitsBehind: res?.commitsBehind || 0,
@@ -817,11 +937,18 @@ export async function runHordeTui(
           // Service discovery is best-effort and must never disrupt the TUI.
         }
       }
+      if (
+        updateState?.status === "updated" &&
+        Number.isFinite(updateState.completedAt) &&
+        Date.now() - updateState.completedAt >= UPDATE_SUCCESS_TTL_MS
+      ) {
+        updateState = null;
+      }
       if (updateState) {
         room.update = updateState;
       } else if (enableUpdate && !room.update) {
         try {
-          const checked = await cachedUpdateStatus({ checkFn: updateCheck, exec });
+          const checked = await cachedUpdateStatus({ checkFn: updateCheck, exec, env });
           if (checked?.available) room.update = checked;
         } catch {
           // Update check is best-effort and must never disrupt the TUI.
@@ -950,20 +1077,10 @@ export async function runHordeTui(
         paint();
         void (async () => {
           try {
-            const res = await updateRunner({ force: true, exec });
-            updateState =
-              res?.ok && res.updated
-                ? {
-                    available: false,
-                    status: "updated",
-                    toSha: res.toSha,
-                    commitsBehind: res.commitsBehind,
-                  }
-                : {
-                    available: false,
-                    status: "error",
-                    message: res?.error || res?.status || "Update failed",
-                  };
+            const res = await updateRunner({ force: true, exec, env });
+            const outcome = resolvePullUpdateOutcome(res);
+            updateState = outcome.updateState;
+            if (outcome.notice) view.notice = outcome.notice;
           } catch (error) {
             updateState = {
               available: false,
@@ -971,7 +1088,12 @@ export async function runHordeTui(
               message: error.message,
             };
           }
-          if (view.room) view.setRoom({ ...view.room, update: updateState });
+          if (view.room) {
+            const nextRoom = { ...view.room };
+            if (updateState) nextRoom.update = updateState;
+            else delete nextRoom.update;
+            view.setRoom(nextRoom);
+          }
           paint();
         })();
         return;
