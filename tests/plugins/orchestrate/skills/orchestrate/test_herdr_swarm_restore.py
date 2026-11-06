@@ -28,7 +28,7 @@ class FakeHerdr:
 
     def call(self, *args):
         if args[:2] == ("pane", "rename"):
-            self.pane["label"] = args[3]
+            self.pane["label"] = args[3].strip()
         elif args[:2] == ("pane", "run"):
             self.runs.append(args)
             if self.start:
@@ -198,6 +198,19 @@ class RestoreTests(unittest.TestCase):
             {"pane_id": "w1:p2", "label": "Swarm · Refine Orkest coordinator delegation"},
         ]
         self.assertEqual(views.locate(record, duplicate_panes)["pane_id"], "w1:p2")
+
+    def test_prepare_and_locate_handle_72_char_space_boundary_and_legacy_trailing_spaces(self):
+        rooms = self.base / "mailbox-v1/rooms"
+        rooms.mkdir(parents=True, exist_ok=True)
+        title = "Toggle compact usage meters (5h/weekly), add rich color differentiation to Orchestrator header"
+        self.assertEqual(title[71], " ")
+        (rooms / "room-a.json").write_text(json.dumps({"id": "room-a", "title": title}))
+        views.prepare(self.base, "room-a", "w1:p2", self.cli, self.env, self.api)
+        record = views.load(self.state)
+        self.assertFalse(record["label"].endswith(" "))
+        self.assertEqual(views.restore(self.base, self.env, self.api), [{"room": "room-a", "status": "restored"}])
+        legacy_record = {**record, "label": f"{record['label']} "}
+        self.assertEqual(views.locate(legacy_record, self.api.panes())["pane_id"], "w1:p2")
 
 
 if __name__ == "__main__":
