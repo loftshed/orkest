@@ -120,7 +120,7 @@ python3 <scripts>/run_agent.py routes                         # effective role -
 python3 <scripts>/run_agent.py families                       # live resolution of family selectors (gpt:sol, gemini:fast, claude:best, …)
 python3 <scripts>/run_agent.py models --engine codex --match sol  # query cached/live CLI model catalog (always filter with --match)
 python3 <scripts>/run_agent.py quota                          # live quota per route from monitor, plus OpenRouter credit balance
-node <checkout>/plugins/orchestrate/bin/ork.mjs --help        # hall/rooms, horde/stooges TUI, foundry, smelter, radar, routes, quota, telemetry, and session naming
+node <checkout>/plugins/orchestrate/bin/ork.mjs --help        # hall/rooms, horde TUI, foundry, smelter, radar, routes, quota, telemetry, and session naming
 ```
 
 Routes are configured in `~/.config/orchestrate/config.json` (`run_agent.py init` writes a starter file) overlaid on [`routes.default.json`](skills/orchestrate/references/routes.default.json). Model selectors (`family` or `family:tier` from [`families.json`](skills/orchestrate/references/families.json)) resolve against the live catalog so model upgrades do not require config edits. For task archetypes and route tiers, see [`archetype-rationale.md`](skills/orchestrate/references/archetype-rationale.md).
@@ -200,7 +200,7 @@ Details: [`skills/orchestrate/references/coordinator.md`](skills/orchestrate/ref
 
 ### Swarm rooms and Horde TUI (`ork`)
 
-`ork horde` (`ork stooges` is a supported alias) opens a coordinator conversation beside a live
+`ork horde` opens a coordinator conversation beside a live
 swarm tree. Give it an objective; the coordinator assigns workers and can appoint native subswarm
 leads (`ork hall`, alias `ork rooms`). All branches share the room's agent and depth limits.
 Workers use the existing dispatch, evidence and review workflow.

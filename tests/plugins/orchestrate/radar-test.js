@@ -4,14 +4,14 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 
 import {
+  WORKFORCE_ROLES,
+  workforceRoleInfo,
+} from "../../../plugins/orchestrate/lib/horde-room.mjs";
+import {
   diffCatalogAgainstSeen,
   loadBenchmarkPriors,
   radarCli,
 } from "../../../plugins/orchestrate/lib/radar.mjs";
-import {
-  WORKFORCE_ROLES,
-  workforceRoleInfo,
-} from "../../../plugins/orchestrate/lib/stooges-room.mjs";
 import { updateModelRadar } from "../../../scripts/update-model-radar.mjs";
 
 describe("ork radar and benchmark priors", () => {

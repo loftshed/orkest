@@ -361,7 +361,7 @@ that run; inspect any proposed changes independently before deciding what can be
 ## Command a Horde swarm
 
 Use `run_agent.py horde "objective"` or `node <plugin-root>/bin/ork.mjs horde "objective"`
-(`stooges` remains a supported alias) to open a coordinator conversation beside its live swarm tree.
+to open a coordinator conversation beside its live swarm tree.
 The default coordinator is Codex; `--engine claude|agy|opencode` selects another installed harness
 with its configured account and permissions. Interactive launch requires Node.js and tmux on `PATH`.
 

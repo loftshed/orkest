@@ -1,4 +1,4 @@
-"""A real Stooges terminal launches once, shows live work, and reconnects without another agent."""
+"""A real Horde terminal launches once, shows live work, and reconnects without another agent."""
 
 from __future__ import annotations
 
@@ -197,7 +197,7 @@ class SwarmLaunchTests(unittest.TestCase):
                 environment.pop(key, None)
             clients = []
 
-            def launch(arguments, command="stooges"):
+            def launch(arguments, command="horde"):
                 pid, master = pty.fork()
                 if pid == 0:
                     termios.tcsetwinsize(0, (34, 200))

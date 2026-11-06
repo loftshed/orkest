@@ -55,7 +55,6 @@ ork update [--check|--apply] [--json]
 ork radar [--line|--json] [--refresh]
 ork gate [--heavy] [--label <text>] -- <command>   (also: ork gate status|install|uninstall)
 ork swarm [toggle|open|close]   (alias for ork horde toggle|open|close)
-ork stooges [arguments]         (alias for ork horde)
 ork factory [status|run|groom] [--dry-run] [--json]   (alias for ork foundry)
 ork rooms --help                (alias for ork hall)
 ork setup [--dry-run] [--trust-codex-hooks]   (install mailbox, hooks and shell wrapper shortcuts)
@@ -66,7 +65,7 @@ ork routes [--archetype <name>] [--json] [--width 120]
 ork quota [--line|--json] [--refresh]
 ork telemetry [--runs-dir <directory>] [--json] [--width 120]
 
-Interactive Horde / Stooges opens a coordinator conversation alongside its swarm tree (default: Codex).
+Interactive Horde opens a coordinator conversation alongside its swarm tree (default: Codex).
 --attach-room reconnects; --view only observes. Subswarm leads use native subagents.
 New members are queued for the coordinator to assign; --print and --json never launch models.
 Use --cwd to choose the room's repository. Closing the view leaves workers running.
@@ -636,8 +635,8 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
     stdout.write(HELP);
     return;
   }
-  if (!["horde", "stooges"].includes(positionals[0]))
-    throw new Error("Expected ork horde, ork stooges, or ork horde spawn; use --help");
+  if (positionals[0] !== "horde")
+    throw new Error("Expected ork horde or ork horde spawn; use --help");
   if (values.team && values.preset) throw new Error("Choose --team or --preset");
   if (values.json && values.print) throw new Error("Choose --json or --print");
   const width = Number(values.width || stdout.columns || 100);

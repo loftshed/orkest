@@ -189,7 +189,7 @@ def bundled_module(name: str) -> Any:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=__doc__,
-        epilog="Subcommands: consult, mailbox, events, steer, listen, probe, horde, stooges, models, routes, families, "
+        epilog="Subcommands: consult, mailbox, events, steer, listen, probe, horde, models, routes, families, "
         "quota, doctor, prune, init (run `<subcommand> --help`). "
         "Peer communication: mailbox peers lists task/model/harness labels; mailbox focus sets your actual "
         "task and optional verified model/host metadata. mailbox send --to SESSION --message TEXT sends; "
@@ -1987,17 +1987,16 @@ def main() -> int:
     argv = sys.argv[1:]
     if argv and argv[0] == "probe":
         return probe_main(argv[1:])
-    if argv and argv[0] in {"horde", "stooges"}:
-        subcmd = argv[0]
+    if argv and argv[0] == "horde":
         plugin_root = Path(__file__).resolve().parents[3]
-        command = ["node", str(plugin_root / "bin" / "ork.mjs"), subcmd, *argv[1:]]
+        command = ["node", str(plugin_root / "bin" / "ork.mjs"), "horde", *argv[1:]]
         try:
             return subprocess.run(command, check=False).returncode
         except FileNotFoundError:
-            print(f"run_agent.py {subcmd} requires Node.js (`node`) on PATH.", file=sys.stderr)
+            print("run_agent.py horde requires Node.js (`node`) on PATH.", file=sys.stderr)
             return 127
         except OSError as exc:
-            print(f"run_agent.py {subcmd} could not start Node.js: {exc}", file=sys.stderr)
+            print(f"run_agent.py horde could not start Node.js: {exc}", file=sys.stderr)
             return 126
     if argv and argv[0] == "messages":
         print("run_agent.py messages was removed; use run_agent.py mailbox.", file=sys.stderr)
