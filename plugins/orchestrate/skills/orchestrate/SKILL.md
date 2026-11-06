@@ -1,6 +1,6 @@
 ---
 name: orchestrate
-description: "Delegate bounded implementation or read-only consultation across provider boundaries using local Codex, Antigravity, Claude Code, or OpenCode. Validate model and effort, check live quota, preserve context, record usage and evidence, recover bounded corrections, and audit results. Use for explicitly requested external-agent work or cross-platform handoffs, for example 'ask GPT-5.6 Sol', 'have Gemini check this', 'try it with GLM', or one focused question to a stronger model ('get Opus's opinion on this', 'ask GPT whether X is safe') through `consult`. Always prefer the host harness's built-in tools for messaging or spawning agents within the same harness (GPT in Codex, Gemini in Gemini/Antigravity, Claude in Claude Code). Also use for requests to inspect Orkest agent or team status, follow their updates through the shared workboard, or promote the current conversation to coordinator ('you are the coordinator now'). Do not trigger for ordinary coding or same-harness delegation."
+description: "Invoke autonomously at will—or when requested by the user—to run cross-vendor consultations (`consult`), independent cold diff reviews, root-cause investigations, or bounded cross-harness implementation tasks across local Codex, Antigravity, Claude Code, and OpenCode CLIs. Validate model and effort, check live quota and repo policy, preserve context, record usage and evidence, recover bounded corrections, and audit results. Proactively call `consult` when a second opinion, architectural sanity check, or adversarial code review from another model family adds confidence, and delegate bounded tasks across harnesses when parallel execution or spare quota speeds up delivery. Also use to inspect Orkest swarm/workboard status or promote the current chat to coordinator ('you are the coordinator now'). Keep same-harness, same-account subagents and messaging on the host's native tools."
 metadata:
   version: 0.67.0
   requirements: Python 3.11+, POSIX file locking, git, and at least one installed/authenticated executor CLI (`codex`, `agy`, `claude`, or `opencode`).
@@ -8,10 +8,14 @@ metadata:
 
 # Orchestrate
 
-Act as the conductor. Turn the user's approved intent into a precise brief, dispatch the requested
-local executor, and keep responsibility for correctness and the final report. Every implementation
-executor runs with full tool permissions; that removes friction, it does not widen the task's
-authorized scope. A consultant (`consult`) runs in its engine's no-write mode instead.
+Act as the conductor. Invoke `orchestrate` either when the user names another model/harness or
+proactively at your own discretion—such as calling `consult` for an independent cross-vendor diff
+review, architectural sanity check, or tricky root-cause diagnosis, or dispatching bounded parallel
+work (`run_agent.py`, `ork side`, `ork hall`) across harnesses within repository policy and the
+active billing context. Turn the task into a precise brief, dispatch the local executor, and keep
+responsibility for correctness and the final report. Every implementation executor runs with full
+tool permissions; that removes friction, it does not widen the task's authorized scope. A
+consultant (`consult`) runs in its engine's no-write mode instead.
 
 `<skill-directory>` below is this file's physical directory. Start with
 `python3 <skill-directory>/scripts/run_agent.py doctor` on an unfamiliar machine: it names the host,

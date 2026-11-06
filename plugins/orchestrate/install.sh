@@ -94,7 +94,6 @@ link "$skill" "$hub"
 # Harness skill directories, linked only when that harness is installed (its config dir exists).
 for entry in \
   "$HOME/.claude:skills:claude" \
-  "$HOME/.claude-personal:skills:claude" \
   "$HOME/.codex:skills:codex" \
   "$HOME/.config/opencode:skills:opencode" \
   "$HOME/.gemini/config:skills:gemini" \
@@ -105,6 +104,12 @@ for entry in \
   if [ "$kind" = claude ] && [ "$with_claude" = 0 ]; then continue; fi
   link "$hub" "$base/$sub/orchestrate"
 done
+if [ "$with_claude" = 1 ]; then
+  for claude_dir in "$HOME"/.claude-*; do
+    [ -d "$claude_dir" ] || continue
+    link "$hub" "$claude_dir/skills/orchestrate"
+  done
+fi
 
 set --
 [ "$trust_hooks" = 0 ] || set -- --trust-codex-hooks

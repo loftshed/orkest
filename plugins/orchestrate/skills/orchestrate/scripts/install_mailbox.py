@@ -234,6 +234,43 @@ def prune_daemon_runtimes(
     return pruned
 
 
+def install_orchestrate_skill_links(home: Path, *, dry_run: bool = False) -> bool:
+    """Keep <harness>/skills/orchestrate linked to ~/.agents/skills/orchestrate across installed harnesses."""
+    hub = home / ".agents/skills/orchestrate"
+    if not (hub / "SKILL.md").is_file():
+        return False
+    changed = False
+    targets: list[Path] = [
+        home / ".codex",
+        home / ".gemini/config",
+        home / ".gemini/antigravity",
+        home / ".config/opencode",
+    ]
+    for claude_dir in [home / ".claude", *sorted(home.glob(".claude-*"))]:
+        if not claude_dir.is_dir():
+            continue
+        if (claude_dir / "plugins/cache/orkest/orchestrate").is_dir():
+            continue
+        targets.append(claude_dir)
+    for base_dir in targets:
+        if not base_dir.is_dir():
+            continue
+        skill_link = base_dir / "skills/orchestrate"
+        if skill_link.is_symlink() and skill_link.exists() and skill_link.resolve() == hub.resolve():
+            continue
+        if dry_run:
+            print(f"would link orchestrate skill: {skill_link} -> {hub}")
+        else:
+            skill_link.parent.mkdir(parents=True, exist_ok=True)
+            if skill_link.exists() or skill_link.is_symlink():
+                skill_link.rename(skill_link.with_name(f"{skill_link.name}.mailbox-bak.{time.time_ns()}"))
+                rotate_backups(skill_link)
+            skill_link.symlink_to(hub, target_is_directory=True)
+            print(f"✓ orchestrate skill linked: {skill_link} -> {hub}")
+        changed = True
+    return changed
+
+
 def remove_legacy_skill_links(home: Path, *, dry_run: bool = False) -> list[Path]:
     """Remove legacy `agent-executor` skill links across harnesses when refreshing."""
     removed: list[Path] = []
@@ -800,6 +837,8 @@ def install_shell_wrappers(home: Path, ork_cli: Path | None = None, *, dry_run: 
         changed = True
 
     if remove_legacy_skill_links(home, dry_run=dry_run):
+        changed = True
+    if install_orchestrate_skill_links(home, dry_run=dry_run):
         changed = True
     if install_swarm_command(home, dry_run=dry_run):
         changed = True
