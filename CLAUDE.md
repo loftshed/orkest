@@ -32,6 +32,7 @@ Both scripts call `./node_modules/.bin` directly, so they work without pnpm on P
 - **Let the gate decide style.** ESLint, Prettier, markdownlint, cspell, ruff and shellcheck run on commit and in CI. Fix what a rule reports instead of disabling it; an unavoidable inline disable carries a `-- reason`. New words go in [`project-words.txt`](project-words.txt).
 - **Plugin-relative paths** use `${CLAUDE_PLUGIN_ROOT}` or `${CLAUDE_SKILL_DIR}`, quoted wherever a shell expands them. The validator fails when one points at a missing file.
 - **Keep documentation short.** Say what the reader needs to do or know, once. Put gotchas under a Troubleshooting heading.
+- **Follow the TUI design system.** Terminal UI changes in `plugins/orchestrate/lib/tui-*.mjs` and `horde-view.mjs` follow [docs/terminal-ui.md](docs/terminal-ui.md) and can be visually compared with [docs/tui-visual-testing.md](docs/tui-visual-testing.md).
 
 ## Hooks
 

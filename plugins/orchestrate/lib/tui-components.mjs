@@ -16,7 +16,7 @@ const CONTROL_ICONS = Object.freeze({
   dismiss: "\u{F060}",
   "scroll-up": "\u{F062}",
   "scroll-down": "\u{F063}",
-  "preview-back": "\u{F03A}",
+  "preview-back": "\u{F060}",
   "preview-open": "\u{F120}",
   "preview-follow": "\u{F021}",
   "preview-up": "\u{F062}",

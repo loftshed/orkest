@@ -38,6 +38,7 @@ function fixture({ zoomed = false, readError = false, zoomError = false } = {}) 
   const preview = createAgentPreview({
     env: { HERDR_PANE_ID: "w1:p2" },
     exec,
+    zoom: true,
     onChange: (snapshot) => {
       state.snapshots.push(snapshot);
     },
@@ -349,6 +350,7 @@ describe("agent terminal preview", () => {
     const snapshots = [];
     const preview = createAgentPreview({
       env: { HERDR_PANE_ID: "w1:p2" },
+      zoom: true,
       onChange: (value) => {
         snapshots.push(value);
       },

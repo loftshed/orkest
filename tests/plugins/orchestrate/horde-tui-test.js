@@ -1151,7 +1151,7 @@ describe("terminal lifecycle", () => {
       ),
     ).toBe(false);
     expect(execCalls).toEqual([
-      ["herdr", ["pane", "focus", "--pane", "hp-1"]],
+      ["herdr", ["agent", "focus", "hp-1"]],
       ["tmux", ["select-pane", "-t", "%2"]],
     ]);
 
@@ -1370,16 +1370,20 @@ describe("terminal lifecycle", () => {
     });
     expect(view.servicesMode).toBe("expanded");
 
-    // Render the clickable update banner and retain the Shift+U shortcut:
+    // Render the clickable update bubble at the bottom and retain the Shift+U shortcut:
     view.setRoom({
       ...room,
       update: { available: true, commitsBehind: 3, remoteSha: "a1b2c3d4" },
     });
-    const updateAvailableText = view.render(100).join("\n");
-    expect(updateAvailableText).toContain(
-      "Update  ↑ 3 new commits on origin/main · click to update",
-    );
-    expect(updateAvailableText).toContain(" Update ");
+    const updateAvailableLines = view.render(100);
+    const updateAvailableText = updateAvailableLines.join("\n");
+    expect(updateAvailableText).toContain("┌ Update");
+    expect(updateAvailableText).toContain("Shift+U");
+    expect(updateAvailableText).toContain("↑ 3 new commits on origin/main · click to update");
+    const slotsLineIdx = updateAvailableLines.findIndex((line) => line.includes("slots · page"));
+    const updateHeaderIdx = updateAvailableLines.findIndex((line) => line.includes("┌ Update"));
+    expect(updateHeaderIdx).toBeGreaterThan(slotsLineIdx);
+    expect(updateAvailableLines.find((line) => line.includes("View chat"))).not.toContain("Update");
     expect(view.handleKey("U")).toEqual({ type: "pull-update" });
     // Lowercase 'u' still toggles quotaMode:
     expect(view.handleKey("u")).toBe(true);

@@ -146,7 +146,7 @@ describe("clickable Swarm View", () => {
     expect(view.render(80).map(plain).join("\n")).toContain("q or Ctrl-C Quit");
   });
 
-  it("shows Return to chat only while previewing another agent", () => {
+  it("shows only Back (without a redundant Return to chat button) while previewing another agent", () => {
     const data = room();
     data.herdrCoordinatorPaneId = "w1:p2";
     const onFocusPane = vi.fn();
@@ -159,11 +159,11 @@ describe("clickable Swarm View", () => {
       text: "Another agent's chat",
       loading: false,
     });
-    expect(view.render(160).map(plain).join("\n")).toContain("Return to chat");
-    click(view, "Return to chat", 160);
-    expect(onFocusPane.mock.calls[0][0]).toMatchObject({ id: "conductor", herdrPaneId: "w1:p2" });
-    view.setPreview(null);
-    expect(view.render(160).map(plain).join("\n")).not.toContain("Return to chat");
+    const rendered = view.render(160).map(plain).join("\n");
+    expect(rendered).toContain("Back");
+    expect(rendered).not.toContain("Return to chat");
+    click(view, "Back", 160);
+    expect(view.preview).toBeNull();
   });
 
   it("keeps both Antigravity meters visible in a narrow compact strip", () => {
@@ -187,7 +187,7 @@ describe("clickable Swarm View", () => {
     expect(view.quotaMode).toBe("collapsed");
     expect(view.render(40).every((line) => displayWidth(line) <= 40)).toBe(true);
   });
-  it("routes terminal mouse input to a read-only preview and restores the split on quit", async () => {
+  it("routes terminal mouse input to an inline read-only preview without zooming the pane", async () => {
     // eslint-disable-next-line unicorn/prefer-event-target -- The TUI consumes Node terminal stream events.
     const input = Object.assign(new EventEmitter(), {
       isTTY: true,
@@ -238,12 +238,11 @@ describe("clickable Swarm View", () => {
         "--lines",
         "200",
       ]);
-      expect(commands).toContainEqual(["herdr", "pane", "zoom", "--pane", "w1:p9", "--on"]);
+      expect(commands).not.toContainEqual(["herdr", "pane", "zoom", "--pane", "w1:p9", "--on"]);
     } finally {
       input.emit("data", "q");
       await running;
     }
-    expect(commands).toContainEqual(["herdr", "pane", "zoom", "--pane", "w1:p9", "--off"]);
     expect(outputText).toContain("\u{1B}[?1003l");
     expect(input.setRawMode.mock.calls).toEqual([[true], [false]]);
   });
@@ -280,6 +279,7 @@ describe("clickable Swarm View", () => {
       },
     });
     click(view, "2 beta", 120);
+    click(view, "Back", 120);
     view.handleInput("c");
     click(view, "1 background", 120);
     expect(opened).toEqual(["beta", "background"]);
@@ -326,9 +326,10 @@ describe("clickable Swarm View", () => {
     expect(view.overlay).toBe("help");
   });
 
-  it("keeps the live preview on the left and routes agent clicks in the right panel", () => {
+  it("renders the live preview in a container below the focused agent card and switches or closes inline", () => {
     const onPreview = vi.fn();
     const view = new HordeView(room(), { height: 32, onPreview });
+    view.focusId = "alpha";
     view.setPreview({
       agentId: "alpha",
       title: "alpha",
@@ -337,15 +338,25 @@ describe("clickable Swarm View", () => {
       loading: false,
     });
     const rendered = view.render(160).map(plain);
-    expect(rendered.join("\n")).toContain("Live screen · read only");
-    expect(
-      rendered.some(
-        (line) => line.includes("Current chat screen") && line.indexOf("Current chat screen") < 80,
-      ),
-    ).toBe(true);
-    click(view, "2 beta", 160);
-    expect(onPreview.mock.calls[0][0]).toMatchObject({ id: "beta" });
-    expect(click(view, "Agents", 160)).toEqual({ type: "close-preview" });
+    const joined = rendered.join("\n");
+    expect(joined).toContain("Live screen · read only");
+    expect(joined).toContain("Current chat screen");
+    expect(joined).toContain("3 alpha");
+    expect(joined).not.toContain("2 beta");
+    expect(joined).not.toContain("1 background");
+    click(view, "Next", 160);
+    expect(onPreview.mock.calls[0][0]).toMatchObject({ id: "background" });
+    expect(click(view, "Back", 160)).toEqual({ type: "close-preview" });
+    expect(view.preview).toBeNull();
+    view.setPreview({
+      agentId: "alpha",
+      title: "alpha",
+      kind: "terminal",
+      text: "Current chat screen",
+      loading: false,
+    });
+    expect(click(view, "3 alpha", 160)).toEqual({ type: "close-preview" });
+    expect(view.preview).toBeNull();
     expect(rendered.every((line) => displayWidth(line) <= 160)).toBe(true);
   });
 
@@ -359,7 +370,7 @@ describe("clickable Swarm View", () => {
       loading: false,
     });
     expect(view.render(44).map(plain).join("\n")).toContain("Current chat screen");
-    expect(click(view, "Agents", 44)).toEqual({ type: "close-preview" });
+    expect(click(view, "Back", 44)).toEqual({ type: "close-preview" });
     expect(view.render(44).every((line) => displayWidth(line) <= 44)).toBe(true);
   });
 
@@ -440,5 +451,19 @@ describe("clickable Swarm View", () => {
     expect(hitTest(mono.targets, 4, 1)).toMatchObject({ id: "open" });
     expect(hitTest(mono.targets, 4, 2)).toBeUndefined();
     expect(hitTest(mono.targets, 4, 3)).toMatchObject({ id: "close" });
+  });
+
+  it("hides Inactive when no agents are inactive, expands hidden inactive rows on click, and clicks bottom Update bubble", () => {
+    const activeOnly = room();
+    activeOnly.agents = activeOnly.agents.filter((agent) => agent.status === "running");
+    const activeView = new HordeView(activeOnly, { height: 32 });
+    expect(activeView.render(80).map(plain).join("\n")).not.toContain("Inactive");
+
+    const withInactive = room();
+    withInactive.update = { available: true, commitsBehind: 2, remoteSha: "abc1234" };
+    const view = new HordeView(withInactive, { height: 32, completedMode: "hidden" });
+    expect(click(view, "1 inactive hidden", 80)).toBe(true);
+    expect(view.completedMode).toBe("expanded");
+    expect(click(view, "click to update", 80)).toEqual({ type: "pull-update" });
   });
 });

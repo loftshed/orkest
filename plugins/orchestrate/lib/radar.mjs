@@ -12,7 +12,9 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { parseArgs, promisify } from "node:util";
 
+import { shouldUseColor } from "../../monitor/lib/render.mjs";
 import { cacheHome } from "./runtime-paths.mjs";
+import { glyphSet, glyphTier, renderPanel, renderTable, tone, wrapText } from "./tui-box.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -28,7 +30,7 @@ const TELEMETRY_SCRIPT_PATH = path.resolve(
 
 const SUPPORTED_HARNESSES = ["claude", "codex", "agy", "opencode"];
 
-export const RADAR_HELP = `ork radar [status|diff|priors] [--json] [--priors <path>] [--runs-dir <dir>]
+export const RADAR_HELP = `ork radar [status|diff|priors] [--json] [--priors <path>] [--runs-dir <dir>] [--width 120]
 `;
 
 export function detectInstalledEngines(env = process.env) {
@@ -228,48 +230,85 @@ function buildArchetypePriors(priors) {
   return result;
 }
 
-function formatRadarText(subcommand, report) {
-  const lines = [`Model Release Radar (${subcommand})`];
+function formatRadarText(subcommand, report, options = {}) {
+  const tier = options.tier || glyphTier(options.env);
+  const hasColor = Boolean(options.color);
+  const width = Math.max(40, Math.min(1000, Number(options.width) || 120));
+  const bodyWidth = Math.max(20, width - 6);
+  const title = `Model Release Radar (${subcommand})`;
+
   if (subcommand === "priors") {
-    lines.push("", "Archetype Priors:");
+    const body = [tone("Archetype Priors:", "heading", hasColor)];
     const archetypeEntries = Object.entries(report.archetypes || {});
     for (const [archetype, entries] of archetypeEntries) {
       const summary = entries
         .map((item) => `${item.id} (${(item.composite_prior * 100).toFixed(1)}%)`)
         .join(", ");
-      lines.push(`  ${archetype}: ${summary}`);
+      body.push(...wrapText(`  ${archetype}: ${summary}`, bodyWidth));
     }
-    lines.push("", "Model Scoreboard Priors:");
+    body.push("", tone("Model Scoreboard Priors:", "heading", hasColor));
     const modelEntries = Object.entries(report.priors.models || {});
-    for (const [id, info] of modelEntries) {
-      lines.push(
-        `  ${id} [${info.engine}] composite=${(info.composite_prior * 100).toFixed(1)}% swe=${(info.swe_bench_verified * 100).toFixed(1)}% lcb=${(info.livecodebench * 100).toFixed(1)}% aider=${(info.aider_polyglot * 100).toFixed(1)}%`,
-      );
-    }
-    return lines.join("\n");
+    const tableRows = modelEntries.map(([id, info]) => [
+      id,
+      info.engine,
+      `${(info.composite_prior * 100).toFixed(1)}%`,
+      `${(info.swe_bench_verified * 100).toFixed(1)}%`,
+      `${(info.livecodebench * 100).toFixed(1)}%`,
+      `${(info.aider_polyglot * 100).toFixed(1)}%`,
+    ]);
+    body.push(
+      ...renderTable(
+        ["Model", "Engine", "Composite", "SWE", "LCB", "Aider"],
+        tableRows,
+        bodyWidth,
+        {
+          color: hasColor,
+          tier,
+          weights: [0.36, 0.14, 0.14, 0.12, 0.12, 0.12],
+        },
+      ),
+    );
+    return renderPanel(title, body, width, { color: hasColor, glyphs: glyphSet(tier) })
+      .map((line) => line.trimEnd())
+      .join("\n");
   }
 
-  lines.push(
+  const body = [
     `Tracked models: ${report.diff.models.length} | New: ${report.diff.newModels.length} | Deprecated: ${report.diff.deprecatedModels.length}`,
-  );
+  ];
   if (report.diff.newModels.length > 0) {
-    lines.push(`New models: ${report.diff.newModels.join(", ")}`);
+    body.push(
+      ...wrapText(
+        `${tone("New models:", "success bold", hasColor)} ${report.diff.newModels.join(", ")}`,
+        bodyWidth,
+      ),
+    );
   }
   if (report.diff.deprecatedModels.length > 0) {
-    lines.push(`Deprecated models: ${report.diff.deprecatedModels.join(", ")}`);
+    body.push(
+      ...wrapText(
+        `${tone("Deprecated models:", "warning bold", hasColor)} ${report.diff.deprecatedModels.join(", ")}`,
+        bodyWidth,
+      ),
+    );
   }
   if (report.diff.alerts.length > 0) {
-    lines.push("", "Silent-Nerf Telemetry Alerts:");
+    body.push("", tone("Silent-Nerf Telemetry Alerts:", "error bold", hasColor));
     for (const alert of report.diff.alerts) {
       const dropPct = ((alert.degradation_drop || 0) * 100).toFixed(1);
-      lines.push(
-        `  [DEGRADED] ${alert.model} on ${alert.archetype}: 14d drop -${dropPct}% (${alert.rolling_14d_runs} runs)`,
+      body.push(
+        ...wrapText(
+          `  ${tone("[DEGRADED]", "error bold", hasColor)} ${alert.model} on ${alert.archetype}: 14d drop -${dropPct}% (${alert.rolling_14d_runs} runs)`,
+          bodyWidth,
+        ),
       );
     }
   } else {
-    lines.push("Telemetry health: all tracked buckets healthy.");
+    body.push(tone("Telemetry health: all tracked buckets healthy.", "success", hasColor));
   }
-  return lines.join("\n");
+  return renderPanel(title, body, width, { color: hasColor, glyphs: glyphSet(tier) })
+    .map((line) => line.trimEnd())
+    .join("\n");
 }
 
 export async function radarCli(argv = [], options = {}) {
@@ -298,6 +337,7 @@ export async function radarCli(argv = [], options = {}) {
       refresh: { type: "boolean" },
       "runs-dir": { type: "string" },
       "seen-catalog": { type: "string" },
+      width: { type: "string" },
     },
   });
 
@@ -350,7 +390,12 @@ export async function radarCli(argv = [], options = {}) {
 
   const output = values.json
     ? JSON.stringify(report, null, 2)
-    : formatRadarText(subcommand, report);
+    : formatRadarText(subcommand, report, {
+        color: options.color ?? (options.stdout ? shouldUseColor(options.stdout) : false),
+        env: options.env,
+        tier: options.tier,
+        width: values.width || options.width || options.stdout?.columns || 120,
+      });
   if (options.stdout && typeof options.stdout.write === "function") {
     options.stdout.write(`${output}\n`);
   }

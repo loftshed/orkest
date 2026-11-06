@@ -1,5 +1,7 @@
+import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { ANSI as MONITOR_ANSI } from "../../../plugins/monitor/lib/render.mjs";
 import { HordeView } from "../../../plugins/orchestrate/lib/horde-view.mjs";
 import {
   displayWidth,
@@ -296,12 +298,48 @@ describe("terminal presentation components", () => {
       "│ project  ·  󰔛 1 active  ·  󰀪 1 blocked  ·  󰄬 1 complete",
     );
     expect(plain(rendered.join("\n"))).toContain("└─┤ ⣷ Checking header layout");
-    expect(plain(rendered.join("\n"))).toContain(" \u{F233} Services ");
+    expect(plain(rendered.join("\n"))).toContain(" \u{F078} \u{F233} Services ");
+    expect(rendered.map(plain).find((line) => line.includes("View chat"))).not.toContain(
+      "Services",
+    );
     view.handleKey("v");
     const collapsedLines = view.render(80).map(plain);
     expect(collapsedLines.join("\n")).toContain(
-      "\u{F233} Services  1 running · localhost :5017 preview",
+      "\u{F054} \u{F233} Services  1 running · localhost :5017 preview",
     );
     expect(collapsedLines.find((line) => line.includes("View chat"))).not.toContain("Services");
+  });
+
+  it("keeps statusline, monitor, and DEFAULT_THEME 256-color tokens in parity", () => {
+    const statuslinePy = readFileSync(
+      new URL(
+        "../../../plugins/orchestrate/skills/orchestrate/scripts/agent_statusline.py",
+        import.meta.url,
+      ),
+      "utf8",
+    );
+    const palettePairs = [
+      [31, 203],
+      [32, 114],
+      [33, 221],
+      [34, 111],
+      [35, 176],
+      [36, 80],
+    ];
+    for (const [slot, colorCode] of palettePairs) {
+      expect(DEFAULT_THEME[`identity${slot}`]).toBe(`38;5;${colorCode};1`);
+      expect(statuslinePy).toContain(`${slot}: ${colorCode}`);
+    }
+    expect(DEFAULT_THEME.leadModel).toBe("38;5;117;1");
+    expect(DEFAULT_THEME.leadEffort).toBe("38;5;180;1");
+    expect(DEFAULT_THEME.leadSeparator).toBe("38;5;245");
+    expect(statuslinePy).toContain('"model": 117');
+    expect(statuslinePy).toContain('"effort": 180');
+    expect(statuslinePy).toContain('"separator": 245');
+
+    expect(MONITOR_ANSI.quotaOk).toBe(`\u{1B}[${DEFAULT_THEME.quotaOk}m`);
+    expect(MONITOR_ANSI.quotaMid).toBe(`\u{1B}[${DEFAULT_THEME.quotaMid}m`);
+    expect(MONITOR_ANSI.quotaLow).toBe(`\u{1B}[${DEFAULT_THEME.quotaLow}m`);
+    expect(MONITOR_ANSI.quotaTrack).toBe(`\u{1B}[${DEFAULT_THEME.quotaTrack}m`);
   });
 });

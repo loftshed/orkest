@@ -13,7 +13,7 @@ import { resetAnnouncements, resetDetails } from "./resets.mjs";
 import { formatClock, formatDuration } from "./time.mjs";
 import { SNAPSHOT_SCHEMA, VERSION } from "./version.mjs";
 
-const ANSI = {
+export const ANSI = Object.freeze({
   reset: "\u{1B}[0m",
   bold: "\u{1B}[1m",
   dim: "\u{1B}[2m",
@@ -21,8 +21,18 @@ const ANSI = {
   green: "\u{1B}[32m",
   yellow: "\u{1B}[33m",
   cyan: "\u{1B}[36m",
+  quotaOk: "\u{1B}[38;5;71m",
+  quotaMid: "\u{1B}[38;5;179m",
+  quotaLow: "\u{1B}[38;5;208m",
+  quotaTrack: "\u{1B}[2;38;5;240m",
+});
+const LEVEL_COLOR = {
+  ok: "quotaOk",
+  mid: "quotaMid",
+  low: "quotaLow",
+  out: "red",
+  error: "red",
 };
-const LEVEL_COLOR = { ok: "green", mid: "yellow", low: "red", out: "red", error: "red" };
 
 export function shouldUseColor(stream = process.stdout) {
   return Boolean(stream.isTTY) && !process.env.NO_COLOR && process.env.TERM !== "dumb";
@@ -46,13 +56,14 @@ const padStart = (s, n) => " ".repeat(Math.max(0, n - visibleLength(s))) + s;
 export const surplusText = (surplus) =>
   `${surplus >= 0 ? "+" : "−"}${Math.round(Math.abs(surplus))} pts`;
 
-function bar(pct, width) {
+function bar(pct, width, c, levelColor) {
   const eighths = Math.round((Math.max(0, Math.min(100, pct)) / 100) * width * 8);
   const full = Math.floor(eighths / 8);
   const part = eighths % 8;
-  return (
-    "█".repeat(full) + (part ? "▏▎▍▌▋▊▉"[part - 1] : "") + "·".repeat(width - full - (part ? 1 : 0))
-  );
+  const filled = "█".repeat(full) + (part ? "▏▎▍▌▋▊▉"[part - 1] : "");
+  const track = "·".repeat(width - full - (part ? 1 : 0));
+  if (!c) return filled + track;
+  return (filled ? c(levelColor, filled) : "") + (track ? c("quotaTrack", track) : "");
 }
 
 function resetText(w, blocker, now, c) {
@@ -64,8 +75,8 @@ function resetText(w, blocker, now, c) {
 }
 
 function surplusColor(surplus) {
-  if (surplus >= 15) return "green";
-  if (surplus <= -10) return "yellow";
+  if (surplus >= 15) return "quotaOk";
+  if (surplus <= -10) return "quotaMid";
   return "dim";
 }
 
@@ -104,7 +115,7 @@ export function renderReport(
       const pct = padStart(dead ? SKULL : `${Math.floor(w.remainingPct)}%`, 4);
       const reset = resetText(w, blocker, now, c);
       out.push(
-        `   ${pad(w.label, 22)} ${c(LEVEL_COLOR[lv], bar(blocker ? 0 : w.remainingPct, 14))} ${c(LEVEL_COLOR[lv], pct)} ${dead ? " ".repeat(4) : "left"}   ${reset}`,
+        `   ${pad(w.label, 22)} ${bar(blocker ? 0 : w.remainingPct, 14, c, LEVEL_COLOR[lv])} ${c(LEVEL_COLOR[lv], pct)} ${dead ? " ".repeat(4) : "left"}   ${reset}`,
       );
     }
     const credits = creditBalance(account);
