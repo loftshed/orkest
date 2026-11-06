@@ -10,16 +10,11 @@ import {
   focusAgentPane,
   notifyHerdrTransitions,
   runHordeTui,
-  runStoogesTui,
+  runTui,
 } from "../../../plugins/orchestrate/bin/horde-tui.mjs";
 import * as hordeTuiModule from "../../../plugins/orchestrate/bin/horde-tui.mjs";
-import { runTui } from "../../../plugins/orchestrate/bin/stooges-tui.mjs";
-import * as stoogesTuiModule from "../../../plugins/orchestrate/bin/stooges-tui.mjs";
 import * as factoryModule from "../../../plugins/orchestrate/lib/factory.mjs";
 import * as foundryModule from "../../../plugins/orchestrate/lib/foundry.mjs";
-import * as hordeRoomModule from "../../../plugins/orchestrate/lib/horde-room.mjs";
-import { HordeView, normalizeAgent } from "../../../plugins/orchestrate/lib/horde-view.mjs";
-import * as hordeViewModule from "../../../plugins/orchestrate/lib/horde-view.mjs";
 import {
   addMembers,
   createRoom,
@@ -28,14 +23,13 @@ import {
   roomPath,
   updateRoom,
   validateRoom,
-} from "../../../plugins/orchestrate/lib/stooges-room.mjs";
-import * as stoogesRoomModule from "../../../plugins/orchestrate/lib/stooges-room.mjs";
+} from "../../../plugins/orchestrate/lib/horde-room.mjs";
 import {
+  HordeView,
+  normalizeAgent,
   normalizeModelAndEffort,
   shortAgentName,
-  StoogesView,
-} from "../../../plugins/orchestrate/lib/stooges-view.mjs";
-import * as stoogesViewModule from "../../../plugins/orchestrate/lib/stooges-view.mjs";
+} from "../../../plugins/orchestrate/lib/horde-view.mjs";
 import {
   ANSI,
   cellWidth,
@@ -57,7 +51,7 @@ const exec = promisify(execFile);
 const cli = path.resolve("plugins/orchestrate/bin/ork.mjs");
 const temporary = [];
 async function directory() {
-  const dir = await mkdtemp(path.join(tmpdir(), "stooges-test-"));
+  const dir = await mkdtemp(path.join(tmpdir(), "horde-test-"));
   temporary.push(dir);
   return dir;
 }
@@ -163,8 +157,8 @@ describe("swarm rooms", () => {
 });
 
 describe("tui-box primitives and HordeView unification", () => {
-  it("exports reusable box, width, and table primitives from tui-box and aliases HordeView", () => {
-    expect(HordeView).toBe(StoogesView);
+  it("exports reusable box, width, and table primitives from tui-box and HordeView", () => {
+    expect(typeof HordeView).toBe("function");
     expect(ANSI.cyan).toBe("36");
     expect(GLYPHS.unicode.topLeft).toBe("┌");
     expect(cellWidth("a")).toBe(1);
@@ -222,7 +216,7 @@ describe("tui-box primitives and HordeView unification", () => {
 
   it("focuses and pins detail while new output arrives", () => {
     const room = fixture("claude:haiku*2,agy:flash*2");
-    const view = new StoogesView(room, { now: () => 2000 });
+    const view = new HordeView(room, { now: () => 2000 });
     view.handleInput("2");
     view.handleInput("p");
     view.handleInput("1");
@@ -239,7 +233,7 @@ describe("tui-box primitives and HordeView unification", () => {
   });
 
   it("supports more than nine members with page-local number keys", () => {
-    const view = new StoogesView(fixture("claude:haiku*12"));
+    const view = new HordeView(fixture("claude:haiku*12"));
     view.render(80);
     view.handleInput("n");
     view.handleInput("n");
@@ -253,7 +247,7 @@ describe("tui-box primitives and HordeView unification", () => {
   it("keeps focus, detail and navigation visible on a short terminal", () => {
     const room = fixture("claude:haiku*9");
     room.agents[0].output = ["First agent result"];
-    const view = new StoogesView(room, { height: 18 });
+    const view = new HordeView(room, { height: 18 });
     view.render(80);
     for (let index = 0; index < 8; index++) view.handleInput("\u{1B}[B");
     const lines = view.render(80);
@@ -267,7 +261,7 @@ describe("tui-box primitives and HordeView unification", () => {
   it("fits Unicode and strips injected terminal controls", () => {
     const room = fixture();
     room.agents[2].output = ["\u{1B}[2J界界 👩‍💻 safe\u{7}"];
-    const lines = new StoogesView(room).render(32);
+    const lines = new HordeView(room).render(32);
     expect(lines.every((line) => displayWidth(line) <= 32)).toBe(true);
     expect(lines.join("\n")).toContain("safe");
     expect(lines.join("\n")).not.toContain("\u{1B}");
@@ -277,7 +271,7 @@ describe("tui-box primitives and HordeView unification", () => {
     const room = fixture();
     room.agents[2].status = "running";
     room.agents[2].output = ["\u{1B}[31munsafe\u{1B}[0m 👩‍💻 界\nnext line"];
-    const view = new StoogesView(room, { now: () => 2000, height: 28, color: true });
+    const view = new HordeView(room, { now: () => 2000, height: 28, color: true });
     for (const width of [40, 47, 48, 63, 64, 79, 80, 120]) {
       const lines = view.render(width);
       expect(lines.every((line) => displayWidth(line) <= width)).toBe(true);
@@ -297,10 +291,10 @@ describe("tui-box primitives and HordeView unification", () => {
     expect(displayWidth("\u{E0A0}")).toBe(1);
     expect(displayWidth("󰚩")).toBe(1);
     expect(wrapText("界", 1)).toEqual(["?"]);
-    const ascii = new StoogesView(fixture(), { height: 24, tier: "ascii" }).render(40);
+    const ascii = new HordeView(fixture(), { height: 24, tier: "ascii" }).render(40);
     expect(ascii.join("\n")).toContain("+ Swarm · sample-room");
     expect(ascii.every((line) => displayWidth(line) <= 40)).toBe(true);
-    const nerd = new StoogesView(fixture(), { height: 24, tier: "nerd" }).render(80);
+    const nerd = new HordeView(fixture(), { height: 24, tier: "nerd" }).render(80);
     expect(nerd.join("\n")).toContain("╭ Swarm · sample-room");
     expect(nerd.join("\n")).toContain("󰔛");
     expect(nerd.join("\n")).toContain("󰀪");
@@ -342,7 +336,7 @@ describe("tui-box primitives and HordeView unification", () => {
     room.agents[1].name = "snoobix-gemini-4-argon-medium-orkest-56";
     room.agents[1].resolvedModel = "gemini-4-argon-medium";
     room.agents[1].resolvedEffort = "—";
-    const rendered = new StoogesView(room, { height: 28, tier: "nerd" }).render(90).join("\n");
+    const rendered = new HordeView(room, { height: 28, tier: "nerd" }).render(90).join("\n");
     expect(rendered).toContain("Orchestrator: gribble");
     expect(rendered).not.toContain("gribble-gemini-4-argon-medium-orkest-1f");
     expect(rendered).toContain("Gemini 4 Argon / medium");
@@ -355,7 +349,7 @@ describe("tui-box primitives and HordeView unification", () => {
   it("renders an empty room, key help and a coalesced log overlay", () => {
     const room = fixture();
     room.agents = [];
-    const view = new StoogesView(room, { height: 24, color: true });
+    const view = new HordeView(room, { height: 24, color: true });
     const emptyLines = view.render(80);
     const emptyRowIndex = emptyLines.findIndex((line) =>
       plain(line).includes("The coordinator will add agents as work is assigned."),
@@ -384,7 +378,7 @@ describe("tui-box primitives and HordeView unification", () => {
       { id: "codex", short: "C", windows: [{ remainingPct: 92 }, { remainingPct: 81 }] },
       { id: "claude", short: "K", windows: [{ remainingPct: 64 }] },
     ];
-    const view = new StoogesView(room, { tier: "unicode" });
+    const view = new HordeView(room, { tier: "unicode" });
     const lines = view.render(100);
     expect(view.quotaMode).toBe("collapsed");
     expect(lines.filter((line) => line.includes("Quota"))).toHaveLength(0);
@@ -410,7 +404,7 @@ describe("tui-box primitives and HordeView unification", () => {
         ],
       },
     ];
-    const lines = new StoogesView(room, { tier: "unicode" }).render(100);
+    const lines = new HordeView(room, { tier: "unicode" }).render(100);
     const summary = lines.find((line) => line.includes("AG Gemini"));
     expect(summary).toContain("AG Gemini ━━━─ 77%");
     expect(summary).toContain("AG Claude/GPT ━─── 10%");
@@ -438,7 +432,7 @@ describe("tui-box primitives and HordeView unification", () => {
         ],
       },
     ];
-    const rendered = new StoogesView(room, { now: () => 1000, quotaMode: "expanded" })
+    const rendered = new HordeView(room, { now: () => 1000, quotaMode: "expanded" })
       .render(100)
       .join("\n");
     expect(rendered).toContain("Quota");
@@ -527,7 +521,7 @@ describe("tui-box primitives and HordeView unification", () => {
     ];
     const nowMs = 1_793_754_000_000;
     const resetDay = new Date(1_794_013_200_000).toLocaleDateString("en-US", { weekday: "short" });
-    const rendered = new StoogesView(room, { now: () => nowMs, height: 32, quotaMode: "expanded" })
+    const rendered = new HordeView(room, { now: () => nowMs, height: 32, quotaMode: "expanded" })
       .render(90)
       .join("\n");
     expect(rendered).toContain("CW ");
@@ -549,7 +543,7 @@ describe("tui-box primitives and HordeView unification", () => {
     room.agents[2].objective = "Third task working";
     room.agents[2].observedAt = new Date(980_000).toISOString();
 
-    const view = new StoogesView(room, { now: () => 1_000_000, height: 28, tier: "unicode" });
+    const view = new HordeView(room, { now: () => 1_000_000, height: 28, tier: "unicode" });
     const collapsed = view.render(90).join("\n");
     // Most recent running agent (haiku-3) is #1 and focused; older completed agents (haiku-2, haiku-1) collapse below it
     expect(collapsed).toContain("┌ ▸ 1 haiku-3");
@@ -579,7 +573,7 @@ describe("tui-box primitives and HordeView unification", () => {
     room.agents[0].observedAt = "2026-11-04T02:00:00Z";
     room.agents[1].status = "completed";
     room.agents[1].observedAt = "2026-11-04T03:00:00Z";
-    const view = new StoogesView(room, { height: 24, tier: "unicode" });
+    const view = new HordeView(room, { height: 24, tier: "unicode" });
     expect(view.room.agents.map((agent) => agent.id)).toEqual(["haiku-2", "haiku-1"]);
     expect(view.focusId).toBe("haiku-2");
 
@@ -612,7 +606,7 @@ describe("tui-box primitives and HordeView unification", () => {
       objective: "Inspect current result",
       observedAt: "2026-11-04T13:00:00Z",
     });
-    const view = new StoogesView(room, { height: 36, tier: "unicode" });
+    const view = new HordeView(room, { height: 36, tier: "unicode" });
     const rendered = view.render(100).join("\n");
     expect(rendered).toContain("1 active");
     expect(rendered).toContain("awaiting review");
@@ -637,7 +631,7 @@ describe("tui-box primitives and HordeView unification", () => {
     const room = fixture();
     room.agents = [room.agents[0]];
     Object.assign(room.agents[0], { status: "review", runtimeState: "idle" });
-    const view = new StoogesView(room, { height: 32, completedMode: "expanded" });
+    const view = new HordeView(room, { height: 32, completedMode: "expanded" });
     expect(view.render(100).join("\n")).toContain("idle · last reported review");
     expect(view.needsAnimation).toBe(false);
   });
@@ -646,7 +640,7 @@ describe("tui-box primitives and HordeView unification", () => {
     const room = fixture("claude:haiku,agy:flash");
     room.quotaError = "Quota unavailable";
     room.services = [{ kind: "port", port: 5017, name: "preview" }];
-    const lines = new StoogesView(room, {
+    const lines = new HordeView(room, {
       height: 40,
       tier: "unicode",
       quotaMode: "expanded",
@@ -700,7 +694,7 @@ describe("tui-box primitives and HordeView unification", () => {
       agent.name = index === 0 ? "codex:sample-project" : "sample-project";
       agent.status = index === 2 ? "completed" : "working";
     }
-    const rendered = new StoogesView(room, { height: 32, tier: "unicode" }).render(90).join("\n");
+    const rendered = new HordeView(room, { height: 32, tier: "unicode" }).render(90).join("\n");
     expect(rendered).toContain("sample-project · 3 agents");
     expect(rendered.match(/sample-project/gu)).toHaveLength(1);
     expect(rendered).toContain("▸ ");
@@ -724,7 +718,7 @@ describe("tui-box primitives and HordeView unification", () => {
       slug: "wt-50",
     };
 
-    const unicodeLines = new StoogesView(room, { height: 28, tier: "unicode", color: true }).render(
+    const unicodeLines = new HordeView(room, { height: 28, tier: "unicode", color: true }).render(
       90,
     );
     expect(unicodeLines.every((line) => displayWidth(line) <= 90)).toBe(true);
@@ -734,7 +728,7 @@ describe("tui-box primitives and HordeView unification", () => {
     expect(unicodeText).not.toContain("\u{1B}[44;97;1m");
     expect(unicodeText).toContain("\u{1B}[48;5;237;97;1m");
 
-    const asciiText = new StoogesView(room, { height: 28, tier: "ascii" }).render(85).join("\n");
+    const asciiText = new HordeView(room, { height: 28, tier: "ascii" }).render(85).join("\n");
     expect(asciiText).toContain("| orkest · 2 agents");
     expect(asciiText).toContain("| + > 1 haiku-1");
     expect(asciiText).toContain("+-+ Awaiting assignment");
@@ -758,14 +752,14 @@ describe("ork CLI", () => {
     };
     const printed = await exec(
       process.execPath,
-      [cli, "stooges", "--fixture", file, "--print", "--width", "70"],
+      [cli, "horde", "--fixture", file, "--print", "--width", "70"],
       { env },
     );
     expect(printed.stdout).toContain("┌ Swarm · sample-room");
     expect(printed.stdout).toContain("3/64 slots");
     expect(printed.stdout).toContain(" Shortcuts");
     expect(printed.stdout).not.toContain("\u{1B}");
-    const json = await exec(process.execPath, [cli, "stooges", "--fixture", file, "--json"], {
+    const json = await exec(process.execPath, [cli, "horde", "--fixture", file, "--json"], {
       env,
     });
     expect(JSON.parse(json.stdout).agents[0].output).toEqual([
@@ -791,7 +785,7 @@ describe("ork CLI", () => {
   ])("rejects invalid options %j before creating rooms", async (...args) => {
     const dir = await directory();
     await expect(
-      exec(process.execPath, [cli, "stooges", ...args], {
+      exec(process.execPath, [cli, "horde", ...args], {
         env: { ...process.env, AGENT_EXECUTOR_HOME: dir },
       }),
     ).rejects.toMatchObject({ code: 1, stderr: expect.stringContaining("ork:") });
@@ -809,7 +803,7 @@ describe("ork CLI", () => {
     const file = path.join(dir, "fixture.json");
     await writeFile(file, contents);
     await expect(
-      exec(process.execPath, [cli, "stooges", "--fixture", file, "--print"], {
+      exec(process.execPath, [cli, "horde", "--fixture", file, "--print"], {
         env: { ...process.env, AGENT_EXECUTOR_HOME: dir },
       }),
     ).rejects.toMatchObject({ code: 1, stderr: expect.stringContaining("ork:") });
@@ -820,7 +814,7 @@ describe("ork CLI", () => {
     const env = { ...process.env, AGENT_EXECUTOR_HOME: dir };
     const created = await exec(
       process.execPath,
-      [cli, "stooges", "--preset", "scout-swarm", "--json"],
+      [cli, "horde", "--preset", "scout-swarm", "--json"],
       { env },
     );
     const room = JSON.parse(created.stdout);
@@ -833,7 +827,7 @@ describe("ork CLI", () => {
     ]);
     const spawned = await exec(
       process.execPath,
-      [cli, "stooges", "spawn", "--attach-room", room.id, "--team", "claude:haiku", "--json"],
+      [cli, "horde", "spawn", "--attach-room", room.id, "--team", "claude:haiku", "--json"],
       { env },
     );
     expect(JSON.parse(spawned.stdout).agents.at(-1)).toMatchObject({
@@ -958,12 +952,7 @@ describe("terminal lifecycle", () => {
     }
   });
 
-  it("supports o-key pane focus, focusAgentPane, notifyHerdrTransitions, and primary module shim parity", async () => {
-    expect(stoogesRoomModule.createRoom).toBe(hordeRoomModule.createRoom);
-    expect(stoogesRoomModule.WORKFORCE_ROLES).toBe(hordeRoomModule.WORKFORCE_ROLES);
-    expect(stoogesViewModule.HordeView).toBe(hordeViewModule.HordeView);
-    expect(stoogesTuiModule.runHordeTui).toBe(hordeTuiModule.runHordeTui);
-    expect(runStoogesTui).toBe(runHordeTui);
+  it("supports o-key pane focus, focusAgentPane, notifyHerdrTransitions, and primary module exports", async () => {
     expect(runTui).toBe(runHordeTui);
     expect(factoryModule.foundryCommand).toBe(foundryModule.foundryCommand);
     expect(factoryModule.runSmelterPass).toBe(foundryModule.runSmelterPass);

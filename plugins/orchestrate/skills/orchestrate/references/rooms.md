@@ -6,7 +6,7 @@ billing policy, deadlines, scope and verification. The examples use `ork`; witho
 use `node <plugin-root>/bin/ork.mjs`.
 
 For an interactive coordinator that builds and supervises its own team, use
-[`ork horde "objective"`](swarm.md) (`ork stooges` and `ork hall` are supported aliases). The commands
+[`ork horde "objective"`](swarm.md). The commands
 below also work independently.
 
 ## Create and dispatch

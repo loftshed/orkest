@@ -7,6 +7,12 @@ import { promisify } from "node:util";
 import { afterEach, expect, it } from "vitest";
 
 import { roomsCommand } from "../../../plugins/orchestrate/bin/rooms.mjs";
+import { parseTeam, readRoom, updateRoom } from "../../../plugins/orchestrate/lib/horde-room.mjs";
+import {
+  agentFolder,
+  HordeView,
+  worktreeBadge,
+} from "../../../plugins/orchestrate/lib/horde-view.mjs";
 import {
   bindSession,
   dispatchMember,
@@ -15,12 +21,6 @@ import {
   newRoom,
   observeRoom,
 } from "../../../plugins/orchestrate/lib/rooms.mjs";
-import { parseTeam, readRoom, updateRoom } from "../../../plugins/orchestrate/lib/stooges-room.mjs";
-import {
-  agentFolder,
-  StoogesView,
-  worktreeBadge,
-} from "../../../plugins/orchestrate/lib/stooges-view.mjs";
 import { pauseBranch, reserveLead } from "../../../plugins/orchestrate/lib/swarm.mjs";
 
 const execute = promisify(execFile);
@@ -48,7 +48,7 @@ it("creates a conversational room through the CLI without launching a model in J
   const { root } = await fixture();
   const result = await execute(
     process.execPath,
-    [cli, "stooges", "Fix a cache failure", "--engine", "agy", "--max-agents", "4", "--json"],
+    [cli, "horde", "Fix a cache failure", "--engine", "agy", "--max-agents", "4", "--json"],
     {
       env: { ...process.env, AGENT_EXECUTOR_HOME: root },
     },
@@ -239,7 +239,7 @@ it("projects current session status and nesting without treating a lead report a
     name: "example-gpt-test-high-cache-aa",
     status: "reported complete",
   });
-  const view = new StoogesView(observed, { height: 30, tier: "unicode" });
+  const view = new HordeView(observed, { height: 30, tier: "unicode" });
   const output = view.render(85).join("\n");
   expect(output).toContain("│ ┌ ▸ 1 haiku-1");
   expect(output).toContain("├─┤ Awaiting assignment");
@@ -313,7 +313,7 @@ it("assigns preset workforce roles, groups agent cards by working folder, and pr
   });
   expect(observed.agents[0].workforceRole).toBe("debugger");
 
-  const view = new StoogesView(observed, { height: 34, tier: "unicode" });
+  const view = new HordeView(observed, { height: 34, tier: "unicode" });
   const output = view.render(110).join("\n");
   expect(output).toContain(`│ ${path.basename(worktreeA)} · 1 agent`);
   expect(output).toContain(`│ ${path.basename(worktreeB)} · 2 agents`);
@@ -383,12 +383,12 @@ it("groups disposable git worktrees under their parent folder, renders wt:<slug>
   expect(agentFolder(saved.agents[2], saved)).toBe(persistentDir);
   expect(worktreeBadge(saved.agents[2], saved)).toBe("");
 
-  const view = new StoogesView(saved, { height: 36, tier: "unicode", color: true });
+  const view = new HordeView(saved, { height: 36, tier: "unicode", color: true });
   const coloredOutput = view.render(110).join("\n");
   expect(coloredOutput).not.toContain("\u{1B}[48;5;24;97;1m");
   expect(coloredOutput).toContain("\u{1B}[48;5;237;97;1m");
 
-  const plainView = new StoogesView(saved, { height: 36, tier: "unicode" });
+  const plainView = new HordeView(saved, { height: 36, tier: "unicode" });
   const output = plainView.render(140).join("\n");
   expect(output).toContain(`│ ${path.basename(room.cwd)} · 2 agents`);
   expect(output).toContain(`│ ${path.basename(persistentDir)} · 1 agent`);
@@ -412,7 +412,7 @@ it("groups disposable git worktrees under their parent folder, renders wt:<slug>
   expect(agentFolder(promotedRoom.agents[0], promotedRoom)).toBe(disposableDir);
   expect(worktreeBadge(promotedRoom.agents[0], promotedRoom)).toBe("");
 
-  const promotedOutput = new StoogesView(promotedRoom, { height: 36, tier: "unicode" })
+  const promotedOutput = new HordeView(promotedRoom, { height: 36, tier: "unicode" })
     .render(140)
     .join("\n");
   expect(promotedOutput).toContain(`wt-50 · 1 agent`);

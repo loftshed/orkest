@@ -1,6 +1,6 @@
 # Conversational swarms
 
-`ork horde "objective"` (`ork stooges` is a supported alias) opens a normal coordinator harness next
+`ork horde "objective"` opens a normal coordinator harness next
 to its live swarm tree.
 `ork agy`, `ork codex`, `ork claude` and `ork opencode` are shortcuts that let the user enter their
 goal in the coordinator conversation after launch.

@@ -1154,7 +1154,6 @@ export async function runHordeTui(
   if (terminalError) throw terminalError;
 }
 
-export const runStoogesTui = runHordeTui;
 export const runTui = runHordeTui;
 
 if (import.meta.url === pathToFileURL(process.argv[1] || "").href) {

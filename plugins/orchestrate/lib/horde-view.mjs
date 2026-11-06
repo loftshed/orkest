@@ -2071,5 +2071,3 @@ export class HordeView {
     return this.marginLines(lines, width);
   }
 }
-
-export { HordeView as StoogesView };

@@ -39,9 +39,9 @@ SPEC.loader.exec_module(RUNNER)
 MAILBOX = RUNNER.bundled_module("peer_mailbox")
 
 
-class StoogesCommandTests(unittest.TestCase):
+class HordeCommandTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory(prefix="agent-stooges-command-")
+        self.temporary = tempfile.TemporaryDirectory(prefix="agent-horde-command-")
         self.root = Path(self.temporary.name)
 
     def tearDown(self) -> None:
@@ -51,14 +51,14 @@ class StoogesCommandTests(unittest.TestCase):
         node = self.root / "node"
         node.write_text(
             "#!/bin/sh\n"
-            'printf \'%s\\n\' "$@" > "$STOOGES_ARGV_CAPTURE"\n'
-            "printf 'stooges child output\\n'\n"
-            'exit "${STOOGES_EXIT:-0}"\n',
+            'printf \'%s\\n\' "$@" > "$HORDE_ARGV_CAPTURE"\n'
+            "printf 'horde child output\\n'\n"
+            'exit "${HORDE_EXIT:-0}"\n',
             encoding="utf-8",
         )
         node.chmod(0o755)
 
-    def test_stooges_forwards_arguments_and_returns_child_status(self) -> None:
+    def test_horde_forwards_arguments_and_returns_child_status(self) -> None:
         self.install_fake_node()
         capture = self.root / "argv.txt"
         argv = [
@@ -73,14 +73,14 @@ class StoogesCommandTests(unittest.TestCase):
             [
                 sys.executable,
                 str(SCRIPT),
-                "stooges",
+                "horde",
                 *argv,
             ],
             env={
                 **os.environ,
                 "PATH": str(self.root),
-                "STOOGES_ARGV_CAPTURE": str(capture),
-                "STOOGES_EXIT": "23",
+                "HORDE_ARGV_CAPTURE": str(capture),
+                "HORDE_EXIT": "23",
             },
             capture_output=True,
             text=True,
@@ -92,7 +92,7 @@ class StoogesCommandTests(unittest.TestCase):
             received,
             [
                 str(SCRIPT.resolve().parents[3] / "bin" / "ork.mjs"),
-                "stooges",
+                "horde",
                 "spawn",
                 "--team",
                 "claude:haiku*2,codex:luna:max",
@@ -102,12 +102,12 @@ class StoogesCommandTests(unittest.TestCase):
             ],
         )
         self.assertEqual(result.returncode, 23)
-        self.assertEqual(result.stdout, "stooges child output\n")
+        self.assertEqual(result.stdout, "horde child output\n")
         self.assertEqual(result.stderr, "")
 
-    def test_stooges_reports_when_node_is_unavailable(self) -> None:
+    def test_horde_reports_when_node_is_unavailable(self) -> None:
         result = subprocess.run(
-            [sys.executable, str(SCRIPT), "stooges", "--help"],
+            [sys.executable, str(SCRIPT), "horde", "--help"],
             env={**os.environ, "PATH": str(self.root)},
             capture_output=True,
             text=True,

@@ -17,7 +17,7 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[5]
 SCRIPTS = ROOT / "plugins" / "orchestrate" / "skills" / "orchestrate" / "scripts"
-SPEC = importlib.util.spec_from_file_location("stooges_cmd_under_test", SCRIPTS / "run_agent.py")
+SPEC = importlib.util.spec_from_file_location("horde_cmd_under_test", SCRIPTS / "run_agent.py")
 assert SPEC and SPEC.loader
 COMMAND = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(COMMAND)
@@ -25,11 +25,11 @@ SPEC.loader.exec_module(COMMAND)
 import room_store  # noqa: E402
 
 
-class StoogesCommandTests(unittest.TestCase):
+class HordeCommandTests(unittest.TestCase):
     def test_missing_node_has_actionable_error(self) -> None:
         stderr = io.StringIO()
         with (
-            mock.patch.object(sys, "argv", ["run_agent.py", "stooges", "--json"]),
+            mock.patch.object(sys, "argv", ["run_agent.py", "horde", "--json"]),
             mock.patch.object(COMMAND.subprocess, "run", side_effect=FileNotFoundError("node")),
             contextlib.redirect_stderr(stderr),
         ):
@@ -40,7 +40,7 @@ class StoogesCommandTests(unittest.TestCase):
     def test_failed_exec_has_distinct_exit_code(self) -> None:
         stderr = io.StringIO()
         with (
-            mock.patch.object(sys, "argv", ["run_agent.py", "stooges"]),
+            mock.patch.object(sys, "argv", ["run_agent.py", "horde"]),
             mock.patch.object(COMMAND.subprocess, "run", side_effect=OSError("permission denied")),
             contextlib.redirect_stderr(stderr),
         ):
@@ -50,18 +50,18 @@ class StoogesCommandTests(unittest.TestCase):
     def test_literal_arguments_and_environment_are_forwarded_without_a_shell(self) -> None:
         args = ["--fixture", "/tmp/room with spaces $(touch nope).json", "--json"]
         with (
-            mock.patch.object(sys, "argv", ["run_agent.py", "stooges", *args]),
+            mock.patch.object(sys, "argv", ["run_agent.py", "horde", *args]),
             mock.patch.object(COMMAND.subprocess, "run", return_value=subprocess.CompletedProcess([], 1)) as run,
         ):
             self.assertEqual(COMMAND.main(), 1)
         positional, keywords = run.call_args
         self.assertEqual(positional[0][0], "node")
-        self.assertEqual(positional[0][2:], ["stooges", *args])
+        self.assertEqual(positional[0][2:], ["horde", *args])
         self.assertEqual(keywords, {"check": False})
 
     @unittest.skipUnless(shutil.which("node"), "Node.js is required for the integration bridge")
     def test_real_runner_dispatch_preserves_fixture_arguments(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="stooges bridge ") as temporary:
+        with tempfile.TemporaryDirectory(prefix="horde bridge ") as temporary:
             root = Path(temporary)
             fixture = root / "room $(touch SHOULD_NOT_EXIST).json"
             room = {
@@ -78,7 +78,7 @@ class StoogesCommandTests(unittest.TestCase):
                 "MONITOR_CONFIG": str(root / "monitor-config.json"),
             }
             result = subprocess.run(
-                [sys.executable, str(SCRIPTS / "run_agent.py"), "stooges", "--fixture", str(fixture), "--json"],
+                [sys.executable, str(SCRIPTS / "run_agent.py"), "horde", "--fixture", str(fixture), "--json"],
                 cwd=root,
                 env=env,
                 capture_output=True,
@@ -93,7 +93,7 @@ class StoogesCommandTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("node"), "Node.js is required for the integration bridge")
     def test_real_runner_preserves_error_exit_and_cache_override(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="stooges-cache-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="horde-cache-") as temporary:
             root = Path(temporary)
             env = {
                 **os.environ,
@@ -102,7 +102,7 @@ class StoogesCommandTests(unittest.TestCase):
                 "MONITOR_CACHE_DIR": str(root / "monitor"),
                 "MONITOR_CONFIG": str(root / "monitor-config.json"),
             }
-            command = [sys.executable, str(SCRIPTS / "run_agent.py"), "stooges"]
+            command = [sys.executable, str(SCRIPTS / "run_agent.py"), "horde"]
             invalid = subprocess.run(
                 command + ["--unknown-option"], env=env, capture_output=True, text=True, check=False, timeout=15
             )

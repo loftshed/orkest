@@ -19,19 +19,19 @@ import {
   selectSparePools,
 } from "../../../plugins/orchestrate/lib/factory.mjs";
 import * as hallModule from "../../../plugins/orchestrate/lib/hall.mjs";
-import * as roomsModule from "../../../plugins/orchestrate/lib/rooms.mjs";
-import {
-  cacheHome,
-  configPath,
-  envFirst,
-} from "../../../plugins/orchestrate/lib/runtime-paths.mjs";
 import {
   createRoom,
   mailboxRoot,
   parseTeam,
   refreshMemberWorktrees,
   updateRoom,
-} from "../../../plugins/orchestrate/lib/stooges-room.mjs";
+} from "../../../plugins/orchestrate/lib/horde-room.mjs";
+import * as roomsModule from "../../../plugins/orchestrate/lib/rooms.mjs";
+import {
+  cacheHome,
+  configPath,
+  envFirst,
+} from "../../../plugins/orchestrate/lib/runtime-paths.mjs";
 import * as swarmModule from "../../../plugins/orchestrate/lib/swarm.mjs";
 
 const exec = promisify(execFile);
