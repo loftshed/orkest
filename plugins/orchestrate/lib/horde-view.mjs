@@ -95,6 +95,24 @@ function isInactive(member) {
   );
 }
 
+function quotaWindowKind(window) {
+  if (window.kind === "5h" || window.windowMins === 300) return "5h";
+  if (window.kind === "weekly" || window.windowMins >= 1440) return "weekly";
+  const label = `${window.label || ""} ${window.id || ""}`;
+  if (/\b5-?h(?:our)?\b|\bsession\b/iu.test(label)) return "5h";
+  if (/\b(?:wk|week(?:ly)?|7-?d(?:ay)?)\b/iu.test(label)) return "weekly";
+  return "";
+}
+
+function leadStageTone(member) {
+  if (member.paused || /blocked|paused|stale/u.test(member.status)) return "leadWarning";
+  if (/failed|error/u.test(member.status)) return "leadError";
+  if (/complete/u.test(member.status)) return "leadSuccess";
+  if (member.status === "planning") return "leadPlanning";
+  if (member.status === "testing") return "leadTesting";
+  return ACTIVE_STATUSES.has(member.status) ? "leadModel" : "muted";
+}
+
 function phaseLabel(member) {
   if (member.paused) return "new launches paused";
   if (member.dispatch && member.status === "review" && !isExecuting(member))
@@ -730,6 +748,7 @@ export class HordeView {
       tier = process.env.ORK_GLYPHS ? glyphTier() : "nerd",
       completedMode = "collapsed",
       quotaMode = "collapsed",
+      quotaWindow = "5h",
       servicesMode = "expanded",
       inHerdr = false,
       onFocusPane,
@@ -740,11 +759,12 @@ export class HordeView {
     this.now = now;
     this.height = height;
     this.renderWidth = 80;
-    this.color = color;
-    this.appearance = { enabled: color, theme: resolveTheme(theme) };
+    this.color = color && !process.env.NO_COLOR;
+    this.appearance = { enabled: this.color, theme: resolveTheme(theme) };
     this.tier = tier;
     this.inHerdr = Boolean(inHerdr);
     this.completedMode = COMPLETED_MODES.includes(completedMode) ? completedMode : "collapsed";
+    this.quotaWindow = quotaWindow === "weekly" ? "weekly" : "5h";
     this.quotaMode = QUOTA_MODES.has(quotaMode) ? quotaMode : "expanded";
     this.servicesMode = SERVICES_MODES.has(servicesMode) ? servicesMode : "expanded";
     this.onFocusPane = typeof onFocusPane === "function" ? onFocusPane : undefined;
@@ -765,6 +785,7 @@ export class HordeView {
     this.preview = null;
     this.previewWidth = 0;
     this.previewOffset = 0;
+    this.previewFollow = true;
     this.previewLatestText = "";
   }
 
@@ -944,6 +965,7 @@ export class HordeView {
       }
       if (key === "r") {
         this.previewOffset = 0;
+        this.previewFollow = true;
         this.preview.text = this.previewLatestText;
         return true;
       }
@@ -1009,6 +1031,9 @@ export class HordeView {
           Math.max(0, Math.ceil(this.room.agents.length / this.pageSize) - 1),
         );
         return true;
+      }
+      case "w": {
+        return this.toggleQuotaWindow();
       }
       case "u": {
         if (!this.room.accounts?.length && !this.room.quotaError) return false;
@@ -1110,16 +1135,25 @@ export class HordeView {
     return Boolean(session && agent.session?.id === session && (agent.herdrPaneId || agent.paneId));
   }
 
+  toggleQuotaWindow() {
+    this.quotaWindow = this.quotaWindow === "5h" ? "weekly" : "5h";
+    return true;
+  }
+
   setPreview(snapshot) {
-    if (snapshot?.agentId !== this.preview?.agentId || snapshot?.loading) this.previewOffset = 0;
+    if (snapshot?.agentId !== this.preview?.agentId || snapshot?.loading) {
+      this.previewOffset = 0;
+      this.previewFollow = true;
+    }
     this.previewLatestText = snapshot?.text || "";
     this.preview =
-      snapshot && this.previewOffset > 0 ? { ...snapshot, text: this.preview.text } : snapshot;
+      snapshot && !this.previewFollow ? { ...snapshot, text: this.preview.text } : snapshot;
   }
 
   scrollPreview(delta) {
     this.previewOffset = Math.max(0, this.previewOffset + delta);
-    if (this.previewOffset === 0 && this.preview) this.preview.text = this.previewLatestText;
+    this.previewFollow = this.preview?.kind === "terminal" && this.previewOffset === 0;
+    if (this.previewFollow && this.preview) this.preview.text = this.previewLatestText;
   }
 
   handleMouse({ x, y, button, action }) {
@@ -1246,6 +1280,7 @@ export class HordeView {
         "m           Toggle mouse capture to select terminal text",
         "c           Cycle inactive agents (collapse / hide / expand)",
         "u           Expand or collapse quota view",
+        "w           Switch compact quota between 5h and weekly",
         "U           Pull available Orkest update",
         "v           Expand or collapse running services view",
         "n           Next page",
@@ -1345,16 +1380,21 @@ export class HordeView {
   quotaSummaryLines(innerWidth) {
     const chevron = disclosure("", true, this.tier);
     const chevronWidth = displayWidth(chevron);
-    const stripWidth = Math.max(1, innerWidth - chevronWidth - 2);
+    const stripWidth = Math.max(1, innerWidth - chevronWidth - 5);
     const appendChevron = (line, isFirst) => {
       const fitted = fitStyled(` ${line}`, stripWidth + 1);
-      if (!isFirst) return `${fitted}${" ".repeat(chevronWidth + 1)}`;
+      if (!isFirst) return `${fitted}${" ".repeat(chevronWidth + 4)}`;
       const mark = tone(
         chevron,
         this.hovered === "quota-heading" ? "quotaHover" : "muted",
         this.appearance,
       );
-      return `${fitted} ${mark}`;
+      const period = tone(
+        this.quotaWindow === "weekly" ? "wk" : "5h",
+        this.hovered === "quota-window" ? "buttonHover" : "leadModel",
+        this.appearance,
+      );
+      return `${fitted} ${period} ${mark}`;
     };
     if (this.room.quotaError) {
       return [appendChevron(`unavailable: ${plain(this.room.quotaError)}`, true)];
@@ -1395,6 +1435,9 @@ export class HordeView {
         else if (pool === "gemini") label = "Gemini";
         if (groups.size === 1 && providerMark(account.provider, this.tier)) label = "";
         const measured = group.filter((window) => Number.isFinite(window.remainingPct));
+        const matching = measured.filter((window) => quotaWindowKind(window) === this.quotaWindow);
+        const active = matching.length > 0 ? matching : measured;
+        const exhausted = measured.some((window) => window.remainingPct <= 0);
         const scope = quotaAccountScope(account);
         const brand = providerMark(account.provider, this.tier);
         const accountLabel = scope
@@ -1405,12 +1448,11 @@ export class HordeView {
               .filter(Boolean)
               .join(" ")
           : [quotaAccountLabel(account, this.tier), label].filter(Boolean).join(" ");
+        const remaining =
+          active.length > 0 ? Math.min(...active.map((window) => window.remainingPct)) : undefined;
         rows.get(scope).push({
           label: accountLabel,
-          remaining:
-            measured.length > 0
-              ? Math.min(...measured.map((window) => window.remainingPct))
-              : undefined,
+          remaining: exhausted ? 0 : remaining,
           detail: formatCreditSuffix(account).replace(/^ · /u, ""),
         });
       }
@@ -1625,7 +1667,7 @@ export class HordeView {
           key: "o",
           disabled: preview.kind !== "terminal",
         },
-        { id: "preview-follow", label: "Follow", key: "r", active: this.previewOffset === 0 },
+        { id: "preview-follow", label: "Follow", key: "r", active: this.previewFollow },
         { id: "preview-up", label: "Up", key: "\u{1B}[5~", hint: "PgUp" },
         { id: "preview-down", label: "Down", key: "\u{1B}[6~", hint: "PgDn" },
         { id: "preview-previous", label: "Prev", key: "[" },
@@ -1647,6 +1689,14 @@ export class HordeView {
             tier: this.tier,
           });
     this.previewOffset = Math.min(this.previewOffset, Math.max(0, rows.length - budget));
+    if (this.previewFollow) {
+      const response =
+        preview.kind === "activity"
+          ? rows.findIndex((line) => /^Response:(?:\s|$)/u.test(plain(line).trim()))
+          : -1;
+      const start = Math.max(0, rows.length - budget);
+      this.previewOffset = response >= 0 ? Math.max(0, start - response) : 0;
+    }
     const end = Math.max(0, rows.length - this.previewOffset);
     const body = rows.slice(Math.max(0, end - budget), end).map((line) => `${pad}${line}`);
     while (body.length < budget) body.push("");
@@ -1693,7 +1743,9 @@ export class HordeView {
     const selected = room.agents.slice(this.page * size, (this.page + 1) * size);
     const phase = phaseLabel;
     const roleOf = (member) => plain(member?.progress?.role || member?.workforceRole || "").trim();
-    const model = (member) => {
+    const style = (text, token) => tone(text, token, this.appearance);
+    const separator = (text) => style(text, "leadSeparator");
+    const model = (member, isStyled = false) => {
       const data = member.progress || member;
       const rawModel =
         member.resolvedModel || data.model || member.model || member.engine || "default model";
@@ -1708,32 +1760,35 @@ export class HordeView {
       const brand =
         providerMark(modelName, this.tier) ||
         providerMark(member.engine || data.harness, this.tier);
+      if (isStyled) {
+        return `${brand ? `${colorProviderMarks(brand, this.appearance)} ` : ""}${style(`${modelName || "default model"}${provenance}`, "leadModel")}${effort && effort !== "—" ? `${separator(" / ")}${style(effort, "leadEffort")}` : ""}`;
+      }
       return `${brand ? `${brand} ` : ""}${modelName || "default model"}${provenance}${effort && effort !== "—" ? ` / ${effort}` : ""}`;
     };
     const innerWidth = Math.max(1, width - 2);
     const leadFolder = agentFolder(lead, room);
     const leadRole = roleOf(lead);
-    const leadRoleBadge = leadRole ? ` [${leadRole}]` : "";
+    const leadRoleBadge = leadRole ? style(` [${leadRole}]`, "leadBranch bold") : "";
     const leadIcon = this.tier === "nerd" ? "\u{F06A9} " : "";
+    const identityColor = lead.color ?? lead.progress?.color;
+    const identityTone = [31, 32, 33, 34, 35, 36].includes(Number(identityColor))
+      ? `identity${identityColor}`
+      : "identity36";
     const leadTitle =
       lead.name || lead.progress?.name
-        ? `${leadIcon}Orchestrator: ${shortAgentName(lead)}`
-        : `${leadIcon}Coordinator`;
+        ? `${style("ork:", "muted")} ${style(`${leadIcon}${shortAgentName(lead)}`, identityTone)}`
+        : `${style(leadIcon, identityTone)}${style("Coordinator", "bold")}`;
     const leadBranch = plain(
       lead.branch || lead.progress?.branch || lead.worktree?.branch || "",
     ).trim();
     const leadEngine = plain(lead.engine || "").trim();
-    const leadPane = plain(
-      lead.herdrPaneId || lead.paneId || lead.progress?.herdrPaneId || lead.progress?.paneId || "",
-    ).trim();
     const leadLocation =
       room.agents.length === 0 || selected.every((agent) => agentFolder(agent, room) !== leadFolder)
-        ? ` · folder: ${shortFolder(leadFolder)}`
+        ? `${separator(" · ")}${style("folder:", "muted")} ${style(shortFolder(leadFolder), "bold")}`
         : "";
     const leadMetaParts = [
-      `${leadTitle}${leadRoleBadge}${leadLocation}${leadBranch ? ` (${leadBranch})` : ""}`,
-      ...(leadEngine ? [leadEngine] : []),
-      ...(leadPane ? [leadPane] : []),
+      `${leadTitle}${leadRoleBadge}${leadLocation}${leadBranch ? style(` (${leadBranch})`, "leadBranch") : ""}`,
+      ...(leadEngine ? [`${style("harness:", "muted")} ${style(leadEngine, "leadEngine")}`] : []),
     ];
     const leadGoal = plain(lead.progress?.goal || "").trim();
     const leadTask = cleanProgressTask(lead);
@@ -1756,9 +1811,17 @@ export class HordeView {
       leadMissionLine && leadRunning
         ? `${tone(this.tier === "ascii" ? ">" : SPINNER[Math.floor(now / 120) % SPINNER.length], "shimmerSpinner", this.appearance)} ${shimmerText(fittedMission, now, this.appearance)}`
         : fittedMission;
+    const stageTone = leadStageTone(lead);
+    const leadSuffix = progressSuffix(lead, now)
+      .split(" · ")
+      .slice(1)
+      .map(
+        (part) => `${separator(" · ")}${style(part, part === "live" ? "leadSuccess" : stageTone)}`,
+      )
+      .join("");
     let leadLines = [
-      leadMetaParts.join(" · "),
-      `${statusGlyph(lead, now, this.tier)} ${model(lead)} | ${phase(lead)}${progressSuffix(lead, now)}`,
+      leadMetaParts.join(separator(" · ")),
+      `${style(statusGlyph(lead, now, this.tier), stageTone)} ${model(lead, true)}${separator(" | ")}${style(phase(lead), stageTone)}${leadSuffix}`,
       ...(leadMissionLine ? [renderedMission] : []),
     ];
     if (lead.status === "session unavailable" && room.agents.length > 0) {
@@ -1821,6 +1884,14 @@ export class HordeView {
           y: lines.length + 1,
           width: innerWidth,
           height: drawerRows.length,
+        },
+        {
+          id: "quota-window",
+          key: "w",
+          x: inside - displayWidth(disclosure("", true, this.tier)) - 2,
+          y: lines.length + 1,
+          width: 3,
+          height: 1,
         },
       ]);
       const vBorder = tone(glyphs.vertical, "border", this.appearance);

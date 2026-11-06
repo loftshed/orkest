@@ -1,10 +1,13 @@
 import { EventEmitter } from "node:events";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { runHordeTui } from "../../../plugins/orchestrate/bin/horde-tui.mjs";
 import { HordeView } from "../../../plugins/orchestrate/lib/horde-view.mjs";
 import { displayWidth, plain } from "../../../plugins/orchestrate/lib/tui-box.mjs";
 import { actionBar, hitTest } from "../../../plugins/orchestrate/lib/tui-components.mjs";
+
+beforeEach(() => vi.stubEnv("NO_COLOR", ""));
+afterEach(() => vi.unstubAllEnvs());
 
 function room() {
   return {
@@ -38,27 +41,31 @@ function click(view, text, width) {
 }
 
 describe("clickable Swarm View", () => {
-  it("returns to the current session's live chat instead of previewing it", () => {
-    const data = room();
-    data.herdrCoordinatorPaneId = "w1:p2";
-    data.conductor = { name: "Current session", session: { id: "session-current" } };
-    const onFocusPane = vi.fn();
-    const onPreview = vi.fn();
-    const view = new HordeView(data, { height: 40, onFocusPane, onPreview });
-    click(view, "3 alpha", 120);
-    expect(onFocusPane.mock.calls[0][0]).toMatchObject({ id: "alpha", herdrPaneId: "w1:p2" });
-    expect(onPreview).not.toHaveBeenCalled();
-    expect(view.render(120).map(plain).join("\n")).not.toContain("Return to chat");
-    view.setRoom(data);
-    view.handleInput("\r");
-    expect(onFocusPane.mock.calls).toHaveLength(2);
-    click(view, "Orchestrator: Current session", 120);
-    expect(onFocusPane.mock.calls.at(-1)[0]).toMatchObject({
-      id: "conductor",
-      herdrPaneId: "w1:p2",
-    });
-    expect(onPreview).not.toHaveBeenCalled();
-  });
+  it.each(["nerd", "unicode", "ascii"])(
+    "returns to the current session's live chat in %s tier",
+    (tier) => {
+      const data = room();
+      data.herdrCoordinatorPaneId = "w1:p2";
+      data.conductor = { name: "Current session", session: { id: "session-current" } };
+      const onFocusPane = vi.fn();
+      const onPreview = vi.fn();
+      const view = new HordeView(data, { height: 40, onFocusPane, onPreview, tier });
+      click(view, "3 alpha", 120);
+      expect(onFocusPane.mock.calls[0][0]).toMatchObject({ id: "alpha", herdrPaneId: "w1:p2" });
+      expect(onPreview).not.toHaveBeenCalled();
+      expect(view.render(120).map(plain).join("\n")).not.toContain("Return to chat");
+      view.setRoom(data);
+      view.handleInput("\r");
+      expect(onFocusPane.mock.calls).toHaveLength(2);
+      const header = tier === "nerd" ? "ork: \u{F06A9} Current session" : "ork: Current session";
+      click(view, header, 120);
+      expect(onFocusPane.mock.calls.at(-1)[0]).toMatchObject({
+        id: "conductor",
+        herdrPaneId: "w1:p2",
+      });
+      expect(onPreview).not.toHaveBeenCalled();
+    },
+  );
 
   it("keeps quota to one summary row until its chevron is clicked", () => {
     const data = room();
@@ -76,6 +83,53 @@ describe("clickable Swarm View", () => {
     expect(view.quotaMode).toBe("expanded");
     expect(view.render(80).map(plain).join("\n")).toContain("\u{F078} Quota");
     click(view, "\u{F078} Quota");
+    expect(view.quotaMode).toBe("collapsed");
+  });
+
+  it.each([40, 80, 160])("toggles quota windows by pointer and keyboard at width %i", (width) => {
+    const data = room();
+    data.accounts = [
+      {
+        short: "CL",
+        windows: [
+          { kind: "5h", remainingPct: 90 },
+          { kind: "weekly", remainingPct: 30 },
+        ],
+      },
+    ];
+    const view = new HordeView(data, { height: 32 });
+    expect(view.render(width).map(plain).join("\n")).toContain("90%");
+    click(view, "5h", width);
+    expect(view.quotaMode).toBe("collapsed");
+    expect(view.render(width).map(plain).join("\n")).toContain("30%");
+    expect(view.quotaWindow).toBe("weekly");
+    view.setRoom(data);
+    expect(view.quotaWindow).toBe("weekly");
+    click(view, "wk", width);
+    expect(view.render(width).map(plain).join("\n")).toContain("90%");
+    for (const [label, nextWindow, percentage] of [
+      ["5h", "weekly", "30%"],
+      ["wk", "5h", "90%"],
+    ]) {
+      const point = pointAt(view, label, width);
+      view.handleMouse({ ...point, x: point.x + 1, action: "press", button: 0 });
+      expect(view.quotaWindow).toBe(nextWindow);
+      expect(view.quotaMode).toBe("collapsed");
+      expect(view.render(width).map(plain).join("\n")).toContain(percentage);
+    }
+    // The space and disclosure after the window label still expand the drawer.
+    for (const offset of [2, 3]) {
+      const point = pointAt(view, "5h", width);
+      view.handleMouse({ ...point, x: point.x + offset, action: "press", button: 0 });
+      expect(view.quotaMode).toBe("expanded");
+      expect(view.quotaWindow).toBe("5h");
+      view.handleInput("u");
+    }
+    view.handleInput("w");
+    expect(view.render(width).map(plain).join("\n")).toContain("30%");
+    click(view, "CL", width);
+    expect(view.quotaMode).toBe("expanded");
+    view.handleInput("u");
     expect(view.quotaMode).toBe("collapsed");
   });
 
@@ -340,6 +394,36 @@ describe("clickable Swarm View", () => {
     expect(view.render(160).map(plain).join("\n")).not.toContain("Chat line 81");
     view.handleInput("\u{1B}[6~");
     expect(view.render(160).map(plain).join("\n")).toContain("Chat line 81");
+  });
+
+  it("anchors long recorded responses while allowing manual scrolling and refresh", () => {
+    const view = new HordeView(room(), { height: 24 });
+    const actions = Array.from({ length: 40 }, (_, i) => `Action ${i}`).join("\n");
+    const answer = Array.from({ length: 60 }, (_, i) => `Answer line ${i + 1}`).join("\n");
+    const text = `Recent activity:\n${actions}\n\nResponse:\n${answer}`;
+    view.setPreview({ agentId: "alpha", title: "alpha", kind: "activity", text });
+    const rendered = () => view.render(80).map(plain).join("\n");
+    expect(rendered()).toContain("Response:");
+    expect(rendered()).toContain("Answer line 1");
+    view.handleInput("\u{1B}[6~");
+    expect(rendered()).toContain("Answer line 20");
+    const held = rendered();
+    view.setPreview({ ...view.preview, text: `${text}\nNew final line` });
+    expect(rendered()).toBe(held);
+    for (let i = 0; i < 10; i++) view.handleInput("\u{1B}[6~");
+    expect(rendered()).toContain("Answer line 60");
+    view.handleInput("r");
+    expect(rendered()).toContain("Response:");
+    view.handleMouse({ x: 4, y: 10, action: "scroll-up", button: 4 });
+    expect(rendered()).toContain("Action 39");
+    view.handleInput("r");
+    view.setPreview({
+      ...view.preview,
+      text: `Recent activity:\n${actions}\n\nResponse:\nShort answer`,
+    });
+    expect(rendered()).toContain("Action 39");
+    expect(rendered()).toContain("Response:");
+    expect(rendered()).toContain("Short answer");
   });
 
   it("renders semantic button colors and retains labels without color", () => {

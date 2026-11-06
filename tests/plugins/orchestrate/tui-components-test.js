@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { HordeView } from "../../../plugins/orchestrate/lib/horde-view.mjs";
 import {
@@ -17,6 +17,9 @@ import {
   treeCard,
 } from "../../../plugins/orchestrate/lib/tui-components.mjs";
 import { DEFAULT_THEME, resolveTheme } from "../../../plugins/orchestrate/lib/tui-theme.mjs";
+
+beforeEach(() => vi.stubEnv("NO_COLOR", ""));
+afterEach(() => vi.unstubAllEnvs());
 
 describe("terminal presentation components", () => {
   it("uses provider brands and distinct business/personal icons without losing account labels", () => {
@@ -79,7 +82,7 @@ describe("terminal presentation components", () => {
     const rows = view.quotaSummaryLines(150);
     expect(rows).toHaveLength(2);
     expect(plain(rows[0]).trimEnd()).toMatch(
-      /^ \u{F1AD} {2}\u{EC82} all ━━━─ 80% {2}\u{EC82} fable ━━── 40% +\u{F078}$/u,
+      /^ \u{F1AD} {2}\u{EC82} all ━━━─ 80% {2}\u{EC82} fable ━━── 40% +5h \u{F078}$/u,
     );
     expect(plain(rows[1]).trimEnd()).toBe(
       " \u{F007}  \u{EC82} ━━── 60%  \u{E7F0} Gemini ━━── 55%  \u{E7F0} Claude/GPT ──── 0%  \u{EC81} ━━━─ 80%",

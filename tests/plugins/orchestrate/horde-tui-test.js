@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   focusAgentPane,
@@ -55,7 +55,9 @@ async function directory() {
   temporary.push(dir);
   return dir;
 }
+beforeEach(() => vi.stubEnv("NO_COLOR", ""));
 afterEach(async () => {
+  vi.unstubAllEnvs();
   await Promise.all(temporary.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
@@ -337,7 +339,7 @@ describe("tui-box primitives and HordeView unification", () => {
     room.agents[1].resolvedModel = "gemini-4-argon-medium";
     room.agents[1].resolvedEffort = "—";
     const rendered = new HordeView(room, { height: 28, tier: "nerd" }).render(90).join("\n");
-    expect(rendered).toContain("Orchestrator: gribble");
+    expect(rendered).toContain("ork: \u{F06A9} gribble");
     expect(rendered).not.toContain("gribble-gemini-4-argon-medium-orkest-1f");
     expect(rendered).toContain("Gemini 4 Argon / medium");
     expect(rendered).not.toContain("(Medium) / medium");
@@ -370,6 +372,134 @@ describe("tui-box primitives and HordeView unification", () => {
     expect(plain(logFrame)).toContain("haiku-1: Source inspected (×2)");
     expect(logFrame).toContain("\u{1B}[36;1mhaiku-1:\u{1B}[0m Source inspected");
     expect(plain(logFrame)).toContain("Room log");
+  });
+
+  it.each([
+    [{ kind: "5h" }, { kind: "weekly" }],
+    [{ windowMins: 300 }, { windowMins: 10_080 }],
+    [{ label: "session" }, { id: "7-day" }],
+  ])("selects measured quota periods with honest fallback and exhaustion", (short, weekly) => {
+    const room = fixture();
+    room.accounts = [
+      {
+        short: "CL",
+        windows: [
+          { ...short, remainingPct: 92 },
+          { ...weekly, remainingPct: 21 },
+        ],
+      },
+      { short: "CX", windows: [{ ...weekly, remainingPct: 63 }] },
+      { short: "OLD", windows: [{ remainingPct: 45 }] },
+      {
+        short: "ZERO",
+        windows: [
+          { ...short, remainingPct: 100 },
+          { ...weekly, remainingPct: 0 },
+        ],
+      },
+    ];
+    const view = new HordeView(room, { tier: "ascii", quotaWindow: "weekly" });
+    expect(view.quotaSummaryLines(140).map(plain).join("\n")).toMatch(
+      /CL .*21%.*CX .*63%.*OLD .*45%.*ZERO .*0%/u,
+    );
+    view.handleInput("w");
+    expect(view.quotaSummaryLines(140).map(plain).join("\n")).toMatch(
+      /CL .*92%.*CX .*63%.*OLD .*45%.*ZERO .*0%/u,
+    );
+  });
+
+  it.each([
+    [31, 203],
+    [32, 114],
+    [33, 221],
+    [34, 111],
+    [35, 176],
+    [36, 80],
+  ])(
+    "styles coordinator identity %i and semantic segments without changing text",
+    (identity, palette) => {
+      const room = fixture();
+      room.agents = [];
+      room.conductor = {
+        name: "gribble",
+        cwd: "/workspace/orkest",
+        branch: "main",
+        engine: "agy",
+        paneId: "w1:p1",
+        model: "gemini-test",
+        effort: "high",
+        status: "blocked",
+        progress: { color: identity, role: "lead" },
+      };
+      const view = new HordeView(room, { color: true, tier: "nerd", now: () => 1000 });
+      const colored = view.render(160).join("\n");
+      expect(colored).toContain(
+        `\u{1B}[2mork:\u{1B}[0m \u{1B}[38;5;${palette};1m\u{F06A9} gribble\u{1B}[0m`,
+      );
+      expect(plain(colored)).toContain("ork: \u{F06A9} gribble");
+      expect(plain(colored)).toContain("harness: agy");
+      expect(colored).toContain("\u{1B}[2mharness:\u{1B}[0m \u{1B}[38;5;80magy\u{1B}[0m");
+      expect(plain(colored)).not.toContain("w1:p1");
+      expect(colored).toContain("\u{1B}[38;5;117;1mgemini-test");
+      expect(colored).toContain("\u{1B}[38;5;180;1mhigh");
+      expect(colored).toContain("\u{1B}[38;5;245m | ");
+      expect(colored).toContain("\u{1B}[38;5;245m / ");
+      expect(colored).toContain("\u{1B}[1morkest");
+      expect(colored).toContain("\u{1B}[38;5;176m (main)");
+      expect(colored).toContain("\u{1B}[38;5;221;1mblocked");
+      const uncolored = new HordeView(room, { color: false, tier: "nerd", now: () => 1000 })
+        .render(160)
+        .join("\n");
+      expect(colored.split("\n").map(plain).join("\n")).toBe(uncolored);
+      for (const tier of ["nerd", "unicode", "ascii"]) {
+        const narrow = new HordeView(room, { color: true, tier }).render(40);
+        expect(narrow.every((line) => displayWidth(line) <= 40)).toBe(true);
+        expect(narrow.map(plain).join("\n")).toContain(
+          tier === "nerd" ? "ork: \u{F06A9} gribble" : "ork: gribble",
+        );
+      }
+    },
+  );
+
+  it.each([
+    ["failed", 203],
+    ["completed", 114],
+    ["planning", 180],
+    ["testing", 80],
+    ["running", 117],
+  ])("colors the %s coordinator stage", (status, code) => {
+    const room = fixture();
+    room.conductor.status = status;
+    const text = new HordeView(room, { color: true }).render(140).join("\n");
+    expect(text).toContain(`\u{1B}[38;5;${code};1m${status}`);
+  });
+
+  it("uses explicit identity color and marks fresh progress as live", () => {
+    const room = fixture();
+    room.conductor = {
+      name: "gribble",
+      status: "running",
+      color: 35,
+      progress: { color: 31, reportedAt: "2026-11-06T12:00:00Z" },
+    };
+    const options = { color: true, tier: "nerd", now: () => Date.parse("2026-11-06T12:00:10Z") };
+    const live = new HordeView(room, options).render(140).join("\n");
+    expect(live).toContain("\u{1B}[38;5;176;1m\u{F06A9} gribble");
+    expect(live).toContain("\u{1B}[38;5;114;1mlive");
+    room.conductor.paused = true;
+    const paused = new HordeView(room, options).render(140).join("\n");
+    expect(paused).toContain("\u{1B}[38;5;221;1mnew launches paused");
+  });
+
+  it("honors NO_COLOR for coordinator styling", () => {
+    vi.stubEnv("NO_COLOR", "1");
+    try {
+      const text = new HordeView(fixture(), { color: true }).render(100).join("\n");
+      expect(text).toContain("Coordinator");
+      expect(text).toBe(text.split("\n").map(plain).join("\n"));
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it("starts quota collapsed with each account's lowest remaining percentage on one row", () => {
@@ -1195,7 +1325,8 @@ describe("terminal lifecycle", () => {
       now: () => 20_000,
     });
     const expandedText = view.render(100).join("\n");
-    expect(expandedText).toContain("Orchestrator: gribble (feat/swarm-view) · agy · pane-lead-1");
+    expect(expandedText).toContain("ork: gribble (feat/swarm-view) · harness: agy");
+    expect(expandedText).not.toContain("pane-lead-1");
     expect(expandedText).toContain("Ship Swarm View v2 — Coordinating slice 2A");
     expect(expandedText).toContain("▾ Quota");
     expect(expandedText).toContain("▾ Services");
@@ -1211,7 +1342,7 @@ describe("terminal lifecycle", () => {
     expect(view.handleKey("u")).toBe(true);
     expect(view.quotaMode).toBe("collapsed");
     const collapsedText = view.render(100).join("\n");
-    expect(collapsedText).toContain("C ━━━─ 81%");
+    expect(collapsedText).toContain("C ━━━─ 92%");
     expect(collapsedText).toContain("K ━━━─ 64%");
     expect(collapsedText.split("\n").filter((line) => line.includes("Quota"))).toHaveLength(0);
 

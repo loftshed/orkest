@@ -1,10 +1,15 @@
 import { appendFile, mkdir, mkdtemp, rename, rm, stat, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { readAudit } = vi.hoisted(() => ({ readAudit: [] }));
+
+vi.mock("node:os", async (importOriginal) => {
+  const actual = await importOriginal();
+  return { ...actual, homedir: vi.fn(actual.homedir) };
+});
 
 vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal();
@@ -44,6 +49,7 @@ beforeEach(async () => {
   readAudit.length = 0;
   resetActivityCursorCache();
   context.root = await mkdtemp(path.join(tmpdir(), "ork-agent-activity-"));
+  vi.mocked(homedir).mockReturnValue(context.root);
 });
 
 afterEach(async () => {
@@ -77,6 +83,10 @@ function codexTool(name, arguments_) {
     type: "response_item",
     payload: { type: "function_call", name, arguments: arguments_ },
   };
+}
+
+function codexCustomTool(name, input) {
+  return { type: "response_item", payload: { type: "custom_tool_call", name, input } };
 }
 
 function jsonl(...rows) {
@@ -181,6 +191,255 @@ function createOpenCodeDb(dbPath, session) {
 }
 
 describe("agent activity streaming cursors", () => {
+  it.each([
+    ['await tools.exec_command({cmd: "git status --short"})', "git status --short"],
+    ["await tools.exec_command({cmd: 'git diff --stat'})", "git diff --stat"],
+    ["await tools.exec_command({cmd: `git log -1`})", "git log -1"],
+    [String.raw`await tools.exec_command({"cmd":"echo \"ready\""})`, 'echo "ready"'],
+    [JSON.stringify({ cmd: "git branch --show-current" }), "git branch --show-current"],
+  ])("extracts shell commands from Codex custom tool input %s", async (input, command) => {
+    await codexTranscript(
+      context.root,
+      "custom-exec",
+      jsonl(codexCustomTool("functions.exec", input)),
+    );
+    expect(
+      await readAgentActivity({ activitySource: codexSource(context.root, "custom-exec") }),
+    ).toBe(`Used functions.exec · ${command}`);
+  });
+
+  it("shows file paths from custom patch input", async () => {
+    const patch =
+      "*** Begin Patch\n*** Update File: src/view.mjs\n@@\n-old\n+new\n*** Add File: docs/view.md\n+Example\n*** Delete File: old.txt\n*** End Patch";
+    await codexTranscript(
+      context.root,
+      "custom-patch",
+      jsonl(codexCustomTool("apply_patch", patch)),
+    );
+    expect(
+      await readAgentActivity({ activitySource: codexSource(context.root, "custom-patch") }),
+    ).toBe("Used apply_patch · src/view.mjs, docs/view.md, old.txt");
+  });
+
+  it("caps custom tool details without merging different raw inputs", async () => {
+    const prefix = `echo ${"x".repeat(235)}`;
+    const first = codexCustomTool(
+      "functions.exec",
+      `await tools.exec_command({cmd: "${prefix}first"})`,
+    );
+    const second = codexCustomTool(
+      "functions.exec",
+      `await tools.exec_command({cmd: "${prefix}second"})`,
+    );
+    await codexTranscript(context.root, "custom-long", jsonl(first, first, second));
+    expect(
+      await readAgentActivity({ activitySource: codexSource(context.root, "custom-long") }),
+    ).toBe(`Used functions.exec · ${prefix}… (×2)\nUsed functions.exec · ${prefix}…`);
+  });
+
+  it.each(["description", "path", "pattern", "subject", "cmd"])(
+    "caps structured %s tool details",
+    async (field) => {
+      const detail = "x".repeat(300);
+      await codexTranscript(
+        context.root,
+        "long-detail",
+        jsonl(codexTool("inspect", { [field]: detail })),
+      );
+      expect(
+        await readAgentActivity({ activitySource: codexSource(context.root, "long-detail") }),
+      ).toBe(`Used inspect · ${"x".repeat(240)}…`);
+    },
+  );
+
+  it("removes memory citations from assistant messages and reports", async () => {
+    const citation =
+      "<oai-mem-citation>\n<citation_entries>\nnotes.md:1-2\n</citation_entries>\n</oai-mem-citation>";
+    await codexTranscript(
+      context.root,
+      "citations",
+      jsonl(codexText(`Visible update.\n${citation}`), codexText(citation)),
+    );
+    expect(
+      await readAgentActivity({
+        activitySource: codexSource(context.root, "citations"),
+        answer: `Done.\n${citation}`,
+      }),
+    ).toBe("Recent activity:\nVisible update.\n\nResponse:\nDone.");
+  });
+
+  it.each(["objective", "progress", "question"])(
+    "preserves long task descriptions from %s up to 4000 characters",
+    async (field) => {
+      const task = `Review this plan:\n${"detail ".repeat(100)}`;
+      const agent = (text) => ({
+        [field]: field === "progress" ? { task: text } : text,
+        answer: "Done.",
+      });
+      expect(await readAgentActivity(agent(task))).toBe(`Task: ${task.trim()}\n\nResponse:\nDone.`);
+      const overlongTask = "x".repeat(4100);
+      expect(await readAgentActivity(agent(overlongTask))).toBe(
+        `Task: ${"x".repeat(4000)}…\n\nResponse:\nDone.`,
+      );
+    },
+  );
+
+  it.each(["codex", "claude", "agy"])(
+    "loads %s session activity using result metadata and its default account directory",
+    async (engine) => {
+      const session = "result-session";
+      const cwd = "/workspace/project";
+      if (engine === "codex") {
+        await codexTranscript(
+          path.join(context.root, ".codex"),
+          session,
+          jsonl(codexText("Recovered update.")),
+        );
+      } else if (engine === "claude") {
+        const directory = path.join(context.root, ".claude", "projects", "-workspace-project");
+        await mkdir(directory, { recursive: true });
+        await writeFile(
+          path.join(directory, `${session}.jsonl`),
+          jsonl({
+            type: "assistant",
+            message: { content: [{ type: "text", text: "Recovered update." }] },
+          }),
+        );
+      } else {
+        await agyTranscript(path.join(context.root, ".gemini"), session, "transcript_full.jsonl", [
+          { type: "PLANNER_RESPONSE", content: "Recovered update." },
+        ]);
+      }
+      const resultPath = path.join(context.root, "result.json");
+      await writeFile(
+        resultPath,
+        JSON.stringify({
+          engine,
+          session_id: session,
+          started_at: "2026-11-05T12:00:00.000Z",
+          repository: cwd,
+          final_message: "Finished report.",
+        }),
+      );
+      expect(await readAgentActivity({ resultPath })).toBe(
+        "Recent activity:\nRecovered update.\n\nResponse:\nFinished report.",
+      );
+      await codexTranscript(
+        context.root,
+        "explicit-source",
+        jsonl(codexText("Explicit source wins.")),
+      );
+      expect(
+        await readAgentActivity({
+          resultPath,
+          activitySource: codexSource(context.root, "explicit-source"),
+        }),
+      ).toBe("Recent activity:\nExplicit source wins.\n\nResponse:\nFinished report.");
+    },
+  );
+
+  it("recovers full reports from explicit artifacts and truncated-summary siblings", async () => {
+    const answer = `${"Detailed finding. ".repeat(600)}Final conclusion.\n\n\u{60}\u{60}\u{60}js\nif (ready) {\n  run();\n}\n\u{60}\u{60}\u{60}`;
+    const resultPath = path.join(context.root, "result.json");
+    const fullPath = path.join(context.root, "report.txt");
+    await writeFile(fullPath, answer);
+    await writeFile(
+      resultPath,
+      JSON.stringify({ final_message: "Short summary", final_output_path: fullPath }),
+    );
+    expect(await readAgentActivity({ resultPath })).toBe(`Response:\n${answer}`);
+    await writeFile(path.join(context.root, "final-output.txt"), answer);
+    await writeFile(
+      resultPath,
+      JSON.stringify({
+        final_message: "Start [truncated; complete report is in the raw artifacts] end",
+      }),
+    );
+    expect(await readAgentActivity({ resultPath })).toBe(`Response:\n${answer}`);
+    await writeFile(
+      resultPath,
+      JSON.stringify({ final_message: "Summary survives", final_output_path: "missing.txt" }),
+    );
+    expect(await readAgentActivity({ resultPath })).toBe("Response:\nSummary survives");
+  });
+
+  it("keeps long updates and messages and marks the extreme response ceiling", async () => {
+    const update = `Start ${"detail ".repeat(500)}update end`;
+    await codexTranscript(context.root, "long-text", jsonl(codexText(update)));
+    const text = await readAgentActivity({
+      activitySource: codexSource(context.root, "long-text"),
+      answer: "a".repeat(33_000),
+      messages: [{ text: update }],
+    });
+    expect(text).toContain(`Messages to orchestrator:\n• ${update}`);
+    expect(text).toContain(`Recent activity:\n${update}`);
+    expect(text).toContain(`Response:\n${"a".repeat(32_000)}…`);
+  });
+
+  it("keeps distinct long commands, orders actions before the response, and reports overflow", async () => {
+    const prefix = `echo ${"shared-prefix-".repeat(12)}`;
+    const first = codexTool("Bash", { command: `${prefix}first` });
+    const second = codexTool("Bash", { command: `${prefix}second` });
+    const file = await codexTranscript(context.root, "long-actions", jsonl(first, second));
+    const agent = {
+      activitySource: codexSource(context.root, "long-actions"),
+      answer: "Final response",
+    };
+    expect(await readAgentActivity(agent)).toBe(
+      `Recent activity:\nUsed Bash · ${prefix}first\nUsed Bash · ${prefix}second\n\nResponse:\nFinal response`,
+    );
+    const actions = Array.from({ length: 130 }, (_, i) =>
+      codexTool("Bash", { command: `echo action-${i}` }),
+    );
+    await appendFile(file, jsonl(...actions));
+    const text = await readAgentActivity(agent);
+    expect(text).toContain("… 12 earlier actions omitted");
+    expect(text).toContain("Used Bash · echo action-10\nUsed Bash · echo action-11");
+    expect(text).toContain("Used Bash · echo action-129\n\nResponse:\nFinal response");
+  });
+
+  it("does not collapse different commands that share a description", async () => {
+    await codexTranscript(
+      context.root,
+      "described-actions",
+      jsonl(
+        codexTool("Bash", { description: "Check files", command: "cat first.txt" }),
+        codexTool("Bash", { description: "Check files", command: "cat second.txt" }),
+      ),
+    );
+    expect(
+      await readAgentActivity({ activitySource: codexSource(context.root, "described-actions") }),
+    ).toBe("Used Bash · Check files\nUsed Bash · Check files");
+  });
+
+  it("retains chronological order when old commentary is pinned around retained tools", async () => {
+    const rows = [
+      codexText("Opening update"),
+      ...Array.from({ length: 140 }, (_, i) =>
+        i === 50 ? codexText("Middle update") : codexTool("Bash", { command: `echo action-${i}` }),
+      ),
+    ];
+    await codexTranscript(context.root, "ordered-actions", jsonl(...rows));
+    const text = await readAgentActivity({
+      activitySource: codexSource(context.root, "ordered-actions"),
+    });
+    expect(text).toContain("Opening update\nUsed Bash · echo action-20");
+    expect(text).toContain("Used Bash · echo action-49\nMiddle update\nUsed Bash · echo action-51");
+  });
+
+  it("reads a complete final JSONL record without a newline exactly once", async () => {
+    const file = await codexTranscript(
+      context.root,
+      "no-newline",
+      JSON.stringify(codexText("Final record")),
+    );
+    const agent = { activitySource: codexSource(context.root, "no-newline") };
+    expect(await readAgentActivity(agent)).toBe("Final record");
+    expect(await readAgentActivity(agent)).toBe("Final record");
+    await appendFile(file, `\n${jsonl(codexText("Next record"))}`);
+    expect(await readAgentActivity(agent)).toBe("Final record\nNext record");
+  });
+
   it("reads only appended bytes and performs no reads while the file is idle", async () => {
     const session = "incremental-session";
     const file = await codexTranscript(context.root, session, jsonl(codexText("Started")));

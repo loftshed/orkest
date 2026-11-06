@@ -136,4 +136,11 @@ it("formats Herdr swarm pane labels and syncs live title changes to Herdr", asyn
   );
   expect(await syncHerdrViewLabel(room, { env, exec })).toBe(false);
   expect(calls).toHaveLength(1);
+  expect(
+    herdrSwarmPaneLabel({
+      id: "room-b",
+      title:
+        "Toggle compact usage meters (5h/weekly), add rich color differentiation to Orchestrator header",
+    }),
+  ).toBe("Swarm · Toggle compact usage meters (5h/weekly), add rich color differentiation");
 });

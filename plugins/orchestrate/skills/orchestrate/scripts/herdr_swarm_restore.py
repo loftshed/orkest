@@ -38,7 +38,7 @@ def swarm_pane_label(base: Path, room: str) -> str:
         ),
         "",
     )
-    cleaned = " ".join(raw.split())[:72]
+    cleaned = " ".join(raw.split())[:72].rstrip()
     return f"Swarm · {cleaned}" if cleaned else "Orkest Swarm"
 
 
@@ -186,7 +186,8 @@ def locate(record: dict[str, Any], panes: list[dict[str, Any]]) -> dict[str, Any
     label = record.get("label")
     if not isinstance(label, str) or not label.startswith(VALID_LABEL_PREFIXES):
         return None
-    matches = [pane for pane in panes if pane.get("label") == label]
+    normalized = label.strip()
+    matches = [pane for pane in panes if isinstance(pane.get("label"), str) and pane["label"].strip() == normalized]
     if len(matches) == 1:
         return matches[0]
     if len(matches) > 1 and isinstance(record.get("pane"), str):

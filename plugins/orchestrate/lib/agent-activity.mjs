@@ -7,9 +7,9 @@ const SESSION_ID = /^[A-Za-z0-9_-]{1,100}$/u;
 const MAX_BYTES = 2 * 1024 * 1024;
 const MAX_CHUNK_BYTES = 64 * 1024;
 const MAX_CURSORS = 64;
-const MAX_EVENTS = 24;
-const MAX_PINNED_TEXTS = 6;
-const MAX_RECENT_TOOLS = 16;
+const MAX_EVENTS = 120;
+const MAX_PINNED_TEXTS = 24;
+const MAX_RECENT_TOOLS = 80;
 const MAX_PENDING_BYTES = MAX_BYTES;
 const MAX_SENT_MESSAGES = 64;
 const TAB_BYTE = 9;
@@ -45,16 +45,13 @@ function shortText(value) {
   return typeof value === "string" ? value.trim().replaceAll(/\s+/gu, " ").slice(0, 400) : "";
 }
 
-function assistantText(value, maxChars = 1600) {
+function assistantText(value, maxChars = 32_000) {
   if (typeof value !== "string") return "";
-  return value
+  const text = value
+    .replaceAll(/<oai-mem-citation>[\s\S]*?<\/oai-mem-citation>/gu, "")
     .replaceAll("\r\n", "\n")
-    .split("\n")
-    .map((line) => line.replaceAll(/[\t ]+/gu, " ").trimEnd())
-    .join("\n")
-    .replaceAll(/\n{3,}/gu, "\n\n")
-    .trim()
-    .slice(0, maxChars);
+    .trim();
+  return text.length > maxChars ? `${text.slice(0, maxChars)}…` : text;
 }
 
 function parseToolArgs(args) {
@@ -85,37 +82,63 @@ function cleanShellCommand(rawCommand) {
       /['"]([A-Za-z0-9_./-]+\.(?:tsx?|jsx?|mjs|cjs|py|md|json|css|scss|html))['"]/u,
     );
     const target = fileMatch?.[1] ? path.basename(fileMatch[1]) : "";
-    return target ? `python3 inline script (${target})` : "python3 inline script";
+    return assistantText(
+      target ? `python3 inline script (${target})` : "python3 inline script",
+      240,
+    );
   }
-  return s.slice(0, 96);
+  return assistantText(s, 240);
 }
 
-function toolDetail(parsed) {
-  if (!parsed || typeof parsed !== "object") return "";
-  const desc = shortText(parsed.description || parsed.toolSummary || "");
-  if (desc) return desc.slice(0, 96);
-  const file = parsed.AbsolutePath || parsed.file_path || parsed.path || parsed.SearchPath;
-  const pattern = shortText(parsed.pattern || parsed.Query || parsed.Pattern || "");
-  if (pattern && typeof file === "string" && file) {
-    return `${pattern.slice(0, 60)} · ${path.basename(file)}`;
+function toolDetail(parsed, rawArgs) {
+  if (!parsed || typeof parsed !== "object") {
+    if (typeof rawArgs !== "string") return "";
+    const files = rawArgs.matchAll(/^\*\*\* (?:Update|Add|Delete) File: (.+)$/gmu).toArray();
+    if (files.length > 0)
+      return assistantText(files.map((match) => match[1].trim()).join(", "), 240);
+    const command = rawArgs.match(
+      /(?:\bcmd|["']cmd["'])\s*:\s*("(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|`(?:\\[\s\S]|[^`\\])*`)/u,
+    )?.[1];
+    if (!command) return "";
+    if (command.startsWith('"')) {
+      try {
+        return cleanShellCommand(JSON.parse(command));
+      } catch {
+        // JavaScript strings can contain escapes that JSON does not accept.
+      }
+    }
+    return cleanShellCommand(command.slice(1, -1).replaceAll(/\\([\\"'`])/gu, "$1"));
   }
-  if (typeof file === "string" && file) return path.basename(file);
-  if (pattern) return pattern.slice(0, 80);
+  const desc = assistantText(parsed.description || parsed.toolSummary || "", 240);
+  if (desc) return desc;
+  const file = parsed.AbsolutePath || parsed.file_path || parsed.path || parsed.SearchPath;
+  const pattern = assistantText(parsed.pattern || parsed.Query || parsed.Pattern || "");
+  if (pattern && typeof file === "string" && file) {
+    return assistantText(`${pattern} · ${path.basename(file)}`, 240);
+  }
+  if (typeof file === "string" && file) return assistantText(path.basename(file), 240);
+  if (pattern) return assistantText(pattern, 240);
   const cmd = cleanShellCommand(parsed.command || parsed.CommandLine || parsed.cmd || "");
   if (cmd) return cmd;
-  const sub = shortText(parsed.Role || parsed.subject || "");
-  if (sub) return sub.slice(0, 80);
+  const sub = assistantText(parsed.Role || parsed.subject || "", 240);
+  if (sub) return sub;
   return "";
 }
 
 function toolLabel(name, args) {
   const parsed = parseToolArgs(args);
-  const detail = toolDetail(parsed);
-  return `Used ${shortText(name)}${detail ? ` · ${detail}` : ""}`;
+  const detail = toolDetail(parsed, args);
+  return {
+    label: `Used ${shortText(name)}${detail ? ` · ${detail}` : ""}`,
+    key: JSON.stringify([name, args]),
+  };
 }
 
 function createActivityState() {
   return {
+    sequence: 0,
+    toolCount: 0,
+    textCount: 0,
     commentary: [],
     handback: "",
     lastEvent: null,
@@ -127,11 +150,13 @@ function createActivityState() {
 }
 
 function addActivityEvent(state, kind, value) {
-  const normalizedValue = kind === "text" ? assistantText(value, 1600) : value.slice(0, 400);
+  const normalizedValue = kind === "text" ? assistantText(value) : value.label;
   if (!normalizedValue) return;
 
+  if (kind === "tool") state.toolCount++;
+  else state.textCount++;
   const previous = state.lastEvent;
-  if (kind === "tool" && previous?.kind === "tool" && previous.baseValue === normalizedValue) {
+  if (kind === "tool" && previous?.kind === "tool" && previous.key === value.key) {
     previous.count++;
     previous.value = `${previous.baseValue} (×${previous.count})`;
     return;
@@ -139,8 +164,9 @@ function addActivityEvent(state, kind, value) {
 
   const item =
     kind === "tool"
-      ? { kind, value: normalizedValue, baseValue: normalizedValue, count: 1 }
+      ? { kind, value: normalizedValue, baseValue: normalizedValue, key: value.key, count: 1 }
       : { kind, value: normalizedValue };
+  item.sequence = state.sequence++;
   state.lastEvent = item;
   state.recentEvents.push(item);
   if (state.recentEvents.length > MAX_EVENTS) state.recentEvents.shift();
@@ -154,7 +180,7 @@ function addActivityEvent(state, kind, value) {
 }
 
 function addSentMessage(state, to, rawText) {
-  const text = assistantText(rawText, 600);
+  const text = assistantText(rawText, 4000);
   if (!text || state.sentMessageKeys.has(text)) return;
   state.sentMessageKeys.add(text);
   state.sentMessages.push({ to: shortText(to || ""), text });
@@ -164,45 +190,21 @@ function addSentMessage(state, to, rawText) {
 }
 
 function activitySummary(state) {
-  const tailSlice = state.recentEvents;
-  const tailHasText = tailSlice.some((item) => item.kind === "text");
-  let selected = tailSlice;
-  if (tailHasText) {
-    const tailTexts = new Set(tailSlice.filter((item) => item.kind === "text"));
-    const textRoom = Math.max(
-      0,
-      MAX_PINNED_TEXTS - tailSlice.filter((item) => item.kind === "text").length,
-    );
-    const earlierTexts = textRoom
-      ? state.commentary.filter((item) => !tailTexts.has(item)).slice(-textRoom)
-      : [];
-    if (earlierTexts.length > 0) {
-      selected = [...earlierTexts, ...tailSlice.slice(-(MAX_EVENTS - earlierTexts.length))];
-    }
-  } else {
-    selected = [...state.commentary, ...state.recentTools];
-  }
-
-  let lastTextIndex = -1;
-  for (let index = selected.length - 1; index >= 0; index--) {
-    if (selected[index].kind === "text") {
-      lastTextIndex = index;
-      break;
-    }
-  }
-  const eventsText = selected
-    .map((item, index) =>
-      item.kind === "text"
-        ? assistantText(item.value, index === lastTextIndex ? 1600 : 400)
-        : item.value,
-    )
-    .filter(Boolean)
-    .join("\n");
-  const commentary = state.commentary
-    .map((item, index) =>
-      assistantText(item.value, index === state.commentary.length - 1 ? 1600 : 400),
-    )
-    .filter(Boolean);
+  // Pinned commentary and retained tools share transcript order, even across gaps.
+  const selected = [
+    ...new Set([...state.recentEvents, ...state.commentary, ...state.recentTools]),
+  ].sort((a, b) => a.sequence - b.sequence);
+  const omittedTools =
+    state.toolCount -
+    selected.reduce((count, item) => count + (item.kind === "tool" ? item.count : 0), 0);
+  const omittedTexts = state.textCount - selected.filter((item) => item.kind === "text").length;
+  const eventsText = [
+    ...(state.truncatedStart ? ["… Earlier transcript bytes omitted"] : []),
+    ...(omittedTools ? [`… ${omittedTools} earlier actions omitted`] : []),
+    ...(omittedTexts ? [`… ${omittedTexts} earlier updates omitted`] : []),
+    ...selected.map((item) => item.value),
+  ].join("\n");
+  const commentary = state.commentary.map((item) => item.value);
   return {
     eventsText,
     handback: state.handback,
@@ -233,7 +235,7 @@ function parseTranscriptLine(state, line, engine) {
     const toolCalls = row.tool_calls || [];
     for (const call of toolCalls) {
       const parsedArgs = parseToolArgs(call.args);
-      if (call.name === "send_message" && assistantText(parsedArgs?.Message, 600)) {
+      if (call.name === "send_message" && assistantText(parsedArgs?.Message, 4000)) {
         addSentMessage(state, parsedArgs.Recipient, parsedArgs.Message);
         continue;
       }
@@ -250,14 +252,14 @@ function parseTranscriptLine(state, line, engine) {
       if (block.name === "SubagentHandback") {
         const message = assistantText(
           parsedInput?.message || parsedInput?.content || parsedInput?.report || "",
-          1600,
+          32_000,
         );
         if (message) state.handback = message;
         continue;
       }
       if (
         block.name === "SendMessage" &&
-        assistantText(parsedInput?.message || parsedInput?.content || "", 600)
+        assistantText(parsedInput?.message || parsedInput?.content || "", 4000)
       ) {
         addSentMessage(
           state,
@@ -276,7 +278,7 @@ function parseTranscriptLine(state, line, engine) {
         if (block.type === "output_text" && assistantText(block.text))
           addActivityEvent(state, "text", block.text);
     } else if (item?.type === "function_call" || item?.type === "custom_tool_call") {
-      addActivityEvent(state, "tool", toolLabel(item.name, item.arguments));
+      addActivityEvent(state, "tool", toolLabel(item.name, item.arguments ?? item.input));
     }
   }
 }
@@ -307,6 +309,7 @@ function consumeTranscriptBytes(cursor, bytes, engine) {
   if (cursor.discardUntilNewline) {
     cursor.pendingBytes = Buffer.alloc(0);
   } else if (remaining.length > MAX_PENDING_BYTES) {
+    cursor.parsed.truncatedStart = true;
     cursor.discardUntilNewline = true;
     cursor.pendingBytes = Buffer.alloc(0);
   } else {
@@ -319,6 +322,7 @@ function consumeTranscriptBytes(cursor, bytes, engine) {
 function createTranscriptCursor(info) {
   const startOffset = info.size > BigInt(MAX_BYTES) ? info.size - BigInt(MAX_BYTES) : 0n;
   const parsed = createActivityState();
+  parsed.truncatedStart = startOffset > 0n;
   return {
     ino: info.ino,
     size: info.size,
@@ -430,6 +434,15 @@ async function readTranscript(file, engine) {
         }
         consumeTranscriptBytes(cursor, chunk, engine);
       }
+      // A complete JSON object at EOF is a record even without a final newline.
+      // Incomplete bytes stay pending until the writer finishes the record.
+      const pending = cursor.pendingBytes.toString("utf8");
+      if (parseJsonObject(pending)) {
+        parseTranscriptLine(cursor.parsed, pending, engine);
+        cursor.pendingBytes = Buffer.alloc(0);
+        cursor.byteOffset = cursor.readOffset;
+      }
+      cursor.summary = activitySummary(cursor.parsed);
       cursor.ino = info.ino;
       cursor.size = info.size;
       cursor.mtimeNs = info.mtimeNs;
@@ -599,9 +612,14 @@ async function fileExists(targetPath) {
   }
 }
 
-async function transcriptFile(source, home) {
+async function transcriptFile(source) {
   const { engine, session = "", parentSession, cwd, parentCwd, roomCwd, startedAt } = source;
-  const accountHome = source.accountHome || home || "";
+  const defaultDirectories = { codex: ".codex", claude: ".claude", agy: ".gemini" };
+  const accountHome =
+    source.accountHome ||
+    (Object.hasOwn(defaultDirectories, engine)
+      ? path.join(homedir(), defaultDirectories[engine])
+      : "");
   const subagentId =
     source.agentId || (session.startsWith("subagent-") ? session.slice("subagent-".length) : "");
   const effectiveSession = session || (subagentId ? `subagent-${subagentId}` : "");
@@ -663,20 +681,47 @@ async function readResultSummary(resultPath) {
     const raw = await readFile(resultPath, "utf8");
     const parsed = JSON.parse(raw);
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      const answer = assistantText(
-        parsed.answer || parsed.final_message || parsed.reported_outcome || "",
-        1600,
-      );
-      const uncertainty = assistantText(parsed.uncertainty || "", 600);
-      const error = assistantText(parsed.error || "", 600);
+      let fullOutput = "";
+      const outputPaths = [];
+      if (typeof parsed.final_output_path === "string" && parsed.final_output_path.trim()) {
+        outputPaths.push(path.resolve(path.dirname(resultPath), parsed.final_output_path));
+      }
+      if (
+        typeof parsed.final_message === "string" &&
+        parsed.final_message.includes("[truncated; complete report is in the raw artifacts]")
+      ) {
+        outputPaths.push(path.join(path.dirname(resultPath), "final-output.txt"));
+      }
+      for (const outputPath of outputPaths) {
+        try {
+          fullOutput = assistantText(await readFile(outputPath, "utf8"));
+          if (fullOutput) break;
+        } catch {
+          // Retain the report summary if its raw artifact is no longer available.
+        }
+      }
+      const answer =
+        fullOutput ||
+        assistantText(parsed.answer || parsed.final_message || parsed.reported_outcome || "");
+      const uncertainty = assistantText(parsed.uncertainty || "", 4000);
+      const error = assistantText(parsed.error || "", 4000);
       const verification =
         typeof parsed.verification?.status === "string" ? parsed.verification.status.trim() : "";
-      return { answer, uncertainty, error, verification, liveOutput: "" };
+      const activitySource =
+        typeof parsed.engine === "string" && typeof parsed.session_id === "string"
+          ? {
+              engine: parsed.engine,
+              session: parsed.session_id,
+              startedAt: parsed.started_at,
+              cwd: parsed.repository,
+            }
+          : null;
+      return { answer, uncertainty, error, verification, liveOutput: "", activitySource };
     }
   } catch {
     const runDir = path.dirname(resultPath);
     for (const fallbackFile of ["final-output.txt", "stdout.txt"]) {
-      const liveText = assistantText(await tail(path.join(runDir, fallbackFile)), 1600);
+      const liveText = assistantText(await tail(path.join(runDir, fallbackFile)), 32_000);
       if (liveText) {
         return { answer: "", uncertainty: "", error: "", verification: "", liveOutput: liveText };
       }
@@ -688,33 +733,36 @@ async function readResultSummary(resultPath) {
 /** Show recent visible assistant messages, results, and tool actions from a pane-less or finished agent. */
 export async function readAgentActivity(agent) {
   if (!agent || typeof agent !== "object") return "";
-  const source = agent.activitySource;
+  const resultPromise = agent.resultPath
+    ? readResultSummary(agent.resultPath)
+    : Promise.resolve(null);
   const transcriptPromise = (async () => {
+    const source = agent.activitySource || (await resultPromise)?.activitySource;
     if (!source) return { ...EMPTY_ACTIVITY };
     if (source.engine === "opencode") return readOpenCodeActivity(source);
     const file = await transcriptFile(source);
     return file ? readTranscript(file, source.engine) : { ...EMPTY_ACTIVITY };
   })();
-  const [parsedTranscript, resultInfo] = await Promise.all([
-    transcriptPromise,
-    agent.resultPath ? readResultSummary(agent.resultPath) : Promise.resolve(null),
-  ]);
+  const [parsedTranscript, resultInfo] = await Promise.all([transcriptPromise, resultPromise]);
   const transcriptEvents = parsedTranscript.eventsText;
   const commentary = parsedTranscript.commentary || [];
   const answer =
-    resultInfo?.answer || assistantText(agent.answer || "", 1600) || parsedTranscript.handback;
-  const uncertainty = resultInfo?.uncertainty || assistantText(agent.uncertainty || "", 600);
-  const error = resultInfo?.error || assistantText(agent.error || "", 600);
+    resultInfo?.answer || assistantText(agent.answer || "", 32_000) || parsedTranscript.handback;
+  const uncertainty = resultInfo?.uncertainty || assistantText(agent.uncertainty || "", 4000);
+  const error = resultInfo?.error || assistantText(agent.error || "", 4000);
   const verification = resultInfo?.verification || "";
   const liveOutput = resultInfo?.liveOutput || "";
   const rawMessages = Array.isArray(agent.messages) ? [...agent.messages] : [];
   for (const sent of parsedTranscript.sentMessages) {
-    if (rawMessages.every((m) => assistantText(m.text || "", 600) !== sent.text)) {
+    if (rawMessages.every((m) => assistantText(m.text || "", 4000) !== sent.text)) {
       rawMessages.push(sent);
     }
   }
   const messages = rawMessages;
-  const rawTask = shortText(agent.objective || agent.progress?.task || agent.question || "");
+  const rawTask = assistantText(
+    agent.objective || agent.progress?.task || agent.question || "",
+    4000,
+  );
   const task = rawTask && rawTask !== "not set" ? rawTask : "";
 
   const hasRichActivity = Boolean(
@@ -739,7 +787,7 @@ export async function readAgentActivity(agent) {
     const formattedMessages = messages
       .map((msg) => {
         const kindPrefix = msg.kind ? `[${shortText(msg.kind)}] ` : "";
-        const body = assistantText(msg.text || "", 600);
+        const body = assistantText(msg.text || "", 4000);
         return body ? `• ${kindPrefix}${body}` : "";
       })
       .filter(Boolean);
@@ -747,6 +795,7 @@ export async function readAgentActivity(agent) {
       sections.push(`Messages to orchestrator:\n${formattedMessages.join("\n")}`);
     }
   }
+  if (transcriptEvents) sections.push(`Recent activity:\n${transcriptEvents}`);
   if (answer) {
     const responseLines = [`Response:\n${answer}`];
     if (uncertainty) responseLines.push(`Uncertainty: ${uncertainty}`);
@@ -765,7 +814,6 @@ export async function readAgentActivity(agent) {
   }
   if (error) sections.push(`Error: ${error}`);
   if (liveOutput) sections.push(`Live output:\n${liveOutput}`);
-  if (transcriptEvents) sections.push(`Recent activity:\n${transcriptEvents}`);
   return sections.join("\n\n");
 }
 

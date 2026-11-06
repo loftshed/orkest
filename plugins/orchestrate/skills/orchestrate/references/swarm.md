@@ -96,12 +96,17 @@ coordinator card returns to the current session's interactive chat. In Herdr,
 the view temporarily expands to show the preview on the left and agents on the right. **Agents**
 returns to the original split; **Open terminal** opens the real chat for typing. A preview shows
 the current screen, not guaranteed full chat history. Agents without a terminal show recorded activity.
+Recorded activity shows actions before the final response and opens at the response when it spans
+multiple screens. Page Up, Page Down and the mouse wheel scroll the history; **Follow** restores
+automatic positioning. Retention limits show an omission notice.
 
 Quota starts with compact meters grouped into Work and Personal rows, each with its own accent.
-Unassigned accounts stay separate. Each pool shows its lowest remaining percentage; Antigravity's
+Unassigned accounts stay separate. Click `5h`/`wk` or press `w` to switch the compact meters between
+five-hour and weekly windows. Pools without that window show their available usage, and an exhausted
+window always keeps its pool at zero. Antigravity's
 Claude/GPT and Gemini pools remain separate. Icons identify the provider: Claude is orange,
 Antigravity uses blue Google icons for both pools, and Codex is light gray. Icon mode omits AG and CX, and single-pool meters need no pool label.
-Click the quota chevron to expand or collapse the details. The bottom buttons open the log, **Shortcuts**,
+Click the meters or quota chevron, or press `u`, to expand or collapse the details. The bottom buttons open the log, **Shortcuts**,
 and other actions. Nerd Font icons are the default; `ORK_GLYPHS=unicode` or `ascii` selects a fallback.
 The **Shortcuts** menu lists keyboard controls, including `m` to toggle mouse capture for text selection.
 

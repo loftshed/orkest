@@ -54,7 +54,7 @@ export function herdrSwarmPaneLabel(room) {
       .map((value) => plain(value || "").trim())
       .find((value) => value && value !== "New swarm" && value !== "not set" && value !== roomId) ||
     "";
-  const cleaned = raw.replaceAll(/\s+/gu, " ").slice(0, 72);
+  const cleaned = raw.replaceAll(/\s+/gu, " ").slice(0, 72).trimEnd();
   return cleaned ? `Swarm · ${cleaned}` : "Orkest Swarm";
 }
 
