@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.65.0
+
+- feat(orchestrate): propagate repo .env and .worktreeinclude across subagents and worktrees (#110)
+
 ## 0.64.1
 
 - fix(orchestrate): harden SQLite concurrency, permissions, OpenCode tail, and Python bridge (#108)
