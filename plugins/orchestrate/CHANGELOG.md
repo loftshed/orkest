@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.63.0
+
+- feat(orchestrate): stream transcript activity via byte-offset cursors and OpenCode SQLite (#105)
+
 ## 0.62.1
 
 - fix(orchestrate): serialize side room allocation, lock reaping, and event acknowledgements (#101) (#103)
