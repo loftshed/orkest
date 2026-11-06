@@ -8,15 +8,7 @@
  * bounded worker runs.
  */
 import { execFile, execFileSync } from "node:child_process";
-import {
-  cpSync,
-  existsSync,
-  mkdirSync,
-  readdirSync,
-  readFileSync,
-  statSync,
-  writeFileSync,
-} from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -28,6 +20,7 @@ import { getAccounts } from "../../monitor/lib/store.mjs";
 import { resolveWorktreeMarkerPath } from "./horde-room.mjs";
 import { glyphSet, glyphTier, renderPanel, renderTable, wrapText } from "./horde-view.mjs";
 import { cacheHome, configPath, envFirst } from "./runtime-paths.mjs";
+import { bootstrapWorktreeInclude as bootstrapWorktreeIncludeShared } from "./worktree-env.mjs";
 
 const execute = promisify(execFile);
 const scriptsDir = fileURLToPath(new URL("../skills/orchestrate/scripts/", import.meta.url));
@@ -726,136 +719,12 @@ export function matchIssueToPool(issues, lanes, activeAllowPaths = [], policy = 
   return matchIssuesToPools(issues, lanes, activeAllowPaths, policy)[0] ?? null;
 }
 
-function globToRegExp(globPattern) {
-  let regexStr = "^";
-  for (let i = 0; i < globPattern.length; i += 1) {
-    const ch = globPattern[i];
-    if (ch === "*") {
-      if (globPattern[i + 1] === "*") {
-        regexStr += ".*";
-        i += 1;
-      } else {
-        regexStr += "[^/]*";
-      }
-    } else if (ch === "?") {
-      regexStr += "[^/]";
-    } else if (".+^${}()|[]\\".includes(ch)) {
-      regexStr += `\\${ch}`;
-    } else {
-      regexStr += ch;
-    }
-  }
-  regexStr += "$";
-  return new RegExp(regexStr, "u");
-}
-
-function listRelativeFilesRecursive(rootDir, currentRel = "") {
-  const absDir = currentRel ? path.join(rootDir, currentRel) : rootDir;
-  let entries;
-  try {
-    entries = readdirSync(absDir, { withFileTypes: true });
-  } catch {
-    return [];
-  }
-  const files = [];
-  for (const entry of entries) {
-    if (entry.name === ".git" || entry.name === "node_modules") continue;
-    const relPath = currentRel ? `${currentRel}/${entry.name}` : entry.name;
-    if (entry.isDirectory()) {
-      files.push(...listRelativeFilesRecursive(rootDir, relPath));
-    } else if (entry.isFile() || entry.isSymbolicLink()) {
-      files.push(relPath);
-    }
-  }
-  return files;
-}
-
-function resolveTrackedFilesSet(repoRoot) {
-  try {
-    const out = execFileSync("git", ["ls-files"], {
-      cwd: repoRoot,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    });
-    return new Set(
-      out
-        .split(/\r?\n/u)
-        .map((line) => normalizeRelativePath(line))
-        .filter(Boolean),
-    );
-  } catch {
-    return new Set();
-  }
-}
-
 /**
- * Copies untracked local files matching `<repoRoot>/.worktreeinclude` patterns
+ * Copies untracked local `.env*` files and `<repoRoot>/.worktreeinclude` patterns
  * from `repoRoot` into `worktreePath`.
  */
-export function bootstrapWorktreeInclude(repoRoot, worktreePath) {
-  if (!repoRoot || !worktreePath) return [];
-  const resolvedRoot = path.resolve(repoRoot);
-  const resolvedWorktree = path.resolve(worktreePath);
-  const includeFile = path.join(resolvedRoot, ".worktreeinclude");
-  if (!existsSync(includeFile)) return [];
-
-  const rawLines = readFileSync(includeFile, "utf8").split(/\r?\n/u);
-  const patterns = rawLines
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0 && !line.startsWith("#"))
-    .map((line) => normalizeRelativePath(line))
-    .filter((pattern) => Boolean(pattern) && !pattern.startsWith(".."));
-  if (patterns.length === 0) return [];
-
-  const trackedSet = resolveTrackedFilesSet(resolvedRoot);
-  const candidateFiles = new Set();
-  let allFiles = null;
-
-  for (const pattern of patterns) {
-    if (/[*?[\]]/u.test(pattern)) {
-      allFiles ??= listRelativeFilesRecursive(resolvedRoot);
-      const matcher = globToRegExp(pattern);
-      for (const relFile of allFiles) {
-        if (matcher.test(relFile) && !trackedSet.has(relFile)) {
-          candidateFiles.add(relFile);
-        }
-      }
-      continue;
-    }
-
-    const sourcePath = path.join(resolvedRoot, pattern);
-    if (!existsSync(sourcePath)) continue;
-    try {
-      const stat = statSync(sourcePath);
-      if (stat.isDirectory()) {
-        for (const relFile of listRelativeFilesRecursive(resolvedRoot, pattern)) {
-          if (!trackedSet.has(relFile)) candidateFiles.add(relFile);
-        }
-      } else if (!trackedSet.has(pattern)) {
-        candidateFiles.add(pattern);
-      }
-    } catch {
-      /* Ignore unreadable candidate paths. */
-    }
-  }
-
-  const sortedFiles = [...candidateFiles].sort((a, b) => a.localeCompare(b));
-  const copied = [];
-  for (const relFile of sortedFiles) {
-    if (relFile.startsWith("..")) continue;
-    const src = path.join(resolvedRoot, relFile);
-    const dest = path.join(resolvedWorktree, relFile);
-    if (
-      path.relative(resolvedRoot, src).startsWith("..") ||
-      path.relative(resolvedWorktree, dest).startsWith("..")
-    ) {
-      continue;
-    }
-    mkdirSync(path.dirname(dest), { recursive: true });
-    cpSync(src, dest, { force: true, recursive: true });
-    copied.push(relFile);
-  }
-  return copied;
+export function bootstrapWorktreeInclude(repoRoot, worktreePath, options) {
+  return bootstrapWorktreeIncludeShared(repoRoot, worktreePath, options);
 }
 
 export function resolveWorktreeGitDir(worktreePath) {
@@ -1137,6 +1006,7 @@ async function provisionDisposableWorktree(cwd, worktreeSlug, branch, issueNumbe
       2,
     )}\n`,
   );
+  bootstrapWorktreeInclude(resolvedCwd, worktreePath, { overwrite: false });
   return worktreePath;
 }
 

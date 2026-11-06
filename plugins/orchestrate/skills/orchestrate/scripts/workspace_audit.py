@@ -556,6 +556,8 @@ def run_verification_commands(
 
     command_results: list[dict[str, Any]] = []
     environment = dict(os.environ)
+    with contextlib.suppress(Exception):
+        _runner().bundled_module("repo_env").apply_repo_dotenv(environment, repo)
     environment["PWD"] = str(repo)
     # Python checks (including their subprocesses) must not mutate the worktree
     # merely by importing project modules. Explicit writers are still audited.

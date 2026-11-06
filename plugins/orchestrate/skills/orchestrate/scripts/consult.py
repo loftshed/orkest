@@ -845,7 +845,13 @@ def consult_environment(
     reading: bool,
     web: bool = False,
 ) -> dict[str, str]:
-    environment = _runner().executor_environment(engine, workspace, claude_config_dir, session_id=session_id)
+    environment = _runner().executor_environment(
+        engine,
+        workspace,
+        claude_config_dir,
+        session_id=session_id,
+        read_only=True,
+    )
     # A standalone consultant must not inherit the supervising actor's mailbox identity.
     for key in ("AGENT_MAILBOX_SESSION", "AGENT_MAILBOX_LISTENER_SESSION", "AGENT_MAILBOX_PEER"):
         environment.pop(key, None)

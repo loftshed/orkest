@@ -11,6 +11,7 @@ evals
 Fira
 glab
 glpat
+GOFLAGS
 gtimeout
 herdr
 killpg
@@ -40,6 +41,8 @@ pyupgrade
 qwen
 RDWR
 refactorer
+RUSTC
+SHLVL
 stooges
 swiftc
 tcsetwinsize

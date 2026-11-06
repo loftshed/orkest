@@ -831,8 +831,16 @@ def executor_environment(
     repo: Path | None = None,
     claude_config_dir: Path | str | None = None,
     session_id: str | None = None,
+    *,
+    read_only: bool = False,
 ) -> dict[str, str]:
     environment = {key: value for key, value in os.environ.items() if not HOST_SESSION_ENV.match(key)}
+    if read_only:
+        environment["ORKEST_READONLY_RUN"] = "1"
+    else:
+        environment.pop("ORKEST_READONLY_RUN", None)
+    if repo is not None:
+        bundled_module("repo_env").apply_repo_dotenv(environment, repo)
     if engine == "claude":
         if claude_config_dir is not None:
             for key in CLAUDE_AUTH_ENV_OVERRIDES:
@@ -1721,6 +1729,8 @@ def native_handoff(args: argparse.Namespace, host: str) -> int:
         enforced_paths=enforced,
         worker_model=args.model or preferred_model(args.engine),
     )
+    if enforced:
+        bundled_module("repo_env").bootstrap_worktree_env(repo, overwrite=False)
     out_dir = prepare_out_dir(args.out_dir, repo)
     scratch = prepare_scratch_dir(out_dir) if not enforced else None
     submitted_path = out_dir / "submitted-brief.txt"
@@ -2251,6 +2261,8 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
             completion_hook=completion_hook,
         )
 
+    if not args.dry_run and previous_result is None and enforced_paths:
+        bundled_module("repo_env").bootstrap_worktree_env(repo, overwrite=False)
     before = git_state(repo, tracked_paths)
     git_identity_before = git_identity(repo)
     git_metadata_before = git_metadata_snapshot(repo) if not enforced_paths else {}
@@ -2381,6 +2393,7 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
         repo,
         args.claude_config_dir,
         session_id=segment_session,
+        read_only=not enforced_paths,
     )
     # A delegated worker owns its own mailbox identity, even when its conductor is a listener.
     environment.pop("AGENT_MAILBOX_LISTENER_SESSION", None)
