@@ -463,6 +463,7 @@ class CoordinatorTests(unittest.TestCase):
                 "dispatch", "--kind", "correction", "--request-id", "repair", "--review-id", proof
             )
         self.assertEqual((code, corrected["runner_status"]), (0, "completed"))
+        self.assertNotIn("--timeout", corrected["command"])
         result = COORDINATOR.read(Path(corrected["result_path"]))
         self.assertEqual(
             (result["session_id"], result["effort"]["bound"], result["resumed_from"]),
@@ -1031,6 +1032,107 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(result["scope_owner"], "worker")
         self.assertEqual(result["scope_hints"], ["allowed"])
         self.assertEqual(result["scope_violations"], [])
+
+    def test_dispatch_without_timeout_keeps_the_runner_default(self):
+        code, run = self.start()
+        self.assertEqual(code, 0, run)
+        self.assertNotIn("--timeout", run["command"])
+        self.assertNotIn("timeout", COORDINATOR.load(self.directory)["runs"][0])
+
+    def test_dispatch_timeout_reaches_the_runner_when_the_task_budget_allows_it(self):
+        # 90m exceeds the default 1h deadline, so the task needs a longer --time-budget first.
+        self.directory = self.fixture.external_path / "long-task"
+        init = ("init", "--task-spec", str(self.spec_path), "--host", "claude", "--time-budget")
+        code, error = self.call(*init, "soon")
+        self.assertEqual(code, 2)
+        self.assertIn("invalid --time-budget", error)
+        self.assertEqual(self.call(*init, "2h")[0], 0)
+        with mock.patch.dict(os.environ, {"FAKE_NO_CHANGE": "1"}):
+            code, run = self.call(
+                "dispatch",
+                "--kind",
+                "investigation",
+                "--request-id",
+                "long-read",
+                "--engine",
+                "agy",
+                "--model",
+                "gemini-3.8-flash-medium",
+                "--timeout",
+                "90m",
+            )
+        self.assertEqual(code, 0, run)
+        self.assertEqual((run["runner_status"], run["timeout"]), ("completed", "90m"))
+        self.assertEqual(run["command"][run["command"].index("--timeout") + 1], "90m")
+        argv = json.loads((self.fixture.external_path / "capture.json").read_text())["argv"]
+        self.assertEqual(argv[argv.index("--print-timeout") + 1], "5490s")
+
+    def test_timeout_is_validated_and_refused_beyond_the_task_deadline(self):
+        before = COORDINATOR.load(self.directory)
+        for value, message in (
+            ("soon", "invalid --timeout"),
+            ("0m", "invalid --timeout"),
+            ("2h", "--timeout 2h exceeds the task's remaining"),
+        ):
+            code, error = self.start("timed", "implementation", "--timeout", value)
+            self.assertEqual(code, 2)
+            self.assertIn(message, error)
+        code, error = self.call(
+            "dispatch",
+            "--kind",
+            "implementation",
+            "--request-id",
+            "native-timed",
+            "--transport",
+            "native",
+            "--engine",
+            "claude",
+            "--model",
+            "claude-sonnet-5",
+            "--timeout",
+            "25m",
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("a native run ends at the task deadline", error)
+        after = COORDINATOR.load(self.directory)
+        self.assertEqual((after["runs"], after["budget"]), ([], before["budget"]))
+        self.assertFalse((self.directory / "runs").exists())
+
+    def test_correction_inherits_the_timeout_only_while_it_fits_the_deadline(self):
+        with mock.patch.dict(os.environ, {"FAKE_REPORT_STATUS": "BLOCKED"}):
+            code, blocked = self.start("implement", "implementation", "--timeout", "25m")
+        self.assertEqual((code, blocked["runner_status"], blocked["timeout"]), (0, "blocked", "25m"))
+        proof = self.reviewed_evidence()
+        state = COORDINATOR.load(self.directory)
+        deadline = state["deadline"]
+        state["deadline"] = (dt.datetime.now(dt.UTC) + dt.timedelta(minutes=10)).isoformat()
+        COORDINATOR.save(self.directory, state)
+        correction = ("dispatch", "--kind", "correction", "--request-id", "repair", "--review-id", proof)
+        code, error = self.call(*correction)
+        self.assertEqual(code, 2)
+        self.assertIn("inherited --timeout 25m exceeds the task's remaining", error)
+        state = COORDINATOR.load(self.directory)
+        state["deadline"] = deadline
+        COORDINATOR.save(self.directory, state)
+        with mock.patch.dict(os.environ, {"FAKE_CONTENT": "corrected output\n"}):
+            code, corrected = self.call(*correction)
+        self.assertEqual((code, corrected["runner_status"], corrected["timeout"]), (0, "completed", "25m"))
+        self.assertEqual(corrected["command"][corrected["command"].index("--timeout") + 1], "25m")
+
+    def test_correction_can_replace_the_inherited_timeout(self):
+        with mock.patch.dict(os.environ, {"FAKE_REPORT_STATUS": "BLOCKED"}):
+            code, blocked = self.start("implement", "implementation", "--timeout", "25m")
+        self.assertEqual(code, 0, blocked)
+        proof = self.reviewed_evidence()
+        state = COORDINATOR.load(self.directory)
+        state["deadline"] = (dt.datetime.now(dt.UTC) + dt.timedelta(minutes=10)).isoformat()
+        COORDINATOR.save(self.directory, state)
+        with mock.patch.dict(os.environ, {"FAKE_CONTENT": "corrected output\n"}):
+            code, corrected = self.call(
+                "dispatch", "--kind", "correction", "--request-id", "repair", "--review-id", proof, "--timeout", "5m"
+            )
+        self.assertEqual((code, corrected["runner_status"], corrected["timeout"]), (0, "completed", "5m"))
+        self.assertEqual(corrected["command"][corrected["command"].index("--timeout") + 1], "5m")
 
     def test_background_completion_event_auto_settles_coordinator_task(self):
         code, run = self.start("bg-auto-settle", "implementation", "--background")

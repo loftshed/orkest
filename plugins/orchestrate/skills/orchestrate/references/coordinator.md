@@ -55,6 +55,13 @@ finish afterward. Three consultation calls total, including one challenge, and o
 allowed within the task allowance. Exhaustion returns work to the conductor, without automatically
 asking the user. The conductor can investigate or narrow the task within existing authority.
 
+Each executor run also stops at the runner's `--timeout`: 15 minutes unless `dispatch --timeout
+DURATION` (`25m`, `1h30m`) sets another. The run records it, the runner gets it (agy's
+`--print-timeout` follows it), and a correction inherits it unless the correction passes its own.
+A timeout longer than the task's remaining time is refused, never shortened, so give `init
+--time-budget` room for every run you plan. Native dispatch takes no `--timeout`; the host stops
+its tool at the task deadline.
+
 External dispatch is foreground by default. Use `--background` to return the durable run handle
 immediately, then supervise `events wait EVENT_ID --messages` and call `recover` after completion.
 This keeps the conductor available for questions and permits concurrent read-only runs. Reusing
@@ -180,9 +187,10 @@ is a limit (at most one per audited task), not a required step.
 
 New tasks require the persisted host review ID. `review --run-id ID --decision supported --review-id
 ID` records supported advice. `dispatch --kind correction --request-id repair-1 --review-id ID`
-inherits the original engine, model, effort, variant, billing, session, scope, and checks. Add
-`--transport native` for a native continuation. No unchanged failed prompt or safety-violation
-resumption is allowed. Original failed/blocked outcomes remain unchanged.
+inherits the original engine, model, effort, variant, billing, session, scope, checks and runner
+timeout; only `--timeout` may be overridden. Add `--transport native` for a native continuation.
+No unchanged failed prompt or safety-violation resumption is allowed. Original failed/blocked
+outcomes remain unchanged.
 
 `review --run-id ID --decision accept --review-id ID` requires the latest completed audited work,
 all original criteria, unchanged workspace/history, and current evidence. `reject` records failed
