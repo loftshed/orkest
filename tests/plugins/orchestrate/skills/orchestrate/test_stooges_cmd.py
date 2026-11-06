@@ -22,6 +22,8 @@ assert SPEC and SPEC.loader
 COMMAND = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(COMMAND)
 
+import room_store  # noqa: E402
+
 
 class StoogesCommandTests(unittest.TestCase):
     def test_missing_node_has_actionable_error(self) -> None:
@@ -116,7 +118,7 @@ class StoogesCommandTests(unittest.TestCase):
             )
             self.assertEqual(created.returncode, 0, created.stderr)
             room = json.loads(created.stdout)
-            saved = json.loads((root / "mailbox-v1" / "rooms" / f"{room['id']}.json").read_text())
+            saved = room_store.read_room(root / "mailbox-v1", room["id"])
             self.assertEqual(saved, room)
             self.assertEqual([agent["status"] for agent in room["agents"]], ["queued"])
 

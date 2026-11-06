@@ -10,12 +10,14 @@ import {
   addMembers,
   createRoom,
   detectWorktree,
+  listRawRooms,
   mailboxRoot,
   normalizeWorkforceRole,
   readRoom,
   refreshMemberWorktrees,
   resolveWorktreeMarkerPath,
   updateRoom,
+  validateRoom,
   WORKFORCE_ROLES,
   workforceRoleInfo,
 } from "./horde-room.mjs";
@@ -524,20 +526,31 @@ async function roomTasks(request) {
 }
 
 export async function listRooms(root = mailboxRoot()) {
+  const rooms = [];
+  const errors = [];
+  const rawRooms = listRawRooms(root).sort((a, b) => a.id.localeCompare(b.id));
+  for (const room of rawRooms) {
+    try {
+      rooms.push(validateRoom(room));
+    } catch (error) {
+      errors.push({ file: `${room.id}.json`, error: error.message });
+    }
+  }
   let files;
   try {
     files = await readdir(path.join(root, "rooms"));
   } catch (error) {
-    if (error.code === "ENOENT") return { rooms: [], errors: [] };
-    throw error;
+    if (error.code !== "ENOENT") throw error;
+    files = [];
   }
-  const rooms = [];
-  const errors = [];
   files.sort((a, b) => a.localeCompare(b));
   for (const file of files) {
     if (!file.endsWith(".json")) continue;
     try {
-      rooms.push(await readRoom(file.slice(0, -5), root));
+      const room = JSON.parse(await readFile(path.join(root, "rooms", file), "utf8"));
+      if (!room || room.id !== file.slice(0, -5))
+        throw new Error("Room identity does not match its filename");
+      validateRoom(room);
     } catch (error) {
       errors.push({ file, error: error.message });
     }
@@ -1308,16 +1321,8 @@ async function appendNativePeers(room, snapshots, root) {
     }
   };
   collectRoomSessions(room);
-  let roomEntries;
-  try {
-    roomEntries = await readdir(path.join(root, "rooms"));
-  } catch {
-    roomEntries = [];
-  }
-  for (const entry of roomEntries) {
-    if (!entry.endsWith(".json") || entry === `${room.id}.json`) continue;
-    const otherRoom = await readOptionalJson(path.join(root, "rooms", entry), 512 * 1024);
-    if (otherRoom) collectRoomSessions(otherRoom);
+  for (const otherRoom of listRawRooms(root)) {
+    if (otherRoom.id !== room.id) collectRoomSessions(otherRoom);
   }
   const existingIds = new Set(["conductor", ...room.agents.map((agent) => agent.id)]);
   const conductorPid = snapshots?.conductor?.pid || room.conductor?.pid;

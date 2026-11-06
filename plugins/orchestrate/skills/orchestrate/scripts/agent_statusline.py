@@ -23,6 +23,7 @@ import agent_terminal
 import mailbox_tasks
 import mailbox_work
 import peer_mailbox as mailbox
+import room_store
 import room_tasks
 
 COLORS = (31, 32, 33, 34, 35, 36)
@@ -94,20 +95,16 @@ def session_from(payload: Any) -> str | None:
 
 def bound_rooms(base: Path, peer: dict[str, Any]) -> list[tuple[dict[str, Any], dict[str, Any]]]:
     """Find explicit bindings to this session, never infer a room from its directory."""
-    paths = list((base / "rooms").glob("*.json"))
-    if len(paths) > MAX_ROOMS:
+    rooms = room_store.list_rooms(base)
+    if len(rooms) > MAX_ROOMS:
         return []
     found = []
     engine = "agy" if peer["harness"] == "gemini" else peer["harness"]
-    for path in paths:
+    for room in rooms:
         try:
-            if path.stat().st_size > MAX_ROOM_BYTES:
-                continue
-            room = mailbox.load(path)
             if (
                 not room
                 or room.get("schema") != "agent-executor.room.v1"
-                or room.get("id") != path.stem
                 or room.get("machine") != socket.gethostname()
                 or not isinstance(room.get("cwd"), str)
                 or not isinstance(room.get("agents"), list)

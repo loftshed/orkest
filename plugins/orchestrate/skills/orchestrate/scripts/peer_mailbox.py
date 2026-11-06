@@ -30,6 +30,7 @@ if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
 import mailbox_cli  # noqa: E402
+import room_store  # noqa: E402
 from mailbox_cli import (  # noqa: E402, F401
     build_parser,
     caller,
@@ -1270,8 +1271,7 @@ def shares_swarm_room(base: Path, first: dict[str, Any], second: dict[str, Any])
     if len(pair) < 2:
         return False
     with contextlib.suppress(OSError):
-        for path in (base / "rooms").glob("*.json"):
-            room = load(path)
+        for room in room_store.list_rooms(base):
             if not isinstance(room, dict) or not isinstance(room.get("agents"), list):
                 continue
             members: set[str] = set()
@@ -1726,24 +1726,27 @@ def _room_has_live_member(base: Path, room: dict[str, Any]) -> bool:
 
 def _prune_rooms_and_briefs(base: Path, cutoff: dt.datetime) -> None:
     max_age_seconds = MAX_AGE.total_seconds()
-    for room_path in (base / "rooms").glob("*.json"):
-        with contextlib.suppress(OSError):
-            if time.time() - room_path.stat().st_mtime <= max_age_seconds:
+    for room in room_store.list_rooms(base):
+        with contextlib.suppress(OSError, ValueError, TypeError):
+            updated = room.get("updatedAt")
+            if isinstance(updated, int | float):
+                timestamp = updated / 1000
+            elif isinstance(updated, str):
+                timestamp = dt.datetime.fromisoformat(updated.replace("Z", "+00:00")).timestamp()
+            else:
                 continue
-            room = load(room_path)
-            if isinstance(room, dict) and _room_has_live_member(base, room):
+            if time.time() - timestamp <= max_age_seconds or _room_has_live_member(base, room):
                 continue
-            room_path.unlink(missing_ok=True)
-            _unlink_stale_lock(room_path.with_suffix(".lock"))
+            room_store.delete_room(base, room["id"], expected=room)
     brief_roots = [base / "swarm-briefs"]
-    if (base / "rooms").exists():
+    if (base / "rooms.db").exists() or (base / "rooms").exists():
         brief_roots.append(base.parent / "swarm-briefs")
     for brief_root in brief_roots:
         for brief_dir in brief_root.glob("*"):
             with contextlib.suppress(OSError):
                 if (
                     brief_dir.is_dir()
-                    and not (base / "rooms" / f"{brief_dir.name}.json").exists()
+                    and room_store.read_room(base, brief_dir.name) is None
                     and time.time() - brief_dir.stat().st_mtime > max_age_seconds
                 ):
                     shutil.rmtree(brief_dir, ignore_errors=True)

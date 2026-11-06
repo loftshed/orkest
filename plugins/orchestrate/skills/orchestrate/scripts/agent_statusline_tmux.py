@@ -19,6 +19,7 @@ import time
 from pathlib import Path
 
 import peer_mailbox as mailbox
+import room_store
 
 _RESUME_VALUE_FLAGS = frozenset({"--resume", "-r", "--session-id", "--conversation", "--session", "-s"})
 _NON_SESSION_FLAG_VALUES = frozenset({"last", "help", "read-only", "workspace-write", "danger-full-access"})
@@ -101,14 +102,8 @@ def find_session_swarm_room(
     best_room: dict[str, object] | None = None
     best_score: tuple[int, int, float, int, str] = (-1, -1, -1.0, -1, "")
     with contextlib.suppress(OSError):
-        for path in sorted((base / "rooms").glob("*.json")):
-            room = mailbox.load(path)
-            if (
-                not isinstance(room, dict)
-                or room.get("schema") != "agent-executor.room.v1"
-                or room.get("id") != path.stem
-                or not room.get("swarm")
-            ):
+        for room in room_store.list_rooms(base):
+            if not isinstance(room, dict) or room.get("schema") != "agent-executor.room.v1" or not room.get("swarm"):
                 continue
             if only_room is not None and room.get("id") != only_room:
                 continue
@@ -187,35 +182,8 @@ def rebind_session_swarm_room(
     new_session_id: str,
 ) -> dict[str, object] | None:
     """Update a swarm coordinator or lead member's bound session ID after a `/clear` handover."""
-    try:
-        target = _room_path(base, room_id)
-    except ValueError:
-        return None
-    with contextlib.suppress(OSError), mailbox.locked(target), _node_room_lock(target):
-        data = mailbox.load(target)
-        if not isinstance(data, dict):
-            return None
-        member = data.get("conductor") if member_id == "conductor" else None
-        if member is None and isinstance(data.get("agents"), list):
-            for agent in data["agents"]:
-                if isinstance(agent, dict) and agent.get("id") == member_id:
-                    member = agent
-                    break
-        if not isinstance(member, dict):
-            return None
-        session_obj = member.get("session")
-        if isinstance(session_obj, dict):
-            old_id = session_obj.get("id")
-            if isinstance(old_id, str) and old_id and old_id != new_session_id:
-                prev = member.get("previousSessions")
-                history = [item for item in prev if isinstance(item, str)] if isinstance(prev, list) else []
-                if old_id not in history:
-                    history.append(old_id)
-                member["previousSessions"] = history[-16:]
-            session_obj["id"] = new_session_id
-        data["updatedAt"] = int(time.time() * 1000)
-        mailbox.write(target, data)
-        return data
+    with contextlib.suppress(OSError, ValueError):
+        return room_store.rebind(base, room_id, member_id, new_session_id)
     return None
 
 
@@ -454,21 +422,8 @@ def _node_room_lock(path: Path):
 
 
 def _update_room_metadata(base: Path, room_id: str, **fields: str | None) -> dict[str, object] | None:
-    try:
-        path = _room_path(base, room_id)
-    except ValueError:
-        return None
-    with contextlib.suppress(OSError), mailbox.locked(path), _node_room_lock(path):
-        data = mailbox.load(path)
-        if not isinstance(data, dict):
-            return None
-        for key, value in fields.items():
-            if value is None:
-                data.pop(key, None)
-            else:
-                data[key] = value
-        mailbox.write(path, data)
-        return data
+    with contextlib.suppress(OSError, ValueError):
+        return room_store.set_metadata(base, room_id, **fields)
     return None
 
 
@@ -607,7 +562,7 @@ def _reuse_herdr_swarm_view_unlocked(
         old_room_id = record.get("room")
         if not isinstance(old_room_id, str):
             continue
-        old_room = restoration.load(_room_path(base, old_room_id))
+        old_room = room_store.read_room(base, old_room_id)
         if not old_room or old_room.get("herdrCoordinatorPaneId") != coordinator_pane:
             continue
         if old_room.get("herdrWorkspaceId") and old_room["herdrWorkspaceId"] != workspace_id:
@@ -758,8 +713,7 @@ def _find_herdr_room(base: Path, pane_id: str) -> str:
     best_id = ""
     best_updated = -1
     with contextlib.suppress(OSError):
-        for path in sorted((base / "rooms").glob("*.json")):
-            room = mailbox.load(path)
+        for room in room_store.list_rooms(base):
             if not isinstance(room, dict) or (
                 room.get("herdrCoordinatorPaneId") != pane_id and room.get("herdrViewPaneId") != pane_id
             ):
@@ -805,7 +759,7 @@ def _ensure_bound_room(
         already_bound = False
         if base is not None:
             with contextlib.suppress(ValueError):
-                existing = mailbox.load(_room_path(base, current_room))
+                existing = room_store.read_room(base, current_room)
                 if isinstance(existing, dict):
                     conductor = existing.get("conductor")
                     if isinstance(conductor, dict) and isinstance(conductor.get("session"), dict):
@@ -922,7 +876,7 @@ def _toggle_herdr_swarm_view_unlocked(
     current_room = resolved_room
     room_data = None
     with contextlib.suppress(ValueError):
-        room_data = mailbox.load(_room_path(base, current_room))
+        room_data = room_store.read_room(base, current_room)
     recorded_view_pane = (
         room_data.get("herdrViewPaneId")
         if isinstance(room_data, dict) and isinstance(room_data.get("herdrViewPaneId"), str)
@@ -1284,7 +1238,7 @@ def main(arguments: list[str]) -> int:
         herdr = os.environ.get("HERDR_BIN_PATH") or shutil.which("herdr")
         room_data = None
         with contextlib.suppress(ValueError):
-            room_data = mailbox.load(_room_path(mailbox.root(), room))
+            room_data = room_store.read_room(mailbox.root(), room)
         coord_pane = (
             room_data.get("herdrCoordinatorPaneId")
             if isinstance(room_data, dict) and isinstance(room_data.get("herdrCoordinatorPaneId"), str)

@@ -66,17 +66,24 @@ def valid_store_ids(base: Path) -> set[str]:
     return ids
 
 
+def runtime_sources() -> dict[str, Path]:
+    skill = Path(__file__).resolve().parent.parent
+    plugin = skill if (skill / "lib").is_dir() else skill.parents[1]
+    return {
+        **{folder: skill / folder for folder in ("scripts", "references", "templates")},
+        **{folder: plugin / folder for folder in ("bin", "lib")},
+    }
+
+
 @functools.cache
 def runtime_revision() -> str:
     digest = hashlib.sha256()
-    skill = Path(__file__).resolve().parent.parent
-    for folder in ("scripts", "references", "templates"):
-        directory = skill / folder
+    for folder, directory in runtime_sources().items():
         if not directory.is_dir():
             continue
         for path in sorted(directory.rglob("*")):
             if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc":
-                digest.update(str(path.relative_to(skill)).encode())
+                digest.update(str(Path(folder) / path.relative_to(directory)).encode())
                 digest.update(path.read_bytes())
     return digest.hexdigest()[:16]
 
@@ -89,12 +96,9 @@ def runtime_bundle(base: Path) -> Path:
     if not destination.exists():
         stage = Path(tempfile.mkdtemp(prefix=".runtime-", dir=directory))
         try:
-            skill = Path(__file__).resolve().parent.parent
-            for folder in ("scripts", "references", "templates"):
-                if (skill / folder).is_dir():
-                    shutil.copytree(
-                        skill / folder, stage / folder, ignore=shutil.ignore_patterns("__pycache__", "*.pyc")
-                    )
+            for folder, source in runtime_sources().items():
+                if source.is_dir():
+                    shutil.copytree(source, stage / folder, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
             mailbox.write(stage / "runtime.json", {"revision": revision, "storeId": store_id(base)})
             os.replace(stage, destination)
         finally:

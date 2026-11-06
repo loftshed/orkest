@@ -19,6 +19,7 @@ import unittest
 import urllib.parse
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from unittest import mock
 
 import mailbox_evaluation_server
 import test_mailbox
@@ -55,6 +56,47 @@ class TestMailboxDaemon(unittest.TestCase):
     def start(self):
         self.state = daemon.ensure_running(self.base)
         return self.state
+
+    def test_runtime_bundle_contains_a_working_node_room_bridge_and_hashes_bin_and_lib(self):
+        entry = daemon.runtime_bundle(self.base)
+        stage = entry.parent.parent
+        self.assertTrue((stage / "bin/room-store.mjs").is_file())
+        self.assertTrue((stage / "lib/horde-room.mjs").is_file())
+        self.assertTrue((stage / "lib/orkest-sqlite.mjs").is_file())
+        code = """
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import mailbox_daemon
+import room_store
+base = Path(sys.argv[2])
+room_store.put_room(base, {"id": "staged", "agents": [], "title": "Staged bridge"})
+print(room_store.read_room(base, "staged")["title"])
+print(mailbox_daemon.runtime_revision())
+"""
+        result = subprocess.run(
+            [sys.executable, "-B", "-c", code, str(stage / "scripts"), str(self.base)],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
+        )
+        self.assertEqual(result.stdout.splitlines(), ["Staged bridge", daemon.runtime_revision()])
+        with mock.patch.object(daemon, "__file__", str(entry)):
+            daemon.runtime_revision.cache_clear()
+            try:
+                before = daemon.runtime_revision()
+                target = stage / "bin/room-store.mjs"
+                target.write_text(target.read_text() + "\n// revision change\n")
+                daemon.runtime_revision.cache_clear()
+                changed_bin = daemon.runtime_revision()
+                self.assertNotEqual(before, changed_bin)
+                target = stage / "lib/horde-room.mjs"
+                target.write_text(target.read_text() + "\n// revision change\n")
+                daemon.runtime_revision.cache_clear()
+                self.assertNotEqual(changed_bin, daemon.runtime_revision())
+            finally:
+                daemon.runtime_revision.cache_clear()
 
     def test_background_presence_check_reports_a_killed_agent_without_a_discovery_call(self):
         child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])

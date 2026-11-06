@@ -1,15 +1,24 @@
+import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, readFile, realpath, rm, utimes, writeFile } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { roomsCommand } from "../../../plugins/orchestrate/bin/rooms.mjs";
 import {
+  createRoom,
+  deleteRoom,
+  listRawRooms,
   parseTeam,
+  readRawRoom,
   readRoom,
+  roomsDbPath,
+  updateRawRoom,
   updateRoom,
   withRoomLock,
 } from "../../../plugins/orchestrate/lib/horde-room.mjs";
+import { openOrkestSqlite } from "../../../plugins/orchestrate/lib/orkest-sqlite.mjs";
 import {
   dispatchMember,
   growRoom,
@@ -272,6 +281,7 @@ describe("room execution", () => {
 
   it("reports corrupt rooms alongside valid rooms", async () => {
     const { root } = await fixture();
+    await mkdir(path.join(root, "rooms"), { recursive: true });
     await writeFile(path.join(root, "rooms", "broken.json"), "{", "utf8");
     const result = await listRooms(root);
     expect(result.rooms.map((room) => room.id)).toEqual(["room-a"]);
@@ -1052,5 +1062,144 @@ describe("room lock ownership", () => {
       pid: process.pid,
       token: "replacement",
     });
+  });
+});
+
+describe("SQLite room persistence", () => {
+  const execute = promisify(execFile);
+  const moduleUrl = new URL("../../../plugins/orchestrate/lib/horde-room.mjs", import.meta.url)
+    .href;
+
+  it("imports legacy rooms once, archives them, and keeps corrupt files visible", async () => {
+    const root = await directory();
+    await mkdir(path.join(root, "rooms"));
+    const legacy = createRoom([], { id: "legacy", cwd: root });
+    await writeFile(path.join(root, "rooms/legacy.json"), JSON.stringify(legacy));
+    await writeFile(
+      path.join(root, "rooms/minimal.json"),
+      JSON.stringify({ cwd: root, agents: [] }),
+    );
+    await writeFile(path.join(root, "rooms/broken.json"), "{");
+    await writeFile(
+      path.join(root, "rooms/mismatch.json"),
+      JSON.stringify({ id: "wrong", agents: [] }),
+    );
+    const listed = await listRooms(root);
+    expect(listed.rooms.map((room) => room.id)).toEqual(["legacy"]);
+    expect(listed.errors.map((error) => error.file).sort((a, b) => a.localeCompare(b))).toEqual([
+      "broken.json",
+      "minimal.json",
+      "mismatch.json",
+    ]);
+    const archived = JSON.parse(
+      await readFile(path.join(root, "rooms.v1-backup/legacy.json"), "utf8"),
+    );
+    expect(archived).toEqual(legacy);
+    expect(readRawRoom("minimal", root)).toMatchObject({ id: "minimal", cwd: root, agents: [] });
+    await updateRoom(
+      "legacy",
+      async (room) => {
+        await new Promise((resolve) => setImmediate(resolve));
+        room.title = "Updated through SQLite";
+        return room;
+      },
+      { root },
+    );
+    expect((await readRoom("legacy", root)).title).toBe("Updated through SQLite");
+    await expect(readFile(path.join(root, "rooms/legacy.json"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    expect(await readFile(path.join(root, "rooms/broken.json"), "utf8")).toBe("{");
+    expect(deleteRoom("minimal", root)).toBe(true);
+    expect(listRawRooms(root).map((room) => room.id)).toEqual(["legacy"]);
+    using db = openOrkestSqlite(roomsDbPath(root));
+    expect(db.tagStore.get`PRAGMA journal_mode`.journal_mode).toBe("wal");
+    expect(db.tagStore.get`PRAGMA synchronous`.synchronous).toBe(2);
+    expect(db.tagStore.get`PRAGMA application_id`.application_id).toBe(1_330_793_298);
+  });
+
+  it("recovers an import interrupted after commit before archive without losing the room", async () => {
+    const root = await directory();
+    await mkdir(path.join(root, "rooms"));
+    await writeFile(
+      path.join(root, "rooms/recovery.json"),
+      JSON.stringify({ id: "recovery", counter: 0 }),
+    );
+    const child = `
+      import fs from "node:fs";
+      import { syncBuiltinESMExports } from "node:module";
+      fs.renameSync = () => process.exit(73);
+      syncBuiltinESMExports();
+      const { listRawRooms } = await import(${JSON.stringify(moduleUrl)});
+      listRawRooms(process.argv[1]);
+    `;
+    await expect(
+      execute(process.execPath, ["--input-type=module", "-e", child, root]),
+    ).rejects.toMatchObject({ code: 73 });
+    {
+      using db = openOrkestSqlite(roomsDbPath(root));
+      db.tagStore
+        .run`UPDATE rooms SET data = '{"id":"recovery","counter":1}', revision = revision + 1 WHERE id = 'recovery'`;
+    }
+    expect(readRawRoom("recovery", root)).toEqual({ id: "recovery", counter: 1 });
+    await expect(readFile(path.join(root, "rooms/recovery.json"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    const archived = JSON.parse(
+      await readFile(path.join(root, "rooms.v1-backup/recovery.json"), "utf8"),
+    );
+    expect(archived).toEqual({ id: "recovery", counter: 0 });
+  });
+
+  it("retries async callbacks across processes without losing updates", async () => {
+    const root = await directory();
+    await updateRoom(
+      "concurrent",
+      () => ({ ...createRoom([], { id: "concurrent", cwd: root }), counter: 0 }),
+      { root, create: true },
+    );
+    const child = `
+      import { updateRoom } from ${JSON.stringify(moduleUrl)};
+      const root = process.argv[1];
+      for (let i = 0; i < 6; i++) {
+        await updateRoom("concurrent", async (room) => {
+          await new Promise((resolve) => setTimeout(resolve, 3));
+          room.counter++;
+          return room;
+        }, { root });
+      }
+    `;
+    await Promise.all(
+      Array.from({ length: 4 }, () =>
+        execute(process.execPath, ["--input-type=module", "-e", child, root]),
+      ),
+    );
+    expect((await readRoom("concurrent", root)).counter).toBe(24);
+  });
+
+  it("preserves identity and missing/create contracts and protects conditional deletion", async () => {
+    const root = await directory();
+    await expect(updateRoom("absent", (room) => room, { root })).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await updateRawRoom("raw", () => ({ id: "raw", agents: [] }), { root, create: true });
+    await expect(updateRawRoom("raw", () => [], { root })).rejects.toThrow(
+      "expected a plain object",
+    );
+    const date = Object.assign(new Date(), { id: "raw" });
+    await expect(updateRawRoom("raw", () => date, { root })).rejects.toThrow(
+      "expected a plain object",
+    );
+    const before = readRawRoom("raw", root);
+    await expect(updateRawRoom("raw", () => ({}), { root, create: true })).rejects.toThrow(
+      "Room already exists: raw",
+    );
+    await expect(
+      updateRawRoom("raw", (room) => ({ ...room, id: "other" }), { root }),
+    ).rejects.toThrow("Cannot change room identity");
+    await updateRawRoom("raw", (room) => ({ ...room, title: "Fresh" }), { root });
+    expect(deleteRoom("raw", root, before)).toBe(false);
+    expect(readRawRoom("raw", root).title).toBe("Fresh");
+    expect(deleteRoom("raw", root)).toBe(true);
   });
 });

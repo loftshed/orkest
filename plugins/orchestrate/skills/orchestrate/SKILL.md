@@ -384,7 +384,10 @@ node plugins/orchestrate/bin/ork.mjs horde --fixture /path/to/room.json --print 
 ```
 
 `--json` outputs room JSON, `--print` renders one frame, and `--fixture` reads saved state offline.
-None starts models. Rooms use `agent-executor.room.v1` under `<agent-executor cache>/mailbox-v1/rooms/`.
+None starts models. Rooms use `agent-executor.room.v1` in `<agent-executor cache>/mailbox-v1/rooms.db`.
+Node owns this SQLite WAL store; Python uses the bundled `room_store.py` bridge. Legacy `rooms/*.json`
+records migrate on access into the database and `rooms.v1-backup/`. Invalid JSON stays in `rooms/`
+and appears in listing errors. Backups are outside live discovery; updates write only SQLite.
 `--attach-room ID` reconnects to a live coordinator; add `--view` to observe only. Closing a view
 does not cancel workers. Use `ork hall add --parent MEMBER` (`ork rooms` is a supported alias) to
 place workers beneath a native lead.

@@ -18,6 +18,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+import room_store
 import runtime_paths
 
 SCHEMA = "orkest.herdr-view.v1"
@@ -25,7 +26,7 @@ VALID_LABEL_PREFIXES = ("Orkest swarm ", "Orkest Swarm", "Swarm · ")
 
 
 def swarm_pane_label(base: Path, room: str) -> str:
-    room_data = load(base / "mailbox-v1" / "rooms" / f"{room}.json") or {}
+    room_data = room_store.read_room(base / "mailbox-v1", room) or {}
     conductor = room_data.get("conductor") if isinstance(room_data.get("conductor"), dict) else {}
     progress = conductor.get("progress") if isinstance(conductor.get("progress"), dict) else {}
     candidates = (room_data.get("title"), progress.get("goal"), room_data.get("objective"))
@@ -288,8 +289,7 @@ def adopt(base: Path, env: dict[str, str], api: Herdr, cli: Path) -> list[dict[s
 def _adopt_unlocked(base: Path, env: dict[str, str], api: Herdr, cli: Path) -> list[dict[str, str]]:
     outcomes = []
     panes = {pane["pane_id"]: pane for pane in api.panes()}
-    for path in sorted((base / "mailbox-v1" / "rooms").glob("*.json")):
-        room = load(path) or {}
+    for room in room_store.list_rooms(base / "mailbox-v1"):
         room_id, pane_id = room.get("id"), room.get("herdrViewPaneId")
         if not isinstance(room_id, str) or pane_id not in panes:
             continue

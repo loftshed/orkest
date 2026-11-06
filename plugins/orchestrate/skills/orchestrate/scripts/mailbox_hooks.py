@@ -18,6 +18,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import room_store
 from mailbox_store import (
     _MB,
     NAME_RULE,
@@ -588,7 +589,7 @@ def _swarm_next_advisor(
     member_id: str,
 ) -> str:
     """Compute canonical swarmNextDigest over actionable room items and emit a compact advisor when changed."""
-    fresh_room = _MB.load(base / "rooms" / f"{room_id}.json")
+    fresh_room = room_store.read_room(base, room_id)
     if isinstance(fresh_room, dict):
         room = fresh_room
     agents = [a for a in (room.get("agents") or []) if isinstance(a, dict)]
@@ -922,7 +923,7 @@ def swarm_coordinator_context(
 
     if not re.fullmatch(r"[\w-]{1,80}", room_id, flags=re.ASCII):
         return ""
-    loaded_room = _MB.load(base / "rooms" / f"{room_id}.json")
+    loaded_room = room_store.read_room(base, room_id)
     if not isinstance(loaded_room, dict) or not loaded_room.get("swarm"):
         return ""
     room = loaded_room
@@ -992,7 +993,7 @@ def swarm_coordinator_context(
                 timeout=5,
                 check=False,
             )
-        rebound = _MB.load(base / "rooms" / f"{room_id}.json")
+        rebound = room_store.read_room(base, room_id)
         if isinstance(rebound, dict):
             room = rebound
             bound_session = ((room.get("conductor") or {}).get("session") or {}).get("id")

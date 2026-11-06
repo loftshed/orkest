@@ -25,6 +25,7 @@ CLI = SCRIPTS.parents[2] / "bin/ork.mjs"
 sys.path.insert(0, str(SCRIPTS))
 import agent_progress as progress  # noqa: E402
 import peer_mailbox as mailbox  # noqa: E402
+import room_store  # noqa: E402
 import swarm_status  # noqa: E402
 
 
@@ -52,7 +53,7 @@ class SwarmStatusTests(unittest.TestCase):
             room["cwd"] = str(home / "another-checkout")
             self.assertEqual(swarm_status.snapshot(room, base), {})
 
-    def test_update_room_metadata_acquires_node_directory_lock_and_explicit_room_overrides_tmux_option(self):
+    def test_update_room_metadata_uses_sqlite_and_explicit_room_overrides_tmux_option(self):
         from unittest import mock
 
         import agent_statusline_tmux
@@ -71,7 +72,7 @@ class SwarmStatusTests(unittest.TestCase):
             updated = agent_statusline_tmux._update_room_metadata(base, "room-explicit", updatedByPython="yes")
             self.assertIsNotNone(updated)
             self.assertFalse(Path(f"{room_path}.lock").exists())
-            self.assertEqual(mailbox.load(room_path).get("updatedByPython"), "yes")
+            self.assertEqual(room_store.read_room(base, "room-explicit").get("updatedByPython"), "yes")
 
             def fake_run(cmd, **_kwargs):
                 if "@orkest_coordinator_pane" in cmd:
@@ -301,8 +302,8 @@ class SwarmLaunchTests(unittest.TestCase):
                 wait_for(lambda output: b"no live coordinator terminal" in output, ended)
             finally:
                 # These room files and private servers were created only by this test.
-                for file in (base / "rooms").glob("*.json"):
-                    key = str(base.resolve()) + "/" + file.stem
+                for saved_room in room_store.list_rooms(base):
+                    key = str(base.resolve()) + "/" + saved_room["id"]
                     server = "orkest-label-" + hashlib.sha256(key.encode()).hexdigest()[:12]
                     subprocess.run(["tmux", "-L", server, "kill-server"], capture_output=True, check=False)
                 for pid, master in clients:
@@ -379,18 +380,17 @@ class HerdrSwarmLaunchTests(unittest.TestCase):
         import agent_statusline_tmux
 
         with self._reused_pane_room() as (home, base, previous, session):
-            old_path = base / "rooms" / "previous-room.json"
-            old_content = old_path.read_bytes()
+            old_content = room_store.read_room(base, "previous-room")
             opened = agent_statusline_tmux.toggle_swarm_view(
                 "open", session_id=session, harness="codex", cwd=str(home), base=base
             )
             self.assertEqual(opened["status"], "opened")
             self.assertNotEqual(opened["room"], previous["id"])
-            current = mailbox.load(base / "rooms" / f"{opened['room']}.json")
+            current = room_store.read_room(base, opened["room"])
             self.assertEqual(current["conductor"]["session"]["id"], session)
             self.assertEqual(current["herdrCoordinatorPaneId"], "w1:p1")
             self.assertEqual(swarm_status.snapshot(current, base)["conductor"]["task"], "Inspect current changes")
-            self.assertEqual(old_path.read_bytes(), old_content)
+            self.assertEqual(room_store.read_room(base, "previous-room"), old_content)
             reopened = agent_statusline_tmux.toggle_swarm_view(
                 "open", session_id=session, harness="codex", cwd=str(home), base=base
             )
@@ -424,8 +424,8 @@ class HerdrSwarmLaunchTests(unittest.TestCase):
             self.assertEqual(len([call for call in state["calls"] if call[:2] == ["pane", "split"]]), 1)
             self.assertIn(["pane", "send-keys", old_view, "q"], state["calls"])
             self.assertIn(f"AGENT_EXECUTOR_HOME={home}", state["runs"][-1]["command"])
-            self.assertIsNone(mailbox.load(base / "rooms" / "previous-room.json").get("herdrViewPaneId"))
-            self.assertEqual(mailbox.load(base / "rooms" / f"{opened['room']}.json")["herdrViewPaneId"], old_view)
+            self.assertIsNone(room_store.read_room(base, "previous-room").get("herdrViewPaneId"))
+            self.assertEqual(room_store.read_room(base, opened["room"])["herdrViewPaneId"], old_view)
             old_state = herdr_swarm_restore.state_path(base.parent, previous["id"], environment)
             self.assertTrue(old_state.with_suffix(".closed").exists())
 
@@ -452,7 +452,7 @@ class HerdrSwarmLaunchTests(unittest.TestCase):
             self.assertEqual(opened["pane"], "w1:p3")
             state = json.loads((home / "herdr-state.json").read_text())
             self.assertNotIn(["pane", "send-keys", old_view, "q"], state["calls"])
-            self.assertEqual(mailbox.load(base / "rooms" / "previous-room.json")["herdrViewPaneId"], old_view)
+            self.assertEqual(room_store.read_room(base, "previous-room")["herdrViewPaneId"], old_view)
 
     def test_explicitly_attached_room_keeps_its_original_coordinator_and_workers(self):
         import agent_statusline_tmux
@@ -462,7 +462,7 @@ class HerdrSwarmLaunchTests(unittest.TestCase):
                 "open", room=previous["id"], session_id=session, harness="codex", cwd=str(home), base=base
             )
             self.assertEqual(opened["room"], previous["id"])
-            persisted = mailbox.load(base / "rooms" / "previous-room.json")
+            persisted = room_store.read_room(base, "previous-room")
             self.assertEqual(persisted["conductor"], previous["conductor"])
             self.assertEqual(persisted["agents"], previous["agents"])
             self.assertEqual(persisted["messages"], previous["messages"])
@@ -476,7 +476,7 @@ class HerdrSwarmLaunchTests(unittest.TestCase):
                 "open", session_id=session, harness="codex", cwd=str(home), base=base
             )
             self.assertEqual(opened["room"], previous["id"])
-            persisted = mailbox.load(base / "rooms" / "previous-room.json")
+            persisted = room_store.read_room(base, "previous-room")
             self.assertEqual(persisted["agents"], previous["agents"])
             self.assertEqual(persisted["messages"], previous["messages"])
 
@@ -669,7 +669,7 @@ class HerdrSwarmLaunchTests(unittest.TestCase):
                 self.assertEqual(state["runs"][0]["pane"], "w1:p2")
                 self.assertIn(f"horde --attach-room {room_id} --view", state["runs"][0]["command"])
 
-                room_data = mailbox.load(base / "rooms" / f"{room_id}.json")
+                room_data = room_store.read_room(base, room_id)
                 self.assertEqual(room_data["herdrViewPaneId"], "w1:p2")
                 self.assertEqual(room_data["herdrCoordinatorPaneId"], "w1:p1")
 
@@ -691,7 +691,7 @@ class HerdrSwarmLaunchTests(unittest.TestCase):
                     state = json.loads(state_file.read_text())
                     self.assertNotIn("w1:p2", state["panes"])
                     self.assertIn("w1:p99", state["panes"])
-                    room_data = mailbox.load(base / "rooms" / f"{room_id}.json")
+                    room_data = room_store.read_room(base, room_id)
                     self.assertNotIn("herdrViewPaneId", room_data)
 
                     already_closed = agent_statusline_tmux.toggle_swarm_view("close", base=base)
@@ -707,7 +707,7 @@ class HerdrSwarmLaunchTests(unittest.TestCase):
                         reopened,
                         {"status": "opened", "room": room_id, "backend": "herdr", "pane": "w1:p3"},
                     )
-                    room_data = mailbox.load(base / "rooms" / f"{room_id}.json")
+                    room_data = room_store.read_room(base, room_id)
                     self.assertEqual(room_data["herdrViewPaneId"], "w1:p3")
                 finally:
                     os.environ.clear()
@@ -846,7 +846,7 @@ class HerdrSwarmLaunchTests(unittest.TestCase):
                 cleared_me = mailbox.annotate(base, cleared_sid, aliases=[session_id], clearedFrom=session_id)
                 cleared_summary = mailbox_hooks.swarm_coordinator_context(base, cleared_me, "SessionStart")
                 self.assertIn("Reconnected to swarm room room-newer (Active Horde)", cleared_summary)
-                updated_room = mailbox.load(base / "rooms" / "room-newer.json")
+                updated_room = room_store.read_room(base, "room-newer")
                 self.assertEqual(updated_room["conductor"]["session"]["id"], cleared_sid)
                 self.assertIn(session_id, updated_room["conductor"]["previousSessions"])
             finally:

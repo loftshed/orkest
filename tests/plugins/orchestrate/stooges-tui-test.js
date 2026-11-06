@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -138,12 +138,14 @@ describe("swarm rooms", () => {
 
   it("rejects a stored room whose identity differs from its filename", async () => {
     const root = await directory();
-    await updateRoom("sample-room", () => fixture(), { root, create: true });
+    await mkdir(path.join(root, "rooms"));
     await writeFile(
       roomPath("sample-room", root),
       JSON.stringify({ ...fixture(), id: "other-room" }),
     );
-    await expect(readRoom("sample-room", root)).rejects.toThrow(/identity|match/iu);
+    await expect(readRoom("sample-room", root)).rejects.toMatchObject({ code: "ENOENT" });
+    const invalidRoom = JSON.parse(await readFile(roomPath("sample-room", root), "utf8"));
+    expect(invalidRoom.id).toBe("other-room");
   });
 
   it("leaves the old room intact when an update fails", async () => {
@@ -771,6 +773,9 @@ describe("ork CLI", () => {
     await expect(
       readFile(path.join(dir, "mailbox-v1/rooms/sample-room.json")),
     ).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(path.join(dir, "mailbox-v1/rooms.db"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
   });
 
   it.each([

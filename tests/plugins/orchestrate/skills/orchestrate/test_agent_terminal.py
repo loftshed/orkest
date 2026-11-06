@@ -31,6 +31,7 @@ import agent_statusline  # noqa: E402
 import agent_terminal  # noqa: E402
 import mailbox_hooks  # noqa: E402
 import peer_mailbox as mailbox  # noqa: E402
+import room_store  # noqa: E402
 
 
 class HerdrMetadataTests(unittest.TestCase):
@@ -202,7 +203,7 @@ class HerdrMetadataTests(unittest.TestCase):
         another = {**room, "id": "another-room", "updatedAt": 2000}
         another_path = self.base / "rooms" / "another-room.json"
         mailbox.write(another_path, another)
-        another_content = another_path.read_bytes()
+        another_content = room_store.read_room(self.base, "another-room")
         os.environ["ORKEST_SWARM_ROOM"] = "promoted-room"
         agent_terminal.bind(self.session, "codex", {})
         self.metadata.clear()
@@ -223,7 +224,7 @@ class HerdrMetadataTests(unittest.TestCase):
             {"title": "snorfle · working", "display_agent": "Coordinator · builder · fixture-model"},
         )
         self.assertEqual(progress.read(self.base, peer)["role"], "builder")
-        self.assertEqual(another_path.read_bytes(), another_content)
+        self.assertEqual(room_store.read_room(self.base, "another-room"), another_content)
 
     def test_a_resume_alias_is_not_presented_as_an_exact_coordinator_binding(self):
         mailbox.annotate(self.base, self.session, aliases=["previous-coordinator"])
@@ -264,12 +265,12 @@ class HerdrMetadataTests(unittest.TestCase):
         }
         room_path = self.base / "rooms" / "parent-room.json"
         mailbox.write(room_path, room)
-        original = room_path.read_bytes()
+        original = room_store.read_room(self.base, room["id"])
         self.assertTrue(agent_terminal.bind(self.session, "codex", {}))
         self.assertEqual(
             self.metadata.get("w1:p1"), {"title": "snorfle · working", "display_agent": "Lead · fixture-model"}
         )
-        self.assertEqual(room_path.read_bytes(), original)
+        self.assertEqual(room_store.read_room(self.base, room["id"]), original)
 
     def test_a_binding_in_another_checkout_does_not_supply_role_or_room_metadata(self):
         room = {
@@ -288,10 +289,10 @@ class HerdrMetadataTests(unittest.TestCase):
         }
         room_path = self.base / "rooms" / "another-checkout-room.json"
         mailbox.write(room_path, room)
-        original = room_path.read_bytes()
+        original = room_store.read_room(self.base, room["id"])
         self.assertTrue(agent_terminal.bind(self.session, "codex", {}))
         self.assertEqual(self.metadata.get("w1:p1"), {"title": "snorfle · working", "display_agent": "fixture-model"})
-        self.assertEqual(room_path.read_bytes(), original)
+        self.assertEqual(room_store.read_room(self.base, room["id"]), original)
 
 
 @unittest.skipUnless(shutil.which("tmux"), "native pane binding requires tmux")
