@@ -37,6 +37,7 @@ import {
   statusRow,
   treeCard,
 } from "./tui-components.mjs";
+import { renderLogLine, renderMarkdown, stripInlineMarkdown } from "./tui-markdown.mjs";
 import { resolveTheme } from "./tui-theme.mjs";
 
 export {
@@ -1100,13 +1101,11 @@ export class HordeView {
 
   overlayLines(width) {
     let title = this.overlay === "help" ? "Keyboard shortcuts" : "Room log";
-    const messages = coalesceMessages(this.room.messages).map(
-      (message) =>
-        `${plain(message.from)}: ${plain(message.text)}${message.count > 1 ? ` (×${message.count})` : ""}`,
-    );
-    let rows;
+    const pad = width >= 6 ? " " : "";
+    const interior = Math.max(1, width - 6);
+    let wrapped;
     if (this.overlay === "help") {
-      rows = [
+      const helpRows = [
         "↑/↓ or 1–9  Select agent",
         "0           Return to the current session's live chat",
         "Enter       Preview selected agent's screen without typing into it",
@@ -1126,22 +1125,41 @@ export class HordeView {
         "Glyphs      Set ORK_GLYPHS=ascii|unicode|nerd",
         "Icons       Nerd Font by default; unicode or ascii selects fallback",
       ];
+      wrapped = helpRows.flatMap((row) =>
+        wrapText(row, interior).map((line, lineIndex) => {
+          if (lineIndex === 0 && interior >= 20 && line.length > 12) {
+            return `${tone(line.slice(0, 12), "mdSection", this.appearance)}${line.slice(12)}`;
+          }
+          return line;
+        }),
+      );
     } else if (this.overlay === "activity") {
       const agent = this.room.agents.find((member) => member.id === this.activityId);
       title = agent ? shortAgentName(agent) : "Agent activity";
-      rows = [
-        "No interactive chat attached.",
-        ...(agent?.output || []),
-        agent?.question || "",
-      ].filter(Boolean);
+      const activityBody = [...(agent?.output || []), agent?.question || ""]
+        .filter(Boolean)
+        .join("\n\n");
+      wrapped = [
+        tone("No interactive chat attached.", "muted", this.appearance),
+        ...(activityBody
+          ? renderMarkdown(activityBody, interior, { color: this.appearance, tier: this.tier })
+          : []),
+      ];
     } else {
-      rows = messages.length > 0 ? messages : ["No room messages yet"];
+      const coalesced = coalesceMessages(this.room.messages);
+      wrapped =
+        coalesced.length > 0
+          ? coalesced.flatMap((message) =>
+              renderLogLine(message.from, message.text, message.count, interior, {
+                color: this.appearance,
+                tier: this.tier,
+              }),
+            )
+          : [tone("No room messages yet", "muted", this.appearance)];
     }
-    const interior = Math.max(1, width - 6);
-    const wrapped = rows.flatMap((line) => wrapText(line, interior));
     const count = Math.max(1, this.height - 7);
     const start = Math.max(0, Math.min(this.logOffset, wrapped.length - count));
-    const visible = wrapped.slice(start, start + count);
+    const visible = wrapped.slice(start, start + count).map((line) => `${pad}${line}`);
     return this.panel(title, visible, width);
   }
 
@@ -1416,18 +1434,26 @@ export class HordeView {
       { color: this.appearance, hovered: this.hovered, tier: this.tier },
     );
     const budget = Math.max(1, this.height - controls.lines.length - 3);
-    const rows = String(preview.text || "")
-      .split(/\r?\n/u)
-      .flatMap((line) => wrapText(plain(line), Math.max(1, width - 4)));
+    const pad = width >= 6 ? " " : "";
+    const textWidth = Math.max(1, width - 2 - pad.length * 2);
+    const rows =
+      preview.kind === "terminal"
+        ? String(preview.text || "")
+            .split(/\r?\n/u)
+            .flatMap((line) => wrapText(plain(line), textWidth))
+        : renderMarkdown(preview.text || "", textWidth, {
+            color: this.appearance,
+            tier: this.tier,
+          });
     this.previewOffset = Math.min(this.previewOffset, Math.max(0, rows.length - budget));
     const end = Math.max(0, rows.length - this.previewOffset);
-    const body = rows.slice(Math.max(0, end - budget), end);
+    const body = rows.slice(Math.max(0, end - budget), end).map((line) => `${pad}${line}`);
     while (body.length < budget) body.push("");
     const heading = preview.kind === "terminal" ? "Live screen · read only" : "Recorded activity";
     const state = preview.loading ? "Loading..." : preview.error || heading;
     const lines = this.panel(
       plain(preview.title || "Agent"),
-      [tone(state, preview.error ? "error" : "muted", this.appearance), ...body],
+      [`${pad}${tone(state, preview.error ? "error" : "muted", this.appearance)}`, ...body],
       Math.max(1, width),
     );
     const contentHeight = Math.max(0, this.height - controls.lines.length);
@@ -1791,7 +1817,7 @@ export class HordeView {
     }
     const focused = room.agents.find((agent) => agent.id === (this.pinnedId || this.focusId));
     const rawDetail = focused?.output?.at(-1);
-    const detail = rawDetail ? plain(rawDetail) : "";
+    const detail = rawDetail ? stripInlineMarkdown(rawDetail) : "";
     const focusedTask = focused ? plain(focused.progress?.task || focused.objective || "") : "";
     if (detail && (this.pinnedId || detail !== focusedTask) && lines.length < this.height - 4) {
       const tag = this.pinnedId ? "pinned" : "detail";
