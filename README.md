@@ -166,7 +166,7 @@ The repository ships two plugins. Their READMEs cover full CLI flags, routing ta
 
 ## Install
 
-Requires Git, Node.js 22.18+, Python 3.11+, `tmux`, and at least one installed, authenticated
+Requires Git, Node.js 26.13+ (Active LTS), Python 3.11+, `tmux`, and at least one installed, authenticated
 harness CLI (`claude`, `codex`, `agy`, or `opencode`).
 
 ```sh
