@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.61.0
+
+- feat(orchestrate): enrich in-progress agent preview with updates, command details, and handback (#98)
+
 ## 0.60.0
 
 - feat(orchestrate): add alien-orc name generator, rich agent preview, and cspell cleanup (#97)
