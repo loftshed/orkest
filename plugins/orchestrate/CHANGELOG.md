@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.62.0
+
+- feat(orchestrate): standardize on Node 26.13 LTS and add orkest-sqlite gateway (#99) (#104)
+
 ## 0.61.0
 
 - feat(orchestrate): enrich in-progress agent preview with updates, command details, and handback (#98)
