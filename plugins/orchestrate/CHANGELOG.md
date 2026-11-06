@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.70.0
+
+- feat(orchestrate): add 5h/weekly meter toggle, color ork header, and fix activity truncations (#121)
+
 ## 0.69.0
 
 - feat(orchestrate): allow agents to invoke orchestrate autonomously at will (#120)
