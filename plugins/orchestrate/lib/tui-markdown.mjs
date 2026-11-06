@@ -654,13 +654,31 @@ export function renderMarkdown(value, width, { color = false, tier = glyphTier()
       continue;
     }
 
-    if (cleanLine.startsWith("Task: ")) {
-      const taskSpans = parseInlineSpans(cleanLine.slice(6));
+    if (cleanLine.startsWith("Task: ") || cleanLine.startsWith("Asked: ")) {
+      const colonIdx = cleanLine.indexOf(":");
+      const label = cleanLine.slice(0, colonIdx + 1);
+      const taskSpans = parseInlineSpans(cleanLine.slice(colonIdx + 2));
       output.push(
         ...wrapSpans(taskSpans, width, {
           color,
           firstPrefix: [
-            { text: "Task:", style: "mdSection" },
+            { text: label, style: "mdSection" },
+            { text: " ", style: "" },
+          ],
+          restPrefix: [{ text: "  ", style: "" }],
+        }),
+      );
+      index += 1;
+      continue;
+    }
+
+    if (cleanLine.startsWith("Question: ")) {
+      const questionSpans = parseInlineSpans(cleanLine.slice(10));
+      output.push(
+        ...wrapSpans(questionSpans, width, {
+          color,
+          firstPrefix: [
+            { text: "Question:", style: "warning bold" },
             { text: " ", style: "" },
           ],
           restPrefix: [{ text: "  ", style: "" }],
