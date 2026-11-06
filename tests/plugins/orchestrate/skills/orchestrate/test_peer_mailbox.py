@@ -18,6 +18,7 @@ from unittest.mock import patch
 SCRIPTS = Path(__file__).resolve().parents[5] / "plugins/orchestrate/skills/orchestrate/scripts"
 sys.path.insert(0, str(SCRIPTS))
 import peer_mailbox as mailbox  # noqa: E402
+import room_store  # noqa: E402
 import runtime_paths  # noqa: E402
 
 
@@ -348,6 +349,11 @@ class PeerAliasAndPruneSafetyTests(unittest.TestCase):
         (orphan_brief / "brief.md").write_text("old brief")
         os.utime(orphan_brief, (old_time, old_time))
 
+        live_brief = self.base.parent / "swarm-briefs" / "live-room"
+        live_brief.mkdir(parents=True, exist_ok=True)
+        (live_brief / "brief.md").write_text("keep live room brief")
+        os.utime(live_brief, (old_time, old_time))
+
         stale_progress = self.base / "progress" / "dead-peer.json"
         old_stamp = mailbox.stamp(mailbox.now() - mailbox.MAX_AGE * 2)
         mailbox.write(stale_progress, {"session": "dead-peer", "stage": "complete", "updatedAt": old_stamp})
@@ -376,9 +382,14 @@ class PeerAliasAndPruneSafetyTests(unittest.TestCase):
         finally:
             os.close(fd)
 
+        self.assertIsNone(room_store.read_room(self.base, "dead-room"))
+        self.assertEqual(
+            room_store.read_room(self.base, "live-room")["conductor"]["session"]["id"], live_peer["session"]
+        )
         self.assertFalse(dead_room.exists())
-        self.assertTrue(live_room.exists())
+        self.assertFalse(live_room.exists())
         self.assertFalse(orphan_brief.exists())
+        self.assertTrue(live_brief.exists())
         self.assertFalse(stale_progress.exists())
         board = mailbox.load(board_path)
         self.assertEqual([item["id"] for item in board["items"]], ["active-open"])
@@ -404,6 +415,24 @@ class MailboxModuleDecompositionTests(unittest.TestCase):
         for symbol in ("session_arg", "caller", "table", "render_work", "build_parser"):
             self.assertIs(getattr(mailbox, symbol), getattr(mailbox_cli, symbol))
         self.assertFalse(hasattr(mailbox, "session_identity"))
+
+
+class SqliteSharedRoomTests(unittest.TestCase):
+    def test_shared_room_is_detected_after_import_and_rebinding(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            room_store.put_room(
+                base,
+                {
+                    "id": "shared",
+                    "conductor": {"session": {"id": "first"}},
+                    "agents": [{"id": "worker", "mailboxSession": "second"}],
+                },
+            )
+            self.assertTrue(mailbox.shares_swarm_room(base, {"session": "first"}, {"session": "second"}))
+            room_store.rebind(base, "shared", "conductor", "new")
+            self.assertFalse(mailbox.shares_swarm_room(base, {"session": "first"}, {"session": "second"}))
+            self.assertTrue(mailbox.shares_swarm_room(base, {"session": "new"}, {"session": "second"}))
 
 
 if __name__ == "__main__":

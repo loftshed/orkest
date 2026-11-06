@@ -4,7 +4,12 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { roomsCommand } from "../../../plugins/orchestrate/bin/rooms.mjs";
-import { parseTeam, readRoom, updateRoom } from "../../../plugins/orchestrate/lib/horde-room.mjs";
+import {
+  listRawRooms,
+  parseTeam,
+  readRoom,
+  updateRoom,
+} from "../../../plugins/orchestrate/lib/horde-room.mjs";
 import { newRoom } from "../../../plugins/orchestrate/lib/rooms.mjs";
 import { promoteSession } from "../../../plugins/orchestrate/lib/session-promotion.mjs";
 
@@ -119,7 +124,7 @@ describe("adopting the running conversation", () => {
       },
     ]);
     expect(second.room.conductor.workforceRole).toBe("builder");
-    expect(await readdir(path.join(root, "rooms"))).toEqual([`${first.room.id}.json`]);
+    expect(listRawRooms(root).map((room) => room.id)).toEqual([first.room.id]);
   });
 
   it("never adopts a historical room or a stale inherited room belonging to another coordinator", async () => {
@@ -139,14 +144,14 @@ describe("adopting the running conversation", () => {
       },
       { root },
     );
-    const before = await readFile(path.join(root, "rooms/old-room.json"), "utf8");
+    const before = await readRoom("old-room", root);
     const result = await promoteSession(
       { session: "live-session", cwd },
       { ...options, env: { ORKEST_SWARM_ROOM: historical.id } },
     );
     expect(result.room.id).toMatch(/^conversation-/u);
     expect(result.room.conductor.session.id).toBe("live-session");
-    expect(await readFile(path.join(root, "rooms/old-room.json"), "utf8")).toBe(before);
+    expect(await readRoom("old-room", root)).toEqual(before);
   });
 
   it("refuses explicit replacement of another coordinator without changing the room", async () => {
@@ -165,11 +170,11 @@ describe("adopting the running conversation", () => {
       },
       { root },
     );
-    const before = await readFile(path.join(root, "rooms/occupied.json"), "utf8");
+    const before = await readRoom("occupied", root);
     await expect(
       promoteSession({ session: "live-session", cwd, room: target.id }, options),
     ).rejects.toThrow("already has another coordinator");
-    expect(await readFile(path.join(root, "rooms/occupied.json"), "utf8")).toBe(before);
+    expect(await readRoom("occupied", root)).toEqual(before);
     expect(refreshed).toEqual([]);
   });
 
@@ -239,7 +244,7 @@ describe("adopting the running conversation", () => {
       promoteSession({ session: "live-session", cwd }, options),
     ]);
     expect(first.room.id).toBe(second.room.id);
-    expect(await readdir(path.join(root, "rooms"))).toEqual([`${first.room.id}.json`]);
+    expect(listRawRooms(root).map((room) => room.id)).toEqual([first.room.id]);
     expect((await readRoom(first.room.id, root)).conductor.session.id).toBe("live-session");
   });
 
@@ -261,11 +266,11 @@ describe("adopting the running conversation", () => {
   it("does not bypass team authority for an unbound coordinator slot", async () => {
     const { cwd, root, options } = await fixture();
     await newRoom([], { id: "authority-room", cwd, root, authority: "team-a" });
-    const before = await readFile(path.join(root, "rooms/authority-room.json"), "utf8");
+    const before = await readRoom("authority-room", root);
     await expect(
       promoteSession({ session: "live-session", cwd, room: "authority-room" }, options),
     ).rejects.toThrow("leadership handoff");
-    expect(await readFile(path.join(root, "rooms/authority-room.json"), "utf8")).toBe(before);
+    expect(await readRoom("authority-room", root)).toEqual(before);
   });
 
   it("exposes promotion through hall/rooms with the caller's native session environment", async () => {

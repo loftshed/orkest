@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-import { withRoomLock } from "./horde-room.mjs";
+import { listRawRooms, readRawRoom, updateRawRoom } from "./horde-room.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -269,44 +269,24 @@ function resolveGitRoot(cwd, runCmd) {
  * Locate the active Swarm Room for this session or working directory, if one exists.
  */
 function findTargetRoom(mailboxDir, { roomId, session, cwd }) {
-  const roomsDir = path.join(mailboxDir, "rooms");
-  if (!fs.existsSync(roomsDir)) return null;
-
   if (roomId) {
-    const directPath = path.join(roomsDir, `${roomId}.json`);
-    if (fs.existsSync(directPath)) {
-      try {
-        return { path: directPath, data: JSON.parse(fs.readFileSync(directPath, "utf8")) };
-      } catch {
-        return null;
-      }
+    try {
+      return { root: mailboxDir, data: readRawRoom(roomId, mailboxDir) };
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
     }
   }
-
-  let entries;
-  try {
-    entries = fs
-      .readdirSync(roomsDir)
-      .filter((name) => name.endsWith(".json"))
-      .map((name) => {
-        const fullPath = path.join(roomsDir, name);
-        const stat = fs.statSync(fullPath);
-        return { fullPath, mtimeMs: stat.mtimeMs };
-      })
-      .sort((a, b) => b.mtimeMs - a.mtimeMs);
-  } catch {
-    return null;
-  }
+  const entries = listRawRooms(mailboxDir);
 
   const resolvedCwd = cwd ? path.resolve(cwd) : null;
   let cwdMatch = null;
 
   for (const entry of entries) {
     try {
-      const data = JSON.parse(fs.readFileSync(entry.fullPath, "utf8"));
+      const data = entry;
       if (!data || typeof data !== "object") continue;
       if (roomId && (data.id === roomId || data.roomId === roomId)) {
-        return { path: entry.fullPath, data };
+        return { root: mailboxDir, data };
       }
       if (session) {
         const parentSession = data.parent?.session;
@@ -314,13 +294,13 @@ function findTargetRoom(mailboxDir, { roomId, session, cwd }) {
           Array.isArray(data.agents) &&
           data.agents.some((agent) => agent && agent.session === session);
         if (parentSession === session || memberMatch) {
-          return { path: entry.fullPath, data };
+          return { root: mailboxDir, data };
         }
       }
       if (!cwdMatch && resolvedCwd) {
         const roomCwd = data.cwd || data.repoRoot || data.parent?.cwd;
         if (roomCwd && path.resolve(roomCwd) === resolvedCwd) {
-          cwdMatch = { path: entry.fullPath, data };
+          cwdMatch = { root: mailboxDir, data };
         }
       }
     } catch {
@@ -332,77 +312,71 @@ function findTargetRoom(mailboxDir, { roomId, session, cwd }) {
 }
 
 /**
- * Register a `side-<N>` member inside a Swarm Room JSON file atomically so
+ * Register a `side-<N>` member inside a Swarm Room atomically so
  * `/swarm` and `ork next` track its live progress and completion without touching
  * the parent session's mailbox inbox.
  */
 async function registerSideMemberInRoom(roomRecord, sideSpec) {
-  if (!roomRecord || !roomRecord.path || !roomRecord.data) {
+  if (!roomRecord || !roomRecord.root || !roomRecord.data) {
     return { roomId: null, memberId: sideSpec.defaultMemberId };
   }
-  return withRoomLock(roomRecord.path, () => {
-    const room = JSON.parse(fs.readFileSync(roomRecord.path, "utf8"));
-    const agents = Array.isArray(room.agents) ? room.agents : [];
-    const existingSideNums = agents
-      .map((agent) => {
-        const match = String(agent?.id || "").match(/^side-(\d+)$/);
-        return match ? Number(match[1]) : 0;
-      })
-      .filter((n) => Number.isFinite(n) && n > 0);
-    const nextNum = existingSideNums.length > 0 ? Math.max(...existingSideNums) + 1 : 1;
-    const memberId = `side-${nextNum}`;
-    const nowIso = new Date().toISOString();
+  const saved = await updateRawRoom(
+    roomRecord.data.id,
+    (room) => {
+      const agents = Array.isArray(room.agents) ? room.agents : [];
+      const existingSideNums = agents
+        .map((agent) => {
+          const match = String(agent?.id || "").match(/^side-(\d+)$/);
+          return match ? Number(match[1]) : 0;
+        })
+        .filter((n) => Number.isFinite(n) && n > 0);
+      const nextNum = existingSideNums.length > 0 ? Math.max(...existingSideNums) + 1 : 1;
+      const memberId = `side-${nextNum}`;
+      const nowIso = new Date().toISOString();
 
-    const memberEntry = {
-      id: memberId,
-      role: "side",
-      sideMode: sideSpec.mode,
-      sideId: sideSpec.sideId,
-      engine: sideSpec.engine || "auto",
-      model: sideSpec.model || null,
-      effort: sideSpec.effort || null,
-      status: "running",
-      mission: sideSpec.idea,
-      title: sideSpec.title,
-      isolatedInbox: true,
-      keepWorktree: Boolean(sideSpec.worktreePath),
-      createdAt: nowIso,
-      updatedAt: nowIso,
-    };
-
-    if (sideSpec.worktreePath) {
-      memberEntry.worktree = {
-        path: sideSpec.worktreePath,
-        branch: sideSpec.branch,
-      };
-    }
-
-    if (sideSpec.taskDir) {
-      memberEntry.dispatch = {
-        taskDir: sideSpec.taskDir,
-        runId: sideSpec.runId || null,
-        kind: sideSpec.kind,
+      const memberEntry = {
+        id: memberId,
+        role: "side",
+        sideMode: sideSpec.mode,
+        sideId: sideSpec.sideId,
+        engine: sideSpec.engine || "auto",
+        model: sideSpec.model || null,
+        effort: sideSpec.effort || null,
         status: "running",
-        startedAt: nowIso,
+        mission: sideSpec.idea,
+        title: sideSpec.title,
+        isolatedInbox: true,
+        keepWorktree: Boolean(sideSpec.worktreePath),
+        createdAt: nowIso,
+        updatedAt: nowIso,
       };
-    }
 
-    room.agents = [...agents, memberEntry];
-    room.updatedAt = nowIso;
+      if (sideSpec.worktreePath) {
+        memberEntry.worktree = {
+          path: sideSpec.worktreePath,
+          branch: sideSpec.branch,
+        };
+      }
 
-    const tmpPath = `${roomRecord.path}.${crypto.randomUUID()}.tmp`;
-    fs.writeFileSync(tmpPath, `${JSON.stringify(room, null, 2)}\n`, "utf8");
-    try {
-      fs.renameSync(tmpPath, roomRecord.path);
-    } finally {
-      fs.rmSync(tmpPath, { force: true });
-    }
+      if (sideSpec.taskDir) {
+        memberEntry.dispatch = {
+          taskDir: sideSpec.taskDir,
+          runId: sideSpec.runId || null,
+          kind: sideSpec.kind,
+          status: "running",
+          startedAt: nowIso,
+        };
+      }
 
-    return {
-      roomId: room.id || room.roomId || path.basename(roomRecord.path, ".json"),
-      memberId,
-    };
-  });
+      room.agents = [...agents, memberEntry];
+      room.updatedAt = nowIso;
+
+      return room;
+    },
+    { root: roomRecord.root },
+  );
+  const member = saved.agents.find((agent) => agent.sideId === sideSpec.sideId);
+  return { roomId: saved.id, memberId: member.id };
 }
 
 function provisionSideWorktree(repoRoot, shortId, runCmd) {

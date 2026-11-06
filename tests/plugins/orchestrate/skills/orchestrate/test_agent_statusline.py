@@ -23,6 +23,7 @@ import agent_statusline_tmux as tmux  # noqa: E402
 import mailbox_tasks  # noqa: E402
 import mailbox_work  # noqa: E402
 import peer_mailbox as mailbox  # noqa: E402
+import room_store  # noqa: E402
 
 STATUSLINE = SCRIPTS / "agent_statusline.py"
 
@@ -540,6 +541,70 @@ class RoomLockTests(unittest.TestCase):
             )
             self.assertEqual(result.stdout, f"Room is locked: {self.path}\n")
             self.assertEqual(json.loads((self.lock / "owner").read_text())["pid"], os.getpid())
+
+
+class RoomStoreTests(unittest.TestCase):
+    def test_empty_store_never_spawns_node_and_legacy_import_is_cached_and_invalidated(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary) / "mailbox-v1"
+            with mock.patch.object(room_store.subprocess, "run", side_effect=AssertionError("unexpected Node spawn")):
+                self.assertEqual(room_store.list_rooms(base), [])
+                self.assertIsNone(room_store.read_room(base, "missing"))
+            legacy = base / "rooms" / "legacy.json"
+            mailbox.write(legacy, {"id": "legacy", "agents": [], "title": "Before"})
+            with mock.patch.object(sqlite3, "connect", side_effect=AssertionError("Python must not open rooms.db")):
+                self.assertEqual(room_store.read_room(base, "legacy")["title"], "Before")
+                self.assertFalse(legacy.exists())
+                self.assertTrue((base / "rooms.v1-backup" / "legacy.json").exists())
+                room_store.list_rooms(base)
+                with mock.patch.object(room_store.subprocess, "run", side_effect=AssertionError("cache miss")):
+                    cached = room_store.read_room(base, "legacy")
+                    cached["title"] = "Local mutation"
+                    self.assertEqual(room_store.read_room(base, "legacy")["title"], "Before")
+                room_store._invoke(base, "set-meta", "legacy", {"title": "External change"})
+                self.assertEqual(room_store.read_room(base, "legacy")["title"], "External change")
+                self.assertEqual(
+                    tmux._update_room_metadata(base, "legacy", title="Metadata", removed=None)["title"], "Metadata"
+                )
+                self.assertEqual(room_store.read_room(base, "legacy")["title"], "Metadata")
+                self.assertFalse(legacy.exists())
+
+    def test_rebind_preserves_history_and_wal_changes_invalidate_cached_rooms(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary) / "mailbox-v1"
+            room_store.put_room(base, {"id": "room", "agents": [], "conductor": {"session": {"id": "old"}}})
+            room_store.list_rooms(base)
+            rebound = tmux.rebind_session_swarm_room(base, "room", "conductor", "new")
+            self.assertEqual(rebound["conductor"], {"session": {"id": "new"}, "previousSessions": ["old"]})
+            self.assertEqual(
+                tmux.rebind_session_swarm_room(base, "room", "conductor", "new")["conductor"]["previousSessions"],
+                ["old"],
+            )
+            self.assertIsNone(tmux.rebind_session_swarm_room(base, "room", "absent", "new"))
+            room_store.list_rooms(base)
+            sqlite_module = (SCRIPTS.parents[2] / "lib/orkest-sqlite.mjs").as_uri()
+            script = f"""
+              import {{ openOrkestSqlite }} from {json.dumps(sqlite_module)};
+              const db = openOrkestSqlite(process.argv[1] + '/rooms.db');
+              db.exec(`UPDATE rooms SET data = json_set(data, '$.title', 'WAL update'), revision = revision + 1`);
+              console.log('ready');
+              process.stdin.once('data', () => {{ db.close(); process.exit(0); }});
+            """
+            child = subprocess.Popen(
+                ["node", "--input-type=module", "-e", script, str(base)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                self.assertEqual(child.stdout.readline().strip(), "ready")
+                self.assertTrue((base / "rooms.db-wal").exists())
+                self.assertEqual(room_store.read_room(base, "room")["title"], "WAL update")
+                self.assertEqual(room_store.read_room(base, "room")["conductor"]["session"]["id"], "new")
+            finally:
+                _, errors = child.communicate("close", timeout=10)
+                self.assertEqual(child.returncode, 0, errors)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,15 @@
 import { execFileSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
-import { readFileSync, realpathSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  statSync,
+} from "node:fs";
 import {
   link,
   mkdir,
@@ -15,6 +24,7 @@ import {
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
+import { migrateSchema, openOrkestSqlite, withImmediateTransaction } from "./orkest-sqlite.mjs";
 import { cacheHome } from "./runtime-paths.mjs";
 
 export const ROOM_SCHEMA = "agent-executor.room.v1";
@@ -22,12 +32,14 @@ const ID = /^[\w-]{1,80}$/u;
 const ENGINES = new Set(["claude", "agy", "codex", "opencode"]);
 const EFFORTS = new Set(["low", "medium", "high", "xhigh", "max", "ultra"]);
 
-export const WORKFORCE_ROLES = JSON.parse(
-  readFileSync(
-    new URL("../skills/orchestrate/references/workforce-roles.json", import.meta.url),
-    "utf8",
-  ),
+const sourceRolesPath = new URL(
+  "../skills/orchestrate/references/workforce-roles.json",
+  import.meta.url,
 );
+const rolesPath = existsSync(sourceRolesPath)
+  ? sourceRolesPath
+  : new URL("../references/workforce-roles.json", import.meta.url);
+export const WORKFORCE_ROLES = JSON.parse(readFileSync(rolesPath, "utf8"));
 const ROLE_ALIASES = new Map(
   Object.values(WORKFORCE_ROLES).flatMap((role) => [
     [role.id, role.id],
@@ -461,11 +473,171 @@ export function createRoom(
   return validateRoom(room);
 }
 
-export async function readRoom(id, root) {
-  const text = await readFile(roomPath(id, root), "utf8");
-  const room = validateRoom(JSON.parse(text));
-  if (room.id !== id) throw new Error("Room identity does not match its filename");
+export function roomsDbPath(root = mailboxRoot()) {
+  return path.join(root, "rooms.db");
+}
+
+function validateRawRoom(room, id) {
+  if (
+    !room ||
+    typeof room !== "object" ||
+    ![Object.prototype, null].includes(Object.getPrototypeOf(room))
+  )
+    throw new Error("Invalid room: expected a plain object");
+  if (room.id !== id) throw new Error("Cannot change room identity");
   return room;
+}
+
+function missingRoom(id) {
+  return Object.assign(new Error(`Room not found: ${id}`), { code: "ENOENT" });
+}
+
+function legacyFiles(root) {
+  try {
+    return readdirSync(path.join(root, "rooms"))
+      .filter((file) => file.endsWith(".json"))
+      .sort((a, b) => a.localeCompare(b));
+  } catch (error) {
+    if (error.code === "ENOENT") return [];
+    throw error;
+  }
+}
+
+function legacyRecord(root, file) {
+  const id = file.slice(0, -5);
+  const source = roomPath(id, root);
+  const raw = readFileSync(source, "utf8");
+  const info = statSync(source, { bigint: true });
+  const room = JSON.parse(raw);
+  if (!room || typeof room !== "object" || Array.isArray(room))
+    throw new Error("Invalid room: expected a plain object");
+  if (room.id !== undefined && room.id !== id)
+    throw new Error("Room identity does not match its filename");
+  room.id ??= id;
+  validateRawRoom(room, id);
+  const digest = createHash("sha256").update(`${info.ino}:${info.mtimeNs}:${raw}`).digest("hex");
+  const updated = room.updatedAt;
+  const timestamp = typeof updated === "number" ? updated : Date.parse(updated);
+  room.updatedAt ??= Number(info.mtimeMs);
+  return {
+    room,
+    source,
+    digest,
+    updatedAt: Number.isFinite(timestamp) ? Math.trunc(timestamp) : Number(info.mtimeMs),
+  };
+}
+
+/** Commit imports before archiving. The ledger makes interrupted archival safe to resume. */
+function syncLegacyRoomFiles(db, root) {
+  if (legacyFiles(root).length === 0) return;
+  withImmediateTransaction(db, () => {
+    for (const file of legacyFiles(root)) {
+      let record;
+      try {
+        record = legacyRecord(root, file);
+      } catch {
+        // Invalid legacy files stay discoverable so listRooms can report their errors.
+        continue;
+      }
+      const { room, digest, updatedAt } = record;
+      if (
+        db.tagStore.get`SELECT digest FROM legacy_room_imports WHERE file = ${file}`?.digest ===
+        digest
+      )
+        continue;
+      db.tagStore.run`
+        INSERT INTO rooms (id, cwd, updated_at, data) VALUES (${room.id}, ${typeof room.cwd === "string" ? room.cwd : ""}, ${updatedAt}, ${JSON.stringify(room)})
+        ON CONFLICT(id) DO UPDATE SET cwd = excluded.cwd, updated_at = excluded.updated_at,
+          revision = rooms.revision + 1, data = excluded.data`;
+      db.tagStore.run`INSERT INTO legacy_room_imports (file, digest) VALUES (${file}, ${digest})
+        ON CONFLICT(file) DO UPDATE SET digest = excluded.digest`;
+    }
+  });
+  withImmediateTransaction(db, () => {
+    for (const file of legacyFiles(root)) {
+      let record;
+      try {
+        record = legacyRecord(root, file);
+      } catch {
+        continue;
+      }
+      if (
+        db.tagStore.get`SELECT digest FROM legacy_room_imports WHERE file = ${file}`?.digest !==
+        record.digest
+      )
+        continue;
+      const backup = path.join(root, "rooms.v1-backup");
+      mkdirSync(backup, { recursive: true, mode: 0o700 });
+      const destination = path.join(backup, file);
+      const target = existsSync(destination)
+        ? path.join(backup, `${file}.${record.digest}`)
+        : destination;
+      renameSync(record.source, target);
+      chmodSync(target, 0o400);
+    }
+  });
+}
+
+function openRooms(root) {
+  const db = openOrkestSqlite(roomsDbPath(root), { synchronous: "FULL" });
+  try {
+    migrateSchema(db, {
+      applicationId: 1_330_793_298,
+      migrations: [
+        (connection) =>
+          connection.exec(`
+          CREATE TABLE rooms (
+            id TEXT PRIMARY KEY, cwd TEXT NOT NULL, updated_at INTEGER NOT NULL,
+            revision INTEGER NOT NULL DEFAULT 1, data TEXT NOT NULL CHECK (json_valid(data))
+          ) STRICT;
+          CREATE INDEX rooms_updated_at ON rooms (updated_at DESC);
+          CREATE INDEX rooms_cwd ON rooms (cwd);
+          CREATE TABLE legacy_room_imports (file TEXT PRIMARY KEY, digest TEXT NOT NULL) STRICT;
+        `),
+      ],
+    });
+    syncLegacyRoomFiles(db, root);
+    return db;
+  } catch (error) {
+    db.close();
+    throw error;
+  }
+}
+
+export function readRawRoom(id, root = mailboxRoot()) {
+  roomPath(id, root);
+  if (!existsSync(roomsDbPath(root)) && !existsSync(path.join(root, "rooms")))
+    throw missingRoom(id);
+  using db = openRooms(root);
+  const row = db.tagStore.get`SELECT data FROM rooms WHERE id = ${id}`;
+  if (!row) throw missingRoom(id);
+  return JSON.parse(row.data);
+}
+
+export function listRawRooms(root = mailboxRoot()) {
+  if (!existsSync(roomsDbPath(root)) && !existsSync(path.join(root, "rooms"))) return [];
+  using db = openRooms(root);
+  return db.tagStore.all`SELECT data FROM rooms ORDER BY updated_at DESC, id ASC`.map((row) =>
+    JSON.parse(row.data),
+  );
+}
+
+export async function readRoom(id, root = mailboxRoot()) {
+  return validateRoom(readRawRoom(id, root));
+}
+
+export function deleteRoom(id, root = mailboxRoot(), expected) {
+  roomPath(id, root);
+  if (!existsSync(roomsDbPath(root)) && !existsSync(path.join(root, "rooms"))) return false;
+  using db = openRooms(root);
+  return withImmediateTransaction(db, () => {
+    const result =
+      expected === undefined
+        ? db.tagStore.run`DELETE FROM rooms WHERE id = ${id}`
+        : db.tagStore
+            .run`DELETE FROM rooms WHERE id = ${id} AND data = ${JSON.stringify(expected)}`;
+    return result.changes === 1;
+  });
 }
 
 function pidAlive(pid) {
@@ -616,29 +788,47 @@ export async function withRoomLock(file, update) {
   }
 }
 
-/** Atomic replacement under a bounded, exclusive lock prevents concurrent spawns losing members. */
-export async function updateRoom(id, update, { root = mailboxRoot(), create = false } = {}) {
-  const file = roomPath(id, root);
-  return withRoomLock(file, async () => {
-    const temporary = `${file}.${randomUUID()}.tmp`;
-    try {
-      let previous;
-      try {
-        previous = await readRoom(id, root);
-      } catch (error) {
-        if (!create || error.code !== "ENOENT") throw error;
-      }
-      if (create && previous) throw new Error(`Room already exists: ${id}`);
-      const room = validateRoom(await update(previous));
-      if (room.id !== id) throw new Error("Cannot change room identity");
-      room.updatedAt = Date.now();
-      await writeFile(temporary, `${JSON.stringify(room, null, 2)}\n`, { mode: 0o600, flag: "wx" });
-      await rename(temporary, file);
-      return room;
-    } finally {
-      await rm(temporary, { force: true });
+/** Callbacks can await work; conflicting revisions retry with a fresh room outside the transaction. */
+async function updateStoredRoom(
+  id,
+  update,
+  { root = mailboxRoot(), create = false } = {},
+  validate,
+) {
+  roomPath(id, root);
+  for (;;) {
+    let row;
+    {
+      using db = openRooms(root);
+      row = db.tagStore.get`SELECT data, revision FROM rooms WHERE id = ${id}`;
     }
-  });
+    if (create && row) throw new Error(`Room already exists: ${id}`);
+    if (!create && !row) throw missingRoom(id);
+    const previous = row ? validate(JSON.parse(row.data), id) : undefined;
+    const room = validate(validateRawRoom(await update(previous), id), id);
+    if (room.id !== id) throw new Error("Cannot change room identity");
+    room.updatedAt = Date.now();
+    using db = openRooms(root);
+    const committed = withImmediateTransaction(db, () => {
+      const data = JSON.stringify(room);
+      const result = row
+        ? db.tagStore
+            .run`UPDATE rooms SET cwd = ${typeof room.cwd === "string" ? room.cwd : ""}, updated_at = ${room.updatedAt},
+            data = ${data}, revision = revision + 1 WHERE id = ${id} AND revision = ${row.revision} AND data = ${row.data}`
+        : db.tagStore.run`INSERT INTO rooms (id, cwd, updated_at, data)
+            VALUES (${id}, ${typeof room.cwd === "string" ? room.cwd : ""}, ${room.updatedAt}, ${data}) ON CONFLICT(id) DO NOTHING`;
+      return result.changes === 1;
+    });
+    if (committed) return room;
+  }
+}
+
+export async function updateRoom(id, update, options) {
+  return updateStoredRoom(id, update, options, validateRoom);
+}
+
+export async function updateRawRoom(id, update, options) {
+  return updateStoredRoom(id, update, options, validateRawRoom);
 }
 
 export function coalesceMessages(messages = []) {

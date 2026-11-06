@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { readRawRoom } from "../../../plugins/orchestrate/lib/horde-room.mjs";
 import {
   checkRepoPolicyForSide,
   classifySideMode,
@@ -251,7 +252,7 @@ describe("ork side (side missions)", () => {
       }
 
       // Verify room registration
-      const updatedRoom = JSON.parse(fs.readFileSync(roomPath, "utf8"));
+      const updatedRoom = readRawRoom(path.basename(roomPath, ".json"), mailboxDir);
       expect(updatedRoom.agents).toHaveLength(1);
       expect(updatedRoom.agents[0].id).toBe("side-1");
       expect(updatedRoom.agents[0].role).toBe("side");
@@ -349,7 +350,7 @@ describe("ork side (side missions)", () => {
         expect(child.child.exitCode, child.errors()).toBe(0);
         expect(JSON.parse(child.output()).status).toBe("dispatched");
       }
-      const room = JSON.parse(fs.readFileSync(roomPath, "utf8"));
+      const room = readRawRoom(path.basename(roomPath, ".json"), mailboxDir);
       expect(room.agents.map((agent) => agent.id).sort((a, b) => a.localeCompare(b))).toEqual([
         "side-1",
         "side-2",
@@ -419,7 +420,7 @@ describe("ork side (side missions)", () => {
       expect(res.worktreePath).toBe(path.join(repoDir, ".worktrees", "wt-side-exec02"));
       expect(fs.existsSync(path.join(res.worktreePath, ".env.local"))).toBe(true);
 
-      const updatedRoom = JSON.parse(fs.readFileSync(roomPath, "utf8"));
+      const updatedRoom = readRawRoom(path.basename(roomPath, ".json"), mailboxDir);
       expect(updatedRoom.agents).toHaveLength(2);
       expect(updatedRoom.agents[1].id).toBe("side-2");
       expect(updatedRoom.agents[1].keepWorktree).toBe(true);
