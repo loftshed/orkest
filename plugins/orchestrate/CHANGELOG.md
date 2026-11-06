@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.62.1
+
+- fix(orchestrate): serialize side room allocation, lock reaping, and event acknowledgements (#101) (#103)
+
 ## 0.62.0
 
 - feat(orchestrate): standardize on Node 26.13 LTS and add orkest-sqlite gateway (#99) (#104)
