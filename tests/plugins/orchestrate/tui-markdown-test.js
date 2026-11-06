@@ -1,7 +1,10 @@
 import { stripVTControlCharacters } from "node:util";
 import { describe, expect, it } from "vitest";
 
-import { HordeView } from "../../../plugins/orchestrate/lib/horde-view.mjs";
+import {
+  extractAgentFocusMarkdown,
+  HordeView,
+} from "../../../plugins/orchestrate/lib/horde-view.mjs";
 import { displayWidth } from "../../../plugins/orchestrate/lib/tui-box.mjs";
 import {
   parseInlineSpans,
@@ -230,19 +233,84 @@ describe("HordeView themed activity and inner padding", () => {
     expect(terminalPlain.some((line) => line.includes("│ ### RAW_TERMINAL_LINE"))).toBe(true);
   });
 
-  it("strips raw inline Markdown in the compact sidebar detail strip and formats room logs", () => {
-    const view = new HordeView(sampleRoom(), { height: 24, color: true, tier: "unicode" });
+  it("renders a framed multi-line Focus card with themed Markdown and formats room logs", () => {
+    const view = new HordeView(sampleRoom(), { height: 28, color: true, tier: "unicode" });
     view.focusId = "scout";
-    const sidebarPlain = view
-      .render(90)
-      .map((line) => stripVTControlCharacters(line))
-      .join("\n");
-    expect(sidebarPlain).toContain("detail (Scout): Verified grouping.mjs with zero regressions");
-    expect(sidebarPlain).not.toContain("`grouping.mjs`");
+    const sidebarRendered = view.render(90);
+    const sidebarPlain = sidebarRendered.map((line) => stripVTControlCharacters(line)).join("\n");
+    expect(sidebarPlain).toContain("┌ Focus · Scout ");
+    expect(sidebarPlain).toContain("Enter open · p pin ┐");
+    expect(sidebarPlain).toContain("│ Task: Audit layout spacing");
+    expect(sidebarPlain).toContain("│ Verified grouping.mjs with zero regressions");
+    expect(sidebarRendered.join("\n")).toContain(
+      `${ESC}${DEFAULT_THEME.mdCode}mgrouping.mjs${ESC}0m`,
+    );
+
+    // Clicking the framed Focus card opens Recorded activity preview:
+    const focusTarget = view.targets.find((target) => target.id === "focus-card");
+    expect(focusTarget).toBeDefined();
+    expect(
+      view.handleMouse({ x: focusTarget.x + 2, y: focusTarget.y + 1, button: 0, action: "press" }),
+    ).toBe(true);
+    expect(view.preview?.agentId).toBe("scout");
+    view.setPreview(null);
 
     view.handleInput("g");
     const logRendered = view.render(90).join("\n");
     expect(logRendered).toContain(`${ESC}${DEFAULT_THEME.mdSection}mScout:${ESC}0m`);
     expect(logRendered).toContain(`${ESC}${DEFAULT_THEME.mdCode}mgrouping.mjs${ESC}0m`);
+  });
+
+  it("surfaces consultation questions and lead answers instead of trailing Uncertainty or result paths", () => {
+    const consultSummary = extractAgentFocusMarkdown({
+      id: "consult-1",
+      name: "claude consultation",
+      consultation: true,
+      question: "When does SessionStart fire relative to UserPromptSubmit?",
+      answer: [
+        "### Verdict",
+        "",
+        "COMPLETE",
+        "",
+        "`SessionStart` runs once before the first `UserPromptSubmit` hook on fresh sessions.",
+        "",
+        "### Verification",
+        "Checked hook lifecycle.",
+      ].join("\n"),
+      output: [
+        "`SessionStart` runs once before the first `UserPromptSubmit` hook on fresh sessions.",
+        "Uncertainty: - That `SessionStart` precedes the first `UserPromptSubmit` on custom forks",
+      ],
+    });
+    expect(consultSummary).toContain(
+      "Asked: When does SessionStart fire relative to UserPromptSubmit?",
+    );
+    expect(consultSummary).toContain(
+      "`SessionStart` runs once before the first `UserPromptSubmit` hook on fresh sessions.",
+    );
+    expect(consultSummary).not.toContain("Uncertainty:");
+
+    const workerSummary = extractAgentFocusMarkdown(
+      {
+        id: "worker-1",
+        objective: "Harden SQLite room store",
+        resultPath: "/tmp/orchestrate/runs/run-1/result.json",
+        output: [
+          "Harden SQLite room store",
+          "### STATUS",
+          "COMPLETE",
+          "All 5 concurrency invariants verified across processes.",
+          "Uncertainty: None",
+          "Coordinator observed: 2026-11-06T15:00:00Z",
+          "/tmp/orchestrate/runs/run-1/result.json",
+        ],
+      },
+      { isCardCollapsed: true },
+    );
+    expect(workerSummary).toContain("Task: Harden SQLite room store");
+    expect(workerSummary).toContain("All 5 concurrency invariants verified across processes.");
+    expect(workerSummary).not.toContain("Coordinator observed");
+    expect(workerSummary).not.toContain("result.json");
+    expect(workerSummary).not.toContain("Uncertainty");
   });
 });

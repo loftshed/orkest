@@ -504,6 +504,137 @@ function folderTreeRails(entries, tier, columns = 1, hasFollowingSection = false
   });
 }
 
+const BOILERPLATE_HEADING_RE =
+  /^#{1,6}\s*(?:status|summary|verdict|result|results|answer|overview|conclusion|outcome)\s*#*$/iu;
+const TRAILING_SECTION_HEADING_RE =
+  /^#{1,6}\s*(?:files?\s+changed|commands?\s+run|verification|uncertainty|artifacts?|appendix|references?)\b/iu;
+const STANDALONE_OUTCOME_RE = /^(?:COMPLETE|COMPLETED|PASSED|PARTIAL|BLOCKED|FAILED)$/u;
+const INTERNAL_FILE_PATH_RE = /^(?:\/|[A-Za-z]:\\)\S+\.(?:json|jsonl|txt|log)$/iu;
+
+function cleanProgressTask(member) {
+  const t = plain(member?.progress?.task || "").trim();
+  return t && t !== "not set" ? t : "";
+}
+
+function isFocusNoiseLine(rawLine, resultPath = "") {
+  const trimmed = plain(rawLine).trim();
+  if (
+    !trimmed ||
+    /^Coordinator observed:/iu.test(trimmed) ||
+    /^Uncertainty:\s*none\.?$/iu.test(trimmed) ||
+    BOILERPLATE_HEADING_RE.test(trimmed) ||
+    STANDALONE_OUTCOME_RE.test(trimmed) ||
+    TRAILING_SECTION_HEADING_RE.test(trimmed)
+  )
+    return true;
+  if (resultPath && trimmed === plain(resultPath).trim()) return true;
+  return INTERNAL_FILE_PATH_RE.test(trimmed);
+}
+
+function extractAnswerLeadLines(rawAnswer, maxLines = 3) {
+  const lines = String(rawAnswer || "").split(/\r?\n/u);
+  const picked = [];
+  let isInsideFence = false;
+  for (const raw of lines) {
+    const trimmed = plain(raw).trim();
+    if (/^(?:`{3,}|~{3,})/u.test(trimmed)) {
+      isInsideFence = !isInsideFence;
+      continue;
+    }
+    if (
+      isInsideFence ||
+      !trimmed ||
+      /^(?:-\s*){3,}$|^(?:\*\s*){3,}$|^(?:_\s*){3,}$/u.test(trimmed) ||
+      BOILERPLATE_HEADING_RE.test(trimmed) ||
+      STANDALONE_OUTCOME_RE.test(trimmed)
+    )
+      continue;
+    if (TRAILING_SECTION_HEADING_RE.test(trimmed)) {
+      if (picked.length > 0) break;
+      continue;
+    }
+    if (/^Uncertainty:\s*none\.?$/iu.test(trimmed)) continue;
+    if (/^Uncertainty:/iu.test(trimmed) && picked.length > 0) break;
+    picked.push(trimmed);
+    if (picked.length >= maxLines) break;
+  }
+  return picked;
+}
+
+export function extractAgentFocusMarkdown(
+  agent,
+  { isPinned = false, isCardCollapsed = false } = {},
+) {
+  if (!agent) return "";
+  const sections = [];
+  const seen = new Set();
+  const pushUnique = (line) => {
+    const normalized = plain(line).trim();
+    if (!normalized || seen.has(normalized)) return;
+    seen.add(normalized);
+    sections.push(normalized);
+  };
+
+  const taskLine = cleanProgressTask(agent) || plain(agent.objective || "").trim();
+  const errorLine = plain(agent.error || agent.dispatchError || "").trim();
+
+  if (agent.consultation) {
+    const asked = plain(agent.question || taskLine).trim();
+    if (asked) pushUnique(`Asked: ${asked}`);
+    if (errorLine) {
+      pushUnique(`Error: ${errorLine}`);
+    } else if (agent.answer) {
+      for (const line of extractAnswerLeadLines(agent.answer, 3)) {
+        pushUnique(line);
+      }
+    } else {
+      const cleanOut = (agent.output || []).filter(
+        (line) => !isFocusNoiseLine(line, agent.resultPath),
+      );
+      const nonUncertainty = cleanOut.filter(
+        (line) => !/^Uncertainty:/iu.test(plain(line).trim()) && plain(line).trim() !== asked,
+      );
+      const chosen = nonUncertainty.length > 0 ? nonUncertainty.slice(0, 3) : cleanOut.slice(0, 2);
+      for (const line of chosen) pushUnique(line);
+    }
+    return sections.join("\n");
+  }
+
+  if (errorLine) pushUnique(`Error: ${errorLine}`);
+  if (agent.question) {
+    const blockerQuestion = plain(agent.question).trim();
+    if (blockerQuestion && blockerQuestion !== taskLine) {
+      pushUnique(`Question: ${blockerQuestion}`);
+    }
+  }
+  if (isCardCollapsed && taskLine) {
+    pushUnique(`Task: ${taskLine}`);
+  }
+
+  if (agent.answer) {
+    for (const line of extractAnswerLeadLines(agent.answer, 3)) {
+      if (plain(line).trim() !== taskLine) pushUnique(line);
+    }
+  } else {
+    const cleanOut = (agent.output || []).filter(
+      (line) => !isFocusNoiseLine(line, agent.resultPath) && plain(line).trim() !== taskLine,
+    );
+    const nonUncertainty = cleanOut.filter((line) => !/^Uncertainty:/iu.test(plain(line).trim()));
+    let chosen = [];
+    if (nonUncertainty.length > 0) {
+      chosen = nonUncertainty.slice(-3);
+    } else if (cleanOut.length > 0) {
+      chosen = cleanOut.slice(-2);
+    }
+    for (const line of chosen) pushUnique(line);
+  }
+
+  if (sections.length === 0 && isPinned && taskLine) {
+    pushUnique(`Task: ${taskLine}`);
+  }
+  return sections.join("\n");
+}
+
 function joinCardGrid(cards, columns, cardWidth, gap = "  ") {
   if (columns <= 1 || cards.length <= 1) return cards.flat();
   const rows = [];
@@ -1395,6 +1526,76 @@ export class HordeView {
     );
   }
 
+  isCollapsibleCompleted(agent, parentIds) {
+    if (!agent || !isInactive(agent) || agent.id === this.pinnedId) return false;
+    if (agent.id === this.focusId && this.hasExplicitFocus) return false;
+    if (parentIds) return !parentIds.has(agent.id);
+    const agents = Array.isArray(this.room?.agents) ? this.room.agents : [];
+    return agents.every(
+      (member) => !(member.parent && member.parent !== "conductor" && member.parent === agent.id),
+    );
+  }
+
+  focusCardLines(focused, innerWidth, remainingRows, startRow) {
+    if (!focused || remainingRows <= 0) return [];
+    const isPinned = Boolean(this.pinnedId && focused.id === this.pinnedId);
+    const isCardCollapsed =
+      this.completedMode === "collapsed" && this.isCollapsibleCompleted(focused);
+    const markdown = extractAgentFocusMarkdown(focused, { isPinned, isCardCollapsed });
+    if (!markdown) return [];
+
+    const agentLabel = shortAgentName(focused);
+    const titlePrefix = isPinned ? "Pinned" : "Focus";
+    if (remainingRows < 3) {
+      const compactTag = `[${titlePrefix} · ${agentLabel}]`;
+      const styledTag = tone(compactTag, isPinned ? "warning bold" : "mdSection", this.appearance);
+      const rawLast = markdown.split("\n").at(-1) || "";
+      const summary = stripInlineMarkdown(rawLast).replace(/^(?:Task|Asked|Question):\s*/u, "");
+      const budget = Math.max(1, innerWidth - displayWidth(`${compactTag} `));
+      return [`${styledTag} ${fit(summary, budget)}`];
+    }
+
+    const title = `${titlePrefix} · ${agentLabel}`;
+    let rightHint = "";
+    if (innerWidth >= 48) {
+      rightHint = isPinned ? "Enter open · p unpin" : "Enter open · p pin";
+    } else if (innerWidth >= 34) {
+      rightHint = "Enter open";
+    }
+    const pad = innerWidth >= 6 ? " " : "";
+    const bodyWidth = Math.max(1, innerWidth - 2 - pad.length * 2);
+    const maxBodyRows = Math.max(1, Math.min(4, remainingRows - 2));
+    const rendered = renderMarkdown(markdown, bodyWidth, {
+      color: this.appearance,
+      tier: this.tier,
+    }).filter((line, idx, arr) => line !== "" || (idx > 0 && idx < arr.length - 1));
+    let visible = rendered.slice(0, maxBodyRows);
+    if (rendered.length > maxBodyRows && visible.length > 0 && bodyWidth >= 4) {
+      const ellipsis = this.tier === "ascii" ? "..." : "…";
+      const cutWidth = Math.max(1, bodyWidth - displayWidth(ellipsis));
+      const truncatedLast = fitStyled(visible.at(-1), cutWidth).trimEnd();
+      visible = [
+        ...visible.slice(0, -1),
+        `${truncatedLast}${tone(ellipsis, "muted", this.appearance)}`,
+      ];
+    }
+    const paddedBody = visible.map((row) => `${pad}${row}`);
+    let headerTone = isPinned ? "warning bold" : "mdSection";
+    if (this.hovered === "focus-card") headerTone = "buttonHover";
+    const cardLines = this.panel(title, paddedBody, innerWidth, rightHint, headerTone);
+    this.addTargets([
+      {
+        id: "focus-card",
+        agentId: focused.id,
+        x: 1,
+        y: startRow,
+        width: innerWidth,
+        height: cardLines.length,
+      },
+    ]);
+    return cardLines;
+  }
+
   render(width) {
     if (!this.preview || this.overlay) {
       this.previewWidth = 0;
@@ -1513,10 +1714,6 @@ export class HordeView {
     const leadFolder = agentFolder(lead, room);
     const leadRole = roleOf(lead);
     const leadRoleBadge = leadRole ? ` [${leadRole}]` : "";
-    const cleanProgressTask = (member) => {
-      const t = plain(member?.progress?.task || "").trim();
-      return t && t !== "not set" ? t : "";
-    };
     const leadIcon = this.tier === "nerd" ? "\u{F06A9} " : "";
     const leadTitle =
       lead.name || lead.progress?.name
@@ -1659,11 +1856,7 @@ export class HordeView {
       const parentIds = new Set(
         room.agents.map((agent) => agent.parent).filter((p) => p && p !== "conductor"),
       );
-      const isCollapsibleCompleted = (agent) =>
-        isInactive(agent) &&
-        (agent.id !== this.focusId || !this.hasExplicitFocus) &&
-        agent.id !== this.pinnedId &&
-        !parentIds.has(agent.id);
+      const isCollapsibleCompleted = (agent) => this.isCollapsibleCompleted(agent, parentIds);
       const folderGroups = new Map();
       for (const [offset, agent] of selected.entries()) {
         const folder = agentFolder(agent, room);
@@ -1815,20 +2008,20 @@ export class HordeView {
         );
       }
     }
-    const focused = room.agents.find((agent) => agent.id === (this.pinnedId || this.focusId));
-    const rawDetail = focused?.output?.at(-1);
-    const detail = rawDetail ? stripInlineMarkdown(rawDetail) : "";
-    const focusedTask = focused ? plain(focused.progress?.task || focused.objective || "") : "";
-    if (detail && (this.pinnedId || detail !== focusedTask) && lines.length < this.height - 4) {
-      const tag = this.pinnedId ? "pinned" : "detail";
-      const prefix = `${tag} (${shortAgentName(focused)}): `;
-      const detailBudget = Math.max(1, innerWidth - displayWidth(prefix));
-      lines.push(`${tone(prefix, "muted", this.appearance)}${fit(detail, detailBudget)}`);
-    }
     const controls = this.controls(innerWidth);
     const footerHeight = controls.lines.length + 2;
     const contentHeight = Math.max(0, this.height - footerHeight);
     const mainHeight = Math.max(0, contentHeight - serviceBlock.length);
+    const focused = room.agents.find((agent) => agent.id === (this.pinnedId || this.focusId));
+    const focusLines = this.focusCardLines(
+      focused,
+      innerWidth,
+      mainHeight - lines.length,
+      lines.length + 1,
+    );
+    if (focusLines.length > 0) {
+      lines.push(...focusLines);
+    }
     if (room.agents.length === 0) {
       const emptyLines = [];
       for (const line of wrapText(
