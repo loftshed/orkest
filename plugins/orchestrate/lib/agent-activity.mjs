@@ -2,8 +2,10 @@ import { open, readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 
 const SESSION_ID = /^[A-Za-z0-9_-]{1,100}$/u;
-const MAX_BYTES = 128 * 1024;
+const MAX_BYTES = 2 * 1024 * 1024;
 const MAX_EVENTS = 24;
+const MAX_PINNED_TEXTS = 6;
+const MAX_RECENT_TOOLS = 16;
 
 async function tail(file) {
   let handle;
@@ -51,16 +53,64 @@ function parseToolArgs(args) {
   return null;
 }
 
-function toolLabel(name, args) {
-  const parsed = parseToolArgs(args);
-  const file = parsed?.AbsolutePath || parsed?.file_path || parsed?.path;
-  return `Used ${shortText(name)}${typeof file === "string" && file ? ` · ${path.basename(file)}` : ""}`;
+function cleanShellCommand(rawCommand) {
+  if (typeof rawCommand !== "string" || !rawCommand.trim()) return "";
+  let s = rawCommand.trim().replaceAll(/\s+/gu, " ");
+  for (let i = 0; i < 6; i++) {
+    const next = s
+      .replace(/^cd\s+[^;&]+(?:\s*&&|\s*;)\s*/u, "")
+      .replace(/^[A-Za-z_][A-Za-z0-9_]*=(?:\$\([^;]*\)|[^\s;&]+)\s*(?:&&|;)\s*/u, "")
+      .trim();
+    if (next === s) break;
+    s = next;
+  }
+  if (/^python3?\s+-\s*<</u.test(s)) {
+    const fileMatch = rawCommand.match(
+      /['"]([A-Za-z0-9_./-]+\.(?:tsx?|jsx?|mjs|cjs|py|md|json|css|scss|html))['"]/u,
+    );
+    const target = fileMatch?.[1] ? path.basename(fileMatch[1]) : "";
+    return target ? `python3 inline script (${target})` : "python3 inline script";
+  }
+  return s.slice(0, 96);
 }
 
-function events(text, engine) {
+function toolDetail(parsed) {
+  if (!parsed || typeof parsed !== "object") return "";
+  const desc = shortText(parsed.description || parsed.toolSummary || "");
+  if (desc) return desc.slice(0, 96);
+  const file = parsed.AbsolutePath || parsed.file_path || parsed.path || parsed.SearchPath;
+  const pattern = shortText(parsed.pattern || parsed.Query || parsed.Pattern || "");
+  if (pattern && typeof file === "string" && file) {
+    return `${pattern.slice(0, 60)} · ${path.basename(file)}`;
+  }
+  if (typeof file === "string" && file) return path.basename(file);
+  if (pattern) return pattern.slice(0, 80);
+  const cmd = cleanShellCommand(parsed.command || parsed.CommandLine || parsed.cmd || "");
+  if (cmd) return cmd;
+  const sub = shortText(parsed.Role || parsed.subject || "");
+  if (sub) return sub.slice(0, 80);
+  return "";
+}
+
+function toolLabel(name, args) {
+  const parsed = parseToolArgs(args);
+  const detail = toolDetail(parsed);
+  return `Used ${shortText(name)}${detail ? ` · ${detail}` : ""}`;
+}
+
+function parseTranscript(text, engine) {
   const raw = [];
+  let handback = "";
+  const sentMessages = [];
   for (const line of text.split("\n")) {
-    if (!line) continue;
+    if (
+      !line ||
+      line.includes('"type":"api-request') ||
+      line.includes('"type": "api-request') ||
+      line.includes('"type":"attachment"')
+    ) {
+      continue;
+    }
     let row;
     try {
       row = JSON.parse(line);
@@ -70,14 +120,43 @@ function events(text, engine) {
     if (engine === "agy" && row.type === "PLANNER_RESPONSE") {
       if (assistantText(row.content)) raw.push({ kind: "text", value: row.content });
       const calls = row.tool_calls || [];
-      for (const call of calls) raw.push({ kind: "tool", value: toolLabel(call.name, call.args) });
+      for (const call of calls) {
+        const parsedArgs = parseToolArgs(call.args);
+        if (call.name === "send_message" && assistantText(parsedArgs?.Message, 600)) {
+          sentMessages.push({
+            to: shortText(parsedArgs?.Recipient || ""),
+            text: assistantText(parsedArgs.Message, 600),
+          });
+          continue;
+        }
+        raw.push({ kind: "tool", value: toolLabel(call.name, call.args) });
+      }
     } else if (engine === "claude" && row.type === "assistant") {
       const content = row.message?.content || [];
       for (const block of content) {
         if (block.type === "text" && assistantText(block.text))
           raw.push({ kind: "text", value: block.text });
-        if (block.type === "tool_use")
-          raw.push({ kind: "tool", value: toolLabel(block.name, block.input) });
+        if (block.type !== "tool_use") continue;
+        const parsedInput = parseToolArgs(block.input);
+        if (block.name === "SubagentHandback") {
+          const msg = assistantText(
+            parsedInput?.message || parsedInput?.content || parsedInput?.report || "",
+            1600,
+          );
+          if (msg) handback = msg;
+          continue;
+        }
+        if (
+          block.name === "SendMessage" &&
+          assistantText(parsedInput?.message || parsedInput?.content || "", 600)
+        ) {
+          sentMessages.push({
+            to: shortText(parsedInput?.to || parsedInput?.recipient || ""),
+            text: assistantText(parsedInput.message || parsedInput.content, 600),
+          });
+          continue;
+        }
+        raw.push({ kind: "tool", value: toolLabel(block.name, block.input) });
       }
     } else if (engine === "codex" && row.type === "response_item") {
       const item = row.payload;
@@ -91,15 +170,45 @@ function events(text, engine) {
       }
     }
   }
-  const sliced = raw.slice(-MAX_EVENTS);
+
+  const collapsed = [];
+  for (const item of raw) {
+    const prev = collapsed.at(-1);
+    if (item.kind === "tool" && prev?.kind === "tool" && prev.baseValue === item.value) {
+      prev.count = (prev.count || 1) + 1;
+      prev.value = `${prev.baseValue} (×${prev.count})`;
+    } else {
+      collapsed.push(
+        item.kind === "tool" ? { ...item, baseValue: item.value, count: 1 } : { ...item },
+      );
+    }
+  }
+
+  const tailSlice = collapsed.slice(-MAX_EVENTS);
+  const tailHasText = tailSlice.some((item) => item.kind === "text");
+  let selected = tailSlice;
+  if (tailHasText) {
+    const earlierTexts = collapsed
+      .slice(0, Math.max(0, collapsed.length - MAX_EVENTS))
+      .filter((item) => item.kind === "text")
+      .slice(-Math.max(0, MAX_PINNED_TEXTS - tailSlice.filter((i) => i.kind === "text").length));
+    if (earlierTexts.length > 0) {
+      selected = [...earlierTexts, ...tailSlice.slice(-(MAX_EVENTS - earlierTexts.length))];
+    }
+  } else {
+    const allTexts = collapsed.filter((item) => item.kind === "text").slice(-MAX_PINNED_TEXTS);
+    const recentTools = collapsed.filter((item) => item.kind === "tool").slice(-MAX_RECENT_TOOLS);
+    selected = [...allTexts, ...recentTools];
+  }
+
   let lastTextIndex = -1;
-  for (let i = sliced.length - 1; i >= 0; i--) {
-    if (sliced[i].kind === "text") {
+  for (let i = selected.length - 1; i >= 0; i--) {
+    if (selected[i].kind === "text") {
       lastTextIndex = i;
       break;
     }
   }
-  return sliced
+  const eventsText = selected
     .map((item, idx) =>
       item.kind === "text"
         ? assistantText(item.value, idx === lastTextIndex ? 1600 : 400)
@@ -107,6 +216,11 @@ function events(text, engine) {
     )
     .filter(Boolean)
     .join("\n");
+  const textItems = collapsed.filter((item) => item.kind === "text").slice(-MAX_PINNED_TEXTS);
+  const commentary = textItems
+    .map((item, idx) => assistantText(item.value, idx === textItems.length - 1 ? 1600 : 400))
+    .filter(Boolean);
+  return { eventsText, handback, sentMessages, commentary };
 }
 
 async function codexFile(home, session, startedAt) {
@@ -231,13 +345,25 @@ export async function readAgentActivity(agent) {
     source ? transcriptFile(source) : Promise.resolve(""),
     agent.resultPath ? readResultSummary(agent.resultPath) : Promise.resolve(null),
   ]);
-  const transcriptEvents = file && source ? events(await tail(file), source.engine) : "";
-  const answer = resultInfo?.answer || assistantText(agent.answer || "", 1600);
+  const parsedTranscript =
+    file && source
+      ? parseTranscript(await tail(file), source.engine)
+      : { eventsText: "", handback: "", sentMessages: [], commentary: [] };
+  const transcriptEvents = parsedTranscript.eventsText;
+  const commentary = parsedTranscript.commentary || [];
+  const answer =
+    resultInfo?.answer || assistantText(agent.answer || "", 1600) || parsedTranscript.handback;
   const uncertainty = resultInfo?.uncertainty || assistantText(agent.uncertainty || "", 600);
   const error = resultInfo?.error || assistantText(agent.error || "", 600);
   const verification = resultInfo?.verification || "";
   const liveOutput = resultInfo?.liveOutput || "";
-  const messages = Array.isArray(agent.messages) ? agent.messages : [];
+  const rawMessages = Array.isArray(agent.messages) ? [...agent.messages] : [];
+  for (const sent of parsedTranscript.sentMessages) {
+    if (rawMessages.every((m) => assistantText(m.text || "", 600) !== sent.text)) {
+      rawMessages.push(sent);
+    }
+  }
+  const messages = rawMessages;
   const rawTask = shortText(agent.objective || agent.progress?.task || agent.question || "");
   const task = rawTask && rawTask !== "not set" ? rawTask : "";
 
@@ -277,6 +403,10 @@ export async function readAgentActivity(agent) {
     if (verification) responseLines.push(`Verification: ${verification}`);
     sections.push(responseLines.join("\n"));
   } else {
+    if (commentary.length > 0) {
+      const updates = commentary.map((item) => `• ${item}`).join("\n");
+      sections.push(`Latest updates:\n${updates}`);
+    }
     const metaLines = [
       uncertainty && `Uncertainty: ${uncertainty}`,
       verification && `Verification: ${verification}`,

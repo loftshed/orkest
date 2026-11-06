@@ -449,9 +449,75 @@ describe("agent terminal preview", () => {
         },
       });
       expect(worktreeActivity).toContain("Task: Run in worktree");
+      expect(worktreeActivity).toContain("Latest updates:");
       expect(worktreeActivity).toContain("Recent activity:");
-      expect(worktreeActivity).toContain("Used Bash");
+      expect(worktreeActivity).toContain("Used Bash · git status");
       expect(worktreeActivity).toContain("Summary:\n- First item\n- Second item");
+
+      const handbackFile = path.join(
+        claudeHome,
+        "projects",
+        parentSlug,
+        "parent-sess-99",
+        "subagents",
+        "agent-sub100.jsonl",
+      );
+      await writeFile(
+        handbackFile,
+        `${JSON.stringify({
+          type: "assistant",
+          message: {
+            content: [
+              { type: "text", text: "Starting verification pass." },
+              {
+                type: "tool_use",
+                name: "Bash",
+                input: {
+                  description: "Run touched unit tests",
+                  command: "cd /work/main-repo && vitest run",
+                },
+              },
+              {
+                type: "tool_use",
+                name: "Bash",
+                input: {
+                  description: "Run touched unit tests",
+                  command: "cd /work/main-repo && vitest run",
+                },
+              },
+              {
+                type: "tool_use",
+                name: "SendMessage",
+                input: { to: "conductor", message: "Unit tests green; finishing report." },
+              },
+              {
+                type: "tool_use",
+                name: "SubagentHandback",
+                input: { message: "### STATUS\n\nCOMPLETE\n\nAll checks passed." },
+              },
+            ],
+          },
+        })}\n`,
+      );
+      const handbackActivity = await readAgentActivity({
+        objective: "Verify batch B",
+        activitySource: {
+          engine: "claude",
+          session: "subagent-sub100",
+          agentId: "sub100",
+          parentSession: "parent-sess-99",
+          cwd: "/work/main-repo",
+          accountHome: claudeHome,
+        },
+      });
+      expect(handbackActivity).toContain("Task: Verify batch B");
+      expect(handbackActivity).toContain(
+        "Messages to orchestrator:\n• Unit tests green; finishing report.",
+      );
+      expect(handbackActivity).toContain("Response:\n### STATUS\n\nCOMPLETE\n\nAll checks passed.");
+      expect(handbackActivity).toContain("Used Bash · Run touched unit tests (×2)");
+      expect(handbackActivity).not.toContain("Used SubagentHandback");
+      expect(handbackActivity).not.toContain("Used SendMessage");
     } finally {
       await rm(home, { recursive: true, force: true });
     }

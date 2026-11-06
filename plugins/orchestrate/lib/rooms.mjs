@@ -949,12 +949,13 @@ export async function observeRoom(idOrRoom, options = {}) {
     if (!member) continue;
     const key = member === room.conductor ? "conductor" : member.id;
     const snapshot = snapshots[key];
-    const sessionId = member.session?.id || member.mailboxSession || member.id;
+    const sessionId =
+      member.session?.id || member.nativeHandle || member.mailboxSession || member.id;
     const peerKey = sessionId ? sessionKey(sessionId) : null;
     const peer = peerKey
       ? await readOptionalJson(path.join(root, "peers", `${peerKey}.json`), 64 * 1024)
       : null;
-    if (member !== room.conductor && peer?.session === sessionId && peer.accountHome) {
+    if (member !== room.conductor && peer && peer.session === sessionId && peer.accountHome) {
       const memberCwd = member.cwd || room.cwd;
       const parentCwd = room.conductor?.cwd || room.cwd;
       member.activitySource = {
@@ -1095,7 +1096,14 @@ async function appendConsultations(room, root) {
           stage = result.status === "answered" ? "complete" : "blocked";
         }
         const workerSession = (isFinished && result.session_id) || job.session_id;
+        let consultationActivitySource;
         if (workerSession) {
+          const matchingNative = room.agents.find(
+            (member) => member.native && member.nativeSession === workerSession,
+          );
+          if (matchingNative?.activitySource) {
+            consultationActivitySource = matchingNative.activitySource;
+          }
           // Provider hooks may also publish this worker as an unbound interactive peer.
           room.agents = room.agents.filter(
             (member) => !(member.native && member.nativeSession === workerSession),
@@ -1136,6 +1144,7 @@ async function appendConsultations(room, root) {
           status,
           runtimeState,
           nativeSession: workerSession || undefined,
+          ...(consultationActivitySource && { activitySource: consultationActivitySource }),
           resultPath: job.result_path,
           ...(answer && { answer }),
           ...(uncertainty && { uncertainty }),
