@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -8,6 +9,7 @@ import { cacheHome, configHome } from "./runtime-paths.mjs";
 export const DEFAULT_UPDATE_INTERVAL_MS = 30 * 60 * 1000;
 
 const DEFAULT_REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+const SHA40_RE = /^[0-9a-f]{40}$/iu;
 
 async function readOptionalJson(filePath) {
   try {
@@ -71,6 +73,94 @@ async function execCommand(exec, command, args, options = {}) {
   return callbackResult || { stdout: "", stderr: "" };
 }
 
+async function resolveGitDirs(repoRoot) {
+  if (!repoRoot) return null;
+  const dotGit = path.join(repoRoot, ".git");
+  let info;
+  try {
+    info = await stat(dotGit);
+  } catch {
+    return null;
+  }
+  if (info.isDirectory()) {
+    return { gitDir: dotGit, commonDir: dotGit };
+  }
+  if (!info.isFile()) return null;
+  let pointer;
+  try {
+    pointer = (await readFile(dotGit, "utf8")).trim();
+  } catch {
+    return null;
+  }
+  if (!pointer.startsWith("gitdir:")) return null;
+  const gitDir = path.resolve(repoRoot, pointer.slice(7).trim());
+  let commonDir = gitDir;
+  try {
+    const commonRel = (await readFile(path.join(gitDir, "commondir"), "utf8")).trim();
+    if (commonRel) commonDir = path.resolve(gitDir, commonRel);
+  } catch {
+    // Standalone gitdir without commondir file.
+  }
+  return { gitDir, commonDir };
+}
+
+export async function resolveOrkestRepoRoot(options = {}) {
+  if (options.repoRoot) return options.repoRoot;
+  const candidate = options.defaultRepoRoot || DEFAULT_REPO_ROOT;
+  const dirs = await resolveGitDirs(candidate);
+  if (dirs) {
+    if (dirs.commonDir !== dirs.gitDir && path.basename(dirs.commonDir) === ".git") {
+      return path.dirname(dirs.commonDir);
+    }
+    return candidate;
+  }
+  const home = options.home || homedir();
+  try {
+    const linkedSkill = await realpath(path.join(home, ".agents", "skills", "orchestrate"));
+    const primaryRoot = path.resolve(linkedSkill, "../../../..");
+    if (await resolveGitDirs(primaryRoot)) return primaryRoot;
+  } catch {
+    // Fall back to DEFAULT_REPO_ROOT when no global skill link exists.
+  }
+  return candidate;
+}
+
+export async function readLocalGitHeadSha(repoRoot) {
+  const dirs = await resolveGitDirs(repoRoot);
+  if (!dirs) return null;
+  let headRaw;
+  try {
+    headRaw = (await readFile(path.join(dirs.gitDir, "HEAD"), "utf8")).trim();
+  } catch {
+    return null;
+  }
+  if (SHA40_RE.test(headRaw)) return headRaw.toLowerCase();
+  if (!headRaw.startsWith("ref:")) return null;
+  const refName = headRaw.slice(4).trim();
+  if (!refName) return null;
+  for (const baseDir of [dirs.gitDir, dirs.commonDir]) {
+    try {
+      const refSha = (await readFile(path.join(baseDir, refName), "utf8")).trim();
+      if (SHA40_RE.test(refSha)) return refSha.toLowerCase();
+    } catch {
+      // Ref may live in commonDir or packed-refs.
+    }
+  }
+  try {
+    const packed = await readFile(path.join(dirs.commonDir, "packed-refs"), "utf8");
+    for (const line of packed.split(/\r?\n/u)) {
+      if (!line || line.startsWith("#") || line.startsWith("^")) continue;
+      const space = line.indexOf(" ");
+      if (space !== 40 || line.slice(41).trim() !== refName) continue;
+      const sha = line.slice(0, 40);
+      if (SHA40_RE.test(sha)) return sha.toLowerCase();
+    }
+  } catch {
+    // No packed-refs file present.
+  }
+  return null;
+}
+
 export function getUpdateStatePath(options = {}) {
   const dir = options.cacheDir || cacheHome(options.env);
   return path.join(dir, "auto-update-v1.json");
@@ -114,7 +204,7 @@ export async function setAutoUpdateEnabled(isEnabled, options = {}) {
 
 export async function checkOrkestUpdate(options = {}) {
   const exec = options.exec || execFile;
-  const repoRoot = options.repoRoot || DEFAULT_REPO_ROOT;
+  const repoRoot = await resolveOrkestRepoRoot(options);
   const cfg = await readAutoUpdateConfig(options);
   const remote = options.remote || cfg.remote || "origin";
   const git = async (args, timeout = 15_000) =>
@@ -170,7 +260,7 @@ export async function checkOrkestUpdate(options = {}) {
 
 export async function runOrkestUpdate(options = {}) {
   const exec = options.exec || execFile;
-  const repoRoot = options.repoRoot || DEFAULT_REPO_ROOT;
+  const repoRoot = await resolveOrkestRepoRoot(options);
   const nowMs = typeof options.now === "function" ? options.now() : (options.now ?? Date.now());
   const nowIso = new Date(nowMs).toISOString();
   const statePath = getUpdateStatePath(options);
@@ -200,11 +290,13 @@ export async function runOrkestUpdate(options = {}) {
     }
   }
 
-  const check = await checkOrkestUpdate(options);
+  const check = await checkOrkestUpdate({ ...options, repoRoot });
   const nextState = {
     ...existingState,
     lastCheckedAt: nowIso,
     status: check.status,
+    ...(check.localSha && { localSha: check.localSha }),
+    ...(check.remoteSha && { remoteSha: check.remoteSha }),
   };
 
   if (check.status !== "update_available") {
@@ -256,6 +348,8 @@ export async function runOrkestUpdate(options = {}) {
     lastUpdatedAt: nowIso,
     fromSha: check.localSha,
     toSha: check.remoteSha,
+    localSha: check.remoteSha,
+    remoteSha: check.remoteSha,
     commitsBehind: check.commitsBehind,
   };
   await writeJsonFile(statePath, updatedState);

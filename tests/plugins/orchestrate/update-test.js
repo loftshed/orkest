@@ -1,13 +1,20 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
+  cachedUpdateStatus,
+  resolvePullUpdateOutcome,
+  UPDATE_SUCCESS_TTL_MS,
+} from "../../../plugins/orchestrate/bin/horde-tui.mjs";
+import {
   checkOrkestUpdate,
   DEFAULT_UPDATE_INTERVAL_MS,
   getUpdateStatePath,
   readAutoUpdateConfig,
+  readLocalGitHeadSha,
+  resolveOrkestRepoRoot,
   runOrkestUpdate,
   runUpdateCli,
   setAutoUpdateEnabled,
@@ -220,7 +227,137 @@ describe("Orkest auto-update (update.mjs)", () => {
       status: "updated",
       fromSha: "aaaa1111",
       toSha: "bbbb2222",
+      localSha: "bbbb2222",
+      remoteSha: "bbbb2222",
       commitsBehind: 3,
     });
+  });
+
+  it("reads local git HEAD across loose refs, packed-refs, and linked worktrees, and resolves pruned worktrees", async () => {
+    const shaA = "1111111111111111111111111111111111111111";
+    const shaB = "2222222222222222222222222222222222222222";
+    const primary = await makeTempDir();
+    await mkdir(path.join(primary, ".git", "refs", "heads"), { recursive: true });
+    await writeFile(path.join(primary, ".git", "HEAD"), "ref: refs/heads/main\n", "utf8");
+    await writeFile(path.join(primary, ".git", "refs", "heads", "main"), `${shaA}\n`, "utf8");
+    expect(await readLocalGitHeadSha(primary)).toBe(shaA);
+
+    // Packed-refs resolution when loose ref is absent:
+    await rm(path.join(primary, ".git", "refs", "heads", "main"));
+    await writeFile(
+      path.join(primary, ".git", "packed-refs"),
+      `# pack-refs with: peeled fully-peeled sorted\n${shaB} refs/heads/main\n`,
+      "utf8",
+    );
+    expect(await readLocalGitHeadSha(primary)).toBe(shaB);
+
+    // Linked worktree resolves back to primary repo root:
+    const wtGitDir = path.join(primary, ".git", "worktrees", "wt-demo");
+    await mkdir(wtGitDir, { recursive: true });
+    await writeFile(path.join(wtGitDir, "commondir"), "../..\n", "utf8");
+    await writeFile(path.join(wtGitDir, "HEAD"), "ref: refs/heads/main\n", "utf8");
+    const wtCheckout = await makeTempDir();
+    await writeFile(path.join(wtCheckout, ".git"), `gitdir: ${wtGitDir}\n`, "utf8");
+    expect(await resolveOrkestRepoRoot({ defaultRepoRoot: wtCheckout })).toBe(primary);
+    expect(await readLocalGitHeadSha(wtCheckout)).toBe(shaB);
+
+    // Pruned disposable worktree falls back via ~/.agents/skills/orchestrate symlink:
+    const fakeHome = await makeTempDir();
+    const skillTarget = path.join(primary, "plugins", "orchestrate", "skills", "orchestrate");
+    await mkdir(skillTarget, { recursive: true });
+    await mkdir(path.join(fakeHome, ".agents", "skills"), { recursive: true });
+    await symlink(skillTarget, path.join(fakeHome, ".agents", "skills", "orchestrate"));
+    const missingWorktree = path.join(primary, "does-not-exist-anymore");
+    expect(await resolveOrkestRepoRoot({ defaultRepoRoot: missingWorktree, home: fakeHome })).toBe(
+      await realpath(primary),
+    );
+  });
+
+  it("clears stale cross-session Update banners without refetching and handles up_to_date clicks cleanly", async () => {
+    const shaOld = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const shaNew = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const repoRoot = await makeTempDir();
+    const cacheDir = await makeTempDir();
+    await mkdir(path.join(repoRoot, ".git", "refs", "heads"), { recursive: true });
+    await writeFile(path.join(repoRoot, ".git", "HEAD"), "ref: refs/heads/main\n", "utf8");
+    await writeFile(path.join(repoRoot, ".git", "refs", "heads", "main"), `${shaOld}\n`, "utf8");
+
+    let checkCalls = 0;
+    const initial = await cachedUpdateStatus({
+      force: true,
+      now: 10_000,
+      repoRoot,
+      cacheDir,
+      checkFn: async () => {
+        checkCalls += 1;
+        return {
+          updateAvailable: true,
+          commitsBehind: 2,
+          localSha: shaOld,
+          remoteSha: shaNew,
+          dirty: false,
+        };
+      },
+    });
+    expect(initial).toMatchObject({
+      available: true,
+      commitsBehind: 2,
+      localSha: shaOld,
+      remoteSha: shaNew,
+      status: "available",
+    });
+    expect(checkCalls).toBe(1);
+
+    // Still behind 1 second later -> stays available from cache without calling checkFn:
+    const stillBehind = await cachedUpdateStatus({
+      now: 11_000,
+      repoRoot,
+      cacheDir,
+      checkFn: async () => {
+        throw new Error("should not refetch while local HEAD is unchanged");
+      },
+    });
+    expect(stillBehind.available).toBe(true);
+
+    // Another session fast-forwards main on disk -> next tick immediately clears banner without calling checkFn:
+    await writeFile(path.join(repoRoot, ".git", "refs", "heads", "main"), `${shaNew}\n`, "utf8");
+    const afterSiblingPull = await cachedUpdateStatus({
+      now: 12_000,
+      repoRoot,
+      cacheDir,
+      checkFn: async () => {
+        throw new Error("should clear banner from local HEAD without network fetch");
+      },
+    });
+    expect(afterSiblingPull).toMatchObject({
+      available: false,
+      commitsBehind: 0,
+      localSha: shaNew,
+      remoteSha: shaNew,
+      status: "up_to_date",
+    });
+
+    // Clicking Update when another session already updated clears banner instead of reporting an error:
+    const upToDateClick = resolvePullUpdateOutcome(
+      { ok: true, updated: false, status: "up_to_date", localSha: shaNew },
+      20_000,
+    );
+    expect(upToDateClick).toEqual({
+      updateState: null,
+      notice: "Orkest is already up to date.",
+    });
+
+    const updatedClick = resolvePullUpdateOutcome(
+      { ok: true, updated: true, status: "updated", toSha: shaNew, commitsBehind: 2 },
+      25_000,
+    );
+    expect(updatedClick.updateState).toEqual({
+      available: false,
+      status: "updated",
+      toSha: shaNew,
+      commitsBehind: 2,
+      completedAt: 25_000,
+    });
+    expect(UPDATE_SUCCESS_TTL_MS).toBeGreaterThanOrEqual(5000);
   });
 });
