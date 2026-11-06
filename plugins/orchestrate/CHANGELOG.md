@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.66.0
+
+- feat(orchestrate): format Recorded activity and Markdown with TUI theme (#112)
+
 ## 0.65.0
 
 - feat(orchestrate): propagate repo .env and .worktreeinclude across subagents and worktrees (#110)
