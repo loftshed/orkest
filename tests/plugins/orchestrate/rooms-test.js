@@ -1,10 +1,15 @@
-import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, utimes, writeFile } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { roomsCommand } from "../../../plugins/orchestrate/bin/rooms.mjs";
-import { parseTeam, readRoom, updateRoom } from "../../../plugins/orchestrate/lib/horde-room.mjs";
+import {
+  parseTeam,
+  readRoom,
+  updateRoom,
+  withRoomLock,
+} from "../../../plugins/orchestrate/lib/horde-room.mjs";
 import {
   dispatchMember,
   growRoom,
@@ -955,5 +960,97 @@ describe("room CLI", () => {
       text: "Schema audit completed with zero breaking changes.",
     });
     expect(observed.messages).toHaveLength(1);
+  });
+});
+
+describe("room lock ownership", () => {
+  it.each(["legacy", "json"])("does not steal an aged live %s owner", async (format) => {
+    const root = await directory();
+    const file = path.join(root, "room.json");
+    const lock = `${file}.lock`;
+    await mkdir(lock);
+    const owner =
+      format === "legacy"
+        ? `${process.pid}\n`
+        : JSON.stringify({ pid: process.pid, token: "python-holder" });
+    await writeFile(path.join(lock, "owner"), owner);
+    const now = Date.now();
+    await utimes(lock, (now - 60_000) / 1000, (now - 60_000) / 1000);
+    const clock = vi
+      .spyOn(Date, "now")
+      .mockReturnValueOnce(now)
+      .mockReturnValue(now + 4000);
+    try {
+      await expect(withRoomLock(file, () => "stolen")).rejects.toThrow("Room is locked:");
+    } finally {
+      clock.mockRestore();
+    }
+    expect(await readFile(path.join(lock, "owner"), "utf8")).toBe(owner);
+  });
+
+  it.each(["dead", "missing", "invalid", "reused", "retired"])(
+    "recovers a %s owner",
+    async (format) => {
+      const root = await directory();
+      const file = path.join(root, "room.json");
+      const lock = `${file}.lock`;
+      await mkdir(lock);
+      if (format !== "missing") {
+        const owner =
+          format === "invalid"
+            ? "partial{"
+            : JSON.stringify({
+                pid: ["dead", "retired"].includes(format) ? 2_147_483_647 : process.pid,
+                token: "ended-acquisition",
+                ...(format === "reused" && { pidBirth: "previous-process" }),
+              });
+        await writeFile(
+          path.join(lock, format === "retired" ? "owner.2147483647.abcd.retired" : "owner"),
+          owner,
+        );
+      }
+      await utimes(lock, 1, 1);
+      expect(await withRoomLock(file, () => "recovered")).toBe("recovered");
+      await expect(readFile(lock)).rejects.toMatchObject({ code: "ENOENT" });
+    },
+  );
+
+  it("gives a missing owner an acquisition grace period", async () => {
+    const root = await directory();
+    const file = path.join(root, "room.json");
+    await mkdir(`${file}.lock`);
+    const now = Date.now();
+    const clock = vi
+      .spyOn(Date, "now")
+      .mockReturnValueOnce(now)
+      .mockReturnValue(now + 4000);
+    try {
+      await expect(withRoomLock(file, () => "stolen")).rejects.toThrow("Room is locked:");
+    } finally {
+      clock.mockRestore();
+    }
+    await writeFile(path.join(`${file}.lock`, "owner"), `${process.pid}\n`);
+    expect(await readFile(path.join(`${file}.lock`, "owner"), "utf8")).toBe(`${process.pid}\n`);
+  });
+
+  it("does not release a replacement acquisition, even with the same PID", async () => {
+    const root = await directory();
+    const file = path.join(root, "room.json");
+    const ownerFile = path.join(`${file}.lock`, "owner");
+    await expect(
+      withRoomLock(file, async () => {
+        const first = JSON.parse(await readFile(ownerFile, "utf8"));
+        expect(first.pid).toBe(process.pid);
+        expect(typeof first.token).toBe("string");
+        await rm(`${file}.lock`, { recursive: true });
+        await mkdir(`${file}.lock`);
+        await writeFile(ownerFile, JSON.stringify({ pid: process.pid, token: "replacement" }));
+        throw new Error("update failed");
+      }),
+    ).rejects.toThrow("update failed");
+    expect(JSON.parse(await readFile(ownerFile, "utf8"))).toEqual({
+      pid: process.pid,
+      token: "replacement",
+    });
   });
 });

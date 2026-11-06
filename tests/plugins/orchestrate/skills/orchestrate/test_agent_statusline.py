@@ -2,19 +2,24 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import re
+import select
 import socket
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SCRIPTS = Path(__file__).resolve().parents[5] / "plugins/orchestrate/skills/orchestrate/scripts"
 sys.path.insert(0, str(SCRIPTS))
+import agent_statusline_tmux as tmux  # noqa: E402
 import mailbox_tasks  # noqa: E402
 import mailbox_work  # noqa: E402
 import peer_mailbox as mailbox  # noqa: E402
@@ -418,6 +423,123 @@ class AgentStatuslineTests(unittest.TestCase):
             payload={"session_id": "claude-123"},
         )
         self.assertEqual(line2, "stage : not set | goal : not set | task : not set\n")
+
+
+class RoomLockTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.path = Path(temporary.name) / "room.json"
+        self.lock = Path(f"{self.path}.lock")
+
+    def age_lock(self):
+        old = time.time() - 60
+        os.utime(self.lock, (old, old))
+
+    def assert_locked(self):
+        with mock.patch.object(tmux.time, "monotonic", side_effect=itertools.count(0, 4)):
+            with self.assertRaisesRegex(OSError, "Room is locked"):
+                with tmux._node_room_lock(self.path):
+                    self.fail("entered another holder's lock")
+
+    def test_aged_live_legacy_and_json_owners_are_preserved(self):
+        self.lock.mkdir()
+        for owner in (f"{os.getpid()}\n", json.dumps({"pid": os.getpid(), "token": "legacy-upgrade"})):
+            with self.subTest(owner=owner):
+                (self.lock / "owner").write_text(owner)
+                self.age_lock()
+                self.assert_locked()
+                self.assertEqual((self.lock / "owner").read_text(), owner)
+
+    def test_dead_missing_invalid_and_reused_owners_recover(self):
+        for kind in ("dead", "missing", "invalid", "reused", "retired"):
+            with self.subTest(kind=kind):
+                self.lock.mkdir()
+                if kind != "missing":
+                    owner = (
+                        "partial{"
+                        if kind == "invalid"
+                        else json.dumps(
+                            {
+                                "pid": 2147483647 if kind in ("dead", "retired") else os.getpid(),
+                                "token": "ended-acquisition",
+                                "pidBirth": "previous-process",
+                            }
+                        )
+                    )
+                    name = "owner.2147483647.abcd.retired" if kind == "retired" else "owner"
+                    (self.lock / name).write_text(owner)
+                self.age_lock()
+                with tmux._node_room_lock(self.path):
+                    current = json.loads((self.lock / "owner").read_text())
+                    self.assertEqual(current["pid"], os.getpid())
+                    self.assertEqual(len(current["token"]), 32)
+                self.assertFalse(self.lock.exists())
+
+    def test_missing_owner_gets_an_acquisition_grace_period(self):
+        self.lock.mkdir()
+        self.assert_locked()
+        self.assertTrue(self.lock.is_dir())
+
+    def test_release_keeps_a_replacement_acquisition_with_same_pid(self):
+        with self.assertRaisesRegex(RuntimeError, "update failed"):
+            with tmux._node_room_lock(self.path):
+                (self.lock / "owner").unlink()
+                self.lock.rmdir()
+                self.lock.mkdir()
+                (self.lock / "owner").write_text(json.dumps({"pid": os.getpid(), "token": "replacement"}))
+                raise RuntimeError("update failed")
+        self.assertEqual(json.loads((self.lock / "owner").read_text()), {"pid": os.getpid(), "token": "replacement"})
+
+    def test_python_and_node_holders_exclude_each_other_when_aged(self):
+        module = SCRIPTS.parents[2] / "lib/horde-room.mjs"
+        script = f"""
+            import {{ withRoomLock }} from {json.dumps(module.as_uri())};
+            await withRoomLock(process.argv[1], async () => {{
+                console.log("acquired");
+                await new Promise((resolve) => process.stdin.once("data", resolve));
+            }});
+        """
+        child = subprocess.Popen(
+            ["node", "--input-type=module", "-e", script, str(self.path)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            self.assertTrue(select.select([child.stdout], [], [], 5)[0], "Node did not acquire the lock")
+            self.assertEqual(child.stdout.readline(), "acquired\n")
+            self.age_lock()
+            self.assert_locked()
+        finally:
+            try:
+                _, errors = child.communicate("release\n", timeout=5)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.communicate()
+                raise
+        self.assertEqual(child.returncode, 0, errors)
+        with tmux._node_room_lock(self.path):
+            self.age_lock()
+            script = f"""
+                import {{ withRoomLock }} from {json.dumps(module.as_uri())};
+                const now = Date.now();
+                let first = true;
+                Date.now = () => {{ if (first) {{ first = false; return now; }} return now + 4000; }};
+                try {{
+                    await withRoomLock(process.argv[1], () => console.log("stolen"));
+                }} catch (error) {{ console.log(error.message); }}
+            """
+            result = subprocess.run(
+                ["node", "--input-type=module", "-e", script, str(self.path)],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=True,
+            )
+            self.assertEqual(result.stdout, f"Room is locked: {self.path}\n")
+            self.assertEqual(json.loads((self.lock / "owner").read_text())["pid"], os.getpid())
 
 
 if __name__ == "__main__":
