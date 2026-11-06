@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.69.0
+
+- feat(orchestrate): allow agents to invoke orchestrate autonomously at will (#120)
+
 ## 0.68.0
 
 - refactor(orchestrate)!: remove legacy stooges aliases, shims, and naming (#118)
