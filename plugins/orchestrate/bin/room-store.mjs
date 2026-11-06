@@ -17,7 +17,7 @@ function payload() {
 }
 
 async function put(room) {
-  for (;;) {
+  for (let attempt = 0; attempt < 16; attempt++) {
     try {
       return await updateRawRoom(id, () => room, { root });
     } catch (error) {
@@ -29,6 +29,7 @@ async function put(room) {
       if (error.message !== `Room already exists: ${id}`) throw error;
     }
   }
+  throw new Error(`Room put exceeded concurrent retries: ${id}`);
 }
 
 async function run() {

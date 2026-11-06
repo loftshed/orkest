@@ -1,8 +1,8 @@
-import { mkdirSync, realpathSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { backup, Database } from "node:sqlite";
 
-const minimumNodeVersion = "26.13.0";
+const minimumNodeVersion = "26.8.0";
 const minimumSqliteVersion = "3.51.3";
 const maximumRetryDelayMs = 1000;
 
@@ -94,6 +94,36 @@ export function resolveCanonicalDbPath(rawPath, { createDir = false } = {}) {
   return path.join(realpathSync(parentPath), path.basename(absolutePath));
 }
 
+function assertNotSymlink(filePath) {
+  let stats;
+  try {
+    stats = lstatSync(filePath);
+  } catch (error) {
+    if (error.code === "ENOENT") return;
+    throw error;
+  }
+  if (stats.isSymbolicLink()) {
+    throw new Error(`Refusing to open symlinked SQLite path: ${filePath}.`);
+  }
+}
+
+function assertSafeSqlitePaths(dbPath) {
+  for (const candidate of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) {
+    assertNotSymlink(candidate);
+  }
+}
+
+function hardenDatabaseFileModes(dbPath) {
+  for (const candidate of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) {
+    assertNotSymlink(candidate);
+    try {
+      chmodSync(candidate, 0o600);
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+  }
+}
+
 /** Open an Orkest database with safe defaults and a cached native tagged-query store. */
 export function openOrkestSqlite(
   rawPath,
@@ -123,6 +153,7 @@ export function openOrkestSqlite(
   }
 
   const dbPath = resolveCanonicalDbPath(rawPath, { createDir: !readOnly });
+  assertSafeSqlitePaths(dbPath);
   const db = new Database(dbPath, {
     allowBareNamedParameters: true,
     defensive: true,
@@ -140,6 +171,7 @@ export function openOrkestSqlite(
       db.exec(`PRAGMA synchronous = ${synchronousMode}`);
       db.exec(`PRAGMA journal_size_limit = ${journalSizeLimit}`);
       db.exec("PRAGMA temp_store = MEMORY");
+      hardenDatabaseFileModes(dbPath);
     }
 
     const createNativeTagStore = db.createTagStore.bind(db);
@@ -189,6 +221,29 @@ export function withImmediateTransaction(db, fn, { maxRetries = 4, baseDelayMs =
   return finishTransaction(db, fn);
 }
 
+function readSchemaState(db, applicationId, migrationCount) {
+  const storedApplicationId = readPragma(db, "PRAGMA application_id").application_id;
+  if (storedApplicationId !== 0 && storedApplicationId !== applicationId) {
+    throw new Error(
+      `SQLite application_id mismatch: expected ${applicationId}, found ${storedApplicationId}.`,
+    );
+  }
+  const storedUserVersion = readPragma(db, "PRAGMA user_version").user_version;
+  if (!Number.isSafeInteger(storedUserVersion) || storedUserVersion < 0) {
+    throw new Error(`SQLite schema version ${storedUserVersion} is invalid.`);
+  }
+  if (storedUserVersion > migrationCount) {
+    throw new Error(
+      `SQLite schema version ${storedUserVersion} is newer than this runtime supports (${migrationCount}).`,
+    );
+  }
+  return {
+    needsApplicationId: storedApplicationId === 0 && applicationId !== 0,
+    needsMigrations: storedUserVersion < migrationCount,
+    storedUserVersion,
+  };
+}
+
 /** Apply ordered migration callbacks atomically and guard the database identity. */
 export function migrateSchema(db, { applicationId = 1_330_793_299, migrations } = {}) {
   assertSqliteRuntime();
@@ -202,28 +257,15 @@ export function migrateSchema(db, { applicationId = 1_330_793_299, migrations } 
     throw new TypeError("migrations must be an ordered array of synchronous functions.");
   }
 
-  db.exec("BEGIN EXCLUSIVE");
-  return finishTransaction(db, () => {
-    const storedApplicationId = readPragma(db, "PRAGMA application_id").application_id;
-    if (storedApplicationId !== 0 && storedApplicationId !== applicationId) {
-      throw new Error(
-        `SQLite application_id mismatch: expected ${applicationId}, found ${storedApplicationId}.`,
-      );
-    }
-    const storedUserVersion = readPragma(db, "PRAGMA user_version").user_version;
-    if (!Number.isSafeInteger(storedUserVersion) || storedUserVersion < 0) {
-      throw new Error(`SQLite schema version ${storedUserVersion} is invalid.`);
-    }
-    if (storedUserVersion > migrations.length) {
-      throw new Error(
-        `SQLite schema version ${storedUserVersion} is newer than this runtime supports (${migrations.length}).`,
-      );
-    }
+  const initial = readSchemaState(db, applicationId, migrations.length);
+  if (!initial.needsApplicationId && !initial.needsMigrations) return;
 
-    if (storedApplicationId === 0 && applicationId !== 0) {
+  return withImmediateTransaction(db, () => {
+    const current = readSchemaState(db, applicationId, migrations.length);
+    if (current.needsApplicationId) {
       db.exec(`PRAGMA application_id = ${applicationId}`);
     }
-    for (let index = storedUserVersion; index < migrations.length; index++) {
+    for (let index = current.storedUserVersion; index < migrations.length; index++) {
       const result = migrations[index](db);
       assertSynchronousResult(result);
       db.exec(`PRAGMA user_version = ${index + 1}`);
@@ -244,5 +286,8 @@ export function isSqliteBusyError(error) {
 export async function backupSqlite(sourceDb, destPath) {
   assertSqliteRuntime();
   const canonicalPath = resolveCanonicalDbPath(destPath, { createDir: true });
-  return backup(sourceDb, canonicalPath);
+  assertSafeSqlitePaths(canonicalPath);
+  const result = await backup(sourceDb, canonicalPath);
+  hardenDatabaseFileModes(canonicalPath);
+  return result;
 }

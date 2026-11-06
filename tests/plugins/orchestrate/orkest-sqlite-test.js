@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, realpath, rm, symlink } from "node:fs/promises";
+import { chmod, mkdtemp, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -44,8 +44,11 @@ describe("Orkest SQLite runtime", () => {
   it("accepts the required Node and SQLite versions and rejects older or unparseable versions", () => {
     expect(assertSqliteRuntime).not.toThrow();
 
-    vi.stubGlobal("process", { versions: { node: "26.12.99", sqlite: "3.54.0" } });
-    expect(assertSqliteRuntime).toThrow("requires Node.js >= 26.13.0");
+    vi.stubGlobal("process", { versions: { node: "26.12.1", sqlite: "3.54.1" } });
+    expect(assertSqliteRuntime).not.toThrow();
+
+    vi.stubGlobal("process", { versions: { node: "26.7.99", sqlite: "3.54.0" } });
+    expect(assertSqliteRuntime).toThrow("requires Node.js >= 26.8.0");
 
     vi.stubGlobal("process", { versions: { node: "26.13.0", sqlite: "3.51.2" } });
     expect(assertSqliteRuntime).toThrow("requires SQLite >= 3.51.3");
@@ -138,6 +141,35 @@ describe("Orkest SQLite connections", () => {
     expect(database.isOpen).toBe(false);
     expect(() => statement.get()).toThrow();
   });
+
+  it("enforces 0600 file permissions and rejects symlinked database or WAL paths", async () => {
+    const dbPath = path.join(temporaryDirectory.path, "secure.sqlite");
+    {
+      using db = openOrkestSqlite(dbPath);
+      db.exec(
+        "CREATE TABLE secrets (value TEXT NOT NULL) STRICT; INSERT INTO secrets VALUES ('x');",
+      );
+      expect((await stat(dbPath)).mode & 0o777).toBe(0o600);
+      expect((await stat(`${dbPath}-wal`)).mode & 0o777).toBe(0o600);
+    }
+
+    await chmod(dbPath, 0o644);
+    {
+      using reopened = openOrkestSqlite(dbPath);
+      reopened.exec("INSERT INTO secrets VALUES ('y')");
+      expect((await stat(dbPath)).mode & 0o777).toBe(0o600);
+    }
+
+    const targetPath = path.join(temporaryDirectory.path, "target.sqlite");
+    await writeFile(targetPath, "");
+    const linkedDb = path.join(temporaryDirectory.path, "linked.sqlite");
+    await symlink(targetPath, linkedDb);
+    expect(() => openOrkestSqlite(linkedDb)).toThrow("Refusing to open symlinked SQLite path");
+
+    const walLinkedDb = path.join(temporaryDirectory.path, "wal-linked.sqlite");
+    await symlink(targetPath, `${walLinkedDb}-wal`);
+    expect(() => openOrkestSqlite(walLinkedDb)).toThrow("Refusing to open symlinked SQLite path");
+  });
 });
 
 describe("Orkest SQLite transactions and migrations", () => {
@@ -226,6 +258,30 @@ describe("Orkest SQLite transactions and migrations", () => {
       `SQLite application_id mismatch: expected 1330793299, found 42`,
     );
   });
+
+  it("does not block WAL readers in migrateSchema once migrations are up to date", () => {
+    const dbPath = path.join(temporaryDirectory.path, "wal-readers.sqlite");
+    const migrations = [
+      (database) =>
+        database.exec(
+          "CREATE TABLE items (value TEXT NOT NULL) STRICT; INSERT INTO items VALUES ('committed');",
+        ),
+    ];
+    {
+      using setup = openOrkestSqlite(dbPath);
+      migrateSchema(setup, { migrations });
+    }
+
+    using writer = openOrkestSqlite(dbPath, { timeout: 50 });
+    writer.exec("BEGIN IMMEDIATE; INSERT INTO items VALUES ('uncommitted');");
+    try {
+      using reader = openOrkestSqlite(dbPath, { timeout: 50 });
+      expect(() => migrateSchema(reader, { migrations })).not.toThrow();
+      expect(reader.tagStore.all`SELECT value FROM items`).toEqual([{ value: "committed" }]);
+    } finally {
+      writer.exec("ROLLBACK");
+    }
+  });
 });
 
 describe("Orkest SQLite backup and process concurrency", () => {
@@ -237,6 +293,7 @@ describe("Orkest SQLite backup and process concurrency", () => {
     const destination = path.join(temporaryDirectory.path, "backups", "snapshot.sqlite");
 
     await backupSqlite(source, destination);
+    expect((await stat(destination)).mode & 0o777).toBe(0o600);
 
     using copy = openOrkestSqlite(destination, { readOnly: true });
     using select = copy.prepare("SELECT value FROM snapshot");

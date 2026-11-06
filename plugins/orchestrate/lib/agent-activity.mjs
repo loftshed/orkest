@@ -503,36 +503,60 @@ async function readOpenCodeActivity(source) {
   let database;
   try {
     database = new Database(dbPath, { readOnly: true, timeout: 50 });
-    const version = database
-      .prepare(
-        "SELECT MAX(time_updated) AS time_updated FROM (SELECT time_updated FROM message WHERE session_id = ? UNION ALL SELECT time_updated FROM part WHERE session_id = ?)",
-      )
-      .get(session, session)?.time_updated;
-    const versionKey = version === null || version === undefined ? "" : String(version);
+    using versionStatement = database.prepare(
+      `SELECT
+        (SELECT COUNT(*) FROM message WHERE session_id = ?) AS message_count,
+        (SELECT COALESCE(MAX(time_updated), -1) FROM message WHERE session_id = ?) AS message_updated,
+        (SELECT COALESCE(SUM(LENGTH(data)), 0) FROM message WHERE session_id = ?) AS message_bytes,
+        (SELECT COUNT(*) FROM part WHERE session_id = ?) AS part_count,
+        (SELECT COALESCE(MAX(time_updated), -1) FROM part WHERE session_id = ?) AS part_updated,
+        (SELECT COALESCE(SUM(LENGTH(data)), 0) FROM part WHERE session_id = ?) AS part_bytes`,
+    );
+    const version = versionStatement.get(session, session, session, session, session, session);
+    const versionKey = `${version.message_count}:${version.message_updated}:${version.message_bytes}:${version.part_count}:${version.part_updated}:${version.part_bytes}`;
     const cached = openCodeCursors.get(key);
     if (cached?.version === versionKey) {
       touchCursor(openCodeCursors, key, cached);
       return cached.summary;
     }
 
-    const assistantIds = new Set();
-    const messages = database
-      .prepare(
-        "SELECT id, data FROM message WHERE session_id = ? ORDER BY time_created ASC LIMIT 200",
-      )
-      .all(session);
-    for (const message of messages) {
-      if (parseJsonObject(message.data)?.role === "assistant") assistantIds.add(message.id);
-    }
+    using recentPartsStatement = database.prepare(
+      `SELECT p.id, p.time_created, p.data
+       FROM part AS p
+       JOIN message AS m ON m.id = p.message_id AND m.session_id = p.session_id
+       WHERE p.session_id = ?
+         AND CASE WHEN json_valid(m.data) THEN json_extract(m.data, '$.role') END = 'assistant'
+       ORDER BY p.time_created DESC, p.id DESC
+       LIMIT 600`,
+    );
+    using pinnedTextStatement = database.prepare(
+      `SELECT p.id, p.time_created, p.data
+       FROM part AS p
+       JOIN message AS m ON m.id = p.message_id AND m.session_id = p.session_id
+       WHERE p.session_id = ?
+         AND CASE WHEN json_valid(m.data) THEN json_extract(m.data, '$.role') END = 'assistant'
+         AND CASE WHEN json_valid(p.data) THEN json_extract(p.data, '$.type') END = 'text'
+       ORDER BY p.time_created DESC, p.id DESC
+       LIMIT ?`,
+    );
+    const recentParts = recentPartsStatement.all(session);
+    const pinnedTextParts = pinnedTextStatement.all(session, MAX_PINNED_TEXTS);
+    const partsById = new Map();
+    for (const part of pinnedTextParts) partsById.set(part.id, part);
+    for (const part of recentParts) partsById.set(part.id, part);
+    const orderedParts = partsById
+      .values()
+      .toArray()
+      .sort((left, right) => {
+        const timeDelta = (left.time_created ?? 0) - (right.time_created ?? 0);
+        if (timeDelta !== 0) return timeDelta;
+        if (left.id < right.id) return -1;
+        if (left.id > right.id) return 1;
+        return 0;
+      });
 
     const state = createActivityState();
-    const parts = database
-      .prepare(
-        "SELECT message_id, data FROM part WHERE session_id = ? ORDER BY time_created ASC, id ASC LIMIT 600",
-      )
-      .all(session);
-    for (const part of parts)
-      if (assistantIds.has(part.message_id)) addOpenCodeActivity(state, part);
+    for (const part of orderedParts) addOpenCodeActivity(state, part);
     const cursor = { version: versionKey, summary: activitySummary(state) };
     touchCursor(openCodeCursors, key, cursor);
     return cursor.summary;
