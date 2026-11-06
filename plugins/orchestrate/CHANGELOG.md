@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.67.0
+
+- feat(orchestrate): replace bottom detail line with framed focus card (#117)
+- fix(orchestrate): sync Update banner across sessions and handle up-to-date clicks (#116)
+
 ## 0.66.0
 
 - feat(orchestrate): format Recorded activity and Markdown with TUI theme (#112)
