@@ -939,7 +939,8 @@ export class HordeView {
         }
         case "?":
         case "g": {
-          this.overlay = key === "?" ? "help" : "logs";
+          const requested = key === "?" ? "help" : "logs";
+          this.overlay = this.overlay === requested ? undefined : requested;
           this.logOffset = 0;
           break;
         }
@@ -952,6 +953,14 @@ export class HordeView {
         case "p": {
           this.logOffset = Math.max(0, this.logOffset - 1);
           break;
+        }
+        case "u": {
+          if (!this.room.accounts?.length && !this.room.quotaError) return false;
+          this.quotaMode = this.quotaMode === "collapsed" ? "expanded" : "collapsed";
+          break;
+        }
+        case "w": {
+          return this.toggleQuotaWindow();
         }
         // No default
       }
@@ -1165,6 +1174,10 @@ export class HordeView {
 
   handleMouse({ x, y, button, action }) {
     if (action === "scroll-up" || action === "scroll-down") {
+      if (this.overlay) {
+        this.logOffset = Math.max(0, this.logOffset + (action === "scroll-down" ? 1 : -1));
+        return true;
+      }
       if (this.preview) {
         this.scrollPreview(action === "scroll-up" ? 3 : -3);
         return true;
@@ -1176,6 +1189,9 @@ export class HordeView {
     if (action !== "press" || button !== 0 || !target) return false;
     if (target.agentId) {
       this.notice = "";
+      if (this.overlay) {
+        this.overlay = undefined;
+      }
       if (this.preview && this.preview.agentId === target.agentId) {
         this.setPreview(null);
         return { type: "close-preview" };
@@ -1286,7 +1302,7 @@ export class HordeView {
     });
   }
 
-  overlayLines(width) {
+  overlayLines(width, height = this.height - 5) {
     let title = this.overlay === "help" ? "Keyboard shortcuts" : "Room log";
     const pad = width >= 6 ? " " : "";
     const interior = Math.max(1, width - 6);
@@ -1345,10 +1361,12 @@ export class HordeView {
             )
           : [tone("No room messages yet", "muted", this.appearance)];
     }
-    const count = Math.max(1, this.height - 7);
+    const count = Math.max(1, height - 2);
     const start = Math.max(0, Math.min(this.logOffset, wrapped.length - count));
     const visible = wrapped.slice(start, start + count).map((line) => `${pad}${line}`);
-    return this.panel(title, visible, width);
+    while (visible.length < count) visible.push("");
+    const rightHint = width >= 46 ? "Esc back · ↑/↓ scroll" : "";
+    return this.panel(title, visible, width, rightHint, "mdSection").slice(0, Math.max(1, height));
   }
 
   quotaLines(width) {
@@ -1761,16 +1779,6 @@ export class HordeView {
     width = Math.max(1, Math.floor(width) || 80);
     this.renderWidth = width;
     this.targets = [];
-    if (this.overlay) {
-      const controls = this.controls(Math.max(1, width - 2));
-      const lines = this.overlayLines(Math.max(1, width - 2)).slice(
-        0,
-        Math.max(0, this.height - controls.lines.length),
-      );
-      while (lines.length < this.height - controls.lines.length) lines.push("");
-      this.addTargets(controls.targets, lines.length);
-      return this.marginLines([...lines, ...controls.lines], width);
-    }
     if (this.height < 8)
       return this.marginLines(
         this.panel("ork", ["Resize terminal to at least 8 rows"], width),
@@ -1873,7 +1881,7 @@ export class HordeView {
     }
     leadLines = leadLines.map((line) => ` ${line}`);
     const maxAgents = room.swarm?.maxAgents ?? 64;
-    const hasAgentTree = room.agents.length > 0;
+    const hasAgentTree = room.agents.length > 0 && (!this.overlay || this.overlay === "activity");
     const hasQuota = Boolean(room.accounts?.length || room.quotaError);
     const isQuotaDrawer = hasQuota && this.quotaMode === "collapsed";
     const hasHerdrPaneHeader = Boolean(
@@ -1956,19 +1964,25 @@ export class HordeView {
         ),
       );
     }
-    if (room.agents.length > 0) {
+    if (room.agents.length > 0 && (!this.overlay || this.overlay === "activity")) {
       const parentIds = new Set(
         room.agents.map((agent) => agent.parent).filter((p) => p && p !== "conductor"),
       );
       const isCollapsibleCompleted = (agent) => this.isCollapsibleCompleted(agent, parentIds);
-      const activePreviewAgentId = this.preview ? this.preview.agentId || this.focusId : "";
+      let activePreviewAgentId = "";
+      if (this.overlay === "activity") {
+        activePreviewAgentId = this.activityId || this.focusId;
+      } else if (this.preview) {
+        activePreviewAgentId = this.preview.agentId || this.focusId;
+      }
       const previewSource = activePreviewAgentId
         ? room.agents.filter((agent) => agent.id === activePreviewAgentId)
         : [];
-      const visibleAgents = this.preview && previewSource.length > 0 ? previewSource : selected;
+      const isFocusedView = Boolean(this.preview || this.overlay === "activity");
+      const visibleAgents = isFocusedView && previewSource.length > 0 ? previewSource : selected;
       const folderGroups = new Map();
       for (const [offset, agent] of visibleAgents.entries()) {
-        const pageIndex = this.preview ? room.agents.findIndex((a) => a.id === agent.id) : offset;
+        const pageIndex = isFocusedView ? room.agents.findIndex((a) => a.id === agent.id) : offset;
         const folder = agentFolder(agent, room);
         if (!folderGroups.has(folder)) folderGroups.set(folder, []);
         folderGroups.get(folder).push({ agent, index: pageIndex >= 0 ? pageIndex : offset });
@@ -1981,19 +1995,19 @@ export class HordeView {
           : "";
         lines.push(this.folderHeaderLine(folder, rawEntries.length, innerWidth, folderSummary));
         const hiddenCompletedCount =
-          !this.preview && this.completedMode === "hidden"
+          !isFocusedView && this.completedMode === "hidden"
             ? rawEntries.filter(({ agent }) => isCollapsibleCompleted(agent)).length
             : 0;
         const entries =
-          !this.preview && this.completedMode === "hidden"
+          !isFocusedView && this.completedMode === "hidden"
             ? rawEntries.filter(({ agent }) => !isCollapsibleCompleted(agent))
             : rawEntries;
         const hasCollapsedRows =
-          !this.preview &&
+          !isFocusedView &&
           this.completedMode === "collapsed" &&
           entries.some(({ agent }) => isCollapsibleCompleted(agent));
         const columns =
-          !this.preview && !hasCollapsedRows && innerWidth >= 100 && entries.length > 1 ? 2 : 1;
+          !isFocusedView && !hasCollapsedRows && innerWidth >= 100 && entries.length > 1 ? 2 : 1;
         const cardWidth =
           columns === 2 ? Math.max(24, Math.floor((innerWidth - gap.length) / 2)) : innerWidth;
         const hasFollowingSection = folder !== lastFolder;
@@ -2009,7 +2023,7 @@ export class HordeView {
           const isFocused = agent.id === this.focusId;
           const isHovered = this.hovered === `agent:${agent.id}`;
           const pointer = this.tier === "ascii" ? ">" : "▸";
-          const chevron = disclosure("", Boolean(this.preview), this.tier);
+          const chevron = disclosure("", isFocusedView, this.tier);
           const isPinned = agent.id === this.pinnedId;
           const currentBadge = this.isCurrentAgent(agent) ? " · This chat" : "";
           const locationBadge = worktreeBadge(agent, room);
@@ -2027,7 +2041,7 @@ export class HordeView {
               ? ` ↳ ${parent ? shortAgentName(parent) : plain(agent.parent)}`
               : "";
           if (
-            !this.preview &&
+            !isFocusedView &&
             this.completedMode === "collapsed" &&
             isCollapsibleCompleted(agent)
           ) {
@@ -2118,7 +2132,7 @@ export class HordeView {
         );
       }
     }
-    const serviceLimit = this.preview ? 0 : this.serviceRowLimit();
+    const serviceLimit = this.preview || this.overlay ? 0 : this.serviceRowLimit();
     const serviceBlock = [];
     if (serviceLimit > 0) {
       if (this.servicesMode === "collapsed") {
@@ -2137,12 +2151,25 @@ export class HordeView {
         );
       }
     }
-    const updateBlock = this.preview ? [] : this.updateBlockLines(innerWidth);
+    const updateBlock = this.preview || this.overlay ? [] : this.updateBlockLines(innerWidth);
     const controls = this.controls(innerWidth);
     const footerHeight = controls.lines.length + 2;
     const contentHeight = Math.max(0, this.height - footerHeight);
     const mainHeight = Math.max(0, contentHeight - serviceBlock.length - updateBlock.length);
-    if (this.preview) {
+    if (this.overlay) {
+      const minOverlayHeight = Math.min(mainHeight, 6);
+      if (mainHeight - lines.length < minOverlayHeight) {
+        const keepTop = Math.max(0, mainHeight - minOverlayHeight);
+        lines.splice(keepTop);
+        this.targets = this.targets
+          .map((target) => ({
+            ...target,
+            height: Math.min(target.height, keepTop - target.y + 1),
+          }))
+          .filter((target) => target.height > 0);
+      }
+      lines.push(...this.overlayLines(innerWidth, Math.max(1, mainHeight - lines.length)));
+    } else if (this.preview) {
       const minPreviewHeight = Math.min(mainHeight, 6);
       if (mainHeight - lines.length < minPreviewHeight) {
         const keepTop = Math.max(0, mainHeight - minPreviewHeight);

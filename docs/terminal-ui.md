@@ -7,7 +7,8 @@ Orkest's terminal UI (`ork horde` / `ork swarm` and statuslines) is built on fou
 | [`tui-theme.mjs`](../plugins/orchestrate/lib/tui-theme.mjs)           | Semantic ANSI SGR token dictionary (`DEFAULT_THEME`) and per-view override validation (`resolveTheme`).                                                            |
 | [`tui-box.mjs`](../plugins/orchestrate/lib/tui-box.mjs)               | Control-character sanitization (`plain`), grapheme display width (`cellWidth`, `displayWidth`), width-safe ANSI fitting (`fitStyled`, `wrapText`), and box frames. |
 | [`tui-components.mjs`](../plugins/orchestrate/lib/tui-components.mjs) | Reusable primitives: `sectionHeading`, `disclosure`, `actionBar`, `statusRow`, `treeCard`, `shimmerText`, and `providerMark`.                                      |
-| [`horde-view.mjs`](../plugins/orchestrate/lib/horde-view.mjs)         | Stateful layout, keyboard/mouse hit targets, disclosure state, and inline preview container for the Swarm pane.                                                    |
+| [`tui-markdown.mjs`](../plugins/orchestrate/lib/tui-markdown.mjs)     | Theme-aware, width-safe Markdown (`renderMarkdown`), structured activity banners, and coalesced room log lines (`renderLogLine`).                                  |
+| [`horde-view.mjs`](../plugins/orchestrate/lib/horde-view.mjs)         | Stateful layout, keyboard/mouse hit targets, disclosure state, and inline preview/overlay containers for the Swarm pane.                                           |
 
 ---
 
@@ -62,13 +63,17 @@ Every component accepts `tier` (`"nerd"`, `"unicode"`, or `"ascii"`), resolved b
    - When collapsed summary lines appear in the tree (such as `✓ N inactive hidden (press c to expand)`), register a mouse hit target on that line so clicking it expands in place.
 3. **Consistent Disclosure Chevrons:**
    - Every collapsible header (`Quota`, `Services`, focused agent preview card) must show its disclosure state in both collapsed (`▸` / `\u{F054}`) and expanded (`▾` / `\u{F078}`) modes.
-4. **Inline Containers Over Pane Zooming:**
+4. **Inline Containers Over Full-Screen Replacement or Pane Zooming:**
    - Opening an agent's log or chat (`Enter` or clicking an agent card) keeps the Swarm pane at its normal split size (`zoom = false`), collapses non-focused agents, and renders the preview in a framed container directly below the focused agent card.
-   - Dismissal uses a single primary **`Back`** (`Esc`) button in the footer toolbar (plus clicking the focused agent card again to collapse), never both `Back` and `Return to chat` at once.
-5. **Internal Pane IDs Stay Hidden:**
+   - Opening reference overlays (`?` Keyboard shortcuts or `g` Room log) also renders in the lower inline container below the Coordinator header and Quota drawer rather than wiping the top of the pane.
+   - Dismissal uses a single primary **`Back`** (`Esc`) button in the footer toolbar (plus clicking the focused agent card or pressing `?`/`g` again to toggle), never both `Back` and `Return to chat` at once.
+5. **Cross-Command Framing & Palette Parity:**
+   - Every tabular or report CLI subcommand (`ork routes`, `ork telemetry`, `ork foundry status`, `ork smelter status`, `ork radar status|diff|priors`) renders through `renderPanel` and `renderTable` with `glyphTier()` so all Orkest terminal output shares the same rounded/square box borders and semantic tokens.
+   - `agent_statusline.py`, `monitor/lib/render.mjs`, and `tui-theme.mjs` share identical 256-color codes for identity (`203`, `114`, `221`, `111`, `176`, `80`), model/effort/separators (`117`, `180`, `245`), and quota health (`71`, `179`, `208`, `240`), verified by unit tests.
+6. **Internal Pane IDs Stay Hidden:**
    - Raw Herdr or tmux pane identifiers (`wQ:p1`, `%12`) belong on click/focus targets (`herdrPaneId`, `paneId`), never in visible header titles or card labels.
    - Focusing a Herdr pane by ID uses `herdr agent focus <herdrPaneId>` (not `herdr pane focus`, which is directional).
-6. **Width & Injection Safety:**
+7. **Width & Injection Safety:**
    - Treat all model/tool/terminal output as untrusted data: sanitize with `plain()` before applying `tone()`, and clamp every rendered line with `fitStyled(line, width)` so escape codes never leak or wrap across borders.
 
 ---
