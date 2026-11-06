@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.64.1
+
+- fix(orchestrate): harden SQLite concurrency, permissions, OpenCode tail, and Python bridge (#108)
+
 ## 0.64.0
 
 - feat(orchestrate): migrate rooms domain to SQLite WAL store and Node bridge (#106)
