@@ -151,6 +151,13 @@ EXIT_STEER_PROCESS_NOT_FOUND = 32
 EXIT_STEER_REJECTED = 33
 
 
+# Round outcomes that stand: the gates' verdict, or an audit violation. Any other ends the run as its last
+# handoff did.
+ROUND_RESULT_STATUSES = frozenset(
+    {"completed", "verification_failed", "history_violation", "scope_violation", "verification_mutation"}
+)
+
+
 class RunnerError(Exception):
     def __init__(self, message: str, exit_code: int = 2) -> None:
         super().__init__(message)
@@ -2337,6 +2344,8 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
     max_rounds, rounds_source = auto_correct_module.effective_rounds(
         getattr(args, "auto_correct", None), task_spec, args.verify_command
     )
+    # The gate's own files, as named before the first handoff; a file written later is never one.
+    gate_candidates = auto_correct_module.gate_paths(args.verify_command, repo) if max_rounds else []
     # Every auto-correct round of this run; absent when the run may use none, so N=0 results are unchanged.
     auto_correct: dict[str, Any] | None = (
         {
@@ -2478,6 +2487,8 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
     round_before = before
     round_started = monotonic_start
     round_executor_start = 0.0
+    round_wait_until: float | None = None
+    last_handoff: dict[str, Any] = {}
     if steering is not None:
         assert completion_event_path is not None
         steering.begin_segment(
@@ -2504,6 +2515,8 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
             attempt_number += 1
             attempt_start = time.monotonic()
             remaining = deadline_remaining(args.deadline)
+            if round_wait_until is not None and remaining is not None:
+                remaining = min(remaining, round_wait_until - attempt_start)
             mailbox_module.set_run_deadline(
                 mailbox_module.root(),
                 mailbox_run_id,
@@ -2990,21 +3003,45 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
 
         if auto_correct is None:
             break
+        round_status = status
         if correction_round:
+            if status in {"failed", "malformed_report", "empty_output"} and (
+                structured_quota_signal(args.engine, stdout_text)
+                or provider_quota_exhausted(provider_error, stderr_text)
+            ):
+                round_status = "provider_quota_exhausted"
             auto_correct["rounds"][-1].update(
                 finished_at=utc_now(),
                 duration_seconds=round(time.monotonic() - round_started, 3),
                 executor_seconds=round(executor_seconds_used - round_executor_start, 3),
                 verification_seconds=round(verification_seconds, 3),
                 attempts=[attempt["attempt"] for attempt in executor_attempts[round_attempts_start:]],
-                status=status,
+                status=round_status,
+                executor_exit_code=process.returncode,
+                timed_out=timed_out,
                 reported_outcome=reported_outcome,
+                report_contract_valid=report_contract_valid,
+                report_contract_violations=report_violations,
+                final_message=final_message,
                 run_delta=state_delta(round_before, after_executor),
                 gate_files_changed=[violation.split(":", 1)[1] for violation in gate_violations],
                 verification=verification,
             )
         elif verification["status"] in {"failed", "timed_out"}:
             auto_correct["initial_verification"] = verification
+        if correction_round and status not in ROUND_RESULT_STATUSES:
+            # A round that fails, times out or returns a bad report never leaves the run worse than no round:
+            # the last handoff's report and gate results stand, and the round record keeps what it returned.
+            status, exit_code = "verification_failed", 25
+            verification = last_handoff["verification"]
+            final_message = last_handoff["final_message"]
+            reported_outcome = last_handoff["reported_outcome"]
+            report_extracted = last_handoff["report_extracted"]
+            report_contract_valid = last_handoff["report_contract_valid"]
+            report_violations = last_handoff["report_violations"]
+            consultation = last_handoff["consultation"]
+            auto_correct.update(outcome="stopped", stop_reason=round_status)
+            break
         if status != "verification_failed":
             if not correction_round:
                 auto_correct["outcome"] = "not_needed"
@@ -3016,15 +3053,12 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
         if correction_round >= max_rounds:
             auto_correct["outcome"] = "exhausted"
             break
-        refusal = (
-            auto_correct_module.round_refusal(
-                executor_seconds_left=timeout_seconds - executor_seconds_used,
-                deadline_left=deadline_remaining(args.deadline),
-                gate_seconds=verification_seconds,
-            )
-            if session_id
-            else "no_session"
-        )
+        round_fit = {
+            "executor_seconds_left": timeout_seconds - executor_seconds_used,
+            "deadline_left": deadline_remaining(args.deadline),
+            "gate_seconds": verification_seconds,
+        }
+        refusal = auto_correct_module.round_refusal(**round_fit) if session_id else "no_session"
         if refusal is not None:
             auto_correct.update(outcome="refused", refused_reason=refusal)
             emit_lifecycle("auto_correct_refused", round=correction_round + 1, reason=refusal)
@@ -3033,6 +3067,15 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
         # scope and gates. History, scope and --expect-changes stay judged from the first snapshot.
         failure = auto_correct_module.failed_command(verification)
         auto_correct_module.archive_verification(correction_round, verification)
+        last_handoff = {
+            "verification": verification,
+            "final_message": final_message,
+            "reported_outcome": reported_outcome,
+            "report_extracted": report_extracted,
+            "report_contract_valid": report_contract_valid,
+            "report_violations": report_violations,
+            "consultation": consultation,
+        }
         executor_attempts[-1].update(
             archive_executor_attempt_artifacts(
                 out_dir=out_dir,
@@ -3044,7 +3087,8 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
             )
         )
         correction_round += 1
-        gates = auto_correct_module.gate_paths(args.verify_command, repo, changed=run_delta["changed_paths"])
+        # Gate files existed before the first handoff and the run has not changed them since.
+        gates = [path for path in gate_candidates if path not in run_delta["changed_paths"]]
         gates_before = {path: path_fingerprint(repo / path) for path in gates}
         round_brief_path = out_dir / f"round-{correction_round}-brief.txt"
         write_private_text(
@@ -3072,7 +3116,13 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
             environment["CLAUDE_CODE_SESSION_ID"] = segment_session
         segment_resumed = True
         usage_baseline = usage.get("cumulative") or usage_baseline
-        round_timeout_seconds = timeout_seconds - executor_seconds_used
+        round_timeout_seconds = auto_correct_module.round_budget(**round_fit)
+        # With a deadline, the round's wait (60 s grace included) ends where the gates still fit after it.
+        round_wait_until = (
+            time.monotonic() + round_fit["deadline_left"] - verification_seconds
+            if round_fit["deadline_left"] is not None
+            else None
+        )
         command = build_executor_command(
             executable=executable,
             engine=args.engine,

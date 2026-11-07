@@ -754,7 +754,8 @@ def dispatch(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
         "variant": variant,
         "billing_mode": billing,
         **({"timeout": timeout} if timeout else {}),
-        **({"auto_correct": auto_correct} if auto_correct else {}),
+        # An explicit 0 is kept too, so a correction inherits the opt-out instead of the spec's default.
+        **({"auto_correct": auto_correct} if auto_correct or rounds is not None else {}),
         "host": host,
         "generation": authority["generation"] if authority else None,
         "allow_credits": bool(args.allow_credits),

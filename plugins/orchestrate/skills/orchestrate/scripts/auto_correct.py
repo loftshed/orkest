@@ -8,8 +8,10 @@ round limit, the correction turn, the gate files a round may not change, and the
 
 from __future__ import annotations
 
+import glob
 import os
 import shlex
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +19,8 @@ MAX_ROUNDS = 2
 # A round needs a correction turn plus another pass of the gates; with less left it is refused.
 MIN_ROUND_SECONDS = 60.0
 INSTRUCTION = "Fix exactly these problems; change nothing else."
+# A glob in a gate command protects at most this many files.
+MAX_GLOB_MATCHES = 500
 
 
 def validate_rounds(value: Any, *, name: str) -> int:
@@ -53,40 +57,94 @@ def _words(command: str) -> list[str]:
         return command.split()
 
 
-def gate_paths(commands: list[str], repo: Path, *, changed: list[str] | tuple[str, ...] = ()) -> list[str]:
-    """Repository files named in the verify commands: the gate's own scripts, tests and inputs.
+def _named(command: str, bases: list[Path], depth: int = 0) -> list[Path]:
+    """Paths the words of a shell command may name: plain, `--flag=value` and glob words, relative to the
+    repository root and to every `cd` target before them, and the words of an inner `sh -c '...'`."""
+    bases = list(bases)
+    found: list[Path] = []
+    words = _words(command)
+    for index, word in enumerate(words):
+        if index and words[index - 1] in ("cd", "pushd") and word and not word.startswith("-"):
+            bases.append(Path(os.path.normpath(Path(word) if Path(word).is_absolute() else bases[-1] / word)))
+            continue
+        if depth < 3 and any(mark in word for mark in (" ", "\t", "\n", ";", "&", "|")):
+            found += _named(word, bases, depth + 1)
+        for candidate in dict.fromkeys((word, *word.split("=", 1)[1:])):
+            if not candidate:
+                continue
+            for base in dict.fromkeys(bases):
+                if any(mark in candidate for mark in "*?["):
+                    matches = sorted(glob.glob(candidate, root_dir=base, recursive=True))[:MAX_GLOB_MATCHES]
+                    found += [Path(os.path.normpath(base / match)) for match in matches]
+                else:
+                    found.append(
+                        Path(os.path.normpath(Path(candidate) if Path(candidate).is_absolute() else base / candidate))
+                    )
+    return found
 
-    A word (or the value of `--flag=value`) counts when it names an existing file inside the repository,
-    relative to its root or absolute. Two kinds of name are the work under test instead, which a
-    correction may change: a file in `changed` (the run's own changes so far, as in
-    `test -s allowed/output.txt`), and a directory (`ruff check src`).
+
+def _ignored(root: Path, names: list[str]) -> set[str]:
+    """Names Git ignores. When Git cannot answer, none: protecting too much beats too little."""
+    if not names:
+        return set()
+    try:
+        answer = subprocess.run(
+            ["git", "check-ignore", "-z", "--stdin"],
+            cwd=root,
+            input=b"\0".join(os.fsencode(name) for name in names),
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return set()
+    if answer.returncode not in (0, 1):
+        return set()
+    return {os.fsdecode(item) for item in answer.stdout.split(b"\0") if item}
+
+
+def gate_paths(commands: list[str], repo: Path) -> list[str]:
+    """The gate's own files: repository files the verify commands name, as the workspace stands now.
+
+    The runner takes them from the snapshot before the first handoff, so a file a gate or the worker
+    writes later is never one. A symlink also protects its target. Directories (`ruff check src`) and
+    files Git ignores (a gate's `> build/gate.log`) are not gate files, and the runner drops any file the
+    run changes before a round (`test -s out.txt`): those are the work under test.
     """
     root = repo.resolve()
-    work = set(changed)
-    found: list[str] = []
+    names: list[str] = []
     for command in commands:
-        for word in _words(command):
-            for candidate in (word, *word.split("=", 1)[1:]):
-                if not candidate:
-                    continue
-                path = Path(os.path.normpath(Path(candidate) if Path(candidate).is_absolute() else root / candidate))
+        for path in _named(command, [root]):
+            for target in (path, path.resolve()) if path.is_symlink() else (path,):
                 try:
-                    relative = path.relative_to(root)
+                    relative = target.relative_to(root)
                 except ValueError:
                     continue
-                if not relative.parts or relative.parts[0] == ".git":
-                    continue
                 name = relative.as_posix()
-                if os.path.lexists(path) and not path.is_dir() and name not in work and name not in found:
-                    found.append(name)
-    return found
+                if (
+                    relative.parts
+                    and relative.parts[0] != ".git"
+                    and os.path.lexists(target)
+                    and not target.is_dir()
+                    and name not in names
+                ):
+                    names.append(name)
+    ignored = _ignored(root, names)
+    return [name for name in names if name not in ignored]
+
+
+def round_budget(*, executor_seconds_left: float, deadline_left: float | None, gate_seconds: float) -> float:
+    """Seconds a round's executor may run: what --timeout left, and never past the deadline less the gates."""
+    if deadline_left is None:
+        return executor_seconds_left
+    return min(executor_seconds_left, deadline_left - gate_seconds)
 
 
 def round_refusal(*, executor_seconds_left: float, deadline_left: float | None, gate_seconds: float) -> str | None:
     """Why a round cannot fit: the executor time left under --timeout, or the task deadline."""
     if executor_seconds_left < MIN_ROUND_SECONDS:
         return "timeout"
-    if deadline_left is not None and deadline_left < MIN_ROUND_SECONDS + gate_seconds:
+    if deadline_left is not None and deadline_left - gate_seconds < MIN_ROUND_SECONDS:
         return "deadline"
     return None
 

@@ -193,7 +193,7 @@ def audit(
         corrector = runner.bundled_module("auto_correct")
         suggestion = None
         if status == "verification_failed":
-            gates = corrector.gate_paths(run["verification_commands"], repository, changed=delta["changed_paths"])
+            gates = [path for path in ready.get("gate_files", []) if path not in delta["changed_paths"]]
             suggestion = corrector.correction_message(corrector.failed_command(verification), verification, gates=gates)
         extra["auto_correct"] = {
             "max_rounds": run["auto_correct"],
@@ -288,6 +288,11 @@ def main() -> None:
             "process_identity": process_identity(os.getpid()),
             "ready_at": runner.utc_now(),
         }
+        if run.get("auto_correct"):
+            # The gate's own files, named before the native worker starts (see auto_correct.gate_paths).
+            ready["gate_files"] = runner.bundled_module("auto_correct").gate_paths(
+                run["verification_commands"], repository
+            )
         runner.write_json_atomic(folder / "ready.json", ready)
         while not (folder / "completion.json").exists():
             if runner.deadline_remaining(state["deadline"]) <= 0 and not (folder / "deadline.json").exists():

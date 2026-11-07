@@ -1136,7 +1136,8 @@ class CoordinatorTests(unittest.TestCase):
 
     def test_auto_correct_rounds_run_before_the_report_and_keep_the_correction_allowance(self):
         gate = "grep -q fixed allowed/output.txt"
-        contents = ["broken\n", "fixed\n", "fixed again\n"]
+        # Implementation: fails, then its round fixes it. Correction: fails again, then its own round fixes it.
+        contents = ["broken\n", "fixed\n", "broken again\n", "fixed at last\n"]
         rounds = {
             "FAKE_ROUNDS": json.dumps([{"FAKE_CONTENT": content} for content in contents]),
             "FAKE_ROUNDS_COUNT": str(self.fixture.external_path / "rounds.txt"),
@@ -1157,6 +1158,36 @@ class CoordinatorTests(unittest.TestCase):
             )
         self.assertEqual((code, corrected["runner_status"], corrected["auto_correct"]), (0, "completed", 1), corrected)
         self.assertEqual(corrected["command"][corrected["command"].index("--auto-correct") + 1], "1")
+        rounds_run = COORDINATOR.read(Path(corrected["result_path"]))["auto_correct"]
+        self.assertEqual((rounds_run["outcome"], rounds_run["rounds_used"]), ("passed", 1))
+        self.assertIn("AUTO-CORRECT ROUND 1 OF 1", rounds_run["rounds"][0]["prompt"])
+        self.assertEqual((self.fixture.repository.path / "allowed/output.txt").read_text(), "fixed at last\n")
+        self.assertEqual(COORDINATOR.load(self.directory)["budget"]["used"], 2)
+
+    def test_an_explicit_zero_is_recorded_and_a_correction_inherits_it(self):
+        state = COORDINATOR.load(self.directory)
+        state["task_spec"]["auto_correct"] = 2
+        COORDINATOR.save(self.directory, state)
+        gate = "grep -qx fixed allowed/output.txt"
+        counter = self.fixture.external_path / "rounds.txt"
+        rounds = {
+            "FAKE_ROUNDS": json.dumps([{"FAKE_CONTENT": "broken\n"}, {"FAKE_CONTENT": "broken again\n"}]),
+            "FAKE_ROUNDS_COUNT": str(counter),
+        }
+        with mock.patch.dict(os.environ, rounds):
+            code, run = self.start("implement", "implementation", "--verify-command", gate, "--auto-correct", "0")
+        self.assertEqual((code, run["runner_status"], run["auto_correct"]), (0, "verification_failed", 0), run)
+        self.assertNotIn("auto_correct", COORDINATOR.read(Path(run["result_path"])))
+        proof = self.reviewed_evidence()
+        with mock.patch.dict(os.environ, rounds):
+            code, corrected = self.call(
+                "dispatch", "--kind", "correction", "--request-id", "repair", "--review-id", proof
+            )
+        self.assertEqual((code, corrected["runner_status"], corrected["auto_correct"]), (0, "verification_failed", 0))
+        self.assertEqual(corrected["command"][corrected["command"].index("--auto-correct") + 1], "0")
+        self.assertNotIn("auto_correct", COORDINATOR.read(Path(corrected["result_path"])))
+        # One executor turn each: the spec's 2 rounds never applied.
+        self.assertEqual(counter.read_text(), "2")
 
     def test_auto_correct_is_validated_and_needs_gates(self):
         for extra, message in (

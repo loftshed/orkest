@@ -64,8 +64,8 @@ its tool at the task deadline.
 
 `dispatch --auto-correct N` (0 to 2) lets the runner fix a failed `--verify-command` gate by resuming
 the same session up to N times before its report; the task spec's `auto_correct` is the default. It
-needs gates, and read-only kinds refuse it. The run records it and a correction inherits it unless it
-passes its own. The rounds stay inside one invocation and share its `--timeout`; they use neither the
+needs gates, and read-only kinds refuse it. The run records it, an explicit 0 included, and a
+correction inherits it unless it passes its own. The rounds stay inside one invocation and share its `--timeout`; they use neither the
 invocation allowance nor the one correction. See [runner.md](runner.md#auto-correct-rounds).
 
 External dispatch is foreground by default. Use `--background` to return the durable run handle
