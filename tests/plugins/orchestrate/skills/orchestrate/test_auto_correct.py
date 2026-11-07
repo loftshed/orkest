@@ -19,6 +19,20 @@ GATE = "grep -qx fixed allowed/output.txt"
 
 
 class AutoCorrectUnitTests(unittest.TestCase):
+    def test_an_absolute_gate_name_through_a_symlinked_prefix_is_still_a_gate_file(self) -> None:
+        # macOS temporary directories live under /var, a symlink to /private/var.
+        with tempfile.TemporaryDirectory() as directory:
+            real = Path(directory) / "real"
+            real.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=real, check=True)
+            (real / "config.toml").write_text("x\n")
+            (real / "check.sh").write_text("x\n")
+            (real / "linked.sh").symlink_to("check.sh")
+            alias = Path(directory) / "alias"
+            alias.symlink_to(real)
+            commands = [f"check --config={alias}/config.toml", f"sh {alias}/linked.sh"]
+            self.assertEqual(AUTO_CORRECT.gate_paths(commands, alias), ["config.toml", "linked.sh", "check.sh"])
+
     def test_gate_files_are_existing_repository_files_named_in_the_commands(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)

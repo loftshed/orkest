@@ -125,6 +125,10 @@ def gate_paths(commands: list[str], repo: Path) -> list[str]:
     names: dict[str, bool] = {}
     for command in commands:
         for path, program in _named(command, [root]):
+            if not path.is_relative_to(root):
+                # An absolute name can reach the repository through a symlinked prefix (macOS
+                # /var -> /private/var). Resolve only its directory, so a symlinked gate stays the link.
+                path = Path(os.path.realpath(path.parent)) / path.name
             for target in (path, path.resolve()) if path.is_symlink() else (path,):
                 try:
                     relative = target.relative_to(root)
