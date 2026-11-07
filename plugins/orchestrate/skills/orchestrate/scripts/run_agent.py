@@ -296,6 +296,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Per-command post-verification timeout such as 10m or 1h",
     )
     parser.add_argument(
+        "--auto-correct",
+        type=int,
+        metavar="ROUNDS",
+        help=(
+            "When a --verify-command gate fails, resume the same session up to ROUNDS times (0-2) with the "
+            "failure and re-run the gates. Default: the task spec's auto_correct, else 0"
+        ),
+    )
+    parser.add_argument(
         "--add-dir",
         action="append",
         default=[],
@@ -650,6 +659,10 @@ def print_summary(result: dict[str, Any], result_path: Path) -> None:
         print(f"AGENT_HISTORY_VIOLATIONS={json.dumps(result['history_violations'])}")
     if result.get("event_errors"):
         print(f"AGENT_EVENT_ERRORS={json.dumps(result['event_errors'])}")
+    auto_correct = result.get("auto_correct")
+    if auto_correct:
+        summary = {key: auto_correct.get(key) for key in ("max_rounds", "rounds_used", "outcome")}
+        print("AGENT_AUTO_CORRECT=" + json.dumps(summary, ensure_ascii=True, separators=(",", ":")))
     review = result.get("review") or {}
     if review:
         print(
@@ -1105,6 +1118,13 @@ def validated_run_options(
         )
     if any(not command.strip() for command in args.verify_command):
         raise RunnerError("--verify-command cannot be empty", 4)
+    if getattr(args, "auto_correct", None) is not None:
+        try:
+            bundled_module("auto_correct").validate_rounds(args.auto_correct, name="--auto-correct")
+        except ValueError as error:
+            raise RunnerError(str(error), 4) from error
+        if args.auto_correct and not args.verify_command:
+            raise RunnerError("--auto-correct requires a --verify-command gate to correct against", 4)
     timeout_seconds = parse_duration(args.timeout)
     deadline_remaining(args.deadline)
     verify_timeout_seconds = parse_duration(
@@ -1752,6 +1772,18 @@ def native_handoff(args: argparse.Namespace, host: str) -> int:
         "Use coordinator.py dispatch --transport native when a durable lease and audit guard are needed. "
         "Use --transport executor when an isolated CLI process or account profile is needed."
     )
+    rounds, rounds_source = bundled_module("auto_correct").effective_rounds(
+        getattr(args, "auto_correct", None), task_spec, args.verify_command
+    )
+    auto_correct = None
+    if rounds:
+        # Native transport never loops: the host sends any correction turn to its own worker.
+        instructions += (
+            f" Auto-correct is not run for native transport: when a gate fails, send the same worker its command, "
+            f"exit code and trimmed output with '{bundled_module('auto_correct').INSTRUCTION}', at most {rounds} "
+            "times."
+        )
+        auto_correct = {"max_rounds": rounds, "source": rounds_source, "mode": "native", "rounds": []}
     result_path = out_dir / "result.json"
     write_json(
         result_path,
@@ -1776,6 +1808,7 @@ def native_handoff(args: argparse.Namespace, host: str) -> int:
             "scratch_dir": str(scratch) if scratch else None,
             "verification_commands": args.verify_command,
             "deadline": args.deadline,
+            **({"auto_correct": auto_correct} if auto_correct else {}),
         },
     )
     print("AGENT_STATUS=native_handoff")
@@ -2300,6 +2333,28 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
         executor_version=version,
     )
 
+    auto_correct_module = bundled_module("auto_correct")
+    max_rounds, rounds_source = auto_correct_module.effective_rounds(
+        getattr(args, "auto_correct", None), task_spec, args.verify_command
+    )
+    # Every auto-correct round of this run; absent when the run may use none, so N=0 results are unchanged.
+    auto_correct: dict[str, Any] | None = (
+        {
+            "max_rounds": max_rounds,
+            "source": rounds_source,
+            "mode": "executor",
+            "rounds_used": 0,
+            "outcome": "not_run",
+            "refused_reason": None,
+            "stop_reason": None,
+            "executor_seconds": 0.0,
+            "initial_verification": None,
+            "rounds": [],
+        }
+        if max_rounds
+        else None
+    )
+
     base_result: dict[str, Any] = {
         "schema": RESULT_SCHEMA,
         "runner_version": RUNNER_VERSION,
@@ -2347,6 +2402,7 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
         "verification_timeout": args.verify_timeout,
         "deadline": args.deadline,
         "mailbox": mailbox_info,
+        **({"auto_correct": auto_correct} if auto_correct is not None else {}),
     }
 
     if args.dry_run:
@@ -2411,6 +2467,17 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
     segment_usage_start = 0
     steers_applied: list[dict[str, Any]] = []
     steered_from: list[str] = []
+    # Auto-correct rounds share --timeout: a round gets the executor time that earlier attempts left.
+    round_timeout_seconds = timeout_seconds
+    executor_seconds_used = 0.0
+    retry_window_start = 0
+    correction_round = 0
+    gates: list[str] = []
+    gates_before: dict[str, Any] = {}
+    round_attempts_start = 0
+    round_before = before
+    round_started = monotonic_start
+    round_executor_start = 0.0
     if steering is not None:
         assert completion_event_path is not None
         steering.begin_segment(
@@ -2432,170 +2499,290 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
             return True
         return steering.poll(process) if steering is not None else False
 
-    while True:
-        attempt_number += 1
-        attempt_start = time.monotonic()
-        remaining = deadline_remaining(args.deadline)
-        mailbox_module.set_run_deadline(
-            mailbox_module.root(),
-            mailbox_run_id,
-            (
-                dt.datetime.now(dt.UTC)
-                + dt.timedelta(
-                    seconds=min(timeout_seconds + 60, max(0, remaining))
-                    if remaining is not None
-                    else timeout_seconds + 60
+    while True:  # one pass per round: the handoff, then each auto-correct round
+        while True:
+            attempt_number += 1
+            attempt_start = time.monotonic()
+            remaining = deadline_remaining(args.deadline)
+            mailbox_module.set_run_deadline(
+                mailbox_module.root(),
+                mailbox_run_id,
+                (
+                    dt.datetime.now(dt.UTC)
+                    + dt.timedelta(
+                        seconds=min(round_timeout_seconds + 60, max(0, remaining))
+                        if remaining is not None
+                        else round_timeout_seconds + 60
+                    )
+                ).isoformat(),
+            )
+            stdin_handle: Any = (
+                stdin_path.open("rb") if args.engine in ("codex", "claude") or agy_stdin else subprocess.DEVNULL
+            )
+            try:
+                emit_lifecycle(
+                    "executor_started",
+                    engine=args.engine,
+                    model=model,
+                    attempt=attempt_number,
                 )
-            ).isoformat(),
-        )
-        stdin_handle: Any = (
-            stdin_path.open("rb") if args.engine in ("codex", "claude") or agy_stdin else subprocess.DEVNULL
-        )
-        try:
+                with (
+                    open_private_binary(stdout_path) as stdout_handle,
+                    open_private_binary(stderr_path) as stderr_handle,
+                ):
+                    process = subprocess.Popen(
+                        command,
+                        cwd=repo,
+                        env=environment,
+                        stdin=stdin_handle,
+                        stdout=stdout_handle,
+                        stderr=stderr_handle,
+                        start_new_session=True,
+                    )
+                    if steering is not None:
+                        steering.executor_started(process.pid)
+                    with forward_termination_signals(process):
+                        timed_out = wait_with_heartbeats(
+                            process,
+                            timeout_seconds=min(round_timeout_seconds + 60, max(0, remaining))
+                            if remaining is not None
+                            else round_timeout_seconds + 60,
+                            heartbeat_seconds=args.heartbeat_seconds,
+                            monotonic_start=monotonic_start,
+                            poll=functools.partial(poll_executor, process)
+                            if steering is not None or credits_watch is not None
+                            else None,
+                        )
+            finally:
+                if stdin_handle is not subprocess.DEVNULL:
+                    stdin_handle.close()
+            attempt_duration = time.monotonic() - attempt_start
+            executor_seconds_used += attempt_duration
+
+            for artifact in (stdout_path, stderr_path, log_path, final_output_path):
+                if artifact.exists():
+                    artifact.chmod(0o600)
+            stdout_bytes = stdout_path.read_bytes() if stdout_path.exists() else b""
+            stderr_bytes = stderr_path.read_bytes() if stderr_path.exists() else b""
+            stdout_text = stdout_bytes.decode("utf-8", errors="replace")
+            stderr_text = stderr_bytes.decode("utf-8", errors="replace")
+            usage = usage_module.normalize_usage(
+                args.engine,
+                stdout_text,
+                resumed=segment_resumed,
+                baseline=usage_baseline,
+            )
+            attempt_usage.append(usage)
+            if segment_resumed:
+                usage_baseline = usage.get("cumulative") or usage_baseline
+            after_attempt = git_state(repo, tracked_paths)
+            git_identity_after_attempt = git_identity(repo)
+            attempt_delta = state_delta(before, after_attempt)
+            attempt_history_violations = find_history_violations(git_identity_before, git_identity_after_attempt)
+            attempt_workspace_changed = before["fingerprint"] != after_attempt["fingerprint"]
+            if (
+                args.engine == "opencode"
+                and process.returncode not in (None, 0)
+                and attempt_number == 1
+                and not attempt_workspace_changed
+                and not attempt_history_violations
+            ):
+                fresh_ver = get_cached_cli_version(executable, environment, force_refresh=True)
+                if opencode_major_version(fresh_ver) != opencode_major_version(version):
+                    version = fresh_ver
+                    command = build_executor_command(
+                        executable=executable,
+                        engine=args.engine,
+                        model=model,
+                        variant=variant,
+                        repo=repo,
+                        add_dirs=add_dirs,
+                        session_id=args.session,
+                        continue_last=args.continue_last,
+                        timeout=args.timeout,
+                        submitted_brief_path=submitted_brief_path,
+                        final_output_path=final_output_path,
+                        log_path=log_path,
+                        effort=effort["bound"] if args.engine in ("codex", "claude") else None,
+                        agy_stdin=agy_stdin,
+                        new_session_id=segment_session if args.engine == "claude" and not segment_resumed else None,
+                        executor_version=version,
+                    )
+                    base_result.update(command=command_preview(command), executor_version=version)
+                    attempt_usage.clear()
+                    continue
+            # agy reports provider errors (e.g. 429) as a terminal status with exit 0; count those as well.
+            terminal_error = provider_terminal_error(args.engine, stdout_text)
+            quota_structured = structured_quota_signal(args.engine, stdout_text)
+            transient_failure = (
+                not timed_out
+                and not quota_structured
+                and (process.returncode not in (None, 0) or terminal_error is not None)
+                and transient_provider_failure(stderr_text, terminal_error)
+            )
+            steered = steering is not None and steering.pending is not None
+            credits_stopped = credits_watch is not None and credits_watch.stopped is not None
+            retry_eligible = (
+                not steered
+                and not credits_stopped
+                and args.retry_read_only > len(executor_attempts) - retry_window_start
+                and transient_failure
+                and not attempt_workspace_changed
+                and not attempt_history_violations
+                and (args.deadline is None or deadline_remaining(args.deadline) > 0)
+            )
+            attempt_record: dict[str, Any] = {
+                "attempt": attempt_number,
+                "segment": segment,
+                "steered": steered,
+                "executor_exit_code": process.returncode,
+                "timed_out": timed_out,
+                "transient_provider_failure": transient_failure,
+                "workspace_changed": attempt_workspace_changed,
+                "history_violations": attempt_history_violations,
+                "run_delta": attempt_delta,
+                "usage": usage,
+            }
             emit_lifecycle(
-                "executor_started",
-                engine=args.engine,
-                model=model,
+                "executor_finished",
+                exit_code=process.returncode,
+                changed_files=len(attempt_delta["changed_paths"]),
                 attempt=attempt_number,
             )
-            with (
-                open_private_binary(stdout_path) as stdout_handle,
-                open_private_binary(stderr_path) as stderr_handle,
-            ):
-                process = subprocess.Popen(
-                    command,
-                    cwd=repo,
-                    env=environment,
-                    stdin=stdin_handle,
-                    stdout=stdout_handle,
-                    stderr=stderr_handle,
-                    start_new_session=True,
-                )
-                if steering is not None:
-                    steering.executor_started(process.pid)
-                with forward_termination_signals(process):
-                    timed_out = wait_with_heartbeats(
-                        process,
-                        timeout_seconds=min(timeout_seconds + 60, max(0, remaining))
-                        if remaining is not None
-                        else timeout_seconds + 60,
-                        heartbeat_seconds=args.heartbeat_seconds,
-                        monotonic_start=monotonic_start,
-                        poll=functools.partial(poll_executor, process)
-                        if steering is not None or credits_watch is not None
-                        else None,
+            if retry_eligible:
+                attempt_record["retrying"] = True
+                attempt_record.update(
+                    archive_executor_attempt_artifacts(
+                        out_dir=out_dir,
+                        attempt=attempt_number,
+                        stdout_path=stdout_path,
+                        stderr_path=stderr_path,
+                        log_path=log_path,
+                        final_output_path=final_output_path,
                     )
-        finally:
-            if stdin_handle is not subprocess.DEVNULL:
-                stdin_handle.close()
-        attempt_duration = time.monotonic() - attempt_start
-
-        for artifact in (stdout_path, stderr_path, log_path, final_output_path):
-            if artifact.exists():
-                artifact.chmod(0o600)
-        stdout_bytes = stdout_path.read_bytes() if stdout_path.exists() else b""
-        stderr_bytes = stderr_path.read_bytes() if stderr_path.exists() else b""
-        stdout_text = stdout_bytes.decode("utf-8", errors="replace")
-        stderr_text = stderr_bytes.decode("utf-8", errors="replace")
-        usage = usage_module.normalize_usage(
-            args.engine,
-            stdout_text,
-            resumed=segment_resumed,
-            baseline=usage_baseline,
-        )
-        attempt_usage.append(usage)
-        if segment_resumed:
-            usage_baseline = usage.get("cumulative") or usage_baseline
-        after_attempt = git_state(repo, tracked_paths)
-        git_identity_after_attempt = git_identity(repo)
-        attempt_delta = state_delta(before, after_attempt)
-        attempt_history_violations = find_history_violations(git_identity_before, git_identity_after_attempt)
-        attempt_workspace_changed = before["fingerprint"] != after_attempt["fingerprint"]
-        if (
-            args.engine == "opencode"
-            and process.returncode not in (None, 0)
-            and attempt_number == 1
-            and not attempt_workspace_changed
-            and not attempt_history_violations
-        ):
-            fresh_ver = get_cached_cli_version(executable, environment, force_refresh=True)
-            if opencode_major_version(fresh_ver) != opencode_major_version(version):
-                version = fresh_ver
-                command = build_executor_command(
-                    executable=executable,
-                    engine=args.engine,
-                    model=model,
-                    variant=variant,
-                    repo=repo,
-                    add_dirs=add_dirs,
-                    session_id=args.session,
-                    continue_last=args.continue_last,
-                    timeout=args.timeout,
-                    submitted_brief_path=submitted_brief_path,
-                    final_output_path=final_output_path,
-                    log_path=log_path,
-                    effort=effort["bound"] if args.engine in ("codex", "claude") else None,
-                    agy_stdin=agy_stdin,
-                    new_session_id=segment_session if args.engine == "claude" and not segment_resumed else None,
-                    executor_version=version,
                 )
-                base_result.update(command=command_preview(command), executor_version=version)
-                attempt_usage.clear()
+                executor_attempts.append(attempt_record)
+                if args.engine == "claude" and not segment_resumed:
+                    segment_session = str(uuid.uuid4())
+                    environment["CLAUDE_CODE_SESSION_ID"] = segment_session
+                    command = build_executor_command(
+                        executable=executable,
+                        engine=args.engine,
+                        model=model,
+                        variant=variant,
+                        repo=repo,
+                        add_dirs=add_dirs,
+                        session_id=args.session,
+                        continue_last=args.continue_last,
+                        timeout=args.timeout,
+                        submitted_brief_path=submitted_brief_path,
+                        final_output_path=final_output_path,
+                        log_path=log_path,
+                        effort=effort["bound"] if args.engine in ("codex", "claude") else None,
+                        agy_stdin=agy_stdin,
+                        new_session_id=segment_session,
+                        executor_version=version,
+                    )
+                    base_result.update(command=command_preview(command))
+                    if steering is not None:
+                        steering.session_hint = segment_session
+                        steering.save(session_id=segment_session)
+                time.sleep(min(float(attempt_number), 3.0))
                 continue
-        # agy reports provider errors (e.g. 429) as a terminal status with exit 0; count those as well.
-        terminal_error = provider_terminal_error(args.engine, stdout_text)
-        quota_structured = structured_quota_signal(args.engine, stdout_text)
-        transient_failure = (
-            not timed_out
-            and not quota_structured
-            and (process.returncode not in (None, 0) or terminal_error is not None)
-            and transient_provider_failure(stderr_text, terminal_error)
-        )
-        steered = steering is not None and steering.pending is not None
-        credits_stopped = credits_watch is not None and credits_watch.stopped is not None
-        retry_eligible = (
-            not steered
-            and not credits_stopped
-            and args.retry_read_only > len(executor_attempts) - segment_attempts_start
-            and transient_failure
-            and not attempt_workspace_changed
-            and not attempt_history_violations
-            and (args.deadline is None or deadline_remaining(args.deadline) > 0)
-        )
-        attempt_record: dict[str, Any] = {
-            "attempt": attempt_number,
-            "segment": segment,
-            "steered": steered,
-            "executor_exit_code": process.returncode,
-            "timed_out": timed_out,
-            "transient_provider_failure": transient_failure,
-            "workspace_changed": attempt_workspace_changed,
-            "history_violations": attempt_history_violations,
-            "run_delta": attempt_delta,
-            "usage": usage,
-        }
-        emit_lifecycle(
-            "executor_finished",
-            exit_code=process.returncode,
-            changed_files=len(attempt_delta["changed_paths"]),
-            attempt=attempt_number,
-        )
-        if retry_eligible:
-            attempt_record["retrying"] = True
+
+            attempt_record["retrying"] = False
             attempt_record.update(
-                archive_executor_attempt_artifacts(
-                    out_dir=out_dir,
-                    attempt=attempt_number,
-                    stdout_path=stdout_path,
-                    stderr_path=stderr_path,
-                    log_path=log_path,
-                    final_output_path=final_output_path,
-                )
+                {
+                    "stdout_path": str(stdout_path),
+                    "stderr_path": str(stderr_path),
+                    "log_path": str(log_path),
+                    "final_output_path": str(final_output_path),
+                }
             )
             executor_attempts.append(attempt_record)
-            if args.engine == "claude" and not segment_resumed:
-                segment_session = str(uuid.uuid4())
-                environment["CLAUDE_CODE_SESSION_ID"] = segment_session
+            if steering is not None:
+                allowed_paths = list(steering.allowed_paths)
+                enforced_paths = list(steering.enforced_paths)
+                base_result["allowed_paths"] = enforced_paths
+                if "." in enforced_paths:
+                    base_result["scope_owner"] = "worker"
+            if steered:
+                assert steering is not None and steering.pending is not None and completion_event_path is not None
+                pending = steering.pending
+                # Close this segment: a superseded result and an already-acknowledged event pointing at the
+                # continuation, so `events wait` follows it and the inbox shows only the combined result.
+                steered_result = {
+                    **base_result,
+                    "status": "steered",
+                    "task_outcome": "steered",
+                    "reported_outcome": None,
+                    "exit_code": None,
+                    "executor_exit_code": process.returncode,
+                    "executor_attempts": executor_attempts[segment_attempts_start:],
+                    "finished_at": utc_now(),
+                    "session_id": pending["session_id"],
+                    "segment": segment,
+                    "run_delta_at_interrupt": attempt_delta,
+                    "history_violations_at_interrupt": attempt_history_violations,
+                    "scope_violations_at_interrupt": find_scope_violations(attempt_delta, enforced_paths),
+                    "usage": usage_module.combine_attempts(attempt_usage[segment_usage_start:]),
+                    "steered_to": {key: pending[key] for key in ("steer_id", "event_id", "event_path", "result_path")},
+                }
+                write_json_atomic(result_path, steered_result)
+                publish_completion_event(
+                    result=steered_result,
+                    result_path=result_path,
+                    event_path=completion_event_path,
+                    notification_mode="none",
+                    completion_hook=None,
+                    extra={
+                        "acknowledged_at": utc_now(),
+                        "superseded_by": pending["event_id"],
+                        "steer_id": pending["steer_id"],
+                        "steered_from": list(steered_from),
+                    },
+                )
+                steered_from.append(completion_event_path.stem)
+                steers_applied.append({key: value for key, value in pending.items() if key != "message"})
+                # Open the continuation: same session, same worktree, same scope, gates, timeouts and
+                # delivery; only the artifact directory, the event and the new user turn differ.
+                segment += 1
+                segment_attempts_start = retry_window_start = len(executor_attempts)
+                segment_usage_start = len(attempt_usage)
+                segment_session = pending["session_id"]
+                if args.engine == "claude" and segment_session:
+                    environment["CLAUDE_CODE_SESSION_ID"] = segment_session
+                segment_resumed = True
+                usage_baseline = usage.get("cumulative") or usage_baseline
+                out_dir = Path(pending["run_dir"])
+                result_path = out_dir / "result.json"
+                completion_event_path = normalize_completion_event_path(Path(pending["event_path"]))
+                _ACTIVE_SEGMENT.update(event_path=completion_event_path, result_path=result_path)
+                submitted_brief_path = out_dir / "submitted-brief.txt"
+                stdout_path = out_dir / "stdout.txt"
+                stderr_path = out_dir / "stderr.txt"
+                log_path = out_dir / "executor.log"
+                final_output_path = out_dir / "final-output.txt"
+                write_private_text(
+                    submitted_brief_path,
+                    steering_brief(
+                        pending["message"],
+                        steer_id=pending["steer_id"],
+                        allowed_paths=enforced_paths,
+                        verify_commands=args.verify_command,
+                        expect_changes=args.expect_changes,
+                        engine=args.engine,
+                        added_allow_paths=pending.get("added_allow_paths"),
+                    )
+                    + mailbox_module.run_instructions(mailbox_run_id),
+                )
+                write_private_text(log_path, "")
+                write_private_text(final_output_path, "")
+                stdin_path = submitted_brief_path
+                if agy_stdin:
+                    stdin_path = out_dir / "agy-input.jsonl"
+                    stdin_path.write_bytes(agy_stream_input(submitted_brief_path.read_text(encoding="utf-8")))
+                    stdin_path.chmod(0o600)
                 command = build_executor_command(
                     executable=executable,
                     engine=args.engine,
@@ -2603,312 +2790,329 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
                     variant=variant,
                     repo=repo,
                     add_dirs=add_dirs,
-                    session_id=args.session,
-                    continue_last=args.continue_last,
+                    session_id=segment_session,
+                    continue_last=False,
                     timeout=args.timeout,
                     submitted_brief_path=submitted_brief_path,
                     final_output_path=final_output_path,
                     log_path=log_path,
                     effort=effort["bound"] if args.engine in ("codex", "claude") else None,
                     agy_stdin=agy_stdin,
-                    new_session_id=segment_session,
                     executor_version=version,
                 )
-                base_result.update(command=command_preview(command))
-                if steering is not None:
-                    steering.session_hint = segment_session
-                    steering.save(session_id=segment_session)
-            time.sleep(min(float(attempt_number), 3.0))
-            continue
-
-        attempt_record["retrying"] = False
-        attempt_record.update(
-            {
-                "stdout_path": str(stdout_path),
-                "stderr_path": str(stderr_path),
-                "log_path": str(log_path),
-                "final_output_path": str(final_output_path),
-            }
-        )
-        executor_attempts.append(attempt_record)
-        if steering is not None:
-            allowed_paths = list(steering.allowed_paths)
-            enforced_paths = list(steering.enforced_paths)
-            base_result["allowed_paths"] = enforced_paths
-            if "." in enforced_paths:
-                base_result["scope_owner"] = "worker"
-        if steered:
-            assert steering is not None and steering.pending is not None and completion_event_path is not None
-            pending = steering.pending
-            # Close this segment: a superseded result and an already-acknowledged event pointing at the
-            # continuation, so `events wait` follows it and the inbox shows only the combined result.
-            steered_result = {
-                **base_result,
-                "status": "steered",
-                "task_outcome": "steered",
-                "reported_outcome": None,
-                "exit_code": None,
-                "executor_exit_code": process.returncode,
-                "executor_attempts": executor_attempts[segment_attempts_start:],
-                "finished_at": utc_now(),
-                "session_id": pending["session_id"],
-                "segment": segment,
-                "run_delta_at_interrupt": attempt_delta,
-                "history_violations_at_interrupt": attempt_history_violations,
-                "scope_violations_at_interrupt": find_scope_violations(attempt_delta, enforced_paths),
-                "usage": usage_module.combine_attempts(attempt_usage[segment_usage_start:]),
-                "steered_to": {key: pending[key] for key in ("steer_id", "event_id", "event_path", "result_path")},
-            }
-            write_json_atomic(result_path, steered_result)
-            publish_completion_event(
-                result=steered_result,
-                result_path=result_path,
-                event_path=completion_event_path,
-                notification_mode="none",
-                completion_hook=None,
-                extra={
-                    "acknowledged_at": utc_now(),
-                    "superseded_by": pending["event_id"],
-                    "steer_id": pending["steer_id"],
-                    "steered_from": list(steered_from),
-                },
-            )
-            steered_from.append(completion_event_path.stem)
-            steers_applied.append({key: value for key, value in pending.items() if key != "message"})
-            # Open the continuation: same session, same worktree, same scope, gates, timeouts and
-            # delivery; only the artifact directory, the event and the new user turn differ.
-            segment += 1
-            segment_attempts_start = len(executor_attempts)
-            segment_usage_start = len(attempt_usage)
-            segment_session = pending["session_id"]
-            if args.engine == "claude" and segment_session:
-                environment["CLAUDE_CODE_SESSION_ID"] = segment_session
-            segment_resumed = True
-            usage_baseline = usage.get("cumulative") or usage_baseline
-            out_dir = Path(pending["run_dir"])
-            result_path = out_dir / "result.json"
-            completion_event_path = normalize_completion_event_path(Path(pending["event_path"]))
-            _ACTIVE_SEGMENT.update(event_path=completion_event_path, result_path=result_path)
-            submitted_brief_path = out_dir / "submitted-brief.txt"
-            stdout_path = out_dir / "stdout.txt"
-            stderr_path = out_dir / "stderr.txt"
-            log_path = out_dir / "executor.log"
-            final_output_path = out_dir / "final-output.txt"
-            write_private_text(
-                submitted_brief_path,
-                steering_brief(
-                    pending["message"],
-                    steer_id=pending["steer_id"],
-                    allowed_paths=enforced_paths,
-                    verify_commands=args.verify_command,
-                    expect_changes=args.expect_changes,
-                    engine=args.engine,
-                    added_allow_paths=pending.get("added_allow_paths"),
+                base_result.update(
+                    command=command_preview(command),
+                    submitted_brief_path=str(submitted_brief_path),
+                    stdout_path=str(stdout_path),
+                    stderr_path=str(stderr_path),
+                    log_path=str(log_path),
+                    final_output_path=str(final_output_path),
                 )
-                + mailbox_module.run_instructions(mailbox_run_id),
-            )
-            write_private_text(log_path, "")
-            write_private_text(final_output_path, "")
-            stdin_path = submitted_brief_path
-            if agy_stdin:
-                stdin_path = out_dir / "agy-input.jsonl"
-                stdin_path.write_bytes(agy_stream_input(submitted_brief_path.read_text(encoding="utf-8")))
-                stdin_path.chmod(0o600)
-            command = build_executor_command(
-                executable=executable,
-                engine=args.engine,
-                model=model,
-                variant=variant,
-                repo=repo,
-                add_dirs=add_dirs,
-                session_id=segment_session,
-                continue_last=False,
-                timeout=args.timeout,
-                submitted_brief_path=submitted_brief_path,
-                final_output_path=final_output_path,
-                log_path=log_path,
-                effort=effort["bound"] if args.engine in ("codex", "claude") else None,
-                agy_stdin=agy_stdin,
-                executor_version=version,
-            )
-            base_result.update(
-                command=command_preview(command),
-                submitted_brief_path=str(submitted_brief_path),
-                stdout_path=str(stdout_path),
-                stderr_path=str(stderr_path),
-                log_path=str(log_path),
-                final_output_path=str(final_output_path),
-            )
-            steering.begin_segment(
-                segment=segment,
-                result_path=result_path,
-                event_path=completion_event_path,
-                stdout_path=stdout_path,
-                log_path=log_path,
-                session_hint=segment_session,
-            )
-            emit_lifecycle("steer_resumed", steer=pending["steer_id"], session=segment_session)
-            continue
-        if steering is not None:
-            steering.save(phase="auditing", executor_pid=None)
-        after_executor = after_attempt
-        git_identity_after_executor = git_identity_after_attempt
-        run_delta_after_executor = attempt_delta
-        history_violations_after_executor = attempt_history_violations
-        workspace_changed_after_executor = attempt_workspace_changed
-        break
+                steering.begin_segment(
+                    segment=segment,
+                    result_path=result_path,
+                    event_path=completion_event_path,
+                    stdout_path=stdout_path,
+                    log_path=log_path,
+                    session_hint=segment_session,
+                )
+                emit_lifecycle("steer_resumed", steer=pending["steer_id"], session=segment_session)
+                continue
+            if steering is not None:
+                steering.save(phase="auditing", executor_pid=None)
+            after_executor = after_attempt
+            git_identity_after_executor = git_identity_after_attempt
+            run_delta_after_executor = attempt_delta
+            history_violations_after_executor = attempt_history_violations
+            workspace_changed_after_executor = attempt_workspace_changed
+            break
 
-    session_id: str | None
-    agy_status = None
-    if args.engine == "codex":
-        candidate_message = (
-            final_output_path.read_text(encoding="utf-8", errors="replace") if final_output_path.exists() else ""
-        )
-        session_id = parse_codex_session_id(stdout_text)
-    elif args.engine == "opencode":
-        candidate_message, session_id = parse_opencode_output(stdout_text)
-    elif args.engine == "claude":
-        candidate_message, session_id, agy_status, _claude_error = parse_claude_output(stdout_text)
-        final_output_path.write_text(candidate_message, encoding="utf-8")
-        final_output_path.chmod(0o600)
-    else:
-        candidate_message, session_id, agy_status = parse_agy_output(stdout_text)
-        session_id = session_id or parse_agy_session_id(log_path)
-        final_output_path.write_text(candidate_message, encoding="utf-8")
-        final_output_path.chmod(0o600)
-    session_id = session_id or segment_session
-    provider_error = provider_terminal_error(args.engine, stdout_text)
-    if (
-        args.engine == "agy"
-        and not timed_out
-        and not candidate_message.strip()
-        and (
-            (timeout_seconds >= 10 and attempt_duration >= timeout_seconds - 5)
-            or "timed out" in (provider_error or "").lower()
-            or "timed out" in stderr_text.lower()
-        )
-    ):
-        timed_out = True
-        if executor_attempts:
-            executor_attempts[-1]["timed_out"] = True
-    raw_report, report_extracted = extract_raw_final_report(candidate_message)
-    final_message = bound_final_message(raw_report)
-    reported_outcome = parse_reported_outcome(
-        raw_report,
-        report_extracted,
-    )
-    report_violations = report_contract_violations(
-        raw_report,
-        report_extracted,
-    )
-    if agy_status is not None and agy_status != "success":
-        if agy_status == "waiting_for_input":
-            reported_outcome = "blocked"
-        elif not (
-            process.returncode == 0
-            and report_extracted
-            and not report_violations
-            and reported_outcome in {"complete", "partial", "blocked"}
-            and bool(provider_error)
+        session_id: str | None
+        agy_status = None
+        if args.engine == "codex":
+            candidate_message = (
+                final_output_path.read_text(encoding="utf-8", errors="replace") if final_output_path.exists() else ""
+            )
+            session_id = parse_codex_session_id(stdout_text)
+        elif args.engine == "opencode":
+            candidate_message, session_id = parse_opencode_output(stdout_text)
+        elif args.engine == "claude":
+            candidate_message, session_id, agy_status, _claude_error = parse_claude_output(stdout_text)
+            final_output_path.write_text(candidate_message, encoding="utf-8")
+            final_output_path.chmod(0o600)
+        else:
+            candidate_message, session_id, agy_status = parse_agy_output(stdout_text)
+            session_id = session_id or parse_agy_session_id(log_path)
+            final_output_path.write_text(candidate_message, encoding="utf-8")
+            final_output_path.chmod(0o600)
+        session_id = session_id or segment_session
+        provider_error = provider_terminal_error(args.engine, stdout_text)
+        if (
+            args.engine == "agy"
+            and not timed_out
+            and not candidate_message.strip()
+            and (
+                (round_timeout_seconds >= 10 and attempt_duration >= round_timeout_seconds - 5)
+                or "timed out" in (provider_error or "").lower()
+                or "timed out" in stderr_text.lower()
+            )
         ):
-            reported_outcome = "failed"
-    report_contract_valid = not report_violations
-    consultation = support.consultation_from_report(raw_report, reported_outcome)
-    if consultation["status"] == "invalid":
-        report_violations.append("invalid_consultation_request")
-        report_contract_valid = False
-    scope_violations_after_executor = find_scope_violations(
-        run_delta_after_executor,
-        enforced_paths,
-    )
-    scratch_report = collect_scratch_artifacts(scratch_dir) if scratch_dir is not None else None
-    if scratch_report is not None:
-        scope_violations_after_executor = [
-            *scope_violations_after_executor,
-            *(f"scratch-escape:{item}" for item in scratch_report["escapes"]),
-        ]
-        scope_violations_after_executor = [
-            *scope_violations_after_executor,
-            *find_git_metadata_changes(git_metadata_before, git_metadata_snapshot(repo)),
-        ]
-
-    preliminary_status, preliminary_exit_code = classify_result(
-        history_violations=history_violations_after_executor,
-        scope_violations=scope_violations_after_executor,
-        timed_out=timed_out,
-        executor_exit_code=process.returncode,
-        stdout_present=bool(candidate_message.strip()),
-        report_extracted=report_extracted,
-        expect_changes=args.expect_changes,
-        workspace_changed=workspace_changed_after_executor,
-        reported_outcome=reported_outcome,
-        report_contract_valid=report_contract_valid,
-    )
-
-    if (
-        credits_watch is not None
-        and credits_watch.stopped is not None
-        and preliminary_status not in {"history_violation", "scope_violation"}
-    ):
-        # The partial work stays audited and preserved but is never verified or accepted as complete.
-        preliminary_status, preliminary_exit_code = "stopped_credits", EXIT_STOPPED_CREDITS
-
-    if preliminary_status == "completed":
-        emit_lifecycle(
-            "verification_started",
-            commands=len(args.verify_command),
+            timed_out = True
+            if executor_attempts:
+                executor_attempts[-1]["timed_out"] = True
+        raw_report, report_extracted = extract_raw_final_report(candidate_message)
+        final_message = bound_final_message(raw_report)
+        reported_outcome = parse_reported_outcome(
+            raw_report,
+            report_extracted,
         )
-        verification = run_verification_commands(
-            args.verify_command,
+        report_violations = report_contract_violations(
+            raw_report,
+            report_extracted,
+        )
+        if agy_status is not None and agy_status != "success":
+            if agy_status == "waiting_for_input":
+                reported_outcome = "blocked"
+            elif not (
+                process.returncode == 0
+                and report_extracted
+                and not report_violations
+                and reported_outcome in {"complete", "partial", "blocked"}
+                and bool(provider_error)
+            ):
+                reported_outcome = "failed"
+        report_contract_valid = not report_violations
+        consultation = support.consultation_from_report(raw_report, reported_outcome)
+        if consultation["status"] == "invalid":
+            report_violations.append("invalid_consultation_request")
+            report_contract_valid = False
+        scope_violations_after_executor = find_scope_violations(
+            run_delta_after_executor,
+            enforced_paths,
+        )
+        scratch_report = collect_scratch_artifacts(scratch_dir) if scratch_dir is not None else None
+        if scratch_report is not None:
+            scope_violations_after_executor = [
+                *scope_violations_after_executor,
+                *(f"scratch-escape:{item}" for item in scratch_report["escapes"]),
+            ]
+            scope_violations_after_executor = [
+                *scope_violations_after_executor,
+                *find_git_metadata_changes(git_metadata_before, git_metadata_snapshot(repo)),
+            ]
+        # A correction round must fix the work, not the gate: changing a file the gates name fails the run.
+        gate_violations = [
+            f"gate-edit:{path}" for path in gates if path_fingerprint(repo / path) != gates_before.get(path)
+        ]
+        scope_violations_after_executor = [*scope_violations_after_executor, *gate_violations]
+
+        preliminary_status, preliminary_exit_code = classify_result(
+            history_violations=history_violations_after_executor,
+            scope_violations=scope_violations_after_executor,
+            timed_out=timed_out,
+            executor_exit_code=process.returncode,
+            stdout_present=bool(candidate_message.strip()),
+            report_extracted=report_extracted,
+            expect_changes=args.expect_changes,
+            workspace_changed=workspace_changed_after_executor,
+            reported_outcome=reported_outcome,
+            report_contract_valid=report_contract_valid,
+        )
+
+        if (
+            credits_watch is not None
+            and credits_watch.stopped is not None
+            and preliminary_status not in {"history_violation", "scope_violation"}
+        ):
+            # The partial work stays audited and preserved but is never verified or accepted as complete.
+            preliminary_status, preliminary_exit_code = "stopped_credits", EXIT_STOPPED_CREDITS
+
+        verification_seconds = 0.0
+        if preliminary_status == "completed":
+            emit_lifecycle(
+                "verification_started",
+                commands=len(args.verify_command),
+            )
+            verification_start = time.monotonic()
+            verification = run_verification_commands(
+                args.verify_command,
+                repo=repo,
+                out_dir=out_dir,
+                timeout_seconds=verify_timeout_seconds,
+                deadline=args.deadline,
+                lease=lease,
+            )
+            verification_seconds = time.monotonic() - verification_start
+            emit_lifecycle(
+                "verification_finished",
+                status=verification["status"],
+                completed=verification["completed_count"],
+            )
+        else:
+            verification = verification_summary(
+                args.verify_command,
+                status="skipped" if args.verify_command else "not_requested",
+                skipped_reason=(f"runner_status:{preliminary_status}" if args.verify_command else None),
+            )
+
+        after = git_state(repo, tracked_paths)
+        git_identity_after = git_identity(repo)
+        git_activity_after = git_activity(repo)
+        run_delta = state_delta(before, after)
+        verification_delta = state_delta(after_executor, after)
+        history_violations = find_history_violations(
+            git_identity_before,
+            git_identity_after,
+        )
+        scope_violations = find_scope_violations(run_delta, enforced_paths)
+        scratch_report = collect_scratch_artifacts(scratch_dir) if scratch_dir is not None else None
+        if scratch_report is not None:
+            scope_violations = [*scope_violations, *(f"scratch-escape:{item}" for item in scratch_report["escapes"])]
+            scope_violations = [
+                *scope_violations,
+                *find_git_metadata_changes(git_metadata_before, git_metadata_snapshot(repo)),
+            ]
+        scope_violations = [*scope_violations, *gate_violations]
+        workspace_changed = before["fingerprint"] != after["fingerprint"]
+        verification_changed_workspace = (
+            verification["completed_count"] > 0 and after_executor["fingerprint"] != after["fingerprint"]
+        )
+
+        status, exit_code = preliminary_status, preliminary_exit_code
+        if history_violations:
+            status, exit_code = "history_violation", 21
+        elif scope_violations:
+            status, exit_code = "scope_violation", 22
+        elif verification_changed_workspace:
+            status, exit_code = "verification_mutation", 26
+        elif verification["status"] in {"failed", "timed_out"}:
+            status, exit_code = "verification_failed", 25
+
+        if auto_correct is None:
+            break
+        if correction_round:
+            auto_correct["rounds"][-1].update(
+                finished_at=utc_now(),
+                duration_seconds=round(time.monotonic() - round_started, 3),
+                executor_seconds=round(executor_seconds_used - round_executor_start, 3),
+                verification_seconds=round(verification_seconds, 3),
+                attempts=[attempt["attempt"] for attempt in executor_attempts[round_attempts_start:]],
+                status=status,
+                reported_outcome=reported_outcome,
+                run_delta=state_delta(round_before, after_executor),
+                gate_files_changed=[violation.split(":", 1)[1] for violation in gate_violations],
+                verification=verification,
+            )
+        elif verification["status"] in {"failed", "timed_out"}:
+            auto_correct["initial_verification"] = verification
+        if status != "verification_failed":
+            if not correction_round:
+                auto_correct["outcome"] = "not_needed"
+            elif status == "completed":
+                auto_correct["outcome"] = "passed"
+            else:
+                auto_correct.update(outcome="stopped", stop_reason="gate_files_changed" if gate_violations else status)
+            break
+        if correction_round >= max_rounds:
+            auto_correct["outcome"] = "exhausted"
+            break
+        refusal = (
+            auto_correct_module.round_refusal(
+                executor_seconds_left=timeout_seconds - executor_seconds_used,
+                deadline_left=deadline_remaining(args.deadline),
+                gate_seconds=verification_seconds,
+            )
+            if session_id
+            else "no_session"
+        )
+        if refusal is not None:
+            auto_correct.update(outcome="refused", refused_reason=refusal)
+            emit_lifecycle("auto_correct_refused", round=correction_round + 1, reason=refusal)
+            break
+        # Open the next round: the same session gets the failed gate as a new turn, in the same worktree,
+        # scope and gates. History, scope and --expect-changes stay judged from the first snapshot.
+        failure = auto_correct_module.failed_command(verification)
+        auto_correct_module.archive_verification(correction_round, verification)
+        executor_attempts[-1].update(
+            archive_executor_attempt_artifacts(
+                out_dir=out_dir,
+                attempt=attempt_number,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                log_path=log_path,
+                final_output_path=final_output_path,
+            )
+        )
+        correction_round += 1
+        gates = auto_correct_module.gate_paths(args.verify_command, repo, changed=run_delta["changed_paths"])
+        gates_before = {path: path_fingerprint(repo / path) for path in gates}
+        round_brief_path = out_dir / f"round-{correction_round}-brief.txt"
+        write_private_text(
+            round_brief_path,
+            auto_correct_module.correction_brief(
+                auto_correct_module.correction_message(failure, verification, gates=gates),
+                round_number=correction_round,
+                max_rounds=max_rounds,
+                allowed_paths=enforced_paths,
+                verify_commands=args.verify_command,
+                expect_changes=args.expect_changes,
+                contract=contract_text,
+            )
+            + mailbox_module.run_instructions(mailbox_run_id),
+        )
+        write_private_text(log_path, "")
+        write_private_text(final_output_path, "")
+        stdin_path = round_brief_path
+        if agy_stdin:
+            stdin_path = out_dir / "agy-input.jsonl"
+            stdin_path.write_bytes(agy_stream_input(round_brief_path.read_text(encoding="utf-8")))
+            stdin_path.chmod(0o600)
+        segment_session = session_id
+        if args.engine == "claude":
+            environment["CLAUDE_CODE_SESSION_ID"] = segment_session
+        segment_resumed = True
+        usage_baseline = usage.get("cumulative") or usage_baseline
+        round_timeout_seconds = timeout_seconds - executor_seconds_used
+        command = build_executor_command(
+            executable=executable,
+            engine=args.engine,
+            model=model,
+            variant=variant,
             repo=repo,
-            out_dir=out_dir,
-            timeout_seconds=verify_timeout_seconds,
-            deadline=args.deadline,
-            lease=lease,
+            add_dirs=add_dirs,
+            session_id=segment_session,
+            continue_last=False,
+            timeout=format_duration(round_timeout_seconds),
+            submitted_brief_path=round_brief_path,
+            final_output_path=final_output_path,
+            log_path=log_path,
+            effort=effort["bound"] if args.engine in ("codex", "claude") else None,
+            agy_stdin=agy_stdin,
+            executor_version=version,
         )
-        emit_lifecycle(
-            "verification_finished",
-            status=verification["status"],
-            completed=verification["completed_count"],
+        base_result.update(command=command_preview(command))
+        if steering is not None:
+            steering.session_hint = segment_session
+        retry_window_start = round_attempts_start = len(executor_attempts)
+        round_before = after
+        round_started = time.monotonic()
+        round_executor_start = executor_seconds_used
+        auto_correct["rounds"].append(
+            {
+                "round": correction_round,
+                "started_at": utc_now(),
+                "session_id": segment_session,
+                "trigger": {key: failure.get(key) for key in ("index", "command", "status", "exit_code")}
+                if failure
+                else None,
+                "gate_files": gates,
+                "timeout_seconds": round(round_timeout_seconds, 3),
+                "command": command_preview(command),
+                "prompt_path": str(round_brief_path),
+                "prompt": round_brief_path.read_text(encoding="utf-8"),
+            }
         )
-    else:
-        verification = verification_summary(
-            args.verify_command,
-            status="skipped" if args.verify_command else "not_requested",
-            skipped_reason=(f"runner_status:{preliminary_status}" if args.verify_command else None),
-        )
-
-    after = git_state(repo, tracked_paths)
-    git_identity_after = git_identity(repo)
-    git_activity_after = git_activity(repo)
-    run_delta = state_delta(before, after)
-    verification_delta = state_delta(after_executor, after)
-    history_violations = find_history_violations(
-        git_identity_before,
-        git_identity_after,
-    )
-    scope_violations = find_scope_violations(run_delta, enforced_paths)
-    scratch_report = collect_scratch_artifacts(scratch_dir) if scratch_dir is not None else None
-    if scratch_report is not None:
-        scope_violations = [*scope_violations, *(f"scratch-escape:{item}" for item in scratch_report["escapes"])]
-        scope_violations = [
-            *scope_violations,
-            *find_git_metadata_changes(git_metadata_before, git_metadata_snapshot(repo)),
-        ]
-    workspace_changed = before["fingerprint"] != after["fingerprint"]
-    verification_changed_workspace = (
-        verification["completed_count"] > 0 and after_executor["fingerprint"] != after["fingerprint"]
-    )
-
-    status, exit_code = preliminary_status, preliminary_exit_code
-    if history_violations:
-        status, exit_code = "history_violation", 21
-    elif scope_violations:
-        status, exit_code = "scope_violation", 22
-    elif verification_changed_workspace:
-        status, exit_code = "verification_mutation", 26
-    elif verification["status"] in {"failed", "timed_out"}:
-        status, exit_code = "verification_failed", 25
+        emit_lifecycle("auto_correct_round", round=correction_round, of=max_rounds, session=segment_session)
     # Only agy has a terminal status of its own; Claude's "unknown" just means no result message was found.
     provider_failed = provider_error is not None or (
         args.engine == "agy" and agy_status not in (None, "success", "waiting_for_input")
@@ -2938,6 +3142,8 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
             "error": refreshed_catalog.get("error"),
         }
 
+    if auto_correct is not None:
+        auto_correct.update(rounds_used=len(auto_correct["rounds"]), executor_seconds=round(executor_seconds_used, 3))
     review = compact_review_bundle(
         repo=repo,
         before=before,

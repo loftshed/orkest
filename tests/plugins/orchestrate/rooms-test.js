@@ -517,6 +517,57 @@ describe("rooms under a team", () => {
       dispatchMember(room.id, "haiku-1", { root, taskDir, run: record, timeout: 1500 }),
     ).rejects.toThrow("--timeout needs a duration");
   });
+
+  it("passes verify gates and auto-correct rounds to the coordinator and keeps them with the intent", async () => {
+    const { root, room, taskDir, run } = await fixture();
+    const calls = [];
+    const record = async (args) => {
+      calls.push(args);
+      return run(args);
+    };
+    await dispatchMember(room.id, "haiku-1", { root, taskDir, run: record });
+    const plain = calls.find((args) => args[0] === "dispatch");
+    expect(plain).not.toContain("--verify-command");
+    expect(plain).not.toContain("--auto-correct");
+    expect((await readRoom(room.id, root)).agents[0].dispatch).not.toHaveProperty("autoCorrect");
+    const gates = { verifyCommands: ["pnpm check", "pnpm test"], autoCorrect: 1 };
+    await dispatchMember(room.id, "luna-1", {
+      root,
+      taskDir,
+      run: record,
+      kind: "implementation",
+      ...gates,
+    });
+    const gated = calls.findLast((args) => args[0] === "dispatch");
+    expect(gated.slice(gated.indexOf("--verify-command"))).toEqual([
+      "--verify-command",
+      "pnpm check",
+      "--verify-command",
+      "pnpm test",
+      "--auto-correct",
+      "1",
+    ]);
+    expect((await readRoom(room.id, root)).agents[1].dispatch).toMatchObject({
+      verifyCommands: ["pnpm check", "pnpm test"],
+      autoCorrect: "1",
+    });
+    const again = { root, taskDir, run: record, kind: "implementation" };
+    await expect(
+      dispatchMember(room.id, "luna-1", { ...again, ...gates, autoCorrect: 2 }),
+    ).rejects.toThrow("Existing dispatch differs: autoCorrect");
+    await expect(
+      dispatchMember(room.id, "luna-1", { ...again, ...gates, verifyCommands: ["pnpm check"] }),
+    ).rejects.toThrow("Existing dispatch differs: verifyCommands");
+    await dispatchMember(room.id, "luna-1", { ...again, ...gates, autoCorrect: "1" });
+    for (const [option, message] of [
+      [{ autoCorrect: "one" }, "--auto-correct needs a number"],
+      [{ autoCorrect: -1 }, "--auto-correct needs a number"],
+      [{ verifyCommands: [" "] }, "--verify-command needs a non-empty command"],
+    ])
+      await expect(
+        dispatchMember(room.id, "haiku-1", { root, taskDir, run: record, ...option }),
+      ).rejects.toThrow(message);
+  });
 });
 
 describe("room CLI", () => {
@@ -569,6 +620,68 @@ describe("room CLI", () => {
       .filter((args) => args[0] === "dispatch")
       .map((args) => args[args.indexOf("--timeout") + 1]);
     expect(timeouts).toEqual(["25m", "40m"]);
+  });
+
+  it("passes repeated --verify-command and --auto-correct to dispatch and launch", async () => {
+    const { root, room, taskDir, run } = await fixture();
+    const calls = [];
+    const record = async (args) => {
+      calls.push(args);
+      return run(args);
+    };
+    const stdout = { write: () => {} };
+    await roomsCommand(
+      [
+        "dispatch",
+        "--room",
+        room.id,
+        "--member",
+        "haiku-1",
+        "--task-dir",
+        taskDir,
+        "--kind",
+        "implementation",
+        "--verify-command",
+        "pnpm check",
+        "--verify-command",
+        "pnpm test",
+        "--auto-correct",
+        "2",
+      ],
+      { stdout, root, run: record },
+    );
+    const plan = path.join(taskDir, "plan.json");
+    await writeFile(
+      plan,
+      JSON.stringify({
+        members: [
+          {
+            id: "luna-1",
+            taskDir,
+            kind: "implementation",
+            verifyCommands: ["gen.py apply --dry-run"],
+            autoCorrect: 1,
+          },
+        ],
+      }),
+    );
+    await roomsCommand(["launch", "--room", room.id, "--plan", plan], {
+      stdout,
+      root,
+      run: record,
+    });
+    const [cli, launched] = calls
+      .filter((args) => args[0] === "dispatch")
+      .map((args) => args.slice(args.indexOf("--verify-command")));
+    expect(cli).toEqual([
+      "--verify-command",
+      "pnpm check",
+      "--verify-command",
+      "pnpm test",
+      "--auto-correct",
+      "2",
+    ]);
+    expect(launched).toEqual(["--verify-command", "gen.py apply --dry-run", "--auto-correct", "1"]);
   });
 
   it("creates and lists rooms", async () => {

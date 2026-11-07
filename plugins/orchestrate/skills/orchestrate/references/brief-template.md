@@ -74,6 +74,10 @@ An optional `context_packet` object accepts four string arrays: `decisions`, `fa
 The nine fields above remain required. Keep native reasoning and opaque tool state in their own
 session. For a narrow read-only question, see [coordinator.md](coordinator.md).
 
+An optional `auto_correct` integer (0 to 2) is the default for the runner's `--auto-correct`: the
+rounds it may resume the session to fix a failed `--verify-command` gate. It leaves the brief
+unchanged and does nothing without a gate. See [runner.md](runner.md#auto-correct-rounds).
+
 The renderer includes the mutation budget, shared constraints, development-check guidance, and the
 ordered five-heading report contract. It does not embed runner-owned `--verify-command` gates;
 keep those exact non-mutating commands on the runner invocation.

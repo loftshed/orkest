@@ -722,6 +722,16 @@ export async function dispatchMember(id, memberId, options = {}) {
   // The coordinator validates the duration and checks it against the task deadline.
   if (options.timeout !== undefined && (typeof options.timeout !== "string" || !options.timeout))
     throw new Error("--timeout needs a duration such as 25m");
+  // Runner gates for implementation work, and the auto-correct rounds the coordinator caps.
+  const verifyCommands = options.verifyCommands ?? [];
+  if (
+    !Array.isArray(verifyCommands) ||
+    verifyCommands.some((command) => typeof command !== "string" || !command.trim())
+  )
+    throw new Error("--verify-command needs a non-empty command");
+  const autoCorrect = options.autoCorrect === undefined ? undefined : String(options.autoCorrect);
+  if (autoCorrect !== undefined && !/^\d+$/.test(autoCorrect))
+    throw new Error("--auto-correct needs a number of rounds such as 1");
   const intent = {
     taskDir: directory,
     taskId: task.task_id,
@@ -731,6 +741,8 @@ export async function dispatchMember(id, memberId, options = {}) {
     billingMode: options.billingMode || "unknown",
     ...(options.packet && { packet: await realpath(options.packet) }),
     ...(options.timeout && { timeout: options.timeout }),
+    ...(verifyCommands.length > 0 && { verifyCommands }),
+    ...(autoCorrect !== undefined && { autoCorrect }),
   };
   const saved = await updateRoom(
     id,
@@ -755,8 +767,10 @@ export async function dispatchMember(id, memberId, options = {}) {
           "billingMode",
           "packet",
           "timeout",
+          "verifyCommands",
+          "autoCorrect",
         ])
-          if (member.dispatch[key] !== intent[key])
+          if (JSON.stringify(member.dispatch[key]) !== JSON.stringify(intent[key]))
             throw new Error(`Existing dispatch differs: ${key}`);
         if (options.requestId && options.requestId !== member.dispatch.requestId)
           throw new Error("A member already has a dispatch; add a member for new work");
@@ -803,6 +817,9 @@ export async function dispatchMember(id, memberId, options = {}) {
     args.push(member.engine === "opencode" ? "--variant" : "--effort", member.effort);
   if (binding.packet) args.push("--packet", binding.packet);
   if (binding.timeout) args.push("--timeout", binding.timeout);
+  const gates = binding.verifyCommands ?? [];
+  for (const command of gates) args.push("--verify-command", command);
+  if (binding.autoCorrect !== undefined) args.push("--auto-correct", binding.autoCorrect);
   let result;
   try {
     result = await run(args);

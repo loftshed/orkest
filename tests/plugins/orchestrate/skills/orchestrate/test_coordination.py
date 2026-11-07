@@ -1134,6 +1134,110 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual((code, corrected["runner_status"], corrected["timeout"]), (0, "completed", "5m"))
         self.assertEqual(corrected["command"][corrected["command"].index("--timeout") + 1], "5m")
 
+    def test_auto_correct_rounds_run_before_the_report_and_keep_the_correction_allowance(self):
+        gate = "grep -q fixed allowed/output.txt"
+        contents = ["broken\n", "fixed\n", "fixed again\n"]
+        rounds = {
+            "FAKE_ROUNDS": json.dumps([{"FAKE_CONTENT": content} for content in contents]),
+            "FAKE_ROUNDS_COUNT": str(self.fixture.external_path / "rounds.txt"),
+        }
+        with mock.patch.dict(os.environ, rounds):
+            code, run = self.start("implement", "implementation", "--verify-command", gate, "--auto-correct", "1")
+        self.assertEqual((code, run["runner_status"], run["auto_correct"]), (0, "completed", 1), run)
+        self.assertEqual(run["command"][run["command"].index("--auto-correct") + 1], "1")
+        result = COORDINATOR.read(Path(run["result_path"]))
+        self.assertEqual((result["auto_correct"]["outcome"], result["auto_correct"]["rounds_used"]), ("passed", 1))
+        state = COORDINATOR.load(self.directory)
+        self.assertEqual((len(state["runs"]), state["budget"]["used"]), (1, 1))
+        # The rounds were not a correction: the one correction is still available, and it inherits them.
+        proof = self.reviewed_evidence()
+        with mock.patch.dict(os.environ, rounds):
+            code, corrected = self.call(
+                "dispatch", "--kind", "correction", "--request-id", "repair", "--review-id", proof
+            )
+        self.assertEqual((code, corrected["runner_status"], corrected["auto_correct"]), (0, "completed", 1), corrected)
+        self.assertEqual(corrected["command"][corrected["command"].index("--auto-correct") + 1], "1")
+
+    def test_auto_correct_is_validated_and_needs_gates(self):
+        for extra, message in (
+            (("--verify-command", "exit 0", "--auto-correct", "3"), "from 0 to 2"),
+            (("--auto-correct", "1"), "requires --verify-command"),
+        ):
+            code, error = self.start("work", "implementation", *extra)
+            self.assertEqual(code, 2)
+            self.assertIn(message, error)
+        code, error = self.start("explore", "investigation", "--auto-correct", "1")
+        self.assertEqual(code, 2)
+        self.assertIn("no verification gates to auto-correct", error)
+        self.assertEqual(COORDINATOR.load(self.directory)["runs"], [])
+        # The spec's rounds are a default for work with gates, inert without them.
+        state = COORDINATOR.load(self.directory)
+        state["task_spec"]["auto_correct"] = 2
+        COORDINATOR.save(self.directory, state)
+        code, run = self.start("work", "implementation")
+        self.assertEqual((code, run["runner_status"]), (0, "completed"), run)
+        self.assertNotIn("auto_correct", run)
+        self.assertNotIn("--auto-correct", run["command"])
+        self.assertNotIn("auto_correct", COORDINATOR.read(Path(run["result_path"])))
+
+    def test_native_auto_correct_returns_the_failed_gate_as_the_suggested_correction(self):
+        gate = "grep -qx fixed allowed/output.txt"
+        code, run = self.call(
+            "dispatch",
+            "--kind",
+            "implementation",
+            "--request-id",
+            "native-1",
+            "--transport",
+            "native",
+            "--engine",
+            "claude",
+            "--model",
+            "claude-sonnet-5",
+            "--verify-command",
+            gate,
+            "--auto-correct",
+            "2",
+        )
+        self.assertEqual((code, run["auto_correct"]), (0, 2), run)
+        packet = self.fixture.external_path / "native.json"
+        try:
+            packet.write_text(json.dumps({"native_handle": "native-test-session"}))
+            self.assertEqual(self.call("native-attach", "--run-id", run["run_id"], "--packet", str(packet))[0], 0)
+            (self.fixture.repository.path / "allowed").mkdir(exist_ok=True)
+            (self.fixture.repository.path / "allowed/output.txt").write_text("broken\n")
+            report = self.fixture.external_path / "native-report.txt"
+            report.write_text(
+                "### STATUS\nCOMPLETE\n### FILES CHANGED\nallowed/output.txt\n### COMMANDS RUN\nnone\n"
+                "### VERIFICATION\nHost will check output.\n### RISKS OR BLOCKERS\nnone\n"
+            )
+            packet.write_text(
+                json.dumps(
+                    {
+                        "native_handle": "native-test-session",
+                        "event_id": "native-completion-1",
+                        "terminal": True,
+                        "tool_status": "completed",
+                        "report_path": str(report),
+                    }
+                )
+            )
+            code, finished = self.call("native-complete", "--run-id", run["run_id"], "--packet", str(packet))
+            self.assertEqual((code, finished["runner_status"]), (0, "verification_failed"), finished)
+            suggestion = finished["suggested_correction"]
+            self.assertIn(f"Gate 1 of 1 failed with exit code 1:\n\n    {gate}", suggestion)
+            self.assertIn("Fix exactly these problems; change nothing else.", suggestion)
+            result = COORDINATOR.read(Path(finished["result_path"]))
+            self.assertEqual(
+                {key: result["auto_correct"][key] for key in ("mode", "rounds_used", "outcome")},
+                {"mode": "native", "rounds_used": 0, "outcome": "handed_to_host"},
+            )
+            self.assertEqual(result["auto_correct"]["suggested_correction"], suggestion)
+            self.assertEqual(COORDINATOR.load(self.directory)["budget"]["used"], 1)
+        finally:
+            if COORDINATOR.NATIVE.process_state(run) == "active":
+                os.kill(run["pid"], 15)
+
     def test_background_completion_event_auto_settles_coordinator_task(self):
         code, run = self.start("bg-auto-settle", "implementation", "--background")
         self.assertEqual(code, 0, run)

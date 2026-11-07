@@ -98,8 +98,8 @@ agy slugs use their base model's tariff. It is not an invoice. See
   `--retry-read-only` eligibility.
 - `--timeout` (default `15m`) bounds each executor attempt: the runner stops the executor 60 s after
   it (`timed_out`, 12), and agy gets `--print-timeout` 90 s after it. `--deadline` only shortens that
-  wait. A coordinator dispatch passes `--timeout` only when given one; see
-  [coordinator.md](coordinator.md#initialize-and-dispatch).
+  wait. [Auto-correct rounds](#auto-correct-rounds) share one `--timeout`. A coordinator dispatch
+  passes `--timeout` only when given one; see [coordinator.md](coordinator.md#initialize-and-dispatch).
 - After a nonzero executor exit the catalog is refreshed to record whether the model still exists.
   A possibly mutating run is never retried; `--retry-read-only <1-3>` retries only unchanged,
   empty-scope transient failures and keeps every attempt.
@@ -110,6 +110,33 @@ Every new run also has dedicated [mailbox sessions](mailbox.md#runs-conductor-an
 and worker messages. Questions and replies use ordinary CLI tool calls inside the existing executor
 session; provider text streaming is not required. This does not expose internal reasoning or automatically
 record every native host message.
+
+## Auto-correct rounds
+
+`--auto-correct N` (0 to 2, default 0) lets the runner fix a failed `--verify-command` gate itself.
+A task spec's `auto_correct` sets the default; the flag overrides it, and it needs a gate. When a gate
+fails after a clean handoff, the runner resumes the same session, as `--session` does, with a
+correction turn: the failing command, its exit code and output tails, and "Fix exactly these problems;
+change nothing else", inside the unchanged scope, checks and report contract. It then runs every gate
+again, up to N rounds, and reports once. With 0 or no option nothing changes.
+
+- `result.auto_correct` records each round: its prompt (`round-<n>-brief.txt`), session, timing,
+  delta and gate results. Earlier logs are kept as `round-<n>-verification-*` and `attempt-<n>-*`.
+  `outcome` is `passed`, `exhausted` (the run stays `verification_failed`), `refused` with
+  `refused_reason`, `stopped` with `stop_reason`, or `not_needed`.
+- History, scope and `--expect-changes` are judged from the snapshot before the first handoff, so
+  the audit covers every round. A round that ends without a gate result (scope or history violation,
+  `BLOCKED`, timeout) ends the run with that status.
+- Rounds share `--timeout`: a round gets the executor time earlier attempts left. It is refused when
+  under 60 s remain (`timeout`), when `--deadline` leaves under 60 s plus the last gate run
+  (`deadline`), or when the executor exposed no session (`no_session`).
+- A round may not change the gate. A file named in a verify command (`python3 tools/gen.py`,
+  `pytest tests/test_x.py`) that the run had not changed before the round is a gate file; changing it
+  fails the run as `scope_violation` with `gate-edit:<path>`. Named directories (`ruff check src`) and
+  files the run already changed (`test -s out.txt`) are the work under test and stay editable.
+- Native transport never loops. A native handoff passes the round limit to the host in its
+  instructions; a coordinator native guard returns the failed gate as `suggested_correction`.
+- Rounds are not a coordinator `correction` and do not use its allowance.
 
 ## Steering a running job
 

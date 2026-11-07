@@ -120,6 +120,17 @@ def _support_module() -> Any:
     return module
 
 
+@functools.cache
+def _auto_correct_module() -> Any:
+    path = Path(__file__).with_name("auto_correct.py")
+    spec = importlib.util.spec_from_file_location("agent_executor_brief_auto_correct", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def markdown_list(values: list[str], *, empty: str = "none") -> str:
     if not values:
         return f"- {empty}"
@@ -213,6 +224,12 @@ def validate_spec(spec: dict[str, Any]) -> dict[str, Any]:
         result["conductor_model"] = conductor_model
     if worker_model:
         result["worker_model"] = worker_model
+    if spec.get("auto_correct") is not None:
+        # Rounds the runner may use to fix a failed --verify-command gate; the brief text is unchanged.
+        try:
+            result["auto_correct"] = _auto_correct_module().validate_rounds(spec["auto_correct"], name="auto_correct")
+        except ValueError as exc:
+            raise BriefSpecError(str(exc)) from exc
     return result
 
 

@@ -1008,7 +1008,19 @@ completed
 - none
 """
 
+def apply_round():
+    """FAKE_ROUNDS: a JSON list of environment updates, one per executor run (the last one repeats)."""
+    rounds = os.environ.get("FAKE_ROUNDS")
+    if not rounds:
+        return
+    counter = pathlib.Path(os.environ["FAKE_ROUNDS_COUNT"])
+    index = int(counter.read_text(encoding="utf-8")) if counter.exists() else 0
+    counter.write_text(str(index + 1), encoding="utf-8")
+    updates = json.loads(rounds)
+    os.environ.update(updates[min(index, len(updates) - 1)])
+
 def mutate():
+    apply_round()
     if os.environ.get("FAKE_NO_CHANGE") == "1":
         return
     destination = pathlib.Path(os.environ.get("FAKE_OUTPUT", "allowed/output.txt"))
@@ -1055,6 +1067,9 @@ def capture(extra=None):
     pathlib.Path(os.environ["FAKE_CAPTURE"]).write_text(
         json.dumps(payload), encoding="utf-8"
     )
+    if os.environ.get("FAKE_CAPTURE_LOG"):
+        with pathlib.Path(os.environ["FAKE_CAPTURE_LOG"]).open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload) + "\n")
 '''
         self._write_executable(
             "codex",

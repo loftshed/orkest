@@ -62,6 +62,15 @@ class BriefRendererTests(unittest.TestCase):
         self.assertEqual(positions, sorted(positions))
         self.assertEqual(sum(rendered.count(f"### {heading}") for heading in RENDERER.REPORT_HEADINGS), 5)
 
+    def test_auto_correct_rounds_are_validated_and_leave_the_brief_unchanged(self) -> None:
+        self.assertNotIn("auto_correct", RENDERER.validate_spec(brief_spec()))
+        spec = {**brief_spec(), "auto_correct": 2}
+        self.assertEqual(RENDERER.validate_spec(spec)["auto_correct"], 2)
+        self.assertEqual(RENDERER.render_brief(spec), RENDERER.render_brief(brief_spec()))
+        for value in (3, -1, "1", True):
+            with self.subTest(value=value), self.assertRaisesRegex(RENDERER.BriefSpecError, "auto_correct must be"):
+                RENDERER.validate_spec({**brief_spec(), "auto_correct": value})
+
     def test_rendered_brief_passes_the_runner_preflight_parser(self) -> None:
         self.assertEqual(
             RUNNER.brief_report_contract_violations(RENDERER.render_brief(brief_spec())),

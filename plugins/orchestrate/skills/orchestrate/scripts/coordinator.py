@@ -44,8 +44,10 @@ NATIVE = module("native_bridge")
 QUOTA = module("quota")
 MAILBOX = module("peer_mailbox")
 AUTHORITY = module("authority")
+AUTO_CORRECT = module("auto_correct")
 SCHEMA = "agent-executor.task.v1"
 READ_ONLY_KINDS = {"consultation", "challenge", "investigation"}
+WORK_KINDS = {"implementation", "correction"}
 ABANDON_GRACE_SECONDS = 10.0
 
 
@@ -229,6 +231,9 @@ def import_result(run: dict[str, Any], state: dict[str, Any], *, skip_event_publ
     )
     if result.get("native_event_id"):
         run["native_event_id"] = result["native_event_id"]
+    if (result.get("auto_correct") or {}).get("suggested_correction"):
+        # A native run never loops: the host sends this to its own worker as the correction turn.
+        run["suggested_correction"] = result["auto_correct"]["suggested_correction"]
     POLICY.settle(state, run, result)
     if not skip_event_publish and run.get("event_path") and not Path(run["event_path"]).exists():
         RUNNER.publish_completion_event(
@@ -554,6 +559,8 @@ def dispatch(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
             raise CoordinationError(
                 "read-only dispatches use evidence in the report; omit implementation verification commands"
             )
+        if args.auto_correct:
+            raise CoordinationError("read-only dispatches have no verification gates to auto-correct")
     # Follow-up agents need the earlier findings, including failed approaches.
     prior_reports = [
         "Prior " + run["kind"] + " result: " + run["result_path"]
@@ -568,6 +575,7 @@ def dispatch(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
     verification = args.verify_command
     billing = args.billing_mode
     timeout = args.timeout
+    rounds = args.auto_correct
     previous_result = None
     evidence_record = None
     if kind == "correction":
@@ -586,6 +594,9 @@ def dispatch(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
         if timeout is None and args.transport != "native":
             # The resumed session keeps the runner limit it was given; an explicit --timeout replaces it.
             timeout = next((run.get("timeout") for run in state["runs"] if run["kind"] == "implementation"), None)
+        if rounds is None:
+            # Like the timeout, the auto-correct rounds carry over unless the correction sets its own.
+            rounds = work.get("auto_correct")
         if (
             any(value is not None for value in (args.engine, args.model, args.effort, args.variant))
             or args.verify_command
@@ -608,6 +619,17 @@ def dispatch(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
             "Conductor evidence: " + json.dumps(proof, ensure_ascii=True)
         ]
         spec["context_packet"] = context
+    if rounds is not None:
+        try:
+            AUTO_CORRECT.validate_rounds(rounds, name="--auto-correct")
+        except ValueError as error:
+            raise CoordinationError(str(error)) from error
+    # Rounds from --auto-correct (or the implementation's), else the spec's; only work with gates uses them.
+    auto_correct = (rounds if rounds is not None else spec.get("auto_correct") or 0) if kind in WORK_KINDS else 0
+    if auto_correct and not verification:
+        if rounds:
+            raise CoordinationError("--auto-correct requires --verify-command gates to correct against")
+        auto_correct = 0
     if timeout is not None:
         # Refused, never clamped: the runner would otherwise stop the worker earlier than the caller asked.
         remaining = RUNNER.deadline_remaining(state["deadline"])
@@ -704,9 +726,11 @@ def dispatch(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
         command += ["--variant", variant]
     if args.allow_credits:
         command += ["--allow-credits"]
-    if kind in {"implementation", "correction"}:
+    if kind in WORK_KINDS:
         for check in verification:
             command += ["--verify-command", check]
+        if rounds is not None:
+            command += ["--auto-correct", str(auto_correct)]
         if spec["allow_paths"] or spec["track_paths"]:
             command += ["--expect-changes"]
     if previous_result:
@@ -730,6 +754,7 @@ def dispatch(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
         "variant": variant,
         "billing_mode": billing,
         **({"timeout": timeout} if timeout else {}),
+        **({"auto_correct": auto_correct} if auto_correct else {}),
         "host": host,
         "generation": authority["generation"] if authority else None,
         "allow_credits": bool(args.allow_credits),
@@ -1084,6 +1109,16 @@ def main(argv: list[str] | None = None) -> int:
                 help="Let a Codex run bill the account's credit balance; only when the user allows spending credits",
             )
             sub.add_argument("--verify-command", action="append", default=[])
+            sub.add_argument(
+                "--auto-correct",
+                type=int,
+                metavar="ROUNDS",
+                help=(
+                    "When a --verify-command gate fails, the runner resumes the same session up to ROUNDS times "
+                    "(0-2) before its report. Default: the task spec's auto_correct, else 0. Separate from the "
+                    "correction allowance; a correction inherits it unless given its own"
+                ),
+            )
             sub.add_argument("--packet", type=Path)
             sub.add_argument("--evidence", type=Path)
             sub.add_argument("--review-id")

@@ -187,6 +187,21 @@ def audit(
         status, code = "verification_failed", 25
     usage = runner.bundled_module("usage").empty()
     usage["gaps"].append("native_host_did_not_expose_verified_provider_usage")
+    extra: dict[str, Any] = {}
+    if run.get("auto_correct"):
+        # The guard never loops: a failed gate goes back to the host as the correction turn to send.
+        corrector = runner.bundled_module("auto_correct")
+        suggestion = None
+        if status == "verification_failed":
+            gates = corrector.gate_paths(run["verification_commands"], repository, changed=delta["changed_paths"])
+            suggestion = corrector.correction_message(corrector.failed_command(verification), verification, gates=gates)
+        extra["auto_correct"] = {
+            "max_rounds": run["auto_correct"],
+            "mode": "native",
+            "rounds_used": 0,
+            "outcome": "handed_to_host" if suggestion else "not_needed",
+            "suggested_correction": suggestion,
+        }
     return {
         "schema": runner.RESULT_SCHEMA,
         "runner_version": "1.0",
@@ -237,6 +252,7 @@ def audit(
         ).total_seconds(),
         "native_receipt": packet,
         "permission_basis": "existing_host_authority; unchanged_by_bridge",
+        **extra,
     }
 
 

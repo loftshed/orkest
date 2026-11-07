@@ -62,6 +62,12 @@ A timeout longer than the task's remaining time is refused, never shortened, so 
 --time-budget` room for every run you plan. Native dispatch takes no `--timeout`; the host stops
 its tool at the task deadline.
 
+`dispatch --auto-correct N` (0 to 2) lets the runner fix a failed `--verify-command` gate by resuming
+the same session up to N times before its report; the task spec's `auto_correct` is the default. It
+needs gates, and read-only kinds refuse it. The run records it and a correction inherits it unless it
+passes its own. The rounds stay inside one invocation and share its `--timeout`; they use neither the
+invocation allowance nor the one correction. See [runner.md](runner.md#auto-correct-rounds).
+
 External dispatch is foreground by default. Use `--background` to return the durable run handle
 immediately, then supervise `events wait EVENT_ID --messages` and call `recover` after completion.
 This keeps the conductor available for questions and permits concurrent read-only runs. Reusing
@@ -116,6 +122,9 @@ An explicit model/effort must match what the host actually sends to its tool.
    Include `observed_model`/`observed_effort` only when the native tool actually reports them.
 5. The guard checks scope/history, runs the declared independent checks once, checks for check
    mutations, and saves the additive result.v2 contract. The task still needs conductor review.
+   With `--auto-correct`, the guard does not loop: a failed gate comes back as `suggested_correction`
+   on the run and in `result.auto_correct`, holding the failing command, exit code, output and the
+   fix-exactly instruction. To use it, dispatch a native `correction` and send it to the same worker.
 
 Native correction requires the original handle and workspace. Native output can be completed while
 the underlying task remains blocked; the report contract determines that distinction. The native
@@ -187,10 +196,10 @@ is a limit (at most one per audited task), not a required step.
 
 New tasks require the persisted host review ID. `review --run-id ID --decision supported --review-id
 ID` records supported advice. `dispatch --kind correction --request-id repair-1 --review-id ID`
-inherits the original engine, model, effort, variant, billing, session, scope, checks and runner
-timeout; only `--timeout` may be overridden. Add `--transport native` for a native continuation.
-No unchanged failed prompt or safety-violation resumption is allowed. Original failed/blocked
-outcomes remain unchanged.
+inherits the original engine, model, effort, variant, billing, session, scope, checks, runner
+timeout and auto-correct rounds; only `--timeout` and `--auto-correct` may be overridden. Add
+`--transport native` for a native continuation. No unchanged failed prompt or safety-violation
+resumption is allowed. Original failed/blocked outcomes remain unchanged.
 
 `review --run-id ID --decision accept --review-id ID` requires the latest completed audited work,
 all original criteria, unchanged workspace/history, and current evidence. `reject` records failed
