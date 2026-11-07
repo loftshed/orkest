@@ -607,7 +607,9 @@ def dispatch(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
         if rounds is None:
             # Like the timeout, the auto-correct rounds carry over unless the correction sets its own.
             inherited = implementation_work(state) if work["kind"] == "verification" else work
-            rounds = inherited.get("auto_correct") if inherited else None
+            # Rounds the implementation took from the task spec stay the spec's: no --auto-correct is passed.
+            if inherited and inherited.get("auto_correct_source") != "task_spec":
+                rounds = inherited.get("auto_correct")
         if (
             any(value is not None for value in (args.engine, args.model, args.effort, args.variant))
             or args.verify_command
@@ -742,7 +744,12 @@ def dispatch(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
             command += ["--verify-command", check]
         if rounds is not None:
             command += ["--auto-correct", str(auto_correct)]
-        if spec["allow_paths"] or spec["track_paths"]:
+        # After a converted auto-correct round the fix may already be in place; the correction then only
+        # has to finish and pass the gates, so it is not required to change anything further.
+        converted = kind == "correction" and bool(
+            ((previous_result or {}).get("auto_correct") or {}).get("converted_from")
+        )
+        if (spec["allow_paths"] or spec["track_paths"]) and not converted:
             command += ["--expect-changes"]
     if previous_result:
         command += ["--session", previous_result["session_id"], "--resume-result", work["result_path"]]
@@ -767,6 +774,7 @@ def dispatch(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
         **({"timeout": timeout} if timeout else {}),
         # An explicit 0 is kept too, so a correction inherits the opt-out instead of the spec's default.
         **({"auto_correct": auto_correct} if auto_correct or rounds is not None else {}),
+        **({"auto_correct_source": "task_spec"} if auto_correct and rounds is None else {}),
         "host": host,
         "generation": authority["generation"] if authority else None,
         "allow_credits": bool(args.allow_credits),

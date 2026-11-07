@@ -729,9 +729,14 @@ export async function dispatchMember(id, memberId, options = {}) {
     verifyCommands.some((command) => typeof command !== "string" || !command.trim())
   )
     throw new Error("--verify-command needs a non-empty command");
-  const autoCorrect = options.autoCorrect === undefined ? undefined : String(options.autoCorrect);
-  if (autoCorrect !== undefined && !/^\d+$/.test(autoCorrect))
+  const rawAutoCorrect =
+    options.autoCorrect === undefined ? undefined : String(options.autoCorrect);
+  if (rawAutoCorrect !== undefined && !/^\d+$/.test(rawAutoCorrect))
     throw new Error("--auto-correct needs a number of rounds such as 1");
+  // Canonical, so a retry with "01" and 1 is the same request.
+  const autoCorrect = rawAutoCorrect === undefined ? undefined : String(Number(rawAutoCorrect));
+  // A new dispatch's member edits, undone if the coordinator refuses it without launching anything.
+  let restoreMember = null;
   const intent = {
     taskDir: directory,
     taskId: task.task_id,
@@ -751,7 +756,10 @@ export async function dispatchMember(id, memberId, options = {}) {
       const member = memberOf(current, memberId);
       if (member.role === "lead")
         throw new Error("A subswarm lead uses native supervision, not worker dispatch");
-      if (!member.dispatch) requireActiveBranch(current, memberId);
+      if (!member.dispatch) {
+        requireActiveBranch(current, memberId);
+        restoreMember = { cwd: member.cwd, workforceRole: member.workforceRole };
+      }
       if (options.cwd) member.cwd = resolvedMemberCwd;
       if (options.workforceRole !== undefined) {
         const normalized = normalizeWorkforceRole(options.workforceRole);
@@ -841,6 +849,11 @@ export async function dispatchMember(id, memberId, options = {}) {
         if (!wasLaunched && agent.dispatch?.requestId === binding.requestId) {
           delete agent.dispatch;
           agent.status = "queued";
+          const restored = Object.entries(restoreMember ?? {});
+          for (const [key, value] of restored) {
+            if (value === undefined) delete agent[key];
+            else agent[key] = value;
+          }
         }
         return current;
       },

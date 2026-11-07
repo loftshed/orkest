@@ -559,6 +559,8 @@ describe("rooms under a team", () => {
       dispatchMember(room.id, "luna-1", { ...again, ...gates, verifyCommands: ["pnpm check"] }),
     ).rejects.toThrow("Existing dispatch differs: verifyCommands");
     await dispatchMember(room.id, "luna-1", { ...again, ...gates, autoCorrect: "1" });
+    // The same request, however the number is written.
+    await dispatchMember(room.id, "luna-1", { ...again, ...gates, autoCorrect: "01" });
     for (const [option, message] of [
       [{ autoCorrect: "one" }, "--auto-correct needs a number"],
       [{ autoCorrect: -1 }, "--auto-correct needs a number"],
@@ -567,6 +569,24 @@ describe("rooms under a team", () => {
       await expect(
         dispatchMember(room.id, "haiku-1", { root, taskDir, run: record, ...option }),
       ).rejects.toThrow(message);
+  });
+});
+
+describe("refused dispatch", () => {
+  it("undoes a refused dispatch's member edits so the next dispatch starts clean", async () => {
+    const { root, room, taskDir, run } = await fixture();
+    const refusing = async (args) => {
+      if (args[0] === "dispatch") throw new Error("coordinator: refused before launch");
+      return run(args);
+    };
+    const before = (await readRoom(room.id, root)).agents[0];
+    await expect(
+      dispatchMember(room.id, "haiku-1", { root, taskDir, run: refusing, workforceRole: "scout" }),
+    ).rejects.toThrow("refused before launch");
+    const after = (await readRoom(room.id, root)).agents[0];
+    expect(after).not.toHaveProperty("dispatch");
+    expect(after.workforceRole).toBe(before.workforceRole);
+    expect(after.cwd).toBe(before.cwd);
   });
 });
 

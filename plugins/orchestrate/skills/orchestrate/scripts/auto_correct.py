@@ -21,8 +21,13 @@ MIN_ROUND_SECONDS = 60.0
 INSTRUCTION = "Fix exactly these problems; change nothing else."
 # Shell words that end one command and start the next, and words that run the command after them.
 OPERATOR_CHARACTERS = frozenset(";&|()")
-COMMAND_PREFIXES = frozenset({"!", "if", "then", "else", "elif", "do", "while", "until", "time", "exec", "command"})
-ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
+COMMAND_PREFIXES = frozenset(
+    {"!", "{", "}", "if", "then", "else", "elif", "do", "while", "until", "time", "exec", "command", "env", "nohup"}
+)
+ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*", re.DOTALL)
+# A shell's inline-command flag (`-c`, `-lc`, `-ec`): the next word is a whole command line.
+INLINE_COMMAND_FLAG = re.compile(r"-[A-Za-z]*c[A-Za-z]*")
+MAX_BASES = 16
 
 
 def validate_rounds(value: Any, *, name: str) -> int:
@@ -62,25 +67,38 @@ def _words(command: str) -> list[str]:
 def _named(command: str, bases: list[Path], depth: int = 0) -> list[tuple[Path, bool]]:
     """Paths the words of a shell command may name, each with whether it is the program a command runs.
 
-    Words count plain and as `--flag=value`, relative to the repository root and to every `cd` target
-    before them, and inside an inner `sh -c '...'`. Glob words are skipped: like a directory, what they
-    match is the work under test.
+    Best effort, and deliberately generous: words count plain and as `--flag=value`, relative to the
+    repository root and to every directory a `cd`/`pushd` may have entered (a subshell's `cd` is not
+    undone), and inside an inner `sh -c '...'`. Glob words are skipped: like a directory, what they
+    match is the work under test. A gate kept outside the worker's allowed paths needs none of this:
+    scope already protects it.
     """
     bases = list(bases)
     found: list[tuple[Path, bool]] = []
     words = _words(command)
     expect_program = True
+    changing_directory = False
     for index, word in enumerate(words):
         if word and set(word) <= OPERATOR_CHARACTERS:
-            expect_program = True
+            expect_program, changing_directory = True, False
             continue
-        if index and words[index - 1] in ("cd", "pushd") and word and not word.startswith("-"):
-            bases.append(Path(os.path.normpath(Path(word) if Path(word).is_absolute() else bases[-1] / word)))
+        if word in ("cd", "pushd") and expect_program:
+            expect_program, changing_directory = False, True
             continue
-        program = expect_program and not ASSIGNMENT.fullmatch(word) and word not in COMMAND_PREFIXES
-        if expect_program and program:
-            expect_program = False
-        if depth < 3 and any(mark in word for mark in (" ", "\t", "\n", ";", "&", "|")):
+        if changing_directory:
+            if word.startswith("-"):
+                continue  # cd -P, cd -L, cd --
+            target = Path(word)
+            entered = [Path(os.path.normpath(target if target.is_absolute() else base / target)) for base in bases]
+            bases = list(dict.fromkeys([*bases, *entered]))[:MAX_BASES]
+            changing_directory = False
+            continue
+        if expect_program and (ASSIGNMENT.fullmatch(word) or word in COMMAND_PREFIXES or word.startswith("-")):
+            program = False  # an assignment, a prefix such as `env`/`exec`/`{`, or a prefix's flag
+        else:
+            program, expect_program = expect_program, False
+        inline = bool(index) and INLINE_COMMAND_FLAG.fullmatch(words[index - 1]) is not None
+        if depth < 3 and (inline or any(mark in word for mark in (" ", "\t", "\n", ";", "&", "|", "("))):
             found += _named(word, bases, depth + 1)
         for candidate in dict.fromkeys((word, *word.split("=", 1)[1:])):
             if not candidate or any(mark in candidate for mark in "*?["):
@@ -89,6 +107,18 @@ def _named(command: str, bases: list[Path], depth: int = 0) -> list[tuple[Path, 
             for base in dict.fromkeys(bases):
                 found.append((Path(os.path.normpath(path if path.is_absolute() else base / path)), program))
     return found
+
+
+def _link_chain(path: Path) -> list[Path]:
+    """A name and every link it passes through: each hop of a symlink chain, then its final target."""
+    chain = [path]
+    for _ in range(40):
+        if not chain[-1].is_symlink():
+            break
+        target = Path(os.readlink(chain[-1]))
+        hop = target if target.is_absolute() else chain[-1].parent / target
+        chain.append(Path(os.path.realpath(hop.parent)) / hop.name)
+    return list(dict.fromkeys(chain))
 
 
 def _ignored(root: Path, names: list[str]) -> set[str]:
@@ -122,22 +152,23 @@ def gate_paths(commands: list[str], repo: Path) -> list[str]:
     (`test -s out.txt`). Those are the work under test.
     """
     root = repo.resolve()
+    # name -> protected even when Git ignores it: the program a command runs, or a link's hop or target.
     names: dict[str, bool] = {}
     for command in commands:
         for path, program in _named(command, [root]):
-            if not path.is_relative_to(root):
-                # An absolute name can reach the repository through a symlinked prefix (macOS
-                # /var -> /private/var). Resolve only its directory, so a symlinked gate stays the link.
-                path = Path(os.path.realpath(path.parent)) / path.name
-            for target in (path, path.resolve()) if path.is_symlink() else (path,):
+            # Name files by their real directory, as Git tracks them: through a symlinked directory
+            # inside the repository, or a symlinked prefix outside it (macOS /var -> /private/var).
+            # Only the directory is resolved, so a symlinked gate stays the link.
+            located = Path(os.path.realpath(path.parent)) / path.name
+            for hop, target in enumerate(_link_chain(located)):
                 try:
                     relative = target.relative_to(root)
                 except ValueError:
                     continue
                 name = relative.as_posix()
                 if relative.parts and relative.parts[0] != ".git" and os.path.lexists(target) and not target.is_dir():
-                    names[name] = names.get(name, False) or program
-    ignored = _ignored(root, [name for name, program in names.items() if not program])
+                    names[name] = names.get(name, False) or program or hop > 0
+    ignored = _ignored(root, [name for name, always in names.items() if not always])
     return [name for name in names if name not in ignored]
 
 

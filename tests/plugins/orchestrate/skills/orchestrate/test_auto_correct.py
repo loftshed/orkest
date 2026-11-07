@@ -19,6 +19,42 @@ GATE = "grep -qx fixed allowed/output.txt"
 
 
 class AutoCorrectUnitTests(unittest.TestCase):
+    def test_gate_names_survive_common_shell_shapes_and_symlink_chains(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory).resolve()
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            (repo / ".gitignore").write_text(".venv/\nbuild/\n")
+            for name in (
+                ".venv/bin/pytest",
+                "gate/check.sh",
+                "d2/b.sh",
+                "real.sh",
+                "build/check.sh",
+                "real-dir/out.txt",
+            ):
+                (repo / name).parent.mkdir(parents=True, exist_ok=True)
+                (repo / name).write_text("x\n")
+            (repo / "mid.sh").symlink_to("real.sh")
+            (repo / "chain.sh").symlink_to("mid.sh")
+            (repo / "to-ignored.sh").symlink_to("build/check.sh")
+            (repo / "dir-link").symlink_to("real-dir")
+            cases = {
+                "env FOO=1 .venv/bin/pytest": [".venv/bin/pytest"],
+                "{ .venv/bin/pytest; }": [".venv/bin/pytest"],
+                "sh -c .venv/bin/pytest": [".venv/bin/pytest"],
+                'FOO="line1\nline2" .venv/bin/pytest': [".venv/bin/pytest"],
+                "cd -P gate && sh check.sh": ["gate/check.sh"],
+                "(cd gate) && cd d2 && sh b.sh": ["d2/b.sh"],
+                'sh -c "(./gate/check.sh)"': ["gate/check.sh"],
+                "sh chain.sh": ["chain.sh", "mid.sh", "real.sh"],
+                "sh to-ignored.sh": ["to-ignored.sh", "build/check.sh"],
+                # A file named through a symlinked directory is the file Git tracks, the worker's output here.
+                "grep -qx fixed dir-link/out.txt": ["real-dir/out.txt"],
+            }
+            for command, expected in cases.items():
+                with self.subTest(command=command):
+                    self.assertEqual(AUTO_CORRECT.gate_paths([command], repo), expected)
+
     def test_an_absolute_gate_name_through_a_symlinked_prefix_is_still_a_gate_file(self) -> None:
         # macOS temporary directories live under /var, a symlink to /private/var.
         with tempfile.TemporaryDirectory() as directory:

@@ -2199,6 +2199,15 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
         steering.allowed_paths = list(allowed_paths)
         steering.tracked_paths = list(tracked_paths)
         steering.enforced_paths = list(enforced_paths)
+    launch_allowed_paths = list(allowed_paths)
+
+    def steer_released(path: str) -> bool:
+        """A path a steer allowed after launch (live or interrupting) is no longer a gate: the user opened it."""
+        if steering is None:
+            return False
+        added = [str(entry) for entry in steering.allowed_paths if entry not in launch_allowed_paths]
+        return any(add == "." or path == add or path.startswith(f"{add}/") for add in added)
+
     ensure_hook_outside_workspaces(completion_hook, [repo, *add_dirs])
     out_dir = prepare_out_dir(args.out_dir, repo)
     result_path = out_dir / "result.json"
@@ -2805,12 +2814,7 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
                 round_wait_until = None
                 # The interrupted round's gates stay protected through the steered turn, judged on the
                 # workspace it leaves; only a path the steer explicitly allowed stops being a gate.
-                added_paths = [str(path) for path in pending.get("added_allow_paths") or []]
-                gates = [
-                    path
-                    for path in gates
-                    if not any(add == "." or path == add or path.startswith(f"{add}/") for add in added_paths)
-                ]
+                gates = [path for path in gates if not steer_released(path)]
                 gates_before = {path: gates_before[path] for path in gates if path in gates_before}
                 round_attempts_start = len(executor_attempts)
                 retry_window_start = len(executor_attempts)
@@ -3015,6 +3019,7 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
                 *find_git_metadata_changes(git_metadata_before, git_metadata_snapshot(repo)),
             ]
         # A correction round must fix the work, not the gate: changing a file the gates name fails the run.
+        gates = [path for path in gates if not steer_released(path)]
         gate_violations = [
             f"gate-edit:{path}" for path in gates if path_fingerprint(repo / path) != gates_before.get(path)
         ]
@@ -3107,9 +3112,16 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
             break
         round_status = status
         if correction_round:
-            if status in {"failed", "malformed_report", "empty_output"} and (
-                structured_quota_signal(args.engine, stdout_text)
-                or provider_quota_exhausted(provider_error, stderr_text)
+            # The same evidence the final classification requires: a provider failure, a structured
+            # quota signal or a non-zero exit, and quota text on the provider's error channels only.
+            round_quota_structured = structured_quota_signal(args.engine, stdout_text)
+            round_provider_failed = provider_error is not None or (
+                args.engine == "agy" and agy_status not in (None, "success", "waiting_for_input")
+            )
+            if (
+                status in {"failed", "malformed_report", "empty_output"}
+                and (round_provider_failed or round_quota_structured or process.returncode not in (None, 0))
+                and (round_quota_structured or provider_quota_exhausted(provider_error, stderr_text))
             ):
                 round_status = "provider_quota_exhausted"
             auto_correct["rounds"][-1].update(
@@ -3195,7 +3207,9 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
         rounds_started += 1
         correction_round = rounds_started
         # Gate files existed before the first handoff and the run has not changed them since.
-        gates = [path for path in gate_candidates if path not in run_delta["changed_paths"]]
+        gates = [
+            path for path in gate_candidates if path not in run_delta["changed_paths"] and not steer_released(path)
+        ]
         gates_before = {path: path_fingerprint(repo / path) for path in gates}
         round_brief_path = out_dir / f"round-{correction_round}-brief.txt"
         write_private_text(

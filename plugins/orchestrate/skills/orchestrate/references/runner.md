@@ -140,16 +140,19 @@ again, up to N rounds, and reports once. With 0 or no option nothing changes.
   (`python3 tools/gen.py`, `pytest tests/test_x.py`) that existed before the first handoff, are not
   ignored by Git, and the run had not changed before the round. The program a command runs, its
   first word, is protected even when Git ignores it (`./node_modules/.bin/vitest`,
-  `.venv/bin/pytest`). Names count after a `cd`, inside `sh -c '...'`, and through a symlink, which
-  protects its target too. Changing a protected file fails the run as `scope_violation` with
+  `.venv/bin/pytest`). Names count after `cd`/`pushd` (flags such as `-P` too, and a subshell's
+  `cd` is not undone), behind prefixes such as `env`, `exec` and `{ ...; }`, inside `sh -c '...'`, and
+  through every hop of a symlink chain, whose hops and target are protected even when ignored. A name
+  reached through a symlinked directory is the file Git tracks. Reading names from shell text is best
+  effort, not a sandbox: keep a gate outside the worker's allowed paths and scope protects it fully. Changing a protected file fails the run as `scope_violation` with
   `gate-edit:<path>`. Directories and globs (`ruff check src`, `mypy src/*.py`), files the run
   itself wrote or changed (`test -s out.txt`) and files the gates write (`> build/gate.log`) are not
   protected.
 - A user steer that interrupts a mechanical round records that round as `steered` (with any gate files
   changed so far) and starts the continuation with fresh segment budgets and handoff state; already
   opened rounds still count toward the global cap. The interrupted round's gate files stay protected and
-  are judged on the workspace the steered turn leaves, so restoring one is not a violation; a path the
-  steer allows with `--allow-path` stops being protected. A resumed correction reuses the first run's
+  are judged on the workspace the steered turn leaves, so restoring one is not a violation. A path a
+  steer allows with `--allow-path`, live or interrupting, stops being protected for the rest of the run. A resumed correction reuses the first run's
   gate candidates and excludes files changed by that earlier run.
 - Native transport never loops. A native handoff passes the round limit to the host in its
   instructions; a coordinator native guard returns the failed gate as `suggested_correction`. As on the

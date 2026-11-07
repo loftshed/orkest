@@ -309,12 +309,15 @@ def main() -> None:
             saved = ((previous or {}).get("auto_correct") or {}).get("gate_candidates")
             if isinstance(saved, list):
                 candidates = saved
+            if previous is not None:
+                # A file the earlier run changed is its work, never a gate again; saved candidates keep that.
+                changed = set((previous.get("run_delta") or {}).get("changed_paths", []))
+                candidates = [path for path in candidates if path not in changed]
             ready["gate_candidates"] = list(candidates)
             if previous is not None:
                 # Only a native correction is a correction round. The first handoff's own edits are the
                 # work under test, exactly as on the executor path, so an initial run enforces no gate files.
-                changed = set((previous.get("run_delta") or {}).get("changed_paths", []))
-                ready["gate_files"] = [path for path in candidates if path not in changed]
+                ready["gate_files"] = list(candidates)
                 ready["gate_fingerprints"] = {
                     path: runner.path_fingerprint(repository / path) for path in ready["gate_files"]
                 }

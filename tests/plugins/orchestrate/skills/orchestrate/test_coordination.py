@@ -1311,6 +1311,57 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(result["auto_correct"]["rounds"][0]["gate_files"], [])
         self.assertEqual(result["scope_violations"], [])
 
+    def test_a_correction_keeps_rounds_taken_from_the_task_spec(self):
+        state = COORDINATOR.load(self.directory)
+        state["task_spec"]["auto_correct"] = 1
+        COORDINATOR.save(self.directory, state)
+        gate = "grep -qx fixed allowed/output.txt"
+        broken = {
+            "FAKE_ROUNDS": json.dumps([{"FAKE_CONTENT": "broken\n"}]),
+            "FAKE_ROUNDS_COUNT": str(self.fixture.external_path / "spec-work-rounds.txt"),
+        }
+        with mock.patch.dict(os.environ, broken):
+            code, failed = self.start("spec-work", "implementation", "--verify-command", gate)
+        self.assertEqual((code, failed["runner_status"]), (0, "verification_failed"), failed)
+        self.assertNotIn("--auto-correct", failed["command"])
+        proof = self.reviewed_evidence()
+        fixed = {
+            "FAKE_ROUNDS": json.dumps([{"FAKE_CONTENT": "fixed\n"}]),
+            "FAKE_ROUNDS_COUNT": str(self.fixture.external_path / "spec-repair-rounds.txt"),
+        }
+        with mock.patch.dict(os.environ, fixed):
+            code, corrected = self.call(
+                "dispatch", "--kind", "correction", "--request-id", "spec-repair", "--review-id", proof
+            )
+        self.assertEqual((code, corrected["runner_status"]), (0, "completed"), corrected)
+        self.assertNotIn("--auto-correct", corrected["command"])
+        self.assertEqual(COORDINATOR.read(Path(corrected["result_path"]))["auto_correct"]["source"], "task_spec")
+
+    def test_a_correction_after_a_converted_round_need_not_change_files(self):
+        gate = "grep -qx fixed allowed/output.txt"
+        # Round 0 fails the gate; round 1 fixes the output but returns a malformed report.
+        rounds = {
+            "FAKE_ROUNDS": json.dumps(
+                [{"FAKE_CONTENT": "broken\n"}, {"FAKE_CONTENT": "fixed\n", "FAKE_REPORT_TEXT": "done"}]
+            ),
+            "FAKE_ROUNDS_COUNT": str(self.fixture.external_path / "converted-rounds.txt"),
+        }
+        with mock.patch.dict(os.environ, rounds):
+            code, failed = self.start(
+                "converted-work", "implementation", "--verify-command", gate, "--auto-correct", "1"
+            )
+        self.assertEqual((code, failed["runner_status"]), (0, "verification_failed"), failed)
+        self.assertEqual(
+            COORDINATOR.read(Path(failed["result_path"]))["auto_correct"]["converted_from"], "malformed_report"
+        )
+        proof = self.reviewed_evidence()
+        with mock.patch.dict(os.environ, {"FAKE_NO_CHANGE": "1"}):
+            code, corrected = self.call(
+                "dispatch", "--kind", "correction", "--request-id", "converted-repair", "--review-id", proof
+            )
+        self.assertNotIn("--expect-changes", corrected["command"])
+        self.assertEqual((code, corrected["runner_status"]), (0, "completed"), corrected)
+
     def test_auto_correct_is_validated_and_needs_gates(self):
         for extra, message in (
             (("--verify-command", "exit 0", "--auto-correct", "3"), "from 0 to 2"),
