@@ -36,6 +36,7 @@ plaude
 plasmoid
 pousr
 PRIO
+pycs
 pypirc
 pyupgrade
 qwen

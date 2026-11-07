@@ -46,11 +46,18 @@ ork hall dispatch --room cache-review --member flash-1 \
   --task-dir /absolute/tasks/long-read --kind investigation --timeout 25m
 ```
 
+An implementation dispatch takes the runner's gates and
+[auto-correct rounds](runner.md#auto-correct-rounds): `--verify-command CMD` (repeatable),
+`--auto-correct N` (0 to 2) and `--protect-path PATH` (repeatable), or `"verifyCommands"`,
+`"autoCorrect"` and `"protectPaths"` on a launch-plan member. When a gate fails, the runner resumes the
+same worker session up to N times before it reports.
+
 Add members with `ork rooms add --room cache-review --team "agy:flash"`. Each member has one dispatch
 intent; add another member for another task. Retrying a dispatch reuses its stored request ID, even
-after a lost response. Changing its task, kind, transport or timeout is rejected. When the
-coordinator refuses a dispatch and records no run for it, nothing launched: the intent is cleared,
-the error stays on the member, and the member can be dispatched again.
+after a lost response. Changing its task, kind, transport, timeout, gates, protect paths, rounds,
+role or folder is rejected.
+When the coordinator refuses a dispatch and records no run for it, nothing launched: the intent is
+cleared, the error stays on the member, and the member can be dispatched again.
 
 `ork rooms launch --room cache-review --plan /absolute/plan.json` dispatches a batch and stops at the
 first error; retry the same plan to recover recorded requests:

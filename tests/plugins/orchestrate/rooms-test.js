@@ -517,6 +517,163 @@ describe("rooms under a team", () => {
       dispatchMember(room.id, "haiku-1", { root, taskDir, run: record, timeout: 1500 }),
     ).rejects.toThrow("--timeout needs a duration");
   });
+
+  it("passes verify gates and auto-correct rounds to the coordinator and keeps them with the intent", async () => {
+    const { root, room, taskDir, run } = await fixture();
+    const calls = [];
+    const record = async (args) => {
+      calls.push(args);
+      return run(args);
+    };
+    await dispatchMember(room.id, "haiku-1", { root, taskDir, run: record });
+    const plain = calls.find((args) => args[0] === "dispatch");
+    expect(plain).not.toContain("--verify-command");
+    expect(plain).not.toContain("--auto-correct");
+    expect((await readRoom(room.id, root)).agents[0].dispatch).not.toHaveProperty("autoCorrect");
+    const gates = { verifyCommands: ["pnpm check", "pnpm test"], autoCorrect: 1 };
+    await dispatchMember(room.id, "luna-1", {
+      root,
+      taskDir,
+      run: record,
+      kind: "implementation",
+      ...gates,
+    });
+    const gated = calls.findLast((args) => args[0] === "dispatch");
+    expect(gated.slice(gated.indexOf("--verify-command"))).toEqual([
+      "--verify-command",
+      "pnpm check",
+      "--verify-command",
+      "pnpm test",
+      "--auto-correct",
+      "1",
+    ]);
+    expect((await readRoom(room.id, root)).agents[1].dispatch).toMatchObject({
+      verifyCommands: ["pnpm check", "pnpm test"],
+      autoCorrect: "1",
+    });
+    expect((await readRoom(room.id, root)).agents[1].dispatch).not.toHaveProperty("protectPaths");
+    const again = { root, taskDir, run: record, kind: "implementation" };
+    await expect(
+      dispatchMember(room.id, "luna-1", { ...again, ...gates, autoCorrect: 2 }),
+    ).rejects.toThrow("Existing dispatch differs: autoCorrect");
+    await expect(
+      dispatchMember(room.id, "luna-1", { ...again, ...gates, verifyCommands: ["pnpm check"] }),
+    ).rejects.toThrow("Existing dispatch differs: verifyCommands");
+    await dispatchMember(room.id, "luna-1", { ...again, ...gates, autoCorrect: "1" });
+    // The same request, however the number is written.
+    await dispatchMember(room.id, "luna-1", { ...again, ...gates, autoCorrect: "01" });
+    for (const [option, message] of [
+      [{ autoCorrect: "one" }, "--auto-correct needs a number"],
+      [{ autoCorrect: -1 }, "--auto-correct needs a number"],
+      [{ verifyCommands: [" "] }, "--verify-command needs a non-empty command"],
+      [{ protectPaths: [""] }, "--protect-path needs a repository-relative path"],
+      [{ protectPaths: "tests" }, "--protect-path needs a repository-relative path"],
+    ])
+      await expect(
+        dispatchMember(room.id, "haiku-1", { root, taskDir, run: record, ...option }),
+      ).rejects.toThrow(message);
+  });
+});
+
+describe("protected paths", () => {
+  it("passes protect paths to the coordinator and keeps them with the intent", async () => {
+    const { root, room, taskDir, run } = await fixture();
+    const calls = [];
+    const record = async (args) => {
+      calls.push(args);
+      return run(args);
+    };
+    const gated = {
+      root,
+      taskDir,
+      run: record,
+      kind: "implementation",
+      verifyCommands: ["pytest tests/test_x.py"],
+      autoCorrect: 1,
+      protectPaths: ["tests/test_x.py", "tests/fixtures"],
+    };
+    await dispatchMember(room.id, "luna-1", gated);
+    const sent = calls.find((args) => args[0] === "dispatch");
+    expect(sent.slice(sent.indexOf("--verify-command"))).toEqual([
+      "--verify-command",
+      "pytest tests/test_x.py",
+      "--protect-path",
+      "tests/test_x.py",
+      "--protect-path",
+      "tests/fixtures",
+      "--auto-correct",
+      "1",
+    ]);
+    const stored = (await readRoom(room.id, root)).agents[1].dispatch;
+    expect(stored.protectPaths).toEqual(["tests/test_x.py", "tests/fixtures"]);
+    expect(stored).not.toHaveProperty("restore");
+    await dispatchMember(room.id, "luna-1", gated);
+    await expect(
+      dispatchMember(room.id, "luna-1", { ...gated, protectPaths: ["tests/test_x.py"] }),
+    ).rejects.toThrow("Existing dispatch differs: protectPaths");
+  });
+});
+
+describe("refused dispatch", () => {
+  it("undoes a refused dispatch's member edits so the next dispatch starts clean", async () => {
+    const { root, room, taskDir, run } = await fixture();
+    const refusing = async (args) => {
+      if (args[0] === "dispatch") throw new Error("coordinator: refused before launch");
+      return run(args);
+    };
+    const before = (await readRoom(room.id, root)).agents[0];
+    await expect(
+      dispatchMember(room.id, "haiku-1", { root, taskDir, run: refusing, workforceRole: "scout" }),
+    ).rejects.toThrow("refused before launch");
+    const after = (await readRoom(room.id, root)).agents[0];
+    expect(after).not.toHaveProperty("dispatch");
+    expect(after.workforceRole).toBe(before.workforceRole);
+    expect(after.cwd).toBe(before.cwd);
+  });
+
+  it("still undoes the edits when the retry of an unknown outcome is refused", async () => {
+    const { root, room, taskDir, run } = await fixture();
+    let shows = 0;
+    const flaky = async (args) => {
+      if (args[0] === "dispatch") throw new Error("coordinator: refused before launch");
+      // The check after the first refusal fails, so that attempt's outcome is unknown.
+      if (args[0] === "show" && ++shows === 2) throw new Error("coordinator: task lock busy");
+      return run(args);
+    };
+    const before = (await readRoom(room.id, root)).agents[0];
+    const attempt = { root, taskDir, run: flaky, requestId: "flaky-1", workforceRole: "scout" };
+    await expect(dispatchMember(room.id, "haiku-1", attempt)).rejects.toThrow(
+      "refused before launch",
+    );
+    const kept = (await readRoom(room.id, root)).agents[0];
+    expect(kept.dispatch.requestId).toBe("flaky-1");
+    expect(kept.workforceRole).toBe("scout");
+    await expect(dispatchMember(room.id, "haiku-1", attempt)).rejects.toThrow(
+      "refused before launch",
+    );
+    const after = (await readRoom(room.id, root)).agents[0];
+    expect(after).not.toHaveProperty("dispatch");
+    expect(after.workforceRole).toBe(before.workforceRole);
+    expect(after.cwd).toBe(before.cwd);
+  });
+
+  it("refuses a retry that would change the member it runs as, leaving the member alone", async () => {
+    const { root, room, taskDir, run } = await fixture();
+    const first = { root, taskDir, run, requestId: "role-1", kind: "implementation" };
+    await dispatchMember(room.id, "haiku-1", { ...first, workforceRole: "builder" });
+    const dispatched = (await readRoom(room.id, root)).agents[0];
+    await expect(
+      dispatchMember(room.id, "haiku-1", { ...first, workforceRole: "scout" }),
+    ).rejects.toThrow("Existing dispatch differs: workforceRole");
+    await expect(
+      dispatchMember(room.id, "haiku-1", { ...first, workforceRole: "nonsense" }),
+    ).rejects.toThrow("Invalid workforce role");
+    const after = (await readRoom(room.id, root)).agents[0];
+    expect(after.workforceRole).toBe(dispatched.workforceRole);
+    expect(after.dispatch).toEqual(dispatched.dispatch);
+    // The same request, member and folder: an idempotent retry.
+    await dispatchMember(room.id, "haiku-1", { ...first, workforceRole: "builder", cwd: room.cwd });
+  });
 });
 
 describe("room CLI", () => {
@@ -569,6 +726,84 @@ describe("room CLI", () => {
       .filter((args) => args[0] === "dispatch")
       .map((args) => args[args.indexOf("--timeout") + 1]);
     expect(timeouts).toEqual(["25m", "40m"]);
+  });
+
+  it("passes repeated --verify-command, --protect-path and --auto-correct to dispatch and launch", async () => {
+    const { root, room, taskDir, run } = await fixture();
+    const calls = [];
+    const record = async (args) => {
+      calls.push(args);
+      return run(args);
+    };
+    const stdout = { write: () => {} };
+    await roomsCommand(
+      [
+        "dispatch",
+        "--room",
+        room.id,
+        "--member",
+        "haiku-1",
+        "--task-dir",
+        taskDir,
+        "--kind",
+        "implementation",
+        "--verify-command",
+        "pnpm check",
+        "--verify-command",
+        "pnpm test",
+        "--protect-path",
+        "tests/a.py",
+        "--protect-path",
+        "tests/b.py",
+        "--auto-correct",
+        "2",
+      ],
+      { stdout, root, run: record },
+    );
+    const plan = path.join(taskDir, "plan.json");
+    await writeFile(
+      plan,
+      JSON.stringify({
+        members: [
+          {
+            id: "luna-1",
+            taskDir,
+            kind: "implementation",
+            verifyCommands: ["gen.py apply --dry-run"],
+            autoCorrect: 1,
+            protectPaths: ["tests/test_gen.py"],
+          },
+        ],
+      }),
+    );
+    await roomsCommand(["launch", "--room", room.id, "--plan", plan], {
+      stdout,
+      root,
+      run: record,
+    });
+    const [cli, launched] = calls
+      .filter((args) => args[0] === "dispatch")
+      .map((args) => args.slice(args.indexOf("--verify-command")));
+    expect(cli).toEqual([
+      "--verify-command",
+      "pnpm check",
+      "--verify-command",
+      "pnpm test",
+      "--protect-path",
+      "tests/a.py",
+      "--protect-path",
+      "tests/b.py",
+      "--auto-correct",
+      "2",
+    ]);
+    expect(launched).toEqual([
+      "--verify-command",
+      "gen.py apply --dry-run",
+      "--protect-path",
+      "tests/test_gen.py",
+      "--auto-correct",
+      "1",
+    ]);
   });
 
   it("creates and lists rooms", async () => {

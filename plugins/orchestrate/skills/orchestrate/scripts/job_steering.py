@@ -281,8 +281,14 @@ def detached_runner_command(
     for verification_command in args.verify_command:
         command.extend(["--verify-command", verification_command])
     command.extend(["--verify-timeout", args.verify_timeout])
+    if getattr(args, "auto_correct", None) is not None:
+        command.extend(["--auto-correct", str(args.auto_correct)])
+    for protected in getattr(args, "protect_path", []):
+        command.extend(["--protect-path", protected])
     if args.expect_changes:
         command.append("--expect-changes")
+    if getattr(args, "expect_task_changes", False):
+        command.append("--expect-task-changes")
     if args.retry_read_only:
         command.extend(["--retry-read-only", str(args.retry_read_only)])
     if args.session:
