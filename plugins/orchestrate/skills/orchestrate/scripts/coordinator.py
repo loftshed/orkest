@@ -339,6 +339,10 @@ def latest_work(state: dict[str, Any]) -> dict[str, Any] | None:
     )
 
 
+def implementation_work(state: dict[str, Any]) -> dict[str, Any] | None:
+    return next((run for run in reversed(state["runs"]) if run["kind"] == "implementation"), None)
+
+
 def reverify(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -> dict[str, Any]:
     """A new host check record never rewrites a failed executor invocation."""
     if not args.reason.strip():
@@ -565,7 +569,7 @@ def dispatch(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
             raise CoordinationError(
                 "read-only dispatches use evidence in the report; omit implementation verification commands"
             )
-        if args.auto_correct:
+        if args.auto_correct is not None:
             raise CoordinationError("read-only dispatches have no verification gates to auto-correct")
     # Follow-up agents need the earlier findings, including failed approaches.
     prior_reports = [
@@ -602,7 +606,8 @@ def dispatch(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
             timeout = next((run.get("timeout") for run in state["runs"] if run["kind"] == "implementation"), None)
         if rounds is None:
             # Like the timeout, the auto-correct rounds carry over unless the correction sets its own.
-            rounds = work.get("auto_correct")
+            inherited = implementation_work(state) if work["kind"] == "verification" else work
+            rounds = inherited.get("auto_correct") if inherited else None
         if (
             any(value is not None for value in (args.engine, args.model, args.effort, args.variant))
             or args.verify_command

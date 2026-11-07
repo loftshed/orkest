@@ -177,6 +177,12 @@ def audit(
     history = runner.find_history_violations(identity, after_identity)
     delta = runner.state_delta(before, after)
     scope = runner.find_scope_violations(delta, allowed)
+    gate_violations = [
+        f"gate-edit:{path}"
+        for path in ready.get("gate_files", [])
+        if runner.path_fingerprint(repository / path) != ready.get("gate_fingerprints", {}).get(path)
+    ]
+    scope = [*scope, *gate_violations]
     if history:
         status, code = "history_violation", 21
     elif scope:
@@ -201,6 +207,7 @@ def audit(
             "rounds_used": 0,
             "outcome": "handed_to_host" if suggestion else "not_needed",
             "suggested_correction": suggestion,
+            "gate_candidates": list(ready.get("gate_files", [])),
         }
     return {
         "schema": runner.RESULT_SCHEMA,
@@ -273,6 +280,7 @@ def main() -> None:
         if not run.get("resume_result") and (task["allow_paths"] or task["track_paths"]):
             runner.bundled_module("repo_env").bootstrap_worktree_env(repository, overwrite=False)
         before, identity = runner.git_state(repository, task["track_paths"]), runner.git_identity(repository)
+        previous = None
         if run.get("resume_result"):
             previous = json.loads(Path(run["resume_result"]).read_text())
             if (
@@ -290,9 +298,15 @@ def main() -> None:
         }
         if run.get("auto_correct"):
             # The gate's own files, named before the native worker starts (see auto_correct.gate_paths).
-            ready["gate_files"] = runner.bundled_module("auto_correct").gate_paths(
-                run["verification_commands"], repository
-            )
+            candidates = runner.bundled_module("auto_correct").gate_paths(run["verification_commands"], repository)
+            saved = ((previous or {}).get("auto_correct") or {}).get("gate_candidates")
+            if isinstance(saved, list):
+                candidates = saved
+            changed = set(((previous or {}).get("run_delta") or {}).get("changed_paths", []))
+            ready["gate_files"] = [path for path in candidates if path not in changed]
+            ready["gate_fingerprints"] = {
+                path: runner.path_fingerprint(repository / path) for path in ready["gate_files"]
+            }
         runner.write_json_atomic(folder / "ready.json", ready)
         while not (folder / "completion.json").exists():
             if runner.deadline_remaining(state["deadline"]) <= 0 and not (folder / "deadline.json").exists():

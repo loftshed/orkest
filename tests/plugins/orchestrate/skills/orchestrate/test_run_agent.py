@@ -1127,7 +1127,12 @@ elif sys.argv[1:3] == ["app-server", "--stdio"]:
             )
 else:
     if sys.argv[1:3] == ["exec", "resume"]:
-        time.sleep(float(os.environ.get("FAKE_RESUME_SLEEP", "0")))
+        sleep_marker = os.environ.get("FAKE_RESUME_SLEEP_MARKER")
+        should_sleep = not sleep_marker or not pathlib.Path(sleep_marker).exists()
+        if sleep_marker:
+            pathlib.Path(sleep_marker).write_text("started", encoding="utf-8")
+        if should_sleep:
+            time.sleep(float(os.environ.get("FAKE_RESUME_SLEEP", "0")))
     else:
         block_until_released(lambda: print(json.dumps({"type": "thread.started", "thread_id": "codex-thread-1"})))
     if transient_failure():
@@ -2856,6 +2861,70 @@ class SteerTests(unittest.TestCase):
             )
         return job
 
+    def launch_auto_correct(self, rounds: list[dict[str, str]]) -> dict:
+        self.run_index += 1
+        index = self.run_index
+        brief = self.external_path / f"auto-correct-steer-brief-{index}.md"
+        brief.write_text("# Objective\n\nCreate the fixture output.\n", encoding="utf-8")
+        capture = self.external_path / f"auto-correct-steer-capture-{index}.json"
+        count = self.external_path / f"auto-correct-steer-rounds-{index}.txt"
+        log = self.external_path / f"auto-correct-steer-invocations-{index}.jsonl"
+        resume_sleep_marker = self.external_path / f"auto-correct-steer-resume-{index}.txt"
+        environment = self.environment(
+            FAKE_CAPTURE=str(capture),
+            FAKE_CAPTURE_LOG=str(log),
+            FAKE_ROUNDS=json.dumps(rounds),
+            FAKE_ROUNDS_COUNT=str(count),
+            FAKE_RESUME_SLEEP="30",
+            FAKE_RESUME_SLEEP_MARKER=str(resume_sleep_marker),
+            FAKE_BLOCK="0",
+            FAKE_OUTPUT="allowed/output.txt",
+        )
+        argv = [
+            str(SCRIPT),
+            "--cwd",
+            str(self.repository.path),
+            "--brief",
+            str(brief),
+            "--engine",
+            "codex",
+            "--detach",
+            "--notify",
+            "none",
+            "--allow-path",
+            "allowed",
+            "--expect-changes",
+            "--verify-command",
+            "grep -qx fixed allowed/output.txt",
+            "--auto-correct",
+            "1",
+            "--timeout",
+            "2m",
+        ]
+        output = io.StringIO()
+        with (
+            mock.patch.object(sys, "argv", argv),
+            mock.patch.dict(os.environ, environment),
+            contextlib.redirect_stdout(output),
+        ):
+            self.assertEqual(RUNNER.main(), 0)
+        values = dict(line.split("=", 1) for line in output.getvalue().splitlines() if line.startswith("AGENT_"))
+        job = {
+            "job_dir": Path(values["AGENT_JOB"]).parent,
+            "job_path": Path(values["AGENT_JOB"]),
+            "event_path": values["AGENT_EVENT"],
+            "event_id": values["AGENT_EVENT_ID"],
+            "result_path": Path(values["AGENT_RESULT"]),
+            "pid": int(values["AGENT_JOB_PID"]),
+            "mailbox": values["AGENT_MAILBOX"],
+            "capture": capture,
+            "invocation_log": log,
+            "round_count": count,
+            "resume_started": resume_sleep_marker,
+        }
+        self.launched = [*getattr(self, "launched", []), job]
+        return job
+
     def steer(self, reference: str, message: str, *extra: str) -> tuple[int, str]:
         output = io.StringIO()
         argv = [str(SCRIPT), "steer", reference, "--message", message, *extra]
@@ -3018,6 +3087,37 @@ class SteerTests(unittest.TestCase):
                 brief = Path(result["submitted_brief_path"]).read_text(encoding="utf-8")
                 self.assertIn(f"Steer the {engine} run.", brief)
                 self.assertIn("EXECUTION AND REPORT CONTRACT", brief)
+
+    def test_steering_during_auto_correct_resets_the_mechanical_round_state(self) -> None:
+        job = self.launch_auto_correct(
+            [
+                {"FAKE_CONTENT": "broken\n"},
+                {"FAKE_CONTENT": "fixed\n", "FAKE_REPORT_STATUS": "FAILED"},
+            ]
+        )
+        self.assertTrue(
+            self.wait_until(
+                lambda: job["resume_started"].exists(),
+                timeout=20,
+            ),
+            "correction executor did not start: "
+            + (job["round_count"].read_text() if job["round_count"].exists() else "missing")
+            + " result="
+            + (job["result_path"].read_text()[:500] if job["result_path"].exists() else "missing"),
+        )
+        exit_code, output = self.steer(job["event_id"], "Use the alternate repair approach.")
+        self.assertEqual(exit_code, 0)
+        values = dict(line.split("=", 1) for line in output.splitlines() if line.startswith("AGENT_"))
+        event = self.wait_event(values["AGENT_EVENT_ID"])
+        self.assertEqual(event["status"], "failed")
+        result = json.loads(Path(values["AGENT_RESULT"]).read_text(encoding="utf-8"))
+        self.assertEqual(result["status"], "failed")
+        self.assertIsNone(result["auto_correct"]["converted_from"])
+        self.assertEqual(result["auto_correct"]["rounds_used"], 1)
+        self.assertEqual(result["auto_correct"]["rounds"][0]["status"], "steered")
+        self.assertEqual(result["auto_correct"]["rounds"][0]["verification"]["status"], "skipped")
+        self.assertTrue(result["auto_correct"]["rounds"][0]["finished_at"])
+        self.assertEqual([attempt["segment"] for attempt in result["executor_attempts"]], [0, 0, 1])
 
     def test_refuses_other_worktrees_and_executors_without_a_session(self) -> None:
         job = self.launch(silent=True)

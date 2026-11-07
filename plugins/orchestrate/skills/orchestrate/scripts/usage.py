@@ -15,6 +15,14 @@ def count(value: Any) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
 
+def finite_cost(value: Any) -> float | None:
+    return (
+        value
+        if isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value) and value >= 0
+        else None
+    )
+
+
 def empty() -> dict[str, Any]:
     return {
         "schema": "agent-executor.usage.v1",
@@ -104,6 +112,17 @@ def claude_events(text: str) -> list[dict[str, Any]]:
     return flat
 
 
+def latest_cost(engine: str, text: str) -> float | None:
+    if engine != "claude":
+        return None
+    finals = [
+        event
+        for event in claude_events(text)
+        if event.get("type") == "result" and isinstance(event.get("total_cost_usd"), int | float)
+    ]
+    return finite_cost(finals[-1].get("total_cost_usd")) if finals else None
+
+
 def codex_buckets(raw: dict[str, Any]) -> dict[str, int | None]:
     total = count(raw.get("input_tokens"))
     read = count(raw.get("cached_input_tokens"))
@@ -127,7 +146,13 @@ def agy_events(text: str) -> list[dict[str, Any]]:
 
 
 def normalize_usage(
-    engine: str, text: str, *, resumed: bool = False, baseline: dict[str, Any] | None = None
+    engine: str,
+    text: str,
+    *,
+    resumed: bool = False,
+    baseline: dict[str, Any] | None = None,
+    baseline_cost: float | None = None,
+    delta_accounting: bool = False,
 ) -> dict[str, Any]:
     result = empty()
     parsed = events(text)
@@ -231,7 +256,30 @@ def normalize_usage(
         if finals:
             raw = finals[-1]["usage"]
             result["cumulative"] = raw
-            if resumed and isinstance(baseline, dict):
+            if resumed and isinstance(baseline, dict) and delta_accounting:
+                fields = {
+                    "fresh_input": "input_tokens",
+                    "cache_read": "cache_read_input_tokens",
+                    "cache_write": "cache_creation_input_tokens",
+                    "output": "output_tokens",
+                }
+                current = {bucket: count(raw.get(field)) for bucket, field in fields.items()}
+                prior = {bucket: count(baseline.get(field)) for bucket, field in fields.items()}
+                reset = any(
+                    current[bucket] is not None and prior[bucket] is not None and current[bucket] < prior[bucket]
+                    for bucket in fields
+                )
+                if reset:
+                    result["gaps"].append("session_counters_reset")
+                    result["totals"] = current
+                else:
+                    result["totals"] = {
+                        bucket: (
+                            max(0, current[bucket] - (prior[bucket] or 0)) if current[bucket] is not None else None
+                        )
+                        for bucket in fields
+                    }
+            elif resumed and isinstance(baseline, dict):
                 result["totals"] = {
                     "fresh_input": (
                         max(0, count(raw.get("input_tokens")) - (count(baseline.get("input_tokens")) or 0))
@@ -269,9 +317,19 @@ def normalize_usage(
                     "cache_write": count(raw.get("cache_creation_input_tokens")),
                     "output": count(raw.get("output_tokens")),
                 }
-            cost = finals[-1].get("total_cost_usd")
-            if isinstance(cost, int | float) and not isinstance(cost, bool) and math.isfinite(cost) and cost >= 0:
-                result["native_cost_usd"] = cost
+            current_cost = finite_cost(finals[-1].get("total_cost_usd"))
+            if resumed and isinstance(baseline, dict) and delta_accounting:
+                prior_cost = baseline_cost
+                if prior_cost is None:
+                    prior_cost = finite_cost(baseline.get("total_cost_usd"))
+                if current_cost is not None and prior_cost is not None:
+                    result["native_cost_usd"] = current_cost if current_cost < prior_cost else current_cost - prior_cost
+                    if current_cost < prior_cost:
+                        result["gaps"].append("session_cost_reset")
+                else:
+                    result["gaps"].append("resumed_cost_without_baseline")
+            else:
+                result["native_cost_usd"] = current_cost
         result["gaps"].append("per_request_context_sizes_not_reported")
     elif engine == "agy":
         snapshots = {}

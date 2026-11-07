@@ -145,6 +145,10 @@ again, up to N rounds, and reports once. With 0 or no option nothing changes.
   `gate-edit:<path>`. Directories and globs (`ruff check src`, `mypy src/*.py`), files the run
   itself wrote or changed (`test -s out.txt`) and files the gates write (`> build/gate.log`) are not
   protected.
+- A user steer that interrupts a mechanical round records that round as `steered` and starts the
+  continuation with fresh segment budgets, gates and handoff state; already opened rounds still count
+  toward the global cap. A resumed correction reuses the first run's gate candidates and excludes files
+  changed by that earlier run.
 - Native transport never loops. A native handoff passes the round limit to the host in its
   instructions; a coordinator native guard returns the failed gate as `suggested_correction`.
 - Rounds are not a coordinator `correction` and do not use its allowance.
@@ -184,8 +188,9 @@ The final result is judged against the snapshot taken before the first segment, 
 `--expect-changes` and the verification gates cover the combined run. `result.steering` lists every
 accepted steer. `<job>/steering.json` records the runner's phase and every request, rejected ones
 included. Each segment gets the full `--timeout`, the same as a retry or a `--session` correction;
-`--deadline` still bounds the whole job. The completion hook and desktop notification fire only for
-the final result.
+steering during an auto-correct round also resets that segment's executor budget and mechanical-round
+state while retaining the global round count. `--deadline` still bounds the whole job. The completion
+hook and desktop notification fire only for the final result.
 
 | Engine     | Session ID source while running                                                  | Resume                        |
 | ---------- | -------------------------------------------------------------------------------- | ----------------------------- |
@@ -211,7 +216,9 @@ Two runtime rejections also exit 33, and in both the executor keeps running unto
   The request is withdrawn.
 
 Usage accounting across segments follows the resume rules above. An interrupted segment may have no
-usage record, and in that case it is reported unknown, not zero.
+usage record, and in that case it is reported unknown, not zero. For auto-correct Claude rounds, the
+native dollar cost is reduced by the same cumulative baseline as the token totals; the ordinary resumed
+path remains unchanged.
 
 ## State and retention
 

@@ -2344,12 +2344,19 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
     )
     # The gate's own files, as named before the first handoff; a file written later is never one.
     gate_candidates = auto_correct_module.gate_paths(args.verify_command, repo) if max_rounds else []
+    if max_rounds and previous_result is not None:
+        saved_candidates = (previous_result.get("auto_correct") or {}).get("gate_candidates")
+        if isinstance(saved_candidates, list):
+            gate_candidates = saved_candidates
+        changed_before_resume = set((previous_result.get("run_delta") or {}).get("changed_paths", []))
+        gate_candidates = [path for path in gate_candidates if path not in changed_before_resume]
     # Every auto-correct round of this run; absent when the run may use none, so N=0 results are unchanged.
     auto_correct: dict[str, Any] | None = (
         {
             "max_rounds": max_rounds,
             "source": rounds_source,
             "mode": "executor",
+            "gate_candidates": list(gate_candidates),
             "rounds_used": 0,
             "outcome": "not_run",
             "refused_reason": None,
@@ -2467,6 +2474,20 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
         raise RunnerError("task deadline expired before executor dispatch", 28)
     usage_module = bundled_module("usage")
     usage_baseline = (previous_result or {}).get("usage", {}).get("cumulative")
+    usage_baseline_cost = None
+    if previous_result:
+        for prior_attempt in reversed(previous_result.get("executor_attempts", [])):
+            prior_stdout = Path(prior_attempt.get("stdout_path") or "")
+            if prior_stdout.is_file():
+                usage_baseline_cost = usage_module.latest_cost(
+                    args.engine, prior_stdout.read_text(encoding="utf-8", errors="replace")
+                )
+                if usage_baseline_cost is not None:
+                    break
+        if usage_baseline_cost is None:
+            candidate_cost = (previous_result.get("usage") or {}).get("native_cost_usd")
+            if isinstance(candidate_cost, int | float) and not isinstance(candidate_cost, bool):
+                usage_baseline_cost = candidate_cost
     attempt_usage: list[dict[str, Any]] = []
     executor_attempts: list[dict[str, Any]] = []
     attempt_number = 0
@@ -2478,10 +2499,13 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
     # Auto-correct rounds share --timeout: a round gets the executor time that earlier attempts left.
     round_timeout_seconds = timeout_seconds
     executor_seconds_used = 0.0
+    total_executor_seconds_used = 0.0
     retry_window_start = 0
     correction_round = 0
+    rounds_started = 0
     gates: list[str] = []
     gates_before: dict[str, Any] = {}
+    gate_edit_violations: list[str] = []
     round_attempts_start = 0
     round_before = before
     round_started = monotonic_start
@@ -2570,6 +2594,7 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
                     stdin_handle.close()
             attempt_duration = time.monotonic() - attempt_start
             executor_seconds_used += attempt_duration
+            total_executor_seconds_used += attempt_duration
 
             for artifact in (stdout_path, stderr_path, log_path, final_output_path):
                 if artifact.exists():
@@ -2583,10 +2608,15 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
                 stdout_text,
                 resumed=segment_resumed,
                 baseline=usage_baseline,
+                baseline_cost=usage_baseline_cost,
+                delta_accounting=auto_correct is not None,
             )
+            attempt_cumulative_cost = usage_module.latest_cost(args.engine, stdout_text)
             attempt_usage.append(usage)
             if segment_resumed:
                 usage_baseline = usage.get("cumulative") or usage_baseline
+            if attempt_cumulative_cost is not None:
+                usage_baseline_cost = attempt_cumulative_cost
             after_attempt = git_state(repo, tracked_paths)
             git_identity_after_attempt = git_identity(repo)
             attempt_delta = state_delta(before, after_attempt)
@@ -2721,6 +2751,45 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
             if steered:
                 assert steering is not None and steering.pending is not None and completion_event_path is not None
                 pending = steering.pending
+                interrupted_gate_violations = [
+                    f"gate-edit:{path}" for path in gates if path_fingerprint(repo / path) != gates_before.get(path)
+                ]
+                gate_edit_violations = list(dict.fromkeys([*gate_edit_violations, *interrupted_gate_violations]))
+                if correction_round and auto_correct is not None:
+                    auto_correct["rounds"][-1].update(
+                        finished_at=utc_now(),
+                        duration_seconds=round(time.monotonic() - round_started, 3),
+                        executor_seconds=round(executor_seconds_used - round_executor_start, 3),
+                        attempts=[attempt["attempt"] for attempt in executor_attempts[round_attempts_start:]],
+                        status="steered",
+                        executor_exit_code=process.returncode,
+                        timed_out=timed_out,
+                        reported_outcome=None,
+                        report_contract_valid=None,
+                        report_contract_violations=[],
+                        final_message="",
+                        run_delta=state_delta(round_before, after_attempt),
+                        gate_files_changed=interrupted_gate_violations,
+                        verification=verification_summary(
+                            args.verify_command,
+                            status="skipped",
+                            skipped_reason="steered",
+                        ),
+                    )
+                # A steer starts a fresh user-controlled segment. Keep the global round count and
+                # completed round records, but do not let mechanical-round state leak into it.
+                correction_round = 0
+                executor_seconds_used = 0.0
+                round_timeout_seconds = timeout_seconds
+                round_wait_until = None
+                gates = []
+                gates_before = {}
+                round_attempts_start = len(executor_attempts)
+                retry_window_start = len(executor_attempts)
+                round_before = after_attempt
+                round_started = time.monotonic()
+                round_executor_start = 0.0
+                last_handoff = {}
                 # Close this segment: a superseded result and an already-acknowledged event pointing at the
                 # continuation, so `events wait` follows it and the inbox shows only the combined result.
                 steered_result = {
@@ -2736,7 +2805,10 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
                     "segment": segment,
                     "run_delta_at_interrupt": attempt_delta,
                     "history_violations_at_interrupt": attempt_history_violations,
-                    "scope_violations_at_interrupt": find_scope_violations(attempt_delta, enforced_paths),
+                    "scope_violations_at_interrupt": [
+                        *find_scope_violations(attempt_delta, enforced_paths),
+                        *gate_edit_violations,
+                    ],
                     "usage": usage_module.combine_attempts(attempt_usage[segment_usage_start:]),
                     "steered_to": {key: pending[key] for key in ("steer_id", "event_id", "event_path", "result_path")},
                 }
@@ -2756,8 +2828,8 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
                 )
                 steered_from.append(completion_event_path.stem)
                 steers_applied.append({key: value for key, value in pending.items() if key != "message"})
-                # Open the continuation: same session, same worktree, same scope, gates, timeouts and
-                # delivery; only the artifact directory, the event and the new user turn differ.
+                # Open the continuation: same session, worktree, scope and delivery, with fresh segment
+                # budgets and no active mechanical round; only the artifact directory and user turn differ.
                 segment += 1
                 segment_attempts_start = retry_window_start = len(executor_attempts)
                 segment_usage_start = len(attempt_usage)
@@ -2766,6 +2838,8 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
                     environment["CLAUDE_CODE_SESSION_ID"] = segment_session
                 segment_resumed = True
                 usage_baseline = usage.get("cumulative") or usage_baseline
+                if attempt_cumulative_cost is not None:
+                    usage_baseline_cost = attempt_cumulative_cost
                 out_dir = Path(pending["run_dir"])
                 result_path = out_dir / "result.json"
                 completion_event_path = normalize_completion_event_path(Path(pending["event_path"]))
@@ -2916,7 +2990,8 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
         gate_violations = [
             f"gate-edit:{path}" for path in gates if path_fingerprint(repo / path) != gates_before.get(path)
         ]
-        scope_violations_after_executor = [*scope_violations_after_executor, *gate_violations]
+        gate_edit_violations = list(dict.fromkeys([*gate_edit_violations, *gate_violations]))
+        scope_violations_after_executor = [*scope_violations_after_executor, *gate_edit_violations]
 
         preliminary_status, preliminary_exit_code = classify_result(
             history_violations=history_violations_after_executor,
@@ -2984,7 +3059,7 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
                 *scope_violations,
                 *find_git_metadata_changes(git_metadata_before, git_metadata_snapshot(repo)),
             ]
-        scope_violations = [*scope_violations, *gate_violations]
+        scope_violations = [*scope_violations, *gate_edit_violations]
         workspace_changed = before["fingerprint"] != after["fingerprint"]
         verification_changed_workspace = (
             verification["completed_count"] > 0 and after_executor["fingerprint"] != after["fingerprint"]
@@ -3026,7 +3101,7 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
                 gate_files_changed=[violation.split(":", 1)[1] for violation in gate_violations],
                 verification=verification,
             )
-        elif verification["status"] in {"failed", "timed_out"}:
+        elif verification["status"] in {"failed", "timed_out"} and auto_correct["initial_verification"] is None:
             auto_correct["initial_verification"] = verification
         if correction_round and status in CONVERTED_ROUND_STATUSES:
             # A round that fails, times out or returns a bad report never leaves the run worse than no round:
@@ -3043,14 +3118,17 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
             auto_correct.update(outcome="stopped", stop_reason=round_status, converted_from=round_status)
             break
         if status != "verification_failed":
-            if not correction_round:
+            if not rounds_started:
                 auto_correct["outcome"] = "not_needed"
             elif status == "completed":
                 auto_correct["outcome"] = "passed"
             else:
-                auto_correct.update(outcome="stopped", stop_reason="gate_files_changed" if gate_violations else status)
+                auto_correct.update(
+                    outcome="stopped",
+                    stop_reason="gate_files_changed" if gate_edit_violations else status,
+                )
             break
-        if correction_round >= max_rounds:
+        if rounds_started >= max_rounds:
             auto_correct["outcome"] = "exhausted"
             break
         round_fit = {
@@ -3061,7 +3139,7 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
         refusal = auto_correct_module.round_refusal(**round_fit) if session_id else "no_session"
         if refusal is not None:
             auto_correct.update(outcome="refused", refused_reason=refusal)
-            emit_lifecycle("auto_correct_refused", round=correction_round + 1, reason=refusal)
+            emit_lifecycle("auto_correct_refused", round=rounds_started + 1, reason=refusal)
             break
         # Open the next round: the same session gets the failed gate as a new turn, in the same worktree,
         # scope and gates. History, scope and --expect-changes stay judged from the first snapshot.
@@ -3086,7 +3164,8 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
                 final_output_path=final_output_path,
             )
         )
-        correction_round += 1
+        rounds_started += 1
+        correction_round = rounds_started
         # Gate files existed before the first handoff and the run has not changed them since.
         gates = [path for path in gate_candidates if path not in run_delta["changed_paths"]]
         gates_before = {path: path_fingerprint(repo / path) for path in gates}
@@ -3116,6 +3195,8 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
             environment["CLAUDE_CODE_SESSION_ID"] = segment_session
         segment_resumed = True
         usage_baseline = usage.get("cumulative") or usage_baseline
+        if attempt_cumulative_cost is not None:
+            usage_baseline_cost = attempt_cumulative_cost
         round_timeout_seconds = auto_correct_module.round_budget(**round_fit)
         # With a deadline, the round's wait (60 s grace included) ends where the gates still fit after it.
         round_wait_until = (
@@ -3193,7 +3274,10 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
         }
 
     if auto_correct is not None:
-        auto_correct.update(rounds_used=len(auto_correct["rounds"]), executor_seconds=round(executor_seconds_used, 3))
+        auto_correct.update(
+            rounds_used=len(auto_correct["rounds"]),
+            executor_seconds=round(total_executor_seconds_used, 3),
+        )
     review = compact_review_bundle(
         repo=repo,
         before=before,

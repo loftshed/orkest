@@ -64,7 +64,7 @@ its tool at the task deadline.
 
 `dispatch --auto-correct N` (0 to 2) lets the runner fix a failed `--verify-command` gate by resuming
 the same session up to N times before its report; the task spec's `auto_correct` is the default. It
-needs gates, and read-only kinds refuse it. The run records it, an explicit 0 included, and a
+needs gates, and read-only kinds refuse it, including an explicit 0. The run records it, an explicit 0 included, and a
 correction inherits it unless it passes its own. The rounds stay inside one invocation and share its `--timeout`; they use neither the
 invocation allowance nor the one correction. See [runner.md](runner.md#auto-correct-rounds).
 
@@ -197,7 +197,8 @@ is a limit (at most one per audited task), not a required step.
 New tasks require the persisted host review ID. `review --run-id ID --decision supported --review-id
 ID` records supported advice. `dispatch --kind correction --request-id repair-1 --review-id ID`
 inherits the original engine, model, effort, variant, billing, session, scope, checks, runner
-timeout and auto-correct rounds; only `--timeout` and `--auto-correct` may be overridden. Add
+timeout and auto-correct rounds; after `reverify` it still inherits the implementation run's setting,
+including an explicit 0. Only `--timeout` and `--auto-correct` may be overridden. Add
 `--transport native` for a native continuation. No unchanged failed prompt or safety-violation
 resumption is allowed. Original failed/blocked outcomes remain unchanged.
 
