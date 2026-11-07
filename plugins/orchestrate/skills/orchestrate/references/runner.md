@@ -145,12 +145,18 @@ again, up to N rounds, and reports once. With 0 or no option nothing changes.
   `gate-edit:<path>`. Directories and globs (`ruff check src`, `mypy src/*.py`), files the run
   itself wrote or changed (`test -s out.txt`) and files the gates write (`> build/gate.log`) are not
   protected.
-- A user steer that interrupts a mechanical round records that round as `steered` and starts the
-  continuation with fresh segment budgets, gates and handoff state; already opened rounds still count
-  toward the global cap. A resumed correction reuses the first run's gate candidates and excludes files
-  changed by that earlier run.
+- A user steer that interrupts a mechanical round records that round as `steered` (with any gate files
+  changed so far) and starts the continuation with fresh segment budgets and handoff state; already
+  opened rounds still count toward the global cap. The interrupted round's gate files stay protected and
+  are judged on the workspace the steered turn leaves, so restoring one is not a violation; a path the
+  steer allows with `--allow-path` stops being protected. A resumed correction reuses the first run's
+  gate candidates and excludes files changed by that earlier run.
 - Native transport never loops. A native handoff passes the round limit to the host in its
-  instructions; a coordinator native guard returns the failed gate as `suggested_correction`.
+  instructions; a coordinator native guard returns the failed gate as `suggested_correction`. As on the
+  executor path, only a native correction enforces gate files, and the guard checks them before it runs
+  any gate, so a changed gate program never executes.
+- A correction resumed from a `reverify` result takes its usage cost baseline from the run that was
+  rechecked, since a host recheck records no cost of its own.
 - Rounds are not a coordinator `correction` and do not use its allowance.
 
 ## Steering a running job

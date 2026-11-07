@@ -149,9 +149,19 @@ def audit(
     if consultation["status"] == "invalid":
         violations.append("invalid_consultation_request")
     allowed = list(dict.fromkeys(spec["allow_paths"] + spec["track_paths"]))
+
+    def changed_gates() -> list[str]:
+        return [
+            f"gate-edit:{path}"
+            for path in ready.get("gate_files", [])
+            if runner.path_fingerprint(repository / path) != ready.get("gate_fingerprints", {}).get(path)
+        ]
+
+    # Checked before any gate runs, so a gate program the worker changed is never executed.
+    gate_violations = changed_gates()
     status, code = runner.classify_result(
         history_violations=runner.find_history_violations(identity, identity_executor),
-        scope_violations=runner.find_scope_violations(delta, allowed),
+        scope_violations=[*runner.find_scope_violations(delta, allowed), *gate_violations],
         timed_out=runner.deadline_remaining(state["deadline"]) <= 0,
         executor_exit_code=0 if packet.get("tool_status") == "completed" else 1,
         stdout_present=bool(report.strip()),
@@ -177,12 +187,7 @@ def audit(
     history = runner.find_history_violations(identity, after_identity)
     delta = runner.state_delta(before, after)
     scope = runner.find_scope_violations(delta, allowed)
-    gate_violations = [
-        f"gate-edit:{path}"
-        for path in ready.get("gate_files", [])
-        if runner.path_fingerprint(repository / path) != ready.get("gate_fingerprints", {}).get(path)
-    ]
-    scope = [*scope, *gate_violations]
+    scope = [*scope, *dict.fromkeys([*gate_violations, *changed_gates()])]
     if history:
         status, code = "history_violation", 21
     elif scope:
@@ -198,8 +203,10 @@ def audit(
         # The guard never loops: a failed gate goes back to the host as the correction turn to send.
         corrector = runner.bundled_module("auto_correct")
         suggestion = None
+        candidates = ready.get("gate_candidates", ready.get("gate_files", []))
         if status == "verification_failed":
-            gates = [path for path in ready.get("gate_files", []) if path not in delta["changed_paths"]]
+            # The gates the host's correction turn must leave alone: named, pre-existing, unchanged so far.
+            gates = [path for path in candidates if path not in delta["changed_paths"]]
             suggestion = corrector.correction_message(corrector.failed_command(verification), verification, gates=gates)
         extra["auto_correct"] = {
             "max_rounds": run["auto_correct"],
@@ -207,7 +214,7 @@ def audit(
             "rounds_used": 0,
             "outcome": "handed_to_host" if suggestion else "not_needed",
             "suggested_correction": suggestion,
-            "gate_candidates": list(ready.get("gate_files", [])),
+            "gate_candidates": list(candidates),
         }
     return {
         "schema": runner.RESULT_SCHEMA,
@@ -302,11 +309,15 @@ def main() -> None:
             saved = ((previous or {}).get("auto_correct") or {}).get("gate_candidates")
             if isinstance(saved, list):
                 candidates = saved
-            changed = set(((previous or {}).get("run_delta") or {}).get("changed_paths", []))
-            ready["gate_files"] = [path for path in candidates if path not in changed]
-            ready["gate_fingerprints"] = {
-                path: runner.path_fingerprint(repository / path) for path in ready["gate_files"]
-            }
+            ready["gate_candidates"] = list(candidates)
+            if previous is not None:
+                # Only a native correction is a correction round. The first handoff's own edits are the
+                # work under test, exactly as on the executor path, so an initial run enforces no gate files.
+                changed = set((previous.get("run_delta") or {}).get("changed_paths", []))
+                ready["gate_files"] = [path for path in candidates if path not in changed]
+                ready["gate_fingerprints"] = {
+                    path: runner.path_fingerprint(repository / path) for path in ready["gate_files"]
+                }
         runner.write_json_atomic(folder / "ready.json", ready)
         while not (folder / "completion.json").exists():
             if runner.deadline_remaining(state["deadline"]) <= 0 and not (folder / "deadline.json").exists():

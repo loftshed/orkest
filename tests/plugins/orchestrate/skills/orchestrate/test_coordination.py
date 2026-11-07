@@ -1445,7 +1445,72 @@ class CoordinatorTests(unittest.TestCase):
             if COORDINATOR.NATIVE.process_state(run) == "active":
                 os.kill(run["pid"], 15)
 
-    def test_native_auto_correct_rejects_a_gate_edit_under_broad_worker_scope(self):
+    def native_round(self, run, name, edits, files_changed, handle=None):
+        """Attach a native run, apply the worker's edits, and complete it with a COMPLETE report."""
+        handle = handle or f"{name}-session"
+        packet = self.fixture.external_path / f"{name}.json"
+        packet.write_text(json.dumps({"native_handle": handle}))
+        self.assertEqual(self.call("native-attach", "--run-id", run["run_id"], "--packet", str(packet))[0], 0)
+        for relative, content in edits.items():
+            target = self.fixture.repository.path / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content)
+        report = self.fixture.external_path / f"{name}-report.txt"
+        report.write_text(
+            f"### STATUS\nCOMPLETE\n### FILES CHANGED\n{files_changed}\n### COMMANDS RUN\nnone\n"
+            "### VERIFICATION\nHost will check output.\n### RISKS OR BLOCKERS\nnone\n"
+        )
+        packet.write_text(
+            json.dumps(
+                {
+                    "native_handle": handle,
+                    "event_id": f"{name}-completion",
+                    "terminal": True,
+                    "tool_status": "completed",
+                    "report_path": str(report),
+                }
+            )
+        )
+        return self.call("native-complete", "--run-id", run["run_id"], "--packet", str(packet))
+
+    def test_native_initial_run_may_change_files_its_gate_names(self):
+        # The first handoff's edits are the work under test, as on the executor path.
+        output = self.fixture.repository.path / "allowed/output.txt"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text("old\n")
+        self.fixture.repository.git("add", "allowed/output.txt")
+        self.fixture.repository.git("commit", "-qm", "tracked output")
+        code, run = self.call(
+            "dispatch",
+            "--kind",
+            "implementation",
+            "--request-id",
+            "native-initial",
+            "--transport",
+            "native",
+            "--engine",
+            "claude",
+            "--model",
+            "claude-sonnet-5",
+            "--verify-command",
+            "grep -qx fixed allowed/output.txt",
+            "--auto-correct",
+            "1",
+        )
+        self.assertEqual(code, 0, run)
+        try:
+            code, finished = self.native_round(
+                run, "native-initial", {"allowed/output.txt": "fixed\n"}, "allowed/output.txt"
+            )
+            self.assertEqual((code, finished["runner_status"]), (0, "completed"), finished)
+            result = COORDINATOR.read(Path(finished["result_path"]))
+            self.assertEqual(result["scope_violations"], [])
+            self.assertEqual(result["auto_correct"]["gate_candidates"], ["allowed/output.txt"])
+        finally:
+            if COORDINATOR.NATIVE.process_state(run) == "active":
+                os.kill(run["pid"], 15)
+
+    def test_native_correction_rejects_a_gate_edit_before_running_the_gate(self):
         state = COORDINATOR.load(self.directory)
         state["task_spec"]["allow_paths"] = ["."]
         COORDINATOR.save(self.directory, state)
@@ -1454,13 +1519,13 @@ class CoordinatorTests(unittest.TestCase):
         gate_path.write_text("grep -qx fixed allowed/output.txt\n")
         self.fixture.repository.git("add", "allowed/check.sh")
         self.fixture.repository.git("commit", "-qm", "native gate")
-        gate = "sh allowed/check.sh"
+        marker = self.fixture.external_path / "tampered-gate-ran"
         code, run = self.call(
             "dispatch",
             "--kind",
             "implementation",
             "--request-id",
-            "native-gate-edit",
+            "native-gate-work",
             "--transport",
             "native",
             "--engine",
@@ -1468,40 +1533,48 @@ class CoordinatorTests(unittest.TestCase):
             "--model",
             "claude-sonnet-5",
             "--verify-command",
-            gate,
+            "sh allowed/check.sh",
             "--auto-correct",
             "1",
         )
         self.assertEqual((code, run["auto_correct"]), (0, 1), run)
-        packet = self.fixture.external_path / "native-gate-edit.json"
+        correction = None
         try:
-            packet.write_text(json.dumps({"native_handle": "native-gate-session"}))
-            self.assertEqual(self.call("native-attach", "--run-id", run["run_id"], "--packet", str(packet))[0], 0)
-            (self.fixture.repository.path / "allowed/output.txt").write_text("broken\n")
-            gate_path.write_text("exit 0\n")
-            report = self.fixture.external_path / "native-gate-report.txt"
-            report.write_text(
-                "### STATUS\nCOMPLETE\n### FILES CHANGED\nallowed/output.txt\n### COMMANDS RUN\nnone\n"
-                "### VERIFICATION\nHost will check output.\n### RISKS OR BLOCKERS\nnone\n"
+            code, finished = self.native_round(
+                run, "native-gate-work", {"allowed/output.txt": "broken\n"}, "allowed/output.txt"
             )
-            packet.write_text(
-                json.dumps(
-                    {
-                        "native_handle": "native-gate-session",
-                        "event_id": "native-gate-completion",
-                        "terminal": True,
-                        "tool_status": "completed",
-                        "report_path": str(report),
-                    }
-                )
+            self.assertEqual((code, finished["runner_status"]), (0, "verification_failed"), finished)
+            proof = self.reviewed_evidence()
+            code, correction = self.call(
+                "dispatch",
+                "--kind",
+                "correction",
+                "--request-id",
+                "native-gate-repair",
+                "--review-id",
+                proof,
+                "--transport",
+                "native",
             )
-            code, finished = self.call("native-complete", "--run-id", run["run_id"], "--packet", str(packet))
-            self.assertEqual((code, finished["runner_status"]), (0, "scope_violation"), finished)
-            result = COORDINATOR.read(Path(finished["result_path"]))
+            self.assertEqual(code, 0, correction)
+            # The worker "fixes" the gate instead of the output; the tampered gate would leave a marker.
+            tampered = f"touch {marker}\nexit 0\n"
+            code, repaired = self.native_round(
+                correction,
+                "native-gate-repair",
+                {"allowed/check.sh": tampered},
+                "allowed/check.sh",
+                handle="native-gate-work-session",
+            )
+            self.assertEqual((code, repaired["runner_status"]), (0, "scope_violation"), repaired)
+            result = COORDINATOR.read(Path(repaired["result_path"]))
             self.assertEqual(result["scope_violations"], ["gate-edit:allowed/check.sh"])
+            self.assertEqual(result["verification"]["status"], "skipped")
+            self.assertFalse(marker.exists(), "a changed gate program must never run")
         finally:
-            if COORDINATOR.NATIVE.process_state(run) == "active":
-                os.kill(run["pid"], 15)
+            for active in (run, correction):
+                if active and active.get("pid") and COORDINATOR.NATIVE.process_state(active) == "active":
+                    os.kill(active["pid"], 15)
 
     def test_background_completion_event_auto_settles_coordinator_task(self):
         code, run = self.start("bg-auto-settle", "implementation", "--background")

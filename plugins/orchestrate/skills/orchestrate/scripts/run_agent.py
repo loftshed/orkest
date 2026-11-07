@@ -2123,6 +2123,26 @@ def probe_main(argv: list[str]) -> int:
     return bundled_module("probe_overlay").main(forwarded)
 
 
+def usage_cost_source(previous: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The result whose executor recorded the resumed session's cost.
+
+    A host recheck (coordinator reverify) invokes no model and records no cost of its own; the
+    session's cumulative cost lives in the run it rechecked, so follow `verification_of` back to it.
+    """
+    source = previous
+    for _ in range(4):
+        if not isinstance(source, dict) or source.get("model_invoked") is not False:
+            break
+        rechecked = (source.get("verification_of") or {}).get("path")
+        try:
+            source = json.loads(Path(rechecked).read_text(encoding="utf-8")) if rechecked else None
+        except (OSError, ValueError):
+            source = None
+    if not isinstance(source, dict) or source.get("model_invoked") is False:
+        return None
+    return source
+
+
 def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
     if args.job_dir and not args.detach:
         raise RunnerError("--job-dir requires --detach", 4)
@@ -2475,8 +2495,9 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
     usage_module = bundled_module("usage")
     usage_baseline = (previous_result or {}).get("usage", {}).get("cumulative")
     usage_baseline_cost = None
-    if previous_result:
-        for prior_attempt in reversed(previous_result.get("executor_attempts", [])):
+    cost_source = usage_cost_source(previous_result)
+    if previous_result and cost_source is not None:
+        for prior_attempt in reversed(cost_source.get("executor_attempts", [])):
             prior_stdout = Path(prior_attempt.get("stdout_path") or "")
             if prior_stdout.is_file():
                 usage_baseline_cost = usage_module.latest_cost(
@@ -2485,7 +2506,7 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
                 if usage_baseline_cost is not None:
                     break
         if usage_baseline_cost is None:
-            candidate_cost = (previous_result.get("usage") or {}).get("native_cost_usd")
+            candidate_cost = (cost_source.get("usage") or {}).get("native_cost_usd")
             if isinstance(candidate_cost, int | float) and not isinstance(candidate_cost, bool):
                 usage_baseline_cost = candidate_cost
     attempt_usage: list[dict[str, Any]] = []
@@ -2751,10 +2772,10 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
             if steered:
                 assert steering is not None and steering.pending is not None and completion_event_path is not None
                 pending = steering.pending
-                interrupted_gate_violations = [
-                    f"gate-edit:{path}" for path in gates if path_fingerprint(repo / path) != gates_before.get(path)
+                # Recorded, not final: the steered turn may still restore these, and the gates stay protected.
+                interrupted_gate_changes = [
+                    path for path in gates if path_fingerprint(repo / path) != gates_before.get(path)
                 ]
-                gate_edit_violations = list(dict.fromkeys([*gate_edit_violations, *interrupted_gate_violations]))
                 if correction_round and auto_correct is not None:
                     auto_correct["rounds"][-1].update(
                         finished_at=utc_now(),
@@ -2769,7 +2790,7 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
                         report_contract_violations=[],
                         final_message="",
                         run_delta=state_delta(round_before, after_attempt),
-                        gate_files_changed=interrupted_gate_violations,
+                        gate_files_changed=interrupted_gate_changes,
                         verification=verification_summary(
                             args.verify_command,
                             status="skipped",
@@ -2777,13 +2798,20 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
                         ),
                     )
                 # A steer starts a fresh user-controlled segment. Keep the global round count and
-                # completed round records, but do not let mechanical-round state leak into it.
+                # completed round records, but do not let mechanical-round timing leak into it.
                 correction_round = 0
                 executor_seconds_used = 0.0
                 round_timeout_seconds = timeout_seconds
                 round_wait_until = None
-                gates = []
-                gates_before = {}
+                # The interrupted round's gates stay protected through the steered turn, judged on the
+                # workspace it leaves; only a path the steer explicitly allowed stops being a gate.
+                added_paths = [str(path) for path in pending.get("added_allow_paths") or []]
+                gates = [
+                    path
+                    for path in gates
+                    if not any(add == "." or path == add or path.startswith(f"{add}/") for add in added_paths)
+                ]
+                gates_before = {path: gates_before[path] for path in gates if path in gates_before}
                 round_attempts_start = len(executor_attempts)
                 retry_window_start = len(executor_attempts)
                 round_before = after_attempt
@@ -2807,7 +2835,7 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
                     "history_violations_at_interrupt": attempt_history_violations,
                     "scope_violations_at_interrupt": [
                         *find_scope_violations(attempt_delta, enforced_paths),
-                        *gate_edit_violations,
+                        *(f"gate-edit:{path}" for path in interrupted_gate_changes),
                     ],
                     "usage": usage_module.combine_attempts(attempt_usage[segment_usage_start:]),
                     "steered_to": {key: pending[key] for key in ("steer_id", "event_id", "event_path", "result_path")},

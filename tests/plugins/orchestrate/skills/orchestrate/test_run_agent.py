@@ -2861,7 +2861,9 @@ class SteerTests(unittest.TestCase):
             )
         return job
 
-    def launch_auto_correct(self, rounds: list[dict[str, str]]) -> dict:
+    def launch_auto_correct(
+        self, rounds: list[dict[str, str]], verify_command: str = "grep -qx fixed allowed/output.txt"
+    ) -> dict:
         self.run_index += 1
         index = self.run_index
         brief = self.external_path / f"auto-correct-steer-brief-{index}.md"
@@ -2895,7 +2897,7 @@ class SteerTests(unittest.TestCase):
             "allowed",
             "--expect-changes",
             "--verify-command",
-            "grep -qx fixed allowed/output.txt",
+            verify_command,
             "--auto-correct",
             "1",
             "--timeout",
@@ -3118,6 +3120,54 @@ class SteerTests(unittest.TestCase):
         self.assertEqual(result["auto_correct"]["rounds"][0]["verification"]["status"], "skipped")
         self.assertTrue(result["auto_correct"]["rounds"][0]["finished_at"])
         self.assertEqual([attempt["segment"] for attempt in result["executor_attempts"]], [0, 0, 1])
+
+    def commit_gate_script(self) -> Path:
+        gate = self.repository.path / "allowed/check.sh"
+        gate.parent.mkdir(parents=True, exist_ok=True)
+        gate.write_text("grep -qx fixed allowed/output.txt\n", encoding="utf-8")
+        self.repository.git("add", "allowed/check.sh")
+        self.repository.git("commit", "-qm", "gate script")
+        return gate
+
+    def steer_interrupted_round(self, rounds: list[dict[str, str]], during_round=None) -> dict:
+        job = self.launch_auto_correct(rounds, verify_command="sh allowed/check.sh")
+        self.assertTrue(self.wait_until(lambda: job["resume_started"].exists(), timeout=20), "no correction round")
+        if during_round is not None:
+            during_round()
+        exit_code, output = self.steer(job["event_id"], "Take another approach.")
+        self.assertEqual(exit_code, 0)
+        values = dict(line.split("=", 1) for line in output.splitlines() if line.startswith("AGENT_"))
+        self.wait_event(values["AGENT_EVENT_ID"])
+        return json.loads(Path(values["AGENT_RESULT"]).read_text(encoding="utf-8"))
+
+    def test_a_gate_edit_after_a_steer_still_fails_the_run(self) -> None:
+        self.commit_gate_script()
+        result = self.steer_interrupted_round(
+            [
+                {"FAKE_CONTENT": "broken\n"},
+                # The interrupted correction turn uses no entry; the steered turn "passes" by
+                # rewriting the gate instead of fixing the output.
+                {"FAKE_OUTPUT": "allowed/check.sh", "FAKE_CONTENT": "exit 0\n"},
+            ]
+        )
+        self.assertEqual(result["status"], "scope_violation", result.get("scope_violations"))
+        self.assertIn("gate-edit:allowed/check.sh", result["scope_violations"])
+
+    def test_a_gate_edit_the_steered_turn_reverts_is_not_sticky(self) -> None:
+        gate = self.commit_gate_script()
+        original = gate.read_text(encoding="utf-8")
+        result = self.steer_interrupted_round(
+            [
+                {"FAKE_CONTENT": "broken\n"},
+                # The steered turn (the interrupted one uses no entry) restores the gate it had changed.
+                {"FAKE_OUTPUT": "allowed/check.sh", "FAKE_CONTENT": original},
+            ],
+            # The interrupted correction round had already changed the gate when the steer arrived.
+            during_round=lambda: gate.write_text("exit 0\n", encoding="utf-8"),
+        )
+        self.assertNotIn("gate-edit:allowed/check.sh", result["scope_violations"])
+        self.assertNotEqual(result["status"], "scope_violation")
+        self.assertEqual(result["auto_correct"]["rounds"][0]["gate_files_changed"], ["allowed/check.sh"])
 
     def test_refuses_other_worktrees_and_executors_without_a_session(self) -> None:
         job = self.launch(silent=True)

@@ -146,6 +146,26 @@ class AutoCorrectUnitTests(unittest.TestCase):
         self.assertNotIn("gate's own files", quiet)
 
 
+class UsageCostSourceTests(unittest.TestCase):
+    def test_a_correction_after_reverify_takes_its_cost_baseline_from_the_rechecked_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            implementation = {"model_invoked": True, "usage": {"native_cost_usd": 0.65}, "executor_attempts": []}
+            implementation_path = Path(directory) / "implementation.json"
+            implementation_path.write_text(json.dumps(implementation), encoding="utf-8")
+            reverify = {
+                **implementation,
+                "model_invoked": False,
+                "usage": {"native_cost_usd": 0},
+                "verification_of": {"path": str(implementation_path)},
+            }
+            self.assertEqual(RUNNER.usage_cost_source(reverify), implementation)
+            self.assertIs(RUNNER.usage_cost_source(implementation), implementation)
+            self.assertIsNone(RUNNER.usage_cost_source(None))
+            # A recheck whose original result is gone gives no baseline rather than a wrong zero.
+            implementation_path.unlink()
+            self.assertIsNone(RUNNER.usage_cost_source(reverify))
+
+
 class AutoCorrectRunnerTests(unittest.TestCase):
     """The runner resumes the same executor session for each round; fake executors stand in for the CLIs."""
 
