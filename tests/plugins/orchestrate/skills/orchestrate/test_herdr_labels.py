@@ -484,6 +484,10 @@ class StatusCommandTests(unittest.TestCase):
         self.assertEqual(self.run_status(HERDR_SOCKET_PATH=str(self.home / "other.sock")), "\n")
 
     def test_cli_success_and_timed_out_lookup_stay_within_budget(self):
+        # The 300 ms contract is enforced locally. Shared CI runners start the CLI cold and slowly, so
+        # there the ceiling is 0.9 s: still below the fake Herdr's 1 s delay, which proves the lookup
+        # timeout fired instead of waiting for Herdr.
+        budget = 0.9 if os.environ.get("CI") else 0.3
         for extra, expected in (
             ({}, " codex-ivory-elk-49 · working · Verify patch\n"),
             ({"FAKE_DELAY": "1"}, "\n"),
@@ -491,7 +495,7 @@ class StatusCommandTests(unittest.TestCase):
             with self.subTest(extra=extra):
                 start = time.monotonic()
                 self.assertEqual(self.run_status(**extra), expected)
-                self.assertLess(time.monotonic() - start, 0.3)
+                self.assertLess(time.monotonic() - start, budget)
 
 
 class SymlinkedTempStatusCommandTests(StatusCommandTests):
