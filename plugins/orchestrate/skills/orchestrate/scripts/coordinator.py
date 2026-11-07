@@ -361,6 +361,12 @@ def reverify(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
     if digest(path) != work["result_sha256"]:
         raise CoordinationError("previous result changed")
     previous = read(path)
+    converted = (previous.get("auto_correct") or {}).get("converted_from")
+    if converted:
+        raise CoordinationError(
+            f"the run's last auto-correct round ended {converted}, so its report and gate results predate "
+            "that round's changes; dispatch the bounded correction instead of rechecking"
+        )
     if (
         previous["status"] not in {"completed", "verification_failed"}
         or previous.get("scope_violations")

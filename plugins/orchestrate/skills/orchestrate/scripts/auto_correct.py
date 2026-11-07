@@ -8,8 +8,8 @@ round limit, the correction turn, the gate files a round may not change, and the
 
 from __future__ import annotations
 
-import glob
 import os
+import re
 import shlex
 import subprocess
 from pathlib import Path
@@ -19,8 +19,10 @@ MAX_ROUNDS = 2
 # A round needs a correction turn plus another pass of the gates; with less left it is refused.
 MIN_ROUND_SECONDS = 60.0
 INSTRUCTION = "Fix exactly these problems; change nothing else."
-# A glob in a gate command protects at most this many files.
-MAX_GLOB_MATCHES = 500
+# Shell words that end one command and start the next, and words that run the command after them.
+OPERATOR_CHARACTERS = frozenset(";&|()")
+COMMAND_PREFIXES = frozenset({"!", "if", "then", "else", "elif", "do", "while", "until", "time", "exec", "command"})
+ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
 
 
 def validate_rounds(value: Any, *, name: str) -> int:
@@ -57,29 +59,35 @@ def _words(command: str) -> list[str]:
         return command.split()
 
 
-def _named(command: str, bases: list[Path], depth: int = 0) -> list[Path]:
-    """Paths the words of a shell command may name: plain, `--flag=value` and glob words, relative to the
-    repository root and to every `cd` target before them, and the words of an inner `sh -c '...'`."""
+def _named(command: str, bases: list[Path], depth: int = 0) -> list[tuple[Path, bool]]:
+    """Paths the words of a shell command may name, each with whether it is the program a command runs.
+
+    Words count plain and as `--flag=value`, relative to the repository root and to every `cd` target
+    before them, and inside an inner `sh -c '...'`. Glob words are skipped: like a directory, what they
+    match is the work under test.
+    """
     bases = list(bases)
-    found: list[Path] = []
+    found: list[tuple[Path, bool]] = []
     words = _words(command)
+    expect_program = True
     for index, word in enumerate(words):
+        if word and set(word) <= OPERATOR_CHARACTERS:
+            expect_program = True
+            continue
         if index and words[index - 1] in ("cd", "pushd") and word and not word.startswith("-"):
             bases.append(Path(os.path.normpath(Path(word) if Path(word).is_absolute() else bases[-1] / word)))
             continue
+        program = expect_program and not ASSIGNMENT.fullmatch(word) and word not in COMMAND_PREFIXES
+        if expect_program and program:
+            expect_program = False
         if depth < 3 and any(mark in word for mark in (" ", "\t", "\n", ";", "&", "|")):
             found += _named(word, bases, depth + 1)
         for candidate in dict.fromkeys((word, *word.split("=", 1)[1:])):
-            if not candidate:
+            if not candidate or any(mark in candidate for mark in "*?["):
                 continue
+            path = Path(candidate)
             for base in dict.fromkeys(bases):
-                if any(mark in candidate for mark in "*?["):
-                    matches = sorted(glob.glob(candidate, root_dir=base, recursive=True))[:MAX_GLOB_MATCHES]
-                    found += [Path(os.path.normpath(base / match)) for match in matches]
-                else:
-                    found.append(
-                        Path(os.path.normpath(Path(candidate) if Path(candidate).is_absolute() else base / candidate))
-                    )
+                found.append((Path(os.path.normpath(path if path.is_absolute() else base / path)), program))
     return found
 
 
@@ -107,29 +115,25 @@ def gate_paths(commands: list[str], repo: Path) -> list[str]:
     """The gate's own files: repository files the verify commands name, as the workspace stands now.
 
     The runner takes them from the snapshot before the first handoff, so a file a gate or the worker
-    writes later is never one. A symlink also protects its target. Directories (`ruff check src`) and
-    files Git ignores (a gate's `> build/gate.log`) are not gate files, and the runner drops any file the
-    run changes before a round (`test -s out.txt`): those are the work under test.
+    writes later is never one. A symlink also protects its target. The program a command runs is
+    protected even when Git ignores it (`./node_modules/.bin/vitest`, `.venv/bin/pytest`). Not gate
+    files: directories and globs (`ruff check src`, `mypy src/*.py`), other ignored files (a gate's
+    `> build/gate.log`), and, as the runner drops them before each round, files the run changed
+    (`test -s out.txt`). Those are the work under test.
     """
     root = repo.resolve()
-    names: list[str] = []
+    names: dict[str, bool] = {}
     for command in commands:
-        for path in _named(command, [root]):
+        for path, program in _named(command, [root]):
             for target in (path, path.resolve()) if path.is_symlink() else (path,):
                 try:
                     relative = target.relative_to(root)
                 except ValueError:
                     continue
                 name = relative.as_posix()
-                if (
-                    relative.parts
-                    and relative.parts[0] != ".git"
-                    and os.path.lexists(target)
-                    and not target.is_dir()
-                    and name not in names
-                ):
-                    names.append(name)
-    ignored = _ignored(root, names)
+                if relative.parts and relative.parts[0] != ".git" and os.path.lexists(target) and not target.is_dir():
+                    names[name] = names.get(name, False) or program
+    ignored = _ignored(root, [name for name, program in names.items() if not program])
     return [name for name in names if name not in ignored]
 
 

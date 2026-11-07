@@ -1211,6 +1211,57 @@ class CoordinatorTests(unittest.TestCase):
         self.assertNotIn("--auto-correct", run["command"])
         self.assertNotIn("auto_correct", COORDINATOR.read(Path(run["result_path"])))
 
+    def test_reverify_refuses_a_run_whose_last_round_broke_down(self):
+        gate = "grep -q fixed allowed/output.txt"
+        rounds = {
+            "FAKE_ROUNDS": json.dumps(
+                [
+                    {"FAKE_CONTENT": "broken\n"},
+                    {"FAKE_CONTENT": "fixed\n", "FAKE_REPORT_STATUS": "FAILED"},
+                    {"FAKE_CONTENT": "fixed again\n"},
+                ]
+            ),
+            "FAKE_ROUNDS_COUNT": str(self.fixture.external_path / "rounds.txt"),
+        }
+        with mock.patch.dict(os.environ, rounds):
+            code, run = self.start("implement", "implementation", "--verify-command", gate, "--auto-correct", "1")
+        self.assertEqual((code, run["runner_status"]), (0, "verification_failed"), run)
+        self.assertEqual(COORDINATOR.read(Path(run["result_path"]))["auto_correct"]["converted_from"], "failed")
+        # The report and gate results predate the failed round's change, so a recheck cannot judge the work.
+        code, error = self.call("reverify", "--run-id", run["run_id"], "--request-id", "check-1", "--reason", "recheck")
+        self.assertEqual(code, 2)
+        self.assertIn("dispatch the bounded correction", error)
+        proof = self.reviewed_evidence()
+        with mock.patch.dict(os.environ, rounds):
+            code, corrected = self.call(
+                "dispatch", "--kind", "correction", "--request-id", "repair", "--review-id", proof
+            )
+        self.assertEqual((code, corrected["runner_status"]), (0, "completed"), corrected)
+
+    def test_a_round_that_undoes_all_work_ends_no_changes_and_cannot_be_rechecked(self):
+        fake = self.fixture.external_path / "codex"
+        fake.rename(self.fixture.external_path / "codex-real")
+        fake.write_text(
+            "#!/bin/sh\n"
+            '"$(dirname "$0")/codex-real" "$@"; status=$?\n'
+            'if [ "$1" = exec ] && [ "$2" = resume ]; then rm -rf allowed; fi\n'
+            'exit "$status"\n'
+        )
+        fake.chmod(0o700)
+        rounds = {
+            "FAKE_ROUNDS": json.dumps([{"FAKE_CONTENT": "broken\n"}, {"FAKE_NO_CHANGE": "1"}]),
+            "FAKE_ROUNDS_COUNT": str(self.fixture.external_path / "rounds.txt"),
+        }
+        gate = "! grep -q broken allowed/output.txt 2>/dev/null"
+        with mock.patch.dict(os.environ, rounds):
+            code, run = self.start("implement", "implementation", "--verify-command", gate, "--auto-correct", "1")
+        self.assertEqual((code, run["runner_status"]), (0, "no_changes"), run)
+        result = COORDINATOR.read(Path(run["result_path"]))
+        self.assertEqual((result["exit_code"], result["run_delta"]["changed_paths"]), (20, []))
+        code, error = self.call("reverify", "--run-id", run["run_id"], "--request-id", "check-1", "--reason", "recheck")
+        self.assertEqual(code, 2)
+        self.assertIn("cannot repair a failed executor report", error)
+
     def test_native_auto_correct_returns_the_failed_gate_as_the_suggested_correction(self):
         gate = "grep -qx fixed allowed/output.txt"
         code, run = self.call(

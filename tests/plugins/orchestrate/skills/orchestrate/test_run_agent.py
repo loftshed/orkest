@@ -1049,6 +1049,8 @@ def transient_failure():
     return True
 
 def report():
+    if os.environ.get("FAKE_REPORT_TEXT"):
+        return os.environ["FAKE_REPORT_TEXT"]
     if os.environ.get("FAKE_MALFORMED") == "1":
         return "unstructured output"
     status = os.environ.get("FAKE_REPORT_STATUS", "completed")

@@ -214,8 +214,9 @@ not retroactively make a failed worker run successful or excuse unmet acceptance
 When a specific problem in a verification command has been corrected, `reverify --run-id ID
 --request-id CHECK_ID --reason EXPLANATION [--verify-command COMMAND]` records a separate host-only
 verification phase. It requires unchanged audited work, remaining time, and a completed executor
-report; it cannot repair scope/history violations or a failed/blocked worker. It does not launch a
-model or spend another invocation. Its new result can support acceptance while the original failed
+report; it cannot repair scope/history violations, a failed/blocked worker, or a run whose last
+auto-correct round broke down (`auto_correct.converted_from`). It does not launch a model or spend
+another invocation. Its new result can support acceptance while the original failed
 check stays failed. Repeat passed checks only for a concrete change or concern.
 
 Use `record-decision --packet decision.json [--review-id ID]` for reusable knowledge separately

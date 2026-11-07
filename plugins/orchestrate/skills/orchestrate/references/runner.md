@@ -125,10 +125,12 @@ again, up to N rounds, and reports once. With 0 or no option nothing changes.
   `outcome` is `passed`, `exhausted` (the run stays `verification_failed`), `refused` with
   `refused_reason`, `stopped` with `stop_reason`, or `not_needed`.
 - History, scope and `--expect-changes` are judged from the snapshot before the first handoff, so
-  the audit covers every round. A scope or history violation in a round ends the run as that
-  violation. Any other failed round (a timeout, `FAILED` or `BLOCKED`, a malformed report) leaves the
-  run as its last handoff did: `verification_failed`, with that handoff's report and gate results.
-  `stop_reason` and the round record say what the round returned.
+  the audit covers every round. A round's status stands when it is a violation, `blocked` (its own
+  report and any consultation request) or `no_changes` (the round undid the work). A round that broke
+  down (`failed`, `timed_out`, an empty or malformed report, a credits stop) leaves the run as its last
+  handoff did: `verification_failed` with that handoff's report and gate results, and
+  `converted_from` naming the round's status. That report predates the round's changes, so
+  `coordinator.py reverify` refuses the result; the bounded `correction` is the way on.
 - Rounds share `--timeout`: a round gets the executor time earlier attempts left. It is refused when
   under 60 s remain (`timeout`), when `--deadline` leaves under 60 s plus the last gate run
   (`deadline`), or when the executor exposed no session (`no_session`). A round's wait keeps the
@@ -136,11 +138,13 @@ again, up to N rounds, and reports once. With 0 or no option nothing changes.
   gates to run again.
 - A round may not change the gate. Only these files are protected: files named in a verify command
   (`python3 tools/gen.py`, `pytest tests/test_x.py`) that existed before the first handoff, are not
-  ignored by Git, and the run had not changed before the round. Names count after a `cd`, inside
-  `sh -c '...'`, through a glob, and through a symlink, which protects its target too. Changing a
-  protected file fails the run as `scope_violation` with `gate-edit:<path>`. Directories
-  (`ruff check src`), files the run itself wrote or changed (`test -s out.txt`) and files the gates
-  write (`> build/gate.log`) are not protected.
+  ignored by Git, and the run had not changed before the round. The program a command runs, its
+  first word, is protected even when Git ignores it (`./node_modules/.bin/vitest`,
+  `.venv/bin/pytest`). Names count after a `cd`, inside `sh -c '...'`, and through a symlink, which
+  protects its target too. Changing a protected file fails the run as `scope_violation` with
+  `gate-edit:<path>`. Directories and globs (`ruff check src`, `mypy src/*.py`), files the run
+  itself wrote or changed (`test -s out.txt`) and files the gates write (`> build/gate.log`) are not
+  protected.
 - Native transport never loops. A native handoff passes the round limit to the host in its
   instructions; a coordinator native guard returns the failed gate as `suggested_correction`.
 - Rounds are not a coordinator `correction` and do not use its allowance.

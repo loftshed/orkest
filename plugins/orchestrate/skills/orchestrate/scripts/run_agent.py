@@ -151,11 +151,9 @@ EXIT_STEER_PROCESS_NOT_FOUND = 32
 EXIT_STEER_REJECTED = 33
 
 
-# Round outcomes that stand: the gates' verdict, or an audit violation. Any other ends the run as its last
-# handoff did.
-ROUND_RESULT_STATUSES = frozenset(
-    {"completed", "verification_failed", "history_violation", "scope_violation", "verification_mutation"}
-)
+# A correction round that broke down (no usable handoff) ends the run as its last handoff did. Any other
+# round status stands: the gates' verdict, BLOCKED, no net change, or an audit violation.
+CONVERTED_ROUND_STATUSES = frozenset({"failed", "timed_out", "malformed_report", "empty_output", "stopped_credits"})
 
 
 class RunnerError(Exception):
@@ -2356,6 +2354,7 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
             "outcome": "not_run",
             "refused_reason": None,
             "stop_reason": None,
+            "converted_from": None,
             "executor_seconds": 0.0,
             "initial_verification": None,
             "rounds": [],
@@ -3029,9 +3028,10 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
             )
         elif verification["status"] in {"failed", "timed_out"}:
             auto_correct["initial_verification"] = verification
-        if correction_round and status not in ROUND_RESULT_STATUSES:
+        if correction_round and status in CONVERTED_ROUND_STATUSES:
             # A round that fails, times out or returns a bad report never leaves the run worse than no round:
             # the last handoff's report and gate results stand, and the round record keeps what it returned.
+            # They predate the round's changes, so `coordinator reverify` refuses this result.
             status, exit_code = "verification_failed", 25
             verification = last_handoff["verification"]
             final_message = last_handoff["final_message"]
@@ -3040,7 +3040,7 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
             report_contract_valid = last_handoff["report_contract_valid"]
             report_violations = last_handoff["report_violations"]
             consultation = last_handoff["consultation"]
-            auto_correct.update(outcome="stopped", stop_reason=round_status)
+            auto_correct.update(outcome="stopped", stop_reason=round_status, converted_from=round_status)
             break
         if status != "verification_failed":
             if not correction_round:

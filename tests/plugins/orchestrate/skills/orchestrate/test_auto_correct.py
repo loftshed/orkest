@@ -37,8 +37,13 @@ class AutoCorrectUnitTests(unittest.TestCase):
             for name in files:
                 (repo / name).parent.mkdir(parents=True, exist_ok=True)
                 (repo / name).write_text("x\n")
-            (repo / ".gitignore").write_text("build/\n")
+            (repo / ".gitignore").write_text("build/\n.venv/\nnode_modules/\n")
             (repo / "link-check.sh").symlink_to("real-check.sh")
+            for name in (".venv/bin/pytest", "node_modules/vitest/vitest.mjs"):
+                (repo / name).parent.mkdir(parents=True, exist_ok=True)
+                (repo / name).write_text("x\n")
+            (repo / "node_modules/.bin").mkdir()
+            (repo / "node_modules/.bin/vitest").symlink_to("../vitest/vitest.mjs")
             commands = [
                 "python3 tools/gen.py apply --dry-run && ruff check src tests",
                 "pytest tests/test_x.py --rootdir=. < data/in.json;cat missing.txt",
@@ -57,10 +62,16 @@ class AutoCorrectUnitTests(unittest.TestCase):
                 ],
                 # A symlinked script protects the link and its target.
                 "sh link-check.sh": ["link-check.sh", "real-check.sh"],
-                # A glob protects what it matches.
-                "for f in suite/*.sh; do sh $f; done": ["suite/a.sh", "suite/b.sh"],
-                # Git-ignored names are output the gate writes, not the gate.
+                # Like a directory, a glob names the work under test.
+                "for f in suite/*.sh; do sh $f; done": [],
+                # Git-ignored arguments are output the gate writes, not the gate.
                 "sh tools/gen.py > build/gate.log": ["tools/gen.py"],
+                # The program a command runs is protected even when Git ignores it, with its link target.
+                "FORCE=1 .venv/bin/pytest tests/test_x.py > build/gate.log": [".venv/bin/pytest", "tests/test_x.py"],
+                "cd gate && ../node_modules/.bin/vitest run": [
+                    "node_modules/.bin/vitest",
+                    "node_modules/vitest/vitest.mjs",
+                ],
                 # An unbalanced quote falls back to whitespace words rather than failing the run.
                 f"check --config={repo}/config.toml 'x": ["config.toml"],
             }
@@ -403,10 +414,53 @@ class AutoCorrectRunnerTests(unittest.TestCase):
                 self.assertEqual(
                     (record["outcome"], record["stop_reason"], record["rounds_used"]), ("stopped", reason, 1)
                 )
+                self.assertEqual(record["converted_from"], reason)
                 [entry] = record["rounds"]
                 self.assertEqual(entry["status"], reason)
                 self.assertEqual(entry["verification"]["status"], "skipped")
                 self.assertEqual(result["verification"]["status"], "failed")
+
+    def test_a_blocked_round_surfaces_its_report_and_consultation_request(self) -> None:
+        request = {
+            "question": "Which date form does the schema allow for a [?] reading?",
+            "decision_needed": "Choose the EDTF form",
+            "observations": ["The gate rejects 1850 for a [?] reading"],
+            "attempts": ["Wrote 1850"],
+            "versions": ["gen.py 4"],
+            "hypotheses": ["The schema wants 1850?"],
+        }
+        blocked = (
+            "### STATUS\nBLOCKED\n\n### FILES CHANGED\n- none\n\n### COMMANDS RUN\n- none\n\n"
+            "### VERIFICATION\n- not run\n\n### RISKS OR BLOCKERS\n- needs a decision\n\n"
+            f"```consultation-request\n{json.dumps(request)}\n```\n"
+        )
+        code, result, _out, _summary, runs = self.run_rounds(
+            [{"FAKE_CONTENT": "broken\n"}, {"FAKE_CONTENT": "broken again\n", "FAKE_REPORT_TEXT": blocked}], rounds=2
+        )
+        self.assertEqual((code, result["status"], result["reported_outcome"], len(runs)), (24, "blocked", "blocked", 2))
+        self.assertTrue(result["final_message"].startswith("### STATUS\nBLOCKED"))
+        self.assertEqual(result["consultation"]["status"], "requested")
+        self.assertEqual(result["consultation"]["request"]["decision_needed"], "Choose the EDTF form")
+        record = result["auto_correct"]
+        self.assertEqual((record["stop_reason"], record["converted_from"]), ("blocked", None))
+
+    def test_a_round_that_undoes_the_work_ends_no_changes(self) -> None:
+        fake = self.fixture.external_path / "codex"
+        fake.rename(self.fixture.external_path / "codex-real")
+        fake.write_text(
+            "#!/bin/sh\n"
+            '"$(dirname "$0")/codex-real" "$@"; status=$?\n'
+            'if [ "$1" = exec ] && [ "$2" = resume ]; then rm -rf allowed; fi\n'
+            'exit "$status"\n'
+        )
+        fake.chmod(0o700)
+        code, result, _out, _summary, runs = self.run_rounds(
+            [{"FAKE_CONTENT": "broken\n"}, {"FAKE_NO_CHANGE": "1"}], rounds=1
+        )
+        self.assertEqual((code, result["status"], result["run_delta"]["changed_paths"]), (20, "no_changes", []))
+        self.assertEqual(
+            (result["auto_correct"]["stop_reason"], result["auto_correct"]["converted_from"]), ("no_changes", None)
+        )
 
     def test_native_transport_hands_the_correction_to_the_host_instead_of_looping(self) -> None:
         code, result, _out, _summary, runs = self.run_rounds(
@@ -437,7 +491,7 @@ class AutoCorrectRunnerTests(unittest.TestCase):
         )
         self.assertIn("Do not change the gate's own files: allowed/check.sh.", runs[1]["stdin"])
 
-    def test_gate_files_reached_through_cd_shells_symlinks_and_globs_are_protected(self) -> None:
+    def test_gate_files_reached_through_cd_shells_symlinks_and_ignored_programs_are_protected(self) -> None:
         shapes = (
             (
                 "cd",
@@ -447,12 +501,7 @@ class AutoCorrectRunnerTests(unittest.TestCase):
             ),
             ("sh -c", {"allowed/check.sh": f"{GATE}\n"}, "sh -c 'sh allowed/check.sh'", "allowed/check.sh"),
             ("symlink", {"allowed/real-check.sh": f"{GATE}\n"}, "sh allowed/check.sh", "allowed/real-check.sh"),
-            (
-                "glob",
-                {"allowed/tests/t.sh": f"{GATE}\n"},
-                "for f in allowed/tests/*.sh; do sh $f || exit 1; done",
-                "allowed/tests/t.sh",
-            ),
+            ("ignored program", {".gitignore": "plans/\n.venv/\n"}, "./.venv/bin/check", ".venv/bin/check"),
         )
         for shape, files, gate, edited in shapes:
             with self.subTest(shape=shape):
@@ -463,6 +512,11 @@ class AutoCorrectRunnerTests(unittest.TestCase):
                     os.symlink("real-check.sh", self.fixture.repository.path / "allowed/check.sh")
                     self.fixture.repository.git("add", "allowed/check.sh")
                     self.fixture.repository.git("commit", "-qm", "link")
+                if shape == "ignored program":
+                    program = self.fixture.repository.path / ".venv/bin/check"
+                    program.parent.mkdir(parents=True)
+                    program.write_text(f"#!/bin/sh\n{GATE}\n")
+                    program.chmod(0o755)
                 code, result, _out, _summary, runs = self.run_rounds(
                     [{"FAKE_CONTENT": "broken\n"}, {"FAKE_OUTPUT": edited, "FAKE_CONTENT": "exit 0\n"}],
                     rounds=1,
@@ -471,6 +525,16 @@ class AutoCorrectRunnerTests(unittest.TestCase):
                 self.assertEqual((code, result["status"], len(runs)), (22, "scope_violation", 2))
                 self.assertEqual(result["scope_violations"], [f"gate-edit:{edited}"])
                 self.assertEqual(result["auto_correct"]["stop_reason"], "gate_files_changed")
+
+    def test_files_a_glob_matches_stay_editable(self) -> None:
+        self.commit({"allowed/b.txt": "needs-update\n"})
+        code, result, _out, _summary, runs = self.run_rounds(
+            [{"FAKE_CONTENT": "x\n"}, {"FAKE_OUTPUT": "allowed/b.txt", "FAKE_CONTENT": "done\n"}],
+            rounds=1,
+            verify=["! grep -q needs-update allowed/*.txt"],
+        )
+        self.assertEqual((code, result["status"], len(runs)), (0, "completed", 2))
+        self.assertEqual(result["auto_correct"]["rounds"][0]["gate_files"], [])
 
     def test_files_the_gate_writes_are_not_gate_files(self) -> None:
         # The gate logs to an ignored file that did not exist before the run; the worker re-runs the gate.
