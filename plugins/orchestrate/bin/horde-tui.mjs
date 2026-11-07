@@ -6,6 +6,11 @@ import { pathToFileURL } from "node:url";
 import { shouldUseColor } from "../../monitor/lib/render.mjs";
 import { CACHE_DIR, CONFIG_PATH } from "../../monitor/lib/store.mjs";
 import { createAgentPreview } from "../lib/agent-preview.mjs";
+import {
+  createHerdrLifecycleSubscriber,
+  isCurrentHerdrAgent,
+  verifiedHerdrAgentPane,
+} from "../lib/herdr-context.mjs";
 import { markHerdrViewClosed, syncHerdrViewLabel } from "../lib/herdr-view-state.mjs";
 import { createRoom, mailboxRoot, readRoom } from "../lib/horde-room.mjs";
 import { fit, HordeView, shortAgentName } from "../lib/horde-view.mjs";
@@ -28,6 +33,7 @@ import {
 export const UPDATE_SUCCESS_TTL_MS = 15_000;
 
 const PANE_ID_RE = /^[A-Za-z0-9_.:%][A-Za-z0-9_.:%-]{0,63}$/u;
+const ORKEST_TMUX_SERVER = /^orkest-label-[0-9a-f]{12}$/u;
 
 const TERMINAL_STAGES = new Set([
   "completed",
@@ -122,11 +128,11 @@ export function resolvePullUpdateOutcome(res, nowMs = Date.now()) {
   };
 }
 
-async function runExecOutput(exec, command, args) {
+async function runExecOutput(exec, command, args, env = process.env) {
   try {
     if (exec === execFile) {
       return await new Promise((resolve) => {
-        execFile(command, args, { timeout: 1500, maxBuffer: 512 * 1024 }, (err, stdout = "") =>
+        execFile(command, args, { env, timeout: 1500, maxBuffer: 512 * 1024 }, (err, stdout = "") =>
           resolve(err ? "" : String(stdout || "")),
         );
       });
@@ -152,11 +158,11 @@ async function runExecOutput(exec, command, args) {
   }
 }
 
-async function runExec(exec, command, args) {
+async function runExec(exec, command, args, env = process.env) {
   try {
     if (exec === execFile) {
       return await new Promise((resolve) => {
-        execFile(command, args, (err) => resolve(!err));
+        execFile(command, args, { env, timeout: 3000 }, (err) => resolve(!err));
       });
     }
     let callbackError = null;
@@ -172,22 +178,28 @@ async function runExec(exec, command, args) {
   }
 }
 
-export async function focusAgentPane(agent, { exec = execFile } = {}) {
+export async function focusAgentPane(agent, { exec = execFile, env = process.env } = {}) {
   if (!agent || typeof agent !== "object") return false;
   const rawHerdrPaneId = agent.herdrPaneId || agent.progress?.herdrPaneId;
   const herdrPaneId = typeof rawHerdrPaneId === "string" ? rawHerdrPaneId.trim() : "";
-  if (herdrPaneId && PANE_ID_RE.test(herdrPaneId)) {
-    return runExec(exec, "herdr", ["agent", "focus", herdrPaneId]);
+  if (herdrPaneId) {
+    if (!PANE_ID_RE.test(herdrPaneId) || env.HERDR_ENV !== "1" || !isCurrentHerdrAgent(agent, env))
+      return false;
+    const session = agent.session?.id || agent.nativeSession || agent.activitySource?.session;
+    if (typeof session !== "string" || !session) return false;
+    const binary = env.HERDR_BIN_PATH || "herdr";
+    const pane = await verifiedHerdrAgentPane(herdrPaneId, session, (args) =>
+      runExecOutput(exec, binary, args, env),
+    );
+    return pane ? runExec(exec, binary, ["agent", "focus", pane], env) : false;
   }
   const rawPaneId = agent.paneId || agent.progress?.paneId;
   const paneId = typeof rawPaneId === "string" ? rawPaneId.trim() : "";
   if (paneId && PANE_ID_RE.test(paneId)) {
     const rawServer = agent.terminalServer || agent.progress?.terminalServer;
     const server = typeof rawServer === "string" ? rawServer.trim() : "";
-    const tmuxArgs =
-      server && PANE_ID_RE.test(server)
-        ? ["-L", server, "select-pane", "-t", paneId]
-        : ["select-pane", "-t", paneId];
+    if (!ORKEST_TMUX_SERVER.test(server)) return false;
+    const tmuxArgs = ["-L", server, "select-pane", "-t", paneId];
     return runExec(exec, "tmux", tmuxArgs);
   }
   return false;
@@ -223,7 +235,7 @@ export function notifyHerdrTransitions(
     return false;
   }
 
-  if (env?.HERDR_ENV !== "1" && !env?.HERDR_SOCKET && !env?.HERDR_PANE_ID) return false;
+  if (env?.HERDR_ENV !== "1") return false;
   if (!isAllTerminal) {
     seen.delete("room:all-complete");
   }
@@ -239,15 +251,20 @@ export function notifyHerdrTransitions(
     if ((prevStage === "blocked" && prev?.summary === agent.summary) || seen.has(key)) continue;
     seen.add(key);
     isTriggered = true;
-    void runExec(exec, "herdr", [
-      "notification",
-      "show",
-      `Orkest: ${agent.person || agent.id} blocked`,
-      "--body",
-      String(agent.summary || "Needs attention"),
-      "--sound",
-      "request",
-    ]);
+    void runExec(
+      exec,
+      env.HERDR_BIN_PATH || "herdr",
+      [
+        "notification",
+        "show",
+        `Orkest: ${agent.person || agent.id} blocked`,
+        "--body",
+        String(agent.summary || "Needs attention"),
+        "--sound",
+        "request",
+      ],
+      env,
+    );
   }
 
   const hadActive = prevAgents.some((agent) => {
@@ -257,15 +274,20 @@ export function notifyHerdrTransitions(
   if (isAllTerminal && hadActive && !seen.has("room:all-complete")) {
     seen.add("room:all-complete");
     isTriggered = true;
-    void runExec(exec, "herdr", [
-      "notification",
-      "show",
-      "Orkest: Horde complete",
-      "--body",
-      `All ${nextAgents.length} agents finished.`,
-      "--sound",
-      "done",
-    ]);
+    void runExec(
+      exec,
+      env.HERDR_BIN_PATH || "herdr",
+      [
+        "notification",
+        "show",
+        "Orkest: Horde complete",
+        "--body",
+        `All ${nextAgents.length} agents finished.`,
+        "--sound",
+        "done",
+      ],
+      env,
+    );
   }
 
   return isTriggered;
@@ -858,6 +880,7 @@ export async function runHordeTui(
     env = process.env,
     theme,
     exec = execFile,
+    herdrConnect,
   } = {},
 ) {
   if (!input.isTTY || !output.isTTY)
@@ -887,13 +910,19 @@ export async function runHordeTui(
       view.notice = `Opening ${shortAgentName(agent)}...`;
       void previewController
         .close()
-        .then((snapshot) => !snapshot?.error && !isStopped && focusAgentPane(agent, { exec }))
+        .then((snapshot) => !snapshot?.error && !isStopped && focusAgentPane(agent, { exec, env }))
         .then((opened) => {
           isNavigationPending = false;
           if (isStopped) return;
           view.notice = opened
             ? `Opened ${shortAgentName(agent)}`
             : "Could not open chat. Its terminal may have closed.";
+          paint();
+        })
+        .catch(() => {
+          isNavigationPending = false;
+          if (isStopped) return;
+          view.notice = "Could not open chat. Its terminal may have closed.";
           paint();
         });
     },
@@ -1016,9 +1045,23 @@ export async function runHordeTui(
       paint();
     },
   });
+  const herdrSubscriber =
+    env?.HERDR_ENV === "1"
+      ? createHerdrLifecycleSubscriber({
+          env,
+          ...(herdrConnect && { connect: herdrConnect }),
+          onInvalidate: () => {
+            if (!isStopped) void refresh();
+          },
+          onReconcile: () => {
+            if (!isStopped) void refresh();
+          },
+        })
+      : null;
   const cleanup = () => {
     if (isStopped) return;
     isStopped = true;
+    herdrSubscriber?.stop();
     clearInterval(timer);
     clearInterval(refreshTimer);
     input.off("data", onData);
@@ -1056,7 +1099,7 @@ export async function runHordeTui(
   };
   const closeView = async () => {
     try {
-      await markHerdrViewClosed(initialRoom.id, env);
+      await markHerdrViewClosed(initialRoom.id, env, exec);
     } catch (error) {
       terminalError ??= error;
     } finally {
@@ -1145,6 +1188,7 @@ export async function runHordeTui(
       process.on("SIGTERM", cleanup);
       process.on("SIGHUP", cleanup);
       output.on?.("resize", onResize);
+      herdrSubscriber?.start();
       paint();
       void refresh();
     });

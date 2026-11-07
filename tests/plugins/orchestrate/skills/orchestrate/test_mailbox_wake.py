@@ -862,15 +862,22 @@ class MailboxWakeTests(unittest.TestCase):
                 base,
                 "claude-pane",
                 herdrPaneId="%42",
+                herdrEndpoint="/tmp/orkest-herdr-test.sock",
+                herdrBinary="/usr/bin/herdr",
                 terminalServer="orkest-label-0123456789ab",
             )
             commands: list[list[str]] = []
+            endpoints: list[str | None] = []
 
-            def fake_herdr_run(cmd, **_kwargs):
+            def fake_herdr_run(cmd, **kwargs):
                 commands.append(list(cmd))
-                if cmd[:3] == ["herdr", "agent", "get"]:
-                    return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({"state": "idle"}), stderr="")
-                if cmd[:3] == ["herdr", "agent", "prompt"]:
+                endpoints.append(kwargs.get("env", {}).get("HERDR_SOCKET_PATH"))
+                if cmd[:3] == ["/usr/bin/herdr", "agent", "get"]:
+                    agent = {"agent_status": "idle", "agent_session": {"kind": "id", "value": "claude-pane"}}
+                    return subprocess.CompletedProcess(
+                        cmd, 0, stdout=json.dumps({"result": {"type": "agent_info", "agent": agent}}), stderr=""
+                    )
+                if cmd[:3] == ["/usr/bin/herdr", "agent", "prompt"]:
                     return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
                 return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
 
@@ -884,20 +891,36 @@ class MailboxWakeTests(unittest.TestCase):
                 (sent["wake"]["status"], sent["wake"]["transport"], sent["wake"]["pane"], sent["wake"]["phase"]),
                 ("scheduled", "herdr-pane", "%42", "submitted"),
             )
-            self.assertEqual(commands[0], ["herdr", "agent", "get", "%42"])
-            self.assertEqual(commands[1][:4], ["herdr", "agent", "prompt", "%42"])
+            self.assertEqual(commands[0], ["/usr/bin/herdr", "agent", "get", "%42"])
+            self.assertEqual(commands[1][:4], ["/usr/bin/herdr", "agent", "prompt", "%42"])
+            self.assertEqual(endpoints[:2], ["/tmp/orkest-herdr-test.sock"] * 2)
 
-            # When Herdr is busy or unavailable, wake_terminal_pane falls back to Orkest tmux pane.
+            # A busy Herdr agent must not be woken through an old tmux binding.
             commands.clear()
 
             def fake_tmux_run(cmd, **_kwargs):
                 commands.append(list(cmd))
-                if cmd[:3] == ["herdr", "agent", "get"]:
-                    return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({"state": "running"}), stderr="")
+                if cmd[:3] == ["/usr/bin/herdr", "agent", "get"]:
+                    agent = {"agent_status": "working", "agent_session": {"kind": "id", "value": "claude-pane"}}
+                    return subprocess.CompletedProcess(
+                        cmd, 0, stdout=json.dumps({"result": {"type": "agent_info", "agent": agent}}), stderr=""
+                    )
                 if "list-panes" in cmd:
                     return subprocess.CompletedProcess(cmd, 0, stdout="%7\tclaude-pane\t0\n", stderr="")
                 return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
+            with (
+                patch.object(mailbox_wake, "claude_record", return_value=None),
+                patch.object(mailbox_wake.shutil, "which", side_effect=lambda name: f"/usr/bin/{name}"),
+                patch.object(mailbox_wake.subprocess, "run", side_effect=fake_tmux_run),
+            ):
+                busy = peer_mailbox.send(base, sender=sender, to=target["name"], text="busy herdr", wake=True)
+            self.assertEqual(busy["wake"]["status"], "unavailable")
+            self.assertEqual([cmd[1:3] for cmd in commands], [["agent", "get"]])
+
+            # A peer running outside Herdr can still use its private tmux pane.
+            peer_mailbox.annotate(base, "claude-pane", herdrPaneId=None, herdrEndpoint=None, herdrBinary=None)
+            commands.clear()
             with (
                 patch.object(mailbox_wake, "claude_record", return_value=None),
                 patch.object(mailbox_wake.shutil, "which", side_effect=lambda name: f"/usr/bin/{name}"),
@@ -915,6 +938,50 @@ class MailboxWakeTests(unittest.TestCase):
             )
             self.assertTrue(any("send-keys" in cmd and "-l" in cmd for cmd in commands))
             self.assertTrue(any("send-keys" in cmd and cmd[-1] == "Enter" for cmd in commands))
+
+    def test_herdr_wake_refuses_reused_pane_and_does_not_retry_uncertain_prompt_in_tmux(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary) / "mailbox"
+            target = peer_mailbox.register(base, session="claude-pane", harness="claude", cwd=temporary, state="idle")
+            target = peer_mailbox.annotate(
+                base,
+                target["session"],
+                herdrPaneId="w1:p2",
+                herdrEndpoint="/tmp/target-herdr.sock",
+                herdrBinary="/usr/bin/herdr",
+                terminalServer="orkest-label-0123456789ab",
+            )
+            commands = []
+
+            def wrong_agent(cmd, **kwargs):
+                commands.append((list(cmd), kwargs.get("env", {}).get("HERDR_SOCKET_PATH")))
+                if cmd[1:3] == ["agent", "get"]:
+                    agent = {"agent_status": "idle", "agent_session": {"kind": "id", "value": "another-session"}}
+                    return subprocess.CompletedProcess(
+                        cmd, 0, stdout=json.dumps({"result": {"type": "agent_info", "agent": agent}}), stderr=""
+                    )
+                return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
+
+            with patch.object(mailbox_wake.subprocess, "run", side_effect=wrong_agent):
+                self.assertIsNone(mailbox_wake.wake_terminal_pane(base, target, {"id": "notice-1"}))
+            self.assertEqual(commands[0][1], "/tmp/target-herdr.sock")
+            self.assertFalse(any(cmd[1:3] == ["agent", "prompt"] for cmd, _ in commands))
+
+            commands.clear()
+
+            def uncertain_prompt(cmd, **kwargs):
+                commands.append(list(cmd))
+                if cmd[1:3] == ["agent", "get"]:
+                    agent = {"agent_status": "done", "agent_session": {"kind": "id", "value": "claude-pane"}}
+                    return subprocess.CompletedProcess(
+                        cmd, 0, stdout=json.dumps({"result": {"type": "agent_info", "agent": agent}}), stderr=""
+                    )
+                raise subprocess.TimeoutExpired(cmd, 3)
+
+            with patch.object(mailbox_wake.subprocess, "run", side_effect=uncertain_prompt):
+                result = mailbox_wake.wake_terminal_pane(base, target, {"id": "notice-1"})
+            self.assertEqual(result["phase"], "unknown")
+            self.assertEqual([cmd[1:3] for cmd in commands], [["agent", "get"], ["agent", "prompt"]])
 
     def test_mcp_tool_call_automatically_persists_agy_control_for_gemini_sessions(self):
         with tempfile.TemporaryDirectory() as temporary:

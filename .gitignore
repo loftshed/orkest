@@ -23,3 +23,10 @@ docs/mailbox-feedback/reports/
 *.swp
 **/.claude/.cc-writes/
 **/.claude/**/*.local.*
+.codex-attachments/
+
+# Share repository skills even when a machine-wide ignore hides .agents.
+!.agents/
+.agents/*
+!.agents/skills/
+!.agents/skills/**

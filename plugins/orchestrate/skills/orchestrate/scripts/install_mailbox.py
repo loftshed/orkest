@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import json
 import os
@@ -316,7 +317,9 @@ def _install_claude_command(home: Path, name: str, content: str, *, dry_run: boo
     return changed
 
 
-def _install_cross_harness_skill(home: Path, name: str, content: str, *, dry_run: bool = False) -> bool:
+def _install_cross_harness_skill(
+    home: Path, name: str, content: str, *, include_claude: bool = False, dry_run: bool = False
+) -> bool:
     changed = False
     skill_hub = home / f".agents/skills/{name}"
     skill_file = skill_hub / "SKILL.md"
@@ -328,10 +331,14 @@ def _install_cross_harness_skill(home: Path, name: str, content: str, *, dry_run
             configuration.write_private(skill_file, content)
             print(f"✓ /{name} skill: {skill_file}")
         changed = True
-    duplicate_parents = (
-        home / ".claude/skills",
-        *(p / "skills" for p in sorted(home.glob(".claude-*")) if p.is_dir()),
-        home / ".gemini/antigravity/skills",
+    duplicate_parents: tuple[Path, ...] = (
+        (home / ".gemini/antigravity/skills",)
+        if include_claude
+        else (
+            home / ".claude/skills",
+            *(p / "skills" for p in sorted(home.glob(".claude-*")) if p.is_dir()),
+            home / ".gemini/antigravity/skills",
+        )
     )
     for dup_parent in duplicate_parents:
         dup_link = dup_parent / name
@@ -345,10 +352,18 @@ def _install_cross_harness_skill(home: Path, name: str, content: str, *, dry_run
                     dup_link.unlink(missing_ok=True)
                 print(f"✓ removed duplicate /{name} skill link: {dup_link}")
             changed = True
-    skill_parents = (
+    skill_parents: tuple[Path, ...] = (
         home / ".codex/skills",
         home / ".gemini/config/skills",
         home / ".config/opencode/skills",
+        *(
+            (
+                home / ".claude/skills",
+                *(p / "skills" for p in sorted(home.glob(".claude-*")) if p.is_dir()),
+            )
+            if include_claude
+            else ()
+        ),
     )
     for skill_parent in skill_parents:
         if not skill_parent.parent.is_dir():
@@ -545,6 +560,34 @@ def uninstall_herdr_integration(home: Path, ork_cli: Path | None = None, *, dry_
         config_file.write_text(updated_cfg, encoding="utf-8")
         print(f"✓ Herdr managed shortcut removed: {config_file}")
     return changed
+
+
+def install_herdr_skill(
+    home: Path, *, plugin_root: Path | None = None, ork_cli: Path | None = None, dry_run: bool = False
+) -> bool:
+    """Install the official Herdr skill across ~/.agents/skills, Codex, Antigravity, and OpenCode."""
+    content = ""
+    herdr = _herdr_binary()
+    if herdr:
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            proc = subprocess.run([herdr, "--skill"], capture_output=True, text=True, timeout=5, check=False)
+            if proc.returncode == 0 and proc.stdout.strip().startswith("---"):
+                content = proc.stdout
+    if not content:
+        source_root = _herdr_source_root(ork_cli)
+        if source_root is not None:
+            repo_skill = source_root / ".agents/skills/herdr/SKILL.md"
+            if repo_skill.is_file():
+                content = repo_skill.read_text(encoding="utf-8")
+    if not content:
+        for root in _candidate_plugin_roots(plugin_root, ork_cli):
+            candidate = root.parent.parent / ".agents/skills/herdr/SKILL.md"
+            if candidate.is_file():
+                content = candidate.read_text(encoding="utf-8")
+                break
+    if not content:
+        return False
+    return _install_cross_harness_skill(home, "herdr", content, include_claude=True, dry_run=dry_run)
 
 
 def install_swarm_skill(home: Path, *, dry_run: bool = False) -> bool:
@@ -855,6 +898,8 @@ def install_shell_wrappers(home: Path, ork_cli: Path | None = None, *, dry_run: 
     if install_update_command(home, ork_cli=ork_cli, dry_run=dry_run):
         changed = True
     if install_update_skill(home, ork_cli=ork_cli, dry_run=dry_run):
+        changed = True
+    if install_herdr_skill(home, ork_cli=ork_cli, dry_run=dry_run):
         changed = True
     if install_agy_statusline(home / ".gemini/antigravity-cli/settings.json", dry_run=dry_run):
         changed = True

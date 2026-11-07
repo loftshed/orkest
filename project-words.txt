@@ -46,6 +46,7 @@ SHLVL
 stooges
 swiftc
 tcsetwinsize
+tcsh
 todoread
 todowrite
 udcff

@@ -44,26 +44,8 @@ command = [
   "close",
 ]
 
-[[actions]]
-id = "overview"
-title = "Open Orkest Swarms"
-description = "Open the Orkest Swarm View in a right-side split pane"
-contexts = ["workspace"]
-command = [
-  "python3",
-  "plugins/orchestrate/skills/orchestrate/scripts/agent_statusline_tmux.py",
-  "--toggle-swarm",
-  "open",
-]
-
 [[panes]]
 id = "room"
 title = "Orkest Swarm"
 placement = "split"
-command = ["node", "plugins/orchestrate/bin/ork.mjs", "horde", "--view"]
-
-[[panes]]
-id = "overview"
-title = "Orkest Swarms"
-placement = "tab"
-command = ["node", "plugins/orchestrate/bin/ork.mjs", "horde", "--view"]
+command = ["sh", "-c", 'exec python3 "$HERDR_PLUGIN_ROOT/plugins/orchestrate/skills/orchestrate/scripts/herdr_swarm_restore.py" --view']

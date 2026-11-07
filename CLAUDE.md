@@ -23,6 +23,7 @@ Both scripts call `./node_modules/.bin` directly, so they work without pnpm on P
 
 - **Issue-board driven delivery:** Track work as detailed, self-contained issues on the board (`gh issue` / the shared Orkest workboard) rather than accumulating unrelated changes into a single large branch.
 - **Lead delegation & small PRs:** Assign a lead Orkest agent to monitor the board, delegate bounded issues to workers in isolated worktrees, and merge focused pull requests per issue.
+- **Project skills:** [`.agents/skills/herdr`](.agents/skills/herdr/SKILL.md) (linked into [`.claude/skills/herdr`](.claude/skills/herdr) and enabled via `skillOverrides` in [`.claude/settings.json`](.claude/settings.json)) is automatically available across Claude Code, Codex, Antigravity, and OpenCode when working in this repository or inside a Herdr session (`HERDR_ENV=1`).
 
 ## Rules for changes
 

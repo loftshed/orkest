@@ -1,43 +1,56 @@
 # Herdr integration
 
-Install from a checkout with `./plugins/orchestrate/install.sh`. When Herdr 0.9.5 or newer is
-available, setup registers the source manifest through `herdr plugin link`. `ork update` runs the
-same setup after updating the checkout. Existing disabled registrations and custom shortcuts stay
-unchanged. An installation owned by another checkout is left alone.
+Inside Herdr, `ork codex`, `ork claude`, `ork agy`, `ork opencode`, and `ork label` launch the agent
+directly in its pane. Herdr detects the agent, tracks its native session, and restores its terminal
+layout. Orkest keeps the swarm's room, tasks, and mailbox. Attaching to a swarm from inside Herdr
+focuses its live Herdr coordinator pane rather than attaching to a private tmux session. Outside
+Herdr the same launch commands use a private tmux session for the footer and reattachment.
 
-Installing only the Claude plugin cache does not include the repository's Herdr manifest. Run the
-checkout installer for Herdr integration. Setup reports missing Herdr or an unavailable manifest;
-it does not create a shortcut to an unregistered plugin. A newly added shortcut may require Herdr's
-normal config reload in a running client.
+## Install and open
+
+Run `./plugins/orchestrate/install.sh` from the checkout. With Herdr 0.9.5 or newer, the installer
+links the plugin, installs the `herdr` skill across local agent harnesses (`.agents/skills/herdr`,
+Claude Code, Codex, Antigravity, and OpenCode), and registers `Ctrl+Alt+S` when the shortcut is
+available. `ork update` refreshes the same registration and respects custom shortcuts, disabled
+plugins, and installations owned by another checkout. A running client may need a config reload for a
+new shortcut. The Claude plugin cache alone does not include the repository's Herdr manifest.
+
+Use `ork swarm open`, `ork swarm close`, or the toggle shortcut from the coordinator. Orkest opens
+Herdr's `orkest.swarms` plugin pane with the room ID. Open reuses the existing display, including
+after it moves to another workspace. Selecting the pane entrypoint directly uses the room of the
+invoking coordinator. In a shared or ambiguous context, open the desired room explicitly.
+
+Preview, focus, and mailbox delivery verify the native conversation at its Herdr endpoint. A
+mailbox wake goes to an idle or done agent. If Herdr cannot confirm a submission, the message
+stays queued. Orkest reports the agent's title, model, and active child count (with model/effort
+provenance) as expiring display metadata on the parent pane without marking an idle parent as
+working. While running inside Herdr, Horde View subscribes to Herdr lifecycle events over the
+server socket to invalidate cached state and reconcile on reconnect or `events_lost`.
+
+To inspect Orkest bindings against live Herdr panes without mutating state, run
+`python3 plugins/orchestrate/skills/orchestrate/scripts/herdr_swarm_restore.py --inventory`
+(optionally `--room <ROOM_ID>`), which reports `pane_existence`, `available_shell`,
+`live_agent_conversation`, `executing_worker`, and `accepted_task` for each resource.
 
 ## Restart and close
 
-Each opened swarm display receives a unique persistent pane label and a server-scoped record in
-the Orkest cache. Herdr's startup hook runs after restoring its layout. Orkest finds that label and:
+Herdr restores the layout on startup. Orkest's startup hook can then restart the display in its
+restored pane. Orkest tracks the live terminal ID and the pane label separately. When a cold restart
+assigns a new terminal ID, the hook requires a unique saved label and an idle shell or the exact
+running view. Busy, missing, renamed, and ambiguous panes are skipped. The hook creates no splits.
 
-- Leaves an already running view alone, including during live handoff.
-- Restarts a view only when its owned pane contains an idle shell.
-- Skips busy, ambiguous, renamed, missing, or failed panes. Startup never adds a split.
-- Preserves workers and room history; only the display is restored.
+Pressing `q`, keyboard Ctrl-C, or `ork swarm close` closes the display and records that choice for
+the next restart. The coordinator and workers keep running. Closing a pane through Herdr removes it
+from the saved layout. If an older installation has an open view, updating from inside Herdr adopts
+it after checking its foreground command. Use `ork swarm close` for a view still running old code.
 
-Pressing `q`, keyboard Ctrl-C, or `ork swarm close` records deliberate closure. Server shutdown and
-terminal teardown preserve restore intent. Closing a pane in Herdr removes it from the restored
-layout, so it stays closed too.
+Herdr can accept a restore command before it starts. Orkest checks the foreground process before
+confirming the launch. If Open reports an unconfirmed previous launch, close and reopen the view.
 
-Updates run inside Herdr adopt older running views only when their process arguments prove the
-exact Orkest executable and room. Already running old code cannot acquire the new `q` handler;
-use `ork swarm close` during that transition. Subsequent launches use the new handler.
-
-Herdr acknowledges queued command input before the command starts. Orkest checks the actual
-foreground process and prevents duplicate submissions while confirmation is pending. If Open
-reports an unconfirmed previous launch, close that swarm view and open it again to retry.
+See Herdr's [plugin panes and startup hooks](https://herdr.dev/tui/docs/plugins/) and
+[session restore documentation](https://herdr.dev/tui/docs/session-state/).
 
 ## Uninstall
 
-`./plugins/orchestrate/uninstall.sh` unregisters this checkout's Herdr plugin and exact managed
-shortcut, and removes only skill links resolving to this checkout. Custom shortcuts, other
-installations, configuration, and saved state remain.
-
-The integration uses Herdr's documented [startup hooks](https://herdr.dev/tui/docs/plugins/#startup-hooks)
-and [pane APIs](https://herdr.dev/tui/docs/socket-api/). Cold restarts restore layout rather than
-arbitrary processes; see [session restore](https://herdr.dev/tui/docs/session-state/).
+`./plugins/orchestrate/uninstall.sh` removes this checkout's plugin registration, managed shortcut,
+and its skill links. Swarm records and custom Herdr configuration remain available.

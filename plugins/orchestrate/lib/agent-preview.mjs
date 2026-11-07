@@ -1,20 +1,35 @@
 import { execFile } from "node:child_process";
 
 import { readAgentActivity } from "./agent-activity.mjs";
+import { isCurrentHerdrAgent, verifiedHerdrAgentPane } from "./herdr-context.mjs";
 import { plain } from "./tui-box.mjs";
 
 const PANE_ID = /^[A-Za-z0-9_.:%][A-Za-z0-9_.:%-]{0,63}$/u;
+const ORKEST_TMUX_SERVER = /^orkest-label-[0-9a-f]{12}$/u;
 
 function identifier(value) {
   return typeof value === "string" && PANE_ID.test(value) ? value : "";
 }
 
-function terminalTarget(agent) {
-  const herdrPane = identifier(agent.herdrPaneId || agent.progress?.herdrPaneId);
-  if (herdrPane) return `herdr:${herdrPane}`;
+function herdrPaneBinding(agent) {
+  const value = agent.herdrPaneId || agent.progress?.herdrPaneId;
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function terminalTarget(agent, env) {
+  const boundHerdrPane = herdrPaneBinding(agent);
+  if (boundHerdrPane)
+    return env.HERDR_ENV === "1" && identifier(boundHerdrPane)
+      ? JSON.stringify([
+          "herdr",
+          agent.herdrEndpoint || agent.progress?.herdrEndpoint,
+          boundHerdrPane,
+        ])
+      : "activity";
   const tmuxPane = identifier(agent.paneId || agent.progress?.paneId);
   if (!tmuxPane) return "activity";
   const server = identifier(agent.terminalServer || agent.progress?.terminalServer);
+  if (!ORKEST_TMUX_SERVER.test(server)) return "activity";
   return JSON.stringify(["tmux", server, tmuxPane]);
 }
 
@@ -41,7 +56,7 @@ export function createAgentPreview({
   let zoomQueue = Promise.resolve();
   let zoomError = "";
   let pendingRead;
-  const currentPane = identifier(env.HERDR_PANE_ID);
+  const currentPane = env.HERDR_ENV === "1" ? identifier(env.HERDR_PANE_ID) : "";
   const herdr = env.HERDR_BIN_PATH || "herdr";
 
   function run(command, args) {
@@ -75,6 +90,7 @@ export function createAgentPreview({
     if (!zoom || !currentPane) return Promise.resolve();
     return queueZoom(async () => {
       if (token !== generation || !active || isOwnedZoom) return;
+      if (herdrPaneBinding(active) && !isCurrentHerdrAgent(active, env)) return;
       const response = JSON.parse(await run(herdr, ["pane", "layout", "--pane", currentPane]));
       const layout = response.result?.layout ?? response.layout;
       if (typeof layout?.zoomed !== "boolean") throw new Error("Pane layout is unavailable");
@@ -96,8 +112,13 @@ export function createAgentPreview({
   async function read(token) {
     const agent = active;
     if (!agent || token !== generation) return null;
-    const herdrPane = identifier(agent.herdrPaneId || agent.progress?.herdrPaneId);
-    const tmuxPane = identifier(agent.paneId || agent.progress?.paneId);
+    const boundHerdrPane = herdrPaneBinding(agent);
+    const herdrPane = env.HERDR_ENV === "1" ? identifier(boundHerdrPane) : "";
+    const server = identifier(agent.terminalServer || agent.progress?.terminalServer);
+    const tmuxPane =
+      !boundHerdrPane && ORKEST_TMUX_SERVER.test(server)
+        ? identifier(agent.paneId || agent.progress?.paneId)
+        : "";
     try {
       let text;
       let kind = herdrPane || tmuxPane ? "terminal" : "activity";
@@ -107,19 +128,26 @@ export function createAgentPreview({
         }
         try {
           if (herdrPane) {
+            if (!isCurrentHerdrAgent(agent, env))
+              throw new Error("The agent belongs to another Herdr server");
+            const session =
+              agent.session?.id || agent.nativeSession || agent.activitySource?.session;
+            const pane = await verifiedHerdrAgentPane(herdrPane, session, (args) =>
+              run(herdr, args),
+            );
+            if (!pane || pane === currentPane)
+              throw new Error("The agent in this pane has changed");
             text = await run(herdr, [
-              "pane",
+              "agent",
               "read",
-              herdrPane,
+              pane,
               "--source",
               "visible",
               "--lines",
               "200",
             ]);
           } else {
-            const server = identifier(agent.terminalServer || agent.progress?.terminalServer);
-            const args = server ? ["-L", server] : [];
-            text = await run("tmux", [...args, "capture-pane", "-p", "-t", tmuxPane]);
+            text = await run("tmux", ["-L", server, "capture-pane", "-p", "-t", tmuxPane]);
           }
         } catch (terminalError) {
           const fallback =
@@ -157,7 +185,7 @@ export function createAgentPreview({
   function refresh(agent) {
     if (!active || isDisposed) return Promise.resolve(null);
     if (agent?.id === active.id) {
-      const hasChangedTarget = terminalTarget(agent) !== terminalTarget(active);
+      const hasChangedTarget = terminalTarget(agent, env) !== terminalTarget(active, env);
       active = agent;
       if (hasChangedTarget) {
         generation++;
@@ -166,7 +194,7 @@ export function createAgentPreview({
           title: plain(agent.progress?.name || agent.name || agent.id || "Agent"),
           text: "",
           error: "",
-          kind: terminalTarget(agent) === "activity" ? "activity" : "terminal",
+          kind: terminalTarget(agent, env) === "activity" ? "activity" : "terminal",
           loading: true,
         });
       }
@@ -191,10 +219,7 @@ export function createAgentPreview({
     active = agent;
     const token = ++generation;
     zoomError = "";
-    const isTerminal = Boolean(
-      identifier(agent.herdrPaneId || agent.progress?.herdrPaneId) ||
-      identifier(agent.paneId || agent.progress?.paneId),
-    );
+    const isTerminal = terminalTarget(agent, env) !== "activity";
     publish({
       agentId: agent.id,
       title: plain(agent.progress?.name || agent.name || agent.id || "Agent"),

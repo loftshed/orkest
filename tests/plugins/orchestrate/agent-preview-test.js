@@ -5,6 +5,10 @@ import { describe, expect, it } from "vitest";
 
 import { readAgentActivity } from "../../../plugins/orchestrate/lib/agent-activity.mjs";
 import { createAgentPreview } from "../../../plugins/orchestrate/lib/agent-preview.mjs";
+import { herdrEndpoint } from "../../../plugins/orchestrate/lib/herdr-context.mjs";
+
+const HERDR_SOCKET_PATH = path.join(tmpdir(), "orkest-preview-herdr.sock");
+const HERDR_ENDPOINT = herdrEndpoint({ HERDR_SOCKET_PATH });
 
 function fixture({ zoomed = false, readError = false, zoomError = false } = {}) {
   const state = {
@@ -19,31 +23,60 @@ function fixture({ zoomed = false, readError = false, zoomError = false } = {}) 
   const exec = (command, args, options, callback) => {
     expect(options.timeout).toBe(2500);
     queueMicrotask(() => {
-      if (args[1] === "layout")
-        callback(null, JSON.stringify({ result: { layout: { zoomed: state.zoomed } } }));
-      else if (args[1] === "zoom") {
-        if (state.zoomError) return callback(new Error("layout refused"));
-        state.zoomed = args.includes("--on");
-        state.zoomWrites.push(state.zoomed);
-        callback(null, "{}");
-      } else {
-        const pane = args[1] === "read" ? args[2] : args.at(-1);
-        state.reads.push({ command, args });
-        if (state.held.has(pane)) state.held.set(pane, callback);
-        else if (state.readError) callback(new Error("terminal closed"));
-        else callback(null, `Conversation from ${pane}\nAssistant: working`);
+      switch (args[1]) {
+        case "layout": {
+          callback(null, JSON.stringify({ result: { layout: { zoomed: state.zoomed } } }));
+          break;
+        }
+        case "zoom": {
+          if (state.zoomError) return callback(new Error("layout refused"));
+          state.zoomed = args.includes("--on");
+          state.zoomWrites.push(state.zoomed);
+          callback(null, "{}");
+          break;
+        }
+        case "get": {
+          callback(
+            null,
+            JSON.stringify({
+              result: {
+                type: "agent_info",
+                agent: { agent_session: { kind: "id", value: "preview-test-session" } },
+              },
+            }),
+          );
+          break;
+        }
+        default: {
+          const pane = args[1] === "read" ? args[2] : args.at(-1);
+          state.reads.push({ command, args });
+          if (state.held.has(pane)) state.held.set(pane, callback);
+          else if (state.readError) callback(new Error("terminal closed"));
+          else callback(null, `Conversation from ${pane}\nAssistant: working`);
+        }
       }
     });
   };
   const preview = createAgentPreview({
-    env: { HERDR_PANE_ID: "w1:p2" },
+    env: { HERDR_ENV: "1", HERDR_SOCKET_PATH, HERDR_PANE_ID: "w1:p2" },
     exec,
     zoom: true,
     onChange: (snapshot) => {
       state.snapshots.push(snapshot);
     },
   });
-  return { state, preview };
+  const bound = (agent) =>
+    agent
+      ? { herdrEndpoint: HERDR_ENDPOINT, nativeSession: "preview-test-session", ...agent }
+      : agent;
+  return {
+    state,
+    preview: {
+      ...preview,
+      open: (agent) => preview.open(bound(agent)),
+      refresh: (agent) => preview.refresh(bound(agent)),
+    },
+  };
 }
 
 async function until(callback) {
@@ -66,7 +99,7 @@ describe("agent terminal preview", () => {
     expect(state.zoomed).toBe(true);
     expect(state.reads[0]).toEqual({
       command: "herdr",
-      args: ["pane", "read", "w1:p3", "--source", "visible", "--lines", "200"],
+      args: ["agent", "read", "w1:p3", "--source", "visible", "--lines", "200"],
     });
     expect(await preview.refresh()).toEqual(result);
     await preview.close();
@@ -83,6 +116,66 @@ describe("agent terminal preview", () => {
     await preview.dispose();
     expect(state.zoomed).toBe(true);
     expect(state.zoomWrites).toEqual([]);
+  });
+
+  it("does not read a pane from another Herdr server even when the pane ID collides", async () => {
+    const { state, preview } = fixture();
+    const result = await preview.open({
+      id: "other-server",
+      herdrPaneId: "w1:p3",
+      herdrEndpoint: "/tmp/another-herdr.sock",
+      output: ["Recorded work"],
+    });
+    expect(state.reads).toHaveLength(0);
+    expect(state.zoomWrites).toHaveLength(0);
+    expect(result.kind).toBe("activity");
+    expect(result.text).toContain("Recorded work");
+  });
+
+  it("reads the verified agent in its new workspace after a pane move", async () => {
+    const calls = [];
+    const preview = createAgentPreview({
+      env: { HERDR_ENV: "1", HERDR_SOCKET_PATH },
+      exec(_command, args, _options, callback) {
+        calls.push(args);
+        if (args[1] === "get" && args[2] === "w1:p3") return callback(new Error("agent_not_found"));
+        if (args[1] === "current")
+          return callback(null, JSON.stringify({ result: { pane: { pane_id: "w2:p1" } } }));
+        if (args[1] === "get")
+          return callback(
+            null,
+            JSON.stringify({
+              result: {
+                type: "agent_info",
+                agent: { agent_session: { kind: "id", value: "session-a" } },
+              },
+            }),
+          );
+        return callback(null, "Moved agent");
+      },
+    });
+    const snapshot = await preview.open({
+      id: "worker",
+      nativeSession: "session-a",
+      herdrPaneId: "w1:p3",
+      herdrEndpoint: HERDR_ENDPOINT,
+    });
+    expect(snapshot.text).toBe("Moved agent");
+    expect(calls.at(-1).slice(0, 3)).toEqual(["agent", "read", "w2:p1"]);
+    await preview.dispose();
+  });
+
+  it("does not read a reused Herdr pane belonging to another conversation", async () => {
+    const { state, preview } = fixture();
+    const result = await preview.open({
+      id: "reused-pane",
+      herdrPaneId: "w1:p3",
+      nativeSession: "other-session",
+      output: ["Recorded work"],
+    });
+    expect(state.reads).toHaveLength(0);
+    expect(result.kind).toBe("activity");
+    expect(result.text).toContain("Recorded work");
   });
 
   it("shows recorded activity for a worker without a terminal", async () => {
@@ -256,16 +349,39 @@ describe("agent terminal preview", () => {
       env: {},
       exec(command, args, _options, callback) {
         expect(command).toBe("tmux");
-        expect(args).toEqual(["-L", "test-server", "capture-pane", "-p", "-t", "%3"]);
+        expect(args).toEqual(["-L", "orkest-label-0123456789ab", "capture-pane", "-p", "-t", "%3"]);
         callback(null, "\u{1B}[31mAssistant\u{1B}[0m\nSafe text\u{1B}]2;title\u{7}");
       },
       onChange: (value) => {
         latest = value;
       },
     });
-    await preview.open({ id: "tmux-a", progress: { paneId: "%3", terminalServer: "test-server" } });
+    await preview.open({
+      id: "tmux-a",
+      progress: { paneId: "%3", terminalServer: "orkest-label-0123456789ab" },
+    });
     expect(latest.text).toBe("Assistant\nSafe text");
     expect(latest.kind).toBe("terminal");
+    await preview.dispose();
+  });
+
+  it("does not use a stale tmux binding for a Herdr agent outside Herdr", async () => {
+    const preview = createAgentPreview({
+      env: {},
+      exec: () => {
+        throw new Error("terminal should not be accessed");
+      },
+    });
+    const result = await preview.open({
+      id: "herdr-a",
+      herdrPaneId: "w1:p3",
+      herdrEndpoint: "/tmp/herdr.sock",
+      paneId: "%3",
+      terminalServer: "orkest-label-0123456789ab",
+      output: ["Recorded work"],
+    });
+    expect(result.kind).toBe("activity");
+    expect(result.text).toBe("Recorded work");
     await preview.dispose();
   });
 
@@ -349,7 +465,7 @@ describe("agent terminal preview", () => {
     let isZoomed = false;
     const snapshots = [];
     const preview = createAgentPreview({
-      env: { HERDR_PANE_ID: "w1:p2" },
+      env: { HERDR_ENV: "1", HERDR_SOCKET_PATH, HERDR_PANE_ID: "w1:p2" },
       zoom: true,
       onChange: (value) => {
         snapshots.push(value);
@@ -357,6 +473,16 @@ describe("agent terminal preview", () => {
       exec(_command, args, _options, callback) {
         if (args[1] === "layout")
           callback(null, JSON.stringify({ result: { layout: { zoomed: isZoomed } } }));
+        else if (args[1] === "get")
+          callback(
+            null,
+            JSON.stringify({
+              result: {
+                type: "agent_info",
+                agent: { agent_session: { kind: "id", value: "preview-test-session" } },
+              },
+            }),
+          );
         else if (args.includes("--on"))
           finishZoom = () => {
             isZoomed = true;
@@ -368,7 +494,12 @@ describe("agent terminal preview", () => {
         } else callback(null, "Conversation");
       },
     });
-    const opening = preview.open({ id: "a", herdrPaneId: "w1:p3" });
+    const opening = preview.open({
+      id: "a",
+      herdrPaneId: "w1:p3",
+      herdrEndpoint: HERDR_ENDPOINT,
+      nativeSession: "preview-test-session",
+    });
     await until(() => typeof finishZoom === "function");
     const closing = preview.close();
     finishZoom();

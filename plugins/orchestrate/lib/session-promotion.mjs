@@ -6,6 +6,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
+import { herdrEndpoint } from "./herdr-context.mjs";
 import { createRoom, mailboxRoot, readRoom, updateRoom } from "./horde-room.mjs";
 import { coordinatorBrief, isPeerLive, writeCoordinatorBrief } from "./rooms.mjs";
 
@@ -68,6 +69,8 @@ async function currentPeer(root, session, cwd, env, now) {
     throw new Error("The live session belongs to a different checkout");
   if (env.HERDR_PANE_ID && peer.herdrPaneId && env.HERDR_PANE_ID !== peer.herdrPaneId)
     throw new Error("The live session belongs to a different terminal pane");
+  if (env.HERDR_ENV === "1" && peer.herdrPaneId && peer.herdrEndpoint !== herdrEndpoint(env))
+    throw new Error("The live session belongs to a different Herdr server");
   return { peer, engine, checkout };
 }
 
@@ -194,12 +197,14 @@ export async function promoteSession(
       ...(peer.effort && { effort: peer.effort }),
       session: { id: peer.session, engine, machine: hostname(), cwd: checkout },
       ...(peer.herdrPaneId && { herdrPaneId: peer.herdrPaneId }),
+      ...(peer.herdrEndpoint && { herdrEndpoint: peer.herdrEndpoint }),
       ...(peer.herdrWorkspaceId && { herdrWorkspaceId: peer.herdrWorkspaceId }),
       ...(peer.paneId && { paneId: peer.paneId }),
       ...(peer.terminalServer && { terminalServer: peer.terminalServer }),
     };
     room.promotion = { association, session: peer.session, startedAt: peer.startedAt };
     if (peer.herdrPaneId) room.herdrCoordinatorPaneId = peer.herdrPaneId;
+    if (peer.herdrEndpoint) room.herdrEndpoint = peer.herdrEndpoint;
     if (peer.herdrWorkspaceId) room.herdrWorkspaceId = peer.herdrWorkspaceId;
     return room;
   };

@@ -1181,7 +1181,18 @@ def hook(
         spaces = payload.get("workspacePaths")
         cwd = spaces[0] if isinstance(spaces, list) and spaces and isinstance(spaces[0], str) else os.getcwd()
     if event == "SessionEnd":
+        existing_peer = _MB.load(peer_path(base, session))
+        parent_to_refresh = (
+            existing_peer.get("parentSession")
+            if isinstance(existing_peer, dict) and existing_peer.get("isSubagent")
+            else None
+        )
         _MB.end_session(base, session, reason=str(payload.get("reason") or ""), pid=_MB.harness_pid(harness))
+        if isinstance(parent_to_refresh, str) and parent_to_refresh:
+            with contextlib.suppress(Exception):
+                import agent_terminal
+
+                agent_terminal.refresh_parent_pane(base, parent_to_refresh)
         return None
     if event == "SubagentStart":
         raw_agent_id = payload.get("agent_id") or payload.get("subagent_id")
@@ -1203,18 +1214,24 @@ def hook(
                 if jsonl_candidate.is_file():
                     sub_jsonl = jsonl_candidate
             sub_model = payload.get("model") or payload.get("modelName")
+            sub_model_source = "runtime"
             if isinstance(sub_model, dict):
                 sub_model = sub_model.get("id")
             if isinstance(sub_model, str) and sub_model.strip().lower() == "auto":
                 sub_model = None
             if not (isinstance(sub_model, str) and sub_model.strip()) and sub_jsonl is not None:
                 sub_model = _MB.transcript_model({"transcript_path": str(sub_jsonl)})
+                if sub_model:
+                    sub_model_source = "runtime"
             if not (isinstance(sub_model, str) and sub_model.strip()):
                 meta_model = meta_data.get("model")
                 if isinstance(meta_model, str) and meta_model.strip() and meta_model.strip().lower() != "auto":
                     sub_model = meta_model.strip()
-            if not (isinstance(sub_model, str) and sub_model.strip()):
-                sub_model = _MB.transcript_model(payload)
+                    sub_model_source = "requested"
+            sub_effort = payload.get("effort") or payload.get("effortLevel") or meta_data.get("effort")
+            if isinstance(sub_effort, dict):
+                sub_effort = sub_effort.get("level") or sub_effort.get("effort")
+            sub_effort_str = str(sub_effort).strip() if isinstance(sub_effort, str) and sub_effort.strip() else None
             sub_desc = str(meta_data.get("description") or "").strip()[:160]
             sub_peer = _MB.register(
                 base,
@@ -1225,8 +1242,9 @@ def hook(
                 state="busy",
                 cwd_source="hook",
                 model=sub_model if isinstance(sub_model, str) and sub_model.strip() else None,
-                model_source="runtime",
+                model_source=sub_model_source,
                 account=account_home_dir,
+                effort=sub_effort_str,
             )
             extra_annotations: dict[str, Any] = {
                 "isSubagent": True,
@@ -1252,6 +1270,10 @@ def hook(
                     "updatedAt": _MB.stamp(),
                 },
             )
+            with contextlib.suppress(Exception):
+                import agent_terminal
+
+                agent_terminal.refresh_parent_pane(base, session)
         if os.environ.get("ORKEST_READONLY_RUN") != "1":
             with contextlib.suppress(Exception):
                 import repo_env
@@ -1269,6 +1291,10 @@ def hook(
                 existing_prog["updatedAt"] = _MB.stamp()
                 _MB.write(prog_path, existing_prog)
             _MB.end_session(base, sub_sid, reason="completed", pid=_MB.harness_pid(harness))
+            with contextlib.suppress(Exception):
+                import agent_terminal
+
+                agent_terminal.refresh_parent_pane(base, session)
         return {}
     state = {"SessionStart": "idle", "UserPromptSubmit": "busy", "PreInvocation": "busy", "Stop": "idle"}.get(event)
     if state is None:
@@ -1330,7 +1356,7 @@ def hook(
         subagent_fields: dict[str, Any] = {"isSubagent": True}
         if parent_session:
             subagent_fields["parentSession"] = parent_session
-        for k in ("terminalServer", "herdrPaneId", "herdrWorkspaceId"):
+        for k in ("terminalServer", "herdrPaneId", "herdrWorkspaceId", "herdrEndpoint", "herdrBinary"):
             if me.get(k) is not None or (valid_peer(previous) and previous.get(k) is not None):
                 subagent_fields[k] = None
         if any(me.get(k) != v for k, v in subagent_fields.items()):
@@ -1340,15 +1366,41 @@ def hook(
         if re.fullmatch(r"orkest-label-[0-9a-f]{12}", terminal_server) and me.get("terminalServer") != terminal_server:
             me = _MB.annotate(base, session, terminalServer=terminal_server) or me
         if _herdr_active():
+            if me.get("terminalServer") is not None:
+                me = _MB.annotate(base, session, terminalServer=None) or me
+            from herdr_context import endpoint as herdr_endpoint
+
             herdr_pane = os.environ.get("HERDR_PANE_ID", "").strip()
             herdr_workspace = os.environ.get("HERDR_WORKSPACE_ID", "").strip()
+            herdr_binary = os.environ.get("HERDR_BIN_PATH") or shutil.which("herdr")
             herdr_fields: dict[str, Any] = {}
             if herdr_pane and me.get("herdrPaneId") != herdr_pane:
                 herdr_fields["herdrPaneId"] = herdr_pane
             if herdr_workspace and me.get("herdrWorkspaceId") != herdr_workspace:
                 herdr_fields["herdrWorkspaceId"] = herdr_workspace
+            endpoint = herdr_endpoint(dict(os.environ))
+            if herdr_pane and me.get("herdrEndpoint") != endpoint:
+                herdr_fields["herdrEndpoint"] = endpoint
+            if herdr_pane and herdr_binary and me.get("herdrBinary") != herdr_binary:
+                herdr_fields["herdrBinary"] = herdr_binary
             if herdr_fields:
                 me = _MB.annotate(base, session, **herdr_fields) or me
+        else:
+            stale_herdr_fields = {
+                key: None
+                for key in (
+                    "herdrPaneId",
+                    "herdrWorkspaceId",
+                    "herdrEndpoint",
+                    "herdrBinary",
+                    "herdrSyncedTitle",
+                    "herdrSyncedTarget",
+                    "herdrSyncedAt",
+                )
+                if me.get(key) is not None
+            }
+            if stale_herdr_fields:
+                me = _MB.annotate(base, session, **stale_herdr_fields) or me
     if event == "SessionStart" or (gemini and event == "PreInvocation" and previous is None):
         with contextlib.suppress(Exception):
             import repo_env
@@ -1374,6 +1426,13 @@ def hook(
 
             if _herdr_active() or agent_terminal.context(harness):
                 agent_terminal.bind(session, harness, payload, base=base, force=event == "SessionStart")
+    elif (is_subagent or me.get("isSubagent")) and not mid_turn:
+        target_parent = parent_session or me.get("parentSession")
+        if isinstance(target_parent, str) and target_parent.strip():
+            with contextlib.suppress(Exception):
+                import agent_terminal
+
+                agent_terminal.refresh_parent_pane(base, target_parent)
     if not me.get("isSubagent") and event in {"SessionStart", "UserPromptSubmit", "PreInvocation", "Stop"}:
         with contextlib.suppress(Exception):
             import mailbox_work as _WORK
