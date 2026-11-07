@@ -2,12 +2,16 @@ import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
+  copyFileSync,
   existsSync,
+  lstatSync,
   mkdirSync,
+  mkdtempSync,
   readdirSync,
   readFileSync,
   realpathSync,
   renameSync,
+  rmSync,
   statSync,
 } from "node:fs";
 import {
@@ -21,6 +25,7 @@ import {
   stat,
   writeFile,
 } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
@@ -634,6 +639,74 @@ export function readRawRoom(id, root = mailboxRoot()) {
   const row = db.tagStore.get`SELECT data FROM rooms WHERE id = ${id}`;
   if (!row) throw missingRoom(id);
   return JSON.parse(row.data);
+}
+
+/** Diagnostic snapshot: never initialize, migrate, archive or repair a room store. */
+export function listRawRoomsReadOnly(root = mailboxRoot()) {
+  const rooms = new Map();
+  if (existsSync(roomsDbPath(root))) {
+    const rows = readRoomSnapshot(root);
+    for (const row of rows) {
+      const room = JSON.parse(row.data);
+      rooms.set(room.id, room);
+    }
+  }
+  for (const file of legacyFiles(root)) {
+    try {
+      const { room } = legacyRecord(root, file);
+      rooms.set(room.id, room);
+    } catch {
+      /* Leave malformed records untouched. */
+    }
+  }
+  return rooms
+    .values()
+    .toArray()
+    .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+}
+
+function snapshotSignature(files) {
+  return files.map((file) => {
+    try {
+      const info = lstatSync(file, { bigint: true });
+      if (!info.isFile()) throw new Error(`Expected a regular SQLite file: ${file}`);
+      return [info.dev, info.ino, info.size, info.mtimeNs, info.ctimeNs].join(":");
+    } catch (error) {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    }
+  });
+}
+
+function readRoomSnapshot(root) {
+  // Even SQLite read-only connections may create WAL/SHM sidecars. Open a private
+  // copy instead, checking for concurrent checkpoints or commits around the copy.
+  const scratch = mkdtempSync(path.join(tmpdir(), "ork-room-snapshot-"));
+  const source = roomsDbPath(root);
+  const files = [source, `${source}-wal`];
+  try {
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const before = snapshotSignature(files);
+      if (!before[0]) return [];
+      const directory = path.join(scratch, String(attempt));
+      mkdirSync(directory, { mode: 0o700 });
+      const target = path.join(directory, "rooms.db");
+      try {
+        copyFileSync(source, target);
+        if (before[1]) copyFileSync(`${source}-wal`, `${target}-wal`);
+      } catch (error) {
+        if (error.code === "ENOENT") continue;
+        throw error;
+      }
+      const after = snapshotSignature(files);
+      if (before.some((value, index) => value !== after[index])) continue;
+      using db = openOrkestSqlite(target, { readOnly: true });
+      return db.tagStore.all`SELECT data FROM rooms ORDER BY updated_at DESC, id ASC`;
+    }
+    throw new Error("Room store changed while taking the read-only snapshot; retry resume-status");
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
 }
 
 export function listRawRooms(root = mailboxRoot()) {

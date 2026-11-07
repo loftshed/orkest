@@ -104,6 +104,39 @@ class HerdrMetadataTests(unittest.TestCase):
         )
         progress.report(self.base, peer, goal="Inspect changes", task="Review current changes", stage="working")
 
+    def test_attested_native_session_supplies_coordinator_role_and_terminal_metadata(self):
+        self.agent_session = "native-visible-session"
+        mailbox.annotate(self.base, self.session, nativeSession=self.agent_session, nativeSessions=[self.agent_session])
+        room_store.put_room(
+            self.base,
+            {
+                "schema": "agent-executor.room.v1",
+                "id": "native-room",
+                "cwd": str(self.home),
+                "machine": socket.gethostname(),
+                "swarm": {"maxAgents": 12, "maxDepth": 3},
+                "agents": [],
+                "conductor": {
+                    "engine": "codex",
+                    "session": {
+                        "id": self.agent_session,
+                        "engine": "codex",
+                        "machine": socket.gethostname(),
+                        "cwd": str(self.home),
+                    },
+                },
+            },
+        )
+        self.assertEqual(
+            agent_terminal._resolve_structural_role(self.base, self.agent_session, "codex", None),
+            ("native-room", "Coordinator", True),
+        )
+        agent_terminal.bind(self.agent_session, "codex", {"cwd": str(self.home)}, base=self.base, force=True)
+        self.assertEqual(
+            self.metadata.get("w1:p1"), {"title": "snorfle · working", "display_agent": "Coordinator · fixture-model"}
+        )
+        self.assertEqual(room_store.read_room(self.base, "native-room")["herdrCoordinatorPaneId"], "w1:p1")
+
     def test_same_display_text_is_published_again_when_a_session_moves_to_another_pane(self):
         self.assertTrue(agent_terminal.bind(self.session, "codex", {"model": "fixture-model"}))
         os.environ["HERDR_PANE_ID"] = "w1:p2"

@@ -120,7 +120,8 @@ def bound_rooms(base: Path, peer: dict[str, Any]) -> list[tuple[dict[str, Any], 
                     continue
                 binding = member["session"]
                 if (
-                    binding.get("id") == peer["session"]
+                    (resolved := mailbox.room_session_peer(base, room, member))
+                    and resolved["session"] == peer["session"]
                     and binding.get("engine") == engine
                     and binding.get("machine") == socket.gethostname()
                     and isinstance(binding.get("cwd"), str)
@@ -183,10 +184,16 @@ def identity(
 ) -> dict[str, Any] | None:
     base = base if base is not None else mailbox.root()
     try:
-        peer = mailbox.load(mailbox.peer_path(base, session))
+        peer = mailbox.session_peer(
+            base,
+            session,
+            harness=harness,
+            cwd=payload.get("cwd") if isinstance(payload, dict) else None,
+            allow_inactive_exact=True,
+        )
     except mailbox.MailboxError:
         return None
-    if not mailbox.valid_peer(peer) or peer["session"] != session or (harness and peer["harness"] != harness):
+    if not mailbox.valid_peer(peer):
         return None
     name = peer["name"]
     if not name or not all(character.isprintable() for character in name):

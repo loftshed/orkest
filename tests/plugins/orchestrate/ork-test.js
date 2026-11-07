@@ -6,7 +6,7 @@ import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { HALL_HELP, hallCommand } from "../../../plugins/orchestrate/bin/hall.mjs";
-import { coordinatorArguments } from "../../../plugins/orchestrate/bin/ork.mjs";
+import { coordinatorArguments, resumeArguments } from "../../../plugins/orchestrate/bin/ork.mjs";
 import {
   extractIssueArchetype,
   extractTaskSpec,
@@ -39,6 +39,52 @@ const cli = path.resolve("plugins/orchestrate/bin/ork.mjs");
 const temporary = [];
 
 describe("coordinator launch arguments", () => {
+  it.each([
+    [
+      "claude",
+      ["--cwd", "/checkout", "--resume", "old-session"],
+      ["--resume-swarm", "--cwd", "/checkout", "--", "claude", "--resume", "old-session"],
+    ],
+    [
+      "codex",
+      ["--cwd", "/checkout", "--model", "gpt", "resume", "old-session"],
+      [
+        "--resume-swarm",
+        "--cwd",
+        "/checkout",
+        "--",
+        "codex",
+        "--model",
+        "gpt",
+        "resume",
+        "old-session",
+      ],
+    ],
+    [
+      "agy",
+      ["--harness-arg=--conversation", "--harness-arg=old-session"],
+      ["--resume-swarm", "--", "agy", "--conversation", "old-session"],
+    ],
+    [
+      "opencode",
+      ["--harness-arg=-s", "--harness-arg=old-session"],
+      ["--resume-swarm", "--", "opencode", "-s", "old-session"],
+    ],
+    [
+      "claude",
+      ["--session-id=old-session"],
+      ["--resume-swarm", "--", "claude", "--session-id=old-session"],
+    ],
+    [
+      "agy",
+      ["--session", "old-session"],
+      ["--resume-swarm", "--", "agy", "--session", "old-session"],
+    ],
+    ["claude", ["-c"], ["--resume-swarm", "--", "claude", "-c"]],
+    ["codex", ["-c", "model=gpt", "-s", "workspace-write"], null],
+  ])("routes native resume options for %s before room creation", (engine, args, expected) => {
+    expect(resumeArguments(engine, args)).toEqual(expected);
+  });
   it.each([
     ["codex", ["--yolo"], ["--yolo", "the coordinator prompt"]],
     [

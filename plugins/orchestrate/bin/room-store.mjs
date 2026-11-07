@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 
 import { deleteRoom, listRawRooms, readRawRoom, updateRawRoom } from "../lib/horde-room.mjs";
+import { rebindSession } from "../lib/rooms.mjs";
 
 const { positionals, values } = parseArgs({
   allowPositionals: true,
@@ -63,29 +64,7 @@ async function run() {
       const { member: memberId, session } = payload();
       if (typeof memberId !== "string" || typeof session !== "string" || !session)
         throw new Error("Member and session are required");
-      return updateRawRoom(
-        id,
-        (room) => {
-          const member =
-            memberId === "conductor"
-              ? room.conductor
-              : room.agents?.find((agent) => agent.id === memberId);
-          if (!member) throw Object.assign(new Error("Room member not found"), { code: "ENOENT" });
-          if (member.session && typeof member.session === "object") {
-            const previous = member.session.id;
-            if (typeof previous === "string" && previous && previous !== session) {
-              const history = Array.isArray(member.previousSessions)
-                ? member.previousSessions.filter((item) => typeof item === "string")
-                : [];
-              if (!history.includes(previous)) history.push(previous);
-              member.previousSessions = history.slice(-16);
-            }
-            member.session.id = session;
-          }
-          return room;
-        },
-        { root },
-      );
+      return rebindSession(id, memberId, session, root);
     }
     case "delete": {
       const text = readFileSync(0, "utf8").trim();

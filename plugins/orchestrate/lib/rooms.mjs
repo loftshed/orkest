@@ -16,6 +16,7 @@ import {
   readRoom,
   refreshMemberWorktrees,
   resolveWorktreeMarkerPath,
+  updateRawRoom,
   updateRoom,
   validateRoom,
   WORKFORCE_ROLES,
@@ -615,21 +616,40 @@ export async function growRoom(
 export async function bindSession(
   id,
   memberId,
-  { session, engine, cwd, workforceRole, root = mailboxRoot() },
+  { session, engine, cwd, workforceRole, repairOnly = false, root = mailboxRoot() },
 ) {
   if (!session || !["claude", "codex", "agy", "opencode"].includes(engine))
     throw new Error("Session binding requires a session ID and supported engine");
   const resolvedCwd = cwd ? await realpath(cwd) : undefined;
   return updateRoom(
     id,
-    (room) => {
+    async (room) => {
       const member = memberOf(room, memberId);
+      if (!isLocalSessionBinding(room, member))
+        throw new Error("The target binding belongs to a different machine");
       if (member.engine && member.engine !== engine)
         throw new Error("Session engine differs from room member");
-      if (member.role === "lead" && member.session && member.session.id !== session)
-        throw new Error(
-          "This lead already has a native session; continue supervising that session",
-        );
+      const owner = await resolveRoomSessionPeer(room, root, member);
+      const peer =
+        owner && sessionIdentities(owner).includes(session)
+          ? owner
+          : await resolveSessionPeer(session, root, {
+              engine,
+              cwd: resolvedCwd || member.cwd || room.cwd,
+            });
+      const replacing = member.session && member.session.id !== (peer?.session || session);
+      if (repairOnly || (replacing && (memberId === "conductor" || member.role === "lead"))) {
+        if (!peer || !(await ownsSessionBinding(room, peer, root, member)))
+          throw new Error(
+            "This lead already has a native session; repair requires its live attested peer",
+          );
+        if (room.authority && replacing)
+          throw new Error(
+            "An authority-managed room requires its existing leadership handoff workflow",
+          );
+      }
+      session = peer?.session || session;
+      rememberSession(member, session);
       if (resolvedCwd) member.cwd = resolvedCwd;
       if (workforceRole !== undefined) {
         const normalized = normalizeWorkforceRole(workforceRole);
@@ -1022,11 +1042,13 @@ export async function observeRoom(idOrRoom, options = {}) {
     const snapshot = snapshots[key];
     const sessionId =
       member.session?.id || member.nativeHandle || member.mailboxSession || member.id;
-    const peerKey = sessionId ? sessionKey(sessionId) : null;
-    const peer = peerKey
-      ? await readOptionalJson(path.join(root, "peers", `${peerKey}.json`), 64 * 1024)
+    const peer = sessionId
+      ? await resolveSessionPeer(sessionId, root, {
+          engine: member.engine,
+          cwd: member.session?.cwd || member.cwd || room.cwd,
+        })
       : null;
-    if (member !== room.conductor && peer && peer.session === sessionId && peer.accountHome) {
+    if (member !== room.conductor && peer && peer.accountHome) {
       const memberCwd = member.cwd || room.cwd;
       const parentCwd = room.conductor?.cwd || room.cwd;
       member.activitySource = {
@@ -1951,6 +1973,152 @@ export function isPeerLive(peer, nowMs = Date.now()) {
   return alive ?? ageMs <= UNKNOWN_PID_TTL_MS;
 }
 
+/** Native IDs are recorded by hooks; display aliases never establish session ownership. */
+export function sessionIdentities(peer) {
+  return [
+    peer?.session,
+    peer?.nativeSession,
+    ...(Array.isArray(peer?.nativeSessions) ? peer.nativeSessions : []),
+  ].filter((id) => typeof id === "string" && sessionKey(id));
+}
+
+async function sessionPeerCandidates(
+  session,
+  root = mailboxRoot(),
+  { engine, cwd, now = Date.now() } = {},
+) {
+  const key = sessionKey(session);
+  if (!key) return [];
+  const expectedCwd = cwd ? await resolveCwd(cwd) : undefined;
+  const harness = engine === "agy" ? "gemini" : engine;
+  const eligible = async (peer, isAlias = false) =>
+    isValidPeer(peer) &&
+    isPeerLive(peer, now) &&
+    (!peer.machine || peer.machine === hostname()) &&
+    (!harness || peer.harness === harness) &&
+    (!isAlias ||
+      !(peer.isSubagent || peer.delegatedRun || peer.run || peer.session.startsWith("run-"))) &&
+    (!expectedCwd || (await resolveCwd(peer.checkout || peer.cwd)) === expectedCwd);
+  const direct = await readOptionalJson(path.join(root, "peers", `${key}.json`), 64 * 1024);
+  if (direct?.session === session && (await eligible(direct))) return [direct];
+  let files;
+  try {
+    files = await readdir(path.join(root, "peers"));
+  } catch (error) {
+    if (error.code === "ENOENT") return [];
+    throw error;
+  }
+  const matches = [];
+  for (const file of files) {
+    if (!file.endsWith(".json")) continue;
+    const peer = await readOptionalJson(path.join(root, "peers", file), 64 * 1024);
+    if (sessionIdentities(peer).includes(session) && (await eligible(peer, true)))
+      matches.push(peer);
+  }
+  return matches;
+}
+
+export async function resolveSessionPeer(session, root = mailboxRoot(), options = {}) {
+  const matches = await sessionPeerCandidates(session, root, options);
+  return matches.length === 1 ? matches[0] : null;
+}
+
+export function roomOwnerSessions(room, member = room.conductor) {
+  return [
+    ...new Set(
+      [
+        member?.session?.id,
+        member?.mailboxSession,
+        ...(member === room.conductor || member?.id === "conductor"
+          ? [room.promotion?.session]
+          : []),
+        ...(Array.isArray(member?.previousSessions) ? member.previousSessions : []),
+      ].filter((id) => typeof id === "string" && id),
+    ),
+  ];
+}
+
+export function isLocalSessionBinding(room, member = room.conductor) {
+  return (
+    (!room.machine || room.machine === hostname()) &&
+    (!member?.session?.machine || member.session.machine === hostname())
+  );
+}
+
+async function roomSessionPeers(room, root, member = room.conductor) {
+  if (!isLocalSessionBinding(room, member)) return [];
+  const ids = roomOwnerSessions(room, member);
+  const options = {
+    engine: member?.session?.engine || member?.engine,
+    cwd: member?.session?.cwd || member?.cwd || room.cwd,
+  };
+  const candidates = new Map();
+  for (const id of ids) {
+    const matches = await sessionPeerCandidates(id, root, options);
+    const recorded = matches.find((owner) => owner.session === id);
+    if (recorded) return [recorded];
+    for (const owner of matches) candidates.set(owner.session, owner);
+  }
+  // Room-recorded mailbox keys outrank unbound native-ID claimants. Without
+  // that evidence, retain every claimant so ambiguity cannot authorize repair.
+  return candidates.values().toArray();
+}
+
+export async function resolveRoomSessionPeer(room, root = mailboxRoot(), member = room.conductor) {
+  const peers = await roomSessionPeers(room, root, member);
+  return peers.length === 1 ? peers[0] : null;
+}
+
+export async function hasOtherLiveOwner(room, peer, root, member = room.conductor) {
+  return (await roomSessionPeers(room, root, member)).some(
+    (owner) => owner.session !== peer.session,
+  );
+}
+
+export async function ownsSessionBinding(room, peer, root, member = room.conductor) {
+  const owner = await resolveRoomSessionPeer(room, root, member);
+  return Boolean(owner && owner.session === peer.session);
+}
+
+export function rememberSession(member, session, additional = []) {
+  const previous = [member.session?.id, ...additional].filter(
+    (id) => typeof id === "string" && id && id !== session,
+  );
+  if (previous.length === 0) return;
+  const history = [...new Set([...(member.previousSessions || []), ...previous])];
+  member.previousSessions = history.length > 32 ? [history[0], ...history.slice(-31)] : history;
+}
+
+/** Hook /clear repair shares the same ownership guard as explicit binding. */
+export async function rebindSession(id, memberId, session, root = mailboxRoot()) {
+  return updateRawRoom(
+    id,
+    async (room) => {
+      const member = memberOf(room, memberId);
+      if (!isLocalSessionBinding(room, member))
+        throw new Error("The target binding belongs to a different machine");
+      const owner = await resolveRoomSessionPeer(room, root, member);
+      const peer =
+        owner && sessionIdentities(owner).includes(session)
+          ? owner
+          : await resolveSessionPeer(session, root, {
+              engine: member.engine,
+              cwd: member.session?.cwd || member.cwd || room.cwd,
+            });
+      if (!peer || !(await ownsSessionBinding(room, peer, root, member)))
+        throw new Error("Repair requires the live attested owner of this binding");
+      if (room.authority && member.session?.id !== peer.session)
+        throw new Error(
+          "An authority-managed room requires its existing leadership handoff workflow",
+        );
+      rememberSession(member, peer.session);
+      if (member.session) member.session.id = peer.session;
+      return room;
+    },
+    { root },
+  );
+}
+
 function repositoryName(peer) {
   const raw = peer.repo || peer.checkout || peer.cwd || "";
   const base = path.basename(raw);
@@ -2018,13 +2186,15 @@ export async function interactiveProgress(room, root = mailboxRoot()) {
       binding.machine !== currentHost
     )
       continue;
-    const key = sessionKey(binding.id);
-    if (!key) continue;
-    const expectedHarness = binding.engine === "agy" ? "gemini" : binding.engine;
-    const peer = await readOptionalJson(path.join(root, "peers", `${key}.json`), 64 * 1024);
-    if (!isValidPeer(peer) || peer.session !== binding.id) continue;
-    if (expectedHarness && peer.harness !== expectedHarness) continue;
-    if (!isPeerLive(peer)) continue;
+    let peer = await resolveRoomSessionPeer(room, root, member);
+    // Exact conductor keys can retain their established room after a directory move.
+    // Native alias searches remain confined to the bound checkout.
+    if (!peer && member.id === "conductor" && isLocalSessionBinding(room, member)) {
+      const exact = await resolveSessionPeer(binding.id, root, { engine: binding.engine });
+      if (exact?.session === binding.id) peer = exact;
+    }
+    if (!peer) continue;
+    const key = sessionKey(peer.session);
     const expectedCwd = await resolveCwd(binding.cwd || member.cwd || room.cwd);
     const peerCwd = await resolveCwd(peer.checkout || peer.cwd);
     const isBoundConductor =

@@ -2,6 +2,7 @@ import path from "node:path";
 import { parseArgs } from "node:util";
 
 import { loadPresets, mailboxRoot, parseTeam, updateRoom } from "../lib/horde-room.mjs";
+import { resumeRoomStatus } from "../lib/room-resume.mjs";
 import {
   assignWorkforceRole,
   bindSession,
@@ -22,6 +23,7 @@ import { promoteSession } from "../lib/session-promotion.mjs";
 
 export const ROOMS_HELP = `ork rooms list [--json]
 ork hall promote [--session ID] [--room ID] [--objective TEXT] [--cwd PATH]   (adopt this live conversation as coordinator)
+ork rooms resume-status [--cwd PATH] [--json]   (read-only resume history)
 ork rooms show --room ID [--json]
 ork rooms create --team TEAM [--group GROUP] [--title TITLE] [--cwd PATH] [--id ID] [--authority TEAM_ID]
 ork rooms add --room ID --team TEAM [--parent conductor|MEMBER] [--role ROLE] [--cwd PATH]
@@ -140,6 +142,10 @@ export async function roomsCommand(
         },
         { root, env, ...(refreshTerminal && { refresh: refreshTerminal }) },
       );
+      break;
+    }
+    case "resume-status": {
+      result = await resumeRoomStatus({ root, cwd: values.cwd });
       break;
     }
     case "list": {

@@ -1592,8 +1592,14 @@ describe("SQLite room persistence", () => {
     await writeFile(
       path.join(root, "peers", "coord-null-herdr.json"),
       JSON.stringify({
-        schema: "orchestrate.peer.v1",
+        schema: "agent-executor.peer.v1",
         session: "coord-null-herdr",
+        name: "coordinator",
+        harness: room.conductor.engine,
+        cwd: room.cwd,
+        pid: process.pid,
+        startedAt: new Date().toISOString(),
+        lastSeenAt: new Date().toISOString(),
         herdrPaneId: null,
         herdrWorkspaceId: null,
         herdrEndpoint: null,

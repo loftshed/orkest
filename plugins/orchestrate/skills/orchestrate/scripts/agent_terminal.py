@@ -143,7 +143,7 @@ def refresh_parent_pane(base: Path, parent_session: str | None) -> bool:
         return False
     try:
         mailbox.session_key(parent_session)
-        peer_data = mailbox.load(mailbox.peer_path(base, parent_session))
+        peer_data = mailbox.session_peer(base, parent_session)
     except (mailbox.MailboxError, OSError):
         return False
     if not isinstance(peer_data, dict) or peer_data.get("isSubagent") or peer_data.get("delegatedRun"):
@@ -157,7 +157,7 @@ def refresh_parent_pane(base: Path, parent_session: str | None) -> bool:
     workspace_id = _clean_text(peer_data.get("herdrWorkspaceId")) or None
     return _sync_herdr_pane(
         base=base,
-        session=parent_session,
+        session=peer_data["session"],
         harness=harness,
         peer_data=peer_data,
         payload={},
@@ -182,6 +182,8 @@ def _resolve_structural_role(
     with contextlib.suppress(Exception):
         import agent_statusline_tmux
 
+        if not isinstance(peer_data, dict):
+            peer_data = mailbox.session_peer(base, session, harness=harness)
         peer_cwd = peer_data.get("checkout") or peer_data.get("cwd") if isinstance(peer_data, dict) else None
         aliases = (
             peer_data.get("aliases")
@@ -211,7 +213,7 @@ def _resolve_structural_role(
             )
             if not peer_cwd or not bound_cwd or Path(peer_cwd).resolve() == Path(bound_cwd).resolve():
                 matched_room_id = matched["id"]
-                if matched.get("_matchedSessionId") == session:
+                if matched.get("_matchedSessionId") in mailbox.native_session_ids(peer_data):
                     is_exact_conductor = member_id == "conductor"
                     structural_role = "Coordinator" if is_exact_conductor else "Lead"
     return matched_room_id, structural_role, is_exact_conductor
@@ -298,7 +300,9 @@ def _sync_herdr_pane(
             and binary
         ):
             herdr_env = {**os.environ, "HERDR_SOCKET_PATH": endpoint}
-            occupant = verified_agent(binary, pane_id, {session}, env=herdr_env, timeout=0.5)
+            occupant = verified_agent(
+                binary, pane_id, mailbox.native_session_ids(peer_data), env=herdr_env, timeout=0.5
+            )
             ref = occupant["agent_session"] if occupant else {}
             if occupant and isinstance(ref.get("agent"), str) and ref["agent"]:
                 resolved_pane = occupant["pane_id"]
@@ -393,9 +397,10 @@ def bind(
         base = base or mailbox.root()
         peer_data: dict[str, Any] | None = None
         with contextlib.suppress(Exception):
-            loaded = mailbox.load(mailbox.peer_path(base, session))
+            loaded = mailbox.session_peer(base, session, harness=harness, cwd=payload.get("cwd"))
             if isinstance(loaded, dict):
                 peer_data = loaded
+                session = loaded["session"]
         if isinstance(peer_data, dict) and (peer_data.get("isSubagent") or peer_data.get("delegatedRun")):
             return False
         matched_room_id, structural_role, is_exact_conductor = _resolve_structural_role(
