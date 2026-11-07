@@ -1716,14 +1716,14 @@ def native_session_ids(peer: dict[str, Any] | None) -> set[str]:
     }
 
 
-def session_peer(
+def _session_peer_candidates(
     base: Path,
     session: str,
     *,
     harness: str | None = None,
     cwd: str | None = None,
     allow_inactive_exact: bool = False,
-) -> dict[str, Any] | None:
+) -> list[dict[str, Any]]:
     """Resolve an exact mailbox key first, then one live interactive native identity."""
     harness = "gemini" if harness == "agy" else harness
 
@@ -1748,15 +1748,78 @@ def session_peer(
     try:
         direct = load(peer_path(base, session))
     except MailboxError:
-        return None
+        return []
     if eligible(direct) and direct["session"] == session:
-        return direct
+        return [direct]
     matches = [
         peer
         for file in (base / "peers").glob("*.json")
         if eligible(peer := load(file), True) and session in native_session_ids(peer)
     ]
+    return matches
+
+
+def session_peer(
+    base: Path,
+    session: str,
+    *,
+    harness: str | None = None,
+    cwd: str | None = None,
+    allow_inactive_exact: bool = False,
+) -> dict[str, Any] | None:
+    """Resolve an exact key or a unique eligible native identity."""
+    matches = _session_peer_candidates(
+        base, session, harness=harness, cwd=cwd, allow_inactive_exact=allow_inactive_exact
+    )
     return matches[0] if len(matches) == 1 else None
+
+
+def local_session_binding(room: dict[str, Any], member: dict[str, Any]) -> bool:
+    host = socket.gethostname()
+    return (not room.get("machine") or room["machine"] == host) and (
+        not (member.get("session") or {}).get("machine") or member["session"]["machine"] == host
+    )
+
+
+def room_owner_sessions(room: dict[str, Any], member: dict[str, Any]) -> list[str]:
+    return list(
+        dict.fromkeys(
+            value
+            for value in [
+                (member.get("session") or {}).get("id"),
+                member.get("mailboxSession"),
+                (room.get("promotion") or {}).get("session")
+                if member is room.get("conductor") or member.get("id") == "conductor"
+                else None,
+                *(member.get("previousSessions") or []),
+            ]
+            if isinstance(value, str) and value
+        )
+    )
+
+
+def room_session_peers(base: Path, room: dict[str, Any], member: dict[str, Any]) -> list[dict[str, Any]]:
+    """Prefer live mailbox keys recorded in the room; otherwise retain all claimants."""
+    if not local_session_binding(room, member):
+        return []
+    binding = member.get("session") or {}
+    candidates = {}
+    for sid in room_owner_sessions(room, member):
+        for owner in _session_peer_candidates(
+            base,
+            sid,
+            harness=binding.get("engine") or member.get("engine"),
+            cwd=binding.get("cwd") or member.get("cwd") or room.get("cwd"),
+        ):
+            candidates[owner["session"]] = owner
+            if owner["session"] == sid:
+                return [owner]
+    return list(candidates.values())
+
+
+def room_session_peer(base: Path, room: dict[str, Any], member: dict[str, Any]) -> dict[str, Any] | None:
+    peers = room_session_peers(base, room, member)
+    return peers[0] if len(peers) == 1 else None
 
 
 def _room_has_live_member(base: Path, room: dict[str, Any]) -> bool:
@@ -1764,21 +1827,7 @@ def _room_has_live_member(base: Path, room: dict[str, Any]) -> bool:
     for member in members:
         if not isinstance(member, dict):
             continue
-        session = member.get("session")
-        if (
-            isinstance(session, dict)
-            and isinstance(session.get("id"), str)
-            and session_peer(
-                base,
-                session["id"],
-                harness=session.get("engine"),
-                cwd=session.get("cwd") or member.get("cwd") or room.get("cwd"),
-            )
-        ):
-            return True
-        if isinstance(member.get("mailboxSession"), str) and session_peer(
-            base, member["mailboxSession"], harness=member.get("engine"), cwd=member.get("cwd") or room.get("cwd")
-        ):
+        if room_session_peers(base, room, member):
             return True
         pid = member.get("pid")
         if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 and pid_alive(pid):

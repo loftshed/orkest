@@ -120,11 +120,7 @@ def bound_rooms(base: Path, peer: dict[str, Any]) -> list[tuple[dict[str, Any], 
                     continue
                 binding = member["session"]
                 if (
-                    (
-                        resolved := mailbox.session_peer(
-                            base, binding.get("id", ""), harness=peer["harness"], cwd=str(checkout)
-                        )
-                    )
+                    (resolved := mailbox.room_session_peer(base, room, member))
                     and resolved["session"] == peer["session"]
                     and binding.get("engine") == engine
                     and binding.get("machine") == socket.gethostname()

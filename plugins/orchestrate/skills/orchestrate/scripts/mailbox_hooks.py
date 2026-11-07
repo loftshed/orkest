@@ -916,6 +916,16 @@ def swarm_coordinator_context(
     _record_native_swarm_identity(base, me)
     room_id = os.environ.get("ORKEST_SWARM_ROOM", "").strip()
     if is_turn_start and os.environ.get("ORKEST_RESUME_SWARM") == "1":
+        # A stale inherited room must not make this new process claim another
+        # live coordinator's terminal or brief. Resume by target in a fresh room.
+        inherited = (
+            room_store.read_room(base, room_id) if re.fullmatch(r"[\w-]{1,80}", room_id, flags=re.ASCII) else None
+        )
+        if isinstance(inherited, dict) and any(
+            owner["session"] != me["session"]
+            for owner in _MB.room_session_peers(base, inherited, inherited.get("conductor") or {})
+        ):
+            os.environ.pop("ORKEST_SWARM_ROOM", None)
         promoted = _promote_resumed_coordinator(base, me)
         if not promoted:
             return ""
@@ -988,6 +998,8 @@ def swarm_coordinator_context(
     if not isinstance(loaded_room, dict) or not loaded_room.get("swarm"):
         return ""
     room = loaded_room
+    if not _MB.local_session_binding(room, room.get("conductor") or {}):
+        return ""
     engine = "agy" if me["harness"] == "gemini" else me["harness"]
     conductor = room.get("conductor") or {}
     candidate_ids = _MB.native_session_ids(me)
@@ -998,7 +1010,13 @@ def swarm_coordinator_context(
                 if not isinstance(agent, dict) or agent.get("role") != "lead" or agent.get("engine") != engine:
                     continue
                 lead_sid = (agent.get("session") or {}).get("id") if isinstance(agent.get("session"), dict) else None
-                if isinstance(lead_sid, str) and lead_sid in candidate_ids:
+                owner = _MB.room_session_peer(base, room, agent)
+                if (
+                    isinstance(lead_sid, str)
+                    and lead_sid in candidate_ids
+                    and owner
+                    and owner["session"] == me["session"]
+                ):
                     member_id = str(agent.get("id") or "")
                     if lead_sid != me["session"] and member_id:
                         import agent_statusline_tmux
@@ -1006,8 +1024,9 @@ def swarm_coordinator_context(
                         rebound = agent_statusline_tmux.rebind_session_swarm_room(
                             base, room_id, member_id, me["session"]
                         )
-                        if isinstance(rebound, dict):
-                            room = rebound
+                        if not isinstance(rebound, dict):
+                            return ""
+                        room = rebound
                     instance_key = (
                         f"{room_id}:{me.get('terminalServer') or me.get('herdrPaneId') or me.get('pid') or ''}"
                     )
@@ -1020,6 +1039,10 @@ def swarm_coordinator_context(
                     return _swarm_next_advisor(base, me, room, room_id, member_id) if is_turn_start else ""
         return ""
 
+    if bound_session:
+        owner = _MB.room_session_peer(base, room, conductor)
+        if not owner or owner["session"] != me["session"]:
+            return ""
     if bound_session and bound_session != me["session"] and bound_session in candidate_ids:
         import agent_statusline_tmux
 

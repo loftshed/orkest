@@ -20,11 +20,10 @@ def snapshot(room: dict, base: Path) -> dict:
             binding = {"id": member["mailboxSession"], "engine": member["engine"], "machine": room.get("machine")}
         if not binding:
             continue
-        session = binding["id"]
         harness = {"agy": "gemini"}.get(binding["engine"], binding["engine"])
         try:
             expected_cwd = Path(binding.get("cwd") or member.get("cwd") or room["cwd"]).resolve()
-            peer = mailbox.session_peer(base, session, harness=harness, cwd=str(expected_cwd))
+            peer = mailbox.room_session_peer(base, room, member)
             peer_cwd = (
                 Path(peer.get("checkout") or peer["cwd"]).resolve()
                 if isinstance(peer, dict) and (peer.get("checkout") or peer.get("cwd"))

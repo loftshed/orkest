@@ -119,23 +119,13 @@ def find_session_swarm_room(
             conductor = room.get("conductor")
             if isinstance(conductor, dict):
                 c_engine = conductor.get("engine")
-                c_session = conductor.get("session")
-                bound_id = c_session.get("id") if isinstance(c_session, dict) else None
-                mailbox_sid = (
-                    conductor.get("mailboxSession") if isinstance(conductor.get("mailboxSession"), str) else None
-                )
-                owner_ids = [
-                    bound_id,
-                    mailbox_sid,
-                    (room.get("promotion") or {}).get("session"),
-                    *(conductor.get("previousSessions") or []),
-                ]
-                # Recorded live ownership outranks any other peer's native identity.
-                if peer and any(
-                    (owner := mailbox.session_peer(base, owner_id, harness=harness, cwd=cwd))
-                    and owner["session"] != peer["session"]
-                    for owner_id in owner_ids
-                    if isinstance(owner_id, str)
+                if not mailbox.local_session_binding(room, conductor):
+                    continue
+                owner_ids = mailbox.room_owner_sessions(room, conductor)
+                # A dead historical ID never outranks a room's current live owner.
+                if any(
+                    not peer or owner["session"] != peer["session"]
+                    for owner in mailbox.room_session_peers(base, room, conductor)
                 ):
                     continue
                 for sid in owner_ids:
@@ -157,6 +147,11 @@ def find_session_swarm_room(
                     a_session = agent.get("session")
                     bound_id = a_session.get("id") if isinstance(a_session, dict) else None
                     mailbox_sid = agent.get("mailboxSession") if isinstance(agent.get("mailboxSession"), str) else None
+                    if not mailbox.local_session_binding(room, agent) or any(
+                        not peer or owner["session"] != peer["session"]
+                        for owner in mailbox.room_session_peers(base, room, agent)
+                    ):
+                        continue
                     for sid in (bound_id, mailbox_sid, *(agent.get("previousSessions") or [])):
                         if (
                             isinstance(sid, str)
@@ -1292,7 +1287,30 @@ def main(arguments: list[str]) -> int:
             )
             matched = find_session_swarm_room(base_dir, resumed_session, harness=harness, cwd=cwd, aliases=aliases)
             if isinstance(matched, dict) and isinstance(matched.get("id"), str):
-                room = matched["id"]
+                member = (
+                    matched.get("conductor")
+                    if matched.get("_matchedMemberId") == "conductor"
+                    else next(
+                        (
+                            agent
+                            for agent in matched.get("agents", [])
+                            if agent.get("id") == matched.get("_matchedMemberId")
+                        ),
+                        None,
+                    )
+                )
+                # This lookup precedes registration of a new process. Even an
+                # exact resume target is unavailable while its owner is live.
+                if member and not mailbox.room_session_peers(base_dir, matched, member):
+                    room = matched["id"]
+        if resume_swarm and room:
+            base_dir = mailbox.root()
+            selected = room_store.read_room(base_dir, room)
+            if isinstance(selected, dict) and (
+                not mailbox.local_session_binding(selected, selected.get("conductor") or {})
+                or mailbox.room_session_peers(base_dir, selected, selected.get("conductor") or {})
+            ):
+                room = None
         if herdr_active:
             import herdr_swarm_restore as restoration
 
@@ -1303,6 +1321,7 @@ def main(arguments: list[str]) -> int:
             environment.pop("HERDR_AGENT", None)
             environment["ORKEST_TERMINAL_HARNESS"] = harness
             if resume_swarm:
+                environment.pop("ORKEST_SWARM_ROOM", None)
                 environment["ORKEST_RESUME_SWARM"] = "1"
                 if resumed_session:
                     environment["ORKEST_RESUME_TARGET"] = resumed_session
@@ -1421,6 +1440,7 @@ def main(arguments: list[str]) -> int:
     environment["ORKEST_TERMINAL_SERVER"] = socket
     environment["ORKEST_TERMINAL_HARNESS"] = harness
     if resume_swarm:
+        environment.pop("ORKEST_SWARM_ROOM", None)
         environment["ORKEST_RESUME_SWARM"] = "1"
         if resumed_session:
             environment["ORKEST_RESUME_TARGET"] = resumed_session

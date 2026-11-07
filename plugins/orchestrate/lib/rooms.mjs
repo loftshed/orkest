@@ -625,12 +625,18 @@ export async function bindSession(
     id,
     async (room) => {
       const member = memberOf(room, memberId);
+      if (!isLocalSessionBinding(room, member))
+        throw new Error("The target binding belongs to a different machine");
       if (member.engine && member.engine !== engine)
         throw new Error("Session engine differs from room member");
-      const peer = await resolveSessionPeer(session, root, {
-        engine,
-        cwd: resolvedCwd || member.cwd || room.cwd,
-      });
+      const owner = await resolveRoomSessionPeer(room, root, member);
+      const peer =
+        owner && sessionIdentities(owner).includes(session)
+          ? owner
+          : await resolveSessionPeer(session, root, {
+              engine,
+              cwd: resolvedCwd || member.cwd || room.cwd,
+            });
       const replacing = member.session && member.session.id !== (peer?.session || session);
       if (repairOnly || (replacing && (memberId === "conductor" || member.role === "lead"))) {
         if (!peer || !(await ownsSessionBinding(room, peer, root, member)))
@@ -1931,13 +1937,13 @@ export function sessionIdentities(peer) {
   ].filter((id) => typeof id === "string" && sessionKey(id));
 }
 
-export async function resolveSessionPeer(
+async function sessionPeerCandidates(
   session,
   root = mailboxRoot(),
   { engine, cwd, now = Date.now() } = {},
 ) {
   const key = sessionKey(session);
-  if (!key) return null;
+  if (!key) return [];
   const expectedCwd = cwd ? await resolveCwd(cwd) : undefined;
   const harness = engine === "agy" ? "gemini" : engine;
   const eligible = async (peer, isAlias = false) =>
@@ -1949,12 +1955,12 @@ export async function resolveSessionPeer(
       !(peer.isSubagent || peer.delegatedRun || peer.run || peer.session.startsWith("run-"))) &&
     (!expectedCwd || (await resolveCwd(peer.checkout || peer.cwd)) === expectedCwd);
   const direct = await readOptionalJson(path.join(root, "peers", `${key}.json`), 64 * 1024);
-  if (direct?.session === session && (await eligible(direct))) return direct;
+  if (direct?.session === session && (await eligible(direct))) return [direct];
   let files;
   try {
     files = await readdir(path.join(root, "peers"));
   } catch (error) {
-    if (error.code === "ENOENT") return null;
+    if (error.code === "ENOENT") return [];
     throw error;
   }
   const matches = [];
@@ -1964,6 +1970,11 @@ export async function resolveSessionPeer(
     if (sessionIdentities(peer).includes(session) && (await eligible(peer, true)))
       matches.push(peer);
   }
+  return matches;
+}
+
+export async function resolveSessionPeer(session, root = mailboxRoot(), options = {}) {
+  const matches = await sessionPeerCandidates(session, root, options);
   return matches.length === 1 ? matches[0] : null;
 }
 
@@ -1973,38 +1984,64 @@ export function roomOwnerSessions(room, member = room.conductor) {
       [
         member?.session?.id,
         member?.mailboxSession,
-        ...(member === room.conductor ? [room.promotion?.session] : []),
+        ...(member === room.conductor || member?.id === "conductor"
+          ? [room.promotion?.session]
+          : []),
         ...(Array.isArray(member?.previousSessions) ? member.previousSessions : []),
       ].filter((id) => typeof id === "string" && id),
     ),
   ];
 }
 
-export async function hasOtherLiveOwner(room, peer, root, member = room.conductor) {
-  for (const id of roomOwnerSessions(room, member)) {
-    const owner = await resolveSessionPeer(id, root, {
-      engine: member?.engine,
-      cwd: member?.session?.cwd || member?.cwd || room.cwd,
-    });
-    if (owner && owner.session !== peer.session) return true;
+export function isLocalSessionBinding(room, member = room.conductor) {
+  return (
+    (!room.machine || room.machine === hostname()) &&
+    (!member?.session?.machine || member.session.machine === hostname())
+  );
+}
+
+async function roomSessionPeers(room, root, member = room.conductor) {
+  if (!isLocalSessionBinding(room, member)) return [];
+  const ids = roomOwnerSessions(room, member);
+  const options = {
+    engine: member?.session?.engine || member?.engine,
+    cwd: member?.session?.cwd || member?.cwd || room.cwd,
+  };
+  const candidates = new Map();
+  for (const id of ids) {
+    const matches = await sessionPeerCandidates(id, root, options);
+    const recorded = matches.find((owner) => owner.session === id);
+    if (recorded) return [recorded];
+    for (const owner of matches) candidates.set(owner.session, owner);
   }
-  return false;
+  // Room-recorded mailbox keys outrank unbound native-ID claimants. Without
+  // that evidence, retain every claimant so ambiguity cannot authorize repair.
+  return candidates.values().toArray();
+}
+
+export async function resolveRoomSessionPeer(room, root = mailboxRoot(), member = room.conductor) {
+  const peers = await roomSessionPeers(room, root, member);
+  return peers.length === 1 ? peers[0] : null;
+}
+
+export async function hasOtherLiveOwner(room, peer, root, member = room.conductor) {
+  return (await roomSessionPeers(room, root, member)).some(
+    (owner) => owner.session !== peer.session,
+  );
 }
 
 export async function ownsSessionBinding(room, peer, root, member = room.conductor) {
-  if (await hasOtherLiveOwner(room, peer, root, member)) return false;
-  const ids = sessionIdentities(peer);
-  return roomOwnerSessions(room, member).some((id) => ids.includes(id));
+  const owner = await resolveRoomSessionPeer(room, root, member);
+  return Boolean(owner && owner.session === peer.session);
 }
 
 export function rememberSession(member, session, additional = []) {
   const previous = [member.session?.id, ...additional].filter(
     (id) => typeof id === "string" && id && id !== session,
   );
-  if (previous.length > 0)
-    member.previousSessions = [...new Set([...(member.previousSessions || []), ...previous])].slice(
-      -32,
-    );
+  if (previous.length === 0) return;
+  const history = [...new Set([...(member.previousSessions || []), ...previous])];
+  member.previousSessions = history.length > 32 ? [history[0], ...history.slice(-31)] : history;
 }
 
 /** Hook /clear repair shares the same ownership guard as explicit binding. */
@@ -2013,10 +2050,16 @@ export async function rebindSession(id, memberId, session, root = mailboxRoot())
     id,
     async (room) => {
       const member = memberOf(room, memberId);
-      const peer = await resolveSessionPeer(session, root, {
-        engine: member.engine,
-        cwd: member.session?.cwd || member.cwd || room.cwd,
-      });
+      if (!isLocalSessionBinding(room, member))
+        throw new Error("The target binding belongs to a different machine");
+      const owner = await resolveRoomSessionPeer(room, root, member);
+      const peer =
+        owner && sessionIdentities(owner).includes(session)
+          ? owner
+          : await resolveSessionPeer(session, root, {
+              engine: member.engine,
+              cwd: member.session?.cwd || member.cwd || room.cwd,
+            });
       if (!peer || !(await ownsSessionBinding(room, peer, root, member)))
         throw new Error("Repair requires the live attested owner of this binding");
       if (room.authority && member.session?.id !== peer.session)
@@ -2098,13 +2141,10 @@ export async function interactiveProgress(room, root = mailboxRoot()) {
       binding.machine !== currentHost
     )
       continue;
-    let peer = await resolveSessionPeer(binding.id, root, {
-      engine: binding.engine,
-      cwd: binding.cwd || member.cwd || room.cwd,
-    });
+    let peer = await resolveRoomSessionPeer(room, root, member);
     // Exact conductor keys can retain their established room after a directory move.
     // Native alias searches remain confined to the bound checkout.
-    if (!peer && member.id === "conductor") {
+    if (!peer && member.id === "conductor" && isLocalSessionBinding(room, member)) {
       const exact = await resolveSessionPeer(binding.id, root, { engine: binding.engine });
       if (exact?.session === binding.id) peer = exact;
     }

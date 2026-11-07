@@ -11,6 +11,7 @@ import { createRoom, listRawRooms, mailboxRoot, readRoom, updateRoom } from "./h
 import {
   coordinatorBrief,
   hasOtherLiveOwner,
+  isLocalSessionBinding,
   isPeerLive,
   ownsSessionBinding,
   rememberSession,
@@ -154,7 +155,7 @@ export async function promoteSession(
   const resumeTarget = env.ORKEST_RESUME_TARGET;
   const available = (room) => room && !room.closedAt && room.status !== "closed";
   const sameCheckout = async (room) => {
-    if (room.machine && room.machine !== hostname()) return false;
+    if (!isLocalSessionBinding(room)) return false;
     let roomCwd;
     try {
       roomCwd = await realpath(room.cwd);

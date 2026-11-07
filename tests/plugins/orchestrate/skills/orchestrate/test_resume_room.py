@@ -213,24 +213,32 @@ print(json.dumps({'rooms': [r['id'] for r in rooms], 'room': room, 'notice': not
             self.assertIsNone(terminal._find_herdr_peer(base, "dead", "%1"))
 
     def test_live_owner_cannot_be_replaced_by_a_forged_identity_or_resume(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            home = Path(temporary)
-            base = home / "mailbox-v1"
-            mailbox.register(base, session="owner", harness="claude", cwd=temporary, pid=os.getpid())
-            attacker = mailbox.register(base, session="attacker", harness="claude", cwd=temporary, pid=os.getpid())
-            room = self.room(base, home, "unattested-native")
-            room["promotion"] = {"session": "owner"}
-            room["conductor"]["previousSessions"] = ["owner"]
-            room = room_store.put_room(base, room)
-            for field in ("aliases", "nativeSessions"):
+        for field in ("aliases", "nativeSessions"):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
+                home = Path(temporary)
+                base = home / "mailbox-v1"
+                mailbox.register(base, session="owner", harness="claude", cwd=temporary, pid=os.getpid())
+                attacker = mailbox.register(base, session="attacker", harness="claude", cwd=temporary, pid=os.getpid())
+                room = self.room(base, home, "unattested-native")
+                room["promotion"] = {"session": "owner"}
+                room["conductor"]["previousSessions"] = ["owner"]
+                room = room_store.put_room(base, room)
                 attacker = mailbox.annotate(base, "attacker", **{field: ["unattested-native"]})
-                self.assertIsNone(terminal.find_session_swarm_room(base, "attacker", harness="claude", cwd=temporary))
+                self.assertIsNone(
+                    terminal.find_session_swarm_room(
+                        base, "attacker", harness="claude", cwd=temporary, only_room=room["id"]
+                    )
+                )
                 self.assertIsNone(terminal.rebind_session_swarm_room(base, room["id"], "conductor", "attacker"))
                 environment = self.environment(home)
                 environment.update(ORKEST_RESUME_SWARM="1", ORKEST_SWARM_ROOM=room["id"])
                 with patch.dict(os.environ, environment, clear=True):
-                    self.assertEqual(mailbox_hooks.swarm_coordinator_context(base, attacker), "")
+                    notice = mailbox_hooks.swarm_coordinator_context(base, attacker)
+                    self.assertIn("Swarm", notice)
                 self.assertEqual(room_store.read_room(base, room["id"]), room)
+                separate = [r for r in room_store.list_rooms(base) if r["id"] != room["id"]]
+                self.assertEqual(len(separate), 1)
+                self.assertEqual(separate[0]["conductor"]["session"]["id"], "attacker")
 
     def test_launcher_preserves_resume_target_for_hooks_without_the_old_peer(self):
         for harness, command in (
@@ -269,3 +277,166 @@ print(json.dumps({'rooms': [r['id'] for r in rooms], 'room': room, 'notice': not
                 self.assertEqual(captured["env"]["ORKEST_SWARM_ROOM"], "existing-room")
                 self.assertEqual(captured["env"]["ORKEST_RESUME_TARGET"], "old-native")
                 self.assertEqual(captured["env"]["ORKEST_RESUME_SWARM"], "1")
+
+    def test_resume_launch_leaves_live_room_metadata_and_environment_alone(self):
+        for inherited in (False, True):
+            with self.subTest(inherited=inherited), tempfile.TemporaryDirectory() as temporary:
+                home = Path(temporary)
+                base = home / "mailbox-v1"
+                mailbox.register(base, session="live-owner", harness="claude", cwd=temporary, pid=os.getpid())
+                room = self.room(base, home, "live-owner")
+                room.update(herdrCoordinatorPaneId="%1", herdrViewPaneId="%10")
+                room = room_store.put_room(base, room)
+                environment = self.environment(home)
+                environment.update(HERDR_ENV="1", HERDR_PANE_ID="%2", HERDR_SOCKET_PATH=str(home / "fake.sock"))
+                if inherited:
+                    environment["ORKEST_SWARM_ROOM"] = room["id"]
+                captured = {}
+
+                def launch(_binary, argv, env, captured=captured):
+                    captured.update(argv=argv, env=env)
+                    raise SystemExit(0)
+
+                def open_view(*_args, **kwargs):
+                    terminal._update_room_metadata(kwargs["base"], kwargs["room"], herdrViewPaneId="%20")
+                    return "%20"
+
+                with (
+                    patch.dict(os.environ, environment, clear=True),
+                    patch.object(sys.stdin, "isatty", return_value=True),
+                    patch.object(sys.stdout, "isatty", return_value=True),
+                    patch.object(terminal.shutil, "which", return_value="/fake"),
+                    patch.object(terminal, "_open_herdr_swarm_view", side_effect=open_view),
+                    patch.object(terminal.os, "execvpe", side_effect=launch),
+                    patch.object(terminal.os, "chdir"),
+                ):
+                    with self.assertRaises(SystemExit):
+                        terminal.main(["--resume-swarm", "--cwd", temporary, "--", "claude", "--resume", "live-owner"])
+                self.assertEqual(captured["argv"], ["claude", "--resume", "live-owner"])
+                self.assertIsNone(captured["env"].get("ORKEST_SWARM_ROOM"), "launcher exported the live room")
+                self.assertEqual(room_store.read_room(base, room["id"]), room)
+                peer = mailbox.register(base, session="resumer", harness="claude", cwd=temporary, pid=os.getpid())
+                # Simulate a stale inherited room too: the hook must safely use a separate room.
+                child_env = {**captured["env"], "ORKEST_SWARM_ROOM": room["id"], "HERDR_ENV": "0"}
+                with patch.dict(os.environ, child_env, clear=True):
+                    notice = mailbox_hooks.swarm_coordinator_context(base, peer)
+                self.assertIn("Swarm", notice)
+                self.assertEqual(room_store.read_room(base, room["id"]), room)
+                self.assertEqual(len(room_store.list_rooms(base)), 2)
+
+    def test_dead_previous_id_does_not_match_a_room_with_a_live_owner(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            base = home / "mailbox-v1"
+            mailbox.register(base, session="current", harness="claude", cwd=temporary, pid=os.getpid())
+            room = self.room(base, home, "current")
+            room["conductor"]["previousSessions"] = ["dead-original"]
+            room_store.put_room(base, room)
+            self.assertIsNone(terminal.find_session_swarm_room(base, "dead-original", harness="claude", cwd=temporary))
+            self.assertEqual(
+                terminal.find_session_swarm_room(base, "current", harness="claude", cwd=temporary)["id"], room["id"]
+            )
+
+    def test_native_collision_preserves_recorded_owner_and_denies_ambiguous_claimants(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            base = home / "mailbox-v1"
+            owner = mailbox.register(base, session="owner", harness="claude", cwd=temporary, pid=os.getpid())
+            owner = mailbox.annotate(base, "owner", nativeSessions=["native-id"], model="owner-model")
+            attacker = mailbox.register(base, session="attacker", harness="claude", cwd=temporary, pid=os.getpid())
+            attacker = mailbox.annotate(base, "attacker", nativeSessions=["native-id"])
+            room = self.room(base, home)
+            room["promotion"] = {"session": "owner"}
+            room = room_store.put_room(base, room)
+            self.assertEqual([r[0]["id"] for r in agent_statusline.bound_rooms(base, owner)], [room["id"]])
+            self.assertEqual(swarm_status.snapshot(room, base)["conductor"]["model"], "owner-model")
+            self.assertTrue(mailbox._room_has_live_member(base, room))
+            self.assertIsNone(terminal.find_session_swarm_room(base, "attacker", harness="claude", cwd=temporary))
+            for explicit in (False, True):
+                environment = self.environment(home)
+                if explicit:
+                    environment["ORKEST_SWARM_ROOM"] = room["id"]
+                with patch.dict(os.environ, environment, clear=True):
+                    self.assertEqual(mailbox_hooks.swarm_coordinator_context(base, attacker), "")
+            self.assertEqual(room_store.read_room(base, room["id"]), room)
+            del room["promotion"]
+            room = room_store.put_room(base, room)
+            self.assertIsNone(terminal.find_session_swarm_room(base, "attacker", harness="claude", cwd=temporary))
+            self.assertIsNone(terminal.rebind_session_swarm_room(base, room["id"], "conductor", "owner"))
+            self.assertEqual(room_store.read_room(base, room["id"]), room)
+
+    def test_non_owner_cannot_match_or_read_a_live_lead_brief(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            base = home / "mailbox-v1"
+            lead = mailbox.register(base, session="lead-owner", harness="claude", cwd=temporary, pid=os.getpid())
+            attacker = mailbox.register(base, session="attacker", harness="claude", cwd=temporary, pid=os.getpid())
+            attacker = mailbox.annotate(base, "attacker", nativeSessions=["lead-owner"])
+            room = self.room(base, home, "absent-conductor")
+            room["agents"] = [
+                {
+                    **room["conductor"],
+                    "id": "lead-1",
+                    "objective": "Private lead objective",
+                    "session": {
+                        "id": "lead-owner",
+                        "engine": "claude",
+                        "cwd": temporary,
+                        "machine": socket.gethostname(),
+                    },
+                }
+            ]
+            room = room_store.put_room(base, room)
+            self.assertIsNone(terminal.find_session_swarm_room(base, "attacker", harness="claude", cwd=temporary))
+            environment = self.environment(home)
+            environment["ORKEST_SWARM_ROOM"] = room["id"]
+            with patch.dict(os.environ, environment, clear=True):
+                self.assertEqual(mailbox_hooks.swarm_coordinator_context(base, attacker), "")
+                self.assertIn("Private lead objective", mailbox_hooks.swarm_coordinator_context(base, lead))
+            self.assertEqual(room_store.read_room(base, room["id"]), room)
+
+    def test_lead_brief_is_withheld_when_owner_repair_fails(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            base = home / "mailbox-v1"
+            lead = mailbox.register(base, session="lead-owner", harness="claude", cwd=temporary, pid=os.getpid())
+            lead = mailbox.annotate(base, "lead-owner", nativeSessions=["native-lead"])
+            room = self.room(base, home, "absent-conductor")
+            room["agents"] = [
+                {
+                    **room["conductor"],
+                    "id": "lead-1",
+                    "objective": "Private lead objective",
+                    "session": {
+                        "id": "native-lead",
+                        "engine": "claude",
+                        "cwd": temporary,
+                        "machine": socket.gethostname(),
+                    },
+                }
+            ]
+            room = room_store.put_room(base, room)
+            environment = self.environment(home)
+            environment["ORKEST_SWARM_ROOM"] = room["id"]
+            with patch.dict(os.environ, environment, clear=True):
+                with patch.object(terminal, "rebind_session_swarm_room", return_value=None):
+                    self.assertEqual(mailbox_hooks.swarm_coordinator_context(base, lead), "")
+                self.assertIn("Private lead objective", mailbox_hooks.swarm_coordinator_context(base, lead))
+            self.assertEqual(room_store.read_room(base, room["id"])["agents"][0]["session"]["id"], "lead-owner")
+
+    def test_hooks_refuse_foreign_room_and_binding_machines(self):
+        for where in ("room", "binding"):
+            with self.subTest(where=where), tempfile.TemporaryDirectory() as temporary:
+                home = Path(temporary)
+                base = home / "mailbox-v1"
+                peer = mailbox.register(base, session="owner", harness="claude", cwd=temporary, pid=os.getpid())
+                room = self.room(base, home, "owner")
+                target = room if where == "room" else room["conductor"]["session"]
+                target["machine"] = "foreign-host"
+                room = room_store.put_room(base, room)
+                environment = self.environment(home)
+                environment["ORKEST_SWARM_ROOM"] = room["id"]
+                with patch.dict(os.environ, environment, clear=True):
+                    self.assertEqual(mailbox_hooks.swarm_coordinator_context(base, peer), "")
+                self.assertIsNone(terminal.find_session_swarm_room(base, "owner", harness="claude", cwd=temporary))
+                self.assertEqual(room_store.read_room(base, room["id"]), room)
