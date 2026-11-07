@@ -1385,7 +1385,7 @@ def hook(
                 herdr_fields["herdrBinary"] = herdr_binary
             if herdr_fields:
                 me = _MB.annotate(base, session, **herdr_fields) or me
-        else:
+        elif harness != "codex" or terminal_server:
             stale_herdr_fields = {
                 key: None
                 for key in (
@@ -1424,7 +1424,12 @@ def hook(
         with contextlib.suppress(Exception):
             import agent_terminal
 
-            if _herdr_active() or agent_terminal.context(harness):
+            shared_codex = (
+                harness == "codex"
+                and ("unittest" not in sys.modules or os.environ.get("ORKEST_TEST_ALLOW_HERDR") == "1")
+                and (agent_terminal.discovery_available() or me.get("herdrPaneId"))
+            )
+            if not mid_turn and (_herdr_active() or shared_codex or agent_terminal.context(harness)):
                 agent_terminal.bind(session, harness, payload, base=base, force=event == "SessionStart")
     elif (is_subagent or me.get("isSubagent")) and not mid_turn:
         target_parent = parent_session or me.get("parentSession")

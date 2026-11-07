@@ -16,9 +16,8 @@ from typing import Any
 import peer_mailbox as mailbox
 from herdr_context import endpoint as herdr_endpoint
 from herdr_context import verified_agent
+from herdr_labels import codex_title_session, display_label, work_title
 
-_HERDR_METADATA_TTL_MS = 120_000
-_HERDR_METADATA_REFRESH_SEC = 45
 _SUBAGENT_MAX_STALE_SEC = 1800.0
 
 
@@ -217,6 +216,51 @@ def _resolve_structural_role(
     return matched_room_id, structural_role, is_exact_conductor
 
 
+def discovery_available() -> bool:
+    """Do not spawn a CLI merely to discover whether Herdr is installed/running."""
+    return Path(herdr_endpoint(dict(os.environ))).exists()
+
+
+def _codex_title_pane(base: Path, session: str, binary: str, env: dict[str, str]) -> dict | None:
+    sessions = {session}
+    for path in (base / "peers").glob("*.json"):
+        peer = mailbox.load(path)
+        if isinstance(peer, dict) and peer.get("harness") == "codex" and isinstance(peer.get("session"), str):
+            sessions.add(peer["session"])
+    try:
+        response = subprocess.run(
+            [binary, "pane", "list"], env=env, capture_output=True, text=True, timeout=0.5, check=False
+        )
+        if response.returncode:
+            return None
+        panes = json.loads(response.stdout).get("result", {}).get("panes", [])
+        matches = []
+        for pane in panes:
+            if not isinstance(pane, dict) or pane.get("agent") != "codex" or not pane.get("pane_id"):
+                continue
+            ref = pane.get("agent_session")
+            if ref is not None and not (
+                isinstance(ref, dict)
+                and ref.get("kind") == "id"
+                and ref.get("value") == session
+                and ref.get("agent") == "codex"
+            ):
+                continue
+            if codex_title_session(pane.get("terminal_title"), sessions) == session:
+                matches.append(pane)
+        return matches[0] if len(matches) == 1 else None
+    except (OSError, ValueError, AttributeError, TypeError, subprocess.SubprocessError):
+        return None
+
+
+def _clear_herdr(base: Path, session: str, peer: dict, *, miss: bool = False) -> None:
+    fields = {key: None for key in peer if key.startswith("herdr")}
+    if miss:
+        fields["herdrDiscoveryMissAt"] = peer.get("herdrDiscoveryMissAt") or time.time()
+    if fields:
+        mailbox.annotate(base, session, **fields)
+
+
 def _sync_herdr_pane(
     *,
     base: Path,
@@ -230,120 +274,62 @@ def _sync_herdr_pane(
     binary: str | None,
     force: bool = False,
     structural_role: str | None = None,
+    occupant: dict | None = None,
 ) -> bool:
-    annotations: dict[str, Any] = {}
-    if isinstance(peer_data, dict) and peer_data.get("terminalServer") is not None:
-        annotations["terminalServer"] = None
-    if not isinstance(peer_data, dict) or peer_data.get("herdrPaneId") != pane_id:
-        annotations["herdrPaneId"] = pane_id
-    if workspace_id and (not isinstance(peer_data, dict) or peer_data.get("herdrWorkspaceId") != workspace_id):
-        annotations["herdrWorkspaceId"] = workspace_id
-    if not isinstance(peer_data, dict) or peer_data.get("herdrEndpoint") != endpoint:
-        annotations["herdrEndpoint"] = endpoint
-    if binary and (not isinstance(peer_data, dict) or peer_data.get("herdrBinary") != binary):
-        annotations["herdrBinary"] = binary
+    if not isinstance(peer_data, dict):
+        return False
+    import agent_progress
 
-    if isinstance(peer_data, dict):
-        if structural_role is None:
-            _, structural_role, _ = _resolve_structural_role(
-                base, session, harness, peer_data, only_room=os.environ.get("ORKEST_SWARM_ROOM") or None
-            )
-        person = peer_data.get("person")
-        raw_name = peer_data.get("name")
-        short_name = (
-            raw_name.split("-", 1)[0].strip()
-            if isinstance(raw_name, str) and raw_name.strip()
-            else (person.strip() if isinstance(person, str) and person.strip() else "")
-        )
-        stage = ""
-        role = ""
-        with contextlib.suppress(Exception):
-            import agent_progress
-
-            progress = agent_progress.read(base, peer_data)
-            if isinstance(progress, dict):
-                stage = str(progress.get("stage") or "").strip()
-                role = str(progress.get("role") or "").strip()
-        title = f"{short_name} · {stage}" if short_name and stage else short_name
-        report_seq = time.time_ns()
-        model_str, effort_str, source_str = _extract_model_and_effort(peer_data, payload)
-        children_info = aggregate_children(base, peer_data)
-        child_summary = children_info["summary"]
-        child_digest = children_info["digest"]
-        roles = [structural_role]
-        if role.casefold() != structural_role.casefold():
-            roles.append(role)
-        display_agent = " · ".join(part for part in (*roles, model_str, child_summary) if part)
-        provenance = "observed" if source_str == "runtime" and model_str else ""
-        extra_sync: list[str] = []
-        if effort_str:
-            extra_sync.append(f"effort={effort_str}")
-        if provenance and isinstance(peer_data.get("modelSource"), str):
-            extra_sync.append(f"prov={provenance}")
-        if child_digest:
-            extra_sync.append(f"children={child_digest}")
-        base_sync_key = f"{title}|{display_agent}" if display_agent else title
-        sync_key = f"{base_sync_key}|{'|'.join(extra_sync)}" if extra_sync else base_sync_key
-        sync_target: dict[str, Any] = {"endpoint": endpoint, "pane": pane_id}
-        last_sync = peer_data.get("herdrSyncedAt")
-        if (
-            title
-            and (
-                force
-                or peer_data.get("herdrSyncedTitle") != sync_key
-                or peer_data.get("herdrSyncedTarget") != sync_target
-                or not isinstance(last_sync, int | float)
-                or time.time() - last_sync >= _HERDR_METADATA_REFRESH_SEC
-            )
-            and binary
-        ):
-            herdr_env = {**os.environ, "HERDR_SOCKET_PATH": endpoint}
-            occupant = verified_agent(binary, pane_id, {session}, env=herdr_env, timeout=0.5)
-            ref = occupant["agent_session"] if occupant else {}
-            if occupant and isinstance(ref.get("agent"), str) and ref["agent"]:
-                resolved_pane = occupant["pane_id"]
-                if resolved_pane != pane_id:
-                    annotations["herdrPaneId"] = resolved_pane
-                sync_target = {"endpoint": endpoint, "pane": resolved_pane}
-                cmd = [
-                    binary,
-                    "pane",
-                    "report-metadata",
-                    resolved_pane,
-                    "--source",
-                    "orkest",
-                    "--agent",
-                    ref["agent"],
-                    "--title",
-                    title,
-                    "--seq",
-                    str(report_seq),
-                    "--ttl-ms",
-                    str(_HERDR_METADATA_TTL_MS),
-                ]
-                # Session-only integrations have no lifecycle authority to match.
-                if ref.get("source") == "herdr:opencode":
-                    cmd.extend(["--applies-to-source", ref["source"]])
-                if display_agent:
-                    cmd.extend(["--display-agent", display_agent])
-                else:
-                    cmd.append("--clear-display-agent")
-                with contextlib.suppress(OSError, subprocess.SubprocessError):
-                    res = subprocess.run(
-                        cmd,
-                        env=herdr_env,
-                        capture_output=True,
-                        text=True,
-                        timeout=0.5,
-                        check=False,
-                    )
-                    if getattr(res, "returncode", 1) == 0:
-                        annotations["herdrSyncedTitle"] = sync_key
-                        annotations["herdrSyncedTarget"] = sync_target
-                        annotations["herdrSyncedAt"] = time.time()
-    if annotations:
-        with contextlib.suppress(Exception):
-            mailbox.annotate(base, session, **annotations)
+    progress = agent_progress.read(base, peer_data) or {}
+    title = work_title(progress)
+    display_agent = display_label(peer_data)
+    sync_key = f"{title}|{display_agent}"
+    herdr_env = {**os.environ, "HERDR_SOCKET_PATH": endpoint}
+    target = {"endpoint": endpoint, "pane": pane_id}
+    changed = force or peer_data.get("herdrSyncedTitle") != sync_key or peer_data.get("herdrSyncedTarget") != target
+    if occupant is None and changed and binary:
+        occupant = verified_agent(binary, pane_id, {session}, env=herdr_env, timeout=0.5)
+    if occupant:
+        pane_id = occupant["pane_id"]
+        workspace_id = occupant.get("workspace_id") or pane_id.split(":", 1)[0]
+    annotations: dict[str, Any] = {
+        "terminalServer": None,
+        "herdrPaneId": pane_id,
+        "herdrWorkspaceId": workspace_id,
+        "herdrEndpoint": endpoint,
+        "herdrBinary": binary,
+        "herdrDiscoveryMissAt": None,
+    }
+    target = {"endpoint": endpoint, "pane": pane_id}
+    changed = force or peer_data.get("herdrSyncedTitle") != sync_key or peer_data.get("herdrSyncedTarget") != target
+    if changed and binary and occupant:
+        ref = occupant.get("agent_session") or {}
+        kind = ref.get("agent") or occupant.get("agent")
+        if kind:
+            cmd = [
+                binary,
+                "pane",
+                "report-metadata",
+                pane_id,
+                "--source",
+                "orkest",
+                "--agent",
+                kind,
+                "--display-agent",
+                display_agent,
+                "--seq",
+                str(time.time_ns()),
+            ]
+            cmd.extend(["--title", title] if title else ["--clear-title"])
+            if ref.get("source") == "herdr:opencode":
+                cmd.extend(["--applies-to-source", ref["source"]])
+            with contextlib.suppress(OSError, subprocess.SubprocessError):
+                result = subprocess.run(cmd, env=herdr_env, capture_output=True, text=True, timeout=0.5, check=False)
+                if result.returncode == 0:
+                    annotations.update(herdrSyncedTitle=sync_key, herdrSyncedTarget=target, herdrSyncedAt=time.time())
+    updates = {key: value for key, value in annotations.items() if peer_data.get(key) != value}
+    if updates:
+        mailbox.annotate(base, session, **updates)
     return True
 
 
@@ -386,8 +372,6 @@ def bind(
     herdr = herdr_context(harness)
     if herdr:
         target = None
-    if not target and not herdr:
-        return False
     try:
         mailbox.session_key(session)
         base = base or mailbox.root()
@@ -397,6 +381,25 @@ def bind(
             if isinstance(loaded, dict):
                 peer_data = loaded
         if isinstance(peer_data, dict) and (peer_data.get("isSubagent") or peer_data.get("delegatedRun")):
+            return False
+        occupant = None
+        endpoint = herdr_endpoint(dict(os.environ))
+        binary = os.environ.get("HERDR_BIN_PATH") or shutil.which("herdr")
+        if harness == "codex" and not target and isinstance(peer_data, dict):
+            if force and peer_data.get("herdrDiscoveryMissAt"):
+                mailbox.annotate(base, session, herdrDiscoveryMissAt=None)
+                peer_data["herdrDiscoveryMissAt"] = None
+            if herdr and binary:
+                occupant = verified_agent(
+                    binary, herdr[0], {session}, env={**os.environ, "HERDR_SOCKET_PATH": endpoint}, timeout=0.5
+                )
+            if not occupant and discovery_available() and binary and not peer_data.get("herdrDiscoveryMissAt"):
+                occupant = _codex_title_pane(base, session, binary, {**os.environ, "HERDR_SOCKET_PATH": endpoint})
+            if not occupant:
+                _clear_herdr(base, session, peer_data, miss=discovery_available())
+                return False
+            herdr = (occupant["pane_id"], occupant.get("workspace_id") or occupant["pane_id"].split(":", 1)[0])
+        if not target and not herdr:
             return False
         matched_room_id, structural_role, is_exact_conductor = _resolve_structural_role(
             base,
@@ -417,6 +420,7 @@ def bind(
                 "herdrSyncedTitle",
                 "herdrSyncedTarget",
                 "herdrSyncedAt",
+                "herdrDiscoveryMissAt",
             ):
                 if peer_data.get(key) is not None:
                     annotations[key] = None
@@ -436,6 +440,7 @@ def bind(
                 binary=binary,
                 force=force,
                 structural_role=structural_role,
+                occupant=occupant,
             )
         elif annotations:
             with contextlib.suppress(Exception):
@@ -444,7 +449,9 @@ def bind(
             with contextlib.suppress(Exception):
                 import agent_statusline_tmux
 
-                pane_id, workspace_id = herdr
+                stored = mailbox.load(mailbox.peer_path(base, session)) or {}
+                pane_id = stored.get("herdrPaneId")
+                workspace_id = stored.get("herdrWorkspaceId")
                 agent_statusline_tmux._update_room_metadata(
                     base,
                     matched_room_id,

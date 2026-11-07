@@ -50,6 +50,7 @@ class HerdrMetadataTests(unittest.TestCase):
             "HERDR_SOCKET_PATH": str(self.home / "server.sock"),
             "ORKEST_TERMINAL_HARNESS": "codex",
             "ORKEST_TEST_ALLOW_HERDR": "1",
+            "ORK_GLYPHS": "ascii",
         }
         for key in ("ORKEST_TERMINAL_SERVER", "TMUX", "TMUX_PANE", "ORKEST_SWARM_ROOM", "HERDR_BIN_PATH"):
             environment.pop(key, None)
@@ -68,6 +69,8 @@ class HerdrMetadataTests(unittest.TestCase):
                 )
             if command[:2] != ["/fake/herdr", "pane"]:
                 return original_run(command, **kwargs)
+            if command[2] == "list":
+                return subprocess.CompletedProcess(command, 0, stdout='{"result":{"panes":[]}}', stderr="")
             self.reports.append(command)
             if command[2] != "report-metadata" or command[3].startswith("--"):
                 return subprocess.CompletedProcess(command, 2, stdout="", stderr="unknown option")
@@ -100,7 +103,12 @@ class HerdrMetadataTests(unittest.TestCase):
             pid=os.getpid(),
         )
         peer = mailbox.annotate(
-            self.base, self.session, person="snorfle", name="snorfle-fixture-model-medium-project-aa"
+            self.base,
+            self.session,
+            person="snorfle",
+            name="snorfle-fixture-model-medium-project-aa",
+            nativeName="snorfle-fixture-model-medium-project-aa",
+            nativeNameSource="explicit",
         )
         progress.report(self.base, peer, goal="Inspect changes", task="Review current changes", stage="working")
 
@@ -108,7 +116,13 @@ class HerdrMetadataTests(unittest.TestCase):
         self.assertTrue(agent_terminal.bind(self.session, "codex", {"model": "fixture-model"}))
         os.environ["HERDR_PANE_ID"] = "w1:p2"
         self.assertTrue(agent_terminal.bind(self.session, "codex", {"model": "fixture-model"}))
-        self.assertEqual(self.metadata.get("w1:p2"), {"title": "snorfle · working", "display_agent": "fixture-model"})
+        self.assertEqual(
+            self.metadata.get("w1:p2"),
+            {
+                "title": "working · Review current changes",
+                "display_agent": "[C] snorfle-fixture-model-medium-project-aa",
+            },
+        )
 
     def test_codex_resume_hook_republishes_metadata_after_same_pane_restoration(self):
         payload = {
@@ -120,37 +134,61 @@ class HerdrMetadataTests(unittest.TestCase):
             "effort": "medium",
         }
         mailbox.hook(payload, harness="codex", base=self.base)
-        self.assertEqual(self.metadata.get("w1:p1"), {"title": "snorfle · working", "display_agent": "fixture-model"})
+        self.assertEqual(
+            self.metadata.get("w1:p1"),
+            {
+                "title": "working · Review current changes",
+                "display_agent": "[C] snorfle-fixture-model-medium-project-aa",
+            },
+        )
         self.metadata.clear()
         mailbox.hook(payload, harness="codex", base=self.base)
-        self.assertEqual(self.metadata.get("w1:p1"), {"title": "snorfle · working", "display_agent": "fixture-model"})
+        self.assertEqual(
+            self.metadata.get("w1:p1"),
+            {
+                "title": "working · Review current changes",
+                "display_agent": "[C] snorfle-fixture-model-medium-project-aa",
+            },
+        )
 
     def test_unchanged_turn_metadata_is_cached_for_the_same_endpoint_and_pane(self):
         self.assertTrue(agent_terminal.bind(self.session, "codex", {"model": "fixture-model"}))
         self.assertTrue(agent_terminal.bind(self.session, "codex", {"model": "fixture-model"}))
-        self.assertEqual(self.metadata["w1:p1"], {"title": "snorfle · working", "display_agent": "fixture-model"})
+        self.assertEqual(
+            self.metadata["w1:p1"],
+            {
+                "title": "working · Review current changes",
+                "display_agent": "[C] snorfle-fixture-model-medium-project-aa",
+            },
+        )
         self.assertEqual(len(self.reports), 1)
         stored = mailbox.load(mailbox.peer_path(self.base, self.session))
         self.assertEqual(stored["herdrSyncedTarget"], {"endpoint": str(self.home / "server.sock"), "pane": "w1:p1"})
-        self.assertIn("--ttl-ms", self.reports[0])
+        self.assertNotIn("--ttl-ms", self.reports[0])
         self.assertIn("--seq", self.reports[0])
         self.assertEqual(self.reports[0][self.reports[0].index("--agent") + 1], "codex")
 
-    def test_metadata_refreshes_after_expiry_and_skips_a_reused_pane(self):
+    def test_metadata_needs_no_expiry_refresh_and_skips_a_reused_pane(self):
         self.assertTrue(agent_terminal.bind(self.session, "codex", {"model": "fixture-model"}))
         mailbox.annotate(self.base, self.session, herdrSyncedAt=0)
         self.assertTrue(agent_terminal.bind(self.session, "codex", {"model": "fixture-model"}))
-        self.assertEqual(len(self.reports), 2)
+        self.assertEqual(len(self.reports), 1)
         self.agent_session = "another-session"
-        self.assertTrue(agent_terminal.bind(self.session, "codex", {"model": "fixture-model"}, force=True))
-        self.assertEqual(len(self.reports), 2)
+        self.assertFalse(agent_terminal.bind(self.session, "codex", {"model": "fixture-model"}, force=True))
+        self.assertEqual(len(self.reports), 1)
 
     def test_another_endpoint_gets_the_same_session_metadata(self):
         self.assertTrue(agent_terminal.bind(self.session, "codex", {"model": "fixture-model"}))
         self.metadata.clear()
         os.environ["HERDR_SOCKET_PATH"] = str(self.home / "another-server.sock")
         self.assertTrue(agent_terminal.bind(self.session, "codex", {"model": "fixture-model"}))
-        self.assertEqual(self.metadata.get("w1:p1"), {"title": "snorfle · working", "display_agent": "fixture-model"})
+        self.assertEqual(
+            self.metadata.get("w1:p1"),
+            {
+                "title": "working · Review current changes",
+                "display_agent": "[C] snorfle-fixture-model-medium-project-aa",
+            },
+        )
         self.assertEqual(len(self.reports), 2)
 
     def test_subagent_hooks_leave_parent_pane_metadata_untouched(self):
@@ -167,7 +205,13 @@ class HerdrMetadataTests(unittest.TestCase):
         self.assertEqual(self.metadata, {})
         mailbox.annotate(self.base, self.session, isSubagent=False)
         mailbox.hook(payload, harness="codex", base=self.base)
-        self.assertEqual(self.metadata.get("w1:p1"), {"title": "snorfle · working", "display_agent": "fixture-model"})
+        self.assertEqual(
+            self.metadata.get("w1:p1"),
+            {
+                "title": "working · Review current changes",
+                "display_agent": "[C] snorfle-fixture-model-medium-project-aa",
+            },
+        )
 
     def test_delegated_worker_hooks_leave_parent_pane_metadata_untouched(self):
         with mock.patch.object(mailbox, "detect_harness", return_value="claude"):
@@ -192,9 +236,15 @@ class HerdrMetadataTests(unittest.TestCase):
         self.assertEqual(self.metadata, {})
         os.environ.pop("AGENT_MAILBOX_SESSION")
         mailbox.hook(payload, harness="codex", base=self.base)
-        self.assertEqual(self.metadata.get("w1:p1"), {"title": "snorfle · working", "display_agent": "fixture-model"})
+        self.assertEqual(
+            self.metadata.get("w1:p1"),
+            {
+                "title": "working · Review current changes",
+                "display_agent": "[C] snorfle-fixture-model-medium-project-aa",
+            },
+        )
 
-    def test_refresh_cli_publishes_the_exact_rooms_coordinator_role_without_changing_workforce_role(self):
+    def test_refresh_cli_keeps_identity_and_does_not_change_workforce_role(self):
         peer = mailbox.load(mailbox.peer_path(self.base, self.session))
         progress.report(
             self.base, peer, goal="Inspect changes", task="Review current changes", stage="working", role="builder"
@@ -225,7 +275,6 @@ class HerdrMetadataTests(unittest.TestCase):
         another_content = room_store.read_room(self.base, "another-room")
         os.environ["ORKEST_SWARM_ROOM"] = "promoted-room"
         agent_terminal.bind(self.session, "codex", {})
-        self.metadata.clear()
         argv = [
             "agent_statusline.py",
             "--native-status",
@@ -240,7 +289,10 @@ class HerdrMetadataTests(unittest.TestCase):
             self.assertEqual(agent_statusline.main(), 0)
         self.assertEqual(
             self.metadata.get("w1:p1"),
-            {"title": "snorfle · working", "display_agent": "Coordinator · builder · fixture-model"},
+            {
+                "title": "working · Review current changes",
+                "display_agent": "[C] snorfle-fixture-model-medium-project-aa",
+            },
         )
         self.assertEqual(progress.read(self.base, peer)["role"], "builder")
         self.assertEqual(room_store.read_room(self.base, "another-room"), another_content)
@@ -262,7 +314,13 @@ class HerdrMetadataTests(unittest.TestCase):
         }
         mailbox.write(self.base / "rooms" / "previous-room.json", room)
         self.assertTrue(agent_terminal.bind(self.session, "codex", {}))
-        self.assertEqual(self.metadata.get("w1:p1"), {"title": "snorfle · working", "display_agent": "fixture-model"})
+        self.assertEqual(
+            self.metadata.get("w1:p1"),
+            {
+                "title": "working · Review current changes",
+                "display_agent": "[C] snorfle-fixture-model-medium-project-aa",
+            },
+        )
 
     def test_a_top_level_lead_does_not_replace_the_root_coordinators_pane(self):
         room = {
@@ -287,7 +345,11 @@ class HerdrMetadataTests(unittest.TestCase):
         original = room_store.read_room(self.base, room["id"])
         self.assertTrue(agent_terminal.bind(self.session, "codex", {}))
         self.assertEqual(
-            self.metadata.get("w1:p1"), {"title": "snorfle · working", "display_agent": "Lead · fixture-model"}
+            self.metadata.get("w1:p1"),
+            {
+                "title": "working · Review current changes",
+                "display_agent": "[C] snorfle-fixture-model-medium-project-aa",
+            },
         )
         self.assertEqual(room_store.read_room(self.base, room["id"]), original)
 
@@ -310,13 +372,25 @@ class HerdrMetadataTests(unittest.TestCase):
         mailbox.write(room_path, room)
         original = room_store.read_room(self.base, room["id"])
         self.assertTrue(agent_terminal.bind(self.session, "codex", {}))
-        self.assertEqual(self.metadata.get("w1:p1"), {"title": "snorfle · working", "display_agent": "fixture-model"})
+        self.assertEqual(
+            self.metadata.get("w1:p1"),
+            {
+                "title": "working · Review current changes",
+                "display_agent": "[C] snorfle-fixture-model-medium-project-aa",
+            },
+        )
         self.assertEqual(room_store.read_room(self.base, room["id"]), original)
 
     def test_parent_pane_aggregates_children_without_marking_parent_working_or_stealing_parent_model(self):
         mailbox.annotate(self.base, self.session, state="idle")
         self.assertTrue(agent_terminal.bind(self.session, "codex", {"model": "fixture-model", "effort": "medium"}))
-        self.assertEqual(self.metadata.get("w1:p1"), {"title": "snorfle · working", "display_agent": "fixture-model"})
+        self.assertEqual(
+            self.metadata.get("w1:p1"),
+            {
+                "title": "working · Review current changes",
+                "display_agent": "[C] snorfle-fixture-model-medium-project-aa",
+            },
+        )
 
         # Start a subagent without explicit model in payload (should NOT inherit parent transcript model)
         parent_transcript = self.home / "parent-transcript.jsonl"
@@ -334,7 +408,10 @@ class HerdrMetadataTests(unittest.TestCase):
         self.assertIsNone(sub_peer.get("model"))
         self.assertEqual(
             self.metadata.get("w1:p1"),
-            {"title": "snorfle · working", "display_agent": "fixture-model · 1 child: subagent"},
+            {
+                "title": "working · Review current changes",
+                "display_agent": "[C] snorfle-fixture-model-medium-project-aa",
+            },
         )
         # Parent peer state remains idle so mailbox wakes are not blocked
         parent_peer = mailbox.load(mailbox.peer_path(self.base, self.session))
@@ -354,8 +431,8 @@ class HerdrMetadataTests(unittest.TestCase):
         self.assertEqual(
             self.metadata.get("w1:p1"),
             {
-                "title": "snorfle · working",
-                "display_agent": "fixture-model · 2 children: subagent, gpt-6-sol/high observed",
+                "title": "working · Review current changes",
+                "display_agent": "[C] snorfle-fixture-model-medium-project-aa",
             },
         )
 
@@ -376,7 +453,12 @@ class HerdrMetadataTests(unittest.TestCase):
             parentSession=self.session,
         )
         agent_terminal.refresh_parent_pane(self.base, self.session)
-        self.assertIn("2 children:", self.metadata["w1:p1"]["display_agent"])
+        self.assertEqual(
+            agent_terminal.aggregate_children(self.base, mailbox.load(mailbox.peer_path(self.base, self.session)))[
+                "count"
+            ],
+            2,
+        )
 
         # Stop both subagents -> count clears and ordinary display_agent text is restored
         for sub_id in ("sub-1", "sub-2"):
@@ -393,20 +475,23 @@ class HerdrMetadataTests(unittest.TestCase):
             )
         self.assertEqual(
             self.metadata.get("w1:p1"),
-            {"title": "snorfle · working", "display_agent": "fixture-model"},
+            {
+                "title": "working · Review current changes",
+                "display_agent": "[C] snorfle-fixture-model-medium-project-aa",
+            },
         )
 
-    def test_effort_and_provenance_changes_trigger_resync(self):
+    def test_only_presentation_changes_trigger_resync(self):
         self.assertTrue(agent_terminal.bind(self.session, "codex", {"model": "fixture-model", "effort": "medium"}))
         self.assertEqual(len(self.reports), 1)
-        # Changing only effort triggers a new report-metadata call
+        # Effort and provenance alone do not change the visible name or work.
         mailbox.annotate(self.base, self.session, effort="high")
         self.assertTrue(agent_terminal.bind(self.session, "codex", {"model": "fixture-model", "effort": "high"}))
-        self.assertEqual(len(self.reports), 2)
-        # Setting runtime modelSource triggers a new report-metadata call
+        self.assertEqual(len(self.reports), 1)
+        # Runtime provenance also leaves presentation unchanged.
         mailbox.annotate(self.base, self.session, modelSource="runtime")
         self.assertTrue(agent_terminal.bind(self.session, "codex", {"model": "fixture-model", "effort": "high"}))
-        self.assertEqual(len(self.reports), 3)
+        self.assertEqual(len(self.reports), 1)
 
 
 @unittest.skipUnless(shutil.which("tmux"), "native pane binding requires tmux")
@@ -421,7 +506,7 @@ class TerminalTests(unittest.TestCase):
         subprocess.run([*self.tmux, "-f", "/dev/null", "new-session", "-d", "--", "sleep", "120"], check=True)
         self.addCleanup(lambda: subprocess.run([*self.tmux, "kill-server"], capture_output=True, check=False))
         socket = subprocess.check_output([*self.tmux, "display-message", "-p", "#{socket_path}"], text=True).strip()
-        self.environment = {**os.environ, "AGENT_EXECUTOR_HOME": str(self.home)}
+        self.environment = {**os.environ, "AGENT_EXECUTOR_HOME": str(self.home), "XDG_CONFIG_HOME": str(self.home)}
         for key in (
             "ORKEST_TERMINAL_SERVER",
             "ORKEST_TERMINAL_HARNESS",
@@ -760,27 +845,15 @@ class TerminalTests(unittest.TestCase):
                 self.assertTrue(agent_terminal.bind(session, "claude", {"model": "claude-sonnet"}))
             reports = [call for call in calls if call[1:3] == ["pane", "report-metadata"]]
             self.assertEqual(len(reports), 1)
-            self.assertEqual(
-                reports[0][: reports[0].index("--seq")],
-                [
-                    "/usr/local/bin/herdr",
-                    "pane",
-                    "report-metadata",
-                    "w1:p9",
-                    "--source",
-                    "orkest",
-                    "--agent",
-                    "claude",
-                    "--title",
-                    "snorfle · working",
-                ],
-            )
-            self.assertEqual(reports[0][-2:], ["--display-agent", "builder · claude-sonnet"])
+            self.assertNotIn("--ttl-ms", reports[0])
+            self.assertEqual(reports[0][reports[0].index("--agent") + 1], "claude")
+            self.assertEqual(reports[0][reports[0].index("--title") + 1], "working · Sync title")
+            self.assertEqual(reports[0][reports[0].index("--display-agent") + 1], " snorfle-test-high-footer-aa")
             stored = mailbox.load(mailbox.peer_path(self.base, session))
-            self.assertEqual(stored["herdrSyncedTitle"], "snorfle · working|builder · claude-sonnet")
+            self.assertEqual(stored["herdrSyncedTitle"], "working · Sync title| snorfle-test-high-footer-aa")
             self.assertEqual(stored["herdrBinary"], "/usr/local/bin/herdr")
 
-            # In Herdr (without ORKEST_TERMINAL_SERVER), --native-status still emits the native statusline
+            # Herdr draws the label, so the native statusline emits no duplicate.
             herdr_status_out = subprocess.check_output(
                 [
                     sys.executable,
@@ -795,10 +868,10 @@ class TerminalTests(unittest.TestCase):
                     "--width",
                     "120",
                 ],
-                env=herdr_env,
+                env={**herdr_env, "HERDR_BIN_PATH": "/nonexistent/herdr"},
                 text=True,
             )
-            self.assertEqual(json.loads(herdr_status_out)["name"], "snorfle")
+            self.assertEqual(herdr_status_out, "")
 
             # Subagent peer is refused by bind()
             sub_session = "herdr-subagent"
@@ -939,7 +1012,10 @@ class TerminalTests(unittest.TestCase):
                     self.assertEqual(launched["harness"], harness)
                     self.assertIsNone(launched["agent_hint"])
                     self.assertEqual(launched["herdr_pane"], "w1:p1")
-                    self.assertEqual(launched["args"], [])
+                    self.assertEqual(
+                        launched["args"],
+                        ["-c", 'tui.terminal_title=["thread-title","session-id"]'] if harness == "codex" else [],
+                    )
                 finally:
                     deadline = time.monotonic() + 3
                     while time.monotonic() < deadline:

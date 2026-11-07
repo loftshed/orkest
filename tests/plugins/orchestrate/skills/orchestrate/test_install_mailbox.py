@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import os
+import pty
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -18,6 +21,7 @@ import mailbox_mcp  # noqa: E402 -- the server defines the installed tool catalo
 
 class InstallMailboxTests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(mock.patch.object(sys.stdin, "isatty", return_value=False))
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.base = Path(self.temporary.name)
@@ -29,6 +33,79 @@ class InstallMailboxTests(unittest.TestCase):
         self.addCleanup(environment.stop)
         self.path = self.base / "settings.json"
         self.script = Path("/home/example/skill hub/peer_mailbox.py")
+
+    def test_herdr_ui_is_offered_only_on_a_tty_and_preserves_explicit_settings(self):
+        config = self.base / "config.toml"
+        original = "[ui]\nshow_agent_labels_on_pane_borders = false\ntab_bar_right = []\n"
+        config.write_text(original)
+        with (
+            mock.patch.object(sys.stdin, "isatty", return_value=True),
+            mock.patch("builtins.input", side_effect=AssertionError("unexpected prompt")),
+        ):
+            self.assertFalse(installer._offer_herdr_ui(config))
+        self.assertEqual(config.read_text(), original)
+        config.write_text('[keys]\nprefix = "ctrl+a"\n')
+        with mock.patch("builtins.input", side_effect=AssertionError("non-TTY prompt")):
+            self.assertFalse(installer._offer_herdr_ui(config))
+        with (
+            mock.patch.object(sys.stdin, "isatty", return_value=True),
+            mock.patch("builtins.input", side_effect=["n", ""]),
+        ):
+            self.assertFalse(installer._offer_herdr_ui(config))
+        self.assertEqual(tomllib.loads(config.read_text()), {"keys": {"prefix": "ctrl+a"}})
+        with (
+            mock.patch.object(sys.stdin, "isatty", return_value=True),
+            mock.patch("builtins.input", side_effect=["y", "yes"]),
+        ):
+            self.assertTrue(installer._offer_herdr_ui(config))
+        parsed = tomllib.loads(config.read_text())
+        self.assertEqual(parsed["keys"], {"prefix": "ctrl+a"})
+        self.assertEqual(
+            parsed["ui"],
+            {
+                "show_agent_labels_on_pane_borders": True,
+                "tab_bar_right": [
+                    {"type": "command", "command": "ork herdr-status", "interval_seconds": 1, "timeout_seconds": 1}
+                ],
+            },
+        )
+
+    def test_herdr_ui_inserts_into_existing_table_without_changing_other_tables(self):
+        config = self.base / "config.toml"
+        config.write_text("[ui] # keep\npane_gaps = false\n[ui.sidebar]\nwidth = 20\n")
+        with (
+            mock.patch.object(sys.stdin, "isatty", return_value=True),
+            mock.patch("builtins.input", side_effect=["y", "n"]),
+        ):
+            self.assertTrue(installer._offer_herdr_ui(config))
+        self.assertEqual(
+            tomllib.loads(config.read_text()),
+            {"ui": {"pane_gaps": False, "show_agent_labels_on_pane_borders": True, "sidebar": {"width": 20}}},
+        )
+
+    def test_installer_suite_defaults_to_noninteractive_even_on_a_pty(self):
+        master, slave = pty.openpty()
+        try:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    "-m",
+                    "unittest",
+                    "test_install_mailbox.InstallMailboxTests.test_herdr_enabled_refresh_preserves_existing_shortcut_and_reads_manifest_again",
+                ],
+                cwd=Path(__file__).parent,
+                stdin=slave,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                env={**os.environ, "HERDR_ENV": "0"},
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("[y/N]", result.stdout)
+        finally:
+            os.close(slave)
+            os.close(master)
 
     def test_jsonc_comments_and_trailing_commas_preserve_strings(self):
         path = self.base / "config.jsonc"

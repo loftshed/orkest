@@ -185,7 +185,10 @@ monitor mcp-install
 ```
 
 Make sure `~/.local/bin` is on your `PATH`. Run `ork setup --trust-codex-hooks` (or approve `/hooks`
-once in Codex) to enable turn hooks, and see
+once in Codex) to enable turn hooks. Inside Herdr, Codex uses its terminal session title to bind
+shared app-server hooks to the correct pane. Herdr draws persistent agent names for every harness;
+`ork setup` offers optional border labels and an `ork herdr-status` tab bar entry. See
+[Herdr agent labels](docs/herdr.md#agent-labels-and-focused-status) and
 [terminal footer setup](plugins/orchestrate/README.md#agent-status-in-terminal-footers) if you want
 the status bar outside `ork` launches.
 

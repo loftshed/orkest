@@ -1258,6 +1258,9 @@ def main(arguments: list[str]) -> int:
                 matched = find_session_swarm_room(base_dir, resumed_session, harness=harness, cwd=cwd, aliases=aliases)
                 if isinstance(matched, dict) and isinstance(matched.get("id"), str):
                     room = matched["id"]
+        if Path(command[0]).name == "codex":
+            titles = '["thread-title","session-id"]' if herdr_active else '["session-id"]'
+            command = [command[0], "-c", f"tui.terminal_title={titles}", *command[1:]]
         if herdr_active:
             import herdr_swarm_restore as restoration
 
@@ -1302,9 +1305,6 @@ def main(arguments: list[str]) -> int:
             except OSError as error:
                 print(f"Could not launch {command[0]} in Herdr: {error}", file=sys.stderr)
                 return 2
-        if Path(command[0]).name == "codex":
-            # The private tmux footer identifies this conversation even when Codex shares a daemon.
-            command = [command[0], "-c", 'tui.terminal_title=["session-id"]', *command[1:]]
     tmux = shutil.which("tmux")
     if not tmux:
         print("ork label needs tmux on PATH", file=sys.stderr)

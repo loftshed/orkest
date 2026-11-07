@@ -57,6 +57,7 @@ ork gate [--heavy] [--label <text>] -- <command>   (also: ork gate status|instal
 ork swarm [toggle|open|close]   (alias for ork horde toggle|open|close)
 ork factory [status|run|groom] [--dry-run] [--json]   (alias for ork foundry)
 ork rooms --help                (alias for ork hall)
+ork herdr-status                     (focused Herdr pane agent, plain text)
 ork setup [--dry-run] [--trust-codex-hooks]   (install mailbox, hooks and shell wrapper shortcuts)
 ork label [--lines 1|2] -- codex|claude|agy|opencode [arguments]   (direct in Herdr; tmux footer elsewhere)
 ork progress --session ID --goal TEXT --task TEXT --stage working [--role ROLE]
@@ -430,6 +431,10 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
   if (engineShortcut) argv = ["horde", ...argv.slice(1)];
   if (argv[0] === "setup") {
     process.exitCode = await terminalCommand("install_mailbox.py", argv.slice(1));
+    return;
+  }
+  if (argv[0] === "herdr-status") {
+    process.exitCode = await terminalCommand("herdr_status.py", argv.slice(1));
     return;
   }
   if (argv[0] === "progress") {

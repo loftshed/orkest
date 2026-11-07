@@ -479,6 +479,54 @@ def _herdr_shortcut_available(config: str) -> bool:
     )
 
 
+def _offer_herdr_ui(config_file: Path) -> bool:
+    """Offer missing UI settings without overriding any explicit user preference."""
+    if not sys.stdin.isatty():
+        return False
+    existing = config_file.read_text(encoding="utf-8") if config_file.is_file() else ""
+    try:
+        ui = tomllib.loads(existing).get("ui", {})
+    except tomllib.TOMLDecodeError:
+        return False
+    if not isinstance(ui, dict):
+        return False
+    additions = []
+    offers = (
+        ("show_agent_labels_on_pane_borders", "Show Orkest agent labels on Herdr pane borders? [y/N] ", "true"),
+        (
+            "tab_bar_right",
+            "Show the focused Orkest agent in Herdr's tab bar? [y/N] ",
+            '[{ type = "command", command = "ork herdr-status", interval_seconds = 1, timeout_seconds = 1 }]',
+        ),
+    )
+    for key, prompt, value in offers:
+        if key in ui:
+            continue
+        try:
+            accepted = input(prompt).strip().lower() in {"y", "yes"}
+        except (EOFError, OSError):
+            accepted = False
+        if accepted:
+            additions.append(f"{key} = {value}\n")
+    if not additions:
+        return False
+    block = "".join(additions)
+    # Add at the beginning of the existing table so nested/following tables retain their scope.
+    header = re.search(r"(?m)^\[ui\][ \t]*(?:#.*)?$", existing)
+    if header:
+        updated = existing[: header.end()] + "\n" + block + existing[header.end() :]
+    elif "ui" not in tomllib.loads(existing):
+        updated = existing.rstrip() + "\n\n[ui]\n" + block
+    else:
+        return False  # Preserve unusual inline/dotted table declarations verbatim.
+    tomllib.loads(updated)
+    config_file.parent.mkdir(parents=True, exist_ok=True)
+    if config_file.exists():
+        backup(config_file)
+    config_file.write_text(updated, encoding="utf-8")
+    return True
+
+
 def install_herdr_integration(home: Path, ork_cli: Path | None = None, *, dry_run: bool = False) -> bool:
     """Refresh the official local plugin registration without editing Herdr's private registry."""
     herdr = _herdr_binary()
@@ -513,6 +561,8 @@ def install_herdr_integration(home: Path, ork_cli: Path | None = None, *, dry_ru
             existing_cfg.rstrip() + ("\n" if existing_cfg.strip() else "") + HERDR_SHORTCUT_BLOCK, encoding="utf-8"
         )
         print(f"✓ Herdr ctrl+alt+s shortcut: {config_file}")
+    if enabled:
+        _offer_herdr_ui(config_file)
     cli = ork_cli or (Path(__file__).resolve().parents[3] / "bin/ork.mjs")
     helper = cli.resolve().parent.parent / "skills/orchestrate/scripts/herdr_swarm_restore.py"
     if enabled and os.environ.get("HERDR_ENV") == "1" and helper.is_file():
