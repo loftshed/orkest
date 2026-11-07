@@ -40,6 +40,8 @@ class HerdrMetadataTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.home = Path(temporary.name).resolve()
         self.base = self.home / "mailbox-v1"
+        (self.home / "server.sock").touch()
+        (self.home / "another-server.sock").touch()
         environment = {
             **os.environ,
             "AGENT_EXECUTOR_HOME": str(self.home),
@@ -61,16 +63,18 @@ class HerdrMetadataTests(unittest.TestCase):
         original_which = shutil.which
 
         def fake_run(command, **kwargs):
-            if command[:3] == ["/fake/herdr", "agent", "get"]:
-                ref = {"agent": "codex", "source": "herdr:codex", "kind": "id", "value": self.agent_session}
-                agent = {"agent_session": ref}
-                return subprocess.CompletedProcess(
-                    command, 0, stdout=json.dumps({"result": {"type": "agent_info", "agent": agent}}), stderr=""
-                )
             if command[:2] != ["/fake/herdr", "pane"]:
                 return original_run(command, **kwargs)
             if command[2] == "list":
-                return subprocess.CompletedProcess(command, 0, stdout='{"result":{"panes":[]}}', stderr="")
+                pane = {
+                    "pane_id": os.environ["HERDR_PANE_ID"],
+                    "agent": "codex",
+                    "agent_session": None,
+                    "terminal_title": "Work | " + self.agent_session,
+                }
+                return subprocess.CompletedProcess(
+                    command, 0, stdout=json.dumps({"result": {"panes": [pane]}}), stderr=""
+                )
             self.reports.append(command)
             if command[2] != "report-metadata" or command[3].startswith("--"):
                 return subprocess.CompletedProcess(command, 2, stdout="", stderr="unknown option")
@@ -90,7 +94,7 @@ class HerdrMetadataTests(unittest.TestCase):
         )
         self.enterContext(mock.patch.object(mailbox_hooks, "_maybe_trigger_auto_update"))
         self.enterContext(mock.patch.object(mailbox, "harness_pid", return_value=os.getpid()))
-        self.session = "codex-resume-session-2222"
+        self.session = "019a5da8-1234-5678-9abc-123456789012"
         self.agent_session = self.session
         peer = mailbox.register(
             self.base,

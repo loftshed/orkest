@@ -20,7 +20,8 @@ from pathlib import Path
 
 import peer_mailbox as mailbox
 import room_store
-from herdr_context import verified_agent
+from herdr_context import canonical_endpoint, verified_agent
+from herdr_labels import agent_harness
 
 _RESUME_VALUE_FLAGS = frozenset({"--resume", "-r", "--session-id", "--conversation", "--session", "-s"})
 _NON_SESSION_FLAG_VALUES = frozenset({"last", "help", "read-only", "workspace-write", "danger-full-access"})
@@ -611,6 +612,7 @@ def _open_herdr_swarm_view_unlocked(
 def _find_herdr_peer(
     base: Path, session_id: str | None, pane_id: str, *, endpoint: str | None = None
 ) -> dict[str, object] | None:
+    canonical = canonical_endpoint(endpoint)
     if session_id:
         with contextlib.suppress(Exception):
             peer = mailbox.load(mailbox.peer_path(base, session_id))
@@ -618,7 +620,7 @@ def _find_herdr_peer(
                 isinstance(peer, dict)
                 and not peer.get("isSubagent")
                 and not peer.get("delegatedRun")
-                and (endpoint is None or peer.get("herdrEndpoint") == endpoint)
+                and (endpoint is None or canonical_endpoint(peer.get("herdrEndpoint")) == canonical)
             ):
                 return peer
     if not pane_id:
@@ -633,7 +635,7 @@ def _find_herdr_peer(
                 continue
             if peer.get("herdrPaneId") != pane_id:
                 continue
-            if endpoint is not None and peer.get("herdrEndpoint") != endpoint:
+            if endpoint is not None and canonical_endpoint(peer.get("herdrEndpoint")) != canonical:
                 continue
             if best is None or str(peer.get("lastSeenAt", "")) >= str(best.get("lastSeenAt", "")):
                 best = peer
@@ -644,6 +646,7 @@ def _find_herdr_room(base: Path, pane_id: str, *, endpoint: str | None = None) -
     if not pane_id:
         return ""
     best_id = ""
+    canonical = canonical_endpoint(endpoint)
     best_updated = -1
     with contextlib.suppress(OSError):
         for room in room_store.list_rooms(base):
@@ -651,7 +654,7 @@ def _find_herdr_room(base: Path, pane_id: str, *, endpoint: str | None = None) -
                 room.get("herdrCoordinatorPaneId") != pane_id and room.get("herdrViewPaneId") != pane_id
             ):
                 continue
-            if endpoint is not None and room.get("herdrEndpoint") != endpoint:
+            if endpoint is not None and canonical_endpoint(room.get("herdrEndpoint")) != canonical:
                 continue
             room_id = room.get("id")
             if not isinstance(room_id, str) or not room_id:
@@ -779,7 +782,7 @@ def _toggle_herdr_swarm_view_unlocked(
             ref = pane.get("agent_session") or {}
             if ref.get("kind") == "id" and isinstance(ref.get("value"), str):
                 session_id = ref["value"]
-                harness = harness or {"agy": "gemini"}.get(ref.get("agent"), ref.get("agent"))
+                harness = harness or agent_harness(ref.get("agent"))
     peer = _find_herdr_peer(base, session_id, coordinator_pane, endpoint=current_endpoint)
     if peer and session_id and peer.get("session") != session_id and session_id not in (peer.get("aliases") or []):
         peer = None

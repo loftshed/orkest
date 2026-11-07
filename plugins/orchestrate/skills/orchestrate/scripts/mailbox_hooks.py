@@ -1365,7 +1365,7 @@ def hook(
         terminal_server = os.environ.get("ORKEST_TERMINAL_SERVER", "").strip()
         if re.fullmatch(r"orkest-label-[0-9a-f]{12}", terminal_server) and me.get("terminalServer") != terminal_server:
             me = _MB.annotate(base, session, terminalServer=terminal_server) or me
-        if _herdr_active():
+        if _herdr_active() and harness != "codex":
             if me.get("terminalServer") is not None:
                 me = _MB.annotate(base, session, terminalServer=None) or me
             from herdr_context import endpoint as herdr_endpoint
@@ -1379,6 +1379,7 @@ def hook(
             if herdr_workspace and me.get("herdrWorkspaceId") != herdr_workspace:
                 herdr_fields["herdrWorkspaceId"] = herdr_workspace
             endpoint = herdr_endpoint(dict(os.environ))
+            # Rewrite older alias paths too, so every new binding stores the canonical endpoint.
             if herdr_pane and me.get("herdrEndpoint") != endpoint:
                 herdr_fields["herdrEndpoint"] = endpoint
             if herdr_pane and herdr_binary and me.get("herdrBinary") != herdr_binary:

@@ -110,6 +110,20 @@ class RestoreTests(unittest.TestCase):
         )
         self.assertEqual(len(self.api.runs), 1)
 
+    def test_restore_matches_aliased_endpoints_and_stores_canonical_path_after_move(self):
+        alias = self.base / "alias"
+        alias.symlink_to(self.base.resolve(), target_is_directory=True)
+        alias_socket = str(alias / "server.sock")
+        canonical_socket = str((self.base / "server.sock").resolve())
+        for stored, environment in ((alias_socket, canonical_socket), (canonical_socket, alias_socket)):
+            with self.subTest(stored=stored):
+                record = views.load(self.state)
+                views.save(self.state, {**record, "endpoint": stored, "pane": "old-pane"})
+                outcomes = views.restore(self.base, {**self.env, "HERDR_SOCKET_PATH": environment}, self.api)
+                self.assertEqual(outcomes[0]["room"], "room-a")
+                self.assertIn(outcomes[0]["status"], ("restored", "already_running"))
+                self.assertEqual(views.load(self.state)["endpoint"], canonical_socket)
+
     def test_cold_restore_rebinds_a_recreated_terminal_but_ordinary_lookup_does_not(self):
         self.api.pane.update({"pane_id": "w7:p9", "terminal_id": "recreated-terminal"})
         self.assertIsNone(views.locate(views.load(self.state), self.api.panes()))
@@ -233,6 +247,9 @@ class RestoreTests(unittest.TestCase):
         self.assertEqual(views.locate(legacy_record, self.api.panes())["pane_id"], "w1:p2")
 
     def test_inventory_reconciles_five_dimensions_without_mutating_or_calling_restore(self):
+        alias = self.base / "alias"
+        alias.symlink_to(self.base.resolve(), target_is_directory=True)
+        alias_socket = str(alias / "server.sock")
         rooms = self.base / "mailbox-v1/rooms"
         peers = self.base / "mailbox-v1/peers"
         rooms.mkdir(parents=True, exist_ok=True)
@@ -243,7 +260,7 @@ class RestoreTests(unittest.TestCase):
                     "id": "room-a",
                     "title": "Audit Herdr Inventory",
                     "cwd": str(self.base),
-                    "herdrEndpoint": views.endpoint(self.env),
+                    "herdrEndpoint": alias_socket,
                     "herdrCoordinatorPaneId": "w1:p1",
                     "herdrViewPaneId": "w1:p2",
                     "conductor": {
@@ -272,11 +289,12 @@ class RestoreTests(unittest.TestCase):
                     "harness": "codex",
                     "state": "busy",
                     "herdrPaneId": "w1:p1",
-                    "herdrEndpoint": views.endpoint(self.env),
+                    "herdrEndpoint": alias_socket,
                 }
             )
         )
         views.prepare(self.base, "room-a", "w1:p2", self.cli, self.env, self.api)
+        views.save(self.state, {**views.load(self.state), "endpoint": alias_socket})
         coord_pane = {
             "pane_id": "w1:p1",
             "terminal_id": "coord-term",

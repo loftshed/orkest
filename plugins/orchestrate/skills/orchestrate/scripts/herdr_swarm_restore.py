@@ -22,7 +22,7 @@ from typing import Any
 
 import room_store
 import runtime_paths
-from herdr_context import endpoint
+from herdr_context import canonical_endpoint, endpoint
 
 SCHEMA = "orkest.herdr-view.v1"
 VALID_LABEL_PREFIXES = ("Orkest swarm ", "Orkest Swarm", "Swarm · ")
@@ -247,7 +247,10 @@ def restore(
         for path, record in records:
             if not record or record.get("schema") != SCHEMA:
                 continue
-            if record.get("endpoint") != endpoint(env) or record.get("host") != socket.gethostname():
+            if (
+                canonical_endpoint(record.get("endpoint")) != endpoint(env)
+                or record.get("host") != socket.gethostname()
+            ):
                 continue
             if not isinstance(record.get("cli"), str) or not isinstance(record.get("room"), str):
                 continue
@@ -273,7 +276,12 @@ def restore(
                     if terminal_id and (
                         terminal_id != record.get("terminal_id") or pane["pane_id"] != record.get("pane")
                     ):
-                        record = {**record, "terminal_id": terminal_id, "pane": pane["pane_id"]}
+                        record = {
+                            **record,
+                            "terminal_id": terminal_id,
+                            "pane": pane["pane_id"],
+                            "endpoint": endpoint(env),
+                        }
                         save(path, record)
                 if view_process(info, cli, room):
                     path.with_suffix(".pending").unlink(missing_ok=True)
@@ -327,7 +335,7 @@ def _adopt_unlocked(base: Path, env: dict[str, str], api: Herdr, cli: Path) -> l
         room_id, pane_id = room.get("id"), room.get("herdrViewPaneId")
         if not isinstance(room_id, str) or pane_id not in panes:
             continue
-        if room.get("herdrEndpoint") not in (None, endpoint(env)):
+        if room.get("herdrEndpoint") is not None and canonical_endpoint(room.get("herdrEndpoint")) != endpoint(env):
             continue
         state = state_path(base, room_id, env)
         if state.exists():
@@ -438,7 +446,7 @@ def inventory(
             if (
                 isinstance(rec, dict)
                 and rec.get("schema") == SCHEMA
-                and rec.get("endpoint") == current_endpoint
+                and canonical_endpoint(rec.get("endpoint")) == current_endpoint
                 and rec.get("host") == socket.gethostname()
                 and isinstance(rec.get("room"), str)
             ):
@@ -469,7 +477,7 @@ def inventory(
             closed_tombstone = bool(rec_path and rec_path.with_suffix(".closed").exists())
             recorded_pane_id = (rec.get("pane") if rec else None) or room.get("herdrViewPaneId")
             recorded_terminal_id = rec.get("terminal_id") if rec else None
-            if room_endpoint and room_endpoint != current_endpoint and not rec:
+            if room_endpoint and canonical_endpoint(room_endpoint) != current_endpoint and not rec:
                 pane_existence = "unreachable_endpoint"
                 matched_pane = None
                 matching_strength = "none"
@@ -558,7 +566,7 @@ def inventory(
             matching_strength = "none"
             if not member_pane_id:
                 pane_existence = "not_bound"
-            elif member_endpoint and member_endpoint != current_endpoint:
+            elif member_endpoint and canonical_endpoint(member_endpoint) != current_endpoint:
                 pane_existence = "unreachable_endpoint"
             else:
                 matched_pane = panes_by_id.get(member_pane_id)
@@ -629,7 +637,7 @@ def inventory(
                 continue
             matched_pane = None
             matching_strength = "none"
-            if peer_endpoint and peer_endpoint != current_endpoint:
+            if peer_endpoint and canonical_endpoint(peer_endpoint) != current_endpoint:
                 pane_existence = "unreachable_endpoint"
             else:
                 matched_pane = panes_by_id.get(peer_pane_id)
@@ -722,7 +730,7 @@ def main() -> int:
                 for row in room_store.list_rooms(mailbox)
                 if source_pane
                 and row.get("herdrCoordinatorPaneId") == source_pane
-                and row.get("herdrEndpoint") == endpoint(env)
+                and canonical_endpoint(row.get("herdrEndpoint")) == endpoint(env)
                 and (not room or row["id"] == room)
             ]
             if len(candidates) != 1:

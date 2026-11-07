@@ -6,6 +6,11 @@ from pathlib import Path
 from typing import Any
 
 
+def canonical_endpoint(path: str | None) -> str | None:
+    """Compare persisted socket paths through the same aliases as environment paths."""
+    return str(Path(path).expanduser().resolve()) if isinstance(path, str) and path else None
+
+
 def endpoint(env: dict[str, str]) -> str:
     if env.get("HERDR_SOCKET_PATH"):
         return str(Path(env["HERDR_SOCKET_PATH"]).expanduser().resolve())

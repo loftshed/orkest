@@ -14,8 +14,8 @@ from pathlib import Path
 from typing import Any
 
 import peer_mailbox as mailbox
+from herdr_context import canonical_endpoint, verified_agent
 from herdr_context import endpoint as herdr_endpoint
-from herdr_context import verified_agent
 from herdr_labels import codex_title_session, display_label, work_title
 
 _SUBAGENT_MAX_STALE_SEC = 1800.0
@@ -148,7 +148,7 @@ def refresh_parent_pane(base: Path, parent_session: str | None) -> bool:
     if not isinstance(peer_data, dict) or peer_data.get("isSubagent") or peer_data.get("delegatedRun"):
         return False
     pane_id = _clean_text(peer_data.get("herdrPaneId"))
-    endpoint = _clean_text(peer_data.get("herdrEndpoint"))
+    endpoint = canonical_endpoint(_clean_text(peer_data.get("herdrEndpoint")))
     harness = _clean_text(peer_data.get("harness"))
     binary = _clean_text(peer_data.get("herdrBinary")) or os.environ.get("HERDR_BIN_PATH") or shutil.which("herdr")
     if not pane_id or not endpoint or not harness or not binary:
@@ -284,9 +284,13 @@ def _sync_herdr_pane(
     title = work_title(progress)
     display_agent = display_label(peer_data)
     sync_key = f"{title}|{display_agent}"
+    endpoint = str(Path(endpoint).expanduser().resolve())
     herdr_env = {**os.environ, "HERDR_SOCKET_PATH": endpoint}
     target = {"endpoint": endpoint, "pane": pane_id}
-    changed = force or peer_data.get("herdrSyncedTitle") != sync_key or peer_data.get("herdrSyncedTarget") != target
+    previous_target = peer_data.get("herdrSyncedTarget")
+    if isinstance(previous_target, dict):
+        previous_target = {**previous_target, "endpoint": canonical_endpoint(previous_target.get("endpoint"))}
+    changed = force or peer_data.get("herdrSyncedTitle") != sync_key or previous_target != target
     if occupant is None and changed and binary:
         occupant = verified_agent(binary, pane_id, {session}, env=herdr_env, timeout=0.5)
     if occupant:
@@ -301,7 +305,9 @@ def _sync_herdr_pane(
         "herdrDiscoveryMissAt": None,
     }
     target = {"endpoint": endpoint, "pane": pane_id}
-    changed = force or peer_data.get("herdrSyncedTitle") != sync_key or peer_data.get("herdrSyncedTarget") != target
+    changed = force or peer_data.get("herdrSyncedTitle") != sync_key or previous_target != target
+    if not changed:
+        annotations["herdrSyncedTarget"] = target
     if changed and binary and occupant:
         ref = occupant.get("agent_session") or {}
         kind = ref.get("agent") or occupant.get("agent")
@@ -370,7 +376,7 @@ def bind(
 ) -> bool:
     target = context(harness)
     herdr = herdr_context(harness)
-    if herdr:
+    if herdr and harness != "codex":
         target = None
     try:
         mailbox.session_key(session)
@@ -389,16 +395,16 @@ def bind(
             if force and peer_data.get("herdrDiscoveryMissAt"):
                 mailbox.annotate(base, session, herdrDiscoveryMissAt=None)
                 peer_data["herdrDiscoveryMissAt"] = None
-            if herdr and binary:
-                occupant = verified_agent(
-                    binary, herdr[0], {session}, env={**os.environ, "HERDR_SOCKET_PATH": endpoint}, timeout=0.5
-                )
-            if not occupant and discovery_available() and binary and not peer_data.get("herdrDiscoveryMissAt"):
+            # A shared app-server inherits its launcher's pane, not this session's pane.
+            # Codex has no native agent_session in Herdr 0.9.5; verify its terminal title instead.
+            if discovery_available() and binary and not peer_data.get("herdrDiscoveryMissAt"):
                 occupant = _codex_title_pane(base, session, binary, {**os.environ, "HERDR_SOCKET_PATH": endpoint})
             if not occupant:
                 _clear_herdr(base, session, peer_data, miss=discovery_available())
                 return False
             herdr = (occupant["pane_id"], occupant.get("workspace_id") or occupant["pane_id"].split(":", 1)[0])
+        elif harness == "codex":
+            herdr = None
         if not target and not herdr:
             return False
         matched_room_id, structural_role, is_exact_conductor = _resolve_structural_role(

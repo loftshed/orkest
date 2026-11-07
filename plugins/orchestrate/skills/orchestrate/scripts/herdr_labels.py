@@ -29,11 +29,16 @@ def bounded(value: str, limit: int = 80) -> str:
     return value if len(value) <= limit else value[: limit - 5] + "…" + value[-4:]
 
 
+def agent_harness(kind: str | None) -> str | None:
+    """Herdr uses agy for Antigravity; the other agent kinds match Orkest harnesses."""
+    return "gemini" if kind == "agy" else kind
+
+
 def display_label(peer: dict) -> str:
     tier = os.environ.get("ORK_GLYPHS", "nerd").strip().lower()
     icons = _ICONS.get(tier, _ICONS["unicode"])
     harness = peer.get("harness")
-    icon = icons.get("gemini" if harness == "agy" else harness, "")
+    icon = icons.get(agent_harness(harness), "")
     return bounded(" ".join(part for part in (icon, plain(peer.get("name") or peer.get("person"))) if part))
 
 

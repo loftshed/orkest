@@ -9,8 +9,8 @@ import time
 
 import agent_progress
 import peer_mailbox as mailbox
-from herdr_context import endpoint
-from herdr_labels import codex_title_session, display_label, plain, work_title
+from herdr_context import canonical_endpoint, endpoint
+from herdr_labels import agent_harness, codex_title_session, display_label, plain, work_title
 
 
 def status() -> str:
@@ -41,14 +41,16 @@ def status() -> str:
             and not peer.get("isSubagent")
             and not peer.get("delegatedRun")
             and peer.get("herdrPaneId") == pane.get("pane_id")
-            and peer.get("herdrEndpoint") == endpoint(dict(os.environ))
+            and canonical_endpoint(peer.get("herdrEndpoint")) == endpoint(dict(os.environ))
             and mailbox.is_live(peer)
         ):
             peers.append(peer)
     ref = pane.get("agent_session") or {}
     if ref.get("kind") == "id" and ref.get("agent") == pane.get("agent"):
         matches = [
-            peer for peer in peers if peer["session"] == ref.get("value") and peer["harness"] == ref.get("agent")
+            peer
+            for peer in peers
+            if peer["session"] == ref.get("value") and peer["harness"] == agent_harness(ref.get("agent"))
         ]
     elif pane.get("agent") == "codex" and not ref:
         session = codex_title_session(pane.get("terminal_title"), codex_sessions)
