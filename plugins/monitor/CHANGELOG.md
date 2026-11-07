@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.18.0
+
+- feat(orchestrate): render agent preview inline and unify Swarm TUI controls (#123)
+
 ## 0.17.0
 
 - feat(orchestrate): add alien-orc name generator, rich agent preview, and cspell cleanup (#97)

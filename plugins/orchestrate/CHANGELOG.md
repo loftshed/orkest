@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.72.0
+
+- feat(orchestrate): align Herdr 0.9.5 protocol v22 and bundle herdr skill (#124)
+- feat(orchestrate): render agent preview inline and unify Swarm TUI controls (#123)
+
 ## 0.71.0
 
 - feat(orchestrate): optional --timeout for room/coordinator dispatch, --time-budget for init-task (#122)
