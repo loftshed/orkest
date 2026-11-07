@@ -995,17 +995,26 @@ export async function observeRoom(idOrRoom, options = {}) {
         startedAt: peer.startedAt || snapshot?.startedAt,
       };
     }
-    const herdrPaneId = snapshot?.herdrPaneId || peer?.herdrPaneId || member.herdrPaneId;
+    const peerClearedHerdr = peer && "herdrPaneId" in peer && peer.herdrPaneId === null;
+    if (peerClearedHerdr && !snapshot?.herdrPaneId) {
+      delete member.herdrPaneId;
+      delete member.herdrWorkspaceId;
+      delete member.herdrEndpoint;
+    } else {
+      const herdrPaneId = snapshot?.herdrPaneId || peer?.herdrPaneId || member.herdrPaneId;
+      if (herdrPaneId) member.herdrPaneId = herdrPaneId;
+      const herdrWorkspaceId =
+        snapshot?.herdrWorkspaceId || peer?.herdrWorkspaceId || member.herdrWorkspaceId;
+      const herdrEndpoint = snapshot?.herdrEndpoint || peer?.herdrEndpoint || member.herdrEndpoint;
+      if (herdrWorkspaceId) member.herdrWorkspaceId = cleanLine(herdrWorkspaceId);
+      if (herdrEndpoint) member.herdrEndpoint = cleanLine(herdrEndpoint);
+    }
     const paneId = snapshot?.paneId || peer?.paneId || member.paneId;
-    if (herdrPaneId) member.herdrPaneId = herdrPaneId;
     if (paneId) member.paneId = paneId;
     const pid = snapshot?.pid || peer?.pid || member.pid;
     const branch = snapshot?.branch || peer?.branch || member.branch;
-    const herdrWorkspaceId =
-      snapshot?.herdrWorkspaceId || peer?.herdrWorkspaceId || member.herdrWorkspaceId;
     if (Number.isSafeInteger(pid) && pid > 0) member.pid = pid;
     if (branch) member.branch = cleanLine(branch);
-    if (herdrWorkspaceId) member.herdrWorkspaceId = cleanLine(herdrWorkspaceId);
     if (!room.swarm) continue;
     if (snapshot) {
       if (!member.dispatch && snapshot.runtimeState) member.runtimeState = snapshot.runtimeState;
@@ -1341,6 +1350,8 @@ async function appendNativePeers(room, snapshots, root) {
   const conductorPid = snapshots?.conductor?.pid || room.conductor?.pid;
   const conductorWorkspace =
     snapshots?.conductor?.herdrWorkspaceId || room.conductor?.herdrWorkspaceId;
+  const conductorEndpoint =
+    snapshots?.conductor?.herdrEndpoint || room.conductor?.herdrEndpoint || room.herdrEndpoint;
   const roomCreatedMs = parseStampMs(room.createdAt);
   let rawPeerEntries;
   try {
@@ -1364,6 +1375,8 @@ async function appendNativePeers(room, snapshots, root) {
     ) {
       continue;
     }
+    if (room.herdrEndpoint && peer.herdrPaneId && peer.herdrEndpoint !== room.herdrEndpoint)
+      continue;
     const peerCwd = await resolveCwd(peer.checkout || peer.cwd);
     if (!peerCwd || (peerCwd !== roomCwd && !peerCwd.startsWith(`${roomCwd}${path.sep}`))) continue;
     const isSameSharedProcess =
@@ -1374,7 +1387,12 @@ async function appendNativePeers(room, snapshots, root) {
       peer.parentSession === room.conductor.session.id,
     );
     const isSameWorkspace = Boolean(
-      peer.herdrWorkspaceId && conductorWorkspace && peer.herdrWorkspaceId === conductorWorkspace,
+      peer.herdrWorkspaceId &&
+      conductorWorkspace &&
+      peer.herdrWorkspaceId === conductorWorkspace &&
+      peer.herdrEndpoint &&
+      conductorEndpoint &&
+      peer.herdrEndpoint === conductorEndpoint,
     );
     const peerStartedMs = parseStampMs(peer.startedAt);
     const hasStartedSinceRoom =
@@ -1432,6 +1450,7 @@ async function appendNativePeers(room, snapshots, root) {
       progressRecord?.goal || (room.title && room.title !== room.id ? room.title : "") || "not set",
     );
     const herdrPaneId = cleanLine(peer.herdrPaneId);
+    const herdrEndpoint = cleanLine(peer.herdrEndpoint);
     const paneId = cleanLine(peer.paneId);
     const branch = cleanLine(peer.branch);
     const latestActivityIso = subagentMeta?.lastActivityIso || peer.lastSeenAt || null;
@@ -1464,6 +1483,7 @@ async function appendNativePeers(room, snapshots, root) {
       ...(Number.isSafeInteger(peer.pid) && peer.pid > 0 && { pid: peer.pid }),
       ...(branch && { branch }),
       ...(herdrPaneId && { herdrPaneId }),
+      ...(herdrEndpoint && { herdrEndpoint }),
       ...(paneId && { paneId }),
       observedAt,
       status,
@@ -1482,6 +1502,7 @@ async function appendNativePeers(room, snapshots, root) {
         ...(Number.isSafeInteger(peer.pid) && peer.pid > 0 && { pid: peer.pid }),
         ...(branch && { branch }),
         ...(herdrPaneId && { herdrPaneId }),
+        ...(herdrEndpoint && { herdrEndpoint }),
         ...(paneId && { paneId }),
         goal: goalText,
         task: taskText,
@@ -1967,7 +1988,10 @@ export async function interactiveProgress(room, root = mailboxRoot()) {
         Boolean(
           peer.herdrWorkspaceId &&
           room.herdrWorkspaceId &&
-          peer.herdrWorkspaceId === room.herdrWorkspaceId,
+          peer.herdrWorkspaceId === room.herdrWorkspaceId &&
+          peer.herdrEndpoint &&
+          room.herdrEndpoint &&
+          peer.herdrEndpoint === room.herdrEndpoint,
         ));
     if (!peerCwd || (!isBoundConductor && peerCwd !== expectedCwd && peerCwd !== roomCwd)) continue;
     const effectiveCwd =
@@ -2031,6 +2055,7 @@ export async function interactiveProgress(room, root = mailboxRoot()) {
     const paneId = cleanLine(peer.paneId || member.paneId);
     const branch = cleanLine(peer.branch || member.branch);
     const herdrWorkspaceId = cleanLine(peer.herdrWorkspaceId || member.herdrWorkspaceId);
+    const herdrEndpoint = cleanLine(peer.herdrEndpoint || member.herdrEndpoint);
     const person = cleanLine(peer.person);
     const color =
       STATUS_COLORS[createHash("sha256").update(binding.id).digest()[0] % STATUS_COLORS.length];
@@ -2047,6 +2072,7 @@ export async function interactiveProgress(room, root = mailboxRoot()) {
       ...(Number.isSafeInteger(peer.pid) && peer.pid > 0 && { pid: peer.pid }),
       ...(branch && { branch }),
       ...(herdrWorkspaceId && { herdrWorkspaceId }),
+      ...(herdrEndpoint && { herdrEndpoint }),
       ...(herdrPaneId && { herdrPaneId }),
       ...(paneId && { paneId }),
       goal: goal || "not set",

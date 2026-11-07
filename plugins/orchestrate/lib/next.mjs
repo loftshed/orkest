@@ -833,14 +833,15 @@ async function defaultExecAgent(args, { cwd = process.cwd() } = {}) {
 }
 
 function sendHerdrApprovalNotification(title, body, { env = process.env, execFileSyncFn } = {}) {
-  if (env?.HERDR_ENV !== "1" && !env?.HERDR_SOCKET && !env?.HERDR_PANE_ID) return false;
+  if (env?.HERDR_ENV !== "1") return false;
   try {
     const runner = execFileSyncFn || execFileSync;
     runner(
-      "herdr",
+      env.HERDR_BIN_PATH || "herdr",
       ["notification", "show", title, "--body", String(body || ""), "--sound", "request"],
       {
         encoding: "utf8",
+        env,
         stdio: ["ignore", "pipe", "ignore"],
       },
     );

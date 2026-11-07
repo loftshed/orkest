@@ -470,34 +470,66 @@ def wake_terminal_pane(base: Path, target: dict[str, Any], message: dict[str, An
     message_id = str(message.get("id") or "")
     prompt_text = notification(message_id)
     herdr_pane_id = target.get("herdrPaneId")
-    if isinstance(herdr_pane_id, str) and herdr_pane_id.strip() and shutil.which("herdr"):
+    herdr_endpoint = target.get("herdrEndpoint")
+    herdr_binary = target.get("herdrBinary")
+    if not isinstance(herdr_binary, str) or not Path(herdr_binary).is_absolute():
+        herdr_binary = shutil.which("herdr")
+    if (
+        isinstance(herdr_pane_id, str)
+        and herdr_pane_id.strip()
+        and isinstance(herdr_endpoint, str)
+        and Path(herdr_endpoint).is_absolute()
+        and herdr_binary
+    ):
         herdr_pane_id = herdr_pane_id.strip()
-        with contextlib.suppress(OSError, ValueError, subprocess.SubprocessError):
-            probe = subprocess.run(
-                ["herdr", "agent", "get", herdr_pane_id],
-                capture_output=True,
-                text=True,
-                timeout=3,
-                check=False,
-            )
-            if getattr(probe, "returncode", 1) == 0:
-                info = json.loads(probe.stdout or "{}")
-                if isinstance(info, dict):
-                    agent_state = (
-                        info.get("state")
-                        or info.get("status")
-                        or (info.get("agent", {}).get("state") if isinstance(info.get("agent"), dict) else None)
-                    )
-                    if agent_state in {"idle", "done"}:
-                        sent = subprocess.run(
-                            ["herdr", "agent", "prompt", herdr_pane_id, prompt_text],
-                            capture_output=True,
-                            text=True,
-                            timeout=3,
-                            check=False,
-                        )
-                        if getattr(sent, "returncode", 0) == 0:
-                            return {"status": "scheduled", "transport": "herdr-pane", "pane": herdr_pane_id}
+        herdr_env = {**os.environ, "HERDR_SOCKET_PATH": herdr_endpoint}
+        from herdr_context import verified_agent
+
+        aliases = target.get("aliases")
+        sessions = {
+            item
+            for item in [target.get("session"), *(aliases if isinstance(aliases, list) else [])]
+            if isinstance(item, str) and item
+        }
+        agent = verified_agent(herdr_binary, herdr_pane_id, sessions, env=herdr_env)
+        if agent and agent.get("agent_status") in {"idle", "done"}:
+            herdr_pane_id = agent["pane_id"]
+            try:
+                sent = subprocess.run(
+                    [herdr_binary, "agent", "prompt", herdr_pane_id, prompt_text],
+                    env=herdr_env,
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
+                    check=False,
+                )
+            except (OSError, subprocess.SubprocessError):
+                return {
+                    "status": "unavailable",
+                    "transport": "herdr-pane",
+                    "phase": "unknown",
+                    "reason": "Herdr prompt outcome is unknown; message remains queued",
+                }
+            if getattr(sent, "returncode", 1) == 0:
+                return {"status": "scheduled", "transport": "herdr-pane", "pane": herdr_pane_id}
+            combined_out = f"{getattr(sent, 'stdout', '') or ''}\n{getattr(sent, 'stderr', '') or ''}"
+            if "agent_not_idle" in combined_out:
+                return {
+                    "status": "unavailable",
+                    "transport": "herdr-pane",
+                    "phase": "pre_submit",
+                    "reason": "Herdr agent is no longer idle; message remains queued for turn hooks",
+                }
+            return {
+                "status": "unavailable",
+                "transport": "herdr-pane",
+                "phase": "unknown",
+                "reason": "Herdr did not confirm prompt submission; message remains queued",
+            }
+        # A Herdr binding owns this conversation. Never send keys to an older tmux binding.
+        return None
+    if isinstance(herdr_pane_id, str) and herdr_pane_id.strip():
+        return None
     server = target.get("terminalServer")
     if isinstance(server, str) and re.fullmatch(r"orkest-label-[0-9a-f]{12}", server) and shutil.which("tmux"):
         with contextlib.suppress(OSError, subprocess.SubprocessError):

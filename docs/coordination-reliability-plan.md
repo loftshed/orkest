@@ -46,18 +46,18 @@ request or inheritance explicitly when it is the only information available.
 These findings justify the work below. Preserve their reproductions as isolated regression tests,
 not machine-specific paths in product behavior.
 
-| Finding                        | Evidence and limit                                                                                                                                                                                       | Disposition                                                                                                               |
-| ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
-| False activity                 | `rooms.mjs` maps finished runs to review; `horde-view.mjs` counts review as active. An idle peer with saved review progress reproduced review/fresh output.                                              | Separate phase from runtime activity in issue 2.                                                                          |
-| Native defaults and provenance | Executor fast routing selects a fast tier. `coordinator.native` prefers same-engine transport independently of requested model. Historical native spawn arguments were not established.                  | Test current capabilities and preserve provenance in issue 3; do not claim that routing caused the historical screenshot. |
-| Continuation gap               | `_swarm_next_advisor` runs at turn start. A Stop hook with queued work and no eligible incoming mail produced no continuation. `next.mjs` has a separate explicit loop.                                  | Reuse the coordinator and existing loop rather than another scheduler in issue 5.                                         |
-| Lost room updates              | Two pre-read side-registration snapshots both allocated `side-1`; the last replace discarded the first member in a scratch reproduction.                                                                 | Fresh-read allocation and mutation under the shared lock in issue 1. No historical production loss was proved.            |
-| Live lock reaping              | Python's room lock replaced an aged lock held by a live process in a scratch reproduction.                                                                                                               | Repair ownership and release rules before migrating writers. Existing metadata writers already take both lock types.      |
-| Lost acknowledgement           | A notifier write after an intervening acknowledgement restored `acknowledged_at` to null in a controlled interleave.                                                                                     | Serialize completion updates, keep acknowledgement monotonic and external notification outside the lock.                  |
-| Side dispatch failure          | Real `ork side --investigate` failed before dispatch: `scope_owner=coordinator` is rejected by the conductor/worker schema.                                                                              | Repair the producer and test the real command boundary in issue 1.                                                        |
-| Herdr wake response            | Installed Herdr returns `result.agent.agent_status`; the wake adapter reads different fields and its fixture hides the mismatch. A read-only probe returned idle while the adapter parser returned null. | Normalize actual responses and verify the target conversation before enabling Herdr continuation in issue 6.              |
-| Herdr view ownership           | Manual split/run has no rollback on launch failure; close discards ownership even if both close attempts fail. Coordinator/view exit does not pair with view-pane retirement.                            | Repair owned-resource lifetime in issue 6; never classify arbitrary idle shells as disposable.                            |
-| Herdr visibility               | Installed CLI/schema supports display-only metadata. Default rows display agent text, not arbitrary custom tokens. Rendered output and TTL behavior were not tested.                                     | Qualify the display path in issue 6 without changing semantic agent state.                                                |
+| Finding                        | Evidence and limit                                                                                                                                                                      | Disposition                                                                                                               |
+| ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| False activity                 | `rooms.mjs` maps finished runs to review; `horde-view.mjs` counts review as active. An idle peer with saved review progress reproduced review/fresh output.                             | Separate phase from runtime activity in issue 2.                                                                          |
+| Native defaults and provenance | Executor fast routing selects a fast tier. `coordinator.native` prefers same-engine transport independently of requested model. Historical native spawn arguments were not established. | Test current capabilities and preserve provenance in issue 3; do not claim that routing caused the historical screenshot. |
+| Continuation gap               | `_swarm_next_advisor` runs at turn start. A Stop hook with queued work and no eligible incoming mail produced no continuation. `next.mjs` has a separate explicit loop.                 | Reuse the coordinator and existing loop rather than another scheduler in issue 5.                                         |
+| Lost room updates              | Two pre-read side-registration snapshots both allocated `side-1`; the last replace discarded the first member in a scratch reproduction.                                                | Fresh-read allocation and mutation under the shared lock in issue 1. No historical production loss was proved.            |
+| Live lock reaping              | Python's room lock replaced an aged lock held by a live process in a scratch reproduction.                                                                                              | Repair ownership and release rules before migrating writers. Existing metadata writers already take both lock types.      |
+| Lost acknowledgement           | A notifier write after an intervening acknowledgement restored `acknowledged_at` to null in a controlled interleave.                                                                    | Serialize completion updates, keep acknowledgement monotonic and external notification outside the lock.                  |
+| Side dispatch failure          | Real `ork side --investigate` failed before dispatch: `scope_owner=coordinator` is rejected by the conductor/worker schema.                                                             | Repair the producer and test the real command boundary in issue 1.                                                        |
+| Herdr wake response            | The earlier adapter missed `result.agent.agent_status` in a live idle response. The repaired adapter delivered once to the recorded endpoint in a two-server test.                      | The adapter verifies the native conversation and skips blocked agents.                                                    |
+| Herdr view ownership           | The earlier adapter created shell splits manually. Native plugin panes now retire on exit, and the startup hook restores a uniquely identified display after a cold restart.            | Verified on an isolated server through pane movement, deliberate closure, and two restarts.                               |
+| Herdr visibility               | Live agent records contained Orkest title and model text for both session-only and full lifecycle hooks. The overlay expired after its configured two minutes.                          | Native agent reads verified the overlay. Sidebar rendering remains a visual check.                                        |
 
 The prune/unregister lock-target unlink hazard is a source-level concern, not a reproduced failure.
 Audit it in issue 1. The native child planning this document bound a real session successfully,
@@ -262,13 +262,10 @@ pane IDs are server-scoped and can change on a move. Use the owning `HERDR_BIN_P
 assuming the binary and endpoint from the caller's PATH identify the target. A timeout does not
 prove a prompt was not sent; recover its outcome before retrying.
 
-Unify swarm-view creation around an explicitly owned resource, using the existing manifest pane
-entrypoint where qualified. A failed launch must roll back only the new split; if rollback fails,
-retain its identity and report recovery-needed. A failed close must preserve ownership until an
-authoritative read confirms absence. Define the view command's exit policy so `q`, launch failure
-and coordinator exit cannot silently accumulate shell-backed views. Closing a view must not
-terminate its coordinator, workers or unrelated user panes. Qualify manifest-pane exit and restore
-behavior rather than assuming plugin ownership guarantees automatic deletion.
+New room displays use the `orkest.swarms` plugin pane entrypoint. Open passes the room to
+Herdr and checks the running command. The startup hook handles cold layout restores, which
+replace plugin processes with shells. Closing the display retires its pane and records the
+closure. The room and its workers remain available.
 
 Add a read-only owned-resource report that reconciles Orkest bindings with Herdr inventory.
 Distinguish pane existence, available shell, live agent conversation, executing worker and accepted
@@ -313,8 +310,8 @@ Documentation checked against installed Herdr 0.9.5:
 [agent automation](https://herdr.dev/tui/docs/agent-automation/),
 [session state and restore](https://herdr.dev/tui/docs/session-state/),
 [plugin panes](https://herdr.dev/tui/docs/plugins/#panes), and
-[socket API](https://herdr.dev/tui/docs/socket-api/). Actual multi-server routing, view exit/restore,
-metadata expiry and sidebar rendering still require isolated qualification.
+[socket API](https://herdr.dev/tui/docs/socket-api/). Isolated server tests cover view exit and cold restore,
+workspace moves, native metadata, and mailbox delivery. Sidebar rendering is a separate visual check.
 
 ### 7. Bound read costs and close the storage decision
 

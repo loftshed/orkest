@@ -36,7 +36,7 @@ See [Herdr setup, upgrades, and swarm restoration](../../docs/herdr.md).
 Orkest can display each session's agent name, model, reasoning effort, repository, task stage, team goal,
 and current task in a persistent terminal footer (`NO_COLOR` disables color).
 
-Use the same outer tmux footer for every harness:
+Outside Herdr, use the same outer tmux footer for every harness:
 
 ```sh
 ork label -- codex
@@ -46,8 +46,9 @@ ork label -- opencode
 ```
 
 Pass `--lines 2` before `--` to split identity and repository from task progress across two rows.
-Arguments after `--` pass through to the harness. Detaching (`Ctrl-b d`) leaves the session running
-and prints the reattach command.
+Arguments after `--` pass through to the harness. Detaching (`Ctrl-b d`) leaves the tmux session
+running and prints the reattach command. In Herdr, `ork label` runs the harness directly in the
+current pane. Herdr owns the terminal display and session lifecycle there.
 
 Agents update their displayed goal, task, and stage (`planning`, `working`, `testing`, `review`, `blocked`, `complete`) with:
 

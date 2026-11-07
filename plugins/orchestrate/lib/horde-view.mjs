@@ -440,12 +440,14 @@ export function normalizeAgent(agent, room) {
   if (!agent || typeof agent !== "object") return agent;
   const worktree = resolveMemberWorktree(agent, room?.cwd);
   const herdrPaneId = agent.herdrPaneId || agent.progress?.herdrPaneId;
+  const herdrEndpoint = agent.herdrEndpoint || agent.progress?.herdrEndpoint;
   const paneId = agent.paneId || agent.progress?.paneId;
   return {
     ...agent,
     _cachedWorktree: worktree,
     ...(worktree && { worktree }),
     ...(herdrPaneId && { herdrPaneId }),
+    ...(herdrEndpoint && { herdrEndpoint }),
     ...(paneId && { paneId }),
   };
 }
@@ -1140,6 +1142,7 @@ export class HordeView {
         ...this.room.conductor,
         id: "conductor",
         ...(this.room.herdrCoordinatorPaneId && { herdrPaneId: this.room.herdrCoordinatorPaneId }),
+        ...(this.room.herdrEndpoint && { herdrEndpoint: this.room.herdrEndpoint }),
       };
     return this.room.agents.find((agent) => agent.id === this.focusId);
   }

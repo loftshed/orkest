@@ -1,29 +1,18 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, realpath, rename, unlink, writeFile } from "node:fs/promises";
-import { homedir, hostname } from "node:os";
+import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { hostname } from "node:os";
 import path from "node:path";
 
+import { herdrEndpoint } from "./herdr-context.mjs";
 import { cacheHome } from "./runtime-paths.mjs";
 import { plain } from "./tui-box.mjs";
 
 async function resolveHerdrStateFile(roomId, env = process.env) {
-  if (env.HERDR_ENV !== "1" || typeof roomId !== "string" || !roomId) return null;
-  const config = path.join(env.XDG_CONFIG_HOME || path.join(homedir(), ".config"), "herdr");
-  const socket =
-    env.HERDR_SOCKET_PATH ||
-    (env.HERDR_SESSION
-      ? path.join(config, "sessions", env.HERDR_SESSION, "herdr.sock")
-      : path.join(config, "herdr.sock"));
-  let endpoint;
-  try {
-    endpoint = await realpath(socket);
-  } catch (error) {
-    if (error.code !== "ENOENT") throw error;
-    const parent = await realpath(path.dirname(socket));
-    endpoint = path.join(parent, path.basename(socket));
-  }
+  if (env.HERDR_ENV !== "1" || !env.HERDR_PANE_ID || typeof roomId !== "string" || !roomId)
+    return null;
+  const endpoint = herdrEndpoint(env);
   const digest = (value) => createHash("sha256").update(value).digest("hex");
   const directory = path.join(cacheHome(env), "herdr-views-v1", digest(endpoint).slice(0, 24));
   const file = env.ORKEST_HERDR_VIEW_STATE || path.join(directory, `${digest(roomId)}.json`);
@@ -58,17 +47,39 @@ export function herdrSwarmPaneLabel(room) {
   return cleaned ? `Swarm · ${cleaned}` : "Orkest Swarm";
 }
 
+async function ownedViewPane(record, env, exec) {
+  if (!record.terminal_id) return env.HERDR_PANE_ID === record.pane ? record.pane : null;
+  const binary = env.HERDR_BIN_PATH || "herdr";
+  return new Promise((resolve) => {
+    exec(binary, ["pane", "current", "--current"], { timeout: 2000, env }, (error, stdout) => {
+      try {
+        const pane = !error && JSON.parse(stdout).result.pane;
+        resolve(pane?.terminal_id === record.terminal_id ? pane.pane_id : null);
+      } catch {
+        resolve(null);
+      }
+    });
+  });
+}
+
 /** Sync the Herdr pane border title with the swarm room title or coordinator goal. */
 export async function syncHerdrViewLabel(room, { env = process.env, exec = execFile } = {}) {
   const roomId = typeof room?.id === "string" ? room.id : "";
   const resolved = await resolveHerdrStateFile(roomId, env);
   if (!resolved) return false;
   const { file, record } = resolved;
-  const paneId = typeof record.pane === "string" ? record.pane.trim() : "";
-  if (!paneId) return false;
   const nextLabel = herdrSwarmPaneLabel(room);
   if (record.label === nextLabel) return false;
-  const updated = { ...record, label: nextLabel };
+  const paneId = await ownedViewPane(record, env, exec);
+  if (!paneId) return false;
+  const binary = env.HERDR_BIN_PATH || "herdr";
+  const renamed = await new Promise((resolve) => {
+    exec(binary, ["pane", "rename", paneId, nextLabel], { timeout: 2000, env }, (error) =>
+      resolve(!error),
+    );
+  });
+  if (!renamed) return false;
+  const updated = { ...record, pane: paneId, label: nextLabel };
   await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
   const tempFile = path.join(path.dirname(file), `.${path.basename(file)}.${randomUUID()}.tmp`);
   try {
@@ -82,17 +93,13 @@ export async function syncHerdrViewLabel(room, { env = process.env, exec = execF
     }
     throw error;
   }
-  const binary = env.HERDR_BIN_PATH || "herdr";
-  await new Promise((resolve) => {
-    exec(binary, ["pane", "rename", paneId, nextLabel], { timeout: 2000, env }, () => resolve());
-  });
   return true;
 }
 
 /** Deliberate display closure; process termination during a server restart preserves intent. */
-export async function markHerdrViewClosed(room, env = process.env) {
+export async function markHerdrViewClosed(room, env = process.env, exec = execFile) {
   const resolved = await resolveHerdrStateFile(room, env);
-  if (!resolved) return;
+  if (!resolved || !(await ownedViewPane(resolved.record, env, exec))) return;
   const { file } = resolved;
   await writeFile(file.replace(/\.json$/u, ".closed"), "closed\n", { mode: 0o600 });
   try {

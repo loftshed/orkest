@@ -36,7 +36,7 @@ From any repository:
 ork claude     # or: ork codex, ork agy, ork opencode
 ```
 
-That opens your harness with Orkest's status footer and room tracking attached. Inside any session,
+That opens your harness with room tracking attached, using a tmux footer outside Herdr. Inside any session,
 toggle the live Swarm View split pane with `/swarm` (or `ork swarm`).
 
 You can also kick off a swarm with an initial objective or team preset:

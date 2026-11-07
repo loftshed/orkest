@@ -16,6 +16,10 @@ import * as hordeTuiModule from "../../../plugins/orchestrate/bin/horde-tui.mjs"
 import * as factoryModule from "../../../plugins/orchestrate/lib/factory.mjs";
 import * as foundryModule from "../../../plugins/orchestrate/lib/foundry.mjs";
 import {
+  createHerdrLifecycleSubscriber,
+  herdrEndpoint,
+} from "../../../plugins/orchestrate/lib/herdr-context.mjs";
+import {
   addMembers,
   createRoom,
   parseTeam,
@@ -1119,11 +1123,33 @@ describe("terminal lifecycle", () => {
     expect(focusedCalls[1].herdrPaneId).toBe("pane-haiku-1");
 
     const execCalls = [];
-    const mockExec = (cmd, args) => {
-      execCalls.push([cmd, args]);
+    const herdrEnv = {
+      HERDR_ENV: "1",
+      HERDR_SOCKET_PATH: path.join(tmpdir(), "horde-tui-herdr.sock"),
     };
-    await focusAgentPane({ id: "a1", herdrPaneId: "hp-1", paneId: "%1" }, { exec: mockExec });
-    await focusAgentPane({ id: "a2", paneId: "%2" }, { exec: mockExec });
+    const endpoint = herdrEndpoint(herdrEnv);
+    const mockExec = (cmd, args, callback) => {
+      execCalls.push([cmd, args]);
+      if (args[0] === "agent" && args[1] === "get")
+        callback(
+          null,
+          JSON.stringify({
+            result: {
+              type: "agent_info",
+              agent: { agent_session: { kind: "id", value: "native-1" } },
+            },
+          }),
+        );
+      else callback(null, "");
+    };
+    await focusAgentPane(
+      { id: "a1", herdrPaneId: "hp-1", herdrEndpoint: endpoint, session: { id: "native-1" } },
+      { exec: mockExec, env: herdrEnv },
+    );
+    await focusAgentPane(
+      { id: "a2", paneId: "%2", terminalServer: "orkest-label-0123456789ab" },
+      { exec: mockExec },
+    );
     expect(
       await focusAgentPane({ id: "a-bad-1", herdrPaneId: "-malicious-flag" }, { exec: mockExec }),
     ).toBe(false);
@@ -1132,8 +1158,9 @@ describe("terminal lifecycle", () => {
     );
     expect(
       await focusAgentPane(
-        { id: "a3", herdrPaneId: "hp-err" },
+        { id: "a3", herdrPaneId: "hp-err", herdrEndpoint: endpoint, session: { id: "native-1" } },
         {
+          env: herdrEnv,
           exec: () => {
             throw new Error("herdr unavailable");
           },
@@ -1142,8 +1169,14 @@ describe("terminal lifecycle", () => {
     ).toBe(false);
     expect(
       await focusAgentPane(
-        { id: "a4", herdrPaneId: "hp-cb-err" },
         {
+          id: "a4",
+          herdrPaneId: "hp-cb-err",
+          herdrEndpoint: endpoint,
+          session: { id: "native-1" },
+        },
+        {
+          env: herdrEnv,
           exec: (_cmd, _args, cb) => {
             cb(new Error("command failed"));
           },
@@ -1151,9 +1184,35 @@ describe("terminal lifecycle", () => {
       ),
     ).toBe(false);
     expect(execCalls).toEqual([
+      ["herdr", ["agent", "get", "hp-1"]],
       ["herdr", ["agent", "focus", "hp-1"]],
-      ["tmux", ["select-pane", "-t", "%2"]],
+      ["tmux", ["-L", "orkest-label-0123456789ab", "select-pane", "-t", "%2"]],
     ]);
+    expect(
+      await focusAgentPane(
+        {
+          herdrPaneId: "hp-1",
+          herdrEndpoint: "/tmp/other-herdr.sock",
+          session: { id: "native-1" },
+        },
+        { exec: mockExec, env: herdrEnv },
+      ),
+    ).toBe(false);
+    expect(execCalls).toHaveLength(3);
+    expect(
+      await focusAgentPane(
+        { herdrPaneId: "hp-1", herdrEndpoint: endpoint, session: { id: "another-session" } },
+        { exec: mockExec, env: herdrEnv },
+      ),
+    ).toBe(false);
+    expect(execCalls.at(-1)).toEqual(["herdr", ["agent", "get", "hp-1"]]);
+    expect(
+      await focusAgentPane(
+        { herdrPaneId: "hp-1", paneId: "%3", terminalServer: "orkest-label-0123456789ab" },
+        { exec: mockExec, env: {} },
+      ),
+    ).toBe(false);
+    expect(execCalls.at(-1)).toEqual(["herdr", ["agent", "get", "hp-1"]]);
 
     const notificationCalls = [];
     const notificationExec = (cmd, args) => {
@@ -1167,7 +1226,7 @@ describe("terminal lifecycle", () => {
         null,
         [{ id: "a1", person: "gribble", stage: "blocked", summary: "Already blocked" }],
         seededSet,
-        { env: { HERDR_PANE_ID: "hp-1" }, exec: notificationExec },
+        { env: { HERDR_ENV: "1", HERDR_PANE_ID: "hp-1" }, exec: notificationExec },
       ),
     ).toBe(false);
     expect(seededSet.has("a1:blocked:Already blocked")).toBe(true);
@@ -1179,7 +1238,7 @@ describe("terminal lifecycle", () => {
         null,
         [{ id: "a1", person: "gribble", stage: "completed", summary: "Already done" }],
         seededCompleteSet,
-        { env: { HERDR_PANE_ID: "hp-1" }, exec: notificationExec },
+        { env: { HERDR_ENV: "1", HERDR_PANE_ID: "hp-1" }, exec: notificationExec },
       ),
     ).toBe(false);
     expect(seededCompleteSet.has("room:all-complete")).toBe(true);
@@ -1192,7 +1251,7 @@ describe("terminal lifecycle", () => {
         [{ id: "a1", person: "gribble", stage: "", summary: "" }],
         [{ id: "a1", person: "gribble", stage: "completed", summary: "Done" }],
         emptyStageSet,
-        { env: { HERDR_PANE_ID: "hp-1" }, exec: notificationExec },
+        { env: { HERDR_ENV: "1", HERDR_PANE_ID: "hp-1" }, exec: notificationExec },
       ),
     ).toBe(false);
     expect(notificationCalls).toHaveLength(0);
@@ -1212,7 +1271,7 @@ describe("terminal lifecycle", () => {
 
     // Fires edge-triggered blocked notification when HERDR_PANE_ID is present:
     notifyHerdrTransitions(prev, nextBlocked, notifiedSet, {
-      env: { HERDR_PANE_ID: "hp-1" },
+      env: { HERDR_ENV: "1", HERDR_PANE_ID: "hp-1" },
       exec: notificationExec,
     });
     expect(notificationCalls).toEqual([
@@ -1233,7 +1292,7 @@ describe("terminal lifecycle", () => {
 
     // Deduplicated on repeated poll with same state:
     notifyHerdrTransitions(prev, nextBlocked, notifiedSet, {
-      env: { HERDR_PANE_ID: "hp-1" },
+      env: { HERDR_ENV: "1", HERDR_PANE_ID: "hp-1" },
       exec: notificationExec,
     });
     expect(notificationCalls).toHaveLength(1);
@@ -1244,7 +1303,7 @@ describe("terminal lifecycle", () => {
       { id: "a2", person: "snoobix", stage: "completed", summary: "Done" },
     ];
     notifyHerdrTransitions(nextBlocked, nextDone, notifiedSet, {
-      env: { HERDR_SOCKET: "/tmp/herdr.sock" },
+      env: { HERDR_ENV: "1", HERDR_SOCKET_PATH: "/tmp/herdr.sock" },
       exec: notificationExec,
     });
     expect(notificationCalls).toHaveLength(2);
@@ -1529,5 +1588,96 @@ describe("terminal lifecycle", () => {
       ttlMs: 60_000,
     });
     expect(cached).toHaveLength(2);
+  });
+
+  it("subscribes to Herdr lifecycle events, invalidates on pane updates, and reconciles on events_lost", async () => {
+    const sockets = [];
+    function createFakeSocket() {
+      const listeners = new Map();
+      const sock = {
+        written: [],
+        destroyed: false,
+        on(event, fn) {
+          const list = listeners.get(event) || [];
+          list.push(fn);
+          listeners.set(event, list);
+        },
+        emit(event, ...args) {
+          const handlers = listeners.get(event) || [];
+          for (const fn of handlers) fn(...args);
+        },
+        write(chunk) {
+          sock.written.push(String(chunk));
+        },
+        destroy() {
+          sock.destroyed = true;
+        },
+      };
+      return sock;
+    }
+    const invalidations = [];
+    const reconciles = [];
+    const sub = createHerdrLifecycleSubscriber({
+      env: { HERDR_ENV: "1", HERDR_SOCKET_PATH: "/tmp/fake-herdr.sock" },
+      connect: () => {
+        const sock = createFakeSocket();
+        sockets.push(sock);
+        return sock;
+      },
+      onInvalidate: (evt) => {
+        invalidations.push(evt);
+      },
+      onReconcile: (evt) => {
+        reconciles.push(evt);
+      },
+      paneIds: ["w1:p1"],
+      reconnectDelayMs: 5,
+      maxReconnectDelayMs: 20,
+    });
+    sub.start();
+    expect(sockets).toHaveLength(1);
+    sockets[0].emit("connect");
+    expect(sockets[0].written).toHaveLength(1);
+    const req = JSON.parse(sockets[0].written[0]);
+    expect(req.method).toBe("events.subscribe");
+    expect(req.params.subscriptions).toContainEqual({ type: "pane.updated" });
+    expect(req.params.subscriptions).toContainEqual({
+      type: "pane.agent_status_changed",
+      pane_id: "w1:p1",
+    });
+
+    sockets[0].emit(
+      "data",
+      `${JSON.stringify({ id: req.id, result: { type: "subscription_started" } })}\n`,
+    );
+    expect(sub.isSubscribed).toBe(true);
+    expect(reconciles).toHaveLength(1);
+    expect(invalidations.at(-1)?.reason).toBe("subscription_started");
+
+    sockets[0].emit(
+      "data",
+      `${JSON.stringify({ event: "pane_updated", data: { type: "pane_updated" } })}\n`,
+    );
+    expect(invalidations.at(-1)?.reason).toBe("pane_updated");
+
+    // Simulate events_lost -> should destroy socket, schedule reconnect, and re-subscribe
+    sockets[0].emit("data", `${JSON.stringify({ error: { code: "events_lost" } })}\n`);
+    expect(sockets[0].destroyed).toBe(true);
+    expect(sub.isSubscribed).toBe(false);
+    expect(invalidations.at(-1)?.reason).toBe("events_lost");
+
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    expect(sockets).toHaveLength(2);
+    sockets[1].emit("connect");
+    const req2 = JSON.parse(sockets[1].written[0]);
+    sockets[1].emit(
+      "data",
+      `${JSON.stringify({ id: req2.id, result: { type: "subscription_started" } })}\n`,
+    );
+    expect(sub.isSubscribed).toBe(true);
+    expect(sub.generation).toBe(2);
+    expect(reconciles).toHaveLength(2);
+    sub.stop();
+    expect(sockets[1].destroyed).toBe(true);
   });
 });

@@ -614,6 +614,7 @@ describe("room CLI", () => {
         cwd,
         pid: process.pid,
         herdrPaneId: "herdr-pane-42",
+        herdrEndpoint: "/tmp/observed-herdr.sock",
         paneId: "%42",
         startedAt: nowIso,
         lastSeenAt: nowIso,
@@ -649,6 +650,7 @@ describe("room CLI", () => {
 
     const observed = await observeRoom(room.id, { root });
     expect(observed.agents[0].herdrPaneId).toBe("herdr-pane-42");
+    expect(observed.agents[0].herdrEndpoint).toBe("/tmp/observed-herdr.sock");
     expect(observed.agents[0].paneId).toBe("%42");
     expect(observed.agents[0].progress.task).not.toBe("Legacy task should be ignored");
   });
@@ -726,6 +728,15 @@ describe("room CLI", () => {
       cwd,
       root,
     });
+    await updateRoom(
+      room.id,
+      (current) => {
+        current.herdrEndpoint = "/tmp/room-herdr.sock";
+        current.conductor.herdrWorkspaceId = "w1";
+        return current;
+      },
+      { root },
+    );
     await mkdir(path.join(root, "peers"), { recursive: true });
     await mkdir(path.join(root, "progress"), { recursive: true });
     const nowIso = new Date().toISOString();
@@ -762,6 +773,8 @@ describe("room CLI", () => {
         pid: process.pid,
         branch: "feat/swarm-view",
         herdrPaneId: "herdr-pane-77",
+        herdrWorkspaceId: "w1",
+        herdrEndpoint: "/tmp/room-herdr.sock",
         startedAt: nowIso,
         lastSeenAt: nowIso,
       }),
@@ -780,6 +793,24 @@ describe("room CLI", () => {
         task: "Auditing native subagent discovery",
         stage: "working",
         updatedAt: nowIso,
+      }),
+    );
+
+    await writeFile(
+      path.join(root, "peers", "other-server.json"),
+      JSON.stringify({
+        schema: "agent-executor.peer.v1",
+        session: "other-server",
+        name: "other-codex-orkest-dd",
+        harness: "codex",
+        state: "busy",
+        cwd,
+        pid: process.pid,
+        herdrPaneId: "herdr-pane-77",
+        herdrWorkspaceId: "w1",
+        herdrEndpoint: "/tmp/another-herdr.sock",
+        startedAt: nowIso,
+        lastSeenAt: nowIso,
       }),
     );
 
@@ -808,6 +839,8 @@ describe("room CLI", () => {
     expect(nativeAgent.status).toBe("running");
     expect(nativeAgent.branch).toBe("feat/swarm-view");
     expect(nativeAgent.herdrPaneId).toBe("herdr-pane-77");
+    expect(nativeAgent.herdrEndpoint).toBe("/tmp/room-herdr.sock");
+    expect(observed.agents.some((agent) => agent.nativeSession === "other-server")).toBe(false);
     expect(nativeAgent.progress.task).toBe("Auditing native subagent discovery");
     expect(nativeAgent.activitySource).toEqual({
       engine: "agy",
@@ -1312,5 +1345,32 @@ describe("SQLite room persistence", () => {
         { root, maxAttempts: 2 },
       ),
     ).rejects.toThrow("exceeded 2 concurrent retries: active-room");
+  });
+
+  it("clears stale member herdrPaneId when peer explicitly nulls Herdr bindings", async () => {
+    const { root, room } = await fixture();
+    room.conductor.session = { id: "coord-null-herdr", machine: hostname() };
+    room.conductor.herdrPaneId = "w1:p1";
+    room.conductor.herdrWorkspaceId = "w1";
+    room.conductor.herdrEndpoint = "/tmp/old-herdr.sock";
+    await mkdir(path.join(root, "peers"), { recursive: true });
+    await writeFile(
+      path.join(root, "peers", "coord-null-herdr.json"),
+      JSON.stringify({
+        schema: "orchestrate.peer.v1",
+        session: "coord-null-herdr",
+        herdrPaneId: null,
+        herdrWorkspaceId: null,
+        herdrEndpoint: null,
+      }),
+    );
+    const observed = await observeRoom(room, {
+      root,
+      progress: async () => ({}),
+      discoverNativePeers: false,
+    });
+    expect(observed.conductor.herdrPaneId).toBeUndefined();
+    expect(observed.conductor.herdrWorkspaceId).toBeUndefined();
+    expect(observed.conductor.herdrEndpoint).toBeUndefined();
   });
 });

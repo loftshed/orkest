@@ -692,6 +692,35 @@ class InstallMailboxTests(unittest.TestCase):
         self.assertFalse((self.base / ".claude-plugin-managed/skills/orchestrate").exists())
         self.assertFalse(installer.install_orchestrate_skill_links(self.base))
 
+    def test_install_herdr_skill_links_across_harnesses_with_repo_fallback(self):
+        root, cli = self.herdr_source()
+        repo_skill = root / ".agents/skills/herdr/SKILL.md"
+        repo_skill.parent.mkdir(parents=True)
+        repo_skill.write_text("---\nname: herdr\ndescription: Control Herdr.\n---\n# Herdr\n")
+        for d in (
+            self.base / ".codex",
+            self.base / ".gemini/config",
+            self.base / ".config/opencode",
+            self.base / ".claude",
+            self.base / ".claude-personal",
+        ):
+            d.mkdir(parents=True)
+        self.assertTrue(installer.install_herdr_skill(self.base, ork_cli=cli, dry_run=True))
+        self.assertFalse((self.base / ".agents/skills/herdr/SKILL.md").exists())
+        self.assertTrue(installer.install_herdr_skill(self.base, ork_cli=cli))
+        hub = self.base / ".agents/skills/herdr"
+        self.assertTrue((hub / "SKILL.md").is_file())
+        for linked in (
+            self.base / ".codex/skills/herdr",
+            self.base / ".gemini/config/skills/herdr",
+            self.base / ".config/opencode/skills/herdr",
+            self.base / ".claude/skills/herdr",
+            self.base / ".claude-personal/skills/herdr",
+        ):
+            self.assertTrue(linked.is_symlink(), str(linked))
+            self.assertEqual(linked.resolve(), hub.resolve())
+        self.assertFalse(installer.install_herdr_skill(self.base, ork_cli=cli))
+
 
 if __name__ == "__main__":
     unittest.main()

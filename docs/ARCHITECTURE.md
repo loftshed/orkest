@@ -73,10 +73,10 @@ Every Orkest command has a plain-English engineering meaning alongside its `ork`
 - **Foundry Evaluation Contracts**: `ork foundry` (configured and tracked via `foundry-state.json`) and task specs support scoped `--verify` (`verify_cmd`) and `--acceptance` (`acceptance_criteria`) flags.
 - **Post-Builder Verification**: Builders run scoped verification commands (capped at `--maxWorkers=2`) outside the model after handoff, paired with acceptance criteria checks before a worktree advances to `ork smelter`.
 
-### C. Deep Herdr Integration (`herdr pane report-metadata`, `.herdr/commands.toml`)
+### C. Herdr Integration (`herdr pane report-metadata`, plugin actions)
 
-- **Live Pane Metadata & Notifications**: When `HERDR_ENV=1`, `agent_terminal.py` and `agent_progress.py` push display-only pane titles, agent badges, and state labels via `herdr pane report-metadata` (debounced on change) and emit attention notifications when workers block, fail, or complete.
-- **Interactive Pane Focus & Command Palette**: Pressing `o` in `HordeView` focuses the selected agent's Herdr or tmux pane. Repository-level commands and shortcuts (`orkest.toggle-horde-view`, `orkest.quota-radar`, `orkest.smelter-audit`, `orkest.foundry-status`) are declared in [`.herdr/commands.toml`](../.herdr/commands.toml).
+- **Pane Metadata & Notifications**: In Herdr, `agent_terminal.py` reports display-only title and agent text (including active child counts and model/effort provenance on parent panes) after checking the native session, without altering the parent's `idle`/`done` status. Herdr owns lifecycle state; the Horde View subscribes to Herdr lifecycle events over the server socket to invalidate cached state and sends attention notifications for blocked workers and completed swarms.
+- **Interactive Pane Focus, Inventory & Actions**: Pressing `o` in Horde View focuses a verified agent pane, and `herdr_swarm_restore.py --inventory` provides a read-only reconciliation of Orkest bindings against passive Herdr snapshot and process inventory across five dimensions (`pane_existence`, `available_shell`, `live_agent_conversation`, `executing_worker`, and `accepted_task`). The [plugin manifest](../herdr-plugin.toml) declares the room pane, open/close/toggle actions, and a startup hook for cold layout restores. Herdr registers the shortcut through `[[keys.command]]`.
 
 ---
 

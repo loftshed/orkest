@@ -1,10 +1,16 @@
 import { EventEmitter } from "node:events";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { runHordeTui } from "../../../plugins/orchestrate/bin/horde-tui.mjs";
+import { herdrEndpoint } from "../../../plugins/orchestrate/lib/herdr-context.mjs";
 import { HordeView } from "../../../plugins/orchestrate/lib/horde-view.mjs";
 import { displayWidth, plain } from "../../../plugins/orchestrate/lib/tui-box.mjs";
 import { actionBar, hitTest } from "../../../plugins/orchestrate/lib/tui-components.mjs";
+
+const HERDR_SOCKET_PATH = path.join(tmpdir(), "orkest-mouse-test-herdr.sock");
+const HERDR_ENDPOINT = herdrEndpoint({ HERDR_SOCKET_PATH });
 
 beforeEach(() => vi.stubEnv("NO_COLOR", ""));
 afterEach(() => vi.unstubAllEnvs());
@@ -21,9 +27,18 @@ function room() {
         name: "alpha",
         status: "running",
         herdrPaneId: "w1:p2",
+        herdrEndpoint: HERDR_ENDPOINT,
+        nativeSession: "alpha-session",
         output: ["Inspecting changes"],
       },
-      { id: "beta", name: "beta", status: "running", herdrPaneId: "w1:p3" },
+      {
+        id: "beta",
+        name: "beta",
+        status: "running",
+        herdrPaneId: "w1:p3",
+        herdrEndpoint: HERDR_ENDPOINT,
+        nativeSession: "beta-session",
+      },
       { id: "background", name: "background", status: "completed", output: ["Review finished"] },
     ],
   };
@@ -209,15 +224,36 @@ describe("clickable Swarm View", () => {
     const exec = (command, args, options, callback) => {
       commands.push([command, ...args]);
       let text = "{}";
-      if (args[1] === "layout") text = JSON.stringify({ result: { layout: { zoomed: false } } });
-      else if (args[1] === "read") text = "Agent beta chat\nAssistant: inspecting changes";
+      switch (args[1]) {
+        case "layout": {
+          text = JSON.stringify({ result: { layout: { zoomed: false } } });
+          break;
+        }
+        case "get": {
+          text = JSON.stringify({
+            result: {
+              type: "agent_info",
+              agent: { agent_session: { kind: "id", value: "beta-session" } },
+            },
+          });
+
+          break;
+        }
+        case "read": {
+          {
+            text = "Agent beta chat\nAssistant: inspecting changes";
+            // No default
+          }
+          break;
+        }
+      }
       callback(null, text);
     };
     const running = runHordeTui(async () => room(), {
       input,
       output,
       exec,
-      env: { HERDR_PANE_ID: "w1:p9" },
+      env: { HERDR_ENV: "1", HERDR_SOCKET_PATH, HERDR_PANE_ID: "w1:p9" },
       quota: false,
       services: false,
       update: false,
@@ -230,7 +266,7 @@ describe("clickable Swarm View", () => {
       expect(outputText).toContain("Live screen · read only");
       expect(commands).toContainEqual([
         "herdr",
-        "pane",
+        "agent",
         "read",
         "w1:p3",
         "--source",

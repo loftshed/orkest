@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { roomsCommand } from "../../../plugins/orchestrate/bin/rooms.mjs";
+import { herdrEndpoint } from "../../../plugins/orchestrate/lib/herdr-context.mjs";
 import {
   listRawRooms,
   parseTeam,
@@ -42,6 +43,7 @@ async function fixture(changes = {}) {
     lastSeenAt: new Date().toISOString(),
     herdrPaneId: "w1:p2",
     herdrWorkspaceId: "w1",
+    herdrEndpoint: path.join(directory, "herdr.sock"),
     model: "gpt:sol",
     ...changes,
   };
@@ -74,6 +76,7 @@ describe("adopting the running conversation", () => {
       herdrPaneId: "w1:p2",
     });
     expect(result.room.herdrCoordinatorPaneId).toBe("w1:p2");
+    expect(result.room.herdrEndpoint).toBe(peer.herdrEndpoint);
     expect(result.room.objective).toBe("Coordinate search work");
     expect(result.brief).toContain("You are the root coordinator of an Orkest swarm.");
     expect(result.brief).toContain("Route every action:");
@@ -84,6 +87,19 @@ describe("adopting the running conversation", () => {
     expect((await readRoom(result.room.id, root)).conductor.session.id).toBe("live-session");
     const presence = await readFile(path.join(root, "peers/live-session.json"), "utf8");
     expect(JSON.parse(presence)).toEqual(peer);
+  });
+
+  it("rejects a pane binding from another Herdr server", async () => {
+    const { cwd, options, directory } = await fixture();
+    options.env = {
+      HERDR_ENV: "1",
+      HERDR_PANE_ID: "w1:p2",
+      HERDR_SOCKET_PATH: path.join(directory, "different-herdr.sock"),
+    };
+    expect(herdrEndpoint(options.env)).not.toBe(path.join(directory, "herdr.sock"));
+    await expect(promoteSession({ session: "live-session", cwd }, options)).rejects.toThrow(
+      "different Herdr server",
+    );
   });
 
   it("repeats promotion idempotently and preserves existing workers and objective", async () => {

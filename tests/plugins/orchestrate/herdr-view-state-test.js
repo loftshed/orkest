@@ -33,6 +33,7 @@ async function fixture() {
     JSON.stringify({
       schema: "orkest.herdr-view.v1",
       room: "room-a",
+      pane: "w1:p2",
       endpoint: socket,
       host: hostname(),
     }),
@@ -42,6 +43,7 @@ async function fixture() {
     closed: file.replace(/\.json$/u, ".closed"),
     env: {
       HERDR_ENV: "1",
+      HERDR_PANE_ID: "w1:p2",
       HERDR_SOCKET_PATH: socket,
       ORCHESTRATE_HOME: root,
       ORKEST_HERDR_VIEW_STATE: file,
@@ -112,13 +114,17 @@ it("formats Herdr swarm pane labels and syncs live title changes to Herdr", asyn
     JSON.stringify({
       ...initialRecord,
       pane: "w1:p2",
+      terminal_id: "room-terminal",
       label: "Orkest Swarm",
     }),
   );
   const calls = [];
   const exec = (binary, args, _options, callback) => {
     calls.push([binary, ...args]);
-    callback?.(null, "", "");
+    callback(
+      null,
+      JSON.stringify({ result: { pane: { pane_id: "w2:p5", terminal_id: "room-terminal" } } }),
+    );
   };
   const room = {
     id: "room-a",
@@ -129,13 +135,20 @@ it("formats Herdr swarm pane labels and syncs live title changes to Herdr", asyn
   expect(herdrSwarmPaneLabel(room)).toBe("Swarm · Refine Orkest coordinator delegation");
   expect(await syncHerdrViewLabel(room, { env, exec })).toBe(true);
   expect(calls).toEqual([
-    ["herdr", "pane", "rename", "w1:p2", "Swarm · Refine Orkest coordinator delegation"],
+    ["herdr", "pane", "current", "--current"],
+    ["herdr", "pane", "rename", "w2:p5", "Swarm · Refine Orkest coordinator delegation"],
   ]);
   expect(JSON.parse(await readFile(file, "utf8")).label).toBe(
     "Swarm · Refine Orkest coordinator delegation",
   );
   expect(await syncHerdrViewLabel(room, { env, exec })).toBe(false);
-  expect(calls).toHaveLength(1);
+  expect(calls).toHaveLength(2);
+  const changedRoom = { ...room, title: "New task" };
+  const failedRename = (_binary, _args, _options, callback) => callback(new Error("pane closed"));
+  expect(await syncHerdrViewLabel(changedRoom, { env, exec: failedRename })).toBe(false);
+  expect(JSON.parse(await readFile(file, "utf8")).label).toBe(
+    "Swarm · Refine Orkest coordinator delegation",
+  );
   expect(
     herdrSwarmPaneLabel({
       id: "room-b",
@@ -143,4 +156,17 @@ it("formats Herdr swarm pane labels and syncs live title changes to Herdr", asyn
         "Toggle compact usage meters (5h/weekly), add rich color differentiation to Orchestrator header",
     }),
   ).toBe("Swarm · Toggle compact usage meters (5h/weekly), add rich color differentiation");
+});
+
+it("keeps a managed view open when a separate viewer of the same room quits", async () => {
+  const { env, file, closed } = await fixture();
+  const record = JSON.parse(await readFile(file, "utf8"));
+  await writeFile(file, JSON.stringify({ ...record, terminal_id: "room-terminal" }));
+  const exec = (_binary, _args, _options, callback) =>
+    callback(
+      null,
+      JSON.stringify({ result: { pane: { pane_id: "w2:p8", terminal_id: "other" } } }),
+    );
+  await markHerdrViewClosed("room-a", { ...env, HERDR_PANE_ID: "w2:p8" }, exec);
+  await expect(readFile(closed, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
 });
