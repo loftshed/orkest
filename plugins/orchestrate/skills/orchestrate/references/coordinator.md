@@ -66,7 +66,10 @@ its tool at the task deadline.
 the same session up to N times before its report; the task spec's `auto_correct` is the default. It
 needs gates, and read-only kinds refuse it, including an explicit 0. The run records it, an explicit 0 included, and a
 correction inherits it unless it passes its own. The rounds stay inside one invocation and share its `--timeout`; they use neither the
-invocation allowance nor the one correction. See [runner.md](runner.md#auto-correct-rounds).
+invocation allowance nor the one correction. Repeatable `--protect-path PATH` adds files or
+directories a round may not change to the spec's `protect_paths`; the run records them, a correction
+inherits them and may add more, and read-only kinds refuse them. See
+[runner.md](runner.md#auto-correct-rounds) for what is protected without them.
 
 External dispatch is foreground by default. Use `--background` to return the durable run handle
 immediately, then supervise `events wait EVENT_ID --messages` and call `recover` after completion.
@@ -197,8 +200,10 @@ is a limit (at most one per audited task), not a required step.
 New tasks require the persisted host review ID. `review --run-id ID --decision supported --review-id
 ID` records supported advice. `dispatch --kind correction --request-id repair-1 --review-id ID`
 inherits the original engine, model, effort, variant, billing, session, scope, checks, runner
-timeout and auto-correct rounds; after `reverify` it still inherits the implementation run's setting,
-including an explicit 0. Only `--timeout` and `--auto-correct` may be overridden. Add
+timeout, auto-correct rounds and protect paths; after `reverify` it still inherits the implementation
+run's setting, including an explicit 0. Only `--timeout` and `--auto-correct` may be overridden, and
+`--protect-path` may add paths. A correction must leave the task changed from where the
+implementation began (`--expect-task-changes`): undoing the work ends `no_changes`. Add
 `--transport native` for a native continuation. No unchanged failed prompt or safety-violation
 resumption is allowed. Original failed/blocked outcomes remain unchanged.
 

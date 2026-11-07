@@ -224,6 +224,9 @@ def validate_spec(spec: dict[str, Any]) -> dict[str, Any]:
         result["conductor_model"] = conductor_model
     if worker_model:
         result["worker_model"] = worker_model
+    if spec.get("protect_paths"):
+        # Files an auto-correct round may not change, beyond those the gates run; the brief text is unchanged.
+        result["protect_paths"] = normalize_repo_paths(require_text_list(spec, "protect_paths"), "protect_paths")
     if spec.get("auto_correct") is not None:
         # Rounds the runner may use to fix a failed --verify-command gate; the brief text is unchanged.
         try:

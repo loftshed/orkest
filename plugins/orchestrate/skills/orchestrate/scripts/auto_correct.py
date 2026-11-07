@@ -4,30 +4,101 @@ When a `--verify-command` gate fails after a clean handoff, the runner can resum
 session with a correction turn and run the gates again, at most `MAX_ROUNDS` times. run_agent.py owns
 the loop, the audit and the timing; this module holds the parts that need none of its state: the
 round limit, the correction turn, the gate files a round may not change, and the fit check.
+
+Gate files come from three places only: the program a verify command runs when it is a repository
+file, the script it hands to an interpreter, and the explicit protect_paths. Arguments in general are
+not read as files; see gate_paths.
 """
 
 from __future__ import annotations
 
 import os
+import posixpath
 import re
-import shlex
-import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 MAX_ROUNDS = 2
 # A round needs a correction turn plus another pass of the gates; with less left it is refused.
 MIN_ROUND_SECONDS = 60.0
 INSTRUCTION = "Fix exactly these problems; change nothing else."
-# Shell words that end one command and start the next, and words that run the command after them.
-OPERATOR_CHARACTERS = frozenset(";&|()")
-COMMAND_PREFIXES = frozenset(
-    {"!", "{", "}", "if", "then", "else", "elif", "do", "while", "until", "time", "exec", "command", "env", "nohup"}
+# A check that is itself wrong goes to review, not into the work: the worker stops instead of editing it.
+BLOCKED_GUIDANCE = (
+    "If a check itself is wrong, do not change it; stop and report BLOCKED with the evidence that the "
+    "check, not the work, is at fault."
 )
+# Shell operators, longest first. A redirection's next word is its target; a here-document's is its delimiter.
+OPERATORS = ("&>>", "<<-", "<<<", "&&", "||", ";;", "|&", ">>", "<<", "<>", ">|", ">&", "<&", "&>")
+OPERATORS += tuple(";&|()<>\n")
+REDIRECTIONS = frozenset({"&>>", "<<<", ">>", "<>", ">|", ">&", "<&", "&>", "<", ">"})
+HERE_DOCUMENTS = frozenset({"<<", "<<-"})
+# Words that start a command without being its program.
+KEYWORDS = frozenset({"!", "{", "}", "if", "then", "else", "elif", "fi", "do", "done", "while", "until"})
 ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*", re.DOTALL)
-# A shell's inline-command flag (`-c`, `-lc`, `-ec`): the next word is a whole command line.
-INLINE_COMMAND_FLAG = re.compile(r"-[A-Za-z]*c[A-Za-z]*")
-MAX_BASES = 16
+# Commands that run the command after them: (short options that take a value, long ones that do).
+WRAPPERS = {
+    "env": ("uCS", frozenset({"--unset", "--chdir", "--split-string"})),
+    "exec": ("a", frozenset()),
+    "command": ("", frozenset()),
+    "time": ("fo", frozenset({"--format", "--output"})),
+    "nohup": ("", frozenset()),
+    "nice": ("n", frozenset({"--adjustment"})),
+    "timeout": ("sk", frozenset({"--signal", "--kill-after"})),
+}
+SHELLS = frozenset({"sh", "bash", "zsh", "dash"})
+SOURCE = frozenset({".", "source"})
+PYTHON = re.compile(r"python(?:\d+(?:\.\d+)*t?)?")
+
+
+class Interpreter(NamedTuple):
+    """How an interpreter's options read, so its first operand, the script, can be found."""
+
+    value: str = ""  # short options whose value is the rest of the word or the next word
+    rest: str = ""  # short options whose value is the rest of the word only
+    inline: str = ""  # short options after which no script runs: inline code or a module
+    long_value: frozenset[str] = frozenset()
+    long_inline: frozenset[str] = frozenset()
+    runs: frozenset[str] = frozenset()  # subcommands the script follows (`deno run x.ts`)
+
+
+INTERPRETERS = {
+    "python": Interpreter(value="WX", inline="cm", long_value=frozenset({"--check-hash-based-pycs"})),
+    "node": Interpreter(
+        value="rC",
+        inline="ep",
+        long_value=frozenset(
+            {"--require", "--import", "--loader", "--experimental-loader", "--conditions", "--input-type"}
+            | {"--env-file", "--title"}
+        ),
+        # Inline code, and modes in which the operands are tests or package scripts, not a script to run.
+        long_inline=frozenset({"--eval", "--print", "--test", "--run"}),
+    ),
+    "ruby": Interpreter(value="IrCE", rest="xF0W", inline="e"),
+    "perl": Interpreter(value="I", rest="MmDd0ixlCF", inline="eE"),
+    "deno": Interpreter(
+        value="cL",
+        long_value=frozenset({"--config", "--import-map", "--lock", "--cert", "--location", "--seed", "--log-level"}),
+        long_inline=frozenset({"--eval"}),
+        runs=frozenset({"run", "serve"}),
+    ),
+    "bun": Interpreter(
+        value="r",
+        inline="ep",
+        long_value=frozenset({"--preload", "--config", "--cwd", "--env-file", "--tsconfig-override"}),
+        long_inline=frozenset({"--eval", "--print"}),
+        runs=frozenset({"run"}),
+    ),
+}
+# PowerShell options are case-insensitive words.
+PWSH_FILE = frozenset({"-f", "-file"})
+PWSH_INLINE = frozenset({"-c", "-command", "-e", "-ec", "-encodedcommand", "-cwa", "-commandwithargs"})
+PWSH_VALUE = frozenset(
+    {"-ex", "-ep", "-executionpolicy", "-wd", "-workingdirectory", "-config", "-configurationname", "-o"}
+    | {"-of", "-outputformat", "-if", "-inp", "-inputformat", "-w", "-windowstyle", "-settings", "-settingsfile"}
+    | {"-custompipename"}
+)
+MAX_DEPTH = 4
+MAX_LINK_HOPS = 40
 
 
 def validate_rounds(value: Any, *, name: str) -> int:
@@ -55,121 +126,406 @@ def failed_command(verification: dict[str, Any]) -> dict[str, Any] | None:
     return next((command for command in verification.get("commands", []) if command.get("status") != "passed"), None)
 
 
-def _words(command: str) -> list[str]:
-    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
-    lexer.whitespace_split = True
-    try:
-        return list(lexer)
-    except ValueError:
-        return command.split()
+def _substitution(command: str, start: int, text: list[str], nested: list[str]) -> int:
+    """Read a `$(...)` or backquoted command at `start` into the word; the command runs too. Returns its end."""
+    if command[start] == "`":
+        end = start + 1
+        while end < len(command) and command[end] != "`":
+            end += 2 if command[end] == "\\" else 1
+        nested.append(command[start + 1 : end].replace("\\`", "`"))
+        text.append(command[start : end + 1])
+        return end + 1
+    depth, end = 1, start + 2
+    while end < len(command) and depth:
+        char = command[end]
+        if char == "\\":
+            end += 2
+            continue
+        if char in "'\"":
+            close = command.find(char, end + 1)
+            end = len(command) if close < 0 else close + 1
+            continue
+        depth += {"(": 1, ")": -1}.get(char, 0)
+        end += 1
+    nested.append(command[start + 2 : end - 1 if depth == 0 else end])
+    text.append(command[start:end])
+    return end
 
 
-def _named(command: str, bases: list[Path], depth: int = 0) -> list[tuple[Path, bool]]:
-    """Paths the words of a shell command may name, each with whether it is the program a command runs.
+def _skip_here_document(command: str, start: int, delimiter: str, strip_tabs: bool) -> int:
+    """The index after a here-document's body, which is data, not commands."""
+    position = start
+    while position < len(command):
+        newline = command.find("\n", position)
+        end = len(command) if newline < 0 else newline
+        line = command[position:end]
+        position = end + 1
+        if (line.lstrip("\t") if strip_tabs else line) == delimiter:
+            break
+    return min(position, len(command))
 
-    Best effort, and deliberately generous: words count plain and as `--flag=value`, relative to the
-    repository root and to every directory a `cd`/`pushd` may have entered (a subshell's `cd` is not
-    undone), and inside an inner `sh -c '...'`. Glob words are skipped: like a directory, what they
-    match is the work under test. A gate kept outside the worker's allowed paths needs none of this:
-    scope already protects it.
-    """
-    bases = list(bases)
-    found: list[tuple[Path, bool]] = []
-    words = _words(command)
-    expect_program = True
-    changing_directory = False
-    for index, word in enumerate(words):
-        if word and set(word) <= OPERATOR_CHARACTERS:
-            expect_program, changing_directory = True, False
-            continue
-        if word in ("cd", "pushd") and expect_program:
-            expect_program, changing_directory = False, True
-            continue
-        if changing_directory:
-            if word.startswith("-"):
-                continue  # cd -P, cd -L, cd --
-            target = Path(word)
-            entered = [Path(os.path.normpath(target if target.is_absolute() else base / target)) for base in bases]
-            bases = list(dict.fromkeys([*bases, *entered]))[:MAX_BASES]
-            changing_directory = False
-            continue
-        if expect_program and (ASSIGNMENT.fullmatch(word) or word in COMMAND_PREFIXES or word.startswith("-")):
-            program = False  # an assignment, a prefix such as `env`/`exec`/`{`, or a prefix's flag
-        else:
-            program, expect_program = expect_program, False
-        inline = bool(index) and INLINE_COMMAND_FLAG.fullmatch(words[index - 1]) is not None
-        if depth < 3 and (inline or any(mark in word for mark in (" ", "\t", "\n", ";", "&", "|", "("))):
-            found += _named(word, bases, depth + 1)
-        for candidate in dict.fromkeys((word, *word.split("=", 1)[1:])):
-            if not candidate or any(mark in candidate for mark in "*?["):
+
+def _tokens(command: str) -> list[tuple[str, str, list[str]]]:
+    """A POSIX shell command line as ("word", text, commands substituted in it) and ("op", operator, [])."""
+    tokens: list[tuple[str, str, list[str]]] = []
+    text: list[str] = []
+    nested: list[str] = []
+    started = quoted = False
+    documents: list[tuple[str, bool]] = []
+    awaiting_delimiter: str | None = None
+
+    def flush() -> None:
+        nonlocal text, nested, started, quoted, awaiting_delimiter
+        if started:
+            word = "".join(text)
+            tokens.append(("word", word, nested))
+            if awaiting_delimiter is not None:
+                documents.append((word, awaiting_delimiter == "<<-"))
+                awaiting_delimiter = None
+        text, nested, started, quoted = [], [], False, False
+
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if char == "\\":
+            if command.startswith("\\\n", index):
+                index += 2  # a line continuation joins the lines
                 continue
-            path = Path(candidate)
-            for base in dict.fromkeys(bases):
-                found.append((Path(os.path.normpath(path if path.is_absolute() else base / path)), program))
+            text.append(command[index + 1 : index + 2])
+            started = quoted = True
+            index += 2
+        elif char == "'":
+            close = command.find("'", index + 1)
+            close = len(command) if close < 0 else close
+            text.append(command[index + 1 : close])
+            started = quoted = True
+            index = close + 1
+        elif char == '"':
+            started = quoted = True
+            index += 1
+            while index < len(command) and command[index] != '"':
+                escaped = command[index + 1 : index + 2]
+                if command[index] == "\\" and escaped in ("$", "`", '"', "\\", "\n"):
+                    text.append("" if escaped == "\n" else escaped)
+                    index += 2
+                elif command.startswith("$(", index) or command[index] == "`":
+                    index = _substitution(command, index, text, nested)
+                else:
+                    text.append(command[index])
+                    index += 1
+            index += 1
+        elif command.startswith("$(", index) or char == "`":
+            index = _substitution(command, index, text, nested)
+            started = True
+        elif char == "#" and not started:
+            newline = command.find("\n", index)
+            index = len(command) if newline < 0 else newline
+        elif char in " \t\r":
+            flush()
+            index += 1
+        else:
+            operator = next((op for op in OPERATORS if command.startswith(op, index)), None)
+            if operator is None:
+                text.append(char)
+                started = True
+                index += 1
+                continue
+            if started and not quoted and "".join(text).isdigit() and operator in REDIRECTIONS | HERE_DOCUMENTS:
+                text, nested, started = [], [], False  # `2>&1`: a file descriptor, not a word
+            flush()
+            tokens.append(("op", operator, []))
+            index += len(operator)
+            if operator in HERE_DOCUMENTS:
+                awaiting_delimiter = operator
+            elif operator == "\n":
+                for delimiter, strip_tabs in documents:
+                    index = _skip_here_document(command, index, delimiter, strip_tabs)
+                documents.clear()
+    flush()
+    return tokens
+
+
+def _literal(word: str) -> bool:
+    """A word that names one path as written: no expansion, glob or brace a shell would rewrite."""
+    return bool(word) and not word.startswith("~") and not any(mark in word for mark in "$`*?[{")
+
+
+def _options(words: list[str], index: int, short: str = "", long: frozenset[str] = frozenset()) -> tuple[int, dict]:
+    """Skip options from `index`: the first operand's index and the values of the options that take one."""
+    values: dict[str, str] = {}
+    while index < len(words):
+        word = words[index]
+        if word == "--":
+            return index + 1, values
+        if word.startswith("--"):
+            name, equals, value = word.partition("=")
+            if name in long and not equals and index + 1 < len(words):
+                index += 1
+                value = words[index]
+            values[name] = value
+        elif len(word) > 1 and word.startswith("-"):
+            for position, flag in enumerate(word[1:], 2):
+                if flag in short:
+                    value = word[position:]
+                    if not value and index + 1 < len(words):
+                        index += 1
+                        value = words[index]
+                    values[flag] = value
+                    break
+        else:
+            return index, values
+        index += 1
+    return index, values
+
+
+def _shell_script(operands: list[str]) -> tuple[str, str] | None:
+    inline = stdin = False
+    index = 0
+    while index < len(operands):
+        word = operands[index]
+        if word in ("--", "-"):
+            index += 1
+            break
+        if word.startswith("--"):
+            index += 2 if word in ("--rcfile", "--init-file") else 1
+            continue
+        if len(word) > 1 and word[0] in "-+":
+            inline = inline or (word[0] == "-" and "c" in word)
+            stdin = stdin or (word[0] == "-" and "s" in word)
+            index += 2 if "o" in word or "O" in word else 1  # `-o pipefail`, `+O extglob`
+            continue
+        break
+    if index >= len(operands):
+        return None if inline else ("stdin", "")
+    if inline:
+        return "command", operands[index]
+    return ("stdin", "") if stdin else ("script", operands[index])
+
+
+def _pwsh_script(operands: list[str]) -> tuple[str, str] | None:
+    index = 0
+    while index < len(operands):
+        word = operands[index].lower()
+        if word in PWSH_FILE:
+            return ("script", operands[index + 1]) if index + 1 < len(operands) else None
+        if word in PWSH_INLINE:
+            return None
+        if word.startswith("-"):
+            index += 2 if word in PWSH_VALUE else 1
+            continue
+        return "script", operands[index]
+    return None
+
+
+def _script(program: str, operands: list[str]) -> tuple[str, str] | None:
+    """What an interpreter runs: ("script", path), ("command", shell text), ("stdin", ""), or None.
+
+    The script is the first operand after the interpreter's options (`python3 -u tools/gen.py apply x`
+    runs tools/gen.py). Inline code and modules (`python3 -c`, `-m`, `node -e`) run no script file;
+    a shell's `-c` string is a command line of its own.
+    """
+    name = posixpath.basename(program)
+    if name in SHELLS:
+        return _shell_script(operands)
+    if name in SOURCE:
+        index, _ = _options(operands, 0)
+        return ("script", operands[index]) if index < len(operands) else None
+    if name == "pwsh":
+        return _pwsh_script(operands)
+    spec = INTERPRETERS.get("python" if PYTHON.fullmatch(name) else name)
+    if spec is None:
+        return None
+    index, subcommand = 0, bool(spec.runs)
+    while index < len(operands):
+        word = operands[index]
+        if word == "--":
+            return ("script", operands[index + 1]) if index + 1 < len(operands) else None
+        if word == "-":
+            return "stdin", ""
+        if word.startswith("--"):
+            option, equals, _ = word.partition("=")
+            if option in spec.long_inline:
+                return None
+            index += 2 if option in spec.long_value and not equals else 1
+            continue
+        if len(word) > 1 and word.startswith("-"):
+            for position, flag in enumerate(word[1:], 2):
+                if flag in spec.inline:
+                    return None
+                if flag in spec.value or flag in spec.rest:
+                    if flag in spec.value and position == len(word):
+                        index += 1  # its value is the next word
+                    break
+            index += 1
+            continue
+        if subcommand:
+            subcommand = False
+            if word in spec.runs:
+                index += 1
+                continue
+            if re.fullmatch(r"[a-z][a-z-]*", word):
+                return None  # another subcommand, such as `deno test` or `bun install`
+        return "script", word
+    return "stdin", ""
+
+
+def _simple_command(
+    words: list[str], inputs: list[str], base: Path, stack: list[Path], found: list[Path], depth: int
+) -> Path:
+    """Add the files one simple command runs to `found`; returns the directory the next command runs in."""
+    index, directory = 0, base
+    while index < len(words):
+        word = words[index]
+        if word in KEYWORDS or ASSIGNMENT.fullmatch(word):
+            index += 1
+            continue
+        wrapper = posixpath.basename(word)
+        if wrapper not in WRAPPERS:
+            break
+        index, values = _options(words, index + 1, *WRAPPERS[wrapper])
+        if wrapper == "env":
+            chdir = values.get("C", values.get("--chdir"))
+            if chdir is not None and _literal(chdir):
+                directory = directory / chdir
+            split = values.get("S", values.get("--split-string"))
+            if split is not None:
+                if depth < MAX_DEPTH:
+                    found.extend(_named(split, directory, depth + 1))
+                return base
+        if wrapper == "timeout":
+            index += 1  # the duration
+    if index >= len(words):
+        return base
+    program, operands = words[index], words[index + 1 :]
+    if program in ("cd", "pushd", "popd"):
+        if program == "popd":
+            return stack.pop() if stack else base
+        start, _ = _options(operands, 0)
+        target = operands[start] if start < len(operands) else ""
+        if not _literal(target) or target == "-" or target.startswith("+"):
+            return base  # cd alone, cd -, pushd +1: not a directory this can follow
+        if program == "pushd":
+            stack.append(base)
+        return base / target
+    if "/" in program and _literal(program):
+        found.append(directory / program)
+    script = _script(program, operands)
+    if script is not None:
+        kind, value = script
+        if kind == "command" and depth < MAX_DEPTH:
+            found.extend(_named(value, directory, depth + 1))
+        elif kind == "script" and _literal(value):
+            found.append(directory / value)
+        elif kind == "stdin" and inputs and _literal(inputs[-1]):
+            found.append(directory / inputs[-1])  # `sh < gate.sh`
+    return base
+
+
+def _named(command: str, base: Path, depth: int = 0) -> list[Path]:
+    """The files a shell command line runs: each command's program when it is a path, and the script an
+    interpreter is given. Follows `cd`/`pushd`/`popd` and subshells, `sh -c '...'` and `$(...)`."""
+    found: list[Path] = []
+    stack: list[Path] = []
+    scopes: list[tuple[Path, list[Path]]] = []
+    words: list[str] = []
+    inputs: list[str] = []
+    redirection: str | None = None
+    for kind, text, nested in [*_tokens(command), ("op", ";", [])]:
+        if kind == "word":
+            if depth < MAX_DEPTH:
+                for inner in nested:
+                    found.extend(_named(inner, base, depth + 1))
+            if redirection is None:
+                words.append(text)
+            elif redirection == "<":
+                inputs.append(text)
+            redirection = None
+            continue
+        if text in REDIRECTIONS or text in HERE_DOCUMENTS:
+            redirection = text
+            continue
+        redirection = None
+        if words:
+            base = _simple_command(words, inputs, base, stack, found, depth)
+            words, inputs = [], []
+        if text == "(":
+            scopes.append((base, list(stack)))
+        elif text == ")" and scopes:
+            base, stack = scopes.pop()  # a subshell's cd is undone
     return found
 
 
-def _link_chain(path: Path) -> list[Path]:
-    """A name and every link it passes through: each hop of a symlink chain, then its final target."""
-    chain = [path]
-    for _ in range(40):
-        if not chain[-1].is_symlink():
-            break
-        target = Path(os.readlink(chain[-1]))
-        hop = target if target.is_absolute() else chain[-1].parent / target
-        chain.append(Path(os.path.realpath(hop.parent)) / hop.name)
-    return list(dict.fromkeys(chain))
-
-
-def _ignored(root: Path, names: list[str]) -> set[str]:
-    """Names Git ignores. When Git cannot answer, none: protecting too much beats too little."""
-    if not names:
-        return set()
+def _record(path: Path, root: Path, names: dict[str, None]) -> None:
+    """Name a path whose directory is already real, as Git tracks it: relative to the root, outside .git."""
     try:
-        answer = subprocess.run(
-            ["git", "check-ignore", "-z", "--stdin"],
-            cwd=root,
-            input=b"\0".join(os.fsencode(name) for name in names),
-            capture_output=True,
-            timeout=30,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return set()
-    if answer.returncode not in (0, 1):
-        return set()
-    return {os.fsdecode(item) for item in answer.stdout.split(b"\0") if item}
+        relative = path.relative_to(root)
+    except ValueError:
+        return
+    if relative.parts and relative.parts[0] != ".git":
+        names[relative.as_posix()] = None
+
+
+def _protect(path: Path, root: Path, names: dict[str, None], *, explicit: bool, hops: int = 0) -> None:
+    """Add the names a file at `path` depends on: every symlinked directory on the way to it, each hop of a
+    symlink chain and its target. A derived name counts only for an existing file; an explicit one always."""
+    current = Path(path.anchor)
+    *directories, last = path.parts[1:] or ("",)
+    for part in directories:
+        if part == "..":
+            current = current.parent
+            continue
+        current = current / part
+        if current.is_symlink():
+            _record(current, root, names)
+            current = Path(os.path.realpath(current))
+    target = current.parent if last == ".." else current / last
+    if target.is_symlink():
+        _record(target, root, names)
+        try:
+            link = Path(os.readlink(target))
+        except OSError:
+            return
+        if hops < MAX_LINK_HOPS:
+            _protect(link if link.is_absolute() else current / link, root, names, explicit=explicit, hops=hops + 1)
+        return
+    if last and (explicit or (target.exists() and not target.is_dir())):
+        _record(target, root, names)
 
 
 def gate_paths(commands: list[str], repo: Path) -> list[str]:
-    """The gate's own files: repository files the verify commands name, as the workspace stands now.
+    """The gate's own files that verify commands run, as the workspace stands now.
 
-    The runner takes them from the snapshot before the first handoff, so a file a gate or the worker
-    writes later is never one. A symlink also protects its target. The program a command runs is
-    protected even when Git ignores it (`./node_modules/.bin/vitest`, `.venv/bin/pytest`). Not gate
-    files: directories and globs (`ruff check src`, `mypy src/*.py`), other ignored files (a gate's
-    `> build/gate.log`), and, as the runner drops them before each round, files the run changed
-    (`test -s out.txt`). Those are the work under test.
+    Two kinds count: the program a command runs when it is given as a path (`./gate.sh`,
+    `.venv/bin/pytest`, `node_modules/.bin/vitest`), and the script handed to an interpreter
+    (`python3 tools/gen.py`, `bash -e check.sh`). Arguments are never gate files: `pytest tests/x.py`
+    protects nothing, and neither do redirections or globs. Git-ignored files count too. The runner
+    takes these from the snapshot before the first handoff and drops files the run changes, which are
+    the work under test. Anything else a gate depends on is listed in protect_paths.
     """
-    root = repo.resolve()
-    # name -> protected even when Git ignores it: the program a command runs, or a link's hop or target.
-    names: dict[str, bool] = {}
+    root = Path(os.path.realpath(repo))
+    names: dict[str, None] = {}
     for command in commands:
-        for path, program in _named(command, [root]):
-            # Name files by their real directory, as Git tracks them: through a symlinked directory
-            # inside the repository, or a symlinked prefix outside it (macOS /var -> /private/var).
-            # Only the directory is resolved, so a symlinked gate stays the link.
-            located = Path(os.path.realpath(path.parent)) / path.name
-            for hop, target in enumerate(_link_chain(located)):
-                try:
-                    relative = target.relative_to(root)
-                except ValueError:
-                    continue
-                name = relative.as_posix()
-                if relative.parts and relative.parts[0] != ".git" and os.path.lexists(target) and not target.is_dir():
-                    names[name] = names.get(name, False) or program or hop > 0
-    ignored = _ignored(root, [name for name, always in names.items() if not always])
-    return [name for name in names if name not in ignored]
+        for path in _named(command, root):
+            _protect(path, root, names, explicit=False)
+    return list(names)
+
+
+def protected_paths(entries: list[str], repo: Path) -> list[str]:
+    """Explicit protect_paths entries (repository-relative files or directories) as names to fingerprint.
+
+    Each is protected whether or not it exists, is ignored by Git or was changed by the run, together
+    with the symlinked directories and link hops it is reached through.
+    """
+    root = Path(os.path.realpath(repo))
+    names: dict[str, None] = {}
+    for entry in entries:
+        _protect(root / entry, root, names, explicit=True)
+    return list(names)
+
+
+def released(path: str, rules: list[str]) -> bool:
+    """Whether a path a steer explicitly allowed (`rules`, each a path or ".") covers `path`."""
+    return any(rule == "." or path == rule or path.startswith(f"{rule}/") for rule in rules)
 
 
 def round_budget(*, executor_seconds_left: float, deadline_left: float | None, gate_seconds: float) -> float:
@@ -217,6 +573,7 @@ def correction_message(failure: dict[str, Any] | None, verification: dict[str, A
         lines.append(
             "Do not change the gate's own files: " + ", ".join(gates) + ". A round that changes them fails the run."
         )
+    lines.append(BLOCKED_GUIDANCE)
     return "\n".join(lines)
 
 

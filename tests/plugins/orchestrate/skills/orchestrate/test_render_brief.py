@@ -71,6 +71,15 @@ class BriefRendererTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaisesRegex(RENDERER.BriefSpecError, "auto_correct must be"):
                 RENDERER.validate_spec({**brief_spec(), "auto_correct": value})
 
+    def test_protect_paths_are_normalized_and_leave_the_brief_unchanged(self) -> None:
+        self.assertNotIn("protect_paths", RENDERER.validate_spec(brief_spec()))
+        spec = {**brief_spec(), "protect_paths": ["tests/test_x.py", "tests/fixtures/"]}
+        self.assertEqual(RENDERER.validate_spec(spec)["protect_paths"], ["tests/test_x.py", "tests/fixtures"])
+        self.assertEqual(RENDERER.render_brief(spec), RENDERER.render_brief(brief_spec()))
+        for value in (["../outside"], ["/absolute"], ["."], "tests"):
+            with self.subTest(value=value), self.assertRaises(RENDERER.BriefSpecError):
+                RENDERER.validate_spec({**brief_spec(), "protect_paths": value})
+
     def test_rendered_brief_passes_the_runner_preflight_parser(self) -> None:
         self.assertEqual(
             RUNNER.brief_report_contract_violations(RENDERER.render_brief(brief_spec())),

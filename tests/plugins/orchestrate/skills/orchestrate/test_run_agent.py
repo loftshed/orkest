@@ -2862,7 +2862,12 @@ class SteerTests(unittest.TestCase):
         return job
 
     def launch_auto_correct(
-        self, rounds: list[dict[str, str]], verify_command: str = "grep -qx fixed allowed/output.txt"
+        self,
+        rounds: list[dict[str, str]],
+        verify_command: str = "grep -qx fixed allowed/output.txt",
+        *,
+        allow_path: str = "allowed",
+        extra_env: dict[str, str] | None = None,
     ) -> dict:
         self.run_index += 1
         index = self.run_index
@@ -2873,14 +2878,17 @@ class SteerTests(unittest.TestCase):
         log = self.external_path / f"auto-correct-steer-invocations-{index}.jsonl"
         resume_sleep_marker = self.external_path / f"auto-correct-steer-resume-{index}.txt"
         environment = self.environment(
-            FAKE_CAPTURE=str(capture),
-            FAKE_CAPTURE_LOG=str(log),
-            FAKE_ROUNDS=json.dumps(rounds),
-            FAKE_ROUNDS_COUNT=str(count),
-            FAKE_RESUME_SLEEP="30",
-            FAKE_RESUME_SLEEP_MARKER=str(resume_sleep_marker),
-            FAKE_BLOCK="0",
-            FAKE_OUTPUT="allowed/output.txt",
+            **{
+                "FAKE_CAPTURE": str(capture),
+                "FAKE_CAPTURE_LOG": str(log),
+                "FAKE_ROUNDS": json.dumps(rounds),
+                "FAKE_ROUNDS_COUNT": str(count),
+                "FAKE_RESUME_SLEEP": "30",
+                "FAKE_RESUME_SLEEP_MARKER": str(resume_sleep_marker),
+                "FAKE_BLOCK": "0",
+                "FAKE_OUTPUT": "allowed/output.txt",
+                **(extra_env or {}),
+            }
         )
         argv = [
             str(SCRIPT),
@@ -2894,7 +2902,7 @@ class SteerTests(unittest.TestCase):
             "--notify",
             "none",
             "--allow-path",
-            "allowed",
+            allow_path,
             "--expect-changes",
             "--verify-command",
             verify_command,
@@ -3129,8 +3137,10 @@ class SteerTests(unittest.TestCase):
         self.repository.git("commit", "-qm", "gate script")
         return gate
 
-    def steer_interrupted_round(self, rounds: list[dict[str, str]], during_round=None, *steer_args: str) -> dict:
-        job = self.launch_auto_correct(rounds, verify_command="sh allowed/check.sh")
+    def steer_interrupted_round(
+        self, rounds: list[dict[str, str]], during_round=None, *steer_args: str, allow_path: str = "allowed"
+    ) -> dict:
+        job = self.launch_auto_correct(rounds, verify_command="sh allowed/check.sh", allow_path=allow_path)
         self.assertTrue(self.wait_until(lambda: job["resume_started"].exists(), timeout=20), "no correction round")
         if during_round is not None:
             during_round()
@@ -3179,6 +3189,106 @@ class SteerTests(unittest.TestCase):
         self.assertNotIn("gate-edit:allowed/check.sh", result["scope_violations"])
         self.assertNotEqual(result["status"], "scope_violation")
         self.assertEqual(result["auto_correct"]["rounds"][0]["gate_files_changed"], ["allowed/check.sh"])
+
+    def test_a_steer_naming_a_path_scope_already_covers_still_releases_it(self) -> None:
+        # Argon N3: the steer asks for the gate's own path, or its directory, while scope already covers it.
+        self.commit_gate_script()
+        for launched, steered in ((".", "allowed/check.sh"), ("allowed", "allowed")):
+            with self.subTest(launched=launched, steered=steered):
+                self.repository.git("checkout", "-q", "--", ".")
+                self.repository.git("clean", "-fdq")
+                result = self.steer_interrupted_round(
+                    [{"FAKE_CONTENT": "broken\n"}, {"FAKE_OUTPUT": "allowed/check.sh", "FAKE_CONTENT": "exit 0\n"}],
+                    None,
+                    "--allow-path",
+                    steered,
+                    allow_path=launched,
+                )
+                self.assertEqual((result["status"], result["scope_violations"]), ("completed", []))
+                self.assertEqual(result["auto_correct"]["released_paths"], [steered])
+
+    def test_an_interrupted_round_records_no_gate_edit_for_a_path_the_steer_allows(self) -> None:
+        gate = self.commit_gate_script()
+        result = self.steer_interrupted_round(
+            [{"FAKE_CONTENT": "broken\n"}, {"FAKE_CONTENT": "fixed\n"}],
+            lambda: gate.write_text("exit 0\n", encoding="utf-8"),
+            "--allow-path",
+            "allowed/check.sh",
+        )
+        self.assertEqual((result["status"], result["scope_violations"]), ("completed", []))
+        self.assertEqual(result["auto_correct"]["rounds"][0]["gate_files_changed"], [])
+        superseded = json.loads(Path(result["steering"]["steers"][0]["previous_result_path"]).read_text())
+        self.assertEqual(superseded["scope_violations_at_interrupt"], [])
+
+    def test_a_resumed_run_keeps_the_paths_a_steer_released(self) -> None:
+        # Argon N3: a live steer opens gate/; a correction resumed from that result must not re-gate it.
+        gate = self.repository.path / "gate/check.sh"
+        gate.parent.mkdir(parents=True)
+        gate.write_text("exit 1\n", encoding="utf-8")
+        self.repository.git("add", "gate/check.sh")
+        self.repository.git("commit", "-qm", "gate script")
+        verify = "sh gate/check.sh && grep -qx fixed allowed/output.txt"
+        started, release = self.external_path / "released-started", self.external_path / "release-released"
+        job = self.launch_auto_correct(
+            [{"FAKE_CONTENT": "attempt1\n"}, {"FAKE_CONTENT": "attempt2\n"}],
+            verify,
+            extra_env={
+                "FAKE_BLOCK": "1",
+                "FAKE_STARTED": str(started),
+                "FAKE_RELEASE": str(release),
+                "FAKE_RESUME_SLEEP": "0",
+            },
+        )
+        state = job["job_dir"] / RUNNER.STEER_STATE_NAME
+        self.assertTrue(
+            self.wait_until(
+                lambda: (
+                    started.exists() and state.exists() and json.loads(state.read_text())["phase"] == "executor_running"
+                )
+            )
+        )
+        live = [str(SCRIPT), "steer", job["event_id"], "--allow-path", "gate", "--no-interrupt"]
+        with (
+            mock.patch.object(sys, "argv", live),
+            mock.patch.dict(os.environ, self.environment()),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(RUNNER.main(), 0)
+        release.write_text("go", encoding="utf-8")
+        self.wait_event(job["event_id"])
+        first = json.loads(job["result_path"].read_text(encoding="utf-8"))
+        self.assertEqual(first["status"], "verification_failed")
+        self.assertEqual(
+            (first["auto_correct"]["gate_candidates"], first["auto_correct"]["released_paths"]),
+            (["gate/check.sh"], ["gate"]),
+        )
+        out_dir = self.external_path / "released-resume"
+        brief = self.external_path / "released-brief.md"
+        brief.write_text("# Objective\n\nCreate the fixture output.\n", encoding="utf-8")
+        argv = [str(SCRIPT), "--cwd", str(self.repository.path), "--brief", str(brief), "--engine", "codex"]
+        argv += ["--out-dir", str(out_dir), "--allow-path", "allowed", "--allow-path", "gate", "--expect-changes"]
+        argv += ["--verify-command", verify, "--auto-correct", "1", "--timeout", "2m"]
+        argv += ["--session", first["session_id"], "--resume-result", str(job["result_path"])]
+        environment = self.environment(
+            FAKE_CAPTURE=str(self.external_path / "released-capture.json"),
+            FAKE_ROUNDS=json.dumps(
+                [
+                    {"FAKE_OUTPUT": "allowed/output.txt", "FAKE_CONTENT": "fixed\n"},
+                    {"FAKE_OUTPUT": "gate/check.sh", "FAKE_CONTENT": "exit 0\n"},
+                ]
+            ),
+            FAKE_ROUNDS_COUNT=str(self.external_path / "released-rounds.txt"),
+        )
+        with (
+            mock.patch.object(sys, "argv", argv),
+            mock.patch.dict(os.environ, environment),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            code = RUNNER.main()
+        resumed = json.loads((out_dir / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual((code, resumed["status"], resumed["scope_violations"]), (0, "completed", []))
+        self.assertEqual(resumed["auto_correct"]["released_paths"], ["gate"])
+        self.assertEqual(resumed["auto_correct"]["rounds"][0]["gate_files"], [])
 
     def test_refuses_other_worktrees_and_executors_without_a_session(self) -> None:
         job = self.launch(silent=True)

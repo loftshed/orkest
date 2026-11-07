@@ -131,33 +131,52 @@ again, up to N rounds, and reports once. With 0 or no option nothing changes.
   handoff did: `verification_failed` with that handoff's report and gate results, and
   `converted_from` naming the round's status. That report predates the round's changes, so
   `coordinator.py reverify` refuses the result; the bounded `correction` is the way on.
+- `--expect-task-changes` (with `--expect-changes` and `--resume-result`) judges the net change from
+  where the resumed task began: the resumed result's `task_git_before`, else its `git_before`. The
+  result records `task_git_before` and `task_workspace_changed`. A coordinator correction always
+  passes it, so undoing the implementation's work ends `no_changes`, and a correction after a
+  converted round whose fix is already in place completes once the gates pass.
 - Rounds share `--timeout`: a round gets the executor time earlier attempts left. It is refused when
   under 60 s remain (`timeout`), when `--deadline` leaves under 60 s plus the last gate run
   (`deadline`), or when the executor exposed no session (`no_session`). A round's wait keeps the
   runner's 60 s grace past its timeout, but with `--deadline` it always ends early enough for the
   gates to run again.
-- A round may not change the gate. Only these files are protected: files named in a verify command
-  (`python3 tools/gen.py`, `pytest tests/test_x.py`) that existed before the first handoff, are not
-  ignored by Git, and the run had not changed before the round. The program a command runs, its
-  first word, is protected even when Git ignores it (`./node_modules/.bin/vitest`,
-  `.venv/bin/pytest`). Names count after `cd`/`pushd` (flags such as `-P` too, and a subshell's
-  `cd` is not undone), behind prefixes such as `env`, `exec` and `{ ...; }`, inside `sh -c '...'`, and
-  through every hop of a symlink chain, whose hops and target are protected even when ignored. A name
-  reached through a symlinked directory is the file Git tracks. Reading names from shell text is best
-  effort, not a sandbox: keep a gate outside the worker's allowed paths and scope protects it fully. Changing a protected file fails the run as `scope_violation` with
-  `gate-edit:<path>`. Directories and globs (`ruff check src`, `mypy src/*.py`), files the run
-  itself wrote or changed (`test -s out.txt`) and files the gates write (`> build/gate.log`) are not
-  protected.
+- A round may not change the gate's own files, listed per round as `gate_files`. Changing one fails
+  the run as `scope_violation` with `gate-edit:<path>`. Exactly three kinds are protected:
+  - the program a verify command runs, when it is a path: `./gate.sh`, `.venv/bin/pytest`,
+    `node_modules/.bin/vitest`;
+  - the script handed to `sh`, `bash`, `zsh`, `dash`, `python`, `python3`, `node`, `ruby`, `perl`,
+    `deno`, `bun`, `pwsh`, `.` or `source`: its first operand after the options, so
+    `python3 tools/gen.py apply x` protects `tools/gen.py`. `-m`, `-c` and `-e` run no script file;
+    a shell's `-c` string is read as commands;
+  - every `protect_paths` entry (task spec) and `--protect-path`: files or directories, protected in
+    every round whether or not they exist, Git ignores them or the run changed them.
+- Programs and scripts count as they stood before the first handoff, Git-ignored or not, minus files
+  the run itself has changed, which are the work under test. They are found after `cd`/`pushd`/`popd`
+  (a subshell's `cd` is undone), behind `env`, `exec`, `command`, `time`, `nohup`, `nice`, `timeout`
+  and `{ ...; }`, on every line of a multi-line command, inside `sh -c '...'` and `$(...)`. A
+  symlinked directory on the way and every hop of a symlink chain are protected too.
+- Nothing else is protected. Arguments are not: test files named to a test runner
+  (`pytest tests/test_x.py`), data, config, redirections (`> build/gate.log`), directories and globs
+  stay fixable in a round. Programs a command starts indirectly (`make test`, `npx vitest`,
+  `uv run pytest`, a script calling a script) are not found. Keep a gate outside the worker's
+  allowed paths, where scope protects it in every turn, or list it in `protect_paths`.
+- The correction turn also says that a check which is itself wrong must not be changed: the worker
+  stops and reports `BLOCKED` with the evidence, and the run ends `blocked` with that report and any
+  consultation request for review.
 - A user steer that interrupts a mechanical round records that round as `steered` (with any gate files
   changed so far) and starts the continuation with fresh segment budgets and handoff state; already
   opened rounds still count toward the global cap. The interrupted round's gate files stay protected and
   are judged on the workspace the steered turn leaves, so restoring one is not a violation. A path a
-  steer allows with `--allow-path`, live or interrupting, stops being protected for the rest of the run. A resumed correction reuses the first run's
-  gate candidates and excludes files changed by that earlier run.
+  steer names with `--allow-path`, live or interrupting, stops being protected with everything under
+  it, even when scope already covered it (`.` or a parent directory). `auto_correct.released_paths`
+  records those paths, and a run resumed from that result keeps them released. A resumed correction
+  reuses the first run's gate candidates and protect paths and excludes files that earlier run changed.
 - Native transport never loops. A native handoff passes the round limit to the host in its
   instructions; a coordinator native guard returns the failed gate as `suggested_correction`. As on the
-  executor path, only a native correction enforces gate files, and the guard checks them before it runs
-  any gate, so a changed gate program never executes.
+  executor path, only a native correction enforces gate files, `protect_paths` included, and the guard
+  checks them before it runs any gate, so a changed gate program never executes. A native correction
+  is judged with its implementation, as `--expect-task-changes` would.
 - A correction resumed from a `reverify` result takes its usage cost baseline from the run that was
   rechecked, since a host recheck records no cost of its own.
 - Rounds are not a coordinator `correction` and do not use its allowance.

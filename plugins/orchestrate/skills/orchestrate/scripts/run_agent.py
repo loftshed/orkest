@@ -310,6 +310,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--protect-path",
+        action="append",
+        default=[],
+        help=(
+            "Repository-relative file or directory an auto-correct round may not change, even when Git "
+            "ignores it; repeatable and added to the task spec's protect_paths"
+        ),
+    )
+    parser.add_argument(
         "--add-dir",
         action="append",
         default=[],
@@ -368,6 +377,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--expect-changes",
         action="store_true",
         help="Fail when the Git worktree has no net content change",
+    )
+    parser.add_argument(
+        "--expect-task-changes",
+        action="store_true",
+        help=(
+            "With --expect-changes and --resume-result, judge the net change from where the resumed task "
+            "began (its first run's snapshot), not from this run's start"
+        ),
     )
     parser.add_argument(
         "--retry-read-only",
@@ -1130,6 +1147,9 @@ def validated_run_options(
             raise RunnerError(str(error), 4) from error
         if args.auto_correct and not args.verify_command:
             raise RunnerError("--auto-correct requires a --verify-command gate to correct against", 4)
+    normalize_repo_paths(getattr(args, "protect_path", []), option="--protect-path")
+    if getattr(args, "expect_task_changes", False) and not (args.expect_changes and args.resume_result):
+        raise RunnerError("--expect-task-changes requires --expect-changes and --resume-result", 4)
     timeout_seconds = parse_duration(args.timeout)
     deadline_remaining(args.deadline)
     verify_timeout_seconds = parse_duration(
@@ -2199,14 +2219,22 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
         steering.allowed_paths = list(allowed_paths)
         steering.tracked_paths = list(tracked_paths)
         steering.enforced_paths = list(enforced_paths)
-    launch_allowed_paths = list(allowed_paths)
+    # Paths a steer explicitly allowed in a run this one resumes; they stay released here too.
+    resumed_releases: list[str] = []
+
+    def steer_releases() -> list[str]:
+        """Every path a steer explicitly asked to allow, live or interrupting, whether or not scope already
+        covered it (`.` or a parent directory): the user opened it, so it is no longer a gate file."""
+        requested = [
+            path
+            for entry in (steering.state["steers"] if steering is not None else [])
+            if entry.get("status") == "accepted"
+            for path in entry.get("added_allow_paths") or []
+        ]
+        return list(dict.fromkeys([*resumed_releases, *requested]))
 
     def steer_released(path: str) -> bool:
-        """A path a steer allowed after launch (live or interrupting) is no longer a gate: the user opened it."""
-        if steering is None:
-            return False
-        added = [str(entry) for entry in steering.allowed_paths if entry not in launch_allowed_paths]
-        return any(add == "." or path == add or path.startswith(f"{add}/") for add in added)
+        return bundled_module("auto_correct").released(path, steer_releases())
 
     ensure_hook_outside_workspaces(completion_hook, [repo, *add_dirs])
     out_dir = prepare_out_dir(args.out_dir, repo)
@@ -2289,6 +2317,12 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
                         "billing_mode": args.billing_mode,
                     },
                 )
+            if (
+                args.expect_task_changes
+                and previous_result is not None
+                and not isinstance(previous_result.get("task_git_before") or previous_result.get("git_before"), dict)
+            ):
+                raise RunnerError("--expect-task-changes needs a --resume-result that records git_before", 4)
         except support.ContractError as error:
             raise RunnerError(str(error), 4) from error
         except (OSError, ValueError, TypeError) as error:
@@ -2330,6 +2364,13 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
     if not args.dry_run and previous_result is None and enforced_paths:
         bundled_module("repo_env").bootstrap_worktree_env(repo, overwrite=False)
     before = git_state(repo, tracked_paths)
+    # --expect-task-changes: the net change is judged from where the resumed task began, so a correction
+    # that undoes the work ends no_changes and one whose earlier fix is already in place need not add more.
+    task_before: dict[str, Any] | None = (
+        (previous_result.get("task_git_before") or previous_result["git_before"])
+        if args.expect_task_changes and previous_result is not None
+        else None
+    )
     git_identity_before = git_identity(repo)
     git_metadata_before = git_metadata_snapshot(repo) if not enforced_paths else {}
     git_activity_before = git_activity(repo)
@@ -2373,12 +2414,30 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
     )
     # The gate's own files, as named before the first handoff; a file written later is never one.
     gate_candidates = auto_correct_module.gate_paths(args.verify_command, repo) if max_rounds else []
+    # Explicit gate files: protected in every round, ignored by Git or not, changed by the run or not.
+    protect_entries = normalize_repo_paths(
+        [*((task_spec or {}).get("protect_paths") or []), *args.protect_path], option="--protect-path"
+    )
+    protected = auto_correct_module.protected_paths(protect_entries, repo) if max_rounds else []
+    saved = (previous_result or {}).get("auto_correct") or {}
+    if previous_result is not None:
+        earlier_steers = (previous_result.get("steering") or {}).get("steers") or []
+        resumed_releases.extend(
+            dict.fromkeys(
+                [
+                    *(saved.get("released_paths") or []),
+                    *(path for steer in earlier_steers for path in steer.get("added_allow_paths") or []),
+                ]
+            )
+        )
     if max_rounds and previous_result is not None:
-        saved_candidates = (previous_result.get("auto_correct") or {}).get("gate_candidates")
+        saved_candidates = saved.get("gate_candidates")
         if isinstance(saved_candidates, list):
             gate_candidates = saved_candidates
         changed_before_resume = set((previous_result.get("run_delta") or {}).get("changed_paths", []))
         gate_candidates = [path for path in gate_candidates if path not in changed_before_resume]
+        if isinstance(saved.get("protect_paths"), list):
+            protected = list(dict.fromkeys([*saved["protect_paths"], *protected]))
     # Every auto-correct round of this run; absent when the run may use none, so N=0 results are unchanged.
     auto_correct: dict[str, Any] | None = (
         {
@@ -2386,6 +2445,8 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
             "source": rounds_source,
             "mode": "executor",
             "gate_candidates": list(gate_candidates),
+            "protect_paths": list(protected),
+            "released_paths": steer_releases(),
             "rounds_used": 0,
             "outcome": "not_run",
             "refused_reason": None,
@@ -2433,6 +2494,7 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
         "log_path": str(log_path),
         "final_output_path": str(final_output_path),
         "git_before": before,
+        **({"task_git_before": task_before} if task_before is not None else {}),
         "git_identity_before": git_identity_before,
         "allowed_paths": enforced_paths,
         "tracked_paths": tracked_paths,
@@ -2781,10 +2843,16 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
             if steered:
                 assert steering is not None and steering.pending is not None and completion_event_path is not None
                 pending = steering.pending
+                # The interrupted round's gates stay protected through the steered turn, judged on the
+                # workspace it leaves; only a path the steer explicitly allowed stops being a gate.
+                gates = [path for path in gates if not steer_released(path)]
+                gates_before = {path: gates_before[path] for path in gates if path in gates_before}
                 # Recorded, not final: the steered turn may still restore these, and the gates stay protected.
                 interrupted_gate_changes = [
                     path for path in gates if path_fingerprint(repo / path) != gates_before.get(path)
                 ]
+                if auto_correct is not None:
+                    auto_correct["released_paths"] = steer_releases()
                 if correction_round and auto_correct is not None:
                     auto_correct["rounds"][-1].update(
                         finished_at=utc_now(),
@@ -2812,10 +2880,6 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
                 executor_seconds_used = 0.0
                 round_timeout_seconds = timeout_seconds
                 round_wait_until = None
-                # The interrupted round's gates stay protected through the steered turn, judged on the
-                # workspace it leaves; only a path the steer explicitly allowed stops being a gate.
-                gates = [path for path in gates if not steer_released(path)]
-                gates_before = {path: gates_before[path] for path in gates if path in gates_before}
                 round_attempts_start = len(executor_attempts)
                 retry_window_start = len(executor_attempts)
                 round_before = after_attempt
@@ -3034,7 +3098,9 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
             stdout_present=bool(candidate_message.strip()),
             report_extracted=report_extracted,
             expect_changes=args.expect_changes,
-            workspace_changed=workspace_changed_after_executor,
+            workspace_changed=workspace_changed_after_executor
+            if task_before is None
+            else task_before["fingerprint"] != after_executor["fingerprint"],
             reported_outcome=reported_outcome,
             report_contract_valid=report_contract_valid,
         )
@@ -3206,10 +3272,10 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
         )
         rounds_started += 1
         correction_round = rounds_started
-        # Gate files existed before the first handoff and the run has not changed them since.
-        gates = [
-            path for path in gate_candidates if path not in run_delta["changed_paths"] and not steer_released(path)
-        ]
+        # Gate files: the derived ones that existed before the first handoff and the run has not changed
+        # since, and every protect_paths entry. A path a steer explicitly allowed is neither.
+        derived = [path for path in gate_candidates if path not in run_delta["changed_paths"]]
+        gates = [path for path in dict.fromkeys([*derived, *protected]) if not steer_released(path)]
         gates_before = {path: path_fingerprint(repo / path) for path in gates}
         round_brief_path = out_dir / f"round-{correction_round}-brief.txt"
         write_private_text(
@@ -3319,6 +3385,7 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
         auto_correct.update(
             rounds_used=len(auto_correct["rounds"]),
             executor_seconds=round(total_executor_seconds_used, 3),
+            released_paths=steer_releases(),
         )
     review = compact_review_bundle(
         repo=repo,
@@ -3362,6 +3429,11 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
         # Other worktrees or branches changed during the run: informational, never a failure.
         "concurrent_activity": find_history_violations(git_activity_before, git_activity_after),
         "workspace_changed": workspace_changed,
+        **(
+            {"task_workspace_changed": task_before["fingerprint"] != after["fingerprint"]}
+            if task_before is not None
+            else {}
+        ),
         "workspace_changed_after_executor": workspace_changed_after_executor,
         "verification_changed_workspace": verification_changed_workspace,
         "verification_delta": verification_delta,

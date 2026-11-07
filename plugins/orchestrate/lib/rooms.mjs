@@ -702,9 +702,8 @@ export async function dispatchMember(id, memberId, options = {}) {
   const room = await readRoom(id, root);
   const targetMember =
     memberId === "conductor" ? room.conductor : room.agents.find((agent) => agent.id === memberId);
-  const resolvedMemberCwd = options.cwd
-    ? await realpath(options.cwd)
-    : await realpath(targetMember?.cwd || room.cwd);
+  const currentMemberCwd = await realpath(targetMember?.cwd || room.cwd);
+  const resolvedMemberCwd = options.cwd ? await realpath(options.cwd) : currentMemberCwd;
   if ((await realpath(task.repository)) !== resolvedMemberCwd)
     throw new Error("Task repository differs from room checkout");
   // A room under a team only runs that team's tasks, so a superseded lead cannot dodge the fence here.
@@ -722,21 +721,29 @@ export async function dispatchMember(id, memberId, options = {}) {
   // The coordinator validates the duration and checks it against the task deadline.
   if (options.timeout !== undefined && (typeof options.timeout !== "string" || !options.timeout))
     throw new Error("--timeout needs a duration such as 25m");
-  // Runner gates for implementation work, and the auto-correct rounds the coordinator caps.
+  // Runner gates for implementation work, the files its auto-correct rounds may not change, and the
+  // rounds the coordinator caps.
   const verifyCommands = options.verifyCommands ?? [];
   if (
     !Array.isArray(verifyCommands) ||
     verifyCommands.some((command) => typeof command !== "string" || !command.trim())
   )
     throw new Error("--verify-command needs a non-empty command");
+  const protectPaths = options.protectPaths ?? [];
+  if (
+    !Array.isArray(protectPaths) ||
+    protectPaths.some((entry) => typeof entry !== "string" || !entry.trim())
+  )
+    throw new Error("--protect-path needs a repository-relative path");
   const rawAutoCorrect =
     options.autoCorrect === undefined ? undefined : String(options.autoCorrect);
   if (rawAutoCorrect !== undefined && !/^\d+$/.test(rawAutoCorrect))
     throw new Error("--auto-correct needs a number of rounds such as 1");
   // Canonical, so a retry with "01" and 1 is the same request.
   const autoCorrect = rawAutoCorrect === undefined ? undefined : String(Number(rawAutoCorrect));
-  // A new dispatch's member edits, undone if the coordinator refuses it without launching anything.
-  let restoreMember = null;
+  // Checked before any member field changes: an invalid role never reaches the room.
+  const hasRole = options.workforceRole !== undefined;
+  const requestedRole = hasRole ? normalizeWorkforceRole(options.workforceRole) : undefined;
   const intent = {
     taskDir: directory,
     taskId: task.task_id,
@@ -747,6 +754,7 @@ export async function dispatchMember(id, memberId, options = {}) {
     ...(options.packet && { packet: await realpath(options.packet) }),
     ...(options.timeout && { timeout: options.timeout }),
     ...(verifyCommands.length > 0 && { verifyCommands }),
+    ...(protectPaths.length > 0 && { protectPaths }),
     ...(autoCorrect !== undefined && { autoCorrect }),
   };
   const saved = await updateRoom(
@@ -756,17 +764,8 @@ export async function dispatchMember(id, memberId, options = {}) {
       const member = memberOf(current, memberId);
       if (member.role === "lead")
         throw new Error("A subswarm lead uses native supervision, not worker dispatch");
-      if (!member.dispatch) {
-        requireActiveBranch(current, memberId);
-        restoreMember = { cwd: member.cwd, workforceRole: member.workforceRole };
-      }
-      if (options.cwd) member.cwd = resolvedMemberCwd;
-      if (options.workforceRole !== undefined) {
-        const normalized = normalizeWorkforceRole(options.workforceRole);
-        if (normalized) member.workforceRole = normalized;
-        else delete member.workforceRole;
-      }
       if (member.dispatch) {
+        // A retry repeats the stored request exactly; the member it runs as is part of it.
         for (const key of [
           "taskDir",
           "taskId",
@@ -776,13 +775,19 @@ export async function dispatchMember(id, memberId, options = {}) {
           "packet",
           "timeout",
           "verifyCommands",
+          "protectPaths",
           "autoCorrect",
         ])
           if (JSON.stringify(member.dispatch[key]) !== JSON.stringify(intent[key]))
             throw new Error(`Existing dispatch differs: ${key}`);
+        if (options.cwd && resolvedMemberCwd !== currentMemberCwd)
+          throw new Error("Existing dispatch differs: cwd");
+        if (hasRole && requestedRole !== member.workforceRole)
+          throw new Error("Existing dispatch differs: workforceRole");
         if (options.requestId && options.requestId !== member.dispatch.requestId)
           throw new Error("A member already has a dispatch; add a member for new work");
       } else {
+        requireActiveBranch(current, memberId);
         if (
           task.runs.some((entry) => entry.request_id === intent.requestId) ||
           current.agents.some(
@@ -793,7 +798,14 @@ export async function dispatchMember(id, memberId, options = {}) {
           )
         )
           throw new Error("Request ID already belongs to another dispatch");
-        member.dispatch = intent;
+        // Kept with the intent, so a retry after an unknown outcome can still undo these edits.
+        member.dispatch = {
+          ...intent,
+          restore: { cwd: member.cwd ?? null, workforceRole: member.workforceRole ?? null },
+        };
+        if (options.cwd) member.cwd = resolvedMemberCwd;
+        if (requestedRole) member.workforceRole = requestedRole;
+        else if (hasRole) delete member.workforceRole;
       }
       member.status = "unknown";
       return current;
@@ -827,6 +839,8 @@ export async function dispatchMember(id, memberId, options = {}) {
   if (binding.timeout) args.push("--timeout", binding.timeout);
   const gates = binding.verifyCommands ?? [];
   for (const command of gates) args.push("--verify-command", command);
+  const protectedPaths = binding.protectPaths ?? [];
+  for (const entry of protectedPaths) args.push("--protect-path", entry);
   if (binding.autoCorrect !== undefined) args.push("--auto-correct", binding.autoCorrect);
   let result;
   try {
@@ -847,13 +861,13 @@ export async function dispatchMember(id, memberId, options = {}) {
         const agent = memberOf(current, memberId);
         agent.dispatchError = error.message;
         if (!wasLaunched && agent.dispatch?.requestId === binding.requestId) {
-          delete agent.dispatch;
-          agent.status = "queued";
-          const restored = Object.entries(restoreMember ?? {});
+          const restored = Object.entries(agent.dispatch.restore ?? {});
           for (const [key, value] of restored) {
-            if (value === undefined) delete agent[key];
+            if (value === null) delete agent[key];
             else agent[key] = value;
           }
+          delete agent.dispatch;
+          agent.status = "queued";
         }
         return current;
       },
@@ -868,6 +882,7 @@ export async function dispatchMember(id, memberId, options = {}) {
       // A concurrent refused dispatch of this member may have cleared the intent; this one launched.
       agent.dispatch ||= binding;
       agent.dispatch.runId = result.run_id;
+      delete agent.dispatch.restore;
       delete agent.dispatchError;
       return current;
     },

@@ -167,7 +167,8 @@ def audit(
         stdout_present=bool(report.strip()),
         report_extracted=extracted,
         expect_changes=bool(allowed),
-        workspace_changed=before["fingerprint"] != after_executor["fingerprint"],
+        # A correction is judged with its implementation: the task as a whole must change something.
+        workspace_changed=ready.get("task_git_before", before)["fingerprint"] != after_executor["fingerprint"],
         reported_outcome=outcome,
         report_contract_valid=not violations,
     )
@@ -205,8 +206,10 @@ def audit(
         suggestion = None
         candidates = ready.get("gate_candidates", ready.get("gate_files", []))
         if status == "verification_failed":
-            # The gates the host's correction turn must leave alone: named, pre-existing, unchanged so far.
-            gates = [path for path in candidates if path not in delta["changed_paths"]]
+            # The gates the host's correction turn must leave alone: named, pre-existing, unchanged so far,
+            # and every explicit protect_paths entry.
+            derived = [path for path in candidates if path not in delta["changed_paths"]]
+            gates = list(dict.fromkeys([*derived, *ready.get("protect_paths", [])]))
             suggestion = corrector.correction_message(corrector.failed_command(verification), verification, gates=gates)
         extra["auto_correct"] = {
             "max_rounds": run["auto_correct"],
@@ -215,6 +218,7 @@ def audit(
             "outcome": "handed_to_host" if suggestion else "not_needed",
             "suggested_correction": suggestion,
             "gate_candidates": list(candidates),
+            "protect_paths": list(ready.get("protect_paths", [])),
         }
     return {
         "schema": runner.RESULT_SCHEMA,
@@ -240,6 +244,7 @@ def audit(
         "transport": "native",
         "mailbox": run.get("mailbox"),
         "git_before": before,
+        **({"task_git_before": ready["task_git_before"]} if "task_git_before" in ready else {}),
         "git_identity_before": identity,
         "git_after_executor": after_executor,
         "git_after": after,
@@ -303,9 +308,12 @@ def main() -> None:
             "process_identity": process_identity(os.getpid()),
             "ready_at": runner.utc_now(),
         }
+        if previous is not None and (task_before := previous.get("task_git_before") or previous.get("git_before")):
+            ready["task_git_before"] = task_before
         if run.get("auto_correct"):
             # The gate's own files, named before the native worker starts (see auto_correct.gate_paths).
-            candidates = runner.bundled_module("auto_correct").gate_paths(run["verification_commands"], repository)
+            corrector = runner.bundled_module("auto_correct")
+            candidates = corrector.gate_paths(run["verification_commands"], repository)
             saved = ((previous or {}).get("auto_correct") or {}).get("gate_candidates")
             if isinstance(saved, list):
                 candidates = saved
@@ -314,10 +322,12 @@ def main() -> None:
                 changed = set((previous.get("run_delta") or {}).get("changed_paths", []))
                 candidates = [path for path in candidates if path not in changed]
             ready["gate_candidates"] = list(candidates)
+            # Explicit protect_paths are gate files whether or not Git ignores them or the run changed them.
+            ready["protect_paths"] = corrector.protected_paths(task.get("protect_paths", []), repository)
             if previous is not None:
                 # Only a native correction is a correction round. The first handoff's own edits are the
                 # work under test, exactly as on the executor path, so an initial run enforces no gate files.
-                ready["gate_files"] = list(candidates)
+                ready["gate_files"] = list(dict.fromkeys([*candidates, *ready["protect_paths"]]))
                 ready["gate_fingerprints"] = {
                     path: runner.path_fingerprint(repository / path) for path in ready["gate_files"]
                 }

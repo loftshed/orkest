@@ -571,6 +571,8 @@ def dispatch(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
             )
         if args.auto_correct is not None:
             raise CoordinationError("read-only dispatches have no verification gates to auto-correct")
+        if args.protect_path:
+            raise CoordinationError("read-only dispatches have no auto-correct rounds to protect files from")
     # Follow-up agents need the earlier findings, including failed approaches.
     prior_reports = [
         "Prior " + run["kind"] + " result: " + run["result_path"]
@@ -637,6 +639,18 @@ def dispatch(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
             AUTO_CORRECT.validate_rounds(rounds, name="--auto-correct")
         except ValueError as error:
             raise CoordinationError(str(error)) from error
+    protect: list[str] = []
+    if kind in WORK_KINDS:
+        # Explicit gate files: the spec's, the implementation's for a correction, and any added here.
+        inherited_protect = (implementation_work(state) or {}).get("protect_paths", []) if kind == "correction" else []
+        try:
+            protect = RUNNER.normalize_repo_paths(
+                [*spec.get("protect_paths", []), *inherited_protect, *args.protect_path], option="--protect-path"
+            )
+        except (RUNNER.RunnerError, ValueError) as error:
+            raise CoordinationError(str(error)) from error
+        if protect:
+            spec["protect_paths"] = protect
     # Rounds from --auto-correct (or the implementation's), else the spec's; only work with gates uses them.
     auto_correct = (rounds if rounds is not None else spec.get("auto_correct") or 0) if kind in WORK_KINDS else 0
     if auto_correct and not verification:
@@ -744,13 +758,13 @@ def dispatch(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
             command += ["--verify-command", check]
         if rounds is not None:
             command += ["--auto-correct", str(auto_correct)]
-        # After a converted auto-correct round the fix may already be in place; the correction then only
-        # has to finish and pass the gates, so it is not required to change anything further.
-        converted = kind == "correction" and bool(
-            ((previous_result or {}).get("auto_correct") or {}).get("converted_from")
-        )
-        if (spec["allow_paths"] or spec["track_paths"]) and not converted:
+        if spec["allow_paths"] or spec["track_paths"]:
             command += ["--expect-changes"]
+            if kind == "correction":
+                # The task as a whole must change something, judged from where the implementation began:
+                # a correction that undoes the work ends no_changes, and one after a converted round whose
+                # fix is already in place need not change more.
+                command += ["--expect-task-changes"]
     if previous_result:
         command += ["--session", previous_result["session_id"], "--resume-result", work["result_path"]]
     run = {
@@ -779,6 +793,7 @@ def dispatch(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
         "generation": authority["generation"] if authority else None,
         "allow_credits": bool(args.allow_credits),
         "verification_commands": verification,
+        **({"protect_paths": protect} if protect else {}),
         "event_id": event_path.stem,
         "event_path": str(event_path),
         "completion_owner": "coordinator",
@@ -1129,6 +1144,15 @@ def main(argv: list[str] | None = None) -> int:
                 help="Let a Codex run bill the account's credit balance; only when the user allows spending credits",
             )
             sub.add_argument("--verify-command", action="append", default=[])
+            sub.add_argument(
+                "--protect-path",
+                action="append",
+                default=[],
+                help=(
+                    "File or directory an auto-correct round may not change, Git-ignored or not; repeatable and "
+                    "added to the task spec's protect_paths. A correction inherits the implementation's"
+                ),
+            )
             sub.add_argument(
                 "--auto-correct",
                 type=int,

@@ -22,6 +22,7 @@ SUPPORT = RUNNER.bundled_module("execution_support")
 USAGE = RUNNER.bundled_module("usage")
 COORDINATOR = RUNNER.bundled_module("coordinator")
 MAILBOX = RUNNER.bundled_module("peer_mailbox")
+AUTO_CORRECT = RUNNER.bundled_module("auto_correct")
 
 
 def sample_usage(input_tokens=1000, cached=400, writes=100, output=200):
@@ -1359,8 +1360,147 @@ class CoordinatorTests(unittest.TestCase):
             code, corrected = self.call(
                 "dispatch", "--kind", "correction", "--request-id", "converted-repair", "--review-id", proof
             )
-        self.assertNotIn("--expect-changes", corrected["command"])
+        # Changes are still required, of the task as a whole: the converted round's fix counts.
+        self.assertIn("--expect-changes", corrected["command"])
+        self.assertIn("--expect-task-changes", corrected["command"])
         self.assertEqual((code, corrected["runner_status"]), (0, "completed"), corrected)
+        result = COORDINATOR.read(Path(corrected["result_path"]))
+        self.assertEqual(result["task_git_before"], COORDINATOR.read(Path(failed["result_path"]))["git_before"])
+        self.assertEqual((result["workspace_changed"], result["task_workspace_changed"]), (False, True))
+
+    def undo_on_resume(self):
+        """Make the fake codex delete allowed/broken.txt at the start of every resumed turn."""
+        fake = self.fixture.external_path / "codex"
+        fake.rename(self.fixture.external_path / "codex-real")
+        fake.write_text(
+            "#!/bin/sh\n"
+            'if [ "$1" = exec ] && [ "$2" = resume ]; then rm -f allowed/broken.txt; fi\n'
+            'exec "$(dirname "$0")/codex-real" "$@"\n'
+        )
+        fake.chmod(0o700)
+
+    def test_a_correction_that_leaves_the_task_unchanged_ends_no_changes(self):
+        # Argon N4: the work is undone, by a converted round or by the correction itself, and the
+        # correction adds nothing. Judged against where the implementation began, nothing changed.
+        gate = "test ! -f allowed/broken.txt"
+        wip = {"FAKE_OUTPUT": "allowed/broken.txt", "FAKE_CONTENT": "wip\n"}
+        cases = (
+            (
+                "a converted round undid it",
+                [wip, {"FAKE_NO_CHANGE": "1", "FAKE_MALFORMED": "1"}, {"FAKE_NO_CHANGE": "1"}],
+                1,
+            ),
+            ("the correction undid it", [wip, {"FAKE_NO_CHANGE": "1"}], 0),
+        )
+        for name, contents, rounds in cases:
+            with self.subTest(name):
+                self.tearDown()
+                self.setUp()
+                self.undo_on_resume()
+                environment = {
+                    "FAKE_ROUNDS": json.dumps(contents),
+                    "FAKE_ROUNDS_COUNT": str(self.fixture.external_path / "undo-rounds.txt"),
+                }
+                with mock.patch.dict(os.environ, environment):
+                    code, failed = self.start(
+                        "undo-work", "implementation", "--verify-command", gate, "--auto-correct", str(rounds)
+                    )
+                    self.assertEqual((code, failed["runner_status"]), (0, "verification_failed"), failed)
+                    proof = self.reviewed_evidence()
+                    code, corrected = self.call(
+                        "dispatch", "--kind", "correction", "--request-id", "undo-repair", "--review-id", proof
+                    )
+                self.assertEqual((code, corrected["runner_status"]), (0, "no_changes"), corrected)
+                result = COORDINATOR.read(Path(corrected["result_path"]))
+                self.assertEqual((result["exit_code"], result["task_workspace_changed"]), (20, False))
+                code, error = self.call(
+                    "review",
+                    "--run-id",
+                    corrected["run_id"],
+                    "--decision",
+                    "accept",
+                    "--review-id",
+                    self.reviewed_evidence(),
+                )
+                self.assertEqual(code, 2)
+                self.assertIn("only a completed, audited run", error)
+
+    def test_a_no_op_correction_after_a_converted_round_without_a_fix_still_runs_and_fails_the_gates(self):
+        gate = "grep -qx fixed allowed/output.txt"
+        environment = {
+            "FAKE_ROUNDS": json.dumps(
+                [{"FAKE_CONTENT": "broken\n"}, {"FAKE_NO_CHANGE": "1", "FAKE_MALFORMED": "1"}, {"FAKE_NO_CHANGE": "1"}]
+            ),
+            "FAKE_ROUNDS_COUNT": str(self.fixture.external_path / "no-op-rounds.txt"),
+        }
+        with mock.patch.dict(os.environ, environment):
+            code, failed = self.start("no-op-work", "implementation", "--verify-command", gate, "--auto-correct", "1")
+            self.assertEqual((code, failed["runner_status"]), (0, "verification_failed"), failed)
+            proof = self.reviewed_evidence()
+            code, corrected = self.call(
+                "dispatch",
+                "--kind",
+                "correction",
+                "--request-id",
+                "no-op-repair",
+                "--review-id",
+                proof,
+                "--auto-correct",
+                "0",
+            )
+        # The task changed (the broken output), so the turn is judged by its gates, which still fail.
+        self.assertIn("--expect-task-changes", corrected["command"])
+        self.assertEqual((code, corrected["runner_status"]), (0, "verification_failed"), corrected)
+
+    def test_protect_paths_reach_the_runner_and_a_correction_inherits_them(self):
+        self.fixture.repository.write("allowed/expected.txt", "fixed\n")
+        self.fixture.repository.git("add", "allowed/expected.txt")
+        self.fixture.repository.git("commit", "-qm", "expected output")
+        gate = "cmp -s allowed/expected.txt allowed/output.txt"
+        broken = {"FAKE_CONTENT": "broken\n"}
+        weaken = {"FAKE_OUTPUT": "allowed/expected.txt", "FAKE_CONTENT": "broken\n"}
+        environment = {
+            "FAKE_ROUNDS": json.dumps([broken, broken, broken, weaken]),
+            "FAKE_ROUNDS_COUNT": str(self.fixture.external_path / "protect-rounds.txt"),
+        }
+        with mock.patch.dict(os.environ, environment):
+            code, failed = self.start(
+                "protect-work",
+                "implementation",
+                "--verify-command",
+                gate,
+                "--auto-correct",
+                "1",
+                "--protect-path",
+                "allowed/expected.txt/",
+            )
+            self.assertEqual(
+                (code, failed["runner_status"], failed["protect_paths"]),
+                (0, "verification_failed", ["allowed/expected.txt"]),
+            )
+            spec = COORDINATOR.read(Path(failed["result_path"]).parent.parent / "task-spec.json")
+            self.assertEqual(spec["protect_paths"], ["allowed/expected.txt"])
+            record = COORDINATOR.read(Path(failed["result_path"]))["auto_correct"]
+            self.assertEqual(
+                (record["protect_paths"], record["rounds"][0]["gate_files"]), (["allowed/expected.txt"],) * 2
+            )
+            proof = self.reviewed_evidence()
+            code, corrected = self.call(
+                "dispatch", "--kind", "correction", "--request-id", "protect-repair", "--review-id", proof
+            )
+        self.assertEqual((code, corrected["protect_paths"]), (0, ["allowed/expected.txt"]), corrected)
+        self.assertEqual(corrected["runner_status"], "scope_violation")
+        self.assertEqual(
+            COORDINATOR.read(Path(corrected["result_path"]))["scope_violations"], ["gate-edit:allowed/expected.txt"]
+        )
+        self.tearDown()
+        self.setUp()
+        code, error = self.start("bad-protect", "implementation", "--protect-path", "../outside")
+        self.assertEqual(code, 2)
+        self.assertIn("repository-relative", error)
+        code, error = self.start("explore", "investigation", "--protect-path", "allowed/expected.txt")
+        self.assertEqual(code, 2)
+        self.assertIn("read-only dispatches have no auto-correct rounds", error)
 
     def test_auto_correct_is_validated_and_needs_gates(self):
         for extra, message in (
@@ -1496,7 +1636,7 @@ class CoordinatorTests(unittest.TestCase):
             if COORDINATOR.NATIVE.process_state(run) == "active":
                 os.kill(run["pid"], 15)
 
-    def native_round(self, run, name, edits, files_changed, handle=None):
+    def native_round(self, run, name, edits, files_changed, handle=None, remove=()):
         """Attach a native run, apply the worker's edits, and complete it with a COMPLETE report."""
         handle = handle or f"{name}-session"
         packet = self.fixture.external_path / f"{name}.json"
@@ -1506,6 +1646,8 @@ class CoordinatorTests(unittest.TestCase):
             target = self.fixture.repository.path / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content)
+        for relative in remove:
+            (self.fixture.repository.path / relative).unlink()
         report = self.fixture.external_path / f"{name}-report.txt"
         report.write_text(
             f"### STATUS\nCOMPLETE\n### FILES CHANGED\n{files_changed}\n### COMMANDS RUN\nnone\n"
@@ -1524,13 +1666,13 @@ class CoordinatorTests(unittest.TestCase):
         )
         return self.call("native-complete", "--run-id", run["run_id"], "--packet", str(packet))
 
-    def test_native_initial_run_may_change_files_its_gate_names(self):
+    def test_native_initial_run_may_change_the_gate_scripts_it_runs(self):
         # The first handoff's edits are the work under test, as on the executor path.
-        output = self.fixture.repository.path / "allowed/output.txt"
-        output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text("old\n")
-        self.fixture.repository.git("add", "allowed/output.txt")
-        self.fixture.repository.git("commit", "-qm", "tracked output")
+        script = self.fixture.repository.path / "allowed/check.sh"
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("exit 1\n")
+        self.fixture.repository.git("add", "allowed/check.sh")
+        self.fixture.repository.git("commit", "-qm", "gate script")
         code, run = self.call(
             "dispatch",
             "--kind",
@@ -1544,19 +1686,19 @@ class CoordinatorTests(unittest.TestCase):
             "--model",
             "claude-sonnet-5",
             "--verify-command",
-            "grep -qx fixed allowed/output.txt",
+            "sh allowed/check.sh",
             "--auto-correct",
             "1",
         )
         self.assertEqual(code, 0, run)
         try:
             code, finished = self.native_round(
-                run, "native-initial", {"allowed/output.txt": "fixed\n"}, "allowed/output.txt"
+                run, "native-initial", {"allowed/check.sh": "exit 0\n"}, "allowed/check.sh"
             )
             self.assertEqual((code, finished["runner_status"]), (0, "completed"), finished)
             result = COORDINATOR.read(Path(finished["result_path"]))
             self.assertEqual(result["scope_violations"], [])
-            self.assertEqual(result["auto_correct"]["gate_candidates"], ["allowed/output.txt"])
+            self.assertEqual(result["auto_correct"]["gate_candidates"], ["allowed/check.sh"])
         finally:
             if COORDINATOR.NATIVE.process_state(run) == "active":
                 os.kill(run["pid"], 15)
@@ -1626,6 +1768,81 @@ class CoordinatorTests(unittest.TestCase):
             for active in (run, correction):
                 if active and active.get("pid") and COORDINATOR.NATIVE.process_state(active) == "active":
                     os.kill(active["pid"], 15)
+
+    def native_dispatch(self, request, *extra):
+        return self.call(
+            "dispatch",
+            "--kind",
+            "implementation",
+            "--request-id",
+            request,
+            "--transport",
+            "native",
+            "--engine",
+            "claude",
+            "--model",
+            "claude-sonnet-5",
+            "--verify-command",
+            "grep -qx fixed allowed/output.txt",
+            "--auto-correct",
+            "1",
+            *extra,
+        )
+
+    def native_correction(self, request):
+        proof = self.reviewed_evidence()
+        return self.call(
+            "dispatch", "--kind", "correction", "--request-id", request, "--review-id", proof, "--transport", "native"
+        )
+
+    def test_native_correction_keeps_protect_paths_and_is_judged_with_its_implementation(self):
+        for index, (name, edits, remove, status) in enumerate(
+            (
+                # Editing a listed file fails the correction before any gate runs.
+                ("protected", {"allowed/expected.txt": "broken\n"}, (), "scope_violation"),
+                # Undoing the implementation's work leaves the task unchanged.
+                ("undone", {}, ("allowed/output.txt",), "no_changes"),
+            )
+        ):
+            with self.subTest(name):
+                if index:
+                    self.tearDown()
+                    self.setUp()
+                self.fixture.repository.write("allowed/expected.txt", "fixed\n")
+                self.fixture.repository.git("add", "allowed/expected.txt")
+                self.fixture.repository.git("commit", "-qm", "expected output")
+                run = correction = None
+                try:
+                    code, run = self.native_dispatch(f"native-{name}", "--protect-path", "allowed/expected.txt")
+                    self.assertEqual(code, 0, run)
+                    code, finished = self.native_round(
+                        run, f"native-{name}", {"allowed/output.txt": "broken\n"}, "allowed/output.txt"
+                    )
+                    self.assertEqual((code, finished["runner_status"]), (0, "verification_failed"), finished)
+                    suggestion = finished["suggested_correction"]
+                    self.assertIn("Do not change the gate's own files: allowed/expected.txt.", suggestion)
+                    self.assertIn(AUTO_CORRECT.BLOCKED_GUIDANCE, suggestion)
+                    code, correction = self.native_correction(f"native-{name}-repair")
+                    self.assertEqual((code, correction["protect_paths"]), (0, ["allowed/expected.txt"]), correction)
+                    code, repaired = self.native_round(
+                        correction,
+                        f"native-{name}-repair",
+                        edits,
+                        "allowed/output.txt",
+                        handle=f"native-{name}-session",
+                        remove=remove,
+                    )
+                    self.assertEqual((code, repaired["runner_status"]), (0, status), repaired)
+                    result = COORDINATOR.read(Path(repaired["result_path"]))
+                    self.assertEqual(
+                        result["task_git_before"], COORDINATOR.read(Path(finished["result_path"]))["git_before"]
+                    )
+                    if status == "scope_violation":
+                        self.assertEqual(result["scope_violations"], ["gate-edit:allowed/expected.txt"])
+                finally:
+                    for active in (run, correction):
+                        if active and active.get("pid") and COORDINATOR.NATIVE.process_state(active) == "active":
+                            os.kill(active["pid"], 15)
 
     def test_background_completion_event_auto_settles_coordinator_task(self):
         code, run = self.start("bg-auto-settle", "implementation", "--background")
