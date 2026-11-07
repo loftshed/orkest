@@ -840,7 +840,8 @@ class AutoCorrectRunnerTests(unittest.TestCase):
                 code, result, _out, _summary, runs = self.run_rounds(
                     rounds, rounds=1, verify=[gate], extra_args=["--protect-path", protect]
                 )
-                self.assertEqual((code, result["status"], len(runs)), (22, "scope_violation", 2))
+                expected_turns = 1 if name == "changed by the run" else 2
+                self.assertEqual((code, result["status"], len(runs)), (22, "scope_violation", expected_turns))
                 self.assertEqual(result["scope_violations"], [f"gate-edit:{edited}"])
 
     def test_a_resumed_run_can_judge_its_changes_from_where_the_task_began(self) -> None:
@@ -861,7 +862,7 @@ class AutoCorrectRunnerTests(unittest.TestCase):
             verify_commands=[GATE], no_change=True, session=first["session_id"], extra_args=resume
         )
         self.assertEqual((code, plain["status"]), (20, "no_changes"))
-        self.assertNotIn("task_git_before", plain)
+        self.assertEqual(plain["task_git_before"], first["git_before"])
         # Judged from where the task began, the earlier fix counts: the turn completes once the gates pass.
         code, task, task_dir, _summary, _capture = self.fixture.run_main(
             verify_commands=[GATE],

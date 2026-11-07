@@ -118,7 +118,7 @@ A task spec's `auto_correct` sets the default; the flag overrides it, and it nee
 fails after a clean handoff, the runner resumes the same session, as `--session` does, with a
 correction turn: the failing command, its exit code and output tails, and "Fix exactly these problems;
 change nothing else", inside the unchanged scope, checks and report contract. It then runs every gate
-again, up to N rounds, and reports once. With 0 or no option nothing changes.
+again, up to N rounds, and reports once. Fresh runs with 0 or no option keep their original output.
 
 - `result.auto_correct` records each round: its prompt (`round-<n>-brief.txt`), session, timing,
   delta and gate results. Earlier logs are kept as `round-<n>-verification-*` and `attempt-<n>-*`.
@@ -133,8 +133,8 @@ again, up to N rounds, and reports once. With 0 or no option nothing changes.
   `coordinator.py reverify` refuses the result; the bounded `correction` is the way on.
 - `--expect-task-changes` (with `--expect-changes` and `--resume-result`) judges the net change from
   where the resumed task began: the resumed result's `task_git_before`, else its `git_before`. The
-  result records `task_git_before` and `task_workspace_changed`. A coordinator correction always
-  passes it, so undoing the implementation's work ends `no_changes`, and a correction after a
+  result carries `task_git_before` through every resume, even without this flag, and records
+  `task_workspace_changed`. A coordinator correction always passes it, so undoing the implementation's work ends `no_changes`, and a correction after a
   converted round whose fix is already in place completes once the gates pass.
 - Rounds share `--timeout`: a round gets the executor time earlier attempts left. It is refused when
   under 60 s remain (`timeout`), when `--deadline` leaves under 60 s plus the last gate run
@@ -148,15 +148,18 @@ again, up to N rounds, and reports once. With 0 or no option nothing changes.
   - the script handed to `sh`, `bash`, `zsh`, `dash`, `python`, `python3`, `node`, `ruby`, `perl`,
     `deno`, `bun`, `pwsh`, `.` or `source`: its first operand after the options, so
     `python3 tools/gen.py apply x` protects `tools/gen.py`. `-m`, `-c` and `-e` run no script file;
-    a shell's `-c` string is read as commands;
+    a shell's `-c` string is read as commands. Syntax-check inputs (`node --check`/`-c`, `ruby -c`,
+    `perl -c`) stay editable;
   - every `protect_paths` entry (task spec) and `--protect-path`: files or directories, protected in
-    every round whether or not they exist, Git ignores them or the run changed them.
+    every correction whether or not they exist, Git ignores them or the run changed them. Their
+    fingerprints come from before the first handoff; executor runs reject an explicit protected edit
+    before verification, including on the initial turn.
 - Programs and scripts count as they stood before the first handoff, Git-ignored or not, minus files
   the run itself has changed, which are the work under test. They are found after `cd`/`pushd`/`popd`
   (a subshell's `cd` is undone), behind `env`, `exec`, `command`, `time`, `nohup`, `nice`, `timeout`
-  and `{ ...; }`, on every line of a multi-line command, inside `sh -c '...'` and `$(...)`. A
-  symlinked directory on the way and every hop of a symlink chain are protected too.
-- Nothing else is protected. Arguments are not: test files named to a test runner
+  and `{ ...; }`, on every line of a multi-line command, inside `sh -c '...'`, `$(...)` and process
+  substitutions (`<(...)`, `>(...)`). A symlinked directory on the way and every hop of a symlink chain are protected too.
+- Gate detection is best effort. Nothing else is protected automatically. Arguments are not: test files named to a test runner
   (`pytest tests/test_x.py`), data, config, redirections (`> build/gate.log`), directories and globs
   stay fixable in a round. Programs a command starts indirectly (`make test`, `npx vitest`,
   `uv run pytest`, a script calling a script) are not found. Keep a gate outside the worker's
@@ -171,11 +174,15 @@ again, up to N rounds, and reports once. With 0 or no option nothing changes.
   steer names with `--allow-path`, live or interrupting, stops being protected with everything under
   it, even when scope already covered it (`.` or a parent directory). `auto_correct.released_paths`
   records those paths, and a run resumed from that result keeps them released. A resumed correction
-  reuses the first run's gate candidates and protect paths and excludes files that earlier run changed.
+  protects its first turn too, merges saved gate candidates with new verification commands (including
+  `reverify` gates), and excludes files the task has changed. Protection baselines and releases survive
+  intermediate resumes with `--auto-correct 0`; fresh zero-round runs keep their original output.
 - Native transport never loops. A native handoff passes the round limit to the host in its
   instructions; a coordinator native guard returns the failed gate as `suggested_correction`. As on the
-  executor path, only a native correction enforces gate files, `protect_paths` included, and the guard
-  checks them before it runs any gate, so a changed gate program never executes. A native correction
+  executor correction, a native correction enforces gate files from its first turn. Native implementation
+  captures `protect_paths` fingerprints before its worker starts and carries them into correction, so an
+  implementation edit cannot become the protected baseline. The guard checks gate files before running
+  verification, so a changed gate program never executes in correction. A native correction
   is judged with its implementation, as `--expect-task-changes` would.
 - A correction resumed from a `reverify` result takes its usage cost baseline from the run that was
   rechecked, since a host recheck records no cost of its own.

@@ -65,16 +65,16 @@ INTERPRETERS = {
     "python": Interpreter(value="WX", inline="cm", long_value=frozenset({"--check-hash-based-pycs"})),
     "node": Interpreter(
         value="rC",
-        inline="ep",
+        inline="epc",
         long_value=frozenset(
             {"--require", "--import", "--loader", "--experimental-loader", "--conditions", "--input-type"}
             | {"--env-file", "--title"}
         ),
         # Inline code, and modes in which the operands are tests or package scripts, not a script to run.
-        long_inline=frozenset({"--eval", "--print", "--test", "--run"}),
+        long_inline=frozenset({"--eval", "--print", "--test", "--run", "--check"}),
     ),
-    "ruby": Interpreter(value="IrCE", rest="xF0W", inline="e"),
-    "perl": Interpreter(value="I", rest="MmDd0ixlCF", inline="eE"),
+    "ruby": Interpreter(value="IrCE", rest="xF0W", inline="ec"),
+    "perl": Interpreter(value="I", rest="MmDd0ixlCF", inline="eEc"),
     "deno": Interpreter(
         value="cL",
         long_value=frozenset({"--config", "--import-map", "--lock", "--cert", "--location", "--seed", "--log-level"}),
@@ -127,7 +127,7 @@ def failed_command(verification: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _substitution(command: str, start: int, text: list[str], nested: list[str]) -> int:
-    """Read a `$(...)` or backquoted command at `start` into the word; the command runs too. Returns its end."""
+    """Read a command/process substitution into one word, retaining its nested command. Returns its end."""
     if command[start] == "`":
         end = start + 1
         while end < len(command) and command[end] != "`":
@@ -214,7 +214,7 @@ def _tokens(command: str) -> list[tuple[str, str, list[str]]]:
                     text.append(command[index])
                     index += 1
             index += 1
-        elif command.startswith("$(", index) or char == "`":
+        elif command.startswith(("$(", "<(", ">("), index) or char == "`":
             index = _substitution(command, index, text, nested)
             started = True
         elif char == "#" and not started:
@@ -247,7 +247,11 @@ def _tokens(command: str) -> list[tuple[str, str, list[str]]]:
 
 def _literal(word: str) -> bool:
     """A word that names one path as written: no expansion, glob or brace a shell would rewrite."""
-    return bool(word) and not word.startswith("~") and not any(mark in word for mark in "$`*?[{")
+    return (
+        bool(word)
+        and not word.startswith("~")
+        and not any(mark in word for mark in ("$", "`", "*", "?", "[", "{", "<(", ">("))
+    )
 
 
 def _options(words: list[str], index: int, short: str = "", long: frozenset[str] = frozenset()) -> tuple[int, dict]:
@@ -468,6 +472,9 @@ def _record(path: Path, root: Path, names: dict[str, None]) -> None:
 def _protect(path: Path, root: Path, names: dict[str, None], *, explicit: bool, hops: int = 0) -> None:
     """Add the names a file at `path` depends on: every symlinked directory on the way to it, each hop of a
     symlink chain and its target. A derived name counts only for an existing file; an explicit one always."""
+    # Do not retain parent links for a derived operand that is not an existing gate file.
+    if not explicit and (not path.exists() or path.is_dir()):
+        return
     current = Path(path.anchor)
     *directories, last = path.parts[1:] or ("",)
     for part in directories:

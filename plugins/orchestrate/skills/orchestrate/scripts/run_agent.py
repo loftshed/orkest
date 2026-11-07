@@ -2368,7 +2368,7 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
     # that undoes the work ends no_changes and one whose earlier fix is already in place need not add more.
     task_before: dict[str, Any] | None = (
         (previous_result.get("task_git_before") or previous_result["git_before"])
-        if args.expect_task_changes and previous_result is not None
+        if previous_result is not None
         else None
     )
     git_identity_before = git_identity(repo)
@@ -2413,13 +2413,14 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
         getattr(args, "auto_correct", None), task_spec, args.verify_command
     )
     # The gate's own files, as named before the first handoff; a file written later is never one.
-    gate_candidates = auto_correct_module.gate_paths(args.verify_command, repo) if max_rounds else []
+    saved = (previous_result or {}).get("auto_correct") or {}
+    protection_active = bool(max_rounds or saved)
+    gate_candidates = auto_correct_module.gate_paths(args.verify_command, repo) if protection_active else []
     # Explicit gate files: protected in every round, ignored by Git or not, changed by the run or not.
     protect_entries = normalize_repo_paths(
         [*((task_spec or {}).get("protect_paths") or []), *args.protect_path], option="--protect-path"
     )
-    protected = auto_correct_module.protected_paths(protect_entries, repo) if max_rounds else []
-    saved = (previous_result or {}).get("auto_correct") or {}
+    protected = auto_correct_module.protected_paths(protect_entries, repo) if protection_active else []
     if previous_result is not None:
         earlier_steers = (previous_result.get("steering") or {}).get("steers") or []
         resumed_releases.extend(
@@ -2430,15 +2431,20 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
                 ]
             )
         )
-    if max_rounds and previous_result is not None:
+    if protection_active and previous_result is not None:
         saved_candidates = saved.get("gate_candidates")
         if isinstance(saved_candidates, list):
-            gate_candidates = saved_candidates
-        changed_before_resume = set((previous_result.get("run_delta") or {}).get("changed_paths", []))
+            gate_candidates = list(dict.fromkeys([*saved_candidates, *gate_candidates]))
+        changed_before_resume = set(state_delta(task_before or before, before)["changed_paths"])
         gate_candidates = [path for path in gate_candidates if path not in changed_before_resume]
         if isinstance(saved.get("protect_paths"), list):
             protected = list(dict.fromkeys([*saved["protect_paths"], *protected]))
-    # Every auto-correct round of this run; absent when the run may use none, so N=0 results are unchanged.
+    # Preserve explicit protection from the task's first handoff, including ignored files/directories.
+    # A resumed zero-round segment carries this state forward without opening mechanical rounds.
+    protect_fingerprints = {
+        path: saved.get("protect_fingerprints", {}).get(path, path_fingerprint(repo / path)) for path in protected
+    }
+    # Fresh N=0 runs retain their original output shape.
     auto_correct: dict[str, Any] | None = (
         {
             "max_rounds": max_rounds,
@@ -2446,6 +2452,7 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
             "mode": "executor",
             "gate_candidates": list(gate_candidates),
             "protect_paths": list(protected),
+            "protect_fingerprints": protect_fingerprints,
             "released_paths": steer_releases(),
             "rounds_used": 0,
             "outcome": "not_run",
@@ -2456,7 +2463,7 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
             "initial_verification": None,
             "rounds": [],
         }
-        if max_rounds
+        if protection_active
         else None
     )
 
@@ -2595,8 +2602,17 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
     retry_window_start = 0
     correction_round = 0
     rounds_started = 0
-    gates: list[str] = []
-    gates_before: dict[str, Any] = {}
+    # A resumed correction protects its first turn too. Initial implementation scripts remain editable,
+    # but explicit protect_paths are checked against the baseline captured before any worker starts.
+    gates = [
+        path
+        for path in dict.fromkeys([*(gate_candidates if previous_result is not None else []), *protected])
+        if not steer_released(path)
+    ]
+    gates_before = {
+        path: protect_fingerprints[path] if path in protect_fingerprints else path_fingerprint(repo / path)
+        for path in gates
+    }
     gate_edit_violations: list[str] = []
     round_attempts_start = 0
     round_before = before
@@ -2701,7 +2717,7 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
                 resumed=segment_resumed,
                 baseline=usage_baseline,
                 baseline_cost=usage_baseline_cost,
-                delta_accounting=auto_correct is not None,
+                delta_accounting=bool(max_rounds),
             )
             attempt_cumulative_cost = usage_module.latest_cost(args.engine, stdout_text)
             attempt_usage.append(usage)
@@ -3099,7 +3115,7 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
             report_extracted=report_extracted,
             expect_changes=args.expect_changes,
             workspace_changed=workspace_changed_after_executor
-            if task_before is None
+            if not args.expect_task_changes or task_before is None
             else task_before["fingerprint"] != after_executor["fingerprint"],
             reported_outcome=reported_outcome,
             report_contract_valid=report_contract_valid,
@@ -3174,7 +3190,7 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
         elif verification["status"] in {"failed", "timed_out"}:
             status, exit_code = "verification_failed", 25
 
-        if auto_correct is None:
+        if not max_rounds:
             break
         round_status = status
         if correction_round:
@@ -3276,7 +3292,10 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
         # since, and every protect_paths entry. A path a steer explicitly allowed is neither.
         derived = [path for path in gate_candidates if path not in run_delta["changed_paths"]]
         gates = [path for path in dict.fromkeys([*derived, *protected]) if not steer_released(path)]
-        gates_before = {path: path_fingerprint(repo / path) for path in gates}
+        gates_before = {
+            path: protect_fingerprints[path] if path in protect_fingerprints else path_fingerprint(repo / path)
+            for path in gates
+        }
         round_brief_path = out_dir / f"round-{correction_round}-brief.txt"
         write_private_text(
             round_brief_path,
