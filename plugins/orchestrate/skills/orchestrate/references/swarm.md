@@ -48,6 +48,13 @@ room ID, and refreshes its terminal label.
 Use `--room ID` to adopt a specific room; a different bound coordinator must use the leadership
 handoff workflow instead. Repeating promotion preserves the room's members and existing objective.
 
+Native resume options (`ork claude --resume ID`, `ork codex resume ID`, `ork agy --resume ID`)
+reattach to the recorded room, including after the old process exits. Hooks bind the new mailbox
+identity using the resume target or inherited room and retain prior session IDs in the room.
+A live coordinator still requires the leadership handoff workflow. A closed or missing room falls
+back to promotion into a live room. Native session IDs recorded by hooks resolve to the mailbox
+peer; display names and free-form aliases do not establish ownership.
+
 ## Assign work
 
 1. Read repository instructions and the orchestrate skill. Inspect native tools, live model catalogs,

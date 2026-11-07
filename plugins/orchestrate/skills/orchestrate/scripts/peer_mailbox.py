@@ -16,6 +16,7 @@ import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess  # noqa: F401 -- re-exported for callers/tests patching peer_mailbox.subprocess
 import sys
 import threading
@@ -1703,15 +1704,81 @@ def _unlink_stale_lock(lock_file: Path, *, min_age_seconds: float = LOCK_GRACE_S
             os.close(descriptor)
 
 
+def native_session_ids(peer: dict[str, Any] | None) -> set[str]:
+    """Hook-attested native identities, excluding user-facing names and aliases."""
+    if not isinstance(peer, dict):
+        return set()
+    history = peer.get("nativeSessions")
+    return {
+        value
+        for value in [peer.get("session"), peer.get("nativeSession"), *(history if isinstance(history, list) else [])]
+        if isinstance(value, str) and value
+    }
+
+
+def session_peer(
+    base: Path,
+    session: str,
+    *,
+    harness: str | None = None,
+    cwd: str | None = None,
+    allow_inactive_exact: bool = False,
+) -> dict[str, Any] | None:
+    """Resolve an exact mailbox key first, then one live interactive native identity."""
+    harness = "gemini" if harness == "agy" else harness
+
+    def eligible(peer: Any, alias: bool = False) -> bool:
+        return (
+            valid_peer(peer)
+            and ((allow_inactive_exact and not alias) or is_live(peer))
+            and peer.get("machine", socket.gethostname()) == socket.gethostname()
+            and (not harness or peer["harness"] == harness)
+            and (not cwd or Path(peer.get("checkout") or peer["cwd"]).resolve() == Path(cwd).resolve())
+            and (
+                not alias
+                or not (
+                    peer.get("isSubagent")
+                    or peer.get("delegatedRun")
+                    or peer.get("run")
+                    or peer["session"].startswith("run-")
+                )
+            )
+        )
+
+    try:
+        direct = load(peer_path(base, session))
+    except MailboxError:
+        return None
+    if eligible(direct) and direct["session"] == session:
+        return direct
+    matches = [
+        peer
+        for file in (base / "peers").glob("*.json")
+        if eligible(peer := load(file), True) and session in native_session_ids(peer)
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
 def _room_has_live_member(base: Path, room: dict[str, Any]) -> bool:
     members = [room.get("conductor"), *(room.get("agents") if isinstance(room.get("agents"), list) else [])]
     for member in members:
         if not isinstance(member, dict):
             continue
         session = member.get("session")
-        if isinstance(session, dict) and isinstance(session.get("id"), str) and live_session(base, session["id"]):
+        if (
+            isinstance(session, dict)
+            and isinstance(session.get("id"), str)
+            and session_peer(
+                base,
+                session["id"],
+                harness=session.get("engine"),
+                cwd=session.get("cwd") or member.get("cwd") or room.get("cwd"),
+            )
+        ):
             return True
-        if isinstance(member.get("mailboxSession"), str) and live_session(base, member["mailboxSession"]):
+        if isinstance(member.get("mailboxSession"), str) and session_peer(
+            base, member["mailboxSession"], harness=member.get("engine"), cwd=member.get("cwd") or room.get("cwd")
+        ):
             return True
         pid = member.get("pid")
         if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 and pid_alive(pid):

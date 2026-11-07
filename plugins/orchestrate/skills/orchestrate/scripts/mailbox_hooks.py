@@ -301,6 +301,9 @@ def adopt_cleared(base: Path, me: dict[str, Any]) -> str:
         base,
         me["session"],
         aliases=adopted_aliases,
+        nativeSessions=list(
+            dict.fromkeys([*me.get("nativeSessions", []), old["session"], *old.get("nativeSessions", [])])
+        )[-32:],
         clearedFrom=old["session"],
         awaitingClear=None,
         **({"focus": focus} if focus else {}),
@@ -862,6 +865,47 @@ def _maybe_trigger_auto_update(base: Path, me: dict[str, Any], event: str) -> No
         )
 
 
+def _record_native_swarm_identity(base: Path, me: dict[str, Any]) -> None:
+    """Attest this harness's native environment ID without claiming another live conversation."""
+    if me.get("isSubagent") or me.get("delegatedRun") or _MB.is_run_peer(me):
+        return
+    key = {
+        "claude": "CLAUDE_CODE_SESSION_ID",
+        "codex": "CODEX_THREAD_ID",
+        "gemini": "ANTIGRAVITY_CONVERSATION_ID",
+        "opencode": "OPENCODE_SESSION_ID",
+    }.get(me.get("harness"))
+    native = os.environ.get(key, "") if key else ""
+    if not native:
+        return
+    owner = _MB.session_peer(base, native, harness=me["harness"], cwd=me["cwd"])
+    if owner and owner["session"] != me["session"]:
+        return
+    ids = list(dict.fromkeys([*(me.get("nativeSessions") or []), native]))[-32:]
+    updated = _MB.annotate(base, me["session"], nativeSession=native, nativeSessions=ids)
+    if isinstance(updated, dict):
+        me.update(updated)
+
+
+def _promote_resumed_coordinator(base: Path, me: dict[str, Any]) -> dict[str, Any] | None:
+    cli = Path(__file__).resolve().parents[3] / "bin" / "ork.mjs"
+    environment = {**os.environ, "AGENT_EXECUTOR_HOME": str(base.parent), "ORCHESTRATE_HOME": str(base.parent)}
+    with contextlib.suppress(OSError, ValueError, subprocess.SubprocessError):
+        result = subprocess.run(
+            [room_store._node_binary(), str(cli), "hall", "promote", "--session", me["session"], "--cwd", me["cwd"]],
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if result.returncode == 0:
+            room = json.loads(result.stdout).get("room")
+            if isinstance(room, dict):
+                return room
+    return None
+
+
 def swarm_coordinator_context(
     base: Path, me: dict[str, Any], event: str = "SessionStart", *, mid_turn: bool = False
 ) -> str:
@@ -869,7 +913,23 @@ def swarm_coordinator_context(
     if me.get("isSubagent") or me.get("delegatedRun") or _MB.is_run_peer(me):
         return ""
     is_turn_start = event in {"SessionStart", "UserPromptSubmit"} or (event == "PreInvocation" and not mid_turn)
+    _record_native_swarm_identity(base, me)
     room_id = os.environ.get("ORKEST_SWARM_ROOM", "").strip()
+    if is_turn_start and os.environ.get("ORKEST_RESUME_SWARM") == "1":
+        promoted = _promote_resumed_coordinator(base, me)
+        if not promoted:
+            return ""
+        room_id = promoted["id"]
+        instance_key = f"{room_id}:{me.get('terminalServer') or me.get('herdrPaneId') or me.get('pid') or ''}"
+        if me.get("swarmAutoReconnected") != instance_key and (
+            me.get("terminalServer") or os.environ.get("ORKEST_TERMINAL_SERVER") or _herdr_active()
+        ):
+            import agent_statusline_tmux
+
+            with contextlib.suppress(Exception):
+                agent_statusline_tmux.toggle_swarm_view(
+                    "open", room=room_id, session_id=me["session"], harness=me["harness"], cwd=me.get("cwd"), base=base
+                )
     if not room_id:
         if not is_turn_start:
             return ""
@@ -891,8 +951,9 @@ def swarm_coordinator_context(
         room: dict[str, Any] = matched
         if matched_session != me["session"]:
             rebound = agent_statusline_tmux.rebind_session_swarm_room(base, room_id, member_id, me["session"])
-            if isinstance(rebound, dict):
-                room = rebound
+            if not isinstance(rebound, dict):
+                return ""
+            room = rebound
         instance_key = f"{room_id}:{me.get('terminalServer') or me.get('herdrPaneId') or me.get('pid') or ''}"
         toggled_view = False
         if me.get("swarmAutoReconnected") != instance_key and (
@@ -929,8 +990,7 @@ def swarm_coordinator_context(
     room = loaded_room
     engine = "agy" if me["harness"] == "gemini" else me["harness"]
     conductor = room.get("conductor") or {}
-    aliases_list = me.get("aliases") if isinstance(me.get("aliases"), list) else []
-    candidate_ids = {me["session"], *(item for item in aliases_list if isinstance(item, str))}
+    candidate_ids = _MB.native_session_ids(me)
     bound_session = (conductor.get("session") or {}).get("id")
     if conductor.get("engine") != engine or (bound_session and bound_session not in candidate_ids):
         if isinstance(room.get("agents"), list):
@@ -964,9 +1024,10 @@ def swarm_coordinator_context(
         import agent_statusline_tmux
 
         rebound = agent_statusline_tmux.rebind_session_swarm_room(base, room_id, "conductor", me["session"])
-        if isinstance(rebound, dict):
-            room = rebound
-            bound_session = me["session"]
+        if not isinstance(rebound, dict):
+            return ""
+        room = rebound
+        bound_session = me["session"]
     was_already_bound = bool(bound_session)
     if not bound_session:
         cli = Path(__file__).resolve().parents[3] / "bin" / "ork.mjs"
@@ -1014,7 +1075,8 @@ def swarm_coordinator_context(
             room_id,
             "conductor",
             instance_key,
-            allow_brief=is_prompt_turn and not cli_launched_with_brief,
+            allow_brief=(is_prompt_turn or os.environ.get("ORKEST_RESUME_SWARM") == "1")
+            and not cli_launched_with_brief,
         )
         if delivered:
             return delivered
@@ -1175,11 +1237,15 @@ def hook(
     )
     if not session or not event:
         return None
+    native_session = session
     gemini = harness == "gemini"
     cwd = payload.get("cwd")
     if not cwd:
         spaces = payload.get("workspacePaths")
         cwd = spaces[0] if isinstance(spaces, list) and spaces and isinstance(spaces[0], str) else os.getcwd()
+    canonical = _MB.session_peer(base, session, harness=harness, cwd=cwd)
+    if canonical:
+        session = canonical["session"]
     if event == "SessionEnd":
         existing_peer = _MB.load(peer_path(base, session))
         parent_to_refresh = (
@@ -1352,6 +1418,9 @@ def hook(
         effort=runtime_effort_val,
     )
     me = _MB.mark_delegated(base, me)
+    if not is_subagent and not me.get("delegatedRun"):
+        ids = list(dict.fromkeys([*(me.get("nativeSessions") or []), native_session]))[-32:]
+        me = _MB.annotate(base, session, nativeSession=native_session, nativeSessions=ids) or me
     if is_subagent:
         subagent_fields: dict[str, Any] = {"isSubagent": True}
         if parent_session:

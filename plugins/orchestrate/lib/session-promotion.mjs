@@ -7,8 +7,18 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import { herdrEndpoint } from "./herdr-context.mjs";
-import { createRoom, mailboxRoot, readRoom, updateRoom } from "./horde-room.mjs";
-import { coordinatorBrief, isPeerLive, writeCoordinatorBrief } from "./rooms.mjs";
+import { createRoom, listRawRooms, mailboxRoot, readRoom, updateRoom } from "./horde-room.mjs";
+import {
+  coordinatorBrief,
+  hasOtherLiveOwner,
+  isPeerLive,
+  ownsSessionBinding,
+  rememberSession,
+  resolveSessionPeer,
+  roomOwnerSessions,
+  sessionIdentities,
+  writeCoordinatorBrief,
+} from "./rooms.mjs";
 
 const execute = promisify(execFile);
 const statusline = fileURLToPath(
@@ -34,11 +44,16 @@ function isSameSession(binding, peer, engine, checkout) {
   );
 }
 
-async function currentPeer(root, session, cwd, env, now) {
+async function currentPeer(root, session, cwd, env, now, expectedEngine) {
   let peer;
   try {
     const peerFile = path.join(root, "peers", `${sessionKey(session)}.json`);
-    peer = JSON.parse(await readFile(peerFile, "utf8"));
+    peer =
+      (await resolveSessionPeer(session, root, {
+        now,
+        cwd: cwd || process.cwd(),
+        engine: expectedEngine || env.ORKEST_TERMINAL_HARNESS,
+      })) || JSON.parse(await readFile(peerFile, "utf8"));
   } catch (error) {
     if (error.code === "ENOENT")
       throw new Error(
@@ -51,7 +66,7 @@ async function currentPeer(root, session, cwd, env, now) {
   if (
     !peer ||
     peer.schema !== "agent-executor.peer.v1" ||
-    peer.session !== session ||
+    !sessionIdentities(peer).includes(session) ||
     typeof peer.name !== "string" ||
     typeof peer.cwd !== "string" ||
     !Number.isFinite(Date.parse(peer.startedAt)) ||
@@ -120,7 +135,14 @@ export async function promoteSession(
   ]
     .map((key) => env[key])
     .find(Boolean);
-  const { peer, engine, checkout } = await currentPeer(root, session, cwd, env, now);
+  const { peer, engine, checkout } = await currentPeer(
+    root,
+    session,
+    cwd,
+    env,
+    now,
+    requestedEngine,
+  );
   if (requestedEngine && requestedEngine !== engine)
     throw new Error("The requested engine differs from the registered live session");
   if (
@@ -128,18 +150,51 @@ export async function promoteSession(
     (typeof objective !== "string" || !objective.trim() || objective.length > 12_000)
   )
     throw new Error("Objective must contain 1–12000 characters");
+  const isResume = env.ORKEST_RESUME_SWARM === "1";
+  const resumeTarget = env.ORKEST_RESUME_TARGET;
+  const available = (room) => room && !room.closedAt && room.status !== "closed";
+  const sameCheckout = async (room) => {
+    if (room.machine && room.machine !== hostname()) return false;
+    let roomCwd;
+    try {
+      roomCwd = await realpath(room.cwd);
+    } catch {
+      roomCwd = path.resolve(room.cwd);
+    }
+    return roomCwd === checkout;
+  };
+  const mayResume = async (room) =>
+    isResume &&
+    available(room) &&
+    (await sameCheckout(room)) &&
+    room.conductor?.engine === engine &&
+    !room.authority &&
+    (room.id === env.ORKEST_SWARM_ROOM || roomOwnerSessions(room).includes(resumeTarget)) &&
+    !(await hasOtherLiveOwner(room, peer, root));
+  const mayReuse = async (room) =>
+    available(room) &&
+    room.conductor?.engine === engine &&
+    (await sameCheckout(room)) &&
+    ((await ownsSessionBinding(room, peer, root)) || (await mayResume(room)));
   let roomId = explicitRoom;
   if (!roomId && env.ORKEST_SWARM_ROOM) {
     try {
       const current = await readRoom(env.ORKEST_SWARM_ROOM, root);
-      if (
-        current.machine === hostname() &&
-        (await realpath(current.cwd)) === checkout &&
-        isSameSession(current.conductor?.session, peer, engine, checkout)
-      )
-        roomId = current.id;
-    } catch {
-      /* An inherited stale room must not redirect promotion into historical work. */
+      if (await mayReuse(current)) roomId = current.id;
+      else if (isResume && available(current) && (await sameCheckout(current)))
+        throw new Error(
+          "This room already has another coordinator; use the explicit leadership handoff workflow",
+        );
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+  }
+  if (!roomId) {
+    for (const room of listRawRooms(root)) {
+      if (await mayReuse(room)) {
+        roomId = room.id;
+        break;
+      }
     }
   }
   const association = createHash("sha256")
@@ -153,12 +208,15 @@ export async function promoteSession(
   } catch (error) {
     if (error.code !== "ENOENT" || explicitRoom) throw error;
   }
-  const promote = (existing) => {
+  const promote = async (existing) => {
     const room = existing || createRoom([], { id: roomId, cwd: checkout, engine, now });
-    if (path.resolve(room.cwd) !== checkout || (room.machine && room.machine !== hostname()))
+    if (!(await sameCheckout(room)))
       throw new Error("The target room belongs to a different machine or checkout");
     const binding = room.conductor?.session;
-    if (binding && !isSameSession(binding, peer, engine, checkout))
+    if (!available(room)) throw new Error("Cannot promote into a closed room");
+    const owned = await ownsSessionBinding(room, peer, root);
+    const resuming = await mayResume(room);
+    if (binding && !owned && !resuming)
       throw new Error(
         "This room already has another coordinator; use a new room or the explicit leadership handoff workflow",
       );
@@ -170,6 +228,8 @@ export async function promoteSession(
       !explicitRoom &&
       !env.ORKEST_SWARM_ROOM &&
       existing &&
+      !owned &&
+      !resuming &&
       room.promotion?.association !== association
     )
       throw new Error("This conversation's promotion room has a different owner");
@@ -186,6 +246,7 @@ export async function promoteSession(
       room.title = objective.replaceAll(/\s+/gu, " ").trim().slice(0, 160);
     }
     room.title ||= peer.focus || "Current conversation";
+    rememberSession(room.conductor, peer.session, [room.promotion?.session]);
     room.conductor = {
       ...room.conductor,
       engine,

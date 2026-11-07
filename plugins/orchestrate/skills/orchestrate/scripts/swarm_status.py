@@ -23,8 +23,8 @@ def snapshot(room: dict, base: Path) -> dict:
         session = binding["id"]
         harness = {"agy": "gemini"}.get(binding["engine"], binding["engine"])
         try:
-            peer = mailbox.load(mailbox.peer_path(base, session))
             expected_cwd = Path(binding.get("cwd") or member.get("cwd") or room["cwd"]).resolve()
+            peer = mailbox.session_peer(base, session, harness=harness, cwd=str(expected_cwd))
             peer_cwd = (
                 Path(peer.get("checkout") or peer["cwd"]).resolve()
                 if isinstance(peer, dict) and (peer.get("checkout") or peer.get("cwd"))
@@ -37,7 +37,7 @@ def snapshot(room: dict, base: Path) -> dict:
                 or (peer_cwd != expected_cwd and peer_cwd != Path(room["cwd"]).resolve())
             ):
                 continue
-            item = agent_statusline.identity(session, harness, base=base)
+            item = agent_statusline.identity(peer["session"], harness, base=base)
             if item:
                 result[member["id"]] = item
         except (OSError, ValueError, mailbox.MailboxError):

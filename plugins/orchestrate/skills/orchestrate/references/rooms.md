@@ -9,6 +9,12 @@ For an interactive coordinator that builds and supervises its own team, use
 [`ork horde "objective"`](swarm.md). The commands
 below also work independently.
 
+`ork rooms resume-status --cwd /absolute/project --json` lists live, unavailable, unbound and
+closed rooms, including legacy resume rooms. It only reads the store: it does not migrate, repair
+or remove records. To repair a native-ID binding once hooks have recorded its mailbox identity,
+use `ork rooms bind --room ID --member conductor --session MAILBOX_ID --engine ENGINE`.
+Repair checks recorded ownership and refuses to replace another live coordinator.
+
 ## Create and dispatch
 
 ```sh

@@ -22,7 +22,7 @@ import peer_mailbox as mailbox
 import room_store
 from herdr_context import verified_agent
 
-_RESUME_VALUE_FLAGS = frozenset({"--resume", "-r", "--session-id", "--conversation", "--session", "-s"})
+_RESUME_VALUE_FLAGS = frozenset({"--resume", "-r", "--session-id", "--conversation", "--session", "-s", "-c"})
 _NON_SESSION_FLAG_VALUES = frozenset({"last", "help", "read-only", "workspace-write", "danger-full-access"})
 
 
@@ -39,7 +39,7 @@ def extract_resumed_session_id(command: list[str]) -> str | None:
         if token == "--":
             break
         for flag in _RESUME_VALUE_FLAGS:
-            if flag == "-s" and prog == "codex":
+            if flag in {"-s", "-c"} and prog == "codex":
                 continue
             if token == flag:
                 if idx + 1 < len(tokens):
@@ -84,12 +84,9 @@ def find_session_swarm_room(
     aliases: list[str] | tuple[str, ...] | None = None,
     only_room: str | None = None,
 ) -> dict[str, object] | None:
-    """Find the most recently updated swarm room where this session (or its alias) was in control (conductor or lead)."""
-    candidates = {
-        item.strip()
-        for item in [session_id, *(aliases or ())]
-        if isinstance(item, str) and item.strip() and re.fullmatch(r"[\w-]{1,80}", item.strip(), flags=re.ASCII)
-    }
+    """Find a conductor/lead room using attested native identities; legacy display aliases are ignored."""
+    peer = mailbox.session_peer(base, session_id, harness=harness, cwd=cwd)
+    candidates = mailbox.native_session_ids(peer) if peer else {session_id}
     if not candidates:
         return None
     expected_engine = {"gemini": "agy", "agy": "agy", "claude": "claude", "codex": "codex", "opencode": "opencode"}.get(
@@ -105,6 +102,10 @@ def find_session_swarm_room(
     with contextlib.suppress(OSError):
         for room in room_store.list_rooms(base):
             if not isinstance(room, dict) or room.get("schema") != "agent-executor.room.v1" or not room.get("swarm"):
+                continue
+            if room.get("closedAt") or room.get("status") == "closed":
+                continue
+            if resolved_cwd and isinstance(room.get("cwd"), str) and Path(room["cwd"]).resolve() != resolved_cwd:
                 continue
             if only_room is not None and room.get("id") != only_room:
                 continue
@@ -123,7 +124,21 @@ def find_session_swarm_room(
                 mailbox_sid = (
                     conductor.get("mailboxSession") if isinstance(conductor.get("mailboxSession"), str) else None
                 )
-                for sid in (bound_id, mailbox_sid):
+                owner_ids = [
+                    bound_id,
+                    mailbox_sid,
+                    (room.get("promotion") or {}).get("session"),
+                    *(conductor.get("previousSessions") or []),
+                ]
+                # Recorded live ownership outranks any other peer's native identity.
+                if peer and any(
+                    (owner := mailbox.session_peer(base, owner_id, harness=harness, cwd=cwd))
+                    and owner["session"] != peer["session"]
+                    for owner_id in owner_ids
+                    if isinstance(owner_id, str)
+                ):
+                    continue
+                for sid in owner_ids:
                     if (
                         isinstance(sid, str)
                         and sid in candidates
@@ -142,7 +157,7 @@ def find_session_swarm_room(
                     a_session = agent.get("session")
                     bound_id = a_session.get("id") if isinstance(a_session, dict) else None
                     mailbox_sid = agent.get("mailboxSession") if isinstance(agent.get("mailboxSession"), str) else None
-                    for sid in (bound_id, mailbox_sid):
+                    for sid in (bound_id, mailbox_sid, *(agent.get("previousSessions") or [])):
                         if (
                             isinstance(sid, str)
                             and sid in candidates
@@ -212,7 +227,7 @@ def _discover_socket(
             candidates.append(candidate)
     if session_id:
         with contextlib.suppress(Exception):
-            peer = mailbox.load(mailbox.peer_path(base, session_id))
+            peer = mailbox.session_peer(base, session_id)
             recorded = peer.get("terminalServer") if isinstance(peer, dict) else None
             if (
                 isinstance(recorded, str)
@@ -613,11 +628,14 @@ def _find_herdr_peer(
 ) -> dict[str, object] | None:
     if session_id:
         with contextlib.suppress(Exception):
-            peer = mailbox.load(mailbox.peer_path(base, session_id))
+            peer = mailbox.session_peer(base, session_id)
             if (
                 isinstance(peer, dict)
+                and mailbox.is_live(peer)
                 and not peer.get("isSubagent")
                 and not peer.get("delegatedRun")
+                and not peer.get("run")
+                and not peer["session"].startswith("run-")
                 and (endpoint is None or peer.get("herdrEndpoint") == endpoint)
             ):
                 return peer
@@ -629,7 +647,13 @@ def _find_herdr_peer(
             peer = mailbox.load(path)
             if not isinstance(peer, dict) or not mailbox.valid_peer(peer):
                 continue
-            if peer.get("isSubagent") or peer.get("delegatedRun"):
+            if (
+                not mailbox.is_live(peer)
+                or peer.get("isSubagent")
+                or peer.get("delegatedRun")
+                or peer.get("run")
+                or peer["session"].startswith("run-")
+            ):
                 continue
             if peer.get("herdrPaneId") != pane_id:
                 continue
@@ -781,7 +805,7 @@ def _toggle_herdr_swarm_view_unlocked(
                 session_id = ref["value"]
                 harness = harness or {"agy": "gemini"}.get(ref.get("agent"), ref.get("agent"))
     peer = _find_herdr_peer(base, session_id, coordinator_pane, endpoint=current_endpoint)
-    if peer and session_id and peer.get("session") != session_id and session_id not in (peer.get("aliases") or []):
+    if peer and session_id and peer.get("session") != session_id and session_id not in mailbox.native_session_ids(peer):
         peer = None
     if isinstance(peer, dict):
         if not session_id and isinstance(peer.get("session"), str):
@@ -1077,7 +1101,7 @@ def toggle_swarm_view(
     peer = None
     if session_id:
         with contextlib.suppress(Exception):
-            peer = mailbox.load(mailbox.peer_path(base, session_id))
+            peer = mailbox.session_peer(base, session_id)
         if isinstance(peer, dict) and not harness:
             harness = peer.get("harness")
         if isinstance(peer, dict) and not cwd:
@@ -1183,16 +1207,20 @@ def main(arguments: list[str]) -> int:
             arguments = arguments[2:]
         else:
             break
-    if arguments[:1] in (["--room"], ["--attach-room"]):
+    resume_swarm = False
+    resumed_session = None
+    if arguments[:1] in (["--room"], ["--attach-room"], ["--resume-swarm"], ["--cwd"]):
         parser = argparse.ArgumentParser(description="Open an Orkest coordinator and swarm view")
-        source = parser.add_mutually_exclusive_group(required=True)
+        source = parser.add_mutually_exclusive_group()
         source.add_argument("--room")
+        source.add_argument("--resume-swarm", action="store_true")
         source.add_argument("--attach-room")
         parser.add_argument("--cwd")
         parser.add_argument("--lines", type=int, choices=(1, 2), default=lines)
         parser.add_argument("command", nargs=argparse.REMAINDER)
         args = parser.parse_args(arguments)
         room, cwd, attach, lines = args.room or args.attach_room, args.cwd, bool(args.attach_room), args.lines
+        resume_swarm = args.resume_swarm
         arguments = args.command
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         print("ork label needs an interactive terminal", file=sys.stderr)
@@ -1243,21 +1271,28 @@ def main(arguments: list[str]) -> int:
         if not shutil.which(command[0]):
             print(f"{command[0]} is not installed on PATH", file=sys.stderr)
             return 2
-        if not room:
-            resumed_session = extract_resumed_session_id(command)
-            if resumed_session:
-                base_dir = mailbox.root()
-                peer_data = None
-                with contextlib.suppress(Exception):
-                    peer_data = mailbox.load(mailbox.peer_path(base_dir, resumed_session))
-                aliases = (
-                    peer_data.get("aliases")
-                    if isinstance(peer_data, dict) and isinstance(peer_data.get("aliases"), list)
-                    else None
-                )
-                matched = find_session_swarm_room(base_dir, resumed_session, harness=harness, cwd=cwd, aliases=aliases)
-                if isinstance(matched, dict) and isinstance(matched.get("id"), str):
-                    room = matched["id"]
+        resumed_session = extract_resumed_session_id(command)
+        resume_swarm = (
+            resume_swarm
+            or bool(resumed_session)
+            or any(
+                flag in command[1:]
+                for flag in ("--resume", "--continue", "-r", "resume", *(() if harness == "codex" else ("-c",)))
+            )
+        )
+        if not room and resumed_session:
+            base_dir = mailbox.root()
+            peer_data = None
+            with contextlib.suppress(Exception):
+                peer_data = mailbox.load(mailbox.peer_path(base_dir, resumed_session))
+            aliases = (
+                peer_data.get("aliases")
+                if isinstance(peer_data, dict) and isinstance(peer_data.get("aliases"), list)
+                else None
+            )
+            matched = find_session_swarm_room(base_dir, resumed_session, harness=harness, cwd=cwd, aliases=aliases)
+            if isinstance(matched, dict) and isinstance(matched.get("id"), str):
+                room = matched["id"]
         if herdr_active:
             import herdr_swarm_restore as restoration
 
@@ -1267,6 +1302,10 @@ def main(arguments: list[str]) -> int:
             environment.pop("ORKEST_TERMINAL_SERVER", None)
             environment.pop("HERDR_AGENT", None)
             environment["ORKEST_TERMINAL_HARNESS"] = harness
+            if resume_swarm:
+                environment["ORKEST_RESUME_SWARM"] = "1"
+                if resumed_session:
+                    environment["ORKEST_RESUME_TARGET"] = resumed_session
             if room:
                 environment["ORKEST_SWARM_ROOM"] = room
                 coordinator_pane = os.environ.get("HERDR_PANE_ID", "").strip()
@@ -1381,6 +1420,10 @@ def main(arguments: list[str]) -> int:
                 )
     environment["ORKEST_TERMINAL_SERVER"] = socket
     environment["ORKEST_TERMINAL_HARNESS"] = harness
+    if resume_swarm:
+        environment["ORKEST_RESUME_SWARM"] = "1"
+        if resumed_session:
+            environment["ORKEST_RESUME_TARGET"] = resumed_session
     if room:
         environment["ORKEST_SWARM_ROOM"] = room
     columns, rows = shutil.get_terminal_size((80, 24))

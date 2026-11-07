@@ -425,8 +425,47 @@ export function coordinatorArguments(engine, prompt, harnessArgs = []) {
   return [...harnessArgs, ...(promptFlag ? [promptFlag, prompt] : [prompt])];
 }
 
+/** Keep Orkest wrapper options outside the native harness argument boundary. */
+export function resumeArguments(engine, args) {
+  const native = [];
+  let cwd;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === "--cwd") cwd = args[++i];
+    else if (arg.startsWith("--cwd=")) cwd = arg.slice(6);
+    else if (arg === "--harness-arg") native.push(args[++i]);
+    else if (arg.startsWith("--harness-arg=")) native.push(arg.slice(14));
+    else native.push(arg);
+  }
+  const boundary = native.indexOf("--");
+  const options = boundary === -1 ? native : native.slice(0, boundary);
+  const flags = new Set([
+    "--resume",
+    "-r",
+    "--continue",
+    "--session",
+    "--session-id",
+    "--conversation",
+  ]);
+  if (engine !== "codex") {
+    flags.add("-s");
+    flags.add("-c");
+  }
+  const resuming =
+    options.some((arg) => typeof arg === "string" && flags.has(arg.split("=", 1)[0])) ||
+    (engine === "codex" && options.includes("resume"));
+  return resuming
+    ? ["--resume-swarm", ...(cwd ? ["--cwd", cwd] : []), "--", engine, ...native]
+    : null;
+}
+
 export async function main(argv = process.argv.slice(2), { stdout = process.stdout } = {}) {
   const engineShortcut = COORDINATORS.has(argv[0]) ? argv[0] : undefined;
+  const resume = engineShortcut && resumeArguments(engineShortcut, argv.slice(1));
+  if (resume) {
+    process.exitCode = await terminalCommand("agent_statusline_tmux.py", resume);
+    return;
+  }
   if (engineShortcut) argv = ["horde", ...argv.slice(1)];
   if (argv[0] === "setup") {
     process.exitCode = await terminalCommand("install_mailbox.py", argv.slice(1));
@@ -657,6 +696,15 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
     ...(values["dangerously-skip-permissions"] ? ["--dangerously-skip-permissions"] : []),
     ...(values["remote-control"] ? ["--remote-control"] : []),
   ];
+  const resumeSwarm = resumeArguments(engine, harnessArgs);
+  if (resumeSwarm && !values["attach-room"] && !values.json && !values.print) {
+    process.exitCode = await terminalCommand("agent_statusline_tmux.py", [
+      ...resumeSwarm.slice(0, 1),
+      ...(values.cwd ? ["--cwd", values.cwd] : []),
+      ...resumeSwarm.slice(1),
+    ]);
+    return;
+  }
   const isInteractive = Boolean(
     stdout.isTTY && !values.print && !values.json && !values.view && !values.fixture && !isSpawning,
   );

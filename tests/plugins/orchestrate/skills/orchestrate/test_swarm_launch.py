@@ -495,11 +495,11 @@ class HerdrSwarmLaunchTests(unittest.TestCase):
             self.assertEqual(persisted["agents"], previous["agents"])
             self.assertEqual(persisted["messages"], previous["messages"])
 
-    def test_resume_alias_reuses_the_previous_room_instead_of_creating_another(self):
+    def test_attested_native_identity_reuses_the_previous_room_instead_of_creating_another(self):
         import agent_statusline_tmux
 
         with self._reused_pane_room() as (home, base, previous, session):
-            mailbox.annotate(base, session, aliases=[previous["conductor"]["session"]["id"]])
+            mailbox.annotate(base, session, nativeSessions=[previous["conductor"]["session"]["id"]])
             opened = agent_statusline_tmux.toggle_swarm_view(
                 "open", session_id=session, harness="codex", cwd=str(home), base=base
             )
@@ -861,7 +861,9 @@ class HerdrSwarmLaunchTests(unittest.TestCase):
                     pid=os.getpid() + 1,
                     account=str(home),
                 )
-                cleared_me = mailbox.annotate(base, cleared_sid, aliases=[session_id], clearedFrom=session_id)
+                mailbox.unregister(base, session_id)
+                cleared_me = mailbox.annotate(base, cleared_sid, nativeSessions=[session_id], clearedFrom=session_id)
+                cleared_me = mailbox.annotate(base, cleared_sid, pid=os.getpid())
                 cleared_summary = mailbox_hooks.swarm_coordinator_context(base, cleared_me, "SessionStart")
                 self.assertIn("Reconnected to swarm room room-newer (Active Horde)", cleared_summary)
                 updated_room = room_store.read_room(base, "room-newer")
@@ -895,7 +897,7 @@ class HerdrSwarmLaunchTests(unittest.TestCase):
                 cwd=tmp,
                 pid=os.getpid(),
             )
-            mailbox.annotate(base, parent["session"], herdrPaneId="w1:p1", lastSeenAt="2026-11-04T05:00:00Z")
+            mailbox.annotate(base, parent["session"], herdrPaneId="w1:p1", lastSeenAt=mailbox.stamp())
             child = mailbox.register(
                 base,
                 session="child-session-2222",
@@ -908,7 +910,7 @@ class HerdrSwarmLaunchTests(unittest.TestCase):
                 child["session"],
                 herdrPaneId="w1:p1",
                 isSubagent=True,
-                lastSeenAt="2026-11-04T05:05:00Z",
+                lastSeenAt=mailbox.stamp(),
             )
             found_via_subagent = agent_statusline_tmux._find_herdr_peer(base, "child-session-2222", "w1:p1")
             self.assertIsNotNone(found_via_subagent)
