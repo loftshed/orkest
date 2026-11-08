@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.73.1
+
+- fix(orchestrate): resumed coordinators reattach to their room (#132)
+
 ## 0.73.0
 
 - feat(orchestrate): bounded auto-correct rounds for failed verify gates (#128)
