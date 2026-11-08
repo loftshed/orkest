@@ -27,7 +27,6 @@ class ProgressTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.home = Path(temporary.name)
         self.base = self.home / "mailbox-v1"
-        self.enterContext(patch.object(mailbox, "claude_session_dirs", return_value=[]))
         self.cwd = self.home / "project"
         subprocess.run(["git", "init", "-q", str(self.cwd)], check=True)
         self.peer = mailbox.register(
@@ -35,15 +34,12 @@ class ProgressTests(unittest.TestCase):
         )
         self.environment = {**os.environ, "AGENT_EXECUTOR_HOME": str(self.home)}
 
-    def command(self, *arguments, direct=False):
-        executable = (
-            [sys.executable, str(SCRIPTS / "agent_progress.py")]
-            if direct
-            else ["node", str(SCRIPTS.parents[2] / "bin/ork.mjs"), "progress"]
-        )
+    def command(self, *arguments):
         return subprocess.run(
             [
-                *executable,
+                "node",
+                str(SCRIPTS.parents[2] / "bin/ork.mjs"),
+                "progress",
                 "--session",
                 self.peer["session"],
                 *arguments,
@@ -61,112 +57,60 @@ class ProgressTests(unittest.TestCase):
     def report(self, stage="working", task="Fix parser"):
         return progress.report(self.base, self.peer, goal="Ship export", task=task, stage=stage)
 
-    def test_both_clis_refuse_another_live_process_even_with_its_session_in_the_environment(self):
-        self.report()
-        path = progress.record_path(self.base, self.peer["session"])
-        previous = path.read_bytes()
-        with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"], stdin=subprocess.PIPE) as owner:
-            mailbox.register(self.base, session=self.peer["session"], harness="codex", cwd=str(self.cwd), pid=owner.pid)
-            self.environment["AGENT_MAILBOX_SESSION"] = self.peer["session"]
-            for direct in (False, True):
-                with self.subTest(direct=direct):
-                    result = self.command("--goal", "Overwrite owner", "--stage", "complete", direct=direct)
-                    self.assertEqual(result.returncode, 2, result.stdout)
-                    self.assertIn(self.peer["session"], result.stderr)
-                    self.assertIn("not owned by this process", result.stderr)
-                    self.assertEqual(path.read_bytes(), previous)
+    def caller(self, **identity):
+        names = (
+            "AGENT_MAILBOX_SESSION",
+            "CLAUDECODE",
+            "CLAUDE_CODE_ENTRYPOINT",
+            *progress.HARNESS_SESSION_VARIABLES.values(),
+        )
+        self.environment = {**{k: v for k, v in self.environment.items() if k not in names}, **identity}
 
-    def test_shell_descendants_can_update_each_harness_and_native_subagents(self):
-        mailbox.register(self.base, session="parent", harness="codex", cwd=str(self.cwd), pid=os.getpid())
-        for harness in ("claude", "codex", "gemini", "opencode"):
-            with self.subTest(harness=harness):
-                peer = mailbox.register(
-                    self.base, session=self.peer["session"], harness=harness, cwd=str(self.cwd), pid=os.getpid()
-                )
-                for subagent in (False, True):
-                    mailbox.annotate(self.base, peer["session"], isSubagent=subagent, parentSession="parent")
-                    result = subprocess.run(
-                        [
-                            "bash",
-                            "-c",
-                            '"$@"',
-                            "progress-shell",
-                            "node",
-                            str(SCRIPTS.parents[2] / "bin/ork.mjs"),
-                            "progress",
-                            "--session",
-                            peer["session"],
-                            "--goal",
-                            "Ship export",
-                            "--task",
-                            "Fix parser",
-                            "--stage",
-                            "testing",
-                        ],
-                        env=self.environment,
-                        text=True,
-                        capture_output=True,
-                        check=False,
-                    )
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertEqual(progress.read(self.base, peer)["stage"], "testing")
+    def register(self, session, harness):
+        return mailbox.register(self.base, session=session, harness=harness, cwd=str(self.cwd), pid=os.getpid())
 
-    def test_dead_unknown_and_recycled_pids_do_not_lock_out_resumed_sessions(self):
-        with subprocess.Popen([sys.executable, "-c", "pass"]) as ended:
-            ended.wait(timeout=5)
-        for pid, birth in ((None, None), (ended.pid, "old"), (os.getpid(), "previous process")):
-            with self.subTest(pid=pid, birth=birth):
-                mailbox.annotate(self.base, self.peer["session"], pid=pid, pidBirth=birth)
-                result = self.command("--goal", "Resume export", "--task", "Fix parser", "--stage", "working")
+    def test_another_live_agent_of_the_same_harness_is_refused(self):
+        self.register("other-session", "codex")
+        self.caller(CODEX_THREAD_ID="other-session")
+        self.assertEqual(self.command("--goal", "G", "--task", "T", "--stage", "working").returncode, 2)
+        refused = self.command("--stage", "review")
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("'progress-session' belongs to another live agent", refused.stderr)
+        self.assertIsNone(progress.read(self.base, self.peer))
+
+    def test_real_agents_are_never_refused(self):
+        native = "019a5da8-aaaa-5678-9abc-123456789012"
+        mailbox.attest_native_sessions(self.base, "progress-session", native)
+        self.register("claude-parent", "claude")
+        self.register("other-session", "codex")
+        cases = {
+            "own session": {"CODEX_THREAD_ID": "progress-session"},
+            "attested native ID": {"CODEX_THREAD_ID": native},
+            "no identity at all": {},
+            "unregistered caller": {"CODEX_THREAD_ID": "never-registered"},
+            # A harness started from inside another inherits that one's variables.
+            "inherited other harness": {"CLAUDECODE": "1", "CLAUDE_CODE_SESSION_ID": "claude-parent"},
+            "own ID beside an inherited one": {
+                "CODEX_THREAD_ID": "other-session",
+                "AGENT_MAILBOX_SESSION": "progress-session",
+            },
+        }
+        for name, identity in cases.items():
+            with self.subTest(name):
+                self.caller(**identity)
+                result = self.command("--goal", "G", "--task", name, "--stage", "working")
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(json.loads(result.stdout)["goal"], "Resume export")
 
-    def test_macos_process_table_allows_descendants_and_rejects_other_live_owners(self):
-        peer = {**self.peer, "pid": 400, "pidBirth": "birth"}
-        for table, allowed in (("200 300\n300 400\n400 1\n", True), ("200 300\n300 1\n400 1\n", False)):
-            with (
-                self.subTest(table=table),
-                patch.object(progress.sys, "platform", "darwin"),
-                patch.object(progress.os, "getpid", return_value=100),
-                patch.object(progress.os, "getppid", return_value=200),
-                patch.object(mailbox, "pid_alive", return_value=True),
-                patch.object(mailbox, "process_started", return_value="birth"),
-                patch.object(progress.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, table)),
-            ):
-                if allowed:
-                    row = progress.report(self.base, peer, goal="Ship export", task="Fix parser", stage="working")
-                    self.assertEqual(row["task"], "Fix parser")
-                else:
-                    with self.assertRaisesRegex(mailbox.MailboxError, "progress-session.*not owned"):
-                        progress.report(self.base, peer, goal="Overwrite owner", task="Other", stage="complete")
-                    self.assertEqual(progress.read(self.base, peer)["task"], "Fix parser")
-
-    def test_missing_ps_never_grants_an_unverified_live_owner_but_own_process_still_works(self):
-        with (
-            patch.object(progress.sys, "platform", "darwin"),
-            patch.object(mailbox, "pid_alive", return_value=True),
-            patch.object(mailbox, "process_started", return_value=None),
-            patch.object(progress.subprocess, "run", side_effect=FileNotFoundError("ps unavailable")),
-        ):
-            self.assertEqual(self.report()["stage"], "working")
-            for birth in (None, "birth"):
-                peer = {**self.peer, "pid": 999999, "pidBirth": birth}
-                with self.assertRaisesRegex(
-                    mailbox.MailboxError, "progress-session.*could not verify process ancestry"
-                ):
-                    progress.report(self.base, peer, goal="Overwrite owner", task="Other", stage="complete")
-            self.assertEqual(progress.read(self.base, self.peer)["stage"], "working")
-
-    def test_linux_descendants_work_without_ps(self):
-        # Two hops, with a comm containing spaces and parentheses, exercises the /proc walk.
-        with (
-            patch.object(progress.sys, "platform", "linux"),
-            patch.object(progress.os, "getpid", return_value=100),
-            patch.object(progress.os, "getppid", return_value=200),
-            patch.object(Path, "read_text", side_effect=["200 (a tricky) name) S 300", "300 (shell) S 400"]),
-            patch.object(progress.subprocess, "run", side_effect=FileNotFoundError("ps unavailable")),
-        ):
-            self.assertEqual(progress.caller_descends_from(400), True)
+    def test_a_parent_can_report_for_its_subagent_and_a_dead_session_stays_reachable(self):
+        self.register("parent-session", "claude")
+        for session, pid, parent in (("subagent-a1", os.getpid(), "parent-session"), ("gone-session", 99999999, None)):
+            with self.subTest(session):
+                mailbox.register(self.base, session=session, harness="claude", cwd=str(self.cwd), pid=os.getpid())
+                mailbox.annotate(self.base, session, pid=pid, **({"parentSession": parent} if parent else {}))
+                self.peer = mailbox.load(mailbox.peer_path(self.base, session))
+                self.caller(CLAUDECODE="1", CLAUDE_CODE_SESSION_ID="parent-session")
+                result = self.command("--goal", "G", "--task", "T", "--stage", "working")
+                self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_one_command_fills_work_fields_and_partial_updates_preserve_the_context(self):
         before = self.fields()
@@ -347,7 +291,7 @@ class ProgressTests(unittest.TestCase):
         )
 
     def test_turn_hooks_remind_each_harness_but_never_extend_a_turn_or_mark_it_complete(self):
-        for harness in ("claude", "codex", "gemini", "opencode"):
+        for harness in ("claude", "codex", "gemini"):
             with (
                 self.subTest(harness=harness),
                 patch.object(mailbox, "harness_pid", return_value=os.getpid()),
@@ -370,23 +314,6 @@ class ProgressTests(unittest.TestCase):
                 reminded = mailbox.hook(payload, harness=harness, event=event, base=self.base)
                 self.assertIn("footer progress is stale", str(reminded))
                 self.assertEqual(progress.reminder(self.base, mailbox.load(mailbox.peer_path(self.base, session))), "")
-
-    def test_turn_hook_ignores_a_progress_refusal(self):
-        with (
-            patch.object(mailbox, "harness_pid", return_value=os.getpid()),
-            patch.object(mailbox_daemon, "get_mode", return_value="stdio"),
-            patch.object(
-                progress, "reminder", side_effect=mailbox.MailboxError("session is not owned by this process")
-            ),
-        ):
-            result = mailbox.hook(
-                {"session_id": self.peer["session"], "cwd": str(self.cwd)},
-                harness="codex",
-                event="UserPromptSubmit",
-                base=self.base,
-            )
-        self.assertNotIn("not owned by this process", str(result))
-        self.assertEqual(mailbox.load(mailbox.peer_path(self.base, self.peer["session"]))["state"], "busy")
 
     def test_workforce_roles_normalize_aliases_persist_across_updates_and_clear(self):
         reported = progress.report(

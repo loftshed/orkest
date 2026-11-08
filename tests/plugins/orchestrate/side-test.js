@@ -333,12 +333,14 @@ describe("ork side (side missions)", () => {
         });
         return { child, done: once(child, "close"), output: () => output, errors: () => errors };
       });
+      let isReady = false;
       try {
         await vi.waitFor(
           () => {
             expect(
               ["first", "second"].map((id) => fs.existsSync(path.join(cacheDir, `ready-${id}`))),
             ).toEqual([true, true]);
+            isReady = true;
           },
           // Two cold Node processes can take several seconds to start on shared CI runners.
           { timeout: 20_000 },
@@ -346,6 +348,16 @@ describe("ork side (side missions)", () => {
       } finally {
         fs.writeFileSync(path.join(cacheDir, "release"), "go");
         await Promise.all(children.map(({ done }) => done));
+        // This has flaked on macOS CI with one process never reaching dispatch; say why.
+        if (!isReady) {
+          console.error(
+            children.map(({ child, errors, output }) => ({
+              code: child.exitCode,
+              errors: errors(),
+              output: output(),
+            })),
+          );
+        }
       }
       for (const child of children) {
         expect(child.child.exitCode, child.errors()).toBe(0);

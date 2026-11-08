@@ -11,7 +11,6 @@ import json
 import os
 import shlex
 import socket
-import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -29,57 +28,47 @@ ROLES = tuple(ROLES_DATA.keys())
 ROLE_ALIASES = {alias: role_id for role_id, info in ROLES_DATA.items() for alias in (role_id, *info.get("aliases", ()))}
 
 
-def caller_descends_from(owner_pid: int) -> bool | None:
-    """Walk only our ancestry on Linux; use one portable ps snapshot on macOS.
+HARNESS_SESSION_VARIABLES = {
+    "claude": "CLAUDE_CODE_SESSION_ID",
+    "codex": "CODEX_THREAD_ID",
+    "gemini": "ANTIGRAVITY_CONVERSATION_ID",
+    "opencode": "OPENCODE_SESSION_ID",
+}
 
-    None means ancestry could not be established, not permission to update a live peer.
+
+def refuse_another_agents_session(base: Path, peer: dict[str, Any]) -> None:
+    """Stop an agent overwriting another live agent's progress, for example by pasting the wrong ID.
+
+    Refuses only when the caller's own harness names a different live session of the same harness.
+    Anything uncertain is allowed: process trees differ by harness and install, and a false refusal
+    would silence progress reporting. This guards against mistakes, not a hostile local process.
     """
-    pid = os.getpid()
-    parent = os.getppid()
-    if owner_pid in (pid, parent):
-        return True
-    seen = {pid}
-    if sys.platform == "linux":
-        try:
-            while parent > 1 and parent not in seen:
-                if parent == owner_pid:
-                    return True
-                seen.add(parent)
-                # comm is parenthesized and may itself contain spaces or parentheses.
-                fields = Path(f"/proc/{parent}/stat").read_text().rsplit(")", 1)[1].split()
-                parent = int(fields[1])
-            return parent == owner_pid
-        except (OSError, ValueError, IndexError):
-            pass  # /proc may be unavailable; fall back to the portable process table.
+    identities = [
+        os.environ[name]
+        for name in ("AGENT_MAILBOX_SESSION", *HARNESS_SESSION_VARIABLES.values())
+        if os.environ.get(name)
+    ]
+    own = {
+        peer["session"],
+        peer.get("nativeSession"),
+        peer.get("parentSession"),
+        *(peer.get("nativeSessions") or []),
+        *(peer.get("aliases") or []),
+    }
+    if own.intersection(identities):
+        return
+    harness = mailbox.detect_harness()
+    caller = os.environ.get(HARNESS_SESSION_VARIABLES.get(harness or "", ""))
+    if not caller or harness != peer.get("harness") or not mailbox.is_live(peer):
+        return
     try:
-        result = subprocess.run(["ps", "-A", "-o", "pid=,ppid="], capture_output=True, text=True, timeout=2, check=True)
-        parents = dict(tuple(map(int, line.split())) for line in result.stdout.splitlines() if line.strip())
-    except (OSError, subprocess.SubprocessError, ValueError):
-        return None
-    seen = {pid}
-    parent = os.getppid()
-    while parent > 1 and parent not in seen:
-        if parent == owner_pid:
-            return True
-        seen.add(parent)
-        if parent not in parents:
-            return None
-        parent = parents[parent]
-    return parent == owner_pid
-
-
-def require_owner(peer: dict[str, Any]) -> None:
-    """A dead, unknown or recycled pid must not lock out a resumed session."""
-    pid = peer.get("pid")
-    if mailbox.pid_alive(pid) is not True:
+        other = mailbox.session_peer(base, caller, harness=harness)
+    except (mailbox.MailboxError, OSError, ValueError):
         return
-    birth = mailbox.process_started(pid) if peer.get("pidBirth") else None
-    if birth is not None and birth != peer["pidBirth"]:
-        return
-    ancestry = caller_descends_from(pid)
-    if ancestry is not True:
-        detail = "; could not verify process ancestry" if ancestry is None else ""
-        raise mailbox.MailboxError(f"session {peer['session']!r} is not owned by this process{detail}")
+    if other and other["session"] != peer["session"] and mailbox.is_live(other):
+        raise mailbox.MailboxError(
+            f"session {peer['session']!r} belongs to another live agent; you are {other['session']!r}"
+        )
 
 
 def normalize_role(value: str | None) -> str | None:
@@ -145,7 +134,6 @@ def report(
     stage: str | None,
     role: str | None = None,
 ) -> dict[str, Any]:
-    require_owner(peer)
     path = record_path(base, peer["session"])
     normalized_role = normalize_role(role)
     with mailbox.locked(path):
@@ -253,6 +241,7 @@ def main() -> int:
         peer = mailbox.load(mailbox.peer_path(base, args.session))
         if not mailbox.valid_peer(peer) or mailbox.is_run_peer(peer):
             raise mailbox.MailboxError("register this interactive session with the peer mailbox first")
+        refuse_another_agents_session(base, peer)
         result = report(base, peer, goal=args.goal, task=args.task, stage=args.stage, role=args.role)
         out = {key: result[key] for key in ("goal", "task", "stage", "updatedAt")}
         if "role" in result:
