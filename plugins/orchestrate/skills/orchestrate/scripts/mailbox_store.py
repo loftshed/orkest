@@ -552,12 +552,19 @@ def account_home(harness: str, transcript: str | None = None, environ: Mapping[s
         app_data = Path(environ["ANTIGRAVITY_APP_DATA_DIR"]).expanduser()
         configured = app_data.parent if app_data.name.startswith("antigravity") else app_data
     if transcript:
+        # Compare canonical paths too: homes are often reached through symlinks (macOS /var ->
+        # /private/var, Fedora Atomic /home -> /var/home).
         path = Path(transcript).expanduser()
-        if configured and path.is_relative_to(configured):
+        paths = dict.fromkeys([path, path.resolve()])
+        if configured and any(
+            candidate.is_relative_to(base) for candidate in paths for base in (configured, configured.resolve())
+        ):
             return str(configured.resolve())
-        for parent in path.parents:
-            if parent.parent == Path.home() and (parent.name == default or parent.name.startswith(f"{default}-")):
-                return str(parent.resolve())
+        homes = {Path.home(), Path.home().resolve()}
+        for candidate in paths:
+            for parent in candidate.parents:
+                if parent.parent in homes and (parent.name == default or parent.name.startswith(f"{default}-")):
+                    return str(parent.resolve())
     return str((configured or Path.home() / default).resolve())
 
 
