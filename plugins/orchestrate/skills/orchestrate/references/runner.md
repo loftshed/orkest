@@ -285,6 +285,6 @@ most once a day.
 ## Routes and setup
 
 `routes` prints the effective role → engine/model/effort table: the bundled
-[defaults](routes.default.json) overlaid by `~/.config/agent-executor/config.json`
+[defaults](routes.default.json) overlaid by `~/.config/orchestrate/config.json`
 (`$AGENT_EXECUTOR_CONFIG`, or under `$XDG_CONFIG_HOME`). `init` writes a starter config. `doctor`
 reports the host, installed CLI versions, skill installs, and stale copies.

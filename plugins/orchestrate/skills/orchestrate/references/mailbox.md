@@ -25,7 +25,7 @@ your own rules in `default.rules`.
 `doctor --check-messaging` checks settings and hook trust, then exchanges messages and matching
 replies between installed harness identities in an isolated store. Codex uses its native app server;
 the other identities use MCP protocol clients. This consumes no model quota. Evidence is retained
-under `~/.cache/agent-executor/checks/`. It checks transport and configuration; it does not start
+under `~/.cache/orchestrate/checks/`. It checks transport and configuration; it does not start
 models or test idle activation. Restart an existing harness session after changing registrations.
 
 The checkout installer `plugins/orchestrate/install.sh` includes messaging setup. A native plugin
@@ -548,7 +548,7 @@ resource/context costs and the scope of native-client and synthetic evaluation e
   `mailbox wake-health` for the recipient's route and its repair. An Antigravity conversation without
   a route attaches one with `mailbox attach-wake-route` from its own shell. Unsupported or offline
   hosts still need a turn or an `inbox` call; quiet sends deliberately do not activate them.
-- **Run the CLI from Claude Code with the sandbox off.** The store is under `~/.cache/agent-executor`,
+- **Run the CLI from Claude Code with the sandbox off.** The store is under `~/.cache/orchestrate`,
   outside the sandbox's write allowlist. The MCP server and hooks are not sandboxed.
 - **`no live peer`.** The target's session ended, or it never registered: it has no hooks and has not
   called a mailbox tool yet. A session that shares its process with others also drops out after three

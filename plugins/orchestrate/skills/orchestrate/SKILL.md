@@ -247,7 +247,7 @@ live catalog; Claude Code's aliases and OpenRouter's `~vendor/...-latest` aliase
 exact ID pins a model, and the runner prints `AGENT_NOTE=model_advanced` on stderr when a selector moves.
 
 Pass `--route <role>`; explicit `--engine/--model/--effort` still win. The user's
-`~/.config/agent-executor/config.json` overrides these (`init` writes a starter). Never invent a model
+`~/.config/orchestrate/config.json` overrides these (`init` writes a starter). Never invent a model
 ID: check with a filtered query such as `models --engine codex --match sol`. For a versioned Claude
 request that the catalog cannot verify, use the current vendor alias for the requested family
 (`opus` for Opus, `sonnet` for Sonnet) without another confirmation unless the user explicitly requires
