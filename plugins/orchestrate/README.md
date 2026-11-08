@@ -57,6 +57,9 @@ ork progress --session SESSION_ID --goal 'Ship the feature' --task 'Fix the pars
 ork progress --session SESSION_ID --stage testing
 ```
 
+Reporting for another live session of your own harness is refused, so a wrong ID can't overwrite
+another agent's progress. Anything Orkest can't positively identify is allowed.
+
 To bind an interactive coordinator or worker session to a swarm room:
 
 ```sh

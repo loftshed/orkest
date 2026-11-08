@@ -28,6 +28,50 @@ ROLES = tuple(ROLES_DATA.keys())
 ROLE_ALIASES = {alias: role_id for role_id, info in ROLES_DATA.items() for alias in (role_id, *info.get("aliases", ()))}
 
 
+HARNESS_SESSION_VARIABLES = {
+    "claude": "CLAUDE_CODE_SESSION_ID",
+    "codex": "CODEX_THREAD_ID",
+    "gemini": "ANTIGRAVITY_CONVERSATION_ID",
+    "opencode": "OPENCODE_SESSION_ID",
+}
+
+
+def refuse_another_agents_session(base: Path, peer: dict[str, Any]) -> None:
+    """Stop an agent overwriting another live agent's progress, for example by pasting the wrong ID.
+
+    Refuses only when the caller's own harness names a different live session of the same harness.
+    Anything uncertain is allowed: process trees differ by harness and install, and a false refusal
+    would silence progress reporting. This guards against mistakes, not a hostile local process.
+    """
+    identities = [
+        os.environ[name]
+        for name in ("AGENT_MAILBOX_SESSION", *HARNESS_SESSION_VARIABLES.values())
+        if os.environ.get(name)
+    ]
+    own = {
+        peer["session"],
+        peer.get("nativeSession"),
+        peer.get("parentSession"),
+        *(peer.get("nativeSessions") or []),
+        *(peer.get("aliases") or []),
+    }
+    if own.intersection(identities):
+        return
+    harness = mailbox.detect_harness()
+    caller = os.environ.get(HARNESS_SESSION_VARIABLES.get(harness or "", ""))
+    if not caller or harness != peer.get("harness") or not mailbox.is_live(peer):
+        return
+    try:
+        other = mailbox.session_peer(base, caller, harness=harness)
+    except (mailbox.MailboxError, OSError, ValueError):
+        return
+    # Compared by canonical session, so a parent resumed under a new native ID still owns its subagents.
+    if other and other["session"] not in own and mailbox.is_live(other):
+        raise mailbox.MailboxError(
+            f"session {peer['session']!r} belongs to another live agent; you are {other['session']!r}"
+        )
+
+
 def normalize_role(value: str | None) -> str | None:
     if value is None:
         return None
@@ -198,6 +242,7 @@ def main() -> int:
         peer = mailbox.load(mailbox.peer_path(base, args.session))
         if not mailbox.valid_peer(peer) or mailbox.is_run_peer(peer):
             raise mailbox.MailboxError("register this interactive session with the peer mailbox first")
+        refuse_another_agents_session(base, peer)
         result = report(base, peer, goal=args.goal, task=args.task, stage=args.stage, role=args.role)
         out = {key: result[key] for key in ("goal", "task", "stage", "updatedAt")}
         if "role" in result:

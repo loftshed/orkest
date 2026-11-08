@@ -57,6 +57,72 @@ class ProgressTests(unittest.TestCase):
     def report(self, stage="working", task="Fix parser"):
         return progress.report(self.base, self.peer, goal="Ship export", task=task, stage=stage)
 
+    def caller(self, **identity):
+        names = (
+            "AGENT_MAILBOX_SESSION",
+            "CLAUDECODE",
+            "CLAUDE_CODE_ENTRYPOINT",
+            *progress.HARNESS_SESSION_VARIABLES.values(),
+        )
+        self.environment = {**{k: v for k, v in self.environment.items() if k not in names}, **identity}
+
+    def register(self, session, harness):
+        return mailbox.register(self.base, session=session, harness=harness, cwd=str(self.cwd), pid=os.getpid())
+
+    def test_another_live_agent_of_the_same_harness_is_refused(self):
+        self.register("other-session", "codex")
+        self.caller(CODEX_THREAD_ID="other-session")
+        self.assertEqual(self.command("--goal", "G", "--task", "T", "--stage", "working").returncode, 2)
+        refused = self.command("--stage", "review")
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("'progress-session' belongs to another live agent", refused.stderr)
+        self.assertIsNone(progress.read(self.base, self.peer))
+
+    def test_real_agents_are_never_refused(self):
+        native = "019a5da8-aaaa-5678-9abc-123456789012"
+        mailbox.attest_native_sessions(self.base, "progress-session", native)
+        self.register("claude-parent", "claude")
+        self.register("other-session", "codex")
+        cases = {
+            "own session": {"CODEX_THREAD_ID": "progress-session"},
+            "attested native ID": {"CODEX_THREAD_ID": native},
+            "no identity at all": {},
+            "unregistered caller": {"CODEX_THREAD_ID": "never-registered"},
+            # A harness started from inside another inherits that one's variables.
+            "inherited other harness": {"CLAUDECODE": "1", "CLAUDE_CODE_SESSION_ID": "claude-parent"},
+            "own ID beside an inherited one": {
+                "CODEX_THREAD_ID": "other-session",
+                "AGENT_MAILBOX_SESSION": "progress-session",
+            },
+        }
+        for name, identity in cases.items():
+            with self.subTest(name):
+                self.caller(**identity)
+                result = self.command("--goal", "G", "--task", name, "--stage", "working")
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_resumed_parent_can_report_for_its_subagent_under_a_new_native_id(self):
+        resumed = "resumed-claude-native-2"
+        self.register("root-session", "claude")
+        mailbox.attest_native_sessions(self.base, "root-session", resumed)
+        self.register("subagent-b2", "claude")
+        mailbox.annotate(self.base, "subagent-b2", parentSession="root-session")
+        self.peer = mailbox.load(mailbox.peer_path(self.base, "subagent-b2"))
+        self.caller(CLAUDECODE="1", CLAUDE_CODE_SESSION_ID=resumed)
+        result = self.command("--goal", "G", "--task", "T", "--stage", "working")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_parent_can_report_for_its_subagent_and_a_dead_session_stays_reachable(self):
+        self.register("parent-session", "claude")
+        for session, pid, parent in (("subagent-a1", os.getpid(), "parent-session"), ("gone-session", 99999999, None)):
+            with self.subTest(session):
+                mailbox.register(self.base, session=session, harness="claude", cwd=str(self.cwd), pid=os.getpid())
+                mailbox.annotate(self.base, session, pid=pid, **({"parentSession": parent} if parent else {}))
+                self.peer = mailbox.load(mailbox.peer_path(self.base, session))
+                self.caller(CLAUDECODE="1", CLAUDE_CODE_SESSION_ID="parent-session")
+                result = self.command("--goal", "G", "--task", "T", "--stage", "working")
+                self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_one_command_fills_work_fields_and_partial_updates_preserve_the_context(self):
         before = self.fields()
         self.assertEqual((before["goal"], before["task"], before["stage"]), ("not set", "not set", "not set"))
