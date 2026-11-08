@@ -8,5 +8,7 @@ export default defineConfig({
     reporters: process.env.CI ? ["default", "junit"] : ["default"],
     // Some suites start real CLIs and hooks in temporary homes.
     testTimeout: 30_000,
+    // Snapshot and ANSI assertions expect colour; tests that need NO_COLOR set it themselves.
+    env: { NO_COLOR: "" },
   },
 });
