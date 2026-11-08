@@ -143,6 +143,7 @@ print(json.dumps({'rooms': [r['id'] for r in rooms], 'room': room, 'notice': not
                 focus="Keep the header",
                 herdrPaneId="%1",
             )
+            peer = mailbox.attest_native_sessions(base, peer["session"], "native-id")
             for session, changes in (
                 ("subagent", {"isSubagent": True}),
                 ("delegated", {"delegatedRun": "run-x"}),
@@ -184,6 +185,61 @@ print(json.dumps({'rooms': [r['id'] for r in rooms], 'room': room, 'notice': not
             self.assertEqual(
                 mailbox.session_peer(base, "native-id", harness="claude", cwd=str(home))["session"], "mailbox-id"
             )
+
+    def test_legacy_peer_is_attested_on_next_hook_and_reattaches_for_every_harness(self):
+        for harness, variable in (
+            ("claude", "CLAUDE_CODE_SESSION_ID"),
+            ("codex", "CODEX_THREAD_ID"),
+            ("gemini", "ANTIGRAVITY_CONVERSATION_ID"),
+        ):
+            with self.subTest(harness=harness), tempfile.TemporaryDirectory() as temporary:
+                home = Path(temporary)
+                base = home / "mailbox-v1"
+                mailbox.register(base, session="legacy-mailbox", harness=harness, cwd=temporary, pid=os.getpid())
+                legacy = mailbox.annotate(
+                    base, "legacy-mailbox", nativeSession="native-id", nativeSessions=["forged-history", "native-id"]
+                )
+                room = self.room(base, home)
+                engine = "agy" if harness == "gemini" else harness
+                room["conductor"]["engine"] = engine
+                room["conductor"]["session"]["engine"] = engine
+                room = room_store.put_room(base, room)
+                self.assertIsNone(mailbox.session_peer(base, "native-id"))
+                environment = {**self.environment(home), variable: "native-id", "ORKEST_SWARM_ROOM": room["id"]}
+                with patch.dict(os.environ, environment, clear=True):
+                    notice = mailbox_hooks.swarm_coordinator_context(base, legacy, "SessionStart")
+                self.assertIn("Swarm", notice)
+                self.assertEqual(mailbox.session_peer(base, "native-id")["session"], "legacy-mailbox")
+                self.assertIsNone(mailbox.session_peer(base, "forged-history"))
+                self.assertEqual(room_store.read_room(base, room["id"])["conductor"]["session"]["id"], "legacy-mailbox")
+
+    def test_unambiguous_forged_native_claim_cannot_rebind_or_read_room(self):
+        for kind in ("missing", "fake", "copied", "tampered"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as temporary:
+                home = Path(temporary)
+                base = home / "mailbox-v1"
+                mailbox.register(base, session="owner", harness="claude", cwd=temporary, pid=os.getpid())
+                owner = mailbox.attest_native_sessions(base, "owner", "genuine-native")
+                mailbox.register(base, session="attacker", harness="claude", cwd=temporary, pid=os.getpid())
+                attacker = mailbox.annotate(base, "attacker", nativeSession="native-id", nativeSessions=["native-id"])
+                if kind == "fake":
+                    attacker = mailbox.annotate(base, "attacker", nativeSessionAttestation="a" * 64)
+                elif kind == "copied":
+                    attacker = mailbox.annotate(
+                        base, "attacker", nativeSessionAttestation=owner["nativeSessionAttestation"]
+                    )
+                elif kind == "tampered":
+                    mailbox.attest_native_sessions(base, "attacker", "own-native")
+                    attacker = mailbox.annotate(base, "attacker", nativeSessions=["own-native", "native-id"])
+                room = self.room(base, home)
+                self.assertEqual(mailbox.session_peer(base, "genuine-native")["session"], "owner")
+                self.assertIsNone(mailbox.session_peer(base, "native-id"))
+                self.assertIsNone(terminal.find_session_swarm_room(base, "attacker", harness="claude", cwd=temporary))
+                self.assertIsNone(terminal.rebind_session_swarm_room(base, room["id"], "conductor", "attacker"))
+                environment = {**self.environment(home), "ORKEST_SWARM_ROOM": room["id"]}
+                with patch.dict(os.environ, environment, clear=True):
+                    self.assertEqual(mailbox_hooks.swarm_coordinator_context(base, attacker), "")
+                self.assertEqual(room_store.read_room(base, room["id"]), room)
 
     def test_stale_room_environment_falls_back_to_live_promotion(self):
         for status in ("missing", "closed"):
@@ -347,7 +403,8 @@ print(json.dumps({'rooms': [r['id'] for r in rooms], 'room': room, 'notice': not
             home = Path(temporary)
             base = home / "mailbox-v1"
             owner = mailbox.register(base, session="owner", harness="claude", cwd=temporary, pid=os.getpid())
-            owner = mailbox.annotate(base, "owner", nativeSessions=["native-id"], model="owner-model")
+            mailbox.annotate(base, "owner", model="owner-model")
+            owner = mailbox.attest_native_sessions(base, "owner", "native-id")
             attacker = mailbox.register(base, session="attacker", harness="claude", cwd=temporary, pid=os.getpid())
             attacker = mailbox.annotate(base, "attacker", nativeSessions=["native-id"])
             room = self.room(base, home)
@@ -364,6 +421,7 @@ print(json.dumps({'rooms': [r['id'] for r in rooms], 'room': room, 'notice': not
                 with patch.dict(os.environ, environment, clear=True):
                     self.assertEqual(mailbox_hooks.swarm_coordinator_context(base, attacker), "")
             self.assertEqual(room_store.read_room(base, room["id"]), room)
+            mailbox.attest_native_sessions(base, "attacker", "native-id")
             del room["promotion"]
             room = room_store.put_room(base, room)
             self.assertIsNone(terminal.find_session_swarm_room(base, "attacker", harness="claude", cwd=temporary))
@@ -405,7 +463,7 @@ print(json.dumps({'rooms': [r['id'] for r in rooms], 'room': room, 'notice': not
             home = Path(temporary)
             base = home / "mailbox-v1"
             lead = mailbox.register(base, session="lead-owner", harness="claude", cwd=temporary, pid=os.getpid())
-            lead = mailbox.annotate(base, "lead-owner", nativeSessions=["native-lead"])
+            lead = mailbox.attest_native_sessions(base, "lead-owner", "native-lead")
             room = self.room(base, home, "absent-conductor")
             room["agents"] = [
                 {

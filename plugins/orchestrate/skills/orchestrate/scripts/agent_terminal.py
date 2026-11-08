@@ -212,7 +212,7 @@ def _resolve_structural_role(
             )
             if not peer_cwd or not bound_cwd or Path(peer_cwd).resolve() == Path(bound_cwd).resolve():
                 matched_room_id = matched["id"]
-                if matched.get("_matchedSessionId") in mailbox.native_session_ids(peer_data):
+                if matched.get("_matchedSessionId") in mailbox.native_session_ids(peer_data, base):
                     is_exact_conductor = member_id == "conductor"
                     structural_role = "Coordinator" if is_exact_conductor else "Lead"
     return matched_room_id, structural_role, is_exact_conductor
@@ -224,12 +224,12 @@ def discovery_available() -> bool:
 
 
 def _codex_title_pane(base: Path, session: str, binary: str, env: dict[str, str]) -> dict | None:
-    identities = mailbox.native_session_ids(mailbox.session_peer(base, session, harness="codex"))
+    identities = mailbox.native_session_ids(mailbox.session_peer(base, session, harness="codex"), base)
     sessions = set(identities)
     for path in (base / "peers").glob("*.json"):
         peer = mailbox.load(path)
         if isinstance(peer, dict) and peer.get("harness") == "codex" and isinstance(peer.get("session"), str):
-            sessions.update(mailbox.native_session_ids(peer))
+            sessions.update(mailbox.native_session_ids(peer, base))
     try:
         response = subprocess.run(
             [binary, "pane", "list"], env=env, capture_output=True, text=True, timeout=0.5, check=False
@@ -299,7 +299,9 @@ def _sync_herdr_pane(
         previous_target = {**previous_target, "endpoint": canonical_endpoint(previous_target.get("endpoint"))}
     changed = force or peer_data.get("herdrSyncedTitle") != sync_key or previous_target != target
     if occupant is None and changed and binary:
-        occupant = verified_agent(binary, pane_id, mailbox.native_session_ids(peer_data), env=herdr_env, timeout=0.5)
+        occupant = verified_agent(
+            binary, pane_id, mailbox.native_session_ids(peer_data, base), env=herdr_env, timeout=0.5
+        )
     if occupant:
         pane_id = occupant["pane_id"]
         workspace_id = occupant.get("workspace_id") or pane_id.split(":", 1)[0]

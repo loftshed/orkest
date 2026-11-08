@@ -745,7 +745,7 @@ function pidAlive(pid) {
   }
 }
 
-function processStarted(pid) {
+export function processStarted(pid) {
   try {
     return (
       execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], {

@@ -80,20 +80,25 @@ class StreamingSession:
             self.presence()
 
     def presence(self) -> None:
+        harness = "gemini" if self.engine == "agy" else "claude"
         mailbox.register(
             self.base,
             session=self.session,
-            harness="gemini" if self.engine == "agy" else "claude",
+            harness=harness,
             cwd=os.getcwd(),
+            cwd_source="hook",
+            account=mailbox.account_home(harness),
             pid=self.process.pid,
             state="busy" if self.busy else "idle",
         )
         mailbox.annotate(
             self.base,
             self.session,
-            nativeSession=self.native_session,
             listener={"adapter": "stream-json", "pid": os.getpid(), "pidBirth": mailbox.process_started(os.getpid())},
         )
+
+        if self.native_session:
+            mailbox.attest_native_sessions(self.base, self.session, self.native_session)
 
     def submit(self, text: str) -> None:
         if self.busy:

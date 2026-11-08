@@ -87,7 +87,7 @@ def find_session_swarm_room(
 ) -> dict[str, object] | None:
     """Find a conductor/lead room using attested native identities; legacy display aliases are ignored."""
     peer = mailbox.session_peer(base, session_id, harness=harness, cwd=cwd)
-    candidates = mailbox.native_session_ids(peer) if peer else {session_id}
+    candidates = mailbox.native_session_ids(peer, base) if peer else {session_id}
     if not candidates:
         return None
     expected_engine = {"gemini": "agy", "agy": "agy", "claude": "claude", "codex": "codex", "opencode": "opencode"}.get(
@@ -803,7 +803,12 @@ def _toggle_herdr_swarm_view_unlocked(
                 session_id = ref["value"]
                 harness = harness or agent_harness(ref.get("agent"))
     peer = _find_herdr_peer(base, session_id, coordinator_pane, endpoint=current_endpoint)
-    if peer and session_id and peer.get("session") != session_id and session_id not in mailbox.native_session_ids(peer):
+    if (
+        peer
+        and session_id
+        and peer.get("session") != session_id
+        and session_id not in mailbox.native_session_ids(peer, base)
+    ):
         peer = None
     if isinstance(peer, dict):
         if not session_id and isinstance(peer.get("session"), str):

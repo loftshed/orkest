@@ -151,6 +151,7 @@ from mailbox_store import (  # noqa: E402, F401
     workspace,
     write,
 )
+from native_identity import identity_message, sign_native_ids, verified_native_ids  # noqa: E402
 
 
 @cache
@@ -612,6 +613,7 @@ def register(
     with locked(path):
         migrate_legacy_session(base, session)
         peer = load(path) or {}
+        previous_identity = identity_message(peer) if verified_native_ids(base, peer) else None
         first = not peer
         previous_pid = peer.get("pid")
         moment = stamp()
@@ -693,6 +695,9 @@ def register(
             peer["sharedProcess"] = True
         else:
             peer.pop("sharedProcess", None)
+        # Only evidence verified before changing its bound context may be carried forward.
+        if previous_identity is not None and previous_identity != identity_message(peer):
+            peer["nativeSessionAttestation"] = sign_native_ids(base, peer)
         write(path, peer)
         if harness == "gemini":
             persist_agy_control(base, session, peer.get("pid"))
@@ -1704,16 +1709,31 @@ def _unlink_stale_lock(lock_file: Path, *, min_age_seconds: float = LOCK_GRACE_S
             os.close(descriptor)
 
 
-def native_session_ids(peer: dict[str, Any] | None) -> set[str]:
-    """Hook-attested native identities, excluding user-facing names and aliases."""
+def native_session_ids(peer: dict[str, Any] | None, base: Path | None = None) -> set[str]:
+    """Exact mailbox identity plus MAC-verified native IDs; names and hints confer no ownership."""
     if not isinstance(peer, dict):
         return set()
-    history = peer.get("nativeSessions")
     return {
         value
-        for value in [peer.get("session"), peer.get("nativeSession"), *(history if isinstance(history, list) else [])]
-        if isinstance(value, str) and value
+        for value in [peer.get("session"), *(verified_native_ids(base, peer) if base is not None else [])]
+        if isinstance(value, str) and re.fullmatch(SESSION_ID, value)
     }
+
+
+def attest_native_sessions(base: Path, session: str, *observed: str) -> dict[str, Any]:
+    """Trusted hook/owned-stream entry point. Never carry forward unverified peer-file hints."""
+    if not observed or any(not isinstance(value, str) or not re.fullmatch(SESSION_ID, value) for value in observed):
+        raise MailboxError("invalid observed native session id")
+    path = peer_path(base, session)
+    with locked(path):
+        peer = load(path)
+        if not valid_peer(peer):
+            return peer or {}
+        ids = list(dict.fromkeys([*verified_native_ids(base, peer), *observed]))[-32:]
+        peer.update(nativeSession=observed[-1], nativeSessions=ids)
+        peer["nativeSessionAttestation"] = sign_native_ids(base, peer)
+        write(path, peer)
+        return peer
 
 
 def _session_peer_candidates(
@@ -1754,7 +1774,7 @@ def _session_peer_candidates(
     matches = [
         peer
         for file in (base / "peers").glob("*.json")
-        if eligible(peer := load(file), True) and session in native_session_ids(peer)
+        if eligible(peer := load(file), True) and session in native_session_ids(peer, base)
     ]
     return matches
 
@@ -2168,7 +2188,7 @@ def refresh(
         pid=pid,
         state=state,
         cwd_source="hook" if hooked else source,
-        account=account,
+        account=known.get("accountHome") if hooked and known.get("accountHome") else account,
         effort=effort,
     )
     return mark_delegated(base, me)

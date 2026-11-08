@@ -301,9 +301,6 @@ def adopt_cleared(base: Path, me: dict[str, Any]) -> str:
         base,
         me["session"],
         aliases=adopted_aliases,
-        nativeSessions=list(
-            dict.fromkeys([*me.get("nativeSessions", []), old["session"], *old.get("nativeSessions", [])])
-        )[-32:],
         clearedFrom=old["session"],
         awaitingClear=None,
         **({"focus": focus} if focus else {}),
@@ -311,6 +308,13 @@ def adopt_cleared(base: Path, me: dict[str, Any]) -> str:
     )
     if isinstance(annotated, dict):
         me.update(annotated)
+    # The cleared record is paired by harness/process; only its verified history travels.
+    current_native = (
+        me.get("nativeSession") if me.get("nativeSession") in _MB.native_session_ids(me, base) else me["session"]
+    )
+    me.update(
+        _MB.attest_native_sessions(base, me["session"], *sorted(_MB.native_session_ids(old, base)), current_native)
+    )
     carried, orphaned, replied = [], 0, _MB.replied_to(base, old["session"])
     for message in _MB.messages(base, old["session"], unread_only=False):
         sent = dt.datetime.fromisoformat(message["sentAt"])
@@ -881,8 +885,7 @@ def _record_native_swarm_identity(base: Path, me: dict[str, Any]) -> None:
     owner = _MB.session_peer(base, native, harness=me["harness"], cwd=me["cwd"])
     if owner and owner["session"] != me["session"]:
         return
-    ids = list(dict.fromkeys([*(me.get("nativeSessions") or []), native]))[-32:]
-    updated = _MB.annotate(base, me["session"], nativeSession=native, nativeSessions=ids)
+    updated = _MB.attest_native_sessions(base, me["session"], native)
     if isinstance(updated, dict):
         me.update(updated)
 
@@ -1002,7 +1005,7 @@ def swarm_coordinator_context(
         return ""
     engine = "agy" if me["harness"] == "gemini" else me["harness"]
     conductor = room.get("conductor") or {}
-    candidate_ids = _MB.native_session_ids(me)
+    candidate_ids = _MB.native_session_ids(me, base)
     bound_session = (conductor.get("session") or {}).get("id")
     if conductor.get("engine") != engine or (bound_session and bound_session not in candidate_ids):
         if isinstance(room.get("agents"), list):
@@ -1442,8 +1445,7 @@ def hook(
     )
     me = _MB.mark_delegated(base, me)
     if not is_subagent and not me.get("delegatedRun"):
-        ids = list(dict.fromkeys([*(me.get("nativeSessions") or []), native_session]))[-32:]
-        me = _MB.annotate(base, session, nativeSession=native_session, nativeSessions=ids) or me
+        me = _MB.attest_native_sessions(base, session, native_session) or me
     if is_subagent:
         subagent_fields: dict[str, Any] = {"isSubagent": True}
         if parent_session:

@@ -573,7 +573,7 @@ class RoomStoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary) / "mailbox-v1"
             mailbox.register(base, session="new", harness="claude", cwd=temporary, pid=os.getpid())
-            mailbox.annotate(base, "new", nativeSessions=["old"])
+            mailbox.attest_native_sessions(base, "new", "old")
             room_store.put_room(
                 base, {"id": "room", "cwd": temporary, "agents": [], "conductor": {"session": {"id": "old"}}}
             )

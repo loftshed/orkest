@@ -499,7 +499,7 @@ class HerdrSwarmLaunchTests(unittest.TestCase):
         import agent_statusline_tmux
 
         with self._reused_pane_room() as (home, base, previous, session):
-            mailbox.annotate(base, session, nativeSessions=[previous["conductor"]["session"]["id"]])
+            mailbox.attest_native_sessions(base, session, previous["conductor"]["session"]["id"])
             opened = agent_statusline_tmux.toggle_swarm_view(
                 "open", session_id=session, harness="codex", cwd=str(home), base=base
             )
@@ -862,8 +862,8 @@ class HerdrSwarmLaunchTests(unittest.TestCase):
                     account=str(home),
                 )
                 mailbox.unregister(base, session_id)
-                cleared_me = mailbox.annotate(base, cleared_sid, nativeSessions=[session_id], clearedFrom=session_id)
-                cleared_me = mailbox.annotate(base, cleared_sid, pid=os.getpid())
+                cleared_me = mailbox.attest_native_sessions(base, cleared_sid, session_id)
+                cleared_me = mailbox.annotate(base, cleared_sid, clearedFrom=session_id, pid=os.getpid())
                 cleared_summary = mailbox_hooks.swarm_coordinator_context(base, cleared_me, "SessionStart")
                 self.assertIn("Reconnected to swarm room room-newer (Active Horde)", cleared_summary)
                 updated_room = room_store.read_room(base, "room-newer")

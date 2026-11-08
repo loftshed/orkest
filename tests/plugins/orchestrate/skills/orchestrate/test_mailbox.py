@@ -494,6 +494,19 @@ class MailboxTests(unittest.TestCase):
         refreshed = MAILBOX.register(self.base, session=other["session"], harness="claude", cwd=str(self.repository))
         self.assertEqual(refreshed["accountHome"], other["accountHome"])
 
+    def test_account_home_matches_profiles_through_a_symlinked_home(self):
+        real = Path(self.temporary.name) / "real-home"
+        (real / ".claude-work/projects/x").mkdir(parents=True)
+        linked = Path(self.temporary.name) / "linked-home"
+        linked.symlink_to(real, target_is_directory=True)
+        expected = str((real / ".claude-work").resolve())
+        for home, base in ((linked, real), (real, linked)):
+            with self.subTest(home=home.name), mock.patch.object(Path, "home", return_value=home):
+                transcript = str(base / ".claude-work/projects/x/session.jsonl")
+                self.assertEqual(MAILBOX.account_home("claude", transcript, {}), expected)
+                configured = {"CLAUDE_CONFIG_DIR": str(home / ".claude-work")}
+                self.assertEqual(MAILBOX.account_home("claude", transcript, configured), expected)
+
     def test_account_home_comes_from_transcript_then_environment(self):
         home = Path.home()
         transcript = str(home / ".claude-work" / "projects" / "x" / "session.jsonl")

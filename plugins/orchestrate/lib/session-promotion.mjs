@@ -67,7 +67,7 @@ async function currentPeer(root, session, cwd, env, now, expectedEngine) {
   if (
     !peer ||
     peer.schema !== "agent-executor.peer.v1" ||
-    !sessionIdentities(peer).includes(session) ||
+    !sessionIdentities(peer, root).includes(session) ||
     typeof peer.name !== "string" ||
     typeof peer.cwd !== "string" ||
     !Number.isFinite(Date.parse(peer.startedAt)) ||
