@@ -2445,6 +2445,13 @@ export async function interactiveProgress(room, root = mailboxRoot()) {
       const exact = await resolveSessionPeer(binding.id, root, { engine: binding.engine });
       if (exact?.session === binding.id) peer = exact;
     }
+    if (!peer && binding.engine === "claude" && !binding.id.startsWith("subagent-")) {
+      // A lead may bind a Claude subagent by its bare agent ID; its peer is `subagent-<id>`.
+      const subagent = await resolveSessionPeer(`subagent-${binding.id}`.slice(0, 80), root, {
+        engine: binding.engine,
+      });
+      if (subagent?.isSubagent) peer = subagent;
+    }
     if (!peer) continue;
     const key = sessionKey(peer.session);
     const expectedCwd = await resolveCwd(binding.cwd || member.cwd || room.cwd);
@@ -2466,6 +2473,8 @@ export async function interactiveProgress(room, root = mailboxRoot()) {
     const name = peer.name;
     if (!name || cleanLine(name) !== name) continue;
     const progress = await readProgressRecord(root, key, peer, effectiveCwd, currentHost);
+    // A subagent's hook-assigned role must not replace the role its slot was reserved for.
+    if (peer.isSubagent && member.workforceRole && progress) delete progress.role;
     let goal = room.title && room.title !== room.id ? cleanLine(room.title) : "";
     let isManual = false;
     if (!goal && progress) {

@@ -1354,6 +1354,100 @@ describe("room CLI", () => {
     }
   });
 
+  it.each(["subagent-tx1", "tx1"])(
+    "shows a slot bound as %s as working while live and keeps its reserved role",
+    async (boundSession) => {
+      const root = await realpath(await directory());
+      const cwd = await realpath(await directory());
+      const accountHome = await directory();
+      const parentSession = "c1a1c2d3-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+      const slug = cwd.replaceAll(/[^A-Za-z0-9-]/gu, "-");
+      const subagentsDir = path.join(accountHome, "projects", slug, parentSession, "subagents");
+      await mkdir(subagentsDir, { recursive: true });
+      await mkdir(path.join(root, "peers"), { recursive: true });
+      await mkdir(path.join(root, "progress"), { recursive: true });
+      const room = await newRoom(parseTeam("claude:opus@reviewer"), {
+        id: "room-bound",
+        cwd,
+        root,
+      });
+      await updateRoom(
+        room.id,
+        (current) => {
+          current.conductor.engine = "claude";
+          current.conductor.session = {
+            id: parentSession,
+            engine: "claude",
+            machine: hostname(),
+            cwd,
+          };
+          return current;
+        },
+        { root },
+      );
+      await bindSession(room.id, room.agents[0].id, {
+        session: boundSession,
+        engine: "claude",
+        root,
+      });
+      const nowIso = new Date().toISOString();
+      await writeFile(
+        path.join(subagentsDir, "agent-tx1.meta.json"),
+        JSON.stringify({ agentType: "Explore", description: "Live work", model: "sonnet" }),
+      );
+      await writeFile(path.join(subagentsDir, "agent-tx1.jsonl"), "{}\n");
+      await writeFile(
+        path.join(root, "peers", "subagent-tx1.json"),
+        JSON.stringify({
+          schema: "agent-executor.peer.v1",
+          session: "subagent-tx1",
+          name: "gribnox-claude-opus-5-5-orkest-tx",
+          person: "gribnox",
+          harness: "claude",
+          state: "busy",
+          cwd,
+          checkout: cwd,
+          accountHome,
+          pid: process.pid,
+          sharedProcess: true,
+          isSubagent: true,
+          parentSession,
+          startedAt: nowIso,
+          lastSeenAt: nowIso,
+        }),
+      );
+      await writeFile(
+        path.join(root, "progress", "subagent-tx1.json"),
+        JSON.stringify({
+          schema: "orchestrate.progress.v1",
+          session: "subagent-tx1",
+          harness: "claude",
+          machine: hostname(),
+          accountHome,
+          checkout: cwd,
+          role: "scout",
+          stage: "working",
+          goal: "Native Explore",
+          task: "Live work",
+          updatedAt: nowIso,
+        }),
+      );
+      const previous = process.env.CLAUDE_CONFIG_DIR;
+      process.env.CLAUDE_CONFIG_DIR = accountHome;
+      try {
+        const observed = await observeRoom(room.id, { root });
+        expect(observed.agents).toHaveLength(1);
+        expect(observed.agents[0]).toMatchObject({ status: "working", workforceRole: "reviewer" });
+      } finally {
+        if (previous === undefined) {
+          delete process.env.CLAUDE_CONFIG_DIR;
+        } else {
+          process.env.CLAUDE_CONFIG_DIR = previous;
+        }
+      }
+    },
+  );
+
   it("keeps live peers authoritative and does not hydrate remote or other-engine bindings", async () => {
     const root = await realpath(await directory());
     const cwd = await realpath(await directory());
