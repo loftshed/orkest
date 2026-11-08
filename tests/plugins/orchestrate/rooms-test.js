@@ -1831,7 +1831,11 @@ describe("bounded room continuations", () => {
     });
     expect(task.runs.map((entry) => entry.request_id)).toEqual(["first", "second"]);
     const sent = calls.find((args) => args[0] === "dispatch");
-    expect(sent.slice(sent.indexOf("--task-spec"))).toEqual(["--task-spec", taskSpec]);
+    // The task spec is passed canonically (macOS temp folders sit behind /var -> /private/var).
+    expect(sent.slice(sent.indexOf("--task-spec"))).toEqual([
+      "--task-spec",
+      await realpath(taskSpec),
+    ]);
     expect(sent).not.toContain("--engine");
     expect(sent).not.toContain("--model");
     expect(sent).not.toContain("--effort");
