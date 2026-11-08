@@ -1426,8 +1426,9 @@ def permit_codex_tools(config: Path, *, dry_run: bool = False) -> None:
 
 CODEX_RULES_HEADER = """\
 # Managed by Orkest's installer and rewritten on every install; edits here are lost.
-# Allows only Orkest's own bookkeeping commands (progress, mailbox, room status, waits).
-# Launching workers, dispatching and installing still ask. Put your own rules in default.rules.
+# Allows only Orkest's own bookkeeping commands (progress, mailbox, room status, waits). Mailbox
+# send/ask match the peer-mailbox MCP tools setup already approves. Launching workers, changing
+# rooms, policy or config, updating and installing still ask. Put your own rules in default.rules.
 """
 MAILBOX_COMMANDS = [
     "peers",
@@ -1444,7 +1445,7 @@ MAILBOX_COMMANDS = [
     "channels",
     "name",
 ]
-ORK_ROOM_COMMANDS = ["list", "show", "resume-status", "bind", "objective", "role"]
+ORK_ROOM_COMMANDS = ["list", "show", "resume-status"]
 ORK_COMMANDS = [
     ["progress"],
     ["name"],
@@ -1452,10 +1453,6 @@ ORK_COMMANDS = [
     ["quota"],
     ["radar"],
     ["routes"],
-    ["next", "status"],
-    ["cleanup", "status"],
-    ["policy", "status"],
-    ["update", "--check"],
 ]
 
 
@@ -1485,11 +1482,19 @@ def codex_rules(home: Path, hub: Path, ork_cli: Path | None = None) -> str:
     cli = ork_cli or source.parents[2] / "bin/ork.mjs"
     nodes = ["node", *_path_variants([Path(found) for found in [shutil.which("node")] if found])]
     ork_commands = ["ork", *_path_variants([Path(found) for found in [shutil.which("ork")] if found])]
-    pythons = ["python3", "python"]
+    pythons = [
+        "python3",
+        "python",
+        *_path_variants(
+            [Path(found) for found in [sys.executable, shutil.which("python3"), shutil.which("python")] if found]
+        ),
+    ]
     patterns: list[list] = [
         [pythons, script("agent_progress.py")],
         [pythons, script("run_agent.py"), "mailbox", MAILBOX_COMMANDS],
-        [pythons, script("run_agent.py"), ["events", "models"]],
+        # `events` alone also takes --ack/--ack-all; only waiting is bookkeeping.
+        [pythons, script("run_agent.py"), "events", "wait"],
+        [pythons, script("run_agent.py"), "models"],
         [pythons, script("peer_mailbox.py"), MAILBOX_COMMANDS],
     ]
     for prefix in ([ork_commands], [nodes, _path_variants([cli])]):

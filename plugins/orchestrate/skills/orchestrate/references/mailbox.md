@@ -18,7 +18,8 @@ mailbox commands. Without approval, review them in Codex `/hooks` instead.
 
 Setup also writes `~/.codex/rules/orkest.rules`, so Codex runs Orkest's bookkeeping commands
 (progress, mailbox, room status, event waits) at their installed absolute paths without asking.
-Launching workers, dispatching and installing still ask. The file is rewritten on every install; keep
+Mailbox send and ask match the peer-mailbox tools setup already approves. Launching workers,
+changing rooms, policy or config, updating and installing still ask. The file is rewritten on every install; keep
 your own rules in `default.rules`.
 
 `doctor --check-messaging` checks settings and hook trust, then exchanges messages and matching

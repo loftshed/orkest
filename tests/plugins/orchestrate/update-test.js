@@ -68,6 +68,43 @@ describe("Orkest auto-update (update.mjs)", () => {
     expect((await readAutoUpdateConfig({ configDir })).enabled).toBe(true);
   });
 
+  it("treats --check as a check and --apply as an update, refusing conflicting commands", async () => {
+    const configDir = await makeTempDir();
+    const cacheDir = await makeTempDir();
+    const calls = [];
+    const exec = (_cmd, args, cb) => {
+      calls.push(args.join(" "));
+      if (args.includes("--abbrev-ref")) return cb(null, "main\n");
+      if (args.includes("--porcelain")) return cb(null, "");
+      if (args.includes("rev-list")) return cb(null, "3\n");
+      if (args.includes("rev-parse")) {
+        return cb(null, args.some((arg) => arg.includes("origin/")) ? "2222222\n" : "1111111\n");
+      }
+      cb(null, "");
+    };
+    const stdout = { write() {} };
+    const result = await runUpdateCli(["--check", "--json"], {
+      configDir,
+      cacheDir,
+      repoRoot: "/repo",
+      exec,
+      stdout,
+    });
+    expect(result.status).not.toBe("updated");
+    expect(calls.filter((call) => call.includes("merge --ff-only"))).toEqual([]);
+    await runUpdateCli(["disable"], { configDir, cacheDir, stdout });
+    for (const argv of [
+      ["--check", "enable"],
+      ["--check", "--apply"],
+      ["--apply", "check"],
+    ]) {
+      await expect(runUpdateCli(argv, { configDir, cacheDir, exec, stdout })).rejects.toThrow(
+        /Conflicting update commands/u,
+      );
+    }
+    expect((await readAutoUpdateConfig({ configDir })).enabled).toBe(false);
+  });
+
   it("skips update checks when the working tree is dirty or on a feature branch", async () => {
     const configDir = await makeTempDir();
     const cacheDir = await makeTempDir();

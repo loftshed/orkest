@@ -225,7 +225,16 @@ class InstallMailboxTests(unittest.TestCase):
         self.assertIn(str(hub / "agent_progress.py"), content)
         self.assertIn(str(SCRIPTS.resolve() / "run_agent.py"), content)
         self.assertNotIn('"plugins/orchestrate', content)
-        for blocked in ('"dispatch"', '"launch"', '"prune"', '"hook"', '"--apply"', '"--task-spec"'):
+        for blocked in (
+            '"dispatch"',
+            '"launch"',
+            '"prune"',
+            '"hook"',
+            '"--apply"',
+            '"--task-spec"',
+            '"bind"',
+            '"update"',
+        ):
             self.assertNotIn(blocked, content)
         codex_binary = installer.shutil.which("codex")
         if not codex_binary:
@@ -246,11 +255,19 @@ class InstallMailboxTests(unittest.TestCase):
         self.assertEqual(decision("python3", runner, "mailbox", "inbox", "--session", "s"), "allow")
         self.assertEqual(decision("python3", runner, "events", "wait", "e", "--messages"), "allow")
         self.assertEqual(decision("ork", "rooms", "show", "--room", "r"), "allow")
-        self.assertEqual(decision("ork", "update", "--check"), "allow")
+        self.assertEqual(decision(installer.sys.executable, runner, "mailbox", "inbox"), "allow")
         self.assertIsNone(decision("python3", runner, "--task-spec", "spec.json"))
         self.assertIsNone(decision("python3", runner, "mailbox", "prune"))
         self.assertIsNone(decision("ork", "rooms", "dispatch", "--room", "r"))
-        self.assertIsNone(decision("ork", "update", "--apply"))
+        for command in (
+            ("ork", "update", "--check"),
+            ("ork", "policy", "status", "deny", "codex"),
+            ("ork", "rooms", "bind", "--room", "r", "--member", "m", "--session", "s"),
+            ("ork", "rooms", "objective", "--room", "r", "--objective", "x"),
+            ("ork", "cleanup", "status"),
+            ("python3", runner, "events", "--ack-all"),
+        ):
+            self.assertIsNone(decision(*command), command)
         self.assertIsNone(decision("python3", "plugins/orchestrate/skills/orchestrate/scripts/agent_progress.py"))
 
     def test_codex_permissions_cover_only_known_mailbox_tools_and_are_idempotent(self):
