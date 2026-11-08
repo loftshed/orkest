@@ -39,6 +39,8 @@ RUNNER_OUT_DIR_FILES = frozenset(
 )
 RUNNER_ARCHIVED_ATTEMPT_PATTERN = re.compile(r"attempt-\d+-(?:stdout\.txt|stderr\.txt|executor\.log|final-output\.txt)")
 RUNNER_VERIFICATION_OUTPUT_PATTERN = re.compile(r"verification-\d{2,}\.(?:stdout|stderr)\.txt")
+# Auto-correct rounds: each correction turn, and the gate logs of every round before the last.
+RUNNER_AUTO_CORRECT_PATTERN = re.compile(r"round-\d+-(?:brief\.txt|verification-\d{2,}\.(?:stdout|stderr)\.txt)")
 
 
 def _runner() -> Any:
@@ -367,6 +369,7 @@ def is_runner_out_dir_file(name: str) -> bool:
         name in _attr("RUNNER_OUT_DIR_FILES", RUNNER_OUT_DIR_FILES)
         or _attr("RUNNER_ARCHIVED_ATTEMPT_PATTERN", RUNNER_ARCHIVED_ATTEMPT_PATTERN).fullmatch(name) is not None
         or _attr("RUNNER_VERIFICATION_OUTPUT_PATTERN", RUNNER_VERIFICATION_OUTPUT_PATTERN).fullmatch(name) is not None
+        or RUNNER_AUTO_CORRECT_PATTERN.fullmatch(name) is not None
     )
 
 

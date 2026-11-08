@@ -8,6 +8,7 @@ import subprocess
 import time
 
 import agent_progress
+import agent_terminal
 import peer_mailbox as mailbox
 from herdr_context import canonical_endpoint, endpoint
 from herdr_labels import agent_harness, codex_title_session, display_label, plain, work_title
@@ -35,7 +36,7 @@ def status() -> str:
             return ""
         peer = mailbox.load(path)
         if mailbox.valid_peer(peer) and peer.get("harness") == "codex":
-            codex_sessions.add(peer["session"])
+            codex_sessions.update(mailbox.native_session_ids(peer))
         if (
             mailbox.valid_peer(peer)
             and not peer.get("isSubagent")
@@ -50,17 +51,21 @@ def status() -> str:
         matches = [
             peer
             for peer in peers
-            if peer["session"] == ref.get("value") and peer["harness"] == agent_harness(ref.get("agent"))
+            if ref.get("value") in mailbox.native_session_ids(peer)
+            and peer["harness"] == agent_harness(ref.get("agent"))
         ]
     elif pane.get("agent") == "codex" and not ref:
         session = codex_title_session(pane.get("terminal_title"), codex_sessions)
-        matches = [peer for peer in peers if peer["session"] == session and peer["harness"] == "codex"]
+        matches = [peer for peer in peers if session in mailbox.native_session_ids(peer) and peer["harness"] == "codex"]
     else:
         return ""
     if len(matches) != 1 or time.monotonic() >= deadline:
         return ""
     peer = matches[0]
-    title = work_title(agent_progress.read(base, peer) or {})
+    _, structural_role, _ = agent_terminal._resolve_structural_role(
+        base, peer["session"], peer["harness"], peer, only_room=os.environ.get("ORKEST_SWARM_ROOM") or None
+    )
+    title = work_title(agent_progress.read(base, peer) or {}, structural_role)
     return plain(" · ".join(part for part in (display_label(peer), title) if part))
 
 

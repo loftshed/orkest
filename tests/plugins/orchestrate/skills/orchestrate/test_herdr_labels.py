@@ -84,6 +84,42 @@ class DiscoveryTests(unittest.TestCase):
         self.assertTrue(agent_terminal.bind(SESSION, "codex", {}, base=self.base))
         self.assertEqual([call[:2] for call in self.calls].count(["pane", "report-metadata"]), 1)
 
+    def test_attested_native_identity_discovers_the_canonical_mailbox_peer(self):
+        native = "019a5da8-4321-5678-9abc-123456789012"
+        mailbox.annotate(self.base, SESSION, nativeSession=native, nativeSessions=[native])
+        self.panes[0].update(
+            terminal_title="Resumed work | " + native,
+            agent_session={"kind": "id", "agent": "codex", "value": native},
+        )
+        self.assertTrue(agent_terminal.bind(native, "codex", {}, base=self.base))
+        self.assertEqual(self.peer()["herdrPaneId"], "w3:p2")
+        report = self.calls[-1]
+        self.assertEqual(report[report.index("--display-agent") + 1], "[C] codex-ivory-elk-49")
+        self.assertEqual(report[report.index("--title") + 1], "working · Verify patch")
+
+    def test_display_alias_does_not_attest_a_native_pane_identity(self):
+        alias = "019a5da8-4321-5678-9abc-123456789012"
+        mailbox.annotate(self.base, SESSION, aliases=[alias])
+        self.panes[0]["terminal_title"] = "Other work | " + alias
+        self.assertFalse(agent_terminal.bind(SESSION, "codex", {}, base=self.base))
+        self.assertIsNone(self.peer().get("herdrPaneId"))
+        self.panes[0]["terminal_title"] = "Work | " + SESSION
+        self.assertTrue(agent_terminal.bind(SESSION, "codex", {}, base=self.base, force=True))
+        self.assertEqual(self.peer()["herdrPaneId"], "w3:p2")
+
+    def test_truncated_native_identity_is_rejected_when_another_peer_collides(self):
+        native = "019a5da8-4321-5678-9abc-123456789012"
+        collision = native[:29] + "0000000"
+        mailbox.annotate(self.base, SESSION, nativeSession=native, nativeSessions=[native])
+        mailbox.register(self.base, session="other-peer", harness="codex", cwd=str(self.home), pid=os.getpid())
+        mailbox.annotate(self.base, "other-peer", nativeSession=collision, nativeSessions=[collision])
+        self.panes[0]["terminal_title"] = "Resumed work | " + native[:29] + "..."
+        self.assertFalse(agent_terminal.bind(SESSION, "codex", {}, base=self.base))
+        self.assertIsNone(self.peer().get("herdrPaneId"))
+        self.panes[0]["terminal_title"] = "Resumed work | " + native
+        self.assertTrue(agent_terminal.bind(SESSION, "codex", {}, base=self.base, force=True))
+        self.assertEqual(self.peer()["herdrPaneId"], "w3:p2")
+
     def test_inherited_daemon_pane_is_not_the_sessions_pane(self):
         with mock.patch.dict(os.environ, {"HERDR_ENV": "1", "HERDR_PANE_ID": "w1:p1", "HERDR_WORKSPACE_ID": "w1"}):
             self.assertTrue(agent_terminal.bind(SESSION, "codex", {}, base=self.base))
@@ -153,6 +189,24 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(
             agent_statusline_tmux._find_herdr_room(self.base, "w3:p2", endpoint=str(self.home / "other.sock")), ""
         )
+
+    def test_endpoint_aliases_do_not_allow_run_peers_to_bind(self):
+        import agent_statusline_tmux
+
+        alias = self.home / "alias"
+        alias.symlink_to(self.home, target_is_directory=True)
+        endpoint = str(alias / "herdr/herdr.sock")
+        mailbox.annotate(self.base, SESSION, herdrPaneId="w3:p2", herdrEndpoint=str(self.socket))
+        self.assertEqual(
+            agent_statusline_tmux._find_herdr_peer(self.base, SESSION, "w3:p2", endpoint=endpoint)["session"], SESSION
+        )
+        mailbox.annotate(self.base, SESSION, run="audited-run")
+        for session in (SESSION, None):
+            self.assertIsNone(agent_statusline_tmux._find_herdr_peer(self.base, session, "w3:p2", endpoint=endpoint))
+        mailbox.register(self.base, session="run-worker", harness="codex", cwd=str(self.home), pid=os.getpid())
+        mailbox.annotate(self.base, "run-worker", herdrPaneId="w3:p2", herdrEndpoint=str(self.socket))
+        for session in ("run-worker", None):
+            self.assertIsNone(agent_statusline_tmux._find_herdr_peer(self.base, session, "w3:p2", endpoint=endpoint))
 
     def test_native_hook_rewrites_an_old_endpoint_alias_to_canonical_form(self):
         alias = self.home / "alias"
@@ -283,6 +337,52 @@ class DiscoveryTests(unittest.TestCase):
                     ):
                         self.assertEqual(herdr_status.status(), "")
 
+    def test_focused_status_resolves_only_attested_native_identities(self):
+        import socket
+
+        import herdr_status
+
+        self.assertTrue(agent_terminal.bind(SESSION, "codex", {}, base=self.base))
+        native = "019a5da8-4321-5678-9abc-123456789012"
+        mailbox.annotate(self.base, SESSION, aliases=[native])
+        mailbox.write(
+            self.base / "rooms/native-room.json",
+            {
+                "schema": "agent-executor.room.v1",
+                "id": "native-room",
+                "cwd": str(self.home),
+                "machine": socket.gethostname(),
+                "swarm": {"maxAgents": 4, "maxDepth": 2},
+                "conductor": {"engine": "codex", "session": {"id": native}},
+                "agents": [],
+            },
+        )
+        original_run = subprocess.run
+
+        def focused_run(command, **kwargs):
+            if command[:3] == ["/fake/herdr", "pane", "current"]:
+                return subprocess.CompletedProcess([], 0, json.dumps({"result": {"pane": self.panes[0]}}), "")
+            return original_run(command, **kwargs)
+
+        self.panes[0]["terminal_title"] = "Resumed work | " + native
+        for ref in (None, {"kind": "id", "agent": "codex", "value": native}):
+            with self.subTest(ref=ref):
+                mailbox.annotate(self.base, SESSION, nativeSession=None, nativeSessions=[])
+                self.panes[0]["agent_session"] = ref
+                with (
+                    mock.patch.dict(os.environ, {"HERDR_ACTIVE_PANE_ID": "w3:p2"}),
+                    mock.patch.object(
+                        herdr_status.subprocess,
+                        "run",
+                        side_effect=focused_run,
+                    ),
+                ):
+                    self.assertEqual(herdr_status.status(), "")
+                    mailbox.annotate(self.base, SESSION, nativeSession=native, nativeSessions=[native])
+                    self.assertEqual(
+                        herdr_status.status(), "[C] codex-ivory-elk-49 · Coordinator · working · Verify patch"
+                    )
+
     def test_hook_misses_wait_until_next_session_start(self):
         import mailbox_hooks
         import repo_env
@@ -363,6 +463,8 @@ class DiscoveryTests(unittest.TestCase):
         stored = room_store.read_room(self.base, "moved-room")
         self.assertEqual((stored["herdrCoordinatorPaneId"], stored["herdrWorkspaceId"]), ("w2:p9", "w2"))
         self.assertEqual((self.peer()["herdrPaneId"], self.peer()["herdrWorkspaceId"]), ("w2:p9", "w2"))
+        report = next(call for call in self.calls if call[:2] == ["pane", "report-metadata"])
+        self.assertEqual(report[report.index("--title") + 1], "Coordinator · working · Verify patch")
         self.assertEqual(
             [call[:2] for call in self.calls], [["pane", "list"], ["pane", "report-metadata"], ["pane", "list"]]
         )
@@ -392,6 +494,17 @@ class DiscoveryTests(unittest.TestCase):
 
 
 class LabelTests(unittest.TestCase):
+    def test_structural_role_titles_preserve_the_role_within_the_length_limit(self):
+        self.assertEqual(
+            herdr_labels.work_title({"stage": "working", "task": "x" * 100}, "Coordinator"),
+            "Coordinator · working · " + "x" * 51 + "…xxxx",
+        )
+        self.assertEqual(
+            herdr_labels.work_title({"stage": "working", "task": "x" * 100}, "Lead"),
+            "Lead · working · " + "x" * 58 + "…xxxx",
+        )
+        self.assertEqual(herdr_labels.work_title({}, "Coordinator"), "Coordinator")
+
     def test_full_and_truncated_session_titles_strip_controls_and_reject_spoofs(self):
         for suffix in (SESSION, SESSION[:29] + "...", SESSION[:29] + "…"):
             self.assertEqual(

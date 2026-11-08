@@ -42,15 +42,19 @@ def display_label(peer: dict) -> str:
     return bounded(" ".join(part for part in (icon, plain(peer.get("name") or peer.get("person"))) if part))
 
 
-def work_title(progress: dict) -> str:
-    return bounded(" · ".join(part for part in (plain(progress.get("stage")), plain(progress.get("task"))) if part))
+def work_title(progress: dict, structural_role: str = "") -> str:
+    return bounded(
+        " · ".join(
+            part for part in (plain(structural_role), plain(progress.get("stage")), plain(progress.get("task"))) if part
+        )
+    )
 
 
 def codex_title_session(title: Any, sessions: set[str]) -> str | None:
     # Only the final title component is authoritative; a thread title may itself contain pipes or UUIDs.
     tail = plain(title).rsplit(" | ", 1)[-1]
-    if re.fullmatch(_UUID, tail):
-        return tail if tail in sessions else None
+    if tail in sessions:
+        return tail
     if not re.fullmatch(_PREFIX + r"(?:\.\.\.|…)", tail):
         return None
     prefix = tail.removesuffix("...").removesuffix("…")

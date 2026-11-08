@@ -421,10 +421,13 @@ class SqliteSharedRoomTests(unittest.TestCase):
     def test_shared_room_is_detected_after_import_and_rebinding(self):
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
+            mailbox.register(base, session="new", harness="claude", cwd=temporary, pid=os.getpid())
+            mailbox.annotate(base, "new", nativeSessions=["first"])
             room_store.put_room(
                 base,
                 {
                     "id": "shared",
+                    "cwd": temporary,
                     "conductor": {"session": {"id": "first"}},
                     "agents": [{"id": "worker", "mailboxSession": "second"}],
                 },

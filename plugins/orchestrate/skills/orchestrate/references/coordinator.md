@@ -62,6 +62,15 @@ A timeout longer than the task's remaining time is refused, never shortened, so 
 --time-budget` room for every run you plan. Native dispatch takes no `--timeout`; the host stops
 its tool at the task deadline.
 
+`dispatch --auto-correct N` (0 to 2) lets the runner fix a failed `--verify-command` gate by resuming
+the same session up to N times before its report; the task spec's `auto_correct` is the default. It
+needs gates, and read-only kinds refuse it, including an explicit 0. The run records it, an explicit 0 included, and a
+correction inherits it unless it passes its own. The rounds stay inside one invocation and share its `--timeout`; they use neither the
+invocation allowance nor the one correction. Repeatable `--protect-path PATH` adds files or
+directories a round may not change to the spec's `protect_paths`; the run records them, a correction
+inherits them and may add more, and read-only kinds refuse them. See
+[runner.md](runner.md#auto-correct-rounds) for what is protected without them.
+
 External dispatch is foreground by default. Use `--background` to return the durable run handle
 immediately, then supervise `events wait EVENT_ID --messages` and call `recover` after completion.
 This keeps the conductor available for questions and permits concurrent read-only runs. Reusing
@@ -116,6 +125,9 @@ An explicit model/effort must match what the host actually sends to its tool.
    Include `observed_model`/`observed_effort` only when the native tool actually reports them.
 5. The guard checks scope/history, runs the declared independent checks once, checks for check
    mutations, and saves the additive result.v2 contract. The task still needs conductor review.
+   With `--auto-correct`, the guard does not loop: a failed gate comes back as `suggested_correction`
+   on the run and in `result.auto_correct`, holding the failing command, exit code, output and the
+   fix-exactly instruction. To use it, dispatch a native `correction` and send it to the same worker.
 
 Native correction requires the original handle and workspace. Native output can be completed while
 the underlying task remains blocked; the report contract determines that distinction. The native
@@ -187,10 +199,13 @@ is a limit (at most one per audited task), not a required step.
 
 New tasks require the persisted host review ID. `review --run-id ID --decision supported --review-id
 ID` records supported advice. `dispatch --kind correction --request-id repair-1 --review-id ID`
-inherits the original engine, model, effort, variant, billing, session, scope, checks and runner
-timeout; only `--timeout` may be overridden. Add `--transport native` for a native continuation.
-No unchanged failed prompt or safety-violation resumption is allowed. Original failed/blocked
-outcomes remain unchanged.
+inherits the original engine, model, effort, variant, billing, session, scope, checks, runner
+timeout, auto-correct rounds and protect paths; after `reverify` it still inherits the implementation
+run's setting, including an explicit 0. Only `--timeout` and `--auto-correct` may be overridden, and
+`--protect-path` may add paths. A correction must leave the task changed from where the
+implementation began (`--expect-task-changes`): undoing the work ends `no_changes`. Add
+`--transport native` for a native continuation. No unchanged failed prompt or safety-violation
+resumption is allowed. Original failed/blocked outcomes remain unchanged.
 
 `review --run-id ID --decision accept --review-id ID` requires the latest completed audited work,
 all original criteria, unchanged workspace/history, and current evidence. `reject` records failed
@@ -205,8 +220,9 @@ not retroactively make a failed worker run successful or excuse unmet acceptance
 When a specific problem in a verification command has been corrected, `reverify --run-id ID
 --request-id CHECK_ID --reason EXPLANATION [--verify-command COMMAND]` records a separate host-only
 verification phase. It requires unchanged audited work, remaining time, and a completed executor
-report; it cannot repair scope/history violations or a failed/blocked worker. It does not launch a
-model or spend another invocation. Its new result can support acceptance while the original failed
+report; it cannot repair scope/history violations, a failed/blocked worker, or a run whose last
+auto-correct round broke down (`auto_correct.converted_from`). It does not launch a model or spend
+another invocation. Its new result can support acceptance while the original failed
 check stays failed. Repeat passed checks only for a concrete change or concern.
 
 Use `record-decision --packet decision.json [--review-id ID]` for reusable knowledge separately

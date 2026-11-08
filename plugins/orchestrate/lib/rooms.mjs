@@ -16,6 +16,7 @@ import {
   readRoom,
   refreshMemberWorktrees,
   resolveWorktreeMarkerPath,
+  updateRawRoom,
   updateRoom,
   validateRoom,
   WORKFORCE_ROLES,
@@ -615,21 +616,40 @@ export async function growRoom(
 export async function bindSession(
   id,
   memberId,
-  { session, engine, cwd, workforceRole, root = mailboxRoot() },
+  { session, engine, cwd, workforceRole, repairOnly = false, root = mailboxRoot() },
 ) {
   if (!session || !["claude", "codex", "agy", "opencode"].includes(engine))
     throw new Error("Session binding requires a session ID and supported engine");
   const resolvedCwd = cwd ? await realpath(cwd) : undefined;
   return updateRoom(
     id,
-    (room) => {
+    async (room) => {
       const member = memberOf(room, memberId);
+      if (!isLocalSessionBinding(room, member))
+        throw new Error("The target binding belongs to a different machine");
       if (member.engine && member.engine !== engine)
         throw new Error("Session engine differs from room member");
-      if (member.role === "lead" && member.session && member.session.id !== session)
-        throw new Error(
-          "This lead already has a native session; continue supervising that session",
-        );
+      const owner = await resolveRoomSessionPeer(room, root, member);
+      const peer =
+        owner && sessionIdentities(owner).includes(session)
+          ? owner
+          : await resolveSessionPeer(session, root, {
+              engine,
+              cwd: resolvedCwd || member.cwd || room.cwd,
+            });
+      const replacing = member.session && member.session.id !== (peer?.session || session);
+      if (repairOnly || (replacing && (memberId === "conductor" || member.role === "lead"))) {
+        if (!peer || !(await ownsSessionBinding(room, peer, root, member)))
+          throw new Error(
+            "This lead already has a native session; repair requires its live attested peer",
+          );
+        if (room.authority && replacing)
+          throw new Error(
+            "An authority-managed room requires its existing leadership handoff workflow",
+          );
+      }
+      session = peer?.session || session;
+      rememberSession(member, session);
       if (resolvedCwd) member.cwd = resolvedCwd;
       if (workforceRole !== undefined) {
         const normalized = normalizeWorkforceRole(workforceRole);
@@ -702,9 +722,8 @@ export async function dispatchMember(id, memberId, options = {}) {
   const room = await readRoom(id, root);
   const targetMember =
     memberId === "conductor" ? room.conductor : room.agents.find((agent) => agent.id === memberId);
-  const resolvedMemberCwd = options.cwd
-    ? await realpath(options.cwd)
-    : await realpath(targetMember?.cwd || room.cwd);
+  const currentMemberCwd = await realpath(targetMember?.cwd || room.cwd);
+  const resolvedMemberCwd = options.cwd ? await realpath(options.cwd) : currentMemberCwd;
   if ((await realpath(task.repository)) !== resolvedMemberCwd)
     throw new Error("Task repository differs from room checkout");
   // A room under a team only runs that team's tasks, so a superseded lead cannot dodge the fence here.
@@ -722,6 +741,29 @@ export async function dispatchMember(id, memberId, options = {}) {
   // The coordinator validates the duration and checks it against the task deadline.
   if (options.timeout !== undefined && (typeof options.timeout !== "string" || !options.timeout))
     throw new Error("--timeout needs a duration such as 25m");
+  // Runner gates for implementation work, the files its auto-correct rounds may not change, and the
+  // rounds the coordinator caps.
+  const verifyCommands = options.verifyCommands ?? [];
+  if (
+    !Array.isArray(verifyCommands) ||
+    verifyCommands.some((command) => typeof command !== "string" || !command.trim())
+  )
+    throw new Error("--verify-command needs a non-empty command");
+  const protectPaths = options.protectPaths ?? [];
+  if (
+    !Array.isArray(protectPaths) ||
+    protectPaths.some((entry) => typeof entry !== "string" || !entry.trim())
+  )
+    throw new Error("--protect-path needs a repository-relative path");
+  const rawAutoCorrect =
+    options.autoCorrect === undefined ? undefined : String(options.autoCorrect);
+  if (rawAutoCorrect !== undefined && !/^\d+$/.test(rawAutoCorrect))
+    throw new Error("--auto-correct needs a number of rounds such as 1");
+  // Canonical, so a retry with "01" and 1 is the same request.
+  const autoCorrect = rawAutoCorrect === undefined ? undefined : String(Number(rawAutoCorrect));
+  // Checked before any member field changes: an invalid role never reaches the room.
+  const hasRole = options.workforceRole !== undefined;
+  const requestedRole = hasRole ? normalizeWorkforceRole(options.workforceRole) : undefined;
   const intent = {
     taskDir: directory,
     taskId: task.task_id,
@@ -731,6 +773,9 @@ export async function dispatchMember(id, memberId, options = {}) {
     billingMode: options.billingMode || "unknown",
     ...(options.packet && { packet: await realpath(options.packet) }),
     ...(options.timeout && { timeout: options.timeout }),
+    ...(verifyCommands.length > 0 && { verifyCommands }),
+    ...(protectPaths.length > 0 && { protectPaths }),
+    ...(autoCorrect !== undefined && { autoCorrect }),
   };
   const saved = await updateRoom(
     id,
@@ -739,14 +784,8 @@ export async function dispatchMember(id, memberId, options = {}) {
       const member = memberOf(current, memberId);
       if (member.role === "lead")
         throw new Error("A subswarm lead uses native supervision, not worker dispatch");
-      if (!member.dispatch) requireActiveBranch(current, memberId);
-      if (options.cwd) member.cwd = resolvedMemberCwd;
-      if (options.workforceRole !== undefined) {
-        const normalized = normalizeWorkforceRole(options.workforceRole);
-        if (normalized) member.workforceRole = normalized;
-        else delete member.workforceRole;
-      }
       if (member.dispatch) {
+        // A retry repeats the stored request exactly; the member it runs as is part of it.
         for (const key of [
           "taskDir",
           "taskId",
@@ -755,12 +794,20 @@ export async function dispatchMember(id, memberId, options = {}) {
           "billingMode",
           "packet",
           "timeout",
+          "verifyCommands",
+          "protectPaths",
+          "autoCorrect",
         ])
-          if (member.dispatch[key] !== intent[key])
+          if (JSON.stringify(member.dispatch[key]) !== JSON.stringify(intent[key]))
             throw new Error(`Existing dispatch differs: ${key}`);
+        if (options.cwd && resolvedMemberCwd !== currentMemberCwd)
+          throw new Error("Existing dispatch differs: cwd");
+        if (hasRole && requestedRole !== member.workforceRole)
+          throw new Error("Existing dispatch differs: workforceRole");
         if (options.requestId && options.requestId !== member.dispatch.requestId)
           throw new Error("A member already has a dispatch; add a member for new work");
       } else {
+        requireActiveBranch(current, memberId);
         if (
           task.runs.some((entry) => entry.request_id === intent.requestId) ||
           current.agents.some(
@@ -771,7 +818,14 @@ export async function dispatchMember(id, memberId, options = {}) {
           )
         )
           throw new Error("Request ID already belongs to another dispatch");
-        member.dispatch = intent;
+        // Kept with the intent, so a retry after an unknown outcome can still undo these edits.
+        member.dispatch = {
+          ...intent,
+          restore: { cwd: member.cwd ?? null, workforceRole: member.workforceRole ?? null },
+        };
+        if (options.cwd) member.cwd = resolvedMemberCwd;
+        if (requestedRole) member.workforceRole = requestedRole;
+        else if (hasRole) delete member.workforceRole;
       }
       member.status = "unknown";
       return current;
@@ -803,6 +857,11 @@ export async function dispatchMember(id, memberId, options = {}) {
     args.push(member.engine === "opencode" ? "--variant" : "--effort", member.effort);
   if (binding.packet) args.push("--packet", binding.packet);
   if (binding.timeout) args.push("--timeout", binding.timeout);
+  const gates = binding.verifyCommands ?? [];
+  for (const command of gates) args.push("--verify-command", command);
+  const protectedPaths = binding.protectPaths ?? [];
+  for (const entry of protectedPaths) args.push("--protect-path", entry);
+  if (binding.autoCorrect !== undefined) args.push("--auto-correct", binding.autoCorrect);
   let result;
   try {
     result = await run(args);
@@ -822,6 +881,11 @@ export async function dispatchMember(id, memberId, options = {}) {
         const agent = memberOf(current, memberId);
         agent.dispatchError = error.message;
         if (!wasLaunched && agent.dispatch?.requestId === binding.requestId) {
+          const restored = Object.entries(agent.dispatch.restore ?? {});
+          for (const [key, value] of restored) {
+            if (value === null) delete agent[key];
+            else agent[key] = value;
+          }
           delete agent.dispatch;
           agent.status = "queued";
         }
@@ -838,6 +902,7 @@ export async function dispatchMember(id, memberId, options = {}) {
       // A concurrent refused dispatch of this member may have cleared the intent; this one launched.
       agent.dispatch ||= binding;
       agent.dispatch.runId = result.run_id;
+      delete agent.dispatch.restore;
       delete agent.dispatchError;
       return current;
     },
@@ -977,11 +1042,13 @@ export async function observeRoom(idOrRoom, options = {}) {
     const snapshot = snapshots[key];
     const sessionId =
       member.session?.id || member.nativeHandle || member.mailboxSession || member.id;
-    const peerKey = sessionId ? sessionKey(sessionId) : null;
-    const peer = peerKey
-      ? await readOptionalJson(path.join(root, "peers", `${peerKey}.json`), 64 * 1024)
+    const peer = sessionId
+      ? await resolveSessionPeer(sessionId, root, {
+          engine: member.engine,
+          cwd: member.session?.cwd || member.cwd || room.cwd,
+        })
       : null;
-    if (member !== room.conductor && peer && peer.session === sessionId && peer.accountHome) {
+    if (member !== room.conductor && peer && peer.accountHome) {
       const memberCwd = member.cwd || room.cwd;
       const parentCwd = room.conductor?.cwd || room.cwd;
       member.activitySource = {
@@ -1906,6 +1973,152 @@ export function isPeerLive(peer, nowMs = Date.now()) {
   return alive ?? ageMs <= UNKNOWN_PID_TTL_MS;
 }
 
+/** Native IDs are recorded by hooks; display aliases never establish session ownership. */
+export function sessionIdentities(peer) {
+  return [
+    peer?.session,
+    peer?.nativeSession,
+    ...(Array.isArray(peer?.nativeSessions) ? peer.nativeSessions : []),
+  ].filter((id) => typeof id === "string" && sessionKey(id));
+}
+
+async function sessionPeerCandidates(
+  session,
+  root = mailboxRoot(),
+  { engine, cwd, now = Date.now() } = {},
+) {
+  const key = sessionKey(session);
+  if (!key) return [];
+  const expectedCwd = cwd ? await resolveCwd(cwd) : undefined;
+  const harness = engine === "agy" ? "gemini" : engine;
+  const eligible = async (peer, isAlias = false) =>
+    isValidPeer(peer) &&
+    isPeerLive(peer, now) &&
+    (!peer.machine || peer.machine === hostname()) &&
+    (!harness || peer.harness === harness) &&
+    (!isAlias ||
+      !(peer.isSubagent || peer.delegatedRun || peer.run || peer.session.startsWith("run-"))) &&
+    (!expectedCwd || (await resolveCwd(peer.checkout || peer.cwd)) === expectedCwd);
+  const direct = await readOptionalJson(path.join(root, "peers", `${key}.json`), 64 * 1024);
+  if (direct?.session === session && (await eligible(direct))) return [direct];
+  let files;
+  try {
+    files = await readdir(path.join(root, "peers"));
+  } catch (error) {
+    if (error.code === "ENOENT") return [];
+    throw error;
+  }
+  const matches = [];
+  for (const file of files) {
+    if (!file.endsWith(".json")) continue;
+    const peer = await readOptionalJson(path.join(root, "peers", file), 64 * 1024);
+    if (sessionIdentities(peer).includes(session) && (await eligible(peer, true)))
+      matches.push(peer);
+  }
+  return matches;
+}
+
+export async function resolveSessionPeer(session, root = mailboxRoot(), options = {}) {
+  const matches = await sessionPeerCandidates(session, root, options);
+  return matches.length === 1 ? matches[0] : null;
+}
+
+export function roomOwnerSessions(room, member = room.conductor) {
+  return [
+    ...new Set(
+      [
+        member?.session?.id,
+        member?.mailboxSession,
+        ...(member === room.conductor || member?.id === "conductor"
+          ? [room.promotion?.session]
+          : []),
+        ...(Array.isArray(member?.previousSessions) ? member.previousSessions : []),
+      ].filter((id) => typeof id === "string" && id),
+    ),
+  ];
+}
+
+export function isLocalSessionBinding(room, member = room.conductor) {
+  return (
+    (!room.machine || room.machine === hostname()) &&
+    (!member?.session?.machine || member.session.machine === hostname())
+  );
+}
+
+async function roomSessionPeers(room, root, member = room.conductor) {
+  if (!isLocalSessionBinding(room, member)) return [];
+  const ids = roomOwnerSessions(room, member);
+  const options = {
+    engine: member?.session?.engine || member?.engine,
+    cwd: member?.session?.cwd || member?.cwd || room.cwd,
+  };
+  const candidates = new Map();
+  for (const id of ids) {
+    const matches = await sessionPeerCandidates(id, root, options);
+    const recorded = matches.find((owner) => owner.session === id);
+    if (recorded) return [recorded];
+    for (const owner of matches) candidates.set(owner.session, owner);
+  }
+  // Room-recorded mailbox keys outrank unbound native-ID claimants. Without
+  // that evidence, retain every claimant so ambiguity cannot authorize repair.
+  return candidates.values().toArray();
+}
+
+export async function resolveRoomSessionPeer(room, root = mailboxRoot(), member = room.conductor) {
+  const peers = await roomSessionPeers(room, root, member);
+  return peers.length === 1 ? peers[0] : null;
+}
+
+export async function hasOtherLiveOwner(room, peer, root, member = room.conductor) {
+  return (await roomSessionPeers(room, root, member)).some(
+    (owner) => owner.session !== peer.session,
+  );
+}
+
+export async function ownsSessionBinding(room, peer, root, member = room.conductor) {
+  const owner = await resolveRoomSessionPeer(room, root, member);
+  return Boolean(owner && owner.session === peer.session);
+}
+
+export function rememberSession(member, session, additional = []) {
+  const previous = [member.session?.id, ...additional].filter(
+    (id) => typeof id === "string" && id && id !== session,
+  );
+  if (previous.length === 0) return;
+  const history = [...new Set([...(member.previousSessions || []), ...previous])];
+  member.previousSessions = history.length > 32 ? [history[0], ...history.slice(-31)] : history;
+}
+
+/** Hook /clear repair shares the same ownership guard as explicit binding. */
+export async function rebindSession(id, memberId, session, root = mailboxRoot()) {
+  return updateRawRoom(
+    id,
+    async (room) => {
+      const member = memberOf(room, memberId);
+      if (!isLocalSessionBinding(room, member))
+        throw new Error("The target binding belongs to a different machine");
+      const owner = await resolveRoomSessionPeer(room, root, member);
+      const peer =
+        owner && sessionIdentities(owner).includes(session)
+          ? owner
+          : await resolveSessionPeer(session, root, {
+              engine: member.engine,
+              cwd: member.session?.cwd || member.cwd || room.cwd,
+            });
+      if (!peer || !(await ownsSessionBinding(room, peer, root, member)))
+        throw new Error("Repair requires the live attested owner of this binding");
+      if (room.authority && member.session?.id !== peer.session)
+        throw new Error(
+          "An authority-managed room requires its existing leadership handoff workflow",
+        );
+      rememberSession(member, peer.session);
+      if (member.session) member.session.id = peer.session;
+      return room;
+    },
+    { root },
+  );
+}
+
 function repositoryName(peer) {
   const raw = peer.repo || peer.checkout || peer.cwd || "";
   const base = path.basename(raw);
@@ -1973,13 +2186,15 @@ export async function interactiveProgress(room, root = mailboxRoot()) {
       binding.machine !== currentHost
     )
       continue;
-    const key = sessionKey(binding.id);
-    if (!key) continue;
-    const expectedHarness = binding.engine === "agy" ? "gemini" : binding.engine;
-    const peer = await readOptionalJson(path.join(root, "peers", `${key}.json`), 64 * 1024);
-    if (!isValidPeer(peer) || peer.session !== binding.id) continue;
-    if (expectedHarness && peer.harness !== expectedHarness) continue;
-    if (!isPeerLive(peer)) continue;
+    let peer = await resolveRoomSessionPeer(room, root, member);
+    // Exact conductor keys can retain their established room after a directory move.
+    // Native alias searches remain confined to the bound checkout.
+    if (!peer && member.id === "conductor" && isLocalSessionBinding(room, member)) {
+      const exact = await resolveSessionPeer(binding.id, root, { engine: binding.engine });
+      if (exact?.session === binding.id) peer = exact;
+    }
+    if (!peer) continue;
+    const key = sessionKey(peer.session);
     const expectedCwd = await resolveCwd(binding.cwd || member.cwd || room.cwd);
     const peerCwd = await resolveCwd(peer.checkout || peer.cwd);
     const isBoundConductor =

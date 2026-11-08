@@ -572,7 +572,11 @@ class RoomStoreTests(unittest.TestCase):
     def test_rebind_preserves_history_and_wal_changes_invalidate_cached_rooms(self):
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary) / "mailbox-v1"
-            room_store.put_room(base, {"id": "room", "agents": [], "conductor": {"session": {"id": "old"}}})
+            mailbox.register(base, session="new", harness="claude", cwd=temporary, pid=os.getpid())
+            mailbox.annotate(base, "new", nativeSessions=["old"])
+            room_store.put_room(
+                base, {"id": "room", "cwd": temporary, "agents": [], "conductor": {"session": {"id": "old"}}}
+            )
             room_store.list_rooms(base)
             rebound = tmux.rebind_session_swarm_room(base, "room", "conductor", "new")
             self.assertEqual(rebound["conductor"], {"session": {"id": "new"}, "previousSessions": ["old"]})

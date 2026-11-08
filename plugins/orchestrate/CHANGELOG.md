@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.73.0
+
+- feat(orchestrate): bounded auto-correct rounds for failed verify gates (#128)
+
 ## 0.72.0
 
 - feat(orchestrate): align Herdr 0.9.5 protocol v22 and bundle herdr skill (#124)

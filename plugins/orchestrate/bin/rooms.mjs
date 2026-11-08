@@ -2,6 +2,7 @@ import path from "node:path";
 import { parseArgs } from "node:util";
 
 import { loadPresets, mailboxRoot, parseTeam, updateRoom } from "../lib/horde-room.mjs";
+import { resumeRoomStatus } from "../lib/room-resume.mjs";
 import {
   assignWorkforceRole,
   bindSession,
@@ -22,6 +23,7 @@ import { promoteSession } from "../lib/session-promotion.mjs";
 
 export const ROOMS_HELP = `ork rooms list [--json]
 ork hall promote [--session ID] [--room ID] [--objective TEXT] [--cwd PATH]   (adopt this live conversation as coordinator)
+ork rooms resume-status [--cwd PATH] [--json]   (read-only resume history)
 ork rooms show --room ID [--json]
 ork rooms create --team TEAM [--group GROUP] [--title TITLE] [--cwd PATH] [--id ID] [--authority TEAM_ID]
 ork rooms add --room ID --team TEAM [--parent conductor|MEMBER] [--role ROLE] [--cwd PATH]
@@ -35,6 +37,8 @@ ork rooms init-task --task-spec FILE --task-dir DIR (--host codex|claude|agy|ope
 ork rooms dispatch --room ID --member ID --task-dir DIR [--kind investigation|implementation|consultation|challenge]
                    [--transport executor|native] [--packet FILE] [--request-id ID] [--role ROLE] [--cwd PATH]
                    [--timeout DURATION]   (executor runner limit, default 15m; must fit the task deadline)
+                   [--verify-command CMD]... [--auto-correct ROUNDS]   (implementation gates; rounds 0-2)
+                   [--protect-path PATH]...   (files an auto-correct round may not change)
 ork rooms launch --room ID --plan FILE
 ork rooms bind --room ID --member ID|conductor --session ID --engine ENGINE [--role ROLE] [--cwd PATH] [--keep-worktree]
 ork rooms recover --room ID
@@ -45,6 +49,8 @@ A room or task under a team (--authority) is fenced: init-task, dispatch, launch
 create/add queue members. dispatch/launch use the coordinator and may start billable work.
 Native dispatch returns a reservation for the conductor's native tools.
 launch plan: {"members":[{"id":"haiku-1","taskDir":"/absolute/task","kind":"investigation","timeout":"25m"}]}
+             (an implementation member also takes "verifyCommands":["CMD"], "autoCorrect":1
+              and "protectPaths":["PATH"])
 Task specs and task directories use the existing coordinator contract.
 `;
 
@@ -65,6 +71,8 @@ export async function roomsCommand(
       help: { type: "boolean" },
       json: { type: "boolean" },
       "keep-worktree": { type: "boolean" },
+      "verify-command": { type: "string", multiple: true },
+      "protect-path": { type: "string", multiple: true },
       ...Object.fromEntries(
         [
           "room",
@@ -94,6 +102,7 @@ export async function roomsCommand(
           "role",
           "time-budget",
           "timeout",
+          "auto-correct",
         ].map((name) => [name, { type: "string" }]),
       ),
     },
@@ -133,6 +142,10 @@ export async function roomsCommand(
         },
         { root, env, ...(refreshTerminal && { refresh: refreshTerminal }) },
       );
+      break;
+    }
+    case "resume-status": {
+      result = await resumeRoomStatus({ root, cwd: values.cwd });
       break;
     }
     case "list": {
@@ -268,6 +281,9 @@ export async function roomsCommand(
         workforceRole: values.role,
         cwd: values.cwd,
         timeout: values.timeout,
+        verifyCommands: values["verify-command"],
+        protectPaths: values["protect-path"],
+        autoCorrect: values["auto-correct"],
         ...lead,
       });
 

@@ -149,15 +149,26 @@ def audit(
     if consultation["status"] == "invalid":
         violations.append("invalid_consultation_request")
     allowed = list(dict.fromkeys(spec["allow_paths"] + spec["track_paths"]))
+
+    def changed_gates() -> list[str]:
+        return [
+            f"gate-edit:{path}"
+            for path in ready.get("gate_files", [])
+            if runner.path_fingerprint(repository / path) != ready.get("gate_fingerprints", {}).get(path)
+        ]
+
+    # Checked before any gate runs, so a gate program the worker changed is never executed.
+    gate_violations = changed_gates()
     status, code = runner.classify_result(
         history_violations=runner.find_history_violations(identity, identity_executor),
-        scope_violations=runner.find_scope_violations(delta, allowed),
+        scope_violations=[*runner.find_scope_violations(delta, allowed), *gate_violations],
         timed_out=runner.deadline_remaining(state["deadline"]) <= 0,
         executor_exit_code=0 if packet.get("tool_status") == "completed" else 1,
         stdout_present=bool(report.strip()),
         report_extracted=extracted,
         expect_changes=bool(allowed),
-        workspace_changed=before["fingerprint"] != after_executor["fingerprint"],
+        # A correction is judged with its implementation: the task as a whole must change something.
+        workspace_changed=ready.get("task_git_before", before)["fingerprint"] != after_executor["fingerprint"],
         reported_outcome=outcome,
         report_contract_valid=not violations,
     )
@@ -177,6 +188,7 @@ def audit(
     history = runner.find_history_violations(identity, after_identity)
     delta = runner.state_delta(before, after)
     scope = runner.find_scope_violations(delta, allowed)
+    scope = [*scope, *dict.fromkeys([*gate_violations, *changed_gates()])]
     if history:
         status, code = "history_violation", 21
     elif scope:
@@ -187,6 +199,29 @@ def audit(
         status, code = "verification_failed", 25
     usage = runner.bundled_module("usage").empty()
     usage["gaps"].append("native_host_did_not_expose_verified_provider_usage")
+    extra: dict[str, Any] = {}
+    if "protect_paths" in ready:
+        # The guard never loops: a failed gate goes back to the host as the correction turn to send.
+        corrector = runner.bundled_module("auto_correct")
+        suggestion = None
+        candidates = ready.get("gate_candidates", ready.get("gate_files", []))
+        if status == "verification_failed" and run.get("auto_correct"):
+            # The gates the host's correction turn must leave alone: named, pre-existing, unchanged so far,
+            # and every explicit protect_paths entry.
+            derived = [path for path in candidates if path not in delta["changed_paths"]]
+            gates = list(dict.fromkeys([*derived, *ready.get("protect_paths", [])]))
+            suggestion = corrector.correction_message(corrector.failed_command(verification), verification, gates=gates)
+        extra["auto_correct"] = {
+            "max_rounds": run["auto_correct"],
+            "mode": "native",
+            "rounds_used": 0,
+            "outcome": "handed_to_host" if suggestion else "not_needed",
+            "suggested_correction": suggestion,
+            "gate_candidates": list(candidates),
+            "protect_paths": list(ready.get("protect_paths", [])),
+            "protect_fingerprints": ready["protect_fingerprints"],
+            "released_paths": ready["released_paths"],
+        }
     return {
         "schema": runner.RESULT_SCHEMA,
         "runner_version": "1.0",
@@ -211,6 +246,7 @@ def audit(
         "transport": "native",
         "mailbox": run.get("mailbox"),
         "git_before": before,
+        **({"task_git_before": ready["task_git_before"]} if "task_git_before" in ready else {}),
         "git_identity_before": identity,
         "git_after_executor": after_executor,
         "git_after": after,
@@ -237,6 +273,7 @@ def audit(
         ).total_seconds(),
         "native_receipt": packet,
         "permission_basis": "existing_host_authority; unchanged_by_bridge",
+        **extra,
     }
 
 
@@ -257,6 +294,7 @@ def main() -> None:
         if not run.get("resume_result") and (task["allow_paths"] or task["track_paths"]):
             runner.bundled_module("repo_env").bootstrap_worktree_env(repository, overwrite=False)
         before, identity = runner.git_state(repository, task["track_paths"]), runner.git_identity(repository)
+        previous = None
         if run.get("resume_result"):
             previous = json.loads(Path(run["resume_result"]).read_text())
             if (
@@ -272,6 +310,51 @@ def main() -> None:
             "process_identity": process_identity(os.getpid()),
             "ready_at": runner.utc_now(),
         }
+        if previous is not None and (task_before := previous.get("task_git_before") or previous.get("git_before")):
+            ready["task_git_before"] = task_before
+        saved_state = (previous or {}).get("auto_correct") or {}
+        if run.get("auto_correct") or saved_state:
+            # The gate's own files, named before the native worker starts (see auto_correct.gate_paths).
+            corrector = runner.bundled_module("auto_correct")
+            candidates = corrector.gate_paths(run["verification_commands"], repository)
+            saved = saved_state.get("gate_candidates")
+            if isinstance(saved, list):
+                candidates = list(dict.fromkeys([*saved, *candidates]))
+            if previous is not None:
+                # A file the earlier run changed is its work, never a gate again; saved candidates keep that.
+                changed = set(runner.state_delta(ready.get("task_git_before", before), before)["changed_paths"])
+                candidates = [path for path in candidates if path not in changed]
+            ready["gate_candidates"] = list(candidates)
+            # Explicit protect_paths are gate files whether or not Git ignores them or the run changed them.
+            ready["protect_paths"] = list(
+                dict.fromkeys(
+                    [
+                        *saved_state.get("protect_paths", []),
+                        *corrector.protected_paths(task.get("protect_paths", []), repository),
+                    ]
+                )
+            )
+            ready["protect_fingerprints"] = {
+                path: saved_state.get("protect_fingerprints", {}).get(path, runner.path_fingerprint(repository / path))
+                for path in ready["protect_paths"]
+            }
+            ready["released_paths"] = list(saved_state.get("released_paths", []))
+            # The implementation captures the task baseline. A correction checks it from its first turn.
+            ready["gate_files"] = (
+                [
+                    path
+                    for path in dict.fromkeys([*candidates, *ready["protect_paths"]])
+                    if not corrector.released(path, ready["released_paths"])
+                ]
+                if previous is not None
+                else []
+            )
+            ready["gate_fingerprints"] = {
+                path: ready["protect_fingerprints"][path]
+                if path in ready["protect_fingerprints"]
+                else runner.path_fingerprint(repository / path)
+                for path in ready["gate_files"]
+            }
         runner.write_json_atomic(folder / "ready.json", ready)
         while not (folder / "completion.json").exists():
             if runner.deadline_remaining(state["deadline"]) <= 0 and not (folder / "deadline.json").exists():

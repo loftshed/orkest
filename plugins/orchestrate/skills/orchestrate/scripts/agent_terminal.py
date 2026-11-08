@@ -142,7 +142,7 @@ def refresh_parent_pane(base: Path, parent_session: str | None) -> bool:
         return False
     try:
         mailbox.session_key(parent_session)
-        peer_data = mailbox.load(mailbox.peer_path(base, parent_session))
+        peer_data = mailbox.session_peer(base, parent_session)
     except (mailbox.MailboxError, OSError):
         return False
     if not isinstance(peer_data, dict) or peer_data.get("isSubagent") or peer_data.get("delegatedRun"):
@@ -156,7 +156,7 @@ def refresh_parent_pane(base: Path, parent_session: str | None) -> bool:
     workspace_id = _clean_text(peer_data.get("herdrWorkspaceId")) or None
     return _sync_herdr_pane(
         base=base,
-        session=parent_session,
+        session=peer_data["session"],
         harness=harness,
         peer_data=peer_data,
         payload={},
@@ -181,6 +181,8 @@ def _resolve_structural_role(
     with contextlib.suppress(Exception):
         import agent_statusline_tmux
 
+        if not isinstance(peer_data, dict):
+            peer_data = mailbox.session_peer(base, session, harness=harness)
         peer_cwd = peer_data.get("checkout") or peer_data.get("cwd") if isinstance(peer_data, dict) else None
         aliases = (
             peer_data.get("aliases")
@@ -210,7 +212,7 @@ def _resolve_structural_role(
             )
             if not peer_cwd or not bound_cwd or Path(peer_cwd).resolve() == Path(bound_cwd).resolve():
                 matched_room_id = matched["id"]
-                if matched.get("_matchedSessionId") == session:
+                if matched.get("_matchedSessionId") in mailbox.native_session_ids(peer_data):
                     is_exact_conductor = member_id == "conductor"
                     structural_role = "Coordinator" if is_exact_conductor else "Lead"
     return matched_room_id, structural_role, is_exact_conductor
@@ -222,11 +224,12 @@ def discovery_available() -> bool:
 
 
 def _codex_title_pane(base: Path, session: str, binary: str, env: dict[str, str]) -> dict | None:
-    sessions = {session}
+    identities = mailbox.native_session_ids(mailbox.session_peer(base, session, harness="codex"))
+    sessions = set(identities)
     for path in (base / "peers").glob("*.json"):
         peer = mailbox.load(path)
         if isinstance(peer, dict) and peer.get("harness") == "codex" and isinstance(peer.get("session"), str):
-            sessions.add(peer["session"])
+            sessions.update(mailbox.native_session_ids(peer))
     try:
         response = subprocess.run(
             [binary, "pane", "list"], env=env, capture_output=True, text=True, timeout=0.5, check=False
@@ -242,11 +245,11 @@ def _codex_title_pane(base: Path, session: str, binary: str, env: dict[str, str]
             if ref is not None and not (
                 isinstance(ref, dict)
                 and ref.get("kind") == "id"
-                and ref.get("value") == session
+                and ref.get("value") in identities
                 and ref.get("agent") == "codex"
             ):
                 continue
-            if codex_title_session(pane.get("terminal_title"), sessions) == session:
+            if codex_title_session(pane.get("terminal_title"), sessions) in identities:
                 matches.append(pane)
         return matches[0] if len(matches) == 1 else None
     except (OSError, ValueError, AttributeError, TypeError, subprocess.SubprocessError):
@@ -280,8 +283,12 @@ def _sync_herdr_pane(
         return False
     import agent_progress
 
+    if structural_role is None:
+        _, structural_role, _ = _resolve_structural_role(
+            base, session, harness, peer_data, only_room=os.environ.get("ORKEST_SWARM_ROOM") or None
+        )
     progress = agent_progress.read(base, peer_data) or {}
-    title = work_title(progress)
+    title = work_title(progress, structural_role)
     display_agent = display_label(peer_data)
     sync_key = f"{title}|{display_agent}"
     endpoint = str(Path(endpoint).expanduser().resolve())
@@ -292,7 +299,7 @@ def _sync_herdr_pane(
         previous_target = {**previous_target, "endpoint": canonical_endpoint(previous_target.get("endpoint"))}
     changed = force or peer_data.get("herdrSyncedTitle") != sync_key or previous_target != target
     if occupant is None and changed and binary:
-        occupant = verified_agent(binary, pane_id, {session}, env=herdr_env, timeout=0.5)
+        occupant = verified_agent(binary, pane_id, mailbox.native_session_ids(peer_data), env=herdr_env, timeout=0.5)
     if occupant:
         pane_id = occupant["pane_id"]
         workspace_id = occupant.get("workspace_id") or pane_id.split(":", 1)[0]
@@ -383,9 +390,10 @@ def bind(
         base = base or mailbox.root()
         peer_data: dict[str, Any] | None = None
         with contextlib.suppress(Exception):
-            loaded = mailbox.load(mailbox.peer_path(base, session))
+            loaded = mailbox.session_peer(base, session, harness=harness, cwd=payload.get("cwd"))
             if isinstance(loaded, dict):
                 peer_data = loaded
+                session = loaded["session"]
         if isinstance(peer_data, dict) and (peer_data.get("isSubagent") or peer_data.get("delegatedRun")):
             return False
         occupant = None
