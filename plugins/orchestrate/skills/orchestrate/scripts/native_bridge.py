@@ -222,6 +222,7 @@ def audit(
             suggestion = corrector.correction_message(corrector.failed_command(verification), verification, gates=gates)
         extra["auto_correct"] = {
             "max_rounds": run["auto_correct"],
+            "source": (run.get("auto_correct_source") or "cli") if run["auto_correct"] else None,
             "mode": "native",
             "rounds_used": 0,
             "outcome": "handed_to_host" if suggestion else "not_needed",

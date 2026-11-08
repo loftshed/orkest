@@ -1627,8 +1627,8 @@ class CoordinatorTests(unittest.TestCase):
             self.assertIn("Fix exactly these problems; change nothing else.", suggestion)
             result = COORDINATOR.read(Path(finished["result_path"]))
             self.assertEqual(
-                {key: result["auto_correct"][key] for key in ("mode", "rounds_used", "outcome")},
-                {"mode": "native", "rounds_used": 0, "outcome": "handed_to_host"},
+                {key: result["auto_correct"][key] for key in ("mode", "source", "rounds_used", "outcome")},
+                {"mode": "native", "source": "cli", "rounds_used": 0, "outcome": "handed_to_host"},
             )
             self.assertEqual(result["auto_correct"]["suggested_correction"], suggestion)
             self.assertEqual(COORDINATOR.load(self.directory)["budget"]["used"], 1)

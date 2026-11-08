@@ -253,9 +253,16 @@ class PathScopeTests(unittest.TestCase):
             ["src/jobs", "README.md"],
         )
 
+    def test_root_spellings_normalize_to_the_root_only_when_allowed(self) -> None:
+        for root in (".", "./", ".//"):
+            with self.subTest(root=root):
+                self.assertEqual(RUNNER.normalize_repo_paths([root], option="--allow-path", allow_root=True), ["."])
+
     def test_rejects_root_absolute_and_parent_paths(self) -> None:
         for invalid in (
             ".",
+            "./",
+            ".//",
             "",
             "/tmp/out",
             "../outside",
