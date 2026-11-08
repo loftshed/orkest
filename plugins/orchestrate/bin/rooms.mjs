@@ -67,6 +67,13 @@ export async function roomsCommand(
     refreshTerminal,
   } = {},
 ) {
+  // parseArgs treats a separate negative number as an option; keep the cap's own error.
+  argv = argv.flatMap((argument, index) => {
+    if (index > 0 && argv[index - 1] === "--max-continues" && /^-\d/.test(argument)) return [];
+    if (argument === "--max-continues" && /^-\d/.test(argv[index + 1] ?? ""))
+      return [`${argument}=${argv[index + 1]}`];
+    return [argument];
+  });
   const { positionals, values } = parseArgs({
     args: argv,
     allowPositionals: true,
@@ -259,6 +266,11 @@ export async function roomsCommand(
       break;
     }
     case "init-task": {
+      if (
+        values["max-continues"] !== undefined &&
+        (!/^\d+$/.test(values["max-continues"]) || Number(values["max-continues"]) > 6)
+      )
+        throw new Error("--max-continues must be an integer from 0 to 6 (hard ceiling 6)");
       result = await run([
         "init",
         "--task-spec",

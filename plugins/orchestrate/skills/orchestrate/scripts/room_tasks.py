@@ -23,6 +23,10 @@ RUN_FIELDS = (
     "recovery",
     "kind",
     "task_spec",
+    "resume_result",
+    "resumed_from",
+    "verification_of",
+    "parent_run_id",
 )
 STATES = {"reserved": "reserved", "active": "running", "finished": "review", "cancelled": "cancelled"}
 VERDICTS = {"accept": "completed", "supported": "completed", "reject": "rejected", "takeover": "blocked"}
@@ -45,13 +49,29 @@ def project(cwd: str, member: dict[str, Any], task: dict[str, Any]) -> dict[str,
         raise ValueError("Run identity changed")
     if anchor.get("engine") != member.get("engine") or anchor.get("transport") != binding.get("transport"):
         raise ValueError("Run executor differs from room member")
-    history = [
+    candidates = [
         run
         for run in task["runs"]
         if isinstance(run, dict)
         and run.get("engine") == member.get("engine")
         and run.get("transport") in {binding.get("transport"), "host_checks"}
     ]
+    by_id = {run["run_id"]: run for run in candidates}
+    by_result = {run["result_path"]: run for run in candidates if run.get("result_path")}
+    chain = {anchor["run_id"]}
+    while True:
+        size = len(chain)
+        for run in candidates:
+            if run.get("kind") not in {"continue", "correction", "verification"}:
+                continue
+            parent = by_id.get(run.get("verification_of") or run.get("parent_run_id")) or by_result.get(
+                run.get("resume_result") or run.get("resumed_from")
+            )
+            if parent and (run["run_id"] in chain or parent["run_id"] in chain):
+                chain.update((run["run_id"], parent["run_id"]))
+        if len(chain) == size:
+            break
+    history = [run for run in candidates if run["run_id"] in chain]
     run = history[-1]
     if not isinstance(run.get("run_id"), str) or not run["run_id"]:
         raise ValueError("Run identity changed")

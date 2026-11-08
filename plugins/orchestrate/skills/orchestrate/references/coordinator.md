@@ -52,8 +52,8 @@ New verification commands apply to the new spec. Scope/history violations cannot
 
 Set `--max-continues N` on `init` or the first dispatch, or `max_continues` in the initial task spec.
 The default is 3; 0 disables continues; the hard ceiling is 6 and the cap cannot change after dispatch.
-This cap is independent of the task record's one correction and total invocation allowance. Allow
-sufficient invocations and deadline for the planned continues. Retrying a request ID never spends
+The invocation allowance covers at least the initial run, all permitted continues and one correction;
+a larger explicit allowance is preserved. Allow enough deadline for the planned continues. Retrying a request ID never spends
 another continuation. Older task records default to 3 without migration.
 
 The measured allowance is supervised executor invocations, including failed attempts and

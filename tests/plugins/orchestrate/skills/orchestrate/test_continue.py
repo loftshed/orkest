@@ -135,6 +135,7 @@ class ContinueTests(unittest.TestCase):
         code, error = self.follow()
         self.assertEqual(code, 2)
         self.assertIn("unresolved dispatch", error)
+        self.assertIn("continue requires the previous run to be finished and reviewed", error)
         state["runs"][0]["status"] = "finished"
         result = COORDINATOR.read(Path(run["result_path"]))
         result["session_id"] = None
@@ -169,9 +170,6 @@ class ContinueTests(unittest.TestCase):
         self.assertIn("one correction", error)
 
     def test_first_dispatch_override_allows_six_and_cannot_be_raised_later(self):
-        state = COORDINATOR.load(self.directory)
-        state["budget"]["limit"] = 8
-        COORDINATOR.save(self.directory, state)
         code, error = self.start("bad", "implementation", "--max-continues", "7")
         self.assertEqual(code, 2)
         self.assertIn("hard ceiling 6", error)
@@ -191,6 +189,92 @@ class ContinueTests(unittest.TestCase):
         code, error = self.follow("seventh")
         self.assertEqual(code, 2)
         self.assertIn("continue budget exhausted (6", error)
+
+    def test_high_caps_allow_every_continue_and_preserve_correction_headroom(self):
+        for source, cap, allowance in (("dispatch", 5, 5), ("init", 6, 5), ("spec", 5, 5), ("spec", 6, 12)):
+            with self.subTest(source=source):
+                self.directory = self.fixture.external_path / f"cap-{source}-{cap}"
+                self.spec.pop("max_continues", None)
+                if source == "spec":
+                    self.spec["max_continues"] = cap
+                self.spec.update(allow_paths=[], track_paths=[])
+                self.spec_path.write_text(json.dumps(self.spec))
+                options = ["--max-continues", str(cap)] if source == "init" else []
+                code, state = self.call(
+                    "init",
+                    "--task-spec",
+                    str(self.spec_path),
+                    "--host",
+                    "claude",
+                    "--invocation-allowance",
+                    str(allowance),
+                    *options,
+                )
+                self.assertEqual(code, 0, state)
+                options = ["--max-continues", str(cap)] if source == "dispatch" else []
+                with mock.patch.dict(os.environ, {"FAKE_NO_CHANGE": "1"}):
+                    code, run = self.start("first", "implementation", *options)
+                    self.assertEqual(code, 0, run)
+                    self.assertEqual(COORDINATOR.load(self.directory)["budget"]["limit"], max(allowance, 2 + cap))
+                    for index in range(cap):
+                        self.reviewed(run)
+                        code, run = self.follow(f"continue-{index}")
+                        self.assertEqual(code, 0, run)
+                        self.assertEqual(run["runner_status"], "completed")
+                    proof = self.reviewed_evidence()
+                    code, corrected = self.call(
+                        "dispatch", "--kind", "correction", "--request-id", "correction", "--review-id", proof
+                    )
+                    self.assertEqual(code, 0, corrected)
+                    self.assertEqual(corrected["runner_status"], "completed")
+                self.reviewed(corrected)
+                code, error = self.follow("beyond-cap")
+                self.assertEqual(code, 2)
+                self.assertIn(f"continue budget exhausted ({cap}", error)
+
+    def test_projection_excludes_same_engine_consultations_and_other_member_chains(self):
+        _, first = self.start()
+        proof = self.reviewed_evidence()
+        code, decision = self.call("review", "--run-id", first["run_id"], "--decision", "accept", "--review-id", proof)
+        self.assertEqual((code, decision["decision"]), (0, "accept"))
+        state = COORDINATOR.load(self.directory)
+        member = {
+            "engine": "codex",
+            "dispatch": {
+                "taskId": state["task_id"],
+                "requestId": first["request_id"],
+                "runId": first["run_id"],
+                "transport": "executor",
+            },
+        }
+        for kind in ("consultation", "implementation"):
+            state["runs"].append(
+                {
+                    **first,
+                    "kind": kind,
+                    "run_id": kind,
+                    "request_id": kind,
+                    "resume_result": first["result_path"],
+                    "result_path": f"/other/{kind}.json",
+                    "task_spec": {"objective": "Other member objective"},
+                }
+            )
+            state["decisions"].append({"run_id": kind, "decision": "reject"})
+        state["runs"].append(
+            {
+                **state["runs"][-1],
+                "run_id": "other-continue",
+                "request_id": "other-continue",
+                "kind": "continue",
+                "resume_result": "/other/implementation.json",
+            }
+        )
+        projected = ROOM_TASKS.project(str(self.fixture.repository.path), member, ROOM_TASKS.compact(state))
+        self.assertEqual(
+            (projected["run"]["run_id"], projected["status"], projected["verdict"], projected["objective"]),
+            (first["run_id"], "completed", "accept", "Write the approved output"),
+        )
+        self.assertEqual([run["run_id"] for run in projected["history"]], [first["run_id"]])
 
     def test_init_and_spec_caps_are_validated_and_zero_is_bounded(self):
         for value in (-1, 7):

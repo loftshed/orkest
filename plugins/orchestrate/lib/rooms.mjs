@@ -47,6 +47,10 @@ const RUN_FIELDS = [
   "effort",
   "native_handle",
   "recovery",
+  "resume_result",
+  "resumed_from",
+  "verification_of",
+  "parent_run_id",
 ];
 const TASK_STATES = {
   reserved: "reserved",
@@ -479,10 +483,29 @@ async function projectMemberTask(cwd, member, task) {
   if (binding.runId && anchor.run_id !== binding.runId) throw new Error("Run identity changed");
   if (anchor.engine !== member.engine || anchor.transport !== binding.transport)
     throw new Error("Run executor differs from room member");
-  const history = task.runs.filter(
+  const candidates = task.runs.filter(
     (run) =>
       run.engine === member.engine && [binding.transport, "host_checks"].includes(run.transport),
   );
+  const byId = new Map(candidates.map((run) => [run.run_id, run]));
+  const byResult = new Map(
+    candidates.filter((run) => run.result_path).map((run) => [run.result_path, run]),
+  );
+  const chain = new Set([anchor.run_id]);
+  let size;
+  do {
+    size = chain.size;
+    for (const run of candidates) {
+      if (!["continue", "correction", "verification"].includes(run.kind)) continue;
+      const parent =
+        byId.get(run.verification_of ?? run.parent_run_id) ??
+        byResult.get(run.resume_result ?? run.resumed_from);
+      if (!parent || (!chain.has(run.run_id) && !chain.has(parent.run_id))) continue;
+      chain.add(parent.run_id);
+      chain.add(run.run_id);
+    }
+  } while (chain.size !== size);
+  const history = candidates.filter((run) => chain.has(run.run_id));
   const run = history.at(-1);
   if (typeof run.run_id !== "string" || !run.run_id) throw new Error("Run identity changed");
   const decisions = task.decisions.filter(
@@ -805,17 +828,15 @@ export async function dispatchMember(id, memberId, options = {}) {
       const member = memberOf(current, memberId);
       if (member.role === "lead")
         throw new Error("A subswarm lead uses native supervision, not worker dispatch");
-      const lastRun = task.runs.find((entry) => entry.request_id === member.dispatch?.requestId);
+      if (kind === "continue" && !member.dispatch)
+        throw new Error("continue requires an existing member dispatch");
+      // Only an explicit request ID can retry a continuation; review belongs to the coordinator.
       const continuing =
         kind === "continue" &&
         member.dispatch &&
         (member.dispatch.kind !== "continue" ||
           (options.requestId && options.requestId !== member.dispatch.requestId) ||
-          (!options.requestId &&
-            lastRun?.status === "finished" &&
-            task.decisions.some((entry) => entry.run_id === lastRun.run_id)));
-      if (kind === "continue" && !member.dispatch)
-        throw new Error("continue requires an existing member dispatch");
+          !options.requestId);
       if (
         continuing &&
         (member.dispatch.taskId !== intent.taskId || member.dispatch.taskDir !== directory)

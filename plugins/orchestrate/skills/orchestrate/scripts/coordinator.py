@@ -306,6 +306,8 @@ def initialize(args: argparse.Namespace) -> dict[str, Any]:
     elif not host:
         raise CoordinationError("init needs --host, or --authority for a team's task")
     duration = RUNNER.parse_duration(args.time_budget, option="--time-budget")
+    budget = POLICY.invocation_budget(args.invocation_allowance)
+    budget["limit"] = max(budget["limit"], 1 + continues + 1)  # Initial work and one correction.
     now = dt.datetime.now(dt.UTC)
     state = {
         "schema": SCHEMA,
@@ -319,7 +321,7 @@ def initialize(args: argparse.Namespace) -> dict[str, Any]:
         "task_spec": spec,
         "runs": [],
         "decisions": [],
-        "budget": POLICY.invocation_budget(args.invocation_allowance),
+        "budget": budget,
         "cost_ledger": {},
         "evidence": {"sources": {}, "reviews": {}, "resources": {}},
         "knowledge": [],
@@ -505,7 +507,8 @@ def dispatch(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
         and all(run["kind"] in READ_ONLY_KINDS and run["status"] in {"active", "reserved"} for run in unresolved)
     ):
         raise CoordinationError(
-            "recover the unresolved dispatch before starting new work; only active read-only runs can overlap"
+            ("continue requires the previous run to be finished and reviewed; " if args.kind == "continue" else "")
+            + "recover the unresolved dispatch before starting new work; only active read-only runs can overlap"
         )
     if RUNNER.deadline_remaining(state["deadline"]) <= 0:
         raise CoordinationError("task deadline exhausted; conductor must investigate or replan")
@@ -863,6 +866,8 @@ def dispatch(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
         raise CoordinationError(
             "older task has no enforceable allowance; finish/review it or create a new bounded task"
         )
+    if not state["runs"] and getattr(args, "max_continues", None) is not None:
+        state["budget"]["limit"] = max(state["budget"]["limit"], 1 + limit + state["limits"]["corrections"])
     POLICY.reserve(state, args.request_id)
     state["limits"]["continues"] = limit
     if kind == "continue":
