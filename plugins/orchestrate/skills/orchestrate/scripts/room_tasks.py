@@ -21,6 +21,8 @@ RUN_FIELDS = (
     "effort",
     "native_handle",
     "recovery",
+    "kind",
+    "task_spec",
 )
 STATES = {"reserved": "reserved", "active": "running", "finished": "review", "cancelled": "cancelled"}
 VERDICTS = {"accept": "completed", "supported": "completed", "reject": "rejected", "takeover": "blocked"}
@@ -36,13 +38,23 @@ def project(cwd: str, member: dict[str, Any], task: dict[str, Any]) -> dict[str,
     matches = [run for run in task["runs"] if isinstance(run, dict) and run.get("request_id") == binding["requestId"]]
     if len(matches) != 1:
         raise ValueError("Dispatch has no unique recorded run; retry the same dispatch to recover")
-    run = matches[0]
+    anchor = matches[0]
+    if not isinstance(anchor.get("run_id"), str) or not anchor["run_id"]:
+        raise ValueError("Run identity changed")
+    if binding.get("runId") and anchor["run_id"] != binding["runId"]:
+        raise ValueError("Run identity changed")
+    if anchor.get("engine") != member.get("engine") or anchor.get("transport") != binding.get("transport"):
+        raise ValueError("Run executor differs from room member")
+    history = [
+        run
+        for run in task["runs"]
+        if isinstance(run, dict)
+        and run.get("engine") == member.get("engine")
+        and run.get("transport") in {binding.get("transport"), "host_checks"}
+    ]
+    run = history[-1]
     if not isinstance(run.get("run_id"), str) or not run["run_id"]:
         raise ValueError("Run identity changed")
-    if binding.get("runId") and run["run_id"] != binding["runId"]:
-        raise ValueError("Run identity changed")
-    if run.get("engine") != member.get("engine") or run.get("transport") != binding.get("transport"):
-        raise ValueError("Run executor differs from room member")
     decisions = [
         decision
         for decision in task["decisions"]
@@ -53,13 +65,14 @@ def project(cwd: str, member: dict[str, Any], task: dict[str, Any]) -> dict[str,
     if run.get("runner_status") and run["runner_status"] != "completed":
         state = "failed"
     state = VERDICTS.get(verdict, state)
-    spec = task.get("task_spec")
+    spec = run.get("task_spec", task.get("task_spec"))
     return {
         "run": run,
         "status": state,
         "verdict": verdict,
         "observedAt": task.get("updated_at"),
         "objective": spec.get("objective") if isinstance(spec, dict) else None,
+        "history": history,
     }
 
 

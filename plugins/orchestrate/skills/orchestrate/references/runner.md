@@ -68,6 +68,15 @@ emitted only when usage, rate freshness (30 days, or an entry's `revalidate_on`)
 agy slugs use their base model's tariff. It is not an invoice. See
 [verification findings](research-verification-2026-09-18.md).
 
+## Bounded session continuation
+
+Coordinator `--kind continue` uses `--session`, `--resume-result` and `--resume-new-task` to run a
+new task spec in the recorded session. Executor identity, prior workspace and history checks remain;
+the new scope, tracking and verification commands get a fresh audit baseline. Earlier gate protection
+and scope releases belong to the earlier task. Usage still carries the session baseline. The native
+bridge likewise reserves the same handle and audits the new task without launching a peer CLI.
+The coordinator enforces review and the per-member cap; see [coordinator.md](coordinator.md).
+
 ## Audit and classification
 
 - The runner holds a POSIX worktree lease through execution and verification. Empty-scope runs

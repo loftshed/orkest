@@ -33,6 +33,8 @@ const authorityPath = fileURLToPath(
 );
 
 const RUN_FIELDS = [
+  "kind",
+  "task_spec",
   "run_id",
   "request_id",
   "status",
@@ -472,11 +474,17 @@ async function projectMemberTask(cwd, member, task) {
   );
   if (matches.length !== 1)
     throw new Error("Dispatch has no unique recorded run; retry the same dispatch to recover");
-  const run = matches[0];
-  if (typeof run.run_id !== "string" || !run.run_id) throw new Error("Run identity changed");
-  if (binding.runId && run.run_id !== binding.runId) throw new Error("Run identity changed");
-  if (run.engine !== member.engine || run.transport !== binding.transport)
+  const anchor = matches[0];
+  if (typeof anchor.run_id !== "string" || !anchor.run_id) throw new Error("Run identity changed");
+  if (binding.runId && anchor.run_id !== binding.runId) throw new Error("Run identity changed");
+  if (anchor.engine !== member.engine || anchor.transport !== binding.transport)
     throw new Error("Run executor differs from room member");
+  const history = task.runs.filter(
+    (run) =>
+      run.engine === member.engine && [binding.transport, "host_checks"].includes(run.transport),
+  );
+  const run = history.at(-1);
+  if (typeof run.run_id !== "string" || !run.run_id) throw new Error("Run identity changed");
   const decisions = task.decisions.filter(
     (decision) => isPlainObject(decision) && decision.run_id === run.run_id,
   );
@@ -484,13 +492,14 @@ async function projectMemberTask(cwd, member, task) {
   let state = TASK_STATES[run.status] || "unknown";
   if (run.runner_status && run.runner_status !== "completed") state = "failed";
   state = TASK_VERDICTS[verdict] || state;
-  const spec = isPlainObject(task.task_spec) ? task.task_spec : null;
+  const spec = run.task_spec || task.task_spec;
   return {
     run,
     status: state,
     verdict,
     observedAt: task.updated_at,
     objective: spec ? spec.objective : null,
+    history,
   };
 }
 
@@ -733,9 +742,10 @@ export async function dispatchMember(id, memberId, options = {}) {
     );
   const effectiveRole = options.workforceRole ?? targetMember?.workforceRole;
   const kind = options.kind || workforceRoleInfo(effectiveRole)?.defaultKind || "investigation";
-  if (!["implementation", "investigation", "consultation", "challenge"].includes(kind))
+  if (!["implementation", "investigation", "consultation", "challenge", "continue"].includes(kind))
     throw new Error("Unsupported dispatch kind");
-  const transport = options.transport || "executor";
+  const transport =
+    options.transport || (kind === "continue" && targetMember?.dispatch?.transport) || "executor";
   if (!["executor", "native"].includes(transport))
     throw new Error("Unsupported dispatch transport");
   // The coordinator validates the duration and checks it against the task deadline.
@@ -761,6 +771,15 @@ export async function dispatchMember(id, memberId, options = {}) {
     throw new Error("--auto-correct needs a number of rounds such as 1");
   // Canonical, so a retry with "01" and 1 is the same request.
   const autoCorrect = rawAutoCorrect === undefined ? undefined : String(Number(rawAutoCorrect));
+  const maxContinues =
+    options.maxContinues === undefined ? undefined : Number(options.maxContinues);
+  if (
+    maxContinues !== undefined &&
+    (!/^\d+$/.test(String(options.maxContinues)) || maxContinues > 6)
+  )
+    throw new Error("--max-continues must be an integer from 0 to 6 (hard ceiling 6)");
+  if (kind === "continue" && !options.taskSpec)
+    throw new Error("continue requires a new --task-spec");
   // Checked before any member field changes: an invalid role never reaches the room.
   const hasRole = options.workforceRole !== undefined;
   const requestedRole = hasRole ? normalizeWorkforceRole(options.workforceRole) : undefined;
@@ -776,6 +795,8 @@ export async function dispatchMember(id, memberId, options = {}) {
     ...(verifyCommands.length > 0 && { verifyCommands }),
     ...(protectPaths.length > 0 && { protectPaths }),
     ...(autoCorrect !== undefined && { autoCorrect }),
+    ...(maxContinues !== undefined && { maxContinues }),
+    ...(options.taskSpec && { taskSpec: await realpath(options.taskSpec) }),
   };
   const saved = await updateRoom(
     id,
@@ -784,7 +805,23 @@ export async function dispatchMember(id, memberId, options = {}) {
       const member = memberOf(current, memberId);
       if (member.role === "lead")
         throw new Error("A subswarm lead uses native supervision, not worker dispatch");
-      if (member.dispatch) {
+      const lastRun = task.runs.find((entry) => entry.request_id === member.dispatch?.requestId);
+      const continuing =
+        kind === "continue" &&
+        member.dispatch &&
+        (member.dispatch.kind !== "continue" ||
+          (options.requestId && options.requestId !== member.dispatch.requestId) ||
+          (!options.requestId &&
+            lastRun?.status === "finished" &&
+            task.decisions.some((entry) => entry.run_id === lastRun.run_id)));
+      if (kind === "continue" && !member.dispatch)
+        throw new Error("continue requires an existing member dispatch");
+      if (
+        continuing &&
+        (member.dispatch.taskId !== intent.taskId || member.dispatch.taskDir !== directory)
+      )
+        throw new Error("continue must use the member's existing task");
+      if (member.dispatch && !continuing) {
         // A retry repeats the stored request exactly; the member it runs as is part of it.
         for (const key of [
           "taskDir",
@@ -797,6 +834,8 @@ export async function dispatchMember(id, memberId, options = {}) {
           "verifyCommands",
           "protectPaths",
           "autoCorrect",
+          "maxContinues",
+          "taskSpec",
         ])
           if (JSON.stringify(member.dispatch[key]) !== JSON.stringify(intent[key]))
             throw new Error(`Existing dispatch differs: ${key}`);
@@ -821,7 +860,11 @@ export async function dispatchMember(id, memberId, options = {}) {
         // Kept with the intent, so a retry after an unknown outcome can still undo these edits.
         member.dispatch = {
           ...intent,
-          restore: { cwd: member.cwd ?? null, workforceRole: member.workforceRole ?? null },
+          restore: {
+            cwd: member.cwd ?? null,
+            workforceRole: member.workforceRole ?? null,
+            ...(continuing && { dispatch: member.dispatch }),
+          },
         };
         if (options.cwd) member.cwd = resolvedMemberCwd;
         if (requestedRole) member.workforceRole = requestedRole;
@@ -844,16 +887,13 @@ export async function dispatchMember(id, memberId, options = {}) {
     binding.kind,
     "--transport",
     binding.transport,
-    "--engine",
-    member.engine,
-    "--model",
-    member.model,
+    ...(binding.kind === "continue" ? [] : ["--engine", member.engine, "--model", member.model]),
     "--billing-mode",
     binding.billingMode,
     "--background",
     ...leadArgs(options),
   ];
-  if (member.effort)
+  if (binding.kind !== "continue" && member.effort)
     args.push(member.engine === "opencode" ? "--variant" : "--effort", member.effort);
   if (binding.packet) args.push("--packet", binding.packet);
   if (binding.timeout) args.push("--timeout", binding.timeout);
@@ -862,6 +902,9 @@ export async function dispatchMember(id, memberId, options = {}) {
   const protectedPaths = binding.protectPaths ?? [];
   for (const entry of protectedPaths) args.push("--protect-path", entry);
   if (binding.autoCorrect !== undefined) args.push("--auto-correct", binding.autoCorrect);
+  if (binding.maxContinues !== undefined)
+    args.push("--max-continues", String(binding.maxContinues));
+  if (binding.taskSpec) args.push("--task-spec", binding.taskSpec);
   let result;
   try {
     result = await run(args);
@@ -882,12 +925,14 @@ export async function dispatchMember(id, memberId, options = {}) {
         agent.dispatchError = error.message;
         if (!wasLaunched && agent.dispatch?.requestId === binding.requestId) {
           const restored = Object.entries(agent.dispatch.restore ?? {});
+          const previousDispatch = agent.dispatch.restore?.dispatch;
           for (const [key, value] of restored) {
             if (value === null) delete agent[key];
             else agent[key] = value;
           }
-          delete agent.dispatch;
-          agent.status = "queued";
+          if (previousDispatch) agent.dispatch = previousDispatch;
+          else delete agent.dispatch;
+          agent.status = previousDispatch ? "unknown" : "queued";
         }
         return current;
       },
@@ -987,7 +1032,8 @@ export async function observeRoom(idOrRoom, options = {}) {
     try {
       const item = projections.get(member.id);
       if (!item?.projection) throw new Error(item?.error || "Task snapshot unavailable");
-      const { run: record, status, verdict, observedAt, objective } = item.projection;
+      const { run: record, status, verdict, observedAt, objective, history } = item.projection;
+      member.runHistory = history;
       member.runId = record.run_id;
       member.transport = record.transport;
       member.resultPath = record.result_path;

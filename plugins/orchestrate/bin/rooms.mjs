@@ -34,11 +34,14 @@ ork rooms objective --room ID --objective TEXT
 ork rooms pause|resume --room ID [--member conductor|MEMBER]   (gates new launches)
 ork rooms init-task --task-spec FILE --task-dir DIR (--host codex|claude|agy|opencode|other | --authority TEAM_ID)
                     [--time-budget DURATION]   (task deadline, default 1h)
-ork rooms dispatch --room ID --member ID --task-dir DIR [--kind investigation|implementation|consultation|challenge]
+                    [--max-continues N] [--invocation-allowance N]   (continue cap 0-6, default 3)
+ork rooms dispatch --room ID --member ID --task-dir DIR [--kind investigation|implementation|consultation|challenge|continue]
                    [--transport executor|native] [--packet FILE] [--request-id ID] [--role ROLE] [--cwd PATH]
                    [--timeout DURATION]   (executor runner limit, default 15m; must fit the task deadline)
                    [--verify-command CMD]... [--auto-correct ROUNDS]   (implementation gates; rounds 0-2)
                    [--protect-path PATH]...   (files an auto-correct round may not change)
+                   [--task-spec FILE]   (required for continue, in the existing task/session)
+                   [--max-continues N]   (first dispatch only, hard ceiling 6)
 ork rooms launch --room ID --plan FILE
 ork rooms bind --room ID --member ID|conductor --session ID --engine ENGINE [--role ROLE] [--cwd PATH] [--keep-worktree]
 ork rooms recover --room ID
@@ -103,6 +106,8 @@ export async function roomsCommand(
           "time-budget",
           "timeout",
           "auto-correct",
+          "max-continues",
+          "invocation-allowance",
         ].map((name) => [name, { type: "string" }]),
       ),
     },
@@ -264,6 +269,12 @@ export async function roomsCommand(
           ? ["--authority", values.authority, ...leadArgs]
           : ["--host", requireValue("host")]),
         ...(values["time-budget"] === undefined ? [] : ["--time-budget", values["time-budget"]]),
+        ...(values["max-continues"] === undefined
+          ? []
+          : ["--max-continues", values["max-continues"]]),
+        ...(values["invocation-allowance"] === undefined
+          ? []
+          : ["--invocation-allowance", values["invocation-allowance"]]),
       ]);
 
       break;
@@ -284,6 +295,8 @@ export async function roomsCommand(
         verifyCommands: values["verify-command"],
         protectPaths: values["protect-path"],
         autoCorrect: values["auto-correct"],
+        maxContinues: values["max-continues"],
+        taskSpec: values["task-spec"],
         ...lead,
       });
 

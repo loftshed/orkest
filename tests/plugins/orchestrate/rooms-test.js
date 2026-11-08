@@ -1615,3 +1615,164 @@ describe("SQLite room persistence", () => {
     expect(observed.conductor.herdrEndpoint).toBeUndefined();
   });
 });
+
+describe("bounded room continuations", () => {
+  it("projects the latest request while retaining the first request and old records", async () => {
+    const { root, room, taskDir, task, run } = await fixture();
+    await dispatchMember(room.id, "haiku-1", { root, taskDir, run, requestId: "first" });
+    task.runs[0].status = "finished";
+    task.runs[0].runner_status = "completed";
+    task.decisions.push({ run_id: "run-1", decision: "accept" });
+    task.runs.push({
+      ...task.runs[0],
+      run_id: "run-2",
+      request_id: "second",
+      status: "active",
+      task_spec: { objective: "Second bounded task" },
+    });
+    await writeFile(path.join(taskDir, "task.json"), JSON.stringify(task));
+    const observed = await observeRoom(room.id, { root, discoverNativePeers: false });
+    expect(observed.agents[0]).toMatchObject({
+      runId: "run-2",
+      status: "running",
+      verdict: "pending",
+      objective: "Second bounded task",
+    });
+    expect(observed.agents[0].runHistory.map((entry) => entry.request_id)).toEqual([
+      "first",
+      "second",
+    ]);
+    expect((await readRoom(room.id, root)).agents[0].dispatch.requestId).toBe("first");
+    task.runs[1].status = "finished";
+    task.decisions.push({ run_id: "run-2", decision: "accept" });
+    await writeFile(path.join(taskDir, "task.json"), JSON.stringify(task));
+    expect((await observeRoom(room.id, { root })).agents[0].status).toBe("completed");
+  });
+
+  it("dispatches continue in the same task, inherits transport and retries a lost response", async () => {
+    const { root, room, taskDir, task, run } = await fixture();
+    await dispatchMember(room.id, "haiku-1", {
+      root,
+      taskDir,
+      run,
+      requestId: "first",
+      transport: "native",
+    });
+    task.runs[0].status = "finished";
+    task.decisions.push({ run_id: "run-1", decision: "accept" });
+    const taskSpec = path.join(taskDir, "followup.json");
+    await writeFile(taskSpec, JSON.stringify({ objective: "Follow up" }));
+    let shouldLoseResponse = true;
+    const calls = [];
+    const resume = async (args) => {
+      calls.push(args);
+      const result = await run(args);
+      if (args[0] === "dispatch") {
+        const stored = task.runs.find((entry) => entry.request_id === "second");
+        stored.engine = "claude";
+        result.engine = "claude";
+        if (shouldLoseResponse) {
+          shouldLoseResponse = false;
+          throw new Error("lost continue response");
+        }
+      }
+      return result;
+    };
+    const options = { root, taskDir, taskSpec, run: resume, kind: "continue", requestId: "second" };
+    await expect(dispatchMember(room.id, "haiku-1", options)).rejects.toThrow(
+      "lost continue response",
+    );
+    expect((await readRoom(room.id, root)).agents[0].dispatch.requestId).toBe("second");
+    const continued = await dispatchMember(room.id, "haiku-1", options);
+    expect(continued.dispatch).toMatchObject({
+      run_id: "run-2",
+      request_id: "second",
+      transport: "native",
+    });
+    expect(task.runs.map((entry) => entry.request_id)).toEqual(["first", "second"]);
+    const sent = calls.find((args) => args[0] === "dispatch");
+    expect(sent.slice(sent.indexOf("--task-spec"))).toEqual(["--task-spec", taskSpec]);
+    expect(sent).not.toContain("--engine");
+    expect(sent).not.toContain("--model");
+    expect(sent).not.toContain("--effort");
+    const observed = await observeRoom(room.id, { root, run: resume, discoverNativePeers: false });
+    expect(observed.agents[0]).toMatchObject({ runId: "run-2", status: "running" });
+  });
+
+  it("restores the previous dispatch when continue is refused before launch", async () => {
+    const { root, room, taskDir, task, run } = await fixture();
+    await dispatchMember(room.id, "haiku-1", { root, taskDir, run, requestId: "first" });
+    const taskSpec = path.join(taskDir, "followup.json");
+    await writeFile(taskSpec, "{}");
+    const refusing = async (args) => {
+      if (args[0] === "dispatch") throw new Error("previous run is unreviewed");
+      return run(args);
+    };
+    await expect(
+      dispatchMember(room.id, "haiku-1", {
+        root,
+        taskDir,
+        taskSpec,
+        run: refusing,
+        kind: "continue",
+        requestId: "second",
+      }),
+    ).rejects.toThrow("previous run is unreviewed");
+    const saved = (await readRoom(room.id, root)).agents[0];
+    expect(saved.dispatch).toMatchObject({ requestId: "first", runId: "run-1" });
+    expect(task.runs.map((entry) => entry.request_id)).toEqual(["first"]);
+    expect((await observeRoom(room.id, { root, run })).agents[0].status).toBe("running");
+  });
+
+  it("forwards per-member caps from both CLI entry points and rejects values above six", async () => {
+    const { root, room, taskDir, run } = await fixture();
+    const calls = [];
+    const record = async (args) => {
+      calls.push(args);
+      if (args[0] === "init") return { status: "active" };
+      return run(args);
+    };
+    const stdout = { write() {} };
+    await roomsCommand(
+      [
+        "init-task",
+        "--task-dir",
+        taskDir,
+        "--task-spec",
+        path.join(taskDir, "spec.json"),
+        "--host",
+        "claude",
+        "--max-continues",
+        "6",
+        "--invocation-allowance",
+        "8",
+      ],
+      { root, run: record, stdout },
+    );
+    expect(calls[0].slice(-4)).toEqual(["--max-continues", "6", "--invocation-allowance", "8"]);
+    await roomsCommand(
+      [
+        "dispatch",
+        "--room",
+        room.id,
+        "--member",
+        "haiku-1",
+        "--task-dir",
+        taskDir,
+        "--max-continues",
+        "5",
+      ],
+      { root, run: record, stdout },
+    );
+    expect((await readRoom(room.id, root)).agents[0].dispatch.maxContinues).toBe(5);
+    expect(calls.find((args) => args[0] === "dispatch").slice(-2)).toEqual([
+      "--max-continues",
+      "5",
+    ]);
+    for (const maxContinues of [7, -1, "unlimited", 1.5]) {
+      await expect(
+        dispatchMember(room.id, "luna-1", { root, taskDir, run, maxContinues }),
+      ).rejects.toThrow("hard ceiling 6");
+    }
+  });
+});

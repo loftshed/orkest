@@ -47,7 +47,7 @@ AUTHORITY = module("authority")
 AUTO_CORRECT = module("auto_correct")
 SCHEMA = "agent-executor.task.v1"
 READ_ONLY_KINDS = {"consultation", "challenge", "investigation"}
-WORK_KINDS = {"implementation", "correction"}
+WORK_KINDS = {"implementation", "correction", "continue"}
 ABANDON_GRACE_SECONDS = 10.0
 
 
@@ -287,6 +287,7 @@ def auto_recover_task(directory: Path, *, skip_event_publish: bool = False) -> d
 def initialize(args: argparse.Namespace) -> dict[str, Any]:
     renderer = RUNNER.brief_renderer_module()
     spec = renderer.validate_spec(read(args.task_spec))
+    continues = continue_limit(getattr(args, "max_continues", None), spec)
     repository = RUNNER.git_root(Path(spec["repository_root"]).resolve())
     if repository != Path(spec["repository_root"]).resolve():
         raise CoordinationError("task spec must name the repository root")
@@ -314,7 +315,7 @@ def initialize(args: argparse.Namespace) -> dict[str, Any]:
         "status": "active",
         "created_at": now.isoformat(),
         "deadline": (now + dt.timedelta(seconds=duration)).isoformat(),
-        "limits": {"consultations": 3, "challenges": 1, "corrections": 1},
+        "limits": {"consultations": 3, "challenges": 1, "corrections": 1, "continues": continues},
         "task_spec": spec,
         "runs": [],
         "decisions": [],
@@ -334,13 +335,24 @@ def initialize(args: argparse.Namespace) -> dict[str, Any]:
 
 def latest_work(state: dict[str, Any]) -> dict[str, Any] | None:
     return next(
-        (run for run in reversed(state["runs"]) if run["kind"] in {"implementation", "correction", "verification"}),
+        (run for run in reversed(state["runs"]) if run["kind"] in WORK_KINDS | {"verification"}),
         None,
     )
 
 
 def implementation_work(state: dict[str, Any]) -> dict[str, Any] | None:
-    return next((run for run in reversed(state["runs"]) if run["kind"] == "implementation"), None)
+    return next((run for run in reversed(state["runs"]) if run["kind"] in {"implementation", "continue"}), None)
+
+
+def session_work(state: dict[str, Any]) -> dict[str, Any] | None:
+    return next((run for run in reversed(state["runs"]) if run["transport"] in {"native", "executor"}), None)
+
+
+def continue_limit(value: int | None, spec: dict[str, Any]) -> int:
+    value = spec.get("max_continues", 3) if value is None else value
+    if type(value) is not int or not 0 <= value <= 6:
+        raise CoordinationError("--max-continues must be an integer from 0 to 6 (hard ceiling 6)")
+    return value
 
 
 def reverify(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -> dict[str, Any]:
@@ -356,7 +368,7 @@ def reverify(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
     if (
         state["status"] != "active"
         or not work
-        or work["kind"] not in {"implementation", "correction", "verification"}
+        or work["kind"] not in WORK_KINDS | {"verification"}
         or any(run["kind"] != "verification" for run in later)
         or any(run["status"] != "finished" for run in state["runs"])
     ):
@@ -481,7 +493,11 @@ def dispatch(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
         # A repeated ID never launches another process, including after a crash.
         recover(directory, state)
         return prior
-    if state["status"] != "active":
+    if args.transport is None:
+        args.transport = (
+            (session_work(state) or {}).get("transport", "executor") if args.kind == "continue" else "executor"
+        )
+    if state["status"] != "active" and not (args.kind == "continue" and state["status"] == "accepted"):
         raise CoordinationError("task has been accepted or returned to the conductor")
     unresolved = [run for run in state["runs"] if run["status"] not in {"finished", "cancelled"}]
     if unresolved and not (
@@ -499,6 +515,30 @@ def dispatch(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
         RUNNER.parse_duration(args.timeout)
     work = latest_work(state)
     kind = args.kind
+    limit = continue_limit(state["limits"].get("continues", 3), state["task_spec"])
+    if getattr(args, "max_continues", None) is not None:
+        limit = continue_limit(args.max_continues, state["task_spec"])
+        if state["runs"]:
+            raise CoordinationError("--max-continues is only settable on init or the member's first dispatch")
+    if getattr(args, "task_spec", None) is not None and kind != "continue":
+        raise CoordinationError("dispatch --task-spec is only for --kind continue")
+    if kind == "continue":
+        if sum(run["kind"] == "continue" for run in state["runs"]) >= limit:
+            raise CoordinationError(f"continue budget exhausted ({limit} per member)")
+        work = state["runs"][-1] if state["runs"] else None
+        if (
+            not work
+            or work["status"] != "finished"
+            or not any(decision["run_id"] == work["run_id"] for decision in state["decisions"])
+        ):
+            raise CoordinationError("continue requires the previous run to be finished and reviewed")
+        if args.task_spec is None:
+            raise CoordinationError("continue requires a new --task-spec with its own objective, scope and acceptance")
+        spec = RUNNER.brief_renderer_module().validate_spec(read(args.task_spec))
+        if Path(spec["repository_root"]).resolve() != Path(state["repository"]).resolve():
+            raise CoordinationError("continue task spec repository differs from the member's checkout")
+        if "max_continues" in spec and spec["max_continues"] != limit:
+            raise CoordinationError("continue cannot change the member's max_continues")
     if kind == "implementation" and work:
         raise CoordinationError("initial implementation already dispatched; use a bounded correction")
     if kind in {"consultation", "challenge"}:
@@ -556,7 +596,7 @@ def dispatch(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
                 "Provide evidence-backed findings relevant to the objective and identify unresolved questions; do not implement changes."
             ],
         }
-    else:
+    elif kind != "continue":
         spec = dict(state["task_spec"])
     if kind in READ_ONLY_KINDS:
         spec.update(
@@ -590,6 +630,20 @@ def dispatch(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
     rounds = args.auto_correct
     previous_result = None
     evidence_record = None
+    if kind == "continue":
+        previous_result = read(Path(work["result_path"]))
+        if digest(Path(work["result_path"])) != work["result_sha256"] or not previous_result.get("session_id"):
+            raise CoordinationError("previous result changed or has no exact session id")
+        SUPPORT.validate_resume(previous_result, {"repository": state["repository"]})
+        if any(value is not None for value in (args.engine, args.model, args.effort, args.variant)):
+            raise CoordinationError("continue inherits engine, model, effort and variant; omit overrides")
+        if args.transport != session_work(state)["transport"]:
+            raise CoordinationError("continue inherits the previous run's transport")
+        engine, model_id = previous_result["engine"], previous_result["model"]
+        effort, variant = previous_result.get("effort", {}).get("bound"), previous_result.get("variant")
+        billing = previous_result.get("billing_mode", "unknown")
+        if timeout is None and args.transport != "native":
+            timeout = session_work(state).get("timeout")
     if kind == "correction":
         if not work or work["status"] != "finished" or any(run["kind"] == "correction" for run in state["runs"]):
             raise CoordinationError("one correction requires a finished implementation")
@@ -605,7 +659,7 @@ def dispatch(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
         billing = previous_result.get("billing_mode", "unknown")
         if timeout is None and args.transport != "native":
             # The resumed session keeps the runner limit it was given; an explicit --timeout replaces it.
-            timeout = next((run.get("timeout") for run in state["runs"] if run["kind"] == "implementation"), None)
+            timeout = (implementation_work(state) or {}).get("timeout")
         if rounds is None:
             # Like the timeout, the auto-correct rounds carry over unless the correction sets its own.
             inherited = implementation_work(state) if work["kind"] == "verification" else work
@@ -687,7 +741,7 @@ def dispatch(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
         or RUNNER.detect_conductor_model(Path(state["repository"]))
     )
     if (
-        kind in {"implementation", "correction"}
+        kind in WORK_KINDS
         and (bool(spec.get("allow_paths")) or spec.get("scope_owner") == "worker")
         and (
             SUPPORT.is_upward_delegation(conductor_model, model_id)
@@ -767,10 +821,13 @@ def dispatch(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
                 command += ["--expect-task-changes"]
     if previous_result:
         command += ["--session", previous_result["session_id"], "--resume-result", work["result_path"]]
+        if kind == "continue":
+            command += ["--resume-new-task"]
     run = {
         "run_id": run_id,
         "request_id": args.request_id,
         "kind": kind,
+        "task_spec": spec,
         "status": "dispatching",
         "engine": engine,
         "model": model_id,
@@ -807,6 +864,13 @@ def dispatch(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
             "older task has no enforceable allowance; finish/review it or create a new bounded task"
         )
     POLICY.reserve(state, args.request_id)
+    state["limits"]["continues"] = limit
+    if kind == "continue":
+        # Older records kept only the task-level spec; retain it before advancing the objective.
+        for earlier in state["runs"]:
+            earlier.setdefault("task_spec", state["task_spec"])
+        state["task_spec"] = spec
+        state["status"] = "active"
     state["runs"].append(run)
     save(directory, state)  # Durable intent precedes the external side effect.
     opened_mailbox = MAILBOX.open_run(
@@ -927,6 +991,7 @@ def review(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -> 
     if digest(result_path) != run["result_sha256"]:
         raise CoordinationError("result changed since collection")
     result = read(result_path)
+    review_state = {**state, "task_spec": run.get("task_spec", state["task_spec"])}
     record = {"run_id": args.run_id, "decision": args.decision, "at": RUNNER.utc_now()}
     if getattr(args, "authority_record", None):
         record["generation"] = args.authority_record["generation"]
@@ -938,17 +1003,17 @@ def review(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -> 
         if args.evidence is None and not args.review_id:
             raise CoordinationError("review requires conductor evidence")
         if state.get("evidence_policy") == "host_receipts_required":
-            evidence = EVIDENCE.receipt(state, args.review_id, RUNNER, acceptance=args.decision == "accept")
+            evidence = EVIDENCE.receipt(review_state, args.review_id, RUNNER, acceptance=args.decision == "accept")
             record["evidence"] = {"review_id": evidence["review_id"], "owner": evidence["owner"]}
         else:
             evidence = read(args.evidence)
             record["evidence"] = check_evidence(args.evidence)
         if args.decision == "accept":
             if run is not latest_work(state):
-                raise CoordinationError("accept only the latest implementation or correction")
+                raise CoordinationError("accept only the latest implementation, correction or continue")
             if (
                 state.get("evidence_policy") != "host_receipts_required"
-                and evidence.get("criteria") != state["task_spec"]["acceptance_criteria"]
+                and evidence.get("criteria") != review_state["task_spec"]["acceptance_criteria"]
             ):
                 raise CoordinationError("evidence must list every original acceptance criterion in order")
             repository = Path(state["repository"])
@@ -1083,6 +1148,7 @@ def main(argv: list[str] | None = None) -> int:
     init.add_argument("--authority", help="team whose lead may change this task (see authority.py)")
     init.add_argument("--time-budget", default="1h")
     init.add_argument("--invocation-allowance", type=int, default=5)
+    init.add_argument("--max-continues", type=int, help="Per-member continue cap, 0-6 (default 3)")
     for action in (
         "init",
         "dispatch",
@@ -1112,7 +1178,7 @@ def main(argv: list[str] | None = None) -> int:
         if action == "dispatch":
             sub.add_argument(
                 "--kind",
-                choices=("implementation", "consultation", "challenge", "correction", "investigation"),
+                choices=("implementation", "consultation", "challenge", "correction", "investigation", "continue"),
                 required=True,
             )
             sub.add_argument(
@@ -1121,8 +1187,10 @@ def main(argv: list[str] | None = None) -> int:
                 help="Return the durable run handle immediately; supervise messages and completion",
             )
             sub.add_argument("--request-id", required=True)
+            sub.add_argument("--task-spec", type=Path, help="New bounded task for --kind continue")
+            sub.add_argument("--max-continues", type=int, help="Per-member cap on the first dispatch only, 0-6")
             sub.add_argument("--engine", choices=RUNNER.EXECUTION_ENGINES)
-            sub.add_argument("--transport", choices=("executor", "native"), default="executor")
+            sub.add_argument("--transport", choices=("executor", "native"))
             sub.add_argument("--model")
             sub.add_argument("--effort")
             sub.add_argument("--variant")

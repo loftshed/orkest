@@ -58,12 +58,23 @@ An implementation dispatch takes the runner's gates and
 `"autoCorrect"` and `"protectPaths"` on a launch-plan member. When a gate fails, the runner resumes the
 same worker session up to N times before it reports.
 
-Add members with `ork rooms add --room cache-review --team "agy:flash"`. Each member has one dispatch
-intent; add another member for another task. Retrying a dispatch reuses its stored request ID, even
+Add members with `ork rooms add --room cache-review --team "agy:flash"`. Each member has one current dispatch
+intent; add another member for an independent session. Retrying a dispatch reuses its stored request ID, even
 after a lost response. Changing its task, kind, transport, timeout, gates, protect paths, rounds,
 role or folder is rejected.
 When the coordinator refuses a dispatch and records no run for it, nothing launched: the intent is
 cleared, the error stays on the member, and the member can be dispatched again.
+
+Use `dispatch --kind continue --task-spec /absolute/next.json --request-id phase-2` with the
+member's existing `--task-dir` for another bounded task in its session. The new spec supplies its
+objective, scope and acceptance; engine, model, effort, transport, session and default timeout carry
+over. The previous run must be finished and reviewed, with an audited session ID. A refused continue
+restores the previous binding; retry an uncertain dispatch with the same request ID and spec.
+
+Continues default to 3 per member. Set `--max-continues N` on `init-task` or the first dispatch, or
+`max_continues` in the initial spec (0–6; hard ceiling 6). Later runs cannot raise it. Continues also
+consume the task's invocation allowance and deadline; use `init-task --invocation-allowance N` for
+more total invocations. The one-correction allowance stays separate.
 
 `ork rooms launch --room cache-review --plan /absolute/plan.json` dispatches a batch and stops at the
 first error; retry the same plan to recover recorded requests:
@@ -79,7 +90,8 @@ first error; retry the same plan to recover recorded requests:
 
 ## Collect results
 
-`ork rooms show --room cache-review --json` reports each member's status from coordinator records.
+`ork rooms show --room cache-review --json` reports each member's status from its latest coordinator run,
+with earlier runs in `runHistory` and the same task record.
 `ork rooms recover --room cache-review` collects results through the coordinator. Finished work shows
 as `review` until the coordinator records its verdict; a worker going idle never accepts a task.
 

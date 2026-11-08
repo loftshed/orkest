@@ -78,6 +78,11 @@ def start(directory: Path, run: dict[str, Any], runner: Any) -> None:
                 "the run mailbox is only a fallback if native messaging is unavailable.",
                 "brief_path": str(folder / "brief.md"),
             }
+            if run.get("required_native_handle"):
+                run["native_instructions"]["session"] = run["required_native_handle"]
+                run["native_instructions"]["dispatch"] = (
+                    "Resume the recorded session exactly once with the new brief; attach that same handle."
+                )
             return
         if child.poll() is not None:
             raise ValueError("native audit guard exited before readiness; inspect guard.stderr")
@@ -298,10 +303,14 @@ def main() -> None:
         if run.get("resume_result"):
             previous = json.loads(Path(run["resume_result"]).read_text())
             if (
-                previous["git_after"]["fingerprint"] != before["fingerprint"]
+                previous["git_after"]["fingerprint"]
+                != runner.git_state(repository, previous["tracked_paths"])["fingerprint"]
                 or previous["git_identity_after"] != identity
             ):
                 raise ValueError("native correction workspace differs from the prior audited result")
+        # A continue resumes the session, but starts its own scope, gates and change baseline.
+        if run["kind"] == "continue":
+            previous = None
         ready = {
             "run_id": run_id,
             "git_before": before,
