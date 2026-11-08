@@ -850,12 +850,12 @@ export async function dispatchMember(id, memberId, options = {}) {
         throw new Error("continue must use the member's existing task");
       // A kept `restore` means a launch is still in flight, or its outcome is unknown. Replacing
       // that intent would let the two launches overwrite each other's binding.
-      const previousRunEnded = task.runs.some(
+      const hasPreviousRunEnded = task.runs.some(
         (entry) =>
           entry.request_id === member.dispatch?.requestId &&
           ["finished", "cancelled"].includes(entry.status),
       );
-      if (continuing && member.dispatch.restore && !previousRunEnded)
+      if (continuing && member.dispatch.restore && !hasPreviousRunEnded)
         throw new Error(
           `Another dispatch of this member is still launching; wait for it, or retry it with --request-id ${member.dispatch.requestId}`,
         );
@@ -950,11 +950,11 @@ export async function dispatchMember(id, memberId, options = {}) {
     // The coordinator records a run before any side effect, so a refusal with no run for this
     // request launched nothing: clear the intent so the member can be dispatched again.
     let wasLaunched = true;
-    let launchConfirmed = false;
+    let isLaunchConfirmed = false;
     try {
       const after = await run(["show", "--task-dir", binding.taskDir]);
       wasLaunched = after.runs.some((entry) => entry.request_id === binding.requestId);
-      launchConfirmed = wasLaunched;
+      isLaunchConfirmed = wasLaunched;
     } catch {
       // Unknown outcome: keep the intent so retrying the same request can recover it.
     }
@@ -963,7 +963,7 @@ export async function dispatchMember(id, memberId, options = {}) {
       (current) => {
         const agent = memberOf(current, memberId);
         agent.dispatchError = error.message;
-        if (launchConfirmed && agent.dispatch?.requestId === binding.requestId)
+        if (isLaunchConfirmed && agent.dispatch?.requestId === binding.requestId)
           delete agent.dispatch.restore;
         if (!wasLaunched && agent.dispatch?.requestId === binding.requestId) {
           const restored = Object.entries(agent.dispatch.restore ?? {});
