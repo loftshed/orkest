@@ -189,19 +189,21 @@ def normalize_repo_paths(values: list[str], *, option: str, allow_root: bool = F
     normalized: list[str] = []
     for value in values:
         stripped = value.strip()
-        if allow_root and stripped == ".":
+        candidate = Path(stripped)
+        # pathlib reduces `./`, `.//` and an empty string to `.`, so an empty value is refused first.
+        clean = candidate.as_posix().rstrip("/")
+        if stripped and allow_root and clean == ".":
             if "." not in normalized:
                 normalized.append(".")
             continue
-        candidate = Path(value)
         if (
-            candidate.is_absolute()
-            or stripped in {"", "."}
+            not stripped
+            or candidate.is_absolute()
+            or clean == "."
             or ".." in candidate.parts
             or (candidate.parts and candidate.parts[0] == ".git")
         ):
             raise _runner_error(f"{option} must be a non-root repository-relative path: {value!r}", 4)
-        clean = candidate.as_posix().rstrip("/")
         if clean not in normalized:
             normalized.append(clean)
     return normalized

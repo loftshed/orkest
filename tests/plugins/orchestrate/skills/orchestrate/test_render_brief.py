@@ -149,5 +149,18 @@ class BriefRendererTests(unittest.TestCase):
         self.assertEqual(validated_ro["allow_paths"], [])
 
 
+class RepositoryPathTests(unittest.TestCase):
+    def test_root_spellings_and_blanks_are_refused_unless_the_root_is_allowed(self):
+        for value in (".", "./", ".//", " ./ ", "", "   "):
+            with self.subTest(value=value), self.assertRaises(RENDERER.BriefSpecError):
+                RENDERER.normalize_repo_paths([value], "protect_paths")
+        for value in (".", "./", ".//", " ./ "):
+            with self.subTest(root=value):
+                self.assertEqual(RENDERER.normalize_repo_paths([value], "allow_paths", allow_root=True), ["."])
+        for value in ("", "   "):
+            with self.subTest(blank=value), self.assertRaises(RENDERER.BriefSpecError):
+                RENDERER.normalize_repo_paths([value], "allow_paths", allow_root=True)
+
+
 if __name__ == "__main__":
     unittest.main()
