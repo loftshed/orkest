@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.76.0
+
+- feat(orchestrate): capped continue dispatch kind; member status follows the latest run (#138)
+
 ## 0.75.1
 
 - fix(orchestrate): attest native session identities with daemon-token MACs (#137)
