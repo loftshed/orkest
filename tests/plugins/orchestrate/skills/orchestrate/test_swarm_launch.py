@@ -863,7 +863,11 @@ class HerdrSwarmLaunchTests(unittest.TestCase):
                 )
                 mailbox.unregister(base, session_id)
                 cleared_me = mailbox.annotate(base, cleared_sid, nativeSessions=[session_id], clearedFrom=session_id)
-                cleared_me = mailbox.annotate(base, cleared_sid, pid=os.getpid())
+                # Registered under another pid, so record this process's start time too; a stale
+                # pidBirth makes the peer look dead wherever pid + 1 is a live process (macOS CI).
+                cleared_me = mailbox.annotate(
+                    base, cleared_sid, pid=os.getpid(), pidBirth=mailbox.process_started(os.getpid())
+                )
                 cleared_summary = mailbox_hooks.swarm_coordinator_context(base, cleared_me, "SessionStart")
                 self.assertIn("Reconnected to swarm room room-newer (Active Horde)", cleared_summary)
                 updated_room = room_store.read_room(base, "room-newer")

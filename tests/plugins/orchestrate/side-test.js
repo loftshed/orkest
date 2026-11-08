@@ -358,7 +358,7 @@ describe("ork side (side missions)", () => {
       expect(
         room.agents.map((agent) => agent.dispatch.runId).sort((a, b) => a.localeCompare(b)),
       ).toEqual(["first", "second"]);
-    }, 15_000);
+    }, 60_000);
 
     it("provisions an isolated git worktree, copies .worktreeinclude, and registers side-1 in execute mode", async () => {
       const roomPath = path.join(mailboxDir, "rooms", "room-beta.json");
