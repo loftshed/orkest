@@ -1240,6 +1240,8 @@ describe("room CLI", () => {
           cwd,
         };
         for (const agent of current.agents) agent.status = "reserved";
+        current.agents[1].model = "claude-opus-5-5";
+        current.agents[2].session = { id: "a7", engine: "claude", machine: hostname(), cwd };
         current.agents[0].role = "lead";
         current.agents[0].objective = "Map Herdr capabilities";
         return current;
@@ -1284,6 +1286,8 @@ describe("room CLI", () => {
     );
     // Finished transcript-only subagent for the builder's slot.
     await subagent("a2", `Brief: ${path.join(briefs, `${builder}.md`)}`, { finished: true });
+    // Bound by its bare agent ID: must not be listed a second time.
+    await subagent("a7", "Reviewer task");
     // A second claim on the builder's slot, a claim on the Codex slot, a brief from another
     // room, and a brief read only after launch: none of them may fill a slot.
     await subagent("a3", `Brief: ${path.join(briefs, `${builder}.md`)}`);
@@ -1321,8 +1325,11 @@ describe("room CLI", () => {
         nativeSession: "subagent-a2",
         workforceRole: "builder",
         status: "reported complete",
+        model: "claude-opus-5-5",
+        cwd,
       });
       expect(byId.get(reviewer).nativeSession).toBeUndefined();
+      expect(observed.agents.some((agent) => agent.nativeSession === "subagent-a7")).toBe(false);
       expect(byId.get(codexSlot).nativeSession).toBeUndefined();
 
       const sessions = observed.agents.map((agent) => agent.nativeSession).filter(Boolean);

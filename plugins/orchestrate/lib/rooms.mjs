@@ -1408,7 +1408,13 @@ async function appendNativePeers(room, snapshots, root) {
   const collectRoomSessions = (targetRoom) => {
     for (const member of [targetRoom?.conductor, ...(targetRoom?.agents || [])]) {
       if (!member) continue;
-      if (member.session?.id) boundSessions.add(member.session.id);
+      if (member.session?.id) {
+        boundSessions.add(member.session.id);
+        // A lead may bind a Claude subagent by its bare agent ID; its peer is `subagent-<id>`.
+        if (member.engine === "claude" && !member.session.id.startsWith("subagent-")) {
+          boundSessions.add(`subagent-${member.session.id}`.slice(0, 80));
+        }
+      }
       if (member.mailboxSession) boundSessions.add(member.mailboxSession);
       if (member.nativeSession) boundSessions.add(member.nativeSession);
     }
@@ -1793,17 +1799,24 @@ function claimReservedSlot(room, claims, claimedSlots) {
 function fillReservedSlot(slot, projected) {
   const role = slot.workforceRole || projected.workforceRole;
   const objective = slot.objective || projected.objective;
+  // Before its first reply a subagent reports only its engine as the model; keep the slot's.
+  const model =
+    projected.model && projected.model !== projected.engine
+      ? projected.model
+      : slot.model || projected.model;
   const kept = {
     id: slot.id,
     name: slot.name || projected.name,
     person: slot.person || projected.person,
     role: slot.role || projected.role,
     parent: slot.parent || projected.parent,
+    cwd: slot.cwd || projected.cwd,
+    model,
   };
   Object.assign(slot, projected, kept, {
     workforceRole: role,
     objective,
-    progress: { ...projected.progress, role },
+    progress: { ...projected.progress, role, model, cwd: kept.cwd },
   });
 }
 
