@@ -513,27 +513,23 @@ def _resolve(
     *,
     parents: bool = True,
     hops: int = 0,
-    links: dict[str, str] | None = None,
 ) -> Path | None:
     """Resolve components one link at a time, retaining every hop before following it."""
     current = Path(path.anchor)
     parts = path.parts[1:]
     for index, part in enumerate(parts):
         current = current.parent if part == ".." else current / part
-        saved_link = (links or {}).get(current.relative_to(root).as_posix()) if current.is_relative_to(root) else None
-        if saved_link is not None or (links is None and current.is_symlink()):
+        if current.is_symlink():
             if parents or index == len(parts) - 1:
                 _record(current, root, names)
             if hops >= MAX_LINK_HOPS:
                 return None
             try:
-                link = Path(saved_link if saved_link is not None else os.readlink(current))
+                link = Path(os.readlink(current))
             except OSError:
                 return None
             target = link if link.is_absolute() else current.parent / link
-            return _resolve(
-                target.joinpath(*parts[index + 1 :]), root, names, parents=parents, hops=hops + 1, links=links
-            )
+            return _resolve(target.joinpath(*parts[index + 1 :]), root, names, parents=parents, hops=hops + 1)
     return current
 
 
@@ -603,63 +599,19 @@ def protected_paths(entries: list[str], repo: Path) -> list[str]:
     return list(names)
 
 
-def gate_roots(commands: list[str], entries: list[str], repo: Path) -> list[str]:
-    """Names protected in their own right, before expanding their final symlink.
-
-    Resolve parent aliases so a directly named script keeps its identity in Git's namespace.
-    These roots must survive a release of a different alias that happens to reach them.
-    """
-    root = Path(os.path.realpath(repo))
-    names: dict[str, None] = {}
-    paths = [path for command in commands for path in _named(command, root) if path.is_file()]
-    for path in [*paths, *(root / entry for entry in entries)]:
-        parent = _resolve(path.parent, root, {})
-        if parent is not None:
-            _record(parent / path.name, root, names)
-    return list(names)
-
-
 def released(path: str, rules: list[str]) -> bool:
     """Whether a path a steer explicitly allowed (`rules`, each a path or ".") covers `path`."""
     return any(rule == "." or path == rule or path.startswith(f"{rule}/") for rule in rules)
 
 
-def protected_links(paths: list[str], repo: Path, *, saved: dict[str, Any] | None = None) -> dict[str, str]:
-    """Retain the original link graph; only newly introduced gates get a fresh snapshot on resume."""
-    saved = saved or {}
-    prior = [*saved.get("gate_candidates", []), *saved.get("protect_paths", [])] if "gate_links" in saved else []
-    fresh = [path for path in paths if not released(path, prior) and not any(released(old, [path]) for old in prior)]
-    return {
-        **{path: os.readlink(repo / path) for path in fresh if (repo / path).is_symlink()},
-        **saved.get("gate_links", {}),
-    }
+def release_paths(entries: list[str]) -> list[str]:
+    """The paths a steer frees: exactly those it names, with everything under them.
 
-
-def release_paths(
-    entries: list[str], repo: Path, *, links: dict[str, str] | None = None, independent: list[str] | None = None
-) -> list[str]:
-    """Release named paths through the saved links, stopping at independent gates.
-
-    Directory contents are covered lexically; their inner links confer no authority outside
-    that directory. Only a named path's own link chain expands a release.
+    A release never follows symlinks, so it can never reach a gate through a link, whether the
+    link existed at the start or the worker made it later. To let a worker edit a gate through a
+    link, release the link's target as well; the gate-edit violation names it.
     """
-    if "." in entries:
-        return ["."]
-    root = Path(os.path.realpath(repo))
-    names = dict.fromkeys(entries)
-    barriers = [path for path in independent or [] if not released(path, entries)]
-    for entry in entries:
-        expanded: dict[str, None] = {}
-        target = _resolve(root / entry, root, expanded, parents=False, links=links or {})
-        if target is not None:
-            _record(target, root, expanded)
-        if not any(
-            released(path, barriers) or any(released(gate, [path]) for gate in barriers)
-            for path in expanded
-            if not released(path, entries)
-        ):
-            names.update(expanded)
-    return list(names)
+    return ["."] if "." in entries else list(dict.fromkeys(entries))
 
 
 def round_budget(*, executor_seconds_left: float, deadline_left: float | None, gate_seconds: float) -> float:

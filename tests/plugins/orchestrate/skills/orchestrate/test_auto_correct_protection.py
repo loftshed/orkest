@@ -86,7 +86,7 @@ class ProtectionRunnerTests(unittest.TestCase):
                 (gate / "keep.txt").write_text("tampered\n")
                 self.assertTrue(RUNNER.gate_changed(gate, baseline, releases=[child]))
 
-    def test_resumed_symlink_releases_expand_legacy_and_zero_round_authority(self):
+    def test_resumed_releases_never_follow_a_released_link_to_its_gate(self):
         f = self.fixture
         for source in ("legacy", "zero-round"):
             with self.subTest(source=source):
@@ -104,7 +104,6 @@ class ProtectionRunnerTests(unittest.TestCase):
                 )
                 if source == "legacy":
                     first["auto_correct"]["released_paths"] = [f"{prefix}/check.sh"]
-                    first["auto_correct"].pop("gate_links", None)
                 else:
                     first["steering"] = {
                         "steers": [{"status": "accepted", "added_allow_paths": [f"{prefix}/check.sh"]}]
@@ -124,10 +123,9 @@ class ProtectionRunnerTests(unittest.TestCase):
                     ],
                     extra_env=edit(f"{prefix}/real-check.sh", "exit 0\n"),
                 )
-                self.assertEqual((code, result["status"]), (0, "completed"))
-                self.assertEqual(
-                    result["auto_correct"]["released_paths"], [f"{prefix}/check.sh", f"{prefix}/real-check.sh"]
-                )
+                self.assertEqual((code, result["status"]), (22, "scope_violation"))
+                self.assertEqual(result["scope_violations"], [f"gate-edit:{prefix}/real-check.sh"])
+                self.assertEqual(result["auto_correct"]["released_paths"], [f"{prefix}/check.sh"])
 
     def test_protected_directory_records_nested_symlink_targets(self):
         f = self.fixture
@@ -421,7 +419,7 @@ class ProtectionSteerTests(unittest.TestCase):
         result = self.steer(job, "allowed/tests/new/sub/child.txt")
         self.assertEqual((result["exit_code"], result["status"], result["scope_violations"]), (0, "completed", []))
 
-    def test_resume_does_not_add_worker_planted_descendant_to_saved_links(self):
+    def test_resume_keeps_a_worker_planted_link_release_lexical(self):
         f = self.fixture
         seed(f, {"allowed/tests/child.txt": "old\n", "allowed/target.txt": "work\n"})
         job = f.launch_auto_correct(
@@ -438,7 +436,7 @@ class ProtectionSteerTests(unittest.TestCase):
         result = self.steer(job, "allowed/tests/child.txt", plant_link)
         self.assertEqual((result["exit_code"], result["status"]), (0, "completed"))
         self.assertEqual(result["auto_correct"]["released_paths"], ["allowed/tests/child.txt"])
-        self.assertEqual(result["auto_correct"]["gate_links"], {}, result["auto_correct"])
+        self.assertNotIn("gate_links", result["auto_correct"])
         runner = fixtures.RunnerIntegrationTests()
         runner.__dict__.update(f.__dict__)
         code, resumed, *_ = runner.run_main(
@@ -481,7 +479,7 @@ class ProtectionSteerTests(unittest.TestCase):
         self.assertEqual((code, resumed["status"]), (22, "scope_violation"), resumed.get("error"))
         self.assertEqual(resumed["scope_violations"], ["gate-edit:allowed/tests"])
 
-    def test_releasing_a_symlink_gate_releases_its_target(self):
+    def test_releasing_a_symlink_gate_keeps_its_target_protected(self):
         f = self.fixture
         seed(f, {"allowed/real-check.sh": "exit 1\n"})
         (f.repository.path / "allowed/check.sh").symlink_to("real-check.sh")
@@ -492,10 +490,13 @@ class ProtectionSteerTests(unittest.TestCase):
             "sh allowed/check.sh",
         )
         result = self.steer(job, "allowed/check.sh")
-        self.assertEqual((result["exit_code"], result["status"], result["scope_violations"]), (0, "completed", []))
-        self.assertEqual(result["auto_correct"]["released_paths"], ["allowed/check.sh", "allowed/real-check.sh"])
+        self.assertEqual(
+            (result["exit_code"], result["status"], result["scope_violations"]),
+            (22, "scope_violation", ["gate-edit:allowed/real-check.sh"]),
+        )
+        self.assertEqual(result["auto_correct"]["released_paths"], ["allowed/check.sh"])
 
-    def test_release_uses_the_recorded_target_even_after_the_link_was_retargeted(self):
+    def test_retargeting_a_released_link_never_frees_its_old_target(self):
         f = self.fixture
         seed(f, {"allowed/real-check.sh": "exit 1\n", "allowed/pass-check.sh": "exit 0\n"})
         link = f.repository.path / "allowed/check.sh"
@@ -512,8 +513,11 @@ class ProtectionSteerTests(unittest.TestCase):
             link.symlink_to("pass-check.sh")
 
         result = self.steer(job, "allowed/check.sh", retarget)
-        self.assertEqual((result["exit_code"], result["status"], result["scope_violations"]), (0, "completed", []))
-        self.assertEqual(result["auto_correct"]["released_paths"], ["allowed/check.sh", "allowed/real-check.sh"])
+        self.assertEqual(
+            (result["exit_code"], result["status"], result["scope_violations"]),
+            (22, "scope_violation", ["gate-edit:allowed/real-check.sh"]),
+        )
+        self.assertEqual(result["auto_correct"]["released_paths"], ["allowed/check.sh"])
 
 
 class ProtectionCoordinatorTests(unittest.TestCase):
@@ -528,7 +532,7 @@ class ProtectionCoordinatorTests(unittest.TestCase):
     def result(self, run):
         return coordination.COORDINATOR.read(Path(run["result_path"]))
 
-    def test_native_resume_expands_saved_and_zero_round_symlink_releases(self):
+    def test_native_resume_never_follows_saved_or_zero_round_released_links(self):
         for source in ("saved", "legacy", "zero-round"):
             with self.subTest(source=source):
                 if source != "saved":
@@ -564,9 +568,6 @@ class ProtectionCoordinatorTests(unittest.TestCase):
                 first = self.result(finished)
                 if source != "zero-round":
                     first["auto_correct"]["released_paths"] = ["allowed/check.sh"]
-                    if source == "legacy":
-                        first["auto_correct"].pop("gate_links", None)
-                        first["auto_correct"].pop("gate_roots", None)
                 else:
                     first["steering"] = {"steers": [{"status": "accepted", "added_allow_paths": ["allowed/check.sh"]}]}
                 Path(finished["result_path"]).write_text(json.dumps(first))
@@ -593,12 +594,10 @@ class ProtectionCoordinatorTests(unittest.TestCase):
                 code, finished = c.native_round(
                     run, "corr", {"allowed/real-check.sh": "exit 0\n"}, "allowed/real-check.sh", handle="session"
                 )
-                self.assertEqual(code, 0, finished)
                 result = self.result(finished)
-                self.assertEqual((result["exit_code"], result["status"]), (0, "completed"))
-                self.assertEqual(
-                    result["auto_correct"]["released_paths"], ["allowed/check.sh", "allowed/real-check.sh"]
-                )
+                self.assertEqual((result["exit_code"], result["status"]), (22, "scope_violation"), (code, finished))
+                self.assertEqual(result["scope_violations"], ["gate-edit:allowed/real-check.sh"])
+                self.assertEqual(result["auto_correct"]["released_paths"], ["allowed/check.sh"])
 
     def test_executor_correction_protects_its_first_turn(self):
         c, f = self.coordinator, self.fixture

@@ -222,7 +222,7 @@ class AutoCorrectUnitTests(unittest.TestCase):
         self.assertFalse(released("allowed/check.sh", ["allow"]))
         self.assertFalse(released("allowed/check.sh", []))
 
-    def test_link_cycles_are_bounded_and_releasing_a_child_does_not_release_its_parent(self) -> None:
+    def test_link_cycles_are_bounded(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = self.repository(directory, ("gates/check.sh", "gates/sibling.sh"))
             (repo / "gates/loop").symlink_to(".")
@@ -231,58 +231,14 @@ class AutoCorrectUnitTests(unittest.TestCase):
             (repo / "cycle2").symlink_to("cycle1")
             self.assertEqual(AUTO_CORRECT.protected_paths(["gates"], repo), ["gates", "gates/loop"])
             self.assertEqual(AUTO_CORRECT.protected_paths(["cycle1"], repo), ["cycle1", "cycle2"])
-            links = AUTO_CORRECT.protected_links(AUTO_CORRECT.protected_paths(["alias"], repo), repo)
-            self.assertEqual(
-                AUTO_CORRECT.release_paths(["alias/check.sh"], repo, links=links), ["alias/check.sh", "gates/check.sh"]
-            )
+            self.assertEqual(AUTO_CORRECT.protected_paths(["alias"], repo), ["alias", "gates", "gates/loop"])
 
-    def test_releasing_a_directory_alias_keeps_nested_links_targets_protected(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            repo = self.repository(directory, ("gates/plain.sh", "target.sh"))
-            (repo / "gates/check.sh").symlink_to("../target.sh")
-            (repo / "alias").symlink_to("gates")
-            protected = AUTO_CORRECT.protected_paths(["alias"], repo)
-            links = AUTO_CORRECT.protected_links(protected, repo)
-            self.assertEqual(
-                AUTO_CORRECT.release_paths(["alias"], repo, links=links),
-                ["alias", "gates"],
-            )
-            self.assertEqual(AUTO_CORRECT.release_paths(["."], repo, links=links), ["."])
-
-    def test_release_ignores_live_links_absent_from_the_snapshot(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            repo = self.repository(directory, ("child.txt", "other.txt"))
-            (repo / "child.txt").rename(repo / "original.txt")
-            (repo / "child.txt").symlink_to("other.txt")
-            self.assertEqual(AUTO_CORRECT.release_paths(["child.txt"], repo, links={}), ["child.txt"])
-            self.assertEqual(
-                AUTO_CORRECT.release_paths(["child.txt"], repo, links={"child.txt": "original.txt"}),
-                ["child.txt", "original.txt"],
-            )
-
-    def test_independent_gate_requires_its_own_explicit_release(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            repo = self.repository(directory, ("check.sh",))
-            (repo / "alias.sh").symlink_to("check.sh")
-            links = {"alias.sh": "check.sh"}
-            independent = ["alias.sh", "check.sh"]
-            self.assertEqual(
-                AUTO_CORRECT.release_paths(["alias.sh"], repo, links=links, independent=independent), ["alias.sh"]
-            )
-            self.assertEqual(
-                AUTO_CORRECT.release_paths(["alias.sh", "check.sh"], repo, links=links, independent=independent),
-                ["alias.sh", "check.sh"],
-            )
-
-    def test_releasing_a_link_child_expands_its_nongate_target(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            repo = self.repository(directory, ("target.sh",))
-            self.assertEqual(
-                AUTO_CORRECT.release_paths(
-                    ["gates/link.sh"], repo, links={"gates/link.sh": "../target.sh"}, independent=["gates"]
-                ),
-                ["gates/link.sh", "target.sh"],
-            )
+    def test_releases_are_exactly_the_named_paths_and_never_follow_links(self) -> None:
+        release = AUTO_CORRECT.release_paths
+        self.assertEqual(release(["alias/check.sh"]), ["alias/check.sh"])
+        self.assertEqual(release(["alias", "alias", "gates/link.sh"]), ["alias", "gates/link.sh"])
+        self.assertEqual(release(["alias.sh", "."]), ["."])
+        self.assertEqual(release([]), [])
 
     def test_directory_gate_baselines_exclude_released_children_but_keep_modes_and_siblings(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
