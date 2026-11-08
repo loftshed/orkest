@@ -66,6 +66,7 @@ async function fixture() {
       existing = {
         run_id: `run-${task.runs.length + 1}`,
         request_id: request,
+        kind: args[args.indexOf("--kind") + 1],
         status: "active",
         transport: args[args.indexOf("--transport") + 1],
         engine: args[args.indexOf("--engine") + 1],
@@ -1749,5 +1750,349 @@ describe("SQLite room persistence", () => {
     expect(observed.conductor.herdrPaneId).toBeUndefined();
     expect(observed.conductor.herdrWorkspaceId).toBeUndefined();
     expect(observed.conductor.herdrEndpoint).toBeUndefined();
+  });
+});
+
+describe("bounded room continuations", () => {
+  it("projects the latest request while retaining the first request and old records", async () => {
+    const { root, room, taskDir, task, run } = await fixture();
+    await dispatchMember(room.id, "haiku-1", { root, taskDir, run, requestId: "first" });
+    task.runs[0].status = "finished";
+    task.runs[0].runner_status = "completed";
+    task.decisions.push({ run_id: "run-1", decision: "accept" });
+    task.runs.push({
+      ...task.runs[0],
+      run_id: "run-2",
+      request_id: "second",
+      kind: "continue",
+      resume_result: task.runs[0].result_path,
+      result_path: path.join(taskDir, "second-result.json"),
+      status: "active",
+      task_spec: { objective: "Second bounded task" },
+    });
+    await writeFile(path.join(taskDir, "task.json"), JSON.stringify(task));
+    const observed = await observeRoom(room.id, { root, discoverNativePeers: false });
+    expect(observed.agents[0]).toMatchObject({
+      runId: "run-2",
+      status: "running",
+      verdict: "pending",
+      objective: "Second bounded task",
+    });
+    expect(observed.agents[0].runHistory.map((entry) => entry.request_id)).toEqual([
+      "first",
+      "second",
+    ]);
+    expect((await readRoom(room.id, root)).agents[0].dispatch.requestId).toBe("first");
+    task.runs[1].status = "finished";
+    task.decisions.push({ run_id: "run-2", decision: "accept" });
+    await writeFile(path.join(taskDir, "task.json"), JSON.stringify(task));
+    expect((await observeRoom(room.id, { root })).agents[0].status).toBe("completed");
+  });
+
+  it("dispatches continue in the same task, inherits transport and retries a lost response", async () => {
+    const { root, room, taskDir, task, run } = await fixture();
+    await dispatchMember(room.id, "haiku-1", {
+      root,
+      taskDir,
+      run,
+      requestId: "first",
+      transport: "native",
+    });
+    task.runs[0].status = "finished";
+    task.decisions.push({ run_id: "run-1", decision: "accept" });
+    const taskSpec = path.join(taskDir, "followup.json");
+    await writeFile(taskSpec, JSON.stringify({ objective: "Follow up" }));
+    let shouldLoseResponse = true;
+    const calls = [];
+    const resume = async (args) => {
+      calls.push(args);
+      const result = await run(args);
+      if (args[0] === "dispatch") {
+        const stored = task.runs.find((entry) => entry.request_id === "second");
+        stored.engine = "claude";
+        result.engine = "claude";
+        if (shouldLoseResponse) {
+          shouldLoseResponse = false;
+          throw new Error("lost continue response");
+        }
+      }
+      return result;
+    };
+    const options = { root, taskDir, taskSpec, run: resume, kind: "continue", requestId: "second" };
+    await expect(dispatchMember(room.id, "haiku-1", options)).rejects.toThrow(
+      "lost continue response",
+    );
+    expect((await readRoom(room.id, root)).agents[0].dispatch.requestId).toBe("second");
+    const continued = await dispatchMember(room.id, "haiku-1", options);
+    expect(continued.dispatch).toMatchObject({
+      run_id: "run-2",
+      request_id: "second",
+      transport: "native",
+    });
+    expect(task.runs.map((entry) => entry.request_id)).toEqual(["first", "second"]);
+    const sent = calls.find((args) => args[0] === "dispatch");
+    // The task spec is passed canonically (macOS temp folders sit behind /var -> /private/var).
+    expect(sent.slice(sent.indexOf("--task-spec"))).toEqual([
+      "--task-spec",
+      await realpath(taskSpec),
+    ]);
+    expect(sent).not.toContain("--engine");
+    expect(sent).not.toContain("--model");
+    expect(sent).not.toContain("--effort");
+    const observed = await observeRoom(room.id, { root, run: resume, discoverNativePeers: false });
+    expect(observed.agents[0]).toMatchObject({ runId: "run-2", status: "running" });
+  });
+
+  it.each([
+    ["active", false],
+    ["finished", false],
+    ["finished", true],
+  ])("treats an implicit continue after %s as new work (new path: %s)", async (status, newPath) => {
+    const { root, room, taskDir, task, run } = await fixture();
+    await dispatchMember(room.id, "haiku-1", { root, taskDir, run, requestId: "first" });
+    task.runs[0].status = "finished";
+    task.decisions.push({ run_id: "run-1", decision: "reject" });
+    const taskSpec = path.join(taskDir, "followup.json");
+    await writeFile(taskSpec, "{}");
+    const resume = async (args) => {
+      if (
+        args[0] === "dispatch" &&
+        task.runs.every((entry) => entry.request_id !== args[args.indexOf("--request-id") + 1])
+      ) {
+        const previous = task.runs.at(-1);
+        if (
+          previous.status !== "finished" ||
+          task.decisions.every((entry) => entry.run_id !== previous.run_id)
+        )
+          throw new Error("continue requires the previous run to be finished and reviewed");
+      }
+      const result = await run(args);
+      if (args[0] === "dispatch") {
+        task.runs.at(-1).engine = "claude";
+        result.engine = "claude";
+      }
+      return result;
+    };
+    await dispatchMember(room.id, "haiku-1", {
+      root,
+      taskDir,
+      taskSpec,
+      run: resume,
+      kind: "continue",
+    });
+    task.runs[1].status = status;
+    const nextSpec = newPath ? path.join(taskDir, "next.json") : taskSpec;
+    await writeFile(nextSpec, JSON.stringify({ objective: "Next bounded task" }));
+    await expect(
+      dispatchMember(room.id, "haiku-1", {
+        root,
+        taskDir,
+        taskSpec: nextSpec,
+        run: resume,
+        kind: "continue",
+      }),
+    ).rejects.toThrow("continue requires the previous run to be finished and reviewed");
+    expect(task.runs.map((entry) => entry.run_id)).toEqual(["run-1", "run-2"]);
+  });
+
+  it.each(["verification", "correction"])(
+    "continues after a reviewed %s descendant and keeps the member's chain",
+    async (kind) => {
+      const { root, room, taskDir, task, run } = await fixture();
+      await dispatchMember(room.id, "haiku-1", { root, taskDir, run, requestId: "first" });
+      task.runs[0].status = "finished";
+      task.decisions.push({ run_id: "run-1", decision: "reject" });
+      const taskSpec = path.join(taskDir, "followup.json");
+      await writeFile(taskSpec, "{}");
+      const resume = async (args) => {
+        const previous = task.runs.at(-1);
+        const result = await run(args);
+        if (args[0] === "dispatch") {
+          Object.assign(task.runs.at(-1), {
+            engine: "claude",
+            resume_result: previous.result_path,
+            result_path: path.join(taskDir, `${result.run_id}.json`),
+          });
+          Object.assign(result, task.runs.at(-1));
+        }
+        return result;
+      };
+      await dispatchMember(room.id, "haiku-1", {
+        root,
+        taskDir,
+        taskSpec,
+        run: resume,
+        kind: "continue",
+      });
+      task.runs[1].status = "finished";
+      task.runs.push({
+        ...task.runs[1],
+        run_id: "reviewed-descendant",
+        request_id: "descendant",
+        kind,
+        transport: kind === "verification" ? "host_checks" : "executor",
+        verification_of: kind === "verification" ? "run-2" : undefined,
+        resume_result: kind === "correction" ? task.runs[1].result_path : undefined,
+        result_path: path.join(taskDir, "descendant.json"),
+      });
+      task.decisions.push({ run_id: "reviewed-descendant", decision: "reject" });
+      await writeFile(taskSpec, JSON.stringify({ objective: "Next task" }));
+      const continued = await dispatchMember(room.id, "haiku-1", {
+        root,
+        taskDir,
+        taskSpec,
+        run: resume,
+        kind: "continue",
+      });
+      expect(continued.dispatch.run_id).toBe("run-4");
+      await writeFile(path.join(taskDir, "task.json"), JSON.stringify(task));
+      const observed = await observeRoom(room.id, { root, discoverNativePeers: false });
+      expect(observed.agents[0].runHistory.map((entry) => entry.run_id)).toEqual([
+        "run-1",
+        "run-2",
+        "reviewed-descendant",
+        "run-4",
+      ]);
+    },
+  );
+
+  it("keeps a same-engine consultation and another member out of the bound run chain", async () => {
+    const { root, room, taskDir, task, run } = await fixture();
+    await dispatchMember(room.id, "haiku-1", { root, taskDir, run, requestId: "first" });
+    Object.assign(task.runs[0], {
+      status: "finished",
+      task_spec: { objective: "Member objective" },
+    });
+    task.decisions.push({ run_id: "run-1", decision: "accept" });
+    for (const kind of ["consultation", "implementation"]) {
+      task.runs.push({
+        ...task.runs[0],
+        run_id: kind,
+        request_id: kind,
+        kind,
+        resume_result: task.runs[0].result_path,
+        result_path: path.join(taskDir, `${kind}.json`),
+        task_spec: { objective: "Other objective" },
+      });
+      task.decisions.push({ run_id: kind, decision: "reject" });
+    }
+    await writeFile(path.join(taskDir, "task.json"), JSON.stringify(task));
+    const observed = await observeRoom(room.id, { root, discoverNativePeers: false });
+    expect(observed.agents[0]).toMatchObject({
+      runId: "run-1",
+      status: "completed",
+      verdict: "accept",
+      objective: "Member objective",
+    });
+    expect(observed.agents[0].runHistory.map((entry) => entry.run_id)).toEqual(["run-1"]);
+  });
+
+  it.each(["-1", "7", "1.5", "unlimited"])(
+    "rejects init-task cap %s before calling the coordinator",
+    async (value) => {
+      const root = await directory();
+      const calls = [];
+      for (const option of [["--max-continues", value], [`--max-continues=${value}`]]) {
+        await expect(
+          roomsCommand(
+            [
+              "init-task",
+              "--task-spec",
+              "spec.json",
+              "--task-dir",
+              "task",
+              "--host",
+              "claude",
+              ...option,
+            ],
+            {
+              root,
+              run: async (args) => {
+                calls.push(args);
+                return { status: "active" };
+              },
+            },
+          ),
+        ).rejects.toThrow("--max-continues must be an integer from 0 to 6 (hard ceiling 6)");
+      }
+      expect(calls).toEqual([]);
+    },
+  );
+
+  it("restores the previous dispatch when continue is refused before launch", async () => {
+    const { root, room, taskDir, task, run } = await fixture();
+    await dispatchMember(room.id, "haiku-1", { root, taskDir, run, requestId: "first" });
+    const taskSpec = path.join(taskDir, "followup.json");
+    await writeFile(taskSpec, "{}");
+    const refusing = async (args) => {
+      if (args[0] === "dispatch") throw new Error("previous run is unreviewed");
+      return run(args);
+    };
+    await expect(
+      dispatchMember(room.id, "haiku-1", {
+        root,
+        taskDir,
+        taskSpec,
+        run: refusing,
+        kind: "continue",
+        requestId: "second",
+      }),
+    ).rejects.toThrow("previous run is unreviewed");
+    const saved = (await readRoom(room.id, root)).agents[0];
+    expect(saved.dispatch).toMatchObject({ requestId: "first", runId: "run-1" });
+    expect(task.runs.map((entry) => entry.request_id)).toEqual(["first"]);
+    expect((await observeRoom(room.id, { root, run })).agents[0].status).toBe("running");
+  });
+
+  it("forwards per-member caps from both CLI entry points and rejects values above six", async () => {
+    const { root, room, taskDir, run } = await fixture();
+    const calls = [];
+    const record = async (args) => {
+      calls.push(args);
+      if (args[0] === "init") return { status: "active" };
+      return run(args);
+    };
+    const stdout = { write() {} };
+    await roomsCommand(
+      [
+        "init-task",
+        "--task-dir",
+        taskDir,
+        "--task-spec",
+        path.join(taskDir, "spec.json"),
+        "--host",
+        "claude",
+        "--max-continues",
+        "6",
+        "--invocation-allowance",
+        "8",
+      ],
+      { root, run: record, stdout },
+    );
+    expect(calls[0].slice(-4)).toEqual(["--max-continues", "6", "--invocation-allowance", "8"]);
+    await roomsCommand(
+      [
+        "dispatch",
+        "--room",
+        room.id,
+        "--member",
+        "haiku-1",
+        "--task-dir",
+        taskDir,
+        "--max-continues",
+        "5",
+      ],
+      { root, run: record, stdout },
+    );
+    expect((await readRoom(room.id, root)).agents[0].dispatch.maxContinues).toBe(5);
+    expect(calls.find((args) => args[0] === "dispatch").slice(-2)).toEqual([
+      "--max-continues",
+      "5",
+    ]);
+    for (const maxContinues of [7, -1, "unlimited", 1.5]) {
+      await expect(
+        dispatchMember(room.id, "luna-1", { root, taskDir, run, maxContinues }),
+      ).rejects.toThrow("hard ceiling 6");
+    }
   });
 });

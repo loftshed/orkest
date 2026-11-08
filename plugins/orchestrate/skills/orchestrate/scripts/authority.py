@@ -38,7 +38,7 @@ HARNESS_HOST = {"claude": "claude", "codex": "codex", "gemini": "agy", "agy": "a
 LIVE_RUN = {"dispatching", "reserved", "active", "uncertain"}
 # Coordinator actions hold the team lock only briefly; an authority change waits at most this long.
 LOCK_WAIT_SECONDS = 30.0
-WRITING_KINDS = {"implementation", "correction", "verification"}
+WRITING_KINDS = {"implementation", "correction", "verification", "continue"}
 
 
 class AuthorityError(ValueError):

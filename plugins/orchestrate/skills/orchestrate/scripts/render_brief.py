@@ -233,6 +233,11 @@ def validate_spec(spec: dict[str, Any]) -> dict[str, Any]:
             result["auto_correct"] = _auto_correct_module().validate_rounds(spec["auto_correct"], name="auto_correct")
         except ValueError as exc:
             raise BriefSpecError(str(exc)) from exc
+    if "max_continues" in spec:
+        value = spec["max_continues"]
+        if type(value) is not int or not 0 <= value <= 6:
+            raise BriefSpecError("max_continues must be an integer from 0 to 6 (hard ceiling 6)")
+        result["max_continues"] = value
     return result
 
 
