@@ -112,6 +112,16 @@ class ProgressTests(unittest.TestCase):
         result = self.command("--goal", "G", "--task", "T", "--stage", "working")
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_a_cleared_parent_can_report_for_its_predecessors_subagent(self):
+        self.register("new-parent", "claude")
+        mailbox.annotate(self.base, "new-parent", nativeSessions=["old-parent"], clearedFrom="old-parent")
+        self.register("subagent-c3", "claude")
+        mailbox.annotate(self.base, "subagent-c3", parentSession="old-parent")
+        self.peer = mailbox.load(mailbox.peer_path(self.base, "subagent-c3"))
+        self.caller(CLAUDECODE="1", CLAUDE_CODE_SESSION_ID="new-parent")
+        result = self.command("--goal", "G", "--task", "T", "--stage", "working")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_a_parent_can_report_for_its_subagent_and_a_dead_session_stays_reachable(self):
         self.register("parent-session", "claude")
         for session, pid, parent in (("subagent-a1", os.getpid(), "parent-session"), ("gone-session", 99999999, None)):

@@ -988,9 +988,14 @@ export async function dispatchMember(id, memberId, options = {}) {
       const agent = memberOf(current, memberId);
       // A concurrent refused dispatch of this member may have cleared the intent; this one launched.
       agent.dispatch ||= binding;
-      agent.dispatch.runId = result.run_id;
-      delete agent.dispatch.restore;
-      delete agent.dispatchError;
+      // A delayed response must not touch a newer dispatch that has since taken this member.
+      if (agent.dispatch.requestId === binding.requestId) {
+        agent.dispatch.runId = result.run_id;
+        delete agent.dispatch.restore;
+        delete agent.dispatchError;
+      } else if (agent.dispatch.restore?.dispatch?.requestId === binding.requestId) {
+        agent.dispatch.restore.dispatch.runId = result.run_id;
+      }
       return current;
     },
     { root },

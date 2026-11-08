@@ -164,7 +164,7 @@ export function openOrkestSqlite(
 
   try {
     if (!readOnly) {
-      const journalMode = readPragma(db, "PRAGMA journal_mode = WAL").journal_mode;
+      const journalMode = enableWalMode(db, timeout);
       if (journalMode !== "wal") {
         throw new Error(`Could not enable SQLite WAL mode for ${dbPath}; received ${journalMode}.`);
       }
@@ -191,6 +191,20 @@ export function openOrkestSqlite(
   } catch (error) {
     db.close();
     throw error;
+  }
+}
+
+/** Switch to WAL, retrying because SQLite can skip the busy timeout when connections race on a new database. */
+export function enableWalMode(db, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  const signal = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return readPragma(db, "PRAGMA journal_mode = WAL").journal_mode;
+    } catch (error) {
+      if (!isSqliteBusyError(error) || Date.now() >= deadline) throw error;
+      waitBeforeRetry(signal, 5, Math.min(attempt, 4));
+    }
   }
 }
 

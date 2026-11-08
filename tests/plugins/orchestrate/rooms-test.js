@@ -2490,6 +2490,36 @@ describe("bounded room continuations", () => {
     expect(next.dispatch.run_id).not.toBe(launched.run_id);
   });
 
+  it("keeps a newer dispatch when an older launch reports late", async () => {
+    const { root, room, taskDir, task, run } = await fixture();
+    await dispatchMember(room.id, "haiku-1", { root, taskDir, run, requestId: "first" });
+    task.runs[0].status = "finished";
+    task.decisions.push({ run_id: "run-1", decision: "accept" });
+    const taskSpec = path.join(taskDir, "followup.json");
+    await writeFile(taskSpec, JSON.stringify({ objective: "Follow up" }));
+    const { promise: answered, resolve: answer } = Promise.withResolvers();
+    const delayed = async (args) => {
+      const result = await run(args);
+      if (args[0] === "dispatch") await answered;
+      return result;
+    };
+    const options = { root, taskDir, taskSpec, kind: "continue" };
+    const late = dispatchMember(room.id, "haiku-1", { ...options, run: delayed, requestId: "one" });
+    await vi.waitFor(() => {
+      expect(task.runs.some((entry) => entry.request_id === "one")).toBe(true);
+    });
+    const older = task.runs.find((entry) => entry.request_id === "one");
+    older.status = "finished";
+    task.decisions.push({ run_id: older.run_id, decision: "accept" });
+    const newer = await dispatchMember(room.id, "haiku-1", { ...options, run, requestId: "two" });
+    answer();
+    await late;
+    expect((await readRoom(room.id, root)).agents[0].dispatch).toMatchObject({
+      requestId: "two",
+      runId: newer.dispatch.run_id,
+    });
+  });
+
   it("restores the previous dispatch when continue is refused before launch", async () => {
     const { root, room, taskDir, task, run } = await fixture();
     await dispatchMember(room.id, "haiku-1", { root, taskDir, run, requestId: "first" });
