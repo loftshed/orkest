@@ -610,10 +610,10 @@ def main() -> int:
         args.native_status
         and session
         and not args.tmux
-        and (agent_terminal.bind(session, args.harness, payload) or agent_terminal.herdr_context(args.harness))
-        and (agent_terminal.context(args.harness) or agent_terminal.herdr_context(args.harness))
+        and agent_terminal.bind(session, args.harness, payload)
+        and agent_terminal.context(args.harness)
     ):
-        return 0  # Herdr or the private tmux footer draws the identity.
+        return 0  # The private tmux footer draws the identity. Inside Herdr the harness keeps its own bar too.
     if not session or not (item := identity(session, args.harness, payload)):
         if args.tmux:
             if args.line == 2:

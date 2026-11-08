@@ -894,7 +894,7 @@ class TerminalTests(unittest.TestCase):
             self.assertEqual(stored["herdrSyncedTitle"], "working · Sync title| snorfle-test-high-footer-aa")
             self.assertEqual(stored["herdrBinary"], "/usr/local/bin/herdr")
 
-            # Herdr draws the label, so the native statusline emits no duplicate.
+            # Herdr labelling the pane must never blank the harness's own bar.
             herdr_status_out = subprocess.check_output(
                 [
                     sys.executable,
@@ -912,7 +912,7 @@ class TerminalTests(unittest.TestCase):
                 env={**herdr_env, "HERDR_BIN_PATH": "/nonexistent/herdr"},
                 text=True,
             )
-            self.assertEqual(herdr_status_out, "")
+            self.assertEqual(json.loads(herdr_status_out)["name"], "snorfle")
 
             # Subagent peer is refused by bind()
             sub_session = "herdr-subagent"

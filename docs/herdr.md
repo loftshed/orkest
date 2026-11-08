@@ -24,7 +24,7 @@ Preview, focus, and mailbox delivery verify the native conversation at its Herdr
 mailbox wake goes to an idle or done agent. If Herdr cannot confirm a submission, the message
 stays queued. Orkest reports `<harness icon> <full agent name>` and `<stage> · <task>` as display metadata
 guarded by the pane's agent kind, without an expiry. Idle agents keep their labels; Herdr clears the
-metadata when the agent exits or changes. Native harness status lines yield to Herdr inside its panes.
+metadata when the agent exits or changes. Native harness status lines keep drawing their own bar inside Herdr panes; Herdr's labels add to it.
 Set `ORK_GLYPHS=nerd` (default), `unicode`, or `ascii` to choose icons. While running inside Herdr, Horde View subscribes to Herdr lifecycle events over the
 server socket to invalidate cached state and reconcile on reconnect or `events_lost`.
 
