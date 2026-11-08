@@ -189,17 +189,17 @@ def normalize_repo_paths(values: list[str], *, option: str, allow_root: bool = F
     normalized: list[str] = []
     for value in values:
         stripped = value.strip()
-        candidate = Path(value)
-        # `./` and `.//` name the root too, once pathlib has normalised them.
+        candidate = Path(stripped)
+        # pathlib reduces `./`, `.//` and an empty string to `.`, so an empty value is refused first.
         clean = candidate.as_posix().rstrip("/")
-        if allow_root and "." in (stripped, clean):
+        if stripped and allow_root and clean == ".":
             if "." not in normalized:
                 normalized.append(".")
             continue
         if (
-            candidate.is_absolute()
-            or stripped in {"", "."}
-            or clean in {"", "."}
+            not stripped
+            or candidate.is_absolute()
+            or clean == "."
             or ".." in candidate.parts
             or (candidate.parts and candidate.parts[0] == ".git")
         ):

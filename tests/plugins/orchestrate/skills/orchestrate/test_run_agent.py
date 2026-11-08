@@ -257,12 +257,17 @@ class PathScopeTests(unittest.TestCase):
         for root in (".", "./", ".//"):
             with self.subTest(root=root):
                 self.assertEqual(RUNNER.normalize_repo_paths([root], option="--allow-path", allow_root=True), ["."])
+        for empty in ("", "   "):
+            with self.subTest(empty=empty), self.assertRaises(RUNNER.RunnerError):
+                RUNNER.normalize_repo_paths([empty], option="--allow-path", allow_root=True)
+        self.assertEqual(RUNNER.normalize_repo_paths([" src/jobs/ "], option="--allow-path"), ["src/jobs"])
 
     def test_rejects_root_absolute_and_parent_paths(self) -> None:
         for invalid in (
             ".",
             "./",
             ".//",
+            " ./ ",
             "",
             "/tmp/out",
             "../outside",
