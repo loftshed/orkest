@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.76.1
+
+- fix(orchestrate): keep each harness's own status bar inside Herdr (#146)
+
 ## 0.76.0
 
 - feat(orchestrate): capped continue dispatch kind; member status follows the latest run (#138)
