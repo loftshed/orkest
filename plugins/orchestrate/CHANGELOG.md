@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.76.4
+
+- fix(orchestrate): late launches, cleared parents, and concurrent database opens (#153)
+
 ## 0.76.3
 
 - fix(orchestrate): refuse progress updates for another agent's session (#151)
