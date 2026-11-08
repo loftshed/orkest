@@ -2026,10 +2026,7 @@ describe("bounded room continuations", () => {
     task.decisions.push({ run_id: "run-1", decision: "accept" });
     const taskSpec = path.join(taskDir, "followup.json");
     await writeFile(taskSpec, JSON.stringify({ objective: "Follow up" }));
-    let release;
-    const launched = new Promise((resolve) => {
-      release = resolve;
-    });
+    const { promise: launched, resolve: release } = Promise.withResolvers();
     const slow = async (args) => {
       if (args[0] === "dispatch") await launched;
       return run(args);
