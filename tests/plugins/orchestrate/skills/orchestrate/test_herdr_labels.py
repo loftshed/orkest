@@ -469,7 +469,7 @@ class DiscoveryTests(unittest.TestCase):
             [call[:2] for call in self.calls], [["pane", "list"], ["pane", "report-metadata"], ["pane", "list"]]
         )
 
-    def test_native_labels_yield_to_herdr_for_all_native_adapters(self):
+    def test_native_labels_stay_visible_inside_herdr_for_all_native_adapters(self):
         import agent_statusline
 
         for harness in ("claude", "gemini", "opencode"):
@@ -483,7 +483,7 @@ class DiscoveryTests(unittest.TestCase):
                 mock.patch.object(sys, "stdout", io.StringIO()) as output,
             ):
                 self.assertEqual(agent_statusline.main(), 0)
-                self.assertEqual(output.getvalue(), "")
+                self.assertTrue(output.getvalue().startswith("snorfle | "), output.getvalue())
             with (
                 mock.patch.object(sys, "argv", argv),
                 mock.patch.dict(os.environ, {"HERDR_ENV": "0"}),
@@ -622,3 +622,75 @@ class SymlinkedTempStatusCommandTests(StatusCommandTests):
         alias.symlink_to(root, target_is_directory=True)
         self.enterContext(mock.patch.object(tempfile, "tempdir", str(alias)))
         super().setUp()
+
+
+class HarnessBarInsideHerdrTests(unittest.TestCase):
+    """Herdr's labels add to a harness's own status bar. They must never replace it."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.home = Path(temp.name).resolve()
+        self.base = self.home / "mailbox-v1"
+        self.calls = self.home / "herdr-calls"
+        self.binary = self.home / "herdr"
+        self.socket = self.home / "herdr.sock"
+        self.socket.touch()
+        self.env = {
+            **{key: value for key, value in os.environ.items() if not key.startswith(("HERDR_", "ORKEST_", "TMUX"))},
+            "AGENT_EXECUTOR_HOME": str(self.home),
+            "XDG_CONFIG_HOME": str(self.home),
+            "HERDR_ENV": "1",
+            "HERDR_PANE_ID": "w3:p2",
+            "HERDR_WORKSPACE_ID": "w3",
+            "HERDR_SOCKET_PATH": str(self.socket),
+            "HERDR_BIN_PATH": str(self.binary),
+            "ORKEST_TEST_ALLOW_HERDR": "1",
+            "ORK_GLYPHS": "ascii",
+            "NO_COLOR": "1",
+        }
+        self.enterContext(mock.patch.dict(os.environ, self.env, clear=True))
+        self.fake_herdr(0)
+
+    def fake_herdr(self, status):
+        """Answer `agent get` as Herdr does, for the session under test, and record every call."""
+        info = '{"result":{"type":"agent_info","agent":{"agent_session":{"agent":"%s","source":"herdr:%s","kind":"id","value":"%s"}}}}'
+        self.binary.write_text(
+            "#!/bin/sh\n"
+            f'printf "%s\\n" "$*" >> "{self.calls}"\n'
+            f'if [ "$1 $2" = "agent get" ]; then printf \'{info}\\n\' "$FAKE_KIND" "$FAKE_KIND" "$FAKE_SESSION"; '
+            "else printf '{\"result\":{}}\\n'; fi\n"
+            f"exit {status}\n"
+        )
+        self.binary.chmod(0o755)
+
+    def status(self, harness):
+        session = "bar-" + harness
+        mailbox.register(self.base, session=session, harness=harness, cwd=str(self.home), pid=os.getpid())
+        mailbox.annotate(self.base, session, name="snorfle-test-high-bar-aa")
+        return subprocess.run(
+            [sys.executable, "-B", str(SCRIPTS / "agent_statusline.py"), "--native-status", "--harness", harness],
+            input=json.dumps({"session_id": session, "model": {"id": "runtime-model"}, "terminal_width": 200}),
+            env={
+                **self.env,
+                "ORKEST_TERMINAL_HARNESS": harness,
+                "FAKE_KIND": "agy" if harness == "gemini" else harness,
+                "FAKE_SESSION": session,
+            },
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+
+    def test_every_harness_keeps_its_own_bar_and_still_labels_the_herdr_pane(self):
+        for harness in ("claude", "gemini", "opencode"):
+            with self.subTest(harness=harness):
+                self.calls.unlink(missing_ok=True)
+                self.assertIn("snorfle", self.status(harness))
+                self.assertIn("report-metadata", self.calls.read_text())
+
+    def test_bar_survives_an_unreachable_herdr(self):
+        self.fake_herdr(1)
+        self.assertIn("snorfle", self.status("claude"))
+        self.binary.unlink()
+        self.assertIn("snorfle", self.status("gemini"))
