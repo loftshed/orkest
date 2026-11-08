@@ -521,7 +521,7 @@ def _resolve(
     for index, part in enumerate(parts):
         current = current.parent if part == ".." else current / part
         saved_link = (links or {}).get(current.relative_to(root).as_posix()) if current.is_relative_to(root) else None
-        if saved_link is not None or current.is_symlink():
+        if saved_link is not None or (links is None and current.is_symlink()):
             if parents or index == len(parts) - 1:
                 _record(current, root, names)
             if hops >= MAX_LINK_HOPS:
@@ -554,10 +554,14 @@ def _protect(
     target = _resolve(path, root, names, parents=parents)
     if target is None:
         return
+    seen = set() if seen is None else seen
+    # A link inside a protected directory may name that directory or an ancestor. Keep the
+    # link itself, but never turn it into protection of the surrounding editable workspace.
+    if any(directory.is_relative_to(target) for directory in seen):
+        return
     _record(target, root, names)
     # Directory hashes retain links as links. Record their dependencies separately, without walking
     # outside the repository or revisiting directories through cycles.
-    seen = set() if seen is None else seen
     if explicit and target.is_relative_to(root) and target.is_dir() and target not in seen:
         seen.add(target)
         for directory, directories, files in os.walk(target, followlinks=False):
@@ -599,34 +603,62 @@ def protected_paths(entries: list[str], repo: Path) -> list[str]:
     return list(names)
 
 
+def gate_roots(commands: list[str], entries: list[str], repo: Path) -> list[str]:
+    """Names protected in their own right, before expanding their final symlink.
+
+    Resolve parent aliases so a directly named script keeps its identity in Git's namespace.
+    These roots must survive a release of a different alias that happens to reach them.
+    """
+    root = Path(os.path.realpath(repo))
+    names: dict[str, None] = {}
+    paths = [path for command in commands for path in _named(command, root) if path.is_file()]
+    for path in [*paths, *(root / entry for entry in entries)]:
+        parent = _resolve(path.parent, root, {})
+        if parent is not None:
+            _record(parent / path.name, root, names)
+    return list(names)
+
+
 def released(path: str, rules: list[str]) -> bool:
     """Whether a path a steer explicitly allowed (`rules`, each a path or ".") covers `path`."""
     return any(rule == "." or path == rule or path.startswith(f"{rule}/") for rule in rules)
 
 
-def protected_links(paths: list[str], repo: Path) -> dict[str, str]:
-    """Retain the link graph that gate names depended on before the worker could retarget it."""
-    return {path: os.readlink(repo / path) for path in paths if (repo / path).is_symlink()}
+def protected_links(paths: list[str], repo: Path, *, saved: dict[str, Any] | None = None) -> dict[str, str]:
+    """Retain the original link graph; only newly introduced gates get a fresh snapshot on resume."""
+    saved = saved or {}
+    prior = [*saved.get("gate_candidates", []), *saved.get("protect_paths", [])] if "gate_links" in saved else []
+    fresh = [path for path in paths if not released(path, prior) and not any(released(old, [path]) for old in prior)]
+    return {
+        **{path: os.readlink(repo / path) for path in fresh if (repo / path).is_symlink()},
+        **saved.get("gate_links", {}),
+    }
 
 
-def release_paths(entries: list[str], repo: Path, *, links: dict[str, str] | None = None) -> list[str]:
-    """Release named paths and their link targets, without releasing symlinked parents' siblings."""
+def release_paths(
+    entries: list[str], repo: Path, *, links: dict[str, str] | None = None, independent: list[str] | None = None
+) -> list[str]:
+    """Release named paths through the saved links, stopping at independent gates.
+
+    Directory contents are covered lexically; their inner links confer no authority outside
+    that directory. Only a named path's own link chain expands a release.
+    """
     if "." in entries:
         return ["."]
     root = Path(os.path.realpath(repo))
     names = dict.fromkeys(entries)
-    pending = list(entries)
-    visited: set[str] = set()
-    while pending:
-        entry = pending.pop()
-        if entry in visited:
-            continue
-        visited.add(entry)
-        target = _resolve(root / entry, root, names, parents=False, links=links)
+    barriers = [path for path in independent or [] if not released(path, entries)]
+    for entry in entries:
+        expanded: dict[str, None] = {}
+        target = _resolve(root / entry, root, expanded, parents=False, links=links or {})
         if target is not None:
-            _record(target, root, names)
-        # A released directory alias may expose more recorded links in its target directory.
-        pending.extend(path for path in (links or {}) if path not in visited and released(path, list(names)))
+            _record(target, root, expanded)
+        if not any(
+            released(path, barriers) or any(released(gate, [path]) for gate in barriers)
+            for path in expanded
+            if not released(path, entries)
+        ):
+            names.update(expanded)
     return list(names)
 
 

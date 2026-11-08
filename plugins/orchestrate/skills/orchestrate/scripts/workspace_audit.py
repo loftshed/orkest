@@ -156,23 +156,33 @@ def gate_fingerprint(path: Path) -> dict[str, Any]:
 def gate_changed(path: Path, baseline: dict[str, Any] | None, *, releases: list[Path]) -> bool:
     """Compare against the original baseline, omitting only paths an explicit steer released."""
 
-    def retained(state: dict[str, Any] | None, current: Path) -> dict[str, Any] | None:
-        if state is None or "children" not in state:
+    def retained(state: dict[str, Any] | None, current: Path, other: dict[str, Any] | None) -> dict[str, Any] | None:
+        if state is None or state.get("kind") == "missing":
+            return None
+        if "children" not in state:
             return state
-        return {
-            **state,
-            "children": {
-                name: retained(child, current / name)
-                for name, child in state["children"].items()
-                if not any((current / name).is_relative_to(rule) for rule in releases)
-            },
+        children = {
+            name: kept
+            for name, child in state["children"].items()
+            if not any((current / name).is_relative_to(rule) for rule in releases)
+            if (kept := retained(child, current / name, (other or {}).get("children", {}).get(name))) is not None
         }
+        # Creating/deleting a released child may create/remove its empty ancestor shells too.
+        # Keep modes when both directories exist, and retain every unreleased sibling or entry.
+        if (
+            not children
+            and (other is None or other.get("kind") == "missing")
+            and any(rule.is_relative_to(current) for rule in releases)
+        ):
+            return None
+        return {**state, "children": children}
 
     # Older saved results have opaque directory hashes. Preserve their protection rather than
     # replacing their original baseline with the current workspace after a steer.
     if baseline is not None and baseline.get("kind") == "directory" and "children" not in baseline:
         return _attr("path_fingerprint")(path) != baseline
-    return retained(gate_fingerprint(path), path) != retained(baseline, path)
+    current = gate_fingerprint(path)
+    return retained(current, path, baseline) != retained(baseline, path, current)
 
 
 def normalize_repo_paths(values: list[str], *, option: str, allow_root: bool = False) -> list[str]:

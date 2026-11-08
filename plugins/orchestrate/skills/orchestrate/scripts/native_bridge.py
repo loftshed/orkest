@@ -226,6 +226,7 @@ def audit(
             "protect_fingerprints": ready["protect_fingerprints"],
             "released_paths": ready["released_paths"],
             "gate_links": ready.get("gate_links", {}),
+            "gate_roots": ready.get("gate_roots", []),
         }
     return {
         "schema": runner.RESULT_SCHEMA,
@@ -330,12 +331,25 @@ def main() -> None:
                 changed = set(runner.state_delta(ready.get("task_git_before", before), before)["changed_paths"])
                 candidates = [path for path in candidates if path not in changed]
             ready["gate_candidates"] = list(candidates)
+            ready["gate_roots"] = list(
+                dict.fromkeys(
+                    [
+                        *saved_state.get("gate_roots", []),
+                        *corrector.gate_roots(run["verification_commands"], task.get("protect_paths", []), repository),
+                    ]
+                )
+            )
             # Explicit protect_paths are gate files whether or not Git ignores them or the run changed them.
+            fresh_protect_entries = [
+                entry
+                for entry in task.get("protect_paths", [])
+                if not corrector.released(entry, saved_state.get("protect_paths", []))
+            ]
             ready["protect_paths"] = list(
                 dict.fromkeys(
                     [
                         *saved_state.get("protect_paths", []),
-                        *corrector.protected_paths(task.get("protect_paths", []), repository),
+                        *corrector.protected_paths(fresh_protect_entries, repository),
                     ]
                 )
             )
@@ -343,11 +357,23 @@ def main() -> None:
                 path: saved_state.get("protect_fingerprints", {}).get(path, runner.gate_fingerprint(repository / path))
                 for path in ready["protect_paths"]
             }
-            ready["released_paths"] = list(saved_state.get("released_paths", []))
-            ready["gate_links"] = {
-                **corrector.protected_links([*candidates, *ready["protect_paths"]], repository),
-                **saved_state.get("gate_links", {}),
-            }
+            ready["gate_links"] = corrector.protected_links(
+                [*candidates, *ready["protect_paths"]], repository, saved=saved_state
+            )
+            earlier_steers = ((previous or {}).get("steering") or {}).get("steers") or []
+            ready["released_paths"] = corrector.release_paths(
+                list(
+                    dict.fromkeys(
+                        [
+                            *saved_state.get("released_paths", []),
+                            *(path for steer in earlier_steers for path in steer.get("added_allow_paths") or []),
+                        ]
+                    )
+                ),
+                repository,
+                links=ready["gate_links"],
+                independent=ready["gate_roots"],
+            )
             # The implementation captures the task baseline. A correction checks it from its first turn.
             ready["gate_files"] = (
                 [

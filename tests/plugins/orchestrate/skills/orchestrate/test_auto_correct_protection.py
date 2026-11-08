@@ -41,6 +41,94 @@ class ProtectionRunnerTests(unittest.TestCase):
     def tearDown(self):
         self.fixture.tearDown()
 
+    def test_parent_and_root_links_do_not_widen_directory_protection(self):
+        f = self.fixture
+        seed(f, {"allowed/gates/check.sh": "exit 0\n", "allowed/work/v1/data.txt": "broken\n"})
+        root = f.repository.path
+        (root / "allowed/gates/up").symlink_to("..")
+        (root / "allowed/gates/root_link").symlink_to("../..")
+        (root / "allowed/work/current").symlink_to("v1")
+        f.repository.git("add", "allowed")
+        f.repository.git("commit", "-qm", "ancestor links")
+        self.assertEqual(
+            CORRECTOR.protected_paths(["allowed/gates"], root),
+            ["allowed/gates", "allowed/gates/root_link", "allowed/gates/up"],
+        )
+        code, result, *_ = f.run_main(
+            engine="codex",
+            allow_path="allowed",
+            verify_commands=["sh allowed/gates/check.sh"],
+            extra_args=["--auto-correct", "1", "--protect-path", "allowed/gates"],
+            extra_env=edit("allowed/work/v1/data.txt", "fixed\n"),
+        )
+        self.assertEqual((code, result["status"], result["scope_violations"]), (0, "completed", []))
+
+    def test_released_children_can_create_or_remove_directory_shells(self):
+        root = self.fixture.repository.path
+        for case in ("create", "remove", "missing"):
+            with self.subTest(case=case):
+                gate = root / case
+                child = gate / "sub/child.txt"
+                if case != "missing":
+                    gate.mkdir()
+                    (gate / "keep.txt").write_text("keep\n")
+                if case == "remove":
+                    child.parent.mkdir()
+                    child.write_text("old\n")
+                baseline = RUNNER.gate_fingerprint(gate)
+                if case == "remove":
+                    child.parent.rename(root / "removed-sub")
+                else:
+                    child.parent.mkdir(parents=True)
+                    child.write_text("new\n")
+                self.assertFalse(RUNNER.gate_changed(gate, baseline, releases=[child]))
+                self.assertTrue(RUNNER.gate_changed(gate, baseline, releases=[]))
+                (gate / "keep.txt").write_text("tampered\n")
+                self.assertTrue(RUNNER.gate_changed(gate, baseline, releases=[child]))
+
+    def test_resumed_symlink_releases_expand_legacy_and_zero_round_authority(self):
+        f = self.fixture
+        for source in ("legacy", "zero-round"):
+            with self.subTest(source=source):
+                prefix = f"allowed/{source}"
+                seed(f, {f"{prefix}/real-check.sh": "exit 1\n"})
+                (f.repository.path / prefix / "check.sh").symlink_to("real-check.sh")
+                f.repository.git("add", prefix)
+                f.repository.git("commit", "-qm", "resume link")
+                _, first, folder, *_ = f.run_main(
+                    engine="codex",
+                    allow_path="allowed",
+                    verify_commands=[f"sh {prefix}/check.sh"],
+                    extra_args=["--auto-correct", "1" if source == "legacy" else "0"],
+                    extra_env={"FAKE_NO_CHANGE": "1"},
+                )
+                if source == "legacy":
+                    first["auto_correct"]["released_paths"] = [f"{prefix}/check.sh"]
+                    first["auto_correct"].pop("gate_links", None)
+                else:
+                    first["steering"] = {
+                        "steers": [{"status": "accepted", "added_allow_paths": [f"{prefix}/check.sh"]}]
+                    }
+                (folder / "result.json").write_text(json.dumps(first))
+                code, result, *_ = f.run_main(
+                    engine="codex",
+                    allow_path="allowed",
+                    verify_commands=[f"sh {prefix}/check.sh"],
+                    extra_args=[
+                        "--session",
+                        first["session_id"],
+                        "--resume-result",
+                        str(folder / "result.json"),
+                        "--auto-correct",
+                        "1",
+                    ],
+                    extra_env=edit(f"{prefix}/real-check.sh", "exit 0\n"),
+                )
+                self.assertEqual((code, result["status"]), (0, "completed"))
+                self.assertEqual(
+                    result["auto_correct"]["released_paths"], [f"{prefix}/check.sh", f"{prefix}/real-check.sh"]
+                )
+
     def test_protected_directory_records_nested_symlink_targets(self):
         f = self.fixture
         seed(f, {"allowed/real-check.sh": "exit 1\n", "allowed/output.txt": "broken\n"})
@@ -285,6 +373,91 @@ class ProtectionSteerTests(unittest.TestCase):
         self.steered_result_path = Path(values["AGENT_RESULT"])
         return json.loads(self.steered_result_path.read_text())
 
+    def assert_check_stays_protected(self, released, *, command="sh allowed/check.sh", protect=(), plant=False):
+        f = self.fixture
+        seed(f, {"allowed/check.sh": "exit 1\n", "allowed/tests/one.txt": "old\n"})
+        (f.repository.path / "allowed/gate_a.sh").symlink_to("check.sh")
+        (f.repository.path / "allowed/tests/ref.sh").symlink_to("../check.sh")
+        f.repository.git("add", "allowed")
+        f.repository.git("commit", "-qm", "release links")
+        job = f.launch_auto_correct(
+            [edit("allowed/output.txt", "attempt\n"), edit("allowed/check.sh", "exit 0\n")],
+            command,
+            extra_args=tuple(arg for path in protect for arg in ("--protect-path", path)),
+        )
+
+        def plant_link():
+            child = f.repository.path / "allowed/tests/one.txt"
+            child.rename(f.external_path / "original-child")
+            child.symlink_to("../check.sh")
+
+        result = self.steer(job, released, plant_link if plant else None)
+        self.assertEqual((result["exit_code"], result["status"]), (22, "scope_violation"))
+        self.assertIn("gate-edit:allowed/check.sh", result["scope_violations"])
+        self.assertNotIn("allowed/check.sh", result["auto_correct"]["released_paths"])
+
+    def test_releasing_link_does_not_release_a_directly_named_gate(self):
+        self.assert_check_stays_protected("allowed/gate_a.sh", command="sh allowed/gate_a.sh && sh allowed/check.sh")
+
+    def test_releasing_link_does_not_release_an_explicit_protect_entry(self):
+        self.assert_check_stays_protected(
+            "allowed/gate_a.sh", command="sh allowed/gate_a.sh", protect=("allowed/check.sh",)
+        )
+
+    def test_releasing_directory_does_not_follow_its_inner_links(self):
+        self.assert_check_stays_protected("allowed/tests", protect=("allowed/tests",))
+
+    def test_worker_planted_link_cannot_release_the_check_program(self):
+        self.assert_check_stays_protected("allowed/tests/one.txt", protect=("allowed/tests",), plant=True)
+
+    def test_released_child_can_be_created_in_a_new_subdirectory(self):
+        f = self.fixture
+        seed(f, {"allowed/tests/keep.txt": "keep\n"})
+        job = f.launch_auto_correct(
+            [edit("allowed/output.txt", "attempt\n"), edit("allowed/tests/new/sub/child.txt", "fixed\n")],
+            "grep -qx fixed allowed/tests/new/sub/child.txt",
+            extra_args=("--protect-path", "allowed/tests"),
+        )
+        result = self.steer(job, "allowed/tests/new/sub/child.txt")
+        self.assertEqual((result["exit_code"], result["status"], result["scope_violations"]), (0, "completed", []))
+
+    def test_resume_does_not_add_worker_planted_descendant_to_saved_links(self):
+        f = self.fixture
+        seed(f, {"allowed/tests/child.txt": "old\n", "allowed/target.txt": "work\n"})
+        job = f.launch_auto_correct(
+            [edit("allowed/output.txt", "attempt\n"), edit("allowed/target.txt", "fixed\n")],
+            "grep -qx fixed allowed/target.txt",
+            extra_args=("--protect-path", "allowed/tests"),
+        )
+
+        def plant_link():
+            child = f.repository.path / "allowed/tests/child.txt"
+            child.rename(f.external_path / "original-child")
+            child.symlink_to("../target.txt")
+
+        result = self.steer(job, "allowed/tests/child.txt", plant_link)
+        self.assertEqual((result["exit_code"], result["status"]), (0, "completed"))
+        self.assertEqual(result["auto_correct"]["released_paths"], ["allowed/tests/child.txt"])
+        self.assertEqual(result["auto_correct"]["gate_links"], {}, result["auto_correct"])
+        runner = fixtures.RunnerIntegrationTests()
+        runner.__dict__.update(f.__dict__)
+        code, resumed, *_ = runner.run_main(
+            engine="codex",
+            allow_path="allowed",
+            verify_commands=["grep -qx fixed allowed/target.txt"],
+            extra_args=[
+                "--session",
+                result["session_id"],
+                "--resume-result",
+                str(self.steered_result_path),
+                "--protect-path",
+                "allowed/tests",
+            ],
+            extra_env=edit("allowed/output.txt", "resumed\n"),
+        )
+        self.assertEqual((code, resumed["status"]), (0, "completed"), resumed.get("error"))
+        self.assertEqual(resumed["auto_correct"]["released_paths"], ["allowed/tests/child.txt"])
+
     def test_release_of_one_child_keeps_siblings_protected_against_original_baseline(self):
         f = self.fixture
         seed(f, {"allowed/tests/one.txt": "old\n", "allowed/tests/two.txt": "keep\n"})
@@ -354,6 +527,78 @@ class ProtectionCoordinatorTests(unittest.TestCase):
 
     def result(self, run):
         return coordination.COORDINATOR.read(Path(run["result_path"]))
+
+    def test_native_resume_expands_saved_and_zero_round_symlink_releases(self):
+        for source in ("saved", "legacy", "zero-round"):
+            with self.subTest(source=source):
+                if source != "saved":
+                    self.tearDown()
+                    self.setUp()
+                c, f = self.coordinator, self.fixture
+                seed(f, {"allowed/real-check.sh": "exit 1\n"})
+                (f.repository.path / "allowed/check.sh").symlink_to("real-check.sh")
+                f.repository.git("add", "allowed/check.sh")
+                f.repository.git("commit", "-qm", "native resume link")
+                code, run = c.call(
+                    "dispatch",
+                    "--kind",
+                    "implementation",
+                    "--request-id",
+                    "impl",
+                    "--transport",
+                    "native",
+                    "--engine",
+                    "claude",
+                    "--model",
+                    "claude-opus-4-6",
+                    "--billing-mode",
+                    "subscription",
+                    "--verify-command",
+                    "sh allowed/check.sh",
+                    "--auto-correct",
+                    "0" if source == "zero-round" else "1",
+                )
+                self.assertEqual(code, 0, run)
+                code, finished = c.native_round(run, "impl", {}, "none", handle="session")
+                self.assertEqual(code, 0, finished)
+                first = self.result(finished)
+                if source != "zero-round":
+                    first["auto_correct"]["released_paths"] = ["allowed/check.sh"]
+                    if source == "legacy":
+                        first["auto_correct"].pop("gate_links", None)
+                        first["auto_correct"].pop("gate_roots", None)
+                else:
+                    first["steering"] = {"steers": [{"status": "accepted", "added_allow_paths": ["allowed/check.sh"]}]}
+                Path(finished["result_path"]).write_text(json.dumps(first))
+                # Model an earlier runner's recorded result, including its collection digest.
+                state = coordination.COORDINATOR.load(c.directory)
+                recorded = next(item for item in state["runs"] if item["run_id"] == run["run_id"])
+                coordination.COORDINATOR.import_result(recorded, state)
+                coordination.COORDINATOR.save(c.directory, state)
+                proof = c.reviewed_evidence()
+                code, run = c.call(
+                    "dispatch",
+                    "--kind",
+                    "correction",
+                    "--transport",
+                    "native",
+                    "--request-id",
+                    "corr",
+                    "--review-id",
+                    proof,
+                    "--auto-correct",
+                    "1",
+                )
+                self.assertEqual(code, 0, run)
+                code, finished = c.native_round(
+                    run, "corr", {"allowed/real-check.sh": "exit 0\n"}, "allowed/real-check.sh", handle="session"
+                )
+                self.assertEqual(code, 0, finished)
+                result = self.result(finished)
+                self.assertEqual((result["exit_code"], result["status"]), (0, "completed"))
+                self.assertEqual(
+                    result["auto_correct"]["released_paths"], ["allowed/check.sh", "allowed/real-check.sh"]
+                )
 
     def test_executor_correction_protects_its_first_turn(self):
         c, f = self.coordinator, self.fixture

@@ -2223,8 +2223,8 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
         steering.enforced_paths = list(enforced_paths)
     # Paths a steer explicitly allowed in a run this one resumes; they stay released here too.
     resumed_releases: list[str] = []
-    resolved_releases: dict[str, list[str]] = {}
     gate_links: dict[str, str] = {}
+    gate_roots: list[str] = []
 
     def steer_releases() -> list[str]:
         """Every path a steer explicitly asked to allow, live or interrupting, whether or not scope already
@@ -2235,12 +2235,8 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
             if entry.get("status") == "accepted"
             for path in entry.get("added_allow_paths") or []
         ]
-        # Resolve once, at acceptance: a later link retarget must not broaden this authority.
-        for path in requested:
-            if path not in resolved_releases:
-                resolved_releases[path] = bundled_module("auto_correct").release_paths([path], repo, links=gate_links)
-        return list(
-            dict.fromkeys([*resumed_releases, *(name for path in requested for name in resolved_releases[path])])
+        return bundled_module("auto_correct").release_paths(
+            list(dict.fromkeys([*resumed_releases, *requested])), repo, links=gate_links, independent=gate_roots
         )
 
     def steer_released(path: str) -> bool:
@@ -2430,7 +2426,23 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
     protect_entries = normalize_repo_paths(
         [*((task_spec or {}).get("protect_paths") or []), *args.protect_path], option="--protect-path"
     )
-    protected = auto_correct_module.protected_paths(protect_entries, repo) if protection_active else []
+    # Scanning an inherited directory again would import links the worker planted after its baseline.
+    fresh_protect_entries = [
+        entry for entry in protect_entries if not auto_correct_module.released(entry, saved.get("protect_paths", []))
+    ]
+    protected = auto_correct_module.protected_paths(fresh_protect_entries, repo) if protection_active else []
+    gate_roots = (
+        list(
+            dict.fromkeys(
+                [
+                    *saved.get("gate_roots", []),
+                    *auto_correct_module.gate_roots(args.verify_command, protect_entries, repo),
+                ]
+            )
+        )
+        if protection_active
+        else []
+    )
     if previous_result is not None:
         earlier_steers = (previous_result.get("steering") or {}).get("steers") or []
         resumed_releases.extend(
@@ -2451,10 +2463,7 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
             protected = list(dict.fromkeys([*saved["protect_paths"], *protected]))
     # Preserve explicit protection from the task's first handoff, including ignored files/directories.
     # A resumed zero-round segment carries this state forward without opening mechanical rounds.
-    gate_links = {
-        **auto_correct_module.protected_links([*gate_candidates, *protected], repo),
-        **saved.get("gate_links", {}),
-    }
+    gate_links = auto_correct_module.protected_links([*gate_candidates, *protected], repo, saved=saved)
     protect_fingerprints = {
         path: saved.get("protect_fingerprints", {}).get(path, gate_fingerprint(repo / path)) for path in protected
     }
@@ -2466,6 +2475,7 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
             "mode": "executor",
             "gate_candidates": list(gate_candidates),
             "gate_links": gate_links,
+            "gate_roots": gate_roots,
             "protect_paths": list(protected),
             "protect_fingerprints": protect_fingerprints,
             "released_paths": steer_releases(),

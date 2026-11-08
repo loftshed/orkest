@@ -168,7 +168,9 @@ again, up to N rounds, and reports once. Fresh runs with 0 or no option keep the
   PowerShell stdin/inline commands, `case` patterns inside subshells, and extensionless `bun` scripts.
   Interpreter option handling covers a subset: extra value-taking options (such as `--ext`,
   `--env-file`, `--env-file-if-exists`, `--disable-warning`, `bun -c`) and working-directory options
-  (`--cwd`, Ruby `-C`, PowerShell `-wd`/`-WorkingDirectory`) can hide scripts. Use `--protect-path`
+  (`--cwd`, Ruby `-C`, PowerShell `-wd`/`-WorkingDirectory`) can hide scripts. So can `env -S`
+  strings containing env flags (`-i`, `-u`, `-C`) or `#`, repository wrapper links to `/usr/bin`,
+  and nested `$(...)` inside double quotes inside `$(...)`. Use `--protect-path`
   for each gate reached through these forms; write scope remains the boundary.
 - The correction turn also says that a check which is itself wrong must not be changed: the worker
   stops and reports `BLOCKED` with the evidence, and the run ends `blocked` with that report and any
