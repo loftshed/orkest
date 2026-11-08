@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   assertSqliteRuntime,
   backupSqlite,
+  enableWalMode,
   isSqliteBusyError,
   migrateSchema,
   openOrkestSqlite,
@@ -172,6 +173,33 @@ describe("Orkest SQLite connections", () => {
   });
 });
 
+describe("Orkest SQLite WAL setup", () => {
+  const busy = () => Object.assign(new Error("database is locked"), { errcode: 5 });
+  const fakeDb = (results) => ({
+    prepare: () => ({
+      get() {
+        const next = results.shift();
+        if (next instanceof Error) throw next;
+        return { journal_mode: next };
+      },
+      [Symbol.dispose]() {},
+    }),
+  });
+
+  it("retries a busy switch to WAL and gives up at the deadline", () => {
+    const contended = fakeDb([busy(), busy(), "wal"]);
+    expect(enableWalMode(contended, 1000)).toBe("wal");
+    const stillBusy = fakeDb([busy(), "wal"]);
+    expect(() => enableWalMode(stillBusy, 0)).toThrow("database is locked");
+  });
+
+  it("does not retry other errors", () => {
+    expect(() => enableWalMode(fakeDb([new Error("disk I/O error"), "wal"]), 1000)).toThrow(
+      "disk I/O error",
+    );
+  });
+});
+
 describe("Orkest SQLite transactions and migrations", () => {
   it("retries busy BEGIN IMMEDIATE with bounded jitter and does not retry the callback", () => {
     const busyError = Object.assign(new Error("database is locked"), { errcode: 261 });
@@ -300,6 +328,21 @@ describe("Orkest SQLite backup and process concurrency", () => {
     expect(select.get()).toMatchObject({
       value: "preserved",
     });
+  });
+
+  it("lets many processes open a new database at once", async () => {
+    const workerSource = `
+      import { openOrkestSqlite } from ${JSON.stringify(sqliteModuleUrl)};
+      openOrkestSqlite(process.argv[1]).close();
+    `;
+    for (let round = 0; round < 3; round++) {
+      const databasePath = path.join(temporaryDirectory.path, `opening-${round}.sqlite`);
+      await Promise.all(
+        Array.from({ length: 16 }, () =>
+          execFileAsync(nodeExecutable, ["--input-type=module", "-e", workerSource, databasePath]),
+        ),
+      );
+    }
   });
 
   it("keeps all updates from six concurrent Node processes", async () => {
