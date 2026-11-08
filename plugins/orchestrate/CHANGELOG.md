@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.76.3
+
+- fix(orchestrate): refuse progress updates for another agent's session (#151)
+- fix(orchestrate): refuse a continue while another launch is in flight (#149)
+- fix(orchestrate): show bound subagents' real status; stop defaulting to builder (#150)
+- fix(orchestrate): refuse ./ as a protect path; record native auto-correct source (#148)
+
 ## 0.76.2
 
 - docs(orchestrate): point config and cache paths at orchestrate (#147)
