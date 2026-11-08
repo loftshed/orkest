@@ -1591,6 +1591,12 @@ async function appendNativePeers(room, snapshots, root) {
       status = "running";
     }
     const resolvedModel = cleanLine(subagentMeta?.model || peer.model) || engine;
+    const subagentRole =
+      peer.harness === "claude" && (peer.isSubagent || peer.session.startsWith("subagent-"))
+        ? claudeSubagentRole(
+            subagentMeta?.agentType || cleanLine(peer.focus).replace(/^native\s+/iu, ""),
+          )
+        : undefined;
     const rawTask = cleanLine(
       subagentMeta?.description ||
         peer.subagentDescription ||
@@ -1617,7 +1623,7 @@ async function appendNativePeers(room, snapshots, root) {
       model: resolvedModel,
       ...(peer.effort && { effort: cleanLine(peer.effort) }),
       role: "worker",
-      workforceRole: progressRecord?.role || (subagentMeta ? "builder" : "native"),
+      workforceRole: progressRecord?.role || subagentRole || "native",
       native: true,
       nativeSession: peer.session,
       activitySource: {
@@ -1649,8 +1655,8 @@ async function appendNativePeers(room, snapshots, root) {
         model: resolvedModel || "—",
         effort: cleanLine(peer.effort) || "—",
         cwd: peerCwd,
-        ...((progressRecord?.role || subagentMeta) && {
-          role: progressRecord?.role || "builder",
+        ...((progressRecord?.role || subagentRole) && {
+          role: progressRecord?.role || subagentRole,
         }),
         ...(Number.isSafeInteger(peer.pid) && peer.pid > 0 && { pid: peer.pid }),
         ...(branch && { branch }),
@@ -1946,22 +1952,38 @@ async function readClaudeSubagentFromDir(subagentsDir, agentId) {
       ? meta.model.trim()
       : "";
   const description = typeof meta?.description === "string" ? cleanLine(meta.description) : "";
-  const lastActivityIso = Number.isFinite(tail?.mtimeMs)
-    ? new Date(tail.mtimeMs).toISOString()
+  let activity = tail;
+  if (!activity && meta) {
+    try {
+      activity = await stat(metaPath);
+    } catch {
+      // The metadata may disappear between reading it and observing its timestamps.
+    }
+  }
+  const lastActivityIso = Number.isFinite(activity?.mtimeMs)
+    ? new Date(activity.mtimeMs).toISOString()
     : null;
-  const startedIso = Number.isFinite(tail?.birthtimeMs)
-    ? new Date(tail.birthtimeMs).toISOString()
+  const startedIso = Number.isFinite(activity?.birthtimeMs)
+    ? new Date(activity.birthtimeMs).toISOString()
     : lastActivityIso;
   return {
     agentId,
+    agentType: typeof meta?.agentType === "string" ? cleanLine(meta.agentType) : "",
     description,
     model: observedModel || metaModel,
     finished: Boolean(meta?.finished),
     briefClaims: parseBriefClaims(head),
     lastActivityIso,
     startedIso,
-    mtimeMs: tail?.mtimeMs ?? NaN,
+    mtimeMs: activity?.mtimeMs ?? NaN,
   };
+}
+
+// Generic subagents have no workforce preset; the roster uses its existing native label.
+function claudeSubagentRole(agentType) {
+  const type = cleanLine(agentType).toLowerCase();
+  if (type === "explore") return "scout";
+  if (type === "plan") return "planner";
 }
 
 async function readClaudeSubagentInfo(peer, roomCwd, room) {
@@ -2002,16 +2024,42 @@ async function appendClaudeProjectSubagents(
     } catch {
       continue;
     }
-    const metaFiles = entries
-      .filter((e) => /^agent-[A-Za-z0-9_-]+\.meta\.json$/u.test(e))
-      .sort((a, b) => a.localeCompare(b));
-    for (const file of metaFiles) {
-      const agentId = file.replace(/^agent-/u, "").replace(/\.meta\.json$/u, "");
+    const agentIds = [
+      ...new Set(
+        entries
+          .filter((e) => /^agent-[A-Za-z0-9_.-]+\.(?:meta\.json|jsonl)$/u.test(e))
+          .map((file) => file.replace(/^agent-/u, "").replace(/\.(?:meta\.json|jsonl)$/u, "")),
+      ),
+    ].sort((a, b) => a.localeCompare(b));
+    for (const agentId of agentIds) {
       const subSid = `subagent-${agentId}`.slice(0, 80);
-      if (boundSessions.has(subSid)) continue;
+      const boundSlot = room.agents.find(
+        (member) =>
+          member.engine === "claude" &&
+          !member.dispatch &&
+          !member.mailboxSession &&
+          isLocalSessionBinding(room, member) &&
+          [subSid, agentId].includes(member.session?.id),
+      );
+      if (boundSlot) {
+        // Bound sessions stay deduplicated, but their transcript can still hydrate the slot
+        // after SubagentStop removes the peer. A live peer remains authoritative.
+        const peerOptions = {
+          engine: "claude",
+          cwd: boundSlot.session?.cwd || boundSlot.cwd || roomCwd,
+        };
+        if (
+          claimedSlots.has(boundSlot.id) ||
+          (await resolveSessionPeer(boundSlot.session.id, root, peerOptions)) ||
+          (boundSlot.session.id !== subSid && (await resolveSessionPeer(subSid, root, peerOptions)))
+        )
+          continue;
+      } else if (boundSessions.has(subSid) || !entries.includes(`agent-${agentId}.meta.json`))
+        continue;
       const info = await readClaudeSubagentFromDir(dir, agentId);
       if (!info) continue;
       if (
+        !boundSlot &&
         Number.isFinite(roomCreatedMs) &&
         Number.isFinite(info.mtimeMs) &&
         info.mtimeMs < roomCreatedMs - 60_000
@@ -2019,17 +2067,29 @@ async function appendClaudeProjectSubagents(
         continue;
       }
       const key = sessionKey(subSid);
+      const accountHome = process.env.CLAUDE_CONFIG_DIR || path.join(homedir(), ".claude");
       const savedProgress = key
-        ? await readOptionalJson(path.join(root, "progress", `${key}.json`), 64 * 1024)
+        ? await readProgressRecord(
+            root,
+            key,
+            { session: subSid, harness: "claude", accountHome },
+            roomCwd,
+            hostname(),
+          )
         : null;
       const savedPrefix =
         typeof savedProgress?.name === "string"
           ? cleanLine(savedProgress.name.split("-", 1)[0]).toLowerCase()
           : "";
-      const isFinished = info.finished || !isConductorAlive;
+      const workforceRole = savedProgress?.role || claudeSubagentRole(info.agentType) || "native";
+      const isFinished =
+        info.finished ||
+        !isConductorAlive ||
+        Boolean(boundSlot && savedProgress?.stage === "complete");
       const status = isFinished ? "reported complete" : "running";
       const stage = isFinished ? "complete" : "working";
-      const slot = claimReservedSlot(room, info.briefClaims, claimedSlots);
+      const slot = boundSlot || claimReservedSlot(room, info.briefClaims, claimedSlots);
+      if (boundSlot) claimedSlots.add(boundSlot.id);
       let id = slot?.id;
       if (!slot) {
         const shortId =
@@ -2057,13 +2117,13 @@ async function appendClaudeProjectSubagents(
         engine: "claude",
         model: modelName,
         role: "worker",
-        workforceRole: "builder",
+        workforceRole,
         native: true,
         nativeSession: subSid,
         activitySource: {
           engine: "claude",
           session: subSid,
-          accountHome: process.env.CLAUDE_CONFIG_DIR || path.join(homedir(), ".claude"),
+          accountHome,
           parentSession,
           cwd: roomCwd,
           startedAt: info.startedIso,
@@ -2081,7 +2141,7 @@ async function appendClaudeProjectSubagents(
           model: modelName,
           effort: "—",
           cwd: roomCwd,
-          role: "builder",
+          ...(workforceRole !== "native" && { role: workforceRole }),
           goal: room.title && room.title !== room.id ? cleanLine(room.title) : "Native subagent",
           task: taskText,
           stage,
@@ -2385,6 +2445,13 @@ export async function interactiveProgress(room, root = mailboxRoot()) {
       const exact = await resolveSessionPeer(binding.id, root, { engine: binding.engine });
       if (exact?.session === binding.id) peer = exact;
     }
+    if (!peer && binding.engine === "claude" && !binding.id.startsWith("subagent-")) {
+      // A lead may bind a Claude subagent by its bare agent ID; its peer is `subagent-<id>`.
+      const subagent = await resolveSessionPeer(`subagent-${binding.id}`.slice(0, 80), root, {
+        engine: binding.engine,
+      });
+      if (subagent?.isSubagent) peer = subagent;
+    }
     if (!peer) continue;
     const key = sessionKey(peer.session);
     const expectedCwd = await resolveCwd(binding.cwd || member.cwd || room.cwd);
@@ -2406,6 +2473,8 @@ export async function interactiveProgress(room, root = mailboxRoot()) {
     const name = peer.name;
     if (!name || cleanLine(name) !== name) continue;
     const progress = await readProgressRecord(root, key, peer, effectiveCwd, currentHost);
+    // A subagent's hook-assigned role must not replace the role its slot was reserved for.
+    if (peer.isSubagent && member.workforceRole && progress) delete progress.role;
     let goal = room.title && room.title !== room.id ? cleanLine(room.title) : "";
     let isManual = false;
     if (!goal && progress) {

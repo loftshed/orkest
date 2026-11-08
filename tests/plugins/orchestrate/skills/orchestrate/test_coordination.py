@@ -1902,6 +1902,7 @@ class CoordinatorTests(unittest.TestCase):
         prog_data = MAILBOX.load(prog_path)
         self.assertEqual(prog_data.get("stage"), "working")
         self.assertEqual(prog_data.get("goal"), "Native Explore")
+        self.assertEqual(prog_data.get("role"), "scout")
 
         stop_out = hooks.hook(
             {
@@ -1920,6 +1921,31 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(prog_after.get("stage"), "complete")
         sub_peer_after = MAILBOX.load(MAILBOX.peer_path(base, sub_sid))
         self.assertIsNone(sub_peer_after)
+
+    def test_subagent_start_derives_roles_and_preserves_existing_progress_role(self):
+        hooks = RUNNER.bundled_module("mailbox_hooks")
+        progress = RUNNER.bundled_module("agent_progress")
+        base = self.fixture.external_path / "mailbox-subagent-roles"
+        for index, (agent_type, expected) in enumerate(
+            (("Explore", "scout"), ("Plan", "planner"), ("general-purpose", None), ("custom-agent", None))
+        ):
+            with self.subTest(agent_type=agent_type):
+                payload = {
+                    "session_id": "parent-roles",
+                    "cwd": str(self.fixture.repository.path),
+                    "agent_id": f"role-{index}",
+                    "agent_type": agent_type,
+                }
+                hooks.hook(payload, harness="claude", event="SubagentStart", base=base)
+                peer = MAILBOX.load(MAILBOX.peer_path(base, f"subagent-role-{index}"))
+                record = progress.read(base, peer)
+                self.assertEqual(record.get("role"), expected)
+                self.assertEqual(record["stage"], "working")
+                progress.report(
+                    base, peer, goal="Review role handling", task="Review launch", stage="review", role="reviewer"
+                )
+                hooks.hook(payload, harness="claude", event="SubagentStart", base=base)
+                self.assertEqual(progress.read(base, peer)["role"], "reviewer")
 
 
 class CompletionEventConcurrencyTests(unittest.TestCase):

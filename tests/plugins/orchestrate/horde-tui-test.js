@@ -770,6 +770,20 @@ describe("tui-box primitives and HordeView unification", () => {
     expect(view.needsAnimation).toBe(false);
   });
 
+  it("shows the neutral native label for a subagent without a workforce preset", () => {
+    const room = fixture();
+    room.agents = [room.agents[0]];
+    Object.assign(room.agents[0], {
+      native: true,
+      workforceRole: "native",
+      status: "running",
+      runtimeState: "running",
+      progress: { task: "General subagent task", stage: "working" },
+    });
+    const view = new HordeView(room, { height: 32, color: false });
+    expect(plain(view.render(100).join("\n"))).toContain("[native]");
+  });
+
   it("joins the coordinator, quota, cards and services with one continuous tree spine", () => {
     const room = fixture("claude:haiku,agy:flash");
     room.quotaError = "Quota unavailable";
