@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.75.1
+
+- fix(orchestrate): attest native session identities with daemon-token MACs (#137)
+- fix(orchestrate): close resolver bypasses in auto-correct gate protection (#139)
+
 ## 0.75.0
 
 - fix(orchestrate): Claude subagents fill the room slot named by their brief (#140)
