@@ -80,11 +80,14 @@ class StreamingSession:
             self.presence()
 
     def presence(self) -> None:
+        harness = "gemini" if self.engine == "agy" else "claude"
         mailbox.register(
             self.base,
             session=self.session,
-            harness="gemini" if self.engine == "agy" else "claude",
+            harness=harness,
             cwd=os.getcwd(),
+            cwd_source="hook",
+            account=mailbox.account_home(harness),
             pid=self.process.pid,
             state="busy" if self.busy else "idle",
         )

@@ -20,10 +20,9 @@ export function verifiedNativeIds(peer, root) {
     if (!/^[A-Za-z0-9_-]{32,100}$/u.test(token)) return [];
     const message = JSON.stringify([
       "orkest.native-identity.v1",
-      ...["session", "harness", "machine", "cwd", "checkout", "accountHome"].map(
-        (key) => peer[key] ?? null,
+      ...["session", "harness", "machine", "cwd", "checkout", "accountHome", "nativeSession"].map(
+        (key) => (typeof peer[key] === "string" ? peer[key] : null),
       ),
-      peer.nativeSession ?? null,
       peer.nativeSessions ?? null,
     ]);
     const expected = createHmac("sha256", token).update(message).digest();

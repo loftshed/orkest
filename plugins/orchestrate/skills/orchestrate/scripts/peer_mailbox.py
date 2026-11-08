@@ -151,7 +151,7 @@ from mailbox_store import (  # noqa: E402, F401
     workspace,
     write,
 )
-from native_identity import sign_native_ids, verified_native_ids  # noqa: E402
+from native_identity import identity_message, sign_native_ids, verified_native_ids  # noqa: E402
 
 
 @cache
@@ -613,6 +613,7 @@ def register(
     with locked(path):
         migrate_legacy_session(base, session)
         peer = load(path) or {}
+        previous_identity = identity_message(peer) if verified_native_ids(base, peer) else None
         first = not peer
         previous_pid = peer.get("pid")
         moment = stamp()
@@ -694,6 +695,9 @@ def register(
             peer["sharedProcess"] = True
         else:
             peer.pop("sharedProcess", None)
+        # Only evidence verified before changing its bound context may be carried forward.
+        if previous_identity is not None and previous_identity != identity_message(peer):
+            peer["nativeSessionAttestation"] = sign_native_ids(base, peer)
         write(path, peer)
         if harness == "gemini":
             persist_agy_control(base, session, peer.get("pid"))
@@ -2184,7 +2188,7 @@ def refresh(
         pid=pid,
         state=state,
         cwd_source="hook" if hooked else source,
-        account=account,
+        account=known.get("accountHome") if hooked and known.get("accountHome") else account,
         effort=effort,
     )
     return mark_delegated(base, me)

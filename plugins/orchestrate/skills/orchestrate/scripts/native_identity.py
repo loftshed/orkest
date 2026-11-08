@@ -14,8 +14,10 @@ def identity_message(peer: dict[str, Any]) -> bytes:
     return json.dumps(
         [
             "orkest.native-identity.v1",
-            *[peer.get(key) for key in ("session", "harness", "machine", "cwd", "checkout", "accountHome")],
-            peer.get("nativeSession"),
+            *[
+                value if isinstance(value := peer.get(key), str) else None
+                for key in ("session", "harness", "machine", "cwd", "checkout", "accountHome", "nativeSession")
+            ],
             peer.get("nativeSessions"),
         ],
         ensure_ascii=False,
@@ -46,9 +48,13 @@ def verified_native_ids(base: Path, peer: dict[str, Any]) -> list[str]:
     ]
 
 
-def sign_native_ids(base: Path, peer: dict[str, Any]) -> str:
+def sign_native_ids(base: Path, peer: dict[str, Any]) -> str | None:
+    """Unavailable credentials leave native hints unattested without interrupting mailbox work."""
     import mailbox_daemon
 
-    mailbox_daemon.private_directory(mailbox_daemon.daemon_base(base))
-    token = mailbox_daemon.generate_token(base)
-    return hmac.new(token.encode("ascii"), identity_message(peer), hashlib.sha256).hexdigest()
+    try:
+        mailbox_daemon.private_directory(mailbox_daemon.daemon_base(base))
+        token = mailbox_daemon.generate_token(base)
+        return hmac.new(token.encode("ascii"), identity_message(peer), hashlib.sha256).hexdigest()
+    except (OSError, ValueError, TypeError, UnicodeError):
+        return None

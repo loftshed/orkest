@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
 import {
+  chmod,
   mkdir,
   mkdtemp,
   readdir,
@@ -26,6 +27,7 @@ import { resumeRoomStatus } from "../../../plugins/orchestrate/lib/room-resume.m
 import {
   bindSession,
   interactiveProgress,
+  isPeerLive,
   newRoom,
   ownsSessionBinding,
   rebindSession,
@@ -106,6 +108,61 @@ async function fixture(changes = {}) {
 }
 
 describe("adopting the running conversation", () => {
+  it.each(["unreadable", "public", "symlink", "corrupt"])(
+    "resumes the exact owner with a %s token while rejecting its native alias",
+    async (state) => {
+      const { cwd, root, options, peer, directory } = await fixture({
+        nativeSessions: ["native-owner"],
+      });
+      const first = await promoteSession({ session: peer.session, cwd }, options);
+      const token = path.join(directory, "mailbox-daemon-v1/token.txt");
+      if (state === "symlink") {
+        const target = path.join(directory, "held-token");
+        await writeFile(target, await readFile(token), { mode: 0o600 });
+        await rm(token);
+        await symlink(target, token);
+      } else if (state === "corrupt") {
+        await writeFile(token, "corrupt\n");
+      } else {
+        await chmod(token, state === "unreadable" ? 0o000 : 0o644);
+      }
+      expect(await resolveSessionPeer("native-owner", root, { engine: "codex", cwd })).toBeNull();
+      const resumed = await promoteSession(
+        { session: peer.session, cwd },
+        { ...options, env: { ORKEST_RESUME_SWARM: "1", ORKEST_RESUME_TARGET: peer.session } },
+      );
+      expect(resumed.room.id).toBe(first.room.id);
+      expect(resumed.room.conductor.session.id).toBe(peer.session);
+    },
+  );
+
+  it("ignores a valid native claim from a recycled PID when repairing a room", async () => {
+    const { cwd, root, options, peer } = await fixture({ nativeSessions: ["native-owner"] });
+    const first = await promoteSession({ session: peer.session, cwd }, options);
+    const room = await updateRoom(
+      first.room.id,
+      (value) => {
+        value.conductor.session.id = "native-owner";
+        delete value.promotion;
+        return value;
+      },
+      { root },
+    );
+    const recycled = { ...peer, session: "recycled", pidBirth: "Thu Jan  1 00:00:01 1970" };
+    const recycledFile = path.join(root, "peers/recycled.json");
+    await writeFile(recycledFile, JSON.stringify(recycled));
+    const signed = attest(root, "recycled", "native-owner");
+    expect(isPeerLive(peer)).toBe(true);
+    expect(isPeerLive(signed)).toBe(false);
+    expect((await resolveSessionPeer("native-owner", root, { engine: "codex", cwd })).session).toBe(
+      peer.session,
+    );
+    expect(await ownsSessionBinding(room, peer, root)).toBe(true);
+    expect(
+      (await rebindSession(room.id, "conductor", peer.session, root)).conductor.session.id,
+    ).toBe(peer.session);
+  });
+
   it("keeps a recorded live owner visible under colliding native IDs and refuses ambiguous repairs", async () => {
     const { cwd, root, options, peer } = await fixture({ nativeSessions: ["native-owner"] });
     const first = await promoteSession({ session: peer.session, cwd }, options);

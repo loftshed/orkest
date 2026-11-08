@@ -13,6 +13,7 @@ import {
   listRawRooms,
   mailboxRoot,
   normalizeWorkforceRole,
+  processStarted,
   readRoom,
   refreshMemberWorktrees,
   resolveWorktreeMarkerPath,
@@ -1965,6 +1966,10 @@ export function isPeerLive(peer, nowMs = Date.now()) {
   if (!Number.isFinite(seenMs)) return false;
   const alive = pidAlive(peer.pid);
   if (alive === false) return false;
+  if (alive && peer.pidBirth) {
+    const birth = processStarted(peer.pid);
+    if (birth && birth !== peer.pidBirth) return false;
+  }
   const ageMs = nowMs - seenMs;
   if (ageMs > MAX_PEER_AGE_MS) return false;
   if (alive && peer.sharedProcess) {

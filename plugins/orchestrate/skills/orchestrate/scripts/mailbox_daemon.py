@@ -157,7 +157,7 @@ def load_state(base: Path) -> dict[str, Any] | None:
 
 def read_token(base: Path) -> str:
     path = daemon_base(base) / "token.txt"
-    if not path.exists():
+    if not path.exists() and not path.is_symlink():
         return ""
     private_file(path)
     value = path.read_text(encoding="ascii").strip()
