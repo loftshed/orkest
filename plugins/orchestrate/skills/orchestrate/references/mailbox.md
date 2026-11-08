@@ -16,6 +16,11 @@ missing registrations, turn hooks and scoped Codex tool permissions. Changed set
 `.mailbox-bak.*` copies. For approved Codex hooks, add `--trust-codex-hooks`; this trusts only the four
 mailbox commands. Without approval, review them in Codex `/hooks` instead.
 
+Setup also writes `~/.codex/rules/orkest.rules`, so Codex runs Orkest's bookkeeping commands
+(progress, mailbox, room status, event waits) at their installed absolute paths without asking.
+Launching workers, dispatching and installing still ask. The file is rewritten on every install; keep
+your own rules in `default.rules`.
+
 `doctor --check-messaging` checks settings and hook trust, then exchanges messages and matching
 replies between installed harness identities in an isolated store. Codex uses its native app server;
 the other identities use MCP protocol clients. This consumes no model quota. Evidence is retained

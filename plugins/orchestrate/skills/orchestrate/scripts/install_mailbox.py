@@ -1424,6 +1424,99 @@ def permit_codex_tools(config: Path, *, dry_run: bool = False) -> None:
     print(f"✓ scoped permission for {len(TOOLS)} local Codex mailbox tools")
 
 
+CODEX_RULES_HEADER = """\
+# Managed by Orkest's installer and rewritten on every install; edits here are lost.
+# Allows only Orkest's own bookkeeping commands (progress, mailbox, room status, waits).
+# Launching workers, dispatching and installing still ask. Put your own rules in default.rules.
+"""
+MAILBOX_COMMANDS = [
+    "peers",
+    "send",
+    "ask",
+    "inbox",
+    "receive",
+    "wait",
+    "ack",
+    "history",
+    "focus",
+    "board",
+    "tasks",
+    "channels",
+    "name",
+]
+ORK_ROOM_COMMANDS = ["list", "show", "resume-status", "bind", "objective", "role"]
+ORK_COMMANDS = [
+    ["progress"],
+    ["name"],
+    ["herdr-status"],
+    ["quota"],
+    ["radar"],
+    ["routes"],
+    ["next", "status"],
+    ["cleanup", "status"],
+    ["policy", "status"],
+    ["update", "--check"],
+]
+
+
+def _path_variants(paths: list[Path]) -> list[str]:
+    """Each path as given and fully resolved, since agents quote either (e.g. /home vs /var/home)."""
+    variants: list[str] = []
+    for path in paths:
+        for candidate in (path, path.resolve()):
+            text = str(candidate)
+            if text not in variants:
+                variants.append(text)
+    return variants
+
+
+def codex_rules(home: Path, hub: Path, ork_cli: Path | None = None) -> str:
+    """Codex execpolicy rules allowing Orkest's bookkeeping commands at their absolute install paths.
+
+    Relative paths are left out on purpose: a rule for plugins/orchestrate/... would also allow a
+    same-named script in any other checkout.
+    """
+    source = Path(__file__).resolve().parent
+    script_dirs = [hub, source, home / ".codex/skills/orchestrate/scripts"]
+
+    def script(name: str) -> list[str]:
+        return _path_variants([directory / name for directory in script_dirs])
+
+    cli = ork_cli or source.parents[2] / "bin/ork.mjs"
+    nodes = ["node", *_path_variants([Path(found) for found in [shutil.which("node")] if found])]
+    ork_commands = ["ork", *_path_variants([Path(found) for found in [shutil.which("ork")] if found])]
+    pythons = ["python3", "python"]
+    patterns: list[list] = [
+        [pythons, script("agent_progress.py")],
+        [pythons, script("run_agent.py"), "mailbox", MAILBOX_COMMANDS],
+        [pythons, script("run_agent.py"), ["events", "models"]],
+        [pythons, script("peer_mailbox.py"), MAILBOX_COMMANDS],
+    ]
+    for prefix in ([ork_commands], [nodes, _path_variants([cli])]):
+        patterns.append([*prefix, ["rooms", "hall"], ORK_ROOM_COMMANDS])
+        patterns.extend([*prefix, *command] for command in ORK_COMMANDS)
+    lines = [CODEX_RULES_HEADER]
+    for pattern in patterns:
+        tokens = ", ".join(json.dumps(part, ensure_ascii=False) for part in pattern)
+        lines.append(f'prefix_rule(pattern=[{tokens}], decision="allow", justification="Orkest bookkeeping")')
+    return "\n".join(lines) + "\n"
+
+
+def install_codex_rules(codex: Path, home: Path, hub: Path, *, dry_run: bool = False) -> bool:
+    """Write Orkest's own rules file; Codex loads every rules file under ~/.codex/rules/."""
+    target = codex / "rules/orkest.rules"
+    content = codex_rules(home, hub)
+    if target.is_file() and target.read_text() == content:
+        return False
+    if dry_run:
+        print(f"would write Codex rules for Orkest bookkeeping commands: {target}")
+        return True
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content)
+    print(f"✓ Codex allows Orkest bookkeeping commands: {target}")
+    return True
+
+
 def install_login_startup(home: Path, base: Path, script: Path, *, stdio: bool, dry_run: bool) -> None:
     """Queue startup at macOS login; the current service is already started explicitly by install."""
     if sys.platform != "darwin":
@@ -1525,6 +1618,7 @@ def install(
         if not dry_run or config.exists() and "peer-mailbox" in config.read_text():
             set_codex_timeout(config, dry_run=dry_run)
             permit_codex_tools(config, dry_run=dry_run)
+        install_codex_rules(codex, home, hub, dry_run=dry_run)
         install_hooks(codex / "hooks.json", hub / "peer_mailbox.py", "codex", dry_run=dry_run)
         if trust_codex_hooks:
             trust_codex(hub / "peer_mailbox.py", codex, dry_run=dry_run)
