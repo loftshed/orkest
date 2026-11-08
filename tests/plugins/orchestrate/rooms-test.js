@@ -2019,6 +2019,41 @@ describe("bounded room continuations", () => {
     },
   );
 
+  it("refuses a second continue while the first is still launching and keeps its binding", async () => {
+    const { root, room, taskDir, task, run } = await fixture();
+    await dispatchMember(room.id, "haiku-1", { root, taskDir, run, requestId: "first" });
+    task.runs[0].status = "finished";
+    task.decisions.push({ run_id: "run-1", decision: "accept" });
+    const taskSpec = path.join(taskDir, "followup.json");
+    await writeFile(taskSpec, JSON.stringify({ objective: "Follow up" }));
+    let release;
+    const launched = new Promise((resolve) => {
+      release = resolve;
+    });
+    const slow = async (args) => {
+      if (args[0] === "dispatch") await launched;
+      return run(args);
+    };
+    const options = { root, taskDir, taskSpec, kind: "continue" };
+    const first = dispatchMember(room.id, "haiku-1", { ...options, run: slow });
+    await vi.waitFor(async () => {
+      expect((await readRoom(room.id, root)).agents[0].dispatch.restore).toBeDefined();
+    });
+    const inFlight = (await readRoom(room.id, root)).agents[0].dispatch.requestId;
+    await expect(dispatchMember(room.id, "haiku-1", { ...options, run })).rejects.toThrow(
+      `retry it with --request-id ${inFlight}`,
+    );
+    release();
+    const continued = await first;
+    const member = (await readRoom(room.id, root)).agents[0];
+    expect(member.dispatch).toMatchObject({
+      requestId: inFlight,
+      runId: continued.dispatch.run_id,
+    });
+    expect(member.dispatch.restore).toBeUndefined();
+    expect(member.status).not.toBe("queued");
+  });
+
   it("restores the previous dispatch when continue is refused before launch", async () => {
     const { root, room, taskDir, task, run } = await fixture();
     await dispatchMember(room.id, "haiku-1", { root, taskDir, run, requestId: "first" });

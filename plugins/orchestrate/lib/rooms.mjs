@@ -848,6 +848,12 @@ export async function dispatchMember(id, memberId, options = {}) {
         (member.dispatch.taskId !== intent.taskId || member.dispatch.taskDir !== directory)
       )
         throw new Error("continue must use the member's existing task");
+      // A kept `restore` means a launch is still in flight, or its outcome is unknown. Replacing
+      // that intent would let the two launches overwrite each other's binding.
+      if (continuing && member.dispatch.restore)
+        throw new Error(
+          `Another dispatch of this member is still launching; wait for it, or retry it with --request-id ${member.dispatch.requestId}`,
+        );
       if (member.dispatch && !continuing) {
         // A retry repeats the stored request exactly; the member it runs as is part of it.
         for (const key of [
