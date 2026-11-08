@@ -1,6 +1,6 @@
 {
   "schema": "agent-executor.routes.v1",
-  "note": "Defaults for each role. Override any of them in ~/.config/agent-executor/config.json (run_agent.py init writes a starter). Claude, GPT and Gemini always run in their own harness; opencode routes are for families without one (GLM, DeepSeek, Qwen, Kimi). Models are family selectors (see families.json) that resolve to the newest live ID; write an exact ID to pin one. Archetype routes keep their primary candidate in engine/model/effort and expose ordered alternates through routes.py:route_candidates.",
+  "note": "Defaults for each role. Override any of them in ~/.config/orchestrate/config.json (run_agent.py init writes a starter). Claude, GPT and Gemini always run in their own harness; opencode routes are for families without one (GLM, DeepSeek, Qwen, Kimi). Models are family selectors (see families.json) that resolve to the newest live ID; write an exact ID to pin one. Archetype routes keep their primary candidate in engine/model/effort and expose ordered alternates through routes.py:route_candidates.",
   "routes": {
     "implementation": {
       "engine": "codex",

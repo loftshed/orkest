@@ -70,7 +70,7 @@ python3 <skill-directory>/scripts/run_agent.py events --ack <exact-event-id>
 ```
 
 Detached runs keep private artifacts under `<cache>/jobs-v1` and atomically publish an event under
-`<cache>/completions-v1` (`<cache>` is `~/.cache/agent-executor` or `$AGENT_EXECUTOR_HOME`), so a job
+`<cache>/completions-v1` (`<cache>` is `~/.cache/orchestrate` or `$ORCHESTRATE_HOME`), so a job
 launched by one agent can be collected by another. Acknowledge only after the result and workspace
 delta are reviewed.
 
