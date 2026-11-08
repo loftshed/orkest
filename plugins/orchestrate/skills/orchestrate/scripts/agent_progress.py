@@ -65,7 +65,8 @@ def refuse_another_agents_session(base: Path, peer: dict[str, Any]) -> None:
         other = mailbox.session_peer(base, caller, harness=harness)
     except (mailbox.MailboxError, OSError, ValueError):
         return
-    if other and other["session"] != peer["session"] and mailbox.is_live(other):
+    # Compared by canonical session, so a parent resumed under a new native ID still owns its subagents.
+    if other and other["session"] not in own and mailbox.is_live(other):
         raise mailbox.MailboxError(
             f"session {peer['session']!r} belongs to another live agent; you are {other['session']!r}"
         )
