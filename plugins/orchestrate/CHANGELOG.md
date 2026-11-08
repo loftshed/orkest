@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.75.0
+
+- fix(orchestrate): Claude subagents fill the room slot named by their brief (#140)
+- feat(orchestrate): let Codex run Orkest bookkeeping commands without asking (#141)
+
 ## 0.74.0
 
 - docs(orchestrate): use empty-scope runs for investigations that need tools (#136)
