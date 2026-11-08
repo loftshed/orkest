@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.74.0
+
+- docs(orchestrate): use empty-scope runs for investigations that need tools (#136)
+- feat(orchestrate): Herdr-drawn agent labels for every harness (#131)
+
 ## 0.73.1
 
 - fix(orchestrate): resumed coordinators reattach to their room (#132)
