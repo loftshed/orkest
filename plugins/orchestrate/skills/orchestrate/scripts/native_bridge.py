@@ -154,7 +154,11 @@ def audit(
         return [
             f"gate-edit:{path}"
             for path in ready.get("gate_files", [])
-            if runner.path_fingerprint(repository / path) != ready.get("gate_fingerprints", {}).get(path)
+            if runner.gate_changed(
+                repository / path,
+                ready.get("gate_fingerprints", {}).get(path),
+                releases=[repository / rule for rule in ready.get("released_paths", [])],
+            )
         ]
 
     # Checked before any gate runs, so a gate program the worker changed is never executed.
@@ -326,19 +330,30 @@ def main() -> None:
                 candidates = [path for path in candidates if path not in changed]
             ready["gate_candidates"] = list(candidates)
             # Explicit protect_paths are gate files whether or not Git ignores them or the run changed them.
+            fresh_protect_entries = [
+                entry
+                for entry in task.get("protect_paths", [])
+                if not corrector.released(entry, saved_state.get("protect_paths", []))
+            ]
             ready["protect_paths"] = list(
                 dict.fromkeys(
                     [
                         *saved_state.get("protect_paths", []),
-                        *corrector.protected_paths(task.get("protect_paths", []), repository),
+                        *corrector.protected_paths(fresh_protect_entries, repository),
                     ]
                 )
             )
             ready["protect_fingerprints"] = {
-                path: saved_state.get("protect_fingerprints", {}).get(path, runner.path_fingerprint(repository / path))
+                path: saved_state.get("protect_fingerprints", {}).get(path, runner.gate_fingerprint(repository / path))
                 for path in ready["protect_paths"]
             }
-            ready["released_paths"] = list(saved_state.get("released_paths", []))
+            earlier_steers = ((previous or {}).get("steering") or {}).get("steers") or []
+            ready["released_paths"] = corrector.release_paths(
+                [
+                    *saved_state.get("released_paths", []),
+                    *(path for steer in earlier_steers for path in steer.get("added_allow_paths") or []),
+                ]
+            )
             # The implementation captures the task baseline. A correction checks it from its first turn.
             ready["gate_files"] = (
                 [
@@ -352,7 +367,7 @@ def main() -> None:
             ready["gate_fingerprints"] = {
                 path: ready["protect_fingerprints"][path]
                 if path in ready["protect_fingerprints"]
-                else runner.path_fingerprint(repository / path)
+                else runner.gate_fingerprint(repository / path)
                 for path in ready["gate_files"]
             }
         runner.write_json_atomic(folder / "ready.json", ready)

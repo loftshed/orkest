@@ -2868,6 +2868,7 @@ class SteerTests(unittest.TestCase):
         *,
         allow_path: str = "allowed",
         extra_env: dict[str, str] | None = None,
+        extra_args: tuple[str, ...] = (),
     ) -> dict:
         self.run_index += 1
         index = self.run_index
@@ -2910,6 +2911,7 @@ class SteerTests(unittest.TestCase):
             "1",
             "--timeout",
             "2m",
+            *extra_args,
         ]
         output = io.StringIO()
         with (
