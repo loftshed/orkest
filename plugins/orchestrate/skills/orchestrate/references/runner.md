@@ -173,6 +173,14 @@ again, up to N rounds, and reports once. Fresh runs with 0 or no option keep the
   stay fixable in a round. Programs a command starts indirectly (`make test`, `npx vitest`,
   `uv run pytest`, a script calling a script) are not found. Keep a gate outside the worker's
   allowed paths, where scope protects it in every turn, or list it in `protect_paths`.
+- Accepted parser limitations: `eval`, `find -exec`, `xargs`, `builtin .`, here-strings (`<<<`),
+  PowerShell stdin/inline commands, `case` patterns inside subshells, and extensionless `bun` scripts.
+  Interpreter option handling covers a subset: extra value-taking options (such as `--ext`,
+  `--env-file`, `--env-file-if-exists`, `--disable-warning`, `bun -c`) and working-directory options
+  (`--cwd`, Ruby `-C`, PowerShell `-wd`/`-WorkingDirectory`) can hide scripts. So can `env -S`
+  strings containing env flags (`-i`, `-u`, `-C`) or `#`, repository wrapper links to `/usr/bin`,
+  and nested `$(...)` inside double quotes inside `$(...)`. Use `--protect-path`
+  for each gate reached through these forms; write scope remains the boundary.
 - The correction turn also says that a check which is itself wrong must not be changed: the worker
   stops and reports `BLOCKED` with the evidence, and the run ends `blocked` with that report and any
   consultation request for review.
@@ -181,7 +189,10 @@ again, up to N rounds, and reports once. Fresh runs with 0 or no option keep the
   opened rounds still count toward the global cap. The interrupted round's gate files stay protected and
   are judged on the workspace the steered turn leaves, so restoring one is not a violation. A path a
   steer names with `--allow-path`, live or interrupting, stops being protected with everything under
-  it, even when scope already covered it (`.` or a parent directory). `auto_correct.released_paths`
+  it, even inside a protected directory or when scope already covered it (`.` or a parent directory).
+  Siblings retain their original protection. A release never follows symlinks: to let a worker edit
+  a gate through a link or a symlinked directory, also release the real path the `gate-edit:`
+  violation names. `auto_correct.released_paths`
   records those paths, and a run resumed from that result keeps them released. A resumed correction
   protects its first turn too, merges saved gate candidates with new verification commands (including
   `reverify` gates), and excludes files the task has changed. Protection baselines and releases survive

@@ -50,7 +50,7 @@ ork foundry [status|run|groom] [--dry-run] [--json]
 ork smelter [status|run] [--dry-run] [--json]
 ork side [run|status] [--prompt <text>] [--issue <n>] [--dry-run] [--json]
 ork cleanup [status|run] [--dry-run] [--json]
-ork policy [status|set|allow|deny|reset] [--json]
+ork policy [show|allow|deny|reset] [--json]
 ork update [--check|--apply] [--json]
 ork radar [--line|--json] [--refresh]
 ork gate [--heavy] [--label <text>] -- <command>   (also: ork gate status|install|uninstall)

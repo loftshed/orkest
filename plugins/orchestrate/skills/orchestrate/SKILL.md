@@ -2,7 +2,7 @@
 name: orchestrate
 description: "Invoke autonomously at will—or when requested by the user—to run cross-vendor consultations (`consult`), independent cold diff reviews, root-cause investigations, or bounded cross-harness implementation tasks across local Codex, Antigravity, Claude Code, and OpenCode CLIs. Validate model and effort, check live quota and repo policy, preserve context, record usage and evidence, recover bounded corrections, and audit results. Proactively call `consult` when a second opinion, architectural sanity check, or adversarial code review from another model family adds confidence, and delegate bounded tasks across harnesses when parallel execution or spare quota speeds up delivery. Also use to inspect Orkest swarm/workboard status or promote the current chat to coordinator ('you are the coordinator now'). Keep same-harness, same-account subagents and messaging on the host's native tools."
 metadata:
-  version: 0.73.1
+  version: 0.75.0
   requirements: Python 3.11+, POSIX file locking, git, and at least one installed/authenticated executor CLI (`codex`, `agy`, `claude`, or `opencode`).
 ---
 
@@ -101,14 +101,15 @@ and GPT-OSS pool (`agy` models) is a native Antigravity route and stays allowed.
 Say what you need; the smallest mechanism that serves it wins. A question never becomes a job
 because of which harness or model answers it.
 
-| Need                                      | Use                                                                                                                                           |
-| ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| "Am I missing something?"                 | `consult` (one question, one answer)                                                                                                          |
-| "What about this detail?"                 | `consult --follow-up <result.json>` (same session, context intact)                                                                            |
-| "Find out why this happens."              | `consult --intent investigate --read <repo>` (reads, returns findings with evidence)                                                          |
-| "Check my work."                          | Native tools for a reviewer in this harness; `consult --intent review --read <repo> --diff` or peer mailbox for a reviewer in another harness |
-| "Implement this."                         | The run below: scope, lease, audit, runner-owned verification                                                                                 |
-| "You own this file; I need to change it." | Native messaging for an owner in this harness; peer mailbox for an owner in another harness                                                   |
+| Need                                       | Use                                                                                                                                                            |
+| ------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| "Am I missing something?"                  | `consult` (one question, one answer)                                                                                                                           |
+| "What about this detail?"                  | `consult --follow-up <result.json>` (same session, context intact)                                                                                             |
+| "Find out why this happens."               | `consult --intent investigate --read <repo>` (reads, returns findings with evidence)                                                                           |
+| "Check my work."                           | Native tools for a reviewer in this harness; `consult --intent review --read <repo> --diff` or peer mailbox for a reviewer in another harness                  |
+| Investigate with commands or scratch files | An empty-scope run, when the task needs tools the selected consultant cannot use; see [consult capabilities](references/consult.md#what-the-consultant-can-do) |
+| "Implement this."                          | The run below: scope, lease, audit, runner-owned verification                                                                                                  |
+| "You own this file; I need to change it."  | Native messaging for an owner in this harness; peer mailbox for an owner in another harness                                                                    |
 
 The coordinator's `--kind investigation` and `consultation` remain for work that must count against
 a task's invocation allowance, and for a blocked worker asking its conductor.
@@ -139,13 +140,13 @@ When the user asks what agents are doing or wants updates on a selected team, us
 the mailbox and wait for a change with a bounded local command. Report recorded evidence and staleness;
 do not treat presence as verified progress or completion.
 
-| Situation                                                                        | Action                                                                          |
-| -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
-| Decisions, failed approaches or coupled changes live mainly in this conversation | Continue here                                                                   |
-| Another agent can finish from a portable packet and you can assess the outcome   | Delegate, if it beats the briefing and review cost                              |
-| A finished worker leaves a small fix you already understand and can verify       | Finish it here; another round trip usually costs more than the fix              |
-| The owner lacks one fact, diagnosis or perspective                               | `consult` narrowly and keep ownership                                           |
-| The problem needs exploration before a solution or hypothesis is known           | `consult --intent investigate --read`; let the investigator choose its approach |
+| Situation                                                                        | Action                                                                               |
+| -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| Decisions, failed approaches or coupled changes live mainly in this conversation | Continue here                                                                        |
+| Another agent can finish from a portable packet and you can assess the outcome   | Delegate, if it beats the briefing and review cost                                   |
+| A finished worker leaves a small fix you already understand and can verify       | Finish it here; another round trip usually costs more than the fix                   |
+| The owner lacks one fact, diagnosis or perspective                               | `consult` narrowly and keep ownership                                                |
+| The problem needs exploration before a solution or hypothesis is known           | Choose consultation or an empty-scope run based on the tools the investigation needs |
 
 Those rows describe a **solo session** that owns the work directly. A **swarm coordinator or subswarm
 lead** (`ORKEST_SWARM_ROOM` is set or this conversation was promoted with `ork hall promote`) owns
@@ -294,9 +295,13 @@ never blocks OpenCode.
    non-binding hints. You can also widen a running detached job's scope mid-run via
    `run_agent.py steer <JOB_OR_EVENT> --allow-path <PATH>` (in-place without interrupting when
    `--message` is omitted or `--no-interrupt` is passed).
-   Read-only runs (empty scope) allocate a private per-run scratch directory outside the checkout;
-   artifacts written there are retained and reported without failing the source-scope audit, while
-   symlinks escaping the scratch boundary fail as scope violations.
+   Empty-scope task specs use `"allow_paths": []`, `"track_paths": []`, and omit `scope_owner` or set
+   it to `"conductor"`. They allocate a private per-run scratch directory outside the checkout; the
+   submitted brief names its path. Artifacts there are retained
+   and reported, while symlinks escaping that boundary fail as scope violations. These runs grant
+   executor tools and audit changes after the fact: they are not a read-only sandbox. The audit cannot
+   prove that transient writes, ignored files, outside-repository writes, or external effects did not
+   occur. Choose a no-write consultation when that boundary is required.
 2. The executor must not commit, push, merge, reset, clean, stash, checkout, switch branches, create
    worktrees, publish, or touch secrets. A change to this worktree's branch, HEAD, reflog or stash fails
    the run.

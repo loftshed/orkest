@@ -1214,6 +1214,142 @@ describe("room CLI", () => {
     }
   });
 
+  it("fills reserved slots with the Claude subagents whose launch prompt names their brief", async () => {
+    const root = await realpath(await directory());
+    const cwd = await realpath(await directory());
+    const accountHome = await directory();
+    const parentSession = "b7a1c2d3-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+    const slug = cwd.replaceAll(/[^A-Za-z0-9-]/gu, "-");
+    const subagentsDir = path.join(accountHome, "projects", slug, parentSession, "subagents");
+    await mkdir(subagentsDir, { recursive: true });
+    await mkdir(path.join(root, "peers"), { recursive: true });
+    await mkdir(path.join(root, "progress"), { recursive: true });
+
+    const room = await newRoom(
+      parseTeam("claude:opus@researcher,claude:opus@builder,claude:opus@reviewer,codex:sol"),
+      { id: "room-reserved-slots", cwd, root, title: "Reserved slots" },
+    );
+    const [researcher, builder, reviewer, codexSlot] = room.agents.map((agent) => agent.id);
+    await updateRoom(
+      room.id,
+      (current) => {
+        current.conductor.engine = "claude";
+        current.conductor.session = {
+          id: parentSession,
+          engine: "claude",
+          machine: hostname(),
+          cwd,
+        };
+        for (const agent of current.agents) agent.status = "reserved";
+        current.agents[1].model = "claude-opus-5-5";
+        current.agents[2].session = { id: "a7", engine: "claude", machine: hostname(), cwd };
+        current.agents[0].role = "lead";
+        current.agents[0].objective = "Map Herdr capabilities";
+        return current;
+      },
+      { root },
+    );
+    const briefs = path.join(root, "swarm-briefs", room.id);
+    const prompt = (text) =>
+      `${JSON.stringify({ type: "user", message: { role: "user", content: text } })}\n`;
+    const subagent = async (agentId, text, meta = {}) => {
+      await writeFile(
+        path.join(subagentsDir, `agent-${agentId}.meta.json`),
+        JSON.stringify({ agentType: "general-purpose", description: `Task ${agentId}`, ...meta }),
+      );
+      await writeFile(path.join(subagentsDir, `agent-${agentId}.jsonl`), prompt(text));
+    };
+    // Live peer that names the researcher's brief.
+    await subagent(
+      "a1",
+      `You are ${researcher}. Your brief is at ${path.join(briefs, `${researcher}.md`)}.`,
+    );
+    const nowIso = new Date().toISOString();
+    await writeFile(
+      path.join(root, "peers", "subagent-a1.json"),
+      JSON.stringify({
+        schema: "agent-executor.peer.v1",
+        session: "subagent-a1",
+        name: "gribnox-claude-opus-5-5-orkest-a1",
+        person: "gribnox",
+        harness: "claude",
+        state: "busy",
+        cwd,
+        checkout: cwd,
+        accountHome,
+        pid: process.pid,
+        sharedProcess: true,
+        isSubagent: true,
+        parentSession,
+        startedAt: nowIso,
+        lastSeenAt: nowIso,
+      }),
+    );
+    // Finished transcript-only subagent for the builder's slot.
+    await subagent("a2", `Brief: ${path.join(briefs, `${builder}.md`)}`, { finished: true });
+    // Bound by its bare agent ID: must not be listed a second time.
+    await subagent("a7", "Reviewer task");
+    // A second claim on the builder's slot, a claim on the Codex slot, a brief from another
+    // room, and a brief read only after launch: none of them may fill a slot.
+    await subagent("a3", `Brief: ${path.join(briefs, `${builder}.md`)}`);
+    await subagent("a4", `Brief: ${path.join(briefs, `${codexSlot}.md`)}`);
+    await subagent(
+      "a5",
+      `Brief: ${path.join(root, "swarm-briefs", "other-room", `${reviewer}.md`)}`,
+    );
+    await writeFile(
+      path.join(subagentsDir, "agent-a6.jsonl"),
+      `${prompt("Plain task")}${prompt(`Read ${path.join(briefs, `${reviewer}.md`)}`)}`,
+    );
+    await writeFile(
+      path.join(subagentsDir, "agent-a6.meta.json"),
+      JSON.stringify({ agentType: "general-purpose", description: "Task a6" }),
+    );
+
+    const previous = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = accountHome;
+    try {
+      const observed = await observeRoom(room.id, { root });
+      const byId = new Map(observed.agents.map((agent) => [agent.id, agent]));
+
+      const lead = byId.get(researcher);
+      expect(lead).toMatchObject({
+        nativeSession: "subagent-a1",
+        native: true,
+        role: "lead",
+        workforceRole: "researcher",
+        objective: "Map Herdr capabilities",
+        status: "running",
+      });
+      expect(lead.progress.role).toBe("researcher");
+      expect(byId.get(builder)).toMatchObject({
+        nativeSession: "subagent-a2",
+        workforceRole: "builder",
+        status: "reported complete",
+        model: "claude-opus-5-5",
+        cwd,
+      });
+      expect(byId.get(reviewer).nativeSession).toBeUndefined();
+      expect(observed.agents.some((agent) => agent.nativeSession === "subagent-a7")).toBe(false);
+      expect(byId.get(codexSlot).nativeSession).toBeUndefined();
+
+      const sessions = observed.agents.map((agent) => agent.nativeSession).filter(Boolean);
+      expect(new Set(sessions).size).toBe(sessions.length);
+      for (const extra of ["subagent-a3", "subagent-a4", "subagent-a5", "subagent-a6"]) {
+        const agent = observed.agents.find((candidate) => candidate.nativeSession === extra);
+        expect(agent, extra).toBeDefined();
+        expect([researcher, builder, reviewer, codexSlot]).not.toContain(agent.id);
+      }
+      expect(observed.agents).toHaveLength(8);
+    } finally {
+      if (previous === undefined) {
+        delete process.env.CLAUDE_CONFIG_DIR;
+      } else {
+        process.env.CLAUDE_CONFIG_DIR = previous;
+      }
+    }
+  });
+
   it("projects consultation answers and attaches agent mailbox messages during observeRoom", async () => {
     const rawRoot = await directory();
     const root = await realpath(rawRoot);

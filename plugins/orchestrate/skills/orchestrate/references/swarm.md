@@ -76,7 +76,9 @@ peer; display names and free-form aliases do not establish ownership.
    Inherit model settings unless a supported explicit choice is authorized. Immediately bind the
    returned native session using `ork rooms bind --room ID --member MEMBER --engine ENGINE --session ID`.
    If the tool returns only a handle, supervise that handle and let the child bind its own session.
-   Do not guess a session ID from a handle or nickname.
+   Do not guess a session ID from a handle or nickname. A Claude Code subagent can't see its own
+   session ID, so put the returned brief path in its prompt: the room matches the subagent to this
+   member by that path instead of listing it as an extra member.
    Spawn only for `native_handoff`. A repeated reservation returns `attached` with the existing
    binding or `pending_attachment`. Recover an uncertain spawn through native tools; never assume it
    did not launch and start another copy.

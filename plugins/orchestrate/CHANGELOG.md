@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.75.0
+
+- fix(orchestrate): Claude subagents fill the room slot named by their brief (#140)
+- feat(orchestrate): let Codex run Orkest bookkeeping commands without asking (#141)
+
+## 0.74.0
+
+- docs(orchestrate): use empty-scope runs for investigations that need tools (#136)
+- feat(orchestrate): Herdr-drawn agent labels for every harness (#131)
+
 ## 0.73.1
 
 - fix(orchestrate): resumed coordinators reattach to their room (#132)

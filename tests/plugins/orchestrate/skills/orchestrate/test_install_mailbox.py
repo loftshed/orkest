@@ -208,6 +208,68 @@ class InstallMailboxTests(unittest.TestCase):
         installer.ensure_hub(hub, skill)
         self.assertEqual(len(list(self.base.glob("hub.mailbox-bak.*"))), 1)
 
+    def test_codex_rules_allow_only_absolute_orkest_bookkeeping_commands(self):
+        home = self.base / "home"
+        hub = home / ".agents/skills/orchestrate/scripts"
+        hub.mkdir(parents=True)
+        codex = home / ".codex"
+        with mock.patch.object(installer.shutil, "which", return_value=None):
+            content = installer.codex_rules(home, hub)
+            self.assertTrue(installer.install_codex_rules(codex, home, hub, dry_run=True))
+            self.assertFalse((codex / "rules").exists())
+            self.assertTrue(installer.install_codex_rules(codex, home, hub))
+            self.assertFalse(installer.install_codex_rules(codex, home, hub))
+        rules = codex / "rules/orkest.rules"
+        self.assertEqual(rules.read_text(), content)
+        self.assertFalse((codex / "rules/default.rules").exists())
+        self.assertIn(str(hub / "agent_progress.py"), content)
+        self.assertIn(str(SCRIPTS.resolve() / "run_agent.py"), content)
+        self.assertNotIn('"plugins/orchestrate', content)
+        for blocked in (
+            '"dispatch"',
+            '"launch"',
+            '"prune"',
+            '"hook"',
+            '"--apply"',
+            '"--task-spec"',
+            '"bind"',
+            '"update"',
+        ):
+            self.assertNotIn(blocked, content)
+        codex_binary = installer.shutil.which("codex")
+        if not codex_binary:
+            self.skipTest("codex is not installed")
+
+        def decision(*command: str) -> str | None:
+            result = subprocess.run(
+                [codex_binary, "execpolicy", "check", "--rules", str(rules), *command],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            return json.loads(result.stdout).get("decision")
+
+        progress = str(hub / "agent_progress.py")
+        runner = str(SCRIPTS.resolve() / "run_agent.py")
+        self.assertEqual(decision("python3", progress, "--session", "s", "--stage", "working"), "allow")
+        self.assertEqual(decision("python3", runner, "mailbox", "inbox", "--session", "s"), "allow")
+        self.assertEqual(decision("python3", runner, "events", "wait", "e", "--messages"), "allow")
+        self.assertEqual(decision("ork", "rooms", "show", "--room", "r"), "allow")
+        self.assertEqual(decision(installer.sys.executable, runner, "mailbox", "inbox"), "allow")
+        self.assertIsNone(decision("python3", runner, "--task-spec", "spec.json"))
+        self.assertIsNone(decision("python3", runner, "mailbox", "prune"))
+        self.assertIsNone(decision("ork", "rooms", "dispatch", "--room", "r"))
+        for command in (
+            ("ork", "update", "--check"),
+            ("ork", "policy", "status", "deny", "codex"),
+            ("ork", "rooms", "bind", "--room", "r", "--member", "m", "--session", "s"),
+            ("ork", "rooms", "objective", "--room", "r", "--objective", "x"),
+            ("ork", "cleanup", "status"),
+            ("python3", runner, "events", "--ack-all"),
+        ):
+            self.assertIsNone(decision(*command), command)
+        self.assertIsNone(decision("python3", "plugins/orchestrate/skills/orchestrate/scripts/agent_progress.py"))
+
     def test_codex_permissions_cover_only_known_mailbox_tools_and_are_idempotent(self):
         self.assertEqual(set(installer.TOOLS), {tool["name"] for tool in mailbox_mcp.TOOLS})
         server = {"tools": {"send": {"approval_mode": "approve"}, "unrelated": {"approval_mode": "prompt"}}}

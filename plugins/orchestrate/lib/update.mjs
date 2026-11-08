@@ -369,7 +369,19 @@ export async function runOrkestUpdate(options = {}) {
 export async function runUpdateCli(argv = [], io = {}) {
   const stdout = io.stdout || process.stdout;
   const flags = new Set(argv.filter((arg) => arg.startsWith("--")));
-  const subcommand = argv.find((arg) => !arg.startsWith("--")) || "run";
+  // `--check` and `--apply` are the documented spellings of `check` and `run`; without this, a
+  // `--check` fell through to a full update.
+  const flagCommands = [flags.has("--check") && "check", flags.has("--apply") && "run"].filter(
+    Boolean,
+  );
+  const positional = argv.find((arg) => !arg.startsWith("--"));
+  const requested = new Set([...flagCommands, ...(positional ? [positional] : [])]);
+  if (requested.size > 1) {
+    const error = new Error(`Conflicting update commands: ${[...requested].join(", ")}`);
+    error.exitCode = 2;
+    throw error;
+  }
+  const subcommand = positional || flagCommands[0] || "run";
   const isJsonOutput = flags.has("--json");
   const isQuiet = flags.has("--quiet");
   const options = {
