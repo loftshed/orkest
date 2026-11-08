@@ -36,6 +36,15 @@ HARNESS_SESSION_VARIABLES = {
 }
 
 
+def known_identities(peer: dict[str, Any]) -> set[str | None]:
+    return {
+        peer["session"],
+        peer.get("nativeSession"),
+        *(peer.get("nativeSessions") or []),
+        *(peer.get("aliases") or []),
+    }
+
+
 def refuse_another_agents_session(base: Path, peer: dict[str, Any]) -> None:
     """Stop an agent overwriting another live agent's progress, for example by pasting the wrong ID.
 
@@ -48,13 +57,8 @@ def refuse_another_agents_session(base: Path, peer: dict[str, Any]) -> None:
         for name in ("AGENT_MAILBOX_SESSION", *HARNESS_SESSION_VARIABLES.values())
         if os.environ.get(name)
     ]
-    own = {
-        peer["session"],
-        peer.get("nativeSession"),
-        peer.get("parentSession"),
-        *(peer.get("nativeSessions") or []),
-        *(peer.get("aliases") or []),
-    }
+    own = known_identities(peer) | {peer.get("parentSession")}
+    own.discard(None)
     if own.intersection(identities):
         return
     harness = mailbox.detect_harness()
@@ -65,8 +69,8 @@ def refuse_another_agents_session(base: Path, peer: dict[str, Any]) -> None:
         other = mailbox.session_peer(base, caller, harness=harness)
     except (mailbox.MailboxError, OSError, ValueError):
         return
-    # Compared by canonical session, so a parent resumed under a new native ID still owns its subagents.
-    if other and other["session"] not in own and mailbox.is_live(other):
+    # Compared across known identities, so a parent resumed or cleared under a new ID still owns its subagents.
+    if other and own.isdisjoint(known_identities(other) | {other.get("clearedFrom")}) and mailbox.is_live(other):
         raise mailbox.MailboxError(
             f"session {peer['session']!r} belongs to another live agent; you are {other['session']!r}"
         )
