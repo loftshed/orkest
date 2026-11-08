@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.76.2
+
+- docs(orchestrate): point config and cache paths at orchestrate (#147)
+
 ## 0.76.1
 
 - fix(orchestrate): keep each harness's own status bar inside Herdr (#146)
