@@ -154,7 +154,11 @@ def audit(
         return [
             f"gate-edit:{path}"
             for path in ready.get("gate_files", [])
-            if runner.path_fingerprint(repository / path) != ready.get("gate_fingerprints", {}).get(path)
+            if runner.gate_changed(
+                repository / path,
+                ready.get("gate_fingerprints", {}).get(path),
+                releases=[repository / rule for rule in ready.get("released_paths", [])],
+            )
         ]
 
     # Checked before any gate runs, so a gate program the worker changed is never executed.
@@ -221,6 +225,7 @@ def audit(
             "protect_paths": list(ready.get("protect_paths", [])),
             "protect_fingerprints": ready["protect_fingerprints"],
             "released_paths": ready["released_paths"],
+            "gate_links": ready.get("gate_links", {}),
         }
     return {
         "schema": runner.RESULT_SCHEMA,
@@ -335,10 +340,14 @@ def main() -> None:
                 )
             )
             ready["protect_fingerprints"] = {
-                path: saved_state.get("protect_fingerprints", {}).get(path, runner.path_fingerprint(repository / path))
+                path: saved_state.get("protect_fingerprints", {}).get(path, runner.gate_fingerprint(repository / path))
                 for path in ready["protect_paths"]
             }
             ready["released_paths"] = list(saved_state.get("released_paths", []))
+            ready["gate_links"] = {
+                **corrector.protected_links([*candidates, *ready["protect_paths"]], repository),
+                **saved_state.get("gate_links", {}),
+            }
             # The implementation captures the task baseline. A correction checks it from its first turn.
             ready["gate_files"] = (
                 [
@@ -352,7 +361,7 @@ def main() -> None:
             ready["gate_fingerprints"] = {
                 path: ready["protect_fingerprints"][path]
                 if path in ready["protect_fingerprints"]
-                else runner.path_fingerprint(repository / path)
+                else runner.gate_fingerprint(repository / path)
                 for path in ready["gate_files"]
             }
         runner.write_json_atomic(folder / "ready.json", ready)

@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import posixpath
 import re
+import shlex
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -136,16 +137,27 @@ def _substitution(command: str, start: int, text: list[str], nested: list[str]) 
         text.append(command[start : end + 1])
         return end + 1
     depth, end = 1, start + 2
+    started = False
     while end < len(command) and depth:
         char = command[end]
         if char == "\\":
             end += 2
+            started = True
             continue
         if char in "'\"":
-            close = command.find(char, end + 1)
-            end = len(command) if close < 0 else close + 1
+            quote = char
+            end += 1
+            while end < len(command) and command[end] != quote:
+                end += 2 if quote == '"' and command[end] == "\\" else 1
+            end += 1
+            started = True
+            continue
+        if char == "#" and not started:
+            newline = command.find("\n", end)
+            end = len(command) if newline < 0 else newline
             continue
         depth += {"(": 1, ")": -1}.get(char, 0)
+        started = char not in " \t\r\n;|&()"
         end += 1
     nested.append(command[start + 2 : end - 1 if depth == 0 else end])
     text.append(command[start:end])
@@ -374,7 +386,14 @@ def _script(program: str, operands: list[str]) -> tuple[str, str] | None:
 
 
 def _simple_command(
-    words: list[str], inputs: list[str], base: Path, stack: list[Path], found: list[Path], depth: int
+    words: list[str],
+    inputs: list[str],
+    base: Path,
+    stack: list[Path],
+    previous: list[Path],
+    found: list[Path],
+    depth: int,
+    root: Path,
 ) -> Path:
     """Add the files one simple command runs to `found`; returns the directory the next command runs in."""
     index, directory = 0, base
@@ -384,6 +403,10 @@ def _simple_command(
             index += 1
             continue
         wrapper = posixpath.basename(word)
+        if "/" in word and _literal(word):
+            found.append(directory / word)
+            if Path(os.path.abspath(directory / word)).is_relative_to(root):
+                break  # A repository program named env/time/etc. is still its own program.
         if wrapper not in WRAPPERS:
             break
         index, values = _options(words, index + 1, *WRAPPERS[wrapper])
@@ -394,7 +417,11 @@ def _simple_command(
             split = values.get("S", values.get("--split-string"))
             if split is not None:
                 if depth < MAX_DEPTH:
-                    found.extend(_named(split, directory, depth + 1))
+                    try:
+                        split_words = shlex.split(split, comments=True)
+                    except ValueError:
+                        return base
+                    _simple_command([*split_words, *words[index:]], inputs, directory, [], [], found, depth + 1, root)
                 return base
         if wrapper == "timeout":
             index += 1  # the duration
@@ -403,21 +430,29 @@ def _simple_command(
     program, operands = words[index], words[index + 1 :]
     if program in ("cd", "pushd", "popd"):
         if program == "popd":
-            return stack.pop() if stack else base
+            if stack:
+                previous[:] = [base]
+                return stack.pop()
+            return base
         start, _ = _options(operands, 0)
         target = operands[start] if start < len(operands) else ""
-        if not _literal(target) or target == "-" or target.startswith("+"):
-            return base  # cd alone, cd -, pushd +1: not a directory this can follow
+        if target == "-" and program == "cd":
+            target_path = previous[0] if previous else base
+        elif not _literal(target) or target == "-" or target.startswith("+"):
+            return base  # cd alone, pushd +1: not a directory this can follow
+        else:
+            target_path = base / target
         if program == "pushd":
             stack.append(base)
-        return base / target
+        previous[:] = [base]
+        return target_path
     if "/" in program and _literal(program):
         found.append(directory / program)
     script = _script(program, operands)
     if script is not None:
         kind, value = script
         if kind == "command" and depth < MAX_DEPTH:
-            found.extend(_named(value, directory, depth + 1))
+            found.extend(_named(value, directory, depth + 1, root=root))
         elif kind == "script" and _literal(value):
             found.append(directory / value)
         elif kind == "stdin" and inputs and _literal(inputs[-1]):
@@ -425,12 +460,14 @@ def _simple_command(
     return base
 
 
-def _named(command: str, base: Path, depth: int = 0) -> list[Path]:
+def _named(command: str, base: Path, depth: int = 0, *, root: Path | None = None) -> list[Path]:
     """The files a shell command line runs: each command's program when it is a path, and the script an
     interpreter is given. Follows `cd`/`pushd`/`popd` and subshells, `sh -c '...'` and `$(...)`."""
+    root = base if root is None else root
     found: list[Path] = []
     stack: list[Path] = []
-    scopes: list[tuple[Path, list[Path]]] = []
+    previous: list[Path] = []
+    scopes: list[tuple[Path, list[Path], list[Path]]] = []
     words: list[str] = []
     inputs: list[str] = []
     redirection: str | None = None
@@ -438,7 +475,7 @@ def _named(command: str, base: Path, depth: int = 0) -> list[Path]:
         if kind == "word":
             if depth < MAX_DEPTH:
                 for inner in nested:
-                    found.extend(_named(inner, base, depth + 1))
+                    found.extend(_named(inner, base, depth + 1, root=root))
             if redirection is None:
                 words.append(text)
             elif redirection == "<":
@@ -450,12 +487,12 @@ def _named(command: str, base: Path, depth: int = 0) -> list[Path]:
             continue
         redirection = None
         if words:
-            base = _simple_command(words, inputs, base, stack, found, depth)
+            base = _simple_command(words, inputs, base, stack, previous, found, depth, root)
             words, inputs = [], []
         if text == "(":
-            scopes.append((base, list(stack)))
+            scopes.append((base, list(stack), list(previous)))
         elif text == ")" and scopes:
-            base, stack = scopes.pop()  # a subshell's cd is undone
+            base, stack, previous = scopes.pop()  # a subshell's cd is undone
     return found
 
 
@@ -469,34 +506,66 @@ def _record(path: Path, root: Path, names: dict[str, None]) -> None:
         names[relative.as_posix()] = None
 
 
-def _protect(path: Path, root: Path, names: dict[str, None], *, explicit: bool, hops: int = 0) -> None:
+def _resolve(
+    path: Path,
+    root: Path,
+    names: dict[str, None],
+    *,
+    parents: bool = True,
+    hops: int = 0,
+    links: dict[str, str] | None = None,
+) -> Path | None:
+    """Resolve components one link at a time, retaining every hop before following it."""
+    current = Path(path.anchor)
+    parts = path.parts[1:]
+    for index, part in enumerate(parts):
+        current = current.parent if part == ".." else current / part
+        saved_link = (links or {}).get(current.relative_to(root).as_posix()) if current.is_relative_to(root) else None
+        if saved_link is not None or current.is_symlink():
+            if parents or index == len(parts) - 1:
+                _record(current, root, names)
+            if hops >= MAX_LINK_HOPS:
+                return None
+            try:
+                link = Path(saved_link if saved_link is not None else os.readlink(current))
+            except OSError:
+                return None
+            target = link if link.is_absolute() else current.parent / link
+            return _resolve(
+                target.joinpath(*parts[index + 1 :]), root, names, parents=parents, hops=hops + 1, links=links
+            )
+    return current
+
+
+def _protect(
+    path: Path,
+    root: Path,
+    names: dict[str, None],
+    *,
+    explicit: bool,
+    parents: bool = True,
+    seen: set[Path] | None = None,
+) -> None:
     """Add the names a file at `path` depends on: every symlinked directory on the way to it, each hop of a
     symlink chain and its target. A derived name counts only for an existing file; an explicit one always."""
     # Do not retain parent links for a derived operand that is not an existing gate file.
     if not explicit and (not path.exists() or path.is_dir()):
         return
-    current = Path(path.anchor)
-    *directories, last = path.parts[1:] or ("",)
-    for part in directories:
-        if part == "..":
-            current = current.parent
-            continue
-        current = current / part
-        if current.is_symlink():
-            _record(current, root, names)
-            current = Path(os.path.realpath(current))
-    target = current.parent if last == ".." else current / last
-    if target.is_symlink():
-        _record(target, root, names)
-        try:
-            link = Path(os.readlink(target))
-        except OSError:
-            return
-        if hops < MAX_LINK_HOPS:
-            _protect(link if link.is_absolute() else current / link, root, names, explicit=explicit, hops=hops + 1)
+    target = _resolve(path, root, names, parents=parents)
+    if target is None:
         return
-    if last and (explicit or (target.exists() and not target.is_dir())):
-        _record(target, root, names)
+    _record(target, root, names)
+    # Directory hashes retain links as links. Record their dependencies separately, without walking
+    # outside the repository or revisiting directories through cycles.
+    seen = set() if seen is None else seen
+    if explicit and target.is_relative_to(root) and target.is_dir() and target not in seen:
+        seen.add(target)
+        for directory, directories, files in os.walk(target, followlinks=False):
+            directories[:] = [name for name in directories if name != ".git"]
+            for name in sorted([*directories, *files]):
+                child = Path(directory) / name
+                if child.is_symlink():
+                    _protect(child, root, names, explicit=True, parents=parents, seen=seen)
 
 
 def gate_paths(commands: list[str], repo: Path) -> list[str]:
@@ -533,6 +602,32 @@ def protected_paths(entries: list[str], repo: Path) -> list[str]:
 def released(path: str, rules: list[str]) -> bool:
     """Whether a path a steer explicitly allowed (`rules`, each a path or ".") covers `path`."""
     return any(rule == "." or path == rule or path.startswith(f"{rule}/") for rule in rules)
+
+
+def protected_links(paths: list[str], repo: Path) -> dict[str, str]:
+    """Retain the link graph that gate names depended on before the worker could retarget it."""
+    return {path: os.readlink(repo / path) for path in paths if (repo / path).is_symlink()}
+
+
+def release_paths(entries: list[str], repo: Path, *, links: dict[str, str] | None = None) -> list[str]:
+    """Release named paths and their link targets, without releasing symlinked parents' siblings."""
+    if "." in entries:
+        return ["."]
+    root = Path(os.path.realpath(repo))
+    names = dict.fromkeys(entries)
+    pending = list(entries)
+    visited: set[str] = set()
+    while pending:
+        entry = pending.pop()
+        if entry in visited:
+            continue
+        visited.add(entry)
+        target = _resolve(root / entry, root, names, parents=False, links=links)
+        if target is not None:
+            _record(target, root, names)
+        # A released directory alias may expose more recorded links in its target directory.
+        pending.extend(path for path in (links or {}) if path not in visited and released(path, list(names)))
+    return list(names)
 
 
 def round_budget(*, executor_seconds_left: float, deadline_left: float | None, gate_seconds: float) -> float:

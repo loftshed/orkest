@@ -78,6 +78,72 @@ class AutoCorrectUnitTests(unittest.TestCase):
             commands = [f"{alias}/check.sh --config={alias}/config.toml", f"sh {alias}/linked.sh"]
             self.assertEqual(AUTO_CORRECT.gate_paths(commands, alias), ["check.sh", "linked.sh"])
 
+    def test_wrapper_operands_cd_dash_and_substitution_boundaries(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.repository(directory, ("allowed/check.sh", "allowed/check.py", "sub/x", "other/x"))
+            for name in ("time", "env", "timeout", "nice"):
+                (repo / "allowed" / name).write_text("exit 1\n")
+            cases = {
+                **{f"./allowed/{name}": [f"allowed/{name}"] for name in ("time", "env", "timeout", "nice")},
+                "./allowed/env sh allowed/check.sh": ["allowed/env"],
+                f"{repo}/allowed/env sh allowed/check.sh": ["allowed/env"],
+                'env -S "python3 -u" allowed/check.py': ["allowed/check.py"],
+                "env --split-string='FOO=1' ./allowed/check.sh": ["allowed/check.sh"],
+                'env -S "env -S python3" allowed/check.py': ["allowed/check.py"],
+                'env -C allowed -S "python3 -u" check.py': ["allowed/check.py"],
+                "cd sub && pwd >/dev/null && cd - >/dev/null && sh allowed/check.sh": ["allowed/check.sh"],
+                "cd allowed; cd ../sub; cd -; sh check.sh": ["allowed/check.sh"],
+                "cd allowed; (cd ../other); cd -; sh allowed/check.sh": ["allowed/check.sh"],
+                'test "$(printf "%s" "a\\"b")" = "a\\"b" && sh allowed/check.sh': ["allowed/check.sh"],
+                "out=$(\ncd allowed # 1) step\nsh check.sh\n)": ["allowed/check.sh"],
+                # A # in the middle of a word is literal, so the following command still runs.
+                "out=$(printf foo#bar; sh allowed/check.sh)": ["allowed/check.sh"],
+                "out=$(printf foo\\ #bar; sh allowed/check.sh)": ["allowed/check.sh"],
+            }
+            for command, expected in cases.items():
+                with self.subTest(command=command):
+                    self.assertEqual(AUTO_CORRECT.gate_paths([command], repo), expected)
+
+    def test_documented_indirect_forms_need_explicit_protect_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.repository(
+                directory,
+                (
+                    "allowed/check.sh",
+                    "allowed/check.js",
+                    "allowed/check.ts",
+                    "allowed/check.rb",
+                    "allowed/check.ps1",
+                    "allowed/check-gate",
+                ),
+            )
+            cases = {
+                'eval "sh allowed/check.sh"': "allowed/check.sh",
+                "find allowed -name check.sh -exec sh {} +": "allowed/check.sh",
+                'printf "allowed/check.sh\\n" | xargs sh': "allowed/check.sh",
+                'bash <<< "sh allowed/check.sh"': "allowed/check.sh",
+                "builtin . allowed/check.sh": "allowed/check.sh",
+                "(cd allowed && case x in *) ;; esac && sh check.sh)": "allowed/check.sh",
+                "cd allowed && bun check-gate": "allowed/check-gate",
+                "bun -c bunfig.toml allowed/check.ts": "allowed/check.ts",
+                "deno run --ext ts allowed/check.ts": "allowed/check.ts",
+                "deno run --env-file .env allowed/check.ts": "allowed/check.ts",
+                "node --env-file-if-exists .env allowed/check.js": "allowed/check.js",
+                "node --disable-warning DEP0001 allowed/check.js": "allowed/check.js",
+                "bun --cwd allowed check.ts": "allowed/check.ts",
+                "bun --cwd=allowed check.ts": "allowed/check.ts",
+                "ruby -C allowed check.rb": "allowed/check.rb",
+                "ruby -Callowed check.rb": "allowed/check.rb",
+                "pwsh -wd allowed check.ps1": "allowed/check.ps1",
+                "pwsh -WorkingDirectory allowed -File check.ps1": "allowed/check.ps1",
+                "pwsh < allowed/check.ps1": "allowed/check.ps1",
+                'pwsh -c "./allowed/check.ps1"': "allowed/check.ps1",
+            }
+            for command, gate in cases.items():
+                with self.subTest(command=command):
+                    self.assertEqual(AUTO_CORRECT.gate_paths([command], repo), [])
+                    self.assertEqual(AUTO_CORRECT.protected_paths([gate], repo), [gate])
+
     def test_gate_files_are_the_programs_and_scripts_the_commands_run(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             files = ("tools/gen.py", "tests/test_x.py", "data/in.json", "gate/check.sh", "scripts/env.sh")
@@ -155,6 +221,46 @@ class AutoCorrectUnitTests(unittest.TestCase):
         self.assertTrue(released("gate/check.sh", ["."]))
         self.assertFalse(released("allowed/check.sh", ["allow"]))
         self.assertFalse(released("allowed/check.sh", []))
+
+    def test_link_cycles_are_bounded_and_releasing_a_child_does_not_release_its_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.repository(directory, ("gates/check.sh", "gates/sibling.sh"))
+            (repo / "gates/loop").symlink_to(".")
+            (repo / "alias").symlink_to("gates")
+            (repo / "cycle1").symlink_to("cycle2")
+            (repo / "cycle2").symlink_to("cycle1")
+            self.assertEqual(AUTO_CORRECT.protected_paths(["gates"], repo), ["gates", "gates/loop"])
+            self.assertEqual(AUTO_CORRECT.protected_paths(["cycle1"], repo), ["cycle1", "cycle2"])
+            self.assertEqual(AUTO_CORRECT.release_paths(["alias/check.sh"], repo), ["alias/check.sh", "gates/check.sh"])
+
+    def test_releasing_a_directory_alias_also_releases_its_nested_links_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.repository(directory, ("gates/plain.sh", "target.sh"))
+            (repo / "gates/check.sh").symlink_to("../target.sh")
+            (repo / "alias").symlink_to("gates")
+            protected = AUTO_CORRECT.protected_paths(["alias"], repo)
+            links = AUTO_CORRECT.protected_links(protected, repo)
+            self.assertEqual(
+                AUTO_CORRECT.release_paths(["alias"], repo, links=links),
+                ["alias", "gates", "gates/check.sh", "target.sh"],
+            )
+            self.assertEqual(AUTO_CORRECT.release_paths(["."], repo, links=links), ["."])
+
+    def test_directory_gate_baselines_exclude_released_children_but_keep_modes_and_siblings(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.repository(directory, ("gates/one.txt", "gates/two.txt"))
+            path = repo / "gates"
+            baseline = RUNNER.gate_fingerprint(path)
+            (path / "one.txt").write_text("released\n")
+            releases = [path / "one.txt"]
+            self.assertFalse(RUNNER.gate_changed(path, baseline, releases=releases))
+            self.assertTrue(RUNNER.gate_changed(path, baseline, releases=[]))
+            (path / "new.txt").write_text("unreleased addition\n")
+            self.assertTrue(RUNNER.gate_changed(path, baseline, releases=releases))
+            releases.append(path / "new.txt")
+            self.assertFalse(RUNNER.gate_changed(path, baseline, releases=releases))
+            (path / "two.txt").chmod(0o700)
+            self.assertTrue(RUNNER.gate_changed(path, baseline, releases=releases))
 
     def test_a_round_never_runs_past_the_deadline_less_the_gates(self) -> None:
         budget = AUTO_CORRECT.round_budget

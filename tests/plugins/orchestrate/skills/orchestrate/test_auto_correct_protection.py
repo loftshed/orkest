@@ -41,6 +41,54 @@ class ProtectionRunnerTests(unittest.TestCase):
     def tearDown(self):
         self.fixture.tearDown()
 
+    def test_protected_directory_records_nested_symlink_targets(self):
+        f = self.fixture
+        seed(f, {"allowed/real-check.sh": "exit 1\n", "allowed/output.txt": "broken\n"})
+        gates = f.repository.path / "allowed/gates/nested"
+        gates.mkdir(parents=True)
+        (gates / "check.sh").symlink_to("../../real-check.sh")
+        f.repository.git("add", "allowed/gates")
+        f.repository.git("commit", "-qm", "nested symlink")
+        code, result, *_ = f.run_main(
+            engine="codex",
+            allow_path="allowed",
+            verify_commands=['eval "sh allowed/gates/nested/check.sh"'],
+            extra_args=["--auto-correct", "1", "--protect-path", "allowed/gates"],
+            extra_env=rounds_env(
+                f, [edit("allowed/output.txt", "attempt\n"), edit("allowed/real-check.sh", "exit 0\n")]
+            ),
+        )
+        self.assertEqual((code, result["status"]), (22, "scope_violation"))
+        self.assertIn("gate-edit:allowed/real-check.sh", result["scope_violations"])
+
+    def test_intermediate_directory_symlink_is_protected(self):
+        f = self.fixture
+        seed(f, {"allowed/real/check.sh": "exit 1\n", "allowed/pass/check.sh": "exit 0\n"})
+        (f.repository.path / "allowed/dir1").symlink_to("dir2")
+        (f.repository.path / "allowed/dir2").symlink_to("real")
+        f.repository.git("add", "allowed/dir1", "allowed/dir2")
+        f.repository.git("commit", "-qm", "directory symlink chain")
+        self.assertEqual(
+            CORRECTOR.gate_paths(["sh allowed/dir1/check.sh"], f.repository.path),
+            ["allowed/dir1", "allowed/dir2", "allowed/real/check.sh"],
+        )
+        executor = f.external_path / "codex"
+        executor.rename(f.external_path / "codex-real")
+        executor.write_text(
+            '#!/bin/sh\n"$(dirname "$0")/codex-real" "$@"; rc=$?\n'
+            'if [ "$1" = exec ] && [ "$2" = resume ]; then ln -snf pass allowed/dir2; fi\nexit $rc\n'
+        )
+        executor.chmod(0o755)
+        code, result, *_ = f.run_main(
+            engine="codex",
+            allow_path="allowed",
+            verify_commands=["sh allowed/dir1/check.sh"],
+            extra_args=["--auto-correct", "1"],
+            extra_env=rounds_env(f, [edit("allowed/output.txt", "attempt\n"), {"FAKE_NO_CHANGE": "1"}]),
+        )
+        self.assertEqual((code, result["status"]), (22, "scope_violation"))
+        self.assertEqual(result["scope_violations"], ["gate-edit:allowed/dir2"])
+
     def test_protected_file_changed_on_first_turn_fails_before_verification(self):
         f = self.fixture
         seed(f, {"allowed/expected.txt": "strict\n", "allowed/output.txt": "broken\n", "allowed/flag.txt": "no\n"})
@@ -215,6 +263,84 @@ class ProtectionRunnerTests(unittest.TestCase):
             extra_env=rounds_env(f, [edit("allowed/helper.txt", "new\n"), {"FAKE_NO_CHANGE": "1"}]),
         )
         self.assertEqual((code, result["status"]), (0, "completed"))
+
+
+class ProtectionSteerTests(unittest.TestCase):
+    def setUp(self):
+        self.fixture = fixtures.SteerTests()
+        self.fixture.setUp()
+
+    def tearDown(self):
+        self.fixture.tearDown()
+
+    def steer(self, job, path, during_round=None):
+        f = self.fixture
+        self.assertTrue(f.wait_until(lambda: job["resume_started"].exists(), timeout=20))
+        if during_round is not None:
+            during_round()
+        code, output = f.steer(job["event_id"], "Fix the named gate.", "--allow-path", path)
+        self.assertEqual(code, 0)
+        values = dict(line.split("=", 1) for line in output.splitlines() if line.startswith("AGENT_"))
+        f.wait_event(values["AGENT_EVENT_ID"])
+        self.steered_result_path = Path(values["AGENT_RESULT"])
+        return json.loads(self.steered_result_path.read_text())
+
+    def test_release_of_one_child_keeps_siblings_protected_against_original_baseline(self):
+        f = self.fixture
+        seed(f, {"allowed/tests/one.txt": "old\n", "allowed/tests/two.txt": "keep\n"})
+        job = f.launch_auto_correct(
+            [edit("allowed/output.txt", "attempt\n"), edit("allowed/tests/one.txt", "fixed\n")],
+            "grep -qx fixed allowed/tests/one.txt",
+            extra_args=("--protect-path", "allowed/tests"),
+        )
+        result = self.steer(job, "allowed/tests/one.txt")
+        self.assertEqual((result["exit_code"], result["status"], result["scope_violations"]), (0, "completed", []))
+        # Carry the original baseline into a resume, where a sibling edit still fails.
+        runner = fixtures.RunnerIntegrationTests()
+        runner.__dict__.update(f.__dict__)
+        code, resumed, *_ = runner.run_main(
+            engine="codex",
+            allow_path="allowed",
+            verify_commands=["grep -qx fixed allowed/tests/one.txt"],
+            extra_args=["--session", result["session_id"], "--resume-result", str(self.steered_result_path)],
+            extra_env=edit("allowed/tests/two.txt", "weakened\n"),
+        )
+        self.assertEqual((code, resumed["status"]), (22, "scope_violation"), resumed.get("error"))
+        self.assertEqual(resumed["scope_violations"], ["gate-edit:allowed/tests"])
+
+    def test_releasing_a_symlink_gate_releases_its_target(self):
+        f = self.fixture
+        seed(f, {"allowed/real-check.sh": "exit 1\n"})
+        (f.repository.path / "allowed/check.sh").symlink_to("real-check.sh")
+        f.repository.git("add", "allowed/check.sh")
+        f.repository.git("commit", "-qm", "symlink gate")
+        job = f.launch_auto_correct(
+            [edit("allowed/output.txt", "attempt\n"), edit("allowed/check.sh", "exit 0\n")],
+            "sh allowed/check.sh",
+        )
+        result = self.steer(job, "allowed/check.sh")
+        self.assertEqual((result["exit_code"], result["status"], result["scope_violations"]), (0, "completed", []))
+        self.assertEqual(result["auto_correct"]["released_paths"], ["allowed/check.sh", "allowed/real-check.sh"])
+
+    def test_release_uses_the_recorded_target_even_after_the_link_was_retargeted(self):
+        f = self.fixture
+        seed(f, {"allowed/real-check.sh": "exit 1\n", "allowed/pass-check.sh": "exit 0\n"})
+        link = f.repository.path / "allowed/check.sh"
+        link.symlink_to("real-check.sh")
+        f.repository.git("add", "allowed/check.sh")
+        f.repository.git("commit", "-qm", "symlink gate")
+        job = f.launch_auto_correct(
+            [edit("allowed/output.txt", "attempt\n"), edit("allowed/real-check.sh", "exit 0\n")],
+            "sh allowed/check.sh",
+        )
+
+        def retarget():
+            link.rename(f.external_path / "original-link")
+            link.symlink_to("pass-check.sh")
+
+        result = self.steer(job, "allowed/check.sh", retarget)
+        self.assertEqual((result["exit_code"], result["status"], result["scope_violations"]), (0, "completed", []))
+        self.assertEqual(result["auto_correct"]["released_paths"], ["allowed/check.sh", "allowed/real-check.sh"])
 
 
 class ProtectionCoordinatorTests(unittest.TestCase):

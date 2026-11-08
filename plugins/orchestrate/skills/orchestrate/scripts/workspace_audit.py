@@ -135,6 +135,46 @@ def path_fingerprint(path: Path) -> dict[str, Any]:
     return {"kind": kind, "sha256": digest.hexdigest()}
 
 
+def gate_fingerprint(path: Path) -> dict[str, Any]:
+    """A gate directory's per-entry baseline, so steering can exclude individual descendants.
+
+    Workspace fingerprints keep their existing format. Links stay links here too; the gate resolver
+    records their targets separately.
+    """
+    if path.is_symlink() or not path.is_dir():
+        return _attr("path_fingerprint")(path)
+    try:
+        return {
+            "kind": "directory",
+            "mode": path.stat().st_mode,
+            "children": {child.name: gate_fingerprint(child) for child in sorted(path.iterdir())},
+        }
+    except OSError:
+        return _attr("path_fingerprint")(path)
+
+
+def gate_changed(path: Path, baseline: dict[str, Any] | None, *, releases: list[Path]) -> bool:
+    """Compare against the original baseline, omitting only paths an explicit steer released."""
+
+    def retained(state: dict[str, Any] | None, current: Path) -> dict[str, Any] | None:
+        if state is None or "children" not in state:
+            return state
+        return {
+            **state,
+            "children": {
+                name: retained(child, current / name)
+                for name, child in state["children"].items()
+                if not any((current / name).is_relative_to(rule) for rule in releases)
+            },
+        }
+
+    # Older saved results have opaque directory hashes. Preserve their protection rather than
+    # replacing their original baseline with the current workspace after a steer.
+    if baseline is not None and baseline.get("kind") == "directory" and "children" not in baseline:
+        return _attr("path_fingerprint")(path) != baseline
+    return retained(gate_fingerprint(path), path) != retained(baseline, path)
+
+
 def normalize_repo_paths(values: list[str], *, option: str, allow_root: bool = False) -> list[str]:
     normalized: list[str] = []
     for value in values:

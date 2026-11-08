@@ -516,6 +516,8 @@ git_root = _WORKSPACE_AUDIT_MOD.git_root
 nul_paths = _WORKSPACE_AUDIT_MOD.nul_paths
 hash_path = _WORKSPACE_AUDIT_MOD.hash_path
 path_fingerprint = _WORKSPACE_AUDIT_MOD.path_fingerprint
+gate_fingerprint = _WORKSPACE_AUDIT_MOD.gate_fingerprint
+gate_changed = _WORKSPACE_AUDIT_MOD.gate_changed
 normalize_repo_paths = _WORKSPACE_AUDIT_MOD.normalize_repo_paths
 index_fingerprints = _WORKSPACE_AUDIT_MOD.index_fingerprints
 git_path_fingerprint = _WORKSPACE_AUDIT_MOD.git_path_fingerprint
@@ -2221,6 +2223,8 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
         steering.enforced_paths = list(enforced_paths)
     # Paths a steer explicitly allowed in a run this one resumes; they stay released here too.
     resumed_releases: list[str] = []
+    resolved_releases: dict[str, list[str]] = {}
+    gate_links: dict[str, str] = {}
 
     def steer_releases() -> list[str]:
         """Every path a steer explicitly asked to allow, live or interrupting, whether or not scope already
@@ -2231,7 +2235,13 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
             if entry.get("status") == "accepted"
             for path in entry.get("added_allow_paths") or []
         ]
-        return list(dict.fromkeys([*resumed_releases, *requested]))
+        # Resolve once, at acceptance: a later link retarget must not broaden this authority.
+        for path in requested:
+            if path not in resolved_releases:
+                resolved_releases[path] = bundled_module("auto_correct").release_paths([path], repo, links=gate_links)
+        return list(
+            dict.fromkeys([*resumed_releases, *(name for path in requested for name in resolved_releases[path])])
+        )
 
     def steer_released(path: str) -> bool:
         return bundled_module("auto_correct").released(path, steer_releases())
@@ -2441,8 +2451,12 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
             protected = list(dict.fromkeys([*saved["protect_paths"], *protected]))
     # Preserve explicit protection from the task's first handoff, including ignored files/directories.
     # A resumed zero-round segment carries this state forward without opening mechanical rounds.
+    gate_links = {
+        **auto_correct_module.protected_links([*gate_candidates, *protected], repo),
+        **saved.get("gate_links", {}),
+    }
     protect_fingerprints = {
-        path: saved.get("protect_fingerprints", {}).get(path, path_fingerprint(repo / path)) for path in protected
+        path: saved.get("protect_fingerprints", {}).get(path, gate_fingerprint(repo / path)) for path in protected
     }
     # Fresh N=0 runs retain their original output shape.
     auto_correct: dict[str, Any] | None = (
@@ -2451,6 +2465,7 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
             "source": rounds_source,
             "mode": "executor",
             "gate_candidates": list(gate_candidates),
+            "gate_links": gate_links,
             "protect_paths": list(protected),
             "protect_fingerprints": protect_fingerprints,
             "released_paths": steer_releases(),
@@ -2610,7 +2625,7 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
         if not steer_released(path)
     ]
     gates_before = {
-        path: protect_fingerprints[path] if path in protect_fingerprints else path_fingerprint(repo / path)
+        path: protect_fingerprints[path] if path in protect_fingerprints else gate_fingerprint(repo / path)
         for path in gates
     }
     gate_edit_violations: list[str] = []
@@ -2865,7 +2880,11 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
                 gates_before = {path: gates_before[path] for path in gates if path in gates_before}
                 # Recorded, not final: the steered turn may still restore these, and the gates stay protected.
                 interrupted_gate_changes = [
-                    path for path in gates if path_fingerprint(repo / path) != gates_before.get(path)
+                    path
+                    for path in gates
+                    if gate_changed(
+                        repo / path, gates_before.get(path), releases=[repo / rule for rule in steer_releases()]
+                    )
                 ]
                 if auto_correct is not None:
                     auto_correct["released_paths"] = steer_releases()
@@ -3101,7 +3120,9 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
         # A correction round must fix the work, not the gate: changing a file the gates name fails the run.
         gates = [path for path in gates if not steer_released(path)]
         gate_violations = [
-            f"gate-edit:{path}" for path in gates if path_fingerprint(repo / path) != gates_before.get(path)
+            f"gate-edit:{path}"
+            for path in gates
+            if gate_changed(repo / path, gates_before.get(path), releases=[repo / rule for rule in steer_releases()])
         ]
         gate_edit_violations = list(dict.fromkeys([*gate_edit_violations, *gate_violations]))
         scope_violations_after_executor = [*scope_violations_after_executor, *gate_edit_violations]
@@ -3293,7 +3314,7 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
         derived = [path for path in gate_candidates if path not in run_delta["changed_paths"]]
         gates = [path for path in dict.fromkeys([*derived, *protected]) if not steer_released(path)]
         gates_before = {
-            path: protect_fingerprints[path] if path in protect_fingerprints else path_fingerprint(repo / path)
+            path: protect_fingerprints[path] if path in protect_fingerprints else gate_fingerprint(repo / path)
             for path in gates
         }
         round_brief_path = out_dir / f"round-{correction_round}-brief.txt"
