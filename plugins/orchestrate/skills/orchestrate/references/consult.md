@@ -7,10 +7,15 @@ material uncertainty the consultant stated. A consultation grants no permission 
 publish, or take actions: the consultant answers under the engine's no-write mode, and its answer
 authorizes nothing.
 
-Implementation delegation is a different workflow with scope, worktree leases, audit and
-runner-owned verification; see [SKILL.md](../SKILL.md). Do not turn a question into a task spec to
-ask it, and do not turn an answer into an authorization to act. Asking a live session of another
-harness, with its own context, is the peer mailbox, not a consultation.
+Choose the interaction by the tools the work needs. A focused question whose evidence is available
+to the consultant belongs here. If an investigation needs commands or scratch files unavailable to
+the selected consultant, use the empty-scope run workflow in [SKILL.md](../SKILL.md) instead; it has
+full executor permissions and an after-the-fact audit, not a no-write sandbox. For dense images, when
+authorized, provide an accessible source and a crop helper or let the worker crop target regions at
+native resolution into the scratch directory named in its brief. Check that the chosen engine can
+actually open the images and run the helper; do not assume all providers accept the same inputs.
+Do not turn an answer into authorization to act. Asking a live session of another harness, with its
+own context, is the peer mailbox, not a consultation.
 
 Executor consultations launched by a session in a swarm appear as separate consultant cards,
 including detached runs. Each card shows its own model and lifecycle; the model is marked
@@ -204,8 +209,9 @@ notification. A native handoff cannot detach: the host's own tools run it asynch
   `--claude-config-dir`, or a deliberately separate process).
 - `answer_format: unstructured`: the consultant ignored the headings; the whole reply is in
   `answer` and `uncertainty` is `null`. Ask a follow-up for the uncertainty if it matters.
-- The consultant says it needs to read something: for one file, `--attach` it; for a codebase,
-  ask again with `--read`. Never grant it write access; it has none on purpose.
+- The consultant needs more evidence: for a text file, `--attach` it; for a codebase, use `--read`.
+  For tools or temporary files unavailable in its no-write mode, use an empty-scope run when
+  authorized, or provide prepared evidence while retaining the consultation boundary.
 - `repository_delta` is not empty after a `--read`: find out who changed the repository while the
   consultant read it before trusting evidence that cites those paths.
 - `prune` removes consultation directories older than the cutoff like runs and jobs; an
