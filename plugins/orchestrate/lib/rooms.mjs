@@ -275,8 +275,12 @@ export async function reserveLead(
     briefPath = null;
   }
   let status = isNew ? "native_handoff" : "pending_attachment";
+  const spawnNext =
+    member.engine === "claude"
+      ? "Spawn once through your native tools with this brief path in the prompt, then bind its actual session if the tool returns one; a Claude Code subagent is matched to this member by the brief path."
+      : "Spawn once through your native tools, then bind its actual session before any retry.";
   let next = isNew
-    ? "Spawn once through your native tools, then bind its actual session before any retry."
+    ? spawnNext
     : "An earlier reservation has no attached session. Recover its outcome through native tools; do not spawn again.";
   if (member.session) {
     status = "attached";
@@ -1414,6 +1418,7 @@ async function appendNativePeers(room, snapshots, root) {
     if (otherRoom.id !== room.id) collectRoomSessions(otherRoom);
   }
   const existingIds = new Set(["conductor", ...room.agents.map((agent) => agent.id)]);
+  const claimedSlots = new Set();
   const conductorPid = snapshots?.conductor?.pid || room.conductor?.pid;
   const conductorWorkspace =
     snapshots?.conductor?.herdrWorkspaceId || room.conductor?.herdrWorkspaceId;
@@ -1429,8 +1434,8 @@ async function appendNativePeers(room, snapshots, root) {
   const peerFiles = rawPeerEntries
     .filter((entry) => entry.endsWith(".json"))
     .sort((left, right) => left.localeCompare(right));
+  const maxAgents = room.swarm?.maxAgents || 64;
   for (const entry of peerFiles) {
-    if (room.agents.length >= (room.swarm?.maxAgents || 64)) break;
     const peer = await readOptionalJson(path.join(root, "peers", entry), 64 * 1024);
     if (
       !isValidPeer(peer) ||
@@ -1479,19 +1484,25 @@ async function appendNativePeers(room, snapshots, root) {
         ? await readClaudeSubagentInfo(peer, roomCwd, room)
         : null;
     const person = cleanLine(peer.person);
-    const rawBase =
-      cleanLine(peer.person || peer.shortName || peer.session.slice(0, 8))
-        .toLowerCase()
-        .replaceAll(/[^\w-]/gu, "-")
-        .replaceAll(/^-+|-+$/gu, "")
-        .slice(0, 48) || "native";
-    let id = rawBase;
-    let index = 2;
-    while (existingIds.has(id)) {
-      id = `${rawBase}-${index}`;
-      index++;
+    const slot = subagentMeta
+      ? claimReservedSlot(room, subagentMeta.briefClaims, claimedSlots)
+      : null;
+    let id = slot?.id;
+    if (!slot) {
+      const rawBase =
+        cleanLine(peer.person || peer.shortName || peer.session.slice(0, 8))
+          .toLowerCase()
+          .replaceAll(/[^\w-]/gu, "-")
+          .replaceAll(/^-+|-+$/gu, "")
+          .slice(0, 48) || "native";
+      id = rawBase;
+      let index = 2;
+      while (existingIds.has(id)) {
+        id = `${rawBase}-${index}`;
+        index++;
+      }
+      existingIds.add(id);
     }
-    existingIds.add(id);
     boundSessions.add(peer.session);
     const engine = peer.harness === "gemini" ? "agy" : peer.harness;
     let stage = progressRecord?.stage || (peer.state === "busy" ? "working" : "idle");
@@ -1523,7 +1534,7 @@ async function appendNativePeers(room, snapshots, root) {
     const latestActivityIso = subagentMeta?.lastActivityIso || peer.lastSeenAt || null;
     const observedAt =
       latestActivityIso || progressRecord?.updatedAt || peer.lastSeenAt || peer.startedAt;
-    room.agents.push({
+    const projected = {
       id,
       name: cleanLine(peer.name),
       ...(person && { person }),
@@ -1578,9 +1589,22 @@ async function appendNativePeers(room, snapshots, root) {
         lastSeenAt: latestActivityIso,
         startedAt: peer.startedAt || null,
       },
-    });
+    };
+    if (slot) {
+      fillReservedSlot(slot, projected);
+    } else if (room.agents.length < maxAgents) {
+      room.agents.push(projected);
+    }
   }
-  await appendClaudeProjectSubagents(root, room, roomCwd, boundSessions, existingIds, conductorPid);
+  await appendClaudeProjectSubagents(
+    root,
+    room,
+    roomCwd,
+    boundSessions,
+    existingIds,
+    conductorPid,
+    claimedSlots,
+  );
 }
 
 // cspell:disable
@@ -1710,6 +1734,79 @@ function pickSubagentMartianName(subSid, existingIds, conductorPerson) {
     .slice(0, 6)}`;
 }
 
+async function readHeadText(filePath, maxBytes = 32_768) {
+  let handle;
+  try {
+    handle = await open(filePath, "r");
+    const buffer = Buffer.alloc(maxBytes);
+    const { bytesRead } = await handle.read(buffer, 0, maxBytes, 0);
+    return buffer.toString("utf8", 0, bytesRead);
+  } catch {
+    return "";
+  } finally {
+    await handle?.close();
+  }
+}
+
+// A lead hands a native subagent its room brief path in the launch prompt. That path names the
+// reserved member slot the subagent fills, because a Claude subagent cannot see its own session ID
+// to run `ork rooms bind` itself. Only the first transcript line (the launch prompt) counts, so
+// briefs the subagent reads later never move it to another slot.
+function parseBriefClaims(headText) {
+  const firstLine = String(headText || "").split("\n", 1)[0];
+  return Array.from(
+    firstLine.matchAll(
+      /swarm-briefs[\\/]+([A-Za-z0-9][A-Za-z0-9_.-]{0,127})[\\/]+([A-Za-z0-9][A-Za-z0-9_.-]{0,63})\.md/gu,
+    ),
+    (match) => ({ roomId: match[1], memberId: match[2] }),
+  );
+}
+
+const CLAIMABLE_SLOT_STATUSES = new Set(["reserved", "queued"]);
+
+function claimReservedSlot(room, claims, claimedSlots) {
+  const memberIds = [
+    ...new Set(
+      (claims || []).filter((claim) => claim.roomId === room.id).map((claim) => claim.memberId),
+    ),
+  ];
+  if (memberIds.length !== 1 || claimedSlots.has(memberIds[0])) return null;
+  const slot = room.agents.find((agent) => agent.id === memberIds[0]);
+  if (
+    !slot ||
+    slot.native ||
+    slot.session?.id ||
+    slot.mailboxSession ||
+    slot.nativeSession ||
+    slot.dispatch ||
+    (slot.engine && slot.engine !== "claude") ||
+    !CLAIMABLE_SLOT_STATUSES.has(slot.status)
+  ) {
+    return null;
+  }
+  claimedSlots.add(slot.id);
+  return slot;
+}
+
+// Fill a reserved slot with a projected subagent, keeping the slot's identity, role, parent and
+// assignment so the roster shows one member per agent.
+function fillReservedSlot(slot, projected) {
+  const role = slot.workforceRole || projected.workforceRole;
+  const objective = slot.objective || projected.objective;
+  const kept = {
+    id: slot.id,
+    name: slot.name || projected.name,
+    person: slot.person || projected.person,
+    role: slot.role || projected.role,
+    parent: slot.parent || projected.parent,
+  };
+  Object.assign(slot, projected, kept, {
+    workforceRole: role,
+    objective,
+    progress: { ...projected.progress, role },
+  });
+}
+
 async function readTailText(filePath, maxBytes = 65_536) {
   let handle;
   try {
@@ -1751,9 +1848,10 @@ function claudeSubagentsDirs(accountHome, parentSession, cwds) {
 async function readClaudeSubagentFromDir(subagentsDir, agentId) {
   const metaPath = path.join(subagentsDir, `agent-${agentId}.meta.json`);
   const jsonlPath = path.join(subagentsDir, `agent-${agentId}.jsonl`);
-  const [meta, tail] = await Promise.all([
+  const [meta, tail, head] = await Promise.all([
     readOptionalJson(metaPath, 32 * 1024),
     readTailText(jsonlPath),
+    readHeadText(jsonlPath),
   ]);
   if (!meta && !tail) return null;
   let observedModel = "";
@@ -1777,6 +1875,7 @@ async function readClaudeSubagentFromDir(subagentsDir, agentId) {
     description,
     model: observedModel || metaModel,
     finished: Boolean(meta?.finished),
+    briefClaims: parseBriefClaims(head),
     lastActivityIso,
     startedIso,
     mtimeMs: tail?.mtimeMs ?? NaN,
@@ -1807,6 +1906,7 @@ async function appendClaudeProjectSubagents(
   boundSessions,
   existingIds,
   conductorPid,
+  claimedSlots = new Set(),
 ) {
   const parentSession = room.conductor?.session?.id;
   if (!parentSession || (room.conductor?.engine && room.conductor.engine !== "claude")) return;
@@ -1824,7 +1924,6 @@ async function appendClaudeProjectSubagents(
       .filter((e) => /^agent-[A-Za-z0-9_-]+\.meta\.json$/u.test(e))
       .sort((a, b) => a.localeCompare(b));
     for (const file of metaFiles) {
-      if (room.agents.length >= (room.swarm?.maxAgents || 64)) return;
       const agentId = file.replace(/^agent-/u, "").replace(/\.meta\.json$/u, "");
       const subSid = `subagent-${agentId}`.slice(0, 80);
       if (boundSessions.has(subSid)) continue;
@@ -1848,24 +1947,28 @@ async function appendClaudeProjectSubagents(
       const isFinished = info.finished || !isConductorAlive;
       const status = isFinished ? "reported complete" : "running";
       const stage = isFinished ? "complete" : "working";
-      const shortId =
-        savedPrefix && !existingIds.has(savedPrefix)
-          ? savedPrefix
-          : pickSubagentMartianName(subSid, existingIds, room.conductor?.person);
-      let id = shortId;
-      let index = 2;
-      while (existingIds.has(id)) {
-        id = `${shortId}-${index}`;
-        index++;
+      const slot = claimReservedSlot(room, info.briefClaims, claimedSlots);
+      let id = slot?.id;
+      if (!slot) {
+        const shortId =
+          savedPrefix && !existingIds.has(savedPrefix)
+            ? savedPrefix
+            : pickSubagentMartianName(subSid, existingIds, room.conductor?.person);
+        id = shortId;
+        let index = 2;
+        while (existingIds.has(id)) {
+          id = `${shortId}-${index}`;
+          index++;
+        }
+        existingIds.add(id);
       }
-      existingIds.add(id);
       boundSessions.add(subSid);
       const taskText =
         info.description ||
         (typeof savedProgress?.task === "string" ? cleanLine(savedProgress.task) : "") ||
         `Running subagent (${agentId.slice(0, 12)})`;
       const modelName = info.model || "claude";
-      room.agents.push({
+      const projected = {
         id,
         name: id,
         person: id,
@@ -1904,7 +2007,12 @@ async function appendClaudeProjectSubagents(
           lastSeenAt: info.lastActivityIso,
           startedAt: info.startedIso,
         },
-      });
+      };
+      if (slot) {
+        fillReservedSlot(slot, projected);
+      } else if (room.agents.length < (room.swarm?.maxAgents || 64)) {
+        room.agents.push(projected);
+      }
     }
   }
 }
