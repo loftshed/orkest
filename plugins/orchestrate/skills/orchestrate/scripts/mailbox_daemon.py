@@ -157,7 +157,7 @@ def load_state(base: Path) -> dict[str, Any] | None:
 
 def read_token(base: Path) -> str:
     path = daemon_base(base) / "token.txt"
-    if not path.exists():
+    if not path.exists() and not path.is_symlink():
         return ""
     private_file(path)
     value = path.read_text(encoding="ascii").strip()
@@ -167,21 +167,22 @@ def read_token(base: Path) -> str:
 
 
 def generate_token(base: Path) -> str:
-    existing = read_token(base)
-    if existing:
-        return existing
-    path = daemon_base(base) / "token.txt"
-    token = secrets.token_urlsafe(32)
-    descriptor, temporary = tempfile.mkstemp(prefix=".token-", dir=path.parent)
-    try:
-        with os.fdopen(descriptor, "w", encoding="ascii") as stream:
-            stream.write(token + "\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-    finally:
-        Path(temporary).unlink(missing_ok=True)
-    return token
+    with mailbox.locked(daemon_base(base) / "token.txt"):
+        existing = read_token(base)
+        if existing:
+            return existing
+        path = daemon_base(base) / "token.txt"
+        token = secrets.token_urlsafe(32)
+        descriptor, temporary = tempfile.mkstemp(prefix=".token-", dir=path.parent)
+        try:
+            with os.fdopen(descriptor, "w", encoding="ascii") as stream:
+                stream.write(token + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
+        return token
 
 
 @contextlib.contextmanager

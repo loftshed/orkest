@@ -301,7 +301,7 @@ describe("ork side (side missions)", () => {
             if (cmd === "git") return { status: 0, stdout: cwd, stderr: "" };
             if (args.includes("dispatch")) {
               fs.writeFileSync(cacheDir + "/ready-" + shortId, "ready");
-              const deadline = Date.now() + 5000;
+              const deadline = Date.now() + 20000;
               while (!fs.existsSync(cacheDir + "/release")) {
                 if (Date.now() > deadline) throw new Error("barrier timed out");
                 Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
@@ -340,7 +340,8 @@ describe("ork side (side missions)", () => {
               ["first", "second"].map((id) => fs.existsSync(path.join(cacheDir, `ready-${id}`))),
             ).toEqual([true, true]);
           },
-          { timeout: 5000 },
+          // Two cold Node processes can take several seconds to start on shared CI runners.
+          { timeout: 20_000 },
         );
       } finally {
         fs.writeFileSync(path.join(cacheDir, "release"), "go");

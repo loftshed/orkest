@@ -13,6 +13,7 @@ import {
   listRawRooms,
   mailboxRoot,
   normalizeWorkforceRole,
+  processStarted,
   readRoom,
   refreshMemberWorktrees,
   resolveWorktreeMarkerPath,
@@ -22,6 +23,7 @@ import {
   WORKFORCE_ROLES,
   workforceRoleInfo,
 } from "./horde-room.mjs";
+import { verifiedNativeIds } from "./native-identity.mjs";
 
 const execute = promisify(execFile);
 const plugin = fileURLToPath(new URL("../", import.meta.url));
@@ -667,7 +669,7 @@ export async function bindSession(
         throw new Error("Session engine differs from room member");
       const owner = await resolveRoomSessionPeer(room, root, member);
       const peer =
-        owner && sessionIdentities(owner).includes(session)
+        owner && sessionIdentities(owner, root).includes(session)
           ? owner
           : await resolveSessionPeer(session, root, {
               engine,
@@ -2152,6 +2154,10 @@ export function isPeerLive(peer, nowMs = Date.now()) {
   if (!Number.isFinite(seenMs)) return false;
   const alive = pidAlive(peer.pid);
   if (alive === false) return false;
+  if (alive && peer.pidBirth) {
+    const birth = processStarted(peer.pid);
+    if (birth && birth !== peer.pidBirth) return false;
+  }
   const ageMs = nowMs - seenMs;
   if (ageMs > MAX_PEER_AGE_MS) return false;
   if (alive && peer.sharedProcess) {
@@ -2161,13 +2167,11 @@ export function isPeerLive(peer, nowMs = Date.now()) {
   return alive ?? ageMs <= UNKNOWN_PID_TTL_MS;
 }
 
-/** Native IDs are recorded by hooks; display aliases never establish session ownership. */
-export function sessionIdentities(peer) {
-  return [
-    peer?.session,
-    peer?.nativeSession,
-    ...(Array.isArray(peer?.nativeSessions) ? peer.nativeSessions : []),
-  ].filter((id) => typeof id === "string" && sessionKey(id));
+/** Only MAC-verified hook claims supplement the exact mailbox identity. */
+export function sessionIdentities(peer, root = mailboxRoot()) {
+  return [peer?.session, ...verifiedNativeIds(peer, root)].filter(
+    (id) => typeof id === "string" && sessionKey(id),
+  );
 }
 
 async function sessionPeerCandidates(
@@ -2200,7 +2204,7 @@ async function sessionPeerCandidates(
   for (const file of files) {
     if (!file.endsWith(".json")) continue;
     const peer = await readOptionalJson(path.join(root, "peers", file), 64 * 1024);
-    if (sessionIdentities(peer).includes(session) && (await eligible(peer, true)))
+    if (sessionIdentities(peer, root).includes(session) && (await eligible(peer, true)))
       matches.push(peer);
   }
   return matches;
@@ -2287,7 +2291,7 @@ export async function rebindSession(id, memberId, session, root = mailboxRoot())
         throw new Error("The target binding belongs to a different machine");
       const owner = await resolveRoomSessionPeer(room, root, member);
       const peer =
-        owner && sessionIdentities(owner).includes(session)
+        owner && sessionIdentities(owner, root).includes(session)
           ? owner
           : await resolveSessionPeer(session, root, {
               engine: member.engine,

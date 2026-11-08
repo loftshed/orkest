@@ -36,7 +36,7 @@ def status() -> str:
             return ""
         peer = mailbox.load(path)
         if mailbox.valid_peer(peer) and peer.get("harness") == "codex":
-            codex_sessions.update(mailbox.native_session_ids(peer))
+            codex_sessions.update(mailbox.native_session_ids(peer, base))
         if (
             mailbox.valid_peer(peer)
             and not peer.get("isSubagent")
@@ -51,12 +51,14 @@ def status() -> str:
         matches = [
             peer
             for peer in peers
-            if ref.get("value") in mailbox.native_session_ids(peer)
+            if ref.get("value") in mailbox.native_session_ids(peer, base)
             and peer["harness"] == agent_harness(ref.get("agent"))
         ]
     elif pane.get("agent") == "codex" and not ref:
         session = codex_title_session(pane.get("terminal_title"), codex_sessions)
-        matches = [peer for peer in peers if session in mailbox.native_session_ids(peer) and peer["harness"] == "codex"]
+        matches = [
+            peer for peer in peers if session in mailbox.native_session_ids(peer, base) and peer["harness"] == "codex"
+        ]
     else:
         return ""
     if len(matches) != 1 or time.monotonic() >= deadline:

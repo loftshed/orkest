@@ -86,7 +86,7 @@ class DiscoveryTests(unittest.TestCase):
 
     def test_attested_native_identity_discovers_the_canonical_mailbox_peer(self):
         native = "019a5da8-4321-5678-9abc-123456789012"
-        mailbox.annotate(self.base, SESSION, nativeSession=native, nativeSessions=[native])
+        mailbox.attest_native_sessions(self.base, SESSION, native)
         self.panes[0].update(
             terminal_title="Resumed work | " + native,
             agent_session={"kind": "id", "agent": "codex", "value": native},
@@ -110,9 +110,9 @@ class DiscoveryTests(unittest.TestCase):
     def test_truncated_native_identity_is_rejected_when_another_peer_collides(self):
         native = "019a5da8-4321-5678-9abc-123456789012"
         collision = native[:29] + "0000000"
-        mailbox.annotate(self.base, SESSION, nativeSession=native, nativeSessions=[native])
+        mailbox.attest_native_sessions(self.base, SESSION, native)
         mailbox.register(self.base, session="other-peer", harness="codex", cwd=str(self.home), pid=os.getpid())
-        mailbox.annotate(self.base, "other-peer", nativeSession=collision, nativeSessions=[collision])
+        mailbox.attest_native_sessions(self.base, "other-peer", collision)
         self.panes[0]["terminal_title"] = "Resumed work | " + native[:29] + "..."
         self.assertFalse(agent_terminal.bind(SESSION, "codex", {}, base=self.base))
         self.assertIsNone(self.peer().get("herdrPaneId"))
@@ -378,7 +378,7 @@ class DiscoveryTests(unittest.TestCase):
                     ),
                 ):
                     self.assertEqual(herdr_status.status(), "")
-                    mailbox.annotate(self.base, SESSION, nativeSession=native, nativeSessions=[native])
+                    mailbox.attest_native_sessions(self.base, SESSION, native)
                     self.assertEqual(
                         herdr_status.status(), "[C] codex-ivory-elk-49 · Coordinator · working · Verify patch"
                     )
