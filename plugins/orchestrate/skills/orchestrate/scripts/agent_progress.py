@@ -11,6 +11,7 @@ import json
 import os
 import shlex
 import socket
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,59 @@ ROLES_PATH = Path(__file__).resolve().parents[1] / "references" / "workforce-rol
 ROLES_DATA = json.loads(ROLES_PATH.read_text(encoding="utf-8"))
 ROLES = tuple(ROLES_DATA.keys())
 ROLE_ALIASES = {alias: role_id for role_id, info in ROLES_DATA.items() for alias in (role_id, *info.get("aliases", ()))}
+
+
+def caller_descends_from(owner_pid: int) -> bool | None:
+    """Walk only our ancestry on Linux; use one portable ps snapshot on macOS.
+
+    None means ancestry could not be established, not permission to update a live peer.
+    """
+    pid = os.getpid()
+    parent = os.getppid()
+    if owner_pid in (pid, parent):
+        return True
+    seen = {pid}
+    if sys.platform == "linux":
+        try:
+            while parent > 1 and parent not in seen:
+                if parent == owner_pid:
+                    return True
+                seen.add(parent)
+                # comm is parenthesized and may itself contain spaces or parentheses.
+                fields = Path(f"/proc/{parent}/stat").read_text().rsplit(")", 1)[1].split()
+                parent = int(fields[1])
+            return parent == owner_pid
+        except (OSError, ValueError, IndexError):
+            pass  # /proc may be unavailable; fall back to the portable process table.
+    try:
+        result = subprocess.run(["ps", "-A", "-o", "pid=,ppid="], capture_output=True, text=True, timeout=2, check=True)
+        parents = dict(tuple(map(int, line.split())) for line in result.stdout.splitlines() if line.strip())
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    seen = {pid}
+    parent = os.getppid()
+    while parent > 1 and parent not in seen:
+        if parent == owner_pid:
+            return True
+        seen.add(parent)
+        if parent not in parents:
+            return None
+        parent = parents[parent]
+    return parent == owner_pid
+
+
+def require_owner(peer: dict[str, Any]) -> None:
+    """A dead, unknown or recycled pid must not lock out a resumed session."""
+    pid = peer.get("pid")
+    if mailbox.pid_alive(pid) is not True:
+        return
+    birth = mailbox.process_started(pid) if peer.get("pidBirth") else None
+    if birth is not None and birth != peer["pidBirth"]:
+        return
+    ancestry = caller_descends_from(pid)
+    if ancestry is not True:
+        detail = "; could not verify process ancestry" if ancestry is None else ""
+        raise mailbox.MailboxError(f"session {peer['session']!r} is not owned by this process{detail}")
 
 
 def normalize_role(value: str | None) -> str | None:
@@ -91,6 +145,7 @@ def report(
     stage: str | None,
     role: str | None = None,
 ) -> dict[str, Any]:
+    require_owner(peer)
     path = record_path(base, peer["session"])
     normalized_role = normalize_role(role)
     with mailbox.locked(path):

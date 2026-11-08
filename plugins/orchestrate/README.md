@@ -57,6 +57,10 @@ ork progress --session SESSION_ID --goal 'Ship the feature' --task 'Fix the pars
 ork progress --session SESSION_ID --stage testing
 ```
 
+For a live session, progress updates must come from its recorded process or a descendant
+(including a shell it spawned). An unrelated caller gets a nonzero error naming the session.
+Dead, unknown, or reused PIDs do not prevent a resumed session from reporting progress.
+
 To bind an interactive coordinator or worker session to a swarm room:
 
 ```sh
