@@ -1346,6 +1346,11 @@ def hook(
             if sub_desc:
                 extra_annotations["subagentDescription"] = sub_desc
             _MB.annotate(base, sub_sid, **extra_annotations)
+            import agent_progress
+
+            previous_progress = agent_progress.read(base, sub_peer) or {}
+            # A generic subagent has no workforce preset. Keep any role it already reported.
+            sub_role = previous_progress.get("role") or {"explore": "scout", "plan": "planner"}.get(agent_type.lower())
             _MB.write(
                 base / "progress" / f"{session_key(sub_sid)}.json",
                 {
@@ -1355,7 +1360,7 @@ def hook(
                     "machine": socket.gethostname(),
                     "accountHome": sub_peer.get("accountHome"),
                     "checkout": sub_peer.get("checkout") or cwd,
-                    "role": "builder",
+                    **({"role": sub_role} if sub_role else {}),
                     "stage": "working",
                     "goal": f"Native {agent_type}",
                     "task": sub_desc or f"Running {agent_type} subagent ({agent_id_clean[:12]})",

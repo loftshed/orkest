@@ -20,6 +20,7 @@ import {
 } from "../../../plugins/orchestrate/lib/horde-room.mjs";
 import { openOrkestSqlite } from "../../../plugins/orchestrate/lib/orkest-sqlite.mjs";
 import {
+  bindSession,
   dispatchMember,
   growRoom,
   listRooms,
@@ -1329,8 +1330,11 @@ describe("room CLI", () => {
         model: "claude-opus-5-5",
         cwd,
       });
-      expect(byId.get(reviewer).nativeSession).toBeUndefined();
-      expect(observed.agents.some((agent) => agent.nativeSession === "subagent-a7")).toBe(false);
+      expect(byId.get(reviewer)).toMatchObject({
+        nativeSession: "subagent-a7",
+        workforceRole: "reviewer",
+        status: "running",
+      });
       expect(byId.get(codexSlot).nativeSession).toBeUndefined();
 
       const sessions = observed.agents.map((agent) => agent.nativeSession).filter(Boolean);
@@ -1349,6 +1353,309 @@ describe("room CLI", () => {
       }
     }
   });
+
+  it("keeps live peers authoritative and does not hydrate remote or other-engine bindings", async () => {
+    const root = await realpath(await directory());
+    const cwd = await realpath(await directory());
+    const accountHome = await directory();
+    const parentSession = "parent-bound-guards";
+    const slug = cwd.replaceAll(/[^A-Za-z0-9-]/gu, "-");
+    const subagentsDir = path.join(accountHome, "projects", slug, parentSession, "subagents");
+    await mkdir(subagentsDir, { recursive: true });
+    await mkdir(path.join(root, "peers"), { recursive: true });
+    await mkdir(path.join(root, "progress"), { recursive: true });
+    const room = await newRoom(parseTeam("claude:opus*3,codex:sol"), {
+      id: "room-bound-guards",
+      cwd,
+      root,
+    });
+    const ids = ["live", "remote", "missing", "codex"];
+    await updateRoom(
+      room.id,
+      (current) => {
+        current.conductor.engine = "claude";
+        current.conductor.session = {
+          id: parentSession,
+          engine: "claude",
+          machine: hostname(),
+          cwd,
+        };
+        for (const [index, member] of current.agents.entries()) {
+          member.session = {
+            id: `subagent-${ids[index]}`,
+            engine: member.engine,
+            machine: index === 1 ? "another-machine" : hostname(),
+            cwd,
+          };
+        }
+        return current;
+      },
+      { root },
+    );
+    for (const id of ["live", "remote", "codex"]) {
+      await writeFile(
+        path.join(subagentsDir, `agent-${id}.meta.json`),
+        JSON.stringify({
+          finished: true,
+          agentType: "Explore",
+          model: "sonnet",
+          description: "Old transcript task",
+        }),
+      );
+    }
+    const now = new Date().toISOString();
+    await writeFile(
+      path.join(root, "peers", "subagent-live.json"),
+      JSON.stringify({
+        schema: "agent-executor.peer.v1",
+        session: "subagent-live",
+        harness: "claude",
+        name: "live-agent",
+        state: "busy",
+        cwd,
+        checkout: cwd,
+        accountHome,
+        parentSession,
+        pid: process.pid,
+        sharedProcess: true,
+        isSubagent: true,
+        startedAt: now,
+        lastSeenAt: now,
+      }),
+    );
+    await writeFile(
+      path.join(root, "progress", "subagent-live.json"),
+      JSON.stringify({
+        schema: "orchestrate.progress.v1",
+        session: "subagent-live",
+        harness: "claude",
+        machine: hostname(),
+        accountHome,
+        checkout: cwd,
+        role: "reviewer",
+        goal: "Current goal",
+        task: "Current peer task",
+        stage: "blocked",
+        updatedAt: now,
+      }),
+    );
+    // Transcript-only discovery without metadata remains limited to explicit bindings.
+    await writeFile(path.join(subagentsDir, "agent-unbound.jsonl"), "{}\n");
+    vi.stubEnv("CLAUDE_CONFIG_DIR", accountHome);
+    try {
+      const observed = await observeRoom(room.id, { root });
+      expect(observed.agents).toHaveLength(4);
+      expect(observed.agents[0]).toMatchObject({
+        status: "blocked",
+        runtimeState: "running",
+        workforceRole: "reviewer",
+        progress: { task: "Current peer task", role: "reviewer" },
+      });
+      for (const member of observed.agents.slice(1)) {
+        expect(member.status).toBe("session unavailable");
+        expect(member.nativeSession).toBeUndefined();
+      }
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it.each([
+    ["subagent-tx1", true, "both"],
+    ["tx1", false, "both"],
+    ["tx1", true, "both"],
+    ["subagent-tx1", false, "both"],
+    ["subagent-tx1", false, "transcript"],
+    ["subagent-tx1", true, "meta"],
+  ])(
+    "hydrates bound %s (finished=%s, files=%s) without a peer",
+    async (session, finished, files) => {
+      const root = await realpath(await directory());
+      const cwd = await realpath(await directory());
+      const accountHome = await directory();
+      const parentSession = "parent-transcript";
+      const slug = cwd.replaceAll(/[^A-Za-z0-9-]/gu, "-");
+      const subagentsDir = path.join(accountHome, "projects", slug, parentSession, "subagents");
+      await mkdir(subagentsDir, { recursive: true });
+      const room = await newRoom(parseTeam("claude:opus@reviewer"), {
+        id: "room-bound-transcript",
+        cwd,
+        root,
+        swarm: { maxAgents: 1, maxDepth: 1 },
+      });
+      const memberId = room.agents[0].id;
+      await updateRoom(
+        room.id,
+        (current) => {
+          current.conductor.engine = "claude";
+          current.conductor.session = {
+            id: parentSession,
+            engine: "claude",
+            machine: hostname(),
+            cwd,
+          };
+          current.agents[0].role = "lead";
+          current.agents[0].objective = "Review the assigned change";
+          return current;
+        },
+        { root },
+      );
+      // Probe 13b: explicitly bind a slot, then observe only its local transcript/meta.
+      await bindSession(room.id, memberId, { session, engine: "claude", root });
+      if (files !== "transcript") {
+        await writeFile(
+          path.join(subagentsDir, "agent-tx1.meta.json"),
+          JSON.stringify({
+            agentType: "Explore",
+            description: "Reviewing slot status",
+            model: "sonnet",
+            finished,
+          }),
+        );
+      }
+      if (files !== "meta") {
+        const transcript = path.join(subagentsDir, "agent-tx1.jsonl");
+        await writeFile(
+          transcript,
+          `${JSON.stringify({ message: { model: "claude-sonnet-5-5" } })}\n`,
+        );
+        // Explicit bindings remain meaningful even when the work predates the room.
+        await utimes(transcript, new Date("2026-01-01"), new Date("2026-01-01"));
+      }
+      const stored = await readRawRoom(room.id, root);
+      vi.stubEnv("CLAUDE_CONFIG_DIR", accountHome);
+      try {
+        const observed = await observeRoom(room.id, { root });
+        expect(observed.agents).toHaveLength(1);
+        expect(observed.agents[0]).toMatchObject({
+          id: memberId,
+          session: { id: session },
+          nativeSession: "subagent-tx1",
+          role: "lead",
+          workforceRole: "reviewer",
+          objective: "Review the assigned change",
+          model: files === "meta" ? "sonnet" : "claude-sonnet-5-5",
+          status: finished ? "reported complete" : "running",
+          runtimeState: finished ? "stopped" : "running",
+          progress: {
+            role: "reviewer",
+            stage: finished ? "complete" : "working",
+            task: files === "transcript" ? "Running subagent (tx1)" : "Reviewing slot status",
+          },
+        });
+        expect(Number.isFinite(Date.parse(observed.agents[0].observedAt))).toBe(true);
+        expect(Number.isFinite(Date.parse(observed.agents[0].progress.startedAt))).toBe(true);
+        expect(await readRawRoom(room.id, root)).toEqual(stored);
+        expect((await observeRoom(observed, { root })).agents).toHaveLength(1);
+      } finally {
+        vi.unstubAllEnvs();
+      }
+    },
+  );
+
+  it.each([
+    ["Explore", undefined, "scout"],
+    ["Plan", undefined, "planner"],
+    ["general-purpose", undefined, "native"],
+    ["custom-agent", undefined, "native"],
+    ["Explore", "reviewer", "reviewer"],
+    ["Plan", "builder", "builder"],
+  ])(
+    "projects unmatched %s subagents with saved role %s as %s",
+    async (agentType, savedRole, expectedRole) => {
+      const root = await realpath(await directory());
+      const cwd = await realpath(await directory());
+      const accountHome = await directory();
+      const parentSession = "parent-role";
+      const slug = cwd.replaceAll(/[^A-Za-z0-9-]/gu, "-");
+      const subagentsDir = path.join(accountHome, "projects", slug, parentSession, "subagents");
+      await mkdir(subagentsDir, { recursive: true });
+      await mkdir(path.join(root, "peers"), { recursive: true });
+      await mkdir(path.join(root, "progress"), { recursive: true });
+      const room = await newRoom([], { id: "room-unmatched", cwd, root });
+      await updateRoom(
+        room.id,
+        (current) => {
+          current.conductor.engine = "claude";
+          current.conductor.session = {
+            id: parentSession,
+            engine: "claude",
+            machine: hostname(),
+            cwd,
+          };
+          return current;
+        },
+        { root },
+      );
+      for (const [agentId, live] of [
+        ["live", true],
+        ["finished", false],
+      ]) {
+        await writeFile(
+          path.join(subagentsDir, `agent-${agentId}.meta.json`),
+          JSON.stringify({
+            agentType,
+            description: "Unmatched task",
+            finished: !live,
+          }),
+        );
+        await writeFile(path.join(subagentsDir, `agent-${agentId}.jsonl`), "{}\n");
+        if (live) {
+          // Legacy peers have only focus, not agentType or isSubagent.
+          await writeFile(
+            path.join(root, "peers", `subagent-${agentId}.json`),
+            JSON.stringify({
+              schema: "agent-executor.peer.v1",
+              session: `subagent-${agentId}`,
+              harness: "claude",
+              name: "legacy",
+              state: "busy",
+              cwd,
+              checkout: cwd,
+              accountHome,
+              parentSession,
+              pid: process.pid,
+              sharedProcess: true,
+              focus: `native ${agentType}`,
+              startedAt: new Date().toISOString(),
+              lastSeenAt: new Date().toISOString(),
+            }),
+          );
+          // Exercise the legacy peer fallback without metadata.
+          await writeFile(path.join(subagentsDir, `agent-${agentId}.meta.json`), "{}");
+        }
+        if (savedRole) {
+          await writeFile(
+            path.join(root, "progress", `subagent-${agentId}.json`),
+            JSON.stringify({
+              schema: "orchestrate.progress.v1",
+              session: `subagent-${agentId}`,
+              harness: "claude",
+              machine: hostname(),
+              accountHome,
+              checkout: cwd,
+              role: savedRole,
+              stage: live ? "working" : "complete",
+              goal: "Investigate roles",
+              task: "Unmatched task",
+              updatedAt: new Date().toISOString(),
+            }),
+          );
+        }
+      }
+      vi.stubEnv("CLAUDE_CONFIG_DIR", accountHome);
+      try {
+        const observed = await observeRoom(room.id, { root });
+        expect(observed.agents).toHaveLength(2);
+        for (const agent of observed.agents) {
+          expect(agent.workforceRole).toBe(expectedRole);
+          expect(agent.progress.role || agent.workforceRole).toBe(expectedRole);
+        }
+      } finally {
+        vi.unstubAllEnvs();
+      }
+    },
+  );
 
   it("projects consultation answers and attaches agent mailbox messages during observeRoom", async () => {
     const rawRoot = await directory();
