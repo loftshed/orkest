@@ -20,7 +20,8 @@ from pathlib import Path
 
 import peer_mailbox as mailbox
 import room_store
-from herdr_context import verified_agent
+from herdr_context import canonical_endpoint, verified_agent
+from herdr_labels import agent_harness
 
 _RESUME_VALUE_FLAGS = frozenset({"--resume", "-r", "--session-id", "--conversation", "--session", "-s", "-c"})
 _NON_SESSION_FLAG_VALUES = frozenset({"last", "help", "read-only", "workspace-write", "danger-full-access"})
@@ -621,6 +622,7 @@ def _open_herdr_swarm_view_unlocked(
 def _find_herdr_peer(
     base: Path, session_id: str | None, pane_id: str, *, endpoint: str | None = None
 ) -> dict[str, object] | None:
+    canonical = canonical_endpoint(endpoint)
     if session_id:
         with contextlib.suppress(Exception):
             peer = mailbox.session_peer(base, session_id)
@@ -631,7 +633,7 @@ def _find_herdr_peer(
                 and not peer.get("delegatedRun")
                 and not peer.get("run")
                 and not peer["session"].startswith("run-")
-                and (endpoint is None or peer.get("herdrEndpoint") == endpoint)
+                and (endpoint is None or canonical_endpoint(peer.get("herdrEndpoint")) == canonical)
             ):
                 return peer
     if not pane_id:
@@ -652,7 +654,7 @@ def _find_herdr_peer(
                 continue
             if peer.get("herdrPaneId") != pane_id:
                 continue
-            if endpoint is not None and peer.get("herdrEndpoint") != endpoint:
+            if endpoint is not None and canonical_endpoint(peer.get("herdrEndpoint")) != canonical:
                 continue
             if best is None or str(peer.get("lastSeenAt", "")) >= str(best.get("lastSeenAt", "")):
                 best = peer
@@ -663,6 +665,7 @@ def _find_herdr_room(base: Path, pane_id: str, *, endpoint: str | None = None) -
     if not pane_id:
         return ""
     best_id = ""
+    canonical = canonical_endpoint(endpoint)
     best_updated = -1
     with contextlib.suppress(OSError):
         for room in room_store.list_rooms(base):
@@ -670,7 +673,7 @@ def _find_herdr_room(base: Path, pane_id: str, *, endpoint: str | None = None) -
                 room.get("herdrCoordinatorPaneId") != pane_id and room.get("herdrViewPaneId") != pane_id
             ):
                 continue
-            if endpoint is not None and room.get("herdrEndpoint") != endpoint:
+            if endpoint is not None and canonical_endpoint(room.get("herdrEndpoint")) != canonical:
                 continue
             room_id = room.get("id")
             if not isinstance(room_id, str) or not room_id:
@@ -798,7 +801,7 @@ def _toggle_herdr_swarm_view_unlocked(
             ref = pane.get("agent_session") or {}
             if ref.get("kind") == "id" and isinstance(ref.get("value"), str):
                 session_id = ref["value"]
-                harness = harness or {"agy": "gemini"}.get(ref.get("agent"), ref.get("agent"))
+                harness = harness or agent_harness(ref.get("agent"))
     peer = _find_herdr_peer(base, session_id, coordinator_pane, endpoint=current_endpoint)
     if peer and session_id and peer.get("session") != session_id and session_id not in mailbox.native_session_ids(peer):
         peer = None
@@ -1303,6 +1306,9 @@ def main(arguments: list[str]) -> int:
                 # exact resume target is unavailable while its owner is live.
                 if member and not mailbox.room_session_peers(base_dir, matched, member):
                     room = matched["id"]
+        if Path(command[0]).name == "codex":
+            titles = '["thread-title","session-id"]' if herdr_active else '["session-id"]'
+            command = [command[0], "-c", f"tui.terminal_title={titles}", *command[1:]]
         if resume_swarm and room:
             base_dir = mailbox.root()
             selected = room_store.read_room(base_dir, room)
@@ -1360,9 +1366,6 @@ def main(arguments: list[str]) -> int:
             except OSError as error:
                 print(f"Could not launch {command[0]} in Herdr: {error}", file=sys.stderr)
                 return 2
-        if Path(command[0]).name == "codex":
-            # The private tmux footer identifies this conversation even when Codex shares a daemon.
-            command = [command[0], "-c", 'tui.terminal_title=["session-id"]', *command[1:]]
     tmux = shutil.which("tmux")
     if not tmux:
         print("ork label needs tmux on PATH", file=sys.stderr)

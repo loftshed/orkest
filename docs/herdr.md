@@ -22,15 +22,40 @@ invoking coordinator. In a shared or ambiguous context, open the desired room ex
 
 Preview, focus, and mailbox delivery verify the native conversation at its Herdr endpoint. A
 mailbox wake goes to an idle or done agent. If Herdr cannot confirm a submission, the message
-stays queued. Orkest reports the agent's title, model, and active child count (with model/effort
-provenance) as expiring display metadata on the parent pane without marking an idle parent as
-working. While running inside Herdr, Horde View subscribes to Herdr lifecycle events over the
+stays queued. Orkest reports `<harness icon> <full agent name>` and `<stage> · <task>` as display metadata
+guarded by the pane's agent kind, without an expiry. Idle agents keep their labels; Herdr clears the
+metadata when the agent exits or changes. Native harness status lines yield to Herdr inside its panes.
+Set `ORK_GLYPHS=nerd` (default), `unicode`, or `ascii` to choose icons. While running inside Herdr, Horde View subscribes to Herdr lifecycle events over the
 server socket to invalidate cached state and reconcile on reconnect or `events_lost`.
 
 To inspect Orkest bindings against live Herdr panes without mutating state, run
 `python3 plugins/orchestrate/skills/orchestrate/scripts/herdr_swarm_restore.py --inventory`
 (optionally `--room <ROOM_ID>`), which reports `pane_existence`, `available_shell`,
 `live_agent_conversation`, `executing_worker`, and `accepted_task` for each resource.
+
+## Agent labels and focused status
+
+Inside Herdr, Codex launches with `tui.terminal_title=["thread-title","session-id"]`. Its shared
+app-server hooks can find the pane using the final session ID in that title, even without Herdr
+environment variables. Discovery checks the configured/default XDG socket file before invoking
+Herdr. Missing matches are cached until the next SessionStart; duplicate matches and ambiguous
+truncated IDs are rejected. Outside Herdr, Codex keeps its session-only title and tmux footer.
+
+The installer offers these optional settings only on a terminal and preserves explicit settings:
+
+```toml
+[ui]
+show_agent_labels_on_pane_borders = true
+tab_bar_right = [
+  { type = "command", command = "ork herdr-status", interval_seconds = 1, timeout_seconds = 1 },
+]
+```
+
+`ork herdr-status` prints a plain line with the focused pane's icon, agent name, stage, and task.
+It uses `HERDR_ACTIVE_PANE_ID` and returns an empty line with exit 0 when no agent matches or Herdr
+is slow. Its Herdr lookup times out after 100 ms to keep the command within 300 ms. Labels and work
+metadata are capped at 80 characters, retaining the distinguishing suffix. See Herdr's
+[tab bar configuration](https://herdr.dev/tui/docs/configuration/) for other status entries.
 
 ## Restart and close
 

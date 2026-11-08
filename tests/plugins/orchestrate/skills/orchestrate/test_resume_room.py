@@ -273,7 +273,12 @@ print(json.dumps({'rooms': [r['id'] for r in rooms], 'room': room, 'notice': not
                 ):
                     with self.assertRaises(SystemExit):
                         terminal.main(["--resume-swarm", "--cwd", str(home), "--", *command])
-                self.assertEqual(captured["argv"], command)
+                expected = (
+                    [command[0], "-c", 'tui.terminal_title=["thread-title","session-id"]', *command[1:]]
+                    if harness == "codex"
+                    else command
+                )
+                self.assertEqual(captured["argv"], expected)
                 self.assertEqual(captured["env"]["ORKEST_SWARM_ROOM"], "existing-room")
                 self.assertEqual(captured["env"]["ORKEST_RESUME_TARGET"], "old-native")
                 self.assertEqual(captured["env"]["ORKEST_RESUME_SWARM"], "1")

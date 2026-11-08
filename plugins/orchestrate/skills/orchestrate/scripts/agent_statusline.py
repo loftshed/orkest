@@ -610,10 +610,10 @@ def main() -> int:
         args.native_status
         and session
         and not args.tmux
-        and agent_terminal.bind(session, args.harness, payload, force=args.refresh_terminal)
-        and agent_terminal.context(args.harness)
+        and (agent_terminal.bind(session, args.harness, payload) or agent_terminal.herdr_context(args.harness))
+        and (agent_terminal.context(args.harness) or agent_terminal.herdr_context(args.harness))
     ):
-        return 0  # In a wrapped terminal the native integration only supplies identity to the outer footer.
+        return 0  # Herdr or the private tmux footer draws the identity.
     if not session or not (item := identity(session, args.harness, payload)):
         if args.tmux:
             if args.line == 2:
