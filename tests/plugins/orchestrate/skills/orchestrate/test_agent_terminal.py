@@ -118,7 +118,7 @@ class HerdrMetadataTests(unittest.TestCase):
 
     def test_attested_native_session_supplies_coordinator_role_and_terminal_metadata(self):
         self.agent_session = "native-visible-session"
-        mailbox.annotate(self.base, self.session, nativeSession=self.agent_session, nativeSessions=[self.agent_session])
+        mailbox.attest_native_sessions(self.base, self.session, self.agent_session)
         room_store.put_room(
             self.base,
             {

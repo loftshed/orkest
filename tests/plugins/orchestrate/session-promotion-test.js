@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import {
   mkdir,
   mkdtemp,
@@ -39,6 +40,24 @@ afterEach(async () => {
   );
 });
 
+function attest(root, session, ...ids) {
+  return JSON.parse(
+    execFileSync(
+      "python3",
+      [
+        "-B",
+        "-c",
+        "import json,sys; from pathlib import Path; sys.path.insert(0,sys.argv[1]); import peer_mailbox as m; print(json.dumps(m.attest_native_sessions(Path(sys.argv[2]),sys.argv[3],*sys.argv[4:])))",
+        path.resolve("plugins/orchestrate/skills/orchestrate/scripts"),
+        root,
+        session,
+        ...ids,
+      ],
+      { encoding: "utf8" },
+    ),
+  );
+}
+
 async function fixture(changes = {}) {
   const temporary = await mkdtemp(path.join(tmpdir(), "ork-promote-"));
   const directory = await realpath(temporary);
@@ -47,7 +66,7 @@ async function fixture(changes = {}) {
   const cwd = path.join(directory, "checkout");
   await mkdir(cwd);
   await mkdir(path.join(root, "peers"), { recursive: true });
-  const peer = {
+  let peer = {
     schema: "agent-executor.peer.v1",
     session: "live-session",
     harness: "codex",
@@ -67,6 +86,13 @@ async function fixture(changes = {}) {
   };
   const peerFile = path.join(root, "peers/live-session.json");
   await writeFile(peerFile, JSON.stringify(peer));
+  if (peer.nativeSession || peer.nativeSessions?.length)
+    peer = attest(
+      root,
+      peer.session,
+      ...(peer.nativeSessions || []),
+      ...(peer.nativeSession ? [peer.nativeSession] : []),
+    );
   const refreshed = [];
   const options = {
     root,
@@ -93,7 +119,9 @@ describe("adopting the running conversation", () => {
     );
     const attacker = { ...peer, session: "attacker" };
     await writeFile(path.join(root, "peers/attacker.json"), JSON.stringify(attacker));
-    expect(await resolveSessionPeer("native-owner", root, { engine: "codex", cwd })).toBeNull();
+    expect((await resolveSessionPeer("native-owner", root, { engine: "codex", cwd })).session).toBe(
+      peer.session,
+    );
     expect((await interactiveProgress(room, root)).conductor.name).toBe(peer.name);
     expect(await ownsSessionBinding(room, peer, root)).toBe(true);
     expect(await ownsSessionBinding(room, attacker, root)).toBe(false);
@@ -101,7 +129,8 @@ describe("adopting the running conversation", () => {
     expect(
       (await rebindSession(room.id, "conductor", "native-owner", root)).conductor.session.id,
     ).toBe(peer.session);
-    // Legacy native-only bindings have no evidence to choose between the two claimants.
+    // Even two valid attestations must not authorize an ambiguous legacy repair.
+    attest(root, attacker.session, "native-owner");
     await updateRoom(
       room.id,
       (value) => {
@@ -127,6 +156,48 @@ describe("adopting the running conversation", () => {
     ).rejects.toThrow("another coordinator");
     expect(await readRoom(room.id, root)).toEqual(ambiguous);
   });
+
+  it.each(["missing", "fake", "copied", "tampered"])(
+    "refuses an unambiguous forged native claim with a %s MAC (n4)",
+    async (kind) => {
+      const { cwd, root, options, peer } = await fixture({ nativeSessions: ["genuine-native"] });
+      const first = await promoteSession({ session: peer.session, cwd }, options);
+      const room = await updateRoom(
+        first.room.id,
+        (value) => {
+          value.conductor.session.id = "unowned-native";
+          delete value.promotion;
+          return value;
+        },
+        { root },
+      );
+      let attacker = {
+        ...peer,
+        session: "attacker",
+        nativeSession: "unowned-native",
+        nativeSessions: ["unowned-native"],
+      };
+      if (kind === "missing") delete attacker.nativeSessionAttestation;
+      else if (kind === "fake") attacker.nativeSessionAttestation = "a".repeat(64);
+      await writeFile(path.join(root, "peers/attacker.json"), JSON.stringify(attacker));
+      if (kind === "tampered") {
+        attacker = attest(root, "attacker", "attacker-native");
+        attacker.nativeSessions.push("unowned-native");
+        await writeFile(path.join(root, "peers/attacker.json"), JSON.stringify(attacker));
+      }
+      expect((await resolveSessionPeer("genuine-native", root)).session).toBe(peer.session);
+      expect(await resolveSessionPeer("unowned-native", root)).toBeNull();
+      expect(await ownsSessionBinding(room, attacker, root)).toBe(false);
+      await expect(rebindSession(room.id, "conductor", "attacker", root)).rejects.toThrow("owner");
+      await expect(
+        bindSession(room.id, "conductor", { session: "attacker", engine: "codex", root }),
+      ).rejects.toThrow("attested peer");
+      await expect(
+        promoteSession({ session: "attacker", room: room.id, cwd }, options),
+      ).rejects.toThrow("another coordinator");
+      expect(await readRoom(room.id, root)).toEqual(room);
+    },
+  );
 
   it.each(["room", "binding"])(
     "rejects a foreign %s machine at every binding boundary",

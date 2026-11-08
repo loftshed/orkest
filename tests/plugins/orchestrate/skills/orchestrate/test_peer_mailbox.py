@@ -422,7 +422,7 @@ class SqliteSharedRoomTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
             mailbox.register(base, session="new", harness="claude", cwd=temporary, pid=os.getpid())
-            mailbox.annotate(base, "new", nativeSessions=["first"])
+            mailbox.attest_native_sessions(base, "new", "first")
             room_store.put_room(
                 base,
                 {

@@ -13,7 +13,10 @@ below also work independently.
 closed rooms, including legacy resume rooms. It only reads the store: it does not migrate, repair
 or remove records. To repair a native-ID binding once hooks have recorded its mailbox identity,
 use `ork rooms bind --room ID --member conductor --session MAILBOX_ID --engine ENGINE`.
-Repair checks recorded ownership and refuses to replace another live coordinator.
+Repair checks recorded ownership and refuses to replace another live coordinator. Native ID claims
+require a hook MAC tied to the mailbox identity, harness, machine and checkout, using the daemon token.
+Unsigned legacy claims remain hints until the next hook records the genuine ID; display aliases and
+unverified history never establish ownership. No daemon request is needed for verification.
 
 ## Create and dispatch
 

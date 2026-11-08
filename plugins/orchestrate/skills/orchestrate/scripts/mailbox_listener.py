@@ -91,9 +91,11 @@ class StreamingSession:
         mailbox.annotate(
             self.base,
             self.session,
-            nativeSession=self.native_session,
             listener={"adapter": "stream-json", "pid": os.getpid(), "pidBirth": mailbox.process_started(os.getpid())},
         )
+
+        if self.native_session:
+            mailbox.attest_native_sessions(self.base, self.session, self.native_session)
 
     def submit(self, text: str) -> None:
         if self.busy:
