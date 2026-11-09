@@ -1751,6 +1751,61 @@ describe("room CLI", () => {
     },
   );
 
+  it("gives a plain script a row whose status follows its reported stage", async () => {
+    const root = await realpath(await directory());
+    const cwd = await realpath(await directory());
+    await mkdir(path.join(root, "peers"), { recursive: true });
+    await mkdir(path.join(root, "progress"), { recursive: true });
+    const room = await newRoom([], { id: "room-script-row", cwd, root, title: "Wave 12" });
+    const startedAt = new Date().toISOString();
+    const report = async (session, harness, stage) => {
+      await writeFile(
+        path.join(root, "peers", `${session}.json`),
+        JSON.stringify({
+          schema: "agent-executor.peer.v1",
+          session,
+          name: `${session}-repo-12`,
+          harness,
+          state: "idle",
+          cwd,
+          checkout: cwd,
+          pid: process.pid,
+          startedAt,
+          lastSeenAt: startedAt,
+        }),
+      );
+      await writeFile(
+        path.join(root, "progress", `${session}.json`),
+        JSON.stringify({
+          schema: "orchestrate.progress.v1",
+          session,
+          harness,
+          machine: hostname(),
+          checkout: cwd,
+          stage,
+          goal: "Wave 12",
+          task: "Verifier B phase 2",
+          updatedAt: new Date().toISOString(),
+        }),
+      );
+    };
+    const statusOf = async (session) =>
+      (await observeRoom(room.id, { root })).agents.find((agent) => agent.nativeSession === session)
+        ?.status;
+    for (const [stage, status] of [
+      ["working", "running"],
+      ["testing", "running"],
+      ["blocked", "blocked"],
+      ["complete", "reported complete"],
+    ]) {
+      await report("wave-driver", "unknown", stage);
+      expect(await statusOf("wave-driver"), stage).toBe(status);
+    }
+    // A harness still reports busy or idle through its hooks, so its stage doesn't override them.
+    await report("resting-agent", "claude", "working");
+    expect(await statusOf("resting-agent")).toBe("idle");
+  });
+
   it("projects consultation answers and attaches agent mailbox messages during observeRoom", async () => {
     const rawRoot = await directory();
     const root = await realpath(rawRoot);

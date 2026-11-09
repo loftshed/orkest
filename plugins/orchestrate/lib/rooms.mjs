@@ -1607,7 +1607,8 @@ async function appendNativePeers(room, snapshots, root) {
       status = "reported complete";
     } else if (stage === "blocked") {
       status = "blocked";
-    } else if (peer.state === "busy") {
+    } else if (peer.state === "busy" || (peer.harness === "unknown" && progressRecord)) {
+      // A plain script has no harness hooks to report busy or idle; its stage is the only signal.
       status = "running";
     }
     const resolvedModel = cleanLine(subagentMeta?.model || peer.model) || engine;

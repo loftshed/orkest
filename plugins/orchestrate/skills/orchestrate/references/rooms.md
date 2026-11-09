@@ -79,6 +79,16 @@ Continues default to 3 per member. Set `--max-continues N` on `init-task` or the
 consume the task's invocation allowance and deadline; use `init-task --invocation-allowance N` for
 more total invocations. The one-correction allowance stays separate.
 
+A script that drives workers can show its own row in the Swarm View, with no reserved member. After
+the room exists, run these from the room's folder (the first from this skill directory's path):
+
+```sh
+python3 scripts/run_agent.py mailbox focus --session wave-12 --harness unknown --text "Wave 12 driver"
+ork progress --session wave-12 --goal "Wave 12" --task "Verifier B phase 2" --stage working
+```
+
+The row lasts as long as the process that ran `focus`, and its status follows the reported stage.
+
 `ork rooms launch --room cache-review --plan /absolute/plan.json` dispatches a batch and stops at the
 first error; retry the same plan to recover recorded requests:
 
