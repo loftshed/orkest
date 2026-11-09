@@ -137,6 +137,13 @@ when evidence becomes stale. An unreadable task clears the projected verdict to 
 Cancellation and conductor takeover remain terminal. Later progress updates activity details but
 cannot replace a terminal outcome. Idle runtime alone supplies no acceptance decision.
 
+Herdr's inventory keeps `accepted_task` separate from worker execution: `accepted` follows an
+`accept` decision or an explicit `accepted` status; `supported` follows a `supported` decision
+or status. Legacy `completed`, `complete`, `reported complete`, and `stale` statuses remain
+`awaiting_verification`, as does a finished run without a decision. Other task values remain
+`in_progress`, `unaccepted`, and `untracked`. Python projects recorded task decisions without
+probing the workspace; Swarm View derives stale evidence separately.
+
 The view uses separate glyphs, labels and semantic colours for these outcomes, including counts
 and inactive history. A step fraction appears only from a recorded member `checklist` (or
 `progress.checklist`) with integer `completed` and `total` counts, where

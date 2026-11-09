@@ -371,7 +371,7 @@ def _project_member_task(room: dict[str, Any], member: dict[str, Any]) -> tuple[
                     exec_dim = "blocked"
                 task_dim = {
                     "accept": "accepted",
-                    "supported": "accepted",
+                    "supported": "supported",
                     "reject": "unaccepted",
                     "takeover": "in_progress",
                 }.get(verdict, "awaiting_verification" if run_status == "finished" else "in_progress")
@@ -379,8 +379,12 @@ def _project_member_task(room: dict[str, Any], member: dict[str, Any]) -> tuple[
         except Exception:
             return "unknown", "untracked"
     status = str(member.get("status") or member.get("stage") or "").strip().lower()
-    if status in {"completed", "reported complete"}:
+    if status in {"completed", "complete", "reported complete", "stale"}:
+        return "finished", "awaiting_verification"
+    if status == "accepted":
         return "finished", "accepted"
+    if status == "supported":
+        return "finished", "supported"
     if status in {"cancelled", "canceled", "rejected", "failed"}:
         return "finished", "unaccepted"
     if status == "blocked":

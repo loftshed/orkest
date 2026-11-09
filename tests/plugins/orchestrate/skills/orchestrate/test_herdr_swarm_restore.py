@@ -342,7 +342,7 @@ class RestoreTests(unittest.TestCase):
                 "available_shell": "unavailable",
                 "live_agent_conversation": "none",
                 "executing_worker": "finished",
-                "accepted_task": "accepted",
+                "accepted_task": "awaiting_verification",
             },
         )
 

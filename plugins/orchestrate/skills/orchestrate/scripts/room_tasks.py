@@ -29,7 +29,7 @@ RUN_FIELDS = (
     "parent_run_id",
 )
 STATES = {"reserved": "reserved", "active": "running", "finished": "review", "cancelled": "cancelled"}
-VERDICTS = {"accept": "completed", "supported": "completed", "reject": "rejected", "takeover": "blocked"}
+VERDICTS = {"accept": "accepted", "supported": "supported", "reject": "rejected", "takeover": "blocked"}
 
 
 def project(cwd: str, member: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
@@ -82,7 +82,7 @@ def project(cwd: str, member: dict[str, Any], task: dict[str, Any]) -> dict[str,
     ]
     verdict = (decisions[-1].get("decision") if decisions else None) or "pending"
     state = STATES.get(run.get("status"), "unknown")
-    if run.get("runner_status") and run["runner_status"] != "completed":
+    if run.get("status") != "cancelled" and run.get("runner_status") and run["runner_status"] != "completed":
         state = "failed"
     state = VERDICTS.get(verdict, state)
     spec = run.get("task_spec", task.get("task_spec"))
