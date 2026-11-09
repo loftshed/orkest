@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.76.5
+
+- fix(orchestrate): a script's Swarm View row follows its reported stage (#154)
+
 ## 0.76.4
 
 - fix(orchestrate): late launches, cleared parents, and concurrent database opens (#153)
