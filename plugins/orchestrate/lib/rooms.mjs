@@ -23,6 +23,7 @@ import {
   WORKFORCE_ROLES,
   workforceRoleInfo,
 } from "./horde-room.mjs";
+import { hasTerminalDecision, memberDisplayState } from "./member-state.mjs";
 import { verifiedNativeIds } from "./native-identity.mjs";
 
 const execute = promisify(execFile);
@@ -41,6 +42,7 @@ const RUN_FIELDS = [
   "request_id",
   "status",
   "runner_status",
+  "result_sha256",
   "engine",
   "transport",
   "result_path",
@@ -59,12 +61,6 @@ const TASK_STATES = {
   active: "running",
   finished: "review",
   cancelled: "cancelled",
-};
-const TASK_VERDICTS = {
-  accept: "completed",
-  supported: "completed",
-  reject: "rejected",
-  takeover: "blocked",
 };
 const PROGRESS_STAGES = new Set([
   "planning",
@@ -462,7 +458,147 @@ async function loadCompactedTask(directory) {
   return compactTask(raw);
 }
 
-async function projectMemberTask(cwd, member, task) {
+// Reuse the runner's read-only audit so freshness uses exactly its candidate identity.
+// -B keeps this observation from writing Python bytecode into the installed plugin.
+async function candidateMatches(repository, result, { signal }) {
+  const script = [
+    "import json, sys",
+    "from pathlib import Path",
+    "sys.path.insert(0, sys.argv[1])",
+    "import run_agent as runner",
+    "result = json.loads(sys.argv[3])",
+    "repo = Path(sys.argv[2])",
+    'print(json.dumps(runner.git_state(repo, result.get("tracked_paths", []))["fingerprint"] == result["git_after"]["fingerprint"] and runner.git_identity(repo) == result["git_identity_after"]))',
+  ].join("\n");
+  const { stdout } = await execute(
+    "python3",
+    [
+      "-B",
+      "-c",
+      script,
+      path.dirname(coordinatorPath),
+      repository,
+      JSON.stringify({
+        tracked_paths: result.tracked_paths,
+        git_after: { fingerprint: result.git_after.fingerprint },
+        git_identity_after: result.git_identity_after,
+      }),
+    ],
+    { signal, timeout: 5000, maxBuffer: 1024 * 1024 },
+  );
+  const answer = JSON.parse(stdout);
+  return typeof answer === "boolean" ? answer : null;
+}
+
+const probeCaches = new WeakMap();
+const PROBE_INTERVAL_MS = 30_000;
+
+// Observation never waits for a live audit; each repository permits one probe at a time.
+function cachedCandidateMatch(repository, hash, result, options) {
+  const { candidateProbe = candidateMatches, probeNow = Date.now, probeTimeoutMs = 5000 } = options;
+  let repositories = probeCaches.get(candidateProbe);
+  if (!repositories) {
+    repositories = new Map();
+    probeCaches.set(candidateProbe, repositories);
+  }
+  let repositoryCache = repositories.get(repository);
+  if (!repositoryCache) {
+    repositoryCache = { entries: new Map(), inFlight: null };
+    repositories.set(repository, repositoryCache);
+  }
+  let entry = repositoryCache.entries.get(hash);
+  if (!entry) {
+    entry = { answer: null, checkedAt: null };
+    repositoryCache.entries.set(hash, entry);
+  }
+  if (
+    repositoryCache.inFlight ||
+    (entry.checkedAt !== null && probeNow() - entry.checkedAt < PROBE_INTERVAL_MS)
+  )
+    return entry.answer;
+  const controller = new AbortController();
+  let timer;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(
+      () => {
+        controller.abort();
+        resolve(null);
+      },
+      Math.min(5000, Math.max(1, probeTimeoutMs)),
+    );
+    timer.unref?.();
+  });
+  const probe = Promise.try(() =>
+    candidateProbe(repository, result, { signal: controller.signal }),
+  );
+  const inFlight = (async () => {
+    try {
+      return await probe;
+    } finally {
+      repositoryCache.inFlight = null;
+    }
+  })();
+  repositoryCache.inFlight = inFlight;
+  void (async () => {
+    try {
+      const answer = await Promise.race([inFlight, timeout]);
+      entry.answer = typeof answer === "boolean" ? answer : null;
+    } catch {
+      entry.answer = null;
+    } finally {
+      clearTimeout(timer);
+      entry.checkedAt = probeNow();
+    }
+  })();
+  return entry.answer;
+}
+
+async function evidenceFreshness(repository, run, history, verdict, options) {
+  const result = run.result_path ? await readOptionalJson(run.result_path) : null;
+  const hasDecision = ["accept", "supported"].includes(verdict);
+  const isFinished =
+    run.status === "finished" && (!run.runner_status || run.runner_status === "completed");
+  if (!hasDecision && !isFinished) return null;
+  const hasVerification =
+    run.kind === "verification" ||
+    result?.verification?.status === "passed" ||
+    result?.verification?.commands?.length > 0;
+  if (!hasVerification && !hasDecision) return null;
+  if (hasVerification && (!result?.git_after?.fingerprint || !result?.git_identity_after))
+    return "stale";
+  if (!result) return run.result_sha256 ? "stale" : null;
+  const bytes = await readFile(run.result_path);
+  const resultHash = createHash("sha256").update(bytes).digest("hex");
+  if (run.result_sha256 && resultHash !== run.result_sha256) return "stale";
+  if (run.kind === "verification") {
+    const parent = history.find((item) => item.run_id === run.verification_of);
+    const binding = result.verification_of;
+    if (
+      !parent?.result_sha256 ||
+      binding?.sha256 !== parent.result_sha256 ||
+      binding?.path !== parent.result_path
+    )
+      return "stale";
+    let bytes;
+    try {
+      bytes = await readFile(parent.result_path);
+    } catch {
+      return "stale";
+    }
+    if (!bytes || createHash("sha256").update(bytes).digest("hex") !== binding.sha256)
+      return "stale";
+  }
+  if (
+    verdict === "pending" &&
+    result.git_after?.fingerprint &&
+    result.git_identity_after &&
+    cachedCandidateMatch(repository, resultHash, result, options) === false
+  )
+    return "stale";
+  return null;
+}
+
+async function projectMemberTask(cwd, member, task, options) {
   const binding = member.dispatch;
   if (
     !isPlainObject(task) ||
@@ -519,20 +655,24 @@ async function projectMemberTask(cwd, member, task) {
   );
   const verdict = (decisions.length > 0 ? decisions.at(-1).decision : null) || "pending";
   let state = TASK_STATES[run.status] || "unknown";
-  if (run.runner_status && run.runner_status !== "completed") state = "failed";
-  state = TASK_VERDICTS[verdict] || state;
+  if (run.status !== "cancelled" && run.runner_status && run.runner_status !== "completed")
+    state = "failed";
+  const evidenceState = await evidenceFreshness(resolvedRepo, run, history, verdict, options);
+  const displayState = memberDisplayState({ status: state, verdict, evidenceState });
+  state = displayState === "reported" ? "review" : displayState;
   const spec = run.task_spec || task.task_spec;
   return {
     run,
     status: state,
     verdict,
+    evidenceState,
     observedAt: task.updated_at,
     objective: spec ? spec.objective : null,
     history,
   };
 }
 
-async function roomTasks(request) {
+async function roomTasks(request, options) {
   const tasks = { ...request.tasks };
   const errors = { ...request.errors };
   const members = {};
@@ -555,7 +695,7 @@ async function roomTasks(request) {
     try {
       if (Object.hasOwn(errors, directory)) throw new Error(errors[directory]);
       members[member.id] = {
-        projection: await projectMemberTask(request.cwd, member, tasks[directory]),
+        projection: await projectMemberTask(request.cwd, member, tasks[directory], options),
       };
     } catch (error) {
       members[member.id] = { error: error.message };
@@ -1041,19 +1181,22 @@ export async function observeRoom(idOrRoom, options = {}) {
   const projections = new Map();
   const project = async (members) => {
     const directories = new Set(members.map((member) => member.dispatch.taskDir));
-    const snapshot = await roomTasks({
-      cwd: room.cwd,
-      members: members.map(({ id, engine, dispatch, cwd }) => ({
-        id,
-        engine,
-        dispatch,
-        ...(cwd && { cwd }),
-      })),
-      tasks: Object.fromEntries([...tasks].filter(([directory]) => directories.has(directory))),
-      errors: Object.fromEntries(
-        [...taskErrors].filter(([directory]) => directories.has(directory)),
-      ),
-    });
+    const snapshot = await roomTasks(
+      {
+        cwd: room.cwd,
+        members: members.map(({ id, engine, dispatch, cwd }) => ({
+          id,
+          engine,
+          dispatch,
+          ...(cwd && { cwd }),
+        })),
+        tasks: Object.fromEntries([...tasks].filter(([directory]) => directories.has(directory))),
+        errors: Object.fromEntries(
+          [...taskErrors].filter(([directory]) => directories.has(directory)),
+        ),
+      },
+      options,
+    );
     for (const [directory, task] of Object.entries(snapshot.tasks)) tasks.set(directory, task);
     for (const [id, projection] of Object.entries(snapshot.members))
       projections.set(id, projection);
@@ -1079,7 +1222,15 @@ export async function observeRoom(idOrRoom, options = {}) {
     try {
       const item = projections.get(member.id);
       if (!item?.projection) throw new Error(item?.error || "Task snapshot unavailable");
-      const { run: record, status, verdict, observedAt, objective, history } = item.projection;
+      const {
+        run: record,
+        status,
+        verdict,
+        evidenceState,
+        observedAt,
+        objective,
+        history,
+      } = item.projection;
       member.runHistory = history;
       member.runId = record.run_id;
       member.transport = record.transport;
@@ -1088,6 +1239,7 @@ export async function observeRoom(idOrRoom, options = {}) {
       member.resolvedModel = record.model;
       member.resolvedEffort = record.effort;
       member.verdict = verdict;
+      member.evidenceState = evidenceState;
       member.status = status;
       member.runtimeState =
         { active: "running", finished: "stopped", cancelled: "stopped" }[record.status] ||
@@ -1124,6 +1276,8 @@ export async function observeRoom(idOrRoom, options = {}) {
       ].filter(Boolean);
     } catch (error) {
       member.status = "unknown";
+      member.verdict = "pending";
+      member.evidenceState = null;
       member.runtimeState = "unknown";
       member.output = [error.message];
     }
@@ -1202,14 +1356,11 @@ export async function observeRoom(idOrRoom, options = {}) {
       if (snapshot.role) member.workforceRole = snapshot.role;
       if (snapshot.cwd && (!member.worktree?.path || snapshot.cwd !== member.worktree.parentCwd))
         member.cwd = snapshot.cwd;
-      const isTerminalMember = ["completed", "reported complete", "cancelled", "rejected"].includes(
-        member.status,
-      );
       if (
         !member.dispatch &&
+        !hasTerminalDecision(member) &&
         member.progress.stage &&
-        member.progress.stage !== "not set" &&
-        (!isTerminalMember || snapshot.reportedAt || member.progress.stage === "working")
+        member.progress.stage !== "not set"
       ) {
         member.status =
           member.progress.stage === "complete" ? "reported complete" : member.progress.stage;
@@ -1217,7 +1368,8 @@ export async function observeRoom(idOrRoom, options = {}) {
     } else if (
       member.session &&
       !member.dispatch &&
-      !["completed", "reported complete", "cancelled", "rejected"].includes(member.status)
+      !hasTerminalDecision(member) &&
+      !["completed", "reported complete"].includes(member.status)
     ) {
       member.status = "session unavailable";
       member.runtimeState = "unknown";
@@ -2507,8 +2659,8 @@ export async function interactiveProgress(room, root = mailboxRoot()) {
         ? member.progress.task
         : member.objective,
     );
-    const fallbackStatus =
-      member.status === "reported complete" ? "complete" : cleanLine(member.status);
+    const displayState = memberDisplayState(member);
+    const fallbackStatus = displayState === "reported" ? "complete" : cleanLine(displayState);
     let existingStage = "";
     if (member.progress?.stage && member.progress.stage !== "not set") {
       existingStage = cleanLine(member.progress.stage);

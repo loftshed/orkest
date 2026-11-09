@@ -10,6 +10,7 @@ import path from "node:path";
 
 import { renderLine, timeLeft } from "../../monitor/lib/render.mjs";
 import { coalesceMessages, resolveMemberWorktree } from "./horde-room.mjs";
+import { memberDisplayState, MEMBER_OUTCOMES as OUTCOMES } from "./member-state.mjs";
 import {
   displayWidth,
   fit,
@@ -61,34 +62,36 @@ export {
 } from "./tui-box.mjs";
 
 const ACTIVE_STATUSES = new Set(["running", "working", "planning", "testing", "review"]);
-const COMPLETED_STATUSES = new Set(["completed", "reported complete"]);
+
+function outcome(member) {
+  return OUTCOMES[memberDisplayState(member)];
+}
+
+function outcomeGlyph(state, tier) {
+  return OUTCOMES[state].glyphs[{ ascii: 0, unicode: 1, nerd: 2 }[tier] ?? 1];
+}
 const COMPLETED_MODES = ["collapsed", "hidden", "expanded"];
 const QUOTA_MODES = new Set(["expanded", "collapsed"]);
 const SERVICES_MODES = new Set(["expanded", "collapsed"]);
 const ERROR_STATUSES = new Set(["blocked", "failed", "rejected", "session unavailable"]);
-const STAGE_STEPS = {
-  planning: "1/4",
-  running: "2/4",
-  working: "2/4",
-  testing: "3/4",
-  review: "4/4",
-};
 const SLOT_ID_PATTERN = /^[a-z0-9.]+-\d+$/iu;
 const SESSION_TAG_PATTERN = /^[0-9a-f]{2}$/iu;
 const EFFORT_LEVELS = new Set(["minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
 const TRAILING_EFFORT_PATTERN = /^(.*\S)(?:\s*\(([a-z]+)\)|\s*\[([a-z]+)\]|-([a-z]+))$/iu;
 
 function isExecuting(member) {
+  if (outcome(member) || ["cancelled", "blocked"].includes(memberDisplayState(member)))
+    return false;
   if (member.runtimeState) return member.runtimeState === "running";
   if (member.dispatch && member.status === "review") return false;
   return ACTIVE_STATUSES.has(member.status);
 }
 
 function isInactive(member) {
-  if (ERROR_STATUSES.has(member.status) && member.status !== "session unavailable") return false;
+  if (["stale", "failed", "rejected", "blocked"].includes(memberDisplayState(member))) return false;
   return (
     !isExecuting(member) &&
-    (COMPLETED_STATUSES.has(member.status) ||
+    (Boolean(outcome(member)) ||
       ["idle", "session unavailable"].includes(member.status) ||
       ["idle", "stopped"].includes(member.runtimeState) ||
       (member.dispatch && member.status === "review"))
@@ -105,15 +108,18 @@ function quotaWindowKind(window) {
 }
 
 function leadStageTone(member) {
+  if (outcome(member)) return outcome(member).tone;
   if (member.paused || /blocked|paused|stale/u.test(member.status)) return "leadWarning";
   if (/failed|error/u.test(member.status)) return "leadError";
-  if (/complete/u.test(member.status)) return "leadSuccess";
   if (member.status === "planning") return "leadPlanning";
   if (member.status === "testing") return "leadTesting";
   return ACTIVE_STATUSES.has(member.status) ? "leadModel" : "muted";
 }
 
 function phaseLabel(member) {
+  if (outcome(member)) return outcome(member).label;
+  if (member.verdict === "takeover" || member.status === "conductor_takeover")
+    return "conductor takeover";
   if (member.paused) return "new launches paused";
   if (member.dispatch && member.status === "review" && !isExecuting(member))
     return "awaiting review";
@@ -162,8 +168,15 @@ export function normalizeModelAndEffort(modelName, effort) {
 function progressSuffix(member, now) {
   if (!member || member.paused || !isExecuting(member)) return "";
   const parts = [];
-  const step = STAGE_STEPS[member.status];
-  if (step) parts.push(`step ${step}`);
+  const checklist = member.checklist || member.progress?.checklist;
+  if (
+    Number.isSafeInteger(checklist?.completed) &&
+    Number.isSafeInteger(checklist?.total) &&
+    checklist.total > 0 &&
+    checklist.completed >= 0 &&
+    checklist.completed <= checklist.total
+  )
+    parts.push(`step ${checklist.completed}/${checklist.total}`);
   if (ACTIVE_STATUSES.has(member.status)) {
     const timestamps = [
       member?.progress?.reportedAt,
@@ -184,59 +197,47 @@ function progressSuffix(member, now) {
   return parts.length > 0 ? ` · ${parts.join(" · ")}` : "";
 }
 
-function swarmActivityBadge(room, maxAgents, tier, innerWidth = 80) {
-  const agents = room?.agents || [];
-  const base = `${agents.length}/${maxAgents} slots`;
-  if (agents.length === 0 || innerWidth < 64) return base;
-  const activeCount = agents.filter(isExecuting).length;
-  const doneCount = agents.filter(
-    (a) => !isExecuting(a) && COMPLETED_STATUSES.has(a.status),
-  ).length;
-  const blockedCount = agents.filter((a) => ERROR_STATUSES.has(a.status)).length;
-  const check = glyphSet(tier).completed;
+function activityParts(agents, tier) {
   const parts = [];
-  if (activeCount > 0) parts.push(`${activeCount} active`);
-  if (blockedCount > 0) parts.push(`${blockedCount} blocked`);
-  if (doneCount > 0) parts.push(`${doneCount}${check}`);
-  return parts.length > 0 ? `${parts.join(" · ")} · ${base}` : base;
+  const activeCount = agents.filter(isExecuting).length;
+  const blockedCount = agents.filter((agent) => memberDisplayState(agent) === "blocked").length;
+  if (activeCount)
+    parts.push({ text: `${glyphSet(tier).running} ${activeCount} active`, style: "running" });
+  if (blockedCount)
+    parts.push({ text: `${glyphSet(tier).blocked} ${blockedCount} blocked`, style: "error" });
+  for (const [state, spec] of Object.entries(OUTCOMES)) {
+    const count = agents.filter((agent) => memberDisplayState(agent) === state).length;
+    if (count)
+      parts.push({ text: `${outcomeGlyph(state, tier)} ${count} ${state}`, style: spec.tone });
+  }
+  return parts;
 }
 
-function folderActivitySummary(entries, tier) {
-  const agents = entries.map((entry) => entry.agent || entry);
-  const activeCount = agents.filter(isExecuting).length;
-  const blockedCount = agents.filter((a) => ERROR_STATUSES.has(a.status)).length;
-  const doneCount = agents.filter(
-    (a) => !isExecuting(a) && COMPLETED_STATUSES.has(a.status),
-  ).length;
-  const glyphs = glyphSet(tier);
-  const parts = [];
-  if (activeCount > 0) parts.push(`${glyphs.running} ${activeCount} active`);
-  if (blockedCount > 0) parts.push(`${glyphs.blocked} ${blockedCount} blocked`);
-  if (doneCount > 0) parts.push(`${glyphs.completed} ${doneCount} complete`);
-  if (parts.length === 0) {
-    return `${agents.length} ${agents.length === 1 ? "agent" : "agents"}`;
-  }
-  return parts.join("  ·  ");
+function swarmActivityBadge(room, maxAgents, tier, innerWidth = 80) {
+  const agents = room?.agents || [];
+  const base = { text: `${agents.length}/${maxAgents} slots`, style: "" };
+  if (agents.length === 0 || innerWidth < 64) return [base];
+  return [...activityParts(agents, tier), base];
 }
 
 function toneForStatus(member) {
-  const { status } = member;
+  if (outcome(member)) return outcome(member).tone;
   if (isExecuting(member)) return "running";
-  if (COMPLETED_STATUSES.has(status)) return "success";
-  if (status === "review") return "warning";
+  if (member.status === "review") return "warning";
   if (isInactive(member)) return "muted";
-  if (ERROR_STATUSES.has(status)) return "error";
-  if (status === "queued" || status === "reserved") return "warning";
+  if (ERROR_STATUSES.has(member.status)) return "error";
+  if (member.status === "queued" || member.status === "reserved") return "warning";
   return "muted";
 }
 
 function statusGlyph(agent, now, tier) {
+  const state = memberDisplayState(agent);
+  if (Object.hasOwn(OUTCOMES, state)) return outcomeGlyph(state, tier);
   const glyphs = glyphSet(tier);
   const isActive = isExecuting(agent);
   if (isActive && tier === "unicode") return SPINNER[Math.floor(now / 200) % SPINNER.length];
   if (isActive) return glyphs.running;
   if (ERROR_STATUSES.has(agent.status)) return glyphs.blocked;
-  if (agent.status === "completed" || agent.status === "reported complete") return glyphs.completed;
   return glyphs.idle;
 }
 
@@ -1297,12 +1298,26 @@ export class HordeView {
     const junction = this.tier === "ascii" ? "+" : "├";
     if (rail === "middle" || rail === "end") glyphs.topLeft = junction;
     if (rail === "start" || rail === "middle") glyphs.bottomLeft = junction;
-    return frame(title, body, width, {
+    const detailParts = Array.isArray(right) ? right : null;
+    const detail = detailParts ? detailParts.map((part) => plain(part.text)).join(" · ") : right;
+    const lines = frame(title, body, width, {
       glyphs,
       color: this.appearance,
-      right,
+      right: detail,
       headerTone,
     });
+    if (detailParts && width >= 4) {
+      const tailWidth = Math.min(displayWidth(` ${detail} `), width - 2);
+      const tail = fit(` ${detail} `, tailWidth);
+      const separator = tone(" · ", headerTone, this.appearance);
+      const styledParts = detailParts.map((part) =>
+        tone(plain(part.text), `${headerTone} ${part.style}`, this.appearance),
+      );
+      const padding = tone(" ", headerTone, this.appearance);
+      const styledTail = fitStyled(`${padding}${styledParts.join(separator)}${padding}`, tailWidth);
+      lines[0] = lines[0].replace(tone(tail, headerTone, this.appearance), () => styledTail);
+    }
+    return lines;
   }
 
   overlayLines(width, height = this.height - 5) {
@@ -1650,16 +1665,17 @@ export class HordeView {
     });
   }
 
-  folderHeaderLine(folder, count, innerWidth, summary = "") {
+  folderHeaderLine(folder, count, innerWidth, summary = null) {
     return sectionHeading(
       folder ? shortFolder(folder) : "workspace",
-      summary || `${count} ${count === 1 ? "agent" : "agents"}`,
+      `${count} ${count === 1 ? "agent" : "agents"}`,
       innerWidth,
       {
         prefix: toAsciiTree("│ ", this.tier),
         color: this.appearance,
         tier: this.tier,
         separator: summary ? "  ·  " : " · ",
+        detailParts: summary,
       },
     );
   }
@@ -1993,9 +2009,13 @@ export class HordeView {
       const gap = "  ";
       const lastFolder = folderGroups.keys().toArray().at(-1);
       for (const [folder, rawEntries] of folderGroups) {
-        const folderSummary = hasHerdrPaneHeader
-          ? folderActivitySummary(rawEntries, this.tier)
-          : "";
+        const parts = hasHerdrPaneHeader
+          ? activityParts(
+              rawEntries.map(({ agent }) => agent),
+              this.tier,
+            )
+          : [];
+        const folderSummary = parts.length > 0 ? parts : null;
         lines.push(this.folderHeaderLine(folder, rawEntries.length, innerWidth, folderSummary));
         const hiddenCompletedCount =
           !isFocusedView && this.completedMode === "hidden"
@@ -2052,7 +2072,7 @@ export class HordeView {
             const badge = ` ${isFocused ? pointer : glyph} ${index + 1} ${displayAgentName} `;
             const label = `${currentBadge}${parentBadge}${locationBadge ? ` · ${locationBadge}` : ""} · ${model(agent)}${agent.consultation ? "" : ` · ${taskText}`}`;
             return [
-              statusRow(label, phase(agent), cardWidth, {
+              statusRow(label, `${outcome(agent) ? `${glyph} ` : ""}${phase(agent)}`, cardWidth, {
                 prefix,
                 color: this.appearance,
                 style: toneForStatus(agent),
@@ -2114,24 +2134,33 @@ export class HordeView {
         lines.push(...joinCardGrid(cards, columns, cardWidth, gap));
         if (hiddenCompletedCount === 0) continue;
         const hiddenTargetId = `inactive-hidden:${folder}`;
-        this.addTargets([
-          {
-            id: hiddenTargetId,
-            key: "c",
-            x: 1,
-            y: lines.length + 1,
-            width: innerWidth,
-            height: 1,
-          },
-        ]);
         const summaryPrefix = toAsciiTree(hasFollowingSection ? "├─" : "└─", this.tier);
-        const glyph = glyphSet(this.tier).completed;
-        const summaryText = ` ${glyph} ${hiddenCompletedCount} inactive hidden (press c to expand)`;
-        const summaryWidth = Math.max(1, innerWidth - displayWidth(summaryPrefix));
-        const fittedSummary = fit(summaryText, summaryWidth);
-        const summaryTone = this.hovered === hiddenTargetId ? "buttonHover" : "muted";
+        const hidden = rawEntries.filter(({ agent }) => isCollapsibleCompleted(agent));
+        const summaryText = ` ${hiddenCompletedCount} inactive hidden (press c to expand)`;
+        const hiddenStates = new Map();
+        for (const { agent } of hidden) {
+          const state = memberDisplayState(agent);
+          const group = hiddenStates.get(state) || { agent, count: 0 };
+          group.count++;
+          hiddenStates.set(state, group);
+        }
+        const detailParts = hiddenStates
+          .values()
+          .map(({ agent, count }) => ({
+            text: `${statusGlyph(agent, now, this.tier)} ${count} ${phase(agent)}`,
+            style: toneForStatus(agent),
+          }))
+          .toArray();
+        this.addTargets([
+          { id: hiddenTargetId, key: "c", x: 1, y: lines.length + 1, width: innerWidth, height: 1 },
+        ]);
         lines.push(
-          `${tone(summaryPrefix, "border", this.appearance)}${tone(fittedSummary, summaryTone, this.appearance)}`,
+          sectionHeading(summaryText.trim(), "", innerWidth, {
+            prefix: summaryPrefix,
+            color: this.appearance,
+            tier: this.tier,
+            detailParts,
+          }),
         );
       }
     }

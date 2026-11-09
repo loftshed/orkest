@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -22,6 +22,7 @@ import {
   observeRoom,
 } from "../../../plugins/orchestrate/lib/rooms.mjs";
 import { pauseBranch, reserveLead } from "../../../plugins/orchestrate/lib/swarm.mjs";
+import { retainFixtures } from "../../helpers/retain-fixtures.js";
 
 const execute = promisify(execFile);
 const cli = fileURLToPath(new URL("../../../plugins/orchestrate/bin/ork.mjs", import.meta.url));
@@ -41,7 +42,7 @@ async function fixture({ maxAgents = 6, maxDepth = 3 } = {}) {
   return { root, room };
 }
 afterEach(async () => {
-  for (const dir of directories.splice(0)) await rm(dir, { recursive: true, force: true });
+  await retainFixtures(directories.splice(0));
 });
 
 it("creates a conversational room through the CLI without launching a model in JSON mode", async () => {
@@ -247,7 +248,7 @@ it("projects current session status and nesting without treating a lead report a
   expect(output).toContain("└─┤ Investigate");
   expect(output).toContain("│ ┌ 3 flash-1");
   expect(output).toContain("└─┤ Awaiting assignment");
-  expect(output).toContain("runtime-model / high | reported complete");
+  expect(output).toContain("runtime-model / high | reported (awaiting review)");
   const absent = await observeRoom(room.id, { root, progress: async () => ({}) });
   expect(absent.agents[0].status).toBe("session unavailable");
 });

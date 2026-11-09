@@ -122,7 +122,36 @@ The **Shortcuts** menu lists keyboard controls, including `m` to toggle mouse ca
 Talk to the root coordinator to change direction. It sends focused updates through native messaging
 to its leads. Each lead owns communication and review within its branch. Keep full agent identifiers
 in messages. Use `ork progress` for meaningful task and stage changes; the tree reads the same status
-as the terminal footer. A reported completion or idle session is not verified acceptance.
+as the terminal footer. The outcome vocabulary is:
+
+| Display state              | Recorded basis                                                                                                       |
+| -------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| Reported (awaiting review) | A worker reports completion, including legacy `completed`, or an executor finishes without a decision.               |
+| Supported                  | The conductor records `supported` for consultation advice.                                                           |
+| Accepted                   | The conductor records `accept` for the current candidate.                                                            |
+| Stale (needs revalidation) | A recorded result hash or candidate fingerprint no longer matches, or verification lacks a bound candidate identity. |
+| Failed / rejected          | The runner fails, or the conductor records `reject`.                                                                 |
+
+`rooms show --json` keeps `accepted` and `supported` separate and retains the recorded `verdict`
+when evidence becomes stale. An unreadable task clears the projected verdict to `pending`.
+Cancellation and conductor takeover remain terminal. Later progress updates activity details but
+cannot replace a terminal outcome. Idle runtime alone supplies no acceptance decision.
+
+The view uses separate glyphs, labels and semantic colours for these outcomes, including counts
+and inactive history. A step fraction appears only from a recorded member `checklist` (or
+`progress.checklist`) with integer `completed` and `total` counts, where
+`0 <= completed <= total` and `total > 0`. A stage name supplies no checklist.
+
+Recorded acceptance and support are snapshots: subsequent workspace edits or commits do not
+invalidate them. A decided run becomes stale only if a bound result file changes or verification
+has no candidate identity. Finished, undecided verified results are compared with the live candidate.
+
+Live comparisons reuse the runner's read-only workspace audit in the background. Results are cached
+per repository and result hash for at least 30 seconds, with one probe in flight per repository.
+A five-second timeout or a probe error yields an unknown comparison and leaves work reported
+(awaiting review). While a refresh runs, the last cached comparison remains visible. Host verification
+binds to its parent result path and SHA-256; unbound legacy verification needs revalidation.
+Notifications use the same outcomes and never announce reported work as complete.
 
 `ork rooms pause --room ID [--member MEMBER]` blocks new leads and worker dispatch in that subtree.
 `resume` reopens it. Pausing does not interrupt existing work. For that, use native interruption for

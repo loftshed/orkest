@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Distinguish reported, supported, accepted, stale and failed work in Swarm View; preserve terminal decisions against late progress and show only checklist-backed step counts (#155).
+
 ## 0.76.5
 
 - fix(orchestrate): a script's Swarm View row follows its reported stage (#154)
