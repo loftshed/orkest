@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Report acceptance, development and lint checks separately; derive cold review questions from candidate evidence.
+- Distinguish skipped reviews, reviewer infrastructure failures and gate infrastructure failures from defects.
+- Bind approvals and skip-review waivers to candidate and policy; retry infrastructure failures twice without consuming code repairs.
+
 - Bind Smelter checks, review, approval and integration to one pinned candidate and target, with durable evidence.
 - Commit builder output before Foundry and Next verification; reject check mutations and stale verification.
 - Validate and save coordinator acceptance with its workspace identity under one lease.

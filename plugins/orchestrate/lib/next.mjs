@@ -55,7 +55,12 @@ import { mailboxRoot, resolveWorktreeMarkerPath } from "./horde-room.mjs";
 import { glyphSet, glyphTier, renderPanel, renderTable } from "./horde-view.mjs";
 import { observeRoom, recoverRoom } from "./rooms.mjs";
 import { cacheHome } from "./runtime-paths.mjs";
-import { alignCanonicalPath, classifyBlastRadius, smeltWorktree } from "./smelter.mjs";
+import {
+  alignCanonicalPath,
+  classifyBlastRadius,
+  SMELTER_INFRASTRUCTURE_RETRIES,
+  smeltWorktree,
+} from "./smelter.mjs";
 import { acquireWorkspaceLease, assertWorkspaceLease } from "./workspace-lease.mjs";
 
 const executeAsync = promisify(execFile);
@@ -70,6 +75,11 @@ ork next status|plan [--room <id>] [--task-dir <dir>] [--include-github] [--json
 ork next settle [--room <id>] [--task-dir <dir>] [--json] [--cwd <dir>]
 ork next loop [--room <id>] [--task-dir <dir>] [--max-tier <0|1|2|3>] [--max-steps 10] [--max-invocations 3] [--max-failures 2] [--json] [--cwd <dir>]
 `;
+
+const INFRASTRUCTURE_STATES = new Set([
+  "gate_infrastructure_failure",
+  "review_infrastructure_failure",
+]);
 
 const BLAST_ORDER = { high: 2, low: 0, medium: 1 };
 const HEALTHY_REPAIR_STATES = new Set([
@@ -631,6 +641,45 @@ export async function evaluateNextCandidates({
 
     if (status === "pr_opened") continue;
 
+    if (INFRASTRUCTURE_STATES.has(status)) {
+      const retry = wt.foundryState.infrastructureRetry;
+      const failures = retry?.candidateCommit === wt.head ? retry.count : 0;
+      if (failures <= SMELTER_INFRASTRUCTURE_RETRIES) {
+        tier1.push({
+          blastRadius: wt.blastRadius,
+          id: `tier1:retry_infrastructure:${wt.slug}`,
+          kind: "retry_infrastructure",
+          tier: 1,
+          target: wt.slug,
+          worktree: wt,
+          summary: `Retry ${wt.slug}: ${status} (automatic retry ${Math.max(1, failures)}/${SMELTER_INFRASTRUCTURE_RETRIES}; no code repair)`,
+        });
+      } else {
+        tier3.push({
+          id: `tier3:infrastructure_retry_exhausted:${wt.slug}`,
+          kind: "infrastructure_retry_exhausted",
+          tier: 3,
+          target: wt.slug,
+          worktree: wt,
+          reason: `${status}: automatic infrastructure retries exhausted`,
+          summary: `${wt.slug}: ${status}; ${SMELTER_INFRASTRUCTURE_RETRIES} infrastructure retries exhausted, candidate not marked failing`,
+        });
+      }
+      continue;
+    }
+    if (status === "not_reviewed") {
+      tier1.push({
+        blastRadius: wt.blastRadius,
+        id: `tier1:review_worktree:${wt.slug}`,
+        kind: "smelt_worktree",
+        tier: 1,
+        target: wt.slug,
+        worktree: wt,
+        summary: `Review ${wt.slug}: not_reviewed; no clean review recorded`,
+      });
+      continue;
+    }
+
     const attemptCount = wt.foundryState?.attemptCount ?? 1;
     const maxAttempts = wt.foundryState?.maxAttempts ?? 2;
 
@@ -721,7 +770,7 @@ export async function evaluateNextCandidates({
           id: `tier3:awaiting_human_approval:${wt.slug}`,
           kind: "awaiting_human_approval",
           reason: `High blast radius change in ${wt.slug} requires --approve ${wt.slug}`,
-          summary: `Worktree ${wt.slug} (blast=high) passed cold review and awaits 'ork next --approve ${wt.slug}'`,
+          summary: `Worktree ${wt.slug} (blast=high) review=${wt.foundryState?.evidence?.review?.result || "not_reviewed"} and awaits 'ork next --approve ${wt.slug}'`,
           target: wt.slug,
           tier: 3,
           worktree: wt,
@@ -962,6 +1011,14 @@ async function executeTier0Action(action, options = {}) {
             ? "Launch uncertainty resolved by human approval"
             : "Launcher exited without a usable result",
         }),
+        ...(isApproving && {
+          approval: {
+            candidateCommit: wt.head,
+            policy: "launch-uncertain",
+            approvedBy: "cli ork next --approve",
+            at: new Date().toISOString(),
+          },
+        }),
         status,
       });
       return { action, ok: true, status, foundryState: updated };
@@ -1032,6 +1089,14 @@ async function claimPrimaryAction(action, options) {
         status: "launching",
       });
       return { action: { ...action, worktree: wt, repairSpec, launchingState } };
+    }
+    if (action.kind === "retry_infrastructure") {
+      const retry = state.infrastructureRetry;
+      if (
+        !INFRASTRUCTURE_STATES.has(state.status) ||
+        (retry?.candidateCommit === wt.head && retry.count > SMELTER_INFRASTRUCTURE_RETRIES)
+      )
+        return { status: "stale" };
     }
     if (state.status === "verified" && hasStaleVerification(wt)) return { status: "stale" };
     isRetained = true;
@@ -1229,6 +1294,7 @@ async function executePrimaryAction(
     try {
       const smeltRes = await smeltWorktreeFn(wt, {
         approveHighBlast: action.approveHighBlast,
+        approvedBy: "cli ork next --approve",
         env,
         workspaceLease: action.claimLease,
         cwd,

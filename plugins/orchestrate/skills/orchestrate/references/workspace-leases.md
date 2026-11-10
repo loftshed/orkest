@@ -204,6 +204,52 @@ candidate needs approval again. State and run results carry an
 `ork.smelter.evidence.v1` record with candidate, target, merge base, task-spec digest,
 scope, blast radius, check results, review result and any approval.
 
+### Verification and review claims
+
+Smelter runs every `taskSpec.acceptance_checks` command separately, recording kind
+`acceptance`. If none are defined, it selects `verify_command` as `development`,
+then `./scripts/check.sh` as `default-lint`. It does not select `development_checks`
+as an acceptance fallback. Foundry's builder checks remain kind `development`.
+A run without acceptance checks explicitly says none were defined. Unreached checks
+are `not_run`; each started check records timestamps, exit code and output digest.
+
+The reviewer question names the candidate commit and target SHA and lists only
+recorded check commands, kinds and results. A lint-only run explicitly says tests
+were not run. No implicit test-suite or formatter success is claimed.
+
+Only a usable `FINDINGS` section with no defects is `passed`; concrete findings are
+`findings` and produce `review_changes_requested`. Empty, missing, malformed or
+failed runner output is `review_infrastructure_failure`, with review result
+`infrastructure_failure`. `--skip-review` and `--dry-run` record `not_reviewed`,
+with null findings. Integration outcome and review result are separate: a waived
+review can accompany `merged`, without implying a clean review.
+
+A failed workload is `gate_failed`. Missing gate executables, admission or launch
+failure, and failures without proof that the workload started are
+`gate_infrastructure_failure`. Smelter matches its unique gate label and workspace
+to the gate's run receipt to distinguish wrapper failure from check failure,
+including workloads that exit 2. Missing receipts fail closed as infrastructure;
+no candidate failure is inferred. Injected gate runners must throw with a numeric
+`status` only when a workload ran, or explicitly return
+`result: "infrastructure_failure"` for infrastructure failures.
+
+Next retries infrastructure failures at tier 1, at most twice after the initial
+failure for the same candidate (three failed invocations total). Its durable
+`infrastructureRetry` count is separate from `attemptCount`; infrastructure does
+not launch a repair or consume its allowance. Exhaustion reports
+`infrastructure_retry_exhausted`, preserving the infrastructure status and leaving
+the candidate without a code-failure judgment. A changed candidate starts a new infrastructure budget.
+A non-infrastructure outcome clears the consecutive infrastructure failure count.
+
+High-blast approvals carry `candidateCommit`, policy `high-blast`, `approvedBy`
+and time. The CLI commit argument supplies that binding; Next supplies the saved
+candidate and identifies `cli ork next --approve`. A skip-review waiver carries
+`candidateCommit`, policy `skip-review`, `suppliedBy` and time. `--skip-review`
+creates this waiver for the pinned candidate only. Programmatic callers may supply
+`skipReviewWaiver`; a different candidate or policy is ignored and listed under
+`rejectedAuthorizations`, and review runs normally. The same rejection rule applies
+to programmatic high-blast approval objects. Dry runs never imply a review waiver.
+
 A pinned merge under cooperative leases is not a transaction against actors that
 ignore those leases. Strong unattended guarantees require a controlled integration
 target; a reflog precheck cannot close that race.

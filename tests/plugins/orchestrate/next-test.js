@@ -580,3 +580,67 @@ describe("ork next 4-tier waterfall execution", () => {
     expect(loopRes.steps).toHaveLength(1);
   });
 });
+
+describe("Next distinguishes verification infrastructure from code repairs", () => {
+  it.each(["gate_infrastructure_failure", "review_infrastructure_failure"])(
+    "retries %s twice without repair or false review claims",
+    async (status) => {
+      const root = await makeTempDir("ork-next-infrastructure-retained-");
+      const repo = path.join(root, "repo");
+      await mkdir(repo);
+      const env = { ...process.env, ORCHESTRATE_HOME: path.join(root, "cache") };
+      const wt = await createMockWorktree(root, repo, {
+        statePatch: {
+          status,
+          attemptCount: 2,
+          maxAttempts: 2,
+          infrastructureRetry: { candidateCommit: "candidate-sha", count: 1, maxRetries: 2 },
+        },
+      });
+      const porcelain = `worktree ${repo}\nHEAD target-sha\nbranch refs/heads/main\n\nworktree ${wt.path}\nHEAD candidate-sha\nbranch refs/heads/${wt.branch}\n`;
+      const execMock = (cmd, args) => {
+        if (cmd === "git" && args[0] === "worktree" && args[1] === "list") return porcelain;
+        if (cmd === "git" && args[0] === "rev-list") return "1\n";
+        if (cmd === "git" && args[0] === "rev-parse")
+          return args[1] === "HEAD" ? "candidate-sha\n" : "target-sha\n";
+        return "";
+      };
+      const options = {
+        cwd: repo,
+        env,
+        execFileSyncFn: execMock,
+        stdout: { write() {} },
+        notifyFn() {},
+        smeltWorktreeFn: async (worktree) => {
+          const state = readFoundryState(worktree.worktreePath);
+          writeFoundryState(worktree.worktreePath, {
+            status,
+            infrastructureRetry: {
+              ...state.infrastructureRetry,
+              count: state.infrastructureRetry.count + 1,
+            },
+          });
+          return { ok: false, status, retryable: true };
+        },
+      };
+      for (const count of [2, 3]) {
+        process.exitCode = 0;
+        const result = await nextCommand(["step", "--json"], options);
+        expect(result.executedAction).toMatchObject({ kind: "retry_infrastructure", tier: 1 });
+        expect(readFoundryState(wt.path)).toMatchObject({
+          status,
+          attemptCount: 2,
+          infrastructureRetry: { count },
+        });
+      }
+      process.exitCode = 0;
+      const exhausted = await nextCommand(["step", "--json"], options);
+      expect(exhausted).toMatchObject({
+        status: "awaiting_human",
+        gate: { kind: "infrastructure_retry_exhausted" },
+      });
+      expect(exhausted.gate.summary).toContain("candidate not marked failing");
+      expect(readFoundryState(wt.path)).toMatchObject({ status, attemptCount: 2 });
+    },
+  );
+});

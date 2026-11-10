@@ -11,7 +11,7 @@
  * 4. Smelt & Prune (fast-forward local merge or PR creation + worktree removal)
  */
 import { execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -26,7 +26,55 @@ import { acquireWorkspaceLease, assertWorkspaceLease } from "./workspace-lease.m
 const scriptsDir = fileURLToPath(new URL("../skills/orchestrate/scripts/", import.meta.url));
 
 export const COLD_REVIEW_QUESTION =
-  "Deterministic linters, formatters, and test suites (ork gate --heavy) have already passed on this diff. Review the changes and report ONLY concrete correctness bugs, security vulnerabilities, concurrency/race conditions, or scope violations under FINDINGS. Do not report stylistic preferences or speculative refactors; write 'none' under FINDINGS if no concrete defects exist.";
+  "Review the changes and report ONLY concrete correctness bugs, security vulnerabilities, concurrency/race conditions, or scope violations under FINDINGS. Do not report stylistic preferences or speculative refactors; write 'none' under FINDINGS if no concrete defects exist.";
+
+/** Describe only the candidate and checks actually represented by this evidence. */
+export function buildColdReviewQuestion(evidence) {
+  const checks = evidence.checks || [];
+  const lines = [
+    `Candidate commit: ${evidence.candidate.commit}`,
+    `Target SHA: ${evidence.target.sha}`,
+    "Recorded checks (no other verification is claimed):",
+    ...checks.map(
+      (check) =>
+        `- [${check.kind}] ${JSON.stringify(check.command)}: ${check.result} (exit ${check.exitCode ?? "unknown"})`,
+    ),
+  ];
+  if (checks.length === 0) lines.push("No checks were run.");
+  if (checks.every((check) => check.kind !== "acceptance"))
+    lines.push("No acceptance checks were defined.");
+  if (checks.length > 0 && checks.every((check) => check.kind === "default-lint")) {
+    lines.push(
+      checks.every((check) => check.result === "passed")
+        ? "Only the lint default ran; tests were not run."
+        : "Only the lint default was selected; tests were not run.",
+    );
+  }
+  lines.push("No additional tests, linters or formatters were run beyond the commands listed.");
+  return [...lines, COLD_REVIEW_QUESTION].join("\n");
+}
+
+// Initial failure plus at most two automatic retries, independent of builder repairs.
+export const SMELTER_INFRASTRUCTURE_RETRIES = 2;
+
+function gateReceipt(label, worktreePath, env) {
+  const directory = env.AGENT_GATE_DIR || `/tmp/agent-gate-${process.getuid()}`;
+  try {
+    return (
+      readFileSync(path.join(directory, "runs.jsonl"), "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line))
+        .findLast(
+          (entry) =>
+            entry.label === label &&
+            alignCanonicalPath(entry.cwd) === alignCanonicalPath(worktreePath),
+        ) || null
+    );
+  } catch {
+    return null;
+  }
+}
 
 export const SMELTER_HELP = `ork smelter status [--json] [--target <branch>] [--width 120]
 ork smelter run [--worktree <slug|path>] [--strategy local|pr] [--target <branch>] [--approve-high-blast <commit>] [--dry-run] [--skip-review] [--json]
@@ -43,24 +91,35 @@ export function alignCanonicalPath(targetPath) {
 }
 
 export function parseColdReviewFindings(reviewOutput) {
-  if (reviewOutput == null) {
-    return { findings: "Cold review output missing FINDINGS section", passed: false };
-  }
-  let parsed = null;
-  if (typeof reviewOutput === "object") {
-    parsed = reviewOutput;
-  } else if (typeof reviewOutput === "string") {
+  const infrastructure = (reason) => ({
+    result: "infrastructure_failure",
+    passed: false,
+    findings: null,
+    reason,
+  });
+  if (reviewOutput == null) return infrastructure("Cold review output missing FINDINGS section");
+  let parsed = reviewOutput;
+  if (typeof reviewOutput === "string") {
     const trimmed = reviewOutput.trim();
-    if (!trimmed) {
-      return { findings: "Cold review output missing FINDINGS section", passed: false };
-    }
-    if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+    if (!trimmed) return infrastructure("Cold review output missing FINDINGS section");
+    if (trimmed.startsWith("{")) {
       try {
         parsed = JSON.parse(trimmed);
       } catch {
-        parsed = null;
+        return infrastructure("Unparseable cold review output");
       }
     }
+  }
+  if (
+    parsed &&
+    typeof parsed === "object" &&
+    (parsed.error ||
+      parsed.ok === false ||
+      parsed.passed === false ||
+      ["failed", "error", "timeout", "blocked"].includes(parsed.status) ||
+      (parsed.exit_code != null && parsed.exit_code !== 0))
+  ) {
+    return infrastructure(String(parsed.error || parsed.summary || "Cold review runner failed"));
   }
   let rawFindings =
     parsed?.sections?.FINDINGS ??
@@ -68,48 +127,27 @@ export function parseColdReviewFindings(reviewOutput) {
     parsed?.FINDINGS ??
     parsed?.findings ??
     null;
-  if (rawFindings === null && typeof reviewOutput === "string") {
-    const sectionMatch =
+  if (rawFindings === null && typeof parsed === "string") {
+    const section =
       /(?:^|\r?\n)\s*(?:#+\s*)?FINDINGS\s*:?[ \t]*\r?\n([\s\S]*?)(?=\r?\n\s*(?:#+\s*[A-Z_]+|[A-Z_]{3,}\s*:)|$)/iu.exec(
-        reviewOutput,
+        parsed,
       );
-    if (sectionMatch) {
-      rawFindings = sectionMatch[1];
-    } else {
-      const inlineMatch = /(?:^|\r?\n)\s*(?:#+\s*)?FINDINGS\s*:\s*([^\r\n]+)/iu.exec(reviewOutput);
-      if (inlineMatch) rawFindings = inlineMatch[1];
-    }
+    const inline = /(?:^|\r?\n)\s*(?:#+\s*)?FINDINGS\s*:[ \t]*([^\r\n]+)/iu.exec(parsed);
+    rawFindings = section?.[1] ?? inline?.[1] ?? null;
   }
-  if (typeof rawFindings === "string") {
-    const cleaned = rawFindings
-      .trim()
-      .replaceAll(/^(?:[-*•]\s*)+/gu, "")
-      .trim();
-    if (!cleaned) {
-      return { findings: "Cold review output missing FINDINGS section", passed: false };
-    }
-    if (
-      /^(?:none|no\s+(?:concrete\s+|actionable\s+)?(?:findings|defects|issues)(?:\s+found)?\.?|n\/a|nil|-)$/iu.test(
-        cleaned,
-      )
-    ) {
-      if (parsed && (parsed.passed === false || parsed.ok === false)) {
-        return {
-          findings: String(parsed.error || parsed.summary || "Review requested changes").trim(),
-          passed: false,
-        };
-      }
-      return { findings: "none", passed: true };
-    }
-    return { findings: rawFindings.trim(), passed: false };
-  }
-  if (parsed && (parsed.passed === false || parsed.ok === false)) {
-    return {
-      findings: String(parsed.error || parsed.summary || "Review requested changes").trim(),
-      passed: false,
-    };
-  }
-  return { findings: "Cold review output missing FINDINGS section", passed: false };
+  if (typeof rawFindings !== "string" || !rawFindings.trim())
+    return infrastructure("Cold review output missing FINDINGS section");
+  const cleaned = rawFindings
+    .trim()
+    .replaceAll(/^(?:[-*•]\s*)+/gu, "")
+    .trim();
+  if (
+    /^(?:none|no\s+(?:concrete\s+|actionable\s+)?(?:findings|defects|issues)(?:\s+found)?\.?)$/iu.test(
+      cleaned,
+    )
+  )
+    return { result: "passed", passed: true, findings: "none" };
+  return { result: "findings", passed: false, findings: rawFindings.trim() };
 }
 
 function normalizeRelativePath(rawPath) {
@@ -466,8 +504,7 @@ export function discoverSmeltableWorktrees(
       slug: marker.slug || path.basename(worktreePath),
       taskSpec,
       taskSpecPath,
-      verifyCommand:
-        taskSpec?.verify_command || taskSpec?.development_checks?.[0] || "./scripts/check.sh",
+      verifyCommand: taskSpec?.verify_command || "./scripts/check.sh",
       worktreePath,
     });
   }
@@ -501,6 +538,19 @@ class SmelterLeaseError extends Error {
     super(`Smelter ${status}: ${worktreePath}`);
     this.status = status;
   }
+}
+
+function withVerificationClaims(result) {
+  if (!result.evidence) return result;
+  const { evidence } = result;
+  return {
+    ...result,
+    acceptanceChecksDefined: evidence.acceptanceChecksDefined,
+    verificationSummary: evidence.acceptanceChecksDefined
+      ? "Acceptance checks recorded separately"
+      : "No acceptance checks were defined",
+    reviewStatus: evidence.review.result,
+  };
 }
 
 export async function smeltWorktree(worktree, options = {}) {
@@ -578,10 +628,10 @@ export async function smeltWorktree(worktree, options = {}) {
   try {
     if (!lease.acquired) throw stopped("busy");
     checkState();
-    return await smeltLeasedWorktree(worktree, options, ownership);
+    return withVerificationClaims(await smeltLeasedWorktree(worktree, options, ownership));
   } catch (error) {
     if (!(error instanceof SmelterLeaseError)) throw error;
-    return {
+    return withVerificationClaims({
       ok: false,
       status: error.status,
       reason: error.message,
@@ -590,7 +640,7 @@ export async function smeltWorktree(worktree, options = {}) {
       ...(error.cause && { stateErrors: [error.cause.message] }),
       worktreePath,
       ...(error.status === "state_unreadable" && { stateProblem: loadFoundryState(worktreePath) }),
-    };
+    });
   } finally {
     await targetLease?.release();
     await lease.release();
@@ -623,7 +673,9 @@ async function smeltLeasedWorktree(worktree, options, ownership) {
   }
   const isDryRun = Boolean(options.dryRun || options["dry-run"]);
   const shouldSkipReview = Boolean(options.skipReview || options["skip-review"]);
-  const approvedCommit = options.approveHighBlast || options["approve-high-blast"];
+  const suppliedApproval = options.approveHighBlast || options["approve-high-blast"];
+  const approvedCommit =
+    typeof suppliedApproval === "string" ? suppliedApproval : suppliedApproval?.candidateCommit;
   const execFileSyncFn = options.execFileSync || options.execFileSyncFn || execFileSync;
 
   const canPersistState =
@@ -648,6 +700,8 @@ async function smeltLeasedWorktree(worktree, options, ownership) {
           candidate: evidence.candidate,
           evidence: { ...evidence, outcome: patch.status },
         }),
+        infrastructureRetry: null,
+        findings: null,
         ...patch,
       });
     } catch (error_) {
@@ -665,12 +719,18 @@ async function smeltLeasedWorktree(worktree, options, ownership) {
   }
   const allowPaths =
     options.allowPaths ?? worktreeObj.allowPaths ?? taskSpec?.allow_paths ?? undefined;
-  const verifyCommand =
-    options.verifyCommand ||
-    worktreeObj.verifyCommand ||
-    taskSpec?.verify_command ||
-    taskSpec?.development_checks?.[0] ||
-    "./scripts/check.sh";
+  const explicitCommand =
+    options.verifyCommand || taskSpec?.verify_command || (!taskSpec && worktreeObj.verifyCommand);
+  const checks =
+    Array.isArray(taskSpec?.acceptance_checks) && taskSpec.acceptance_checks.length > 0
+      ? taskSpec.acceptance_checks.map((command) => ({ kind: "acceptance", command }))
+      : [
+          {
+            kind: explicitCommand ? "development" : "default-lint",
+            command: explicitCommand || "./scripts/check.sh",
+          },
+        ];
+  const verifyCommand = checks.map((check) => check.command).join(" && ");
   const workerEngine =
     options.workerEngine ||
     options.engine ||
@@ -765,16 +825,68 @@ async function smeltLeasedWorktree(worktree, options, ownership) {
     blastRadius,
     checks: [],
     review: { engine: null, result: "not_reviewed", outputSha256: null },
+    acceptanceChecksDefined: checks.some((check) => check.kind === "acceptance"),
+    waivers: [],
+    rejectedAuthorizations: [],
     approval:
-      approvedCommit === candidate.commit
+      approvedCommit === candidate.commit &&
+      (typeof suppliedApproval === "string" || suppliedApproval?.policy === "high-blast")
         ? {
             kind: "high-blast",
+            policy: "high-blast",
             candidateCommit: candidate.commit,
-            approvedBy: options.approvedBy || "cli",
+            approvedBy: suppliedApproval?.approvedBy || options.approvedBy || "cli",
             at: new Date().toISOString(),
           }
         : null,
     outcome: null,
+  };
+  if (suppliedApproval && !evidence.approval)
+    evidence.rejectedAuthorizations.push({
+      policy: "high-blast",
+      candidateCommit: approvedCommit ?? null,
+      reason: "Approval ignored: candidate or policy does not match",
+    });
+  const suppliedWaiver = options.skipReviewWaiver;
+  if (!isDryRun && (shouldSkipReview || suppliedWaiver)) {
+    const waiver = suppliedWaiver || {
+      candidateCommit: candidate.commit,
+      policy: "skip-review",
+      suppliedBy: options.approvedBy || "cli --skip-review",
+      at: new Date().toISOString(),
+    };
+    if (
+      waiver.candidateCommit === candidate.commit &&
+      waiver.policy === "skip-review" &&
+      waiver.suppliedBy
+    )
+      evidence.waivers.push({ ...waiver, at: waiver.at || new Date().toISOString() });
+    else
+      evidence.rejectedAuthorizations.push({
+        policy: "skip-review",
+        candidateCommit: waiver.candidateCommit ?? null,
+        reason: "Waiver ignored: candidate, policy or supplier does not match",
+      });
+  }
+  const infrastructureFailure = async (status, detail) => {
+    const previous = loadedMeta.foundryState?.infrastructureRetry;
+    const count = previous?.candidateCommit === candidate.commit ? previous.count + 1 : 1;
+    const infrastructureRetry = {
+      candidateCommit: candidate.commit,
+      count,
+      maxRetries: SMELTER_INFRASTRUCTURE_RETRIES,
+    };
+    await recordState({ status, infrastructureRetry, infrastructureError: detail, findings: null });
+    return {
+      ok: false,
+      status,
+      retryable: true,
+      infrastructureRetry,
+      error: detail,
+      candidate,
+      evidence: { ...evidence, outcome: status },
+      worktreePath,
+    };
   };
   ownership.pin(evidence);
   if (violations.length > 0) {
@@ -799,59 +911,67 @@ async function smeltLeasedWorktree(worktree, options, ownership) {
 
   await ownership.review();
 
-  // Stage 2: Heavy Gate
-  const verifyArgs = splitVerifyCommand(verifyCommand);
-  const gateArgs = ["gate", "--heavy", "--", ...verifyArgs];
-  const checkKind =
-    options.verifyCommand ||
-    worktreeObj.verifyCommand ||
-    taskSpec?.verify_command ||
-    taskSpec?.development_checks?.[0]
-      ? "development"
-      : "default-lint";
-  const checkStartedAt = new Date().toISOString();
-  let stage2;
-  if (isDryRun) {
-    stage2 = {
-      command: ["ork", ...gateArgs],
-      skipped: true,
-      status: "dry-run",
-      verifyCommand,
-    };
-  } else {
+  // Stage 2: each required check has its own result, including checks not reached.
+  evidence.checks = checks.map((check) => ({
+    ...check,
+    exitCode: null,
+    result: "not_run",
+    startedAt: null,
+    endedAt: null,
+    outputSha256: null,
+  }));
+  const stage2 = {
+    checks: evidence.checks,
+    skipped: isDryRun,
+    status: isDryRun ? "not_run" : "passed",
+    verifyCommand,
+  };
+  for (const check of evidence.checks) {
+    if (isDryRun) continue;
+    const verifyArgs = splitVerifyCommand(check.command);
+    const label = `smelter-${randomUUID()}`;
+    const gateArgs = ["gate", "--heavy", "--label", label, "--", ...verifyArgs];
+    check.startedAt = new Date().toISOString();
     try {
-      const gateOutput = gateRunner
+      const output = gateRunner
         ? await gateRunner({
             args: gateArgs,
             command: ["ork", ...gateArgs],
             verifyArgs,
-            verifyCommand,
+            verifyCommand: check.command,
+            kind: check.kind,
             worktreePath,
           })
         : runCmd("ork", gateArgs, worktreePath);
-      ownership.assertHeld();
-      stage2 = {
-        command: ["ork", ...gateArgs],
-        output: gateOutput ?? null,
-        skipped: false,
-        status: "passed",
-        verifyCommand,
-      };
+      if (
+        output &&
+        typeof output === "object" &&
+        (output.ok === false || output.exitCode > 0 || output.result === "infrastructure_failure")
+      ) {
+        const error = new Error(output.error || output.output || "Gate failed");
+        error.status = output.exitCode;
+        error.infrastructureFailure = output.result === "infrastructure_failure";
+        throw error;
+      }
+      Object.assign(check, { exitCode: 0, result: "passed", outputSha256: digest(output ?? null) });
     } catch (error) {
-      evidence.checks.push({
-        kind: checkKind,
-        command: verifyCommand,
-        exitCode: error.status ?? null,
-        result: "failed",
-        startedAt: checkStartedAt,
+      // The wrapper's exit status alone does not prove the workload started. Its
+      // receipt distinguishes a real failed check (including exit 2) from admission/launch failure.
+      const receipt = gateRunner
+        ? null
+        : gateReceipt(label, worktreePath, options.env ?? process.env);
+      const didRun = gateRunner
+        ? Number.isSafeInteger(error.status) && !error.infrastructureFailure
+        : receipt && ["failed", "signaled"].includes(receipt.outcome);
+      Object.assign(check, {
+        exitCode: didRun ? (receipt?.exitCode ?? error.status) : null,
+        result: didRun ? "failed" : "infrastructure_failure",
         endedAt: new Date().toISOString(),
         outputSha256: digest(error.stdout ?? error.message),
       });
       ownership.checkStable();
-      await recordState({
-        gateError: error?.message || String(error),
-        status: "gate_failed",
-      });
+      if (!didRun) return infrastructureFailure("gate_infrastructure_failure", error.message);
+      await recordState({ gateError: error.message, status: "gate_failed" });
       return {
         ok: false,
         status: "gate_failed",
@@ -861,17 +981,9 @@ async function smeltLeasedWorktree(worktree, options, ownership) {
         worktreePath,
       };
     }
+    check.endedAt = new Date().toISOString();
+    ownership.checkStable();
   }
-
-  evidence.checks.push({
-    kind: checkKind,
-    command: verifyCommand,
-    exitCode: isDryRun ? null : 0,
-    result: isDryRun ? "not_run" : "passed",
-    startedAt: checkStartedAt,
-    endedAt: new Date().toISOString(),
-    outputSha256: isDryRun ? null : digest(stage2.output),
-  });
   ownership.checkStable();
 
   // Stage 3: Cross-Vendor Cold Review
@@ -892,37 +1004,44 @@ async function smeltLeasedWorktree(worktree, options, ownership) {
     "--diff",
     target.sha,
     "--question",
-    COLD_REVIEW_QUESTION,
+    buildColdReviewQuestion(evidence),
   ];
   let stage3;
-  if (isDryRun || shouldSkipReview) {
+  if (isDryRun || evidence.waivers.length > 0) {
     stage3 = {
       args: consultArgs,
-      findings: "none",
+      findings: null,
       reviewerEngine,
       skipped: true,
-      status: isDryRun ? "dry-run" : "skipped",
+      status: "not_reviewed",
       workerEngine,
     };
   } else {
     const runAgentScript = path.join(scriptsDir, "run_agent.py");
-    const reviewOutput = reviewRunner
-      ? await reviewRunner({
-          args: consultArgs,
-          reviewerEngine,
-          targetBranch,
-          workerEngine,
-          worktreePath,
-        })
-      : runCmd("python3", [runAgentScript, ...consultArgs], worktreePath);
+    let reviewOutput;
+    try {
+      reviewOutput = reviewRunner
+        ? await reviewRunner({
+            args: consultArgs,
+            reviewerEngine,
+            targetBranch,
+            workerEngine,
+            worktreePath,
+          })
+        : runCmd("python3", [runAgentScript, ...consultArgs], worktreePath);
+    } catch (error) {
+      reviewOutput = { status: "failed", error: error.message, sections: null };
+    }
     const parsedReview = parseColdReviewFindings(reviewOutput);
     evidence.review = {
       engine: reviewerEngine,
-      result: parsedReview.passed ? "passed" : "findings",
+      result: parsedReview.result,
       outputSha256: digest(reviewOutput),
     };
     ownership.checkStable();
-    if (!parsedReview.passed) {
+    if (parsedReview.result === "infrastructure_failure")
+      return infrastructureFailure("review_infrastructure_failure", parsedReview.reason);
+    if (parsedReview.result === "findings") {
       stage3 = {
         args: consultArgs,
         findings: parsedReview.findings,
@@ -991,12 +1110,7 @@ async function smeltLeasedWorktree(worktree, options, ownership) {
   ownership.checkStable();
   await ownership.mutate();
 
-  if (
-    !isDryRun &&
-    blastRadius === "high" &&
-    strategy === "local" &&
-    approvedCommit !== candidate.commit
-  ) {
+  if (!isDryRun && blastRadius === "high" && strategy === "local" && !evidence.approval) {
     await recordState({
       blastRadius,
       status: "awaiting_human_approval",
@@ -1219,7 +1333,7 @@ function renderSmelterStatusPanel(statusData, width, options = {}) {
   const summary = `${statusData.worktrees.length} smeltable worktrees ahead of ${statusData.targetBranch}`;
   const lifecycle = (wt) => {
     if (wt.stateProblem) return `state_unreadable (${wt.stateProblem.kind})`;
-    return wt.disposable ? "disposable" : "keep";
+    return `${wt.foundryState?.status || "unmanaged"}; review=${wt.foundryState?.evidence?.review?.result || "not_reviewed"}`;
   };
   const rows =
     statusData.worktrees.length > 0
@@ -1398,7 +1512,7 @@ export async function smelterCli(
         );
       } else {
         stdout.write(
-          `${item.dryRun ? "Dry-run smelted" : "Smelted"} ${item.worktreeSlug} (${item.branch} -> ${item.targetBranch}, blast=${item.blastRadius}, reviewer=${item.reviewerEngine})\n`,
+          `${item.dryRun ? "Dry-run smelted" : "Smelted"} ${item.worktreeSlug} (${item.branch} -> ${item.targetBranch}, blast=${item.blastRadius}, review=${item.evidence?.review?.result || "not_reviewed"}, reviewer=${item.reviewerEngine}; ${item.verificationSummary})\n`,
         );
       }
     }
