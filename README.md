@@ -12,17 +12,28 @@ tools, permissions and settings. A run that would start spending paid Codex cred
 unless you allow it. Open-weight models are the exception: they go through OpenCode on OpenRouter
 credits.
 
-You keep working in your normal harness CLI. Orkest sits beside it:
+You keep working in your normal harness CLI, with a live tree of every agent beside it.
 
-- **A live swarm tree** of native subagents and cross-harness workers, with each agent's model,
-  role, stage and outcome.
-- **Bounded delegation**: workers get a file scope, a worktree lease and verification that runs
-  outside the model. Work is "reported" until the coordinator reviews and accepts it.
-- **Second opinions** from another vendor's model, read-only.
-- **Quota awareness** across every subscription, so work goes where there is headroom and
-  allowance that would expire unused gets spent.
-- **Guardrails**: per-repository account rules, and a shared gate so parallel agents don't run
-  five test suites at once.
+## Why Orkest
+
+- **Work goes where the quota is.** Orkest reads the 5-hour and weekly windows of every
+  subscription on the machine, ranks where to spend next, and checks before each dispatch: an
+  exhausted account is refused, not discovered mid-task. A lead can name a deputy on a different
+  account to take over if its own runs out.
+- **Allowance that would expire gets used.** When a weekly window is about to roll over with quota
+  left, `ork foundry` picks up ready GitHub issues and spends it on them.
+- **The right account pays.** Per-repository rules keep a work profile off personal repositories
+  and the reverse. Personal accounts are used only when you allow it, and so are paid credits.
+- **"Done" is checked, not believed.** A worker gets a file scope and a lease on the checkout.
+  After it stops, Orkest checks that only allowed paths changed and Git history is untouched, and
+  runs your verification commands outside the model. Until the coordinator accepts the result it
+  is shown as "reported", never as complete.
+- **Another vendor reviews the work.** `consult` gives a different model family a read-only look
+  at a diff or a bug, so a review is not the author's own model agreeing with itself.
+- **One machine, many agents.** A shared gate stops five agents from running five test suites at
+  once, and saves the output so nobody reruns a suite to read what scrolled away.
+- **Model changes are noticed.** Selectors such as `gpt:sol` follow each CLI's live catalog, and
+  `ork radar` flags a model whose pass rate on your own runs has dropped.
 
 ## Quick start
 
