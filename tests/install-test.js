@@ -76,9 +76,16 @@ exit "$DOCTOR_EXIT"
 `,
   );
 
+  // The host may lack tmux or Git (the macOS CI runner has no tmux); the prerequisite check only
+  // needs them to exist, so stand-ins keep these tests about the installer, not the host.
+  const hostTools = path.join(tempRoot, "host-tools");
+  mkdirSync(hostTools);
+  for (const tool of ["tmux", "git"]) writeExecutable(path.join(hostTools, tool), "#!/bin/sh\n");
+
   function makeEnvironment(overrides = {}) {
     return {
       ...process.env,
+      PATH: `${hostTools}${path.delimiter}${process.env.PATH}`,
       HOME: home,
       LOG_PATH: logPath,
       DOCTOR_EXIT: "0",
