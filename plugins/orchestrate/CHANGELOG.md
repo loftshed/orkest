@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.76.10
+
+- fix(orchestrate): show untracked completions as finished, not awaiting review (#174)
+
 ## 0.76.9
 
 - Report acceptance, development and lint checks separately; derive cold review questions from candidate evidence.
