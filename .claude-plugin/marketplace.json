@@ -16,6 +16,6 @@
     }
   ],
   "metadata": {
-    "description": "Personal plugin marketplace and skill backup."
+    "description": "Orkest: coordinate coding agents across Claude Code, Codex, Antigravity and OpenCode, with quota monitoring."
   }
 }

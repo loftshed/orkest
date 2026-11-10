@@ -4,5 +4,6 @@
   "description": "Bounded agent execution, consultation, evidence, and audit.",
   "author": {
     "name": "loftshed"
-  }
+  },
+  "license": "MIT"
 }

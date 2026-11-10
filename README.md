@@ -265,3 +265,7 @@ See [docs/readme.md](docs/readme.md).
 
 - **Corepack reports a missing `pnpm.cjs`:** update Corepack on a supported Node.js version. CI
   pins Corepack 0.36.0.
+
+## Licence
+
+[MIT](LICENSE).
