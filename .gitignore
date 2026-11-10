@@ -25,6 +25,10 @@ docs/mailbox-feedback/reports/
 **/.claude/**/*.local.*
 .codex-attachments/
 
+# Worker checkouts: whole copies of the repository that the linters must not walk.
+.worktrees/
+.claude/worktrees/
+
 # Share repository skills even when a machine-wide ignore hides .agents.
 !.agents/
 .agents/*

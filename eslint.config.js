@@ -24,7 +24,8 @@ const relaxed = {
 };
 
 export default [
-  { ignores: ["node_modules/**"] },
+  // Worktrees are whole copies of the repository; each is linted from its own root.
+  { ignores: ["node_modules/**", ".worktrees/**", ".claude/worktrees/**"] },
   js.configs.recommended,
   unicorn.configs.recommended,
   {
