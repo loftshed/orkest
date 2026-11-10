@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.76.8
+
+- fix(orchestrate): bind verification, review and acceptance to one candidate (#161)
+
 ## 0.76.7
 
 - Bind Smelter checks, review, approval and integration to one pinned candidate and target, with durable evidence.
