@@ -111,7 +111,10 @@ export function demoAccounts() {
   ];
 }
 
-/** A swarm room with a lead, three workers at different stages and one nested reviewer. */
+/**
+ * A swarm room with a lead, three workers at different stages and one nested reviewer.
+ * Agent names come from `generate_martian` in mailbox_store.py, as real sessions get them.
+ */
 export function demoRoom() {
   return {
     id: "demo-room",
@@ -121,7 +124,7 @@ export function demoRoom() {
     herdrCoordinatorPaneId: "w1:p1",
     conductor: {
       id: "lead",
-      name: "atlas",
+      name: "kritor",
       status: "running",
       engine: "claude",
       model: "claude:best",
@@ -136,8 +139,8 @@ export function demoRoom() {
     },
     agents: [
       {
-        id: "birch",
-        name: "birch",
+        id: "sprad",
+        name: "sprad",
         status: "working",
         engine: "codex",
         model: "gpt:sol",
@@ -154,14 +157,14 @@ export function demoRoom() {
         },
       },
       {
-        id: "cedar",
-        name: "cedar",
+        id: "zwarxug",
+        name: "zwarxug",
         status: "working",
         engine: "agy",
         model: "gemini:best",
         effort: "high",
         objective: "Cold-review the eviction ordering diff",
-        parent: "birch",
+        parent: "sprad",
         herdrPaneId: "w1:p3",
         output: ["Reading eviction ordering"],
         progress: {
@@ -172,8 +175,8 @@ export function demoRoom() {
         },
       },
       {
-        id: "rowan",
-        name: "rowan",
+        id: "glozor",
+        name: "glozor",
         status: "blocked",
         engine: "claude",
         model: "claude:fast",
@@ -184,8 +187,8 @@ export function demoRoom() {
         progress: { role: "builder" },
       },
       {
-        id: "maple",
-        name: "maple",
+        id: "sproolel",
+        name: "sproolel",
         status: "completed",
         engine: "agy",
         model: "gemini:fast",
@@ -199,7 +202,7 @@ export function demoRoom() {
       { name: "vite", port: 5173, status: "running", uptime: "14m", cwd: REPO },
       { name: "postgres:16", port: 5432, status: "running", uptime: "2h", kind: "docker" },
     ],
-    messages: [{ from: "birch", text: "TTL patch is ready for review" }],
+    messages: [{ from: "sprad", text: "TTL patch is ready for review" }],
     swarm: { maxAgents: 12, maxDepth: 3 },
   };
 }
