@@ -222,22 +222,13 @@ Requires Git, Node.js 26.13+, Python 3.11+, `tmux`, and at least one installed, 
 ```sh
 git clone https://github.com/loftshed/orkest.git ~/src/orkest
 cd ~/src/orkest
-
-# orchestrate: skills, peer-mailbox MCP server, hooks, and the ork CLI
-./plugins/orchestrate/install.sh
-mkdir -p ~/.local/bin
-ln -sf "$PWD/plugins/orchestrate/bin/ork.mjs" ~/.local/bin/ork
-
-# monitor: CLI, MCP server, and the macOS menu bar app (--no-app for the CLI only)
-./plugins/monitor/install.sh
-monitor mcp-install
+./install.sh
 ```
 
-Make sure `~/.local/bin` is on your `PATH`, then check the setup:
-
-```sh
-python3 ~/.agents/skills/orchestrate/scripts/run_agent.py doctor --check-messaging
-```
+The installer checks the setup when it finishes and warns if `~/.local/bin` is not on your `PATH`.
+Use `--dry-run` to preview, `--no-app` for the monitor CLI without its macOS app, `--no-monitor` to
+skip monitor, `--no-claude` when using the Claude plugin for its skill, or `--trust-codex-hooks` to
+trust the four reviewed Codex mailbox hooks.
 
 Orkest runs from this checkout, with no build step. `ork update` (or `/update`) fast-forwards it
 and refreshes the hooks; `ork cleanup status` previews stale worktrees, locks and backups.

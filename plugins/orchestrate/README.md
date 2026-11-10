@@ -13,19 +13,18 @@ Requires Python 3.11+, Node.js 26.13+ (Active LTS; for `ork` and `horde`), `git`
 Pick one way for Claude Code to load the skill so it does not appear twice:
 
 ```sh
-# Option A: link the skill into every installed harness from a checkout
-<checkout>/plugins/orchestrate/install.sh            # links ~/.agents/skills/orchestrate, writes config, installs mailbox hooks, runs doctor
-<checkout>/plugins/orchestrate/install.sh --dry-run  # preview what would change
+# Option A: install all of Orkest and link skills into installed harnesses
+<checkout>/install.sh
 
 # Option B: use the Claude Code plugin for Claude, and link the remaining harnesses
 claude plugin marketplace add <checkout>
 claude plugin install orchestrate@orkest --scope user
-<checkout>/plugins/orchestrate/install.sh --no-claude
+<checkout>/install.sh --no-claude
 ```
 
-`install.sh` points `~/.agents/skills/orchestrate` at `<checkout>`, links each detected harness's `skills/` directory to that hub, initializes `~/.config/orchestrate/config.json` if missing, installs the `peer-mailbox` MCP registration and turn hooks, and runs `doctor`. To migrate existing `~/.config/agent-executor` and `~/.cache/agent-executor` directories into `~/.config/orchestrate` and `~/.cache/orchestrate` with compatibility symlinks, run `ork cleanup run --migrate-legacy`.
+The root `install.sh` also installs the `ork` and monitor CLIs, registers monitor's MCP server, and runs the messaging doctor. Use `--dry-run` to preview or `--trust-codex-hooks` to trust the four reviewed Codex mailbox hooks. For orchestrate alone, run `plugins/orchestrate/install.sh`; it points `~/.agents/skills/orchestrate` at the checkout, links detected harnesses, initializes config, installs mailbox hooks, and runs `doctor`. To migrate existing `~/.config/agent-executor` and `~/.cache/agent-executor` directories into `~/.config/orchestrate` and `~/.cache/orchestrate` with compatibility symlinks, run `ork cleanup run --migrate-legacy`.
 
-Codex requires one-time approval for command hooks: review them in Codex `/hooks`, or pass `--trust-codex-hooks` to `install.sh` (which trusts only the four reviewed mailbox hook commands).
+Codex requires one-time approval for command hooks: review them in Codex `/hooks`, or pass `--trust-codex-hooks` to either installer (which trusts only the four reviewed mailbox hook commands).
 
 `<checkout>/plugins/orchestrate/uninstall.sh` removes this checkout's skill symlinks and Herdr
 registration while leaving configuration, saved state, backups, and other installations untouched.
