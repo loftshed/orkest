@@ -1,7 +1,16 @@
-import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  symlink,
+  utimes,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   cachedUpdateStatus,
@@ -11,6 +20,7 @@ import {
 import {
   checkOrkestUpdate,
   DEFAULT_UPDATE_INTERVAL_MS,
+  getUpdateConfigPath,
   getUpdateStatePath,
   readAutoUpdateConfig,
   readLocalGitHeadSha,
@@ -35,6 +45,133 @@ afterEach(async () => {
 });
 
 describe("Orkest auto-update (update.mjs)", () => {
+  it("prints help and rejects unknown arguments before calling update, config, state, or exec functions", async () => {
+    const configDir = await makeTempDir();
+    const cacheDir = await makeTempDir();
+    let output = "";
+    const stdout = { write: (chunk) => (output += chunk) };
+    const injected = {
+      updateFn: vi.fn(),
+      checkFn: vi.fn(),
+      setAutoUpdateEnabledFn: vi.fn(),
+      readAutoUpdateConfigFn: vi.fn(),
+      readUpdateStateFn: vi.fn(),
+      exec: vi.fn(),
+      configDir,
+      cacheDir,
+      stdout,
+    };
+
+    for (const arg of ["--help", "-h"]) {
+      const result = await runUpdateCli([arg], injected);
+      expect(result).toMatchObject({ ok: true, status: "help", help: true, exitCode: 0 });
+      expect(output).toContain("Usage: ork update");
+    }
+    expect(output).toContain("--check");
+    expect(output).toContain("--apply");
+
+    for (const arg of ["--hlep", "upgrade"]) {
+      let thrown;
+      try {
+        await runUpdateCli([arg], injected);
+      } catch (error_) {
+        thrown = error_;
+      }
+      const error = thrown;
+      expect(error).toMatchObject({ exitCode: 2 });
+      expect(error.message).toContain(arg);
+    }
+
+    for (const name of [
+      "updateFn",
+      "checkFn",
+      "setAutoUpdateEnabledFn",
+      "readAutoUpdateConfigFn",
+      "readUpdateStateFn",
+      "exec",
+    ]) {
+      expect(injected[name]).not.toHaveBeenCalled();
+    }
+    await expect(readFile(getUpdateStatePath({ cacheDir }), "utf8")).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await expect(readFile(getUpdateConfigPath({ configDir }), "utf8")).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
+  it("keeps the documented update, check, status, toggle, and output flags working", async () => {
+    const configDir = await makeTempDir();
+    const cacheDir = await makeTempDir();
+    const calls = [];
+    let output = "";
+    const stdout = { write: (chunk) => (output += chunk) };
+    const options = {
+      configDir,
+      cacheDir,
+      stdout,
+      updateFn: vi.fn(async (opts) => {
+        calls.push(["update", opts]);
+        return { ok: true, status: "throttled", updated: false };
+      }),
+      checkFn: vi.fn(async (opts) => {
+        calls.push(["check", opts]);
+        return { ok: true, status: "up_to_date", updateAvailable: false };
+      }),
+      setAutoUpdateEnabledFn: vi.fn(async (enabled) => ({ enabled })),
+      readAutoUpdateConfigFn: vi.fn(async () => ({ enabled: true })),
+      readUpdateStateFn: vi.fn(async () => ({ status: "idle" })),
+    };
+
+    await runUpdateCli(["run"], options);
+    output = "";
+    await runUpdateCli(["--apply", "--auto", "--force", "--quiet"], options);
+    expect(options.updateFn).toHaveBeenCalledTimes(2);
+    expect(calls[0][1]).toMatchObject({ auto: false, force: false });
+    expect(calls[1][1]).toMatchObject({ auto: true, force: true });
+    expect(output).toBe("");
+
+    await runUpdateCli(["check"], options);
+    await runUpdateCli(["--check", "--json"], options);
+    expect(options.checkFn).toHaveBeenCalledTimes(2);
+    expect(output).toContain('"status": "up_to_date"');
+
+    const status = await runUpdateCli(["status"], options);
+    expect(status).toMatchObject({
+      status: "idle",
+      autoUpdate: { enabled: true },
+      state: { status: "idle" },
+    });
+    expect(options.readAutoUpdateConfigFn).toHaveBeenCalledTimes(1);
+    expect(options.readUpdateStateFn).toHaveBeenCalledWith(getUpdateStatePath({ cacheDir }));
+
+    await runUpdateCli(["enable"], options);
+    await runUpdateCli(["disable"], options);
+    expect(options.setAutoUpdateEnabledFn.mock.calls.map(([enabled]) => enabled)).toEqual([
+      true,
+      false,
+    ]);
+
+    output = "";
+    await runUpdateCli(["run", "--json"], options);
+    expect(JSON.parse(output)).toMatchObject({ status: "throttled", updated: false });
+
+    output = "";
+    await runUpdateCli(["run"], {
+      ...options,
+      updateFn: async () => ({
+        ok: true,
+        status: "updated",
+        cleanup: {
+          cache: { status: "already_migrated", changed: false },
+          config: { status: "already_migrated", changed: false },
+          repairedWorktrees: [],
+        },
+      }),
+    });
+    expect(output).not.toContain("Legacy state migration:");
+  });
+
   it("reads default config and toggles auto_update.enabled via setAutoUpdateEnabled and CLI", async () => {
     const configDir = await makeTempDir();
     const cacheDir = await makeTempDir();
@@ -200,7 +337,7 @@ describe("Orkest auto-update (update.mjs)", () => {
     });
   });
 
-  it("fast-forwards clean main, runs install_mailbox.py, and invokes legacy cleanup on update", async () => {
+  it("fast-forwards clean main, refreshes mailbox hooks, and invokes legacy migration on update", async () => {
     const configDir = await makeTempDir();
     const cacheDir = await makeTempDir();
     const executed = [];
@@ -268,6 +405,119 @@ describe("Orkest auto-update (update.mjs)", () => {
       remoteSha: "bbbb2222",
       commitsBehind: 3,
     });
+  });
+
+  it("calls the exported migration during update without pruning cleanup state", async () => {
+    const configDir = await makeTempDir();
+    const cacheDir = await makeTempDir();
+    const fakeHome = await makeTempDir();
+    const legacyCache = path.join(fakeHome, ".cache", "agent-executor");
+    const staleLock = path.join(legacyCache, "locks", "old.lock");
+    await mkdir(path.dirname(staleLock), { recursive: true });
+    await writeFile(staleLock, JSON.stringify({ pid: 99_999_999, released: false }), "utf8");
+    await utimes(staleLock, new Date(1), new Date(1));
+    const env = {
+      HOME: fakeHome,
+      XDG_CACHE_HOME: path.join(fakeHome, ".cache"),
+      XDG_CONFIG_HOME: path.join(fakeHome, ".config"),
+      XDG_DATA_HOME: path.join(fakeHome, ".local", "share"),
+    };
+    let output = "";
+    const stdout = { write: (chunk) => (output += chunk) };
+    const executed = [];
+    const updateExec = (cmd, args, cb) => {
+      executed.push([cmd, args]);
+      if (cmd === "git") {
+        if (args.includes("--abbrev-ref")) return cb(null, "main\n");
+        if (args.includes("--porcelain") || args.includes("fetch")) return cb(null, "");
+        if (args.includes("HEAD..origin/main")) return cb(null, "1\n");
+        if (args.includes("origin/main..HEAD")) return cb(null, "0\n");
+        if (args.includes("origin/main") && args.includes("rev-parse")) {
+          return cb(null, "bbbb2222\n");
+        }
+        if (args.includes("HEAD") && args.includes("rev-parse")) return cb(null, "aaaa1111\n");
+        if (args.includes("merge")) return cb(null, "Updating aaaa1111..bbbb2222\n");
+      }
+      cb(null, "");
+    };
+
+    const result = await runUpdateCli(["--apply"], {
+      configDir,
+      cacheDir,
+      env,
+      now: 500_000,
+      repoRoot: "/repo",
+      exec: updateExec,
+      stdout,
+    });
+
+    expect(result).toMatchObject({
+      status: "updated",
+      cleanup: {
+        requested: true,
+        cache: { status: "migrated", changed: true },
+        config: { status: "created_and_linked", changed: true },
+        repairedWorktrees: [],
+      },
+    });
+    expect(output.match(/Legacy state migration:/gu)).toHaveLength(1);
+    expect(
+      await readFile(path.join(fakeHome, ".cache", "orchestrate", "locks", "old.lock"), "utf8"),
+    ).toContain("99999999");
+    expect(executed.some(([cmd]) => cmd === "python3")).toBe(true);
+    expect(executed.some(([cmd, args]) => cmd === "git" && args.includes("merge"))).toBe(true);
+
+    output = "";
+    const jsonResult = await runUpdateCli(["--apply", "--json"], {
+      configDir,
+      cacheDir,
+      env,
+      now: 600_000,
+      repoRoot: "/repo",
+      exec: updateExec,
+      stdout,
+    });
+    expect(JSON.parse(output).cleanup).toEqual(jsonResult.cleanup);
+    expect(jsonResult.cleanup.cache.status).toBe("already_migrated");
+  });
+
+  it("reports migration failures while keeping an otherwise successful update successful", async () => {
+    const configDir = await makeTempDir();
+    const cacheDir = await makeTempDir();
+    let output = "";
+    const updateExec = (cmd, args, cb) => {
+      if (cmd === "git") {
+        if (args.includes("--abbrev-ref")) return cb(null, "main\n");
+        if (args.includes("--porcelain") || args.includes("fetch")) return cb(null, "");
+        if (args.includes("HEAD..origin/main")) return cb(null, "1\n");
+        if (args.includes("origin/main..HEAD")) return cb(null, "0\n");
+        if (args.includes("origin/main") && args.includes("rev-parse")) {
+          return cb(null, "bbbb2222\n");
+        }
+        if (args.includes("HEAD") && args.includes("rev-parse")) return cb(null, "aaaa1111\n");
+      }
+      cb(null, "");
+    };
+
+    const result = await runUpdateCli(["--apply"], {
+      configDir,
+      cacheDir,
+      repoRoot: "/repo",
+      exec: updateExec,
+      cleanupFn: async () => {
+        throw new Error("migration lock is busy");
+      },
+      stdout: { write: (chunk) => (output += chunk) },
+    });
+
+    expect(result).toMatchObject({
+      ok: true,
+      status: "updated",
+      updated: true,
+      migrationError: "migration lock is busy",
+    });
+    expect(output.match(/Legacy state migration failed:/gu)).toHaveLength(1);
+    expect(output).toContain("migration lock is busy");
   });
 
   it("reads local git HEAD across loose refs, packed-refs, and linked worktrees, and resolves pruned worktrees", async () => {

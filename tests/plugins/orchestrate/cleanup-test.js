@@ -12,6 +12,7 @@ import {
   hasActiveWorktreeLease,
   isCleanupLockHeld,
   migrateLegacyDirectory,
+  migrateLegacyState,
   parseCleanupArgs,
   pruneDisposableWorktrees,
   pruneStaleLocks,
@@ -513,6 +514,35 @@ describe("ork cleanup (Slice 1D)", () => {
     expect(resResolved.status).toBe("merged_and_migrated");
     expect(resResolved.conflicts).toEqual([]);
     expect(fs.lstatSync(legacyConfig).isSymbolicLink()).toBe(true);
+  });
+
+  it("migrates legacy cache and config under cleanup.lock without pruning state", () => {
+    const legacyCache = path.join(fakeHome, ".cache", "agent-executor");
+    const legacyConfig = path.join(fakeHome, ".config", "agent-executor");
+    const staleLock = path.join(legacyCache, "locks", "preserved.lock");
+    fs.mkdirSync(path.dirname(staleLock), { recursive: true });
+    fs.mkdirSync(legacyConfig, { recursive: true });
+    fs.writeFileSync(staleLock, JSON.stringify({ pid: 99_999_991, released: false }), "utf8");
+    fs.writeFileSync(path.join(legacyConfig, "config.json"), '{"routes":{}}\n', "utf8");
+    setOldMtime(staleLock, 3600);
+
+    const report = migrateLegacyState({ homeDir: fakeHome, cwd: fakeHome });
+    const cacheHome = path.join(fakeHome, ".cache", "orchestrate");
+    const configHome = path.join(fakeHome, ".config", "orchestrate");
+    const migratedLock = path.join(cacheHome, "locks", "preserved.lock");
+    const cleanupLock = path.join(cacheHome, "cleanup.lock");
+
+    expect(report).toMatchObject({
+      requested: true,
+      cache: { status: "migrated", changed: true },
+      config: { status: "migrated", changed: true },
+      repairedWorktrees: [],
+    });
+    expect(fs.readFileSync(migratedLock, "utf8")).toContain("99999991");
+    expect(fs.readlinkSync(legacyCache)).toBe("orchestrate");
+    expect(fs.readlinkSync(legacyConfig)).toBe("orchestrate");
+    expect(fs.existsSync(path.join(configHome, "config.json"))).toBe(true);
+    expect(isCleanupLockHeld(cleanupLock)).toBe(false);
   });
 
   it("never overrides Git refusal to remove a locked or registered worktree (git_locked / git_remove_refused)", () => {

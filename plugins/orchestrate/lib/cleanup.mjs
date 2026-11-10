@@ -814,6 +814,54 @@ export function repairWorktreesAfterMigration(
   return repaired;
 }
 
+export function migrateLegacyState(context = {}, { lock: heldLock = null } = {}) {
+  const paths = resolveCleanupPaths(context);
+  const isDryRun = context.dryRun === true;
+  const nowMs = typeof context.nowMs === "number" ? context.nowMs : Date.now();
+  const graceMs = context.graceMs ?? 900_000;
+  const lockPath = path.join(paths.cacheHome, "cleanup.lock");
+  const lock =
+    heldLock ||
+    acquireCleanupLock(lockPath, {
+      dryRun: isDryRun,
+      graceMs,
+      nowMs,
+    });
+
+  try {
+    const cache = migrateLegacyDirectory(paths.legacyCacheDir, paths.orchestrateCacheDir, {
+      dryRun: isDryRun,
+      symlinkTarget: "orchestrate",
+    });
+    const config = migrateLegacyDirectory(paths.legacyConfigDir, paths.orchestrateConfigDir, {
+      dryRun: isDryRun,
+      symlinkTarget: "orchestrate",
+    });
+    const targetCacheForRepair =
+      !isDryRun || fs.existsSync(paths.orchestrateCacheDir)
+        ? paths.orchestrateCacheDir
+        : paths.legacyCacheDir;
+    const repairedWorktrees = repairWorktreesAfterMigration(targetCacheForRepair, {
+      dryRun: isDryRun,
+      cwd: context.cwd || process.cwd(),
+    });
+
+    return {
+      requested: true,
+      cache,
+      config,
+      repairedWorktrees,
+    };
+  } finally {
+    if (!heldLock) {
+      lock.release([
+        path.join(paths.orchestrateCacheDir, "cleanup.lock"),
+        path.join(paths.legacyCacheDir, "cleanup.lock"),
+      ]);
+    }
+  }
+}
+
 function collectActiveRunIds(cacheHome) {
   const activeRunIds = new Set();
   for (const dirName of ["runs-v1", "jobs-v1"]) {
@@ -1692,36 +1740,18 @@ export function cleanupCommand(argv = [], context = {}) {
   try {
     let migration = null;
     if (parsed.migrateLegacy) {
-      const cacheMig = migrateLegacyDirectory(
-        initialPaths.legacyCacheDir,
-        initialPaths.orchestrateCacheDir,
+      migration = migrateLegacyState(
         {
+          ...context,
           dryRun: parsed.dryRun,
-          symlinkTarget: "orchestrate",
+          nowMs,
+          graceMs: parsed.graceMs,
+          cwd: parsed.cwd,
+        },
+        {
+          lock,
         },
       );
-      const configMig = migrateLegacyDirectory(
-        initialPaths.legacyConfigDir,
-        initialPaths.orchestrateConfigDir,
-        {
-          dryRun: parsed.dryRun,
-          symlinkTarget: "orchestrate",
-        },
-      );
-      const targetCacheForRepair =
-        !parsed.dryRun || fs.existsSync(initialPaths.orchestrateCacheDir)
-          ? initialPaths.orchestrateCacheDir
-          : initialPaths.legacyCacheDir;
-      const repairedWorktrees = repairWorktreesAfterMigration(targetCacheForRepair, {
-        dryRun: parsed.dryRun,
-        cwd: parsed.cwd,
-      });
-      migration = {
-        requested: true,
-        cache: cacheMig,
-        config: configMig,
-        repairedWorktrees,
-      };
     }
 
     const activePaths = resolveCleanupPaths(context);

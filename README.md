@@ -169,7 +169,7 @@ ork smelter [status|run] [--dry-run] [--json]
 ork side [run|status] [--prompt <text>] [--issue <n>] [--dry-run] [--json]
 ork cleanup [status|run] [--dry-run] [--json]
 ork policy [show|allow|deny|reset] [--json]
-ork update [--check|--apply] [--json]
+ork update [run|check|status|enable|disable] [--check|--apply] [--auto] [--force] [--quiet] [--json] [-h|--help]
 ork radar [--line|--json] [--refresh]
 ork gate [--heavy] [--label <text>] -- <command>   (also: ork gate status|install|uninstall)
 ork swarm [toggle|open|close]   (alias for ork horde toggle|open|close)
@@ -195,7 +195,7 @@ Slash commands, in any harness that loads the plugin:
 - `/horde [toggle|open|close|<goal>]`: Toggle the Orkest Swarm View split pane or launch a swarm for a goal
 - `/side [--later|--issue|--investigate] <idea>`: Launch or park a side mission from the current tab without derailing your main task
 - `/swarm [toggle|open|close|<goal>]`: Toggle the Orkest Swarm View split pane or launch a swarm for a goal
-- `/update [run|check|status|enable|disable] [--auto] [--force] [--quiet] [--json]`: Check for and apply fast-forward Orkest updates, refresh mailbox hooks, and migrate legacy agent-executor state
+- `/update [run|check|status|enable|disable] [--check|--apply] [--auto] [--force] [--quiet] [--json] [-h|--help]`: Check for and apply fast-forward Orkest updates, refresh mailbox hooks, and migrate legacy agent-executor state
 
 <!-- /generated:slash-commands -->
 
