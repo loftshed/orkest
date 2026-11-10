@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.19.0
+
+- feat: install Orkest with one command (#177)
+
 ## 0.18.1
 
 - fix(monitor): probe agy with the sign-in the other sessions use (#172)

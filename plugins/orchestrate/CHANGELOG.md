@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.77.0
+
+- feat: install Orkest with one command (#177)
+- feat(orchestrate): ask several models at once with consult (#178)
+- fix(orchestrate): make ork update --help safe and run legacy migration (#176)
+- fix(orchestrate): show a stopped Claude subagent as cancelled, not running (#175)
+
 ## 0.76.10
 
 - fix(orchestrate): show untracked completions as finished, not awaiting review (#174)
