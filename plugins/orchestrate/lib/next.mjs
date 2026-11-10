@@ -31,7 +31,6 @@ import { shouldUseColor } from "../../monitor/lib/render.mjs";
 import { getAccounts } from "../../monitor/lib/store.mjs";
 import {
   collectActiveWorktreeAllowPaths,
-  commitVerifiedWorktreeChanges,
   countCommitsAhead,
   createFoundryAttempt,
   DEFAULT_ROUTES,
@@ -49,6 +48,7 @@ import {
   resolveWorktreeHeadSha,
   runFoundryWorker,
   updateFoundryAttempt,
+  verifyBuilderWorktree,
   writeFoundryState,
 } from "./foundry.mjs";
 import { mailboxRoot, resolveWorktreeMarkerPath } from "./horde-room.mjs";
@@ -478,6 +478,11 @@ function isSameRebaseConflict(worktree) {
   return isSameWorktreeSha && isSameTargetSha;
 }
 
+function hasStaleVerification(worktree) {
+  const commit = worktree.foundryState?.verification?.candidate?.commit;
+  return !commit || commit !== worktree.head || worktree.isDirty;
+}
+
 export async function evaluateNextCandidates({
   approve = null,
   cwd = process.cwd(),
@@ -650,14 +655,20 @@ export async function evaluateNextCandidates({
       continue;
     }
 
-    if (status === "needs_human" || status === "scope_violated") {
+    if (
+      ["needs_human", "scope_violated", "commit_failed", "verification_mutated_workspace"].includes(
+        status,
+      )
+    ) {
       tier3.push({
         id: `tier3:${status}:${wt.slug}`,
         kind: status,
         reason:
           status === "scope_violated"
             ? `Modified files outside allow_paths: ${(wt.foundryState?.scopeViolations || []).join(", ")}`
-            : wt.foundryState?.reason || "Escalated to human review",
+            : wt.foundryState?.verification?.reason ||
+              wt.foundryState?.reason ||
+              "Escalated to human review",
         summary: `Worktree ${wt.slug} requires human intervention (${status})`,
         target: wt.slug,
         tier: 3,
@@ -695,7 +706,7 @@ export async function evaluateNextCandidates({
     if (status === "awaiting_human_approval") {
       if (matchesApproveTarget(wt, approve)) {
         tier1.push({
-          approveHighBlast: true,
+          approveHighBlast: wt.foundryState?.candidate?.commit,
           blastRadius: wt.blastRadius,
           id: `tier1:smelt_approved:${wt.slug}`,
           kind: "smelt_approved",
@@ -719,7 +730,10 @@ export async function evaluateNextCandidates({
       continue;
     }
 
-    if (!status && (wt.commitsAhead > 0 || wt.isDirty)) {
+    if (
+      (!status && (wt.commitsAhead > 0 || wt.isDirty)) ||
+      (status === "verified" && hasStaleVerification(wt))
+    ) {
       tier0.push({
         id: `tier0:reconcile_worktree_verify:${wt.slug}`,
         kind: "reconcile_worktree_verify",
@@ -732,12 +746,10 @@ export async function evaluateNextCandidates({
     }
 
     if (status === "verified" && wt.commitsAhead > 0) {
-      const isApproved = matchesApproveTarget(wt, approve);
       tier1.push({
-        approveHighBlast: isApproved,
         blastRadius: wt.blastRadius,
-        id: `tier1:${isApproved ? "smelt_approved" : "smelt_worktree"}:${wt.slug}`,
-        kind: isApproved ? "smelt_approved" : "smelt_worktree",
+        id: `tier1:smelt_worktree:${wt.slug}`,
+        kind: "smelt_worktree",
         summary: `Smelt verified worktree ${wt.slug} (${wt.branch} -> ${targetBranch}, blast=${wt.blastRadius})`,
         target: wt.slug,
         tier: 1,
@@ -967,7 +979,8 @@ async function executeTier0Action(action, options = {}) {
       }
       case "reconcile_worktree_verify": {
         {
-          isStillEligible = !state.status;
+          isStillEligible =
+            !state.status || (state.status === "verified" && hasStaleVerification(wt));
           // No default
         }
         break;
@@ -1020,6 +1033,7 @@ async function claimPrimaryAction(action, options) {
       });
       return { action: { ...action, worktree: wt, repairSpec, launchingState } };
     }
+    if (state.status === "verified" && hasStaleVerification(wt)) return { status: "stale" };
     isRetained = true;
     return { action: { ...action, worktree: wt, claimLease: lease } };
   } finally {
@@ -1136,24 +1150,18 @@ async function executeTier0Held(
   if (action.kind === "reconcile_worktree_verify") {
     const wt = action.worktree;
     const normalizedVerify = enforceScopedVerifyCommand(wt.verifyCommand);
-    const verifyRes = await execVerifyFn(normalizedVerify, {
-      cwd: wt.worktreePath,
+    const checked = await verifyBuilderWorktree(wt.worktreePath, {
       issue: wt.issue,
+      allowPaths: wt.allowPaths,
+      targetBranch,
+      command: normalizedVerify,
+      execFileSyncFn,
+      execVerifyFn,
+      assertHeld: () => assertWorkspaceLease(workspaceLease),
     });
-    assertWorkspaceLease(workspaceLease);
-    const isVerifyOk =
-      typeof verifyRes?.ok === "boolean" ? verifyRes.ok : (verifyRes?.exitCode ?? 1) === 0;
-    let commitsAhead = wt.commitsAhead;
-    if (isVerifyOk && wt.isDirty) {
-      try {
-        commitVerifiedWorktreeChanges(wt.worktreePath, wt.issue, { execFileSyncFn });
-        const recounted = countCommitsAhead(wt.worktreePath, targetBranch, { execFileSyncFn });
-        commitsAhead = recounted.resolved ? recounted.commitsAhead : Math.max(1, commitsAhead);
-      } catch {
-        commitsAhead = Math.max(1, commitsAhead);
-      }
-    }
-    const newStatus = isVerifyOk ? "verified" : "verification_failed";
+    const isVerifyOk = checked.verification.ok;
+    const commitsAhead = checked.commitsAhead;
+    const newStatus = checked.status;
     const state = writeFoundryState(wt.worktreePath, {
       attemptCount: wt.foundryState?.attemptCount ?? 1,
       branch: wt.branch,
@@ -1162,14 +1170,8 @@ async function executeTier0Held(
       issue: wt.issue ? { number: wt.issue, title: "" } : null,
       status: newStatus,
       targetBranch,
-      verification: {
-        command: normalizedVerify,
-        exitCode: verifyRes?.exitCode ?? (isVerifyOk ? 0 : 1),
-        ok: isVerifyOk,
-        output: verifyRes?.output || "",
-        status: isVerifyOk ? "passed" : "failed",
-        verifiedAt: new Date().toISOString(),
-      },
+      verification: checked.verification,
+      ...(checked.scopeViolations && { scopeViolations: checked.scopeViolations }),
       verifyCommand: normalizedVerify,
     });
     await writeNextLedger(
@@ -1226,7 +1228,7 @@ async function executePrimaryAction(
     const wt = action.worktree;
     try {
       const smeltRes = await smeltWorktreeFn(wt, {
-        approveHighBlast: Boolean(action.approveHighBlast),
+        approveHighBlast: action.approveHighBlast,
         env,
         workspaceLease: action.claimLease,
         cwd,
@@ -1387,39 +1389,37 @@ async function executePrimaryAction(
       let commitsAhead = counted.commitsAhead;
       const hasChanges = commitsAhead > 0 || dirtyCheck.isDirty;
 
-      let isVerifyOk = false;
-      let verifyOutput = "";
-      let verifyExitCode = 1;
-      if (didRepairBuilderSucceed && hasChanges) {
-        const verifyRes = await execVerifyFn(repairSpec.verifyCommand, {
-          cwd: wt.worktreePath,
-          issue: wt.issue,
-        });
-        assertWorkspaceLease(finalLease);
-        if (typeof verifyRes?.exitCode === "number") {
-          verifyExitCode = verifyRes.exitCode;
-        } else {
-          verifyExitCode = verifyRes?.ok === false ? 1 : 0;
-        }
-        isVerifyOk = typeof verifyRes?.ok === "boolean" ? verifyRes.ok : verifyExitCode === 0;
-        verifyOutput = typeof verifyRes?.output === "string" ? verifyRes.output : "";
-        if (isVerifyOk && dirtyCheck.isDirty) {
-          try {
-            commitVerifiedWorktreeChanges(wt.worktreePath, wt.issue, { execFileSyncFn });
-            const recounted = countCommitsAhead(wt.worktreePath, targetBranch, { execFileSyncFn });
-            commitsAhead = recounted.resolved ? recounted.commitsAhead : Math.max(1, commitsAhead);
-          } catch {
-            commitsAhead = Math.max(1, commitsAhead);
-          }
-        }
-      }
-
-      let finalStatus = "verified";
-      if (outcome === "uncertain") finalStatus = "launch_uncertain";
-      else if (!isVerifyOk) {
-        finalStatus = didRepairBuilderSucceed ? "verification_failed" : "worker_failed";
-        if (nextAttempt >= maxAttempts) finalStatus = "needs_human";
-      }
+      const checked =
+        didRepairBuilderSucceed && (hasChanges || !counted.resolved)
+          ? await verifyBuilderWorktree(wt.worktreePath, {
+              issue: wt.issue,
+              allowPaths: wt.allowPaths,
+              targetBranch,
+              command: repairSpec.verifyCommand,
+              execFileSyncFn,
+              execVerifyFn,
+              assertHeld: () => assertWorkspaceLease(finalLease),
+            })
+          : {
+              status: outcome === "uncertain" ? "launch_uncertain" : "worker_failed",
+              commitsAhead: counted.resolved ? commitsAhead : null,
+              verification: {
+                ok: false,
+                status: "not_run",
+                command: repairSpec.verifyCommand,
+                exitCode: null,
+                output: "",
+                verifiedAt: new Date().toISOString(),
+              },
+            };
+      commitsAhead = checked.commitsAhead;
+      const isVerifyOk = checked.verification.ok;
+      let finalStatus = checked.status;
+      if (
+        ["verification_failed", "worker_failed"].includes(finalStatus) &&
+        nextAttempt >= maxAttempts
+      )
+        finalStatus = "needs_human";
 
       assertWorkspaceLease(finalLease);
       const newState = writeFoundryState(wt.worktreePath, {
@@ -1460,14 +1460,8 @@ async function executePrimaryAction(
         }),
         status: finalStatus,
         targetBranch,
-        verification: {
-          command: repairSpec.verifyCommand,
-          exitCode: verifyExitCode,
-          ok: isVerifyOk,
-          output: verifyOutput,
-          status: isVerifyOk ? "passed" : "failed",
-          verifiedAt: new Date().toISOString(),
-        },
+        verification: checked.verification,
+        ...(checked.scopeViolations && { scopeViolations: checked.scopeViolations }),
       });
 
       await writeNextLedger(

@@ -465,7 +465,7 @@ describe("durable workspace adoption with retained real Git and process fixtures
         return { sections: { FINDINGS: "None" } };
       },
     });
-    expect(result).toMatchObject({ status: "stale", ok: false });
+    expect(result).toMatchObject({ status: "stale_candidate", ok: false });
     expect(git(f.repo, "rev-parse", "HEAD")).toBe(mainHead);
     expect(readFileSync(resolveFoundryStatePath(wt), "utf8")).toBe(state);
   });
@@ -511,7 +511,7 @@ try {
         gateRunner: async () => "ok",
         reviewRunner: async () => ({ sections: { FINDINGS: "None" } }),
       });
-      expect(result).toMatchObject({ status: "stale", ok: false });
+      expect(result).toMatchObject({ status: "stale_candidate", ok: false });
       expect(git(f.repo, "rev-parse", "HEAD")).toBe(mainHead);
       expect(readFileSync(resolveFoundryStatePath(wt), "utf8")).toBe(state);
       expect(git(wt, "log", "-1", "--format=%s")).toBe("handover writer");

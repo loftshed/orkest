@@ -218,14 +218,24 @@ describe("ork next 4-tier waterfall execution", () => {
       branch: "feat/issue-101",
       issue: 101,
       slug: "wt-101",
-      statePatch: { blastRadius: "low", commitsAhead: 1, status: "verified" },
+      statePatch: {
+        blastRadius: "low",
+        commitsAhead: 1,
+        status: "verified",
+        verification: { candidate: { commit: "3333333" } },
+      },
     });
     const wtVerifiedMed = await createMockWorktree(rootDir, repoRoot, {
       allowPaths: ["plugins/orchestrate/lib/next.mjs"],
       branch: "feat/issue-102",
       issue: 102,
       slug: "wt-102",
-      statePatch: { blastRadius: "medium", commitsAhead: 1, status: "verified" },
+      statePatch: {
+        blastRadius: "medium",
+        commitsAhead: 1,
+        status: "verified",
+        verification: { candidate: { commit: "2222222" } },
+      },
     });
 
     let wasPrunedMerged = false;
@@ -258,7 +268,9 @@ describe("ork next 4-tier waterfall execution", () => {
         if (opts?.cwd === wtMerged.path) return "0\n";
         return "1\n";
       }
-      if (cmd === "git" && args[0] === "status") return "";
+      if (cmd === "git" && ["status", "ls-files", "diff"].includes(args[0])) return "";
+      if (cmd === "git" && args[0] === "rev-parse" && args[1] === "HEAD")
+        return opts?.cwd === wtVerifiedLow.path ? "3333333\n" : "2222222\n";
       return "main-sha-1\n";
     };
 
@@ -315,6 +327,7 @@ describe("ork next 4-tier waterfall execution", () => {
         blastRadius: "high",
         commitsAhead: 1,
         status: "awaiting_human_approval",
+        candidate: { commit: "2222222" },
       },
     });
 
@@ -332,7 +345,8 @@ describe("ork next 4-tier waterfall execution", () => {
     const execMock = (cmd, args) => {
       if (cmd === "git" && args[0] === "worktree" && args[1] === "list") return porcelain;
       if (cmd === "git" && args[0] === "rev-list") return "1\n";
-      if (cmd === "git" && args[0] === "status") return "";
+      if (cmd === "git" && ["status", "ls-files", "diff"].includes(args[0])) return "";
+      if (cmd === "git" && args[0] === "rev-parse" && args[1] === "HEAD") return "2222222\n";
       return "main-sha-1\n";
     };
 
@@ -371,7 +385,7 @@ describe("ork next 4-tier waterfall execution", () => {
     expect(approvedRes.ok).toBe(true);
     expect(approvedRes.exitCode).toBe(0);
     expect(approvedRes.executedAction.kind).toBe("smelt_approved");
-    expect(approvedCallOptions.approveHighBlast).toBe(true);
+    expect(approvedCallOptions.approveHighBlast).toBe("2222222");
   });
 
   it("performs bounded Tier 2 self-repair (maxAttempts=2) and escalates to needs_human on second failure", async () => {
@@ -416,7 +430,7 @@ describe("ork next 4-tier waterfall execution", () => {
     const execMock = (cmd, args) => {
       if (cmd === "git" && args[0] === "worktree" && args[1] === "list") return porcelain;
       if (cmd === "git" && args[0] === "rev-list") return "1\n";
-      if (cmd === "git" && args[0] === "status") return "";
+      if (cmd === "git" && ["status", "ls-files", "diff"].includes(args[0])) return "";
       return "2222222\n";
     };
 

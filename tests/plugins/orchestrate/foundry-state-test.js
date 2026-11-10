@@ -323,6 +323,7 @@ read();
       status: "verified",
       attemptCount: 7,
       allowPaths: ["tracked.txt"],
+      verification: { candidate: { commit: git(f.worktree, "rev-parse", "HEAD") } },
     });
     const beforeHead = git(f.worktree, "rev-parse", "HEAD");
     const env = { ...process.env, ORCHESTRATE_HOME: path.join(f.root, "cache") };

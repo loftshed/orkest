@@ -136,8 +136,13 @@ without a usable status, becomes `launch_uncertain`. An unreadable result file c
 fall back to a status line; without either source the outcome remains uncertain.
 A missing status never means completed.
 
-Verification, host commit and final state writes require exclusive ownership
-again. If a surviving executor prevents reacquisition, the launcher returns busy
+Builder commit, verification and final state writes require exclusive ownership
+again. Foundry and Next check changed and untracked paths against the task allow-list
+before staging, then commit builder changes before running checks. A failed commit
+stops with `commit_failed`; check output is never committed. Verification records
+carry the candidate commit and tree; changed HEAD or dirty status after checks is
+`verification_mutated_workspace`. Next revalidates verified states with a missing
+or different candidate commit. If a surviving executor prevents reacquisition, the launcher returns busy
 with a nonzero exit and names the worktree; the durable `launching` attempt stays
 untouched. No unleased state write or automatic relaunch occurs. Tests select a
 stub with the `runnerScriptPath` option while exercising the real default launchers.
@@ -168,18 +173,45 @@ another writer. Lock files and failed temporary files are retained.
 ## Smelter phases
 
 The worktree lease is exclusive for state checks, the clean-worktree check and
-rebase. Smelter records the post-rebase HEAD SHA, releases the exclusive lease,
-and acquires a shared lease for the heavy gate and cold review. The shared lease
-excludes cooperating writers and coexists with the reviewer's own shared lease.
-After acquisition it checks that HEAD still matches and the worktree is clean.
-It repeats both checks after review, then releases the shared lease and reacquires
-exclusive ownership before state writes, merge and existing disposable pruning.
-That final acquisition rechecks HEAD and clean status too. Local merge additionally
-holds the target checkout's exclusive lease.
+rebase. Smelter resolves the Git common directory and pins `refs/heads/<target>`
+once, rebases onto that SHA, then records `{ commit, tree, branch }`. Scope and
+blast radius use the pinned target-to-candidate diff, with renames disabled.
+Without an allow-list, scope is `unchecked`.
 
-These handovers are not atomic. A writer can acquire between modes; HEAD and clean
-status checks detect its changes and return `stale` without merging or writing
-state. A failed acquisition returns busy. Launching, running, launch_uncertain and
-unreadable state are refused before the first Git command, for both discovery and
-direct `--worktree` calls. These checks pin only the worktree HEAD across the lease
-handovers. Full candidate and target pinning remains issue #157.
+Smelter releases the exclusive lease and acquires a shared lease for the heavy
+gate and cold review. That lease excludes cooperating writers and coexists with
+the reviewer's shared lease. Each handover and the ends of gate and review check
+the candidate HEAD, clean status (including untracked files), and pinned target
+ref. Changes stop with `stale_candidate`, `check_mutated_workspace` or
+`stale_target`. A failed acquisition returns busy. These mode handovers are not
+atomic; checks detect a writer that acquired between them. Launching, running,
+launch_uncertain and unreadable state are refused before the first Git command.
+
+After review, exclusive ownership is reacquired. Local integration finds the
+actual target checkout through `git worktree list --porcelain` and takes its
+exclusive lease. Its attached HEAD must name the target ref at the pinned SHA;
+Smelter merges the candidate SHA with `--ff-only`, preserving unrelated dirty,
+staged and untracked content. Overlapping changes are left for Git to refuse;
+Smelter never stashes, resets or cleans the target. Only a branch checked out
+nowhere uses compare-and-swap `git update-ref`. The target ref must equal the
+candidate before `merged` is recorded or disposable pruning is attempted. A failed
+state write after integration returns `merged_state_unrecorded` with `ok: false`.
+The PR strategy pushes `<candidate>:refs/heads/<branch>`.
+
+High-blast local integration requires `--approve-high-blast <commit>`. Next's
+`--approve <slug>` passes the candidate saved in `awaiting_human_approval`; a new
+candidate needs approval again. State and run results carry an
+`ork.smelter.evidence.v1` record with candidate, target, merge base, task-spec digest,
+scope, blast radius, check results, review result and any approval.
+
+A pinned merge under cooperative leases is not a transaction against actors that
+ignore those leases. Strong unattended guarantees require a controlled integration
+target; a reflog precheck cannot close that race.
+
+## Coordinator acceptance
+
+Accepting a run holds the workspace lease while validating evidence, comparing the
+workspace fingerprint and Git identity, setting accepted status and saving the
+decision. Its `candidate: { fingerprint, git_identity }` is a snapshot of precisely
+that workspace; it does not cover later content. Supported consultations keep their
+existing acceptance rules.

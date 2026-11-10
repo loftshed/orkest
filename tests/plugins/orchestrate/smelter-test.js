@@ -45,6 +45,7 @@ import { retainFixtures } from "../../helpers/retain-fixtures.js";
 // Foundry tests model Git explicitly too; no fallback can reach the host Git binary.
 function foundryRun(args, options) {
   return foundryRunImpl(args, {
+    execVerifyFn: async () => ({ exitCode: 0, ok: true, output: "explicit fixture verifier" }),
     execFileSyncFn: (cmd, argv) => {
       if (cmd === "git" && argv[0] === "rev-list") return "1\n";
       if (cmd === "git" && argv[0] === "rev-parse") return "fixture-head\n";
@@ -539,8 +540,7 @@ describe("foundry re-exports and factory fixes", () => {
       status: "worker_failed",
     });
 
-    // When the builder leaves uncommitted working-tree changes and verifyCommand passes,
-    // Foundry stages and commits those verified changes on the worktree branch:
+    // Foundry commits builder changes before invoking the verifier:
     const hostGitCalls = [];
     const dirtyWorktreePath = path.join(rootDir, "wt-dirty-88");
     await mkdir(dirtyWorktreePath);
@@ -554,13 +554,15 @@ describe("foundry re-exports and factory fixes", () => {
       execFileSyncFn: (cmd, args) => {
         hostGitCalls.push([cmd, ...args]);
         if (cmd === "git" && args[0] === "status" && args[1] === "--porcelain") {
-          return " M plugins/orchestrate/lib/foundry.mjs\n";
+          return hostGitCalls.some((c) => c[1] === "commit")
+            ? ""
+            : " M plugins/orchestrate/lib/foundry.mjs\n";
         }
         if (cmd === "git" && args[0] === "rev-list") {
           const hasCommitted = hostGitCalls.some((c) => c[0] === "git" && c[1] === "commit");
           return hasCommitted ? "1\n" : "0\n";
         }
-        if (cmd === "git" && args[0] === "rev-parse" && args[1] === "HEAD") {
+        if (cmd === "git" && args[0] === "rev-parse" && ["HEAD", "HEAD^{tree}"].includes(args[1])) {
           return "abcdef1234567\n";
         }
         return "";
@@ -733,157 +735,57 @@ describe("ork smelter", () => {
     });
   });
 
-  it("executes the 4-stage smeltWorktree pipeline with dry-run, injectable callbacks, scope enforcement, and strategy support", async () => {
-    const rootDir = await makeTempDir("ork-smelter-pipeline-");
-    const repoRoot = path.join(rootDir, "repo");
-    const worktreePath = path.join(rootDir, "wt");
-    await mkdir(repoRoot);
-    await mkdir(worktreePath);
-    const baseWorktree = {
-      allowPaths: ["plugins/orchestrate/lib/smelter.mjs", "tests/plugins/orchestrate/"],
-      branch: "feat/issue-63",
-      disposable: true,
-      engine: "claude",
-      issue: 63,
-      parentCwd: repoRoot,
-      path: worktreePath,
-      slug: "wt-63",
-      verifyCommand: "./scripts/check.sh",
+  it("records dry-run evidence, pins merge and review arguments, and supports PR strategy", async () => {
+    const root = await makeTempDir("ork-smelter-pipeline-");
+    const wt = { path: root, branch: "builder", disposable: false, allowPaths: ["source.mjs"] };
+    const commands = [];
+    const execMock = (cmd, args) => {
+      commands.push([cmd, ...args]);
+      if (args[0] === "rev-parse") return "fixture-head";
+      if (args[0] === "symbolic-ref") return "builder";
+      if (args[0] === "diff") return "source.mjs\0";
+      return "";
     };
-
-    const recordedCmds = [];
-    const execMock = (cmd, args, opts) => {
-      recordedCmds.push({ args, cmd, cwd: opts?.cwd });
-      if (cmd === "git" && args[0] === "status") return "";
-      if (cmd === "git" && args[0] === "rev-parse") return "fixture-head";
-      if (cmd === "git" && args[0] === "diff") {
-        return "plugins/orchestrate/lib/smelter.mjs\ntests/plugins/orchestrate/smelter-test.js\n";
-      }
-      return "ok";
-    };
-
-    const dryRunRes = await smeltWorktree(baseWorktree, {
+    const dry = await smeltWorktree(wt, { dryRun: true, execFileSyncFn: execMock });
+    expect(dry).toMatchObject({
       dryRun: true,
-      execFileSyncFn: execMock,
-      targetBranch: "main",
-    });
-    expect(dryRunRes.dryRun).toBe(true);
-    expect(dryRunRes.blastRadius).toBe("medium");
-    expect(dryRunRes.reviewerEngine).toBe("codex");
-    expect(dryRunRes.pruned).toBe(false);
-    expect(dryRunRes.stages.rebaseAndScope.status).toBe("dry-run");
-    expect(dryRunRes.stages.heavyGate.status).toBe("dry-run");
-    expect(dryRunRes.stages.coldReview.status).toBe("dry-run");
-    expect(dryRunRes.stages.smeltAndPrune.status).toBe("dry-run");
-    // Only git status and git diff run during dry-run:
-    expect(
-      recordedCmds
-        .filter((c) => c.args[0] !== "rev-parse" && c.args[0] !== "status")
-        .map((c) => [c.cmd, ...c.args]),
-    ).toEqual([["git", "diff", "--name-only", "--no-renames", "main...HEAD"]]);
-
-    recordedCmds.length = 0;
-    const gateCalls = [];
-    const reviewCalls = [];
-    const fullRes = await smeltWorktree(baseWorktree, {
-      execFileSyncFn: execMock,
-      gateRunner: async (info) => {
-        gateCalls.push(info);
-        return "gate passed";
+      pruned: false,
+      evidence: {
+        scope: { result: "passed" },
+        candidate: { commit: "fixture-head", branch: "builder" },
       },
+    });
+    expect(commands.some((entry) => entry[1] === "rebase")).toBe(false);
+    const reviews = [];
+    const full = await smeltWorktree(wt, {
+      execFileSyncFn: execMock,
+      gateRunner: async () => "passed",
       reviewRunner: async (info) => {
-        reviewCalls.push(info);
+        reviews.push(info);
         return "FINDINGS:\nnone";
       },
-      strategy: "local",
-      targetBranch: "main",
     });
-
-    expect(fullRes.ok).toBe(true);
-    expect(fullRes.pruned).toBe(true);
-    expect(gateCalls).toHaveLength(1);
-    expect(gateCalls[0].command).toEqual(["ork", "gate", "--heavy", "--", "./scripts/check.sh"]);
-    expect(reviewCalls).toHaveLength(1);
-    expect(reviewCalls[0].args).toEqual([
-      "consult",
-      "--intent",
-      "review",
-      "--engine",
-      "codex",
-      "--transport",
-      "executor",
-      "--format",
-      "json",
-      "--read",
-      worktreePath,
-      "--diff",
-      "main",
-      "--question",
-      COLD_REVIEW_QUESTION,
+    expect(full).toMatchObject({ ok: true, status: "merged", pruned: false });
+    expect(commands).toContainEqual(["git", "rebase", "fixture-head"]);
+    expect(commands).toContainEqual([
+      "git",
+      "update-ref",
+      "refs/heads/main",
+      "fixture-head",
+      "fixture-head",
     ]);
-    expect(
-      recordedCmds
-        .filter((c) => c.args[0] !== "rev-parse" && c.args[0] !== "status")
-        .map((c) => [c.cmd, ...c.args]),
-    ).toEqual([
-      ["git", "diff", "--name-only", "--no-renames", "main...HEAD"],
-      ["git", "rebase", "main"],
-      ["git", "merge", "--ff-only", "feat/issue-63"],
-      ["git", "worktree", "remove", worktreePath],
-      ["git", "branch", "-d", "feat/issue-63"],
-    ]);
-
-    // Kept worktree (disposable: false) should not be removed in local strategy:
-    recordedCmds.length = 0;
-    const keepRes = await smeltWorktree(
-      { ...baseWorktree, disposable: false },
-      {
-        execFileSyncFn: execMock,
-        skipReview: true,
-        strategy: "local",
-      },
-    );
-    expect(keepRes.pruned).toBe(false);
-    expect(
-      recordedCmds
-        .filter((c) => c.args[0] !== "rev-parse" && c.args[0] !== "status")
-        .map((c) => [c.cmd, ...c.args]),
-    ).toEqual([
-      ["git", "diff", "--name-only", "--no-renames", "main...HEAD"],
-      ["git", "rebase", "main"],
-      ["ork", "gate", "--heavy", "--", "./scripts/check.sh"],
-      ["git", "merge", "--ff-only", "feat/issue-63"],
-    ]);
-
-    // PR strategy pushes and opens a PR via gh pr create:
-    recordedCmds.length = 0;
-    const prRes = await smeltWorktree(baseWorktree, {
+    expect(reviews[0].args[reviews[0].args.indexOf("--diff") + 1]).toBe("fixture-head");
+    const pr = await smeltWorktree(wt, {
       execFileSyncFn: execMock,
       skipReview: true,
       strategy: "pr",
-      targetBranch: "main",
     });
-    expect(prRes.strategy).toBe("pr");
-    expect(
-      recordedCmds
-        .filter((c) => c.args[0] !== "rev-parse" && c.args[0] !== "status")
-        .map((c) => [c.cmd, ...c.args]),
-    ).toContainEqual(["gh", "pr", "create", "--base", "main", "--head", "feat/issue-63", "--fill"]);
-
-    // Scope audit rejects modifications outside allow_paths:
-    await expect(
-      smeltWorktree(baseWorktree, {
-        changedPaths: ["plugins/orchestrate/bin/ork.mjs"],
-        execFileSyncFn: execMock,
-      }),
-    ).rejects.toThrow(/Scope audit failed/u);
-
-    // Dirty worktree is rejected in Stage 1:
-    await expect(
-      smeltWorktree(baseWorktree, {
-        execFileSyncFn: (cmd, args) => (cmd === "git" && args[0] === "status" ? " M dirty.js" : ""),
-      }),
-    ).rejects.toThrow(/uncommitted changes/u);
+    expect(pr.status).toBe("pr_opened");
+    expect(commands).toContainEqual(["git", "push", "origin", "fixture-head:refs/heads/builder"]);
+    expect(COLD_REVIEW_QUESTION).toBe(reviews[0].args.at(-1));
+    await expect(smeltWorktree(wt, { execFileSyncFn: () => " M dirty.js" })).rejects.toThrow(
+      /uncommitted changes/u,
+    );
   });
 
   it("supports smelterCli status --json and run --dry-run --json", async () => {
@@ -932,7 +834,7 @@ describe("ork smelter", () => {
       if (cmd === "git" && args[0] === "rev-list") return "1\n";
       if (cmd === "git" && args[0] === "status") return "";
       if (cmd === "git" && args[0] === "rev-parse") return "fixture-head";
-      if (cmd === "git" && args[0] === "diff") return "plugins/orchestrate/lib/smelter.mjs\n";
+      if (cmd === "git" && args[0] === "diff") return "plugins/orchestrate/lib/smelter.mjs\0";
       return "";
     };
 
@@ -978,7 +880,7 @@ describe("ork smelter", () => {
     });
     expect(result.disposable).toBe(false);
     expect(result.stages.smeltAndPrune.operations).toEqual([
-      ["git", "merge", "--ff-only", path.basename(unmarkedDir)],
+      ["git", "update-ref", "refs/heads/main", "fixture-head", "fixture-head"],
     ]);
   });
 
@@ -1139,9 +1041,13 @@ describe("ork smelter", () => {
     await expect(
       smeltWorktree(baseWt, {
         changedPaths: ["README.md"],
-        execFileSyncFn: (cmd, args) => (args[0] === "rev-parse" ? "fixture-head" : ""),
+        execFileSyncFn: (cmd, args) => {
+          if (args[0] === "rev-parse") return "fixture-head";
+          if (args[0] === "diff") return "README.md\0";
+          return "";
+        },
       }),
-    ).rejects.toThrow(/Scope audit failed/u);
+    ).resolves.toMatchObject({ status: "scope_violated" });
     expect(readFoundryState(wtPath)).toMatchObject({
       schema: FOUNDRY_STATE_SCHEMA,
       scopeViolations: ["README.md"],
@@ -1153,12 +1059,13 @@ describe("ork smelter", () => {
       smeltWorktree(baseWt, {
         changedPaths: ["plugins/orchestrate/lib/smelter.mjs"],
         execFileSyncFn: (cmd, args) => {
-          if (cmd === "git" && args[0] === "rebase" && args[1] === "main") {
+          if (cmd === "git" && args[0] === "rebase" && args[1] === "target-sha-99") {
             throw new Error("CONFLICT (content): Merge conflict");
           }
-          if (cmd === "git" && args[0] === "rev-parse" && args[1] === "main") {
+          if (cmd === "git" && args[0] === "rev-parse" && args[1] === "refs/heads/main") {
             return "target-sha-99\n";
           }
+          if (args[0] === "rev-parse") return "wt-head-99";
           return "";
         },
       }),
@@ -1183,7 +1090,10 @@ describe("ork smelter", () => {
           throw new Error("Heavy gate failed");
         },
       }),
-    ).rejects.toThrow(/Heavy gate failed/u);
+    ).resolves.toMatchObject({
+      status: "gate_failed",
+      evidence: { checks: [{ result: "failed", exitCode: null }] },
+    });
     expect(readFoundryState(wtPath)).toMatchObject({
       schema: FOUNDRY_STATE_SCHEMA,
       status: "gate_failed",
@@ -1213,7 +1123,11 @@ describe("ork smelter", () => {
     // 5. High blast radius local merge pauses with awaiting_human_approval until approveHighBlast is set:
     const highBlastRes = await smeltWorktree(baseWt, {
       changedPaths: ["plugins/orchestrate/bin/ork.mjs"],
-      execFileSyncFn: (cmd, args) => (args[0] === "rev-parse" ? "fixture-head" : ""),
+      execFileSyncFn: (cmd, args) => {
+        if (args[0] === "rev-parse") return "fixture-head";
+        if (args[0] === "diff") return "plugins/orchestrate/bin/ork.mjs\0";
+        return "";
+      },
       gateRunner: async () => "ok",
       reviewRunner: async () => ({ sections: { FINDINGS: "None" } }),
       strategy: "local",
@@ -1227,11 +1141,15 @@ describe("ork smelter", () => {
       status: "awaiting_human_approval",
     });
 
-    // 6. With approveHighBlast: true, high blast radius merges and records status: "merged":
+    // 6. With a matching approveHighBlast commit, high blast radius merges and records status: "merged":
     const approvedRes = await smeltWorktree(baseWt, {
-      approveHighBlast: true,
+      approveHighBlast: "fixture-head",
       changedPaths: ["plugins/orchestrate/bin/ork.mjs"],
-      execFileSyncFn: (cmd, args) => (args[0] === "rev-parse" ? "fixture-head" : ""),
+      execFileSyncFn: (cmd, args) => {
+        if (args[0] === "rev-parse") return "fixture-head";
+        if (args[0] === "diff") return "plugins/orchestrate/bin/ork.mjs\0";
+        return "";
+      },
       gateRunner: async () => "ok",
       reviewRunner: async () => ({ sections: { FINDINGS: "None" } }),
       strategy: "local",
@@ -1271,13 +1189,19 @@ describe("ork smelter", () => {
             if (cmd === "git" && args[0] === "status") return "";
             if (cmd === "git" && args[0] === "diff") {
               expect(args).toContain("--no-renames");
-              return "out-of-scope/secret.txt\nplugins/orchestrate/lib/smelter.mjs\n";
+              return "out-of-scope/secret.txt\0plugins/orchestrate/lib/smelter.mjs\0";
             }
+            if (args[0] === "rev-parse") return "fixture-head";
             return "";
           },
         },
       ),
-    ).rejects.toThrow(/Scope audit failed.*out-of-scope\/secret\.txt/u);
+    ).resolves.toMatchObject({
+      status: "scope_violated",
+      evidence: {
+        scope: { changedPaths: ["out-of-scope/secret.txt", "plugins/orchestrate/lib/smelter.mjs"] },
+      },
+    });
 
     // runSmeltCli prints "Halted ..." and sets process.exitCode = 1 when ok: false
     const rootDir = await makeTempDir("ork-smelter-halted-");
@@ -1328,7 +1252,7 @@ describe("ork smelter", () => {
         if (cmd === "git" && args[0] === "rev-list") return "1\n";
         if (cmd === "git" && args[0] === "status") return "";
         if (cmd === "git" && args[0] === "rev-parse") return "fixture-head";
-        if (cmd === "git" && args[0] === "diff") return "plugins/orchestrate/lib/smelter.mjs\n";
+        if (cmd === "git" && args[0] === "diff") return "plugins/orchestrate/lib/smelter.mjs\0";
         return "";
       },
       gateRunner: async () => "ok",

@@ -2,6 +2,10 @@
 
 ## 0.76.7
 
+- Bind Smelter checks, review, approval and integration to one pinned candidate and target, with durable evidence.
+- Commit builder output before Foundry and Next verification; reject check mutations and stale verification.
+- Validate and save coordinator acceptance with its workspace identity under one lease.
+
 - Persist Foundry and repair attempts before launch; gate uncertain outcomes without resetting allowances.
 - Protect Next host actions and Smelter mutation/review phases with workspace leases.
 - Release Next scheduling ownership before workers run; serialize atomic ledger updates separately.
