@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -15,6 +16,22 @@ try:
     import fcntl
 except ImportError:
     fcntl = None
+
+
+def _load_repo_paths() -> Any:
+    """Load the shared path rules by file. These scripts are loaded by path from a copied directory,
+    so a sibling is not importable by name unless a caller happened to put it on `sys.path`."""
+    spec = importlib.util.spec_from_file_location(
+        "agent_executor_repo_paths", Path(__file__).with_name("repo_paths.py")
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError("could not load repository path rules")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_REPO_PATHS = _load_repo_paths()
 
 
 class ContractError(ValueError):
@@ -250,9 +267,7 @@ def is_upward_delegation(conductor_model: str | None, worker_model: str | None) 
 
 
 def _path_covered(path: str, prefixes: list[str]) -> bool:
-    if path == ".git" or path.startswith(".git/"):
-        return False
-    return any(prefix == "." or path == prefix or path.startswith(f"{prefix}/") for prefix in prefixes)
+    return _REPO_PATHS.path_covered_by_prefixes(path, prefixes)
 
 
 def validate_resume(previous: dict[str, Any], expected: dict[str, Any]) -> None:

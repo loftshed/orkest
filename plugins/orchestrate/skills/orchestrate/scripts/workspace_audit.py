@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -12,6 +13,23 @@ import sys
 import time
 from pathlib import Path
 from typing import Any
+
+
+def _load_repo_paths() -> Any:
+    """Load the shared path rules by file. These scripts are loaded by path from a copied directory,
+    so a sibling is not importable by name unless a caller happened to put it on `sys.path`."""
+    spec = importlib.util.spec_from_file_location(
+        "agent_executor_repo_paths", Path(__file__).with_name("repo_paths.py")
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError("could not load repository path rules")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_REPO_PATHS = _load_repo_paths()
+
 
 MAX_VERIFICATION_TAIL_BYTES = 64 * 1024
 MAX_VERIFICATION_TAIL_LINE_CHARS = 500
@@ -186,27 +204,11 @@ def gate_changed(path: Path, baseline: dict[str, Any] | None, *, releases: list[
 
 
 def normalize_repo_paths(values: list[str], *, option: str, allow_root: bool = False) -> list[str]:
-    normalized: list[str] = []
-    for value in values:
-        stripped = value.strip()
-        candidate = Path(stripped)
-        # pathlib reduces `./`, `.//` and an empty string to `.`, so an empty value is refused first.
-        clean = candidate.as_posix().rstrip("/")
-        if stripped and allow_root and clean == ".":
-            if "." not in normalized:
-                normalized.append(".")
-            continue
-        if (
-            not stripped
-            or candidate.is_absolute()
-            or clean == "."
-            or ".." in candidate.parts
-            or (candidate.parts and candidate.parts[0] == ".git")
-        ):
-            raise _runner_error(f"{option} must be a non-root repository-relative path: {value!r}", 4)
-        if clean not in normalized:
-            normalized.append(clean)
-    return normalized
+    try:
+        return _REPO_PATHS.normalize_repo_paths(values, allow_root=allow_root)
+    except ValueError as exc:
+        value = exc.args[0]
+        raise _runner_error(f"{option} must be a non-root repository-relative path: {value!r}", 4) from exc
 
 
 def index_fingerprints(repo: Path) -> dict[str, str]:
@@ -385,9 +387,7 @@ def compact_review_bundle(
 
 
 def path_is_allowed(path: str, prefixes: list[str]) -> bool:
-    if path == ".git" or path.startswith(".git/"):
-        return False
-    return any(prefix == "." or path == prefix or path.startswith(f"{prefix}/") for prefix in prefixes)
+    return _REPO_PATHS.path_covered_by_prefixes(path, prefixes)
 
 
 def find_scope_violations(delta: dict[str, list[str]], allowed_paths: list[str]) -> list[str]:
