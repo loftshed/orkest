@@ -137,6 +137,19 @@ class StatusTruthTests(unittest.TestCase):
                         (dimensions["executing_worker"], dimensions["accepted_task"]), ("finished", expected)
                     )
 
+    def test_inventory_projects_untracked_and_answered_completion(self):
+        for completion in ("untracked", "answered"):
+            with self.subTest(completion=completion):
+                member = {"id": "worker-a", "status": "reported complete", "completion": completion}
+                room = {"id": "room-a", "cwd": str(self.root), "agents": [member]}
+                self.assertEqual(views._project_member_task(room, member), ("finished", "untracked"))
+        # Without provenance, or while still running, nothing changes.
+        member = {"id": "worker-a", "status": "reported complete"}
+        room = {"id": "room-a", "cwd": str(self.root), "agents": [member]}
+        self.assertEqual(views._project_member_task(room, member), ("finished", "awaiting_verification"))
+        member = {"id": "worker-a", "status": "running", "completion": "untracked"}
+        self.assertEqual(views._project_member_task(room, member), ("executing", "in_progress"))
+
     def test_footer_renders_distinct_outcome_colors(self):
         for stage, color in (
             ("accepted", 114),

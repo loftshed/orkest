@@ -379,6 +379,14 @@ def _project_member_task(room: dict[str, Any], member: dict[str, Any]) -> tuple[
         except Exception:
             return "unknown", "untracked"
     status = str(member.get("status") or member.get("stage") or "").strip().lower()
+    if member.get("completion") in {"untracked", "answered"} and status in {
+        "completed",
+        "complete",
+        "reported complete",
+        "accepted",
+        "supported",
+    }:
+        return "finished", "untracked"
     if status in {"completed", "complete", "reported complete", "stale"}:
         return "finished", "awaiting_verification"
     if status == "accepted":

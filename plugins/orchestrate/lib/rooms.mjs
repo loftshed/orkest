@@ -1489,6 +1489,7 @@ async function appendConsultations(room, root) {
           effort: job.effort,
           cwd: job.cwd || parent.cwd || room.cwd,
           status,
+          ...(isFinished && result.status === "answered" && { completion: "answered" }),
           runtimeState,
           nativeSession: workerSession || undefined,
           ...(consultationActivitySource && { activitySource: consultationActivitySource }),
@@ -1819,6 +1820,12 @@ async function appendNativePeers(room, snapshots, root) {
       ...(paneId && { paneId }),
       observedAt,
       status,
+      // Unreserved discovered peers have no dispatch, so no coordinator can review them.
+      ...(!slot &&
+        stage === "complete" &&
+        (progressRecord?.role || subagentRole || "native") !== "lead" && {
+          completion: "untracked",
+        }),
       runtimeState: status === "running" ? "running" : "idle",
       objective: taskText,
       output: [taskText].filter(Boolean),
@@ -2305,6 +2312,7 @@ async function appendClaudeProjectSubagents(
         cwd: roomCwd,
         observedAt: info.lastActivityIso || info.startedIso,
         status,
+        ...(!slot && isFinished && { completion: "untracked" }),
         runtimeState: isFinished ? "stopped" : "running",
         objective: taskText,
         output: [taskText],

@@ -3,6 +3,9 @@ export const MEMBER_OUTCOMES = Object.freeze({
   supported: { label: "supported", tone: "supported", glyphs: ["s", "◇", "󰓎"] },
   accepted: { label: "accepted", tone: "accepted", glyphs: ["+", "✓", "󰄬"] },
   stale: { label: "stale (needs revalidation)", tone: "stale", glyphs: ["~", "↻", "󰑐"] },
+  // Neutral: nothing is waiting on a reviewer, and the member may still be resumed.
+  finished: { label: "finished", tone: "muted", glyphs: ["-", "·", "󰄰"], neutral: true },
+  answered: { label: "answered", tone: "muted", glyphs: ["-", "◦", "󰋽"], neutral: true },
   failed: { label: "failed", tone: "failed", glyphs: ["x", "✗", "󰅖"] },
   rejected: { label: "rejected", tone: "failed", glyphs: ["x", "✗", "󰅖"] },
 });
@@ -33,8 +36,11 @@ export function memberDisplayState(member = {}) {
   if (status === "conductor_takeover") return "blocked";
   if (member.evidenceState === "stale" || status === "stale") return "stale";
   if (decision) return decision;
-  if (["completed", "complete", "reported complete", "accepted", "supported"].includes(status))
+  if (["completed", "complete", "reported complete", "accepted", "supported"].includes(status)) {
+    if (member.completion === "untracked") return "finished";
+    if (member.completion === "answered") return "answered";
     return "reported";
+  }
   if (member.dispatch && status === "review" && member.runtimeState !== "running")
     return "reported";
   return status || "unknown";
@@ -45,5 +51,6 @@ export function hasTerminalDecision(member) {
 }
 
 export function isTerminalDisplayState(state) {
-  return Object.hasOwn(MEMBER_OUTCOMES, state) || state === "cancelled";
+  if (state === "cancelled") return true;
+  return Object.hasOwn(MEMBER_OUTCOMES, state) && !MEMBER_OUTCOMES[state].neutral;
 }
