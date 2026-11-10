@@ -444,7 +444,8 @@ describe("clickable Swarm View", () => {
   });
 
   it("anchors long recorded responses while allowing manual scrolling and refresh", () => {
-    const view = new HordeView(room(), { height: 24 });
+    // A fixed clock: the spinner and shimmer follow it, and this test compares whole renders.
+    const view = new HordeView(room(), { height: 24, now: () => 0 });
     const actions = Array.from({ length: 40 }, (_, i) => `Action ${i}`).join("\n");
     const answer = Array.from({ length: 60 }, (_, i) => `Answer line ${i + 1}`).join("\n");
     const text = `Recent activity:\n${actions}\n\nResponse:\n${answer}`;
