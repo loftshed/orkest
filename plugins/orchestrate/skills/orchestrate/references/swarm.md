@@ -9,6 +9,10 @@ With no objective, ask the user what they want, then record it with `ork hall ob
 Existing authentication, permissions and model defaults remain in effect. Starting the conversation
 sends its brief to that harness. `--print`, `--json`, `--view` and fixture views never start models.
 
+A room shows its own checkout, its conductor's subagents and workers recorded on its members. Other
+worktrees in the repository are separate from that room. The peer mailbox's `peers` and
+`board --view status` commands show every session in the repository.
+
 The coordinator owns the outcome, assignments, conflict resolution and final verification. Stay
 available to the user while children work. Use native supervision for agents in your harness and
 the orchestrate runner for other harnesses. Do not silently change accounts or billing contexts.
