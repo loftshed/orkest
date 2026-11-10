@@ -272,7 +272,7 @@ class ContinueTests(unittest.TestCase):
         projected = ROOM_TASKS.project(str(self.fixture.repository.path), member, ROOM_TASKS.compact(state))
         self.assertEqual(
             (projected["run"]["run_id"], projected["status"], projected["verdict"], projected["objective"]),
-            (first["run_id"], "completed", "accept", "Write the approved output"),
+            (first["run_id"], "accepted", "accept", "Write the approved output"),
         )
         self.assertEqual([run["run_id"] for run in projected["history"]], [first["run_id"]])
 

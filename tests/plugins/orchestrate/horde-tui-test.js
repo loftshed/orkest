@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -50,6 +50,7 @@ import {
   tone,
   wrapText,
 } from "../../../plugins/orchestrate/lib/tui-box.mjs";
+import { retainFixtures } from "../../helpers/retain-fixtures.js";
 
 const exec = promisify(execFile);
 const cli = path.resolve("plugins/orchestrate/bin/ork.mjs");
@@ -62,7 +63,7 @@ async function directory() {
 beforeEach(() => vi.stubEnv("NO_COLOR", ""));
 afterEach(async () => {
   vi.unstubAllEnvs();
-  await Promise.all(temporary.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+  await retainFixtures(temporary.splice(0));
 });
 
 function fixture(team = "claude:haiku,agy:flash,codex:luna:max") {
@@ -349,7 +350,7 @@ describe("tui-box primitives and HordeView unification", () => {
     expect(rendered).not.toContain("(Medium) / medium");
     expect(rendered).toContain("1 snoobix");
     expect(rendered).toContain("gemini-4-argon / medium");
-    expect(rendered).toContain("󰄬 2 snorfle");
+    expect(rendered).toContain("󰋗 2 snorfle");
   });
 
   it("renders an empty room, key help and a coalesced log overlay", () => {
@@ -467,13 +468,13 @@ describe("tui-box primitives and HordeView unification", () => {
 
   it.each([
     ["failed", 203],
-    ["completed", 114],
+    ["reported (awaiting review)", 221],
     ["planning", 180],
     ["testing", 80],
     ["running", 117],
   ])("colors the %s coordinator stage", (status, code) => {
     const room = fixture();
-    room.conductor.status = status;
+    room.conductor.status = status === "reported (awaiting review)" ? "completed" : status;
     const text = new HordeView(room, { color: true }).render(140).join("\n");
     expect(text).toContain(`\u{1B}[38;5;${code};1m${status}`);
   });
@@ -681,10 +682,11 @@ describe("tui-box primitives and HordeView unification", () => {
     const collapsed = view.render(90).join("\n");
     // Most recent running agent (haiku-3) is #1 and focused; older completed agents (haiku-2, haiku-1) collapse below it
     expect(collapsed).toContain("┌ ▸ 1 haiku-3");
-    expect(collapsed).toContain("step 2/4 · live");
-    expect(collapsed).toContain("├─ ✓ 2 haiku-2");
+    expect(collapsed).toContain("haiku | running · live");
+    expect(collapsed).not.toContain("step 2/4");
+    expect(collapsed).toContain("├─ ○ 2 haiku-2");
     expect(collapsed).toContain("Second task done");
-    expect(collapsed).toContain("└─ ✓ 3 haiku-1");
+    expect(collapsed).toContain("└─ ○ 3 haiku-1");
     expect(collapsed).toContain("First task done");
 
     // Press c -> hidden mode
@@ -1233,7 +1235,7 @@ describe("terminal lifecycle", () => {
       notificationCalls.push([cmd, args]);
     };
 
-    // Initial startup seed (prevAgents = null) records existing blocked/complete states without notifying:
+    // Initial startup seed (prevAgents = null) records existing blocked/reported states without notifying:
     const seededSet = new Set();
     expect(
       notifyHerdrTransitions(
@@ -1255,10 +1257,10 @@ describe("terminal lifecycle", () => {
         { env: { HERDR_ENV: "1", HERDR_PANE_ID: "hp-1" }, exec: notificationExec },
       ),
     ).toBe(false);
-    expect(seededCompleteSet.has("room:all-complete")).toBe(true);
+    expect(seededCompleteSet.has('room:outcomes:[["reported",1]]')).toBe(true);
     expect(notificationCalls).toHaveLength(0);
 
-    // Empty/missing previous stage does not count as active for all-complete transition:
+    // Empty/missing previous stage does not trigger an outcome notification:
     const emptyStageSet = new Set();
     expect(
       notifyHerdrTransitions(
@@ -1311,7 +1313,7 @@ describe("terminal lifecycle", () => {
     });
     expect(notificationCalls).toHaveLength(1);
 
-    // Fires all-complete notification when all agents finish after at least one was active:
+    // Announces reported outcomes when all agents finish after at least one was active:
     const nextDone = [
       { id: "a1", person: "gribble", stage: "completed", summary: "Done" },
       { id: "a2", person: "snoobix", stage: "completed", summary: "Done" },
@@ -1326,14 +1328,14 @@ describe("terminal lifecycle", () => {
       [
         "notification",
         "show",
-        "Orkest: Horde complete",
+        "Orkest: Swarm reported (awaiting review)",
         "--body",
-        "All 2 agents finished.",
+        "All 2 agents reported (awaiting review).",
         "--sound",
-        "done",
+        "request",
       ],
     ]);
-    expect(notifiedSet.has("room:all-complete")).toBe(true);
+    expect(notifiedSet.has('room:outcomes:[["reported",2]]')).toBe(true);
   });
 
   it("renders redesigned orchestrator card, collapsible inline quota, and running services footer", async () => {

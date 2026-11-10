@@ -230,16 +230,25 @@ export function sectionHeading(
   label,
   detail,
   width,
-  { prefix = "", color = false, tier = "unicode", separator = " · " } = {},
+  { prefix = "", color = false, tier = "unicode", separator = " · ", detailParts = null } = {},
 ) {
   const available = Math.max(0, width - displayWidth(prefix));
-  const suffix = detail ? `${separator}${plain(detail)}` : "";
+  const text = detailParts?.length
+    ? detailParts.map((part) => plain(part.text)).join("  ·  ")
+    : plain(detail);
+  const suffix = text ? `${separator}${text}` : "";
+  const styledSuffix = detailParts?.length
+    ? tone(separator, "muted", color) +
+      detailParts
+        .map((part) => tone(plain(part.text), part.style, color))
+        .join(tone("  ·  ", "muted", color))
+    : tone(suffix, "muted", color);
   const nameWidth = Math.max(0, available - displayWidth(suffix));
   const name =
     displayWidth(label) > nameWidth ? elide(label, nameWidth, tier).trimEnd() : plain(label);
   return fitStyled(
     tone(prefix, "border", color) +
-      fitStyled(tone(name, "heading", color) + tone(suffix, "muted", color), available),
+      fitStyled(tone(name, "heading", color) + styledSuffix, available),
     width,
   );
 }

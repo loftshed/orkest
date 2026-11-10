@@ -28,6 +28,7 @@ import {
   observeRoom,
   recoverRoom,
 } from "../../../plugins/orchestrate/lib/rooms.mjs";
+import { retainFixtures } from "../../helpers/retain-fixtures.js";
 
 const directories = [];
 async function directory() {
@@ -36,7 +37,7 @@ async function directory() {
   return dir;
 }
 afterEach(async () => {
-  for (const dir of directories.splice(0)) await rm(dir, { recursive: true, force: true });
+  await retainFixtures(directories.splice(0));
 });
 
 async function fixture() {
@@ -207,7 +208,7 @@ describe("room execution", () => {
       runtimeState: "stopped",
     });
     task.decisions.push({ run_id: "run-1", decision: "supported" });
-    expect((await observeRoom(room.id, { root, run })).agents[0].status).toBe("completed");
+    expect((await observeRoom(room.id, { root, run })).agents[0].status).toBe("supported");
     task.decisions.length = 0;
     task.runs[0].runner_status = "failed";
     expect((await observeRoom(room.id, { root, run })).agents[0].status).toBe("failed");
@@ -351,12 +352,12 @@ describe("room execution", () => {
       '{"nested":'.repeat(1100) + "0" + "}".repeat(1100),
     );
     expect((await observeRoom(room.id, { root })).agents.map((member) => member.status)).toEqual([
-      "completed",
+      "supported",
       "unknown",
     ]);
     await writeFile(path.join(secondDir, "task.json"), "{");
     expect((await observeRoom(room.id, { root })).agents.map((member) => member.status)).toEqual([
-      "completed",
+      "supported",
       "unknown",
     ]);
 
@@ -364,7 +365,7 @@ describe("room execution", () => {
     secondTask.runs[0].runner_status = "completed";
     await writeFile(path.join(secondDir, "task.json"), JSON.stringify(secondTask));
     expect((await observeRoom(room.id, { root })).agents.map((member) => member.status)).toEqual([
-      "completed",
+      "supported",
       "review",
     ]);
   });
@@ -2242,7 +2243,7 @@ describe("bounded room continuations", () => {
     task.runs[1].status = "finished";
     task.decisions.push({ run_id: "run-2", decision: "accept" });
     await writeFile(path.join(taskDir, "task.json"), JSON.stringify(task));
-    expect((await observeRoom(room.id, { root })).agents[0].status).toBe("completed");
+    expect((await observeRoom(room.id, { root })).agents[0].status).toBe("accepted");
   });
 
   it("dispatches continue in the same task, inherits transport and retries a lost response", async () => {
@@ -2436,7 +2437,7 @@ describe("bounded room continuations", () => {
     const observed = await observeRoom(room.id, { root, discoverNativePeers: false });
     expect(observed.agents[0]).toMatchObject({
       runId: "run-1",
-      status: "completed",
+      status: "accepted",
       verdict: "accept",
       objective: "Member objective",
     });

@@ -32,6 +32,8 @@ To inspect Orkest bindings against live Herdr panes without mutating state, run
 `python3 plugins/orchestrate/skills/orchestrate/scripts/herdr_swarm_restore.py --inventory`
 (optionally `--room <ROOM_ID>`), which reports `pane_existence`, `available_shell`,
 `live_agent_conversation`, `executing_worker`, and `accepted_task` for each resource.
+See the [Swarm outcome rules](../plugins/orchestrate/skills/orchestrate/references/swarm.md)
+for the task values and their recorded basis.
 
 ## Agent labels and focused status
 
