@@ -4,5 +4,6 @@
   "description": "Remaining subscription quota across Claude Code profiles, Codex and Antigravity, with a ranking of where to spend it. MCP server, CLI/TUI and macOS menu bar app.",
   "author": {
     "name": "loftshed"
-  }
+  },
+  "license": "MIT"
 }
