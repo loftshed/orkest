@@ -232,7 +232,8 @@ ork horde --attach-room <room-id> --view
 Codex is the default coordinator. Claude, Antigravity and OpenCode retain their configured accounts,
 models and permissions. **Ctrl-b Tab** switches panes; **Ctrl-b d** detaches. `--view`, `--print` and
 `--json` never launch models. Subswarm leads use their parent's native harness; workers can use other
-harnesses. The initial workflow supports one checkout with serialized mutating worker runs.
+harnesses. Writers in one checkout take turns; `ork hall worktree` gives a member its own checkout so
+several can implement at once.
 
 Details: [conversational swarms](skills/orchestrate/references/swarm.md),
 [room commands](skills/orchestrate/references/rooms.md) and

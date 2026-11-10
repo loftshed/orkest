@@ -35,9 +35,10 @@ Task directories live outside the repository. `ork horde --preset bug-court` (or
 `heavy-trifecta`) opens a coordinator with a queued preset team. Add `--json` to create the roster
 without starting a conversation. `ork horde --attach-room ID --view` shows a live view.
 
-A room works in one checkout, and the runner's writer lease is exclusive per checkout, so a room runs
-one implementation at a time; other members run as investigation, consultation or challenge.
-`patch-race` needs a separate worktree per candidate and cannot run in a room yet.
+For concurrent implementation, give each writing member a checkout with
+`ork hall worktree --room ID --member MEMBER`. Set the task spec's `repository_root` to the printed
+path, then dispatch that member; its runner lease applies to its own checkout. Reviewing and
+integrating each result remains the conductor's job, and `patch-race` remains unsupported in a room.
 
 A room shows its own checkout, its conductor's subagents and workers recorded on its members. Other
 worktrees in the repository are separate from that room. The peer mailbox's `peers` and
