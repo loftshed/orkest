@@ -115,10 +115,10 @@ export async function captures(repo) {
         cols: 110,
         rows: 30,
         prepare(view) {
-          view.focusId = "birch";
+          view.focusId = "sprad";
           view.setPreview({
-            agentId: "birch",
-            title: "birch",
+            agentId: "sprad",
+            title: "sprad",
             kind: "terminal",
             loading: false,
             text: DEMO_TERMINAL,

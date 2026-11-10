@@ -62,3 +62,8 @@ xcrun
 xhigh
 xpzf
 magick
+kritor
+sprad
+zwarxug
+glozor
+sproolel
