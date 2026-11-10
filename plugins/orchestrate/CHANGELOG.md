@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.76.6
 
 - Distinguish reported, supported, accepted, stale and failed work in Swarm View; preserve terminal decisions against late progress and show only checklist-backed step counts (#155).
 
