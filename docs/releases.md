@@ -27,6 +27,19 @@ The commit subjects become the changelog entry. To write the notes yourself, add
 them under a `## Unreleased` heading at the top of the plugin's `CHANGELOG.md`;
 the release turns that heading into the version.
 
+## Merging
+
+Release notes come from the subjects of the commits that land on `main` (merge commits are
+ignored), so the merge method decides what the changelog says:
+
+- **Squash** a pull request that is one change. Its title becomes the one changelog line.
+- **Rebase** a batch of small fixes, one conventional commit per issue, each naming its issue
+  (`fix(orchestrate): … (#123)`). Every commit becomes its own line. A squash here would collapse
+  the batch into one line and hide the rest.
+
+CI checks the tip of a batch, not each commit, so keep a batch to changes that are safe to revert
+together.
+
 ## Trying it locally
 
 ```sh
