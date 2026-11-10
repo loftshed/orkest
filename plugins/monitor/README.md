@@ -199,6 +199,10 @@ Menu bar refresh interval: `defaults write local.monitor.bar refreshSeconds 300`
 
 The server's instructions remind agents that switching accounts can switch billing context (work vs personal) and that they must follow the user's rules about which accounts they may use. The ranking is advice, not authorization.
 
+## Troubleshooting
+
+- **Antigravity sessions are signed out a minute or two after a quota refresh (Linux):** `agy` keeps its sign-in in a file or in the desktop keyring depending on whether it sees an SSH session, with a separate refresh token in each. A probe started by the desktop (the KDE widget) used to read a keyring copy that nothing else refreshed, and refreshing it revoked the current sign-in. The probe now presents itself as an SSH session when `~/.gemini/antigravity-cli/antigravity-oauth-token` exists, so it shares the sign-in your terminal sessions use. If you sign in to `agy` only from a graphical session and have no such file, nothing changes. To force the old behaviour, set `"env": {"SSH_CONNECTION": null}` on the Antigravity account in the config; a value for any of `SSH_CONNECTION`, `SSH_CLIENT` or `SSH_TTY` is left as you set it.
+
 ## Development
 
 ```sh
