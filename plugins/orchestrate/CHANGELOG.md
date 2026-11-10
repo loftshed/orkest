@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Share advisory workspace leases across Python, Node and existing cache roots.
+- Preserve unreadable Foundry state and refuse automated Next and Smelter actions.
+- Replace Next directory-lock reclaim with a persistent flock lease.
+
 ## 0.76.5
 
 - fix(orchestrate): a script's Swarm View row follows its reported stage (#154)

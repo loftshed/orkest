@@ -21,9 +21,37 @@ class ContractError(ValueError):
     pass
 
 
+class LeaseDescriptor(int):
+    """An existing caller's primary descriptor, plus the full set for future pass_fds."""
+
+    def __new__(cls, descriptors: list[int]) -> LeaseDescriptor:
+        instance = super().__new__(cls, descriptors[0])
+        instance.descriptors = tuple(descriptors)
+        return instance
+
+
+def lease_roots(cache: Path) -> list[Path]:
+    """Bridge existing well-known roots, preserving a nested namespace."""
+    cache = cache.resolve()
+    roots = {cache}
+    if not (os.environ.get("ORCHESTRATE_HOME") or os.environ.get("AGENT_EXECUTOR_HOME")):
+        for base in (cache, *cache.parents):
+            if base.name in {"orchestrate", "agent-executor"}:
+                other = base.parent / ("agent-executor" if base.name == "orchestrate" else "orchestrate")
+                # Workspace locks establish whether the sibling is an active lease root.
+                if (other / "worktree-locks-v1").is_dir():
+                    roots.add((other / cache.relative_to(base)).resolve())
+                break
+    return sorted(roots, key=str)
+
+
 @contextlib.contextmanager
 def workspace_lease(repository: Path, cache: Path, *, read_only: bool = False) -> Iterator[int]:
-    """Allow concurrent readers or one writer; a child inherits the lease across parent death.
+    """Allow concurrent readers or one writer across all active lease roots.
+
+    Only the acquiring process holds these descriptors today. Its exit releases
+    the lease even if a child it started is still running. Callers must explicitly
+    pass every descriptor to a child to extend ownership across parent death.
 
     Keep the lock file in place. Unlinking a flock file allows another process to
     acquire a different inode while an existing holder still owns the old one.
@@ -31,23 +59,26 @@ def workspace_lease(repository: Path, cache: Path, *, read_only: bool = False) -
     """
     if fcntl is None:
         raise ContractError("workspace leases require POSIX flock on this platform")
-    directory = (cache / "worktree-locks-v1").resolve()
     repository = repository.resolve()
-    if directory == repository or repository in directory.parents:
-        raise ContractError("the executor cache must be outside the repository")
-    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     key = hashlib.sha256(os.fsencode(str(repository))).hexdigest()
-    descriptor = os.open(directory / (key + ".lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    descriptors = []
     try:
-        try:
-            fcntl.flock(descriptor, (fcntl.LOCK_SH if read_only else fcntl.LOCK_EX) | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise ContractError(f"another executor owns the worktree: {repository}") from exc
-        # Closing, rather than explicitly unlocking, keeps inherited child locks
-        # valid if the runner disappears before its executor has exited.
-        yield descriptor
+        for root in lease_roots(cache):
+            directory = root / "worktree-locks-v1"
+            if directory == repository or repository in directory.parents:
+                raise ContractError("the executor cache must be outside the repository")
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            descriptor = os.open(directory / (key + ".lock"), os.O_CREAT | os.O_RDWR, 0o600)
+            descriptors.append(descriptor)
+            try:
+                fcntl.flock(descriptor, (fcntl.LOCK_SH if read_only else fcntl.LOCK_EX) | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise ContractError(f"another executor owns the worktree: {repository}") from exc
+        yield LeaseDescriptor(descriptors)
     finally:
-        os.close(descriptor)
+        # Never unlink or explicitly unlock an inode another holder may share.
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
 
 
 def bind_effort(engine: str, model: str, requested: str | None, catalog: dict[str, Any]) -> dict[str, Any]:

@@ -12,7 +12,7 @@
  */
 import { execFile, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs, promisify } from "node:util";
@@ -29,8 +29,8 @@ import {
   foundryRun,
   hasWorktreeDirtyChanges,
   loadFactoryPolicy,
+  loadFoundryState,
   planBatch,
-  readFoundryState,
   resolveFoundryStatePath,
   resolveTaskSpecPath,
   resolveWorktreeGitDir,
@@ -42,6 +42,7 @@ import { glyphSet, glyphTier, renderPanel, renderTable } from "./horde-view.mjs"
 import { observeRoom, recoverRoom } from "./rooms.mjs";
 import { cacheHome } from "./runtime-paths.mjs";
 import { alignCanonicalPath, classifyBlastRadius, smeltWorktree } from "./smelter.mjs";
+import { acquireWorkspaceLease } from "./workspace-lease.mjs";
 
 const executeAsync = promisify(execFile);
 const scriptsDir = fileURLToPath(new URL("../skills/orchestrate/scripts/", import.meta.url));
@@ -78,16 +79,6 @@ function readJsonIfExists(filePath) {
   }
 }
 
-function isPidAlive(pid) {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return error.code === "EPERM";
-  }
-}
-
 export function resolveRepoKey(repoRoot = process.cwd()) {
   const canonical = alignCanonicalPath(repoRoot);
   const base =
@@ -103,60 +94,14 @@ export function resolveNextStateDir(repoRoot = process.cwd(), env = process.env)
   return path.join(cacheHome(env), "next-v1", resolveRepoKey(repoRoot));
 }
 
-export function acquireNextLock(
-  repoRoot = process.cwd(),
-  { env = process.env, pid = process.pid, staleMs = 15_000 } = {},
-) {
-  const stateDir = resolveNextStateDir(repoRoot, env);
-  mkdirSync(stateDir, { mode: 0o700, recursive: true });
-  const lockDir = path.join(stateDir, "next.lock");
-  const ownerFile = path.join(lockDir, "owner.json");
-
-  const tryCreate = () => {
-    mkdirSync(lockDir, { mode: 0o700 });
-    writeFileSync(
-      ownerFile,
-      `${JSON.stringify({ acquiredAt: new Date().toISOString(), pid }, null, 2)}\n`,
-    );
-    return { acquired: true, lockDir, ownerFile, pid, stateDir };
-  };
-
-  try {
-    return tryCreate();
-  } catch (error) {
-    if (error.code !== "EEXIST") throw error;
-  }
-
-  let isStale;
-  const owner = readJsonIfExists(ownerFile);
-  if (owner && Number.isSafeInteger(owner.pid)) {
-    isStale = !isPidAlive(owner.pid);
-  } else {
-    try {
-      const info = statSync(lockDir);
-      isStale = Date.now() - info.mtimeMs > staleMs;
-    } catch {
-      isStale = true;
-    }
-  }
-
-  if (isStale) {
-    rmSync(lockDir, { force: true, recursive: true });
-    return tryCreate();
-  }
-
-  throw new Error(
-    `ork next is already running for ${path.resolve(repoRoot)} (lock held by PID ${owner?.pid ?? "unknown"})`,
-  );
+export async function acquireNextLock(repoRoot = process.cwd(), { env = process.env } = {}) {
+  const lease = await acquireWorkspaceLease(repoRoot, { env, namespace: "next-locks" });
+  if (!lease.acquired) throw new Error(`ork next is already running for ${path.resolve(repoRoot)}`);
+  return lease;
 }
 
-export function releaseNextLock(lockInfo) {
-  if (!lockInfo?.lockDir) return;
-  try {
-    rmSync(lockInfo.lockDir, { force: true, recursive: true });
-  } catch {
-    /* Ignore lock cleanup errors. */
-  }
+export async function releaseNextLock(lockInfo) {
+  await lockInfo?.release();
 }
 
 export function readNextLedger(repoRoot = process.cwd(), { env = process.env } = {}) {
@@ -280,7 +225,9 @@ export function discoverManagedWorktrees(
       readJsonIfExists(path.join(gitDir, "task-spec.json")) ||
       readJsonIfExists(path.join(worktreePath, ".orkest-task-spec.json"));
     const foundryStatePath = resolveFoundryStatePath(worktreePath);
-    const foundryState = readFoundryState(worktreePath);
+    const loadedState = loadFoundryState(worktreePath);
+    const foundryState = loadedState.state;
+    const stateProblem = ["missing", "ok"].includes(loadedState.kind) ? null : loadedState;
 
     const counted = countCommitsAhead(worktreePath, targetBranch, { execFileSyncFn });
     const commitsAhead = counted.resolved
@@ -305,6 +252,7 @@ export function discoverManagedWorktrees(
       engine: marker.engine || taskSpec?.engine || foundryState?.lastRun?.engine || "codex",
       foundryState,
       foundryStatePath,
+      stateProblem,
       gitDir,
       head,
       isDirty: dirtyCheck.isDirty,
@@ -556,6 +504,18 @@ export async function evaluateNextCandidates({
   }
 
   for (const wt of worktrees) {
+    if (wt.stateProblem) {
+      tier3.push({
+        id: `tier3:state_unreadable:${wt.slug}`,
+        kind: "state_unreadable",
+        tier: 3,
+        target: wt.slug,
+        worktree: wt,
+        reason: wt.stateProblem.error,
+        summary: `Worktree ${wt.slug} has unreadable Foundry state (${wt.stateProblem.kind})`,
+      });
+      continue;
+    }
     const status = wt.foundryState?.status || null;
 
     if (status === "abandoned") continue;
@@ -1104,8 +1064,12 @@ async function executePrimaryAction(
         status: finalStatus,
       };
     } catch (error) {
-      const updatedState = readFoundryState(wt.worktreePath);
-      const failureStatus = updatedState?.status || "smelt_failed";
+      const loadedState = loadFoundryState(wt.worktreePath);
+      const updatedState = loadedState.state;
+      const stateProblem = ["missing", "ok"].includes(loadedState.kind) ? null : loadedState;
+      const failureStatus = stateProblem
+        ? "state_unreadable"
+        : updatedState?.status || "smelt_failed";
       writeNextLedger(
         cwd,
         {
@@ -1120,7 +1084,7 @@ async function executePrimaryAction(
           },
           worktrees: {
             [wt.slug]: {
-              attemptCount: updatedState?.attemptCount ?? 1,
+              attemptCount: updatedState?.attemptCount ?? wt.foundryState?.attemptCount ?? 1,
               lastAction: action.kind,
               status: failureStatus,
               updatedAt: new Date().toISOString(),
@@ -1129,7 +1093,7 @@ async function executePrimaryAction(
         },
         { env },
       );
-      if (["rebase_conflict", "scope_violated"].includes(failureStatus)) {
+      if (["rebase_conflict", "scope_violated", "state_unreadable"].includes(failureStatus)) {
         if (typeof notifyFn === "function") {
           notifyFn(`Orkest: ${wt.slug} ${failureStatus}`, error?.message || action.summary);
         } else {
@@ -1549,7 +1513,8 @@ export async function nextCommand(
         issue: wt.issue,
         path: wt.path,
         slug: wt.slug,
-        status: wt.foundryState?.status || "notIndexed",
+        stateProblem: wt.stateProblem ?? null,
+        status: wt.stateProblem ? "state_unreadable" : wt.foundryState?.status || "notIndexed",
       })),
     };
     if (values.json) {
@@ -1566,7 +1531,7 @@ export async function nextCommand(
   }
 
   const runSingleStep = async () => {
-    const lock = isDryRun ? null : acquireNextLock(effectiveCwd, { env });
+    const lock = isDryRun ? null : await acquireNextLock(effectiveCwd, { env });
     try {
       const settledActions = [];
       let evaluated = await evaluateNextCandidates({
@@ -1749,7 +1714,7 @@ export async function nextCommand(
         targetBranch,
       };
     } finally {
-      if (lock) releaseNextLock(lock);
+      if (lock) await releaseNextLock(lock);
     }
   };
 

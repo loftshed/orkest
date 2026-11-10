@@ -8,8 +8,19 @@
  * bounded worker runs.
  */
 import { execFile, execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import {
+  closeSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+} from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { hostname } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs, promisify } from "node:util";
@@ -740,26 +751,97 @@ export function resolveFoundryStatePath(worktreePath) {
   return path.join(resolveWorktreeGitDir(worktreePath), "orkest", "foundry-state.json");
 }
 
-export function readFoundryState(worktreePath) {
-  if (!worktreePath) return null;
-  const statePath = resolveFoundryStatePath(worktreePath);
-  if (!existsSync(statePath)) return null;
-  try {
-    return JSON.parse(readFileSync(statePath, "utf8"));
-  } catch {
-    return null;
+export class FoundryStateError extends Error {
+  constructor(problem, preservedPath = null) {
+    super(`Foundry state ${problem.kind}: ${problem.path}: ${problem.error}`);
+    this.name = "FoundryStateError";
+    this.kind = problem.kind;
+    this.path = problem.path;
+    this.preservedPath = preservedPath;
   }
+}
+
+export function loadFoundryState(worktreePath) {
+  const statePath = resolveFoundryStatePath(worktreePath);
+  const result = { kind: "missing", state: null, path: statePath, error: null };
+  let bytes;
+  try {
+    bytes = readFileSync(statePath);
+  } catch (error) {
+    if (error.code === "ENOENT") return result;
+    return { ...result, kind: "corrupt", error: error.message };
+  }
+  let state;
+  try {
+    state = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+  } catch (error) {
+    return { ...result, kind: "corrupt", error: error.message };
+  }
+  if (
+    !state ||
+    typeof state !== "object" ||
+    Array.isArray(state) ||
+    (Object.hasOwn(state, "schema") &&
+      !["ork.foundry.state.v1", FOUNDRY_STATE_SCHEMA].includes(state.schema))
+  ) {
+    return {
+      ...result,
+      kind: "unsupported",
+      error: "Unknown Foundry state schema or non-object state",
+    };
+  }
+  return { ...result, kind: "ok", state };
+}
+
+export function readFoundryState(worktreePath) {
+  const loaded = loadFoundryState(worktreePath);
+  if (loaded.kind === "missing") return null;
+  if (loaded.kind !== "ok") throw new FoundryStateError(loaded);
+  return loaded.state;
+}
+
+function syncDirectory(directory) {
+  const descriptor = openSync(directory, "r");
+  try {
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+function preserveFoundryProblem(problem) {
+  // The canonical bytes stay in place: later reads must remain closed too.
+  const bytes = readFileSync(problem.path);
+  const digest = createHash("sha256").update(bytes).digest("hex").slice(0, 16);
+  const preservedPath = `${problem.path}.${problem.kind}-${digest}`;
+  let descriptor;
+  try {
+    descriptor = openSync(preservedPath, "wx", 0o600);
+  } catch (error) {
+    if (error.code !== "EEXIST" || !readFileSync(preservedPath).equals(bytes)) throw error;
+    throw new FoundryStateError(problem, preservedPath);
+  }
+  try {
+    writeFileSync(descriptor, bytes);
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
+  syncDirectory(path.dirname(problem.path));
+  throw new FoundryStateError(problem, preservedPath);
 }
 
 export function writeFoundryState(worktreePath, statePatch = {}) {
   const resolvedWorktree = path.resolve(worktreePath);
   const statePath = resolveFoundryStatePath(resolvedWorktree);
-  const existing = readFoundryState(resolvedWorktree) || {};
+  const loaded = loadFoundryState(resolvedWorktree);
+  if (!["missing", "ok"].includes(loaded.kind)) preserveFoundryProblem(loaded);
+  const existing = loaded.state || {};
   const nowIso = new Date().toISOString();
   const merged = {
     ...existing,
     ...statePatch,
-    attemptCount: statePatch.attemptCount ?? existing.attemptCount ?? 1,
+    attemptCount: Math.max(statePatch.attemptCount ?? 1, existing.attemptCount ?? 1),
     maxAttempts: statePatch.maxAttempts ?? existing.maxAttempts ?? 2,
     schema: FOUNDRY_STATE_SCHEMA,
     targetBranch: statePatch.targetBranch ?? existing.targetBranch ?? "main",
@@ -769,8 +851,70 @@ export function writeFoundryState(worktreePath, statePatch = {}) {
       statePatch.worktreeSlug ?? existing.worktreeSlug ?? path.basename(resolvedWorktree),
   };
   mkdirSync(path.dirname(statePath), { recursive: true });
-  writeFileSync(statePath, `${JSON.stringify(merged, null, 2)}\n`);
+  const temporaryPath = `${statePath}.tmp-${randomUUID()}`;
+  const descriptor = openSync(temporaryPath, "wx", 0o600);
+  try {
+    writeFileSync(descriptor, `${JSON.stringify(merged, null, 2)}\n`);
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
+  renameSync(temporaryPath, statePath);
+  syncDirectory(path.dirname(statePath));
   return merged;
+}
+
+export function processIdentity(pid = process.pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return null;
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const ticks = stat
+      .slice(stat.lastIndexOf(")") + 1)
+      .trim()
+      .split(/\s+/u, 20)[19];
+    return ticks ? `proc-start-ticks:${ticks}` : null;
+  } catch {
+    return null;
+  }
+}
+
+export function createFoundryAttempt(
+  state,
+  { intent = "launch", route, pid = process.pid, now = new Date().toISOString() } = {},
+) {
+  if (!["launch", "repair"].includes(intent)) throw new Error("Invalid Foundry attempt intent");
+  const number = (state?.attemptCount ?? 0) + 1;
+  return {
+    attemptCount: number,
+    attempt: {
+      id: randomUUID(),
+      number,
+      intent,
+      status: "launching",
+      startedAt: now,
+      endedAt: null,
+      launcher: { pid, processIdentity: processIdentity(pid), host: hostname() },
+      route: {
+        engine: route?.engine ?? null,
+        model: route?.model ?? null,
+        effort: route?.effort ?? null,
+      },
+      error: null,
+    },
+  };
+}
+
+export function updateFoundryAttempt(
+  state,
+  { status, error = null, now = new Date().toISOString() },
+) {
+  if (!state?.attempt || !["running", "finished", "failed", "uncertain"].includes(status)) {
+    throw new Error("An existing Foundry attempt and valid status are required");
+  }
+  return {
+    attemptCount: Math.max(state.attemptCount, state.attempt.number),
+    attempt: { ...state.attempt, status, error, endedAt: status === "running" ? null : now },
+  };
 }
 
 export function countCommitsAhead(
@@ -880,8 +1024,9 @@ export function collectActiveWorktreeAllowPaths(
       marker = null;
     }
     if (!marker || marker.disposable === false) continue;
-    const state = readFoundryState(wtPath);
-    if (state?.status && ["merged", "abandoned"].includes(state.status)) continue;
+    const loadedState = loadFoundryState(wtPath);
+    if (loadedState.kind === "ok" && ["merged", "abandoned"].includes(loadedState.state.status))
+      continue;
     const specFile = resolveTaskSpecPath(wtPath);
     if (!existsSync(specFile)) continue;
     try {

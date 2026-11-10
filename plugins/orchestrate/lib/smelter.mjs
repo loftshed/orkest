@@ -17,7 +17,7 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
 import { shouldUseColor } from "../../monitor/lib/render.mjs";
-import { readFoundryState, resolveFoundryStatePath, writeFoundryState } from "./foundry.mjs";
+import { loadFoundryState, resolveFoundryStatePath, writeFoundryState } from "./foundry.mjs";
 import { resolveWorktreeMarkerPath } from "./horde-room.mjs";
 import { glyphSet, glyphTier, renderPanel, renderTable } from "./horde-view.mjs";
 
@@ -315,8 +315,19 @@ function loadWorktreeMetadata(worktreePath, explicitMarkerPath = null) {
     }
   }
   const foundryStatePath = resolveFoundryStatePath(worktreePath);
-  const foundryState = readFoundryState(worktreePath);
-  return { foundryState, foundryStatePath, gitDir, marker, markerPath, taskSpec, taskSpecPath };
+  const loadedState = loadFoundryState(worktreePath);
+  const foundryState = loadedState.state;
+  const stateProblem = ["missing", "ok"].includes(loadedState.kind) ? null : loadedState;
+  return {
+    foundryState,
+    foundryStatePath,
+    stateProblem,
+    gitDir,
+    marker,
+    markerPath,
+    taskSpec,
+    taskSpecPath,
+  };
 }
 
 function resolveGitSha(cwd, ref, execFileSyncFn = execFileSync) {
@@ -371,8 +382,16 @@ export function discoverSmeltableWorktrees(
   for (const entry of rawEntries) {
     const worktreePath = path.resolve(entry.worktree);
     if (alignCanonicalPath(worktreePath) === canonicalRoot) continue;
-    const { foundryState, foundryStatePath, gitDir, marker, markerPath, taskSpec, taskSpecPath } =
-      loadWorktreeMetadata(worktreePath);
+    const {
+      foundryState,
+      foundryStatePath,
+      stateProblem,
+      gitDir,
+      marker,
+      markerPath,
+      taskSpec,
+      taskSpecPath,
+    } = loadWorktreeMetadata(worktreePath);
     if (!marker || typeof marker !== "object") continue;
     if (!includeKeep && marker.disposable === false) continue;
 
@@ -415,7 +434,7 @@ export function discoverSmeltableWorktrees(
     } catch {
       commitsAhead = 0;
     }
-    if (commitsAhead <= 0) continue;
+    if (commitsAhead <= 0 && !stateProblem) continue;
 
     const branch = entry.branch || marker.branch || null;
     smeltable.push({
@@ -426,6 +445,7 @@ export function discoverSmeltableWorktrees(
       engine: marker.engine || taskSpec?.engine || null,
       foundryState,
       foundryStatePath,
+      stateProblem,
       gitDir,
       head: entry.head || null,
       issue: marker.issue ?? taskSpec?.issue ?? null,
@@ -473,6 +493,14 @@ export async function smeltWorktree(worktree, options = {}) {
       : { ...worktree };
   const worktreePath = path.resolve(worktreeObj.worktreePath || worktreeObj.path || process.cwd());
   const loadedMeta = loadWorktreeMetadata(worktreePath, worktreeObj.markerPath);
+  if (loadedMeta.stateProblem || worktreeObj.stateProblem) {
+    return {
+      ok: false,
+      status: "state_unreadable",
+      stateProblem: loadedMeta.stateProblem || worktreeObj.stateProblem,
+      worktreePath,
+    };
+  }
   const hasMarker = Boolean(worktreeObj.marker || loadedMeta.marker);
   const marker = worktreeObj.marker ?? loadedMeta.marker ?? {};
   const taskSpec = worktreeObj.taskSpec ?? loadedMeta.taskSpec ?? null;
@@ -936,6 +964,10 @@ function renderSmelterStatusPanel(statusData, width, options = {}) {
   const tier = options.tier || glyphTier();
   const bodyWidth = Math.max(20, width - 6);
   const summary = `${statusData.worktrees.length} smeltable worktrees ahead of ${statusData.targetBranch}`;
+  const lifecycle = (wt) => {
+    if (wt.stateProblem) return `state_unreadable (${wt.stateProblem.kind})`;
+    return wt.disposable ? "disposable" : "keep";
+  };
   const rows =
     statusData.worktrees.length > 0
       ? statusData.worktrees.map((wt) => [
@@ -943,7 +975,7 @@ function renderSmelterStatusPanel(statusData, width, options = {}) {
           wt.branch || "--",
           wt.issue ? `#${wt.issue}` : "--",
           `+${wt.commitsAhead}`,
-          wt.disposable ? "disposable" : "keep",
+          lifecycle(wt),
         ])
       : [["None", "--", "--", "0", "No disposable worktrees ahead of target"]];
   const table = renderTable(
@@ -1022,6 +1054,7 @@ export async function smelterCli(
         disposable: wt.disposable,
         engine: wt.engine,
         foundryState: wt.foundryState ?? null,
+        stateProblem: wt.stateProblem ?? null,
         issue: wt.issue,
         path: wt.path,
         slug: wt.slug,
