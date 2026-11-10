@@ -16,6 +16,7 @@ import { describe, expect, it } from "vitest";
 import {
   collectActiveWorktreeAllowPaths,
   createFoundryAttempt,
+  foundryLauncherAlive,
   FoundryStateError,
   loadFoundryState,
   processIdentity,
@@ -169,13 +170,10 @@ describe("strict Foundry state with retained fixtures", () => {
         route: { engine: "codex", model: "test", effort: "high" },
       },
     });
-    const ticks = readFileSync(`/proc/${process.pid}/stat`, "utf8")
-      .split(")")
-      .at(-1)
-      .trim()
-      .split(/\s+/u, 20)[19];
-    expect(processIdentity()).toBe(`proc-start-ticks:${ticks}`);
-    expect(launch.attempt.launcher.processIdentity).toBe(`proc-start-ticks:${ticks}`);
+    const identity = processIdentity();
+    expect(typeof identity).toBe("string");
+    expect(processIdentity()).toBe(identity);
+    expect(launch.attempt.launcher.processIdentity).toBe(identity);
     const state = writeFoundryState(f.root, launch);
     const running = writeFoundryState(f.root, updateFoundryAttempt(state, { status: "running" }));
     expect(running.attempt).toMatchObject({
@@ -195,6 +193,37 @@ describe("strict Foundry state with retained fixtures", () => {
       attemptCount: 7,
       attempt: { status: "uncertain", error: "lost result", endedAt: "2026-11-09T01:00:00Z" },
     });
+  });
+
+  it("uses a stable live process identity and does not retain it after that process exits", async () => {
+    const child = spawn(process.execPath, ["-e", "process.stdin.resume(); console.log('ready');"], {
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const lines = createInterface({ input: child.stdout })[Symbol.asyncIterator]();
+    const closed = new Promise((resolve) => child.once("close", resolve));
+    try {
+      expect((await lines.next()).value).toBe("ready");
+      const identity = processIdentity(child.pid);
+      const attemptState = createFoundryAttempt(null, { pid: child.pid });
+      expect(foundryLauncherAlive(attemptState)).toBe(true);
+      expect(typeof identity).toBe("string");
+      expect(identity.length).toBeGreaterThan(0);
+      expect(processIdentity(child.pid)).toBe(identity);
+      child.stdin.end();
+      expect(await closed).toBe(0);
+      expect(processIdentity(child.pid)).not.toBe(identity);
+      expect(foundryLauncherAlive(attemptState)).toBe(false);
+      const originalPath = process.env.PATH;
+      try {
+        process.env.PATH = fixture().root; // No ps: absence cannot be distinguished from an unavailable identity.
+        expect(foundryLauncherAlive(attemptState)).toBe(true);
+      } finally {
+        process.env.PATH = originalPath;
+      }
+    } finally {
+      child.stdin.end();
+      await closed;
+    }
   });
 
   it("a concurrent real reader observes only complete atomic states", async () => {

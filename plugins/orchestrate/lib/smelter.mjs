@@ -20,6 +20,7 @@ import { shouldUseColor } from "../../monitor/lib/render.mjs";
 import { loadFoundryState, resolveFoundryStatePath, writeFoundryState } from "./foundry.mjs";
 import { resolveWorktreeMarkerPath } from "./horde-room.mjs";
 import { glyphSet, glyphTier, renderPanel, renderTable } from "./horde-view.mjs";
+import { acquireWorkspaceLease, assertWorkspaceLease } from "./workspace-lease.mjs";
 
 const scriptsDir = fileURLToPath(new URL("../skills/orchestrate/scripts/", import.meta.url));
 
@@ -346,6 +347,9 @@ function resolveGitSha(cwd, ref, execFileSyncFn = execFileSync) {
 
 const SKIPPED_SMELTER_STATES = new Set([
   "abandoned",
+  "launching",
+  "running",
+  "launch_uncertain",
   "merged",
   "needs_human",
   "pr_opened",
@@ -395,6 +399,7 @@ export function discoverSmeltableWorktrees(
     if (!marker || typeof marker !== "object") continue;
     if (!includeKeep && marker.disposable === false) continue;
 
+    if (!includeAllStates && !foundryState && !stateProblem) continue;
     if (!includeAllStates && foundryState && typeof foundryState.status === "string") {
       if (SKIPPED_SMELTER_STATES.has(foundryState.status)) {
         continue;
@@ -486,7 +491,98 @@ function splitVerifyCommand(verifyCommand) {
  * 3. Stage 3 (Cross-Vendor Cold Review)
  * 4. Stage 4 (Smelt & Prune)
  */
+class SmelterLeaseError extends Error {
+  constructor(status, worktreePath) {
+    super(`Smelter ${status}: ${worktreePath}`);
+    this.status = status;
+  }
+}
+
 export async function smeltWorktree(worktree, options = {}) {
+  const worktreePath = path.resolve(
+    typeof worktree === "string"
+      ? worktree
+      : worktree.worktreePath || worktree.path || process.cwd(),
+  );
+  const acquireLease = options.acquireWorkspaceLeaseFn || acquireWorkspaceLease;
+  let lease = options.workspaceLease || (await acquireLease(worktreePath, { env: options.env }));
+  let isReadOnly = false;
+  let pinnedHead = null;
+  let targetLease;
+  const execGit = options.execFileSync || options.execFileSyncFn || execFileSync;
+  const stopped = (status) => new SmelterLeaseError(status, worktreePath);
+  const checkState = () => {
+    assertWorkspaceLease(lease);
+    const loaded = loadFoundryState(worktreePath);
+    if (loaded.kind === "missing") {
+      if (
+        loadWorktreeMetadata(worktreePath).marker ||
+        (typeof worktree === "object" && worktree.marker)
+      )
+        throw stopped("unmanaged");
+      return;
+    }
+    if (loaded.kind !== "ok") throw stopped("state_unreadable");
+    if (["launching", "running", "launch_uncertain"].includes(loaded.state.status))
+      throw stopped(loaded.state.status);
+  };
+  const checkStable = () => {
+    checkState();
+    const head = resolveGitSha(worktreePath, "HEAD", execGit);
+    const dirty = String(
+      execGit("git", ["status", "--porcelain"], { cwd: worktreePath, encoding: "utf8" }) ?? "",
+    ).trim();
+    if (!pinnedHead || head !== pinnedHead || dirty) throw stopped("stale");
+  };
+  const changeMode = async (nextReadOnly) => {
+    assertWorkspaceLease(lease);
+    if (isReadOnly === nextReadOnly) return;
+    await lease.release();
+    lease = await acquireLease(worktreePath, { env: options.env, readOnly: nextReadOnly });
+    if (!lease.acquired) throw stopped("busy");
+    isReadOnly = nextReadOnly;
+    checkStable();
+  };
+  const ownership = {
+    assertHeld() {
+      assertWorkspaceLease(lease);
+      if (targetLease) assertWorkspaceLease(targetLease);
+    },
+    async review() {
+      pinnedHead = resolveGitSha(worktreePath, "HEAD", execGit);
+      await changeMode(true);
+    },
+    async mutate() {
+      await changeMode(false);
+    },
+    checkStable,
+    async target(repoRoot) {
+      assertWorkspaceLease(lease);
+      if (alignCanonicalPath(repoRoot) === alignCanonicalPath(worktreePath)) return;
+      targetLease = await acquireWorkspaceLease(repoRoot, { env: options.env });
+      if (!targetLease.acquired) throw stopped("busy");
+    },
+  };
+  try {
+    if (!lease.acquired) throw stopped("busy");
+    checkState();
+    return await smeltLeasedWorktree(worktree, options, ownership);
+  } catch (error) {
+    if (!(error instanceof SmelterLeaseError)) throw error;
+    return {
+      ok: false,
+      status: error.status,
+      reason: error.message,
+      worktreePath,
+      ...(error.status === "state_unreadable" && { stateProblem: loadFoundryState(worktreePath) }),
+    };
+  } finally {
+    await targetLease?.release();
+    await lease.release();
+  }
+}
+
+async function smeltLeasedWorktree(worktree, options, ownership) {
   const worktreeObj =
     typeof worktree === "string"
       ? { path: path.resolve(worktree), worktreePath: path.resolve(worktree) }
@@ -527,17 +623,15 @@ export async function smeltWorktree(worktree, options = {}) {
         existsSync(loadedMeta.gitDir) ||
         existsSync(worktreePath),
       ));
-  const recordState = (patch) => {
+  const recordState = async (patch) => {
+    await ownership.mutate();
+    ownership.assertHeld();
     if (!canPersistState) return null;
-    try {
-      return writeFoundryState(worktreePath, {
-        issue: worktreeObj.issue ?? marker.issue ?? taskSpec?.issue ?? null,
-        targetBranch,
-        ...patch,
-      });
-    } catch {
-      return null;
-    }
+    return writeFoundryState(worktreePath, {
+      issue: worktreeObj.issue ?? marker.issue ?? taskSpec?.issue ?? null,
+      targetBranch,
+      ...patch,
+    });
   };
 
   let resolvedHeadBranch = null;
@@ -594,8 +688,14 @@ export async function smeltWorktree(worktree, options = {}) {
 
   const commands = [];
   const runCmd = (cmd, args, cwd = worktreePath) => {
+    ownership.assertHeld();
     commands.push({ args, cmd, cwd });
-    return execFileSyncFn(cmd, args, { cwd, encoding: "utf8", maxBuffer: 32 * 1024 * 1024 });
+    return execFileSyncFn(cmd, args, {
+      cwd,
+      env: options.env ?? process.env,
+      encoding: "utf8",
+      maxBuffer: 32 * 1024 * 1024,
+    });
   };
 
   // Stage 1: Rebase & Scope Audit
@@ -625,7 +725,7 @@ export async function smeltWorktree(worktree, options = {}) {
   if (Array.isArray(allowPaths) && allowPaths.length > 0) {
     const violations = changedPaths.filter((filePath) => !isPathAllowed(filePath, allowPaths));
     if (violations.length > 0) {
-      recordState({
+      await recordState({
         scopeViolations: violations,
         status: "scope_violated",
       });
@@ -650,7 +750,7 @@ export async function smeltWorktree(worktree, options = {}) {
       const targetHeadSha =
         resolveGitSha(worktreePath, targetBranch, execFileSyncFn) ||
         resolveGitSha(repoRoot, targetBranch, execFileSyncFn);
-      recordState({
+      await recordState({
         rebase: {
           conflictOn: {
             targetHeadSha,
@@ -671,6 +771,8 @@ export async function smeltWorktree(worktree, options = {}) {
     status: isDryRun ? "dry-run" : "passed",
     targetBranch,
   };
+
+  await ownership.review();
 
   // Stage 2: Heavy Gate
   const verifyArgs = splitVerifyCommand(verifyCommand);
@@ -694,6 +796,7 @@ export async function smeltWorktree(worktree, options = {}) {
             worktreePath,
           })
         : runCmd("ork", gateArgs, worktreePath);
+      ownership.assertHeld();
       stage2 = {
         command: ["ork", ...gateArgs],
         output: gateOutput ?? null,
@@ -702,7 +805,7 @@ export async function smeltWorktree(worktree, options = {}) {
         verifyCommand,
       };
     } catch (error) {
-      recordState({
+      await recordState({
         gateError: error?.message || String(error),
         status: "gate_failed",
       });
@@ -750,6 +853,7 @@ export async function smeltWorktree(worktree, options = {}) {
           worktreePath,
         })
       : runCmd("python3", [runAgentScript, ...consultArgs], worktreePath);
+    ownership.checkStable();
     const parsedReview = parseColdReviewFindings(reviewOutput);
     if (!parsedReview.passed) {
       stage3 = {
@@ -761,7 +865,7 @@ export async function smeltWorktree(worktree, options = {}) {
         status: "changes_requested",
         workerEngine,
       };
-      recordState({
+      await recordState({
         findings: parsedReview.findings,
         reviewerEngine,
         status: "review_changes_requested",
@@ -815,8 +919,11 @@ export async function smeltWorktree(worktree, options = {}) {
     };
   }
 
+  ownership.checkStable();
+  await ownership.mutate();
+
   if (!isDryRun && blastRadius === "high" && strategy === "local" && !shouldApproveHighBlast) {
-    recordState({
+    await recordState({
       blastRadius,
       status: "awaiting_human_approval",
     });
@@ -872,6 +979,7 @@ export async function smeltWorktree(worktree, options = {}) {
         : []),
     ];
     if (!isDryRun) {
+      await ownership.target(repoRoot);
       let currentRepoBranch = "";
       if (existsSync(path.join(repoRoot, ".git"))) {
         try {
@@ -891,7 +999,7 @@ export async function smeltWorktree(worktree, options = {}) {
         );
       }
       runCmd("git", ["merge", "--ff-only", branch], repoRoot);
-      recordState({ status: "merged" });
+      await recordState({ status: "merged" });
       if (isDisposable) {
         runCmd("git", ["worktree", "remove", worktreePath], repoRoot);
         runCmd("git", ["branch", "-d", branch], repoRoot);
@@ -916,7 +1024,7 @@ export async function smeltWorktree(worktree, options = {}) {
     if (!isDryRun) {
       runCmd("git", ["push", "-u", "origin", branch], worktreePath);
       prOutput = runCmd("gh", prArgs, worktreePath);
-      recordState({ status: "pr_opened" });
+      await recordState({ status: "pr_opened" });
     }
     stage4 = {
       branch,

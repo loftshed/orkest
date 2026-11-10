@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Persist Foundry and repair attempts before launch; gate uncertain outcomes without resetting allowances.
+- Protect Next host actions and Smelter mutation/review phases with workspace leases.
+- Release Next scheduling ownership before workers run; serialize atomic ledger updates separately.
+- Pass all workspace lease descriptors to executors and consultants across runner death.
+- Use portable process identities for launcher recovery and retain test fixtures by default.
+
 - Share advisory workspace leases across Python, Node and existing cache roots.
 - Preserve unreadable Foundry state and refuse automated Next and Smelter actions.
 - Replace Next directory-lock reclaim with a persistent flock lease.

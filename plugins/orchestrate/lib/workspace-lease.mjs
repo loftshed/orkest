@@ -103,3 +103,8 @@ export async function withWorkspaceLease(workspacePath, options, callback) {
     await lease.release();
   }
 }
+
+/** Check ownership again after an await and before each subsequent host mutation. */
+export function assertWorkspaceLease(lease) {
+  if (!lease?.held) throw new Error("Workspace lease holder was lost");
+}

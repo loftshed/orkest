@@ -2704,6 +2704,7 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
                         stdout=stdout_handle,
                         stderr=stderr_handle,
                         start_new_session=True,
+                        pass_fds=lease.descriptors if lease is not None else (),
                     )
                     if steering is not None:
                         steering.executor_started(process.pid)

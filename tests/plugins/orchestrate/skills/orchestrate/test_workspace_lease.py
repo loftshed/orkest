@@ -36,8 +36,13 @@ class WorkspaceLeaseTests(unittest.TestCase):
             self.assertEqual(len(lease.descriptors), 2)
             self.assertEqual(lease, lease.descriptors[0])
             self.assertFalse(any(os.get_inheritable(fd) for fd in lease.descriptors))
-            roots = [str(Path(os.readlink(f"/proc/self/fd/{fd}")).parents[1]) for fd in lease.descriptors]
-            self.assertEqual(roots, [str(self.legacy), str(self.primary)])
+            actual = [(os.fstat(fd).st_dev, os.fstat(fd).st_ino) for fd in lease.descriptors]
+            expected = []
+            for root in (self.legacy, self.primary):
+                lock = next((root / "worktree-locks-v1").glob("*.lock"))
+                stat = lock.stat()
+                expected.append((stat.st_dev, stat.st_ino))
+            self.assertEqual(actual, expected)
         with support.workspace_lease(self.workspace, self.legacy) as lease:
             self.assertEqual(len(lease.descriptors), 2)
 

@@ -22,7 +22,7 @@ class ContractError(ValueError):
 
 
 class LeaseDescriptor(int):
-    """An existing caller's primary descriptor, plus the full set for future pass_fds."""
+    """An existing caller's primary descriptor, plus the full set for pass_fds."""
 
     def __new__(cls, descriptors: list[int]) -> LeaseDescriptor:
         instance = super().__new__(cls, descriptors[0])
@@ -49,9 +49,9 @@ def lease_roots(cache: Path) -> list[Path]:
 def workspace_lease(repository: Path, cache: Path, *, read_only: bool = False) -> Iterator[int]:
     """Allow concurrent readers or one writer across all active lease roots.
 
-    Only the acquiring process holds these descriptors today. Its exit releases
-    the lease even if a child it started is still running. Callers must explicitly
-    pass every descriptor to a child to extend ownership across parent death.
+    Callers explicitly pass every descriptor to executor and consultant children
+    to extend ownership across parent death. A surviving descendant may keep the
+    advisory lease until it exits; descriptors are closed, never explicitly unlocked.
 
     Keep the lock file in place. Unlinking a flock file allows another process to
     acquire a different inode while an existing holder still owns the old one.

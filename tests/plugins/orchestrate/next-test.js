@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -15,6 +15,7 @@ import {
   releaseNextLock,
   writeNextLedger,
 } from "../../../plugins/orchestrate/lib/next.mjs";
+import { retainFixtures } from "../../helpers/retain-fixtures.js";
 
 const temporary = [];
 
@@ -26,7 +27,7 @@ async function makeTempDir(prefix = "ork-next-test-") {
 
 afterEach(async () => {
   process.exitCode = 0;
-  await Promise.all(temporary.splice(0).map((dir) => rm(dir, { force: true, recursive: true })));
+  await retainFixtures(temporary.splice(0));
 });
 
 async function createMockWorktree(
@@ -103,7 +104,7 @@ describe("ork next lock, ledger, and repair spec builder", () => {
     expect(recoveredLock.acquired).toBe(true);
     await releaseNextLock(recoveredLock);
 
-    const updatedLedger = writeNextLedger(
+    const updatedLedger = await writeNextLedger(
       repoRoot,
       {
         historyEntry: {
