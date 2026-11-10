@@ -295,7 +295,7 @@ describe("terminal presentation components", () => {
     expect(rendered[3]).toContain("\u{1B}[38;5;149m⣷\u{1B}[0m");
     expect(rendered[3]).toContain("\u{1B}[38;5;150;1m");
     expect(plain(rendered.join("\n"))).toContain(
-      "│ project  ·  󰔛 1 active  ·  󰀪 1 blocked  ·  󰄬 1 complete",
+      "│ project  ·  󰔛 1 active  ·  󰀪 1 blocked  ·  󰋗 1 reported",
     );
     expect(plain(rendered.join("\n"))).toContain("└─┤ ⣷ Checking header layout");
     expect(plain(rendered.join("\n"))).toContain(" \u{F078} \u{F233} Services ");

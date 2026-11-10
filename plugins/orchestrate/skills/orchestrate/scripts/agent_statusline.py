@@ -455,9 +455,13 @@ def field_colors(item: dict[str, Any]) -> dict[str, int | None]:
         else 203
         if stage in {"failed", "rejected"}
         else 221
-        if stage in {"blocked", "reserved"}
+        if stage in {"blocked", "reserved", "reported", "completed", "complete", "reported complete"}
         else 114
-        if stage in {"completed", "complete"}
+        if stage == "accepted"
+        else 80
+        if stage == "supported"
+        else 176
+        if stage == "stale"
         else 117
         if stage in {"running", "active", "claimed", "review"}
         else None

@@ -14,6 +14,11 @@ import {
 import { markHerdrViewClosed, syncHerdrViewLabel } from "../lib/herdr-view-state.mjs";
 import { createRoom, mailboxRoot, readRoom } from "../lib/horde-room.mjs";
 import { fit, HordeView, shortAgentName } from "../lib/horde-view.mjs";
+import {
+  isTerminalDisplayState,
+  MEMBER_OUTCOMES,
+  memberDisplayState,
+} from "../lib/member-state.mjs";
 import { configHome } from "../lib/runtime-paths.mjs";
 import {
   createTerminalInput,
@@ -34,16 +39,6 @@ export const UPDATE_SUCCESS_TTL_MS = 15_000;
 
 const PANE_ID_RE = /^[A-Za-z0-9_.:%][A-Za-z0-9_.:%-]{0,63}$/u;
 const ORKEST_TMUX_SERVER = /^orkest-label-[0-9a-f]{12}$/u;
-
-const TERMINAL_STAGES = new Set([
-  "completed",
-  "complete",
-  "reported complete",
-  "failed",
-  "canceled",
-  "cancelled",
-  "rejected",
-]);
 
 const quotaCache = {
   snapshotPath: "",
@@ -205,10 +200,27 @@ export async function focusAgentPane(agent, { exec = execFile, env = process.env
   return false;
 }
 
-function resolveStage(agent) {
-  return String(agent?.stage ?? agent?.progress?.stage ?? agent?.status ?? "")
-    .trim()
-    .toLowerCase();
+function notificationSummary(agents) {
+  const counts = new Map();
+  for (const agent of agents) {
+    const state = memberDisplayState(agent || {});
+    if (!isTerminalDisplayState(state)) return null;
+    counts.set(state, (counts.get(state) || 0) + 1);
+  }
+  if (counts.size === 0) return null;
+  const entries = [...counts].sort(([a], [b]) => a.localeCompare(b));
+  const label = (state) => MEMBER_OUTCOMES[state]?.label || state;
+  return {
+    key: `room:outcomes:${JSON.stringify(entries)}`,
+    title: entries.length === 1 ? `Swarm ${label(entries[0][0])}` : "Swarm outcomes",
+    body:
+      entries.length === 1
+        ? `All ${agents.length} agents ${label(entries[0][0])}.`
+        : entries.map(([state, count]) => `${count} ${label(state)}`).join(" · ") + ".",
+    sound: entries.every(([state]) => ["accepted", "supported"].includes(state))
+      ? "done"
+      : "request",
+  };
 }
 
 export function notifyHerdrTransitions(
@@ -219,34 +231,33 @@ export function notifyHerdrTransitions(
 ) {
   if (!Array.isArray(nextAgents)) return false;
   const seen = notifiedSet instanceof Set ? notifiedSet : new Set();
-  const isAllTerminal =
-    nextAgents.length > 0 && nextAgents.every((agent) => TERMINAL_STAGES.has(resolveStage(agent)));
+  const summary = notificationSummary(nextAgents);
 
   if (!Array.isArray(prevAgents)) {
     for (const agent of nextAgents) {
       if (!agent || typeof agent !== "object") continue;
-      if (resolveStage(agent) === "blocked") {
+      if (memberDisplayState(agent || {}) === "blocked") {
         seen.add(`${agent.id}:blocked:${agent.summary}`);
       }
     }
-    if (isAllTerminal) {
-      seen.add("room:all-complete");
-    }
+    if (summary) seen.add(summary.key);
     return false;
   }
 
   if (env?.HERDR_ENV !== "1") return false;
-  if (!isAllTerminal) {
-    seen.delete("room:all-complete");
+  if (!summary) {
+    for (const key of seen) {
+      if (key.startsWith("room:outcomes:")) seen.delete(key);
+    }
   }
   let isTriggered = false;
 
   for (const agent of nextAgents) {
     if (!agent || typeof agent !== "object") continue;
-    const stage = resolveStage(agent);
+    const stage = memberDisplayState(agent || {});
     if (stage !== "blocked") continue;
     const prev = prevAgents.find((item) => item?.id === agent.id);
-    const prevStage = resolveStage(prev);
+    const prevStage = memberDisplayState(prev || {});
     const key = `${agent.id}:blocked:${agent.summary}`;
     if ((prevStage === "blocked" && prev?.summary === agent.summary) || seen.has(key)) continue;
     seen.add(key);
@@ -267,12 +278,10 @@ export function notifyHerdrTransitions(
     );
   }
 
-  const hadActive = prevAgents.some((agent) => {
-    const stage = resolveStage(agent);
-    return stage !== "" && !TERMINAL_STAGES.has(stage);
-  });
-  if (isAllTerminal && hadActive && !seen.has("room:all-complete")) {
-    seen.add("room:all-complete");
+  const hadKnownState = prevAgents.some((agent) => memberDisplayState(agent || {}) !== "unknown");
+  const previous = notificationSummary(prevAgents);
+  if (summary && hadKnownState && summary.key !== previous?.key && !seen.has(summary.key)) {
+    seen.add(summary.key);
     isTriggered = true;
     void runExec(
       exec,
@@ -280,11 +289,11 @@ export function notifyHerdrTransitions(
       [
         "notification",
         "show",
-        "Orkest: Horde complete",
+        `Orkest: ${summary.title}`,
         "--body",
-        `All ${nextAgents.length} agents finished.`,
+        summary.body,
         "--sound",
-        "done",
+        summary.sound,
       ],
       env,
     );
@@ -298,7 +307,7 @@ function toNotificationAgents(room) {
     ...agent,
     id: agent.id,
     person: agent.person || agent.progress?.person || shortAgentName(agent) || agent.id,
-    stage: agent.stage || agent.progress?.stage || agent.status,
+    stage: memberDisplayState(agent),
     summary:
       agent.summary ??
       agent.question ??

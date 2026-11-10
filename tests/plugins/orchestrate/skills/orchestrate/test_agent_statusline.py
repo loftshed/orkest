@@ -278,7 +278,7 @@ class AgentStatuslineTests(unittest.TestCase):
         self.assertEqual((self.fields()["task"], self.fields()["stage"]), ("Test the footer", "review"))
         task["decisions"].append({"run_id": "run-a", "decision": "accept"})
         mailbox.write(directory / "task.json", task)
-        self.assertEqual(self.fields()["stage"], "completed")
+        self.assertEqual(self.fields()["stage"], "accepted")
         task["runs"].pop(0)
         task["decisions"].clear()
         task["runs"][0]["runner_status"] = "failed"
