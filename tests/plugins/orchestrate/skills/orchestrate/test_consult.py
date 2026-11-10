@@ -643,6 +643,37 @@ class ConsultTests(unittest.TestCase):
         self.assertIn("Use a shared lock file; unlinking it races.", output)
         self.assertCountEqual(quota_models, ["gpt-5.6-sol", "gpt-5.6-luna"])
 
+    def test_repository_policy_is_checked_for_every_panel_consultant(self) -> None:
+        checked = []
+
+        def deny_sol(_cwd, engine, _claude_config_dir=None):
+            checked.append(engine)
+            if len(checked) == 1:
+                raise RUNNER.RunnerError("Harness 'codex' is denied by repository policy", 2)
+
+        with mock.patch.object(RUNNER, "enforce_repo_policy", side_effect=deny_sol):
+            code, panel, output = self.consult(
+                "--question", "Why?", "--model", "gpt-5.6-sol,gpt-5.6-luna", "--format", "text"
+            )
+
+        self.assertEqual(len(checked), 2)
+        self.assertEqual(code, 0)
+        self.assertEqual(sorted(result["status"] for result in panel["consultants"]), ["answered", "refused"])
+        self.assertIn("denied by repository policy", output)
+
+    def test_a_single_consultation_is_refused_by_repository_policy_before_it_runs(self) -> None:
+        denied = RUNNER.RunnerError("Harness 'codex' is denied by repository policy", 2)
+        with (
+            mock.patch.object(RUNNER, "enforce_repo_policy", side_effect=denied) as policy,
+            mock.patch.object(CONSULT, "perform") as perform,
+            self.assertRaises(RUNNER.RunnerError) as raised,
+        ):
+            CONSULT.main(["--question", "Why?", "--model", "gpt-5.6-luna"])
+
+        self.assertEqual(raised.exception.exit_code, 2)
+        policy.assert_called_once()
+        perform.assert_not_called()
+
     def test_all_failed_panel_uses_the_first_consultants_exit_code(self) -> None:
         def refuse_both(_engine, model, **_kwargs):
             code = 15 if model == "gpt-5.6-sol" else 18

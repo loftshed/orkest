@@ -43,7 +43,6 @@ EXIT_FAILED = 1
 EXIT_EMPTY_OUTPUT = 3
 EXIT_TIMED_OUT = 12
 EXIT_LEASE_HELD = 27
-_PANEL_INPUT_HANDOFF: dict[str, Any] | None = None
 # File names and directories that hold credentials far more often than context. The caller pastes
 # redacted text through --context instead; the consultant's provider must never receive a secret.
 SECRET_NAME_PATTERNS = (
@@ -583,12 +582,12 @@ def resolve_reading(args: argparse.Namespace, previous: dict[str, Any] | None) -
     return intent, repository
 
 
-def build_request(args: argparse.Namespace) -> dict[str, Any]:
-    global _PANEL_INPUT_HANDOFF
-    is_panel = len(getattr(args, "models", [])) > 1
-    if is_panel and not hasattr(args, "_panel_inputs"):
-        # run_agent.py builds once for its repository-policy boundary before calling main().
-        _PANEL_INPUT_HANDOFF = None
+SHARED_INPUT_KEYS = ("question", "context", "attachments", "change")
+
+
+def build_request(args: argparse.Namespace, *, shared_inputs: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Build one consultation request. `shared_inputs` reuses the question, context, attachments and
+    diff another request already read, so a panel reads standard input and files once."""
     runner = _runner()
     if args.request is not None:
         try:
@@ -602,7 +601,7 @@ def build_request(args: argparse.Namespace) -> dict[str, Any]:
         raise _error("--question is required")
     previous = load_follow_up(args.follow_up) if args.follow_up else None
     intent, repository = resolve_reading(args, previous)
-    panel_inputs = getattr(args, "_panel_inputs", None)
+    panel_inputs = shared_inputs
     question = (
         panel_inputs["question"] if panel_inputs is not None else read_text_argument(args.question, option="--question")
     )
@@ -672,8 +671,6 @@ def build_request(args: argparse.Namespace) -> dict[str, Any]:
             f"the consultation prompt is {prompt_size // 1024} KiB; keep it under {MAX_PROMPT_BYTES // 1024} KiB "
             "by quoting only the relevant parts"
         )
-    if is_panel and not hasattr(args, "_panel_inputs"):
-        _PANEL_INPUT_HANDOFF = {key: request[key] for key in ("question", "context", "attachments", "change")}
     return request
 
 
@@ -1283,7 +1280,8 @@ def _perform(
         stdin_path = directory / "agy-input.jsonl"
         stdin_path.write_bytes(runner.agy_stream_input(prompt_path.read_text(encoding="utf-8")))
         stdin_path.chmod(0o600)
-    runner.emit_lifecycle("consultant_started", engine=engine, model=model, intent=intent)
+    if emit_output:
+        runner.emit_lifecycle("consultant_started", engine=engine, model=model, intent=intent)
     stdin_handle: Any = stdin_path.open("rb") if stdin_path is not None else subprocess.DEVNULL
     repository_before = runner.git_state(workspace) if reading else None
     credits_watch = None
@@ -1337,7 +1335,8 @@ def _perform(
             artifact.chmod(0o600)
     stdout_text = stdout_path.read_text(encoding="utf-8", errors="replace") if stdout_path.exists() else ""
     stderr_text = stderr_path.read_text(encoding="utf-8", errors="replace") if stderr_path.exists() else ""
-    runner.emit_lifecycle("consultant_finished", exit_code=process.returncode)
+    if emit_output:
+        runner.emit_lifecycle("consultant_finished", exit_code=process.returncode)
     # Informational: the engine's no-write mode is what prevents edits; the conductor or the user may
     # legitimately edit a repository while a reader looks at it, so a change is reported, not judged.
     repository_delta = (
@@ -1511,6 +1510,12 @@ def launch_detached(request: dict[str, Any], args: argparse.Namespace) -> int:
     return 0
 
 
+def enforce_policy(request: dict[str, Any]) -> None:
+    """Refuse a consultant whose engine the repository's policy denies (`ork policy`)."""
+    target = Path(request["read"]) if request.get("read") else Path.cwd()
+    _runner().enforce_repo_policy(target, request["engine"], request.get("claude_config_dir"))
+
+
 def run_panel_member(
     request: dict[str, Any],
     *,
@@ -1520,6 +1525,7 @@ def run_panel_member(
     """Run one isolated consultant and turn any preflight refusal into its own result file."""
     runner = _runner()
     try:
+        enforce_policy(request)
         exit_code = perform(
             request,
             out_dir=out_dir,
@@ -1598,14 +1604,8 @@ def perform_panel(requests: list[dict[str, Any]], args: argparse.Namespace) -> i
         request, out_dir = item
         return run_panel_member(request, out_dir=out_dir, dry_run=args.dry_run)
 
-    # Keep lifecycle notices from individual workers out of the combined text and JSON response.
-    emit_lifecycle = runner.emit_lifecycle
-    runner.emit_lifecycle = lambda *_args, **_kwargs: None
-    try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(requests))) as pool:
-            outcomes = list(pool.map(run_member, zip(requests, member_dirs, strict=True)))
-    finally:
-        runner.emit_lifecycle = emit_lifecycle
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(requests))) as pool:
+        outcomes = list(pool.map(run_member, zip(requests, member_dirs, strict=True)))
     consultant_results = [result for _exit_code, result in outcomes]
     exit_codes = [exit_code for exit_code, _result in outcomes]
     any_answered = any(result["status"] == "answered" for result in consultant_results)
@@ -1626,7 +1626,6 @@ def perform_panel(requests: list[dict[str, Any]], args: argparse.Namespace) -> i
 
 
 def main(argv: list[str] | None = None) -> int:
-    global _PANEL_INPUT_HANDOFF
     runner = _runner()
     args = parse_args(argv)
     if (args.completion_event or args.notify) and not (args.detach or args.request):
@@ -1639,19 +1638,14 @@ def main(argv: list[str] | None = None) -> int:
             raise _error("a model panel cannot be combined with --detach")
         if args.request:
             raise _error("a model panel cannot be combined with an internal --request")
-        requests = []
-        panel_inputs = _PANEL_INPUT_HANDOFF
-        _PANEL_INPUT_HANDOFF = None
+        requests: list[dict[str, Any]] = []
+        shared_inputs = None
         for model in args.models:
             model_args = argparse.Namespace(**vars(args))
             model_args.model = model
-            if panel_inputs is not None:
-                model_args._panel_inputs = panel_inputs
-            request = build_request(model_args)
+            request = build_request(model_args, shared_inputs=shared_inputs)
             requests.append(request)
-            if panel_inputs is None:
-                panel_inputs = {key: request[key] for key in ("question", "context", "attachments", "change")}
-                _PANEL_INPUT_HANDOFF = None
+            shared_inputs = shared_inputs or {key: request[key] for key in SHARED_INPUT_KEYS}
         if any(request["transport"] == "native" for request in requests):
             raise _error("a model panel needs executor transport; pass --transport executor for native models")
         parent_session = next(
@@ -1682,6 +1676,9 @@ def main(argv: list[str] | None = None) -> int:
         return perform_panel(requests, args)
 
     request = build_request(args)
+    if not args.request:
+        # A detached child (--request) was already checked by the parent that wrote its request.
+        enforce_policy(request)
     if "parent_session" not in request:
         request["parent_session"] = next(
             (
