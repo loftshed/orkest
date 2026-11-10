@@ -124,15 +124,15 @@ to its leads. Each lead owns communication and review within its branch. Keep fu
 in messages. Use `ork progress` for meaningful task and stage changes; the tree reads the same status
 as the terminal footer. The outcome vocabulary is:
 
-| Display state              | Recorded basis                                                                                                                                    |
-| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Reported (awaiting review) | A dispatched or room-bound member (including leads) reports completion, including legacy `completed`, or an executor finishes without a decision. |
-| Finished                   | A discovered subagent or peer session ended with no dispatch, so nothing is waiting on a decision.                                                |
-| Answered                   | A standalone `consult` returned an answer; there is no task to accept.                                                                            |
-| Supported                  | The conductor records `supported` for consultation advice.                                                                                        |
-| Accepted                   | The conductor records `accept` for the current candidate.                                                                                         |
-| Stale (needs revalidation) | A recorded result hash or candidate fingerprint no longer matches, or verification lacks a bound candidate identity.                              |
-| Failed / rejected          | The runner fails, or the conductor records `reject`.                                                                                              |
+| Display state              | Recorded basis                                                                                                                                                                                                                       |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Reported (awaiting review) | A dispatched or room-bound member (including leads and briefed workers), or a peer holding claimed, blocked or review workboard items, reports completion, including legacy `completed`, or an executor finishes without a decision. |
+| Finished                   | A discovered subagent or peer session ended with no dispatch, so nothing is waiting on a decision.                                                                                                                                   |
+| Answered                   | A standalone `consult` returned an answer; there is no task to accept.                                                                                                                                                               |
+| Supported                  | The conductor records `supported` for consultation advice.                                                                                                                                                                           |
+| Accepted                   | The conductor records `accept` for the current candidate.                                                                                                                                                                            |
+| Stale (needs revalidation) | A recorded result hash or candidate fingerprint no longer matches, or verification lacks a bound candidate identity.                                                                                                                 |
+| Failed / rejected          | The runner fails, or the conductor records `reject`.                                                                                                                                                                                 |
 
 `rooms show --json` keeps `accepted` and `supported` separate and retains the recorded `verdict`
 when evidence becomes stale. An unreadable task clears the projected verdict to `pending`.
@@ -148,8 +148,11 @@ or status. Legacy `completed`, `complete`, `reported complete`, and `stale` stat
 probing the workspace; Swarm View derives stale evidence separately.
 
 Finished and answered are neutral: they are not counted as reported, are listed as inactive, and a
-later progress update replaces them. Only a recorded `dispatch` or a room-bound member can show
-"reported (awaiting review)".
+later progress update replaces them. They apply only where nothing could be reviewed. A member that
+has a `dispatch`, is room-bound, holds a reserved slot or holds workboard items stays "reported
+(awaiting review)" until a decision is recorded. The marker is computed when a room is observed and
+is not stored with it, so Herdr's Python inventory shows it only for a room it was given with the
+marker.
 
 The view uses separate glyphs, labels and semantic colours for these outcomes, including counts
 and inactive history. A step fraction appears only from a recorded member `checklist` (or

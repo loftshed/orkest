@@ -1642,6 +1642,15 @@ async function appendRoomMessages(room, root) {
   room.messages = [...existing, ...discoveredRoomMessages];
 }
 
+/**
+ * Whether a finished discovered session has nothing a reviewer could accept: it holds no reserved
+ * slot (leads and briefed workers do) and its last report names no claimed, blocked or review
+ * workboard item (`workContext` is a digest of those items and is absent without them).
+ */
+function isUntrackedCompletion({ slot, progress }) {
+  return !slot && !progress?.workContext;
+}
+
 async function appendNativePeers(room, snapshots, root) {
   const roomCwd = await resolveCwd(room.cwd);
   if (!roomCwd) return;
@@ -1821,11 +1830,8 @@ async function appendNativePeers(room, snapshots, root) {
       observedAt,
       status,
       // Unreserved discovered peers have no dispatch, so no coordinator can review them.
-      ...(!slot &&
-        stage === "complete" &&
-        (progressRecord?.role || subagentRole || "native") !== "lead" && {
-          completion: "untracked",
-        }),
+      ...(stage === "complete" &&
+        isUntrackedCompletion({ slot, progress: progressRecord }) && { completion: "untracked" }),
       runtimeState: status === "running" ? "running" : "idle",
       objective: taskText,
       output: [taskText].filter(Boolean),
@@ -2312,7 +2318,8 @@ async function appendClaudeProjectSubagents(
         cwd: roomCwd,
         observedAt: info.lastActivityIso || info.startedIso,
         status,
-        ...(!slot && isFinished && { completion: "untracked" }),
+        ...(isFinished &&
+          isUntrackedCompletion({ slot, progress: savedProgress }) && { completion: "untracked" }),
         runtimeState: isFinished ? "stopped" : "running",
         objective: taskText,
         output: [taskText],

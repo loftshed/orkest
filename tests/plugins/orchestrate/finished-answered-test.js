@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { notifyHerdrTransitions } from "../../../plugins/orchestrate/bin/horde-tui.mjs";
 import { roomsCommand } from "../../../plugins/orchestrate/bin/rooms.mjs";
-import { createRoom, parseTeam } from "../../../plugins/orchestrate/lib/horde-room.mjs";
+import { createRoom, parseTeam, updateRoom } from "../../../plugins/orchestrate/lib/horde-room.mjs";
 import { HordeView } from "../../../plugins/orchestrate/lib/horde-view.mjs";
 import {
   isTerminalDisplayState,
@@ -119,7 +119,19 @@ describe("completion provenance in rooms", () => {
     const root = await directory();
     const cwd = await directory();
     const room = await newRoom(parseTeam("claude:haiku"), { id: "room-json", cwd, root });
-    room.conductor.session = { id: "supervisor-j", machine: hostname() };
+    const session = { id: "supervisor-j", engine: "claude", machine: hostname(), cwd };
+    room.conductor.engine = "claude";
+    room.conductor.session = session;
+    // Persisted, so the command below reloads the room and still finds the consultation.
+    await updateRoom(
+      room.id,
+      async (current) => {
+        current.conductor.engine = "claude";
+        current.conductor.session = session;
+        return current;
+      },
+      { root },
+    );
     const dir = path.join(root, "consultations", "supervisor-j");
     await mkdir(dir, { recursive: true });
     const resultPath = path.join(root, "result.json");
@@ -162,6 +174,7 @@ describe("completion provenance in rooms", () => {
       root,
       stdout: { write: (text) => (output += text) },
     });
-    expect(JSON.parse(output).agents).toBeDefined();
+    const listed = JSON.parse(output).agents.find((agent) => agent.id === "consult-j");
+    expect(listed.completion).toBe("answered");
   });
 });

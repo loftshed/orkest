@@ -1763,7 +1763,7 @@ describe("room CLI", () => {
     await mkdir(path.join(root, "progress"), { recursive: true });
     const room = await newRoom([], { id: "room-script-row", cwd, root, title: "Wave 12" });
     const startedAt = new Date().toISOString();
-    const report = async (session, harness, stage) => {
+    const report = async (session, harness, stage, extra = {}) => {
       await writeFile(
         path.join(root, "peers", `${session}.json`),
         JSON.stringify({
@@ -1791,6 +1791,7 @@ describe("room CLI", () => {
           goal: "Wave 12",
           task: "Verifier B phase 2",
           updatedAt: new Date().toISOString(),
+          ...extra,
         }),
       );
     };
@@ -1810,6 +1811,11 @@ describe("room CLI", () => {
     }
     // A discovered peer without a dispatch has nothing to review.
     expect((await agentOf("wave-driver")).completion).toBe("untracked");
+    // A peer whose last report names claimed, blocked or review workboard items may still owe a
+    // review, so it stays "reported complete" rather than "finished".
+    await report("board-holder", "unknown", "complete", { workContext: "0".repeat(64) });
+    expect((await agentOf("board-holder")).completion).toBeUndefined();
+    expect((await agentOf("board-holder")).status).toBe("reported complete");
     // A harness still reports busy or idle through its hooks, so its stage doesn't override them.
     await report("resting-agent", "claude", "working");
     expect(await statusOf("resting-agent")).toBe("idle");
