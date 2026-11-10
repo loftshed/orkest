@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.80.0
+
+- feat(orchestrate): give a room member its own worktree for concurrent work (#185)
+
 ## 0.79.0
 
 - feat(orchestrate): preview a worker's diff in Swarm View (#183)
