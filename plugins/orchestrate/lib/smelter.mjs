@@ -11,6 +11,7 @@
  * 4. Smelt & Prune (fast-forward local merge or PR creation + worktree removal)
  */
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -28,7 +29,7 @@ export const COLD_REVIEW_QUESTION =
   "Deterministic linters, formatters, and test suites (ork gate --heavy) have already passed on this diff. Review the changes and report ONLY concrete correctness bugs, security vulnerabilities, concurrency/race conditions, or scope violations under FINDINGS. Do not report stylistic preferences or speculative refactors; write 'none' under FINDINGS if no concrete defects exist.";
 
 export const SMELTER_HELP = `ork smelter status [--json] [--target <branch>] [--width 120]
-ork smelter run [--worktree <slug|path>] [--strategy local|pr] [--target <branch>] [--approve-high-blast] [--dry-run] [--skip-review] [--json]
+ork smelter run [--worktree <slug|path>] [--strategy local|pr] [--target <branch>] [--approve-high-blast <commit>] [--dry-run] [--skip-review] [--json]
 `;
 
 export function alignCanonicalPath(targetPath) {
@@ -233,8 +234,11 @@ export function getBranchDiffFiles(
 
 export function isPathAllowed(changedPath, allowPaths) {
   if (!Array.isArray(allowPaths) || allowPaths.length === 0) return true;
-  const candidate = normalizeRelativePath(changedPath);
-  if (!candidate || candidate.startsWith("..")) return false;
+  // Git -z paths are literal: trimming or treating backslashes as separators can widen scope.
+  if (typeof changedPath !== "string" || !changedPath) return false;
+  const candidate = path.posix.normalize(changedPath);
+  if (candidate === ".." || candidate.startsWith("../") || path.posix.isAbsolute(candidate))
+    return false;
   return allowPaths.some((rawAllowed) => {
     const allowed = normalizeRelativePath(rawAllowed);
     if (!allowed) return false;
@@ -337,6 +341,7 @@ function resolveGitSha(cwd, ref, execFileSyncFn = execFileSync) {
       execFileSyncFn("git", ["rev-parse", ref], {
         cwd,
         encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
       }) ?? "",
     ).trim();
     return out || null;
@@ -507,7 +512,8 @@ export async function smeltWorktree(worktree, options = {}) {
   const acquireLease = options.acquireWorkspaceLeaseFn || acquireWorkspaceLease;
   let lease = options.workspaceLease || (await acquireLease(worktreePath, { env: options.env }));
   let isReadOnly = false;
-  let pinnedHead = null;
+  let candidate = null;
+  let evidence = null;
   let targetLease;
   const execGit = options.execFileSync || options.execFileSyncFn || execFileSync;
   const stopped = (status) => new SmelterLeaseError(status, worktreePath);
@@ -529,10 +535,13 @@ export async function smeltWorktree(worktree, options = {}) {
   const checkStable = () => {
     checkState();
     const head = resolveGitSha(worktreePath, "HEAD", execGit);
+    if (!candidate || head !== candidate.commit) throw stopped("stale_candidate");
     const dirty = String(
       execGit("git", ["status", "--porcelain"], { cwd: worktreePath, encoding: "utf8" }) ?? "",
     ).trim();
-    if (!pinnedHead || head !== pinnedHead || dirty) throw stopped("stale");
+    if (dirty) throw stopped("check_mutated_workspace");
+    if (resolveGitSha(worktreePath, evidence.target.ref, execGit) !== evidence.target.sha)
+      throw stopped("stale_target");
   };
   const changeMode = async (nextReadOnly) => {
     assertWorkspaceLease(lease);
@@ -548,8 +557,11 @@ export async function smeltWorktree(worktree, options = {}) {
       assertWorkspaceLease(lease);
       if (targetLease) assertWorkspaceLease(targetLease);
     },
+    pin(record) {
+      evidence = record;
+      candidate = record.candidate;
+    },
     async review() {
-      pinnedHead = resolveGitSha(worktreePath, "HEAD", execGit);
       await changeMode(true);
     },
     async mutate() {
@@ -559,8 +571,8 @@ export async function smeltWorktree(worktree, options = {}) {
     async target(repoRoot) {
       assertWorkspaceLease(lease);
       if (alignCanonicalPath(repoRoot) === alignCanonicalPath(worktreePath)) return;
-      targetLease = await acquireWorkspaceLease(repoRoot, { env: options.env });
-      if (!targetLease.acquired) throw stopped("busy");
+      targetLease = await acquireLease(repoRoot, { env: options.env });
+      if (!targetLease.acquired) throw stopped("target_busy");
     },
   };
   try {
@@ -573,6 +585,9 @@ export async function smeltWorktree(worktree, options = {}) {
       ok: false,
       status: error.status,
       reason: error.message,
+      evidence: evidence ? { ...evidence, outcome: error.status } : null,
+      candidate,
+      ...(error.cause && { stateErrors: [error.cause.message] }),
       worktreePath,
       ...(error.status === "state_unreadable" && { stateProblem: loadFoundryState(worktreePath) }),
     };
@@ -608,10 +623,7 @@ async function smeltLeasedWorktree(worktree, options, ownership) {
   }
   const isDryRun = Boolean(options.dryRun || options["dry-run"]);
   const shouldSkipReview = Boolean(options.skipReview || options["skip-review"]);
-  const shouldApproveHighBlast = Boolean(options.approveHighBlast || options["approve-high-blast"]);
-  const repoRoot = path.resolve(
-    options.repoRoot || options.cwd || worktreeObj.parentCwd || marker.parentCwd || process.cwd(),
-  );
+  const approvedCommit = options.approveHighBlast || options["approve-high-blast"];
   const execFileSyncFn = options.execFileSync || options.execFileSyncFn || execFileSync;
 
   const canPersistState =
@@ -623,42 +635,28 @@ async function smeltLeasedWorktree(worktree, options, ownership) {
         existsSync(loadedMeta.gitDir) ||
         existsSync(worktreePath),
       ));
+  let evidence = null;
   const recordState = async (patch) => {
     await ownership.mutate();
     ownership.assertHeld();
     if (!canPersistState) return null;
-    return writeFoundryState(worktreePath, {
-      issue: worktreeObj.issue ?? marker.issue ?? taskSpec?.issue ?? null,
-      targetBranch,
-      ...patch,
-    });
+    try {
+      return writeFoundryState(worktreePath, {
+        issue: worktreeObj.issue ?? marker.issue ?? taskSpec?.issue ?? null,
+        targetBranch,
+        ...(evidence && {
+          candidate: evidence.candidate,
+          evidence: { ...evidence, outcome: patch.status },
+        }),
+        ...patch,
+      });
+    } catch (error_) {
+      const error = new SmelterLeaseError("state_write_failed", worktreePath);
+      error.cause = error_;
+      throw error;
+    }
   };
 
-  let resolvedHeadBranch = null;
-  if (
-    !options.branch &&
-    !worktreeObj.branch &&
-    !marker.branch &&
-    existsSync(path.join(worktreePath, ".git"))
-  ) {
-    try {
-      const headRef = String(
-        execFileSyncFn("git", ["rev-parse", "--abbrev-ref", "HEAD"], {
-          cwd: worktreePath,
-          encoding: "utf8",
-        }) ?? "",
-      ).trim();
-      if (headRef && headRef !== "HEAD") resolvedHeadBranch = headRef;
-    } catch {
-      /* Ignore git lookup errors on non-git or mocked paths. */
-    }
-  }
-  const branch =
-    options.branch ||
-    worktreeObj.branch ||
-    marker.branch ||
-    resolvedHeadBranch ||
-    path.basename(worktreePath);
   let isDisposable = hasMarker && marker.disposable !== false;
   if (options.disposable !== undefined) {
     isDisposable = Boolean(options.disposable);
@@ -699,6 +697,14 @@ async function smeltLeasedWorktree(worktree, options, ownership) {
   };
 
   // Stage 1: Rebase & Scope Audit
+  const commonDir = path.resolve(
+    worktreePath,
+    String(runCmd("git", ["rev-parse", "--git-common-dir"])).trim(),
+  );
+  const repoRoot = commonDir;
+  const target = { ref: `refs/heads/${targetBranch}`, sha: null };
+  target.sha = resolveGitSha(worktreePath, target.ref, execFileSyncFn);
+  if (!target.sha) return { ok: false, status: "target_missing", target, worktreePath };
   const porcelainStatus = String(
     runCmd("git", ["status", "--porcelain"], worktreePath) ?? "",
   ).trim();
@@ -706,61 +712,80 @@ async function smeltLeasedWorktree(worktree, options, ownership) {
     throw new Error(`Worktree ${worktreePath} has uncommitted changes:\n${porcelainStatus}`);
   }
 
-  let changedPaths;
-  if (Array.isArray(options.changedPaths)) {
-    changedPaths = options.changedPaths.map(normalizeRelativePath).filter(Boolean);
-  } else if (Array.isArray(worktreeObj.changedPaths)) {
-    changedPaths = worktreeObj.changedPaths.map(normalizeRelativePath).filter(Boolean);
-  } else {
-    const diffOut = String(
-      runCmd(
-        "git",
-        ["diff", "--name-only", "--no-renames", `${targetBranch}...HEAD`],
-        worktreePath,
-      ) ?? "",
-    );
-    changedPaths = diffOut.split(/\r?\n/u).map(normalizeRelativePath).filter(Boolean);
-  }
-
-  if (Array.isArray(allowPaths) && allowPaths.length > 0) {
-    const violations = changedPaths.filter((filePath) => !isPathAllowed(filePath, allowPaths));
-    if (violations.length > 0) {
-      await recordState({
-        scopeViolations: violations,
-        status: "scope_violated",
-      });
-      throw new Error(
-        `Scope audit failed: files outside allow_paths (${allowPaths.join(", ")}): ${violations.join(", ")}`,
-      );
-    }
-  }
-
-  const blastRadius = classifyBlastRadius(changedPaths);
   if (!isDryRun) {
     try {
-      runCmd("git", ["rebase", targetBranch], worktreePath);
+      runCmd("git", ["rebase", target.sha]);
     } catch (error) {
       try {
-        execFileSyncFn("git", ["rebase", "--abort"], { cwd: worktreePath, encoding: "utf8" });
+        runCmd("git", ["rebase", "--abort"]);
       } catch {
-        /* Ignore abort error if rebase had not started. */
+        /* A rebase that never started has nothing to abort. */
       }
-      const worktreeHeadSha =
-        worktreeObj.head || resolveGitSha(worktreePath, "HEAD", execFileSyncFn);
-      const targetHeadSha =
-        resolveGitSha(worktreePath, targetBranch, execFileSyncFn) ||
-        resolveGitSha(repoRoot, targetBranch, execFileSyncFn);
       await recordState({
         rebase: {
           conflictOn: {
-            targetHeadSha,
-            worktreeHeadSha,
+            targetHeadSha: target.sha,
+            worktreeHeadSha: resolveGitSha(worktreePath, "HEAD", execFileSyncFn),
           },
         },
         status: "rebase_conflict",
       });
       throw error;
     }
+  }
+  const candidate = {
+    commit: String(runCmd("git", ["rev-parse", "HEAD"])).trim(),
+    tree: String(runCmd("git", ["rev-parse", "HEAD^{tree}"])).trim(),
+    branch: String(runCmd("git", ["symbolic-ref", "--short", "HEAD"])).trim(),
+  };
+  const branch = candidate.branch;
+  const changedPaths = String(
+    runCmd("git", ["diff", "--name-only", "--no-renames", "-z", target.sha, candidate.commit]),
+  )
+    .split("\0")
+    .filter(Boolean);
+  const violations = changedPaths.filter((filePath) => !isPathAllowed(filePath, allowPaths));
+  const blastRadius = classifyBlastRadius(changedPaths);
+  const specPath = worktreeObj.taskSpecPath || loadedMeta.taskSpecPath;
+  const digest = (value) =>
+    createHash("sha256")
+      .update(
+        typeof value === "string" || Buffer.isBuffer(value) ? value : JSON.stringify(value ?? null),
+      )
+      .digest("hex");
+  let scopeResult = allowPaths?.length > 0 ? "passed" : "unchecked";
+  if (violations.length > 0) scopeResult = "violated";
+  evidence = {
+    schema: "ork.smelter.evidence.v1",
+    candidate,
+    target,
+    mergeBase: String(runCmd("git", ["merge-base", target.sha, candidate.commit])).trim(),
+    spec: specPath ? { path: specPath, sha256: digest(readFileSync(specPath)) } : null,
+    scope: { allowPaths: allowPaths ?? [], changedPaths, result: scopeResult },
+    blastRadius,
+    checks: [],
+    review: { engine: null, result: "not_reviewed", outputSha256: null },
+    approval:
+      approvedCommit === candidate.commit
+        ? {
+            kind: "high-blast",
+            candidateCommit: candidate.commit,
+            approvedBy: options.approvedBy || "cli",
+            at: new Date().toISOString(),
+          }
+        : null,
+    outcome: null,
+  };
+  ownership.pin(evidence);
+  if (violations.length > 0) {
+    await recordState({ scopeViolations: violations, status: "scope_violated" });
+    return {
+      ok: false,
+      status: "scope_violated",
+      evidence: { ...evidence, outcome: "scope_violated" },
+      candidate,
+      worktreePath,
+    };
   }
   const stage1 = {
     allowPaths: allowPaths ?? [],
@@ -777,6 +802,14 @@ async function smeltLeasedWorktree(worktree, options, ownership) {
   // Stage 2: Heavy Gate
   const verifyArgs = splitVerifyCommand(verifyCommand);
   const gateArgs = ["gate", "--heavy", "--", ...verifyArgs];
+  const checkKind =
+    options.verifyCommand ||
+    worktreeObj.verifyCommand ||
+    taskSpec?.verify_command ||
+    taskSpec?.development_checks?.[0]
+      ? "development"
+      : "default-lint";
+  const checkStartedAt = new Date().toISOString();
   let stage2;
   if (isDryRun) {
     stage2 = {
@@ -805,16 +838,45 @@ async function smeltLeasedWorktree(worktree, options, ownership) {
         verifyCommand,
       };
     } catch (error) {
+      evidence.checks.push({
+        kind: checkKind,
+        command: verifyCommand,
+        exitCode: error.status ?? null,
+        result: "failed",
+        startedAt: checkStartedAt,
+        endedAt: new Date().toISOString(),
+        outputSha256: digest(error.stdout ?? error.message),
+      });
+      ownership.checkStable();
       await recordState({
         gateError: error?.message || String(error),
         status: "gate_failed",
       });
-      throw error;
+      return {
+        ok: false,
+        status: "gate_failed",
+        error: error.message,
+        candidate,
+        evidence: { ...evidence, outcome: "gate_failed" },
+        worktreePath,
+      };
     }
   }
 
+  evidence.checks.push({
+    kind: checkKind,
+    command: verifyCommand,
+    exitCode: isDryRun ? null : 0,
+    result: isDryRun ? "not_run" : "passed",
+    startedAt: checkStartedAt,
+    endedAt: new Date().toISOString(),
+    outputSha256: isDryRun ? null : digest(stage2.output),
+  });
+  ownership.checkStable();
+
   // Stage 3: Cross-Vendor Cold Review
   const reviewerEngine = selectColdReviewerEngine(workerEngine);
+  evidence.review.engine = reviewerEngine;
   const consultArgs = [
     "consult",
     "--intent",
@@ -828,7 +890,7 @@ async function smeltLeasedWorktree(worktree, options, ownership) {
     "--read",
     worktreePath,
     "--diff",
-    targetBranch,
+    target.sha,
     "--question",
     COLD_REVIEW_QUESTION,
   ];
@@ -853,8 +915,13 @@ async function smeltLeasedWorktree(worktree, options, ownership) {
           worktreePath,
         })
       : runCmd("python3", [runAgentScript, ...consultArgs], worktreePath);
-    ownership.checkStable();
     const parsedReview = parseColdReviewFindings(reviewOutput);
+    evidence.review = {
+      engine: reviewerEngine,
+      result: parsedReview.passed ? "passed" : "findings",
+      outputSha256: digest(reviewOutput),
+    };
+    ownership.checkStable();
     if (!parsedReview.passed) {
       stage3 = {
         args: consultArgs,
@@ -871,6 +938,8 @@ async function smeltLeasedWorktree(worktree, options, ownership) {
         status: "review_changes_requested",
       });
       return {
+        evidence: { ...evidence, outcome: "review_changes_requested" },
+        candidate,
         allowPaths: allowPaths ?? [],
         blastRadius,
         branch,
@@ -922,13 +991,20 @@ async function smeltLeasedWorktree(worktree, options, ownership) {
   ownership.checkStable();
   await ownership.mutate();
 
-  if (!isDryRun && blastRadius === "high" && strategy === "local" && !shouldApproveHighBlast) {
+  if (
+    !isDryRun &&
+    blastRadius === "high" &&
+    strategy === "local" &&
+    approvedCommit !== candidate.commit
+  ) {
     await recordState({
       blastRadius,
       status: "awaiting_human_approval",
     });
     return {
       allowPaths: allowPaths ?? [],
+      evidence: { ...evidence, outcome: "awaiting_human_approval" },
+      candidate,
       awaitingApproval: true,
       blastRadius,
       branch,
@@ -969,60 +1045,127 @@ async function smeltLeasedWorktree(worktree, options, ownership) {
   // Stage 4: Smelt & Prune
   let stage4;
   if (strategy === "local") {
+    let isPruned = false;
+    const entries = parsePorcelainWorktrees(
+      String(runCmd("git", ["worktree", "list", "--porcelain"])),
+    );
+    const checkout = entries.find((entry) => entry.branch === targetBranch);
     const plannedOps = [
-      ["git", "merge", "--ff-only", branch],
-      ...(isDisposable
-        ? [
-            ["git", "worktree", "remove", worktreePath],
-            ["git", "branch", "-d", branch],
-          ]
-        : []),
+      checkout
+        ? ["git", "merge", "--ff-only", candidate.commit]
+        : ["git", "update-ref", target.ref, candidate.commit, target.sha],
     ];
     if (!isDryRun) {
-      await ownership.target(repoRoot);
-      let currentRepoBranch = "";
-      if (existsSync(path.join(repoRoot, ".git"))) {
+      if (checkout) {
+        await ownership.target(checkout.worktree);
+        let attached = "";
         try {
-          currentRepoBranch = String(
-            execFileSyncFn("git", ["rev-parse", "--abbrev-ref", "HEAD"], {
-              cwd: repoRoot,
-              encoding: "utf8",
-            }) ?? "",
+          attached = String(
+            runCmd("git", ["symbolic-ref", "-q", "HEAD"], checkout.worktree),
           ).trim();
         } catch {
-          currentRepoBranch = "";
+          /* Detached target is refused below. */
+        }
+        if (attached !== target.ref)
+          return {
+            ok: false,
+            status: "target_detached",
+            candidate,
+            evidence: { ...evidence, outcome: "target_detached" },
+            worktreePath,
+          };
+        if (resolveGitSha(checkout.worktree, "HEAD", execFileSyncFn) !== target.sha)
+          return {
+            ok: false,
+            status: "stale_target",
+            candidate,
+            evidence: { ...evidence, outcome: "stale_target" },
+            worktreePath,
+          };
+        ownership.checkStable();
+        try {
+          runCmd("git", ["merge", "--ff-only", candidate.commit], checkout.worktree);
+        } catch (error) {
+          return {
+            ok: false,
+            status: "merge_failed",
+            error: error.message,
+            candidate,
+            evidence: { ...evidence, outcome: "merge_failed" },
+            worktreePath,
+          };
+        }
+      } else {
+        ownership.checkStable();
+        try {
+          runCmd("git", ["update-ref", target.ref, candidate.commit, target.sha], repoRoot);
+        } catch (error) {
+          const status =
+            resolveGitSha(worktreePath, target.ref, execFileSyncFn) === target.sha
+              ? "merge_failed"
+              : "stale_target";
+          return {
+            ok: false,
+            status,
+            error: error.message,
+            candidate,
+            evidence: { ...evidence, outcome: status },
+            worktreePath,
+          };
         }
       }
-      if (currentRepoBranch && currentRepoBranch !== "HEAD" && currentRepoBranch !== targetBranch) {
-        throw new Error(
-          `Cannot fast-forward merge into ${repoRoot}: checked out branch is ${currentRepoBranch}, expected ${targetBranch}`,
-        );
+      if (resolveGitSha(worktreePath, target.ref, execFileSyncFn) !== candidate.commit)
+        return {
+          ok: false,
+          status: "merge_unconfirmed",
+          candidate,
+          evidence: { ...evidence, outcome: "merge_unconfirmed" },
+          worktreePath,
+        };
+      try {
+        await recordState({ status: "merged" });
+      } catch (error) {
+        return {
+          ok: false,
+          status: "merged_state_unrecorded",
+          stateErrors: [error.cause?.message || error.message],
+          candidate,
+          evidence: { ...evidence, outcome: "merged_state_unrecorded" },
+          worktreePath,
+        };
       }
-      runCmd("git", ["merge", "--ff-only", branch], repoRoot);
-      await recordState({ status: "merged" });
-      if (isDisposable) {
+      if (
+        isDisposable &&
+        resolveGitSha(worktreePath, target.ref, execFileSyncFn) === candidate.commit &&
+        resolveGitSha(worktreePath, "HEAD", execFileSyncFn) === candidate.commit
+      ) {
         runCmd("git", ["worktree", "remove", worktreePath], repoRoot);
-        runCmd("git", ["branch", "-d", branch], repoRoot);
+        runCmd("git", ["branch", "-d", candidate.branch], repoRoot);
+        isPruned = true;
       }
     }
     stage4 = {
       branch,
       disposable: isDisposable,
       operations: plannedOps,
-      pruned: !isDryRun && isDisposable,
+      pruned: isPruned,
       status: isDryRun ? "dry-run" : "passed",
       strategy: "local",
       targetBranch,
     };
   } else {
-    const prArgs = ["pr", "create", "--base", targetBranch, "--head", branch, "--fill"];
+    const prArgs = ["pr", "create", "--base", targetBranch, "--head", candidate.branch, "--fill"];
     const plannedOps = [
-      ["git", "push", "-u", "origin", branch],
+      ["git", "push", "origin", `${candidate.commit}:refs/heads/${candidate.branch}`],
       ["gh", ...prArgs],
     ];
     let prOutput = null;
     if (!isDryRun) {
-      runCmd("git", ["push", "-u", "origin", branch], worktreePath);
+      runCmd(
+        "git",
+        ["push", "origin", `${candidate.commit}:refs/heads/${candidate.branch}`],
+        worktreePath,
+      );
       prOutput = runCmd("gh", prArgs, worktreePath);
       await recordState({ status: "pr_opened" });
     }
@@ -1040,6 +1183,8 @@ async function smeltLeasedWorktree(worktree, options, ownership) {
 
   const finalSmeltStatus = strategy === "local" ? "merged" : "pr_opened";
   return {
+    evidence: { ...evidence, outcome: isDryRun ? "dry-run" : finalSmeltStatus },
+    candidate,
     allowPaths: allowPaths ?? [],
     blastRadius,
     branch,
@@ -1117,7 +1262,7 @@ export async function smelterCli(
     allowPositionals: true,
     args: argv,
     options: {
-      "approve-high-blast": { type: "boolean" },
+      "approve-high-blast": { type: "string" },
       "dry-run": { type: "boolean" },
       help: { short: "h", type: "boolean" },
       json: { type: "boolean" },
@@ -1214,7 +1359,7 @@ export async function smelterCli(
   const results = [];
   for (const wt of selected) {
     const res = await smeltWorktree(wt, {
-      approveHighBlast: Boolean(values["approve-high-blast"]),
+      approveHighBlast: values["approve-high-blast"],
       cwd,
       dryRun: Boolean(values["dry-run"]),
       execFileSyncFn,

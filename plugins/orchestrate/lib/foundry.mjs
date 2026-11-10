@@ -1069,7 +1069,7 @@ export function countCommitsAhead(
       }) ?? "",
     ).trim();
     const parsed = Number(out);
-    if (Number.isSafeInteger(parsed) && parsed >= 0) {
+    if (out && Number.isSafeInteger(parsed) && parsed >= 0) {
       return { commitsAhead: parsed, resolved: true };
     }
   } catch {
@@ -1093,14 +1093,14 @@ export function hasWorktreeDirtyChanges(worktreePath, { execFileSyncFn = execFil
   }
 }
 
-export function commitVerifiedWorktreeChanges(
+export function commitBuilderWorktreeChanges(
   worktreePath,
   issueNumber,
   { execFileSyncFn = execFileSync } = {},
 ) {
   const message = issueNumber
     ? `feat(foundry): resolve #${issueNumber}`
-    : "feat(foundry): apply verified builder changes";
+    : "feat(foundry): apply builder changes";
   execFileSyncFn("git", ["add", "-A"], {
     cwd: worktreePath,
     encoding: "utf8",
@@ -1112,6 +1112,123 @@ export function commitVerifiedWorktreeChanges(
     stdio: ["ignore", "pipe", "ignore"],
   });
   return { committed: true, message };
+}
+
+/** Commit builder output before checks; check output is always left for inspection. */
+export async function verifyBuilderWorktree(
+  worktreePath,
+  {
+    issue,
+    allowPaths = [],
+    targetBranch = "main",
+    command,
+    execFileSyncFn = execFileSync,
+    execVerifyFn = defaultExecVerify,
+    assertHeld = () => {},
+  } = {},
+) {
+  const git = (...args) => {
+    assertHeld();
+    return String(execFileSyncFn("git", args, { cwd: worktreePath, encoding: "utf8" }) ?? "");
+  };
+  const verification = {
+    command,
+    kind: "development",
+    candidate: null,
+    exitCode: null,
+    ok: false,
+    output: "",
+    status: "not_run",
+    verifiedAt: new Date().toISOString(),
+    committedByHost: false,
+  };
+  const failure = (status, reason, extra = {}) => ({
+    status,
+    commitsAhead: null,
+    verification: { ...verification, reason, ...extra },
+  });
+  let candidate;
+  let commitsAhead;
+  try {
+    const paths = new Set(
+      [
+        ...git("diff", "--name-only", "--no-renames", "-z", "HEAD").split("\0"),
+        ...git("ls-files", "--others", "--exclude-standard", "-z").split("\0"),
+      ].filter(Boolean),
+    );
+    const violations = [...paths].filter(
+      (changed) =>
+        !allowPaths.some((raw) => {
+          const allowed = normalizeRelativePath(raw);
+          return (
+            allowed === "." ||
+            (allowed && (changed === allowed || changed.startsWith(`${allowed}/`)))
+          );
+        }),
+    );
+    if (violations.length > 0)
+      return {
+        ...failure("scope_violated", `Files outside allow_paths: ${violations.join(", ")}`),
+        scopeViolations: violations,
+      };
+    if (git("status", "--porcelain")) {
+      try {
+        assertHeld();
+        commitBuilderWorktreeChanges(worktreePath, issue, { execFileSyncFn });
+        verification.committedByHost = true;
+      } catch (error) {
+        return failure("commit_failed", error.message);
+      }
+    }
+    candidate = {
+      commit: git("rev-parse", "HEAD").trim(),
+      tree: git("rev-parse", "HEAD^{tree}").trim(),
+    };
+    if (!candidate.commit || !candidate.tree)
+      throw new Error("Cannot resolve verification candidate");
+    verification.candidate = candidate;
+    const counted = countCommitsAhead(worktreePath, targetBranch, { execFileSyncFn });
+    if (!counted.resolved) throw new Error("Cannot resolve commit count");
+    commitsAhead = counted.commitsAhead;
+  } catch (error) {
+    return failure("verification_failed", error.message);
+  }
+  const beforeCheck = hasWorktreeDirtyChanges(worktreePath, { execFileSyncFn });
+  if (!beforeCheck.resolved || beforeCheck.isDirty)
+    return {
+      ...failure("verification_mutated_workspace", "Workspace is dirty after builder commit"),
+      commitsAhead,
+    };
+  let result;
+  try {
+    assertHeld();
+    result = await execVerifyFn(command, { cwd: worktreePath, issue });
+  } catch (error) {
+    result = { ok: false, exitCode: error.status ?? 1, output: error.message };
+  }
+  const exitCode = result?.exitCode ?? (result?.ok === true ? 0 : 1);
+  const isPassed = exitCode === 0 && result?.ok !== false;
+  Object.assign(verification, {
+    exitCode,
+    output: result?.output || "",
+    status: isPassed ? "passed" : "failed",
+    ok: isPassed,
+  });
+  const dirty = hasWorktreeDirtyChanges(worktreePath, { execFileSyncFn });
+  assertHeld();
+  if (git("rev-parse", "HEAD").trim() !== candidate.commit || !dirty.resolved || dirty.isDirty) {
+    return {
+      status: "verification_mutated_workspace",
+      commitsAhead,
+      verification: {
+        ...verification,
+        ok: false,
+        status: "failed",
+        reason: "Verification changed HEAD or left a dirty workspace",
+      },
+    };
+  }
+  return { status: isPassed ? "verified" : "verification_failed", commitsAhead, verification };
 }
 
 export function resolveWorktreeHeadSha(worktreePath, { execFileSyncFn = execFileSync } = {}) {
@@ -1742,17 +1859,19 @@ export async function foundryCommand(
     if (typeof countCommitsAheadFn === "function") {
       commitsAhead = Number(await countCommitsAheadFn(worktreePath, targetBranch));
     } else {
-      commitsAhead = countCommitsAhead(worktreePath, targetBranch, { execFileSyncFn }).commitsAhead;
+      const counted = countCommitsAhead(worktreePath, targetBranch, { execFileSyncFn });
+      commitsAhead = counted.resolved ? counted.commitsAhead : null;
     }
     assertWorkspaceLease(finalLease);
     const dirtyCheck = hasWorktreeDirtyChanges(worktreePath, { execFileSyncFn });
     const isDirtyWorktree = dirtyCheck.isDirty;
-    const hasWorktreeChanges = commitsAhead > 0 || isDirtyWorktree;
+    const hasWorktreeChanges = commitsAhead === null || commitsAhead > 0 || isDirtyWorktree;
 
     const normalizedVerifyCommand = enforceScopedVerifyCommand(match.verifyCommand);
     const nowIso = new Date().toISOString();
     let verification;
     let finalStatus;
+    let scopeViolations;
 
     if (!didBuilderSucceed || !hasWorktreeChanges) {
       finalStatus = outcome === "uncertain" ? "launch_uncertain" : "worker_failed";
@@ -1769,51 +1888,19 @@ export async function foundryCommand(
         verifiedAt: nowIso,
       };
     } else {
-      let wasHostCommitted = false;
-      let rawVerifyResult;
-      if (typeof execVerifyFn === "function") {
-        rawVerifyResult = await execVerifyFn(normalizedVerifyCommand, {
-          cwd: worktreePath,
-          issue: match.issue.number,
-        });
-      } else if (execAgentFn === defaultExecAgent) {
-        rawVerifyResult = await defaultExecVerify(normalizedVerifyCommand, {
-          cwd: worktreePath,
-          issue: match.issue.number,
-        });
-      } else {
-        rawVerifyResult = { exitCode: 0, ok: true, output: "" };
-      }
-      assertWorkspaceLease(finalLease);
-      let verifyExitCode = 0;
-      if (typeof rawVerifyResult?.exitCode === "number") {
-        verifyExitCode = rawVerifyResult.exitCode;
-      } else if (rawVerifyResult?.ok === false) {
-        verifyExitCode = 1;
-      }
-      const isVerifyOk =
-        typeof rawVerifyResult?.ok === "boolean" ? rawVerifyResult.ok : verifyExitCode === 0;
-      if (isVerifyOk && isDirtyWorktree) {
-        try {
-          commitVerifiedWorktreeChanges(worktreePath, match.issue.number, { execFileSyncFn });
-          wasHostCommitted = true;
-          const recounted = countCommitsAhead(worktreePath, targetBranch, { execFileSyncFn });
-          commitsAhead = recounted.resolved ? recounted.commitsAhead : Math.max(1, commitsAhead);
-        } catch {
-          commitsAhead = Math.max(1, commitsAhead);
-        }
-      }
-      finalStatus = isVerifyOk ? "verified" : "verification_failed";
-      verification = {
-        acceptanceCriteria,
+      const checked = await verifyBuilderWorktree(worktreePath, {
+        issue: match.issue.number,
+        allowPaths: match.allowPaths,
+        targetBranch,
         command: normalizedVerifyCommand,
-        committedByHost: wasHostCommitted,
-        exitCode: verifyExitCode,
-        ok: isVerifyOk,
-        output: typeof rawVerifyResult?.output === "string" ? rawVerifyResult.output : "",
-        status: isVerifyOk ? "passed" : "failed",
-        verifiedAt: nowIso,
-      };
+        execFileSyncFn,
+        execVerifyFn: execVerifyFn || defaultExecVerify,
+        assertHeld: () => assertWorkspaceLease(finalLease),
+      });
+      commitsAhead = checked.commitsAhead;
+      finalStatus = checked.status;
+      scopeViolations = checked.scopeViolations;
+      verification = { ...checked.verification, acceptanceCriteria };
     }
 
     const headSha = resolveWorktreeHeadSha(worktreePath, { execFileSyncFn });
@@ -1843,6 +1930,7 @@ export async function foundryCommand(
       targetBranch,
       updatedAt: verification.verifiedAt,
       verification,
+      ...(scopeViolations && { scopeViolations }),
       verifyCommand: normalizedVerifyCommand,
       worktreePath,
       worktreeSlug: match.worktreeSlug,

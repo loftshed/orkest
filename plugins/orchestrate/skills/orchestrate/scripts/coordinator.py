@@ -1008,30 +1008,38 @@ def review(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -> 
             raise CoordinationError("only a completed, audited run can be accepted or supported")
         if args.evidence is None and not args.review_id:
             raise CoordinationError("review requires conductor evidence")
-        if state.get("evidence_policy") == "host_receipts_required":
-            evidence = EVIDENCE.receipt(review_state, args.review_id, RUNNER, acceptance=args.decision == "accept")
-            record["evidence"] = {"review_id": evidence["review_id"], "owner": evidence["owner"]}
-        else:
-            evidence = read(args.evidence)
-            record["evidence"] = check_evidence(args.evidence)
+
+        def validate_evidence() -> dict[str, Any]:
+            if state.get("evidence_policy") == "host_receipts_required":
+                evidence = EVIDENCE.receipt(review_state, args.review_id, RUNNER, acceptance=args.decision == "accept")
+                record["evidence"] = {"review_id": evidence["review_id"], "owner": evidence["owner"]}
+            else:
+                evidence = read(args.evidence)
+                record["evidence"] = check_evidence(args.evidence)
+            return evidence
+
         if args.decision == "accept":
-            if run is not latest_work(state):
-                raise CoordinationError("accept only the latest implementation, correction or continue")
-            if (
-                state.get("evidence_policy") != "host_receipts_required"
-                and evidence.get("criteria") != review_state["task_spec"]["acceptance_criteria"]
-            ):
-                raise CoordinationError("evidence must list every original acceptance criterion in order")
             repository = Path(state["repository"])
             with SUPPORT.workspace_lease(repository, RUNNER.default_agent_cache_dir()):
+                evidence = validate_evidence()
+                if run is not latest_work(state):
+                    raise CoordinationError("accept only the latest implementation, correction or continue")
                 if (
-                    RUNNER.git_state(repository, result["tracked_paths"])["fingerprint"]
-                    != result["git_after"]["fingerprint"]
-                    or RUNNER.git_identity(repository) != result["git_identity_after"]
+                    state.get("evidence_policy") != "host_receipts_required"
+                    and evidence.get("criteria") != review_state["task_spec"]["acceptance_criteria"]
                 ):
+                    raise CoordinationError("evidence must list every original acceptance criterion in order")
+                fingerprint = RUNNER.git_state(repository, result["tracked_paths"])["fingerprint"]
+                git_identity = RUNNER.git_identity(repository)
+                if fingerprint != result["git_after"]["fingerprint"] or git_identity != result["git_identity_after"]:
                     raise CoordinationError("workspace changed since verification")
-            state["status"] = "accepted"
-        elif run["kind"] not in READ_ONLY_KINDS:
+                record["candidate"] = {"fingerprint": fingerprint, "git_identity": git_identity}
+                state["status"] = "accepted"
+                state["decisions"].append(record)
+                save(directory, state)
+            return record
+        validate_evidence()
+        if run["kind"] not in READ_ONLY_KINDS:
             raise CoordinationError("supported is a consultation decision")
     elif args.decision == "takeover":
         state["status"] = "conductor_takeover"
