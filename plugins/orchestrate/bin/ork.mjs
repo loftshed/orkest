@@ -845,6 +845,8 @@ if (entry === fileURLToPath(import.meta.url)) {
     await main();
   } catch (error) {
     console.error(`ork: ${error.message}`);
-    process.exitCode = process.argv[2] === "update" && error.exitCode === 2 ? 2 : 1;
+    // Commands mark usage errors with their own code (2); anything else is a plain failure.
+    process.exitCode =
+      Number.isSafeInteger(error.exitCode) && error.exitCode > 0 ? error.exitCode : 1;
   }
 }
