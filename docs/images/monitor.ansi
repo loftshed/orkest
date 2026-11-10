@@ -1,0 +1,25 @@
+[1m Monitor[0m  [2m5:00 PM[0m  [2mdata 1m old[0m
+
+ [1m[38;5;179mClaude · work[0m[2m  subscription[0m
+   5-hour                 [38;5;71m██████████▏[0m[2;38;5;240m···[0m [38;5;71m 72%[0m left   [2mresets[0m 7:30 PM today [2m(in 2h 30m)[0m
+   weekly                 [38;5;179m█████▍[0m[2;38;5;240m········[0m [38;5;179m 38%[0m left   [2mresets[0m Fri 7:24 AM [2m(in 2d 14h)[0m
+
+ [1m[38;5;71mClaude · personal[0m[2m  subscription[0m
+   5-hour                 [38;5;71m██████████████[0m [38;5;71m100%[0m left   [2mresets[0m 10:00 PM today [2m(in 5h 00m)[0m
+   weekly                 [38;5;71m████████████▌[0m[2;38;5;240m·[0m [38;5;71m 89%[0m left   [2mresets[0m Fri 9:48 PM [2m(in 3d 4h)[0m
+
+ [1m[38;5;179mCodex · ChatGPT[0m[2m  pro[0m
+   weekly                 [38;5;179m██████▎[0m[2;38;5;240m·······[0m [38;5;179m 45%[0m left   [2mresets[0m Sun 7:24 AM [2m(in 4d 14h)[0m
+
+ [1m[38;5;71mAntigravity[0m
+   Gemini weekly          [38;5;71m██████████▋[0m[2;38;5;240m···[0m [38;5;71m 76%[0m left   [2mresets[0m Thu 7:24 PM [2m(in 2d 2h)[0m
+   Gemini 5-hour          [38;5;71m████████████▊[0m[2;38;5;240m·[0m [38;5;71m 91%[0m left   [2mresets[0m 8:00 PM today [2m(in 3h 00m)[0m
+   Claude & GPT weekly    [2;38;5;240m··············[0m [31m   ☠[0m        [2mresets[0m Wed 2:36 AM [2m(in 9h 36m)[0m
+   Claude & GPT 5-hour    [2;38;5;240m··············[0m [31m   ☠[0m        [2munusable until the wk limit resets[0m
+
+ [1mWhere to spend next[0m  [2m(pts = weekly % left minus what even use would leave)[0m
+  1  Antigravity · Gemini               [38;5;71m +46 pts[0m   under-used, spend freely                     [36magy --model gemini:best[0m
+  2  Claude · personal                  [38;5;71m +43 pts[0m   under-used, spend freely                     [36mplaude[0m
+  3  Claude · work                      [2m  +1 pts[0m   on pace                                      [36mclaude[0m
+  4  Codex · ChatGPT                    [38;5;179m −21 pts[0m   ahead of pace, conserve                      [36mcodex[0m
+ [31m ✗[0m  Antigravity · Claude & GPT         [2m        [0m   out until Wed 2:36 AM (in 9h 36m)            [36magy --model claude:best[0m

@@ -21,6 +21,7 @@
     "node_modules/**",
     "project-words.txt",
     "tests/**",
+    "docs/images/**",
     "plugins/orchestrate/skills/orchestrate/scripts/mailbox_store.py",
     "pnpm-lock.yaml"
   ],

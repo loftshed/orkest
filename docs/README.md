@@ -5,6 +5,7 @@ Repository-wide architecture maps, operational guides, and design records:
 - **[ARCHITECTURE.md](ARCHITECTURE.md)** — Complete command glossary (`ork horde`, `ork hall`, `ork foundry`, `ork smelter`, `ork radar`, `ork gate`), deep-module map across Node.js and Python, and IDE IntelliSense setup (`jsconfig.json` / `pyrightconfig.json`).
 - **[terminal-ui.md](terminal-ui.md)** — Terminal UI design system: semantic ANSI palette (`tui-theme.mjs`), glyph tiers (`nerd`/`unicode`/`ascii`), connected rail vs. bubble layout rules, and inline preview containers.
 - **[tui-visual-testing.md](tui-visual-testing.md)** — Deterministic tmux ANSI/SVG visual comparison runner (`scripts/test-tui-visual.js`) and baseline workflow.
+- **[readme.md](readme.md)** — Which parts of the root README are generated (`corepack pnpm readme`), from what, and how the screenshots are drawn.
 - **[releases.md](releases.md)** — How conventional commits on `main` drive automatic per-plugin version bumps, changelogs, tags, and GitHub releases via `scripts/release.js`.
 - **Peer mailbox design records:**
   - **[mailbox-daemon-plan.md](mailbox-daemon-plan.md)** — Service contract and architecture for the shared loopback HTTP MCP mailbox daemon (`mailbox_daemon.py`).

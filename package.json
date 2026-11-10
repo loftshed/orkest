@@ -12,7 +12,8 @@
     "markdownlint": "markdownlint-cli2 \"**/*.md\"",
     "spell": "cspell \"**/*\" --no-progress",
     "test": "./scripts/test.sh",
-    "check": "./scripts/check.sh"
+    "check": "./scripts/check.sh",
+    "readme": "node scripts/readme.js"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.0",

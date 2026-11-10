@@ -14,6 +14,7 @@ Reference: [plugin marketplaces](https://code.claude.com/docs/en/plugin-marketpl
 corepack pnpm install   # dev tools, plus the git hooks
 corepack pnpm check     # the lint gate (scripts/check.sh); CI runs the same script
 corepack pnpm test      # Vitest for JavaScript, unittest for the orchestrate Python (scripts/test.sh)
+corepack pnpm readme    # regenerate the README's command lists and screenshots (scripts/readme.js)
 node scripts/release.js plan   # what the next release would publish
 ```
 
@@ -32,6 +33,7 @@ Both scripts call `./node_modules/.bin` directly, so they work without pnpm on P
 - **Plugin code is ESM `.mjs`** with Node built-ins only, because it runs from a copied cache with no `package.json` or `node_modules`. Repository tooling in `scripts/` is `.js`. When a script checks whether it is the entry point, compare real paths, since plugins are often started through symlinks.
 - **Let the gate decide style.** ESLint, Prettier, markdownlint, cspell, ruff and shellcheck run on commit and in CI. Fix what a rule reports instead of disabling it; an unavoidable inline disable carries a `-- reason`. New words go in [`project-words.txt`](project-words.txt).
 - **Plugin-relative paths** use `${CLAUDE_PLUGIN_ROOT}` or `${CLAUDE_SKILL_DIR}`, quoted wherever a shell expands them. The validator fails when one points at a missing file.
+- **Regenerate the README, don't hand-edit its generated parts.** The `<!-- generated:… -->` blocks and `docs/images/` come from the code; after changing an `ork` command, a slash command or the terminal UI, run `corepack pnpm readme` and commit the result. The gate fails while they are stale. Details: [docs/readme.md](docs/readme.md).
 - **Keep documentation short.** Say what the reader needs to do or know, once. Put gotchas under a Troubleshooting heading.
 - **Follow the TUI design system.** Terminal UI changes in `plugins/orchestrate/lib/tui-*.mjs` and `horde-view.mjs` follow [docs/terminal-ui.md](docs/terminal-ui.md) and can be visually compared with [docs/tui-visual-testing.md](docs/tui-visual-testing.md).
 
