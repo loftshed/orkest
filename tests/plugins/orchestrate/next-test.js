@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -15,6 +15,7 @@ import {
   releaseNextLock,
   writeNextLedger,
 } from "../../../plugins/orchestrate/lib/next.mjs";
+import { retainFixtures } from "../../helpers/retain-fixtures.js";
 
 const temporary = [];
 
@@ -26,7 +27,7 @@ async function makeTempDir(prefix = "ork-next-test-") {
 
 afterEach(async () => {
   process.exitCode = 0;
-  await Promise.all(temporary.splice(0).map((dir) => rm(dir, { force: true, recursive: true })));
+  await retainFixtures(temporary.splice(0));
 });
 
 async function createMockWorktree(
@@ -82,26 +83,28 @@ async function createMockWorktree(
 }
 
 describe("ork next lock, ledger, and repair spec builder", () => {
-  it("manages repo-scoped locks, recovers dead-PID stale locks, and persists bounded ledger history", async () => {
+  it("manages repo-scoped locks, releases dead holders, and persists bounded ledger history", async () => {
     const rootDir = await makeTempDir("ork-next-lock-");
     const repoRoot = path.join(rootDir, "repo");
     const cacheDir = path.join(rootDir, "cache");
     await mkdir(repoRoot, { recursive: true });
     const env = { ORCHESTRATE_HOME: cacheDir };
 
-    const lock1 = acquireNextLock(repoRoot, { env, pid: process.pid });
+    const lock1 = await acquireNextLock(repoRoot, { env });
     expect(lock1.acquired).toBe(true);
-    expect(() => acquireNextLock(repoRoot, { env, pid: process.pid })).toThrow(/already running/u);
-    releaseNextLock(lock1);
+    await expect(acquireNextLock(repoRoot, { env })).rejects.toThrow(/already running/u);
+    await releaseNextLock(lock1);
 
-    // Dead PID lock is automatically recovered:
-    const deadLock = acquireNextLock(repoRoot, { env, pid: 999_999_999 });
+    // Only the real holder's death releases ownership; PID metadata cannot reclaim it.
+    const deadLock = await acquireNextLock(repoRoot, { env });
     expect(deadLock.acquired).toBe(true);
-    const recoveredLock = acquireNextLock(repoRoot, { env, pid: process.pid });
+    process.kill(deadLock.pid, "SIGKILL");
+    await releaseNextLock(deadLock);
+    const recoveredLock = await acquireNextLock(repoRoot, { env });
     expect(recoveredLock.acquired).toBe(true);
-    releaseNextLock(recoveredLock);
+    await releaseNextLock(recoveredLock);
 
-    const updatedLedger = writeNextLedger(
+    const updatedLedger = await writeNextLedger(
       repoRoot,
       {
         historyEntry: {

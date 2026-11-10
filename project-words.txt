@@ -18,6 +18,7 @@ killpg
 kimi
 Löfstedt
 lofstpe
+lslocks
 lstart
 LSUI
 moonshotai
@@ -51,6 +52,8 @@ tcsh
 todoread
 todowrite
 udcff
+unleased
+unparseable
 unstarted
 unstub
 urandom

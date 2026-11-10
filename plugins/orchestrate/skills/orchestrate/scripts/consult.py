@@ -1240,10 +1240,11 @@ def _perform(
     credits_watch = None
     try:
         with contextlib.ExitStack() as stack:
+            lease = None
             if reading:
                 # Readers share the repository; a writer (an implementation run) holds it exclusively.
                 try:
-                    stack.enter_context(
+                    lease = stack.enter_context(
                         support.workspace_lease(workspace, runner.default_agent_cache_dir(), read_only=True)
                     )
                 except support.ContractError as exc:
@@ -1266,6 +1267,7 @@ def _perform(
                 stdout=stdout_handle,
                 stderr=stderr_handle,
                 start_new_session=True,
+                pass_fds=lease.descriptors if lease is not None else (),
             )
             # Visibility must never strand a launched provider before its wait/termination handlers.
             with contextlib.suppress(OSError):

@@ -958,7 +958,8 @@ def abandon(args: argparse.Namespace, directory: Path, state: dict[str, Any]) ->
             run.update(status="cancelled", abandoned=note, recovery="guard not running; nothing was audited")
     elif alive:
         # The runner stops its executor on these signals and exits, releasing the checkout's lease. It is
-        # never killed outright: its executor, in its own process group, would keep the lease.
+        # never killed outright: the executor inherits every lease descriptor and may keep
+        # the checkout leased until it and any inheriting descendants exit.
         sent = []
         for number in (signal.SIGINT, signal.SIGTERM):
             # Only the first signal is the commit point; the waits run outside the team lock.

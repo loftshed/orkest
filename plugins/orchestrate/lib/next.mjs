@@ -11,8 +11,17 @@
  * - Tier 2: Bounded Self-Repair (warm resume first, fresh fallback on crash) & Spare-Pool Foundry Dispatch
  */
 import { execFile, execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import {
+  closeSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+} from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs, promisify } from "node:util";
@@ -24,17 +33,22 @@ import {
   collectActiveWorktreeAllowPaths,
   commitVerifiedWorktreeChanges,
   countCommitsAhead,
+  createFoundryAttempt,
   DEFAULT_ROUTES,
   enforceScopedVerifyCommand,
+  foundryLauncherAlive,
   foundryRun,
   hasWorktreeDirtyChanges,
   loadFactoryPolicy,
+  loadFoundryState,
+  parseRunnerOutput,
   planBatch,
-  readFoundryState,
   resolveFoundryStatePath,
   resolveTaskSpecPath,
   resolveWorktreeGitDir,
   resolveWorktreeHeadSha,
+  runFoundryWorker,
+  updateFoundryAttempt,
   writeFoundryState,
 } from "./foundry.mjs";
 import { mailboxRoot, resolveWorktreeMarkerPath } from "./horde-room.mjs";
@@ -42,6 +56,7 @@ import { glyphSet, glyphTier, renderPanel, renderTable } from "./horde-view.mjs"
 import { observeRoom, recoverRoom } from "./rooms.mjs";
 import { cacheHome } from "./runtime-paths.mjs";
 import { alignCanonicalPath, classifyBlastRadius, smeltWorktree } from "./smelter.mjs";
+import { acquireWorkspaceLease, assertWorkspaceLease } from "./workspace-lease.mjs";
 
 const executeAsync = promisify(execFile);
 const scriptsDir = fileURLToPath(new URL("../skills/orchestrate/scripts/", import.meta.url));
@@ -78,16 +93,6 @@ function readJsonIfExists(filePath) {
   }
 }
 
-function isPidAlive(pid) {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return error.code === "EPERM";
-  }
-}
-
 export function resolveRepoKey(repoRoot = process.cwd()) {
   const canonical = alignCanonicalPath(repoRoot);
   const base =
@@ -103,60 +108,14 @@ export function resolveNextStateDir(repoRoot = process.cwd(), env = process.env)
   return path.join(cacheHome(env), "next-v1", resolveRepoKey(repoRoot));
 }
 
-export function acquireNextLock(
-  repoRoot = process.cwd(),
-  { env = process.env, pid = process.pid, staleMs = 15_000 } = {},
-) {
-  const stateDir = resolveNextStateDir(repoRoot, env);
-  mkdirSync(stateDir, { mode: 0o700, recursive: true });
-  const lockDir = path.join(stateDir, "next.lock");
-  const ownerFile = path.join(lockDir, "owner.json");
-
-  const tryCreate = () => {
-    mkdirSync(lockDir, { mode: 0o700 });
-    writeFileSync(
-      ownerFile,
-      `${JSON.stringify({ acquiredAt: new Date().toISOString(), pid }, null, 2)}\n`,
-    );
-    return { acquired: true, lockDir, ownerFile, pid, stateDir };
-  };
-
-  try {
-    return tryCreate();
-  } catch (error) {
-    if (error.code !== "EEXIST") throw error;
-  }
-
-  let isStale;
-  const owner = readJsonIfExists(ownerFile);
-  if (owner && Number.isSafeInteger(owner.pid)) {
-    isStale = !isPidAlive(owner.pid);
-  } else {
-    try {
-      const info = statSync(lockDir);
-      isStale = Date.now() - info.mtimeMs > staleMs;
-    } catch {
-      isStale = true;
-    }
-  }
-
-  if (isStale) {
-    rmSync(lockDir, { force: true, recursive: true });
-    return tryCreate();
-  }
-
-  throw new Error(
-    `ork next is already running for ${path.resolve(repoRoot)} (lock held by PID ${owner?.pid ?? "unknown"})`,
-  );
+export async function acquireNextLock(repoRoot = process.cwd(), { env = process.env } = {}) {
+  const lease = await acquireWorkspaceLease(repoRoot, { env, namespace: "next-locks" });
+  if (!lease.acquired) throw new Error(`ork next is already running for ${path.resolve(repoRoot)}`);
+  return lease;
 }
 
-export function releaseNextLock(lockInfo) {
-  if (!lockInfo?.lockDir) return;
-  try {
-    rmSync(lockInfo.lockDir, { force: true, recursive: true });
-  } catch {
-    /* Ignore lock cleanup errors. */
-  }
+export async function releaseNextLock(lockInfo) {
+  await lockInfo?.release();
 }
 
 export function readNextLedger(repoRoot = process.cwd(), { env = process.env } = {}) {
@@ -175,31 +134,56 @@ export function readNextLedger(repoRoot = process.cwd(), { env = process.env } =
   };
 }
 
-export function writeNextLedger(repoRoot = process.cwd(), patch = {}, { env = process.env } = {}) {
-  const stateDir = resolveNextStateDir(repoRoot, env);
-  mkdirSync(stateDir, { mode: 0o700, recursive: true });
-  const ledgerPath = path.join(stateDir, "next-ledger.json");
-  const existing = readNextLedger(repoRoot, { env });
-  const nowIso = new Date().toISOString();
-  const nextHistory = Array.isArray(patch.history)
-    ? patch.history.slice(-50)
-    : [
-        ...(existing.history || []),
-        ...(patch.historyEntry ? [{ executedAt: nowIso, ...patch.historyEntry }] : []),
-      ].slice(-50);
-  const nextWorktrees = {
-    ...existing.worktrees,
-    ...patch.worktrees,
-  };
-  const updated = {
-    history: nextHistory,
-    repoRoot: alignCanonicalPath(repoRoot),
-    schema: NEXT_LEDGER_SCHEMA,
-    updatedAt: patch.updatedAt || nowIso,
-    worktrees: nextWorktrees,
-  };
-  writeFileSync(ledgerPath, `${JSON.stringify(updated, null, 2)}\n`);
-  return updated;
+export async function writeNextLedger(
+  repoRoot = process.cwd(),
+  patch = {},
+  { env = process.env } = {},
+) {
+  const lease = await acquireWorkspaceLease(repoRoot, { env, namespace: "next-ledger" });
+  if (!lease.acquired) throw new Error("Next ledger is busy");
+  try {
+    assertWorkspaceLease(lease);
+    const stateDir = resolveNextStateDir(repoRoot, env);
+    mkdirSync(stateDir, { mode: 0o700, recursive: true });
+    const ledgerPath = path.join(stateDir, "next-ledger.json");
+    const existing = readNextLedger(repoRoot, { env });
+    const nowIso = new Date().toISOString();
+    const nextHistory = Array.isArray(patch.history)
+      ? patch.history.slice(-50)
+      : [
+          ...(existing.history || []),
+          ...(patch.historyEntry ? [{ executedAt: nowIso, ...patch.historyEntry }] : []),
+        ].slice(-50);
+    const nextWorktrees = {
+      ...existing.worktrees,
+      ...patch.worktrees,
+    };
+    const updated = {
+      history: nextHistory,
+      repoRoot: alignCanonicalPath(repoRoot),
+      schema: NEXT_LEDGER_SCHEMA,
+      updatedAt: patch.updatedAt || nowIso,
+      worktrees: nextWorktrees,
+    };
+    const temporaryPath = `${ledgerPath}.tmp-${randomUUID()}`;
+    const descriptor = openSync(temporaryPath, "wx", 0o600);
+    try {
+      writeFileSync(descriptor, `${JSON.stringify(updated, null, 2)}\n`);
+      fsyncSync(descriptor);
+    } finally {
+      closeSync(descriptor);
+    }
+    renameSync(temporaryPath, ledgerPath);
+    const directory = openSync(stateDir, "r");
+    try {
+      fsyncSync(directory);
+    } finally {
+      closeSync(directory);
+    }
+    return updated;
+  } finally {
+    await lease.release();
+  }
 }
 
 function parsePorcelainWorktrees(porcelainText) {
@@ -280,7 +264,9 @@ export function discoverManagedWorktrees(
       readJsonIfExists(path.join(gitDir, "task-spec.json")) ||
       readJsonIfExists(path.join(worktreePath, ".orkest-task-spec.json"));
     const foundryStatePath = resolveFoundryStatePath(worktreePath);
-    const foundryState = readFoundryState(worktreePath);
+    const loadedState = loadFoundryState(worktreePath);
+    const foundryState = loadedState.state;
+    const stateProblem = ["missing", "ok"].includes(loadedState.kind) ? null : loadedState;
 
     const counted = countCommitsAhead(worktreePath, targetBranch, { execFileSyncFn });
     const commitsAhead = counted.resolved
@@ -305,6 +291,7 @@ export function discoverManagedWorktrees(
       engine: marker.engine || taskSpec?.engine || foundryState?.lastRun?.engine || "codex",
       foundryState,
       foundryStatePath,
+      stateProblem,
       gitDir,
       head,
       isDirty: dirtyCheck.isDirty,
@@ -495,6 +482,7 @@ export async function evaluateNextCandidates({
   approve = null,
   cwd = process.cwd(),
   discoverWorktreesFn = discoverManagedWorktrees,
+  env = process.env,
   execFileSyncFn = execFileSync,
   execGhFn = null,
   getAccountsFn = null,
@@ -522,6 +510,7 @@ export async function evaluateNextCandidates({
   const tier1 = [];
   const tier2 = [];
   const tier3 = [];
+  const busy = [];
 
   if (observedRoom && Array.isArray(observedRoom.agents)) {
     const notRecovered = observedRoom.agents.filter(
@@ -556,7 +545,68 @@ export async function evaluateNextCandidates({
   }
 
   for (const wt of worktrees) {
-    const status = wt.foundryState?.status || null;
+    if (wt.stateProblem) {
+      tier3.push({
+        id: `tier3:state_unreadable:${wt.slug}`,
+        kind: "state_unreadable",
+        tier: 3,
+        target: wt.slug,
+        worktree: wt,
+        reason: wt.stateProblem.error,
+        summary: `Worktree ${wt.slug} has unreadable Foundry state (${wt.stateProblem.kind})`,
+      });
+      continue;
+    }
+    if (!wt.foundryState) continue; // Marker-only worktrees are unmanaged.
+    const probe = await acquireWorkspaceLease(wt.worktreePath, { env });
+    const isLeaseBusy = !probe.acquired;
+    await probe.release();
+    const status = wt.foundryState.status || null;
+    const launcherBusy =
+      ["launching", "running", "launch_uncertain"].includes(status) &&
+      foundryLauncherAlive(wt.foundryState);
+    if (
+      isLeaseBusy ||
+      (["launching", "running"].includes(status) && launcherBusy) ||
+      (status === "launch_uncertain" && matchesApproveTarget(wt, approve) && launcherBusy)
+    ) {
+      busy.push({
+        id: `busy:${wt.slug}`,
+        kind: "busy",
+        target: wt.slug,
+        tier: null,
+        summary: `Worktree ${wt.slug} is busy`,
+        worktree: wt,
+      });
+      continue;
+    }
+    if (
+      ["launching", "running"].includes(status) ||
+      (status === "launch_uncertain" && matchesApproveTarget(wt, approve))
+    ) {
+      const kind =
+        status === "launch_uncertain" ? "approve_launch_uncertain" : "settle_launch_uncertain";
+      tier0.push({
+        id: `tier0:${kind}:${wt.slug}`,
+        kind,
+        target: wt.slug,
+        tier: 0,
+        summary: `${kind} ${wt.slug}`,
+        worktree: wt,
+      });
+      continue;
+    }
+    if (status === "launch_uncertain") {
+      tier3.push({
+        id: `tier3:launch_uncertain:${wt.slug}`,
+        kind: "launch_uncertain",
+        tier: 3,
+        target: wt.slug,
+        worktree: wt,
+        summary: `Launch outcome uncertain for ${wt.slug}; resolve with --approve ${wt.slug}`,
+      });
+      continue;
+    }
 
     if (status === "abandoned") continue;
 
@@ -782,9 +832,10 @@ export async function evaluateNextCandidates({
     }
   }
 
-  const candidates = [...tier0, ...tier3, ...tier1, ...tier2];
+  const candidates = [...tier0, ...tier3, ...tier1, ...tier2, ...busy];
   return {
     candidates,
+    busy,
     tier0,
     tier1,
     tier2,
@@ -814,22 +865,25 @@ async function defaultExecVerify(command, { cwd = process.cwd() } = {}) {
   }
 }
 
-async function defaultExecAgent(args, { cwd = process.cwd() } = {}) {
-  const script = path.join(scriptsDir, "run_agent.py");
-  const { stdout } = await executeAsync("python3", [script, ...args], {
-    cwd,
-    maxBuffer: 32 * 1024 * 1024,
-    timeout: 600_000,
-  });
-  const trimmed = String(stdout ?? "").trim();
-  if (trimmed.startsWith("{")) {
-    try {
-      return JSON.parse(trimmed);
-    } catch {
-      return { raw: trimmed, status: "completed" };
-    }
+async function defaultExecAgent(
+  args,
+  {
+    cwd = process.cwd(),
+    env = process.env,
+    runnerScriptPath = path.join(scriptsDir, "run_agent.py"),
+  } = {},
+) {
+  try {
+    const { stdout } = await executeAsync("python3", [runnerScriptPath, ...args], {
+      cwd,
+      env,
+      maxBuffer: 32 * 1024 * 1024,
+    });
+    return parseRunnerOutput(stdout);
+  } catch (error) {
+    if (typeof error.code !== "number" || error.signal || error.killed) throw error;
+    return parseRunnerOutput(error.stdout, { exitCode: error.code });
   }
-  return { raw: trimmed, status: "completed" };
 }
 
 function sendHerdrApprovalNotification(title, body, { env = process.env, execFileSyncFn } = {}) {
@@ -851,7 +905,129 @@ function sendHerdrApprovalNotification(title, body, { env = process.env, execFil
   }
 }
 
-async function executeTier0Action(
+function refreshWorktree(wt, { execFileSyncFn = execFileSync, targetBranch = "main" } = {}) {
+  const loaded = loadFoundryState(wt.worktreePath);
+  if (loaded.kind !== "ok")
+    return { status: loaded.kind === "missing" ? "unmanaged" : "state_unreadable" };
+  const counted = countCommitsAhead(wt.worktreePath, targetBranch, { execFileSyncFn });
+  const dirty = hasWorktreeDirtyChanges(wt.worktreePath, { execFileSyncFn });
+  return {
+    worktree: {
+      ...wt,
+      foundryState: loaded.state,
+      head: resolveWorktreeHeadSha(wt.worktreePath, { execFileSyncFn }),
+      commitsAhead: counted.resolved ? counted.commitsAhead : wt.commitsAhead,
+      isDirty: dirty.isDirty,
+    },
+  };
+}
+
+async function executeTier0Action(action, options = {}) {
+  if (!action.worktree) return executeTier0Held(action, options);
+  const lease = await acquireWorkspaceLease(action.worktree.worktreePath, { env: options.env });
+  if (!lease.acquired) return { action, ok: false, status: "busy" };
+  try {
+    assertWorkspaceLease(lease);
+    const fresh = refreshWorktree(action.worktree, options);
+    if (!fresh.worktree) return { action, ok: false, status: fresh.status };
+    const wt = fresh.worktree;
+    const state = wt.foundryState;
+    if (["approve_launch_uncertain", "settle_launch_uncertain"].includes(action.kind)) {
+      if (foundryLauncherAlive(state)) return { action, ok: false, status: "busy" };
+      const isApproving = action.kind === "approve_launch_uncertain";
+      if (
+        isApproving
+          ? state.status !== "launch_uncertain"
+          : !["launching", "running"].includes(state.status)
+      ) {
+        return { action, ok: false, status: "stale" };
+      }
+      const status = isApproving ? "worker_failed" : "launch_uncertain";
+      const updated = writeFoundryState(wt.worktreePath, {
+        ...updateFoundryAttempt(state, {
+          status: isApproving ? "failed" : "uncertain",
+          error: isApproving
+            ? "Launch uncertainty resolved by human approval"
+            : "Launcher exited without a usable result",
+        }),
+        status,
+      });
+      return { action, ok: true, status, foundryState: updated };
+    }
+    let isStillEligible = false;
+    switch (action.kind) {
+      case "prune_merged_worktree": {
+        isStillEligible = state.status === "merged";
+        break;
+      }
+      case "escalate_exhausted_worktree": {
+        isStillEligible =
+          REPAIRABLE_STATES.has(state.status) && state.attemptCount >= state.maxAttempts;
+        break;
+      }
+      case "reconcile_worktree_verify": {
+        {
+          isStillEligible = !state.status;
+          // No default
+        }
+        break;
+      }
+    }
+    if (!isStillEligible) return { action, ok: false, status: "stale" };
+    return await executeTier0Held(
+      { ...action, worktree: wt },
+      { ...options, workspaceLease: lease },
+    );
+  } finally {
+    await lease.release();
+  }
+}
+
+async function claimPrimaryAction(action, options) {
+  if (action.kind === "dispatch_foundry") {
+    const leases = [];
+    const matches = action.batch || [];
+    for (const match of matches) {
+      const lease = await acquireWorkspaceLease(
+        path.join(options.cwd, `issue-${match.issue.number}`),
+        { env: options.env, namespace: "next-dispatch" },
+      );
+      if (!lease.acquired) {
+        await Promise.all(leases.map((held) => held.release()));
+        return { status: "busy" };
+      }
+      leases.push(lease);
+    }
+    return { action: { ...action, dispatchLeases: leases } };
+  }
+  const lease = await acquireWorkspaceLease(action.worktree.worktreePath, { env: options.env });
+  if (!lease.acquired) return { status: "busy" };
+  let isRetained = false;
+  try {
+    assertWorkspaceLease(lease);
+    const fresh = refreshWorktree(action.worktree, options);
+    if (!fresh.worktree) return fresh;
+    const wt = fresh.worktree;
+    const state = wt.foundryState;
+    if (state.status !== action.worktree.foundryState.status) return { status: "stale" };
+    if (action.kind === "repair_worktree") {
+      if (!REPAIRABLE_STATES.has(state.status) || state.attemptCount >= state.maxAttempts)
+        return { status: "stale" };
+      const repairSpec = buildRepairDispatchSpec(wt, state);
+      const launchingState = writeFoundryState(wt.worktreePath, {
+        ...createFoundryAttempt(state, { intent: "repair", route: repairSpec }),
+        status: "launching",
+      });
+      return { action: { ...action, worktree: wt, repairSpec, launchingState } };
+    }
+    isRetained = true;
+    return { action: { ...action, worktree: wt, claimLease: lease } };
+  } finally {
+    if (!isRetained) await lease.release();
+  }
+}
+
+async function executeTier0Held(
   action,
   {
     cwd = process.cwd(),
@@ -859,12 +1035,13 @@ async function executeTier0Action(
     execFileSyncFn = execFileSync,
     execVerifyFn = defaultExecVerify,
     recoverRoomFn = recoverRoom,
+    workspaceLease,
     targetBranch = "main",
   } = {},
 ) {
   if (action.kind === "recover_room") {
     await recoverRoomFn(action.roomId, { root: mailboxRoot(env) });
-    writeNextLedger(
+    await writeNextLedger(
       cwd,
       {
         historyEntry: {
@@ -890,7 +1067,7 @@ async function executeTier0Action(
       status: "needs_human",
       targetBranch,
     });
-    writeNextLedger(
+    await writeNextLedger(
       cwd,
       {
         historyEntry: {
@@ -931,7 +1108,7 @@ async function executeTier0Action(
         /* Branch may already be deleted. */
       }
     }
-    writeNextLedger(
+    await writeNextLedger(
       cwd,
       {
         historyEntry: {
@@ -963,6 +1140,7 @@ async function executeTier0Action(
       cwd: wt.worktreePath,
       issue: wt.issue,
     });
+    assertWorkspaceLease(workspaceLease);
     const isVerifyOk =
       typeof verifyRes?.ok === "boolean" ? verifyRes.ok : (verifyRes?.exitCode ?? 1) === 0;
     let commitsAhead = wt.commitsAhead;
@@ -994,7 +1172,7 @@ async function executeTier0Action(
       },
       verifyCommand: normalizedVerify,
     });
-    writeNextLedger(
+    await writeNextLedger(
       cwd,
       {
         historyEntry: {
@@ -1038,6 +1216,7 @@ async function executePrimaryAction(
     policy,
     provisionWorktreeFn,
     reviewRunner,
+    runnerScriptPath,
     smeltWorktreeFn = smeltWorktree,
     stdout = process.stdout,
     targetBranch = "main",
@@ -1048,6 +1227,8 @@ async function executePrimaryAction(
     try {
       const smeltRes = await smeltWorktreeFn(wt, {
         approveHighBlast: Boolean(action.approveHighBlast),
+        env,
+        workspaceLease: action.claimLease,
         cwd,
         execFileSyncFn,
         gateRunner,
@@ -1055,7 +1236,7 @@ async function executePrimaryAction(
         targetBranch,
       });
       const finalStatus = smeltRes.status || (smeltRes.ok ? "merged" : "failed");
-      writeNextLedger(
+      await writeNextLedger(
         cwd,
         {
           historyEntry: {
@@ -1104,9 +1285,13 @@ async function executePrimaryAction(
         status: finalStatus,
       };
     } catch (error) {
-      const updatedState = readFoundryState(wt.worktreePath);
-      const failureStatus = updatedState?.status || "smelt_failed";
-      writeNextLedger(
+      const loadedState = loadFoundryState(wt.worktreePath);
+      const updatedState = loadedState.state;
+      const stateProblem = ["missing", "ok"].includes(loadedState.kind) ? null : loadedState;
+      const failureStatus = stateProblem
+        ? "state_unreadable"
+        : updatedState?.status || "smelt_failed";
+      await writeNextLedger(
         cwd,
         {
           historyEntry: {
@@ -1120,7 +1305,7 @@ async function executePrimaryAction(
           },
           worktrees: {
             [wt.slug]: {
-              attemptCount: updatedState?.attemptCount ?? 1,
+              attemptCount: updatedState?.attemptCount ?? wt.foundryState?.attemptCount ?? 1,
               lastAction: action.kind,
               status: failureStatus,
               updatedAt: new Date().toISOString(),
@@ -1129,7 +1314,7 @@ async function executePrimaryAction(
         },
         { env },
       );
-      if (["rebase_conflict", "scope_violated"].includes(failureStatus)) {
+      if (["rebase_conflict", "scope_violated", "state_unreadable"].includes(failureStatus)) {
         if (typeof notifyFn === "function") {
           notifyFn(`Orkest: ${wt.slug} ${failureStatus}`, error?.message || action.summary);
         } else {
@@ -1154,184 +1339,197 @@ async function executePrimaryAction(
         ok: false,
         status: failureStatus,
       };
+    } finally {
+      await action.claimLease?.release();
     }
   }
 
   if (action.kind === "repair_worktree") {
     const wt = action.worktree;
     const repairSpec = action.repairSpec || buildRepairDispatchSpec(wt, wt.foundryState);
-    const nextAttempt = (wt.foundryState?.attemptCount ?? 1) + 1;
-    const maxAttempts = wt.foundryState?.maxAttempts ?? 2;
-    let agentResult;
-    try {
-      agentResult = await execAgentFn(repairSpec.args, {
-        cwd: wt.worktreePath,
-        repairSpec,
-        worktree: wt,
-      });
-    } catch (error) {
-      agentResult = { error: error?.message || String(error), ok: false, status: "failed" };
-    }
-
-    const rawAgentStatus = String(
-      agentResult?.status ?? (agentResult?.ok === false ? "failed" : "completed"),
-    )
-      .trim()
-      .toLowerCase();
-    const didRepairBuilderSucceed =
-      (rawAgentStatus === "completed" || rawAgentStatus === "complete") &&
-      agentResult?.ok !== false;
-
-    const dirtyCheck =
-      typeof agentResult?.dirty === "boolean"
-        ? { isDirty: agentResult.dirty, resolved: true }
-        : hasWorktreeDirtyChanges(wt.worktreePath, { execFileSyncFn });
-    const counted = countCommitsAhead(wt.worktreePath, targetBranch, { execFileSyncFn });
-    let commitsAhead;
-    if (typeof agentResult?.commitsAhead === "number") {
-      commitsAhead = agentResult.commitsAhead;
-    } else if (counted.resolved) {
-      commitsAhead = counted.commitsAhead;
-    } else {
-      commitsAhead = Math.max(1, wt.commitsAhead || 1);
-    }
-    const hasChanges = commitsAhead > 0 || dirtyCheck.isDirty;
-
-    let isVerifyOk = false;
-    let verifyOutput = "";
-    let verifyExitCode = 1;
-    if (didRepairBuilderSucceed && hasChanges) {
-      const verifyRes = await execVerifyFn(repairSpec.verifyCommand, {
-        cwd: wt.worktreePath,
-        issue: wt.issue,
-      });
-      if (typeof verifyRes?.exitCode === "number") {
-        verifyExitCode = verifyRes.exitCode;
-      } else {
-        verifyExitCode = verifyRes?.ok === false ? 1 : 0;
-      }
-      isVerifyOk = typeof verifyRes?.ok === "boolean" ? verifyRes.ok : verifyExitCode === 0;
-      verifyOutput = typeof verifyRes?.output === "string" ? verifyRes.output : "";
-      if (isVerifyOk && dirtyCheck.isDirty) {
-        try {
-          commitVerifiedWorktreeChanges(wt.worktreePath, wt.issue, { execFileSyncFn });
-          const recounted = countCommitsAhead(wt.worktreePath, targetBranch, { execFileSyncFn });
-          commitsAhead = recounted.resolved ? recounted.commitsAhead : Math.max(1, commitsAhead);
-        } catch {
-          commitsAhead = Math.max(1, commitsAhead);
-        }
-      }
-    }
-
-    let finalStatus = "verified";
-    if (!isVerifyOk) {
-      finalStatus = nextAttempt >= maxAttempts ? "needs_human" : "verification_failed";
-    }
-
-    const newState = writeFoundryState(wt.worktreePath, {
-      attemptCount: nextAttempt,
-      commitsAhead,
-      headSha:
-        agentResult?.headSha ??
-        agentResult?.head_sha ??
-        resolveWorktreeHeadSha(wt.worktreePath, { execFileSyncFn }) ??
-        wt.head,
-      lastRepair: {
-        attemptNumber: nextAttempt,
-        engine: repairSpec.engine,
-        mode: repairSpec.mode,
-        model: repairSpec.model,
-        repairedAt: new Date().toISOString(),
-        status: finalStatus,
-      },
-      lastRun: {
-        engine: repairSpec.engine,
-        model: repairSpec.model,
-        resultPath:
-          agentResult?.result_path ??
-          agentResult?.resultPath ??
-          wt.foundryState?.lastRun?.resultPath ??
-          null,
-        sessionId:
-          agentResult?.session_id ??
-          agentResult?.sessionId ??
-          wt.foundryState?.lastRun?.sessionId ??
-          null,
-        status: rawAgentStatus,
-      },
-      maxAttempts,
-      ...(finalStatus === "needs_human" && {
-        reason: `Exhausted ${nextAttempt}/${maxAttempts} attempts (repair failed)`,
-      }),
-      status: finalStatus,
-      targetBranch,
-      verification: {
-        command: repairSpec.verifyCommand,
-        exitCode: verifyExitCode,
-        ok: isVerifyOk,
-        output: verifyOutput,
-        status: isVerifyOk ? "passed" : "failed",
-        verifiedAt: new Date().toISOString(),
-      },
+    const nextAttempt = action.launchingState.attemptCount;
+    const maxAttempts = action.launchingState.maxAttempts;
+    const { agentResult, outcome } = await runFoundryWorker(execAgentFn, repairSpec.args, {
+      cwd: wt.worktreePath,
+      env,
+      repairSpec,
+      runnerScriptPath,
+      worktree: wt,
     });
-
-    writeNextLedger(
-      cwd,
-      {
-        historyEntry: {
-          actionId: action.id,
-          attemptCount: nextAttempt,
-          kind: action.kind,
-          repairMode: repairSpec.mode,
-          status: finalStatus,
-          summary: action.summary,
-          target: wt.slug,
-          tier: 2,
-        },
-        worktrees: {
-          [wt.slug]: {
-            attemptCount: nextAttempt,
-            lastAction: action.kind,
-            repairMode: repairSpec.mode,
-            status: finalStatus,
-            updatedAt: newState.updatedAt,
-          },
-        },
-      },
-      { env },
-    );
-
-    if (finalStatus === "needs_human") {
-      if (typeof notifyFn === "function") {
-        notifyFn(
-          `Orkest: ${wt.slug} needs human review`,
-          `Exhausted ${nextAttempt}/${maxAttempts} repair attempts`,
-        );
-      } else {
-        sendHerdrApprovalNotification(
-          `Orkest: ${wt.slug} needs human review`,
-          `Exhausted ${nextAttempt}/${maxAttempts} repair attempts`,
-          { env, execFileSyncFn },
-        );
-      }
+    const finalLease =
+      outcome === "busy" ? null : await acquireWorkspaceLease(wt.worktreePath, { env });
+    if (!finalLease?.acquired)
       return {
         action,
-        exitCode: EXIT_HUMAN_APPROVAL,
-        foundryState: newState,
         ok: false,
-        repairSpec,
-        status: "needs_human",
+        exitCode: 1,
+        status: "busy",
+        error: `Workspace lease busy after repair: ${wt.worktreePath}`,
       };
-    }
+    try {
+      assertWorkspaceLease(finalLease);
+      const current = loadFoundryState(wt.worktreePath);
+      if (current.kind !== "ok")
+        return {
+          action,
+          ok: false,
+          exitCode: 1,
+          status: current.kind === "missing" ? "unmanaged" : "state_unreadable",
+        };
+      if (current.state.attempt?.id !== action.launchingState.attempt.id) {
+        return { action, ok: false, exitCode: 1, status: "stale" };
+      }
+      const rawAgentStatus = agentResult?.status || outcome;
+      const didRepairBuilderSucceed = outcome === "finished";
 
-    return {
-      action,
-      exitCode: isVerifyOk ? 0 : 1,
-      foundryState: newState,
-      ok: isVerifyOk,
-      repairSpec,
-      status: finalStatus,
-    };
+      const dirtyCheck = hasWorktreeDirtyChanges(wt.worktreePath, { execFileSyncFn });
+      const counted = countCommitsAhead(wt.worktreePath, targetBranch, { execFileSyncFn });
+      let commitsAhead = counted.commitsAhead;
+      const hasChanges = commitsAhead > 0 || dirtyCheck.isDirty;
+
+      let isVerifyOk = false;
+      let verifyOutput = "";
+      let verifyExitCode = 1;
+      if (didRepairBuilderSucceed && hasChanges) {
+        const verifyRes = await execVerifyFn(repairSpec.verifyCommand, {
+          cwd: wt.worktreePath,
+          issue: wt.issue,
+        });
+        assertWorkspaceLease(finalLease);
+        if (typeof verifyRes?.exitCode === "number") {
+          verifyExitCode = verifyRes.exitCode;
+        } else {
+          verifyExitCode = verifyRes?.ok === false ? 1 : 0;
+        }
+        isVerifyOk = typeof verifyRes?.ok === "boolean" ? verifyRes.ok : verifyExitCode === 0;
+        verifyOutput = typeof verifyRes?.output === "string" ? verifyRes.output : "";
+        if (isVerifyOk && dirtyCheck.isDirty) {
+          try {
+            commitVerifiedWorktreeChanges(wt.worktreePath, wt.issue, { execFileSyncFn });
+            const recounted = countCommitsAhead(wt.worktreePath, targetBranch, { execFileSyncFn });
+            commitsAhead = recounted.resolved ? recounted.commitsAhead : Math.max(1, commitsAhead);
+          } catch {
+            commitsAhead = Math.max(1, commitsAhead);
+          }
+        }
+      }
+
+      let finalStatus = "verified";
+      if (outcome === "uncertain") finalStatus = "launch_uncertain";
+      else if (!isVerifyOk) {
+        finalStatus = didRepairBuilderSucceed ? "verification_failed" : "worker_failed";
+        if (nextAttempt >= maxAttempts) finalStatus = "needs_human";
+      }
+
+      assertWorkspaceLease(finalLease);
+      const newState = writeFoundryState(wt.worktreePath, {
+        ...updateFoundryAttempt(current.state, {
+          status: outcome,
+          error:
+            agentResult?.error ||
+            (outcome === "uncertain" ? "Runner result unavailable or ambiguous" : null),
+        }),
+        commitsAhead,
+        headSha: resolveWorktreeHeadSha(wt.worktreePath, { execFileSyncFn }),
+        lastRepair: {
+          attemptNumber: nextAttempt,
+          engine: repairSpec.engine,
+          mode: repairSpec.mode,
+          model: repairSpec.model,
+          repairedAt: new Date().toISOString(),
+          status: finalStatus,
+        },
+        lastRun: {
+          engine: repairSpec.engine,
+          model: repairSpec.model,
+          resultPath:
+            agentResult?.result_path ??
+            agentResult?.resultPath ??
+            wt.foundryState?.lastRun?.resultPath ??
+            null,
+          sessionId:
+            agentResult?.session_id ??
+            agentResult?.sessionId ??
+            wt.foundryState?.lastRun?.sessionId ??
+            null,
+          status: rawAgentStatus,
+        },
+        maxAttempts,
+        ...(finalStatus === "needs_human" && {
+          reason: `Exhausted ${nextAttempt}/${maxAttempts} attempts (repair failed)`,
+        }),
+        status: finalStatus,
+        targetBranch,
+        verification: {
+          command: repairSpec.verifyCommand,
+          exitCode: verifyExitCode,
+          ok: isVerifyOk,
+          output: verifyOutput,
+          status: isVerifyOk ? "passed" : "failed",
+          verifiedAt: new Date().toISOString(),
+        },
+      });
+
+      await writeNextLedger(
+        cwd,
+        {
+          historyEntry: {
+            actionId: action.id,
+            attemptCount: nextAttempt,
+            kind: action.kind,
+            repairMode: repairSpec.mode,
+            status: finalStatus,
+            summary: action.summary,
+            target: wt.slug,
+            tier: 2,
+          },
+          worktrees: {
+            [wt.slug]: {
+              attemptCount: nextAttempt,
+              lastAction: action.kind,
+              repairMode: repairSpec.mode,
+              status: finalStatus,
+              updatedAt: newState.updatedAt,
+            },
+          },
+        },
+        { env },
+      );
+
+      if (finalStatus === "needs_human") {
+        if (typeof notifyFn === "function") {
+          notifyFn(
+            `Orkest: ${wt.slug} needs human review`,
+            `Exhausted ${nextAttempt}/${maxAttempts} repair attempts`,
+          );
+        } else {
+          sendHerdrApprovalNotification(
+            `Orkest: ${wt.slug} needs human review`,
+            `Exhausted ${nextAttempt}/${maxAttempts} repair attempts`,
+            { env, execFileSyncFn },
+          );
+        }
+        return {
+          action,
+          exitCode: EXIT_HUMAN_APPROVAL,
+          foundryState: newState,
+          ok: false,
+          repairSpec,
+          status: "needs_human",
+        };
+      }
+
+      return {
+        action,
+        exitCode: isVerifyOk ? 0 : 1,
+        foundryState: newState,
+        ok: isVerifyOk,
+        repairSpec,
+        status: finalStatus,
+      };
+    } finally {
+      await finalLease.release();
+    }
   }
 
   if (action.kind === "dispatch_foundry") {
@@ -1340,6 +1538,7 @@ async function executePrimaryAction(
     const dispatchOne = async (match) =>
       foundryRun(["--issue", String(match.issue.number), "--json"], {
         cwd,
+        env,
         execAgentFn,
         execFileSyncFn,
         execGhFn:
@@ -1353,18 +1552,27 @@ async function executePrimaryAction(
         getAccountsFn,
         policy,
         provisionWorktreeFn,
+        runnerScriptPath,
         stdout: silenceStdout,
         targetBranch,
       });
 
-    const dispatchedResults = action.parallelExpiring
-      ? await Promise.all(matches.map((match) => dispatchOne(match)))
-      : [await dispatchOne(matches[0])];
+    let dispatchedResults;
+    try {
+      const settled = await Promise.allSettled(matches.map((match) => dispatchOne(match)));
+      const failed = settled.find((result) => result.status === "rejected");
+      if (failed) throw failed.reason;
+      dispatchedResults = settled
+        .filter((result) => result.status === "fulfilled")
+        .map((result) => result.value);
+    } finally {
+      await Promise.all((action.dispatchLeases || []).map((lease) => lease.release()));
+    }
 
     const didAllVerify = dispatchedResults.every((res) => res?.status === "verified");
     const finalStatus = didAllVerify ? "verified" : dispatchedResults[0]?.status || "dispatched";
 
-    writeNextLedger(
+    await writeNextLedger(
       cwd,
       {
         historyEntry: {
@@ -1391,6 +1599,12 @@ async function executePrimaryAction(
   }
 
   return { action, exitCode: 0, ok: true, status: "noop" };
+}
+
+function settlementStatus(evaluated, settledActions) {
+  if (evaluated.busy.length > 0 || settledActions.some((action) => action.outcome === "busy"))
+    return "busy";
+  return settledActions.length > 0 ? "settled" : "noop";
 }
 
 function renderNextPanel(payload, width, options = {}) {
@@ -1440,6 +1654,7 @@ export async function nextCommand(
     recoverRoomFn = recoverRoom,
     reviewRunner,
     room,
+    runnerScriptPath,
     smeltWorktreeFn = smeltWorktree,
     stdout = process.stdout,
     targetBranch: defaultTargetBranch = "main",
@@ -1497,6 +1712,9 @@ export async function nextCommand(
     if (!candidate || typeof candidate !== "object") return null;
     const copy = { ...candidate };
     delete copy.worktree;
+    delete copy.claimLease;
+    delete copy.dispatchLeases;
+    delete copy.launchingState;
     return copy;
   };
 
@@ -1513,6 +1731,7 @@ export async function nextCommand(
       approve: values.approve || null,
       cwd: effectiveCwd,
       discoverWorktreesFn,
+      env,
       execFileSyncFn,
       execGhFn,
       getAccountsFn,
@@ -1549,7 +1768,8 @@ export async function nextCommand(
         issue: wt.issue,
         path: wt.path,
         slug: wt.slug,
-        status: wt.foundryState?.status || "notIndexed",
+        stateProblem: wt.stateProblem ?? null,
+        status: wt.stateProblem ? "state_unreadable" : wt.foundryState?.status || "unmanaged",
       })),
     };
     if (values.json) {
@@ -1566,13 +1786,14 @@ export async function nextCommand(
   }
 
   const runSingleStep = async () => {
-    const lock = isDryRun ? null : acquireNextLock(effectiveCwd, { env });
+    const lock = isDryRun ? null : await acquireNextLock(effectiveCwd, { env });
     try {
       const settledActions = [];
       let evaluated = await evaluateNextCandidates({
         approve: values.approve || null,
         cwd: effectiveCwd,
         discoverWorktreesFn,
+        env,
         execFileSyncFn,
         execGhFn,
         getAccountsFn,
@@ -1587,6 +1808,7 @@ export async function nextCommand(
 
       if (!isDryRun && evaluated.tier0.length > 0) {
         for (const t0 of evaluated.tier0) {
+          assertWorkspaceLease(lock);
           const settled = await executeTier0Action(t0, {
             cwd: effectiveCwd,
             env,
@@ -1601,6 +1823,7 @@ export async function nextCommand(
           approve: values.approve || null,
           cwd: effectiveCwd,
           discoverWorktreesFn,
+          env,
           execFileSyncFn,
           execGhFn,
           getAccountsFn,
@@ -1626,7 +1849,7 @@ export async function nextCommand(
           ok: true,
           schema: NEXT_SCHEMA,
           settledActions,
-          status: settledActions.length > 0 ? "settled" : "noop",
+          status: settlementStatus(evaluated, settledActions),
           targetBranch,
         };
       }
@@ -1682,7 +1905,7 @@ export async function nextCommand(
           ok: true,
           schema: NEXT_SCHEMA,
           settledActions,
-          status: settledActions.length > 0 ? "settled" : "noop",
+          status: settlementStatus(evaluated, settledActions),
           targetBranch,
         };
       }
@@ -1705,7 +1928,25 @@ export async function nextCommand(
         };
       }
 
-      const execution = await executePrimaryAction(primaryCandidate, {
+      assertWorkspaceLease(lock);
+      const claim = await claimPrimaryAction(primaryCandidate, {
+        cwd: effectiveCwd,
+        env,
+        execFileSyncFn,
+        targetBranch,
+      });
+      await releaseNextLock(lock);
+      if (!claim.action)
+        return {
+          schema: NEXT_SCHEMA,
+          mode,
+          ok: false,
+          exitCode: 1,
+          status: claim.status,
+          settledActions,
+          executedAction: cleanPrimary,
+        };
+      const execution = await executePrimaryAction(claim.action, {
         cwd: effectiveCwd,
         env,
         execAgentFn,
@@ -1719,6 +1960,7 @@ export async function nextCommand(
         policy,
         provisionWorktreeFn,
         reviewRunner,
+        runnerScriptPath,
         smeltWorktreeFn,
         stdout,
         targetBranch,
@@ -1726,6 +1968,8 @@ export async function nextCommand(
 
       if (execution.exitCode === EXIT_HUMAN_APPROVAL) {
         process.exitCode = EXIT_HUMAN_APPROVAL;
+      } else if (execution.status === "busy") {
+        process.exitCode = execution.exitCode || 1;
       }
 
       return {
@@ -1749,7 +1993,7 @@ export async function nextCommand(
         targetBranch,
       };
     } finally {
-      if (lock) releaseNextLock(lock);
+      if (lock) await releaseNextLock(lock);
     }
   };
 

@@ -8,8 +8,19 @@
  * bounded worker runs.
  */
 import { execFile, execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import {
+  closeSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+} from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { hostname } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs, promisify } from "node:util";
@@ -20,6 +31,7 @@ import { getAccounts } from "../../monitor/lib/store.mjs";
 import { resolveWorktreeMarkerPath } from "./horde-room.mjs";
 import { glyphSet, glyphTier, renderPanel, renderTable, wrapText } from "./horde-view.mjs";
 import { cacheHome, configPath, envFirst } from "./runtime-paths.mjs";
+import { acquireWorkspaceLease, assertWorkspaceLease } from "./workspace-lease.mjs";
 import { bootstrapWorktreeInclude as bootstrapWorktreeIncludeShared } from "./worktree-env.mjs";
 
 const execute = promisify(execFile);
@@ -740,26 +752,97 @@ export function resolveFoundryStatePath(worktreePath) {
   return path.join(resolveWorktreeGitDir(worktreePath), "orkest", "foundry-state.json");
 }
 
-export function readFoundryState(worktreePath) {
-  if (!worktreePath) return null;
-  const statePath = resolveFoundryStatePath(worktreePath);
-  if (!existsSync(statePath)) return null;
-  try {
-    return JSON.parse(readFileSync(statePath, "utf8"));
-  } catch {
-    return null;
+export class FoundryStateError extends Error {
+  constructor(problem, preservedPath = null) {
+    super(`Foundry state ${problem.kind}: ${problem.path}: ${problem.error}`);
+    this.name = "FoundryStateError";
+    this.kind = problem.kind;
+    this.path = problem.path;
+    this.preservedPath = preservedPath;
   }
+}
+
+export function loadFoundryState(worktreePath) {
+  const statePath = resolveFoundryStatePath(worktreePath);
+  const result = { kind: "missing", state: null, path: statePath, error: null };
+  let bytes;
+  try {
+    bytes = readFileSync(statePath);
+  } catch (error) {
+    if (error.code === "ENOENT") return result;
+    return { ...result, kind: "corrupt", error: error.message };
+  }
+  let state;
+  try {
+    state = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+  } catch (error) {
+    return { ...result, kind: "corrupt", error: error.message };
+  }
+  if (
+    !state ||
+    typeof state !== "object" ||
+    Array.isArray(state) ||
+    (Object.hasOwn(state, "schema") &&
+      !["ork.foundry.state.v1", FOUNDRY_STATE_SCHEMA].includes(state.schema))
+  ) {
+    return {
+      ...result,
+      kind: "unsupported",
+      error: "Unknown Foundry state schema or non-object state",
+    };
+  }
+  return { ...result, kind: "ok", state };
+}
+
+export function readFoundryState(worktreePath) {
+  const loaded = loadFoundryState(worktreePath);
+  if (loaded.kind === "missing") return null;
+  if (loaded.kind !== "ok") throw new FoundryStateError(loaded);
+  return loaded.state;
+}
+
+function syncDirectory(directory) {
+  const descriptor = openSync(directory, "r");
+  try {
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+function preserveFoundryProblem(problem) {
+  // The canonical bytes stay in place: later reads must remain closed too.
+  const bytes = readFileSync(problem.path);
+  const digest = createHash("sha256").update(bytes).digest("hex").slice(0, 16);
+  const preservedPath = `${problem.path}.${problem.kind}-${digest}`;
+  let descriptor;
+  try {
+    descriptor = openSync(preservedPath, "wx", 0o600);
+  } catch (error) {
+    if (error.code !== "EEXIST" || !readFileSync(preservedPath).equals(bytes)) throw error;
+    throw new FoundryStateError(problem, preservedPath);
+  }
+  try {
+    writeFileSync(descriptor, bytes);
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
+  syncDirectory(path.dirname(problem.path));
+  throw new FoundryStateError(problem, preservedPath);
 }
 
 export function writeFoundryState(worktreePath, statePatch = {}) {
   const resolvedWorktree = path.resolve(worktreePath);
   const statePath = resolveFoundryStatePath(resolvedWorktree);
-  const existing = readFoundryState(resolvedWorktree) || {};
+  const loaded = loadFoundryState(resolvedWorktree);
+  if (!["missing", "ok"].includes(loaded.kind)) preserveFoundryProblem(loaded);
+  const existing = loaded.state || {};
   const nowIso = new Date().toISOString();
   const merged = {
     ...existing,
     ...statePatch,
-    attemptCount: statePatch.attemptCount ?? existing.attemptCount ?? 1,
+    attemptCount: Math.max(statePatch.attemptCount ?? 1, existing.attemptCount ?? 1),
     maxAttempts: statePatch.maxAttempts ?? existing.maxAttempts ?? 2,
     schema: FOUNDRY_STATE_SCHEMA,
     targetBranch: statePatch.targetBranch ?? existing.targetBranch ?? "main",
@@ -769,8 +852,207 @@ export function writeFoundryState(worktreePath, statePatch = {}) {
       statePatch.worktreeSlug ?? existing.worktreeSlug ?? path.basename(resolvedWorktree),
   };
   mkdirSync(path.dirname(statePath), { recursive: true });
-  writeFileSync(statePath, `${JSON.stringify(merged, null, 2)}\n`);
+  const temporaryPath = `${statePath}.tmp-${randomUUID()}`;
+  const descriptor = openSync(temporaryPath, "wx", 0o600);
+  try {
+    writeFileSync(descriptor, `${JSON.stringify(merged, null, 2)}\n`);
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
+  renameSync(temporaryPath, statePath);
+  syncDirectory(path.dirname(statePath));
   return merged;
+}
+
+export function processIdentity(pid = process.pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return null;
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const ticks = stat
+      .slice(stat.lastIndexOf(")") + 1)
+      .trim()
+      .split(/\s+/u, 20)[19];
+    if (ticks) return `proc-start-ticks:${ticks}`;
+  } catch {
+    // macOS has no /proc; use the same stable birth-time identity as native_bridge.
+  }
+  try {
+    const started = String(
+      execFileSync("ps", ["-p", String(pid), "-o", "lstart="], {
+        encoding: "utf8",
+        env: { ...process.env, TZ: "UTC", LC_ALL: "C" },
+        stdio: ["ignore", "pipe", "pipe"],
+      }),
+    ).trim();
+    if (started) return started;
+    throw new Error(`Process identity unavailable for PID ${pid}`);
+  } catch (error) {
+    // ps exits 1 without diagnostics for an absent PID. Other failures are unknown.
+    if (error.status === 1 && !String(error.stderr || "").trim()) return null;
+    throw error;
+  }
+}
+
+export function createFoundryAttempt(
+  state,
+  { intent = "launch", route, pid = process.pid, now = new Date().toISOString() } = {},
+) {
+  if (!["launch", "repair"].includes(intent)) throw new Error("Invalid Foundry attempt intent");
+  const number = (state?.attemptCount ?? 0) + 1;
+  return {
+    attemptCount: number,
+    attempt: {
+      id: randomUUID(),
+      number,
+      intent,
+      status: "launching",
+      startedAt: now,
+      endedAt: null,
+      launcher: { pid, processIdentity: processIdentity(pid), host: hostname() },
+      route: {
+        engine: route?.engine ?? null,
+        model: route?.model ?? null,
+        effort: route?.effort ?? null,
+      },
+      error: null,
+    },
+  };
+}
+
+export function updateFoundryAttempt(
+  state,
+  { status, error = null, now = new Date().toISOString() },
+) {
+  if (!state?.attempt || !["running", "finished", "failed", "uncertain"].includes(status)) {
+    throw new Error("An existing Foundry attempt and valid status are required");
+  }
+  return {
+    attemptCount: Math.max(state.attemptCount, state.attempt.number),
+    attempt: { ...state.attempt, status, error, endedAt: status === "running" ? null : now },
+  };
+}
+
+/** A missing or unverifiable launcher identity fails closed; never signal it. */
+export function foundryLauncherAlive(state) {
+  const launcher = state?.attempt?.launcher;
+  if (
+    !launcher ||
+    !Number.isSafeInteger(launcher.pid) ||
+    launcher.pid <= 0 ||
+    launcher.host !== hostname() ||
+    !launcher.processIdentity
+  )
+    return true;
+  try {
+    const identity = processIdentity(launcher.pid);
+    return identity !== null && identity === launcher.processIdentity;
+  } catch {
+    return true;
+  } // Unknown liveness must never authorize recovery.
+}
+
+/** Decode the runner protocol, stopping before model-authored final report text. */
+export function parseRunnerOutput(stdout, { exitCode = 0 } = {}) {
+  const raw = String(stdout ?? "");
+  let reported = {};
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) reported = parsed;
+  } catch {
+    for (const line of raw.split(/\r?\n/u)) {
+      if (line === "--- AGENT FINAL REPORT ---") break;
+      const match = /^AGENT_(STATUS|OUTCOME|SESSION|RESULT)=(.*)$/u.exec(line);
+      if (!match) continue;
+      const fields = {
+        STATUS: "status",
+        OUTCOME: "task_outcome",
+        SESSION: "session_id",
+        RESULT: "result_path",
+      };
+      reported[fields[match[1]]] = match[2].trim();
+      if (match[1] === "RESULT") break;
+    }
+  }
+  const resultPath = reported.resultPath ?? reported.result_path ?? null;
+  let result = reported;
+  if (
+    typeof resultPath === "string" &&
+    path.isAbsolute(resultPath) &&
+    path.basename(resultPath) === "result.json"
+  ) {
+    try {
+      const saved = JSON.parse(readFileSync(resultPath, "utf8"));
+      if (saved && typeof saved === "object" && !Array.isArray(saved)) {
+        result = { ...reported, ...saved };
+        if (typeof saved.status !== "string" || !saved.status.trim())
+          result.status = reported.status;
+      }
+    } catch {
+      // A surviving status line is sufficient; an absent status stays uncertain.
+    }
+  }
+  return {
+    ...result,
+    status: result.status ?? null,
+    taskOutcome: result.task_outcome ?? result.taskOutcome ?? null,
+    sessionId: result.session_id ?? result.sessionId ?? null,
+    resultPath,
+    exitCode,
+    raw,
+  };
+}
+
+export async function runFoundryWorker(execAgentFn, args, options) {
+  let agentResult;
+  try {
+    agentResult = await execAgentFn(args, options);
+    if (typeof agentResult === "string") agentResult = parseRunnerOutput(agentResult);
+  } catch (error) {
+    const beforeStart =
+      !error.pid &&
+      !error.killed &&
+      !error.signal &&
+      ["ENOENT", "EACCES", "ENOEXEC"].includes(error.code) &&
+      String(error.syscall || "").startsWith("spawn");
+    return {
+      agentResult: {
+        error: beforeStart
+          ? `Nothing was launched: ${error.message}`
+          : error?.message || String(error),
+      },
+      outcome: beforeStart ? "failed" : "uncertain",
+    };
+  }
+  const status =
+    typeof agentResult?.status === "string" ? agentResult.status.toLowerCase().trim() : "";
+  if (
+    agentResult?.signal ||
+    agentResult?.killed ||
+    agentResult?.timedOut ||
+    agentResult?.timed_out
+  ) {
+    return { agentResult, outcome: "uncertain" };
+  }
+  const exitCode = agentResult?.exitCode ?? agentResult?.exit_code;
+  if (exitCode === 27) return { agentResult, outcome: "busy" };
+  if (status === "native_handoff" || [4, 11, 13, 15, 17, 18, 28].includes(exitCode)) {
+    return {
+      agentResult: {
+        ...agentResult,
+        error: `Nothing was launched (runner status ${status || "unreported"}, exit ${exitCode ?? "unreported"})`,
+      },
+      outcome: "failed",
+    };
+  }
+  if (!status) return { agentResult, outcome: "uncertain" };
+  const taskOutcome = agentResult?.taskOutcome ?? agentResult?.task_outcome;
+  const didComplete =
+    ["completed", "complete"].includes(status) &&
+    agentResult?.ok !== false &&
+    !["failed", "blocked", "not_run"].includes(taskOutcome) &&
+    (exitCode === undefined || exitCode === 0);
+  return { agentResult, outcome: didComplete ? "finished" : "failed" };
 }
 
 export function countCommitsAhead(
@@ -880,8 +1162,9 @@ export function collectActiveWorktreeAllowPaths(
       marker = null;
     }
     if (!marker || marker.disposable === false) continue;
-    const state = readFoundryState(wtPath);
-    if (state?.status && ["merged", "abandoned"].includes(state.status)) continue;
+    const loadedState = loadFoundryState(wtPath);
+    if (loadedState.kind === "ok" && ["merged", "abandoned"].includes(loadedState.state.status))
+      continue;
     const specFile = resolveTaskSpecPath(wtPath);
     if (!existsSync(specFile)) continue;
     try {
@@ -958,24 +1241,38 @@ async function defaultExecGh(args, { cwd = process.cwd() } = {}) {
   return JSON.parse(stdout);
 }
 
-async function defaultExecAgent(args, { cwd = process.cwd() } = {}) {
-  const script = path.join(scriptsDir, "run_agent.py");
-  const { stdout } = await execute("python3", [script, ...args], {
-    cwd,
-    maxBuffer: 16 * 1024 * 1024,
-    timeout: 600_000,
-  });
+async function defaultExecAgent(
+  args,
+  {
+    cwd = process.cwd(),
+    env = process.env,
+    runnerScriptPath = path.join(scriptsDir, "run_agent.py"),
+  } = {},
+) {
   try {
-    return JSON.parse(stdout);
-  } catch {
-    return { stdout: stdout.trim() };
+    const { stdout } = await execute("python3", [runnerScriptPath, ...args], {
+      cwd,
+      env,
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    return parseRunnerOutput(stdout);
+  } catch (error) {
+    if (typeof error.code !== "number" || error.signal || error.killed) throw error;
+    return parseRunnerOutput(error.stdout, { exitCode: error.code });
   }
 }
 
-async function provisionDisposableWorktree(cwd, worktreeSlug, branch, issueNumber, engine = null) {
+async function provisionDisposableWorktree(
+  cwd,
+  worktreeSlug,
+  branch,
+  _issue,
+  _engine,
+  { env = process.env } = {},
+) {
   const resolvedCwd = path.resolve(cwd);
   const repoName = path.basename(resolvedCwd);
-  const worktreeBase = path.join(cacheHome(), "worktrees", repoName);
+  const worktreeBase = path.join(cacheHome(env), "worktrees", repoName);
   const worktreePath = path.join(worktreeBase, worktreeSlug);
   if (existsSync(worktreePath)) {
     throw new Error(`Disposable worktree path already exists: ${worktreePath}`);
@@ -985,28 +1282,6 @@ async function provisionDisposableWorktree(cwd, worktreeSlug, branch, issueNumbe
     cwd: resolvedCwd,
     timeout: 30_000,
   });
-  const { stdout: gitDirRaw } = await execute("git", ["rev-parse", "--git-dir"], {
-    cwd: worktreePath,
-    timeout: 10_000,
-  });
-  const gitDir = path.resolve(worktreePath, gitDirRaw.trim());
-  await writeFile(
-    path.join(gitDir, "orkest.json"),
-    `${JSON.stringify(
-      {
-        branch,
-        createdAt: new Date().toISOString(),
-        disposable: true,
-        ...(engine && { engine }),
-        issue: issueNumber,
-        parentCwd: resolvedCwd,
-        slug: worktreeSlug,
-      },
-      null,
-      2,
-    )}\n`,
-  );
-  bootstrapWorktreeInclude(resolvedCwd, worktreePath, { overwrite: false });
   return worktreePath;
 }
 
@@ -1121,6 +1396,7 @@ export async function foundryCommand(
     activeAllowPaths,
     countCommitsAheadFn,
     cwd = process.cwd(),
+    env = process.env,
     execAgentFn = defaultExecAgent,
     execFileSyncFn,
     execGhFn = defaultExecGh,
@@ -1128,6 +1404,7 @@ export async function foundryCommand(
     getAccountsFn = getAccounts,
     policy: policyOverride,
     provisionWorktreeFn = provisionDisposableWorktree,
+    runnerScriptPath,
     stdout = process.stdout,
     targetBranch = "main",
   } = {},
@@ -1191,11 +1468,11 @@ export async function foundryCommand(
       else stdout.write(`Dry run groom #${issue.number}: ${commandString}\n`);
       return payload;
     }
-    const response = await execAgentFn(consultArgs, { cwd });
+    const response = await execAgentFn(consultArgs, { cwd, env, runnerScriptPath });
     const text =
       typeof response === "string"
         ? response
-        : response?.response || response?.stdout || JSON.stringify(response);
+        : response?.response || response?.stdout || response?.raw || JSON.stringify(response);
     const taskSpec = extractTaskSpec(text);
     const payload = {
       command: commandString,
@@ -1311,7 +1588,7 @@ export async function foundryCommand(
     : [];
 
   const repoName = path.basename(path.resolve(cwd));
-  const plannedWorktreePath = path.join(cacheHome(), "worktrees", repoName, match.worktreeSlug);
+  const plannedWorktreePath = path.join(cacheHome(env), "worktrees", repoName, match.worktreeSlug);
   const runPayload = {
     acceptanceCriteria,
     allowPaths: match.allowPaths,
@@ -1356,11 +1633,66 @@ export async function foundryCommand(
     match.branch,
     match.issue.number,
     match.selectedRoute?.engine || null,
+    { env },
   );
-  bootstrapWorktreeInclude(cwd, worktreePath);
+  const initialLease = await acquireWorkspaceLease(worktreePath, { env });
+  if (!initialLease.acquired) {
+    const busy = {
+      ...runPayload,
+      ok: false,
+      status: "busy",
+      worktreePath,
+      reason: `Workspace lease busy: ${worktreePath}`,
+    };
+    if (values.json) stdout.write(`${JSON.stringify(busy, null, 2)}\n`);
+    else stdout.write(`${busy.reason}\n`);
+    process.exitCode = 1;
+    return busy;
+  }
   const specFile = resolveTaskSpecPath(worktreePath);
-  await mkdir(path.dirname(specFile), { recursive: true });
-  await writeFile(specFile, `${JSON.stringify(match.taskSpec, null, 2)}\n`);
+  let launchingState;
+  try {
+    assertWorkspaceLease(initialLease);
+    if (loadFoundryState(worktreePath).kind !== "missing") {
+      throw new Error(`Foundry state already exists: ${worktreePath}`);
+    }
+    bootstrapWorktreeInclude(cwd, worktreePath);
+    await mkdir(path.dirname(specFile), { recursive: true });
+    assertWorkspaceLease(initialLease);
+    await writeFile(specFile, `${JSON.stringify(match.taskSpec, null, 2)}\n`);
+    assertWorkspaceLease(initialLease);
+    launchingState = writeFoundryState(worktreePath, {
+      ...createFoundryAttempt(null, { route: match.selectedRoute }),
+      acceptanceCriteria,
+      allowPaths: match.allowPaths,
+      branch: match.branch,
+      issue: { number: match.issue.number, title: match.issue.title },
+      maxAttempts: 2,
+      status: "launching",
+      targetBranch,
+      verifyCommand: enforceScopedVerifyCommand(match.verifyCommand),
+      worktreeSlug: match.worktreeSlug,
+    });
+    await writeFile(
+      path.join(resolveWorktreeGitDir(worktreePath), "orkest.json"),
+      `${JSON.stringify(
+        {
+          branch: match.branch,
+          createdAt: new Date().toISOString(),
+          disposable: true,
+          engine: match.selectedRoute.engine,
+          issue: match.issue.number,
+          parentCwd: path.resolve(cwd),
+          slug: match.worktreeSlug,
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    assertWorkspaceLease(initialLease);
+  } finally {
+    await initialLease.release();
+  }
   const routeArchetype = match.classification?.archetype || match.archetype;
   const agentArgs = [
     "--cwd",
@@ -1376,156 +1708,171 @@ export async function foundryCommand(
     match.verifyCommand,
   ];
   if (match.selectedRoute.effort) agentArgs.push("--effort", match.selectedRoute.effort);
-  const agentResult = await execAgentFn(agentArgs, { cwd: worktreePath });
-
-  const rawAgentStatus = String(
-    agentResult?.status ?? (agentResult?.ok === false ? "failed" : "completed"),
-  )
-    .trim()
-    .toLowerCase();
-  const didBuilderSucceed =
-    (rawAgentStatus === "completed" || rawAgentStatus === "complete") && agentResult?.ok !== false;
-
-  let commitsAhead;
-  if (typeof agentResult?.commitsAhead === "number") {
-    commitsAhead = agentResult.commitsAhead;
-  } else if (typeof countCommitsAheadFn === "function") {
-    commitsAhead = Number(await countCommitsAheadFn(worktreePath, targetBranch));
-  } else {
-    const counted = countCommitsAhead(worktreePath, targetBranch, { execFileSyncFn });
-    if (counted.resolved) {
-      commitsAhead = counted.commitsAhead;
-    } else if (execAgentFn === defaultExecAgent || typeof execFileSyncFn === "function") {
-      commitsAhead = 0;
-    } else {
-      commitsAhead = didBuilderSucceed ? 1 : 0;
-    }
-  }
-
-  const dirtyCheck =
-    typeof agentResult?.dirty === "boolean"
-      ? { isDirty: agentResult.dirty, resolved: true }
-      : hasWorktreeDirtyChanges(worktreePath, { execFileSyncFn });
-  const isDirtyWorktree = dirtyCheck.isDirty;
-  const hasWorktreeChanges = commitsAhead > 0 || isDirtyWorktree;
-
-  const normalizedVerifyCommand = enforceScopedVerifyCommand(match.verifyCommand);
-  const nowIso = new Date().toISOString();
-  let verification;
-  let finalStatus;
-
-  if (!didBuilderSucceed || !hasWorktreeChanges) {
-    finalStatus = "worker_failed";
-    verification = {
-      acceptanceCriteria,
-      command: normalizedVerifyCommand,
-      exitCode: null,
-      ok: false,
-      output: "",
-      reason: didBuilderSucceed
-        ? "Builder produced 0 commits and no working-tree changes"
-        : `Builder exited with status ${rawAgentStatus}`,
-      status: "skipped",
-      verifiedAt: nowIso,
-    };
-  } else {
-    let wasHostCommitted = false;
-    let rawVerifyResult;
-    if (typeof execVerifyFn === "function") {
-      rawVerifyResult = await execVerifyFn(normalizedVerifyCommand, {
-        cwd: worktreePath,
-        issue: match.issue.number,
-      });
-    } else if (execAgentFn === defaultExecAgent) {
-      rawVerifyResult = await defaultExecVerify(normalizedVerifyCommand, {
-        cwd: worktreePath,
-        issue: match.issue.number,
-      });
-    } else {
-      rawVerifyResult = { exitCode: 0, ok: true, output: "" };
-    }
-    let verifyExitCode = 0;
-    if (typeof rawVerifyResult?.exitCode === "number") {
-      verifyExitCode = rawVerifyResult.exitCode;
-    } else if (rawVerifyResult?.ok === false) {
-      verifyExitCode = 1;
-    }
-    const isVerifyOk =
-      typeof rawVerifyResult?.ok === "boolean" ? rawVerifyResult.ok : verifyExitCode === 0;
-    if (isVerifyOk && isDirtyWorktree) {
-      try {
-        commitVerifiedWorktreeChanges(worktreePath, match.issue.number, { execFileSyncFn });
-        wasHostCommitted = true;
-        const recounted = countCommitsAhead(worktreePath, targetBranch, { execFileSyncFn });
-        commitsAhead = recounted.resolved ? recounted.commitsAhead : Math.max(1, commitsAhead);
-      } catch {
-        commitsAhead = Math.max(1, commitsAhead);
-      }
-    }
-    finalStatus = isVerifyOk ? "verified" : "verification_failed";
-    verification = {
-      acceptanceCriteria,
-      command: normalizedVerifyCommand,
-      committedByHost: wasHostCommitted,
-      exitCode: verifyExitCode,
-      ok: isVerifyOk,
-      output: typeof rawVerifyResult?.output === "string" ? rawVerifyResult.output : "",
-      status: isVerifyOk ? "passed" : "failed",
-      verifiedAt: nowIso,
-    };
-  }
-
-  const headSha =
-    agentResult?.headSha ??
-    agentResult?.head_sha ??
-    resolveWorktreeHeadSha(worktreePath, { execFileSyncFn });
-  const foundryStateFile = resolveFoundryStatePath(worktreePath);
-  const foundryState = writeFoundryState(worktreePath, {
-    acceptanceCriteria,
-    attemptCount: 1,
-    branch: match.branch,
-    commitsAhead,
-    headSha,
-    issue: { number: match.issue.number, title: match.issue.title },
-    lastRun: {
-      engine: match.selectedRoute.engine,
-      model: match.selectedRoute.model,
-      resultPath: agentResult?.result_path ?? agentResult?.resultPath ?? null,
-      sessionId: agentResult?.session_id ?? agentResult?.sessionId ?? null,
-      status: rawAgentStatus,
-    },
-    maxAttempts: 2,
-    status: finalStatus,
-    targetBranch,
-    updatedAt: verification.verifiedAt,
-    verification,
-    verifyCommand: normalizedVerifyCommand,
-    worktreePath,
-    worktreeSlug: match.worktreeSlug,
+  const { agentResult, outcome } = await runFoundryWorker(execAgentFn, agentArgs, {
+    cwd: worktreePath,
+    env,
+    runnerScriptPath,
   });
-
-  const executedPayload = {
-    ...runPayload,
-    agentArgs,
-    agentResult,
-    commitsAhead,
-    executed: true,
-    foundryState,
-    foundryStateFile,
-    specFile,
-    status: finalStatus,
-    verification,
-    verifyCommand: normalizedVerifyCommand,
-    worktreePath,
-  };
-  if (values.json) {
-    stdout.write(`${JSON.stringify(executedPayload, null, 2)}\n`);
-  } else {
-    stdout.write(
-      `Dispatched #${runPayload.issue.number} in ${runPayload.worktreeSlug} (${runPayload.branch})\n`,
-    );
+  const rawAgentStatus = agentResult?.status || outcome;
+  const didBuilderSucceed = outcome === "finished";
+  const finalLease = outcome === "busy" ? null : await acquireWorkspaceLease(worktreePath, { env });
+  if (!finalLease?.acquired) {
+    const busy = {
+      ...runPayload,
+      executed: true,
+      ok: false,
+      status: "busy",
+      worktreePath,
+      reason: `Workspace lease busy after launch: ${worktreePath}`,
+      foundryState: launchingState,
+    };
+    if (values.json) stdout.write(`${JSON.stringify(busy, null, 2)}\n`);
+    else stdout.write(`${busy.reason}\n`);
+    process.exitCode = 1;
+    return busy;
   }
-  return executedPayload;
+  try {
+    assertWorkspaceLease(finalLease);
+    const currentState = readFoundryState(worktreePath);
+    if (currentState?.attempt?.id !== launchingState.attempt.id) {
+      return { ...runPayload, ok: false, status: "stale", worktreePath };
+    }
+
+    let commitsAhead;
+    if (typeof countCommitsAheadFn === "function") {
+      commitsAhead = Number(await countCommitsAheadFn(worktreePath, targetBranch));
+    } else {
+      commitsAhead = countCommitsAhead(worktreePath, targetBranch, { execFileSyncFn }).commitsAhead;
+    }
+    assertWorkspaceLease(finalLease);
+    const dirtyCheck = hasWorktreeDirtyChanges(worktreePath, { execFileSyncFn });
+    const isDirtyWorktree = dirtyCheck.isDirty;
+    const hasWorktreeChanges = commitsAhead > 0 || isDirtyWorktree;
+
+    const normalizedVerifyCommand = enforceScopedVerifyCommand(match.verifyCommand);
+    const nowIso = new Date().toISOString();
+    let verification;
+    let finalStatus;
+
+    if (!didBuilderSucceed || !hasWorktreeChanges) {
+      finalStatus = outcome === "uncertain" ? "launch_uncertain" : "worker_failed";
+      verification = {
+        acceptanceCriteria,
+        command: normalizedVerifyCommand,
+        exitCode: null,
+        ok: false,
+        output: "",
+        reason: didBuilderSucceed
+          ? "Builder produced 0 commits and no working-tree changes"
+          : agentResult?.error || `Builder exited with status ${rawAgentStatus}`,
+        status: "skipped",
+        verifiedAt: nowIso,
+      };
+    } else {
+      let wasHostCommitted = false;
+      let rawVerifyResult;
+      if (typeof execVerifyFn === "function") {
+        rawVerifyResult = await execVerifyFn(normalizedVerifyCommand, {
+          cwd: worktreePath,
+          issue: match.issue.number,
+        });
+      } else if (execAgentFn === defaultExecAgent) {
+        rawVerifyResult = await defaultExecVerify(normalizedVerifyCommand, {
+          cwd: worktreePath,
+          issue: match.issue.number,
+        });
+      } else {
+        rawVerifyResult = { exitCode: 0, ok: true, output: "" };
+      }
+      assertWorkspaceLease(finalLease);
+      let verifyExitCode = 0;
+      if (typeof rawVerifyResult?.exitCode === "number") {
+        verifyExitCode = rawVerifyResult.exitCode;
+      } else if (rawVerifyResult?.ok === false) {
+        verifyExitCode = 1;
+      }
+      const isVerifyOk =
+        typeof rawVerifyResult?.ok === "boolean" ? rawVerifyResult.ok : verifyExitCode === 0;
+      if (isVerifyOk && isDirtyWorktree) {
+        try {
+          commitVerifiedWorktreeChanges(worktreePath, match.issue.number, { execFileSyncFn });
+          wasHostCommitted = true;
+          const recounted = countCommitsAhead(worktreePath, targetBranch, { execFileSyncFn });
+          commitsAhead = recounted.resolved ? recounted.commitsAhead : Math.max(1, commitsAhead);
+        } catch {
+          commitsAhead = Math.max(1, commitsAhead);
+        }
+      }
+      finalStatus = isVerifyOk ? "verified" : "verification_failed";
+      verification = {
+        acceptanceCriteria,
+        command: normalizedVerifyCommand,
+        committedByHost: wasHostCommitted,
+        exitCode: verifyExitCode,
+        ok: isVerifyOk,
+        output: typeof rawVerifyResult?.output === "string" ? rawVerifyResult.output : "",
+        status: isVerifyOk ? "passed" : "failed",
+        verifiedAt: nowIso,
+      };
+    }
+
+    const headSha = resolveWorktreeHeadSha(worktreePath, { execFileSyncFn });
+    const foundryStateFile = resolveFoundryStatePath(worktreePath);
+    assertWorkspaceLease(finalLease);
+    const foundryState = writeFoundryState(worktreePath, {
+      ...updateFoundryAttempt(currentState, {
+        status: outcome,
+        error:
+          agentResult?.error ||
+          (outcome === "uncertain" ? "Runner result unavailable or ambiguous" : null),
+      }),
+      acceptanceCriteria,
+      branch: match.branch,
+      commitsAhead,
+      headSha,
+      issue: { number: match.issue.number, title: match.issue.title },
+      lastRun: {
+        engine: match.selectedRoute.engine,
+        model: match.selectedRoute.model,
+        resultPath: agentResult?.result_path ?? agentResult?.resultPath ?? null,
+        sessionId: agentResult?.session_id ?? agentResult?.sessionId ?? null,
+        status: rawAgentStatus,
+      },
+      maxAttempts: 2,
+      status: finalStatus,
+      targetBranch,
+      updatedAt: verification.verifiedAt,
+      verification,
+      verifyCommand: normalizedVerifyCommand,
+      worktreePath,
+      worktreeSlug: match.worktreeSlug,
+    });
+
+    const executedPayload = {
+      ...runPayload,
+      agentArgs,
+      agentResult,
+      commitsAhead,
+      executed: true,
+      foundryState,
+      foundryStateFile,
+      specFile,
+      status: finalStatus,
+      verification,
+      verifyCommand: normalizedVerifyCommand,
+      worktreePath,
+    };
+    if (values.json) {
+      stdout.write(`${JSON.stringify(executedPayload, null, 2)}\n`);
+    } else {
+      stdout.write(
+        `Dispatched #${runPayload.issue.number} in ${runPayload.worktreeSlug} (${runPayload.branch})\n`,
+      );
+    }
+    return executedPayload;
+  } finally {
+    await finalLease.release();
+  }
 }
 
 export const factoryCommand = foundryCommand;
