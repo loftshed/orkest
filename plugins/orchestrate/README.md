@@ -149,7 +149,17 @@ python3 <scripts>/run_agent.py consult --intent review \
 python3 <scripts>/run_agent.py consult \
   --question 'What if the file descriptor is inherited across fork+exec?' \
   --follow-up <result.json>
+
+# Ask several models and compare their separate answers
+python3 <scripts>/run_agent.py consult \
+  --question 'Any race conditions or missed edge cases?' \
+  --model gpt:sol --model claude:best --transport executor
 ```
+
+Repeat `--model` or pass comma-separated model preferences for a concurrent panel. Results retain the supplied
+order and each consultant has its own preflight, quota check and `result.json`. Pass `--transport executor` if a model
+would otherwise use native handoff. Panels cannot use `--follow-up` or `--detach`; they exit 0 if any consultant
+answered, otherwise with the first consultant's exit code.
 
 Details: [`skills/orchestrate/references/consult.md`](skills/orchestrate/references/consult.md).
 

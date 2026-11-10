@@ -542,6 +542,163 @@ class ConsultTests(unittest.TestCase):
         self.assertFalse(self.capture_path.exists())
         self.assertEqual(json.loads(summary)["status"], "dry_run")
 
+    def test_repeated_models_collapse_duplicates_and_write_separate_json_results(self) -> None:
+        preflight_models = []
+        quota_models = []
+        original_preflight = CONSULT.preflight
+        original_quota_gate = RUNNER.quota_gate
+
+        def track_preflight(request):
+            preflight_models.append(request["requested_model"])
+            return original_preflight(request)
+
+        def track_quota(engine, model, **kwargs):
+            quota_models.append((engine, model))
+            return original_quota_gate(engine, model, **kwargs)
+
+        with (
+            mock.patch.object(CONSULT, "preflight", side_effect=track_preflight),
+            mock.patch.object(RUNNER, "quota_gate", side_effect=track_quota),
+        ):
+            code, panel, output = self.consult(
+                "--question",
+                "Why?",
+                "--model",
+                "gpt:sol",
+                "--model",
+                "gpt:luna,gpt:sol",
+                "--format",
+                "json",
+            )
+
+        self.assertEqual(code, 0)
+        encoded = json.loads(output)
+        self.assertTrue(encoded["panel"])
+        self.assertEqual(encoded["result_path"], panel["result_path"])
+        consultants = panel["consultants"]
+        self.assertEqual([result["requested_model"] for result in consultants], ["gpt:sol", "gpt:luna"])
+        self.assertEqual([result["status"] for result in consultants], ["answered", "answered"])
+        paths = [Path(result["result_path"]) for result in consultants]
+        self.assertEqual(len(set(paths)), 2)
+        self.assertTrue(all(path.is_file() for path in paths))
+        self.assertCountEqual(preflight_models, ["gpt:sol", "gpt:luna"])
+        self.assertCountEqual(quota_models, [("codex", "gpt-5.6-sol"), ("codex", "gpt-5.6-luna")])
+        saved_panel = json.loads(Path(panel["result_path"]).read_text(encoding="utf-8"))
+        self.assertTrue(saved_panel["panel"])
+        self.assertEqual(
+            [(result["result_path"], result["status"]) for result in saved_panel["consultants"]],
+            [(result["result_path"], result["status"]) for result in consultants],
+        )
+
+    def test_comma_separated_models_print_labeled_answers_in_input_order(self) -> None:
+        code, panel, output = self.consult("--question", "Why?", "--model", "gpt:sol,gpt:luna", "--format", "text")
+        self.assertEqual(code, 0)
+        self.assertTrue(panel["panel"])
+        first = output.index("--- CONSULTANT 1 BEGIN ---")
+        second = output.index("--- CONSULTANT 2 BEGIN ---")
+        self.assertLess(first, second)
+        first_block, second_block = output[first:second], output[second:]
+        self.assertIn("MODEL=gpt-5.6-sol", first_block)
+        self.assertIn("ENGINE=codex", first_block)
+        self.assertIn("STATUS=answered", first_block)
+        self.assertIn("--- ANSWER ---\nUse a shared lock file; unlinking it races.", first_block)
+        self.assertIn(
+            "--- UNCERTAINTY ---\nI could not verify the kernel version; on 5.x the semantics differ.", first_block
+        )
+        self.assertIn("MODEL=gpt-5.6-luna", second_block)
+        self.assertIn("ENGINE=codex", second_block)
+        self.assertIn("STATUS=answered", second_block)
+        self.assertIn("--- ANSWER ---\nUse a shared lock file; unlinking it races.", second_block)
+
+    def test_panel_reads_stdin_once_and_sends_the_same_question_to_each_model(self) -> None:
+        with mock.patch("sys.stdin", io.StringIO("Which lock file?\n")):
+            code, panel, _output = self.consult(
+                "--question", "-", "--model", "gpt-5.6-sol,gpt-5.6-luna", "--format", "json"
+            )
+        self.assertEqual(code, 0, panel)
+        self.assertEqual([result["question"] for result in panel["consultants"]], ["Which lock file?"] * 2)
+        prompts = [Path(result["prompt_path"]).read_text(encoding="utf-8") for result in panel["consultants"]]
+        self.assertEqual(prompts[0], prompts[1])
+
+    def test_a_quota_refusal_does_not_stop_another_panel_consultant(self) -> None:
+        quota_models = []
+        original_quota_gate = RUNNER.quota_gate
+
+        def refuse_sol(engine, model, **kwargs):
+            quota_models.append(model)
+            if model == "gpt-5.6-sol":
+                raise RUNNER.RunnerError("quota exhausted for sol", 15)
+            return original_quota_gate(engine, model, **kwargs)
+
+        with mock.patch.object(RUNNER, "quota_gate", side_effect=refuse_sol):
+            code, panel, output = self.consult(
+                "--question", "Why?", "--model", "gpt-5.6-sol,gpt-5.6-luna", "--format", "text"
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual([result["status"] for result in panel["consultants"]], ["refused", "answered"])
+        self.assertEqual(panel["consultants"][0]["error"], "quota exhausted for sol")
+        self.assertIn("STATUS=refused", output)
+        self.assertIn("ERROR=quota exhausted for sol", output)
+        self.assertIn("Use a shared lock file; unlinking it races.", output)
+        self.assertCountEqual(quota_models, ["gpt-5.6-sol", "gpt-5.6-luna"])
+
+    def test_all_failed_panel_uses_the_first_consultants_exit_code(self) -> None:
+        def refuse_both(_engine, model, **_kwargs):
+            code = 15 if model == "gpt-5.6-sol" else 18
+            raise RUNNER.RunnerError(f"refused {model}", code)
+
+        with mock.patch.object(RUNNER, "quota_gate", side_effect=refuse_both):
+            code, panel, _output = self.consult(
+                "--question", "Why?", "--model", "gpt-5.6-sol,gpt-5.6-luna", "--format", "json"
+            )
+        self.assertEqual(code, 15)
+        self.assertEqual(panel["exit_code"], 15)
+        self.assertEqual([result["exit_code"] for result in panel["consultants"]], [15, 18])
+        self.assertEqual([result["status"] for result in panel["consultants"]], ["refused", "refused"])
+
+    def test_panel_rejects_follow_up_detach_and_native_handoff_before_preflight(self) -> None:
+        previous = self.root / "previous-result.json"
+        previous.write_text(
+            json.dumps(
+                {
+                    "schema": CONSULT.RESULT_SCHEMA,
+                    "status": "answered",
+                    "transport": "executor",
+                    "session_id": "session-1",
+                    "engine": "codex",
+                    "model": "gpt-5.6-sol",
+                }
+            ),
+            encoding="utf-8",
+        )
+        with mock.patch.object(CONSULT, "preflight", side_effect=AssertionError("preflight must not run")):
+            code, result, _ = self.consult(
+                "--question",
+                "Why?",
+                "--model",
+                "gpt-5.6-sol,gpt-5.6-luna",
+                "--follow-up",
+                str(previous),
+            )
+            self.assertEqual(code, 4)
+            self.assertIn("--follow-up", result["error"])
+
+            code, result, _ = self.consult("--question", "Why?", "--model", "gpt-5.6-sol,gpt-5.6-luna", "--detach")
+            self.assertEqual(code, 4)
+            self.assertIn("--detach", result["error"])
+
+            code, result, _ = self.consult(
+                "--question",
+                "Why?",
+                "--model",
+                "gpt-5.6-sol,gpt-5.6-luna",
+                env=self.environment(CODEX_THREAD_ID="caller-session"),
+            )
+            self.assertEqual(code, 4)
+            self.assertIn("executor transport", result["error"])
+        self.assertFalse(self.capture_path.exists())
+
     def test_detached_consultation_runs_the_resolved_model_and_publishes_an_event(self) -> None:
         env = self.environment(AGENT_MAILBOX_SESSION="detached-supervisor")
         code, _result, summary = self.consult(
