@@ -71,7 +71,7 @@ Interactive Horde opens a coordinator conversation alongside its swarm tree (def
 New members are queued for the coordinator to assign; --print and --json never launch models.
 Use --cwd to choose the room's repository. Closing the view leaves workers running.
 1–9 focus an agent; o opens its Herdr/tmux pane; p pins its detail; n advances the page; q exits the display.
-? opens key help; g opens the coalesced room log. Set ORK_GLYPHS=ascii|unicode|nerd to choose a glyph tier.
+? opens key help; g opens the coalesced room log; d previews the focused worker's read-only diff. Set ORK_GLYPHS=ascii|unicode|nerd to choose a glyph tier.
 `;
 
 const execute = promisify(execFile);

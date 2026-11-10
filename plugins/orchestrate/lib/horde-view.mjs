@@ -757,6 +757,7 @@ export class HordeView {
       inHerdr = false,
       onFocusPane,
       onPreview,
+      onDiff,
     } = {},
   ) {
     this.room = treeRoom(room);
@@ -773,6 +774,7 @@ export class HordeView {
     this.servicesMode = SERVICES_MODES.has(servicesMode) ? servicesMode : "expanded";
     this.onFocusPane = typeof onFocusPane === "function" ? onFocusPane : undefined;
     this.onPreview = typeof onPreview === "function" ? onPreview : undefined;
+    this.onDiff = typeof onDiff === "function" ? onDiff : undefined;
     this.lastFocusedAgentId = undefined;
     this.focusId = this.room.agents[0]?.id;
     this.focusFollowsLatest = true;
@@ -984,6 +986,7 @@ export class HordeView {
         return true;
       }
       if (key === "r") {
+        if (this.preview.kind === "diff") return false;
         this.previewOffset = 0;
         this.previewFollow = true;
         this.preview.text = this.previewLatestText;
@@ -1034,6 +1037,14 @@ export class HordeView {
           return true;
         }
         return false;
+      }
+      case "d": {
+        const selected = this.selectedAgent();
+        if (!selected?.resultPath || !this.onDiff) return false;
+        this.hasExplicitFocus = true;
+        this.focusFollowsLatest = false;
+        this.onDiff(selected);
+        return true;
       }
       case "m": {
         this.mouseEnabled = !this.mouseEnabled;
@@ -1232,7 +1243,13 @@ export class HordeView {
             key: "o",
             disabled: this.preview.kind !== "terminal",
           },
-          { id: "preview-follow", label: "Follow", key: "r", active: this.previewFollow },
+          {
+            id: "preview-follow",
+            label: "Follow",
+            key: "r",
+            active: this.previewFollow,
+            disabled: this.preview.kind === "diff",
+          },
           { id: "preview-up", label: "Up", key: "\u{1B}[5~", hint: "PgUp" },
           { id: "preview-down", label: "Down", key: "\u{1B}[6~", hint: "PgDn" },
           { id: "preview-previous", label: "Prev", key: "[" },
@@ -1270,6 +1287,7 @@ export class HordeView {
                 key: "o",
               },
             ]),
+        ...(selected?.resultPath ? [{ id: "diff", label: "Diff", key: "d" }] : []),
         ...(hasInactiveAgents
           ? [
               {
@@ -1331,6 +1349,7 @@ export class HordeView {
         "↑/↓ or 1–9  Select agent",
         "0           Return to the current session's live chat",
         "Enter       Preview selected agent's screen without typing into it",
+        "d           Preview selected agent's worker changes read-only",
         "PgUp/PgDn   Scroll the preview; r follows the latest screen",
         "o           Open selected agent's interactive terminal",
         "Mouse       Click an agent to preview its chat; click buttons for actions",
@@ -1762,17 +1781,21 @@ export class HordeView {
     const budget = Math.max(1, height - 3);
     const pad = width >= 6 ? " " : "";
     const textWidth = Math.max(1, width - 2 - pad.length * 2);
-    const rows =
-      preview.kind === "terminal"
-        ? String(preview.text || "")
-            .split(/\r?\n/u)
-            .flatMap((line) => wrapText(plain(line), textWidth))
-        : renderMarkdown(preview.text || "", textWidth, {
-            color: this.appearance,
-            tier: this.tier,
-          });
+    let rows;
+    if (preview.kind === "diff") rows = this.diffPreviewRows(preview, textWidth);
+    else if (preview.kind === "terminal")
+      rows = String(preview.text || "")
+        .split(/\r?\n/u)
+        .flatMap((line) => wrapText(plain(line), textWidth));
+    else
+      rows = renderMarkdown(preview.text || "", textWidth, {
+        color: this.appearance,
+        tier: this.tier,
+      });
     this.previewOffset = Math.min(this.previewOffset, Math.max(0, rows.length - budget));
-    if (this.previewFollow) {
+    if (preview.kind === "diff" && this.previewFollow) {
+      this.previewOffset = Math.max(0, rows.length - budget);
+    } else if (this.previewFollow) {
       const response =
         preview.kind === "activity"
           ? rows.findIndex((line) => /^Response:(?:\s|$)/u.test(plain(line).trim()))
@@ -1782,17 +1805,77 @@ export class HordeView {
     }
     const end = Math.max(0, rows.length - this.previewOffset);
     const body = rows.slice(Math.max(0, end - budget), end).map((line) => `${pad}${line}`);
+    if (preview.kind === "diff" && preview.loading)
+      body.unshift(`${pad}${tone("Loading...", "muted", this.appearance)}`);
     while (body.length < budget) body.push("");
-    const heading = preview.kind === "terminal" ? "Live screen · read only" : "Recorded activity";
-    const state = preview.loading ? "Loading..." : preview.error || heading;
+    let heading = "Recorded activity";
+    if (preview.kind === "terminal") heading = "Live screen · read only";
+    else if (preview.kind === "diff") heading = "Changes · read only";
+    let state;
+    if (preview.loading && preview.kind !== "diff")
+      state = tone("Loading...", "muted", this.appearance);
+    else if (preview.error) state = tone(preview.error, "error", this.appearance);
+    else if (preview.kind === "diff" && preview.stale)
+      state = `${tone(heading, "muted", this.appearance)} ${tone("· stale", "stale", this.appearance)}`;
+    else state = tone(heading, "muted", this.appearance);
     const rightHint = width >= 44 ? "Esc back · [ ] switch" : "";
     return this.panel(
       plain(preview.title || "Agent"),
-      [`${pad}${tone(state, preview.error ? "error" : "muted", this.appearance)}`, ...body],
+      [`${pad}${state}`, ...body],
       Math.max(1, width),
       rightHint,
       "mdSection",
     ).slice(0, height);
+  }
+
+  diffPreviewRows(preview, width) {
+    const rows = [];
+    if (preview.loading) return rows;
+    const files = Array.isArray(preview.files) ? preview.files : [];
+    if (files.length > 0) {
+      rows.push(tone("Changed files", "muted bold", this.appearance));
+      for (const file of files) {
+        const added = `+${file.added ?? "?"}`;
+        const removed = `-${file.removed ?? "?"}`;
+        const counts = `${tone(added, "accepted", this.appearance)} ${tone(removed, "failed", this.appearance)}`;
+        const pathWidth = Math.max(1, width - displayWidth(counts) - 1);
+        const pathLines = wrapText(plain(file.path), pathWidth);
+        rows.push(
+          fitStyled(`${tone(pathLines[0] || "", "muted bold", this.appearance)} ${counts}`, width),
+        );
+        for (const line of pathLines.slice(1))
+          rows.push(fitStyled(`  ${tone(line, "muted bold", this.appearance)}`, width));
+      }
+      rows.push("");
+    }
+    const diffLines = String(preview.text || "").split(/\r?\n/u);
+    for (const rawLine of diffLines) {
+      const line = plain(rawLine);
+      let role = "";
+      if (
+        line.startsWith("diff --git ") ||
+        line.startsWith("index ") ||
+        line.startsWith("--- ") ||
+        line.startsWith("+++ ") ||
+        line.startsWith("new file mode ") ||
+        line.startsWith("deleted file mode ") ||
+        line.startsWith("old mode ") ||
+        line.startsWith("new mode ") ||
+        line.startsWith("@@")
+      ) {
+        role = "muted bold";
+      } else if (line.startsWith("+")) {
+        role = "accepted";
+      } else if (line.startsWith("-")) {
+        role = "failed";
+      }
+      rows.push(
+        ...wrapText(line, width).map((part) =>
+          fitStyled(role ? tone(part, role, this.appearance) : part, width),
+        ),
+      );
+    }
+    return rows;
   }
 
   renderSidebar(width) {

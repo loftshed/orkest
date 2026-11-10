@@ -161,6 +161,23 @@ describe("clickable Swarm View", () => {
     expect(view.render(80).map(plain).join("\n")).toContain("q or Ctrl-C Quit");
   });
 
+  it("opens a read-only diff only for an agent with a recorded result", () => {
+    const data = room();
+    data.agents[0].resultPath = "/tmp/worker/result.json";
+    const onDiff = vi.fn();
+    const view = new HordeView(data, { height: 32, onDiff });
+    view.focusId = "alpha";
+    expect(view.render(120).map(plain).join("\n")).toContain("Diff");
+    expect(view.handleInput("d")).toBe(true);
+    expect(onDiff).toHaveBeenCalledWith(expect.objectContaining({ id: "alpha" }));
+
+    const withoutResult = new HordeView(room(), { height: 32, onDiff });
+    withoutResult.focusId = "beta";
+    expect(withoutResult.render(120).map(plain).join("\n")).not.toContain("Diff");
+    expect(withoutResult.handleInput("d")).toBe(false);
+    expect(onDiff).toHaveBeenCalledTimes(1);
+  });
+
   it("shows only Back (without a redundant Return to chat button) while previewing another agent", () => {
     const data = room();
     data.herdrCoordinatorPaneId = "w1:p2";
@@ -441,6 +458,45 @@ describe("clickable Swarm View", () => {
     expect(view.render(160).map(plain).join("\n")).not.toContain("Chat line 81");
     view.handleInput("\u{1B}[6~");
     expect(view.render(160).map(plain).join("\n")).toContain("Chat line 81");
+  });
+
+  it("renders diff files, semantic line colors, stale state and scroll controls", () => {
+    const view = new HordeView(room(), { height: 24, color: true, now: () => 0 });
+    const text = [
+      "diff --git a/src/worker.mjs b/src/worker.mjs",
+      "--- a/src/worker.mjs",
+      "+++ b/src/worker.mjs",
+      "@@ -1 +1,2 @@",
+      "+added line",
+      "-removed line",
+      ...Array.from({ length: 100 }, (_, index) => `diff line ${index + 1}`),
+    ].join("\n");
+    view.setPreview({
+      agentId: "alpha",
+      title: "alpha",
+      kind: "diff",
+      loading: false,
+      stale: true,
+      files: [{ path: "src/worker.mjs", added: 2, removed: 1 }],
+      text,
+    });
+
+    const firstRender = view.render(160).join("\n");
+    expect(plain(firstRender)).toContain("Changes · read only · stale");
+    expect(plain(firstRender)).toContain("src/worker.mjs");
+    expect(plain(firstRender)).toContain("+2 -1");
+    expect(firstRender).toContain("\u{1B}[38;5;114;1m+added line\u{1B}[0m");
+    expect(firstRender).toContain("\u{1B}[38;5;203;1m-removed line\u{1B}[0m");
+    expect(firstRender).toContain("\u{1B}[38;5;176;1m· stale\u{1B}[0m");
+    expect(view.targets.some((target) => target.id === "preview-follow")).toBe(false);
+    expect(plain(firstRender)).toContain("Follow");
+    expect(view.handleInput("r")).toBe(false);
+
+    for (let index = 0; index < 10; index++) view.handleInput("\u{1B}[6~");
+    expect(plain(view.render(160).join("\n"))).toContain("diff line 100");
+    view.handleMouse({ x: 4, y: 10, action: "scroll-up", button: 4 });
+    expect(plain(view.render(160).join("\n"))).not.toContain("diff line 100");
+    expect(view.handleInput("\u{1B}")).toEqual({ type: "close-preview" });
   });
 
   it("anchors long recorded responses while allowing manual scrolling and refresh", () => {
