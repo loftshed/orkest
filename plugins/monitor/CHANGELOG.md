@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.18.1
+
+- fix(monitor): probe agy with the sign-in the other sessions use (#172)
+
 ## 0.18.0
 
 - feat(orchestrate): render agent preview inline and unify Swarm TUI controls (#123)
