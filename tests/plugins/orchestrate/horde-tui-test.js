@@ -989,6 +989,77 @@ describe("ork CLI", () => {
 });
 
 describe("terminal lifecycle", () => {
+  it("loads a worker diff and ignores it after focus moves to another agent", async () => {
+    const root = await directory();
+    const resultPath = path.join(root, "result.json");
+    await writeFile(
+      resultPath,
+      JSON.stringify({
+        repository: path.join(root, "repository"),
+        run_delta: { changed_paths: ["changed.txt"] },
+        git_after: { status: [" M changed.txt"], fingerprint: "result-fingerprint" },
+      }),
+    );
+    const room = fixture();
+    for (const agent of room.agents) agent.resultPath = resultPath;
+    // eslint-disable-next-line unicorn/prefer-event-target -- The TUI consumes Node terminal stream events.
+    const input = Object.assign(new EventEmitter(), {
+      isTTY: true,
+      isRaw: false,
+      setRawMode: vi.fn((raw) => {
+        input.isRaw = raw;
+      }),
+      resume() {},
+      pause() {},
+    });
+    const output = { isTTY: true, rows: 32, columns: 120 };
+    let outputText = "";
+    output.write = (chunk) => {
+      outputText += chunk;
+    };
+    let statusCallback;
+    let diffCallback;
+    const exec = (command, args, _options, callback) => {
+      if (args[1] === "status") {
+        statusCallback = callback;
+        return;
+      }
+      if (args[1] === "diff") {
+        diffCallback = callback;
+        return;
+      }
+      callback(null, "{}");
+    };
+    const running = runHordeTui(async () => room, {
+      input,
+      output,
+      exec,
+      env: {},
+      quota: false,
+      services: false,
+      update: false,
+    });
+    try {
+      await vi.waitFor(() => expect(outputText).toContain("View chat"));
+      input.emit("data", "d");
+      await vi.waitFor(() => expect(outputText).toContain("Changes · read only"));
+      expect(outputText).toContain("Loading...");
+      await vi.waitFor(() => expect(statusCallback).toBeTypeOf("function"));
+
+      input.emit("data", "2");
+      await vi.waitFor(() => expect(outputText).toContain("Waiting for branch"));
+      statusCallback(null, " M changed.txt\0");
+      await vi.waitFor(() => expect(diffCallback).toBeTypeOf("function"));
+      diffCallback(null, "diff --git a/changed.txt b/changed.txt\n+OUTDATED DIFF\n");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(outputText).not.toContain("OUTDATED DIFF");
+      expect(plain(outputText)).toContain("Recorded activity");
+    } finally {
+      input.emit("data", "q");
+      await running;
+    }
+  });
+
   it.each([false, true])("restores terminal state after q when raw mode was %s", async (wasRaw) => {
     vi.useFakeTimers();
     // eslint-disable-next-line unicorn/prefer-event-target -- Node readline requires a stream EventEmitter API.

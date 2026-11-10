@@ -112,6 +112,7 @@ the current screen, not guaranteed full chat history. Agents without a terminal 
 Recorded activity shows actions before the final response and opens at the response when it spans
 multiple screens. Page Up, Page Down and the mouse wheel scroll the history; **Follow** restores
 automatic positioning. Retention limits show an omission notice.
+Press `d` on a focused agent with a recorded worker result to open its read-only diff.
 
 Quota starts with compact meters grouped into Work and Personal rows, each with its own accent.
 Unassigned accounts stay separate. Click `5h`/`wk` or press `w` to switch the compact meters between

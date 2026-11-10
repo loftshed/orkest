@@ -71,6 +71,14 @@ export const VISUAL_CASES = Object.freeze([
     tier: "unicode",
   },
   {
+    name: "diff-dark-100",
+    scenario: "diff",
+    cols: 100,
+    rows: 40,
+    palette: "dark",
+    tier: "unicode",
+  },
+  {
     name: "overview-nerd-100",
     scenario: "overview",
     cols: 100,
@@ -309,6 +317,43 @@ export async function renderFixture(repo, spec) {
         ].join("\n"),
       });
 
+      break;
+    }
+    case "diff": {
+      view.focusId = "builder";
+      view.setPreview({
+        agentId: "builder",
+        title: "Builder",
+        kind: "diff",
+        loading: false,
+        stale: false,
+        available: true,
+        files: [
+          { path: "src/search/grouping.mjs", added: 3, removed: 1 },
+          { path: "tests/search/grouping-test.js", added: 2, removed: 0 },
+        ],
+        text: [
+          "diff --git a/src/search/grouping.mjs b/src/search/grouping.mjs",
+          "index 9e6c123..be56f01 100644",
+          "--- a/src/search/grouping.mjs",
+          "+++ b/src/search/grouping.mjs",
+          "@@ -12,4 +12,6 @@ export function groupMatches(matches) {",
+          "   const groups = new Map();",
+          "+  const normalized = normalizeQuery(query);",
+          "+  const ranked = rankMatches(matches, normalized);",
+          "-  for (const match of matches) {",
+          "+  for (const match of ranked) {",
+          "+    if (!groups.has(match.category)) groups.set(match.category, []);",
+          "     groups.get(match.category).push(match);",
+          "diff --git a/tests/search/grouping-test.js b/tests/search/grouping-test.js",
+          "new file mode 100644",
+          "--- /dev/null",
+          "+++ b/tests/search/grouping-test.js",
+          "@@ -0,0 +1,2 @@",
+          '+it("groups normalized queries", () => {',
+          "+  expect(groupMatches(matches)).toHaveLength(2);",
+        ].join("\n"),
+      });
       break;
     }
     case "quota-hover": {

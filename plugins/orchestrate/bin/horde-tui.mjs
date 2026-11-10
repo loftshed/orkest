@@ -5,6 +5,7 @@ import { pathToFileURL } from "node:url";
 
 import { shouldUseColor } from "../../monitor/lib/render.mjs";
 import { CACHE_DIR, CONFIG_PATH } from "../../monitor/lib/store.mjs";
+import { readAgentDiff } from "../lib/agent-diff.mjs";
 import { createAgentPreview } from "../lib/agent-preview.mjs";
 import {
   createHerdrLifecycleSubscriber,
@@ -910,12 +911,14 @@ export async function runHordeTui(
   let prevAgents = toNotificationAgents(initialRoom);
   notifyHerdrTransitions(null, prevAgents, notifiedSet, { env, exec });
   let isNavigationPending = false;
+  let diffGeneration = 0;
   const view = new HordeView(initialRoom, {
     height: output.rows || 32,
     color: shouldUseColor(output),
     theme,
     inHerdr: Boolean(env?.HERDR_ENV === "1" || env?.ORKEST_HERDR_VIEW_STATE),
     onFocusPane: (agent) => {
+      diffGeneration++;
       if (isNavigationPending) return;
       isNavigationPending = true;
       view.notice = `Opening ${shortAgentName(agent)}...`;
@@ -938,7 +941,54 @@ export async function runHordeTui(
         });
     },
     onPreview: (agent) => {
+      diffGeneration++;
       void previewController.open(agent);
+    },
+    onDiff: (agent) => {
+      const token = ++diffGeneration;
+      void previewController.close();
+      view.setPreview({
+        agentId: agent.id,
+        title: shortAgentName(agent),
+        kind: "diff",
+        loading: true,
+        text: "",
+        files: [],
+        stale: false,
+      });
+      paint();
+      void readAgentDiff(agent, { exec })
+        .then((snapshot) => {
+          if (
+            isStopped ||
+            token !== diffGeneration ||
+            view.preview?.kind !== "diff" ||
+            view.preview.agentId !== agent.id
+          )
+            return;
+          view.setPreview(snapshot);
+          paint();
+        })
+        .catch(() => {
+          if (
+            isStopped ||
+            token !== diffGeneration ||
+            view.preview?.kind !== "diff" ||
+            view.preview.agentId !== agent.id
+          )
+            return;
+          view.setPreview({
+            agentId: agent.id,
+            title: shortAgentName(agent),
+            kind: "diff",
+            loading: false,
+            text: "The worker diff could not be read.",
+            files: [],
+            stale: false,
+            available: false,
+          });
+          paint();
+        });
     },
   });
   let isBusy = false;
