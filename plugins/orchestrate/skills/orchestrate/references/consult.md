@@ -44,18 +44,27 @@ python3 <skill-directory>/scripts/run_agent.py consult --intent review \
   --read . --diff origin/main --question 'Anything unsafe in this change?' --model claude:best
 ```
 
-| Input        | Form                                                                                                                            |
-| ------------ | ------------------------------------------------------------------------------------------------------------------------------- |
-| `--question` | Text, `@FILE`, or `-` for stdin. Required.                                                                                      |
-| `--context`  | Text or `@FILE`; repeatable, joined in order.                                                                                   |
-| `--attach`   | A text file inlined under its name (relative path inside `--read`); 128 KiB each, 200 KiB prompt.                               |
-| `--read`     | A Git repository (any directory inside it) the consultant may read and never write.                                             |
-| `--diff`     | `git status --short` and `git diff REF` (default `HEAD`) from `--read`, inlined; 128 KiB at most.                               |
-| `--model`    | Exact ID, family selector (`gpt:sol`, `claude:best`, `deepseek`) or Claude alias (`opus`).                                      |
-| `--engine`   | Only when the model does not say: GPT to Codex, Claude to Claude Code, Gemini to Antigravity, open-weight families to OpenCode. |
-| `--effort`   | Codex catalog effort, Claude `low…max`; Antigravity takes it from the model slug.                                               |
-| `--route`    | Role from `routes` (default `consultation`: `codex gpt:sol --effort high`).                                                     |
-| `--timeout`  | Default 10m for a question, 20m with `--read`.                                                                                  |
+| Input        | Form                                                                                                                             |
+| ------------ | -------------------------------------------------------------------------------------------------------------------------------- |
+| `--question` | Text, `@FILE`, or `-` for stdin. Required.                                                                                       |
+| `--context`  | Text or `@FILE`; repeatable, joined in order.                                                                                    |
+| `--attach`   | A text file inlined under its name (relative path inside `--read`); 128 KiB each, 200 KiB prompt.                                |
+| `--read`     | A Git repository (any directory inside it) the consultant may read and never write.                                              |
+| `--diff`     | `git status --short` and `git diff REF` (default `HEAD`) from `--read`, inlined; 128 KiB at most.                                |
+| `--model`    | Exact ID, family selector (`gpt:sol`, `claude:best`, `deepseek`) or Claude alias (`opus`); repeat or comma-separate for a panel. |
+| `--engine`   | Only when the model does not say: GPT to Codex, Claude to Claude Code, Gemini to Antigravity, open-weight families to OpenCode.  |
+| `--effort`   | Codex catalog effort, Claude `low…max`; Antigravity takes it from the model slug.                                                |
+| `--route`    | Role from `routes` (default `consultation`: `codex gpt:sol --effort high`).                                                      |
+| `--timeout`  | Default 10m for a question, 20m with `--read`.                                                                                   |
+
+Repeat `--model` or pass comma-separated model preferences to ask a panel concurrently. Repeated models are
+collapsed, and output blocks and the JSON `consultants` array keep the supplied order. Each consultant goes through
+its own preflight and quota checks and gets its own consultation directory and `result.json`; an executor run also
+writes its own `prompt.md`. The panel's `result.json` lists those member results. Text output prints each consultant's
+model, engine, status and answer sections. `--format json`
+returns an object with `panel: true` and the full per-consultant result objects. If a model would normally use native
+handoff, pass `--transport executor`; panels cannot be combined with `--follow-up` or `--detach`. The panel exits 0 if
+any consultant answered; if none answered, it returns the first consultant's exit code.
 
 Attachments are refused when their name or directory says credentials, on the path as given and
 on what it resolves to (`.env*`, `*.pem`, `*.key`, `id_rsa*`, anything with `secret` or `credential`

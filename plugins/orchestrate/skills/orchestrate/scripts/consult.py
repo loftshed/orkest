@@ -12,6 +12,7 @@ workflow, with scope, audit and verification.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import contextlib
 import importlib.util
 import json
@@ -182,7 +183,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="REF",
         help="Capture `git status --short` and `git diff REF` (default HEAD) from --read into the prompt",
     )
-    parser.add_argument("--model", help="Model preference: exact ID, family selector (gpt:sol, claude:best) or alias")
+    parser.add_argument(
+        "--model",
+        action="append",
+        dest="model_values",
+        help="Model preference: exact ID, family selector (gpt:sol, claude:best) or alias; repeat or comma-separate",
+    )
     parser.add_argument("--engine", choices=HOSTS, help="Executor CLI; inferred from the model when omitted")
     parser.add_argument("--effort", help="Reasoning effort where the engine takes one")
     parser.add_argument("--variant", help="OpenCode model variant")
@@ -236,7 +242,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--request", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--completion-event", type=Path, help=argparse.SUPPRESS)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    models: list[str] = []
+    for value in args.model_values or []:
+        for item in value.split(","):
+            model = item.strip()
+            if not model:
+                raise _error("--model values must not be empty")
+            if model not in models:
+                models.append(model)
+    args.models = models
+    # Keep the established single-model contract for all existing routing and request code.
+    args.model = models[0] if models else None
+    return args
 
 
 def read_text_argument(value: str, *, option: str) -> str:
@@ -564,7 +582,12 @@ def resolve_reading(args: argparse.Namespace, previous: dict[str, Any] | None) -
     return intent, repository
 
 
-def build_request(args: argparse.Namespace) -> dict[str, Any]:
+SHARED_INPUT_KEYS = ("question", "context", "attachments", "change")
+
+
+def build_request(args: argparse.Namespace, *, shared_inputs: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Build one consultation request. `shared_inputs` reuses the question, context, attachments and
+    diff another request already read, so a panel reads standard input and files once."""
     runner = _runner()
     if args.request is not None:
         try:
@@ -578,11 +601,28 @@ def build_request(args: argparse.Namespace) -> dict[str, Any]:
         raise _error("--question is required")
     previous = load_follow_up(args.follow_up) if args.follow_up else None
     intent, repository = resolve_reading(args, previous)
-    question = read_text_argument(args.question, option="--question")
-    context = "\n\n".join(read_text_argument(value, option="--context") for value in args.context)
+    panel_inputs = shared_inputs
+    question = (
+        panel_inputs["question"] if panel_inputs is not None else read_text_argument(args.question, option="--question")
+    )
+    context = (
+        panel_inputs["context"]
+        if panel_inputs is not None
+        else "\n\n".join(read_text_argument(value, option="--context") for value in args.context)
+    )
     repository_path = Path(repository) if repository else None
-    attachments = [read_attachment(path, repository=repository_path) for path in args.attach]
-    change = capture_diff(repository_path, args.diff) if args.diff is not None and repository_path else None
+    attachments = (
+        panel_inputs["attachments"]
+        if panel_inputs is not None
+        else [read_attachment(path, repository=repository_path) for path in args.attach]
+    )
+    change = (
+        panel_inputs["change"]
+        if panel_inputs is not None
+        else capture_diff(repository_path, args.diff)
+        if args.diff is not None and repository_path
+        else None
+    )
     route = resolve_route(args, previous)
     host = args.host or detect_host()
     transport = decide_transport(args, route["engine"], host, previous)
@@ -942,6 +982,7 @@ def finish(
     completion_event: Path | None,
     notification_mode: str,
     output_format: str,
+    emit_output: bool = True,
 ) -> int:
     runner = _runner()
     result["result_path"] = str(result_path)
@@ -956,7 +997,8 @@ def finish(
             notification_mode=notification_mode,
             completion_hook=None,
         )
-    print_summary(result, output_format=output_format)
+    if emit_output:
+        print_summary(result, output_format=output_format)
     return int(result["exit_code"])
 
 
@@ -1061,6 +1103,7 @@ def perform(
     notification_mode: str,
     output_format: str,
     dry_run: bool,
+    emit_output: bool = True,
 ) -> int:
     runner = _runner()
     started_at = runner.utc_now()
@@ -1078,6 +1121,7 @@ def perform(
             notification_mode=notification_mode,
             output_format=output_format,
             dry_run=dry_run,
+            emit_output=emit_output,
         )
     except Exception as exc:
         if completion_event is None or result_path.exists():
@@ -1118,6 +1162,7 @@ def _perform(
     notification_mode: str,
     output_format: str,
     dry_run: bool,
+    emit_output: bool = True,
 ) -> int:
     runner = _runner()
     support = runner.bundled_module("execution_support")
@@ -1219,6 +1264,7 @@ def _perform(
             completion_event=completion_event,
             notification_mode=notification_mode,
             output_format=output_format,
+            emit_output=emit_output,
         )
 
     environment = consult_environment(
@@ -1234,7 +1280,8 @@ def _perform(
         stdin_path = directory / "agy-input.jsonl"
         stdin_path.write_bytes(runner.agy_stream_input(prompt_path.read_text(encoding="utf-8")))
         stdin_path.chmod(0o600)
-    runner.emit_lifecycle("consultant_started", engine=engine, model=model, intent=intent)
+    if emit_output:
+        runner.emit_lifecycle("consultant_started", engine=engine, model=model, intent=intent)
     stdin_handle: Any = stdin_path.open("rb") if stdin_path is not None else subprocess.DEVNULL
     repository_before = runner.git_state(workspace) if reading else None
     credits_watch = None
@@ -1288,7 +1335,8 @@ def _perform(
             artifact.chmod(0o600)
     stdout_text = stdout_path.read_text(encoding="utf-8", errors="replace") if stdout_path.exists() else ""
     stderr_text = stderr_path.read_text(encoding="utf-8", errors="replace") if stderr_path.exists() else ""
-    runner.emit_lifecycle("consultant_finished", exit_code=process.returncode)
+    if emit_output:
+        runner.emit_lifecycle("consultant_finished", exit_code=process.returncode)
     # Informational: the engine's no-write mode is what prevents edits; the conductor or the user may
     # legitimately edit a repository while a reader looks at it, so a change is reported, not judged.
     repository_delta = (
@@ -1375,6 +1423,7 @@ def _perform(
         completion_event=completion_event,
         notification_mode=notification_mode,
         output_format=output_format,
+        emit_output=emit_output,
     )
 
 
@@ -1461,12 +1510,175 @@ def launch_detached(request: dict[str, Any], args: argparse.Namespace) -> int:
     return 0
 
 
+def enforce_policy(request: dict[str, Any]) -> None:
+    """Refuse a consultant whose engine the repository's policy denies (`ork policy`)."""
+    target = Path(request["read"]) if request.get("read") else Path.cwd()
+    _runner().enforce_repo_policy(target, request["engine"], request.get("claude_config_dir"))
+
+
+def run_panel_member(
+    request: dict[str, Any],
+    *,
+    out_dir: Path,
+    dry_run: bool,
+) -> tuple[int, dict[str, Any]]:
+    """Run one isolated consultant and turn any preflight refusal into its own result file."""
+    runner = _runner()
+    try:
+        enforce_policy(request)
+        exit_code = perform(
+            request,
+            out_dir=out_dir,
+            completion_event=None,
+            notification_mode="none",
+            output_format="text",
+            dry_run=dry_run,
+            emit_output=False,
+        )
+    except Exception as exc:
+        out_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        out_dir.chmod(0o700)
+        exit_code = getattr(exc, "exit_code", EXIT_FAILED)
+        status = "refused" if isinstance(exc, runner.RunnerError) and exit_code != EXIT_FAILED else "failed"
+        result = {
+            **base_result(request, started_at=runner.utc_now()),
+            "status": status,
+            "task_outcome": "failed",
+            "exit_code": exit_code,
+            "error": str(exc),
+            "sections": None,
+            "answer": None,
+            "uncertainty": None,
+            "answer_format": None,
+            "session_id": None,
+            "finished_at": runner.utc_now(),
+        }
+        finish(
+            result,
+            result_path=out_dir / "result.json",
+            completion_event=None,
+            notification_mode="none",
+            output_format="text",
+            emit_output=False,
+        )
+        return int(exit_code), result
+
+    result_path = out_dir / "result.json"
+    return exit_code, json.loads(result_path.read_text(encoding="utf-8"))
+
+
+def print_panel_summary(result: dict[str, Any], *, output_format: str) -> None:
+    if output_format == "json":
+        print(json.dumps(result, indent=2, ensure_ascii=True))
+        return
+    print("AGENT_CONSULT_PANEL=true")
+    print(f"AGENT_CONSULT_PANEL_STATUS={result['status']}")
+    print(f"AGENT_RESULT={result['result_path']}")
+    for index, consultant in enumerate(result["consultants"], start=1):
+        print(f"--- CONSULTANT {index} BEGIN ---")
+        print(f"MODEL={consultant['model']}")
+        print(f"ENGINE={consultant['engine']}")
+        print(f"STATUS={consultant['status']}")
+        if consultant.get("model_observed"):
+            print(f"MODEL_OBSERVED={','.join(consultant['model_observed'])}")
+        if consultant.get("error"):
+            print(f"ERROR={consultant['error']}")
+        if consultant["status"] == "answered":
+            for heading in INTENT_HEADINGS[consultant["intent"]]:
+                print(f"--- {heading} ---")
+                value = (consultant.get("sections") or {}).get(heading)
+                print(value if value is not None else "(the consultant gave no such section)")
+            print("--- END ---")
+        print(f"--- CONSULTANT {index} END ---")
+
+
+def perform_panel(requests: list[dict[str, Any]], args: argparse.Namespace) -> int:
+    runner = _runner()
+    repository = requests[0].get("read")
+    panel_dir = prepare_consult_dir(args.out_dir, repository)
+    member_root = panel_dir / "consultants"
+    member_root.mkdir(mode=0o700)
+    member_dirs = [member_root / f"consultant-{index:02d}" for index in range(1, len(requests) + 1)]
+
+    def run_member(item: tuple[dict[str, Any], Path]) -> tuple[int, dict[str, Any]]:
+        request, out_dir = item
+        return run_panel_member(request, out_dir=out_dir, dry_run=args.dry_run)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(requests))) as pool:
+        outcomes = list(pool.map(run_member, zip(requests, member_dirs, strict=True)))
+    consultant_results = [result for _exit_code, result in outcomes]
+    exit_codes = [exit_code for exit_code, _result in outcomes]
+    any_answered = any(result["status"] == "answered" for result in consultant_results)
+    all_dry_run = all(result["status"] == "dry_run" for result in consultant_results)
+    panel_result_path = panel_dir / "result.json"
+    panel_result = {
+        "schema": "agent-executor.consultation-panel.v1",
+        "panel": True,
+        "status": "answered" if any_answered else "dry_run" if all_dry_run else "failed",
+        "exit_code": 0 if any_answered else exit_codes[0],
+        "consultants": consultant_results,
+        "result_path": str(panel_result_path),
+        "finished_at": runner.utc_now(),
+    }
+    runner.write_json_atomic(panel_result_path, panel_result)
+    print_panel_summary(panel_result, output_format=args.format)
+    return panel_result["exit_code"]
+
+
 def main(argv: list[str] | None = None) -> int:
     runner = _runner()
     args = parse_args(argv)
     if (args.completion_event or args.notify) and not (args.detach or args.request):
         raise _error("--notify is only valid with --detach")
+    panel_mode = len(args.models) > 1
+    if panel_mode:
+        if args.follow_up:
+            raise _error("a model panel cannot be combined with --follow-up")
+        if args.detach:
+            raise _error("a model panel cannot be combined with --detach")
+        if args.request:
+            raise _error("a model panel cannot be combined with an internal --request")
+        requests: list[dict[str, Any]] = []
+        shared_inputs = None
+        for model in args.models:
+            model_args = argparse.Namespace(**vars(args))
+            model_args.model = model
+            request = build_request(model_args, shared_inputs=shared_inputs)
+            requests.append(request)
+            shared_inputs = shared_inputs or {key: request[key] for key in SHARED_INPUT_KEYS}
+        if any(request["transport"] == "native" for request in requests):
+            raise _error("a model panel needs executor transport; pass --transport executor for native models")
+        parent_session = next(
+            (
+                os.environ[key]
+                for key in (
+                    "AGENT_MAILBOX_SESSION",
+                    "CODEX_THREAD_ID",
+                    "CLAUDE_CODE_SESSION_ID",
+                    "ANTIGRAVITY_CONVERSATION_ID",
+                    "OPENCODE_SESSION_ID",
+                )
+                if os.environ.get(key)
+            ),
+            None,
+        )
+        room_id = os.environ.get("ORKEST_SWARM_ROOM") or None
+        if not room_id and parent_session:
+            with contextlib.suppress(OSError):
+                room = runner.bundled_module("agent_statusline_tmux").find_session_swarm_room(
+                    runner.default_agent_cache_dir() / "mailbox-v1", parent_session
+                )
+                if room:
+                    room_id = room["id"]
+        for request in requests:
+            request.setdefault("parent_session", parent_session)
+            request.setdefault("room_id", room_id)
+        return perform_panel(requests, args)
+
     request = build_request(args)
+    if not args.request:
+        # A detached child (--request) was already checked by the parent that wrote its request.
+        enforce_policy(request)
     if "parent_session" not in request:
         request["parent_session"] = next(
             (

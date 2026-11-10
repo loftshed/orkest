@@ -2076,14 +2076,8 @@ def main() -> int:
         return steer_main(argv[1:])
     if argv and argv[0] == "consult":
         auto_prune()
-        consult_mod = bundled_module("consult")
-        if not any(flag in argv[1:] for flag in ("-h", "--help")):
-            c_args = consult_mod.parse_args(argv[1:])
-            if not c_args.request:
-                c_req = consult_mod.build_request(c_args)
-                target_cwd = Path(c_req["read"]) if c_req.get("read") else Path.cwd()
-                enforce_repo_policy(target_cwd, c_req["engine"], c_req.get("claude_config_dir"))
-        return consult_mod.main(argv[1:])
+        # consult enforces repository policy itself, once per consultant, after reading its inputs once.
+        return bundled_module("consult").main(argv[1:])
     if argv and argv[0] == "models":
         return models_main(argv[1:])
     if argv and argv[0] == "events":
