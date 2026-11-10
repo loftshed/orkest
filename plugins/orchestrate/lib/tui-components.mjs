@@ -234,14 +234,14 @@ export function sectionHeading(
 ) {
   const available = Math.max(0, width - displayWidth(prefix));
   const text = detailParts?.length
-    ? detailParts.map((part) => plain(part.text)).join(" · ")
+    ? detailParts.map((part) => plain(part.text)).join("  ·  ")
     : plain(detail);
   const suffix = text ? `${separator}${text}` : "";
   const styledSuffix = detailParts?.length
     ? tone(separator, "muted", color) +
       detailParts
         .map((part) => tone(plain(part.text), part.style, color))
-        .join(tone(" · ", "muted", color))
+        .join(tone("  ·  ", "muted", color))
     : tone(suffix, "muted", color);
   const nameWidth = Math.max(0, available - displayWidth(suffix));
   const name =
