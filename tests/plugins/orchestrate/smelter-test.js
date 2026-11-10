@@ -30,8 +30,8 @@ import {
 } from "../../../plugins/orchestrate/lib/foundry.mjs";
 import {
   alignCanonicalPath,
+  buildColdReviewQuestion,
   classifyBlastRadius,
-  COLD_REVIEW_QUESTION,
   discoverSmeltableWorktrees,
   getBranchDiffFiles,
   parseColdReviewFindings,
@@ -782,7 +782,11 @@ describe("ork smelter", () => {
     });
     expect(pr.status).toBe("pr_opened");
     expect(commands).toContainEqual(["git", "push", "origin", "fixture-head:refs/heads/builder"]);
-    expect(COLD_REVIEW_QUESTION).toBe(reviews[0].args.at(-1));
+    expect(reviews[0].args.at(-1)).toBe(buildColdReviewQuestion(full.evidence));
+    expect(reviews[0].args.at(-1)).toContain("tests were not run");
+    expect(pr.evidence.review.result).toBe("not_reviewed");
+    expect(pr.stages.coldReview.findings).toBeNull();
+    expect(dry.evidence.review.result).toBe("not_reviewed");
     await expect(smeltWorktree(wt, { execFileSyncFn: () => " M dirty.js" })).rejects.toThrow(
       /uncommitted changes/u,
     );
@@ -886,15 +890,20 @@ describe("ork smelter", () => {
 
   it("parses cold review FINDINGS and filters discoverSmeltableWorktrees by foundryState and canonical path", async () => {
     expect(parseColdReviewFindings(null)).toEqual({
-      findings: "Cold review output missing FINDINGS section",
+      findings: null,
+      reason: "Cold review output missing FINDINGS section",
+      result: "infrastructure_failure",
       passed: false,
     });
     expect(parseColdReviewFindings("unstructured text without findings header")).toEqual({
-      findings: "Cold review output missing FINDINGS section",
+      findings: null,
+      reason: "Cold review output missing FINDINGS section",
+      result: "infrastructure_failure",
       passed: false,
     });
     expect(parseColdReviewFindings({ sections: { FINDINGS: "None" } })).toEqual({
       findings: "none",
+      result: "passed",
       passed: true,
     });
     expect(
@@ -907,6 +916,7 @@ describe("ork smelter", () => {
       ),
     ).toEqual({
       findings: "- Bug in smelter.mjs:42\n- Missing test in smelter-test.js",
+      result: "findings",
       passed: false,
     });
 
@@ -1087,12 +1097,12 @@ describe("ork smelter", () => {
         changedPaths: ["plugins/orchestrate/lib/smelter.mjs"],
         execFileSyncFn: (cmd, args) => (args[0] === "rev-parse" ? "fixture-head" : ""),
         gateRunner: async () => {
-          throw new Error("Heavy gate failed");
+          throw Object.assign(new Error("Heavy gate failed"), { status: 1 });
         },
       }),
     ).resolves.toMatchObject({
       status: "gate_failed",
-      evidence: { checks: [{ result: "failed", exitCode: null }] },
+      evidence: { checks: [{ result: "failed", exitCode: 1 }] },
     });
     expect(readFoundryState(wtPath)).toMatchObject({
       schema: FOUNDRY_STATE_SCHEMA,

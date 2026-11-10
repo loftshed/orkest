@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Report acceptance, development and lint checks separately; derive cold review questions from candidate evidence.
+- Distinguish skipped reviews, reviewer infrastructure failures and gate infrastructure failures from defects.
+- Bind approvals and skip-review waivers to candidate and policy; retry infrastructure failures twice without consuming code repairs.
+
 ## 0.76.8
 
 - fix(orchestrate): bind verification, review and acceptance to one candidate (#161)

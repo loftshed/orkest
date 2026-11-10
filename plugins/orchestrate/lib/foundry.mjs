@@ -122,7 +122,14 @@ function validateTaskSpecObject(candidate, requireSchemaTag) {
   ) {
     return null;
   }
+  if (
+    candidate.acceptance_checks !== undefined &&
+    (!Array.isArray(candidate.acceptance_checks) ||
+      candidate.acceptance_checks.some((item) => !(typeof item === "string" && item.trim())))
+  )
+    return null;
   const hasChecks =
+    isNonEmptyStringArray(candidate.acceptance_checks) ||
     isNonEmptyStringArray(candidate.development_checks) ||
     isNonEmptyStringArray(candidate.acceptance_criteria);
   if (!hasChecks) return null;
