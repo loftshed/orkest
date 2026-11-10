@@ -6,6 +6,10 @@
 - Distinguish skipped reviews, reviewer infrastructure failures and gate infrastructure failures from defects.
 - Bind approvals and skip-review waivers to candidate and policy; retry infrastructure failures twice without consuming code repairs.
 
+## 0.76.8
+
+- fix(orchestrate): bind verification, review and acceptance to one candidate (#161)
+
 ## 0.76.7
 
 - Bind Smelter checks, review, approval and integration to one pinned candidate and target, with durable evidence.
