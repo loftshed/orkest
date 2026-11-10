@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.76.9
 
 - Report acceptance, development and lint checks separately; derive cold review questions from candidate evidence.
 - Distinguish skipped reviews, reviewer infrastructure failures and gate infrastructure failures from defects.
