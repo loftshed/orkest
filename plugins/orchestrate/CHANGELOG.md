@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.79.0
+
+- feat(orchestrate): preview a worker's diff in Swarm View (#183)
+- refactor(orchestrate): give repository path rules one implementation (#182)
+
 ## 0.78.0
 
 - feat(orchestrate): show a room its own checkout and the workers it sent out (#181)
