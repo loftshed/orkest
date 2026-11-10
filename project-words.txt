@@ -61,3 +61,4 @@ vtsls
 xcrun
 xhigh
 xpzf
+magick
