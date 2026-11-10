@@ -1,5 +1,12 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -26,7 +33,9 @@ function git(cwd, ...args) {
   }).trim();
 }
 function fixture(taskSpec = {}, { high = false } = {}) {
-  const root = mkdtempSync(path.join(tmpdir(), "ork-verification-retained-"));
+  // Git and the gate report real paths; macOS temp directories sit behind a symlink.
+  const created = mkdtempSync(path.join(tmpdir(), "ork-verification-retained-"));
+  const root = realpathSync(created);
   const repo = path.join(root, "repo");
   const wt = path.join(root, "candidate");
   mkdirSync(repo);
