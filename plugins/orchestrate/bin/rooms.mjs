@@ -7,6 +7,7 @@ import {
   assignWorkforceRole,
   bindSession,
   coordinator,
+  createMemberWorktree,
   dispatchMember,
   growRoom,
   keepWorktree,
@@ -29,6 +30,7 @@ ork rooms create --team TEAM [--group GROUP] [--title TITLE] [--cwd PATH] [--id 
 ork rooms add --room ID --team TEAM [--parent conductor|MEMBER] [--role ROLE] [--cwd PATH]
 ork rooms lead --room ID --member ID --objective TEXT [--role ROLE] [--cwd PATH] [--keep-worktree]   (reserves a native subswarm lead)
 ork rooms role --room ID [--member ID|conductor] --role ROLE [--cwd PATH] [--keep-worktree]   (assign or switch workforce role)
+ork rooms worktree --room ID --member ID [--slug SLUG] [--branch BRANCH]   (create a disposable member checkout)
 ork rooms worktree-keep --room ID --member ID|conductor [--cwd PATH]   (promote a disposable worktree to persistent)
 ork rooms objective --room ID --objective TEXT
 ork rooms pause|resume --room ID [--member conductor|MEMBER]   (gates new launches)
@@ -93,6 +95,8 @@ export async function roomsCommand(
           "group",
           "title",
           "member",
+          "slug",
+          "branch",
           "task-dir",
           "task-spec",
           "host",
@@ -226,6 +230,15 @@ export async function roomsCommand(
       result = await keepWorktree(requireValue("room"), requireValue("member"), {
         root,
         cwd: values.cwd,
+      });
+      break;
+    }
+    case "worktree": {
+      result = await createMemberWorktree(requireValue("room"), requireValue("member"), {
+        root,
+        run,
+        slug: values.slug,
+        branch: values.branch,
       });
       break;
     }

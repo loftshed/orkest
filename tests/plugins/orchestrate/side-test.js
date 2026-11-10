@@ -443,6 +443,64 @@ describe("ork side (side missions)", () => {
       });
     });
 
+    it("keeps the detached fallback when the side branch already exists", async () => {
+      const roomPath = path.join(mailboxDir, "rooms", "room-detached.json");
+      fs.writeFileSync(
+        roomPath,
+        JSON.stringify({
+          id: "room-detached",
+          cwd: repoDir,
+          parent: { id: "conductor", session: "parent-session-detached" },
+          agents: [],
+        }),
+        "utf8",
+      );
+      spawnSync("git", ["init"], { cwd: repoDir, stdio: "ignore" });
+      spawnSync("git", ["config", "user.name", "Side Worktree Tests"], { cwd: repoDir });
+      spawnSync("git", ["config", "user.email", "side-worktree@example.invalid"], {
+        cwd: repoDir,
+      });
+      fs.writeFileSync(path.join(repoDir, "tracked.txt"), "fixture\n", "utf8");
+      spawnSync("git", ["add", "tracked.txt"], { cwd: repoDir });
+      spawnSync("git", ["commit", "-m", "side fixture"], { cwd: repoDir, stdio: "ignore" });
+      spawnSync("git", ["branch", "ork/side-detach01"], { cwd: repoDir });
+
+      const res = await sideCommand(["--room", "room-detached", "--json", "fix a fixture"], {
+        cwd: repoDir,
+        mailboxDir,
+        cacheDir,
+        shortId: "detach01",
+        runCommand: (cmd, args, opts) => {
+          if (cmd === "git") {
+            const result = spawnSync(cmd, args, { cwd: opts.cwd, encoding: "utf8" });
+            return {
+              status: result.status,
+              stdout: result.stdout || "",
+              stderr: result.stderr || "",
+            };
+          }
+          if (cmd === "python3" && args.includes("init"))
+            return { status: 0, stdout: JSON.stringify({ status: "active" }), stderr: "" };
+          if (cmd === "python3" && args.includes("dispatch"))
+            return {
+              status: 0,
+              stdout: JSON.stringify({ run_id: "run-detached", engine: "codex", model: "test" }),
+              stderr: "",
+            };
+          return { status: 0, stdout: "", stderr: "" };
+        },
+      });
+
+      expect(res.status).toBe("dispatched");
+      expect(res.worktreePath).toBe(path.join(repoDir, ".worktrees", "wt-side-detach01"));
+      const branch = spawnSync("git", ["branch", "--show-current"], {
+        cwd: res.worktreePath,
+        encoding: "utf8",
+      });
+      expect(branch.stdout.trim()).toBe("");
+      expect(branch.status).toBe(0);
+    });
+
     it("enforces per-repo harness denylist policy and routes personal Claude to ~/.claude-personal", async () => {
       const configDir = path.join(tmpDir, "config");
       fs.mkdirSync(configDir, { recursive: true });

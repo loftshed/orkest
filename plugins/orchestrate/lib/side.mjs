@@ -7,6 +7,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { listRawRooms, readRawRoom, updateRawRoom } from "./horde-room.mjs";
 import { bootstrapWorktreeInclude } from "./worktree-env.mjs";
+import { provisionWorktree } from "./worktree-provision.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -382,14 +383,13 @@ async function registerSideMemberInRoom(roomRecord, sideSpec) {
 
 function provisionSideWorktree(repoRoot, shortId, runCmd) {
   const worktreesRoot = path.join(repoRoot, ".worktrees");
-  fs.mkdirSync(worktreesRoot, { recursive: true });
   const worktreePath = path.join(worktreesRoot, `wt-side-${shortId}`);
   const branch = `ork/side-${shortId}`;
 
-  const addRes = runCmd("git", ["worktree", "add", "-b", branch, worktreePath, "HEAD"], {
-    cwd: repoRoot,
-  });
-  if (addRes.status !== 0) {
+  try {
+    provisionWorktree(repoRoot, { slug: `wt-side-${shortId}`, branch, exec: runCmd });
+  } catch (error) {
+    if (!["add", "path-exists"].includes(error.stage)) throw error;
     // Fallback to detached worktree if branch name already exists
     const fallbackRes = runCmd("git", ["worktree", "add", "--detach", worktreePath, "HEAD"], {
       cwd: repoRoot,
@@ -397,13 +397,14 @@ function provisionSideWorktree(repoRoot, shortId, runCmd) {
     if (fallbackRes.status !== 0) {
       throw new Error(
         `Failed to provision side-mission worktree at ${worktreePath}: ${
-          addRes.stderr || fallbackRes.stderr || "git worktree add failed"
+          error.stderr || fallbackRes.stderr || "git worktree add failed"
         }`,
+        { cause: error },
       );
     }
-  }
 
-  bootstrapWorktreeInclude(repoRoot, worktreePath, { overwrite: false });
+    bootstrapWorktreeInclude(repoRoot, worktreePath, { overwrite: false });
+  }
 
   return { worktreePath, branch };
 }

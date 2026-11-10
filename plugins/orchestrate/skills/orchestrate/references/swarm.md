@@ -91,11 +91,12 @@ peer; display names and free-form aliases do not establish ownership.
    ledger. Never duplicate a coordinator task on the interactive workboard.
 
 A lead runs as a native subagent, outside the audited leaf-job runner. It must not hold a checkout's
-writer lease while waiting for workers to edit it. Worker scope, invocation allowances, deadlines,
-leases, evidence checks and review remain the existing coordinator's responsibility. A room supports
-one checkout and serializes mutating worker runs. Concurrent implementation across worktrees is not
-part of this first workflow. Cross-harness workers are supported; subswarm leads stay in their
-parent's native harness.
+writer lease while waiting for workers to edit it. For concurrent implementation, create a checkout
+for each writing member with `ork hall worktree --room ID --member MEMBER`, set each task spec's
+`repository_root` to its printed path, and dispatch the member. The conductor reviews and integrates
+each result; `patch-race` remains unsupported in a room. Worker scope, invocation allowances,
+deadlines, leases, evidence checks and review remain the existing coordinator's responsibility.
+Cross-harness workers are supported; subswarm leads stay in their parent's native harness.
 
 The default room has 12 member slots and 3 levels below its root. `--max-agents` and `--max-depth`
 choose those limits at creation. Slots include queued members and leads, remain allocated after

@@ -25,6 +25,11 @@ import {
 } from "./horde-room.mjs";
 import { hasTerminalDecision, memberDisplayState } from "./member-state.mjs";
 import { verifiedNativeIds } from "./native-identity.mjs";
+import {
+  provisionWorktree,
+  resolveRepositoryRoot,
+  validateWorktreeSlug,
+} from "./worktree-provision.mjs";
 
 const execute = promisify(execFile);
 const plugin = fileURLToPath(new URL("../", import.meta.url));
@@ -206,8 +211,9 @@ Leaf work uses ork rooms init-task and dispatch, which preserve the existing run
 deadlines, evidence and review. Native workers use --transport native and your native supervision
 tools; other harnesses use executor transport. Use background dispatch and return to the user while
 work runs. Do not hold a writer lease as a lead while waiting for children to edit that checkout.
-Resolve write ownership before work begins; independent concurrent edits need separate worktrees
-and explicit integration ownership. For this room, mutating worker runs remain serialized.
+Resolve write ownership before work begins. Writers in one checkout take turns; for concurrent
+edits give each writing member its own checkout with ork hall worktree --room ${room.id} --member
+MEMBER, set that task's repository_root to the printed path, and own the integration yourself.
 
 Read results, recover finished runs and verify acceptance before declaring success. A lead's idle or
 reported complete status is not acceptance. Use the existing workboard for native lead assignments
@@ -890,6 +896,92 @@ export async function keepWorktree(id, memberId = "conductor", { root = mailboxR
   );
 }
 
+async function assertMemberDispatchEnded(member, run) {
+  const dispatch = member.dispatch;
+  if (!dispatch) return;
+  if (dispatch.restore || dispatch.status === "running" || !dispatch.requestId || !dispatch.taskDir)
+    throw new Error(`Member ${member.id} has an active or unresolved dispatch`);
+
+  let task;
+  try {
+    task = await run(["show", "--task-dir", dispatch.taskDir]);
+  } catch (error) {
+    throw new Error(`Cannot verify member ${member.id} dispatch status: ${error.message}`, {
+      cause: error,
+    });
+  }
+  const recordedRun = task.runs?.find((entry) => entry.request_id === dispatch.requestId);
+  if (!recordedRun || !["finished", "cancelled"].includes(recordedRun.status))
+    throw new Error(`Member ${member.id} has an active or unresolved dispatch`);
+}
+
+/** Give a room member a dedicated disposable checkout for concurrent implementation work. */
+export async function createMemberWorktree(id, memberId, options = {}) {
+  const { root = mailboxRoot(), run = coordinator, exec } = options;
+  if (memberId === "conductor") throw new Error("A worktree can only be assigned to a worker");
+  const room = await readRoom(id, root);
+  const member = memberOf(room, memberId);
+  if (member.worktree) throw new Error(`Member ${memberId} already has a worktree`);
+  const repositoryRoot = resolveRepositoryRoot(room.cwd, exec);
+  const slug = validateWorktreeSlug(options.slug ?? memberId);
+  const branch = options.branch ?? `ork/room-${slug}`;
+  const planned = {
+    path: path.join(repositoryRoot, ".worktrees", slug),
+    parentCwd: room.cwd,
+    branch,
+    slug,
+    disposable: true,
+  };
+  const previousCwd = member.cwd;
+
+  const reserved = await updateRoom(
+    id,
+    async (current) => {
+      const currentMember = memberOf(current, memberId);
+      if (currentMember.worktree) throw new Error(`Member ${memberId} already has a worktree`);
+      await assertMemberDispatchEnded(currentMember, run);
+      currentMember.worktree = planned;
+      currentMember.cwd = planned.path;
+      return current;
+    },
+    { root },
+  );
+
+  let provisioned;
+  try {
+    provisioned = provisionWorktree(repositoryRoot, { slug, branch, exec });
+  } catch (error) {
+    // Keep the room metadata when git created the worktree but local include setup failed.
+    if (error.stage !== "bootstrap") {
+      await updateRoom(
+        id,
+        (current) => {
+          const currentMember = memberOf(current, memberId);
+          if (currentMember.worktree?.path === planned.path) {
+            delete currentMember.worktree;
+            if (previousCwd === undefined) delete currentMember.cwd;
+            else currentMember.cwd = previousCwd;
+          }
+          return current;
+        },
+        { root },
+      );
+    }
+    throw error;
+  }
+
+  const savedMember = memberOf(reserved, memberId);
+  return {
+    roomId: id,
+    memberId,
+    path: provisioned.path,
+    branch: provisioned.branch,
+    slug: provisioned.slug,
+    parentCwd: room.cwd,
+    worktree: savedMember.worktree,
+  };
+}
+
 /** Persist intent before coordinator dispatch; retries use the same task and request. */
 export async function dispatchMember(id, memberId, options = {}) {
   const { root = mailboxRoot(), run = coordinator } = options;
@@ -900,7 +992,9 @@ export async function dispatchMember(id, memberId, options = {}) {
   const room = await readRoom(id, root);
   const targetMember =
     memberId === "conductor" ? room.conductor : room.agents.find((agent) => agent.id === memberId);
-  const currentMemberCwd = await realpath(targetMember?.cwd || room.cwd);
+  const currentMemberCwd = await realpath(
+    targetMember?.worktree?.path || targetMember?.cwd || room.cwd,
+  );
   const resolvedMemberCwd = options.cwd ? await realpath(options.cwd) : currentMemberCwd;
   if ((await realpath(task.repository)) !== resolvedMemberCwd)
     throw new Error("Task repository differs from room checkout");
@@ -969,9 +1063,12 @@ export async function dispatchMember(id, memberId, options = {}) {
   };
   const saved = await updateRoom(
     id,
-    (current) => {
+    async (current) => {
       if (memberId === "conductor") throw new Error("Dispatch a worker, not the conductor");
       const member = memberOf(current, memberId);
+      const currentCheckout = await realpath(member.worktree?.path || member.cwd || current.cwd);
+      if (currentCheckout !== currentMemberCwd)
+        throw new Error("Member checkout changed before dispatch");
       if (member.role === "lead")
         throw new Error("A subswarm lead uses native supervision, not worker dispatch");
       if (kind === "continue" && !member.dispatch)
