@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.76.7
 
 - Persist Foundry and repair attempts before launch; gate uncertain outcomes without resetting allowances.
 - Protect Next host actions and Smelter mutation/review phases with workspace leases.
