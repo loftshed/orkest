@@ -492,7 +492,10 @@ describe("ork side (side missions)", () => {
       });
 
       expect(res.status).toBe("dispatched");
-      expect(res.worktreePath).toBe(path.join(repoDir, ".worktrees", "wt-side-detach01"));
+      // Git reports the resolved checkout, which differs from the temp path where it is a symlink.
+      expect(res.worktreePath).toBe(
+        path.join(fs.realpathSync(repoDir), ".worktrees", "wt-side-detach01"),
+      );
       const branch = spawnSync("git", ["branch", "--show-current"], {
         cwd: res.worktreePath,
         encoding: "utf8",

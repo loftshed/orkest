@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -13,7 +13,9 @@ import { retainFixtures } from "../../helpers/retain-fixtures.js";
 const directories = [];
 
 async function directory() {
-  const result = await mkdtemp(path.join(tmpdir(), "ork-room-worktree-"));
+  // Resolved, because the system temp directory is a symlink on macOS and Git reports real paths.
+  const created = await mkdtemp(path.join(tmpdir(), "ork-room-worktree-"));
+  const result = await realpath(created);
   directories.push(result);
   return result;
 }
