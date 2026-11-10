@@ -53,6 +53,7 @@ import {
 } from "./foundry.mjs";
 import { mailboxRoot, resolveWorktreeMarkerPath } from "./horde-room.mjs";
 import { glyphSet, glyphTier, renderPanel, renderTable } from "./horde-view.mjs";
+import { memberDisplayState } from "./member-state.mjs";
 import { observeRoom, recoverRoom } from "./rooms.mjs";
 import { cacheHome } from "./runtime-paths.mjs";
 import {
@@ -542,8 +543,11 @@ export async function evaluateNextCandidates({
       });
     }
 
+    // An answered consultation keeps its question, and a finished member has nothing left to ask.
     const blockedAgents = observedRoom.agents.filter(
-      (agent) => agent.status === "blocked" || Boolean(agent.question),
+      (agent) =>
+        !["finished", "answered"].includes(memberDisplayState(agent)) &&
+        (agent.status === "blocked" || Boolean(agent.question)),
     );
     for (const agent of blockedAgents) {
       tier3.push({

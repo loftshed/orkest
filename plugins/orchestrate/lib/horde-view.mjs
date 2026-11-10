@@ -206,6 +206,7 @@ function activityParts(agents, tier) {
   if (blockedCount)
     parts.push({ text: `${glyphSet(tier).blocked} ${blockedCount} blocked`, style: "error" });
   for (const [state, spec] of Object.entries(OUTCOMES)) {
+    if (spec.neutral) continue;
     const count = agents.filter((agent) => memberDisplayState(agent) === state).length;
     if (count)
       parts.push({ text: `${outcomeGlyph(state, tier)} ${count} ${state}`, style: spec.tone });

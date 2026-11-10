@@ -240,6 +240,8 @@ it("projects current session status and nesting without treating a lead report a
     name: "example-gpt-test-high-cache-aa",
     status: "reported complete",
   });
+  // A room-bound member stays reviewable: progress alone never marks it untracked.
+  expect(observed.agents[0].completion).toBeUndefined();
   const view = new HordeView(observed, { height: 30, tier: "unicode" });
   const output = view.render(85).join("\n");
   expect(output).toContain("│ ┌ ▸ 1 haiku-1");

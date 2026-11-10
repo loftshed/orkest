@@ -204,6 +204,8 @@ function notificationSummary(agents) {
   const counts = new Map();
   for (const agent of agents) {
     const state = memberDisplayState(agent || {});
+    // Finished/answered members await nobody, so they neither block nor join a review summary.
+    if (MEMBER_OUTCOMES[state]?.neutral) continue;
     if (!isTerminalDisplayState(state)) return null;
     counts.set(state, (counts.get(state) || 0) + 1);
   }
@@ -215,7 +217,7 @@ function notificationSummary(agents) {
     title: entries.length === 1 ? `Swarm ${label(entries[0][0])}` : "Swarm outcomes",
     body:
       entries.length === 1
-        ? `All ${agents.length} agents ${label(entries[0][0])}.`
+        ? `All ${entries[0][1]} agents ${label(entries[0][0])}.`
         : entries.map(([state, count]) => `${count} ${label(state)}`).join(" · ") + ".",
     sound: entries.every(([state]) => ["accepted", "supported"].includes(state))
       ? "done"

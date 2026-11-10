@@ -148,6 +148,7 @@ describe("room execution", () => {
       modelSource: "observed",
       requestedModel: "requested-worker-model",
       status: "reported complete",
+      completion: "answered",
       runtimeState: "stopped",
       nativeSession: "worker-session",
     });
@@ -1205,6 +1206,7 @@ describe("room CLI", () => {
       expect(completedSub).toBeDefined();
       expect(completedSub.model).toBe("claude-sonnet-5-5");
       expect(completedSub.status).toBe("reported complete");
+      expect(completedSub.completion).toBe("untracked");
       expect(completedSub.progress.task).toBe("Sonnet implements layout Phase 1");
       expect(completedSub.id).not.toMatch(/^subagent-/u);
     } finally {
@@ -1331,6 +1333,8 @@ describe("room CLI", () => {
         model: "claude-opus-5-5",
         cwd,
       });
+      // A reserved slot keeps its workboard review obligations.
+      expect(byId.get(builder).completion).toBeUndefined();
       expect(byId.get(reviewer)).toMatchObject({
         nativeSession: "subagent-a7",
         workforceRole: "reviewer",
@@ -1759,7 +1763,7 @@ describe("room CLI", () => {
     await mkdir(path.join(root, "progress"), { recursive: true });
     const room = await newRoom([], { id: "room-script-row", cwd, root, title: "Wave 12" });
     const startedAt = new Date().toISOString();
-    const report = async (session, harness, stage) => {
+    const report = async (session, harness, stage, extra = {}) => {
       await writeFile(
         path.join(root, "peers", `${session}.json`),
         JSON.stringify({
@@ -1787,12 +1791,15 @@ describe("room CLI", () => {
           goal: "Wave 12",
           task: "Verifier B phase 2",
           updatedAt: new Date().toISOString(),
+          ...extra,
         }),
       );
     };
-    const statusOf = async (session) =>
-      (await observeRoom(room.id, { root })).agents.find((agent) => agent.nativeSession === session)
-        ?.status;
+    const agentOf = async (session) =>
+      (await observeRoom(room.id, { root })).agents.find(
+        (agent) => agent.nativeSession === session,
+      );
+    const statusOf = async (session) => (await agentOf(session))?.status;
     for (const [stage, status] of [
       ["working", "running"],
       ["testing", "running"],
@@ -1802,6 +1809,13 @@ describe("room CLI", () => {
       await report("wave-driver", "unknown", stage);
       expect(await statusOf("wave-driver"), stage).toBe(status);
     }
+    // A discovered peer without a dispatch has nothing to review.
+    expect((await agentOf("wave-driver")).completion).toBe("untracked");
+    // A peer whose last report names claimed, blocked or review workboard items may still owe a
+    // review, so it stays "reported complete" rather than "finished".
+    await report("board-holder", "unknown", "complete", { workContext: "0".repeat(64) });
+    expect((await agentOf("board-holder")).completion).toBeUndefined();
+    expect((await agentOf("board-holder")).status).toBe("reported complete");
     // A harness still reports busy or idle through its hooks, so its stage doesn't override them.
     await report("resting-agent", "claude", "working");
     expect(await statusOf("resting-agent")).toBe("idle");

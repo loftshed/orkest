@@ -1489,6 +1489,7 @@ async function appendConsultations(room, root) {
           effort: job.effort,
           cwd: job.cwd || parent.cwd || room.cwd,
           status,
+          ...(isFinished && result.status === "answered" && { completion: "answered" }),
           runtimeState,
           nativeSession: workerSession || undefined,
           ...(consultationActivitySource && { activitySource: consultationActivitySource }),
@@ -1639,6 +1640,15 @@ async function appendRoomMessages(room, root) {
   discoveredRoomMessages.sort(sortChronologically);
   const existing = Array.isArray(room.messages) ? room.messages : [];
   room.messages = [...existing, ...discoveredRoomMessages];
+}
+
+/**
+ * Whether a finished discovered session has nothing a reviewer could accept: it holds no reserved
+ * slot (leads and briefed workers do) and its last report names no claimed, blocked or review
+ * workboard item (`workContext` is a digest of those items and is absent without them).
+ */
+function isUntrackedCompletion({ slot, progress }) {
+  return !slot && !progress?.workContext;
 }
 
 async function appendNativePeers(room, snapshots, root) {
@@ -1819,6 +1829,9 @@ async function appendNativePeers(room, snapshots, root) {
       ...(paneId && { paneId }),
       observedAt,
       status,
+      // Unreserved discovered peers have no dispatch, so no coordinator can review them.
+      ...(stage === "complete" &&
+        isUntrackedCompletion({ slot, progress: progressRecord }) && { completion: "untracked" }),
       runtimeState: status === "running" ? "running" : "idle",
       objective: taskText,
       output: [taskText].filter(Boolean),
@@ -2305,6 +2318,8 @@ async function appendClaudeProjectSubagents(
         cwd: roomCwd,
         observedAt: info.lastActivityIso || info.startedIso,
         status,
+        ...(isFinished &&
+          isUntrackedCompletion({ slot, progress: savedProgress }) && { completion: "untracked" }),
         runtimeState: isFinished ? "stopped" : "running",
         objective: taskText,
         output: [taskText],
