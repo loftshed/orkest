@@ -1,6 +1,7 @@
+import { existsSync } from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";
 
-import { childEnv, resolveBinary, run } from "../exec.mjs";
+import { childEnv, expandHome, resolveBinary, run } from "../exec.mjs";
 
 const slug = (s) =>
   s
@@ -80,9 +81,37 @@ export function parseAntigravityUsage(payload) {
   return { windows, pools, notes: [] };
 }
 
+const SSH_MARKERS = ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"];
+const LOGIN_FILE = "~/.gemini/antigravity-cli/antigravity-oauth-token";
+
+// On Linux agy keeps its sign-in in one of two places: the file above or the desktop keyring (KWallet).
+// It picks the file when it sees an SSH session and the keyring otherwise, and each place holds its own
+// copy of the refresh token. Sessions started from a terminal, over SSH or not, refresh the file; a probe
+// launched by the desktop (the KDE widget, a timer) inherits no SSH variable and reads the keyring copy,
+// which nothing else refreshes. Once a newer sign-in exists the probe finds that copy expired, refreshes
+// it with a superseded refresh token, and Google revokes the grant: every agy session is signed out a
+// minute or two later. Presenting the probe as an SSH session makes it read, and refresh, the file the
+// other sessions use. Without a sign-in file the keyring stays in charge.
+export function probeEnv(
+  extra = {},
+  { platform = process.platform, hasLoginFile = () => existsSync(expandHome(LOGIN_FILE)) } = {},
+) {
+  const env = childEnv(extra);
+  // A null in the account's env removes a variable; for these it also opts out of the marker.
+  const isOptedOut = SSH_MARKERS.some((name) => extra[name] === null);
+  if (
+    platform !== "linux" ||
+    isOptedOut ||
+    SSH_MARKERS.some((name) => env[name]) ||
+    !hasLoginFile()
+  )
+    return env;
+  return { ...env, SSH_CONNECTION: "127.0.0.1 0 127.0.0.1 22" };
+}
+
 async function runUsage(bin, account) {
   const { code, stdout, stderr } = await run(bin, ["-p", "/usage", "--output-format", "json"], {
-    env: childEnv(account.env ?? {}),
+    env: probeEnv(account.env ?? {}),
     timeoutMs: account.timeoutMs ?? 60_000,
     maxBytes: 1024 * 1024,
   });
