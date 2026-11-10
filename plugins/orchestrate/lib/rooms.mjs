@@ -1765,7 +1765,10 @@ async function appendNativePeers(room, snapshots, root) {
     let stage = progressRecord?.stage || (peer.state === "busy" ? "working" : "idle");
     if (subagentMeta?.finished) stage = "complete";
     let status = "idle";
-    if (stage === "complete") {
+    if (subagentMeta?.interrupted) {
+      // Its peer record still says busy: no hook runs when a subagent is stopped.
+      status = "cancelled";
+    } else if (stage === "complete") {
       status = "reported complete";
     } else if (stage === "blocked") {
       status = "blocked";
@@ -2119,6 +2122,30 @@ function claudeSubagentsDirs(accountHome, parentSession, cwds) {
   return dirs;
 }
 
+/**
+ * Whether a subagent transcript ends with Claude Code's interruption marker. A stopped subagent
+ * runs no stop hook and its metadata never gains `finished`, so the transcript is the only record.
+ */
+function endsInterrupted(tailText) {
+  const lastLine = String(tailText || "")
+    .trimEnd()
+    .split("\n")
+    .at(-1);
+  if (!lastLine) return false;
+  try {
+    const entry = JSON.parse(lastLine);
+    const content = entry?.message?.content;
+    const text = Array.isArray(content) ? content.at(-1)?.text : content;
+    return (
+      entry?.type === "user" &&
+      typeof text === "string" &&
+      text.startsWith("[Request interrupted by user")
+    );
+  } catch {
+    return false;
+  }
+}
+
 async function readClaudeSubagentFromDir(subagentsDir, agentId) {
   const metaPath = path.join(subagentsDir, `agent-${agentId}.meta.json`);
   const jsonlPath = path.join(subagentsDir, `agent-${agentId}.jsonl`);
@@ -2158,6 +2185,7 @@ async function readClaudeSubagentFromDir(subagentsDir, agentId) {
     description,
     model: observedModel || metaModel,
     finished: Boolean(meta?.finished),
+    interrupted: !meta?.finished && endsInterrupted(tail?.text),
     briefClaims: parseBriefClaims(head),
     lastActivityIso,
     startedIso,
@@ -2272,7 +2300,8 @@ async function appendClaudeProjectSubagents(
         info.finished ||
         !isConductorAlive ||
         Boolean(boundSlot && savedProgress?.stage === "complete");
-      const status = isFinished ? "reported complete" : "running";
+      let status = isFinished ? "reported complete" : "running";
+      if (info.interrupted) status = "cancelled";
       const stage = isFinished ? "complete" : "working";
       const slot = boundSlot || claimReservedSlot(room, info.briefClaims, claimedSlots);
       if (boundSlot) claimedSlots.add(boundSlot.id);
@@ -2320,7 +2349,7 @@ async function appendClaudeProjectSubagents(
         status,
         ...(isFinished &&
           isUntrackedCompletion({ slot, progress: savedProgress }) && { completion: "untracked" }),
-        runtimeState: isFinished ? "stopped" : "running",
+        runtimeState: isFinished || info.interrupted ? "stopped" : "running",
         objective: taskText,
         output: [taskText],
         progress: {

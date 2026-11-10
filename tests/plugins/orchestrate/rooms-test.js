@@ -1188,10 +1188,54 @@ describe("room CLI", () => {
       `${JSON.stringify({ message: { model: "claude-sonnet-5-5" } })}\n`,
     );
 
+    // Stopped subagents: no stop hook ran, so the metadata lacks `finished` and a peer record, where
+    // one exists, still says busy. Only the transcript's last entry shows the interruption.
+    const interruption = JSON.stringify({
+      type: "user",
+      message: { content: [{ type: "text", text: "[Request interrupted by user]" }] },
+    });
+    for (const agentId of ["a31stoppedwithpeer", "a32stoppednopeer"]) {
+      await writeFile(
+        path.join(subagentsDir, `agent-${agentId}.meta.json`),
+        JSON.stringify({ agentType: "general-purpose", description: `Stopped ${agentId}` }),
+      );
+      await writeFile(
+        path.join(subagentsDir, `agent-${agentId}.jsonl`),
+        `${JSON.stringify({ message: { model: "claude-fable-5-2" } })}\n${interruption}\n`,
+      );
+    }
+    await writeFile(
+      path.join(root, "peers", "subagent-a31stoppedwithpeer.json"),
+      JSON.stringify({
+        schema: "agent-executor.peer.v1",
+        session: "subagent-a31stoppedwithpeer",
+        name: "stitax-orkest-ae",
+        harness: "claude",
+        state: "busy",
+        cwd,
+        checkout: cwd,
+        accountHome,
+        pid: process.pid,
+        sharedProcess: true,
+        isSubagent: true,
+        parentSession,
+        focus: "native general-purpose",
+        startedAt: new Date().toISOString(),
+        lastSeenAt: new Date().toISOString(),
+      }),
+    );
+
     const prevConfigDir = process.env.CLAUDE_CONFIG_DIR;
     process.env.CLAUDE_CONFIG_DIR = accountHome;
     try {
       const observed = await observeRoom(room.id, { root });
+      for (const session of ["subagent-a31stoppedwithpeer", "subagent-a32stoppednopeer"]) {
+        const stopped = observed.agents.find((a) => a.nativeSession === session);
+        expect(stopped, session).toBeDefined();
+        expect(stopped.status, session).toBe("cancelled");
+        expect(stopped.runtimeState, session).not.toBe("running");
+        expect(stopped.completion, session).toBeUndefined();
+      }
       const activeSub = observed.agents.find((a) => a.id === "ploomix");
       expect(activeSub).toBeDefined();
       expect(activeSub.model).toBe("claude-fable-5-1");
