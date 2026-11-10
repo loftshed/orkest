@@ -39,6 +39,10 @@ A room works in one checkout, and the runner's writer lease is exclusive per che
 one implementation at a time; other members run as investigation, consultation or challenge.
 `patch-race` needs a separate worktree per candidate and cannot run in a room yet.
 
+A room shows its own checkout, its conductor's subagents and workers recorded on its members. Other
+worktrees in the repository are separate from that room. The peer mailbox's `peers` and
+`board --view status` commands show every session in the repository.
+
 For a model native to the conductor, add `--transport native`: it returns a reservation for the
 conductor's own agent tools instead of starting a CLI session.
 

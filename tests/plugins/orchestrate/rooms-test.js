@@ -20,6 +20,7 @@ import {
 } from "../../../plugins/orchestrate/lib/horde-room.mjs";
 import { openOrkestSqlite } from "../../../plugins/orchestrate/lib/orkest-sqlite.mjs";
 import {
+  belongsToRoom,
   bindSession,
   dispatchMember,
   growRoom,
@@ -1096,6 +1097,118 @@ describe("room CLI", () => {
     // Persisted room on disk remains untouched (only 1 declared agent):
     const onDisk = await readRoom(room.id, root);
     expect(onDisk.agents).toHaveLength(1);
+  });
+
+  it("matches exact checkouts, conductor subagents, and recorded member worktrees only", async () => {
+    const root = await realpath(await directory());
+    const mainCheckout = await directory();
+    const rawRoomCwd = path.join(mainCheckout, ".worktrees", "room");
+    const rawSiblingCheckout = path.join(mainCheckout, ".worktrees", "sibling");
+    await Promise.all([
+      mkdir(rawRoomCwd, { recursive: true }),
+      mkdir(rawSiblingCheckout, { recursive: true }),
+    ]);
+    const roomCwd = await realpath(rawRoomCwd);
+    const siblingCheckout = await realpath(rawSiblingCheckout);
+    const rawNestedCheckout = path.join(roomCwd, ".claude", "worktrees", "untracked");
+    await mkdir(rawNestedCheckout, { recursive: true });
+    const nestedCheckout = await realpath(rawNestedCheckout);
+    const rawRecordedWorktreeInside = path.join(roomCwd, ".worktrees", "recorded");
+    await mkdir(rawRecordedWorktreeInside, { recursive: true });
+    const recordedWorktreeInside = await realpath(rawRecordedWorktreeInside);
+    const externalWorktree = await realpath(await directory());
+    const externalSideCwd = await realpath(await directory());
+    const externalSubagentCwd = await realpath(await directory());
+    const room = await newRoom(parseTeam("codex:luna*3"), {
+      id: "room-native-membership",
+      cwd: roomCwd,
+      root,
+      title: "Room membership",
+    });
+    room.conductor.session = { id: "room-conductor-session" };
+    room.conductor.pid = process.pid;
+    room.conductor.herdrWorkspaceId = "room-workspace";
+    room.conductor.herdrEndpoint = "/tmp/room-endpoint.sock";
+    room.herdrEndpoint = "/tmp/room-endpoint.sock";
+    room.agents[0].worktree = { path: externalWorktree, disposable: false };
+    room.agents[1].sideId = "side-member-1";
+    room.agents[1].cwd = externalSideCwd;
+    room.agents[2].worktree = { path: recordedWorktreeInside, disposable: false };
+
+    await mkdir(path.join(root, "peers"), { recursive: true });
+    await mkdir(path.join(root, "progress"), { recursive: true });
+    const now = new Date();
+    const nowIso = now.toISOString();
+    const staleStartedAt = new Date(now.getTime() - 10 * 60_000).toISOString();
+    const writePeer = async (session, cwd, startedAt, extra = {}) => {
+      await writeFile(
+        path.join(root, "peers", `${session}.json`),
+        JSON.stringify({
+          schema: "agent-executor.peer.v1",
+          session,
+          name: `${session}-repo-168`,
+          harness: "codex",
+          state: "busy",
+          cwd,
+          pid: process.pid,
+          startedAt,
+          lastSeenAt: nowIso,
+          ...extra,
+        }),
+      );
+    };
+
+    await Promise.all([
+      writePeer("nested-unrelated", nestedCheckout, nowIso, {
+        parentSession: "another-conductor-session",
+      }),
+      writePeer("recorded-worktree", externalWorktree, staleStartedAt),
+      writePeer("recorded-worktree-inside", recordedWorktreeInside, staleStartedAt),
+      writePeer("recorded-side-cwd", externalSideCwd, staleStartedAt),
+      writePeer("conductor-subagent", externalSubagentCwd, staleStartedAt, {
+        parentSession: "room-conductor-session",
+      }),
+      writePeer("room-checkout-started", roomCwd, nowIso),
+      writePeer("room-checkout-old", roomCwd, staleStartedAt),
+      writePeer("room-checkout-shared", roomCwd, staleStartedAt, { sharedProcess: true }),
+      writePeer("room-checkout-workspace", roomCwd, staleStartedAt, {
+        herdrWorkspaceId: "room-workspace",
+        herdrEndpoint: "/tmp/room-endpoint.sock",
+      }),
+      writePeer("main-checkout", mainCheckout, nowIso),
+      writePeer("sibling-checkout", siblingCheckout, nowIso),
+    ]);
+
+    const observed = await observeRoom(room, { root });
+    const nativeSessions = new Set(
+      observed.agents.map((agent) => agent.nativeSession).filter(Boolean),
+    );
+    expect([...nativeSessions].sort((left, right) => left.localeCompare(right))).toEqual([
+      "conductor-subagent",
+      "recorded-side-cwd",
+      "recorded-worktree",
+      "recorded-worktree-inside",
+      "room-checkout-shared",
+      "room-checkout-started",
+      "room-checkout-workspace",
+    ]);
+  });
+
+  it("exposes the room membership predicate for direct boundary checks", () => {
+    const room = { conductor: { session: { id: "conductor-session" } } };
+    const memberPaths = new Set(["/other/worktree"]);
+    const isMember = (peerCwd, peer) =>
+      belongsToRoom({ peerCwd, roomCwd: "/repo/.worktrees/room", peer, room, memberPaths });
+
+    expect(isMember("/repo/.worktrees/room", {})).toBe(true);
+    expect(isMember("/other/worktree", {})).toBe(true);
+    expect(isMember("/external/subagent", { parentSession: "conductor-session" })).toBe(true);
+    expect(
+      isMember("/repo/.worktrees/room/.claude/worktrees/unrelated", {
+        parentSession: "another-session",
+      }),
+    ).toBe(false);
+    expect(isMember("/repo", {})).toBe(false);
   });
 
   it("enriches active Claude Code background subagents from .meta.json/.jsonl and retains completed subagents", async () => {

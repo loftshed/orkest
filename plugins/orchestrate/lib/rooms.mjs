@@ -1651,6 +1651,19 @@ function isUntrackedCompletion({ slot, progress }) {
   return !slot && !progress?.workContext;
 }
 
+/**
+ * A peer belongs to a room when it uses the room checkout, is a child of the conductor session,
+ * or matches a worktree path or the cwd of a member with dispatch, sideId, or worktree metadata.
+ */
+export function belongsToRoom({ peerCwd, roomCwd, peer, room, memberPaths }) {
+  const conductorSession = room.conductor?.session?.id;
+  return (
+    peerCwd === roomCwd ||
+    (conductorSession && peer.parentSession === conductorSession) ||
+    memberPaths.has(peerCwd)
+  );
+}
+
 async function appendNativePeers(room, snapshots, root) {
   const roomCwd = await resolveCwd(room.cwd);
   if (!roomCwd) return;
@@ -1682,6 +1695,19 @@ async function appendNativePeers(room, snapshots, root) {
   const conductorEndpoint =
     snapshots?.conductor?.herdrEndpoint || room.conductor?.herdrEndpoint || room.herdrEndpoint;
   const roomCreatedMs = parseStampMs(room.createdAt);
+  // Where this room sent its own workers. The room checkout itself is not one of them: sessions
+  // there are judged by the conditions below.
+  const memberPaths = new Set();
+  for (const member of room.agents) {
+    const paths = [
+      member.worktree?.path,
+      ...(member.dispatch || member.sideId || member.worktree ? [member.cwd] : []),
+    ];
+    for (const memberPath of paths) {
+      const resolvedPath = await resolveCwd(memberPath);
+      if (resolvedPath && resolvedPath !== roomCwd) memberPaths.add(resolvedPath);
+    }
+  }
   let rawPeerEntries;
   try {
     rawPeerEntries = await readdir(path.join(root, "peers"));
@@ -1707,7 +1733,7 @@ async function appendNativePeers(room, snapshots, root) {
     if (room.herdrEndpoint && peer.herdrPaneId && peer.herdrEndpoint !== room.herdrEndpoint)
       continue;
     const peerCwd = await resolveCwd(peer.checkout || peer.cwd);
-    if (!peerCwd || (peerCwd !== roomCwd && !peerCwd.startsWith(`${roomCwd}${path.sep}`))) continue;
+    if (!peerCwd || !belongsToRoom({ peerCwd, roomCwd, peer, room, memberPaths })) continue;
     const isSameSharedProcess =
       peer.sharedProcess === true && Boolean(conductorPid) && peer.pid === conductorPid;
     const isSameParentSession = Boolean(
@@ -1728,7 +1754,12 @@ async function appendNativePeers(room, snapshots, root) {
       Number.isFinite(roomCreatedMs) &&
       Number.isFinite(peerStartedMs) &&
       peerStartedMs >= roomCreatedMs - 60_000;
-    if (!(isSameSharedProcess || isSameParentSession || isSameWorkspace || hasStartedSinceRoom)) {
+    // A session in the room checkout must also be tied to this room; a subagent or a dispatched
+    // worker elsewhere already is.
+    if (
+      peerCwd === roomCwd &&
+      !(isSameSharedProcess || isSameParentSession || isSameWorkspace || hasStartedSinceRoom)
+    ) {
       continue;
     }
     const key = sessionKey(peer.session);
