@@ -51,7 +51,7 @@ ork smelter [status|run] [--dry-run] [--json]
 ork side [run|status] [--prompt <text>] [--issue <n>] [--dry-run] [--json]
 ork cleanup [status|run] [--dry-run] [--json]
 ork policy [show|allow|deny|reset] [--json]
-ork update [--check|--apply] [--json]
+ork update [run|check|status|enable|disable] [--check|--apply] [--auto] [--force] [--quiet] [--json] [-h|--help]
 ork radar [--line|--json] [--refresh]
 ork gate [--heavy] [--label <text>] -- <command>   (also: ork gate status|install|uninstall)
 ork swarm [toggle|open|close]   (alias for ork horde toggle|open|close)
@@ -845,6 +845,6 @@ if (entry === fileURLToPath(import.meta.url)) {
     await main();
   } catch (error) {
     console.error(`ork: ${error.message}`);
-    process.exitCode = 1;
+    process.exitCode = process.argv[2] === "update" && error.exitCode === 2 ? 2 : 1;
   }
 }

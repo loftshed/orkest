@@ -7,6 +7,26 @@ import { fileURLToPath } from "node:url";
 import { cacheHome, configHome } from "./runtime-paths.mjs";
 
 export const DEFAULT_UPDATE_INTERVAL_MS = 30 * 60 * 1000;
+const UPDATE_SUBCOMMANDS = new Set(["run", "check", "status", "enable", "disable"]);
+const UPDATE_FLAGS = new Set(["--check", "--apply", "--auto", "--force", "--quiet", "--json"]);
+const UPDATE_HELP_TEXT = `Usage: ork update [run|check|status|enable|disable] [options]
+
+Commands:
+  run       Check for and apply a fast-forward update (the default)
+  check     Check whether an update is available
+  status    Show auto-update settings and the last update status
+  enable    Enable automatic update checks
+  disable   Disable automatic update checks
+
+Options:
+  --check   Run the check command
+  --apply   Run the update command
+  --auto    Apply automatic-update throttling
+  --force   Ignore automatic-update throttling
+  --quiet   Suppress output unless an update succeeds
+  --json    Print the result as JSON
+  -h, --help  Show this help
+`;
 
 const DEFAULT_REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
 const SHA40_RE = /^[0-9a-f]{40}$/iu;
@@ -310,7 +330,8 @@ export async function runOrkestUpdate(options = {}) {
     timeout: 15_000,
   });
 
-  let cleanupResult = null;
+  let migrationReport;
+  let migrationError;
   if (!options.skipPostInstall) {
     const installMailboxPath = path.join(
       repoRoot,
@@ -320,25 +341,22 @@ export async function runOrkestUpdate(options = {}) {
       cwd: repoRoot,
       timeout: 15_000,
     });
-    let cleanupRunner = typeof options.cleanupFn === "function" ? options.cleanupFn : null;
-    if (!cleanupRunner) {
-      try {
+    try {
+      let migrationRunner = typeof options.cleanupFn === "function" ? options.cleanupFn : null;
+      if (!migrationRunner) {
         const mod = await import("./cleanup.mjs");
-        cleanupRunner = mod.runCleanup || mod.cleanupOrkest || null;
-      } catch {
-        cleanupRunner = null;
+        migrationRunner = mod.migrateLegacyState;
       }
-    }
-    if (typeof cleanupRunner === "function") {
-      try {
-        cleanupResult = await cleanupRunner({
-          migrateLegacy: true,
-          dryRun: false,
-          ...options,
-        });
-      } catch {
-        // Legacy cleanup is best-effort during auto-update.
+      if (typeof migrationRunner !== "function") {
+        throw new TypeError("cleanup.mjs does not export migrateLegacyState");
       }
+      migrationReport = await migrationRunner({
+        migrateLegacy: true,
+        dryRun: false,
+        ...options,
+      });
+    } catch (error) {
+      migrationError = error instanceof Error ? error.message : String(error);
     }
   }
 
@@ -362,30 +380,94 @@ export async function runOrkestUpdate(options = {}) {
     fromSha: check.localSha,
     toSha: check.remoteSha,
     commitsBehind: check.commitsBehind,
-    ...(cleanupResult && { cleanup: cleanupResult }),
+    ...(migrationReport !== undefined && migrationReport !== null && { cleanup: migrationReport }),
+    ...(migrationError !== undefined && { migrationError }),
   };
 }
 
-export async function runUpdateCli(argv = [], io = {}) {
-  const stdout = io.stdout || process.stdout;
-  const flags = new Set(argv.filter((arg) => arg.startsWith("--")));
-  // `--check` and `--apply` are the documented spellings of `check` and `run`; without this, a
-  // `--check` fell through to a full update.
-  const flagCommands = [flags.has("--check") && "check", flags.has("--apply") && "run"].filter(
-    Boolean,
-  );
-  const positional = argv.find((arg) => !arg.startsWith("--"));
-  const requested = new Set([...flagCommands, ...(positional ? [positional] : [])]);
+function parseUpdateCliArgs(argv) {
+  if (argv.some((arg) => arg === "--help" || arg === "-h")) {
+    return { help: true };
+  }
+
+  const flags = new Set();
+  const requested = new Set();
+  for (const arg of argv) {
+    if (arg === "--check") {
+      flags.add(arg);
+      requested.add("check");
+    } else if (arg === "--apply") {
+      flags.add(arg);
+      requested.add("run");
+    } else if (UPDATE_FLAGS.has(arg)) {
+      flags.add(arg);
+    } else if (arg.startsWith("-")) {
+      const error = new Error(`Unknown update flag: ${arg}`);
+      error.exitCode = 2;
+      throw error;
+    } else if (UPDATE_SUBCOMMANDS.has(arg)) {
+      requested.add(arg);
+    } else {
+      const error = new Error(`Unknown update subcommand: ${arg}`);
+      error.exitCode = 2;
+      throw error;
+    }
+  }
+
   if (requested.size > 1) {
     const error = new Error(`Conflicting update commands: ${[...requested].join(", ")}`);
     error.exitCode = 2;
     throw error;
   }
-  const subcommand = positional || flagCommands[0] || "run";
+
+  const command = [...requested][0] || "run";
+  return { flags, command };
+}
+
+function formatMigrationOutcome(result) {
+  if (result.migrationError !== undefined) {
+    const message = String(result.migrationError).replaceAll(/\s+/gu, " ").trim();
+    return `Legacy state migration failed: ${message}.\n`;
+  }
+
+  const report = result.cleanup;
+  if (!report) return "";
+  const directoryReports = [report.cache, report.config].filter(Boolean);
+  const repairedWorktrees = Array.isArray(report.repairedWorktrees) ? report.repairedWorktrees : [];
+  const repairedCount = repairedWorktrees.filter((item) => item.status === "repaired").length;
+  const failedCount =
+    directoryReports.filter((item) => item.status === "conflict_preserved").length +
+    repairedWorktrees.filter((item) => item.status === "repair_failed").length;
+  const changed = directoryReports.some((item) => item.changed === true) || repairedCount > 0;
+  if (!changed && failedCount === 0) return "";
+
+  const cacheStatus = report.cache?.status || "unchanged";
+  const configStatus = report.config?.status || "unchanged";
+  return `Legacy state migration: cache=${cacheStatus}, config=${configStatus}, repaired_worktrees=${repairedCount}, failures=${failedCount}.\n`;
+}
+
+export async function runUpdateCli(argv = [], io = {}) {
+  const stdout = io.stdout || process.stdout;
+  const parsed = parseUpdateCliArgs(argv);
+  if (parsed.help) {
+    stdout.write(UPDATE_HELP_TEXT);
+    return { ok: true, status: "help", help: true, exitCode: 0 };
+  }
+
+  const { flags, command: subcommand } = parsed;
+  const {
+    updateFn = runOrkestUpdate,
+    checkFn = checkOrkestUpdate,
+    setAutoUpdateEnabledFn = setAutoUpdateEnabled,
+    readAutoUpdateConfigFn = readAutoUpdateConfig,
+    readUpdateStateFn = readOptionalJson,
+    ...baseOptions
+  } = io;
   const isJsonOutput = flags.has("--json");
   const isQuiet = flags.has("--quiet");
   const options = {
-    ...io,
+    ...baseOptions,
+    stdout,
     auto: flags.has("--auto"),
     force: flags.has("--force"),
   };
@@ -393,27 +475,27 @@ export async function runUpdateCli(argv = [], io = {}) {
   let result;
   switch (subcommand) {
     case "enable": {
-      const config = await setAutoUpdateEnabled(true, options);
+      const config = await setAutoUpdateEnabledFn(true, options);
       result = { ok: true, status: "enabled", autoUpdate: config };
       break;
     }
     case "disable": {
-      const config = await setAutoUpdateEnabled(false, options);
+      const config = await setAutoUpdateEnabledFn(false, options);
       result = { ok: true, status: "disabled", autoUpdate: config };
       break;
     }
     case "status": {
-      const config = await readAutoUpdateConfig(options);
-      const state = (await readOptionalJson(getUpdateStatePath(options))) || {};
+      const config = await readAutoUpdateConfigFn(options);
+      const state = (await readUpdateStateFn(getUpdateStatePath(options))) || {};
       result = { ok: true, status: state.status || "idle", autoUpdate: config, state };
       break;
     }
     case "check": {
-      result = await checkOrkestUpdate(options);
+      result = await checkFn(options);
       break;
     }
     default: {
-      result = await runOrkestUpdate(options);
+      result = await updateFn(options);
       break;
     }
   }
@@ -430,6 +512,7 @@ export async function runUpdateCli(argv = [], io = {}) {
       stdout.write(
         `Orkest updated (${result.fromSha?.slice(0, 7)} -> ${result.toSha?.slice(0, 7)}, ${result.commitsBehind} commit${result.commitsBehind === 1 ? "" : "s"}).\n`,
       );
+      stdout.write(formatMigrationOutcome(result));
       break;
     }
     case "update_available": {
