@@ -86,28 +86,25 @@ def require_text_list(spec: dict[str, Any], field: str) -> list[str]:
     return rendered
 
 
+@functools.cache
+def _repo_paths_module() -> Any:
+    path = Path(__file__).with_name("repo_paths.py")
+    spec = importlib.util.spec_from_file_location("agent_executor_brief_repo_paths", path)
+    if spec is None or spec.loader is None:
+        raise BriefSpecError("could not load repository path rules")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def normalize_repo_paths(values: list[str], field: str, *, allow_root: bool = False) -> list[str]:
-    normalized: list[str] = []
-    for value in values:
-        stripped = value.strip()
-        candidate = Path(stripped)
-        # pathlib reduces `./`, `.//` and an empty string to `.`, so an empty value is refused first.
-        clean = candidate.as_posix().rstrip("/")
-        if stripped and allow_root and clean == ".":
-            if "." not in normalized:
-                normalized.append(".")
-            continue
-        if (
-            not stripped
-            or candidate.is_absolute()
-            or clean == "."
-            or ".." in candidate.parts
-            or (candidate.parts and candidate.parts[0] == ".git")
-        ):
-            raise BriefSpecError(f"{field} must contain non-root repository-relative paths: {value!r}")
-        if clean not in normalized:
-            normalized.append(clean)
-    return normalized
+    repo_paths = _repo_paths_module()
+    try:
+        return repo_paths.normalize_repo_paths(values, allow_root=allow_root)
+    except ValueError as exc:
+        value = exc.args[0]
+        raise BriefSpecError(f"{field} must contain non-root repository-relative paths: {value!r}") from exc
 
 
 @functools.cache

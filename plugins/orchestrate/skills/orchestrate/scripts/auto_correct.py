@@ -12,12 +12,30 @@ not read as files; see gate_paths.
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import posixpath
 import re
 import shlex
 from pathlib import Path
 from typing import Any, NamedTuple
+
+
+def _load_repo_paths() -> Any:
+    """Load the shared path rules by file. These scripts are loaded by path from a copied directory,
+    so a sibling is not importable by name unless a caller happened to put it on `sys.path`."""
+    spec = importlib.util.spec_from_file_location(
+        "agent_executor_repo_paths", Path(__file__).with_name("repo_paths.py")
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError("could not load repository path rules")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_REPO_PATHS = _load_repo_paths()
+
 
 MAX_ROUNDS = 2
 # A round needs a correction turn plus another pass of the gates; with less left it is refused.
@@ -601,7 +619,7 @@ def protected_paths(entries: list[str], repo: Path) -> list[str]:
 
 def released(path: str, rules: list[str]) -> bool:
     """Whether a path a steer explicitly allowed (`rules`, each a path or ".") covers `path`."""
-    return any(rule == "." or path == rule or path.startswith(f"{rule}/") for rule in rules)
+    return _REPO_PATHS.path_covered_by_prefixes(path, rules, exclude_git=False)
 
 
 def release_paths(entries: list[str]) -> list[str]:
