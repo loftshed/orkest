@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.19.1
+
+- chore: license Orkest under MIT (#180)
+
 ## 0.19.0
 
 - feat: install Orkest with one command (#177)

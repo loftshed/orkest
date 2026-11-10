@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.78.0
+
+- feat(orchestrate): show a room its own checkout and the workers it sent out (#181)
+- chore: license Orkest under MIT (#180)
+
 ## 0.77.0
 
 - feat: install Orkest with one command (#177)

@@ -2,7 +2,7 @@
 name: orchestrate
 description: "Invoke autonomously at will—or when requested by the user—to run cross-vendor consultations (`consult`), independent cold diff reviews, root-cause investigations, or bounded cross-harness implementation tasks across local Codex, Antigravity, Claude Code, and OpenCode CLIs. Validate model and effort, check live quota and repo policy, preserve context, record usage and evidence, recover bounded corrections, and audit results. Proactively call `consult` when a second opinion, architectural sanity check, or adversarial code review from another model family adds confidence, and delegate bounded tasks across harnesses when parallel execution or spare quota speeds up delivery. Also use to inspect Orkest swarm/workboard status or promote the current chat to coordinator ('you are the coordinator now'). Keep same-harness, same-account subagents and messaging on the host's native tools."
 metadata:
-  version: 0.77.0
+  version: 0.78.0
   requirements: Python 3.11+, POSIX file locking, git, and at least one installed/authenticated executor CLI (`codex`, `agy`, `claude`, or `opencode`).
 ---
 
