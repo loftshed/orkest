@@ -5,6 +5,13 @@ who is doing what, burning the wrong account's quota, or stepping on each other'
 
 ![Swarm View: a coordinator, three workers and a nested reviewer, with quota meters and running services](docs/images/swarm-view.png)
 
+Every hosted model runs through its vendor's own CLI: Claude through `claude`, GPT through `codex`,
+Gemini through `agy`, each with the login it already has. Where that login is a subscription, a
+swarm spends the subscription, not a metered API key, and every agent keeps its harness's own
+tools, permissions and settings. A run that would start spending paid Codex credits is refused
+unless you allow it. Open-weight models are the exception: they go through OpenCode on OpenRouter
+credits.
+
 You keep working in your normal harness CLI. Orkest sits beside it:
 
 - **A live swarm tree** of native subagents and cross-harness workers, with each agent's model,
@@ -12,7 +19,8 @@ You keep working in your normal harness CLI. Orkest sits beside it:
 - **Bounded delegation**: workers get a file scope, a worktree lease and verification that runs
   outside the model. Work is "reported" until the coordinator reviews and accepts it.
 - **Second opinions** from another vendor's model, read-only.
-- **Quota awareness** across every account, so work goes where there is headroom.
+- **Quota awareness** across every subscription, so work goes where there is headroom and
+  allowance that would expire unused gets spent.
 - **Guardrails**: per-repository account rules, and a shared gate so parallel agents don't run
   five test suites at once.
 
