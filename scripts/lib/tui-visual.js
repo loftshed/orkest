@@ -79,6 +79,14 @@ export const VISUAL_CASES = Object.freeze([
     tier: "unicode",
   },
   {
+    name: "diff-marks-dark-100",
+    scenario: "diff-marks",
+    cols: 100,
+    rows: 40,
+    palette: "dark",
+    tier: "unicode",
+  },
+  {
     name: "overview-nerd-100",
     scenario: "overview",
     cols: 100,
@@ -319,7 +327,8 @@ export async function renderFixture(repo, spec) {
 
       break;
     }
-    case "diff": {
+    case "diff":
+    case "diff-marks": {
       view.focusId = "builder";
       view.setPreview({
         agentId: "builder",
@@ -332,6 +341,22 @@ export async function renderFixture(repo, spec) {
           { path: "src/search/grouping.mjs", added: 3, removed: 1 },
           { path: "tests/search/grouping-test.js", added: 2, removed: 0 },
         ],
+        ...(spec.scenario === "diff-marks" && {
+          marks: [
+            {
+              file: "src/search/grouping.mjs",
+              line: 13,
+              side: "new",
+              text: "  const normalized = normalizeQuery(query);",
+            },
+            {
+              file: "tests/search/grouping-test.js",
+              line: 1,
+              side: "new",
+              text: 'it("groups normalized queries", () => {',
+            },
+          ],
+        }),
         text: [
           "diff --git a/src/search/grouping.mjs b/src/search/grouping.mjs",
           "index 9e6c123..be56f01 100644",
@@ -354,6 +379,7 @@ export async function renderFixture(repo, spec) {
           "+  expect(groupMatches(matches)).toHaveLength(2);",
         ].join("\n"),
       });
+      if (spec.scenario === "diff-marks") view.diffCursor = 6;
       break;
     }
     case "quota-hover": {

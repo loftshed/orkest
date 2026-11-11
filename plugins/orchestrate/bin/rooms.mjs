@@ -1,6 +1,7 @@
 import path from "node:path";
 import { parseArgs } from "node:util";
 
+import { readDiffMarks } from "../lib/diff-marks.mjs";
 import { loadPresets, mailboxRoot, parseTeam, updateRoom } from "../lib/horde-room.mjs";
 import { integrateMemberWorktree } from "../lib/room-integrate.mjs";
 import { resumeRoomStatus } from "../lib/room-resume.mjs";
@@ -22,11 +23,13 @@ import {
   writeCoordinatorBrief,
 } from "../lib/rooms.mjs";
 import { promoteSession } from "../lib/session-promotion.mjs";
+import { plain } from "../lib/tui-box.mjs";
 
 export const ROOMS_HELP = `ork rooms list [--json]
 ork hall promote [--session ID] [--room ID] [--objective TEXT] [--cwd PATH]   (adopt this live conversation as coordinator)
 ork rooms resume-status [--cwd PATH] [--json]   (read-only resume history)
 ork rooms show --room ID [--json]
+ork hall marks --room ID --member ID [--json]   (read marked diff lines; also ork rooms marks)
 ork rooms create --team TEAM [--group GROUP] [--title TITLE] [--cwd PATH] [--id ID] [--authority TEAM_ID]
 ork rooms add --room ID --team TEAM [--parent conductor|MEMBER] [--role ROLE] [--cwd PATH]
 ork rooms lead --room ID --member ID --objective TEXT [--role ROLE] [--cwd PATH] [--keep-worktree]   (reserves a native subswarm lead)
@@ -293,6 +296,24 @@ export async function roomsCommand(
 
       break;
     }
+    case "marks": {
+      // Observed, not stored: a member's result path only exists once its run has been read, and
+      // without it every mark would look stale.
+      const room = await observeRoom(requireValue("room"), { root, run });
+      const memberId = requireValue("member");
+      const member =
+        memberId === "conductor"
+          ? { ...room.conductor, id: "conductor" }
+          : room.agents.find((agent) => agent.id === memberId);
+      if (!member) throw new Error(`Unknown member: ${memberId}`);
+      const stored = await readDiffMarks(room.id, member, { root });
+      result = {
+        member: memberId,
+        stale: stored.stale,
+        marks: stored.marks,
+      };
+      break;
+    }
     case "init-task": {
       if (
         values["max-continues"] !== undefined &&
@@ -376,6 +397,20 @@ export async function roomsCommand(
       throw new Error(ROOMS_HELP);
     }
   }
-  stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+  if (action === "marks" && !values.json) {
+    stdout.write(`stale: ${result.stale}\n`);
+    if (result.marks.length === 0) stdout.write("[]\n");
+    else
+      stdout.write(
+        `${result.marks
+          .map((mark) => {
+            const text = plain(mark.text);
+            return `${plain(mark.file)}:${mark.line}${text ? ` ${text}` : ""}`;
+          })
+          .join("\n")}\n`,
+      );
+  } else {
+    stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+  }
   return result;
 }

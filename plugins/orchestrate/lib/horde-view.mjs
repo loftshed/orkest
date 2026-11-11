@@ -9,6 +9,7 @@
 import path from "node:path";
 
 import { renderLine, timeLeft } from "../../monitor/lib/render.mjs";
+import { mapDiffLines, markText } from "./diff-marks.mjs";
 import { coalesceMessages, resolveMemberWorktree } from "./horde-room.mjs";
 import { memberDisplayState, MEMBER_OUTCOMES as OUTCOMES } from "./member-state.mjs";
 import {
@@ -78,6 +79,11 @@ const SLOT_ID_PATTERN = /^[a-z0-9.]+-\d+$/iu;
 const SESSION_TAG_PATTERN = /^[0-9a-f]{2}$/iu;
 const EFFORT_LEVELS = new Set(["minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
 const TRAILING_EFFORT_PATTERN = /^(.*\S)(?:\s*\(([a-z]+)\)|\s*\[([a-z]+)\]|-([a-z]+))$/iu;
+const DIFF_GUTTER = {
+  nerd: { cursor: "", mark: "" },
+  unicode: { cursor: "›", mark: "●" },
+  ascii: { cursor: ">", mark: "*" },
+};
 
 function isExecuting(member) {
   if (outcome(member) || ["cancelled", "blocked"].includes(memberDisplayState(member)))
@@ -758,6 +764,7 @@ export class HordeView {
       onFocusPane,
       onPreview,
       onDiff,
+      onMarks,
     } = {},
   ) {
     this.room = treeRoom(room);
@@ -775,6 +782,7 @@ export class HordeView {
     this.onFocusPane = typeof onFocusPane === "function" ? onFocusPane : undefined;
     this.onPreview = typeof onPreview === "function" ? onPreview : undefined;
     this.onDiff = typeof onDiff === "function" ? onDiff : undefined;
+    this.onMarks = typeof onMarks === "function" ? onMarks : undefined;
     this.lastFocusedAgentId = undefined;
     this.focusId = this.room.agents[0]?.id;
     this.focusFollowsLatest = true;
@@ -793,6 +801,9 @@ export class HordeView {
     this.previewOffset = 0;
     this.previewFollow = true;
     this.previewLatestText = "";
+    this.diffCursor = 0;
+    this.diffCursorRows = new Map();
+    this.diffPreviewMetrics = null;
   }
 
   quotaRowLimit() {
@@ -985,6 +996,12 @@ export class HordeView {
         this.scrollPreview((key === "\u{1B}[5~" ? 1 : -1) * Math.max(1, this.height - 8));
         return true;
       }
+      if (this.preview.kind === "diff") {
+        if (key === "j" || key === "\u{1B}[B") return this.moveDiffCursor(1);
+        if (key === "k" || key === "\u{1B}[A") return this.moveDiffCursor(-1);
+        if (key === "x") return this.toggleDiffMark();
+        if (key === "X") return this.clearDiffMarks();
+      }
       if (key === "r") {
         if (this.preview.kind === "diff") return false;
         this.previewOffset = 0;
@@ -1173,19 +1190,139 @@ export class HordeView {
   }
 
   setPreview(snapshot) {
-    if (snapshot?.agentId !== this.preview?.agentId || snapshot?.loading) {
+    const isNewPreview =
+      snapshot?.agentId !== this.preview?.agentId || snapshot?.kind !== this.preview?.kind;
+    if (isNewPreview || snapshot?.loading) {
       this.previewOffset = 0;
       this.previewFollow = true;
     }
     this.previewLatestText = snapshot?.text || "";
     this.preview =
       snapshot && !this.previewFollow ? { ...snapshot, text: this.preview.text } : snapshot;
+    if (isNewPreview) this.diffCursor = 0;
+    if (this.preview?.kind === "diff") {
+      this.diffCursor = Math.min(
+        this.diffCursor,
+        Math.max(0, mapDiffLines(this.preview.text).length - 1),
+      );
+    }
   }
 
   scrollPreview(delta) {
     this.previewOffset = Math.max(0, this.previewOffset + delta);
     this.previewFollow = this.preview?.kind === "terminal" && this.previewOffset === 0;
     if (this.previewFollow && this.preview) this.preview.text = this.previewLatestText;
+    if (this.preview?.kind === "diff") this.alignDiffCursorToViewport();
+  }
+
+  moveDiffCursor(delta) {
+    const lineCount = mapDiffLines(this.preview?.text).length;
+    if (lineCount === 0) return false;
+    const next = Math.max(0, Math.min(lineCount - 1, this.diffCursor + delta));
+    if (next === this.diffCursor) return false;
+    this.diffCursor = next;
+    this.previewFollow = false;
+    this.keepDiffCursorVisible();
+    return true;
+  }
+
+  markAtDiffCursor() {
+    if (this.preview?.kind !== "diff") return null;
+    const lines = String(this.preview.text || "").split(/\r?\n/u);
+    const source = lines[this.diffCursor];
+    const mapped = mapDiffLines(this.preview.text)[this.diffCursor];
+    if (!mapped?.file || mapped.kind === "meta") return null;
+    const side = mapped.kind === "removed" ? "old" : "new";
+    const line = side === "old" ? mapped.oldLine : mapped.newLine;
+    if (!Number.isSafeInteger(line) || line < 1) return null;
+    return {
+      file: mapped.file,
+      line,
+      side,
+      text: markText(plain(source || "").slice(1)),
+    };
+  }
+
+  persistDiffMarks(marks) {
+    const agent = this.room.agents.find((member) => member.id === this.preview?.agentId);
+    if (!agent || !this.onMarks) return;
+    try {
+      this.onMarks(agent, marks);
+    } catch (error) {
+      this.notice = `Could not save marks: ${error.message}`;
+    }
+  }
+
+  toggleDiffMark() {
+    if (this.preview?.marksStale) {
+      this.notice = "Stored marks are stale; press X to clear them before marking current lines.";
+      return true;
+    }
+    const mark = this.markAtDiffCursor();
+    if (!mark) return false;
+    const marks = [...(this.preview.marks || [])];
+    const index = marks.findIndex(
+      (current) =>
+        current.file === mark.file && current.line === mark.line && current.side === mark.side,
+    );
+    if (index === -1) marks.push(mark);
+    else marks.splice(index, 1);
+    this.preview = { ...this.preview, marks, marksStale: false };
+    this.persistDiffMarks(marks);
+    return true;
+  }
+
+  clearDiffMarks() {
+    if (this.preview?.kind !== "diff") return false;
+    this.preview = { ...this.preview, marks: [], marksStale: false };
+    this.persistDiffMarks([]);
+    return true;
+  }
+
+  keepDiffCursorVisible() {
+    const row = this.diffCursorRows.get(this.diffCursor);
+    const metrics = this.diffPreviewMetrics;
+    if (row === undefined || !metrics) return;
+    const start = Math.max(0, metrics.rowCount - this.previewOffset - metrics.budget);
+    const end = Math.max(0, metrics.rowCount - this.previewOffset);
+    if (row < start) {
+      this.previewOffset = Math.max(0, metrics.rowCount - metrics.budget - row);
+    } else if (row >= end) {
+      this.previewOffset = Math.max(0, metrics.rowCount - row - 1);
+    }
+    this.previewOffset = Math.min(
+      this.previewOffset,
+      Math.max(0, metrics.rowCount - metrics.budget),
+    );
+  }
+
+  alignDiffCursorToViewport() {
+    const metrics = this.diffPreviewMetrics;
+    if (!metrics) return;
+    const start = Math.max(0, metrics.rowCount - this.previewOffset - metrics.budget);
+    const end = Math.max(0, metrics.rowCount - this.previewOffset);
+    const cursorRow = this.diffCursorRows.get(this.diffCursor);
+    if (cursorRow === undefined || (cursorRow >= start && cursorRow < end)) return;
+    const sourceRows = this.diffCursorRows.entries().toArray();
+    const visible = sourceRows.filter(([, row]) => row >= start && row < end);
+    if (visible.length > 0) {
+      this.diffCursor = cursorRow < start ? visible[0][0] : visible.at(-1)[0];
+      return;
+    }
+    let nearest;
+    let nearestDistance = Infinity;
+    for (const current of sourceRows) {
+      const row = current[1];
+      let distance = 0;
+      if (row < start) distance = start - row;
+      else if (row >= end) distance = row - end + 1;
+      if (distance >= nearestDistance) continue;
+      nearest = current;
+      nearestDistance = distance;
+    }
+    if (!nearest) return;
+    this.diffCursor = nearest[0];
+    this.keepDiffCursorVisible();
   }
 
   handleMouse({ x, y, button, action }) {
@@ -1234,7 +1371,7 @@ export class HordeView {
       );
     }
     if (this.preview) {
-      return actionBar(
+      const bar = actionBar(
         [
           { id: "preview-back", label: "Back", key: "\u{1B}", hint: "Esc", primary: true },
           {
@@ -1250,6 +1387,12 @@ export class HordeView {
             active: this.previewFollow,
             disabled: this.preview.kind === "diff",
           },
+          ...(this.preview.kind === "diff"
+            ? [
+                { id: "diff-mark", label: "x Mark line", key: "x" },
+                { id: "diff-clear", label: "X Clear marks", key: "X" },
+              ]
+            : []),
           { id: "preview-up", label: "Up", key: "\u{1B}[5~", hint: "PgUp" },
           { id: "preview-down", label: "Down", key: "\u{1B}[6~", hint: "PgDn" },
           { id: "preview-previous", label: "Prev", key: "[" },
@@ -1258,6 +1401,7 @@ export class HordeView {
         width,
         { color: this.appearance, hovered: this.hovered, tier: this.tier },
       );
+      return bar;
     }
     const selected = this.selectedAgent();
     const hasInactiveAgents = this.room.agents.some(isInactive);
@@ -1350,6 +1494,7 @@ export class HordeView {
         "0           Return to the current session's live chat",
         "Enter       Preview selected agent's screen without typing into it",
         "d           Preview selected agent's worker changes read-only",
+        "Diff only   j/k or ↑/↓ move the line cursor; x toggles a line mark; X clears that member's marks",
         "PgUp/PgDn   Scroll the preview; r follows the latest screen",
         "o           Open selected agent's interactive terminal",
         "Mouse       Click an agent to preview its chat; click buttons for actions",
@@ -1803,6 +1948,13 @@ export class HordeView {
       const start = Math.max(0, rows.length - budget);
       this.previewOffset = response >= 0 ? Math.max(0, start - response) : 0;
     }
+    if (preview.kind === "diff") {
+      this.diffPreviewMetrics = { rowCount: rows.length, budget };
+      this.alignDiffCursorToViewport();
+    } else {
+      this.diffPreviewMetrics = null;
+      this.diffCursorRows = new Map();
+    }
     const end = Math.max(0, rows.length - this.previewOffset);
     const body = rows.slice(Math.max(0, end - budget), end).map((line) => `${pad}${line}`);
     if (preview.kind === "diff" && preview.loading)
@@ -1815,10 +1967,21 @@ export class HordeView {
     if (preview.loading && preview.kind !== "diff")
       state = tone("Loading...", "muted", this.appearance);
     else if (preview.error) state = tone(preview.error, "error", this.appearance);
-    else if (preview.kind === "diff" && preview.stale)
-      state = `${tone(heading, "muted", this.appearance)} ${tone("· stale", "stale", this.appearance)}`;
-    else state = tone(heading, "muted", this.appearance);
-    const rightHint = width >= 44 ? "Esc back · [ ] switch" : "";
+    else if (preview.kind === "diff") {
+      state = tone(heading, "muted", this.appearance);
+      if (preview.stale) state += ` ${tone("· stale", "stale", this.appearance)}`;
+      state += ` ${tone(`· ${(preview.marks || []).length} marked`, "warning", this.appearance)}`;
+      if (preview.marksStale) state += ` ${tone("· marks stale", "warning", this.appearance)}`;
+    } else state = tone(heading, "muted", this.appearance);
+    let rightHint = "";
+    if (width >= 44) {
+      if (preview.kind === "diff") {
+        if (width >= 62) {
+          const arrows = this.tier === "ascii" ? "arrows" : "↑/↓";
+          rightHint = `j/k or ${arrows} move · Esc back · [ ] switch`;
+        } else rightHint = "j/k move · Esc · [ ]";
+      } else rightHint = "Esc back · [ ] switch";
+    }
     return this.panel(
       plain(preview.title || "Agent"),
       [`${pad}${state}`, ...body],
@@ -1830,6 +1993,7 @@ export class HordeView {
 
   diffPreviewRows(preview, width) {
     const rows = [];
+    this.diffCursorRows = new Map();
     if (preview.loading) return rows;
     const files = Array.isArray(preview.files) ? preview.files : [];
     if (files.length > 0) {
@@ -1849,10 +2013,20 @@ export class HordeView {
       rows.push("");
     }
     const diffLines = String(preview.text || "").split(/\r?\n/u);
-    for (const rawLine of diffLines) {
+    const mappedLines = mapDiffLines(preview.text);
+    const marks = Array.isArray(preview.marks) ? preview.marks : [];
+    const gutter = DIFF_GUTTER[this.tier] || DIFF_GUTTER.unicode;
+    const gutterWidth = Math.min(3, Math.max(0, width - 1));
+    const sourceWidth = Math.max(1, width - gutterWidth);
+    for (const [index, rawLine] of diffLines.entries()) {
       const line = plain(rawLine);
+      const mapped = mappedLines[index] || { file: null, kind: "meta" };
       let role = "";
-      if (
+      if (mapped.kind === "added") {
+        role = "accepted";
+      } else if (mapped.kind === "removed") {
+        role = "failed";
+      } else if (
         line.startsWith("diff --git ") ||
         line.startsWith("index ") ||
         line.startsWith("--- ") ||
@@ -1864,16 +2038,28 @@ export class HordeView {
         line.startsWith("@@")
       ) {
         role = "muted bold";
-      } else if (line.startsWith("+")) {
-        role = "accepted";
-      } else if (line.startsWith("-")) {
-        role = "failed";
       }
-      rows.push(
-        ...wrapText(line, width).map((part) =>
-          fitStyled(role ? tone(part, role, this.appearance) : part, width),
-        ),
-      );
+      const side = mapped.kind === "removed" ? "old" : "new";
+      const location = side === "old" ? mapped.oldLine : mapped.newLine;
+      const marked =
+        location !== null &&
+        location !== undefined &&
+        marks.some(
+          (mark) => mark.file === mapped.file && mark.line === location && mark.side === side,
+        );
+      const isCursor = index === this.diffCursor;
+      const cursorGlyph = isCursor ? tone(gutter.cursor, "selected", this.appearance) : " ";
+      const markGlyph = marked
+        ? tone(gutter.mark, preview.marksStale ? "stale" : "warning bold", this.appearance)
+        : " ";
+      const prefix = `${cursorGlyph}${markGlyph} `;
+      const wrapped = wrapText(line, sourceWidth);
+      this.diffCursorRows.set(index, rows.length);
+      for (const [partIndex, part] of wrapped.entries()) {
+        const rowPrefix = partIndex === 0 ? prefix : " ".repeat(gutterWidth);
+        const styled = tone(part, isCursor ? "selected" : role, this.appearance);
+        rows.push(fitStyled(`${rowPrefix}${styled}`, width));
+      }
     }
     return rows;
   }

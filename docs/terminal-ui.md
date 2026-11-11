@@ -77,6 +77,8 @@ Every component accepts `tier` (`"nerd"`, `"unicode"`, or `"ascii"`), resolved b
    - Focusing a Herdr pane by ID uses `herdr agent focus <herdrPaneId>` (not `herdr pane focus`, which is directional).
 7. **Width & Injection Safety:**
    - Treat all model/tool/terminal output as untrusted data: sanitize with `plain()` before applying `tone()`, and clamp every rendered line with `fitStyled(line, width)` so escape codes never leak or wrap across borders.
+8. **Diff Line Marks:**
+   - The diff preview keeps a source-line cursor and saved marks in a per-tier gutter; semantic tones add emphasis while gutter glyphs keep both states legible without color.
 
 ---
 
