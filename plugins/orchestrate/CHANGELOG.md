@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.81.0
+
+- feat(orchestrate): mark diff lines in Swarm View for the coordinator to quote (#189)
+- feat(orchestrate): integrate an accepted room worktree through an explicit command (#186)
+
 ## 0.80.1
 
 - refactor(orchestrate): build gate-protection state in one place for both routes (#187)
