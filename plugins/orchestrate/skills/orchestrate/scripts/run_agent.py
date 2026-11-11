@@ -2427,39 +2427,33 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
     # The gate's own files, as named before the first handoff; a file written later is never one.
     saved = (audit_previous or {}).get("auto_correct") or {}
     protection_active = bool(max_rounds or saved)
-    gate_candidates = auto_correct_module.gate_paths(args.verify_command, repo) if protection_active else []
     # Explicit gate files: protected in every round, ignored by Git or not, changed by the run or not.
     protect_entries = normalize_repo_paths(
         [*((task_spec or {}).get("protect_paths") or []), *args.protect_path], option="--protect-path"
     )
-    # Scanning an inherited directory again would import links the worker planted after its baseline.
-    fresh_protect_entries = [
-        entry for entry in protect_entries if not auto_correct_module.released(entry, saved.get("protect_paths", []))
-    ]
-    protected = auto_correct_module.protected_paths(fresh_protect_entries, repo) if protection_active else []
+    earlier_steers: list[dict[str, Any]] = []
+    changed_before_resume: set[str] = set()
     if audit_previous is not None:
         earlier_steers = (audit_previous.get("steering") or {}).get("steers") or []
-        resumed_releases.extend(
-            dict.fromkeys(
-                [
-                    *(saved.get("released_paths") or []),
-                    *(path for steer in earlier_steers for path in steer.get("added_allow_paths") or []),
-                ]
-            )
-        )
-    if protection_active and audit_previous is not None:
-        saved_candidates = saved.get("gate_candidates")
-        if isinstance(saved_candidates, list):
-            gate_candidates = list(dict.fromkeys([*saved_candidates, *gate_candidates]))
-        changed_before_resume = set(state_delta(task_before or before, before)["changed_paths"])
-        gate_candidates = [path for path in gate_candidates if path not in changed_before_resume]
-        if isinstance(saved.get("protect_paths"), list):
-            protected = list(dict.fromkeys([*saved["protect_paths"], *protected]))
+        if protection_active:
+            changed_before_resume = set(state_delta(task_before or before, before)["changed_paths"])
+    protection = auto_correct_module.protection_state(
+        repo=repo,
+        verify_commands=args.verify_command if protection_active else [],
+        protect_entries=protect_entries if protection_active else [],
+        saved=saved,
+        earlier_steers=earlier_steers,
+        is_resume=audit_previous is not None,
+        changed_paths_before_resume=changed_before_resume,
+        gate_fingerprint=gate_fingerprint,
+        enforce_on_first_turn=True,
+    )
+    resumed_releases.extend(protection["released_paths"])
+    gate_candidates = protection["gate_candidates"] if protection_active else []
+    protected = protection["protect_paths"] if protection_active else []
+    protect_fingerprints = protection["protect_fingerprints"] if protection_active else {}
     # Preserve explicit protection from the task's first handoff, including ignored files/directories.
     # A resumed zero-round segment carries this state forward without opening mechanical rounds.
-    protect_fingerprints = {
-        path: saved.get("protect_fingerprints", {}).get(path, gate_fingerprint(repo / path)) for path in protected
-    }
     # Fresh N=0 runs retain their original output shape.
     auto_correct: dict[str, Any] | None = (
         {
@@ -2620,11 +2614,7 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
     rounds_started = 0
     # A resumed correction protects its first turn too. Initial implementation scripts remain editable,
     # but explicit protect_paths are checked against the baseline captured before any worker starts.
-    gates = [
-        path
-        for path in dict.fromkeys([*(gate_candidates if audit_previous is not None else []), *protected])
-        if not steer_released(path)
-    ]
+    gates = [path for path in protection["gate_files"] if not steer_released(path)]
     gates_before = {
         path: protect_fingerprints[path] if path in protect_fingerprints else gate_fingerprint(repo / path)
         for path in gates

@@ -122,6 +122,54 @@ class NativeProtectionParityTests(unittest.TestCase):
             (22, "scope_violation", "skipped", ["gate-edit:allowed/expected.txt"]),
         )
 
+    def test_released_protected_path_is_omitted_from_suggested_correction_gates(self):
+        protection.seed(
+            self.fixture,
+            {
+                "allowed/check.sh": "grep -qx fixed allowed/output.txt\n",
+                "allowed/expected.txt": "strict\n",
+                "allowed/output.txt": "broken\n",
+            },
+        )
+        run = self.dispatch_native(
+            "implementation",
+            "native-released-correction-gate",
+            "--verify-command",
+            "sh allowed/check.sh",
+            "--protect-path",
+            "allowed/expected.txt",
+            "--auto-correct",
+            "1",
+        )
+        first = self.native_round(
+            run,
+            "native-released-correction-gate",
+            {"allowed/output.txt": "attempt\n"},
+            "allowed/output.txt",
+        )
+        first_result = self.result(first)
+        self.assertEqual(first_result["status"], "verification_failed")
+        self.rewrite_recorded_result(
+            first,
+            lambda result: result["auto_correct"].update(released_paths=["allowed/expected.txt"]),
+        )
+
+        correction = self.correction("native-released-correction-gate-resume")
+        failed = self.native_round(
+            correction,
+            "native-released-correction-gate-resume",
+            {"allowed/output.txt": "still-broken\n"},
+            "allowed/output.txt",
+            handle=first_result["session_id"],
+        )
+        result = self.result(failed)
+        self.assertEqual(result["status"], "verification_failed")
+        self.assertEqual(result["auto_correct"]["released_paths"], ["allowed/expected.txt"])
+        suggestion = result["auto_correct"]["suggested_correction"]
+        self.assertIsNotNone(suggestion)
+        self.assertIn("Do not change the gate's own files: allowed/check.sh.", suggestion)
+        self.assertNotIn("allowed/expected.txt", suggestion)
+
     def test_zero_round_native_correction_carries_task_baseline_protection_and_releases(self):
         # The coordinator permits one correction, so the zero-round correction is the last native segment.
         protection.seed(

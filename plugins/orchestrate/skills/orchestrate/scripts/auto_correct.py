@@ -17,6 +17,7 @@ import os
 import posixpath
 import re
 import shlex
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -630,6 +631,65 @@ def release_paths(entries: list[str]) -> list[str]:
     link, release the link's target as well; the gate-edit violation names it.
     """
     return ["."] if "." in entries else list(dict.fromkeys(entries))
+
+
+def protection_state(
+    *,
+    repo: Path,
+    verify_commands: list[str],
+    protect_entries: list[str],
+    saved: dict[str, Any],
+    earlier_steers: list[dict[str, Any]],
+    is_resume: bool,
+    changed_paths_before_resume: set[str],
+    gate_fingerprint: Callable[[Path], Any],
+    enforce_on_first_turn: bool,
+) -> dict[str, Any]:
+    """Build shared gate and explicit-protection state for an execution route.
+
+    The current verification commands and fresh explicit entries are combined with saved state on a
+    resume. ``gate_files`` reflects the route's enforcement timing: executors check explicit paths
+    on their first turn, while the native route captures that baseline and checks it on correction.
+    """
+    gate_candidates = gate_paths(verify_commands, repo)
+    saved_candidates = saved.get("gate_candidates")
+    if is_resume and isinstance(saved_candidates, list):
+        gate_candidates = list(dict.fromkeys([*saved_candidates, *gate_candidates]))
+    if is_resume:
+        gate_candidates = [path for path in gate_candidates if path not in changed_paths_before_resume]
+
+    saved_protect_paths = saved.get("protect_paths", [])
+    fresh_entries = [entry for entry in protect_entries if not released(entry, saved_protect_paths)]
+    protect_paths = protected_paths(fresh_entries, repo)
+    saved_paths = saved.get("protect_paths")
+    if is_resume and isinstance(saved_paths, list):
+        protect_paths = list(dict.fromkeys([*saved_paths, *protect_paths]))
+
+    saved_fingerprints = saved.get("protect_fingerprints", {})
+    protect_fingerprints = {path: saved_fingerprints.get(path, gate_fingerprint(repo / path)) for path in protect_paths}
+    released_paths = release_paths(
+        [
+            *(saved.get("released_paths") or []),
+            *(path for steer in earlier_steers for path in steer.get("added_allow_paths") or []),
+        ]
+    )
+
+    gate_files = []
+    if is_resume or enforce_on_first_turn:
+        candidates_to_enforce = gate_candidates if is_resume else []
+        gate_files = [
+            path
+            for path in dict.fromkeys([*candidates_to_enforce, *protect_paths])
+            if not released(path, released_paths)
+        ]
+
+    return {
+        "gate_candidates": gate_candidates,
+        "protect_paths": protect_paths,
+        "protect_fingerprints": protect_fingerprints,
+        "released_paths": released_paths,
+        "gate_files": gate_files,
+    }
 
 
 def round_budget(*, executor_seconds_left: float, deadline_left: float | None, gate_seconds: float) -> float:

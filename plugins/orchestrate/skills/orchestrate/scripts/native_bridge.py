@@ -218,7 +218,12 @@ def audit(
             # The gates the host's correction turn must leave alone: named, pre-existing, unchanged so far,
             # and every explicit protect_paths entry.
             derived = [path for path in candidates if path not in delta["changed_paths"]]
-            gates = list(dict.fromkeys([*derived, *ready.get("protect_paths", [])]))
+            released_paths = ready.get("released_paths", [])
+            gates = [
+                path
+                for path in dict.fromkeys([*derived, *ready.get("protect_paths", [])])
+                if not corrector.released(path, released_paths)
+            ]
             suggestion = corrector.correction_message(corrector.failed_command(verification), verification, gates=gates)
         extra["auto_correct"] = {
             "max_rounds": run["auto_correct"],
@@ -328,52 +333,31 @@ def main() -> None:
             ready["task_git_before"] = task_before
         saved_state = (previous or {}).get("auto_correct") or {}
         if run.get("auto_correct") or saved_state:
-            # The gate's own files, named before the native worker starts (see auto_correct.gate_paths).
             corrector = runner.bundled_module("auto_correct")
-            candidates = corrector.gate_paths(run["verification_commands"], repository)
-            saved = saved_state.get("gate_candidates")
-            if isinstance(saved, list):
-                candidates = list(dict.fromkeys([*saved, *candidates]))
-            if previous is not None:
-                # A file the earlier run changed is its work, never a gate again; saved candidates keep that.
-                changed = set(runner.state_delta(ready.get("task_git_before", before), before)["changed_paths"])
-                candidates = [path for path in candidates if path not in changed]
-            ready["gate_candidates"] = list(candidates)
-            # Explicit protect_paths are gate files whether or not Git ignores them or the run changed them.
-            fresh_protect_entries = [
-                entry
-                for entry in task.get("protect_paths", [])
-                if not corrector.released(entry, saved_state.get("protect_paths", []))
-            ]
-            ready["protect_paths"] = list(
-                dict.fromkeys(
-                    [
-                        *saved_state.get("protect_paths", []),
-                        *corrector.protected_paths(fresh_protect_entries, repository),
-                    ]
-                )
-            )
-            ready["protect_fingerprints"] = {
-                path: saved_state.get("protect_fingerprints", {}).get(path, runner.gate_fingerprint(repository / path))
-                for path in ready["protect_paths"]
-            }
             earlier_steers = ((previous or {}).get("steering") or {}).get("steers") or []
-            ready["released_paths"] = corrector.release_paths(
-                [
-                    *saved_state.get("released_paths", []),
-                    *(path for steer in earlier_steers for path in steer.get("added_allow_paths") or []),
-                ]
-            )
-            # The implementation captures the task baseline. A correction checks it from its first turn.
-            ready["gate_files"] = (
-                [
-                    path
-                    for path in dict.fromkeys([*candidates, *ready["protect_paths"]])
-                    if not corrector.released(path, ready["released_paths"])
-                ]
+            changed_before_resume = (
+                set(runner.state_delta(ready.get("task_git_before", before), before)["changed_paths"])
                 if previous is not None
-                else []
+                else set()
             )
+            protection = corrector.protection_state(
+                repo=repository,
+                verify_commands=run["verification_commands"],
+                protect_entries=task.get("protect_paths", []),
+                saved=saved_state,
+                earlier_steers=earlier_steers,
+                is_resume=previous is not None,
+                changed_paths_before_resume=changed_before_resume,
+                gate_fingerprint=runner.gate_fingerprint,
+                enforce_on_first_turn=False,
+            )
+            candidates = protection["gate_candidates"]
+            ready["gate_candidates"] = list(candidates)
+            ready["protect_paths"] = list(protection["protect_paths"])
+            ready["protect_fingerprints"] = protection["protect_fingerprints"]
+            ready["released_paths"] = protection["released_paths"]
+            # The implementation captures the task baseline. A correction checks it from its first turn.
+            ready["gate_files"] = protection["gate_files"]
             ready["gate_fingerprints"] = {
                 path: ready["protect_fingerprints"][path]
                 if path in ready["protect_fingerprints"]
