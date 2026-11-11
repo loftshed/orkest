@@ -1,12 +1,12 @@
 import { execFileSync } from "node:child_process";
-import { lstat, mkdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { resolveFoundryStatePath, resolveTaskSpecPath, writeFoundryState } from "./foundry.mjs";
 import { mailboxRoot, readRoom, resolveWorktreeMarkerPath, updateRoom } from "./horde-room.mjs";
 import { coordinator, memberOf, observeRoom } from "./rooms.mjs";
 import { isPathAllowed } from "./smelter.mjs";
-import { resolveRepositoryRoot } from "./worktree-provision.mjs";
+import { currentBranch, resolveRepositoryRoot } from "./worktree-provision.mjs";
 
 function invokeGit(exec, cwd, args) {
   if (exec)
@@ -130,7 +130,15 @@ export async function integrateMemberWorktree(id, memberId, options = {}) {
   );
   if (rootCommonDir !== worktreeCommonDir)
     throw new Error("Recorded worktree belongs to a different Git repository");
-  gitOutput(exec, repoRoot, ["rev-parse", "--verify", "main"]);
+  // Where the result belongs: an explicit target, else the branch the worktree was created from,
+  // else the branch the room checkout is on now. Never a guessed default.
+  const targetBranch =
+    options.target || storedMember.worktree.baseBranch || currentBranch(repoRoot, exec);
+  if (!targetBranch)
+    throw new Error(
+      "Cannot tell which branch this result belongs on: the room checkout is detached; pass --target BRANCH",
+    );
+  gitOutput(exec, repoRoot, ["rev-parse", "--verify", `refs/heads/${targetBranch}`]);
 
   const observedRoom = await observeRoom(storedRoom, { root, run });
   const observedMember = memberOf(observedRoom, memberId);
@@ -172,6 +180,7 @@ export async function integrateMemberWorktree(id, memberId, options = {}) {
   if (!branch) throw new Error("Member worktree is detached and cannot be integrated");
   if (storedMember.worktree.branch && storedMember.worktree.branch !== branch)
     throw new Error("Member worktree branch differs from the recorded room branch");
+  if (branch === targetBranch) throw new Error("Member worktree is on its own target branch");
 
   const gitStatus = gitOutput(exec, worktreePath, [
     "status",
@@ -226,65 +235,72 @@ export async function integrateMemberWorktree(id, memberId, options = {}) {
       { cause: error },
     );
   }
+  const previousHead = gitOutput(exec, worktreePath, ["rev-parse", "HEAD"]).trim();
+  let isCommitted = false;
+  let commit;
+  let foundryState;
   try {
     gitOutput(exec, worktreePath, ["add", "-A"]);
     gitOutput(exec, worktreePath, ["commit", "-m", message]);
+    isCommitted = true;
+    commit = gitOutput(exec, worktreePath, ["rev-parse", "HEAD"]).trim();
+    if (!commit) throw new Error("Could not identify the accepted room commit");
+    const commitsAhead = Number(
+      gitOutput(exec, worktreePath, ["rev-list", "--count", `${targetBranch}..HEAD`]).trim(),
+    );
+    if (!Number.isSafeInteger(commitsAhead) || commitsAhead <= 0)
+      throw new Error(`The accepted room commit is not ahead of its target branch ${targetBranch}`);
+    if (gitOutput(exec, worktreePath, ["status", "--porcelain=v1", "--untracked-files=all"]).trim())
+      throw new Error("Git commit left the member worktree dirty");
+
+    const verifyCommand = result.verification_commands.join(" && ");
+    const taskSpec = {
+      schema: "agent-executor.task-spec.v1",
+      objective: observedMember.objective,
+      allow_paths: result.allowed_paths,
+      development_checks: result.verification_commands,
+      verify_command: verifyCommand,
+      engine: result.engine,
+      model: result.model,
+    };
+    const marker = {
+      branch,
+      createdAt: at,
+      disposable: true,
+      engine: result.engine,
+      parentCwd: repoRoot,
+      slug: storedMember.worktree.slug || path.basename(worktreePath),
+    };
+    await mkdir(path.dirname(markerPath), { recursive: true });
+    await writeFile(markerPath, `${JSON.stringify(marker, null, 2)}\n`, { flag: "wx" });
+    await mkdir(path.dirname(taskSpecPath), { recursive: true });
+    await writeFile(taskSpecPath, `${JSON.stringify(taskSpec, null, 2)}\n`, { flag: "wx" });
+    foundryState = writeFoundryState(worktreePath, {
+      branch,
+      commitsAhead,
+      headSha: commit,
+      lastRun: {
+        engine: result.engine,
+        model: result.model,
+        resultPath: observedMember.resultPath,
+      },
+      maxAttempts: 2,
+      status: "verified",
+      targetBranch,
+      verifyCommand,
+      worktreePath,
+      worktreeSlug: storedMember.worktree.slug || path.basename(worktreePath),
+    });
   } catch (error) {
+    // Put the worktree back exactly: the worker's changes uncommitted, the index as it was, and no
+    // queue metadata, so the command can simply be run again.
+    await Promise.all(
+      [markerPath, taskSpecPath, statePath].map((file) => rm(file, { force: true })),
+    );
+    if (isCommitted) gitOutput(exec, worktreePath, ["reset", "--soft", previousHead]);
     await writeFile(indexPath, originalIndex);
     throw error;
   }
-  const commit = gitOutput(exec, worktreePath, ["rev-parse", "HEAD"]).trim();
-  const tree = gitOutput(exec, worktreePath, ["rev-parse", "HEAD^{tree}"]).trim();
-  if (!commit || !tree) throw new Error("Could not identify the accepted room commit");
-  const commitsAhead = Number(
-    gitOutput(exec, worktreePath, ["rev-list", "--count", "main..HEAD"]).trim(),
-  );
-  if (!Number.isSafeInteger(commitsAhead) || commitsAhead <= 0)
-    throw new Error("The accepted room commit is not ahead of the smelter target branch main");
-  if (gitOutput(exec, worktreePath, ["status", "--porcelain=v1", "--untracked-files=all"]).trim())
-    throw new Error("Git commit left the member worktree dirty");
-
-  const verifyCommand = result.verification_commands.join(" && ");
-  const taskSpec = {
-    schema: "agent-executor.task-spec.v1",
-    objective: observedMember.objective,
-    allow_paths: result.allowed_paths,
-    development_checks: result.verification_commands,
-    verify_command: verifyCommand,
-    engine: result.engine,
-    model: result.model,
-  };
-  await mkdir(path.dirname(markerPath), { recursive: true });
-  await writeFile(
-    markerPath,
-    `${JSON.stringify(
-      {
-        branch,
-        createdAt: at,
-        disposable: true,
-        engine: result.engine,
-        parentCwd: repoRoot,
-        slug: storedMember.worktree.slug || path.basename(worktreePath),
-      },
-      null,
-      2,
-    )}\n`,
-    { flag: "wx" },
-  );
-  await mkdir(path.dirname(taskSpecPath), { recursive: true });
-  await writeFile(taskSpecPath, `${JSON.stringify(taskSpec, null, 2)}\n`, { flag: "wx" });
-  const foundryState = writeFoundryState(worktreePath, {
-    branch,
-    commitsAhead,
-    headSha: commit,
-    lastRun: { engine: result.engine, model: result.model, resultPath: observedMember.resultPath },
-    maxAttempts: 2,
-    status: "verified",
-    targetBranch: "main",
-    verifyCommand,
-    worktreePath,
-    worktreeSlug: storedMember.worktree.slug || path.basename(worktreePath),
-  });
 
   const integration = { commit, message, at };
   await updateRoom(
@@ -300,5 +316,5 @@ export async function integrateMemberWorktree(id, memberId, options = {}) {
     { root },
   );
 
-  return { roomId: id, memberId, worktreePath, branch, integration, foundryState };
+  return { roomId: id, memberId, worktreePath, branch, targetBranch, integration, foundryState };
 }

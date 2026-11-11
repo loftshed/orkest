@@ -44,6 +44,12 @@ export function resolveRepositoryRoot(cwd, exec = defaultExec) {
   return path.resolve(result.stdout.trim());
 }
 
+/** The branch checked out in `cwd`, or "" when its HEAD is detached. */
+export function currentBranch(cwd, exec = defaultExec) {
+  const result = execute(exec, ["symbolic-ref", "--short", "-q", "HEAD"], { cwd });
+  return result.status === 0 ? String(result.stdout ?? "").trim() : "";
+}
+
 export function validateWorktreeSlug(slug) {
   if (typeof slug !== "string" || !/^[a-z0-9-]+$/u.test(slug))
     throw new Error("Worktree slug must use lowercase letters, digits, and dashes");

@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, realpath, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -46,9 +46,9 @@ async function directory() {
   return result;
 }
 
-async function repository() {
+async function repository(branch = "main") {
   const repo = await directory();
-  execFileSync("git", ["init", "-b", "main"], { cwd: repo, stdio: "ignore" });
+  execFileSync("git", ["init", "-b", branch], { cwd: repo, stdio: "ignore" });
   execFileSync("git", ["config", "user.name", "Room Integrate Tests"], { cwd: repo });
   execFileSync("git", ["config", "user.email", "room-integrate@example.invalid"], { cwd: repo });
   await mkdir(path.join(repo, "allowed"));
@@ -66,8 +66,9 @@ async function fixture({
   stale = false,
   clean = false,
   noWorktree = false,
+  branch = "main",
 } = {}) {
-  const repo = await repository();
+  const repo = await repository(branch);
   const root = await directory();
   const taskDir = await directory();
   const room = await newRoom(parseTeam("codex:luna:max"), {
@@ -205,6 +206,7 @@ async function expectRefusalUnchanged(f, expectedError, options = {}) {
       run: f.run,
       exec: options.exec || testExec,
       message: options.message ?? message,
+      target: options.target,
     }),
   ).rejects.toThrow(expectedError);
   expect(await captureState(f)).toEqual(before);
@@ -292,5 +294,58 @@ describe("ork hall integrate", () => {
       return testExec(command, args, options);
     };
     await expectRefusalUnchanged(f, "commit hook refused", { exec: failCommit });
+  });
+  const integrate = (f, extra = []) =>
+    roomsCommand(
+      [
+        "integrate",
+        "--room",
+        f.room.id,
+        "--member",
+        memberId,
+        "--message",
+        "feat(room): accepted change",
+        ...extra,
+      ],
+      { root: f.root, run: f.run, exec: testExec, stdout: { write: () => {} } },
+    );
+
+  it("targets the branch the room checkout is on, not a fixed name", async () => {
+    const f = await fixture({ branch: "develop" });
+    const result = await integrate(f);
+    expect(result.targetBranch).toBe("develop");
+    expect(result.foundryState.targetBranch).toBe("develop");
+    expect(git(f.worktree.path, "rev-list", "--count", "develop..HEAD")).toBe("1");
+    const worktreePath = await realpath(f.worktree.path);
+    const listed = (target) =>
+      discoverSmeltableWorktrees(f.repo, { targetBranch: target }).some(
+        (item) => item.path === worktreePath,
+      );
+    expect(listed("develop")).toBe(true);
+    // No `main` exists here, and a run for another branch must not pick this worktree up.
+    expect(listed("release")).toBe(false);
+  });
+
+  it("uses an explicit --target and refuses one that does not exist", async () => {
+    const f = await fixture();
+    execFileSync("git", ["branch", "release"], { cwd: f.repo });
+    await expectRefusalUnchanged(f, "no-such-branch", { target: "no-such-branch" });
+    const result = await integrate(f, ["--target", "release"]);
+    expect(result.targetBranch).toBe("release");
+  });
+
+  it("puts the worktree back when queue metadata cannot be written after the commit", async () => {
+    const f = await fixture();
+    const before = await captureState(f);
+    const head = git(f.worktree.path, "rev-parse", "HEAD");
+    // A file where the task spec's directory must go makes the write fail after the commit.
+    const gitDir = git(f.worktree.path, "rev-parse", "--absolute-git-dir");
+    await writeFile(path.join(gitDir, "orkest"), "in the way\n");
+    await expect(integrate(f)).rejects.toThrow();
+    await rm(path.join(gitDir, "orkest"));
+    expect(git(f.worktree.path, "rev-parse", "HEAD")).toBe(head);
+    expect(await captureState(f)).toEqual(before);
+    // Nothing is left behind, so the same command now succeeds.
+    expect((await integrate(f)).integration.message).toBe("feat(room): accepted change");
   });
 });
