@@ -157,6 +157,10 @@ publication, billing changes, or takeover of another session.
 Read ${path.join(plugin, "skills/orchestrate/references/swarm.md")} now. It describes the commands and
 native supervision contract. Use ${path.join(plugin, "bin/ork.mjs")} through node if ork is not on PATH.
 
+When the user refers to lines they marked, run \`ork hall marks --room ${room.id} --member <member>\`
+and quote those locations in the correction. Stale marks must be re-checked with the user, not
+re-anchored.
+
 Bind your actual native session with ork rooms bind --room ${room.id} --member ${memberId}
 --engine ${member.engine} --session YOUR_ACTUAL_SESSION_ID. Never guess a session ID.
 Keep ork progress current with the overall objective, your current task, and actual stage.

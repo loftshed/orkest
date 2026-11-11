@@ -7,6 +7,7 @@ import { shouldUseColor } from "../../monitor/lib/render.mjs";
 import { CACHE_DIR, CONFIG_PATH } from "../../monitor/lib/store.mjs";
 import { readAgentDiff } from "../lib/agent-diff.mjs";
 import { createAgentPreview } from "../lib/agent-preview.mjs";
+import { readDiffMarks, writeDiffMarks } from "../lib/diff-marks.mjs";
 import {
   createHerdrLifecycleSubscriber,
   isCurrentHerdrAgent,
@@ -946,6 +947,7 @@ export async function runHordeTui(
     },
     onDiff: (agent) => {
       const token = ++diffGeneration;
+      const root = mailboxRoot(env);
       void previewController.close();
       view.setPreview({
         agentId: agent.id,
@@ -955,10 +957,12 @@ export async function runHordeTui(
         text: "",
         files: [],
         stale: false,
+        marks: [],
+        marksStale: false,
       });
       paint();
       void readAgentDiff(agent, { exec })
-        .then((snapshot) => {
+        .then(async (snapshot) => {
           if (
             isStopped ||
             token !== diffGeneration ||
@@ -966,7 +970,20 @@ export async function runHordeTui(
             view.preview.agentId !== agent.id
           )
             return;
-          view.setPreview(snapshot);
+          let markState = { marks: [], stale: false };
+          try {
+            markState = await readDiffMarks(initialRoom.id, agent, { root });
+          } catch (error) {
+            view.notice = `Could not load marks: ${error.message}`;
+          }
+          if (
+            isStopped ||
+            token !== diffGeneration ||
+            view.preview?.kind !== "diff" ||
+            view.preview.agentId !== agent.id
+          )
+            return;
+          view.setPreview({ ...snapshot, marks: markState.marks, marksStale: markState.stale });
           paint();
         })
         .catch(() => {
@@ -989,6 +1006,15 @@ export async function runHordeTui(
           });
           paint();
         });
+    },
+    onMarks: (agent, marks) => {
+      void writeDiffMarks(initialRoom.id, agent, marks, { root: mailboxRoot(env) }).catch(
+        (error) => {
+          if (isStopped || view.preview?.agentId !== agent.id) return;
+          view.notice = `Could not save marks: ${error.message}`;
+          paint();
+        },
+      );
     },
   });
   let isBusy = false;

@@ -17,6 +17,10 @@ The coordinator owns the outcome, assignments, conflict resolution and final ver
 available to the user while children work. Use native supervision for agents in your harness and
 the orchestrate runner for other harnesses. Do not silently change accounts or billing contexts.
 
+When the user refers to lines they marked, run `ork hall marks --room <id> --member <member>` and
+quote those locations in the correction. Stale marks must be re-checked with the user, not
+re-anchored.
+
 ## Route each action
 
 Your context holds the user's intent and architectural decisions; spend it on that rather than
