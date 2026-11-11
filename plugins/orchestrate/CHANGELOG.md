@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.80.1
+
+- refactor(orchestrate): build gate-protection state in one place for both routes (#187)
+
 ## 0.80.0
 
 - feat(orchestrate): give a room member its own worktree for concurrent work (#185)
