@@ -96,6 +96,9 @@ for each writing member with `ork hall worktree --room ID --member MEMBER`, set 
 `repository_root` to its printed path, and dispatch the member. The conductor reviews and integrates
 each result; `patch-race` remains unsupported in a room. Worker scope, invocation allowances,
 deadlines, leases, evidence checks and review remain the existing coordinator's responsibility.
+After review, record `accept` and run
+`ork hall integrate --room ID --member MEMBER --message "feat(scope): subject"` to commit the result and register it with the smelter queue. Recording
+`accept` alone never commits.
 Cross-harness workers are supported; subswarm leads stay in their parent's native harness.
 
 The default room has 12 member slots and 3 levels below its root. `--max-agents` and `--max-depth`

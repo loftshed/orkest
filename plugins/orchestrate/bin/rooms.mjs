@@ -2,6 +2,7 @@ import path from "node:path";
 import { parseArgs } from "node:util";
 
 import { loadPresets, mailboxRoot, parseTeam, updateRoom } from "../lib/horde-room.mjs";
+import { integrateMemberWorktree } from "../lib/room-integrate.mjs";
 import { resumeRoomStatus } from "../lib/room-resume.mjs";
 import {
   assignWorkforceRole,
@@ -31,6 +32,7 @@ ork rooms add --room ID --team TEAM [--parent conductor|MEMBER] [--role ROLE] [-
 ork rooms lead --room ID --member ID --objective TEXT [--role ROLE] [--cwd PATH] [--keep-worktree]   (reserves a native subswarm lead)
 ork rooms role --room ID [--member ID|conductor] --role ROLE [--cwd PATH] [--keep-worktree]   (assign or switch workforce role)
 ork rooms worktree --room ID --member ID [--slug SLUG] [--branch BRANCH]   (create a disposable member checkout)
+ork rooms integrate --room ID --member ID --message SUBJECT   (commit an accepted result into the smelter queue)
 ork rooms worktree-keep --room ID --member ID|conductor [--cwd PATH]   (promote a disposable worktree to persistent)
 ork rooms objective --room ID --objective TEXT
 ork rooms pause|resume --room ID [--member conductor|MEMBER]   (gates new launches)
@@ -66,6 +68,7 @@ export async function roomsCommand(
     env = process.env,
     root = mailboxRoot(env),
     run = coordinator,
+    exec,
     refreshTerminal,
   } = {},
 ) {
@@ -113,6 +116,7 @@ export async function roomsCommand(
           "lead-generation",
           "parent",
           "objective",
+          "message",
           "role",
           "time-budget",
           "timeout",
@@ -239,6 +243,15 @@ export async function roomsCommand(
         run,
         slug: values.slug,
         branch: values.branch,
+      });
+      break;
+    }
+    case "integrate": {
+      result = await integrateMemberWorktree(requireValue("room"), requireValue("member"), {
+        root,
+        run,
+        exec,
+        message: requireValue("message"),
       });
       break;
     }
