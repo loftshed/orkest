@@ -232,6 +232,8 @@ trust the four reviewed Codex mailbox hooks.
 
 Orkest runs from this checkout, with no build step. `ork update` (or `/update`) fast-forwards it
 and refreshes the hooks; `ork cleanup status` previews stale worktrees, locks and backups.
+Updates are never applied silently: a new session says when one is waiting, and Swarm View offers
+it (`U`). `ork update enable` opts in to applying them automatically.
 
 Optional setup:
 

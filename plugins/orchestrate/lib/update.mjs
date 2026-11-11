@@ -15,8 +15,8 @@ Commands:
   run       Check for and apply a fast-forward update (the default)
   check     Check whether an update is available
   status    Show auto-update settings and the last update status
-  enable    Enable automatic update checks
-  disable   Disable automatic update checks
+  enable    Apply updates automatically, without asking
+  disable   Only prompt for updates (the default)
 
 Options:
   --check   Run the check command
@@ -201,7 +201,8 @@ export async function readAutoUpdateConfig(options = {}) {
   } else if (parsed.autoUpdate && typeof parsed.autoUpdate === "object") {
     raw = parsed.autoUpdate;
   }
-  const isEnabled = raw.enabled !== false;
+  // `enabled` means "apply updates without asking"; by default they wait for the user to accept.
+  const isEnabled = raw.enabled === true;
   const rawMinutes = Number(raw.intervalMinutes ?? raw.interval_minutes ?? 30);
   const intervalMinutes = Number.isFinite(rawMinutes) && rawMinutes > 0 ? rawMinutes : 30;
   const remote = typeof raw.remote === "string" && raw.remote.trim() ? raw.remote.trim() : "origin";
@@ -288,9 +289,6 @@ export async function runOrkestUpdate(options = {}) {
   const cfg = await readAutoUpdateConfig(options);
 
   if (options.auto === true) {
-    if (!cfg.enabled) {
-      return { ok: true, status: "disabled", updated: false };
-    }
     const intervalMs =
       options.intervalMs ??
       (Number.isFinite(cfg.intervalMinutes) && cfg.intervalMinutes > 0
@@ -319,7 +317,10 @@ export async function runOrkestUpdate(options = {}) {
     ...(check.remoteSha && { remoteSha: check.remoteSha }),
   };
 
-  if (check.status !== "update_available") {
+  // Without opt-in, a background check only records that an update is waiting.
+  const isRecordOnly = options.auto === true && !cfg.enabled;
+  if (check.status !== "update_available" || isRecordOnly) {
+    if (check.status === "update_available") nextState.commitsBehind = check.commitsBehind;
     await writeJsonFile(statePath, nextState);
     return { ...check, updated: false };
   }
@@ -527,7 +528,11 @@ export async function runUpdateCli(argv = [], io = {}) {
     }
     case "enabled":
     case "disabled": {
-      stdout.write(`Orkest auto-update ${result.status}.\n`);
+      stdout.write(
+        result.status === "enabled"
+          ? "Orkest will apply updates automatically.\n"
+          : "Orkest will ask before applying updates.\n",
+      );
       break;
     }
     default: {

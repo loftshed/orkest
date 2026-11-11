@@ -178,12 +178,14 @@ describe("Orkest auto-update (update.mjs)", () => {
 
     const initial = await readAutoUpdateConfig({ configDir });
     expect(initial).toEqual({
-      enabled: true,
+      enabled: false,
       intervalMinutes: 30,
       remote: "origin",
       branch: "main",
     });
 
+    const enabledNow = await setAutoUpdateEnabled(true, { configDir });
+    expect(enabledNow.enabled).toBe(true);
     const disabled = await setAutoUpdateEnabled(false, { configDir });
     expect(disabled.enabled).toBe(false);
 
@@ -203,6 +205,30 @@ describe("Orkest auto-update (update.mjs)", () => {
 
     await runUpdateCli(["enable"], { configDir, cacheDir, stdout });
     expect((await readAutoUpdateConfig({ configDir })).enabled).toBe(true);
+  });
+
+  it("records an available update without applying it unless auto-apply is enabled", async () => {
+    const cacheDir = await makeTempDir();
+    const configDir = await makeTempDir();
+    const calls = [];
+    const exec = (_cmd, args, cb) => {
+      calls.push(args.join(" "));
+      if (args.includes("--abbrev-ref")) return cb(null, "main\n");
+      if (args.includes("--porcelain")) return cb(null, "");
+      if (args.includes("rev-list"))
+        return cb(null, args.some((arg) => arg.startsWith("HEAD..")) ? "3\n" : "0\n");
+      if (args.includes("rev-parse")) {
+        return cb(null, args.some((arg) => arg.includes("origin/")) ? "2222222\n" : "1111111\n");
+      }
+      cb(null, "");
+    };
+    const options = { auto: true, force: true, configDir, cacheDir, repoRoot: "/repo", exec };
+    const waiting = await runOrkestUpdate(options);
+    expect(waiting).toMatchObject({ status: "update_available", updated: false });
+    expect(calls.filter((call) => call.includes("merge --ff-only"))).toEqual([]);
+    const state = JSON.parse(await readFile(getUpdateStatePath({ cacheDir }), "utf8"));
+    expect(state).toMatchObject({ status: "update_available", remoteSha: "2222222" });
+    expect(state.commitsBehind).toBeGreaterThan(0);
   });
 
   it("treats --check as a check and --apply as an update, refusing conflicting commands", async () => {
