@@ -282,6 +282,15 @@ describe("ork hall integrate", () => {
           ...process.env,
           GIT_CONFIG_GLOBAL: path.join(f.root, "missing-global-gitconfig"),
           GIT_CONFIG_NOSYSTEM: "1",
+          // Without this Git guesses an identity from the user and host name where it can (macOS),
+          // so "no identity configured" would not be refused there.
+          GIT_CONFIG_COUNT: "1",
+          GIT_CONFIG_KEY_0: "user.useConfigOnly",
+          GIT_CONFIG_VALUE_0: "true",
+          GIT_AUTHOR_NAME: "",
+          GIT_AUTHOR_EMAIL: "",
+          GIT_COMMITTER_NAME: "",
+          GIT_COMMITTER_EMAIL: "",
         },
       });
     await expectRefusalUnchanged(f, "identity must be configured", { exec: isolatedExec });
