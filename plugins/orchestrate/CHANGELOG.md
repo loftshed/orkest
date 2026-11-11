@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.83.0
+
+- feat(orchestrate)!: ask before applying Orkest updates (#191)
+
 ## 0.82.0
 
 - feat(orchestrate): show each agent's running processes in Swarm View (#190)
