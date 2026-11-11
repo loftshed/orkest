@@ -1488,13 +1488,54 @@ export async function observeRoom(idOrRoom, options = {}) {
       (typeof idOrRoom === "string" ||
         options.root !== undefined ||
         Boolean(room.conductor?.session) ||
-        room.agents.some((agent) => agent.session || agent.mailboxSession)));
+        room.agents.some((agent) => agent.session || agent.mailboxSession || agent.nativeSession)));
   if (shouldDiscoverNative) {
     await appendNativePeers(room, snapshots, root);
   }
   await appendConsultations(room, root);
   await appendRoomMessages(room, root);
+  resolveDiscoveredParents(room);
   return refreshMemberWorktrees(room);
+}
+
+function resolveDiscoveredParents(room) {
+  const members = [room.conductor, ...room.agents].filter(Boolean);
+  const membersById = new Map(members.map((member) => [member.id || "conductor", member]));
+  const ownerBySession = new Map();
+  for (const member of members) {
+    if (typeof member.nativeSession !== "string" || !member.nativeSession) continue;
+    const owners = ownerBySession.get(member.nativeSession) || [];
+    owners.push(member.id || "conductor");
+    ownerBySession.set(member.nativeSession, owners);
+  }
+
+  const proposals = new Map();
+  for (const member of room.agents) {
+    const parentSession = member.activitySource?.parentSession;
+    if (!member.nativeSession || typeof parentSession !== "string" || !parentSession) continue;
+    const owners = ownerBySession.get(parentSession) || [];
+    const ownerId = owners.length === 1 ? owners[0] : undefined;
+    proposals.set(member.id, ownerId && ownerId !== member.id ? ownerId : "conductor");
+  }
+
+  for (const member of room.agents) {
+    if (!proposals.has(member.id)) continue;
+    const proposedParent = proposals.get(member.id);
+    member.parent = discoveredParentWouldCycle(member.id, proposedParent, proposals, membersById)
+      ? "conductor"
+      : proposedParent;
+  }
+}
+
+function discoveredParentWouldCycle(memberId, parentId, proposals, membersById) {
+  let cursor = parentId;
+  const visited = new Set([memberId]);
+  while (cursor && cursor !== "conductor") {
+    if (visited.has(cursor)) return true;
+    visited.add(cursor);
+    cursor = proposals.get(cursor) || membersById.get(cursor)?.parent || "conductor";
+  }
+  return false;
 }
 
 async function appendConsultations(room, root) {
@@ -1948,6 +1989,7 @@ async function appendNativePeers(room, snapshots, root) {
       workforceRole: progressRecord?.role || subagentRole || "native",
       native: true,
       nativeSession: peer.session,
+      ...(peer.sharedProcess === true && { sharedProcess: true }),
       activitySource: {
         engine,
         session: peer.session,
@@ -2362,11 +2404,63 @@ async function appendClaudeProjectSubagents(
   conductorPid,
   claimedSlots = new Set(),
 ) {
-  const parentSession = room.conductor?.session?.id;
-  if (!parentSession || (room.conductor?.engine && room.conductor.engine !== "claude")) return;
+  const defaultAccountHome = process.env.CLAUDE_CONFIG_DIR || path.join(homedir(), ".claude");
+  const pendingParents = [];
+  const enqueueParent = (member, isConductor = false) => {
+    const engine = member?.engine || member?.activitySource?.engine;
+    const parentSession = isConductor ? member?.session?.id : member?.nativeSession;
+    if (!parentSession || (isConductor ? engine && engine !== "claude" : engine !== "claude")) {
+      return;
+    }
+    pendingParents.push({
+      member,
+      parentSession,
+      isConductor,
+      accountHome: member.activitySource?.accountHome || defaultAccountHome,
+      pid: member.pid || member.progress?.pid || (isConductor ? conductorPid : undefined),
+      cwd:
+        member.progress?.cwd ||
+        member.cwd ||
+        member.session?.cwd ||
+        member.worktree?.path ||
+        roomCwd ||
+        room.cwd,
+    });
+  };
+  enqueueParent(room.conductor, true);
+  for (const member of room.agents) enqueueParent(member);
+  const scannedParents = new Set();
+  while (pendingParents.length > 0) {
+    const parent = pendingParents.shift();
+    if (scannedParents.has(parent.parentSession)) continue;
+    scannedParents.add(parent.parentSession);
+    await appendClaudeProjectSubagentsForParent(
+      root,
+      room,
+      roomCwd,
+      boundSessions,
+      existingIds,
+      claimedSlots,
+      parent,
+    );
+    for (const member of room.agents) enqueueParent(member);
+  }
+}
+
+async function appendClaudeProjectSubagentsForParent(
+  root,
+  room,
+  roomCwd,
+  boundSessions,
+  existingIds,
+  claimedSlots,
+  parent,
+) {
+  const { parentSession, accountHome, cwd: parentCwd } = parent;
+  const parentPid = Number.isSafeInteger(parent.pid) && parent.pid > 0 ? parent.pid : 0;
   const roomCreatedMs = parseStampMs(room.createdAt);
-  const isConductorAlive = !conductorPid || pidAlive(conductorPid) !== false;
-  const dirs = claudeSubagentsDirs(undefined, parentSession, [roomCwd, room.cwd]);
+  const isParentAlive = !parentPid || pidAlive(parentPid) !== false;
+  const dirs = claudeSubagentsDirs(accountHome, parentSession, [parentCwd, roomCwd, room.cwd]);
   for (const dir of dirs) {
     let entries;
     try {
@@ -2396,7 +2490,7 @@ async function appendClaudeProjectSubagents(
         // after SubagentStop removes the peer. A live peer remains authoritative.
         const peerOptions = {
           engine: "claude",
-          cwd: boundSlot.session?.cwd || boundSlot.cwd || roomCwd,
+          cwd: boundSlot.session?.cwd || boundSlot.cwd || parentCwd || roomCwd,
         };
         if (
           claimedSlots.has(boundSlot.id) ||
@@ -2417,13 +2511,12 @@ async function appendClaudeProjectSubagents(
         continue;
       }
       const key = sessionKey(subSid);
-      const accountHome = process.env.CLAUDE_CONFIG_DIR || path.join(homedir(), ".claude");
       const savedProgress = key
         ? await readProgressRecord(
             root,
             key,
             { session: subSid, harness: "claude", accountHome },
-            roomCwd,
+            parentCwd || roomCwd,
             hostname(),
           )
         : null;
@@ -2434,7 +2527,7 @@ async function appendClaudeProjectSubagents(
       const workforceRole = savedProgress?.role || claudeSubagentRole(info.agentType) || "native";
       const isFinished =
         info.finished ||
-        !isConductorAlive ||
+        !isParentAlive ||
         Boolean(boundSlot && savedProgress?.stage === "complete");
       let status = isFinished ? "reported complete" : "running";
       if (info.interrupted) status = "cancelled";
@@ -2446,7 +2539,7 @@ async function appendClaudeProjectSubagents(
         const shortId =
           savedPrefix && !existingIds.has(savedPrefix)
             ? savedPrefix
-            : pickSubagentMartianName(subSid, existingIds, room.conductor?.person);
+            : pickSubagentMartianName(subSid, existingIds, parent.member?.person);
         id = shortId;
         let index = 2;
         while (existingIds.has(id)) {
@@ -2476,11 +2569,11 @@ async function appendClaudeProjectSubagents(
           session: subSid,
           accountHome,
           parentSession,
-          cwd: roomCwd,
+          cwd: parentCwd || roomCwd,
           startedAt: info.startedIso,
         },
         parent: "conductor",
-        cwd: roomCwd,
+        cwd: parentCwd || roomCwd,
         observedAt: info.lastActivityIso || info.startedIso,
         status,
         ...(isFinished &&
@@ -2493,7 +2586,7 @@ async function appendClaudeProjectSubagents(
           person: id,
           model: modelName,
           effort: "—",
-          cwd: roomCwd,
+          cwd: parentCwd || roomCwd,
           ...(workforceRole !== "native" && { role: workforceRole }),
           goal: room.title && room.title !== room.id ? cleanLine(room.title) : "Native subagent",
           task: taskText,

@@ -79,6 +79,8 @@ Every component accepts `tier` (`"nerd"`, `"unicode"`, or `"ascii"`), resolved b
    - Treat all model/tool/terminal output as untrusted data: sanitize with `plain()` before applying `tone()`, and clamp every rendered line with `fitStyled(line, width)` so escape codes never leak or wrap across borders.
 8. **Diff Line Marks:**
    - The diff preview keeps a source-line cursor and saved marks in a per-tier gutter; semantic tones add emphasis while gutter glyphs keep both states legible without color.
+9. **Observed Agent Processes:**
+   - Agent cards show a muted process count and an observed listening port when available; completed agents with remaining processes show `left` in the warning tone. The Focus and Pinned panels list each process by PID, age and a redacted command, with `(by directory)` when attribution came from its working directory. The wording remains explicit in monochrome output.
 
 ---
 

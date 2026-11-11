@@ -118,6 +118,14 @@ export const VISUAL_CASES = Object.freeze([
     palette: "light",
     tier: "unicode",
   },
+  {
+    name: "processes-dark-100",
+    scenario: "processes",
+    cols: 100,
+    rows: 40,
+    palette: "dark",
+    tier: "unicode",
+  },
 ]);
 
 export function syntheticRoom() {
@@ -252,7 +260,53 @@ export async function renderFixture(repo, spec) {
   const { HordeView } = await import(
     pathToFileURL(path.join(repo, "plugins/orchestrate/lib/horde-view.mjs")).href
   );
-  const view = new HordeView(syntheticRoom(), {
+  const room = syntheticRoom();
+  if (spec.scenario === "processes") {
+    room.agents = [
+      {
+        id: "builder",
+        name: "Builder",
+        engine: "codex",
+        model: "gpt-5.1-codex",
+        parent: "conductor",
+        status: "working",
+        progress: { task: "Run the integration suite", stage: "testing" },
+        output: ["The build and tests are running"],
+      },
+    ];
+    room.agentProcesses = {
+      builder: {
+        processes: [
+          {
+            pid: 4121,
+            ppid: 4100,
+            ageSeconds: 42,
+            command: "python3 -m pytest tests/plugins/orchestrate --maxfail=1",
+            via: "tree",
+            ports: [],
+          },
+          {
+            pid: 4125,
+            ppid: 4100,
+            ageSeconds: 420,
+            command: "node node_modules/.bin/vite --port",
+            via: "cwd",
+            ports: [5179],
+          },
+          {
+            pid: 4130,
+            ppid: 4100,
+            ageSeconds: 7200,
+            command: "npm run build",
+            via: "tree",
+            ports: [],
+          },
+        ],
+        more: 1,
+      },
+    };
+  }
+  const view = new HordeView(room, {
     now: () => FIXED_TIME,
     height: spec.rows,
     color: spec.palette !== "mono",
@@ -390,6 +444,11 @@ export async function renderFixture(repo, spec) {
       if (!quota) throw new Error("Quota heading has no mouse target");
       view.handleMouse({ x: quota.x + 1, y: quota.y, action: "move", button: 0 });
 
+      break;
+    }
+    case "processes": {
+      view.focusId = "builder";
+      view.hasExplicitFocus = true;
       break;
     }
     // No default
