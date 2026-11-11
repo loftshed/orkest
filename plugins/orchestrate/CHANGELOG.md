@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.82.0
+
+- feat(orchestrate): show each agent's running processes in Swarm View (#190)
+
 ## 0.81.0
 
 - feat(orchestrate): mark diff lines in Swarm View for the coordinator to quote (#189)
