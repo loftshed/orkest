@@ -26,6 +26,7 @@ import {
 import { hasTerminalDecision, memberDisplayState } from "./member-state.mjs";
 import { verifiedNativeIds } from "./native-identity.mjs";
 import {
+  currentBranch,
   provisionWorktree,
   resolveRepositoryRoot,
   validateWorktreeSlug,
@@ -925,10 +926,13 @@ export async function createMemberWorktree(id, memberId, options = {}) {
   const repositoryRoot = resolveRepositoryRoot(room.cwd, exec);
   const slug = validateWorktreeSlug(options.slug ?? memberId);
   const branch = options.branch ?? `ork/room-${slug}`;
+  // The worktree starts from the room checkout's HEAD, so that branch is where its result belongs.
+  const baseBranch = currentBranch(repositoryRoot, exec);
   const planned = {
     path: path.join(repositoryRoot, ".worktrees", slug),
     parentCwd: room.cwd,
     branch,
+    ...(baseBranch && { baseBranch }),
     slug,
     disposable: true,
   };

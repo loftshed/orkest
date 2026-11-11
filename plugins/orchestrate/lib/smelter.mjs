@@ -443,6 +443,14 @@ export function discoverSmeltableWorktrees(
     if (!includeKeep && marker.disposable === false) continue;
 
     if (!includeAllStates && !foundryState && !stateProblem) continue;
+    // A worktree records the branch its result belongs on; one queued for another branch is left
+    // for a run that targets that branch, never rebased onto this one.
+    if (
+      !includeAllStates &&
+      typeof foundryState?.targetBranch === "string" &&
+      foundryState.targetBranch !== targetBranch
+    )
+      continue;
     if (!includeAllStates && foundryState && typeof foundryState.status === "string") {
       if (SKIPPED_SMELTER_STATES.has(foundryState.status)) {
         continue;

@@ -39,6 +39,11 @@ For concurrent implementation, give each writing member a checkout with
 `ork hall worktree --room ID --member MEMBER`. Set the task spec's `repository_root` to the printed
 path, then dispatch that member; its runner lease applies to its own checkout. Reviewing and
 integrating each result remains the conductor's job, and `patch-race` remains unsupported in a room.
+After reviewing and recording `accept`, commit the result into the smelter queue with
+`ork hall integrate --room ID --member MEMBER --message "feat(scope): subject"`. Recording `accept`
+alone never commits. The result is queued for the branch the worktree was created from (override
+with `--target BRANCH`); when that is not `main`, run the queue for it with
+`ork smelter run --target BRANCH`.
 
 A room shows its own checkout, its conductor's subagents and workers recorded on its members. Other
 worktrees in the repository are separate from that room. The peer mailbox's `peers` and

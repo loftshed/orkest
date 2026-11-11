@@ -22,7 +22,7 @@ async function directory() {
 
 async function gitRepository() {
   const repo = await directory();
-  execFileSync("git", ["init"], { cwd: repo, stdio: "ignore" });
+  execFileSync("git", ["init", "-b", "main"], { cwd: repo, stdio: "ignore" });
   execFileSync("git", ["config", "user.name", "Room Worktree Tests"], { cwd: repo });
   execFileSync("git", ["config", "user.email", "room-worktree@example.invalid"], { cwd: repo });
   await writeFile(path.join(repo, "tracked.txt"), "tracked content\n");
@@ -110,7 +110,7 @@ describe("ork hall worktree", () => {
         {
           id: "haiku-1",
           cwd: printed.path,
-          worktree: { path: printed.path, parentCwd: repo, disposable: true },
+          worktree: { path: printed.path, parentCwd: repo, baseBranch: "main", disposable: true },
         },
         { id: "luna-1" },
       ],

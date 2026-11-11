@@ -148,6 +148,7 @@ export function detectWorktree(cwd, existing, referenceCwd) {
   return {
     ...(wtPath && { path: wtPath }),
     ...(existing.branch && { branch: existing.branch }),
+    ...(existing.baseBranch && { baseBranch: existing.baseBranch }),
     disposable: existing.disposable,
     ...(parentCwd && { parentCwd }),
     ...(slug && { slug }),
@@ -380,6 +381,8 @@ export function validateRoom(room) {
           (typeof member.worktree.parentCwd !== "string" ||
             !path.isAbsolute(member.worktree.parentCwd))) ||
         (member.worktree.branch !== undefined && typeof member.worktree.branch !== "string") ||
+        (member.worktree.baseBranch !== undefined &&
+          typeof member.worktree.baseBranch !== "string") ||
         (member.worktree.slug !== undefined && typeof member.worktree.slug !== "string"))
     )
       throw new Error("Invalid member worktree metadata");
