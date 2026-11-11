@@ -9,6 +9,7 @@
 import path from "node:path";
 
 import { renderLine, timeLeft } from "../../monitor/lib/render.mjs";
+import { redactCommand } from "./agent-processes.mjs";
 import { mapDiffLines, markText } from "./diff-marks.mjs";
 import { coalesceMessages, resolveMemberWorktree } from "./horde-room.mjs";
 import { memberDisplayState, MEMBER_OUTCOMES as OUTCOMES } from "./member-state.mjs";
@@ -542,6 +543,60 @@ const INTERNAL_FILE_PATH_RE = /^(?:\/|[A-Za-z]:\\)\S+\.(?:json|jsonl|txt|log)$/i
 function cleanProgressTask(member) {
   const t = plain(member?.progress?.task || "").trim();
   return t && t !== "not set" ? t : "";
+}
+
+function agentProcessInfo(member, room) {
+  const value = room?.agentProcesses?.[member?.id];
+  const processes = Array.isArray(value?.processes) ? value.processes : [];
+  const more = Number.isSafeInteger(value?.more) && value.more > 0 ? value.more : 0;
+  return { processes, more, count: processes.length + more };
+}
+
+function agentProcessSummary(member, room) {
+  const info = agentProcessInfo(member, room);
+  if (info.count === 0) return null;
+  const state = memberDisplayState(member);
+  const isLeftover = ["reported", "finished", "answered", "completed", "complete"].includes(state);
+  const ports = [
+    ...new Set(
+      info.processes.flatMap((process) =>
+        (Array.isArray(process?.ports) ? process.ports : [])
+          .map(Number)
+          .filter((port) => Number.isSafeInteger(port) && port > 0),
+      ),
+    ),
+  ].toSorted((a, b) => a - b);
+  const countLabel = `${info.count} proc${info.count === 1 ? "" : "s"}${isLeftover ? " left" : ""}`;
+  return {
+    ...info,
+    left: isLeftover,
+    tone: isLeftover ? "warning" : "muted",
+    text: `${countLabel}${ports.length > 0 ? ` · :${ports[0]}` : ""}`,
+    compactText: countLabel,
+  };
+}
+
+function formatProcessAge(seconds) {
+  const age = Number.isFinite(Number(seconds)) ? Math.max(0, Math.floor(Number(seconds))) : 0;
+  if (age < 60) return `${age}s`;
+  if (age < 3600) return `${Math.floor(age / 60)}m`;
+  if (age < 86_400) return `${Math.floor(age / 3600)}h`;
+  return `${Math.floor(age / 86_400)}d`;
+}
+
+function runningProcessLine(process, color) {
+  const command = plain(redactCommand(process?.command)) || "(no command line)";
+  const pid = Number.isSafeInteger(process?.pid) && process.pid > 0 ? process.pid : "?";
+  const ports = [
+    ...new Set(
+      (Array.isArray(process?.ports) ? process.ports : [])
+        .map(Number)
+        .filter((port) => Number.isSafeInteger(port) && port > 0),
+    ),
+  ].toSorted((a, b) => a - b);
+  const portSuffix = ports.map((port) => ` :${port}`).join("");
+  const directorySuffix = process?.via === "cwd" ? tone(" (by directory)", "muted", color) : "";
+  return `${pid}  ${formatProcessAge(process?.ageSeconds)}  ${command}${tone(portSuffix, "running", color)}${directorySuffix}`;
 }
 
 function isFocusNoiseLine(rawLine, resultPath = "") {
@@ -1846,7 +1901,14 @@ export class HordeView {
   }
 
   isCollapsibleCompleted(agent, parentIds) {
-    if (!agent || !isInactive(agent) || agent.id === this.pinnedId) return false;
+    if (
+      !agent ||
+      !isInactive(agent) ||
+      agent.id === this.pinnedId ||
+      agentProcessInfo(agent, this.room).count > 0
+    ) {
+      return false;
+    }
     if (agent.id === this.focusId && this.hasExplicitFocus) return false;
     if (parentIds) return !parentIds.has(agent.id);
     const agents = Array.isArray(this.room?.agents) ? this.room.agents : [];
@@ -1861,7 +1923,8 @@ export class HordeView {
     const isCardCollapsed =
       this.completedMode === "collapsed" && this.isCollapsibleCompleted(focused);
     const markdown = extractAgentFocusMarkdown(focused, { isPinned, isCardCollapsed });
-    if (!markdown) return [];
+    const processInfo = agentProcessInfo(focused, this.room);
+    if (!markdown && processInfo.count === 0) return [];
 
     const agentLabel = shortAgentName(focused);
     const titlePrefix = isPinned ? "Pinned" : "Focus";
@@ -1869,9 +1932,17 @@ export class HordeView {
       const compactTag = `[${titlePrefix} · ${agentLabel}]`;
       const styledTag = tone(compactTag, isPinned ? "warning bold" : "mdSection", this.appearance);
       const rawLast = markdown.split("\n").at(-1) || "";
-      const summary = stripInlineMarkdown(rawLast).replace(/^(?:Task|Asked|Question):\s*/u, "");
+      const detailSummary = stripInlineMarkdown(rawLast).replace(
+        /^(?:Task|Asked|Question):\s*/u,
+        "",
+      );
+      const processSummary = agentProcessSummary(focused, this.room);
+      const summary = detailSummary || processSummary?.text || "";
+      const compactSummary = processSummary
+        ? `${summary}${detailSummary ? ` · ${processSummary.compactText}` : ""}`
+        : summary;
       const budget = Math.max(1, innerWidth - displayWidth(`${compactTag} `));
-      return [`${styledTag} ${fit(summary, budget)}`];
+      return [`${styledTag} ${fit(compactSummary, budget)}`];
     }
 
     const title = `${titlePrefix} · ${agentLabel}`;
@@ -1883,13 +1954,17 @@ export class HordeView {
     }
     const pad = innerWidth >= 6 ? " " : "";
     const bodyWidth = Math.max(1, innerWidth - 2 - pad.length * 2);
-    const maxBodyRows = Math.max(1, Math.min(4, remainingRows - 2));
-    const rendered = renderMarkdown(markdown, bodyWidth, {
-      color: this.appearance,
-      tier: this.tier,
-    }).filter((line, idx, arr) => line !== "" || (idx > 0 && idx < arr.length - 1));
-    let visible = rendered.slice(0, maxBodyRows);
-    if (rendered.length > maxBodyRows && visible.length > 0 && bodyWidth >= 4) {
+    const bodyCapacity = Math.max(1, Math.min(24, remainingRows - 2));
+    const rendered = markdown
+      ? renderMarkdown(markdown, bodyWidth, {
+          color: this.appearance,
+          tier: this.tier,
+        }).filter((line, idx, arr) => line !== "" || (idx > 0 && idx < arr.length - 1))
+      : [];
+    const hasRunning = processInfo.count > 0;
+    const detailLimit = Math.min(4, Math.max(0, bodyCapacity - (hasRunning ? 2 : 0)));
+    let visible = rendered.slice(0, detailLimit);
+    if (rendered.length > detailLimit && visible.length > 0 && bodyWidth >= 4) {
       const ellipsis = this.tier === "ascii" ? "..." : "…";
       const cutWidth = Math.max(1, bodyWidth - displayWidth(ellipsis));
       const truncatedLast = fitStyled(visible.at(-1), cutWidth).trimEnd();
@@ -1897,6 +1972,29 @@ export class HordeView {
         ...visible.slice(0, -1),
         `${truncatedLast}${tone(ellipsis, "muted", this.appearance)}`,
       ];
+    }
+    if (hasRunning && visible.length < bodyCapacity) {
+      visible.push(tone("Running", "mdSection", this.appearance));
+      const runningCapacity = bodyCapacity - visible.length;
+      const availableProcessRows = Math.max(0, runningCapacity);
+      const processRows = processInfo.processes.slice(0, 20);
+      const total = processInfo.count;
+      const canShowMore = total > availableProcessRows;
+      const visibleProcessCount = Math.min(
+        20,
+        processRows.length,
+        canShowMore && availableProcessRows > 0 ? availableProcessRows - 1 : availableProcessRows,
+      );
+      visible.push(
+        ...processRows
+          .slice(0, visibleProcessCount)
+          .map((process) => runningProcessLine(process, this.appearance)),
+      );
+      const omitted = Math.max(0, total - visibleProcessCount);
+      if (omitted > 0 && visible.length < bodyCapacity) {
+        const ellipsis = this.tier === "ascii" ? "..." : "…";
+        visible.push(tone(`${ellipsis}and ${omitted} more`, "muted", this.appearance));
+      }
     }
     const paddedBody = visible.map((row) => `${pad}${row}`);
     let headerTone = isPinned ? "warning bold" : "mdSection";
@@ -2368,11 +2466,23 @@ export class HordeView {
           const renderedTask = agentRunning
             ? `${tone(this.tier === "ascii" ? ">" : SPINNER[Math.floor(now / 120) % SPINNER.length], "shimmerSpinner", this.appearance)} ${shimmerText(fittedTaskText, now, this.appearance)}`
             : fittedTaskText;
-          const statusLine = tone(
-            `${statusGlyph(agent, now, this.tier)}${roleBadge} ${model(agent)} | ${phase(agent)}${progressSuffix(agent, now)}`,
-            `${toneForStatus(agent)}${isFocused ? " bold" : ""}`,
-            this.appearance,
-          );
+          const rawStatusLine = `${statusGlyph(agent, now, this.tier)}${roleBadge} ${model(agent)} | ${phase(agent)}${progressSuffix(agent, now)}`;
+          const statusTone = `${toneForStatus(agent)}${isFocused ? " bold" : ""}`;
+          const processSummary = agentProcessSummary(agent, room);
+          let statusLine = tone(rawStatusLine, statusTone, this.appearance);
+          if (processSummary) {
+            const statusWidth = Math.max(1, cardWidth - displayWidth(prefix) - 3);
+            const variants = [processSummary.text, processSummary.compactText];
+            for (const summaryText of variants) {
+              if (displayWidth(rawStatusLine) + 3 + displayWidth(summaryText) > statusWidth)
+                continue;
+              statusLine =
+                tone(rawStatusLine, statusTone, this.appearance) +
+                tone(" · ", "muted", this.appearance) +
+                tone(summaryText, processSummary.tone, this.appearance);
+              break;
+            }
+          }
           return treeCard(cardTitle, [` ${renderedTask}`, ` ${statusLine}`], cardWidth, {
             emphasized: isFocused || isPinned,
             hovered: isHovered,

@@ -7,6 +7,13 @@ import { shouldUseColor } from "../../monitor/lib/render.mjs";
 import { CACHE_DIR, CONFIG_PATH } from "../../monitor/lib/store.mjs";
 import { readAgentDiff } from "../lib/agent-diff.mjs";
 import { createAgentPreview } from "../lib/agent-preview.mjs";
+import {
+  buildAgentProcesses,
+  descendantsOf,
+  inferServiceProcessName,
+  isInternalOrHarnessProcess,
+  parseProcessTable,
+} from "../lib/agent-processes.mjs";
 import { readDiffMarks, writeDiffMarks } from "../lib/diff-marks.mjs";
 import {
   createHerdrLifecycleSubscriber,
@@ -54,6 +61,7 @@ const serviceCache = {
   key: "",
   fetchedAt: 0,
   services: [],
+  agentProcesses: {},
 };
 
 const updateCache = {
@@ -125,12 +133,15 @@ export function resolvePullUpdateOutcome(res, nowMs = Date.now()) {
   };
 }
 
-async function runExecOutput(exec, command, args, env = process.env) {
+async function runExecOutput(exec, command, args, env = process.env, timeoutMs = 1500) {
   try {
     if (exec === execFile) {
       return await new Promise((resolve) => {
-        execFile(command, args, { env, timeout: 1500, maxBuffer: 512 * 1024 }, (err, stdout = "") =>
-          resolve(err ? "" : String(stdout || "")),
+        execFile(
+          command,
+          args,
+          { env, timeout: timeoutMs, maxBuffer: 512 * 1024 },
+          (err, stdout = "") => resolve(err ? "" : String(stdout || "")),
         );
       });
     }
@@ -523,117 +534,24 @@ function parseLsofCwds(raw) {
 
 function parsePsRows(raw) {
   const rows = new Map();
-  const rawLines = String(raw || "").split(/\r?\n/u);
-  for (const line of rawLines) {
+  const lines = String(raw || "").split(/\r?\n/u);
+  for (const line of lines) {
     const match = /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(\S+)(?:\s+(.*))?$/u.exec(line);
     if (!match) continue;
     const pid = Math.trunc(Number(match[1]));
     const ppid = Math.trunc(Number(match[2]));
-    const etime = match[3].trim();
-    const comm = match[4].trim();
-    const args = (match[5] || "").trim();
-    rows.set(pid, { pid, ppid, etime, comm, args });
+    if (!Number.isSafeInteger(pid) || pid <= 0 || !Number.isSafeInteger(ppid) || ppid < 0) {
+      continue;
+    }
+    rows.set(pid, {
+      pid,
+      ppid,
+      etime: match[3].trim(),
+      comm: match[4].trim(),
+      args: (match[5] || "").trim(),
+    });
   }
   return rows;
-}
-
-const KNOWN_SERVICE_TOKENS = [
-  "vite",
-  "next",
-  "astro",
-  "wrangler",
-  "uvicorn",
-  "gunicorn",
-  "flask",
-  "django",
-  "storybook",
-  "webpack",
-  "parcel",
-  "remix",
-  "nuxt",
-  "svelte",
-  "esbuild",
-  "rollup",
-  "http-server",
-  "serve",
-  "prism",
-  "wiremock",
-  "mock",
-  "postgres",
-  "redis",
-  "mysqld",
-  "mongod",
-  "minio",
-  "caddy",
-  "nginx",
-  "rails",
-  "puma",
-  "spring",
-  "gradle",
-  "maven",
-  "cargo",
-  "deno",
-  "bun",
-];
-
-const INTERNAL_OR_HARNESS_TOKENS = [
-  "agy",
-  "antigravity",
-  "language_server",
-  "claude",
-  "plaude",
-  "codex",
-  "opencode",
-  "cclsp",
-  "tsserver",
-  "vtsls",
-  "rust-analyzer",
-  "pyright",
-  "ruff",
-  "eslint",
-  "mailbox_daemon",
-  "peer_mailbox",
-  "horde-tui",
-  "agent_statusline",
-  "tmux",
-  "herdr",
-  "code helper",
-  "cursor",
-  "electron",
-  "crashpad",
-];
-
-function matchTokenInText(text, tokens) {
-  const lower = String(text || "").toLowerCase();
-  for (const token of tokens) {
-    const escaped = token.replaceAll(/[.*+?^${}()|[\]\\]/gu, String.raw`\$&`);
-    if (new RegExp(`(?:^|[^a-z0-9_])${escaped}(?:$|[^a-z0-9_])`, "u").test(lower)) return token;
-  }
-  return "";
-}
-
-function matchKnownServiceToken(command = "", comm = "", args = "") {
-  return matchTokenInText(`${args} ${comm} ${command}`, KNOWN_SERVICE_TOKENS);
-}
-
-function isInternalOrHarnessProcess(command = "", comm = "", args = "", port = 0) {
-  const execIdentity = `${path.basename(comm || "")} ${command} ${args}`;
-  if (matchTokenInText(execIdentity, INTERNAL_OR_HARNESS_TOKENS)) {
-    return true;
-  }
-  if (Number.isFinite(port) && port >= 49_152) {
-    const knownToken = matchKnownServiceToken(command, comm, args);
-    const hasExplicitPortFlag = /(?:^|\s)(?:--port(?:\s|=)|\b-p\s+\d+)/iu.test(args);
-    if (!knownToken && !hasExplicitPortFlag) return true;
-  }
-  return false;
-}
-
-function inferServiceProcessName(command = "", comm = "", args = "") {
-  const known = matchKnownServiceToken(command, comm, args);
-  if (known) return known;
-  const base = path.basename(comm || command || "process").trim();
-  return base || "process";
 }
 
 function pathWithin(candidate, rootPath) {
@@ -645,8 +563,8 @@ function pathWithin(candidate, rootPath) {
   );
 }
 
-/** Discover live TCP listeners and Docker containers belonging to the room's checkouts or agents. */
-export async function probeRoomServices(room, { exec = execFile } = {}) {
+/** Discover room services and the observed process descendants attached to room members. */
+async function probeRoomDiscovery(room, { exec = execFile } = {}) {
   const explicit = Array.isArray(room?.services)
     ? room.services.filter((svc) => svc && typeof svc === "object").map((svc) => ({ ...svc }))
     : [];
@@ -676,56 +594,115 @@ export async function probeRoomServices(room, { exec = execFile } = {}) {
       rootPaths.add(path.resolve(memberCwd));
     }
   }
-  if (rootPaths.size === 0 && ownerByPid.size === 0) return explicit;
-
-  const discovered = [];
-  const lsofOut = await runExecOutput(exec, "lsof", ["-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pcn"]);
-  const listeners = parseLsofListeners(lsofOut);
-  if (listeners.length > 0) {
-    const pids = [...new Set(listeners.map((item) => item.pid))];
-    const pidArg = pids.join(",");
-    const [psOut, cwdOut] = await Promise.all([
-      runExecOutput(exec, "ps", ["-o", "pid=,ppid=,etime=,comm=,args=", "-p", pidArg]),
-      runExecOutput(exec, "lsof", ["-a", "-p", pidArg, "-d", "cwd", "-Fn"]),
-    ]);
-    const psMap = parsePsRows(psOut);
-    const cwdMap = parseLsofCwds(cwdOut);
-    for (const listener of listeners) {
-      const psInfo = psMap.get(listener.pid);
-      if (isInternalOrHarnessProcess(listener.command, psInfo?.comm, psInfo?.args, listener.port)) {
-        continue;
-      }
-      const cwd = cwdMap.get(listener.pid) || "";
-      const pidOwner =
-        ownerByPid.get(listener.pid) || (psInfo?.ppid ? ownerByPid.get(psInfo.ppid) : undefined);
-      let matchedRoot = "";
-      for (const rootPath of rootPaths) {
-        if (pathWithin(cwd, rootPath) && rootPath.length > matchedRoot.length) {
-          matchedRoot = rootPath;
-        }
-      }
-      if (!pidOwner && !matchedRoot) continue;
-      const wtMeta = matchedRoot ? worktreeByPath.get(matchedRoot) : undefined;
-      let fallbackWorktree = "";
-      if (cwd) fallbackWorktree = path.basename(cwd);
-      else if (room?.cwd) fallbackWorktree = path.basename(room.cwd);
-      const worktree = wtMeta?.badge || fallbackWorktree;
-      const owner = pidOwner || wtMeta?.owner || "";
-      const name = inferServiceProcessName(listener.command, psInfo?.comm, psInfo?.args);
-      discovered.push({
-        kind: "port",
-        port: listener.port,
-        pid: listener.pid,
-        name,
-        ...(cwd && { cwd }),
-        ...(worktree && { worktree }),
-        ...(owner && { owner }),
-        ...(psInfo?.etime && { uptime: psInfo.etime }),
-      });
-    }
+  if (rootPaths.size === 0 && ownerByPid.size === 0) {
+    return { services: explicit, agentProcesses: {} };
   }
 
-  const dockerOut = await runExecOutput(exec, "docker", ["ps", "--format", "{{json .}}"]);
+  const discovered = [];
+  const [lsofOut, processTableOut] = await Promise.all([
+    runExecOutput(exec, "lsof", ["-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pcn"]),
+    runExecOutput(exec, "ps", ["-axo", "pid=,ppid=,etime=,args="], process.env, 2500),
+  ]);
+  const listeners = parseLsofListeners(lsofOut);
+  const processTable = parseProcessTable(processTableOut);
+  const listenerPids = [...new Set(listeners.map((listener) => listener.pid))];
+  const listenerPsOut =
+    listenerPids.length > 0
+      ? await runExecOutput(exec, "ps", [
+          "-o",
+          "pid=,ppid=,etime=,comm=,args=",
+          "-p",
+          listenerPids.join(","),
+        ])
+      : "";
+  const listenerPsRows = parsePsRows(listenerPsOut);
+  const ignored = new Set([process.pid, ...descendantsOf(processTable, process.pid)]);
+  const memberPidCounts = new Map();
+  for (const member of members) {
+    const pid = member.pid || member.progress?.pid;
+    if (Number.isSafeInteger(pid) && pid > 0) {
+      memberPidCounts.set(pid, (memberPidCounts.get(pid) || 0) + 1);
+    }
+  }
+  const memberPids = new Set(memberPidCounts.keys());
+  const uniqueTreeRoots = new Set(
+    members
+      .filter((member) => {
+        const pid = member.pid || member.progress?.pid;
+        return (
+          Number.isSafeInteger(pid) &&
+          memberPidCounts.get(pid) === 1 &&
+          member.sharedProcess !== true
+        );
+      })
+      .map((member) => member.pid || member.progress?.pid),
+  );
+  const uniqueTreeDescendants = new Set(
+    [...uniqueTreeRoots].flatMap((pid) => [...descendantsOf(processTable, pid)]),
+  );
+  const sharedRoots = new Set(
+    members
+      .filter(
+        (member) =>
+          member.sharedProcess === true ||
+          memberPidCounts.get(member.pid || member.progress?.pid) > 1,
+      )
+      .map((member) => member.pid || member.progress?.pid)
+      .filter((pid) => Number.isSafeInteger(pid) && pid > 0),
+  );
+  const processCwdCandidates = new Set();
+  for (const rootPid of sharedRoots) {
+    for (const pid of descendantsOf(processTable, rootPid)) {
+      if (!ignored.has(pid) && !memberPids.has(pid) && !uniqueTreeDescendants.has(pid)) {
+        processCwdCandidates.add(pid);
+      }
+    }
+  }
+  const cwdProbePids = [
+    ...new Set([
+      ...listenerPids,
+      ...[...processCwdCandidates].toSorted((left, right) => left - right).slice(0, 200),
+    ]),
+  ];
+  const [cwdOut, dockerOut] = await Promise.all([
+    cwdProbePids.length > 0
+      ? runExecOutput(exec, "lsof", ["-a", "-p", cwdProbePids.join(","), "-d", "cwd", "-Fn"])
+      : "",
+    runExecOutput(exec, "docker", ["ps", "--format", "{{json .}}"]),
+  ]);
+  const cwdMap = parseLsofCwds(cwdOut);
+  for (const listener of listeners) {
+    const psInfo = listenerPsRows.get(listener.pid);
+    const comm = psInfo?.comm || "";
+    if (isInternalOrHarnessProcess(listener.command, comm, psInfo?.args, listener.port)) continue;
+    const cwd = cwdMap.get(listener.pid) || "";
+    const pidOwner =
+      ownerByPid.get(listener.pid) || (psInfo?.ppid ? ownerByPid.get(psInfo.ppid) : undefined);
+    let matchedRoot = "";
+    for (const rootPath of rootPaths) {
+      if (pathWithin(cwd, rootPath) && rootPath.length > matchedRoot.length) {
+        matchedRoot = rootPath;
+      }
+    }
+    if (!pidOwner && !matchedRoot) continue;
+    const wtMeta = matchedRoot ? worktreeByPath.get(matchedRoot) : undefined;
+    let fallbackWorktree = "";
+    if (cwd) fallbackWorktree = path.basename(cwd);
+    else if (room?.cwd) fallbackWorktree = path.basename(room.cwd);
+    const worktree = wtMeta?.badge || fallbackWorktree;
+    const owner = pidOwner || wtMeta?.owner || "";
+    const name = inferServiceProcessName(listener.command, comm, psInfo?.args);
+    discovered.push({
+      kind: "port",
+      port: listener.port,
+      pid: listener.pid,
+      name,
+      ...(cwd && { cwd }),
+      ...(worktree && { worktree }),
+      ...(owner && { owner }),
+      ...(psInfo?.etime && { uptime: psInfo.etime }),
+    });
+  }
   const repoNames = new Set(
     [...rootPaths].map((rootPath) => path.basename(rootPath).toLowerCase()).filter(Boolean),
   );
@@ -772,7 +749,7 @@ export async function probeRoomServices(room, { exec = execFile } = {}) {
   }
 
   const seenKeys = new Set();
-  const merged = [];
+  const services = [];
   for (const svc of [...explicit, ...discovered]) {
     const key =
       svc.kind === "docker"
@@ -780,12 +757,57 @@ export async function probeRoomServices(room, { exec = execFile } = {}) {
         : `port:${svc.port || svc.name || ""}:${svc.pid || ""}`;
     if (seenKeys.has(key)) continue;
     seenKeys.add(key);
-    merged.push(svc);
+    services.push(svc);
   }
-  return merged;
+  const processMap = buildAgentProcesses({
+    table: processTable,
+    members,
+    listeners: [
+      ...listeners.map((listener) => ({
+        ...listener,
+        comm: listenerPsRows.get(listener.pid)?.comm || "",
+      })),
+      ...services,
+    ],
+    cwdByPid: cwdMap,
+    ignore: ignored,
+  });
+  const agentProcesses = Object.fromEntries(
+    [...processMap].map(([id, value]) => [
+      id,
+      {
+        processes: value.processes.map((item) => ({ ...item, ports: [...item.ports] })),
+        more: value.more,
+      },
+    ]),
+  );
+  return { services, agentProcesses };
 }
 
-export async function cachedServices(
+export async function probeRoomServices(room, options = {}) {
+  try {
+    return (await probeRoomDiscovery(room, options)).services;
+  } catch {
+    return [];
+  }
+}
+
+function cloneAgentProcesses(agentProcesses) {
+  return Object.fromEntries(
+    Object.entries(agentProcesses || {}).map(([id, value]) => [
+      id,
+      {
+        processes: (Array.isArray(value?.processes) ? value.processes : []).map((item) => ({
+          ...item,
+          ports: Array.isArray(item.ports) ? [...item.ports] : [],
+        })),
+        more: Number.isSafeInteger(value?.more) ? value.more : 0,
+      },
+    ]),
+  );
+}
+
+export async function cachedRoomDiscovery(
   room,
   { exec = execFile, now = Date.now, ttlMs = 5000, force = false } = {},
 ) {
@@ -797,13 +819,29 @@ export async function cachedServices(
     stamp - serviceCache.fetchedAt < ttlMs &&
     Array.isArray(serviceCache.services)
   ) {
-    return serviceCache.services.map((svc) => ({ ...svc }));
+    return {
+      services: serviceCache.services.map((svc) => ({ ...svc })),
+      agentProcesses: cloneAgentProcesses(serviceCache.agentProcesses),
+    };
   }
-  const services = await probeRoomServices(room, { exec });
+  let snapshot;
+  try {
+    snapshot = await probeRoomDiscovery(room, { exec });
+  } catch {
+    snapshot = { services: [], agentProcesses: {} };
+  }
   serviceCache.key = key;
   serviceCache.fetchedAt = stamp;
-  serviceCache.services = services;
-  return services.map((svc) => ({ ...svc }));
+  serviceCache.services = snapshot.services;
+  serviceCache.agentProcesses = snapshot.agentProcesses;
+  return {
+    services: snapshot.services.map((svc) => ({ ...svc })),
+    agentProcesses: cloneAgentProcesses(snapshot.agentProcesses),
+  };
+}
+
+export async function cachedServices(room, options = {}) {
+  return (await cachedRoomDiscovery(room, options)).services;
 }
 
 export async function cachedUpdateStatus({
@@ -1050,8 +1088,9 @@ export async function runHordeTui(
       }
       if (enableServices) {
         try {
-          const discovered = await cachedServices(room, { exec });
-          if (discovered.length > 0) room.services = discovered;
+          const discovered = await cachedRoomDiscovery(room, { exec });
+          if (discovered.services.length > 0) room.services = discovered.services;
+          room.agentProcesses = discovered.agentProcesses;
         } catch {
           // Service discovery is best-effort and must never disrupt the TUI.
         }

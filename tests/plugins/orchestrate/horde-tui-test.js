@@ -1409,6 +1409,95 @@ describe("terminal lifecycle", () => {
     expect(notifiedSet.has('room:outcomes:[["reported",2]]')).toBe(true);
   });
 
+  it("shows observed processes on cards and Focus/Pinned panels in monochrome", () => {
+    const room = fixture("claude:haiku,agy:flash");
+    const member = room.agents[0];
+    member.status = "working";
+    member.progress = { ...member.progress, task: "Run the focused suite" };
+    room.agentProcesses = {
+      [member.id]: {
+        processes: [
+          {
+            pid: 9101,
+            ppid: 9100,
+            ageSeconds: 42,
+            command: "python3 -m pytest tests/test_app.py",
+            via: "tree",
+            ports: [],
+          },
+          {
+            pid: 9102,
+            ppid: 9100,
+            ageSeconds: 420,
+            command: "node node_modules/.bin/vite --port",
+            via: "cwd",
+            ports: [5173],
+          },
+        ],
+        more: 1,
+      },
+    };
+
+    const view = new HordeView(room, { height: 40, color: false, tier: "unicode", now: () => 0 });
+    view.focusId = member.id;
+    view.hasExplicitFocus = true;
+    const focusText = plain(view.render(100).join("\n"));
+
+    expect(focusText).toContain("3 procs · :5173");
+    expect(focusText).toContain("Running");
+    expect(focusText).toContain("9101  42s  python3 -m pytest tests/test_app.py");
+    expect(focusText).toContain(
+      "9102  7m  node node_modules/.bin/vite --port :5173 (by directory)",
+    );
+    expect(focusText).toContain("…and 1 more");
+
+    view.pinnedId = member.id;
+    const pinnedText = plain(view.render(100).join("\n"));
+    expect(pinnedText).toContain("Pinned · haiku-1");
+    expect(pinnedText).toContain("Running");
+
+    member.status = "reported complete";
+    member.completion = "untracked";
+    room.agentProcesses[member.id].more = 0;
+    const finishedText = plain(
+      new HordeView(room, { height: 40, color: false, now: () => 0 }).render(100).join("\n"),
+    );
+    expect(finishedText).toContain("2 procs left");
+  });
+
+  it("drops the process count before narrowing the card's model or status text", () => {
+    const room = fixture("claude:haiku,agy:flash");
+    const member = room.agents[0];
+    member.status = "working";
+    room.agentProcesses = {
+      [member.id]: {
+        processes: [
+          {
+            pid: 9101,
+            ppid: 9100,
+            ageSeconds: 5,
+            command: "python test.py",
+            via: "tree",
+            ports: [],
+          },
+        ],
+        more: 0,
+      },
+    };
+    const narrowLines = new HordeView(room, {
+      height: 28,
+      color: false,
+      tier: "ascii",
+      now: () => 0,
+    })
+      .render(24)
+      .map(plain);
+    const statusLine = narrowLines.find((line) => line.includes("haiku |")) || "";
+    expect(statusLine).toContain("haiku |");
+    expect(statusLine).not.toContain("proc");
+    expect(displayWidth(statusLine)).toBeLessThanOrEqual(24);
+  });
+
   it("renders redesigned orchestrator card, collapsible inline quota, and running services footer", async () => {
     const room = fixture("claude:haiku,agy:flash");
     room.title = "Swarm View Upgrade";
@@ -1572,6 +1661,7 @@ describe("terminal lifecycle", () => {
         },
       ],
     };
+    const psCalls = [];
     const mockExec = (cmd, args, cb) => {
       if (cmd === "lsof" && args.includes("-sTCP:LISTEN")) {
         cb(
@@ -1594,7 +1684,21 @@ describe("terminal lifecycle", () => {
         );
         return;
       }
-      if (cmd === "ps") {
+      if (cmd === "ps") psCalls.push(args);
+      if (cmd === "ps" && args.includes("-axo")) {
+        cb(
+          null,
+          [
+            " 9105  9100 02:15 node /Users/dev/orkest/node_modules/.bin/vite --port 4173",
+            " 9000     1 15:00 agy --workspace /Users/dev/orkest",
+            " 9100  9000 12:00 codex --full-auto",
+            " 9999     1 10:00 python -m http.server",
+            "",
+          ].join("\n"),
+        );
+        return;
+      }
+      if (cmd === "ps" && args.includes("-p")) {
         cb(
           null,
           [
@@ -1640,11 +1744,14 @@ describe("terminal lifecycle", () => {
       }
       cb(null, "");
     };
-    const services = await hordeTuiModule.cachedServices(probeRoom, {
+    const discovery = await hordeTuiModule.cachedRoomDiscovery(probeRoom, {
       exec: mockExec,
       now: () => 1000,
       force: true,
     });
+    expect(psCalls.filter((args) => args.includes("-axo"))).toHaveLength(1);
+    expect(psCalls.filter((args) => args.includes("-p"))).toHaveLength(1);
+    const services = discovery.services;
     expect(services).toEqual([
       {
         kind: "port",
@@ -1667,6 +1774,10 @@ describe("terminal lifecycle", () => {
         uptime: "5 minutes",
       },
     ]);
+    expect(discovery.agentProcesses["worker-1"].processes).toContainEqual(
+      expect.objectContaining({ pid: 9105, via: "tree", ports: [4173] }),
+    );
+    expect(discovery.agentProcesses["worker-1"].more).toBe(0);
     const cached = await hordeTuiModule.cachedServices(probeRoom, {
       exec: () => {
         throw new Error("should use cache");

@@ -1194,6 +1194,115 @@ describe("room CLI", () => {
     ]);
   });
 
+  it("nests discovered peers under their owning peer, falls back to conductor, and breaks parent cycles", async () => {
+    const root = await realpath(await directory());
+    const cwd = await realpath(await directory());
+    const room = await newRoom(parseTeam("codex:luna"), {
+      id: "room-discovered-parents",
+      cwd,
+      root,
+    });
+    room.conductor.session = { id: "root-session", engine: "codex", machine: hostname(), cwd };
+    room.conductor.nativeSession = "root-session";
+    await mkdir(path.join(root, "peers"), { recursive: true });
+    const startedAt = new Date().toISOString();
+    const writePeer = async (session, person, parentSession) => {
+      await writeFile(
+        path.join(root, "peers", `${session}.json`),
+        JSON.stringify({
+          schema: "agent-executor.peer.v1",
+          session,
+          name: `${person}-codex-luna-orkest-188`,
+          person,
+          shortName: person,
+          harness: "codex",
+          state: "busy",
+          cwd,
+          checkout: cwd,
+          pid: process.pid,
+          machine: hostname(),
+          parentSession,
+          startedAt,
+          lastSeenAt: startedAt,
+        }),
+      );
+    };
+    // The child sorts before its owner, so the relationship requires a second pass.
+    await writePeer("a-child-session", "child-worker", "z-owner-session");
+    await writePeer("z-owner-session", "owner-worker", "root-session");
+    await writePeer("orphan-session", "orphan-worker", "unowned-session");
+    await writePeer("cycle-a-session", "cycle-a", "cycle-b-session");
+    await writePeer("cycle-b-session", "cycle-b", "cycle-a-session");
+
+    const observed = await observeRoom(room, { root });
+    const bySession = new Map(observed.agents.map((agent) => [agent.nativeSession, agent]));
+    expect(bySession.get("z-owner-session").parent).toBe("conductor");
+    expect(bySession.get("a-child-session").parent).toBe(bySession.get("z-owner-session").id);
+    expect(bySession.get("orphan-session").parent).toBe("conductor");
+    expect(bySession.get("cycle-a-session").parent).toBe("conductor");
+    expect(bySession.get("cycle-b-session").parent).toBe("conductor");
+  });
+
+  it("nests transcript-discovered Claude subagents under their owning worker session", async () => {
+    const root = await realpath(await directory());
+    const cwd = await realpath(await directory());
+    const accountHome = await directory();
+    const parentSession = "worker-parent-session";
+    const slug = cwd.replaceAll(/[^A-Za-z0-9-]/gu, "-");
+    const subagentsDir = path.join(accountHome, "projects", slug, parentSession, "subagents");
+    await mkdir(subagentsDir, { recursive: true });
+    await mkdir(path.join(root, "peers"), { recursive: true });
+    const room = await newRoom(parseTeam("codex:luna"), {
+      id: "room-transcript-parent",
+      cwd,
+      root,
+    });
+    const startedAt = new Date().toISOString();
+    room.conductor.session = { id: "root-session", engine: "codex", machine: hostname(), cwd };
+    await writeFile(
+      path.join(root, "peers", `${parentSession}.json`),
+      JSON.stringify({
+        schema: "agent-executor.peer.v1",
+        session: parentSession,
+        name: "worker-parent-claude-sonnet-orkest-188",
+        person: "worker-parent",
+        shortName: "worker-parent",
+        harness: "claude",
+        model: "claude-sonnet-5-5",
+        state: "busy",
+        cwd,
+        checkout: cwd,
+        accountHome,
+        pid: process.pid,
+        machine: hostname(),
+        parentSession: "root-session",
+        startedAt,
+        lastSeenAt: startedAt,
+      }),
+    );
+    await writeFile(
+      path.join(subagentsDir, "agent-childtranscript.meta.json"),
+      JSON.stringify({
+        agentType: "Explore",
+        model: "claude-sonnet-5-5",
+        description: "Inspect the worker tree",
+      }),
+    );
+    await writeFile(
+      path.join(subagentsDir, "agent-childtranscript.jsonl"),
+      `${JSON.stringify({ message: { model: "claude-sonnet-5-5" } })}\n`,
+    );
+
+    const observed = await observeRoom(room, { root });
+    const worker = observed.agents.find((agent) => agent.nativeSession === parentSession);
+    const transcriptChild = observed.agents.find(
+      (agent) => agent.nativeSession === "subagent-childtranscript",
+    );
+    expect(worker).toBeDefined();
+    expect(transcriptChild).toMatchObject({ parent: worker.id, native: true });
+    expect(transcriptChild.activitySource.parentSession).toBe(parentSession);
+  });
+
   it("exposes the room membership predicate for direct boundary checks", () => {
     const room = { conductor: { session: { id: "conductor-session" } } };
     const memberPaths = new Set(["/other/worktree"]);
