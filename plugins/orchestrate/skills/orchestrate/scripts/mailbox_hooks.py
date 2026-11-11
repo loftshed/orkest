@@ -869,6 +869,30 @@ def _maybe_trigger_auto_update(base: Path, me: dict[str, Any], event: str) -> No
         )
 
 
+def _update_notice(base: Path, me: dict[str, Any]) -> str:
+    """One line at session start when the background check found an update the user has not applied."""
+    if me.get("isSubagent") or me.get("delegatedRun") or _MB.is_run_peer(me):
+        return ""
+    with contextlib.suppress(Exception):
+        state = _MB.load(base.parent / "auto-update-v1.json")
+        if not isinstance(state, dict) or state.get("status") != "update_available":
+            return ""
+        plugin_root = Path(__file__).resolve().parents[3]
+        head = subprocess.run(
+            ["git", "-C", str(plugin_root), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        ).stdout.strip()
+        if not head or head == state.get("remoteSha"):
+            return ""
+        count = state.get("commitsBehind")
+        what = f"{count} new commit{'' if count == 1 else 's'}" if isinstance(count, int) else "new commits"
+        return f"An Orkest update is available ({what}). Tell the user it is there: run /update to apply it, then restart sessions."
+    return ""
+
+
 def _record_native_swarm_identity(base: Path, me: dict[str, Any]) -> None:
     """Attest this harness's native environment ID without claiming another live conversation."""
     if me.get("isSubagent") or me.get("delegatedRun") or _MB.is_run_peer(me):
@@ -1665,6 +1689,7 @@ def hook(
                 "Do not call inbox or ack—finish immediately."
             )
     context = _MB.render_all(delivered, me["name"])
+    update_notice = _update_notice(base, me) if event == "SessionStart" else ""
     hint = "\n".join(
         value
         for value in (
@@ -1672,6 +1697,7 @@ def hook(
             swarm_toggle,
             swarm_brief,
             cleared_notice,
+            update_notice,
             team_notice,
             identity_hint,
             availability_hint,
