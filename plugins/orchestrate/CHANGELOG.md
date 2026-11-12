@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.83.1
+
+- fix(orchestrate): list a delegated run worker that started before the room (#192)
+
 ## 0.83.0
 
 - feat(orchestrate)!: ask before applying Orkest updates (#191)
