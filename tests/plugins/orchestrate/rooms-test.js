@@ -1199,6 +1199,42 @@ describe("room CLI", () => {
     ]);
   });
 
+  it("shows what a delegated run worker is doing from its run's output", async () => {
+    const root = await realpath(await directory());
+    const cwd = await realpath(await directory());
+    const outDir = await realpath(await directory());
+    const room = await newRoom(parseTeam("codex:luna"), { id: "room-delegated-tail", cwd, root });
+    await mkdir(path.join(root, "peers"), { recursive: true });
+    const now = new Date().toISOString();
+    const earlier = new Date(Date.now() - 600_000).toISOString();
+    await writeFile(
+      path.join(root, "peers", "delegated-worker.json"),
+      JSON.stringify({
+        schema: "agent-executor.peer.v1",
+        session: "delegated-worker",
+        name: "delegated-worker-repo",
+        harness: "codex",
+        state: "busy",
+        cwd,
+        pid: process.pid,
+        startedAt: earlier,
+        lastSeenAt: now,
+        delegatedRun: "run-tail",
+      }),
+    );
+    await writeFile(
+      path.join(root, "peers", "run-run-tail-worker.json"),
+      JSON.stringify({ resultPath: path.join(outDir, "result.json") }),
+    );
+    await writeFile(
+      path.join(outDir, "stdout.txt"),
+      `${JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "Checking the cohort" } })}\n`,
+    );
+    const observed = await observeRoom(room, { root });
+    const worker = observed.agents.find((agent) => agent.nativeSession === "delegated-worker");
+    expect(worker.output).toContain("Checking the cohort");
+  });
+
   it("nests discovered peers under their owning peer, falls back to conductor, and breaks parent cycles", async () => {
     const root = await realpath(await directory());
     const cwd = await realpath(await directory());
