@@ -1900,11 +1900,19 @@ async function appendNativePeers(room, snapshots, root) {
       Number.isFinite(roomCreatedMs) &&
       Number.isFinite(peerStartedMs) &&
       peerStartedMs >= roomCreatedMs - 60_000;
+    // A script's delegated run worker is the repository's own work, whenever the room was opened.
+    const isDelegatedRun = Boolean(peer.delegatedRun);
     // A session in the room checkout must also be tied to this room; a subagent or a dispatched
     // worker elsewhere already is.
     if (
       peerCwd === roomCwd &&
-      !(isSameSharedProcess || isSameParentSession || isSameWorkspace || hasStartedSinceRoom)
+      !(
+        isSameSharedProcess ||
+        isSameParentSession ||
+        isSameWorkspace ||
+        hasStartedSinceRoom ||
+        isDelegatedRun
+      )
     ) {
       continue;
     }
