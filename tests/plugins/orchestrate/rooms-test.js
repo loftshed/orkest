@@ -1170,6 +1170,10 @@ describe("room CLI", () => {
       }),
       writePeer("room-checkout-started", roomCwd, nowIso),
       writePeer("room-checkout-old", roomCwd, staleStartedAt),
+      // A script's delegated run that was already working when the room was opened.
+      writePeer("room-checkout-delegated", roomCwd, staleStartedAt, {
+        delegatedRun: "runner-already-working",
+      }),
       writePeer("room-checkout-shared", roomCwd, staleStartedAt, { sharedProcess: true }),
       writePeer("room-checkout-workspace", roomCwd, staleStartedAt, {
         herdrWorkspaceId: "room-workspace",
@@ -1188,6 +1192,7 @@ describe("room CLI", () => {
       "recorded-side-cwd",
       "recorded-worktree",
       "recorded-worktree-inside",
+      "room-checkout-delegated",
       "room-checkout-shared",
       "room-checkout-started",
       "room-checkout-workspace",
