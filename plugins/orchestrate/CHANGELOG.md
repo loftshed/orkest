@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.84.1
+
+- docs(orchestrate): explain Claude Code holding the mailbox wake-up nudge (#194)
+
 ## 0.84.0
 
 - feat(orchestrate): show what a delegated run worker is doing in Swarm View (#193)
