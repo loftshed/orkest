@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.84.0
+
+- feat(orchestrate): show what a delegated run worker is doing in Swarm View (#193)
+
 ## 0.83.1
 
 - fix(orchestrate): list a delegated run worker that started before the room (#192)
