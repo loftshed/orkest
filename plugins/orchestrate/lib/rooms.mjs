@@ -25,6 +25,7 @@ import {
 } from "./horde-room.mjs";
 import { hasTerminalDecision, memberDisplayState } from "./member-state.mjs";
 import { verifiedNativeIds } from "./native-identity.mjs";
+import { readDelegatedRunTail } from "./run-activity.mjs";
 import {
   currentBranch,
   provisionWorktree,
@@ -1986,6 +1987,7 @@ async function appendNativePeers(room, snapshots, root) {
     const latestActivityIso = subagentMeta?.lastActivityIso || peer.lastSeenAt || null;
     const observedAt =
       latestActivityIso || progressRecord?.updatedAt || peer.lastSeenAt || peer.startedAt;
+    const runTail = peer.delegatedRun ? await readDelegatedRunTail(root, peer.delegatedRun) : [];
     const projected = {
       id,
       name: cleanLine(peer.name),
@@ -2023,7 +2025,7 @@ async function appendNativePeers(room, snapshots, root) {
         isUntrackedCompletion({ slot, progress: progressRecord }) && { completion: "untracked" }),
       runtimeState: status === "running" ? "running" : "idle",
       objective: taskText,
-      output: [taskText].filter(Boolean),
+      output: [taskText, ...runTail].filter(Boolean),
       progress: {
         name: cleanLine(peer.name),
         ...(person && { person }),
