@@ -59,6 +59,9 @@ is slow. Its Herdr lookup times out after 100 ms to keep the command within 300 
 metadata are capped at 80 characters, retaining the distinguishing suffix. See Herdr's
 [tab bar configuration](https://herdr.dev/tui/docs/configuration/) for other status entries.
 
+As of Codex 0.167 it has no custom status-line command, so this row is its Orkest status bar. Set
+`tab_bar_position = "bottom"` under `[ui]` to draw it where Claude Code and Antigravity draw theirs.
+
 ## Restart and close
 
 Herdr restores the layout on startup. Orkest's startup hook can then restart the display in its
