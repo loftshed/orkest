@@ -390,5 +390,42 @@ describe("releases in a repository", () => {
       expect(branchOnRemote()).toBe(racing);
       expect(tagsOnRemote()).toBe("");
     });
+
+    test("crates/ork-fast edits trigger orchestrate release and write orchestrate_release_tag to GITHUB_OUTPUT", async () => {
+      put("plugins/orchestrate/.claude-plugin/plugin.json", {
+        name: "orchestrate",
+        version: "0.85.0",
+      });
+      put("plugins/orchestrate/skills/orchestrate/SKILL.md", "---\nname: orchestrate\n---\n");
+      put("plugins/orchestrate/CHANGELOG.md", "# Changelog\n\n## 0.85.0\n\n- Baseline.\n");
+      put("README.md", `${read("README.md")}| \`orchestrate\` | 0.85.0 | orch |\n`);
+      const marketplace = json(".claude-plugin/marketplace.json");
+      marketplace.plugins.push({
+        description: "orchestrate",
+        name: "orchestrate",
+        source: "./plugins/orchestrate",
+      });
+      put(".claude-plugin/marketplace.json", marketplace);
+      commit("feat: orchestrate base");
+      git(["tag", "orchestrate--v0.85.0"]);
+
+      put("crates/ork-fast/src/main.rs", "fn main() {}\n");
+      commit("perf(orchestrate): accelerate hooks");
+
+      const plan = planRelease({ root });
+      expect(plan.releases.find((r) => r.name === "orchestrate")?.version).toBe("0.85.1");
+
+      git(["push", "--quiet", remote, "HEAD:refs/heads/main"]);
+      const outputFile = path.join(scratch, "github_output.txt");
+      const publishEnv = {
+        ...env,
+        GITHUB_SHA: git(["rev-parse", "HEAD"]),
+        GITHUB_OUTPUT: outputFile,
+      };
+      await publish({ env: publishEnv });
+      expect(fs.readFileSync(outputFile, "utf8")).toContain(
+        "orchestrate_release_tag=orchestrate--v0.85.1",
+      );
+    });
   });
 });

@@ -20,6 +20,7 @@ from pathlib import Path
 
 import peer_mailbox as mailbox
 import room_store
+import runtime_paths
 from herdr_context import canonical_endpoint, verified_agent
 from herdr_labels import agent_harness
 
@@ -1486,7 +1487,11 @@ def main(arguments: list[str]) -> int:
     coordinator_pane = create.stdout.strip()
 
     script = Path(__file__).with_name("agent_statusline.py")
-    renderer = [sys.executable, str(script), "--tmux-server", socket, "--harness", harness]
+    fast_bin = runtime_paths.ork_fast_bin(env=environment)
+    if fast_bin and fast_bin.is_file() and os.access(fast_bin, os.X_OK):
+        renderer = [str(fast_bin), "statusline", "--tmux-server", socket, "--harness", harness, "--fallback-script", str(script)]
+    else:
+        renderer = [sys.executable, str(script), "--tmux-server", socket, "--harness", harness]
     if harness == "codex":
         renderer.extend(
             [

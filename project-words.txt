@@ -8,6 +8,8 @@ bunx
 cclsp
 cmbak
 cwds
+clippy
+rustfmt
 deepswe
 evals
 Fira

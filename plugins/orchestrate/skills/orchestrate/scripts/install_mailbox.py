@@ -6,8 +6,10 @@ from __future__ import annotations
 import argparse
 import contextlib
 import copy
+import hashlib
 import json
 import os
+import platform
 import plistlib
 import re
 import shlex
@@ -1089,7 +1091,17 @@ def configuration_status(
                 for event in AGY_EVENTS:
                     command = agy_command(expected.with_name("peer_mailbox.py"), event)
                     if not any(
-                        isinstance(entry, dict) and entry.get("command") == command for entry in group.get(event, [])
+                        isinstance(entry, dict)
+                        and (
+                            entry.get("command") == command
+                            or (
+                                isinstance(entry.get("command"), str)
+                                and "mailbox-hook" in entry.get("command", "")
+                                and f"--event {event}" in entry.get("command", "")
+                                and expected.with_name("peer_mailbox.py").name in entry.get("command", "")
+                            )
+                        )
+                        for entry in group.get(event, [])
                     ):
                         issues.append(f"{event} mailbox hook missing or stale")
             except (OSError, ValueError, AttributeError):
@@ -1097,13 +1109,17 @@ def configuration_status(
         elif hooks_path:
             try:
                 hooks = json.loads(hooks_path.read_text()).get("hooks", {})
-                command = shlex.join(
-                    ["python3", str(expected.with_name("peer_mailbox.py")), "hook", "--harness", harness]
-                )
+                command = hook_command(expected.with_name("peer_mailbox.py"), harness)
                 expected_events = CLAUDE_EVENTS if harness == "claude" else EVENTS
                 for event in expected_events:
                     if not any(
                         entry.get("command") == command
+                        or (
+                            isinstance(entry.get("command"), str)
+                            and "mailbox-hook" in entry.get("command", "")
+                            and f"--harness {harness}" in entry.get("command", "")
+                            and expected.with_name("peer_mailbox.py").name in entry.get("command", "")
+                        )
                         for group in hooks.get(event, [])
                         for entry in group.get("hooks", [])
                     ):
@@ -1132,8 +1148,36 @@ def ensure_hub(hub: Path, skill: Path, *, dry_run: bool = False) -> None:
     hub.symlink_to(skill, target_is_directory=True)
 
 
-def agy_command(script: Path, event: str) -> str:
-    return shlex.join(["python3", str(script), "hook", "--harness", "gemini", "--event", event])
+def agy_command(script: Path, event: str, fast_bin: Path | str | None = None) -> str:
+    py_cmd = shlex.join(["python3", str(script), "hook", "--harness", "gemini", "--event", event])
+    if fast_bin is None:
+        return py_cmd
+    fast_cmd = shlex.join([
+        str(fast_bin),
+        "mailbox-hook",
+        "--harness",
+        "gemini",
+        "--event",
+        event,
+        "--fallback-script",
+        str(script),
+    ])
+    return f"[ -x {shlex.quote(str(fast_bin))} ] && exec {fast_cmd}; exec {py_cmd}"
+
+
+def hook_command(script: Path, harness: str, fast_bin: Path | str | None = None) -> str:
+    py_cmd = shlex.join(["python3", str(script), "hook", "--harness", harness])
+    if fast_bin is None:
+        return py_cmd
+    fast_cmd = shlex.join([
+        str(fast_bin),
+        "mailbox-hook",
+        "--harness",
+        harness,
+        "--fallback-script",
+        str(script),
+    ])
+    return f"[ -x {shlex.quote(str(fast_bin))} ] && exec {fast_cmd}; exec {py_cmd}"
 
 
 def install_agy_statusline(path: Path, *, dry_run: bool = False) -> bool:
@@ -1162,12 +1206,15 @@ def install_agy_statusline(path: Path, *, dry_run: bool = False) -> bool:
     return True
 
 
-def install_agy_hooks(path: Path, script: Path, *, dry_run: bool = False) -> bool:
+def install_agy_hooks(
+    path: Path, script: Path, *, fast_bin: Path | str | None = None, dry_run: bool = False
+) -> bool:
     """Antigravity hooks.json: named groups of flat handler lists; other groups stay untouched."""
     settings = json.loads(path.read_text()) if path.exists() else {}
     before = json.dumps(settings, sort_keys=True)
     settings["peer-mailbox"] = {
-        event: [{"type": "command", "command": agy_command(script, event), "timeout": 10}] for event in AGY_EVENTS
+        event: [{"type": "command", "command": agy_command(script, event, fast_bin=fast_bin), "timeout": 10}]
+        for event in AGY_EVENTS
     }
     if before == json.dumps(settings, sort_keys=True):
         print(f"• hooks already installed: {path}")
@@ -1182,10 +1229,12 @@ def install_agy_hooks(path: Path, script: Path, *, dry_run: bool = False) -> boo
     return True
 
 
-def install_hooks(path: Path, script: Path, harness: str, *, dry_run: bool = False) -> bool:
+def install_hooks(
+    path: Path, script: Path, harness: str, *, fast_bin: Path | str | None = None, dry_run: bool = False
+) -> bool:
     settings = json.loads(path.read_text()) if path.exists() else {}
     before = json.dumps(settings, sort_keys=True)
-    command = shlex.join(["python3", str(script), "hook", "--harness", harness])
+    command = hook_command(script, harness, fast_bin=fast_bin)
     hooks = settings.setdefault("hooks", {})
     target_events = CLAUDE_EVENTS if harness == "claude" else EVENTS
     for event in target_events:
@@ -1194,7 +1243,10 @@ def install_hooks(path: Path, script: Path, harness: str, *, dry_run: bool = Fal
             hook
             for group in groups
             for hook in group.get("hooks", [])
-            if "peer_mailbox.py hook" in hook.get("command", "") or "peer_mailbox.py' hook" in hook.get("command", "")
+            if "peer_mailbox.py hook" in hook.get("command", "")
+            or "peer_mailbox.py' hook" in hook.get("command", "")
+            or "peer_mailbox.py\" hook" in hook.get("command", "")
+            or "mailbox-hook" in hook.get("command", "")
         ]
         desired = {"type": "command", "command": command, "timeout": 3 if event == "SessionEnd" else 10}
         if entries:
@@ -1345,17 +1397,36 @@ def register(
     print(f"✓ {name} mailbox registered ({'stdio' if stdio else 'http'})")
 
 
-def mailbox_hook_updates(response: dict, script: Path, hooks_file: Path) -> dict:
+def mailbox_hook_updates(
+    response: dict, script: Path, hooks_file: Path, *, fast_bin: Path | str | None = None
+) -> dict:
     """Only the four installer-owned commands qualify for explicit scoped trust."""
     expected = ["python3", str(script), "hook", "--harness", "codex"]
     events = {"sessionStart", "userPromptSubmit", "stop", "sessionEnd"}
     matches = []
     for entry in response.get("data", []):
         for hook in entry.get("hooks", []):
+            cmd = hook.get("command", "")
+            is_match = False
+            if shlex.split(cmd) == expected:
+                is_match = True
+            elif (
+                fast_bin is not None
+                and cmd == hook_command(script, "codex", fast_bin=fast_bin)
+            ):
+                is_match = True
+            elif (
+                cmd.startswith("[ -x ")
+                and "mailbox-hook" in cmd
+                and "--harness codex" in cmd
+                and str(script.name) in cmd
+            ):
+                is_match = True
+
             if (
                 hook.get("handlerType") == "command"
                 and Path(hook.get("sourcePath", "")).resolve() == hooks_file.resolve()
-                and shlex.split(hook.get("command", "")) == expected
+                and is_match
                 and hook.get("eventName") in events
             ):
                 matches.append(hook)
@@ -1364,14 +1435,16 @@ def mailbox_hook_updates(response: dict, script: Path, hooks_file: Path) -> dict
     return {hook["key"]: {"trusted_hash": hook["currentHash"]} for hook in matches}
 
 
-def trust_codex(script: Path, codex: Path, *, dry_run: bool = False) -> None:
+def trust_codex(
+    script: Path, codex: Path, *, fast_bin: Path | str | None = None, dry_run: bool = False
+) -> None:
     if dry_run:
         print("would trust only the four installer-owned Codex mailbox hooks")
         return
     with RpcClient(["codex", "app-server", "--stdio"]) as client:
         initialize_codex(client)
         response = client.request("hooks/list", {"cwds": [str(Path.home())]})
-        updates = mailbox_hook_updates(response, script, codex / "hooks.json")
+        updates = mailbox_hook_updates(response, script, codex / "hooks.json", fast_bin=fast_bin)
         current = tomllib.loads((codex / "config.toml").read_text()).get("hooks", {}).get("state", {})
         if all(current.get(key, {}).get("trusted_hash") == value["trusted_hash"] for key, value in updates.items()):
             print("• Codex mailbox hooks already trusted")
@@ -1556,12 +1629,221 @@ def install_login_startup(home: Path, base: Path, script: Path, *, stdio: bool, 
     configuration.write_private(path, content)
 
 
+def target_triple() -> str | None:
+    system = platform.system()
+    machine = platform.machine().lower()
+    if system == "Darwin":
+        if machine in ("arm64", "aarch64"):
+            return "aarch64-apple-darwin"
+        if machine in ("x86_64", "amd64"):
+            return "x86_64-apple-darwin"
+    elif system == "Linux":
+        if machine in ("x86_64", "amd64"):
+            return "x86_64-unknown-linux-gnu"
+        if machine in ("aarch64", "arm64"):
+            return "aarch64-unknown-linux-gnu"
+    return None
+
+
+def orchestrate_plugin_version() -> str:
+    plugin_json = Path(__file__).resolve().parents[3] / ".claude-plugin/plugin.json"
+    if plugin_json.is_file():
+        try:
+            return json.loads(plugin_json.read_text(encoding="utf-8")).get("version", "0.0.0")
+        except (OSError, ValueError):
+            pass
+    return "0.0.0"
+
+
+def _codesign_macos(path: Path) -> None:
+    if platform.system() == "Darwin" and shutil.which("codesign"):
+        try:
+            subprocess.run(
+                ["codesign", "--force", "--sign", "-", str(path)],
+                check=True,
+                capture_output=True,
+            )
+        except (subprocess.SubprocessError, OSError):
+            pass
+
+
+def _install_binary(source_bytes: bytes, dest: Path) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = dest.with_name(f".{dest.name}.tmp.{os.getpid()}.{time.time_ns()}")
+    try:
+        temp_path.write_bytes(source_bytes)
+        temp_path.chmod(0o755)
+        _codesign_macos(temp_path)
+        os.replace(temp_path, dest)
+    finally:
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+
+
+def _build_local_ork_fast(crate_dir: Path, dest: Path) -> bool:
+    cargo = shutil.which("cargo")
+    if not cargo:
+        return False
+    manifest = crate_dir / "Cargo.toml"
+    if not manifest.is_file():
+        return False
+    try:
+        res = subprocess.run(
+            [cargo, "build", "--manifest-path", str(manifest), "--release"],
+            capture_output=True,
+            text=True,
+        )
+        if res.returncode != 0:
+            return False
+        built_bin = crate_dir / "target/release/ork-fast"
+        if not built_bin.is_file():
+            for parent in crate_dir.parents:
+                candidate = parent / "target/release/ork-fast"
+                if candidate.is_file():
+                    built_bin = candidate
+                    break
+            else:
+                return False
+        _install_binary(built_bin.read_bytes(), dest)
+        meta = {
+            "version": orchestrate_plugin_version(),
+            "source": "local-cargo",
+            "installed_at": time.time(),
+        }
+        dest.with_name("ork-fast.meta.json").write_text(json.dumps(meta, indent=2))
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def ensure_ork_fast(
+    *,
+    dry_run: bool = False,
+    home: Path | None = None,
+    base_url: str | None = None,
+    force_build: bool = False,
+    env: dict | None = None,
+) -> Path | None:
+    current_env = os.environ if env is None else env
+    if current_env.get("ORK_DISABLE_FAST") == "1":
+        return None
+    custom_bin = current_env.get("ORK_FAST_BIN")
+    if custom_bin:
+        custom_path = Path(custom_bin).expanduser()
+        if custom_path.is_file() and os.access(custom_path, os.X_OK):
+            return custom_path
+
+    target = target_triple()
+    cache = runtime_paths.cache_home(env=current_env, home=home)
+    dest = cache / "bin" / "ork-fast"
+
+    if dry_run:
+        print(f"would ensure ork-fast accelerator: {dest}")
+        return dest if dest.is_file() and os.access(dest, os.X_OK) else None
+
+    crate_dir = None
+    cur = Path(__file__).resolve().parent
+    for _ in range(8):
+        candidate = cur / "crates/ork-fast"
+        if (candidate / "Cargo.toml").is_file():
+            crate_dir = candidate
+            break
+        cur = cur.parent
+
+    has_local_changes = False
+    if crate_dir and dest.is_file():
+        dest_mtime = dest.stat().st_mtime
+        for p in crate_dir.rglob("*.rs"):
+            if p.stat().st_mtime > dest_mtime:
+                has_local_changes = True
+                break
+        if not has_local_changes and (crate_dir / "Cargo.toml").stat().st_mtime > dest_mtime:
+            has_local_changes = True
+
+    if force_build or has_local_changes:
+        if crate_dir and _build_local_ork_fast(crate_dir, dest):
+            print(f"✓ ork-fast accelerator compiled from source: {dest}")
+            return dest
+
+    version = orchestrate_plugin_version()
+    meta_path = dest.with_name("ork-fast.meta.json")
+    if dest.is_file() and os.access(dest, os.X_OK) and meta_path.is_file():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            if meta.get("version") == version and (meta.get("target") == target or meta.get("source") == "local-cargo"):
+                return dest
+        except (OSError, ValueError):
+            pass
+
+    download_url_base = base_url or os.environ.get(
+        "ORK_FAST_RELEASE_BASE_URL",
+        f"https://github.com/loftshed/orkest/releases/download/orchestrate--v{version}",
+    )
+    if target:
+        try:
+            import urllib.request
+            sums_url = f"{download_url_base}/SHA256SUMS"
+            req = urllib.request.Request(sums_url, headers={"User-Agent": "orkest-installer"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                sums_text = resp.read().decode("utf-8")
+            expected_sha = None
+            binary_filename = f"ork-fast-{target}"
+            for line in sums_text.splitlines():
+                parts = line.strip().split()
+                if len(parts) >= 2 and parts[1].lstrip("*") == binary_filename:
+                    expected_sha = parts[0]
+                    break
+            if expected_sha:
+                bin_url = f"{download_url_base}/{binary_filename}"
+                req_bin = urllib.request.Request(bin_url, headers={"User-Agent": "orkest-installer"})
+                with urllib.request.urlopen(req_bin, timeout=30) as resp:
+                    bin_bytes = resp.read()
+                computed_sha = hashlib.sha256(bin_bytes).hexdigest()
+                if computed_sha.lower() != expected_sha.lower():
+                    raise ValueError(
+                        f"SHA-256 digest mismatch for {binary_filename}: expected {expected_sha}, got {computed_sha}"
+                    )
+                _install_binary(bin_bytes, dest)
+                meta = {
+                    "version": version,
+                    "target": target,
+                    "sha256": computed_sha,
+                    "installed_at": time.time(),
+                }
+                meta_path.write_text(json.dumps(meta, indent=2))
+                print(f"✓ ork-fast accelerator installed: {dest}")
+                return dest
+        except Exception:
+            pass
+
+    if crate_dir and _build_local_ork_fast(crate_dir, dest):
+        print(f"✓ ork-fast accelerator compiled from source: {dest}")
+        return dest
+
+    if dest.is_file() and os.access(dest, os.X_OK):
+        return dest
+
+    print("• ork-fast accelerator not available; using Python reference implementation.")
+    return None
+
+
 def install(
-    *, dry_run: bool = False, trust_codex_hooks: bool = False, verify: bool = True, stdio: bool = False
+    *,
+    dry_run: bool = False,
+    trust_codex_hooks: bool = False,
+    verify: bool = True,
+    stdio: bool = False,
+    fast_bin: Path | None = None,
 ) -> None:
     home = Path.home()
     hub = home / ".agents/skills/orchestrate/scripts"
     ensure_hub(hub.parent, Path(__file__).resolve().parent.parent, dry_run=dry_run)
+
+    if fast_bin is None:
+        fast_bin = ensure_ork_fast(dry_run=dry_run, home=home)
 
     daemon_url = ""
     daemon_token = ""
@@ -1605,7 +1887,7 @@ def install(
                 daemon_token=daemon_token,
                 env=env,
             )
-            install_hooks(profile / "settings.json", hub / "peer_mailbox.py", "claude", dry_run=dry_run)
+            install_hooks(profile / "settings.json", hub / "peer_mailbox.py", "claude", fast_bin=fast_bin, dry_run=dry_run)
 
     if shutil.which("codex"):
         codex = Path(os.environ.get("CODEX_HOME", str(home / ".codex"))).expanduser()
@@ -1624,9 +1906,9 @@ def install(
             set_codex_timeout(config, dry_run=dry_run)
             permit_codex_tools(config, dry_run=dry_run)
         install_codex_rules(codex, home, hub, dry_run=dry_run)
-        install_hooks(codex / "hooks.json", hub / "peer_mailbox.py", "codex", dry_run=dry_run)
+        install_hooks(codex / "hooks.json", hub / "peer_mailbox.py", "codex", fast_bin=fast_bin, dry_run=dry_run)
         if trust_codex_hooks:
-            trust_codex(hub / "peer_mailbox.py", codex, dry_run=dry_run)
+            trust_codex(hub / "peer_mailbox.py", codex, fast_bin=fast_bin, dry_run=dry_run)
         else:
             trusted_state = (
                 tomllib.loads(config.read_text()).get("hooks", {}).get("state", {}) if config.exists() else {}
@@ -1650,7 +1932,7 @@ def install(
             daemon_url=daemon_url,
             daemon_token=daemon_token,
         )
-        install_agy_hooks(home / ".gemini/config/hooks.json", hub / "peer_mailbox.py", dry_run=dry_run)
+        install_agy_hooks(home / ".gemini/config/hooks.json", hub / "peer_mailbox.py", fast_bin=fast_bin, dry_run=dry_run)
 
     if shutil.which("opencode"):
         directory = Path(os.environ.get("XDG_CONFIG_HOME", str(home / ".config"))) / "opencode"
@@ -1691,12 +1973,23 @@ def main(argv: list[str] | None = None) -> int:
         "--trust-codex-hooks", action="store_true", help="explicitly trust only the four installed mailbox hooks"
     )
     parser.add_argument("--stdio", action="store_true", help="install using local stdio rather than the daemon")
+    parser.add_argument(
+        "--fast-bin",
+        type=Path,
+        default=None,
+        help="path to custom ork-fast accelerator binary",
+    )
     args = parser.parse_args(argv)
     try:
         if args.remove_herdr:
             uninstall_herdr_integration(Path.home(), dry_run=args.dry_run)
             return 0
-        install(dry_run=args.dry_run, trust_codex_hooks=args.trust_codex_hooks, stdio=args.stdio)
+        install(
+            dry_run=args.dry_run,
+            trust_codex_hooks=args.trust_codex_hooks,
+            stdio=args.stdio,
+            fast_bin=args.fast_bin,
+        )
     except (ValueError, OSError, RuntimeError, subprocess.SubprocessError) as error:
         parser.exit(1, f"mailbox install: {error}\n")
     return 0

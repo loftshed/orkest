@@ -19,6 +19,10 @@
   "ignorePaths": [
     ".git/**",
     "node_modules/**",
+    "target/**",
+    "crates/**/target/**",
+    "Cargo.lock",
+    "crates/**/Cargo.lock",
     "project-words.txt",
     "tests/**",
     "docs/images/**",

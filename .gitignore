@@ -1,6 +1,8 @@
 # Dependencies and tool state
 node_modules
 node_modules/
+/target/
+crates/**/target/
 .ruff_cache/
 .venv/
 __pycache__/

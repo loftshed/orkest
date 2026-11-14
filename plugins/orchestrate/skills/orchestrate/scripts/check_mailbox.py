@@ -100,12 +100,14 @@ def result_text(result: dict[str, Any]) -> str:
 
 def _verify_codex_hook_trust(native: RpcClient, config: Path) -> None:
     from install_mailbox import mailbox_hook_updates
+    import runtime_paths
 
     hooks = native.request("hooks/list", {"cwds": [str(Path.home())]})
     expected_hooks = mailbox_hook_updates(
         hooks,
         Path.home() / ".agents/skills/orchestrate/scripts/peer_mailbox.py",
         config.with_name("hooks.json"),
+        fast_bin=runtime_paths.ork_fast_bin(),
     )
     trusted = {
         hook["key"]: hook.get("trustStatus")

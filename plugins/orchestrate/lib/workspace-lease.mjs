@@ -1,5 +1,8 @@
 import { spawn } from "node:child_process";
+import { accessSync, constants } from "node:fs";
 import { fileURLToPath } from "node:url";
+
+import { orkFastBin } from "./runtime-paths.mjs";
 
 const holderPath = fileURLToPath(
   new URL("../skills/orchestrate/scripts/lease_holder.py", import.meta.url),
@@ -8,12 +11,25 @@ const holderPath = fileURLToPath(
 /** Advisory, non-blocking lease. Only the private holder receives its stdin pipe. */
 export async function acquireWorkspaceLease(
   workspacePath,
-  { readOnly = false, namespace, env = process.env, pythonCommand = "python3" } = {},
+  { readOnly = false, namespace, env = process.env, pythonCommand = "python3", fastBin } = {},
 ) {
-  const args = ["-B", holderPath, workspacePath];
+  let executable = pythonCommand;
+  let args = ["-B", holderPath, workspacePath];
+  if (pythonCommand === "python3") {
+    const candidate = fastBin ?? orkFastBin(env);
+    if (candidate) {
+      try {
+        accessSync(candidate, constants.X_OK);
+        executable = candidate;
+        args = ["lease-holder", workspacePath];
+      } catch {
+        // Fall back to Python
+      }
+    }
+  }
   if (readOnly) args.push("--read-only");
   if (namespace) args.push("--namespace", namespace);
-  const child = spawn(pythonCommand, args, { env, stdio: ["pipe", "pipe", "pipe"] });
+  const child = spawn(executable, args, { env, stdio: ["pipe", "pipe", "pipe"] });
   // A holder can exit between acquisition and release; EPIPE must not crash the owner.
   child.stdin.on("error", () => {});
   let hasExited = false;

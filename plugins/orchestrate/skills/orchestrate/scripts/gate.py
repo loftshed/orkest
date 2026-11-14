@@ -1111,7 +1111,12 @@ HOOK_NAME = "agent-gate"
 SHELL_TOOLS = "Bash|shell|exec_command|local_shell|unified_exec"
 
 
-def hook_command(script: Path, harness: str) -> str:
+def hook_command(script: Path, harness: str, fast_bin: Path | None = None) -> str:
+    if fast_bin:
+        return (
+            f"[ -x {shlex.quote(str(fast_bin))} ] && exec {shlex.quote(str(fast_bin))} gate-hook --harness {harness} "
+            f"--fallback-script {shlex.quote(str(script))}; exec python3 {shlex.quote(str(script))} hook --harness {harness}"
+        )
     return shlex.join(["python3", str(script), "hook", "--harness", harness])
 
 
@@ -1129,16 +1134,19 @@ def hook_files(home: Path) -> list[tuple[str, Path]]:
 
 
 def ours(entry: dict[str, Any]) -> bool:
-    return "gate.py" in str(entry.get("command", "")) and " hook " in f" {entry.get('command', '')} "
+    cmd = str(entry.get("command", ""))
+    return ("gate.py" in cmd or "ork-fast" in cmd) and (" hook " in f" {cmd} " or "gate-hook" in cmd)
 
 
-def updated(settings: dict[str, Any], harness: str, script: Path | None) -> dict[str, Any]:
+def updated(
+    settings: dict[str, Any], harness: str, script: Path | None, fast_bin: Path | None = None
+) -> dict[str, Any]:
     """Settings with this hook added (script) or removed (None); everything else stays as it was."""
     settings = json.loads(json.dumps(settings))
     if harness == "gemini":
         settings.pop(HOOK_NAME, None)
         if script:
-            entry = {"type": "command", "command": hook_command(script, harness), "timeout": 10}
+            entry = {"type": "command", "command": hook_command(script, harness, fast_bin=fast_bin), "timeout": 10}
             settings[HOOK_NAME] = {"PreToolUse": [{"matcher": "run_command", "hooks": [entry]}]}
         return settings
     hooks = settings.setdefault("hooks", {})
@@ -1148,7 +1156,7 @@ def updated(settings: dict[str, Any], harness: str, script: Path | None) -> dict
     ]
     groups = [group for group in groups if group["hooks"]]
     if script:
-        entry = {"type": "command", "command": hook_command(script, harness), "timeout": 10}
+        entry = {"type": "command", "command": hook_command(script, harness, fast_bin=fast_bin), "timeout": 10}
         groups.append({"matcher": "Bash" if harness == "claude" else SHELL_TOOLS, "hooks": [entry]})
     if groups:
         hooks["PreToolUse"] = groups
@@ -1159,17 +1167,24 @@ def updated(settings: dict[str, Any], harness: str, script: Path | None) -> dict
     return settings
 
 
-def install(*, remove: bool = False, dry_run: bool = False, home: Path | None = None) -> int:
+def install(
+    *, remove: bool = False, dry_run: bool = False, home: Path | None = None, fast_bin: Path | None = None
+) -> int:
     """Add (or remove) the PreToolUse hook in each harness's hook file, backing up what it changes."""
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import mailbox_configuration as configuration
+    import runtime_paths
 
     home = home or Path.home()
     hub = home / ".agents/skills/orchestrate/scripts/gate.py"
     script = None if remove else (hub if hub.is_file() else Path(__file__).resolve())
+    if not remove and fast_bin is None:
+        candidate = runtime_paths.ork_fast_bin(home=home)
+        if candidate and (candidate.is_file() or dry_run):
+            fast_bin = candidate
     for harness, path in hook_files(home):
         settings = json.loads(path.read_text()) if path.exists() else {}
-        result = updated(settings, harness, script)
+        result = updated(settings, harness, script, fast_bin=fast_bin)
         verb = "remove" if remove else "install"
         if result == settings:
             print(f"• nothing to {verb}: {path}")
