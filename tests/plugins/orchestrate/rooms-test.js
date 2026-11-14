@@ -22,6 +22,7 @@ import { openOrkestSqlite } from "../../../plugins/orchestrate/lib/orkest-sqlite
 import {
   belongsToRoom,
   bindSession,
+  coordinatorBrief,
   dispatchMember,
   growRoom,
   listRooms,
@@ -2972,5 +2973,43 @@ describe("bounded room continuations", () => {
         dispatchMember(room.id, "luna-1", { root, taskDir, run, maxContinues }),
       ).rejects.toThrow("hard ceiling 6");
     }
+  });
+
+  it("includes Antigravity Plan/Execute coordinator guidance for agy or orchestrator conductors and omits it otherwise", async () => {
+    const root = await directory();
+    const cwd = await directory();
+    const agyRoom = await newRoom([], {
+      id: "room-agy-orch",
+      cwd,
+      root,
+      engine: "agy",
+      model: "gemini-pro-orchestrator",
+      objective: "Coordinate changes",
+    });
+    expect(agyRoom.conductor.model).toBe("gemini-pro-orchestrator");
+    expect((await readRoom(agyRoom.id, root)).conductor.model).toBe("gemini-pro-orchestrator");
+
+    const agyBrief = coordinatorBrief(agyRoom);
+    expect(agyBrief).toContain("Antigravity Plan/Execute phases:");
+    expect(agyBrief).toContain("exit_plan_mode");
+    expect(agyBrief).toContain("enter_plan_mode");
+    expect(agyBrief).toContain("ork rooms show");
+    expect(agyBrief).toContain("ork hall worktree");
+    expect(agyBrief).toContain("allow_paths");
+    expect(agyBrief).toContain("--verify-command");
+    expect(agyBrief).toContain("gemini:fast");
+    expect(agyBrief).toContain("gemini:hydrogen-high");
+    expect(agyBrief).toContain("gemini:pro");
+    expect(agyBrief).toContain("not `gemini:orchestrator`");
+
+    const codexRoom = await newRoom([], {
+      id: "room-codex",
+      cwd,
+      root,
+      engine: "codex",
+      objective: "Coordinate changes",
+    });
+    expect(codexRoom.conductor.model).toBeUndefined();
+    expect(coordinatorBrief(codexRoom)).not.toContain("Antigravity Plan/Execute phases:");
   });
 });
