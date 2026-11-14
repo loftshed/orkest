@@ -699,7 +699,7 @@ def _cached_claude_help_efforts(
     runner_error_cls = _attr("RunnerError", ValueError)
     parsed: list[str] = []
     try:
-        output = _attr("run_checked")([executable, "--help"], timeout=15, environment=environment).stdout.decode(
+        output = _attr("run_checked")([executable, "--help"], timeout=5, environment=environment).stdout.decode(
             "utf-8", errors="replace"
         )
         parsed = parse_claude_help_efforts(output)
