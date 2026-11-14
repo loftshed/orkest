@@ -544,6 +544,8 @@ class StatusCommandTests(unittest.TestCase):
             'printf \'{"result":{"pane":%s}}\\n\' "$FAKE_PANE"\n'
         )
         self.binary.chmod(0o755)
+        # Warm macOS first-execve scan before measuring the 100 ms runtime lookup.
+        subprocess.run([str(self.binary)], env={**os.environ, "FAKE_PANE": "{}"}, capture_output=True, check=False)
         self.env = {
             **os.environ,
             "AGENT_EXECUTOR_HOME": str(self.home),
@@ -663,6 +665,8 @@ class HarnessBarInsideHerdrTests(unittest.TestCase):
             f"exit {status}\n"
         )
         self.binary.chmod(0o755)
+        # Warm macOS first-execve scan before measuring the 100 ms runtime lookup.
+        subprocess.run([str(self.binary)], env={**os.environ, "FAKE_PANE": "{}"}, capture_output=True, check=False)
 
     def status(self, harness):
         session = "bar-" + harness

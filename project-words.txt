@@ -1,4 +1,5 @@
 abprs
+acked
 aiusage
 AKIA
 APPL
@@ -7,8 +8,10 @@ bunx
 cclsp
 cmbak
 cwds
+deepswe
 evals
 Fira
+fswe
 glab
 glpat
 GOFLAGS
@@ -33,6 +36,7 @@ oopencode
 ork
 orkest
 osascript
+osworld
 plaude
 plasmoid
 pousr

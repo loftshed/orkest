@@ -12,6 +12,7 @@ import {
   tone,
 } from "../../../plugins/orchestrate/lib/tui-box.mjs";
 import {
+  colorProviderMarks,
   providerMark,
   quotaAccountLabel,
   sectionHeading,
@@ -347,5 +348,25 @@ describe("terminal presentation components", () => {
     expect(MONITOR_ANSI.quotaMid).toBe(`\u{1B}[${DEFAULT_THEME.quotaMid}m`);
     expect(MONITOR_ANSI.quotaLow).toBe(`\u{1B}[${DEFAULT_THEME.quotaLow}m`);
     expect(MONITOR_ANSI.quotaTrack).toBe(`\u{1B}[${DEFAULT_THEME.quotaTrack}m`);
+  });
+
+  it("derives provider brands and colored marks dynamically from families.json", () => {
+    expect(providerMark("claude-fable-5-1")).toBe("\u{EC82}");
+    expect(providerMark("astra")).toBe("\u{EC81}");
+    expect(providerMark("sol")).toBe("\u{EC81}");
+    expect(providerMark("terra")).toBe("\u{EC81}");
+    expect(providerMark("luna")).toBe("\u{EC81}");
+    expect(providerMark("flash")).toBe("\u{E7F0}");
+    expect(providerMark("argon")).toBe("\u{E7F0}");
+
+    const color = { enabled: true, theme: resolveTheme() };
+    const styled = colorProviderMarks(
+      `\u{1B}[38;5;250m\u{EC82} claude \u{EC81} gpt \u{E7F0} gemini\u{1B}[0m`,
+      color,
+    );
+    expect(styled).toContain(`\u{1B}[${DEFAULT_THEME.brandClaude}m\u{EC82}\u{1B}[0m`);
+    expect(styled).toContain(`\u{1B}[${DEFAULT_THEME.brandOpenAI}m\u{EC81}\u{1B}[0m`);
+    expect(styled).toContain(`\u{1B}[${DEFAULT_THEME.brandGoogle}m\u{E7F0}\u{1B}[0m`);
+    expect(plain(styled)).toBe("\u{EC82} claude \u{EC81} gpt \u{E7F0} gemini");
   });
 });

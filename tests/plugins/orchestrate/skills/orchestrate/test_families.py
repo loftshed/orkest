@@ -315,5 +315,86 @@ class CoordinatorSelectorTests(unittest.TestCase):
         self.assertEqual(COORDINATOR.RUNNER.native_engine_for("orchestrator-carbon"), "agy")
 
 
+class SchemaAndAuditTests(unittest.TestCase):
+    def test_gemini_flash_alias_matches_fast_and_tier_strengths_stay_aligned(self) -> None:
+        self.assertEqual(RULES["gemini"]["tiers"]["fast"], "flash-medium")
+        self.assertEqual(RULES["gemini"]["tiers"]["flash"], "flash-medium")
+        self.assertEqual(set(RULES["gemini"]["tier_strengths"]), set(RULES["gemini"]["tiers"]))
+        name_fast, tier_fast = FAMILIES.parse_selector("gemini:fast", RULES)
+        name_flash, tier_flash = FAMILIES.parse_selector("gemini:flash", RULES)
+        self.assertEqual(
+            FAMILIES.resolve(name_flash, tier_flash, RULES, AGY),
+            FAMILIES.resolve(name_fast, tier_fast, RULES, AGY),
+        )
+
+    def test_user_override_under_families_config_remains_supported(self) -> None:
+        merged = with_family("custom", {"engine": "codex", "tiers": {"fast": "gpt-6-luna"}})
+        self.assertIn("gpt", merged)
+        self.assertEqual(FAMILIES.resolve("custom", "fast", merged, CODEX), "gpt-6-luna")
+
+    def test_schema_driven_capability_tier_matches_all_harnesses(self) -> None:
+        cases = {
+            "gpt:sol": 3,
+            "gpt-6-astra": 4,
+            "fable": 4,
+            "opus": 3,
+            "sonnet": 2,
+            "haiku": 1,
+            "gemini:flash": 1,
+            "gemini:carbon": 2,
+            "gemini:hydrogen": 1,
+            "gemini-pro-orchestrator": 3,
+            "deepseek:pro": 2,
+            "totally-unknown-model": None,
+        }
+        for model, expected in cases.items():
+            with self.subTest(model=model):
+                self.assertEqual(FAMILIES.capability_tier(model, RULES), expected)
+
+    def test_audit_detects_unresolved_tiers_unmapped_ids_and_cross_harness_models(self) -> None:
+        catalogs = {
+            "codex": {
+                "status": "live",
+                "models": [
+                    {"id": "gpt-6-astra", "vendor": "openai"},
+                    {"id": "gpt-7-mystery", "vendor": "openai"},
+                ],
+            },
+            "agy": {
+                "status": "live",
+                "models": [
+                    {"id": "gemini-3.8-flash-medium", "vendor": "google"},
+                    {"id": "gemini-4-carbon-high", "vendor": "google"},
+                    {"id": "claude-opus-4-6-thinking", "vendor": "anthropic"},
+                ],
+            },
+            "opencode": {
+                "status": "live",
+                "models": [
+                    {"id": "openrouter/anthropic/claude-opus-4-6", "vendor": "anthropic"},
+                    {"id": "openrouter/other-vendor/some-model", "vendor": "other-vendor"},
+                ],
+            },
+        }
+        report = FAMILIES.audit(RULES, catalogs)
+        self.assertTrue(report["has_drift"])
+        self.assertIn("gpt:sol", {item["selector"] for item in report["unresolved_tiers"]})
+        self.assertEqual(
+            report["unmapped_models"],
+            [
+                {
+                    "engine": "codex",
+                    "id": "gpt-7-mystery",
+                    "vendor": "openai",
+                    "reason": "unmapped_family_variant",
+                }
+            ],
+        )
+        cross_ids = {(item["engine"], item["id"], item["native_engine"]) for item in report["cross_harness_models"]}
+        self.assertIn(("agy", "claude-opus-4-6-thinking", "claude"), cross_ids)
+        self.assertIn(("opencode", "openrouter/anthropic/claude-opus-4-6", "claude"), cross_ids)
+        self.assertEqual(report["untracked_aggregator_count"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

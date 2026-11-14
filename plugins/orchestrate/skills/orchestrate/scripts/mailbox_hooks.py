@@ -1564,7 +1564,17 @@ def hook(
         _agy_transcript_phase(effective_transcript) if gemini else (False, None, False)
     )
     has_transcript = bool(effective_transcript and Path(effective_transcript).expanduser().is_file())
-    primary_model = runtime_model if isinstance(runtime_model, str) and runtime_model.strip() else None
+    prev_session_model = (previous.get("sessionModel") or previous.get("model")) if valid_peer(previous) else None
+    explicit_session_model = _clean_model_value(payload.get("sessionModel") or payload.get("session_model"))
+    explicit_step_model = _clean_model_value(
+        payload.get("stepModel")
+        or payload.get("step_model")
+        or payload.get("workerModel")
+        or payload.get("subagentModel")
+    )
+    primary_model = explicit_session_model or (
+        runtime_model if isinstance(runtime_model, str) and runtime_model.strip() else None
+    )
     execution_model: str | None = None
     if gemini:
         if active_orchestrator_model and (primary_model is None or _agy_is_worker_model(primary_model)):
@@ -1574,11 +1584,32 @@ def hook(
         elif (
             (not has_transcript or not saw_turn_boundary)
             and valid_peer(previous)
-            and _agy_is_orchestrator_model(previous.get("model"))
+            and _agy_is_orchestrator_model(prev_session_model)
             and _agy_is_worker_model(primary_model)
         ):
             execution_model = primary_model
-            primary_model = str(previous["model"])
+            primary_model = str(prev_session_model)
+    if explicit_step_model:
+        execution_model = explicit_step_model
+        if prev_session_model and event in {"PreInvocation", "Stop"} and not explicit_session_model:
+            primary_model = str(prev_session_model)
+    elif (
+        not gemini
+        and event == "PreInvocation"
+        and valid_peer(previous)
+        and prev_session_model
+        and primary_model
+        and primary_model != prev_session_model
+        and not explicit_session_model
+        and not payload.get("modelSwitch")
+    ):
+        # Mid-turn step on a different model: keep sessionModel sticky and record transient stepModel.
+        execution_model = primary_model
+        primary_model = str(prev_session_model)
+    session_model = primary_model or (str(prev_session_model) if prev_session_model else None)
+    step_model = execution_model or runtime_model or session_model
+    if execution_model and session_model and execution_model == session_model:
+        execution_model = None
     # Antigravity runs PreInvocation before every model step, tool results included; only the first starts a turn.
     mid_turn = event == "PreInvocation" and valid_peer(previous) and previous.get("state") == "busy"
     me = _MB.register(
@@ -1589,17 +1620,19 @@ def hook(
         pid=_MB.harness_pid(harness),
         state=state,
         cwd_source="hook",
-        model=primary_model,
+        model=session_model,
         model_source="runtime",
+        session_model=session_model,
+        step_model=step_model,
         account=account_home_dir,
         effort=runtime_effort_val,
     )
-    if gemini:
-        if execution_model and execution_model != me.get("model"):
-            if me.get("executionModel") != execution_model:
-                me = _MB.annotate(base, session, executionModel=execution_model) or me
-        elif me.get("executionModel") is not None:
-            me = _MB.annotate(base, session, executionModel=None) or me
+    current_session_model = me.get("sessionModel") or me.get("model")
+    if execution_model and execution_model != current_session_model:
+        if me.get("executionModel") != execution_model:
+            me = _MB.annotate(base, session, executionModel=execution_model) or me
+    elif me.get("executionModel") is not None:
+        me = _MB.annotate(base, session, executionModel=None) or me
     me = _MB.mark_delegated(base, me)
     if not is_subagent and not me.get("delegatedRun"):
         me = _MB.attest_native_sessions(base, session, native_session) or me

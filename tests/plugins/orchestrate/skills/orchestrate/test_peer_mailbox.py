@@ -825,6 +825,68 @@ class AntigravityOrchestratorHookTests(unittest.TestCase):
             self.assertEqual(switched["model"], "gemini-4-hydrogen-high")
             self.assertIsNone(switched.get("executionModel"))
 
+    def test_session_model_and_step_model_separation_across_harnesses(self):
+        harness_cases = [
+            ("claude", "claude-opus-4-6", "claude-haiku-4-5", "claude-sonnet-4-6"),
+            ("codex", "gpt-6-astra", "gpt-6-luna", "gpt-6.1-sol"),
+            (
+                "opencode",
+                "openrouter/z-ai/glm-5.3-flash",
+                "openrouter/deepseek/deepseek-v4-flash",
+                "openrouter/qwen/qwen3-coder",
+            ),
+        ]
+        for harness, initial_model, transient_model, switched_model in harness_cases:
+            with self.subTest(harness=harness):
+                session_id = f"session-{harness}-1"
+                session_key_field = "session_id"
+                base_payload = {
+                    session_key_field: session_id,
+                    "cwd": self.cwd,
+                }
+                with (
+                    patch.dict(os.environ, {}, clear=True),
+                    patch.object(mailbox, "harness_pid", return_value=os.getpid()),
+                ):
+                    mailbox.hook(
+                        {**base_payload, "model": initial_model},
+                        event="SessionStart",
+                        harness=harness,
+                        base=self.base,
+                    )
+                    started = mailbox.load(mailbox.peer_path(self.base, session_id))
+                    initial_name = started["name"]
+                    self.assertEqual(started["model"], initial_model)
+                    self.assertEqual(started["sessionModel"], initial_model)
+                    self.assertEqual(started["stepModel"], initial_model)
+
+                    # Mid-turn step model must not rename the peer or overwrite sticky sessionModel.
+                    mailbox.hook(
+                        {**base_payload, "model": transient_model},
+                        event="PreInvocation",
+                        harness=harness,
+                        base=self.base,
+                    )
+                    mid = mailbox.load(mailbox.peer_path(self.base, session_id))
+                    self.assertEqual(mid["name"], initial_name)
+                    self.assertEqual(mid["model"], initial_model)
+                    self.assertEqual(mid["sessionModel"], initial_model)
+                    self.assertEqual(mid["stepModel"], transient_model)
+                    self.assertEqual(mid["executionModel"], transient_model)
+
+                    # Explicit new user prompt on switched_model updates sticky sessionModel cleanly.
+                    mailbox.hook(
+                        {**base_payload, "model": switched_model},
+                        event="UserPromptSubmit",
+                        harness=harness,
+                        base=self.base,
+                    )
+                    switched = mailbox.load(mailbox.peer_path(self.base, session_id))
+                    self.assertEqual(switched["model"], switched_model)
+                    self.assertEqual(switched["sessionModel"], switched_model)
+                    self.assertEqual(switched["stepModel"], switched_model)
+                    self.assertIsNone(switched.get("executionModel"))
+
 
 if __name__ == "__main__":
     unittest.main()

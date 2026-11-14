@@ -145,6 +145,8 @@ from mailbox_store import (  # noqa: E402, F401
     session_tag,
     short_agent_name,
     stamp,
+    step_model_fields,
+    step_model_name,
     valid_message,
     valid_peer,
     valid_stamp,
@@ -599,11 +601,14 @@ def register(
     cwd_source: str | None = None,
     model: str | None = None,
     model_source: str = "declared",
+    session_model: str | None = None,
+    step_model: str | None = None,
     account: str | None = None,
     effort: str | None = None,
 ) -> dict[str, Any]:
     """Create or refresh presence. A known pid, name, account and effort survive later refreshes that lack them.
     Claude's session metadata names its account; otherwise `account` is the caller's own account_home().
+    Sticky sessionModel drives the readable peer name; transient stepModel records the active turn step.
     The name is martian-model-effort-repo-tag; native addresses remain available for harness messaging."""
     if harness not in HARNESSES:
         raise MailboxError(f"unknown harness {harness!r}")
@@ -635,8 +640,15 @@ def register(
             lastSeenAt=moment,
             state=state or peer.get("state") or "idle",
         )
-        if model is not None:
-            peer.update(model_fields(model, model_source))
+        sticky_model = session_model if session_model is not None else model
+        if sticky_model is not None:
+            peer.update(model_fields(sticky_model, model_source))
+        elif peer.get("model") and not peer.get("sessionModel"):
+            peer["sessionModel"] = peer["model"]
+        if step_model is not None:
+            peer.update(step_model_fields(step_model, model_source))
+        elif sticky_model is not None and not peer.get("executionModel"):
+            peer["stepModel"] = peer["sessionModel"]
         if cwd_source:
             peer["cwdSource"] = cwd_source
         if not is_run_peer(peer):
@@ -676,7 +688,7 @@ def register(
             peer["name"] = readable_name(
                 peer["person"],
                 repository_name(peer),
-                peer.get("model"),
+                peer.get("sessionModel") or peer.get("model"),
                 peer.get("effort"),
                 session_tag(session, peer.get("nativeName"), peer.get("nativeNameSource")),
             )

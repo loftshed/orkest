@@ -67,9 +67,8 @@ PREFERRED_MODELS = {
     "opencode": "glm:flash",
     "claude": "opus",
 }
-# Claude Code has no model-list command. Its aliases resolve to the current model of each tier; exact
+# Claude Code has no model-list command. Its aliases resolve via families.json; exact
 # `claude-*` IDs are passed through and recorded as unverified.
-CLAUDE_MODEL_ALIASES = ("opus", "sonnet", "haiku", "fable", "claude-mythos-5-1")
 CLAUDE_MODEL_ID = re.compile(r"^claude-[a-z0-9][a-z0-9.\-]*(\[1m\])?$")
 # Host session state that must not leak into an executor: harness session IDs, control endpoints,
 # messaging tokens, and the host's account profile (an executor could otherwise act inside, or bill to,
@@ -1205,10 +1204,10 @@ def detect_conductor_model(repo: Path) -> str | None:
                 isinstance(peer, dict)
                 and not mailbox.is_run_peer(peer)
                 and mailbox.same_project(target_ws, peer)
-                and isinstance(peer.get("model"), str)
-                and peer["model"].strip()
+                and isinstance(peer.get("sessionModel") or peer.get("model"), str)
+                and (peer.get("sessionModel") or peer.get("model")).strip()
             ):
-                return peer["model"].strip()
+                return (peer.get("sessionModel") or peer.get("model")).strip()
         ancestors: set[int] = set()
         pid = os.getppid()
         for _ in range(8):
@@ -1233,15 +1232,15 @@ def detect_conductor_model(repo: Path) -> str | None:
                 and not peer.get("delegatedRun")
                 and peer.get("pid") in ancestors
                 and mailbox.same_project(target_ws, peer)
-                and isinstance(peer.get("model"), str)
-                and peer["model"].strip()
+                and isinstance(peer.get("sessionModel") or peer.get("model"), str)
+                and (peer.get("sessionModel") or peer.get("model")).strip()
             ]
             non_shared = [peer for peer in candidates if not peer.get("sharedProcess")]
             if len(non_shared) == 1:
-                return non_shared[0]["model"].strip()
+                return (non_shared[0].get("sessionModel") or non_shared[0]["model"]).strip()
             if candidates:
                 newest = max(candidates, key=lambda item: str(item.get("lastSeenAt") or item.get("startedAt") or ""))
-                return newest["model"].strip()
+                return (newest.get("sessionModel") or newest["model"]).strip()
     return None
 
 

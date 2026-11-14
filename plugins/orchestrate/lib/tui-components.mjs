@@ -1,4 +1,5 @@
 /** Composable terminal presentation, built on the width-safe text and frame helpers. */
+import { allBrandMarks, brandForProvider } from "./families-schema.mjs";
 import { displayWidth, fit, fitStyled, frame, glyphSet, plain, tone } from "./tui-box.mjs";
 
 const CONTROL_ICONS = Object.freeze({
@@ -28,17 +29,7 @@ const CONTROL_ICONS = Object.freeze({
 
 export function providerMark(provider, tier = "nerd") {
   if (tier !== "nerd") return "";
-  const name = String(provider || "").toLowerCase();
-  if (/^(?:claude|anthropic|opus|sonnet|haiku|fable|mythos)(?:$|[-_.:/\s\d])/u.test(name))
-    return "\u{EC82}";
-  if (
-    /^(?:gemini|google|agy|antigravity|argon|carbon|hydrogen|orchestrator|flash)(?:$|[-_.:/\s\d])/u.test(
-      name,
-    )
-  )
-    return "\u{E7F0}";
-  if (/^(?:gpt|codex|openai|astra|sol|terra|luna)(?:$|[-_.:/\s\d])/u.test(name)) return "\u{EC81}";
-  return "";
+  return brandForProvider(provider)?.glyph || "";
 }
 
 /** Only explicit account identity determines ownership. */
@@ -55,14 +46,13 @@ export function quotaAccountScope(account) {
 export function colorProviderMarks(line, color) {
   const enabled = typeof color === "object" ? color?.enabled : color;
   if (!enabled) return line;
+  const marks = allBrandMarks();
+  if (marks.length === 0) return line;
   let surrounding = "";
   const escape = String.fromCodePoint(27);
-  const tokens = new RegExp(String.raw`${escape}\[[0-9;]*m|[\u{EC82}\u{E7F0}\u{EC81}]`, "gu");
-  const styles = {
-    "\u{EC82}": "brandClaude",
-    "\u{E7F0}": "brandGoogle",
-    "\u{EC81}": "brandOpenAI",
-  };
+  const styles = Object.fromEntries(marks.map((entry) => [entry.glyph, entry.tone]));
+  const glyphs = marks.map((entry) => entry.glyph).join("");
+  const tokens = new RegExp(String.raw`${escape}\[[0-9;]*m|[${glyphs}]`, "gu");
   return String(line).replaceAll(tokens, (token) => {
     if (token.startsWith(escape)) {
       surrounding = token === `${escape}[0m` ? "" : surrounding + token;
