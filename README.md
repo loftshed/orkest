@@ -205,7 +205,7 @@ The repository ships two plugins. Their READMEs cover every flag, routing table 
 
 | Plugin                                         | Version | What it does                                                       |
 | ---------------------------------------------- | ------- | ------------------------------------------------------------------ |
-| [`orchestrate`](plugins/orchestrate/README.md) | 0.84.1  | Coordinator conversations, swarms, delegation and shared work.     |
+| [`orchestrate`](plugins/orchestrate/README.md) | 0.85.0  | Coordinator conversations, swarms, delegation and shared work.     |
 | [`monitor`](plugins/monitor/README.md)         | 0.19.1  | Account quota, reset times, credit balances and spending guidance. |
 
 More: [architecture and module map](docs/ARCHITECTURE.md), [Herdr integration](docs/herdr.md),

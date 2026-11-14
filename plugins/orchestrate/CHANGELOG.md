@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.85.0
+
+- feat(orchestrate): support Antigravity Orchestrator sessions and coordinator workflows (#197) (#205)
+- feat(orchestrate): add Gemini 4 Carbon, Hydrogen, and Orchestrator model routing (#196) (#204)
+- fix(orchestrate): preserve valid worker reports across multi-turn Antigravity output (#198) (#203)
+
 ## 0.84.1
 
 - docs(orchestrate): explain Claude Code holding the mailbox wake-up nudge (#194)
