@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.85.2
+
+- docs(orchestrate): refresh model capability research, profiles, benchmark priors, and default routes (#200) (#207)
+
 ## 0.85.1
 
 - refactor(orchestrate): unify catalog-driven detection across all harnesses and wire live ork radar (#206)
