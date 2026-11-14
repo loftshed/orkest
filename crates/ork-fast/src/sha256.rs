@@ -238,6 +238,7 @@ mod tests {
 
     #[test]
     fn test_nist_two_blocks() {
+        // cspell:ignore abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq -- NIST FIPS 180-4 SHA-256 test vector
         assert_eq!(
             sha256_hex(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
             "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"

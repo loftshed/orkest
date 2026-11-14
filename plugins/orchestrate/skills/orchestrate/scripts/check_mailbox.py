@@ -99,8 +99,8 @@ def result_text(result: dict[str, Any]) -> str:
 
 
 def _verify_codex_hook_trust(native: RpcClient, config: Path) -> None:
-    from install_mailbox import mailbox_hook_updates
     import runtime_paths
+    from install_mailbox import mailbox_hook_updates
 
     hooks = native.request("hooks/list", {"cwds": [str(Path.home())]})
     expected_hooks = mailbox_hook_updates(

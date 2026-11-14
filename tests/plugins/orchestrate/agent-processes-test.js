@@ -141,6 +141,12 @@ describe("agent process table", () => {
     expect(allPids).not.toEqual(expect.arrayContaining([205, 206, 207, 209, 300, 301]));
     expect(JSON.stringify(result.get("worker-a"))).not.toContain("test-secret");
     expect(isInternalOrHarnessProcess("claude", "claude", "claude --model sonnet")).toBe(true);
+    expect(
+      isInternalOrHarnessProcess("ork-fast", "ork-fast", "ork-fast gate-hook --harness claude"),
+    ).toBe(true);
+    expect(
+      isInternalOrHarnessProcess("python3", "python3", "python3 /tmp/lease_holder.py /tmp/wt"),
+    ).toBe(true);
   });
 
   it("uses the shared internal-process filter for listener ports", () => {

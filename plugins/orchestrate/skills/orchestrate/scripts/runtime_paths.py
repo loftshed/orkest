@@ -102,4 +102,3 @@ def ork_fast_bin(env: Mapping[str, str] | None = None, home: Path | None = None)
     if explicit:
         return _expand(explicit, home)
     return cache_home(env=source, home=home) / "bin" / "ork-fast"
-

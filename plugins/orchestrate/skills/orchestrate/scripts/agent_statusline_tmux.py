@@ -1488,24 +1488,42 @@ def main(arguments: list[str]) -> int:
 
     script = Path(__file__).with_name("agent_statusline.py")
     fast_bin = runtime_paths.ork_fast_bin(env=environment)
-    if fast_bin and fast_bin.is_file() and os.access(fast_bin, os.X_OK):
-        renderer = [str(fast_bin), "statusline", "--tmux-server", socket, "--harness", harness, "--fallback-script", str(script)]
-    else:
-        renderer = [sys.executable, str(script), "--tmux-server", socket, "--harness", harness]
-    if harness == "codex":
-        renderer.extend(
-            [
-                "--codex-home",
-                str(Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser().resolve()),
-            ]
-        )
-    invocation = shlex.join(renderer).replace("#", "##")
+    codex_args = (
+        [
+            "--codex-home",
+            str(Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser().resolve()),
+        ]
+        if harness == "codex"
+        else []
+    )
+    py_renderer = [sys.executable, str(script), "--tmux-server", socket, "--harness", harness, *codex_args]
+    py_invocation = shlex.join(py_renderer).replace("#", "##")
     source = "--codex-pane" if harness == "codex" else "--terminal-pane"
     # A literal %0 in a status format is parsed by strftime. Expand it from an option instead.
     pane = "#{@orkest_coordinator_pane}"
-    status = f"#({invocation} {source} {pane} --width #{{client_width}} --tmux)"
-    status_0 = f"#({invocation} {source} {pane} --width #{{client_width}} --tmux --line 1)"
-    status_1 = f"#({invocation} {source} {pane} --width #{{client_width}} --tmux --line 2)"
+
+    def _status_format(extra_tail: str = "") -> str:
+        tail = f"{source} {pane} --width #{{client_width}} --tmux{extra_tail}"
+        if fast_bin and fast_bin.is_file() and os.access(fast_bin, os.X_OK):
+            fast_renderer = [
+                str(fast_bin),
+                "statusline",
+                "--tmux-server",
+                socket,
+                "--harness",
+                harness,
+                "--fallback-script",
+                str(script),
+                *codex_args,
+            ]
+            fast_invocation = shlex.join(fast_renderer).replace("#", "##")
+            quoted_bin = shlex.quote(str(fast_bin)).replace("#", "##")
+            return f"#([ -x {quoted_bin} ] && exec {fast_invocation} {tail}; exec {py_invocation} {tail})"
+        return f"#({py_invocation} {tail})"
+
+    status = _status_format()
+    status_0 = _status_format(" --line 1")
+    status_1 = _status_format(" --line 2")
     options = (
         ("@orkest_coordinator_pane", coordinator_pane),
         *([("status", "2")] if lines == 2 else []),

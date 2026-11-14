@@ -860,6 +860,50 @@ class InstallMailboxTests(unittest.TestCase):
             self.assertEqual(linked.resolve(), hub.resolve())
         self.assertFalse(installer.install_herdr_skill(self.base, ork_cli=cli))
 
+    def test_statusline_wrappers_upgrade_claude_and_agy_settings(self):
+        fast_bin = self.base / ".cache/orchestrate/bin/ork-fast"
+        agy_settings = self.base / ".gemini/antigravity-cli/settings.json"
+        agy_settings.parent.mkdir(parents=True)
+        agy_settings.write_text(
+            json.dumps(
+                {
+                    "statusLine": {
+                        "type": "command",
+                        "command": "python3 ~/.agents/skills/orchestrate/scripts/agent_statusline.py --native-status",
+                        "stack_with_default": True,
+                    }
+                }
+            )
+        )
+        self.assertTrue(installer.install_agy_statusline(agy_settings, fast_bin=fast_bin, home=self.base))
+        agy_updated = json.loads(agy_settings.read_text())
+        self.assertIs(agy_updated["statusLine"]["stack_with_default"], False)
+        self.assertIn(
+            f"[ -x {fast_bin} ] && exec {fast_bin} statusline --native-status", agy_updated["statusLine"]["command"]
+        )
+        self.assertIn(
+            f"; exec python3 {self.base}/.agents/skills/orchestrate/scripts/agent_statusline.py --native-status",
+            agy_updated["statusLine"]["command"],
+        )
+        self.assertFalse(installer.install_agy_statusline(agy_settings, fast_bin=fast_bin, home=self.base))
+
+        claude_settings = self.base / ".claude/settings.json"
+        claude_settings.parent.mkdir(parents=True)
+        claude_settings.write_text(
+            json.dumps(
+                {
+                    "statusLine": {
+                        "type": "command",
+                        "command": f"python3 {self.base}/.agents/skills/orchestrate/scripts/agent_statusline.py --harness claude",
+                    }
+                }
+            )
+        )
+        self.assertTrue(installer.install_claude_statusline(claude_settings, fast_bin=fast_bin, home=self.base))
+        claude_updated = json.loads(claude_settings.read_text())
+        self.assertIn("ork-fast statusline --harness claude", claude_updated["statusLine"]["command"])
+        self.assertFalse(installer.install_claude_statusline(claude_settings, fast_bin=fast_bin, home=self.base))
+
 
 if __name__ == "__main__":
     unittest.main()

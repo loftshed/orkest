@@ -137,6 +137,7 @@ jobs:
 
   release-ork-fast-sums:
     needs: [release, release-ork-fast]
+    if: needs.release.outputs.orchestrate_release_tag != ''
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -150,5 +151,6 @@ jobs:
           mkdir -p assets
           cd assets
           gh release download "$TAG" -p "ork-fast-*"
+          test "$(ls -1 ork-fast-* | wc -l)" -eq 4
           sha256sum ork-fast-* > SHA256SUMS
           gh release upload "$TAG" SHA256SUMS --clobber

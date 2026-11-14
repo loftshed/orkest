@@ -15,11 +15,17 @@ use crate::sha256;
 /// Resolve lease roots preserving any nested namespace.
 #[must_use]
 pub fn lease_roots(cache: &Path) -> Vec<PathBuf> {
-    let cache = fs::canonicalize(cache).unwrap_or_else(|_| cache.to_path_buf());
+    let cache = paths::resolve_path(cache).unwrap_or_else(|_| cache.to_path_buf());
     let mut roots = BTreeSet::new();
     roots.insert(cache.clone());
 
-    if env::var("ORCHESTRATE_HOME").is_err() && env::var("AGENT_EXECUTOR_HOME").is_err() {
+    let has_orch = env::var("ORCHESTRATE_HOME")
+        .ok()
+        .is_some_and(|v| !v.is_empty());
+    let has_legacy = env::var("AGENT_EXECUTOR_HOME")
+        .ok()
+        .is_some_and(|v| !v.is_empty());
+    if !has_orch && !has_legacy {
         let mut curr: Option<&Path> = Some(&cache);
         while let Some(base) = curr {
             if let Some(name) = base.file_name().and_then(|n| n.to_str())
@@ -36,7 +42,7 @@ pub fn lease_roots(cache: &Path) -> Vec<PathBuf> {
                         && let Ok(rel) = cache.strip_prefix(base)
                     {
                         let candidate = other.join(rel);
-                        roots.insert(fs::canonicalize(&candidate).unwrap_or(candidate));
+                        roots.insert(paths::resolve_path(&candidate).unwrap_or(candidate));
                     }
                 }
                 break;
@@ -65,7 +71,7 @@ pub fn run(path: &Path, read_only: bool, namespace: Option<&str>) -> io::Result<
         cache.push(ns);
     }
 
-    let repository = match fs::canonicalize(path) {
+    let repository = match paths::resolve_path(path) {
         Ok(canon) => canon,
         Err(err) => {
             let msg = serde_json::json!({

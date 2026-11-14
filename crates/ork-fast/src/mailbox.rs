@@ -1,25 +1,23 @@
 //! Mailbox hook fast path accelerator (<1.5 ms).
 //! Handles the ~95% trivial interactive turns and delegates the ~5% slow paths to python3.
 
-use std::fs;
+use std::ffi::CString;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::paths;
 
-const ANTIGRAVITY_NO_CONTINUE: &[&str] = &[
-    "USER_CANCELED",
-    "ERROR",
-    "MAX_INVOCATIONS",
-    "MAX_FORCED_INVOCATIONS",
-    "MAX_TOKEN_BUDGET_EXCEEDED",
-];
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
-pub fn delegate(
+fn delegate(
     fallback_script: &Path,
     harness: &str,
-    event: Option<&str>,
+    event_arg: Option<&str>,
     stdin_bytes: &[u8],
 ) -> io::Result<()> {
     let mut cmd = Command::new("python3");
@@ -28,22 +26,30 @@ pub fn delegate(
         .arg("hook")
         .arg("--harness")
         .arg(harness);
-
-    if let Some(ev) = event {
+    if let Some(ev) = event_arg {
         cmd.arg("--event").arg(ev);
     }
-
     let mut child = cmd
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
         .spawn()?;
-
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(stdin_bytes);
     }
     let status = child.wait()?;
     std::process::exit(status.code().unwrap_or(0));
+}
+
+fn is_truthy_json(val: &serde_json::Value) -> bool {
+    match val {
+        serde_json::Value::Null => false,
+        serde_json::Value::Bool(b) => *b,
+        serde_json::Value::Number(n) => n.as_f64().is_some_and(|x| x != 0.0),
+        serde_json::Value::String(s) => !s.is_empty(),
+        serde_json::Value::Array(a) => !a.is_empty(),
+        serde_json::Value::Object(o) => !o.is_empty(),
+    }
 }
 
 fn check_slash_commands(text: &str) -> bool {
@@ -59,45 +65,14 @@ fn check_slash_commands(text: &str) -> bool {
         || lower.contains("/clear")
 }
 
-fn is_pid_live(pid: u32) -> bool {
-    unsafe { libc::kill(pid as i32, 0) == 0 }
-}
-
-fn transcript_has_plan_mode_call(path_str: &str) -> bool {
-    let path = PathBuf::from(path_str);
-    if !path.is_file() {
+fn is_pid_live(pid: u64) -> bool {
+    if pid == 0 || pid > i32::MAX as u64 {
         return false;
     }
-    let meta = match fs::metadata(&path) {
-        Ok(m) => m,
-        Err(_) => return false,
-    };
-    let file_len = meta.len();
-    let read_len = 65536.min(file_len);
-    let mut file = match fs::File::open(&path) {
-        Ok(f) => f,
-        Err(_) => return false,
-    };
-    if file_len > read_len {
-        use std::io::Seek;
-        if file.seek(io::SeekFrom::Start(file_len - read_len)).is_err() {
-            return false;
-        }
+    unsafe {
+        libc::kill(pid as i32, 0) == 0
+            || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
-    let mut buffer = Vec::with_capacity(read_len as usize);
-    if file.read_to_end(&mut buffer).is_err() {
-        return false;
-    }
-    let text = String::from_utf8_lossy(&buffer);
-    for line in text.lines().rev() {
-        if line.contains("exit_plan_mode") || line.contains("enter_plan_mode") {
-            return true;
-        }
-        if line.contains("\"USER_INPUT\"") || line.contains("\"USER_EXPLICIT\"") {
-            break;
-        }
-    }
-    false
 }
 
 fn has_unread_mail(inbox_dir: &Path) -> bool {
@@ -113,12 +88,173 @@ fn has_unread_mail(inbox_dir: &Path) -> bool {
         if p.extension().and_then(|ext| ext.to_str()) == Some("json")
             && let Ok(content) = fs::read_to_string(&p)
             && let Ok(val) = serde_json::from_str::<serde_json::Value>(&content)
-            && (val.get("readAt").is_none() || val.get("readAt").is_some_and(|v| v.is_null()))
+            && val.is_object()
+            && !val.get("readAt").is_some_and(is_truthy_json)
         {
             return true;
         }
     }
     false
+}
+
+fn extract_model_str(val: &serde_json::Value) -> Option<String> {
+    let raw = if let Some(s) = val.as_str() {
+        s
+    } else {
+        let obj = val.as_object()?;
+        obj.get("id")
+            .or_else(|| obj.get("model"))
+            .or_else(|| obj.get("name"))
+            .or_else(|| obj.get("display_name"))
+            .and_then(|v| v.as_str())?
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") || trimmed.starts_with('<') {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn payload_changes_model(payload: &serde_json::Value, peer: &serde_json::Value) -> bool {
+    if payload.get("modelSwitch").is_some_and(is_truthy_json) {
+        return true;
+    }
+    for key in [
+        "sessionModel",
+        "session_model",
+        "stepModel",
+        "step_model",
+        "workerModel",
+        "subagentModel",
+    ] {
+        if payload.get(key).and_then(extract_model_str).is_some() {
+            return true;
+        }
+    }
+    if let Some(m) = payload
+        .get("model")
+        .or_else(|| payload.get("modelName"))
+        .and_then(extract_model_str)
+    {
+        let peer_model = peer.get("model").and_then(|v| v.as_str());
+        if peer_model != Some(m.as_str()) {
+            return true;
+        }
+    }
+    false
+}
+
+fn has_newer_colleague_file(peers_dir: &Path, peer_file: &Path) -> bool {
+    let Ok(peer_mtime) = fs::metadata(peer_file).and_then(|m| m.modified()) else {
+        return true;
+    };
+    let Ok(entries) = fs::read_dir(peers_dir) else {
+        return true;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        if p.file_name() == peer_file.file_name() {
+            continue;
+        }
+        if let Ok(other_mtime) = entry.metadata().and_then(|m| m.modified())
+            && other_mtime > peer_mtime
+        {
+            return true;
+        }
+    }
+    false
+}
+
+struct FileLockGuard {
+    fd: libc::c_int,
+}
+
+impl Drop for FileLockGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.fd);
+        }
+    }
+}
+
+fn lock_peer(peer_file: &Path) -> io::Result<FileLockGuard> {
+    if let Some(parent) = peer_file.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let lock_path = peer_file.with_extension("lock");
+    let c_path = CString::new(lock_path.as_os_str().as_bytes())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o600) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let guard = FileLockGuard { fd };
+    if unsafe { libc::flock(fd, libc::LOCK_EX) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(guard)
+}
+
+fn write_json_atomic(path: &Path, value: &serde_json::Value) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "peer path has no parent"))?;
+    fs::create_dir_all(parent)?;
+    let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = parent.join(format!(".mail-{}-{seq}.tmp", std::process::id()));
+    let payload =
+        serde_json::to_vec(value).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+    let write_result = (|| -> io::Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp_path)?;
+        file.write_all(&payload)?;
+        file.sync_all()?;
+        Ok(())
+    })();
+
+    if let Err(err) = write_result {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+
+    if let Err(err) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn update_peer_locked<F>(peer_file: &Path, mutate: F) -> bool
+where
+    F: FnOnce(&mut serde_json::Map<String, serde_json::Value>) -> bool,
+{
+    let Ok(_guard) = lock_peer(peer_file) else {
+        return false;
+    };
+    let Ok(content) = fs::read_to_string(peer_file) else {
+        return false;
+    };
+    let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return false;
+    };
+    if !paths::valid_peer(&val) {
+        return false;
+    }
+    let Some(obj) = val.as_object_mut() else {
+        return false;
+    };
+    if !mutate(obj) {
+        return false;
+    }
+    write_json_atomic(peer_file, &val).is_ok()
 }
 
 pub fn run(
@@ -129,9 +265,9 @@ pub fn run(
     let mut raw_stdin = Vec::new();
     io::stdin().read_to_end(&mut raw_stdin)?;
 
-    let fb = fallback_script.unwrap_or_else(|| {
-        Path::new("/Users/lofstpe1/.agents/skills/orchestrate/scripts/peer_mailbox.py")
-    });
+    let default_fb =
+        paths::expand_home("~/.agents/skills/orchestrate/scripts/peer_mailbox.py", None);
+    let fb = fallback_script.unwrap_or(&default_fb);
 
     if raw_stdin.is_empty() {
         return Ok(());
@@ -215,7 +351,7 @@ pub fn run(
         _ => return delegate(fb, harness, Some(&event), &raw_stdin),
     };
 
-    let base = paths::cache_home(None, None);
+    let base = paths::cache_home(None, None).join("mailbox-v1");
     let s_key = match paths::session_key(&session) {
         Ok(k) => k,
         Err(_) => return delegate(fb, harness, Some(&event), &raw_stdin),
@@ -235,14 +371,21 @@ pub fn run(
         Err(_) => return delegate(fb, harness, Some(&event), &raw_stdin),
     };
 
+    if !paths::valid_peer(&peer)
+        || peer.get("session").and_then(|v| v.as_str()) != Some(session.as_str())
+    {
+        return delegate(fb, harness, Some(&event), &raw_stdin);
+    }
+
     if peer.get("isSubagent").and_then(|v| v.as_bool()) == Some(true)
         || peer.get("delegatedRun").and_then(|v| v.as_bool()) == Some(true)
+        || peer.get("run").and_then(|v| v.as_str()).is_some()
     {
         return delegate(fb, harness, Some(&event), &raw_stdin);
     }
 
     if let Some(pid) = peer.get("pid").and_then(|v| v.as_u64())
-        && !is_pid_live(pid as u32)
+        && !is_pid_live(pid)
     {
         return delegate(fb, harness, Some(&event), &raw_stdin);
     }
@@ -261,66 +404,80 @@ pub fn run(
         && let Ok(c) = fs::read_to_string(&daemon_file)
         && let Ok(d) = serde_json::from_str::<serde_json::Value>(&c)
         && d.get("mode").and_then(|v| v.as_str()) == Some("http")
-        && let Some(dpid) = d.get("pid").and_then(|v| v.as_u64())
-        && !is_pid_live(dpid as u32)
+        && let Some(daemon_pid) = d.get("pid").and_then(|v| v.as_u64())
+        && !is_pid_live(daemon_pid)
     {
         return delegate(fb, harness, Some(&event), &raw_stdin);
     }
 
     // Check unread inbox
-    let inbox_dir = base.join("inboxes").join(&s_key);
+    let inbox_dir = base.join("inbox").join(&s_key);
     if has_unread_mail(&inbox_dir) {
         return delegate(fb, harness, Some(&event), &raw_stdin);
     }
 
-    // Check rooms for obligations
-    let rooms_dir = base.join("rooms");
-    if rooms_dir.is_dir()
-        && let Ok(entries) = fs::read_dir(&rooms_dir)
-    {
-        let mut count = 0;
-        for _ in entries.flatten() {
-            count += 1;
-            if count > 0 {
-                return delegate(fb, harness, Some(&event), &raw_stdin);
-            }
-        }
+    // Check rooms for obligations (only active/open rooms referencing this session)
+    if paths::has_active_room_for_session(&base, &session) {
+        return delegate(fb, harness, Some(&event), &raw_stdin);
     }
 
     // Fast Path execution:
     if event == "Stop" {
-        if harness == "gemini" {
-            if let Some(term) = payload.get("terminationReason").and_then(|v| v.as_str())
-                && ANTIGRAVITY_NO_CONTINUE.contains(&term)
-            {
-                println!("{{}}");
-                return Ok(());
+        let term_reason = if harness == "gemini" {
+            payload
+                .get("terminationReason")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+        } else {
+            None
+        };
+        let updated = update_peer_locked(&peer_file, |obj| {
+            obj.insert(
+                "state".to_string(),
+                serde_json::Value::String("idle".to_string()),
+            );
+            obj.insert(
+                "lastSeenAt".to_string(),
+                serde_json::Value::String(paths::format_utc_iso_z(paths::utc_now_secs())),
+            );
+            if let Some(ref reason) = term_reason {
+                obj.insert(
+                    "lastStopReason".to_string(),
+                    serde_json::Value::String(reason.clone()),
+                );
             }
-
-            let raw_transcript = payload
-                .get("transcript_path")
-                .or_else(|| payload.get("transcriptPath"))
-                .and_then(|v| v.as_str());
-            if let Some(t_path) = raw_transcript
-                && transcript_has_plan_mode_call(t_path)
-            {
-                println!("{{}}");
-                return Ok(());
-            }
-            println!("{{}}");
-            return Ok(());
+            true
+        });
+        if !updated {
+            return delegate(fb, harness, Some(&event), &raw_stdin);
         }
-
-        // Claude / Codex Stop with empty inbox
         return Ok(());
     }
 
     if event == "PreInvocation" {
         let is_busy = peer.get("state").and_then(|v| v.as_str()) == Some("busy");
-        if is_busy {
-            // Mid-turn step
-            if harness == "gemini" {
-                println!("{{}}");
+        let no_stop_reason = peer.get("lastStopReason").is_none_or(|v| v.is_null());
+        if is_busy
+            && no_stop_reason
+            && !payload_changes_model(&payload, &peer)
+            && !has_newer_colleague_file(&base.join("peers"), &peer_file)
+        {
+            let updated = update_peer_locked(&peer_file, |obj| {
+                if !paths::valid_peer(&serde_json::Value::Object(obj.clone()))
+                    || obj.get("state").and_then(|v| v.as_str()) != Some("busy")
+                    || !obj.get("lastStopReason").is_none_or(|v| v.is_null())
+                {
+                    return false;
+                }
+                obj.insert(
+                    "lastSeenAt".to_string(),
+                    serde_json::Value::String(paths::format_utc_iso_z(paths::utc_now_secs())),
+                );
+                true
+            });
+            if !updated {
+                return delegate(fb, harness, Some(&event), &raw_stdin);
             }
             return Ok(());
         }
