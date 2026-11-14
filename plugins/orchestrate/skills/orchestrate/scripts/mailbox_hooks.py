@@ -56,6 +56,120 @@ OPEN_REQUEST_WINDOW = dt.timedelta(hours=24)
 MAILBOX_SENDER = {"session": "mailbox", "name": "mailbox", "harness": "unknown"}
 
 
+def _transcript_tail_entries(
+    transcript_path: str | None, max_bytes: int = _TRANSCRIPT_TAIL_BYTES
+) -> list[dict[str, Any]]:
+    """Read JSON dict entries from the tail of a session transcript without failing on partial lines."""
+    if not isinstance(transcript_path, str) or not transcript_path.strip():
+        return []
+    path = Path(transcript_path).expanduser()
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            offset = max(0, size - max_bytes)
+            handle.seek(offset)
+            chunk = handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return []
+    lines = chunk.splitlines()
+    if offset > 0 and lines:
+        lines = lines[1:]
+    entries: list[dict[str, Any]] = []
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(entry, dict):
+            entries.append(entry)
+    return entries
+
+
+def _agy_is_orchestrator_model(model: str | None) -> bool:
+    return isinstance(model, str) and "orchestrator" in model.strip().lower()
+
+
+def _agy_is_worker_model(model: str | None) -> bool:
+    if not isinstance(model, str):
+        return False
+    lower = model.strip().lower()
+    return ("hydrogen" in lower or "-worker-" in lower) and "orchestrator" not in lower
+
+
+def _entry_has_tool_call(entry: dict[str, Any], name: str) -> bool:
+    tool_calls = entry.get("tool_calls")
+    if not isinstance(tool_calls, list):
+        return False
+    return any(isinstance(call, dict) and call.get("name") == name for call in tool_calls)
+
+
+def _clean_model_value(value: Any) -> str | None:
+    if isinstance(value, dict):
+        value = value.get("id") or value.get("model") or value.get("name")
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped and stripped.lower() != "auto" and not stripped.startswith("<"):
+            return stripped
+    return None
+
+
+def _agy_settings_model(entry: dict[str, Any]) -> str | None:
+    if entry.get("type") != "USER_SETTINGS_CHANGE":
+        return None
+    for key in ("model", "modelName", "modelId", "requestedModel", "selectedModel"):
+        if found := _clean_model_value(entry.get(key)):
+            return found
+    for container_key in ("settings", "userSettings", "userConfig", "config"):
+        container = entry.get(container_key)
+        if isinstance(container, dict):
+            for key in ("model", "modelName", "modelId", "requestedModel", "selectedModel"):
+                if found := _clean_model_value(container.get(key)):
+                    return found
+            planner = container.get("plannerConfig")
+            if isinstance(planner, dict) and (found := _clean_model_value(planner.get("planModel"))):
+                return found
+    return None
+
+
+def _agy_transcript_phase_from_entries(
+    entries: list[dict[str, Any]],
+) -> tuple[bool, str | None, bool]:
+    """Infer (phase_handoff, active_orchestrator_model, saw_turn_boundary) within the current Antigravity user turn."""
+    phase_handoff = False
+    checked_substantive = False
+    saw_turn_boundary = False
+    active_orchestrator_model: str | None = None
+    for entry in reversed(entries):
+        if entry.get("isSidechain"):
+            continue
+        kind = entry.get("type")
+        if kind in {"USER_INPUT", "USER_SETTINGS_CHANGE"} or entry.get("source") == "USER_EXPLICIT":
+            saw_turn_boundary = True
+            break
+        if not checked_substantive and kind not in {"GENERIC", "EPHEMERAL_MESSAGE"}:
+            checked_substantive = True
+            phase_handoff = kind == "PLANNER_RESPONSE" and (
+                _entry_has_tool_call(entry, "exit_plan_mode") or _entry_has_tool_call(entry, "enter_plan_mode")
+            )
+        if (
+            active_orchestrator_model is None
+            and kind == "PLANNER_RESPONSE"
+            and _entry_has_tool_call(entry, "exit_plan_mode")
+        ):
+            model = entry.get("model")
+            if _agy_is_orchestrator_model(model):
+                active_orchestrator_model = str(model).strip()
+        if checked_substantive and active_orchestrator_model is not None and saw_turn_boundary:
+            break
+    return phase_handoff, active_orchestrator_model, saw_turn_boundary
+
+
+def _agy_transcript_phase(transcript_path: str | None) -> tuple[bool, str | None, bool]:
+    """Return (phase_handoff, active_orchestrator_model, saw_turn_boundary) from an Antigravity transcript tail."""
+    return _agy_transcript_phase_from_entries(_transcript_tail_entries(transcript_path))
+
+
 def latest_user_prompt(payload: dict[str, Any], session: str, account: str | None = None) -> str | None:
     """Return the user's latest prompt text from the hook payload or session transcript tail."""
     for key in ("lastUserInput", "prompt", "userMessage", "query"):
@@ -70,25 +184,7 @@ def latest_user_prompt(payload: dict[str, Any], session: str, account: str | Non
             path = candidate
     if path is None:
         return None
-    try:
-        with path.open("rb") as handle:
-            handle.seek(0, os.SEEK_END)
-            size = handle.tell()
-            offset = max(0, size - 16384)
-            handle.seek(offset)
-            chunk = handle.read().decode("utf-8", errors="replace")
-    except OSError:
-        return None
-    lines = chunk.splitlines()
-    if offset > 0 and lines:
-        lines = lines[1:]
-    for line in reversed(lines):
-        try:
-            entry = json.loads(line)
-        except ValueError:
-            continue
-        if not isinstance(entry, dict):
-            continue
+    for entry in reversed(_transcript_tail_entries(str(path), 16384)):
         kind = entry.get("type")
         if kind in {"USER_INPUT", "user"}:
             content = entry.get("content")
@@ -108,39 +204,44 @@ def wake_notice_id(payload: dict[str, Any], session: str, account: str | None = 
     return match.group(1) if prompt and (match := _WAKE_NOTICE_ID.search(prompt)) else None
 
 
-def transcript_model(payload: dict[str, Any]) -> str | None:
+def transcript_model(payload: dict[str, Any], transcript_path: str | None = None) -> str | None:
     """Latest model recorded in a hook's transcript JSONL (catches mid-session `/model` changes)."""
-    raw_path = payload.get("transcript_path") or payload.get("transcriptPath")
-    if not isinstance(raw_path, str) or not raw_path.strip():
+    raw_path = transcript_path or payload.get("transcript_path") or payload.get("transcriptPath")
+    entries = _transcript_tail_entries(raw_path)
+    if not entries:
         return None
-    path = Path(raw_path).expanduser()
-    try:
-        with path.open("rb") as handle:
-            handle.seek(0, os.SEEK_END)
-            size = handle.tell()
-            offset = max(0, size - _TRANSCRIPT_TAIL_BYTES)
-            handle.seek(offset)
-            chunk = handle.read().decode("utf-8", errors="replace")
-    except OSError:
-        return None
-    lines = chunk.splitlines()
-    if offset > 0 and lines:
-        lines = lines[1:]
-    for line in reversed(lines):
-        try:
-            entry = json.loads(line)
-        except ValueError:
+    _, active_orchestrator_model, _ = _agy_transcript_phase_from_entries(entries)
+    fallback_worker_model: str | None = None
+    for entry in reversed(entries):
+        if entry.get("isSidechain"):
             continue
-        if not isinstance(entry, dict) or entry.get("isSidechain"):
+        kind = entry.get("type")
+        if settings_model := _agy_settings_model(entry):
+            return settings_model
+        if kind in {"USER_INPUT", "USER_SETTINGS_CHANGE"} or entry.get("source") == "USER_EXPLICIT":
+            if fallback_worker_model is not None:
+                return fallback_worker_model
             continue
+        if kind == "PLANNER_RESPONSE" and (model := _clean_model_value(entry.get("model"))):
+            if active_orchestrator_model and _agy_is_worker_model(model):
+                return active_orchestrator_model
+            if _agy_is_worker_model(model):
+                if fallback_worker_model is None:
+                    fallback_worker_model = model
+                continue
+            if fallback_worker_model is not None:
+                if _entry_has_tool_call(entry, "exit_plan_mode") and _agy_is_orchestrator_model(model):
+                    return model
+                return fallback_worker_model
+            return model
         message = entry.get("message")
         if not isinstance(message, dict):
             continue
-        if entry.get("type") == "assistant":
+        if kind == "assistant":
             model = message.get("model")
             if isinstance(model, str) and model.strip() and not model.strip().startswith("<"):
                 return model.strip()
-        if entry.get("type") == "user":
+        if kind == "user":
             content = message.get("content")
             if isinstance(content, str) and "<local-command-stdout>Set model to " in content:
                 match = _MODEL_SET_STDOUT.search(content)
@@ -148,7 +249,7 @@ def transcript_model(payload: dict[str, Any]) -> str | None:
                     chosen = (match.group(1) or match.group(2) or "").strip()
                     if chosen:
                         return chosen
-    return None
+    return fallback_worker_model
 
 
 def _agy_subagent_info(transcript_path: str | None) -> tuple[bool, str | None]:
@@ -1422,21 +1523,6 @@ def hook(
         return None
     raw_transcript = payload.get("transcript_path") or payload.get("transcriptPath")
     account_home_dir = _MB.account_home(harness, raw_transcript)
-    runtime_model = payload.get("model") or payload.get("modelName")
-    if isinstance(runtime_model, dict):
-        runtime_model = runtime_model.get("id")
-    if isinstance(runtime_model, str) and runtime_model.strip().lower() == "auto":
-        runtime_model = None
-    if not (isinstance(runtime_model, str) and runtime_model.strip()):
-        runtime_model = _MB.transcript_model(payload)
-    runtime_effort_val = _MB.runtime_effort(harness, payload)
-    if harness == "codex" and (not runtime_model or not runtime_effort_val):
-        db_model, db_effort = _codex_sqlite_settings(account_home_dir, session)
-        if not runtime_model and db_model:
-            runtime_model = db_model
-        if not runtime_effort_val and db_effort:
-            runtime_effort_val = db_effort
-    previous = _MB.load(peer_path(base, session))
     effective_transcript = raw_transcript if isinstance(raw_transcript, str) and raw_transcript.strip() else None
     if gemini and not effective_transcript and session:
         home_dir = (
@@ -1447,6 +1533,23 @@ def hook(
         candidate_transcript = home_dir / "antigravity-cli/brain" / session / ".system_generated/logs/transcript.jsonl"
         if candidate_transcript.is_file():
             effective_transcript = str(candidate_transcript)
+    runtime_model = payload.get("model") or payload.get("modelName")
+    if isinstance(runtime_model, dict):
+        runtime_model = runtime_model.get("id")
+    if isinstance(runtime_model, str) and runtime_model.strip().lower() == "auto":
+        runtime_model = None
+    if not (isinstance(runtime_model, str) and runtime_model.strip()):
+        runtime_model = _MB.transcript_model(payload, effective_transcript)
+    elif isinstance(runtime_model, str):
+        runtime_model = runtime_model.strip()
+    runtime_effort_val = _MB.runtime_effort(harness, payload)
+    if harness == "codex" and (not runtime_model or not runtime_effort_val):
+        db_model, db_effort = _codex_sqlite_settings(account_home_dir, session)
+        if not runtime_model and db_model:
+            runtime_model = db_model
+        if not runtime_effort_val and db_effort:
+            runtime_effort_val = db_effort
+    previous = _MB.load(peer_path(base, session))
     if gemini:
         if valid_peer(previous) and previous.get("isSubagent") and previous.get("parentSession"):
             is_subagent, parent_session = True, str(previous["parentSession"])
@@ -1457,6 +1560,25 @@ def hook(
                 parent_session = parent_session or previous.get("parentSession")
     else:
         is_subagent, parent_session = False, None
+    phase_handoff, active_orchestrator_model, saw_turn_boundary = (
+        _agy_transcript_phase(effective_transcript) if gemini else (False, None, False)
+    )
+    has_transcript = bool(effective_transcript and Path(effective_transcript).expanduser().is_file())
+    primary_model = runtime_model if isinstance(runtime_model, str) and runtime_model.strip() else None
+    execution_model: str | None = None
+    if gemini:
+        if active_orchestrator_model and (primary_model is None or _agy_is_worker_model(primary_model)):
+            if primary_model and primary_model != active_orchestrator_model:
+                execution_model = primary_model
+            primary_model = active_orchestrator_model
+        elif (
+            (not has_transcript or not saw_turn_boundary)
+            and valid_peer(previous)
+            and _agy_is_orchestrator_model(previous.get("model"))
+            and _agy_is_worker_model(primary_model)
+        ):
+            execution_model = primary_model
+            primary_model = str(previous["model"])
     # Antigravity runs PreInvocation before every model step, tool results included; only the first starts a turn.
     mid_turn = event == "PreInvocation" and valid_peer(previous) and previous.get("state") == "busy"
     me = _MB.register(
@@ -1467,11 +1589,17 @@ def hook(
         pid=_MB.harness_pid(harness),
         state=state,
         cwd_source="hook",
-        model=runtime_model if isinstance(runtime_model, str) and runtime_model.strip() else None,
+        model=primary_model,
         model_source="runtime",
         account=account_home_dir,
         effort=runtime_effort_val,
     )
+    if gemini:
+        if execution_model and execution_model != me.get("model"):
+            if me.get("executionModel") != execution_model:
+                me = _MB.annotate(base, session, executionModel=execution_model) or me
+        elif me.get("executionModel") is not None:
+            me = _MB.annotate(base, session, executionModel=None) or me
     me = _MB.mark_delegated(base, me)
     if not is_subagent and not me.get("delegatedRun"):
         me = _MB.attest_native_sessions(base, session, native_session) or me
@@ -1607,6 +1735,8 @@ def hook(
             availability_hint = issue
             _MB.annotate(base, session, httpAvailabilityIssue=issue)
     if gemini and event == "Stop" and payload.get("terminationReason") in ANTIGRAVITY_NO_CONTINUE:
+        return {}
+    if gemini and event == "Stop" and phase_handoff:
         return {}
     import mailbox_channels
 

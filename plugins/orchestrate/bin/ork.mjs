@@ -35,9 +35,9 @@ import { roomsCommand } from "./rooms.mjs";
 
 const COORDINATORS = new Set(["codex", "claude", "agy", "opencode"]);
 
-const HELP = `ork agy|codex|claude|opencode   (open a coordinator; enter your goal in the conversation)
+const HELP = `ork agy|codex|claude [--model <model>] | ork opencode   (open a coordinator; enter your goal in the conversation)
   --harness-arg=<argument>      (pass an argument to the coordinator; repeat as needed)
-ork horde ["objective"] [--engine codex|claude|agy|opencode] [--max-agents 12] [--max-depth 3]
+ork horde ["objective"] [--engine codex|claude|agy|opencode] [--model <model>] [--max-agents 12] [--max-depth 3]
 ork horde [toggle|open|close]   (open or close the live Horde / Swarm View split pane)
 ork horde [--team "claude:haiku*2@scout,agy:flash*2@builder,codex:luna:max@reviewer"]
 ork horde --preset scout-swarm|bug-court|patch-race|heavy-trifecta
@@ -460,32 +460,35 @@ export function resumeArguments(engine, args) {
     : null;
 }
 
-export async function main(argv = process.argv.slice(2), { stdout = process.stdout } = {}) {
+export async function main(
+  argv = process.argv.slice(2),
+  { stdout = process.stdout, runTerminal = terminalCommand } = {},
+) {
   const engineShortcut = COORDINATORS.has(argv[0]) ? argv[0] : undefined;
   const resume = engineShortcut && resumeArguments(engineShortcut, argv.slice(1));
   if (resume) {
-    process.exitCode = await terminalCommand("agent_statusline_tmux.py", resume);
+    process.exitCode = await runTerminal("agent_statusline_tmux.py", resume);
     return;
   }
   if (engineShortcut) argv = ["horde", ...argv.slice(1)];
   if (argv[0] === "setup") {
-    process.exitCode = await terminalCommand("install_mailbox.py", argv.slice(1));
+    process.exitCode = await runTerminal("install_mailbox.py", argv.slice(1));
     return;
   }
   if (argv[0] === "herdr-status") {
-    process.exitCode = await terminalCommand("herdr_status.py", argv.slice(1));
+    process.exitCode = await runTerminal("herdr_status.py", argv.slice(1));
     return;
   }
   if (argv[0] === "progress") {
-    process.exitCode = await terminalCommand("agent_progress.py", argv.slice(1));
+    process.exitCode = await runTerminal("agent_progress.py", argv.slice(1));
     return;
   }
   if (argv[0] === "gate") {
-    process.exitCode = await terminalCommand("gate.py", argv.slice(1));
+    process.exitCode = await runTerminal("gate.py", argv.slice(1));
     return;
   }
   if (argv[0] === "label") {
-    process.exitCode = await terminalCommand("agent_statusline_tmux.py", argv.slice(1));
+    process.exitCode = await runTerminal("agent_statusline_tmux.py", argv.slice(1));
     return;
   }
   if (
@@ -494,7 +497,7 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
   ) {
     const rest = argv.slice(1);
     const action = ["toggle", "open", "close"].includes(rest[0]) ? rest.shift() : "toggle";
-    process.exitCode = await terminalCommand("agent_statusline_tmux.py", [
+    process.exitCode = await runTerminal("agent_statusline_tmux.py", [
       "--toggle-swarm",
       action,
       ...rest,
@@ -666,6 +669,7 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
       width: { type: "string" },
       cwd: { type: "string" },
       engine: { type: "string" },
+      model: { type: "string", short: "m" },
       role: { type: "string" },
       "harness-arg": { type: "string", multiple: true },
       "dangerously-skip-permissions": { type: "boolean" },
@@ -694,16 +698,28 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
     throw new Error(`ork ${engineShortcut} selects ${engineShortcut}; omit --engine`);
   const engine = engineShortcut || values.engine || "codex";
   if (!COORDINATORS.has(engine)) throw new Error("Unsupported coordinator engine");
+  const model = values.model?.trim() || undefined;
+  if (values.model !== undefined && !model) throw new Error("--model requires a value");
+  if (model && engine === "opencode")
+    throw new Error(
+      "OpenCode interactive sessions do not accept --model; choose the model inside OpenCode",
+    );
   const maxAgents = Number(values["max-agents"] || 12);
   const maxDepth = Number(values["max-depth"] || 3);
+  const rawHarnessArgs = values["harness-arg"] || [];
+  const hasModelArg = rawHarnessArgs.some(
+    (arg) =>
+      arg === "--model" || arg.startsWith("--model=") || arg === "-m" || arg.startsWith("-m="),
+  );
   const harnessArgs = [
-    ...(values["harness-arg"] || []),
+    ...rawHarnessArgs,
+    ...(model && !hasModelArg ? ["--model", model] : []),
     ...(values["dangerously-skip-permissions"] ? ["--dangerously-skip-permissions"] : []),
     ...(values["remote-control"] ? ["--remote-control"] : []),
   ];
   const resumeSwarm = resumeArguments(engine, harnessArgs);
   if (resumeSwarm && !values["attach-room"] && !values.json && !values.print) {
-    process.exitCode = await terminalCommand("agent_statusline_tmux.py", [
+    process.exitCode = await runTerminal("agent_statusline_tmux.py", [
       ...resumeSwarm.slice(0, 1),
       ...(values.cwd ? ["--cwd", values.cwd] : []),
       ...resumeSwarm.slice(1),
@@ -718,6 +734,7 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
     objective ||
     engineShortcut ||
     values.engine ||
+    model ||
     harnessArgs.length > 0 ||
     values["max-agents"] ||
     values["max-depth"],
@@ -727,6 +744,7 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
     (objective ||
       engineShortcut ||
       values.engine ||
+      model ||
       harnessArgs.length > 0 ||
       values["max-agents"] ||
       values["max-depth"])
@@ -789,6 +807,7 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
           cwd: values.cwd,
           root,
           engine,
+          ...(model && { model }),
           objective,
           title: objective ? objective.replaceAll(/\s+/gu, " ").slice(0, 160) : "New swarm",
           swarm: { maxAgents, maxDepth },
@@ -803,7 +822,7 @@ export async function main(argv = process.argv.slice(2), { stdout = process.stdo
       await writeCoordinatorBrief(room, { root });
       const prompt = room.objective || command === "opencode" ? coordinatorBrief(room) : "";
       const initial = coordinatorArguments(command, prompt, harnessArgs);
-      process.exitCode = await terminalCommand(
+      process.exitCode = await runTerminal(
         "agent_statusline_tmux.py",
         values["attach-room"]
           ? ["--attach-room", room.id]

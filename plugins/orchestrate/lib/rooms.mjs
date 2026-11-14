@@ -133,6 +133,18 @@ export function coordinatorBrief(room, memberId = "conductor") {
   const roleInfo = workforceRoleInfo(member.workforceRole);
   const workingFolder = member.cwd || room.cwd;
   const roleList = Object.keys(WORKFORCE_ROLES).join(", ");
+  const agyPlanExecute =
+    member.engine === "agy" ||
+    String(member.model || "")
+      .toLowerCase()
+      .includes("orchestrator")
+      ? `
+Antigravity Plan/Execute phases:
+- Planning turns inspect room state (\`ork rooms show\`), worker \`result.json\`, \`git diff\`, and quota read-only, then state exact \`ork\` commands, cross-harness \`--engine\`/\`--model\`, worktree slugs (\`ork hall worktree\`), \`allow_paths\`, and \`--verify-command\` gates when exiting plan mode (\`exit_plan_mode\`).
+- Execution turns execute those \`ork\` and mailbox commands verbatim, yield/end the turn once background workers are running so completions wake the planner, and call \`enter_plan_mode\` immediately if \`dispatch\`, \`recover\`, or integration hits an unexpected failure.
+- Keep bounded \`ork rooms dispatch\` leaf workers on single concrete models (\`gemini:fast\`, \`gemini:hydrogen-high\`, \`gemini:pro\`), not \`gemini:orchestrator\`.
+`
+      : "";
   return `You are the ${memberId === "conductor" ? "root coordinator" : "subswarm lead"} of an Orkest swarm.
 
 Room: ${room.id}
@@ -229,7 +241,7 @@ messaging. A root coordinator reports the combined verified outcome to the user.
 When the user redirects or pauses a branch, stop new dispatch with ork rooms pause. This does not
 interrupt active work: use native interruption for native handles and coordinator cancellation for
 executor runs you own, then collect their results. Never stop another user's terminal or process.
-`;
+${agyPlanExecute}`;
 }
 
 export async function writeCoordinatorBrief(room, { root = mailboxRoot() } = {}) {
@@ -760,6 +772,7 @@ export async function newRoom(
     swarm = { maxAgents: 64, maxDepth: 8 },
     objective,
     engine,
+    model,
     root = mailboxRoot(),
   } = {},
 ) {
@@ -779,6 +792,7 @@ export async function newRoom(
     room.objective = objective || "";
     room.conductor = {
       engine: conductorEngine,
+      ...(model && { model }),
       role: "lead",
       status: "awaiting session",
       ...(room.conductor?.worktree && { worktree: room.conductor.worktree }),

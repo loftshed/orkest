@@ -146,6 +146,24 @@ class AntigravityWakeTests(unittest.TestCase):
         self.assertEqual(sends[0][2]["cascadeConfig"], user_config)
         self.assertEqual(sends[0][2]["customAgentSpec"], agent_spec)
 
+    def test_idle_session_wake_forwards_non_empty_user_config_without_plan_model(self):
+        non_plan_config = {"requestedModel": "gemini-pro-orchestrator", "plannerConfig": {}}
+        trajectory = {
+            "steps": [
+                {"userInput": {"userConfig": {}}},
+                {"userInput": {"lastUserConfig": non_plan_config}},
+            ],
+        }
+        with AgyServer(trajectory=trajectory) as server:
+            self.control(server.address)
+            self.mail("wake-orchestrator-config")
+            message_id = peer_mailbox.incoming(self.base, "agy-target")[0]["id"]
+            result = mailbox_wake.wake(self.target, message_id, base=self.base)
+        self.assertEqual(result["status"], "scheduled")
+        sends = server.sends()
+        self.assertEqual(len(sends), 1)
+        self.assertEqual(sends[0][2]["cascadeConfig"], non_plan_config)
+
     def test_busy_session_keeps_mail_for_the_stop_hook(self):
         with AgyServer("CASCADE_RUN_STATUS_RUNNING") as server:
             self.control(server.address)

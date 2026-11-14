@@ -153,9 +153,9 @@ Every `ork` command:
 <!-- generated:commands -->
 
 ```text
-ork agy|codex|claude|opencode   (open a coordinator; enter your goal in the conversation)
+ork agy|codex|claude [--model <model>] | ork opencode   (open a coordinator; enter your goal in the conversation)
   --harness-arg=<argument>      (pass an argument to the coordinator; repeat as needed)
-ork horde ["objective"] [--engine codex|claude|agy|opencode] [--max-agents 12] [--max-depth 3]
+ork horde ["objective"] [--engine codex|claude|agy|opencode] [--model <model>] [--max-agents 12] [--max-depth 3]
 ork horde [toggle|open|close]   (open or close the live Horde / Swarm View split pane)
 ork horde [--team "claude:haiku*2@scout,agy:flash*2@builder,codex:luna:max@reviewer"]
 ork horde --preset scout-swarm|bug-court|patch-race|heavy-trifecta

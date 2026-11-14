@@ -206,11 +206,7 @@ def _agy_cascade_request_config(trajectory: dict) -> dict:
             if cascade_config is None:
                 for key in ("userConfig", "lastUserConfig"):
                     candidate = user_input.get(key)
-                    if (
-                        isinstance(candidate, dict)
-                        and isinstance(candidate.get("plannerConfig"), dict)
-                        and candidate["plannerConfig"].get("planModel")
-                    ):
+                    if isinstance(candidate, dict) and bool(candidate):
                         cascade_config = candidate
                         break
             if custom_agent_spec is None and isinstance(user_input.get("userAgentSpec"), dict):

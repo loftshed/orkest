@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { afterEach, expect, it } from "vitest";
 
+import { main as orkMain } from "../../../plugins/orchestrate/bin/ork.mjs";
 import { roomsCommand } from "../../../plugins/orchestrate/bin/rooms.mjs";
 import { parseTeam, readRoom, updateRoom } from "../../../plugins/orchestrate/lib/horde-room.mjs";
 import {
@@ -436,4 +437,66 @@ it("groups disposable git worktrees under their parent folder, renders wt:<slug>
   );
   await keepWorktree(room.id, "haiku-1", { root });
   expect((await readRoom(room.id, root)).agents[1].worktree.disposable).toBe(false);
+});
+
+it("persists conductor.model and forwards --model for interactive coordinator launches", async () => {
+  const { root, room: existingRoom } = await fixture();
+  const result = await execute(
+    process.execPath,
+    [cli, "agy", "--model", "gemini-pro-orchestrator", "--json"],
+    {
+      env: { ...process.env, AGENT_EXECUTOR_HOME: root },
+    },
+  );
+  const created = JSON.parse(result.stdout);
+  expect(created.conductor).toMatchObject({
+    engine: "agy",
+    model: "gemini-pro-orchestrator",
+    status: "awaiting session",
+  });
+  expect((await readRoom(created.id, path.join(root, "mailbox-v1"))).conductor.model).toBe(
+    "gemini-pro-orchestrator",
+  );
+
+  const previousHome = process.env.AGENT_EXECUTOR_HOME;
+  process.env.AGENT_EXECUTOR_HOME = root;
+  try {
+    const launches = [];
+    const ttyStdout = { isTTY: true, columns: 100, write() {} };
+    await orkMain(["agy", "-m", "gemini-pro-orchestrator"], {
+      stdout: ttyStdout,
+      runTerminal: async (script, args) => {
+        launches.push({ script, args });
+        return 0;
+      },
+    });
+    expect(launches).toHaveLength(1);
+    expect(launches[0].script).toBe("agent_statusline_tmux.py");
+    expect(launches[0].args.slice(-3)).toEqual(["agy", "--model", "gemini-pro-orchestrator"]);
+
+    // Existing --model/--harness-arg prevents duplicating --model.
+    await orkMain(["agy", "--model", "gemini-pro-orchestrator", "--harness-arg=--model=custom"], {
+      stdout: ttyStdout,
+      runTerminal: async (script, args) => {
+        launches.push({ script, args });
+        return 0;
+      },
+    });
+    expect(launches[1].args.slice(-2)).toEqual(["agy", "--model=custom"]);
+
+    await expect(
+      orkMain(["agy", "--attach-room", existingRoom.id, "--model", "gemini-pro-orchestrator"], {
+        stdout: ttyStdout,
+      }),
+    ).rejects.toThrow("keeps its coordinator");
+    await expect(orkMain(["agy", "--model", " ".repeat(3), "--json"])).rejects.toThrow(
+      "--model requires a value",
+    );
+    await expect(orkMain(["opencode", "--model", "glm:flash", "--json"])).rejects.toThrow(
+      "OpenCode interactive sessions do not accept --model",
+    );
+  } finally {
+    if (previousHome === undefined) delete process.env.AGENT_EXECUTOR_HOME;
+    else process.env.AGENT_EXECUTOR_HOME = previousHome;
+  }
 });

@@ -198,6 +198,48 @@ class WakeRecoveryTests(unittest.TestCase):
         self.assertEqual(stopped["lastStopReason"], "USER_CANCELED")
         self.assertIsNone(resumed["lastStopReason"])
 
+    def test_antigravity_exit_plan_mode_stop_preserves_unread_mail_for_wake_recovery(self):
+        import json
+
+        transcript = Path(self.temporary.name) / "agy-plan.jsonl"
+        transcript.write_text(
+            "".join(
+                json.dumps(entry) + "\n"
+                for entry in (
+                    {"type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "Plan"},
+                    {
+                        "type": "PLANNER_RESPONSE",
+                        "model": "gemini-pro-orchestrator",
+                        "source": "MODEL",
+                        "tool_calls": [{"name": "exit_plan_mode"}],
+                    },
+                    {"type": "GENERIC", "source": "MODEL"},
+                )
+            ),
+            encoding="utf-8",
+        )
+        payload = {
+            "conversationId": "agy-orch",
+            "workspacePaths": [str(SCRIPTS)],
+            "transcriptPath": str(transcript),
+        }
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch.object(peer_mailbox, "harness_pid", return_value=os.getpid()),
+            patch.object(mailbox_wake, "wake", return_value=dict(NOT_SENT)),
+        ):
+            peer_mailbox.hook(
+                {**payload, "model": "gemini-pro-orchestrator"}, harness="gemini", event="SessionStart", base=self.base
+            )
+            sent = peer_mailbox.send(self.base, sender=self.sender, to="agy-orch", text="wake check", wake=True)
+            stop_out = peer_mailbox.hook(
+                {**payload, "terminationReason": "NO_TOOL_CALL"}, harness="gemini", event="Stop", base=self.base
+            )
+            self.assertEqual(stop_out, {})
+            self.assertEqual([m["id"] for m in peer_mailbox.incoming(self.base, "agy-orch")], [sent["id"]])
+            outcome = self.at(3, FakeWake())
+            self.assertEqual(outcome[0]["outcome"], "attempted")
+
     def test_the_daemon_loop_reconciles_until_it_stops(self):
         stopping = threading.Event()
         passes = threading.Event()
