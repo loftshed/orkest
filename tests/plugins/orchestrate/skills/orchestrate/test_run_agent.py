@@ -2614,6 +2614,195 @@ class ClaudeOutputParsingTests(unittest.TestCase):
         self.assertIsNone(RUNNER.codex_terminal_error(recovered_codex))
 
 
+class AgyOutputParsingTests(unittest.TestCase):
+    REPORT = (
+        "### STATUS\nCOMPLETE\n\n### FILES CHANGED\n- output_parsers.py\n\n"
+        "### COMMANDS RUN\n- python3 -m unittest\n\n### VERIFICATION\n- passed\n\n"
+        "### RISKS OR BLOCKERS\n- none\n"
+    )
+
+    def test_multiturn_result_recovers_earlier_valid_report_preserving_final_meta(self) -> None:
+        flat_stream = "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "result",
+                        "status": "success",
+                        "conversation_id": "conv-1",
+                        "response": self.REPORT,
+                        "error": "",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "result",
+                        "status": "SUCCESS",
+                        "conversation_id": "conv-2",
+                        "response": "Done! Summarized the changes.",
+                        "error": "",
+                    }
+                ),
+            ]
+        )
+        self.assertEqual(RUNNER.parse_agy_output(flat_stream), (self.REPORT, "conv-2", "success"))
+
+        envelope_stream = "\n".join(
+            [
+                json.dumps(
+                    {
+                        "event": "result",
+                        "result": {
+                            "status": "SUCCESS",
+                            "conversation_id": "conv-env",
+                            "response": self.REPORT,
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "event": "result",
+                        "result": {
+                            "status": "SUCCESS",
+                            "conversation_id": "conv-env-final",
+                            "response": "Short follow-up summary.",
+                        },
+                    }
+                ),
+            ]
+        )
+        self.assertEqual(RUNNER.parse_agy_output(envelope_stream), (self.REPORT, "conv-env-final", "success"))
+
+    def test_multiturn_recovers_from_assistant_or_message_events_and_skips_user_role(self) -> None:
+        cases = [
+            {"type": "assistant", "content": self.REPORT},
+            {"type": "message", "text": self.REPORT},
+            {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": self.REPORT}]}},
+        ]
+        for event in cases:
+            with self.subTest(event=event["type"]):
+                stream = "\n".join(
+                    [
+                        json.dumps(event),
+                        json.dumps(
+                            {
+                                "type": "result",
+                                "status": "success",
+                                "conversation_id": "conv-msg",
+                                "response": "Short follow-up summary.",
+                                "error": "",
+                            }
+                        ),
+                    ]
+                )
+                self.assertEqual(RUNNER.parse_agy_output(stream), (self.REPORT, "conv-msg", "success"))
+
+        user_only_stream = "\n".join(
+            [
+                json.dumps({"type": "message", "role": "user", "content": self.REPORT}),
+                json.dumps(
+                    {
+                        "type": "result",
+                        "status": "success",
+                        "conversation_id": "conv-user",
+                        "response": "Summary only.",
+                        "error": "",
+                    }
+                ),
+            ]
+        )
+        self.assertEqual(RUNNER.parse_agy_output(user_only_stream), ("Summary only.", "conv-user", "success"))
+
+    def test_multiturn_terminal_error_does_not_fall_back_to_earlier_report(self) -> None:
+        for status, error_msg, extra in (
+            ("error", "", {}),
+            ("failed", "Execution failed", {}),
+            ("success", "quota exceeded", {}),
+            ("success", "", {"is_error": True}),
+        ):
+            with self.subTest(status=status, error=error_msg, extra=extra):
+                stream = "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "type": "result",
+                                "status": "success",
+                                "conversation_id": "conv-1",
+                                "response": self.REPORT,
+                                "error": "",
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "result",
+                                "status": status,
+                                "conversation_id": "conv-err",
+                                "response": "Partial failure",
+                                "error": error_msg,
+                                **extra,
+                            }
+                        ),
+                    ]
+                )
+                self.assertEqual(RUNNER.parse_agy_output(stream), ("Partial failure", "conv-err", status))
+                expected_err = error_msg or None
+                self.assertEqual(RUNNER.agy_terminal_error(stream), expected_err)
+
+        earlier_error_ignored = "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "result",
+                        "status": "error",
+                        "conversation_id": "conv-1",
+                        "response": self.REPORT,
+                        "error": "rate limit",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "result",
+                        "status": "success",
+                        "conversation_id": "conv-2",
+                        "response": "Summary without report headings.",
+                        "error": "",
+                    }
+                ),
+            ]
+        )
+        self.assertEqual(
+            RUNNER.parse_agy_output(earlier_error_ignored),
+            ("Summary without report headings.", "conv-2", "success"),
+        )
+
+    def test_multiturn_freeform_output_returns_final_response(self) -> None:
+        freeform_stream = "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "result",
+                        "status": "success",
+                        "conversation_id": "conv-1",
+                        "response": "Initial analysis without report headings.",
+                        "error": "",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "result",
+                        "status": "SUCCESS",
+                        "conversation_id": "conv-2",
+                        "response": "Final freeform consultation response.",
+                        "error": "",
+                    }
+                ),
+            ]
+        )
+        self.assertEqual(
+            RUNNER.parse_agy_output(freeform_stream),
+            ("Final freeform consultation response.", "conv-2", "success"),
+        )
+
+
 class ProviderQuotaDetectionTests(unittest.TestCase):
     CONTENT = (
         "docs mention live quota checks; form field plan.storageQuota; "

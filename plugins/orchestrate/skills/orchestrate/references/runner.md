@@ -49,18 +49,23 @@ and `--resume-result` keeps a selector on the model the session ran.
 
 Pass `--effort` for reproducible runs. Codex effort is validated against the model's catalog and bound
 as `model_reasoning_effort`; claude takes `low|medium|high|xhigh|max`; agy effort must match the
-catalog slug (`gemini-3.8-flash-high`); agy rejects `--effort` alongside a slug, and no current
-agy model offers `max`. OpenCode keeps its provider `--variant`; never translate
-effort names across providers. Results keep requested, command-bound, and provider-observed settings
-separately; unknown observed settings stay null.
+catalog slug (`-low|-medium|-high|-xhigh`, e.g., `gemini-3.8-flash-high`, `gemini-4-hydrogen-xhigh`),
+while effort-less composite slugs (`gemini-pro-orchestrator`, `gemini-pro-orchestrator-argon`) carry
+no suffix; agy rejects `--effort` alongside a slug, and no current agy model offers `max`. OpenCode
+keeps its provider `--variant`; never translate effort names across providers. Results keep
+requested, command-bound, and provider-observed settings separately; unknown observed settings stay
+null.
 
 ## Usage and reference cost
 
 `usage` keeps raw counters and exclusive normalized buckets. Codex snapshots are cumulative, so a
 resumed run without a matching prior result has unknown incremental usage. OpenCode records reasoning
 separately and deduplicates steps. agy keeps cumulative and step counters; its billing semantics are
-unknown. claude reports input, cache read/creation and output tokens plus Claude Code's own cost
-estimate (`native_cost_usd`). Unknown is never zero.
+unknown, and Orchestrator runs report blended planner+executor cumulative token counters—bounded
+`run_agent.py` worker dispatches should target concrete single models (`gemini:fast`,
+`gemini:hydrogen-high`, `gemini:pro`) rather than `gemini:orchestrator`. claude reports input,
+cache read/creation and output tokens plus Claude Code's own cost estimate (`native_cost_usd`).
+Unknown is never zero.
 
 `--billing-mode api|subscription|unknown` declares the billing context without inspecting credentials.
 [The dated registry](model-registry.json) holds verified public API tariffs; a reference estimate is
