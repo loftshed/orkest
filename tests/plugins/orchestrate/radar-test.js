@@ -145,4 +145,191 @@ describe("ork radar and benchmark priors", () => {
     expect(syncResult.dry_run).toBe(true);
     expect(syncResult.new_models).toEqual(["anthropic/claude-opus-6-0", "openai/gpt-6.5-nova"]);
   });
+
+  it("reads live cache, refreshes missing or stale catalogs, supports ack, matches prior families, and reports drift", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "radar-live-cache-"));
+    const cacheDir = path.join(tmpDir, "cache");
+    const runsDir = path.join(tmpDir, "runs");
+    fs.mkdirSync(cacheDir, { recursive: true });
+    fs.mkdirSync(runsDir, { recursive: true });
+
+    let refreshCalls = 0;
+    const freshCatalog = {
+      schema: "agent-executor.models.v1",
+      platforms: [
+        {
+          engine: "codex",
+          status: "live",
+          models: [
+            {
+              id: "gpt-6.1-sol",
+              vendor: "openai",
+              supported_efforts: ["low", "medium", "high"],
+            },
+            {
+              id: "gpt-7-unmapped",
+              vendor: "openai",
+              supported_efforts: ["high"],
+            },
+          ],
+        },
+        {
+          engine: "agy",
+          status: "live",
+          models: [
+            { id: "gemini-3.8-flash-medium", vendor: "google", supported_efforts: ["medium"] },
+          ],
+        },
+      ],
+    };
+
+    // Missing models-v1.json triggers refreshCatalog automatically.
+    const statusRes = await radarCli(["status", "--json"], {
+      cacheDir,
+      installedEngines: ["codex", "agy"],
+      refreshCatalog: async () => {
+        refreshCalls += 1;
+        fs.writeFileSync(
+          path.join(cacheDir, "models-v1.json"),
+          JSON.stringify(freshCatalog),
+          "utf8",
+        );
+        return freshCatalog;
+      },
+      runsDir,
+      telemetry: { groups: [] },
+    });
+    expect(refreshCalls).toBe(1);
+    const statusData = JSON.parse(statusRes.stdout);
+    expect(statusData.diff.newModels).toEqual([
+      "gpt-6.1-sol",
+      "gpt-7-unmapped",
+      "gemini-3.8-flash-medium",
+    ]);
+    const solEntry = statusData.diff.models.find((item) => item.id === "gpt-6.1-sol");
+    expect(solEntry.prior).toMatchObject({ family: "gpt:sol" });
+    expect(statusData.audit.has_drift).toBe(true);
+    expect(statusData.audit.unmapped_models.map((item) => item.id)).toContain("gpt-7-unmapped");
+    expect(statusData.audit.unresolved_tiers.map((item) => item.selector)).toContain("gpt:astra");
+
+    // Existing fresh cache skips refresh unless --refresh is passed.
+    const cachedLine = await radarCli(["status", "--line"], {
+      cacheDir,
+      installedEngines: ["codex", "agy"],
+      refreshCatalog: async () => {
+        refreshCalls += 1;
+        return freshCatalog;
+      },
+      runsDir,
+      telemetry: { groups: [] },
+    });
+    expect(refreshCalls).toBe(1);
+    expect(cachedLine.stdout).toContain("radar: tracked=3 new=3");
+    expect(cachedLine.stdout).toContain("unmapped=1");
+
+    // Passing --refresh forces re-discovery even when normalized cache exists.
+    await radarCli(["diff", "--refresh"], {
+      cacheDir,
+      installedEngines: ["codex", "agy"],
+      refreshCatalog: async () => {
+        refreshCalls += 1;
+        return freshCatalog;
+      },
+      runsDir,
+      telemetry: { groups: [] },
+    });
+    expect(refreshCalls).toBe(2);
+
+    // Explicit `ork radar ack` writes models-seen.json and clears newModels on subsequent diff.
+    const ackRes = await radarCli(["ack", "--line"], {
+      cacheDir,
+      installedEngines: ["codex", "agy"],
+      runsDir,
+      telemetry: { groups: [] },
+    });
+    expect(ackRes.stdout).toContain("acked");
+    const seenPayload = JSON.parse(
+      fs.readFileSync(path.join(cacheDir, "models-seen.json"), "utf8"),
+    );
+    expect(seenPayload.schema).toBe("orkest.models-seen.v1");
+    expect(seenPayload.models.map((item) => item.id)).toContain("gpt-6.1-sol");
+
+    const afterAck = await radarCli(["diff", "--json"], {
+      cacheDir,
+      installedEngines: ["codex", "agy"],
+      runsDir,
+      telemetry: { groups: [] },
+    });
+    const afterAckData = JSON.parse(afterAck.stdout);
+    expect(afterAckData.diff.newModels).toEqual([]);
+    expect(afterAckData.diff.deprecatedModels).toEqual([]);
+
+    // Legacy models-v1.json missing supported_efforts triggers refresh cleanly.
+    fs.writeFileSync(
+      path.join(cacheDir, "models-v1.json"),
+      JSON.stringify({
+        platforms: [{ engine: "codex", status: "live", models: [{ id: "gpt-6.1-sol" }] }],
+      }),
+      "utf8",
+    );
+    await radarCli(["status", "--json"], {
+      cacheDir,
+      installedEngines: ["codex", "agy"],
+      refreshCatalog: async () => {
+        refreshCalls += 1;
+        return freshCatalog;
+      },
+      runsDir,
+      telemetry: { groups: [] },
+    });
+    expect(refreshCalls).toBe(3);
+  });
+
+  it("renders null benchmark metrics as dashes, sorts null composite priors last, and supports #200 metric keys", async () => {
+    const dualPriors = {
+      schema: "orkest.benchmarks.prior.v1",
+      models: {
+        "model-unbenchmarked": {
+          engine: "codex",
+          family: "gpt:astra",
+          composite_prior: null,
+          terminal_bench_4_1: null,
+          deepswe_v1_1: undefined,
+          strengths: ["structural-refactor"],
+        },
+        "model-benchmarked": {
+          engine: "claude",
+          family: "claude:best",
+          composite_prior: 0.72,
+          terminal_bench_4_1: 0.75,
+          deepswe_v1_1: 0.71,
+          osworld_2_1: 0.64,
+          frontier_swe_2: 0.69,
+          strengths: ["structural-refactor"],
+        },
+      },
+    };
+    const res = await radarCli(["priors"], {
+      priors: dualPriors,
+      telemetry: { groups: [] },
+      width: 140,
+    });
+    expect(res.exitCode).toBe(0);
+    expect(res.stdout).toContain("model-benchmarked (72.0%), model-unbenchmarked (—)");
+    expect(res.stdout).toContain("TB4.1");
+    expect(res.stdout).toContain("DeepSWE");
+    expect(res.stdout).toContain("OSW2.1");
+    expect(res.stdout).toContain("FSWE2");
+    expect(res.stdout).toContain("—");
+    expect(res.stdout).not.toContain("0.0%");
+    const benchIdx = res.stdout.indexOf("72.0%");
+    const dashLineIdx = res.stdout.indexOf(
+      "model-unbenchmarked",
+      res.stdout.indexOf("Model Scoreboard Priors:"),
+    );
+    expect(benchIdx).toBeGreaterThan(-1);
+    expect(dashLineIdx).toBeGreaterThan(
+      res.stdout.indexOf("model-benchmarked", res.stdout.indexOf("Model Scoreboard Priors:")),
+    );
+  });
 });

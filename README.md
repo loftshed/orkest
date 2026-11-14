@@ -170,7 +170,7 @@ ork side [run|status] [--prompt <text>] [--issue <n>] [--dry-run] [--json]
 ork cleanup [status|run] [--dry-run] [--json]
 ork policy [show|allow|deny|reset] [--json]
 ork update [run|check|status|enable|disable] [--check|--apply] [--auto] [--force] [--quiet] [--json] [-h|--help]
-ork radar [--line|--json] [--refresh]
+ork radar [status|diff|priors|ack] [--refresh] [--ack] [--line|--json]
 ork gate [--heavy] [--label <text>] -- <command>   (also: ork gate status|install|uninstall)
 ork swarm [toggle|open|close]   (alias for ork horde toggle|open|close)
 ork factory [status|run|groom] [--dry-run] [--json]   (alias for ork foundry)

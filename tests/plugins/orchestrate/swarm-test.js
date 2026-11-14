@@ -500,3 +500,93 @@ it("persists conductor.model and forwards --model for interactive coordinator la
     else process.env.AGENT_EXECUTOR_HOME = previousHome;
   }
 });
+
+it("drives parseTeam from families.json schema and live catalog capabilities", () => {
+  const catalog = {
+    platforms: {
+      codex: {
+        status: "live",
+        models: [
+          {
+            id: "gpt-6.1-sol",
+            supported_efforts: ["low", "medium", "high"],
+            composite: false,
+          },
+        ],
+      },
+      agy: {
+        status: "live",
+        models: [
+          {
+            id: "gemini-4-carbon-low",
+            family_stem: "gemini-4-carbon",
+            effort_slug: "low",
+            supported_efforts: ["low", "high"],
+            composite: false,
+          },
+          {
+            id: "gemini-4-carbon-high",
+            family_stem: "gemini-4-carbon",
+            effort_slug: "high",
+            supported_efforts: ["low", "high"],
+            composite: false,
+          },
+          {
+            id: "gemini-pro-orchestrator",
+            family_stem: "gemini-pro-orchestrator",
+            effort_slug: null,
+            supported_efforts: [],
+            composite: true,
+          },
+        ],
+      },
+      claude: {
+        status: "live",
+        models: [
+          {
+            id: "opus",
+            supported_efforts: ["low", "medium", "high", "max"],
+            composite: false,
+          },
+        ],
+      },
+    },
+  };
+
+  const parsed = parseTeam("claude:best:high,agy:flash,codex:sol:high,agy:orchestrator", {
+    catalog,
+  });
+  expect(parsed).toEqual([
+    { engine: "claude", model: "opus", effort: "high", label: "best" },
+    { engine: "agy", model: "gemini:fast", label: "flash" },
+    { engine: "codex", model: "gpt:sol", effort: "high", label: "sol" },
+    { engine: "agy", model: "gemini:orchestrator", label: "orchestrator" },
+  ]);
+
+  expect(parseTeam("agy:carbon:high", { catalog })).toEqual([
+    { engine: "agy", model: "gemini:carbon-high", effort: "high", label: "carbon" },
+  ]);
+
+  expect(() => parseTeam("agy:orchestrator:high", { catalog })).toThrow(/composite/i);
+  expect(() => parseTeam("agy:gemini-4-carbon-high:low", { catalog })).toThrow(/conflicts/i);
+  expect(() => parseTeam("codex:sol:xhigh", { catalog })).toThrow(/Unsupported effort/i);
+  expect(() => parseTeam("codex:gpt-6.1-sol:xhigh", { catalog })).toThrow(/Unsupported effort/i);
+  expect(() => parseTeam("codex:no-such-model", { catalog, validateCatalog: true })).toThrow(
+    /Unknown codex model/,
+  );
+
+  const customSchema = {
+    effort_suffixes: ["turbo"],
+    families: {
+      acme: {
+        engine: "acmecli",
+        default_for_engine: true,
+        default_tier: "base",
+        tiers: { base: "acme-1-base" },
+      },
+    },
+  };
+  expect(parseTeam("acmecli:base:turbo", { schema: customSchema })).toEqual([
+    { engine: "acmecli", model: "acme:base", effort: "turbo", label: "base" },
+  ]);
+});

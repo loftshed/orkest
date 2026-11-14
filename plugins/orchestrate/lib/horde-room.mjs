@@ -29,82 +29,18 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
+import {
+  knownEngines,
+  loadCachedModelCatalog,
+  loadFamiliesSchema,
+  resolveTeamModel,
+  supportedEfforts,
+} from "./families-schema.mjs";
 import { migrateSchema, openOrkestSqlite, withImmediateTransaction } from "./orkest-sqlite.mjs";
 import { cacheHome } from "./runtime-paths.mjs";
 
 export const ROOM_SCHEMA = "agent-executor.room.v1";
 const ID = /^[\w-]{1,80}$/u;
-const ENGINES = new Set(["claude", "agy", "codex", "opencode"]);
-const EFFORTS = new Set(["low", "medium", "high", "xhigh", "max", "ultra"]);
-const CLAUDE_TIER_MAP = Object.freeze({
-  fast: "haiku",
-  balanced: "sonnet",
-  best: "opus",
-  frontier: "fable",
-  mythos: "claude-mythos-5-1",
-  "mythos-5-1": "claude-mythos-5-1",
-  "mythos-5.1": "claude-mythos-5-1",
-  "mythos-5": "claude-mythos-5",
-});
-const AGY_TIER_MAP = Object.freeze({
-  fast: "gemini:fast",
-  flash: "gemini:fast",
-  "flash-low": "gemini:flash-low",
-  "flash-medium": "gemini:fast",
-  "flash-high": "gemini:flash-high",
-  pro: "gemini:pro",
-  argon: "gemini:argon",
-  "argon-low": "gemini:argon-low",
-  "argon-medium": "gemini:argon",
-  "argon-high": "gemini:argon-high",
-  carbon: "gemini:carbon",
-  "carbon-low": "gemini:carbon-low",
-  "carbon-medium": "gemini:carbon",
-  "carbon-high": "gemini:carbon-high",
-  hydrogen: "gemini:hydrogen",
-  "hydrogen-low": "gemini:hydrogen-low",
-  "hydrogen-medium": "gemini:hydrogen",
-  "hydrogen-high": "gemini:hydrogen-high",
-  "hydrogen-xhigh": "gemini:hydrogen-xhigh",
-  orchestrator: "gemini:orchestrator",
-  "orchestrator-carbon": "gemini:orchestrator",
-  "orchestrator-argon": "gemini:orchestrator-argon",
-});
-
-function resolveTeamModel(engine, tier, effort) {
-  const loweredTier = tier.toLowerCase();
-  switch (engine) {
-    case "claude": {
-      if (Object.hasOwn(CLAUDE_TIER_MAP, loweredTier)) {
-        return CLAUDE_TIER_MAP[loweredTier];
-      }
-      if (/^(?:claude-)?(?:opus|sonnet|haiku|fable|mythos)-\d+(?:[.-]\d+)*$/iu.test(tier)) {
-        const prefixed = loweredTier.startsWith("claude-") ? loweredTier : `claude-${loweredTier}`;
-        return prefixed.replaceAll(".", "-");
-      }
-      return tier;
-    }
-    case "codex": {
-      if (["luna", "sol", "terra", "astra"].includes(tier)) {
-        return `gpt:${tier}`;
-      }
-      if (/^\d+(?:\.\d+)?-(?:luna|sol|terra|astra)$/iu.test(tier)) {
-        return `gpt-${loweredTier}`;
-      }
-      return tier;
-    }
-    case "agy": {
-      const agyKey =
-        effort && Object.hasOwn(AGY_TIER_MAP, `${loweredTier}-${effort}`)
-          ? `${loweredTier}-${effort}`
-          : loweredTier;
-      return Object.hasOwn(AGY_TIER_MAP, agyKey) ? AGY_TIER_MAP[agyKey] : tier;
-    }
-    default: {
-      return tier;
-    }
-  }
-}
 
 const sourceRolesPath = new URL(
   "../skills/orchestrate/references/workforce-roles.json",
@@ -281,16 +217,27 @@ export async function loadPresets() {
   );
 }
 
-/** Team shorthand is resolved by the runner's live catalog at launch, never pinned here. */
-export function parseTeam(text) {
+/** Team shorthand is resolved by the runner's live catalog and families.json, never pinned here. */
+export function parseTeam(text, options = {}) {
   if (typeof text !== "string" || !text.trim()) throw new Error("A nonempty team is required");
+  const schema = options.schema || loadFamiliesSchema();
+  const catalog =
+    options.catalog === undefined
+      ? loadCachedModelCatalog({ cacheDir: options.cacheDir })
+      : options.catalog;
+  const validateCatalog =
+    options.validateCatalog === undefined ? Boolean(options.catalog) : options.validateCatalog;
+  const engines = knownEngines(schema);
+  const efforts = supportedEfforts(schema, catalog);
   const members = [];
   for (const raw of text.split(",")) {
     const match =
-      /^(claude|agy|codex|opencode):([^*@,\s]+?)(?:@([A-Za-z0-9_-]+))?(?:\*(\d+))?(?:@([A-Za-z0-9_-]+))?$/u.exec(
+      /^([a-z][a-z0-9_-]*):([^*@,\s]+?)(?:@([A-Za-z0-9_-]+))?(?:\*(\d+))?(?:@([A-Za-z0-9_-]+))?$/u.exec(
         raw.trim(),
       );
-    if (!match || (match[3] && match[5])) throw new Error(`Invalid team member: ${raw}`);
+    if (!match || !engines.has(match[1]) || (match[3] && match[5])) {
+      throw new Error(`Invalid team member: ${raw}`);
+    }
     const [, engine, selection, roleBefore, copies = "1", roleAfter] = match;
     const workforceRole =
       roleBefore || roleAfter ? normalizeWorkforceRole(roleBefore || roleAfter) : undefined;
@@ -299,9 +246,12 @@ export function parseTeam(text) {
       throw new Error("A room supports 1–64 members");
     const parts = selection.split(":");
     if (parts.some((part) => !part)) throw new Error(`Invalid team member: ${raw}`);
-    const effort = parts.length > 1 && EFFORTS.has(parts.at(-1)) ? parts.pop() : undefined;
+    const effort =
+      parts.length > 1 && efforts.has(parts.at(-1).toLowerCase())
+        ? parts.pop().toLowerCase()
+        : undefined;
     const tier = parts.join(":");
-    const model = resolveTeamModel(engine, tier, effort);
+    const model = resolveTeamModel(engine, tier, effort, { schema, catalog, validateCatalog });
     for (let i = 0; i < count; i++)
       members.push({
         engine,
@@ -342,6 +292,7 @@ export function validateRoom(room) {
         ))
     )
       throw new Error(`Invalid room ${key}`);
+  const ENGINES = knownEngines();
   const ids = new Set();
   for (const agent of room.agents) {
     if (

@@ -1,12 +1,26 @@
 {
   "schema": "agent-executor.families.v2",
   "note": "A selector (`gpt:sol`, `deepseek`) names a family and a tier. A tier value that is an exact catalog ID (Claude Code aliases, OpenRouter's maintained `~vendor/...-latest` aliases) is used as is. In a family with a prefix, any other value is a keyword: among live IDs that start with the prefix and contain the keyword as whole words (separated by `-` or `/`), the highest version (`6.1`, `v4`) wins. A family without a prefix takes exact IDs only. Optional tier_strengths describe task fit without changing selector resolution. Run `run_agent.py families` to see what each selector resolves to.",
+  "effort_suffixes": ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
+  "native_exclusions": ["gemma", "gpt-oss"],
   "families": {
     "gpt": {
       "engine": "codex",
+      "default_for_engine": true,
+      "vendor": "openai",
       "prefix": "gpt-",
       "default_tier": "sol",
+      "team_selector_format": "passthrough",
+      "native_providers": ["openai"],
+      "native_keywords": ["gpt", "chatgpt", "codex", "astra", "sol", "terra", "luna"],
+      "brand": {
+        "glyph": "\uEC81",
+        "tone": "brandOpenAI",
+        "aliases": ["gpt", "codex", "openai", "astra", "sol", "terra", "luna"]
+      },
       "tiers": { "luna": "luna", "terra": "terra", "sol": "sol", "astra": "astra" },
+      "capability_tiers": { "luna": 1, "terra": 2, "sol": 3, "astra": 4 },
+      "default_capability_tier": 3,
       "tier_strengths": {
         "sol": ["complex coding", "agentic workflows", "professional software work"],
         "astra": ["demanding reasoning", "complex coding", "multi-step workflows"],
@@ -16,10 +30,39 @@
     },
     "gemini": {
       "engine": "agy",
+      "default_for_engine": true,
+      "vendor": "google",
       "prefix": "gemini-",
       "default_tier": "fast",
+      "team_selector_format": "family",
+      "native_providers": ["google", "google-ai-studio", "google-vertex", "vertex"],
+      "native_keywords": ["gemini", "argon", "carbon", "hydrogen", "orchestrator"],
+      "brand": {
+        "glyph": "\uE7F0",
+        "tone": "brandGoogle",
+        "aliases": [
+          "gemini",
+          "google",
+          "agy",
+          "antigravity",
+          "argon",
+          "carbon",
+          "hydrogen",
+          "orchestrator",
+          "flash"
+        ]
+      },
+      "bare_aliases": {
+        "flash": "fast",
+        "flash-medium": "fast",
+        "argon-medium": "argon",
+        "carbon-medium": "carbon",
+        "hydrogen-medium": "hydrogen",
+        "orchestrator-carbon": "orchestrator"
+      },
       "tiers": {
         "fast": "flash-medium",
+        "flash": "flash-medium",
         "flash-low": "flash-low",
         "flash-high": "flash-high",
         "pro": "carbon-high|argon-high|pro-high",
@@ -36,8 +79,34 @@
         "orchestrator": "gemini-pro-orchestrator",
         "orchestrator-argon": "gemini-pro-orchestrator-argon"
       },
+      "capability_tiers": {
+        "fast": 1,
+        "flash": 1,
+        "flash-low": 1,
+        "flash-medium": 1,
+        "flash-high": 2,
+        "hydrogen": 1,
+        "hydrogen-low": 1,
+        "hydrogen-medium": 1,
+        "hydrogen-high": 2,
+        "hydrogen-xhigh": 2,
+        "carbon": 2,
+        "carbon-low": 2,
+        "carbon-medium": 2,
+        "carbon-high": 3,
+        "argon": 2,
+        "argon-low": 2,
+        "argon-medium": 2,
+        "argon-high": 3,
+        "pro": 3,
+        "pro-high": 3,
+        "orchestrator": 3,
+        "orchestrator-argon": 3,
+        "orchestrator-carbon": 3
+      },
       "tier_strengths": {
         "fast": ["speed", "cost efficiency", "routine agent tasks"],
+        "flash": ["speed", "cost efficiency", "routine agent tasks"],
         "flash-low": ["low latency", "high-throughput tasks"],
         "flash-high": [
           "long-horizon software engineering",
@@ -69,13 +138,41 @@
     },
     "claude": {
       "engine": "claude",
+      "default_for_engine": true,
+      "vendor": "anthropic",
       "default_tier": "best",
+      "team_selector_format": "exact",
+      "native_providers": ["anthropic"],
+      "native_keywords": ["claude", "opus", "sonnet", "haiku", "fable", "mythos"],
+      "shorthands": {
+        "mythos": "claude-mythos-5-1",
+        "mythos-5-1": "claude-mythos-5-1",
+        "mythos-5": "claude-mythos-5"
+      },
+      "versioned_shorthand_stems": ["opus", "sonnet", "haiku", "fable", "mythos"],
+      "default_efforts": ["low", "medium", "high", "xhigh", "max"],
+      "brand": {
+        "glyph": "\uEC82",
+        "tone": "brandClaude",
+        "aliases": ["claude", "anthropic", "opus", "sonnet", "haiku", "fable", "mythos"]
+      },
       "tiers": {
-        "fast": "haiku",
-        "balanced": "sonnet",
         "best": "opus",
+        "balanced": "sonnet",
+        "fast": "haiku",
         "frontier": "fable",
         "mythos": "claude-mythos-5-1"
+      },
+      "capability_tiers": {
+        "fast": 1,
+        "haiku": 1,
+        "balanced": 2,
+        "sonnet": 2,
+        "best": 3,
+        "opus": 3,
+        "frontier": 4,
+        "fable": 4,
+        "mythos": 4
       },
       "tier_strengths": {
         "fast": [
@@ -97,11 +194,15 @@
     },
     "deepseek": {
       "engine": "opencode",
+      "vendor": "deepseek",
       "default_tier": "flash",
+      "native_providers": ["deepseek"],
+      "native_keywords": ["deepseek"],
       "tiers": {
         "flash": "openrouter/~deepseek/deepseek-flash-latest",
         "pro": "openrouter/~deepseek/deepseek-pro-latest"
       },
+      "capability_tiers": { "flash": 1, "pro": 2 },
       "tier_strengths": {
         "flash": ["high-throughput inference", "agentic coding", "multimodal understanding"],
         "pro": ["complex reasoning", "high-effort agent workflows"]
@@ -109,11 +210,16 @@
     },
     "glm": {
       "engine": "opencode",
+      "vendor": "z-ai",
       "default_tier": "flash",
+      "native_providers": ["z-ai", "zai"],
+      "native_keywords": ["glm"],
       "tiers": {
         "flash": "openrouter/~z-ai/glm-flash-latest",
         "full": "openrouter/~z-ai/glm-latest"
       },
+      "capability_tiers": { "flash": 1, "full": 2, "pro": 2 },
+      "default_capability_tier": 2,
       "tier_strengths": {
         "flash": ["fast agentic coding", "multimodal tasks"],
         "full": ["complex software engineering", "multi-agent collaboration"]
@@ -121,8 +227,13 @@
     },
     "kimi": {
       "engine": "opencode",
+      "vendor": "moonshotai",
       "default_tier": "default",
+      "native_providers": ["moonshotai", "kimi"],
+      "native_keywords": ["kimi"],
       "tiers": { "default": "openrouter/~moonshotai/kimi-latest" },
+      "capability_tiers": { "default": 2 },
+      "default_capability_tier": 2,
       "tier_strengths": {
         "default": ["multimodal understanding", "visual-to-code workflows", "agent swarms"]
       }

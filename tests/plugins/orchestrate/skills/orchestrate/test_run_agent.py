@@ -1256,6 +1256,19 @@ else:
             + r"""
 if "--version" in sys.argv:
     print("claude test 0.0")
+elif "--help" in sys.argv:
+    help_log = os.environ.get("FAKE_CLAUDE_HELP_LOG")
+    if help_log:
+        with open(help_log, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(sys.argv[1:]) + "\n")
+    if os.environ.get("FAKE_CLAUDE_HELP_EXIT"):
+        raise SystemExit(int(os.environ["FAKE_CLAUDE_HELP_EXIT"]))
+    print(
+        os.environ.get(
+            "FAKE_CLAUDE_HELP",
+            "  --effort <level>                Effort level for the current session (low, medium, high, max)",
+        )
+    )
 elif "-p" in sys.argv:
     # An execution run: the brief arrives on stdin. Like Claude Code's json output, a blocked run prints nothing.
     prompt = sys.stdin.read()
@@ -4312,3 +4325,160 @@ class ProcessAndResumeRegressionTests(unittest.TestCase):
             self.assertEqual(result_ok["status"], "completed")
         finally:
             RUNNER.shutil.rmtree(policy_file.parent, ignore_errors=True)
+
+    def test_normalized_catalog_records_cover_all_four_harnesses(self) -> None:
+        fake_home = self.external_path / "catalog-home"
+        cache_root = self.external_path / "normalized-cache"
+        stats_dir = fake_home / ".claude"
+        stats_dir.mkdir(parents=True, exist_ok=True)
+        (stats_dir / "stats-cache.json").write_text(
+            json.dumps({"modelUsage": {"claude-opus-4-6-20260201": {"inputTokens": 10}}}),
+            encoding="utf-8",
+        )
+        peers_dir = cache_root / "agent-executor" / "mailbox-v1" / "peers"
+        peers_dir.mkdir(parents=True, exist_ok=True)
+        (peers_dir / "worker.json").write_text(
+            json.dumps({"model": "claude-sonnet-4-6"}),
+            encoding="utf-8",
+        )
+
+        opencode_cache = cache_root / "opencode"
+        opencode_cache.mkdir(parents=True, exist_ok=True)
+        (opencode_cache / "models.json").write_text(
+            json.dumps(
+                {
+                    "openrouter": {
+                        "models": {
+                            "deepseek/deepseek-v4-flash": {
+                                "name": "DeepSeek V4 Flash",
+                                "family": "deepseek",
+                                "reasoning_options": [{"type": "effort", "values": ["low", "high"]}],
+                                "variants": {"turbo": {}},
+                            }
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        help_log = self.external_path / "claude-help-calls.jsonl"
+        unsafe_call = self.external_path / "claude-unsafe-normalized.txt"
+        agy_models = (
+            "Fetching available models...\n"
+            "gemini-4-carbon-low           Gemini 4 Carbon (Low)\n"
+            "gemini-4-carbon-high          Gemini 4 Carbon (High)\n"
+            "gemini-pro-orchestrator       Gemini Pro Orchestrator"
+        )
+        environment = {
+            "HOME": str(fake_home),
+            "XDG_CACHE_HOME": str(cache_root),
+            "AGENT_EXECUTOR_HOME": str(cache_root / "agent-executor"),
+            "ORCHESTRATE_HOME": "",
+            "PATH": f"{self.external_path}{os.pathsep}{os.environ['PATH']}",
+            "FAKE_AGY_MODELS": agy_models,
+            "FAKE_OPENCODE_MODELS": "openrouter/deepseek/deepseek-v4-flash",
+            "FAKE_CLAUDE_HELP": "--effort <level>  Effort level (low, medium, high)",
+            "FAKE_CLAUDE_HELP_LOG": str(help_log),
+            "FAKE_CLAUDE_UNSAFE_CALL": str(unsafe_call),
+        }
+        with mock.patch.dict(os.environ, environment):
+            codex = RUNNER.discover_engine_catalog("codex", refresh=True)
+            agy = RUNNER.discover_engine_catalog("agy", refresh=True)
+            claude_first = RUNNER.discover_engine_catalog("claude", refresh=True)
+            claude_cached = RUNNER.discover_engine_catalog("claude")
+            opencode = RUNNER.discover_engine_catalog("opencode", refresh=True)
+
+        self.assertFalse(unsafe_call.exists())
+        codex_luna = next(m for m in codex["models"] if m["id"] == "gpt-5.6-luna")
+        self.assertEqual(codex_luna["vendor"], "openai")
+        self.assertEqual(codex_luna["family_stem"], "gpt-5.6")
+        self.assertEqual(codex_luna["tier"], "luna")
+        self.assertIn("high", codex_luna["supported_efforts"])
+        self.assertFalse(codex_luna["composite"])
+
+        agy_by_id = {m["id"]: m for m in agy["models"]}
+        self.assertEqual(agy_by_id["gemini-4-carbon-low"]["family_stem"], "gemini-4-carbon")
+        self.assertEqual(agy_by_id["gemini-4-carbon-low"]["effort_slug"], "low")
+        self.assertEqual(agy_by_id["gemini-4-carbon-low"]["supported_efforts"], ["low", "high"])
+        self.assertFalse(agy_by_id["gemini-4-carbon-low"]["composite"])
+        self.assertEqual(agy_by_id["gemini-pro-orchestrator"]["supported_efforts"], [])
+        self.assertIsNone(agy_by_id["gemini-pro-orchestrator"]["effort_slug"])
+        self.assertTrue(agy_by_id["gemini-pro-orchestrator"]["composite"])
+
+        self.assertEqual(len(help_log.read_text(encoding="utf-8").splitlines()), 1)
+        claude_by_id = {m["id"]: m for m in claude_cached["models"]}
+        self.assertEqual(claude_by_id["opus"]["supported_efforts"], ["low", "medium", "high"])
+        self.assertIn("claude-opus-4-6-20260201", claude_by_id["opus"]["observed_resolved_ids"])
+        self.assertIn("claude-sonnet-4-6", claude_by_id["sonnet"]["observed_resolved_ids"])
+        self.assertEqual(claude_first["models"], claude_cached["models"])
+
+        oc_deepseek = opencode["models"][0]
+        self.assertEqual(oc_deepseek["vendor"], "deepseek")
+        self.assertEqual(oc_deepseek["provider"], "openrouter")
+        self.assertEqual(oc_deepseek["variants"], ["turbo"])
+        self.assertEqual(oc_deepseek["supported_efforts"], ["low", "high", "turbo"])
+
+        # Legacy cache entries lacking normalized capability keys trigger re-discovery.
+        cache_file = cache_root / "agent-executor" / "models-v1.json"
+        cached_payload = json.loads(cache_file.read_text(encoding="utf-8"))
+        cached_payload["platforms"]["codex"]["catalog"]["models"][0].pop("supported_efforts", None)
+        cache_file.write_text(json.dumps(cached_payload), encoding="utf-8")
+        with mock.patch.dict(os.environ, environment):
+            refreshed_codex = RUNNER.discover_engine_catalog("codex")
+        self.assertEqual(refreshed_codex["cache"]["status"], "miss")
+        self.assertIn("supported_efforts", refreshed_codex["models"][0])
+
+        # Failing claude --help falls back to families.json default_efforts without blocking discovery.
+        fallback_env = {
+            **environment,
+            "XDG_CACHE_HOME": str(self.external_path / "fallback-cache"),
+            "AGENT_EXECUTOR_HOME": str(self.external_path / "fallback-cache" / "agent-executor"),
+            "FAKE_CLAUDE_HELP_EXIT": "2",
+        }
+        with mock.patch.dict(os.environ, fallback_env):
+            claude_fallback = RUNNER.discover_engine_catalog("claude", refresh=True)
+        self.assertEqual(claude_fallback["status"], "live")
+        self.assertEqual(
+            claude_fallback["models"][0]["supported_efforts"],
+            list(RUNNER._MODEL_ROUTING_MOD.families_module().claude_default_efforts()),
+        )
+
+    def test_families_cli_audit_reports_drift_and_honors_strict(self) -> None:
+        mock_codex = {
+            "engine": "codex",
+            "status": "live",
+            "models": [
+                {"id": "gpt-6-astra", "vendor": "openai", "supported_efforts": ["high"]},
+                {"id": "gpt-7-mystery", "vendor": "openai", "supported_efforts": ["high"]},
+            ],
+        }
+        mock_all = {
+            "codex": mock_codex,
+            "agy": {"engine": "agy", "status": "not_installed", "models": []},
+            "claude": {"engine": "claude", "status": "not_installed", "models": []},
+            "opencode": {"engine": "opencode", "status": "not_installed", "models": []},
+        }
+        with mock.patch.object(
+            RUNNER,
+            "discover_engine_catalog",
+            side_effect=lambda engine, refresh=False: mock_all[engine],
+        ):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code = RUNNER.families_main(["--audit", "--format", "json"])
+            strict_out = io.StringIO()
+            with contextlib.redirect_stdout(strict_out):
+                strict_code = RUNNER.families_main(["--audit", "--strict"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(strict_code, 1)
+        payload = json.loads(out.getvalue())
+        self.assertEqual(payload["schema"], "agent-executor.families-audit.v1")
+        self.assertTrue(payload["has_drift"])
+        self.assertEqual([item["id"] for item in payload["unmapped_models"]], ["gpt-7-mystery"])
+        unresolved_selectors = {item["selector"] for item in payload["unresolved_tiers"]}
+        self.assertIn("gpt:sol", unresolved_selectors)
+        self.assertIn("gpt:luna", unresolved_selectors)
+        self.assertIn("gpt:sol", strict_out.getvalue())
+        self.assertIn("gpt-7-mystery", strict_out.getvalue())
