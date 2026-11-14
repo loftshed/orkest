@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.85.1
+
+- refactor(orchestrate): unify catalog-driven detection across all harnesses and wire live ork radar (#206)
+
 ## 0.85.0
 
 - feat(orchestrate): support Antigravity Orchestrator sessions and coordinator workflows (#197) (#205)
