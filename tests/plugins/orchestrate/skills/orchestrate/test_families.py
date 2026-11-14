@@ -317,14 +317,32 @@ class CoordinatorSelectorTests(unittest.TestCase):
 
 class SchemaAndAuditTests(unittest.TestCase):
     def test_gemini_flash_alias_matches_fast_and_tier_strengths_stay_aligned(self) -> None:
-        self.assertEqual(RULES["gemini"]["tiers"]["fast"], "flash-medium")
+        self.assertEqual(RULES["gemini"]["tiers"]["fast"], "hydrogen-medium|flash-medium")
         self.assertEqual(RULES["gemini"]["tiers"]["flash"], "flash-medium")
         self.assertEqual(set(RULES["gemini"]["tier_strengths"]), set(RULES["gemini"]["tiers"]))
+        self.assertEqual(set(RULES["kimi"]["tier_strengths"]), set(RULES["kimi"]["tiers"]))
         name_fast, tier_fast = FAMILIES.parse_selector("gemini:fast", RULES)
         name_flash, tier_flash = FAMILIES.parse_selector("gemini:flash", RULES)
         self.assertEqual(
             FAMILIES.resolve(name_flash, tier_flash, RULES, AGY),
             FAMILIES.resolve(name_fast, tier_fast, RULES, AGY),
+        )
+        mixed_gemini = ["gemini-3.8-flash-medium", "gemini-4-hydrogen-medium"]
+        self.assertEqual(
+            FAMILIES.resolve(*FAMILIES.parse_selector("gemini:fast", RULES), RULES, mixed_gemini),
+            "gemini-4-hydrogen-medium",
+        )
+        self.assertEqual(
+            FAMILIES.resolve(*FAMILIES.parse_selector("gemini:flash", RULES), RULES, mixed_gemini),
+            "gemini-3.8-flash-medium",
+        )
+        self.assertEqual(
+            FAMILIES.resolve(
+                *FAMILIES.parse_selector("kimi:pro", RULES),
+                RULES,
+                ["openrouter/~moonshotai/kimi-latest", "openrouter/moonshotai/kimi-k3.1-pro"],
+            ),
+            "openrouter/moonshotai/kimi-k3.1-pro",
         )
 
     def test_user_override_under_families_config_remains_supported(self) -> None:

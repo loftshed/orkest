@@ -11,6 +11,7 @@ cwds
 deepswe
 evals
 Fira
+flashx
 fswe
 glab
 glpat
@@ -50,7 +51,9 @@ refactorer
 RUSTC
 SHLVL
 stooges
+swebench
 swiftc
+tbench
 tcsetwinsize
 tcsh
 todoread

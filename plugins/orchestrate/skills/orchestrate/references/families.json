@@ -61,7 +61,7 @@
         "orchestrator-carbon": "orchestrator"
       },
       "tiers": {
-        "fast": "flash-medium",
+        "fast": "hydrogen-medium|flash-medium",
         "flash": "flash-medium",
         "flash-low": "flash-low",
         "flash-high": "flash-high",
@@ -105,7 +105,7 @@
         "orchestrator-carbon": 3
       },
       "tier_strengths": {
-        "fast": ["speed", "cost efficiency", "routine agent tasks"],
+        "fast": ["speed", "cost efficiency", "agentic coding", "routine agent tasks"],
         "flash": ["speed", "cost efficiency", "routine agent tasks"],
         "flash-low": ["low latency", "high-throughput tasks"],
         "flash-high": [
@@ -231,11 +231,15 @@
       "default_tier": "default",
       "native_providers": ["moonshotai", "kimi"],
       "native_keywords": ["kimi"],
-      "tiers": { "default": "openrouter/~moonshotai/kimi-latest" },
-      "capability_tiers": { "default": 2 },
+      "tiers": {
+        "default": "openrouter/~moonshotai/kimi-latest",
+        "pro": "openrouter/moonshotai/kimi-k3.1-pro"
+      },
+      "capability_tiers": { "default": 2, "pro": 2 },
       "default_capability_tier": 2,
       "tier_strengths": {
-        "default": ["multimodal understanding", "visual-to-code workflows", "agent swarms"]
+        "default": ["multimodal understanding", "visual-to-code workflows", "agent swarms"],
+        "pro": ["frontier open-weight coding", "deep reasoning", "agentic workflows"]
       }
     }
   }

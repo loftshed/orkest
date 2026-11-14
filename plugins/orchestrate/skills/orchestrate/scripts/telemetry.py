@@ -17,7 +17,7 @@ from typing import Any
 
 Z_95 = 1.959963984540054
 FAILURE_STATUSES = {"FAILED", "FAILURE", "VERIFICATION_FAILED", "PARTIAL"}
-NON_QUALITY_OUTCOMES = {"dry_run", "preflight_failed", "provider_quota_exhausted"}
+NON_QUALITY_OUTCOMES = {"dry_run", "native_handoff", "not_run", "preflight_failed", "provider_quota_exhausted"}
 WINDOW_14D_SECONDS = 14 * 86400
 DEGRADATION_MIN_QUALITY_RUNS = 5
 DEGRADATION_MIN_DROP = 0.15
@@ -85,7 +85,7 @@ def _requested_model(result: dict[str, Any]) -> str | None:
 
 
 def _is_quality_run(result: dict[str, Any]) -> bool:
-    """Exclude dry runs, preflight failures, and quota exhaustion from quality denominators."""
+    """Exclude dry runs, native handoffs, not-run stubs, preflight failures, and quota exhaustion."""
     if result.get("dry_run") is True:
         return False
     review = _mapping(result.get("review"))

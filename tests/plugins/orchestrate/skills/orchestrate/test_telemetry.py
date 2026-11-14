@@ -136,7 +136,9 @@ class TelemetrySummaryTests(unittest.TestCase):
                         "status": "COMPLETE",
                     },
                 )
-            for idx, non_quality in enumerate(("dry_run", "preflight_failed", "provider_quota_exhausted")):
+            for idx, non_quality in enumerate(
+                ("dry_run", "native_handoff", "not_run", "preflight_failed", "provider_quota_exhausted")
+            ):
                 self.write_result(
                     runs,
                     f"non-quality-{idx}",
@@ -148,10 +150,34 @@ class TelemetrySummaryTests(unittest.TestCase):
                         "status": non_quality,
                     },
                 )
+            self.write_result(
+                runs,
+                "native-handoff-not-run",
+                {
+                    "task_archetype": "debug-invariants",
+                    "engine": "codex",
+                    "model": "gpt-6-sol",
+                    "effort": "high",
+                    "status": "native_handoff",
+                    "task_outcome": "not_run",
+                },
+            )
+            self.write_result(
+                runs,
+                "completed-not-run",
+                {
+                    "task_archetype": "debug-invariants",
+                    "engine": "codex",
+                    "model": "gpt-6-sol",
+                    "effort": "high",
+                    "status": "completed",
+                    "task_outcome": "not_run",
+                },
+            )
             summary = TELEMETRY.summarize_runs(runs)
 
         group = summary["groups"][0]
-        self.assertEqual(group["runs"], 7)
+        self.assertEqual(group["runs"], 11)
         self.assertEqual(group["quality_runs"], 4)
         self.assertEqual(group["accepted_runs"], 4)
         self.assertEqual(group["accepted_rate"], 1.0)
