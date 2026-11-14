@@ -230,6 +230,32 @@ class ExecutionExtensionTests(unittest.TestCase):
         code, result, _, _, capture = self.fixture.run_main(engine="agy", extra_args=["--effort", "high"])
         self.assertEqual((code, result["status"], capture), (4, "preflight_failed", {}))
 
+    def test_agy_bind_effort_supports_xhigh_and_effortless_orchestrators(self):
+        self.assertEqual(
+            SUPPORT.bind_effort("agy", "gemini-4-hydrogen-xhigh", None, {}),
+            {"requested": None, "bound": "xhigh", "binding": "catalog_model_slug", "observed": None},
+        )
+        self.assertEqual(
+            SUPPORT.bind_effort("agy", "gemini-4-hydrogen-xhigh", "xhigh", {}),
+            {"requested": "xhigh", "bound": "xhigh", "binding": "catalog_model_slug", "observed": None},
+        )
+        with self.assertRaisesRegex(SUPPORT.ContractError, "xhigh"):
+            SUPPORT.bind_effort("agy", "gemini-4-hydrogen-xhigh", "high", {})
+
+        for model in ("gemini-pro-orchestrator", "gemini-pro-orchestrator-argon"):
+            with self.subTest(model=model):
+                self.assertEqual(
+                    SUPPORT.bind_effort("agy", model, None, {}),
+                    {
+                        "requested": None,
+                        "bound": None,
+                        "binding": "cli_default_or_config",
+                        "observed": None,
+                    },
+                )
+                with self.assertRaisesRegex(SUPPORT.ContractError, "xhigh"):
+                    SUPPORT.bind_effort("agy", model, "high", {})
+
     def test_agy_terminal_failure_cannot_be_overridden_by_complete_report(self):
         with mock.patch.dict(os.environ, {"FAKE_AGY_STATUS": "error"}):
             code, result, _, _, capture = self.fixture.run_main(engine="agy")
@@ -1031,20 +1057,47 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(SUPPORT.model_capability_tier("claude-haiku-4-5"), 1)
         self.assertEqual(SUPPORT.model_capability_tier("gpt-6-luna"), 1)
         self.assertEqual(SUPPORT.model_capability_tier("gemini-3.8-flash-medium"), 1)
+        self.assertEqual(SUPPORT.model_capability_tier("gemini:hydrogen"), 1)
+        self.assertEqual(SUPPORT.model_capability_tier("gemini:hydrogen-low"), 1)
+        self.assertEqual(SUPPORT.model_capability_tier("gemini-4-hydrogen-low"), 1)
+        self.assertEqual(SUPPORT.model_capability_tier("gemini-4-hydrogen-medium"), 1)
         self.assertEqual(SUPPORT.model_capability_tier("sonnet"), 2)
         self.assertEqual(SUPPORT.model_capability_tier("claude-sonnet-4-6"), 2)
         self.assertEqual(SUPPORT.model_capability_tier("gpt-5.6-terra"), 2)
+        self.assertEqual(SUPPORT.model_capability_tier("gemini:hydrogen-high"), 2)
+        self.assertEqual(SUPPORT.model_capability_tier("gemini:hydrogen-xhigh"), 2)
+        self.assertEqual(SUPPORT.model_capability_tier("gemini-4-hydrogen-high"), 2)
+        self.assertEqual(SUPPORT.model_capability_tier("gemini-4-hydrogen-xhigh"), 2)
+        self.assertEqual(SUPPORT.model_capability_tier("gemini:carbon"), 2)
+        self.assertEqual(SUPPORT.model_capability_tier("gemini:carbon-low"), 2)
+        self.assertEqual(SUPPORT.model_capability_tier("gemini-4-carbon-low"), 2)
+        self.assertEqual(SUPPORT.model_capability_tier("gemini-4-carbon-medium"), 2)
         self.assertEqual(SUPPORT.model_capability_tier("opus"), 3)
         self.assertEqual(SUPPORT.model_capability_tier("gpt-6-sol"), 3)
         self.assertEqual(SUPPORT.model_capability_tier("gemini-3.1-pro-high"), 3)
         self.assertEqual(SUPPORT.model_capability_tier("gemini-4-argon-high"), 3)
+        self.assertEqual(SUPPORT.model_capability_tier("gemini:carbon-high"), 3)
+        self.assertEqual(SUPPORT.model_capability_tier("gemini-4-carbon-high"), 3)
+        self.assertEqual(SUPPORT.model_capability_tier("gemini:orchestrator"), 3)
+        self.assertEqual(SUPPORT.model_capability_tier("gemini:orchestrator-argon"), 3)
+        self.assertEqual(SUPPORT.model_capability_tier("gemini-pro-orchestrator"), 3)
+        self.assertEqual(SUPPORT.model_capability_tier("gemini-pro-orchestrator-argon"), 3)
+        self.assertEqual(SUPPORT.model_capability_tier("orchestrator-carbon"), 3)
         self.assertEqual(SUPPORT.model_capability_tier("gpt-6-astra"), 4)
         self.assertEqual(SUPPORT.model_capability_tier("fable"), 4)
 
         self.assertTrue(SUPPORT.is_upward_delegation("haiku", "sonnet"))
+        self.assertTrue(SUPPORT.is_upward_delegation("haiku", "gemini-4-hydrogen-xhigh"))
+        self.assertTrue(SUPPORT.is_upward_delegation("gemini-4-hydrogen-medium", "gemini-4-hydrogen-xhigh"))
+        self.assertTrue(SUPPORT.is_upward_delegation("gemini-4-hydrogen-xhigh", "gemini-4-carbon-high"))
         self.assertTrue(SUPPORT.is_upward_delegation("sonnet", "gpt-6-astra"))
         self.assertTrue(SUPPORT.is_upward_delegation("claude-sonnet-4-6", "opus"))
         self.assertTrue(SUPPORT.is_upward_delegation("sonnet", "gemini-4-argon-high"))
+        self.assertTrue(SUPPORT.is_upward_delegation("sonnet", "gemini-4-carbon-high"))
+        self.assertTrue(SUPPORT.is_upward_delegation("sonnet", "gemini-pro-orchestrator"))
+        self.assertTrue(SUPPORT.is_upward_delegation("sonnet", "gemini-pro-orchestrator-argon"))
+        self.assertFalse(SUPPORT.is_upward_delegation("sonnet", "gemini-4-carbon-medium"))
+        self.assertFalse(SUPPORT.is_upward_delegation("opus", "gemini-pro-orchestrator"))
         self.assertFalse(SUPPORT.is_upward_delegation("gpt-6-astra", "sonnet"))
         self.assertFalse(SUPPORT.is_upward_delegation("gpt-6-astra", "gpt-6-astra"))
         self.assertFalse(SUPPORT.is_upward_delegation(None, "gpt-6-astra"))

@@ -67,6 +67,45 @@ class FamilyResolutionTests(unittest.TestCase):
         with self.assertRaises(FAMILIES.SelectorError):
             self.resolve("gpt:sol", ["gpt-6-solar", "gpt-oss-120b-medium"])
 
+    def test_gemini_pro_fallback_and_carbon_hydrogen_orchestrator_tiers(self) -> None:
+        carbon_catalog = [
+            "gemini-3.1-pro-high",
+            "gemini-4.5-argon-high",
+            "gemini-4-carbon-low",
+            "gemini-4-carbon-medium",
+            "gemini-4-carbon-high",
+            "gemini-4.1-carbon-high",
+        ]
+        self.assertEqual(self.resolve("gemini:pro", carbon_catalog), "gemini-4.1-carbon-high")
+        self.assertEqual(
+            self.resolve("gemini:pro", ["gemini-3.1-pro-high", "gemini-4-argon-high"]),
+            "gemini-4-argon-high",
+        )
+        self.assertEqual(self.resolve("gemini:pro", ["gemini-3.1-pro-high"]), "gemini-3.1-pro-high")
+        self.assertEqual(self.resolve("gemini:carbon", carbon_catalog), "gemini-4-carbon-medium")
+        self.assertEqual(self.resolve("gemini:carbon-low", carbon_catalog), "gemini-4-carbon-low")
+        self.assertEqual(self.resolve("gemini:carbon-high", carbon_catalog), "gemini-4.1-carbon-high")
+
+        hydrogen_catalog = [
+            "gemini-4-hydrogen-low",
+            "gemini-4-hydrogen-medium",
+            "gemini-4-hydrogen-high",
+            "gemini-4-hydrogen-xhigh",
+        ]
+        self.assertEqual(self.resolve("gemini:hydrogen", hydrogen_catalog), "gemini-4-hydrogen-medium")
+        self.assertEqual(self.resolve("gemini:hydrogen-low", hydrogen_catalog), "gemini-4-hydrogen-low")
+        self.assertEqual(self.resolve("gemini:hydrogen-high", hydrogen_catalog), "gemini-4-hydrogen-high")
+        self.assertEqual(self.resolve("gemini:hydrogen-xhigh", hydrogen_catalog), "gemini-4-hydrogen-xhigh")
+
+        orchestrator_catalog = ["gemini-pro-orchestrator", "gemini-pro-orchestrator-argon"]
+        self.assertEqual(self.resolve("gemini:orchestrator", orchestrator_catalog), "gemini-pro-orchestrator")
+        self.assertEqual(
+            self.resolve("gemini:orchestrator-argon", orchestrator_catalog),
+            "gemini-pro-orchestrator-argon",
+        )
+        with self.assertRaises(FAMILIES.SelectorError):
+            self.resolve("gemini:orchestrator", ["gemini-pro-orchestrator-argon"])
+
     def test_bare_family_uses_default_tier_and_latest_is_optional(self) -> None:
         self.assertEqual(self.resolve("gpt", CODEX), "gpt-6.1-sol")
         self.assertEqual(self.resolve("latest:gpt:luna", CODEX), "gpt-6-luna")
@@ -271,6 +310,9 @@ class CoordinatorSelectorTests(unittest.TestCase):
         self.assertEqual(COORDINATOR.RUNNER.native_engine_for("mythos"), "claude")
         self.assertEqual(COORDINATOR.RUNNER.native_engine_for("astra"), "codex")
         self.assertEqual(COORDINATOR.RUNNER.native_engine_for("argon-high"), "agy")
+        self.assertEqual(COORDINATOR.RUNNER.native_engine_for("carbon-high"), "agy")
+        self.assertEqual(COORDINATOR.RUNNER.native_engine_for("hydrogen-xhigh"), "agy")
+        self.assertEqual(COORDINATOR.RUNNER.native_engine_for("orchestrator-carbon"), "agy")
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import json
 import os
@@ -21,6 +22,8 @@ def load(name: str):
 
 RUNTIME_PATHS = load("runtime_paths")
 ROUTES = load("routes")
+FAMILIES = load("families")
+RUNNER = load("run_agent")
 
 
 class RoutesConfigPathTests(unittest.TestCase):
@@ -80,6 +83,113 @@ class RoutesConfigPathTests(unittest.TestCase):
             )
             self.assertEqual(ROUTES.config_path(), preferred)
             self.assertEqual(ROUTES.load_routes()["implementation"]["model"], "gpt:sol")
+
+
+class ModelRoutingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.env = mock.patch.dict(
+            os.environ,
+            {
+                "AGENT_EXECUTOR_CONFIG": str(self.root / "absent-config.json"),
+                "ORCHESTRATE_CONFIG": "",
+                "AGENT_EXECUTOR_HOME": str(self.root / "cache"),
+                "XDG_CACHE_HOME": str(self.root / "xdg-cache"),
+            },
+        )
+        self.env.start()
+
+    def tearDown(self) -> None:
+        self.env.stop()
+        self.temp.cleanup()
+
+    def test_agy_bare_tier_aliases_resolve_carbon_hydrogen_and_orchestrator(self) -> None:
+        rules = FAMILIES.load_families()
+        bare_cases = {
+            "carbon": ("gemini", "carbon"),
+            "carbon-medium": ("gemini", "carbon"),
+            "carbon-low": ("gemini", "carbon-low"),
+            "carbon-high": ("gemini", "carbon-high"),
+            "hydrogen": ("gemini", "hydrogen"),
+            "hydrogen-medium": ("gemini", "hydrogen"),
+            "hydrogen-low": ("gemini", "hydrogen-low"),
+            "hydrogen-high": ("gemini", "hydrogen-high"),
+            "hydrogen-xhigh": ("gemini", "hydrogen-xhigh"),
+            "orchestrator": ("gemini", "orchestrator"),
+            "orchestrator-carbon": ("gemini", "orchestrator"),
+            "orchestrator-argon": ("gemini", "orchestrator-argon"),
+        }
+        for alias, expected in bare_cases.items():
+            with self.subTest(alias=alias):
+                self.assertEqual(RUNNER.parse_bare_tier_selector("agy", alias, rules), expected)
+
+        catalog = {
+            "status": "live",
+            "models": [
+                {"id": model_id}
+                for model_id in (
+                    "gemini-4-carbon-low",
+                    "gemini-4-carbon-medium",
+                    "gemini-4-carbon-high",
+                    "gemini-4-hydrogen-low",
+                    "gemini-4-hydrogen-medium",
+                    "gemini-4-hydrogen-high",
+                    "gemini-4-hydrogen-xhigh",
+                    "gemini-pro-orchestrator",
+                    "gemini-pro-orchestrator-argon",
+                )
+            ],
+        }
+        resolved_cases = {
+            "carbon": "gemini-4-carbon-medium",
+            "carbon-medium": "gemini-4-carbon-medium",
+            "carbon-high": "gemini-4-carbon-high",
+            "hydrogen": "gemini-4-hydrogen-medium",
+            "hydrogen-medium": "gemini-4-hydrogen-medium",
+            "hydrogen-xhigh": "gemini-4-hydrogen-xhigh",
+            "orchestrator": "gemini-pro-orchestrator",
+            "orchestrator-carbon": "gemini-pro-orchestrator",
+            "orchestrator-argon": "gemini-pro-orchestrator-argon",
+        }
+        with mock.patch.object(RUNNER, "note_selector_advance"):
+            for alias, expected_model in resolved_cases.items():
+                with self.subTest(alias=alias):
+                    self.assertEqual(
+                        RUNNER.select_live_model("agy", alias, catalog),
+                        (expected_model, "family_latest"),
+                    )
+
+        for alias in ("carbon", "carbon-medium", "hydrogen", "hydrogen-medium", "orchestrator", "orchestrator-carbon"):
+            args = argparse.Namespace(route=None, engine=None, model=alias, effort=None, variant=None)
+            resolved = RUNNER._MODEL_ROUTING_MOD.resolve_route(args)
+            self.assertEqual(resolved.engine, "agy")
+
+    def test_opencode_refuses_carbon_hydrogen_and_orchestrator_models_with_exit_17(self) -> None:
+        native_models = (
+            "carbon",
+            "carbon-medium",
+            "gemini-4-carbon-high",
+            "openrouter/google/gemini-4-carbon-high",
+            "hydrogen",
+            "hydrogen-medium",
+            "gemini-4-hydrogen-xhigh",
+            "openrouter/google/gemini-4-hydrogen-xhigh",
+            "orchestrator",
+            "orchestrator-carbon",
+            "gemini-pro-orchestrator",
+            "gemini-pro-orchestrator-argon",
+            "openrouter/google/gemini-pro-orchestrator",
+        )
+        for model in native_models:
+            with self.subTest(model=model):
+                self.assertEqual(RUNNER.native_engine_for(model), "agy")
+                with self.assertRaises(RUNNER.RunnerError) as enforce_exc:
+                    RUNNER.enforce_native_route("opencode", model)
+                self.assertEqual(enforce_exc.exception.exit_code, 17)
+                with self.assertRaises(RUNNER.RunnerError) as preflight_exc:
+                    RUNNER.executor_preflight("opencode", model)
+                self.assertEqual(preflight_exc.exception.exit_code, 17)
 
 
 if __name__ == "__main__":
