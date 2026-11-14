@@ -36,6 +36,75 @@ export const ROOM_SCHEMA = "agent-executor.room.v1";
 const ID = /^[\w-]{1,80}$/u;
 const ENGINES = new Set(["claude", "agy", "codex", "opencode"]);
 const EFFORTS = new Set(["low", "medium", "high", "xhigh", "max", "ultra"]);
+const CLAUDE_TIER_MAP = Object.freeze({
+  fast: "haiku",
+  balanced: "sonnet",
+  best: "opus",
+  frontier: "fable",
+  mythos: "claude-mythos-5-1",
+  "mythos-5-1": "claude-mythos-5-1",
+  "mythos-5.1": "claude-mythos-5-1",
+  "mythos-5": "claude-mythos-5",
+});
+const AGY_TIER_MAP = Object.freeze({
+  fast: "gemini:fast",
+  flash: "gemini:fast",
+  "flash-low": "gemini:flash-low",
+  "flash-medium": "gemini:fast",
+  "flash-high": "gemini:flash-high",
+  pro: "gemini:pro",
+  argon: "gemini:argon",
+  "argon-low": "gemini:argon-low",
+  "argon-medium": "gemini:argon",
+  "argon-high": "gemini:argon-high",
+  carbon: "gemini:carbon",
+  "carbon-low": "gemini:carbon-low",
+  "carbon-medium": "gemini:carbon",
+  "carbon-high": "gemini:carbon-high",
+  hydrogen: "gemini:hydrogen",
+  "hydrogen-low": "gemini:hydrogen-low",
+  "hydrogen-medium": "gemini:hydrogen",
+  "hydrogen-high": "gemini:hydrogen-high",
+  "hydrogen-xhigh": "gemini:hydrogen-xhigh",
+  orchestrator: "gemini:orchestrator",
+  "orchestrator-carbon": "gemini:orchestrator",
+  "orchestrator-argon": "gemini:orchestrator-argon",
+});
+
+function resolveTeamModel(engine, tier, effort) {
+  const loweredTier = tier.toLowerCase();
+  switch (engine) {
+    case "claude": {
+      if (Object.hasOwn(CLAUDE_TIER_MAP, loweredTier)) {
+        return CLAUDE_TIER_MAP[loweredTier];
+      }
+      if (/^(?:claude-)?(?:opus|sonnet|haiku|fable|mythos)-\d+(?:[.-]\d+)*$/iu.test(tier)) {
+        const prefixed = loweredTier.startsWith("claude-") ? loweredTier : `claude-${loweredTier}`;
+        return prefixed.replaceAll(".", "-");
+      }
+      return tier;
+    }
+    case "codex": {
+      if (["luna", "sol", "terra", "astra"].includes(tier)) {
+        return `gpt:${tier}`;
+      }
+      if (/^\d+(?:\.\d+)?-(?:luna|sol|terra|astra)$/iu.test(tier)) {
+        return `gpt-${loweredTier}`;
+      }
+      return tier;
+    }
+    case "agy": {
+      const agyKey =
+        effort && Object.hasOwn(AGY_TIER_MAP, `${loweredTier}-${effort}`)
+          ? `${loweredTier}-${effort}`
+          : loweredTier;
+      return Object.hasOwn(AGY_TIER_MAP, agyKey) ? AGY_TIER_MAP[agyKey] : tier;
+    }
+    default: {
+      return tier;
+    }
+  }
+}
 
 const sourceRolesPath = new URL(
   "../skills/orchestrate/references/workforce-roles.json",
@@ -232,50 +301,7 @@ export function parseTeam(text) {
     if (parts.some((part) => !part)) throw new Error(`Invalid team member: ${raw}`);
     const effort = parts.length > 1 && EFFORTS.has(parts.at(-1)) ? parts.pop() : undefined;
     const tier = parts.join(":");
-    let model = tier;
-    const claudeTierMap = {
-      fast: "haiku",
-      balanced: "sonnet",
-      best: "opus",
-      frontier: "fable",
-      mythos: "claude-mythos-5-1",
-      "mythos-5-1": "claude-mythos-5-1",
-      "mythos-5.1": "claude-mythos-5-1",
-      "mythos-5": "claude-mythos-5",
-    };
-    if (engine === "claude") {
-      const loweredTier = tier.toLowerCase();
-      if (Object.hasOwn(claudeTierMap, loweredTier)) {
-        model = claudeTierMap[loweredTier];
-      } else if (/^(?:claude-)?(?:opus|sonnet|haiku|fable|mythos)-\d+(?:[.-]\d+)*$/iu.test(tier)) {
-        const prefixed = loweredTier.startsWith("claude-") ? loweredTier : `claude-${loweredTier}`;
-        model = prefixed.replaceAll(".", "-");
-      }
-    } else if (engine === "codex") {
-      if (["luna", "sol", "terra", "astra"].includes(tier)) {
-        model = `gpt:${tier}`;
-      } else if (/^\d+(?:\.\d+)?-(?:luna|sol|terra|astra)$/iu.test(tier)) {
-        model = `gpt-${tier.toLowerCase()}`;
-      }
-    } else if (
-      engine === "agy" &&
-      [
-        "fast",
-        "flash",
-        "flash-low",
-        "flash-medium",
-        "flash-high",
-        "pro",
-        "argon",
-        "argon-low",
-        "argon-medium",
-        "argon-high",
-      ].includes(tier)
-    ) {
-      if (tier === "flash" || tier === "flash-medium") model = "gemini:fast";
-      else if (tier === "argon-medium") model = "gemini:argon";
-      else model = `gemini:${tier}`;
-    }
+    const model = resolveTeamModel(engine, tier, effort);
     for (let i = 0; i < count; i++)
       members.push({
         engine,

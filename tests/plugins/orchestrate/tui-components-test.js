@@ -26,6 +26,12 @@ afterEach(() => vi.unstubAllEnvs());
 describe("terminal presentation components", () => {
   it("uses provider brands and distinct business/personal icons without losing account labels", () => {
     expect(providerMark("gemini:fast")).toBe("\u{E7F0}");
+    expect(providerMark("carbon")).toBe("\u{E7F0}");
+    expect(providerMark("gemini-4-carbon-high")).toBe("\u{E7F0}");
+    expect(providerMark("hydrogen")).toBe("\u{E7F0}");
+    expect(providerMark("gemini-4-hydrogen-xhigh")).toBe("\u{E7F0}");
+    expect(providerMark("orchestrator")).toBe("\u{E7F0}");
+    expect(providerMark("gemini-pro-orchestrator")).toBe("\u{E7F0}");
     expect(providerMark("claude:best")).toBe("\u{EC82}");
     expect(providerMark("gpt:sol")).toBe("\u{EC81}");
     expect(quotaAccountLabel({ id: "claude-work", provider: "claude", short: "CW" })).toBe(

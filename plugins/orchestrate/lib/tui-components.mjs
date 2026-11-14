@@ -31,7 +31,11 @@ export function providerMark(provider, tier = "nerd") {
   const name = String(provider || "").toLowerCase();
   if (/^(?:claude|anthropic|opus|sonnet|haiku|fable|mythos)(?:$|[-_.:/\s\d])/u.test(name))
     return "\u{EC82}";
-  if (/^(?:gemini|google|agy|antigravity|argon|flash)(?:$|[-_.:/\s\d])/u.test(name))
+  if (
+    /^(?:gemini|google|agy|antigravity|argon|carbon|hydrogen|orchestrator|flash)(?:$|[-_.:/\s\d])/u.test(
+      name,
+    )
+  )
     return "\u{E7F0}";
   if (/^(?:gpt|codex|openai|astra|sol|terra|luna)(?:$|[-_.:/\s\d])/u.test(name)) return "\u{EC81}";
   return "";

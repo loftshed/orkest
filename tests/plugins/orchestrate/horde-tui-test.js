@@ -95,6 +95,29 @@ describe("swarm rooms", () => {
     ]);
   });
 
+  it("parses AGY Carbon, Hydrogen, and Orchestrator team shorthands", () => {
+    expect(
+      parseTeam(
+        "agy:carbon,agy:carbon-low,agy:carbon-medium,agy:carbon-high,agy:hydrogen,agy:hydrogen-low,agy:hydrogen-medium,agy:hydrogen-high,agy:hydrogen-xhigh,agy:orchestrator,agy:orchestrator-carbon,agy:orchestrator-argon,agy:carbon:high,agy:hydrogen:xhigh",
+      ),
+    ).toEqual([
+      { engine: "agy", model: "gemini:carbon", label: "carbon" },
+      { engine: "agy", model: "gemini:carbon-low", label: "carbon-low" },
+      { engine: "agy", model: "gemini:carbon", label: "carbon-medium" },
+      { engine: "agy", model: "gemini:carbon-high", label: "carbon-high" },
+      { engine: "agy", model: "gemini:hydrogen", label: "hydrogen" },
+      { engine: "agy", model: "gemini:hydrogen-low", label: "hydrogen-low" },
+      { engine: "agy", model: "gemini:hydrogen", label: "hydrogen-medium" },
+      { engine: "agy", model: "gemini:hydrogen-high", label: "hydrogen-high" },
+      { engine: "agy", model: "gemini:hydrogen-xhigh", label: "hydrogen-xhigh" },
+      { engine: "agy", model: "gemini:orchestrator", label: "orchestrator" },
+      { engine: "agy", model: "gemini:orchestrator", label: "orchestrator-carbon" },
+      { engine: "agy", model: "gemini:orchestrator-argon", label: "orchestrator-argon" },
+      { engine: "agy", model: "gemini:carbon-high", effort: "high", label: "carbon" },
+      { engine: "agy", model: "gemini:hydrogen-xhigh", effort: "xhigh", label: "hydrogen" },
+    ]);
+  });
+
   it.each([
     "",
     "claude:haiku*0",

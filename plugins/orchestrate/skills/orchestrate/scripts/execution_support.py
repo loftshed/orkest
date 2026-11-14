@@ -114,10 +114,12 @@ def bind_effort(engine: str, model: str, requested: str | None, catalog: dict[st
     elif engine == "agy":
         # Exact catalog-validated slugs work on old and new AGY versions. Never
         # silently change the user's selected model to satisfy an effort request.
-        match = re.search(r"-(low|medium|high)$", model)
+        match = re.search(r"-(low|medium|high|xhigh)$", model)
         bound = match.group(1) if match else None
         if requested is not None and requested != bound:
-            raise ContractError("AGY effort must match an exact catalog model ending in -low, -medium, or -high")
+            raise ContractError(
+                "AGY effort must match an exact catalog model ending in -low, -medium, -high, or -xhigh"
+            )
         if bound:
             result.update(bound=bound, binding="catalog_model_slug")
     elif engine == "claude" and requested is not None:
@@ -203,6 +205,15 @@ SELECTOR_TIERS: dict[str, int] = {
     "gemini:argon": 2,
     "gemini:pro": 3,
     "gemini:argon-high": 3,
+    "gemini:hydrogen-low": 1,
+    "gemini:hydrogen": 1,
+    "gemini:hydrogen-high": 2,
+    "gemini:hydrogen-xhigh": 2,
+    "gemini:carbon-low": 2,
+    "gemini:carbon": 2,
+    "gemini:carbon-high": 3,
+    "gemini:orchestrator": 3,
+    "gemini:orchestrator-argon": 3,
     "deepseek:flash": 1,
     "deepseek:pro": 2,
     "deepseek": 1,
@@ -229,7 +240,9 @@ def model_capability_tier(model: str | None) -> int | None:
         "opus" in words
         or "sol" in words
         or "argon-high" in leaf
+        or "carbon-high" in leaf
         or "pro-high" in leaf
+        or "orchestrator" in words
         or ("gemini" in leaf and "pro" in words)
         or (leaf.startswith("gpt-") and not words.intersection({"luna", "terra", "astra", "oss"}))
     ):
@@ -240,6 +253,9 @@ def model_capability_tier(model: str | None) -> int | None:
         or "flash-low" in leaf
         or "flash-medium" in leaf
         or ("flash" in words and "high" not in words)
+        or "hydrogen-low" in leaf
+        or "hydrogen-medium" in leaf
+        or ("hydrogen" in words and not words.intersection({"high", "xhigh"}))
     ):
         return 1
     if (
@@ -249,6 +265,12 @@ def model_capability_tier(model: str | None) -> int | None:
         or "argon-low" in leaf
         or "argon-medium" in leaf
         or "argon" in words
+        or "hydrogen-high" in leaf
+        or "hydrogen-xhigh" in leaf
+        or ("hydrogen" in words and bool(words.intersection({"high", "xhigh"})))
+        or "carbon-low" in leaf
+        or "carbon-medium" in leaf
+        or "carbon" in words
         or "kimi" in words
         or ("deepseek" in leaf and "pro" in words)
         or ("glm" in leaf and "flash" not in words)

@@ -51,7 +51,11 @@ MODEL_CACHE_SCHEMA = "agent-executor.model-cache.v1"
 _NATIVE_FAMILIES = (
     ("claude", {"anthropic"}, {"claude", "opus", "sonnet", "haiku", "fable", "mythos"}),
     ("codex", {"openai"}, {"gpt", "chatgpt", "codex", "astra", "sol", "terra", "luna"}),
-    ("agy", {"google", "google-ai-studio", "google-vertex", "vertex"}, {"gemini", "argon"}),
+    (
+        "agy",
+        {"google", "google-ai-studio", "google-vertex", "vertex"},
+        {"gemini", "argon", "carbon", "hydrogen", "orchestrator"},
+    ),
 )
 _ENGINE_DEFAULT_FAMILY = {
     "codex": "gpt",
@@ -62,6 +66,9 @@ _BARE_TIER_ALIASES = {
     ("agy", "flash"): ("gemini", "fast"),
     ("agy", "flash-medium"): ("gemini", "fast"),
     ("agy", "argon-medium"): ("gemini", "argon"),
+    ("agy", "carbon-medium"): ("gemini", "carbon"),
+    ("agy", "hydrogen-medium"): ("gemini", "hydrogen"),
+    ("agy", "orchestrator-carbon"): ("gemini", "orchestrator"),
 }
 
 

@@ -22,10 +22,19 @@
         "fast": "flash-medium",
         "flash-low": "flash-low",
         "flash-high": "flash-high",
-        "pro": "pro-high|argon-high",
+        "pro": "carbon-high|argon-high|pro-high",
         "argon": "argon-medium",
         "argon-low": "argon-low",
-        "argon-high": "argon-high"
+        "argon-high": "argon-high",
+        "carbon": "carbon-medium",
+        "carbon-low": "carbon-low",
+        "carbon-high": "carbon-high",
+        "hydrogen": "hydrogen-medium",
+        "hydrogen-low": "hydrogen-low",
+        "hydrogen-high": "hydrogen-high",
+        "hydrogen-xhigh": "hydrogen-xhigh",
+        "orchestrator": "gemini-pro-orchestrator",
+        "orchestrator-argon": "gemini-pro-orchestrator-argon"
       },
       "tier_strengths": {
         "fast": ["speed", "cost efficiency", "routine agent tasks"],
@@ -38,7 +47,24 @@
         "pro": ["broad knowledge", "advanced reasoning", "large-context synthesis"],
         "argon": ["balanced reasoning", "coding", "agentic workflows"],
         "argon-low": ["fast reasoning", "low latency", "routine tasks"],
-        "argon-high": ["deep reasoning", "complex coding", "multi-step synthesis"]
+        "argon-high": ["deep reasoning", "complex coding", "multi-step synthesis"],
+        "carbon": ["balanced reasoning", "coding", "agentic workflows"],
+        "carbon-low": ["fast reasoning", "low latency", "routine tasks"],
+        "carbon-high": ["deep reasoning", "complex coding", "multi-step synthesis"],
+        "hydrogen": ["speed", "cost efficiency", "routine agent tasks"],
+        "hydrogen-low": ["low latency", "high-throughput tasks"],
+        "hydrogen-high": ["agentic coding", "multi-step workflows", "balanced reasoning"],
+        "hydrogen-xhigh": [
+          "extended reasoning",
+          "complex workflows",
+          "high-throughput engineering"
+        ],
+        "orchestrator": ["multi-agent orchestration", "adaptive routing", "complex synthesis"],
+        "orchestrator-argon": [
+          "multi-agent orchestration",
+          "deep reasoning routing",
+          "complex synthesis"
+        ]
       }
     },
     "claude": {
