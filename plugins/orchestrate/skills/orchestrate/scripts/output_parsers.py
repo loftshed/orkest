@@ -103,6 +103,41 @@ def parse_jsonl_events(text: str) -> list[dict[str, Any]]:
     return events
 
 
+def _agy_result_status(event: dict[str, Any]) -> str:
+    status = event.get("status")
+    return status.strip().lower() if isinstance(status, str) and status.strip() else "unknown"
+
+
+def _agy_is_error_result(event: dict[str, Any], norm_status: str | None = None) -> bool:
+    status = norm_status if norm_status is not None else _agy_result_status(event)
+    error = event.get("error")
+    return (
+        status in {"error", "failed"} or bool(event.get("is_error")) or (isinstance(error, str) and bool(error.strip()))
+    )
+
+
+def _agy_event_candidate(event: dict[str, Any]) -> str:
+    kind = event.get("type") or event.get("event")
+    if kind == "result":
+        if event.get("type") != "result" or _agy_is_error_result(event):
+            return ""
+        response = event.get("response")
+        return response if isinstance(response, str) else ""
+    if kind in {"assistant", "message"}:
+        role = event.get("role")
+        if role is None and isinstance(event.get("message"), dict):
+            role = event["message"].get("role")
+        if isinstance(role, str) and role.strip().lower() != "assistant":
+            return ""
+        for key in ("content", "text", "message", "assistant"):
+            if key == "assistant" and kind != "assistant":
+                continue
+            candidate = claude_result_text(event.get(key))
+            if candidate:
+                return candidate
+    return ""
+
+
 def parse_agy_output(text: str) -> tuple[str, str | None, str | None]:
     events = _bundled_module("usage").agy_events(text)
     results = [event for event in events if event.get("type") == "result"]
@@ -122,12 +157,20 @@ def parse_agy_output(text: str) -> tuple[str, str | None, str | None]:
         return text, None, None
     final = results[-1]
     response = final.get("response")
-    status = final.get("status")
-    return (
-        response if isinstance(response, str) else "",
-        final.get("conversation_id"),
-        status.strip().lower() if isinstance(status, str) and status.strip() else "unknown",
-    )
+    response_text = response if isinstance(response, str) else ""
+    norm_status = _agy_result_status(final)
+    is_error = _agy_is_error_result(final, norm_status)
+    if not is_error:
+        extract_raw_final_report = _bundled_module("report_contract").extract_raw_final_report
+        if not extract_raw_final_report(response_text)[1]:
+            # Follow-up agy turns (such as a post-report summary) can replace the final result's text.
+            # Scan earlier non-error results and assistant/message events in reverse to preserve a valid report.
+            for event in reversed(events):
+                candidate = _agy_event_candidate(event)
+                if candidate and extract_raw_final_report(candidate)[1]:
+                    response_text = candidate
+                    break
+    return response_text, final.get("conversation_id"), norm_status
 
 
 def agy_terminal_error(text: str) -> str | None:
