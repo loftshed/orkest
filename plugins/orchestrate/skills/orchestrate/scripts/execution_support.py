@@ -34,6 +34,19 @@ def _load_repo_paths() -> Any:
 _REPO_PATHS = _load_repo_paths()
 
 
+def _load_families_mod() -> Any:
+    """Load shared family rules by file alongside repo_paths."""
+    spec = importlib.util.spec_from_file_location("agent_executor_families", Path(__file__).with_name("families.py"))
+    if spec is None or spec.loader is None:
+        raise ImportError("could not load family rules")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_FAMILIES = _load_families_mod()
+
+
 class ContractError(ValueError):
     pass
 
@@ -98,6 +111,21 @@ def workspace_lease(repository: Path, cache: Path, *, read_only: bool = False) -
             os.close(descriptor)
 
 
+def _catalog_record(catalog: dict[str, Any], model: str) -> dict[str, Any]:
+    if not isinstance(catalog, dict):
+        return {}
+    return next((item for item in catalog.get("models", []) if isinstance(item, dict) and item.get("id") == model), {})
+
+
+def _record_supported_efforts(record: dict[str, Any]) -> list[str]:
+    if not record:
+        return []
+    raw = record.get("supported_efforts")
+    if not isinstance(raw, list):
+        raw = record.get("reasoning_efforts", [])
+    return [str(item).strip().lower() for item in raw if isinstance(item, str) and item.strip()]
+
+
 def bind_effort(engine: str, model: str, requested: str | None, catalog: dict[str, Any]) -> dict[str, Any]:
     result: dict[str, Any] = {
         "requested": requested,
@@ -105,28 +133,42 @@ def bind_effort(engine: str, model: str, requested: str | None, catalog: dict[st
         "binding": "cli_default_or_config",
         "observed": None,
     }
+    record = _catalog_record(catalog, model)
     if engine == "codex" and requested is not None:
-        record = next((item for item in catalog.get("models", []) if item.get("id") == model), {})
-        supported = record.get("reasoning_efforts", [])
+        supported = _record_supported_efforts(record)
         if requested not in supported:
             raise ContractError(f"effort {requested!r} is not advertised for {model}; supported: {supported}")
         result.update(bound=requested, binding="model_reasoning_effort")
     elif engine == "agy":
         # Exact catalog-validated slugs work on old and new AGY versions. Never
         # silently change the user's selected model to satisfy an effort request.
-        match = re.search(r"-(low|medium|high|xhigh)$", model)
-        bound = match.group(1) if match else None
+        suffixes = _FAMILIES.effort_suffixes()
+        if record:
+            if record.get("composite") or (record.get("effort_slug") is None and not _record_supported_efforts(record)):
+                bound = None
+            else:
+                bound = record.get("effort_slug")
+        else:
+            head, sep, tail = model.rpartition("-")
+            bound = tail.lower() if (sep and head and tail.lower() in suffixes) else None
         if requested is not None and requested != bound:
-            raise ContractError(
-                "AGY effort must match an exact catalog model ending in -low, -medium, -high, or -xhigh"
-            )
+            suffix_text = ", ".join(f"-{s}" for s in suffixes)
+            raise ContractError(f"AGY effort must match an exact catalog model ending in one of: {suffix_text}")
         if bound:
             result.update(bound=bound, binding="catalog_model_slug")
     elif engine == "claude" and requested is not None:
-        if requested not in ("low", "medium", "high", "xhigh", "max"):
-            raise ContractError("Claude effort must be one of low, medium, high, xhigh, max")
+        supported = _record_supported_efforts(record) or list(_FAMILIES.claude_default_efforts())
+        if requested not in supported:
+            raise ContractError(f"Claude effort must be one of {', '.join(supported)}")
         result.update(bound=requested, binding="claude --effort")
     elif engine == "opencode" and requested is not None:
+        supported = _record_supported_efforts(record)
+        variants = record.get("variants") if isinstance(record.get("variants"), list) else []
+        allowed = list(dict.fromkeys([*supported, *[str(v).lower() for v in variants if isinstance(v, str)]]))
+        if allowed and requested.lower() not in allowed:
+            raise ContractError(
+                f"effort/variant {requested!r} is not supported for {model}; supported: {', '.join(allowed)}"
+            )
         result.update(bound=requested, binding="opencode_variant")
     elif requested is not None:
         raise ContractError("--effort is supported for Codex, AGY and Claude; use --variant for OpenCode")
@@ -188,95 +230,12 @@ RESUMABLE_STATUSES = {
 }
 
 
-SELECTOR_TIERS: dict[str, int] = {
-    "claude:fast": 1,
-    "claude:balanced": 2,
-    "claude:best": 3,
-    "claude:frontier": 4,
-    "claude:mythos": 4,
-    "gpt:luna": 1,
-    "gpt:terra": 2,
-    "gpt:sol": 3,
-    "gpt:astra": 4,
-    "gemini:flash-low": 1,
-    "gemini:fast": 1,
-    "gemini:flash-high": 2,
-    "gemini:argon-low": 2,
-    "gemini:argon": 2,
-    "gemini:pro": 3,
-    "gemini:argon-high": 3,
-    "gemini:hydrogen-low": 1,
-    "gemini:hydrogen": 1,
-    "gemini:hydrogen-high": 2,
-    "gemini:hydrogen-xhigh": 2,
-    "gemini:carbon-low": 2,
-    "gemini:carbon": 2,
-    "gemini:carbon-high": 3,
-    "gemini:orchestrator": 3,
-    "gemini:orchestrator-argon": 3,
-    "deepseek:flash": 1,
-    "deepseek:pro": 2,
-    "deepseek": 1,
-    "glm:flash": 1,
-    "glm:full": 2,
-    "glm": 1,
-    "kimi": 2,
-    "kimi:default": 2,
-}
+SELECTOR_TIERS: dict[str, int] = _FAMILIES.selector_capability_tiers()
 
 
 def model_capability_tier(model: str | None) -> int | None:
     """Return a coarse capability tier (1=fast/lightweight .. 4=apex frontier), or None when unknown."""
-    if not isinstance(model, str) or not model.strip():
-        return None
-    normalized = model.strip().lower().removeprefix("latest:")
-    if normalized in SELECTOR_TIERS:
-        return SELECTOR_TIERS[normalized]
-    leaf = normalized.rsplit("/", 1)[-1].split("[", 1)[0]
-    words = {word for word in re.split(r"[^a-z0-9.]+", leaf) if word}
-    if "astra" in words or "fable" in words or "mythos" in words:
-        return 4
-    if (
-        "opus" in words
-        or "sol" in words
-        or "argon-high" in leaf
-        or "carbon-high" in leaf
-        or "pro-high" in leaf
-        or "orchestrator" in words
-        or ("gemini" in leaf and "pro" in words)
-        or (leaf.startswith("gpt-") and not words.intersection({"luna", "terra", "astra", "oss"}))
-    ):
-        return 3
-    if (
-        "haiku" in words
-        or "luna" in words
-        or "flash-low" in leaf
-        or "flash-medium" in leaf
-        or ("flash" in words and "high" not in words)
-        or "hydrogen-low" in leaf
-        or "hydrogen-medium" in leaf
-        or ("hydrogen" in words and not words.intersection({"high", "xhigh"}))
-    ):
-        return 1
-    if (
-        "sonnet" in words
-        or "terra" in words
-        or "flash-high" in leaf
-        or "argon-low" in leaf
-        or "argon-medium" in leaf
-        or "argon" in words
-        or "hydrogen-high" in leaf
-        or "hydrogen-xhigh" in leaf
-        or ("hydrogen" in words and bool(words.intersection({"high", "xhigh"})))
-        or "carbon-low" in leaf
-        or "carbon-medium" in leaf
-        or "carbon" in words
-        or "kimi" in words
-        or ("deepseek" in leaf and "pro" in words)
-        or ("glm" in leaf and "flash" not in words)
-    ):
-        return 2
-    return None
+    return _FAMILIES.capability_tier(model)
 
 
 def is_upward_delegation(conductor_model: str | None, worker_model: str | None) -> bool:

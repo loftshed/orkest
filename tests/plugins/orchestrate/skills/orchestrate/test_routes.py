@@ -191,6 +191,71 @@ class ModelRoutingTests(unittest.TestCase):
                     RUNNER.executor_preflight("opencode", model)
                 self.assertEqual(preflight_exc.exception.exit_code, 17)
 
+    def test_bind_effort_uses_normalized_catalog_and_composite_metadata_across_engines(self) -> None:
+        support = load("execution_support")
+        codex_cat = {
+            "models": [{"id": "gpt-6.1-sol", "supported_efforts": ["low", "high"]}],
+        }
+        self.assertEqual(
+            support.bind_effort("codex", "gpt-6.1-sol", "high", codex_cat),
+            {"requested": "high", "bound": "high", "binding": "model_reasoning_effort", "observed": None},
+        )
+        with self.assertRaises(support.ContractError):
+            support.bind_effort("codex", "gpt-6.1-sol", "xhigh", codex_cat)
+
+        agy_cat = {
+            "models": [
+                {
+                    "id": "gemini-4-carbon-high",
+                    "effort_slug": "high",
+                    "supported_efforts": ["low", "high"],
+                    "composite": False,
+                },
+                {
+                    "id": "gemini-pro-orchestrator",
+                    "effort_slug": None,
+                    "supported_efforts": [],
+                    "composite": True,
+                },
+            ]
+        }
+        self.assertEqual(
+            support.bind_effort("agy", "gemini-4-carbon-high", "high", agy_cat),
+            {"requested": "high", "bound": "high", "binding": "catalog_model_slug", "observed": None},
+        )
+        with self.assertRaises(support.ContractError):
+            support.bind_effort("agy", "gemini-4-carbon-high", "low", agy_cat)
+        self.assertEqual(
+            support.bind_effort("agy", "gemini-pro-orchestrator", None, agy_cat),
+            {"requested": None, "bound": None, "binding": "cli_default_or_config", "observed": None},
+        )
+        with self.assertRaises(support.ContractError):
+            support.bind_effort("agy", "gemini-pro-orchestrator", "high", agy_cat)
+
+        claude_cat = {"models": [{"id": "opus", "supported_efforts": ["low", "medium", "high", "max"]}]}
+        self.assertEqual(
+            support.bind_effort("claude", "opus", "max", claude_cat),
+            {"requested": "max", "bound": "max", "binding": "claude --effort", "observed": None},
+        )
+        with self.assertRaises(support.ContractError):
+            support.bind_effort("claude", "opus", "xhigh", claude_cat)
+
+        opencode_cat = {
+            "models": [
+                {
+                    "id": "openrouter/deepseek/deepseek-v4-flash",
+                    "supported_efforts": ["low", "high"],
+                    "variants": ["turbo"],
+                }
+            ]
+        }
+        self.assertEqual(
+            support.bind_effort("opencode", "openrouter/deepseek/deepseek-v4-flash", "turbo", opencode_cat),
+            {"requested": "turbo", "bound": "turbo", "binding": "opencode_variant", "observed": None},
+        )
+        with self.assertRaises(support.ContractError):
+            support.bind_effort("opencode", "openrouter/deepseek/deepseek-v4-flash", "extreme", opencode_cat)
+
 
 if __name__ == "__main__":
     unittest.main()

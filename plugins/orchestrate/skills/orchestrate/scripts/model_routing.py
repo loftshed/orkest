@@ -32,52 +32,53 @@ PREFERRED_MODELS = {
     "opencode": "glm:flash",
     "claude": "opus",
 }
-CLAUDE_MODEL_ALIASES = ("opus", "sonnet", "haiku", "fable", "claude-mythos-5-1")
-CLAUDE_MODEL_SHORTHANDS = {
-    "mythos": "claude-mythos-5-1",
-    "mythos-5-1": "claude-mythos-5-1",
-    "mythos-5": "claude-mythos-5",
-}
-_CLAUDE_VERSIONED_SHORTHAND = re.compile(
-    r"^(?:claude-)?(opus|sonnet|haiku|fable|mythos)-(\d+(?:[.-]\d+)*)(\[1m\])?$",
-    re.IGNORECASE,
-)
 CLAUDE_MODEL_ID = re.compile(r"^claude-[a-z0-9][a-z0-9.\-]*(\[1m\])?$")
 EXIT_ROUTE_NOT_ALLOWED = 17
 DEFAULT_CATALOG_MAX_AGE_SECONDS = 24 * 60 * 60
 MODEL_CATALOG_SCHEMA = "agent-executor.models.v1"
 MODEL_CACHE_SCHEMA = "agent-executor.model-cache.v1"
-
-_NATIVE_FAMILIES = (
-    ("claude", {"anthropic"}, {"claude", "opus", "sonnet", "haiku", "fable", "mythos"}),
-    ("codex", {"openai"}, {"gpt", "chatgpt", "codex", "astra", "sol", "terra", "luna"}),
-    (
-        "agy",
-        {"google", "google-ai-studio", "google-vertex", "vertex"},
-        {"gemini", "argon", "carbon", "hydrogen", "orchestrator"},
-    ),
+_REQUIRED_CAPABILITY_KEYS = (
+    "vendor",
+    "family_stem",
+    "supported_efforts",
+    "effort_slug",
+    "composite",
+    "observed_resolved_ids",
 )
-_ENGINE_DEFAULT_FAMILY = {
-    "codex": "gpt",
-    "agy": "gemini",
-    "claude": "claude",
-}
-_BARE_TIER_ALIASES = {
-    ("agy", "flash"): ("gemini", "fast"),
-    ("agy", "flash-medium"): ("gemini", "fast"),
-    ("agy", "argon-medium"): ("gemini", "argon"),
-    ("agy", "carbon-medium"): ("gemini", "carbon"),
-    ("agy", "hydrogen-medium"): ("gemini", "hydrogen"),
-    ("agy", "orchestrator-carbon"): ("gemini", "orchestrator"),
-}
+
+
+def _claude_model_aliases(families: dict[str, dict[str, Any]] | None = None) -> tuple[str, ...]:
+    return _attr("families_module")().claude_aliases(families)
+
+
+def _claude_model_shorthands(families: dict[str, dict[str, Any]] | None = None) -> dict[str, str]:
+    return _attr("families_module")().claude_shorthands(families)
+
+
+def _claude_versioned_pattern(families: dict[str, dict[str, Any]] | None = None) -> re.Pattern[str] | None:
+    stems = _attr("families_module")().claude_versioned_stems(families)
+    if not stems:
+        return None
+    joined = "|".join(re.escape(stem) for stem in stems)
+    return re.compile(rf"^(?:claude-)?({joined})-(\d+(?:[.-]\d+)*)(\[1m\])?$", re.IGNORECASE)
+
+
+def __getattr__(name: str) -> Any:
+    if name == "CLAUDE_MODEL_ALIASES":
+        return _claude_model_aliases()
+    if name == "_NATIVE_FAMILIES":
+        return _attr("families_module")().native_family_specs()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def normalize_claude_model_id(model: str) -> str:
     stripped = model.strip()
     lowered = stripped.lower()
-    if lowered in CLAUDE_MODEL_SHORTHANDS:
-        return CLAUDE_MODEL_SHORTHANDS[lowered]
-    match = _CLAUDE_VERSIONED_SHORTHAND.match(stripped)
+    shorthands = _claude_model_shorthands()
+    if lowered in shorthands:
+        return shorthands[lowered]
+    pattern = _claude_versioned_pattern()
+    match = pattern.match(stripped) if pattern is not None else None
     if match:
         family, version, suffix = match.groups()
         normalized_ver = version.replace(".", "-")
@@ -90,11 +91,13 @@ def parse_bare_tier_selector(
     selector: str,
     families: dict[str, dict[str, Any]],
 ) -> tuple[str, str] | None:
+    mod = _attr("families_module")()
     lowered = selector.strip().lower()
-    alias = _BARE_TIER_ALIASES.get((engine, lowered))
+    aliases = mod.bare_tier_aliases(families)
+    alias = aliases.get((engine, lowered))
     if alias and alias[0] in families and alias[1] in families[alias[0]].get("tiers", {}):
         return alias
-    default_family = _ENGINE_DEFAULT_FAMILY.get(engine)
+    default_family = mod.engine_default_families(families).get(engine)
     if default_family and default_family in families and lowered in families[default_family].get("tiers", {}):
         return default_family, lowered
     return None
@@ -215,6 +218,62 @@ def normalized_option_values(values: Any, *, keys: tuple[str, ...]) -> list[str]
     return normalized
 
 
+def _split_effort_suffix(model_id: str, suffixes: tuple[str, ...]) -> tuple[str, str | None]:
+    head, sep, tail = model_id.rpartition("-")
+    if sep and head and tail.lower() in suffixes:
+        return head, tail.lower()
+    return model_id, None
+
+
+def _infer_vendor(model_id: str, families: dict[str, dict[str, Any]] | None = None) -> str | None:
+    lowered = model_id.strip().lower()
+    if not lowered:
+        return None
+    if "/" in lowered:
+        segments = [seg.lstrip("~") for seg in lowered.split("/") if seg]
+        if len(segments) >= 3 and segments[0] == "openrouter":
+            return segments[1]
+        if segments and segments[0] != "opencode":
+            return segments[0]
+        leaf = segments[-1] if segments else lowered
+    else:
+        leaf = lowered
+    mod = _attr("families_module")()
+    loaded = families if families is not None else mod.load_families()
+    tokens = [tok for tok in re.split(r"[-_.:~]", leaf) if tok]
+    if len(tokens) >= 2 and tokens[0] == "gpt" and tokens[1] == "oss":
+        return "openai"
+    if "gemma" in tokens:
+        return "google"
+    for family in loaded.values():
+        if not isinstance(family, dict):
+            continue
+        vendor = family.get("vendor")
+        if not isinstance(vendor, str) or not vendor.strip():
+            continue
+        prefix = family.get("prefix")
+        if isinstance(prefix, str) and prefix and leaf.startswith(prefix.lower()):
+            return vendor.strip().lower()
+        keywords = {str(k).lower() for k in (family.get("native_keywords") or []) if isinstance(k, str)}
+        if keywords.intersection(tokens):
+            return vendor.strip().lower()
+    if "/" in lowered and lowered.startswith("opencode/"):
+        return "opencode"
+    return None
+
+
+def _codex_stem_and_tier(model_id: str, families: dict[str, dict[str, Any]] | None = None) -> tuple[str, str | None]:
+    mod = _attr("families_module")()
+    loaded = families if families is not None else mod.load_families()
+    suffixes = mod.effort_suffixes()
+    stem, _ = _split_effort_suffix(model_id, suffixes)
+    gpt_tiers = {str(k).lower() for k in (loaded.get("gpt", {}).get("tiers") or {})}
+    head, sep, tail = stem.rpartition("-")
+    if sep and head and tail.lower() in gpt_tiers:
+        return head, tail.lower()
+    return stem, None
+
+
 def normalized_codex_model(item: dict[str, Any]) -> dict[str, Any] | None:
     model_id = item.get("id")
     if not isinstance(model_id, str) or not model_id.strip():
@@ -227,6 +286,8 @@ def normalized_codex_model(item: dict[str, Any]) -> dict[str, Any] | None:
         item.get("supportedServiceTiers"),
         keys=("serviceTier", "tier", "value", "id"),
     )
+    families = _attr("families_module")().load_families()
+    family_stem, tier = _codex_stem_and_tier(model_id, families)
     return {
         "id": model_id,
         "display_name": item.get("displayName") or model_id,
@@ -236,6 +297,13 @@ def normalized_codex_model(item: dict[str, Any]) -> dict[str, Any] | None:
         "reasoning_efforts": reasoning_efforts,
         "default_reasoning_effort": item.get("defaultReasoningEffort"),
         "service_tiers": service_tiers,
+        "vendor": _infer_vendor(model_id, families),
+        "family_stem": family_stem,
+        "tier": tier,
+        "supported_efforts": list(reasoning_efforts),
+        "effort_slug": None,
+        "composite": False,
+        "observed_resolved_ids": [],
     }
 
 
@@ -374,24 +442,394 @@ def codex_model_records(executable: str, environment: dict[str, str]) -> list[di
     return records
 
 
-def simple_model_records(lines: str) -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
+def _parse_tabular_catalog_rows(lines: str) -> list[tuple[str, str]]:
+    rows: list[tuple[str, str]] = []
     seen: set[str] = set()
-    for line in lines.splitlines():
-        model_id, _, display_name = line.strip().partition("\t")
+    for raw_line in lines.splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        if "\t" in stripped:
+            model_id, _, display_name = stripped.partition("\t")
+        else:
+            parts = re.split(r"\s{2,}", stripped, maxsplit=1)
+            model_id = parts[0]
+            display_name = parts[1] if len(parts) > 1 else ""
         if not model_id or re.search(r"\s", model_id) or model_id in seen:
             continue
         seen.add(model_id)
+        rows.append((model_id, display_name.strip() or model_id))
+    return rows
+
+
+def simple_model_records(lines: str) -> list[dict[str, Any]]:
+    families = _attr("families_module")().load_families()
+    return [
+        {
+            "id": model_id,
+            "display_name": display_name,
+            "description": "",
+            "default": False,
+            "hidden": False,
+            "reasoning_efforts": [],
+            "default_reasoning_effort": None,
+            "service_tiers": [],
+            "vendor": _infer_vendor(model_id, families),
+            "family_stem": model_id,
+            "supported_efforts": [],
+            "effort_slug": None,
+            "composite": False,
+            "observed_resolved_ids": [],
+        }
+        for model_id, display_name in _parse_tabular_catalog_rows(lines)
+    ]
+
+
+def agy_model_records(lines: str) -> list[dict[str, Any]]:
+    mod = _attr("families_module")()
+    families = mod.load_families()
+    suffixes = mod.effort_suffixes()
+    suffix_rank = {suffix: idx for idx, suffix in enumerate(suffixes)}
+    rows = _parse_tabular_catalog_rows(lines)
+    parsed_rows: list[tuple[str, str, str, str | None]] = []
+    stem_efforts: dict[str, set[str]] = {}
+    for model_id, display_name in rows:
+        stem, effort_slug = _split_effort_suffix(model_id, suffixes)
+        parsed_rows.append((model_id, display_name, stem, effort_slug))
+        if effort_slug is not None:
+            stem_efforts.setdefault(stem.lower(), set()).add(effort_slug)
+
+    records: list[dict[str, Any]] = []
+    for model_id, display_name, stem, effort_slug in parsed_rows:
+        grouped = stem_efforts.get(stem.lower(), set())
+        ordered_efforts = sorted(grouped, key=lambda item: (suffix_rank.get(item, 999), item))
+        is_composite = effort_slug is None and not ordered_efforts
         records.append(
             {
                 "id": model_id,
-                "display_name": display_name.strip() or model_id,
+                "display_name": display_name,
                 "description": "",
                 "default": False,
                 "hidden": False,
-                "reasoning_efforts": [],
+                "reasoning_efforts": list(ordered_efforts),
                 "default_reasoning_effort": None,
                 "service_tiers": [],
+                "vendor": _infer_vendor(model_id, families),
+                "family_stem": stem,
+                "supported_efforts": list(ordered_efforts),
+                "effort_slug": effort_slug,
+                "composite": is_composite,
+                "observed_resolved_ids": [],
+            }
+        )
+    return records
+
+
+def _read_opencode_models_cache() -> dict[str, Any]:
+    cache_home = Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache"))
+    cache_path = cache_home / "opencode" / "models.json"
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _strip_snapshot_stem(slug: str) -> str:
+    cleaned = re.sub(r"-(?:20\d{6}|\d{4})$", "", slug.strip())
+    return cleaned or slug.strip()
+
+
+def _opencode_efforts_and_variants(meta: dict[str, Any] | None) -> tuple[list[str], list[str]]:
+    if not isinstance(meta, dict):
+        return [], []
+    efforts: list[str] = []
+    options = meta.get("reasoning_options")
+    if isinstance(options, list):
+        for option in options:
+            if not isinstance(option, dict) or option.get("type") != "effort":
+                continue
+            for val in option.get("values") or []:
+                if isinstance(val, str) and val.strip():
+                    lowered = val.strip().lower()
+                    if lowered not in efforts:
+                        efforts.append(lowered)
+    raw_variants = meta.get("variants")
+    variants: list[str] = []
+    if isinstance(raw_variants, dict):
+        for key in raw_variants:
+            if isinstance(key, str) and key.strip():
+                lowered = key.strip().lower()
+                variants.append(lowered)
+                if lowered not in efforts:
+                    efforts.append(lowered)
+    return efforts, variants
+
+
+def opencode_model_records(lines: str) -> list[dict[str, Any]]:
+    families = _attr("families_module")().load_families()
+    local_cache = _read_opencode_models_cache()
+    records: list[dict[str, Any]] = []
+    for model_id, display_name in _parse_tabular_catalog_rows(lines):
+        segments = [seg for seg in model_id.split("/") if seg]
+        if len(segments) >= 3:
+            routing_provider = segments[0].lstrip("~").lower()
+            cache_key = "/".join(segments[1:])
+            model_slug = segments[-1]
+        elif len(segments) == 2:
+            routing_provider = segments[0].lstrip("~").lower()
+            cache_key = segments[1]
+            model_slug = segments[1]
+        else:
+            routing_provider = ""
+            cache_key = model_id
+            model_slug = model_id
+
+        provider_models = (local_cache.get(routing_provider) or {}).get("models")
+        meta = provider_models.get(cache_key) if isinstance(provider_models, dict) else None
+        if meta is None and isinstance(provider_models, dict) and "~" in cache_key:
+            meta = provider_models.get(cache_key.replace("~", "", 1))
+        supported_efforts, variants = _opencode_efforts_and_variants(meta)
+        family_stem = (
+            str(meta.get("family")).strip()
+            if isinstance(meta, dict) and isinstance(meta.get("family"), str) and meta.get("family").strip()
+            else _strip_snapshot_stem(model_slug)
+        )
+        resolved_display = (
+            str(meta.get("name")).strip()
+            if isinstance(meta, dict)
+            and isinstance(meta.get("name"), str)
+            and meta.get("name").strip()
+            and display_name == model_id
+            else display_name
+        )
+        description = str(meta.get("description") or "").strip() if isinstance(meta, dict) else ""
+        record: dict[str, Any] = {
+            "id": model_id,
+            "display_name": resolved_display,
+            "description": description,
+            "default": False,
+            "hidden": False,
+            "reasoning_efforts": list(supported_efforts),
+            "default_reasoning_effort": None,
+            "service_tiers": [],
+            "provider": routing_provider or None,
+            "vendor": _infer_vendor(model_id, families),
+            "family_stem": family_stem,
+            "supported_efforts": supported_efforts,
+            "effort_slug": None,
+            "composite": False,
+            "observed_resolved_ids": [],
+        }
+        if variants:
+            record["variants"] = variants
+        records.append(record)
+    return records
+
+
+def parse_claude_help_efforts(help_text: str) -> list[str]:
+    lines = help_text.splitlines()
+    for index, line in enumerate(lines):
+        if not re.search(r"(?:^|\s)--effort(?:\s|=|<|$)", line):
+            continue
+        window = " ".join(lines[index : index + 3])
+        after_flag = re.split(r"--effort\b", window, maxsplit=1)[-1]
+        match = re.search(r"\(([^)]+)\)", after_flag)
+        if not match:
+            continue
+        raw = re.sub(
+            r"^(?:choices?|values?|levels?|default\s*:?)\s*:?\s*", "", match.group(1).strip(), flags=re.IGNORECASE
+        )
+        parts = [part.strip().lower() for part in re.split(r"[,/|]+|\bor\b", raw) if part.strip()]
+        efforts = [
+            part
+            for part in parts
+            if re.fullmatch(r"[a-z][a-z0-9-]{0,15}", part)
+            and part not in {"choices", "values", "levels", "default", "current", "session"}
+        ]
+        if efforts:
+            return list(dict.fromkeys(efforts))
+    return []
+
+
+def _agent_cache_dir() -> Path:
+    fn = _attr("default_agent_cache_dir")
+    if callable(fn):
+        return Path(fn())
+    return Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache")) / "orchestrate"
+
+
+def _claude_help_cache_path() -> Path:
+    return _agent_cache_dir() / "claude-help-v1.json"
+
+
+def _cached_claude_help_efforts(
+    executable: str,
+    version: str | None,
+    environment: dict[str, str],
+    *,
+    refresh: bool = False,
+    families: dict[str, dict[str, Any]] | None = None,
+) -> list[str]:
+    mod = _attr("families_module")()
+    fallback = list(mod.claude_default_efforts(families))
+    resolved_path, mtime_ns, size = _attr("_stat_executable")(executable)
+    cache_path = _claude_help_cache_path()
+    cache_payload: dict[str, Any] = {}
+    try:
+        loaded = json.loads(cache_path.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            cache_payload = loaded
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        cache_payload = {}
+
+    if not refresh:
+        entry = cache_payload.get(executable)
+        if (
+            isinstance(entry, dict)
+            and isinstance(entry.get("efforts"), list)
+            and entry["efforts"]
+            and (not entry.get("path") or not resolved_path or entry["path"] == resolved_path)
+            and (entry.get("mtime_ns") is None or mtime_ns is None or entry["mtime_ns"] == mtime_ns)
+            and (entry.get("size") is None or size is None or entry["size"] == size)
+            and (not version or not entry.get("version") or entry["version"] == version)
+        ):
+            return [str(v).strip().lower() for v in entry["efforts"] if isinstance(v, str) and v.strip()]
+
+    runner_error_cls = _attr("RunnerError", ValueError)
+    parsed: list[str] = []
+    try:
+        output = _attr("run_checked")([executable, "--help"], timeout=5, environment=environment).stdout.decode(
+            "utf-8", errors="replace"
+        )
+        parsed = parse_claude_help_efforts(output)
+    except (OSError, runner_error_cls, subprocess.SubprocessError):
+        parsed = []
+
+    if parsed:
+        cache_payload[executable] = {
+            "version": version,
+            "path": resolved_path,
+            "mtime_ns": mtime_ns,
+            "size": size,
+            "efforts": parsed,
+            "fetched_at": _attr("utc_now")(),
+        }
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            cache_path.parent.chmod(0o700)
+            temporary_path = cache_path.parent / f".{cache_path.name}.{uuid.uuid4().hex}.tmp"
+            try:
+                _attr("write_private_text")(
+                    temporary_path, json.dumps(cache_payload, indent=2, ensure_ascii=True) + "\n"
+                )
+                os.replace(temporary_path, cache_path)
+                cache_path.chmod(0o600)
+            finally:
+                with contextlib.suppress(FileNotFoundError):
+                    temporary_path.unlink()
+        except OSError:
+            pass
+        return parsed
+    return fallback
+
+
+def _observed_claude_resolved_ids(aliases: tuple[str, ...]) -> dict[str, list[str]]:
+    observed_all: set[str] = set()
+    claude_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude"))
+    stats_path = claude_dir / "stats-cache.json"
+    try:
+        stats = json.loads(stats_path.read_text(encoding="utf-8"))
+        if isinstance(stats, dict):
+            model_usage = stats.get("modelUsage")
+            if isinstance(model_usage, dict):
+                for model_id in model_usage:
+                    if isinstance(model_id, str) and CLAUDE_MODEL_ID.match(model_id.strip()):
+                        observed_all.add(model_id.strip())
+            daily = stats.get("dailyModelTokens")
+            if isinstance(daily, list):
+                for day in daily:
+                    tokens_by_model = day.get("tokensByModel") if isinstance(day, dict) else None
+                    if isinstance(tokens_by_model, dict):
+                        for model_id in tokens_by_model:
+                            if isinstance(model_id, str) and CLAUDE_MODEL_ID.match(model_id.strip()):
+                                observed_all.add(model_id.strip())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+
+    peers_dir = _agent_cache_dir() / "mailbox-v1" / "peers"
+    if peers_dir.is_dir():
+        for peer_file in peers_dir.glob("*.json"):
+            try:
+                peer = json.loads(peer_file.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                continue
+            if not isinstance(peer, dict):
+                continue
+            for key in ("sessionModel", "stepModel", "model", "executionModel"):
+                val = peer.get(key)
+                if isinstance(val, str) and CLAUDE_MODEL_ID.match(val.strip()):
+                    observed_all.add(val.strip())
+
+    by_alias: dict[str, list[str]] = {alias: [] for alias in aliases}
+    for alias in aliases:
+        stripped = alias.lower().removeprefix("claude-")
+        stem_tokens = [tok for tok in stripped.split("-") if tok and not tok.isdigit()]
+        stem_key = stem_tokens[0] if stem_tokens else stripped
+        matches: list[str] = []
+        for obs_id in sorted(observed_all):
+            obs_tokens = re.split(r"[-_.:~\[\]]+", obs_id.lower())
+            if stem_key in obs_tokens:
+                matches.append(obs_id)
+        by_alias[alias] = matches
+    return by_alias
+
+
+def claude_model_records(
+    executable: str | None = None,
+    version: str | None = None,
+    environment: dict[str, str] | None = None,
+    *,
+    refresh: bool = False,
+) -> list[dict[str, Any]]:
+    mod = _attr("families_module")()
+    families = _attr("load_model_families")()
+    aliases = mod.claude_aliases(families)
+    claude_cfg = families.get("claude", {}) if isinstance(families, dict) else {}
+    default_tier = claude_cfg.get("default_tier")
+    default_target = (claude_cfg.get("tiers") or {}).get(default_tier) if isinstance(default_tier, str) else None
+    if executable:
+        supported_efforts = _cached_claude_help_efforts(
+            executable,
+            version,
+            environment or {},
+            refresh=refresh,
+            families=families,
+        )
+    else:
+        supported_efforts = list(mod.claude_default_efforts(families))
+    observed_map = _observed_claude_resolved_ids(aliases)
+    records: list[dict[str, Any]] = []
+    for alias in aliases:
+        stem = alias if alias.startswith("claude-") else f"claude-{alias}"
+        label = f"Claude {alias.title()} (current)"
+        records.append(
+            {
+                "id": alias,
+                "name": label,
+                "display_name": label,
+                "description": "",
+                "default": bool(default_target and alias == default_target),
+                "hidden": False,
+                "reasoning_efforts": list(supported_efforts),
+                "default_reasoning_effort": None,
+                "service_tiers": [],
+                "vendor": claude_cfg.get("vendor") or "anthropic",
+                "family_stem": stem,
+                "supported_efforts": list(supported_efforts),
+                "effort_slug": None,
+                "composite": False,
+                "observed_resolved_ids": list(observed_map.get(alias, [])),
             }
         )
     return records
@@ -425,18 +863,15 @@ def discover_live_engine_catalog(
     try:
         version = version or _attr("cli_version")(executable, environment)
         if engine == "claude":
-            # No safe model-list command: offer the tier aliases (never invoke Claude to discover models).
+            # Non-LLM inspection only: alias definitions + cached `--help` efforts + local stats/peers.
             return {
                 "engine": engine,
                 "status": "live",
-                "source": "claude aliases (Claude Code has no model-list command)",
+                "source": "claude aliases + --help capabilities",
                 "executable": executable,
                 "version": version,
                 "discovered_at": discovered_at,
-                "models": [
-                    {"id": alias, "name": f"Claude {alias.title()} (current)", "hidden": False}
-                    for alias in CLAUDE_MODEL_ALIASES
-                ],
+                "models": claude_model_records(executable, version, environment, refresh=refresh),
                 "error": None,
             }
         if engine == "codex":
@@ -446,7 +881,7 @@ def discover_live_engine_catalog(
             output = _attr("run_checked")([executable, "models"], timeout=60, environment=environment).stdout.decode(
                 "utf-8", errors="replace"
             )
-            models = _attr("simple_model_records")(output)
+            models = _attr("agy_model_records")(output)
             source = "agy models"
         else:
             version = version or _attr("get_cached_cli_version")(executable, environment)
@@ -477,7 +912,7 @@ def discover_live_engine_catalog(
                     )
                 else:
                     raise
-            models = _attr("simple_model_records")(output)
+            models = _attr("opencode_model_records")(output)
         if not models:
             raise _runner_error(f"{engine} returned an empty model catalog", 11)
         return {
@@ -677,10 +1112,13 @@ def cached_catalog_entry(
     catalog = entry.get("catalog")
     cached_at_epoch = entry.get("cached_at_epoch")
     if isinstance(catalog, dict) and any(
-        not isinstance(item, dict) or not isinstance(item.get("id"), str) or re.search(r"\s", item["id"])
+        not isinstance(item, dict)
+        or not isinstance(item.get("id"), str)
+        or re.search(r"\s", item["id"])
+        or not all(key in item for key in _REQUIRED_CAPABILITY_KEYS)
         for item in catalog.get("models", [])
     ):
-        return None  # Refresh catalogs written by the pre-column-aware parser.
+        return None  # Refresh legacy or pre-capability-schema catalogs.
     if (
         not isinstance(catalog, dict)
         or catalog.get("status") != "live"
@@ -755,7 +1193,7 @@ def discover_engine_catalog(
         return _attr("discover_live_engine_catalog")(engine, refresh=refresh, executable=executable)
 
     path = cache_path or _attr("default_model_cache_path")()
-    if not refresh and engine != "claude":
+    if not refresh:
         cached = _attr("cached_catalog_entry")(
             _attr("read_model_cache")(path),
             engine,
@@ -765,6 +1203,14 @@ def discover_engine_catalog(
         )
         if cached is not None:
             cached["cache"]["path"] = str(path)
+            if engine == "claude":
+                aliases = tuple(
+                    m["id"] for m in cached.get("models", []) if isinstance(m, dict) and isinstance(m.get("id"), str)
+                )
+                observed = _observed_claude_resolved_ids(aliases)
+                cached["models"] = [
+                    {**m, "observed_resolved_ids": list(observed.get(m["id"], []))} for m in cached.get("models", [])
+                ]
             return cached
 
     catalog = _attr("discover_live_engine_catalog")(
@@ -774,7 +1220,7 @@ def discover_engine_catalog(
         version=version,
     )
     catalog["cache"] = {
-        "status": ("not_applicable" if engine == "claude" else ("refreshed" if refresh else "miss")),
+        "status": ("refreshed" if refresh else "miss"),
         "path": str(path),
         "age_seconds": 0,
         "max_age_seconds": max_age_seconds,
@@ -870,17 +1316,7 @@ def native_engine_for(model: str) -> str | None:
     is for families without one here: GLM, DeepSeek, Qwen, Kimi and the like. Open-weight GPT-OSS and
     Gemma are not the hosted families and stay allowed.
     """
-    segments = model.lower().split("/")
-    tokens = re.split(r"[-_.:~]", segments[-1])
-    if "gemma" in tokens or any(a == "gpt" and b == "oss" for a, b in zip(tokens, tokens[1:], strict=False)):
-        return None
-    for engine, providers, names in _NATIVE_FAMILIES:
-        if any(segment in providers for segment in segments[:-1]):
-            return engine
-        for index, token in enumerate(tokens):
-            if token in names and not (token == "gpt" and index + 1 < len(tokens) and tokens[index + 1] == "oss"):
-                return engine
-    return None
+    return _attr("families_module")().native_engine_for_model(model)
 
 
 def enforce_native_route(engine: str, model: str) -> None:
@@ -1127,14 +1563,64 @@ def families_main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--format", choices=("text", "json"), default="text")
     parser.add_argument("--refresh", action="store_true", help="Refresh the model catalogs first")
+    parser.add_argument(
+        "--audit",
+        action="store_true",
+        help="Check live catalogs and families.json for unmapped IDs and unresolved tiers",
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Exit non-zero when --audit finds unmapped live models or unresolved tiers",
+    )
     args = parser.parse_args(argv)
     families = _attr("load_model_families")()
+    mod = _attr("families_module")()
+    engines = sorted({family["engine"] for family in families.values() if isinstance(family.get("engine"), str)})
+    catalog_records: dict[str, dict[str, Any]] = {}
     catalogs: dict[str, list[str]] = {}
-    for engine in sorted({family["engine"] for family in families.values()}):
+    for engine in engines:
         catalog = _attr("discover_engine_catalog")(engine, refresh=args.refresh)
+        catalog_records[engine] = catalog
         if catalog.get("status") == "live":
             catalogs[engine] = [m["id"] for m in catalog.get("models", []) if not m.get("hidden", False)]
-    rows = _attr("families_module")().report(families, catalogs)
+    rows = mod.report(families, catalogs)
+    if args.audit:
+        audit_result = mod.audit(families, catalog_records)
+        if args.format == "json":
+            print(
+                json.dumps(
+                    {
+                        "schema": "agent-executor.families-audit.v1",
+                        **audit_result,
+                        "families": rows,
+                    },
+                    indent=2,
+                )
+            )
+            return 1 if (args.strict and audit_result["has_drift"]) else 0
+        unresolved = audit_result["unresolved_tiers"]
+        unmapped = audit_result["unmapped_models"]
+        unavailable = audit_result["unavailable_engines"]
+        print(
+            f"Audit: {len(unresolved)} unresolved tier(s), "
+            f"{len(unmapped)} unmapped live model(s)"
+            + (f" ({len(unavailable)} unavailable engine(s): {', '.join(unavailable)})" if unavailable else "")
+        )
+        if unresolved:
+            print("Unresolved tiers:")
+            for item in unresolved:
+                print(f"  {item['selector']} ({item['engine']}, target={item['target']!r}) -> None")
+        if unmapped:
+            print("Unmapped live catalog IDs:")
+            for item in unmapped[:25]:
+                print(f"  {item['engine']}: {item['id']}")
+            if len(unmapped) > 25:
+                print(f"  ... (+{len(unmapped) - 25} more)")
+        if not unresolved and not unmapped:
+            print("No drift detected across available catalogs.")
+        return 1 if (args.strict and audit_result["has_drift"]) else 0
+
     if args.format == "json":
         print(json.dumps(rows, indent=2))
         return 0

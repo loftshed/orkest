@@ -659,7 +659,11 @@ def display_name(peer: dict[str, Any]) -> str:
 
 
 def model_name(peer: dict[str, Any]) -> str:
-    return peer.get("model") or "model unknown"
+    return peer.get("sessionModel") or peer.get("model") or "model unknown"
+
+
+def step_model_name(peer: dict[str, Any]) -> str:
+    return peer.get("stepModel") or peer.get("executionModel") or model_name(peer)
 
 
 def harness_name(peer: dict[str, Any]) -> str:
@@ -677,10 +681,21 @@ def display_label(peer: dict[str, Any]) -> str:
     )
 
 
-def model_fields(model: str, source: str = "declared") -> dict[str, str]:
+def model_fields(model: str, source: str = "declared", *, step_model: str | None = None) -> dict[str, str]:
     if not isinstance(model, str) or not model.strip() or len(model) > 200:
         raise MailboxError("model must be a nonempty model ID or name of at most 200 characters")
-    return {"model": " ".join(model.split()), "modelSource": source}
+    cleaned = " ".join(model.split())
+    fields = {"model": cleaned, "sessionModel": cleaned, "modelSource": source}
+    if isinstance(step_model, str) and step_model.strip() and len(step_model) <= 200:
+        fields["stepModel"] = " ".join(step_model.split())
+    return fields
+
+
+def step_model_fields(step_model: str, source: str = "runtime") -> dict[str, str]:
+    if not isinstance(step_model, str) or not step_model.strip() or len(step_model) > 200:
+        raise MailboxError("step_model must be a nonempty model ID or name of at most 200 characters")
+    cleaned = " ".join(step_model.split())
+    return {"stepModel": cleaned, "stepModelSource": source}
 
 
 def harness_fields(label: str) -> dict[str, str]:

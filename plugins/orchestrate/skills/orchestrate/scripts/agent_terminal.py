@@ -32,7 +32,13 @@ def _extract_model_and_effort(
 ) -> tuple[str, str, str]:
     payload = payload if isinstance(payload, dict) else {}
     peer = peer_data if isinstance(peer_data, dict) else {}
-    raw_model = peer.get("model") or payload.get("model")
+    raw_model = (
+        peer.get("stepModel")
+        or peer.get("executionModel")
+        or peer.get("sessionModel")
+        or peer.get("model")
+        or payload.get("model")
+    )
     raw_effort = peer.get("effort") or payload.get("effort")
     if isinstance(raw_model, dict):
         if not raw_effort:

@@ -271,7 +271,15 @@ def identity(
     role = (progress.get("role") if progress else None) or (
         rooms[0][1].get("workforceRole") if len(rooms) == 1 else None
     )
-    raw_model = model or recorded_model or text(peer.get("model")) or "—"
+    raw_model = (
+        model
+        or recorded_model
+        or text(peer.get("stepModel"))
+        or text(peer.get("executionModel"))
+        or text(peer.get("sessionModel"))
+        or text(peer.get("model"))
+        or "—"
+    )
     raw_effort = effort or recorded_effort or text(peer.get("effort")) or "—"
     normalized_model, normalized_effort = normalize_model_and_effort(raw_model, raw_effort)
     return {

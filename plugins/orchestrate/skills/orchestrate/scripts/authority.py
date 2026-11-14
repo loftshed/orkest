@@ -569,7 +569,7 @@ def session_facts(session: str, harness: str, model: str | None, account_home: s
     return {
         "session": session,
         "harness": "gemini" if harness == "agy" else harness,
-        "model": model or peer.get("model"),
+        "model": model or peer.get("sessionModel") or peer.get("model"),
         "accountHome": account_home or peer.get("accountHome"),
         "repo": peer.get("repo") or repository_here(),
     }
