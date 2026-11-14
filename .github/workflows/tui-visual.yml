@@ -1,4 +1,4 @@
-# cspell:words libncurses
+# cspell:words libncurses librsvg firacode fontconfig ryanoasis
 name: Terminal visuals
 
 on:
@@ -40,7 +40,7 @@ jobs:
       - name: Build tmux 3.8
         run: |
           sudo apt-get update
-          sudo apt-get install --yes libevent-dev libncurses-dev
+          sudo apt-get install --yes libevent-dev libncurses-dev librsvg2-bin fonts-firacode fontconfig
           curl --fail --location --silent --show-error \
             https://github.com/tmux/tmux/releases/download/3.8/tmux-3.8.tar.gz \
             --output "$RUNNER_TEMP/tmux-3.8.tar.gz"
@@ -52,6 +52,17 @@ jobs:
           make install
           "$RUNNER_TEMP/tmux-install/bin/tmux" -V | grep --fixed-strings --line-regexp 'tmux 3.8'
           echo "$RUNNER_TEMP/tmux-install/bin" >> "$GITHUB_PATH"
+      - name: Install Nerd Fonts Symbols
+        run: |
+          mkdir -p "$HOME/.local/share/fonts/NerdFontsSymbolsOnly"
+          curl --fail --location --silent --show-error \
+            https://github.com/ryanoasis/nerd-fonts/releases/download/v3.5.1/NerdFontsSymbolsOnly.tar.xz \
+            --output "$RUNNER_TEMP/NerdFontsSymbolsOnly.tar.xz"
+          echo '01172f37db8543edb102e5cb5c64101c9f4686630804d49b419aa07b23a69996  '"$RUNNER_TEMP/NerdFontsSymbolsOnly.tar.xz" | sha256sum --check
+          tar -xJf "$RUNNER_TEMP/NerdFontsSymbolsOnly.tar.xz" \
+            -C "$HOME/.local/share/fonts/NerdFontsSymbolsOnly" \
+            --wildcards '*.ttf'
+          fc-cache -f
       - name: Capture before and after
         env:
           BASE_REF: ${{ github.event.pull_request.base.sha || inputs.base_ref || 'main' }}

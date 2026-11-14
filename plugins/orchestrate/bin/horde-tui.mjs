@@ -22,7 +22,7 @@ import {
 } from "../lib/herdr-context.mjs";
 import { markHerdrViewClosed, syncHerdrViewLabel } from "../lib/herdr-view-state.mjs";
 import { createRoom, mailboxRoot, readRoom } from "../lib/horde-room.mjs";
-import { fit, HordeView, shortAgentName } from "../lib/horde-view.mjs";
+import { fit, formatWorktreeBadge, HordeView, shortAgentName } from "../lib/horde-view.mjs";
 import {
   isTerminalDisplayState,
   MEMBER_OUTCOMES,
@@ -30,12 +30,15 @@ import {
 } from "../lib/member-state.mjs";
 import { configHome } from "../lib/runtime-paths.mjs";
 import {
+  ALT_SCROLL_DISABLE,
   createTerminalInput,
   MOUSE_DISABLE,
   MOUSE_ENABLE,
   TERMINAL_INPUT_DISABLE,
   TERMINAL_INPUT_ENABLE,
 } from "../lib/tui-input.mjs";
+
+export { ALT_SCROLL_DISABLE, ALT_SCROLL_ENABLE } from "../lib/tui-input.mjs";
 import {
   checkOrkestUpdate,
   getUpdateStatePath,
@@ -585,7 +588,7 @@ async function probeRoomDiscovery(room, { exec = execFile } = {}) {
       rootPaths.add(resolvedWt);
       const slug = member.worktree?.slug || path.basename(resolvedWt);
       worktreeByPath.set(resolvedWt, {
-        badge: member.worktree?.disposable ? `wt:${slug}` : slug,
+        badge: member.worktree?.disposable ? formatWorktreeBadge(slug) : slug,
         owner: label,
       });
     }
@@ -930,6 +933,7 @@ export async function runHordeTui(
     updateRunner = runOrkestUpdate,
     env = process.env,
     theme,
+    mouse = true,
     exec = execFile,
     herdrConnect,
   } = {},
@@ -955,6 +959,7 @@ export async function runHordeTui(
     height: output.rows || 32,
     color: shouldUseColor(output),
     theme,
+    mouseEnabled: mouse,
     inHerdr: Boolean(env?.HERDR_ENV === "1" || env?.ORKEST_HERDR_VIEW_STATE),
     onFocusPane: (agent) => {
       diffGeneration++;
@@ -1241,7 +1246,11 @@ export async function runHordeTui(
         void previewController.close();
       }
       if (action && typeof action === "object" && action.type === "mouse-toggle") {
-        output.write(action.enabled ? MOUSE_ENABLE : MOUSE_DISABLE);
+        output.write(
+          action.enabled
+            ? `${MOUSE_ENABLE}${ALT_SCROLL_DISABLE}`
+            : `${MOUSE_DISABLE}${ALT_SCROLL_DISABLE}`,
+        );
       }
       if (action && typeof action === "object" && action.type === "pull-update") {
         updateState = { available: false, status: "updating" };
@@ -1300,7 +1309,11 @@ export async function runHordeTui(
     isAlternateScreen = true;
     isCursorHidden = true;
     isInputModeOwned = true;
-    output.write(TERMINAL_INPUT_ENABLE);
+    output.write(
+      view.mouseEnabled
+        ? TERMINAL_INPUT_ENABLE
+        : `${MOUSE_DISABLE}\u{1B}[?2004h${ALT_SCROLL_DISABLE}`,
+    );
     await new Promise((resolve) => {
       resolveExit = resolve;
       timer = setInterval(() => {

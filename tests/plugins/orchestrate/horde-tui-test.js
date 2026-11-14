@@ -221,11 +221,13 @@ describe("tui-box primitives and HordeView unification", () => {
     ];
     let rendered = plain(new HordeView(room).render(120).join("\n"));
     expect(rendered).toContain("supervisor-model");
-    expect(rendered).toContain("[consultant] \u{EC82} worker-model (requested) / high");
+    expect(rendered).toContain("[consultant]");
+    expect(rendered).toContain("\u{EC82} worker-model (requested) / high");
     room.agents[0].model = "confirmed-worker";
     room.agents[0].modelSource = "observed";
     rendered = plain(new HordeView(room).render(120).join("\n"));
-    expect(rendered).toContain("[consultant] \u{EC82} confirmed-worker / high");
+    expect(rendered).toContain("[consultant]");
+    expect(rendered).toContain("\u{EC82} confirmed-worker / high");
     expect(rendered).not.toContain("(requested)");
   });
 
@@ -241,7 +243,7 @@ describe("tui-box primitives and HordeView unification", () => {
     expect(narrow.join("\n")).toContain("1 luna-1");
     expect(narrow.join("\n")).toContain("2 flash-1");
     expect(narrow.join("\n")).toContain("3 haiku-1");
-    expect(narrow.join("\n")).toContain("3/64 slots · page 1/1");
+    expect(narrow.join("\n")).not.toContain("3/64 slots · page 1/1");
   });
 
   it("focuses and pins detail while new output arrives", () => {
@@ -263,7 +265,7 @@ describe("tui-box primitives and HordeView unification", () => {
   });
 
   it("supports more than nine members with page-local number keys", () => {
-    const view = new HordeView(fixture("claude:haiku*12"));
+    const view = new HordeView(fixture("claude:haiku*12"), { height: 18 });
     view.render(80);
     view.handleInput("n");
     view.handleInput("n");
@@ -291,7 +293,9 @@ describe("tui-box primitives and HordeView unification", () => {
   it("fits Unicode and strips injected terminal controls", () => {
     const room = fixture();
     room.agents[2].output = ["\u{1B}[2J界界 👩‍💻 safe\u{7}"];
-    const lines = new HordeView(room).render(32);
+    const view = new HordeView(room);
+    view.handleKey("1");
+    const lines = view.render(32);
     expect(lines.every((line) => displayWidth(line) <= 32)).toBe(true);
     expect(lines.join("\n")).toContain("safe");
     expect(lines.join("\n")).not.toContain("\u{1B}");
@@ -302,6 +306,7 @@ describe("tui-box primitives and HordeView unification", () => {
     room.agents[2].status = "running";
     room.agents[2].output = ["\u{1B}[31munsafe\u{1B}[0m 👩‍💻 界\nnext line"];
     const view = new HordeView(room, { now: () => 2000, height: 28, color: true });
+    view.handleKey("1");
     for (const width of [40, 47, 48, 63, 64, 79, 80, 120]) {
       const lines = view.render(width);
       expect(lines.every((line) => displayWidth(line) <= width)).toBe(true);
@@ -367,7 +372,8 @@ describe("tui-box primitives and HordeView unification", () => {
     room.agents[1].resolvedModel = "gemini-4-argon-medium";
     room.agents[1].resolvedEffort = "—";
     const rendered = new HordeView(room, { height: 28, tier: "nerd" }).render(90).join("\n");
-    expect(rendered).toContain("ork: \u{F06A9} gribble");
+    expect(rendered).toContain("\u{F06A9} gribble");
+    expect(rendered).not.toContain("ork: ");
     expect(rendered).not.toContain("gribble-gemini-4-argon-medium-orkest-1f");
     expect(rendered).toContain("Gemini 4 Argon / medium");
     expect(rendered).not.toContain("(Medium) / medium");
@@ -461,12 +467,12 @@ describe("tui-box primitives and HordeView unification", () => {
       };
       const view = new HordeView(room, { color: true, tier: "nerd", now: () => 1000 });
       const colored = view.render(160).join("\n");
-      expect(colored).toContain(
-        `\u{1B}[2mork:\u{1B}[0m \u{1B}[38;5;${palette};1m\u{F06A9} gribble\u{1B}[0m`,
-      );
-      expect(plain(colored)).toContain("ork: \u{F06A9} gribble");
-      expect(plain(colored)).toContain("harness: agy");
-      expect(colored).toContain("\u{1B}[2mharness:\u{1B}[0m \u{1B}[38;5;80magy\u{1B}[0m");
+      expect(colored).toContain(`\u{1B}[38;5;${palette};1m\u{F06A9} gribble\u{1B}[0m`);
+      expect(plain(colored)).toContain("\u{F06A9} gribble");
+      expect(plain(colored)).not.toContain("ork: ");
+      expect(plain(colored)).toContain("agy");
+      expect(plain(colored)).not.toContain("harness: ");
+      expect(colored).toContain("\u{1B}[38;5;80magy\u{1B}[0m");
       expect(plain(colored)).not.toContain("w1:p1");
       expect(colored).toContain("\u{1B}[38;5;117;1mgemini-test");
       expect(colored).toContain("\u{1B}[38;5;180;1mhigh");
@@ -483,8 +489,9 @@ describe("tui-box primitives and HordeView unification", () => {
         const narrow = new HordeView(room, { color: true, tier }).render(40);
         expect(narrow.every((line) => displayWidth(line) <= 40)).toBe(true);
         expect(narrow.map(plain).join("\n")).toContain(
-          tier === "nerd" ? "ork: \u{F06A9} gribble" : "ork: gribble",
+          tier === "nerd" ? "\u{F06A9} gribble" : "gribble",
         );
+        expect(narrow.map(plain).join("\n")).not.toContain("ork: ");
       }
     },
   );
@@ -704,13 +711,12 @@ describe("tui-box primitives and HordeView unification", () => {
     const view = new HordeView(room, { now: () => 1_000_000, height: 28, tier: "unicode" });
     const collapsed = view.render(90).join("\n");
     // Most recent running agent (haiku-3) is #1 and focused; older completed agents (haiku-2, haiku-1) collapse below it
-    expect(collapsed).toContain("┌ ▸ 1 haiku-3");
-    expect(collapsed).toContain("haiku | running · live");
+    expect(collapsed).toContain("├─▸");
+    expect(collapsed).toContain("1 haiku-3");
+    expect(collapsed).toContain("haiku · running · live");
     expect(collapsed).not.toContain("step 2/4");
-    expect(collapsed).toContain("├─ ○ 2 haiku-2");
-    expect(collapsed).toContain("Second task done");
-    expect(collapsed).toContain("└─ ○ 3 haiku-1");
-    expect(collapsed).toContain("First task done");
+    expect(collapsed).toContain("├─  ○ 2 haiku-2");
+    expect(collapsed).toContain("└─  ○ 3 haiku-1");
 
     // Press c -> hidden mode
     view.handleInput("c");
@@ -722,8 +728,10 @@ describe("tui-box primitives and HordeView unification", () => {
     // Press c -> expanded mode
     view.handleInput("c");
     const expanded = view.render(90).join("\n");
-    expect(expanded).toContain("┌ 2 haiku-2");
-    expect(expanded).toContain("┌ 3 haiku-1");
+    expect(expanded).toContain("2 haiku-2");
+    expect(expanded).toContain("Second task done");
+    expect(expanded).toContain("3 haiku-1");
+    expect(expanded).toContain("First task done");
   });
 
   it("orders agents from most recent to least recent so new agents push old ones off the bottom", () => {
@@ -771,10 +779,10 @@ describe("tui-box primitives and HordeView unification", () => {
     expect(rendered).toContain("awaiting review");
     expect(rendered).toContain("idle · last reported working");
     expect(rendered).not.toContain("┌ ▸ 1 haiku-2");
-    expect(rendered).toMatch(/haiku[^\n]*\| idle/u);
+    expect(rendered).toMatch(/haiku[^\n]*· idle|idle[^\n]*· haiku/u);
     expect(view.needsAnimation).toBe(true);
     view.handleInput("1");
-    expect(view.render(100).join("\n")).toContain("┌ ▸ 1 haiku-2");
+    expect(view.render(100).join("\n")).toContain("├─▸ · 1 haiku-2");
     room.agents[2].runtimeState = "stopped";
     view.setRoom(room);
     expect(view.needsAnimation).toBe(false);
@@ -783,7 +791,7 @@ describe("tui-box primitives and HordeView unification", () => {
     view.setRoom(room);
     const blocked = view.render(100).join("\n");
     expect(blocked).toContain("1 blocked");
-    expect(blocked).toContain("┌ 2 haiku-3");
+    expect(blocked).toContain("2 haiku-3");
   });
 
   it("shows an idle native reviewer without implying an unaccepted executor result", () => {
@@ -819,13 +827,13 @@ describe("tui-box primitives and HordeView unification", () => {
       quotaMode: "expanded",
     }).render(90);
     const serviceIndex = lines.findIndex((line) => line.includes("Services"));
-    const slotsIndex = lines.findIndex((line) => line.includes("slots · page"));
-    const lastCardJunction = lines.findLastIndex((line) => line.startsWith(" └─┤"));
+    const firstAgentLine = lines.findIndex((line) => line.includes("flash-1"));
+    const lastAgentLine = lines.findLastIndex((line) => line.includes("haiku-1"));
     expect(lines[0][1]).toBe("┌");
     expect(lines.find((line) => line.includes("Quota"))[1]).toBe("├");
-    expect(lines.slice(1, lastCardJunction).every((line) => "│├".includes(line[1]))).toBe(true);
-    expect(serviceIndex).toBe(slotsIndex + 1);
-    expect(lines.join("\n")).toContain("├─┤ Awaiting assignment");
+    expect(lines.slice(1, firstAgentLine).every((line) => "│├".includes(line[1]))).toBe(true);
+    expect(serviceIndex).toBeGreaterThan(lastAgentLine);
+    expect(lines.join("\n")).toContain("Awaiting assignment");
     expect(lines.every((line) => displayWidth(line) <= 90)).toBe(true);
   });
 
@@ -849,10 +857,9 @@ describe("tui-box primitives and HordeView unification", () => {
       );
       const start = lines.findIndex((line) => line.includes("project · 1 agent"));
       const end = lines.findIndex((line) => line.includes("haiku-2"));
-      const slotsIndex = lines.findIndex((line) => line.includes("slots · page"));
       const serviceIndex = lines.findIndex((line) => line.includes("Services"));
       expect(lines.slice(start, end).every((line) => "│├".includes(line[1]))).toBe(true);
-      expect(serviceIndex).toBe(slotsIndex + 1);
+      expect(serviceIndex).toBeGreaterThan(end);
       expect(lines.find((line) => line.includes("long-audit"))).toContain(" · 1 agent");
       expect(lines.every((line) => displayWidth(line) <= width)).toBe(true);
       expect(lines.find((line) => line.includes("haiku-2"))).toContain("↳ supervisor");
@@ -868,7 +875,8 @@ describe("tui-box primitives and HordeView unification", () => {
       agent.status = index === 2 ? "completed" : "working";
     }
     const rendered = new HordeView(room, { height: 32, tier: "unicode" }).render(90).join("\n");
-    expect(rendered).toContain("sample-project · 3 agents");
+    expect(rendered).toContain("sample-project");
+    expect(rendered).not.toContain("── sample-project · 3 agents ──");
     expect(rendered.match(/sample-project/gu)).toHaveLength(1);
     expect(rendered).toContain("▸ ");
     expect(rendered).toContain("codex");
@@ -897,17 +905,18 @@ describe("tui-box primitives and HordeView unification", () => {
     expect(unicodeLines.every((line) => displayWidth(line) <= 90)).toBe(true);
     const unicodeText = unicodeLines.join("\n");
     expect(plain(unicodeText)).toContain("orkest · 2 agents");
-    expect(unicodeText).toContain("wt:wt-50");
+    expect(unicodeText).toContain("wt:50");
+    expect(unicodeText).not.toContain("wt:wt-50");
     expect(unicodeText).not.toContain("\u{1B}[44;97;1m");
     expect(unicodeText).toContain("\u{1B}[48;5;237;97;1m");
 
     const asciiText = new HordeView(room, { height: 28, tier: "ascii" }).render(85).join("\n");
-    expect(asciiText).toContain("| orkest · 2 agents");
-    expect(asciiText).toContain("| + > 1 haiku-1");
-    expect(asciiText).toContain("+-+ Awaiting assignment");
-    expect(asciiText).toContain("| + 2 pro-1");
-    expect(asciiText).toContain("`-+ > Awaiting assignment");
-    expect(asciiText).toContain("wt:wt-50");
+    expect(asciiText).toContain("orkest · 2 agents");
+    expect(asciiText).toContain("+-> ! 1 haiku-1");
+    expect(asciiText).toContain("Awaiting assignment");
+    expect(asciiText).toContain("`-  > 2 pro-1");
+    expect(asciiText).toContain("wt:50");
+    expect(asciiText).not.toContain("wt:wt-50");
   });
 });
 
@@ -1515,10 +1524,22 @@ describe("terminal lifecycle", () => {
     })
       .render(24)
       .map(plain);
-    const statusLine = narrowLines.find((line) => line.includes("haiku |")) || "";
-    expect(statusLine).toContain("haiku |");
-    expect(statusLine).not.toContain("proc");
-    expect(displayWidth(statusLine)).toBeLessThanOrEqual(24);
+    const agentLine = narrowLines.find((line) => line.includes("haiku-1")) || "";
+    expect(agentLine).toContain("2 haiku-1");
+    expect(narrowLines.join("\n")).not.toContain("proc");
+    expect(displayWidth(agentLine)).toBeLessThanOrEqual(24);
+
+    const widerLines = new HordeView(room, {
+      height: 28,
+      color: false,
+      tier: "ascii",
+      now: () => 0,
+    })
+      .render(35)
+      .map(plain);
+    const widerAgentLine = widerLines.find((line) => line.includes("haiku-1")) || "";
+    expect(widerAgentLine).toContain("2 haiku-1");
+    expect(widerAgentLine).toContain("haiku · working");
   });
 
   it("renders redesigned orchestrator card, collapsible inline quota, and running services footer", async () => {
@@ -1580,10 +1601,15 @@ describe("terminal lifecycle", () => {
       height: 34,
       tier: "unicode",
       quotaMode: "expanded",
+      servicesMode: "expanded",
       now: () => 20_000,
     });
     const expandedText = view.render(100).join("\n");
-    expect(expandedText).toContain("ork: gribble (feat/swarm-view) · harness: agy");
+    expect(expandedText).toContain("gribble");
+    expect(expandedText).toContain("(feat/swarm-view)");
+    expect(expandedText).toContain("agy");
+    expect(expandedText).not.toContain("ork: ");
+    expect(expandedText).not.toContain("harness: ");
     expect(expandedText).not.toContain("pane-lead-1");
     expect(expandedText).toContain("Ship Swarm View v2 — Coordinating slice 2A");
     expect(expandedText).toContain("▾ Quota");
@@ -1635,12 +1661,8 @@ describe("terminal lifecycle", () => {
     });
     const updateAvailableLines = view.render(100);
     const updateAvailableText = updateAvailableLines.join("\n");
-    expect(updateAvailableText).toContain("┌ Update");
-    expect(updateAvailableText).toContain("Shift+U");
+    expect(updateAvailableText).toContain("Update");
     expect(updateAvailableText).toContain("↑ 3 new commits on origin/main · click to update");
-    const slotsLineIdx = updateAvailableLines.findIndex((line) => line.includes("slots · page"));
-    const updateHeaderIdx = updateAvailableLines.findIndex((line) => line.includes("┌ Update"));
-    expect(updateHeaderIdx).toBeGreaterThan(slotsLineIdx);
     expect(updateAvailableLines.find((line) => line.includes("View chat"))).not.toContain("Update");
     expect(view.handleKey("U")).toEqual({ type: "pull-update" });
     // Lowercase 'u' still toggles quotaMode:
@@ -1782,7 +1804,7 @@ describe("terminal lifecycle", () => {
         pid: 9105,
         name: "vite",
         cwd: "/Users/dev/orkest/.worktrees/wt-ui",
-        worktree: "wt:wt-ui",
+        worktree: "wt:ui",
         owner: "snoobix",
         uptime: "02:15",
       },
@@ -1900,5 +1922,101 @@ describe("terminal lifecycle", () => {
     expect(reconciles).toHaveLength(2);
     sub.stop();
     expect(sockets[1].destroyed).toBe(true);
+  });
+
+  it("preserves ArchScout name, omits duplicate QUESTION_GLYPH on reported rows, avoids wt:wt- doubling, and truncates overflow with ellipsis", () => {
+    const room = fixture("codex:gpt-sol,agy:gemini-fast,claude:claude-best");
+    room.title = "demo";
+    room.cwd = "/workspace/demo";
+    room.update = { available: true, commitsBehind: 3, remoteSha: "b4d9c8e", status: "available" };
+    room.services = [{ name: "Dev server", port: 5173, status: "running", uptime: "5m" }];
+    room.agents = [
+      {
+        id: "search-coord",
+        name: "SearchCoord",
+        parent: "conductor",
+        engine: "codex",
+        model: "gpt:sol",
+        status: "working",
+        progress: { task: "Coordinating index and query workers", stage: "working" },
+      },
+      {
+        id: "arch-scout",
+        name: "ArchScout",
+        parent: "search-coord",
+        engine: "agy",
+        model: "gemini:fast",
+        status: "completed",
+        outcome: "completed",
+        objective: "Explore existing search patterns",
+        output: ["Found reusable index abstractions"],
+      },
+      {
+        id: "query-worker",
+        name: "QueryWorker",
+        parent: "search-coord",
+        engine: "claude",
+        model: "claude:best",
+        status: "blocked",
+        question: "Should missing schema fields default to null across all queries?",
+        objective: "Refactor query syntax",
+      },
+    ];
+    room.agentProcesses = {
+      "arch-scout": {
+        processes: [
+          {
+            pid: 9012,
+            ppid: 9000,
+            ageSeconds: 240,
+            command: "python3 -m unittest test_indexer",
+            via: "cwd",
+            ports: [3000],
+          },
+        ],
+        more: 0,
+      },
+    };
+
+    const view = new HordeView(room, { height: 28, tier: "nerd", color: false, now: () => 0 });
+    view.focusId = "arch-scout";
+    view.hasExplicitFocus = true;
+    const lines56 = view.render(56).map(plain);
+
+    const archRow = lines56.find((line) => line.includes("ArchScout")) || "";
+    expect(archRow).toContain("3 ArchScout");
+    expect(archRow).toContain("gemini:fast · review");
+    expect(archRow).not.toContain("reported (awaiting review)");
+    expect(archRow.match(/\u{F02D7}/gu)).toHaveLength(1);
+
+    const archSubtitle = lines56.find((line) => line.includes("1 proc left")) || "";
+    expect(archSubtitle).toContain("1 proc left · :3000");
+    expect(archSubtitle).not.toMatch(/·\s*$/u);
+
+    const questionLine = lines56.find((line) => line.includes("Question:")) || "";
+    expect(questionLine).toContain("…");
+
+    const focusProcLine = lines56.find((line) => line.includes("9012  4m")) || "";
+    expect(focusProcLine).toContain("…");
+
+    const updateLine = lines56.find((line) => line.includes("Update")) || "";
+    expect(updateLine).not.toContain("click to up ");
+
+    // Collapsed completed reported row at wide width uses `<model> · reported (awaiting review)` and single glyph,
+    // and disposable worktree `wt-indexer` renders as `wt:indexer` (never `wt:wt-`):
+    room.agentProcesses = {};
+    room.agents[1].worktree = {
+      disposable: true,
+      slug: "wt-indexer",
+      path: "/workspace/demo/.worktrees/wt-indexer",
+      parentCwd: "/workspace/demo",
+    };
+    const wideView = new HordeView(room, { height: 28, tier: "nerd", color: false, now: () => 0 });
+    const wideLines = wideView.render(100).map(plain);
+    const wideArchRow = wideLines.find((line) => line.includes("ArchScout")) || "";
+    expect(wideArchRow).toContain("gemini:fast · reported (awaiting review)");
+    expect(wideArchRow.match(/\u{F02D7}/gu)).toHaveLength(1);
+    expect(wideLines.join("\n")).toContain("wt:indexer");
+    expect(wideLines.join("\n")).not.toContain("wt:wt-");
   });
 });

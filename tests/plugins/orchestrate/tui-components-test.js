@@ -97,7 +97,8 @@ describe("terminal presentation components", () => {
       " \u{F007}  \u{EC82} ━━── 60%  \u{E7F0} Gemini ━━── 55%  \u{E7F0} Claude/GPT ──── 0%  \u{EC81} ━━━─ 80%",
     );
     const rendered = view.render(152).join("\n");
-    expect(plain(rendered)).toContain("│ \u{F06A9} Coordinator · folder: workspace");
+    expect(plain(rendered)).toContain("│ \u{F06A9} Coordinator · workspace");
+    expect(plain(rendered)).not.toContain("folder: workspace");
     expect(plain(rendered)).toContain("│ \u{F1AD}  \u{EC82} all ━━━─ 80%");
     expect(rendered).toContain("\u{1B}[38;5;173m\u{EC82}\u{1B}[0m");
     expect(rendered).toContain("\u{1B}[38;5;33m\u{E7F0}\u{1B}[0m");
@@ -304,17 +305,17 @@ describe("terminal presentation components", () => {
     expect(plain(rendered.join("\n"))).toContain(
       "│ project  ·  󰔛 1 active  ·  󰀪 1 blocked  ·  󰋗 1 reported",
     );
-    expect(plain(rendered.join("\n"))).toContain("└─┤ ⣷ Checking header layout");
-    expect(plain(rendered.join("\n"))).toContain(" \u{F078} \u{F233} Services ");
+    expect(plain(rendered.join("\n"))).toContain("⣷ Checking header layout");
+    expect(plain(rendered.join("\n"))).toContain(
+      "\u{F054} \u{F233} Services  1 running · localhost :5017 preview",
+    );
     expect(rendered.map(plain).find((line) => line.includes("View chat"))).not.toContain(
       "Services",
     );
     view.handleKey("v");
-    const collapsedLines = view.render(80).map(plain);
-    expect(collapsedLines.join("\n")).toContain(
-      "\u{F054} \u{F233} Services  1 running · localhost :5017 preview",
-    );
-    expect(collapsedLines.find((line) => line.includes("View chat"))).not.toContain("Services");
+    const expandedLines = view.render(80).map(plain);
+    expect(expandedLines.join("\n")).toContain(" \u{F078} \u{F233} Services ");
+    expect(expandedLines.find((line) => line.includes("View chat"))).not.toContain("Services");
   });
 
   it("keeps statusline, monitor, and DEFAULT_THEME 256-color tokens in parity", () => {

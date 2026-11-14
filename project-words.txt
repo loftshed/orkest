@@ -12,6 +12,8 @@ clippy
 rustfmt
 libc
 splitn
+librsvg
+rsvg
 deepswe
 evals
 Fira
