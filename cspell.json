@@ -11,6 +11,7 @@
     "node",
     "npm",
     "python",
+    "rust",
     "softwareTerms",
     "swift",
     "words"
@@ -19,6 +20,10 @@
   "ignorePaths": [
     ".git/**",
     "node_modules/**",
+    "target/**",
+    "crates/**/target/**",
+    "Cargo.lock",
+    "crates/**/Cargo.lock",
     "project-words.txt",
     "tests/**",
     "docs/images/**",
@@ -27,6 +32,7 @@
   ],
   "ignoreRegExpList": [
     "/\\b[0-9a-f]{32,64}\\b/gi",
+    "/\\b0x[0-9a-f_]+(?:[ui](?:8|16|32|64|128|size))?\\b/gi",
     "/https?:\\/\\/\\S+/g",
     "/\\b[A-Z0-9_]{15,}\\b/g"
   ]

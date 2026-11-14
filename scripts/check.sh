@@ -32,6 +32,13 @@ else
   echo "check: uv is not installed; skipping ruff (CI still runs it)." >&2
 fi
 
+if command -v cargo > /dev/null 2>&1; then
+  step cargo fmt --manifest-path crates/ork-fast/Cargo.toml --check
+  step cargo clippy --manifest-path crates/ork-fast/Cargo.toml --all-targets -- -D warnings
+else
+  echo "check: cargo is not installed; skipping Rust lint (CI still runs it)." >&2
+fi
+
 # Shell scripts: *.sh, the husky hooks and executables with a sh/bash shebang.
 is_shell_script() {
   case "$1" in

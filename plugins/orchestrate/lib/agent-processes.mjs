@@ -54,6 +54,8 @@ const INTERNAL_OR_HARNESS_TOKENS = [
   "pyright",
   "mailbox_daemon",
   "peer_mailbox",
+  "ork-fast",
+  "lease_holder",
   "horde-tui",
   "agent_statusline",
   "tmux",

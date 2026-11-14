@@ -104,7 +104,24 @@ function latestTag(tags, name) {
   return versions.length > 0 ? `${prefix}${versions.at(-1)}` : null;
 }
 
-const shippedPaths = (name) => [`plugins/${name}`, `:(exclude)plugins/${name}/CHANGELOG.md`];
+const shippedPaths = (name) => {
+  const paths = [`plugins/${name}`, `:(exclude)plugins/${name}/CHANGELOG.md`];
+  if (name === "orchestrate") {
+    paths.push("crates/ork-fast");
+  }
+  return paths;
+};
+
+function recordOrchestrateOutput(releases, env = process.env) {
+  const output = env?.GITHUB_OUTPUT;
+  if (!output) return;
+  const match = releases.find(
+    (r) => r.name === "orchestrate" || r.tag?.startsWith("orchestrate--v"),
+  );
+  if (match) {
+    fs.appendFileSync(output, `orchestrate_release_tag=${match.tag}\n`);
+  }
+}
 
 // ── changelog ──────────────────────────────────────────────────────────────
 
@@ -451,7 +468,9 @@ export async function publishRelease({
     }
     const released = existingReleaseCommit(git, head, remoteHead);
     if (!released) return "The default branch has moved on; the newer run will publish.";
-    await createGitHubReleases(releasesIn(git, released), released, { ...settings, request });
+    const existing = releasesIn(git, released);
+    recordOrchestrateOutput(existing, env);
+    await createGitHubReleases(existing, released, { ...settings, request });
     return `Already released ${head.slice(0, 7)}; GitHub releases are in place.`;
   }
 
@@ -497,6 +516,7 @@ export async function publishRelease({
     `${commit}:refs/heads/${settings.branch}`,
     ...plan.releases.map((release) => `refs/tags/${release.tag}`),
   ]);
+  recordOrchestrateOutput(plan.releases, env);
   await createGitHubReleases(plan.releases, commit, { ...settings, request });
   return `Released ${plan.releases.map((release) => release.tag).join(", ")}.`;
 }
