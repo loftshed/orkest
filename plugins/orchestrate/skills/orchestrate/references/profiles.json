@@ -1,6 +1,6 @@
 {
   "schema": "agent-executor.profiles.v1",
-  "verified_at": "2026-10-17",
+  "verified_at": "2026-11-14",
   "status": "workload_hypotheses_not_quality_rankings",
   "instructions": "Use native host first. Access must be observed in that host, not inferred from public API availability. Effort candidates must be validated by the selected harness. Never switch Claude billing profiles implicitly. OpenCode preferences remain in the existing runner. `selectors` (see families.json) resolve to the newest live ID when the registry is read; `model_ids` are exact.",
   "profiles": [
@@ -9,75 +9,109 @@
       "selectors": ["gpt:luna"],
       "roles": ["mechanical", "implementation"],
       "effort_candidate": "medium",
-      "prompt_adjustment": "Give a bounded transformation, examples, and observable criteria. Expose ambiguity that changes the result."
+      "prompt_adjustment": "Give a bounded transformation, examples, and observable criteria; prefer gpt:terra for nontrivial or multi-file implementation. Expose ambiguity that changes the result."
     },
     {
       "id": "terra",
       "selectors": ["gpt:terra"],
-      "roles": ["implementation"],
+      "roles": ["implementation", "mechanical", "pointdexter"],
       "effort_candidate": "medium",
-      "prompt_adjustment": "Give the goal, repository conventions, and criteria; leave routine implementation choices to the worker."
+      "prompt_adjustment": "Give the goal, repository conventions, and observable criteria; leave routine implementation and UI choices to the worker (gpt-6.1-terra requires codex >= 0.159.0)."
     },
     {
       "id": "sol",
       "selectors": ["gpt:sol"],
       "roles": ["implementation", "consultation", "pointdexter", "review"],
       "effort_candidate": "medium",
-      "prompt_adjustment": "State the outcome, review scope, and evidence needed to finish. Keep focused review within that scope."
+      "prompt_adjustment": "State the outcome, review scope, and evidence needed to finish. Keep focused review within that scope. Note gpt-6.1-sol defaults to a 500K Codex context window and ultra effort spawns Codex subagents; avoid ultra on single-worker leaves."
     },
     {
       "id": "astra",
       "selectors": ["gpt:astra"],
       "roles": ["hard_task", "conductor", "consultation"],
       "effort_candidate": "medium",
-      "prompt_adjustment": "Make completion and authorized autonomy explicit. Let the agent resolve routine choices with proportional verification."
+      "prompt_adjustment": "Make completion and authorized autonomy explicit. Let the agent resolve routine choices with proportional verification. Watch the 272K long-context tariff step (2x input, 1.5x output)."
+    },
+    {
+      "id": "carbon",
+      "selectors": ["gemini:carbon", "gemini:carbon-high", "gemini:pro"],
+      "roles": ["hard_task", "conductor", "review", "consultation"],
+      "effort_candidate": "medium",
+      "prompt_adjustment": "Put key context before the specific question and preserve opaque native tool state in agy. Use medium by default or high for deep reasoning, UI engineering, and 1M-context synthesis (intro rates double on 2026-12-01)."
+    },
+    {
+      "id": "argon",
+      "selectors": ["gemini:argon", "gemini:argon-high"],
+      "roles": ["conductor", "implementation", "consultation"],
+      "effort_candidate": "medium",
+      "prompt_adjustment": "Put repository context before the bounded question and preserve opaque native tool state in agy. Suited to balanced long-repository engineering with lower per-turn token spend than Carbon (intro rates double on 2026-12-01)."
+    },
+    {
+      "id": "hydrogen",
+      "selectors": [
+        "gemini:hydrogen",
+        "gemini:hydrogen-high",
+        "gemini:hydrogen-xhigh",
+        "gemini:fast"
+      ],
+      "roles": ["implementation", "mechanical", "pointdexter", "review"],
+      "effort_candidate": "high",
+      "prompt_adjustment": "Put relevant context before the specific question and preserve opaque native tool state in agy. Use high effort for coding or xhigh for extended reasoning; preferred fast Gemini workhorse over legacy gemini-3.8-flash."
+    },
+    {
+      "id": "orchestrator",
+      "selectors": ["gemini:orchestrator", "gemini:orchestrator-argon"],
+      "model_ids": ["gemini-pro-orchestrator", "gemini-pro-orchestrator-argon"],
+      "roles": ["conductor"],
+      "effort_candidate": "not_applicable",
+      "prompt_adjustment": "Use for Antigravity-managed multi-model orchestration that switches internally across Carbon and Hydrogen; do not pass an effort slug, and treat it separately from single-model leaf workers with standalone API tariffs."
     },
     {
       "id": "flash",
-      "selectors": ["gemini:flash-low", "gemini:fast", "gemini:flash-high"],
-      "roles": ["pointdexter", "mechanical", "implementation"],
+      "selectors": ["gemini:flash-low", "gemini:flash", "gemini:flash-high"],
+      "roles": ["optional_helper", "mechanical"],
       "effort_candidate": "medium",
-      "prompt_adjustment": "Put relevant context before the specific question. Be direct and preserve opaque native tool state in its own harness."
+      "prompt_adjustment": "Legacy gemini-3.8-flash fallback behind hydrogen; prefer hydrogen for agentic coding. Put relevant context before the specific question and preserve opaque native tool state in agy."
     },
     {
       "id": "sonnet",
       "selectors": ["claude:balanced"],
-      "model_ids": ["claude-sonnet-5", "claude-sonnet-5-5", "claude-sonnet-4-6", "sonnet"],
+      "model_ids": ["claude-sonnet-5-5", "sonnet", "claude-sonnet-5", "claude-sonnet-4-6"],
       "roles": ["conductor", "implementation", "pointdexter", "consultation"],
       "effort_candidate": "high",
-      "prompt_adjustment": "Specify the full intended scope and concise output shape. Use model-specific adaptive effort; evaluate medium when cost matters."
+      "prompt_adjustment": "Specify the full intended scope and concise output shape. Use model-specific adaptive effort (API default high on Sonnet 5.5); evaluate medium when cost matters."
     },
     {
       "id": "opus",
       "selectors": ["claude:best"],
-      "model_ids": ["claude-opus-5", "claude-opus-5-5", "claude-opus-4-6", "opus"],
+      "model_ids": ["claude-opus-5-5", "opus", "claude-opus-5", "claude-opus-4-6"],
       "roles": ["hard_task", "conductor", "review", "consultation"],
       "effort_candidate": "medium",
-      "prompt_adjustment": "Provide a complete spec and room to finish. Avoid repeated general audits or compulsory reviewer delegation."
+      "prompt_adjustment": "Provide a complete spec and room to finish. Avoid repeated general audits or compulsory reviewer delegation. Adaptive thinking is mandatory on Opus 5.5 (default effort medium; supports low..max)."
     },
     {
       "id": "fable",
       "selectors": ["claude:frontier"],
-      "model_ids": ["claude-fable-5-1", "fable"],
+      "model_ids": ["claude-fable-5-2", "fable", "claude-fable-5-1"],
       "roles": ["challenge", "hard_task"],
       "effort_candidate": "medium",
-      "prompt_adjustment": "Batch independent reads and make targeted changes. Preserve native append-only history and opaque thinking blocks; allow adequate output."
+      "prompt_adjustment": "Batch independent reads and make targeted changes. Preserve native append-only history and opaque thinking blocks; allow adequate output (Claude Code defaults to medium effort vs API high)."
     },
     {
       "id": "mythos",
       "selectors": ["claude:mythos"],
-      "model_ids": ["claude-mythos-5-1", "mythos"],
+      "model_ids": ["claude-mythos-5-2", "claude-mythos-5-1", "mythos"],
       "roles": ["challenge", "hard_task"],
       "effort_candidate": "medium",
-      "prompt_adjustment": "Batch independent reads and make targeted changes. Preserve native append-only history and opaque thinking blocks; allow adequate output."
+      "prompt_adjustment": "Batch independent reads and make targeted changes. Preserve native append-only history and opaque thinking blocks; allow adequate output (limited verification-gated access)."
     },
     {
       "id": "haiku",
       "selectors": ["claude:fast"],
-      "model_ids": ["claude-haiku-4-5-20251001", "claude-haiku-4-5", "haiku"],
-      "roles": ["optional_helper"],
-      "effort_candidate": "not_applicable",
-      "prompt_adjustment": "Use clear bounded instructions and examples. Do not apply Claude 5 adaptive effort controls to Haiku."
+      "model_ids": ["claude-haiku-5-5", "haiku", "claude-haiku-4-5-20251001", "claude-haiku-4-5"],
+      "roles": ["mechanical", "optional_helper", "pointdexter"],
+      "effort_candidate": "medium",
+      "prompt_adjustment": "Use clear bounded instructions and examples. Haiku 5.5 supports adaptive thinking and low..max effort (default medium); keep prompts under 100K tokens to stay below the 5x long-context pricing tier."
     }
   ]
 }

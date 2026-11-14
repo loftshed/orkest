@@ -76,7 +76,8 @@ class UsageTests(unittest.TestCase):
 
     def test_tariff_estimates_expire_and_do_not_guess_long_context_tiers(self):
         registry = json.loads((fixtures.SKILL_DIR / "references/model-registry.json").read_text())
-        now = dt.datetime(2026, 10, 17, 16, tzinfo=dt.UTC)
+        verified = dt.datetime.fromisoformat(registry["verified_at"].replace("Z", "+00:00"))
+        now = verified + dt.timedelta(hours=16)
         usage = USAGE.normalize_usage("codex", usage_stream(sample_usage()))
         estimate = USAGE.estimate_tariff(usage, "gpt-5.6-luna", registry, billing_mode="subscription", now=now)
         self.assertEqual((estimate["estimated_usd"], estimate["actual_charge_usd"]), (0.000373, None))
@@ -90,6 +91,33 @@ class UsageTests(unittest.TestCase):
         self.assertEqual(expired["gaps"], ["tariff_requires_live_refresh"])
         slug = USAGE.estimate_tariff(usage, "gemini-3.8-flash-high", registry, billing_mode="api", now=now)
         self.assertNotIn("model_has_no_verified_tariff", slug["gaps"])
+        zero_write = USAGE.normalize_usage("codex", usage_stream(sample_usage(1000, 400, 0, 200)))
+        self.assertEqual(registry["models"]["gemini-4-carbon"]["revalidate_on"], "2026-12-01")
+        carbon = USAGE.estimate_tariff(zero_write, "gemini-4-carbon-high", registry, billing_mode="api", now=now)
+        self.assertEqual(carbon["estimated_usd"], 0.00324)
+        carbon_expired = USAGE.estimate_tariff(
+            zero_write,
+            "gemini-4-carbon-high",
+            registry,
+            billing_mode="api",
+            now=dt.datetime(2026, 12, 1, 0, 0, tzinfo=dt.UTC),
+        )
+        self.assertEqual(
+            (carbon_expired["estimated_usd"], carbon_expired["gaps"]),
+            (None, ["tariff_requires_live_refresh"]),
+        )
+        hydrogen_xhigh = USAGE.estimate_tariff(
+            zero_write, "gemini-4-hydrogen-xhigh", registry, billing_mode="api", now=now
+        )
+        self.assertEqual(hydrogen_xhigh["estimated_usd"], 0.00243)
+        self.assertNotIn("model_has_no_verified_tariff", hydrogen_xhigh["gaps"])
+        orchestrator = USAGE.estimate_tariff(
+            zero_write, "gemini-pro-orchestrator", registry, billing_mode="api", now=now
+        )
+        self.assertEqual(
+            (orchestrator["estimated_usd"], orchestrator["gaps"]),
+            (None, ["model_has_no_verified_tariff"]),
+        )
         long = USAGE.normalize_usage("codex", usage_stream(sample_usage(300000)))
         unresolved = USAGE.estimate_tariff(long, "gpt-5.6-luna", registry, billing_mode="api", now=now)
         self.assertEqual(

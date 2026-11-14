@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // Zero-LLM-token model release radar sync script.
 // Fetches public static JSON catalogs (or reads an offline fixture) and reports
-// newly released model IDs from Anthropic, OpenAI, Google, Z.AI, and DeepSeek
-// that are not yet tracked in benchmarks.prior.json.
+// newly released model IDs from Anthropic, OpenAI, Google, Z.AI, DeepSeek,
+// Moonshot, Qwen, and OpenCode that are not yet tracked in benchmarks.prior.json.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -25,9 +25,14 @@ export const VENDOR_PREFIXES = [
   "gemini-",
   "google/",
   "gpt-",
+  "moonshotai/",
   "openai/",
+  "opencode/",
   "openrouter/deepseek/",
+  "openrouter/moonshotai/",
+  "openrouter/qwen/",
   "openrouter/z-ai/",
+  "qwen/",
   "z-ai/",
 ];
 

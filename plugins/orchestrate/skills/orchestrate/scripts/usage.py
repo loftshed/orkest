@@ -418,7 +418,7 @@ def combine_attempts(attempts: list[dict[str, Any]]) -> dict[str, Any]:
 def tariff_for_model(models: dict[str, Any], model: str) -> dict[str, Any] | None:
     if model in models:
         return models[model]
-    stripped = re.sub(r"(?:-(?:low|medium|high|max|thinking))+$", "", model)
+    stripped = re.sub(r"(?:-(?:low|medium|high|xhigh|max|thinking))+$", "", model)
     return models.get(stripped)
 
 

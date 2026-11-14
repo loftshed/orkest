@@ -31,13 +31,13 @@
       "model": "gpt:sol",
       "effort": "high",
       "alternates": [
-        { "engine": "claude", "model": "claude:frontier", "effort": "high" },
-        { "engine": "codex", "model": "gpt:luna", "effort": "max" }
+        { "engine": "claude", "model": "claude:best", "effort": "high" },
+        { "engine": "claude", "model": "claude:frontier", "effort": "high" }
       ]
     },
     "structural-refactor": {
       "engine": "claude",
-      "model": "claude:frontier",
+      "model": "claude:best",
       "effort": "high",
       "alternates": [
         { "engine": "codex", "model": "gpt:sol", "effort": "high" },
@@ -49,15 +49,15 @@
       "model": "gpt:astra",
       "effort": "high",
       "alternates": [
-        { "engine": "claude", "model": "claude:frontier", "effort": "high" },
-        { "engine": "claude", "model": "claude:balanced", "effort": "high" }
+        { "engine": "agy", "model": "gemini:carbon-high" },
+        { "engine": "claude", "model": "claude:best", "effort": "high" }
       ]
     },
     "architecture-conductor": {
       "engine": "agy",
       "model": "gemini:pro",
       "alternates": [
-        { "engine": "claude", "model": "claude:frontier", "effort": "high" },
+        { "engine": "claude", "model": "claude:best", "effort": "high" },
         { "engine": "codex", "model": "gpt:sol", "effort": "high" }
       ]
     },
@@ -66,8 +66,8 @@
       "model": "claude:fast",
       "effort": "medium",
       "alternates": [
-        { "engine": "agy", "model": "gemini:flash-high" },
-        { "engine": "codex", "model": "gpt:luna", "effort": "medium" }
+        { "engine": "agy", "model": "gemini:hydrogen-high" },
+        { "engine": "codex", "model": "gpt:terra", "effort": "medium" }
       ]
     },
     "independent-review": {
@@ -75,8 +75,8 @@
       "model": "gpt:sol",
       "effort": "high",
       "alternates": [
-        { "engine": "claude", "model": "claude:frontier", "effort": "high" },
-        { "engine": "agy", "model": "gemini:flash-high" }
+        { "engine": "claude", "model": "claude:best", "effort": "high" },
+        { "engine": "agy", "model": "gemini:carbon-high" }
       ]
     },
     "web-research": {

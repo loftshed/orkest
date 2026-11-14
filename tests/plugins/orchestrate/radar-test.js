@@ -15,31 +15,55 @@ import {
 import { updateModelRadar } from "../../../scripts/update-model-radar.mjs";
 
 describe("ork radar and benchmark priors", () => {
-  it("loads structured benchmark priors for all supported model families", () => {
+  it("loads structured benchmark priors for all supported model families", async () => {
     const priors = loadBenchmarkPriors();
     expect(priors.schema).toBe("orkest.benchmarks.prior.v1");
     const expectedModels = [
+      "claude-fable-5-2",
       "claude-opus-5-5",
       "claude-sonnet-5-5",
-      "claude-haiku-4-5",
+      "claude-haiku-5-5",
       "gpt-6-astra",
-      "gpt-6-sol",
+      "gpt-6.1-sol",
+      "gpt-6.1-terra",
       "gpt-6-luna",
+      "gemini-4-carbon-high",
       "gemini-4-argon-high",
-      "gemini-4-argon-medium",
+      "gemini-4-hydrogen-high",
       "gemini-3.8-flash-high",
+      "openrouter/moonshotai/kimi-k3.1-pro",
+      "openrouter/z-ai/glm-5.3",
       "openrouter/z-ai/glm-5.3-flash",
-      "openrouter/deepseek/deepseek-v4-flash",
+      "openrouter/deepseek/deepseek-v4.1-flash-1017",
     ];
     for (const modelId of expectedModels) {
-      expect(priors.models[modelId]).toBeDefined();
-      expect(typeof priors.models[modelId].swe_bench_verified).toBe("number");
-      expect(typeof priors.models[modelId].livecodebench).toBe("number");
-      expect(typeof priors.models[modelId].aider_polyglot).toBe("number");
-      expect(typeof priors.models[modelId].composite_prior).toBe("number");
-      expect(Array.isArray(priors.models[modelId].strengths)).toBe(true);
-      expect(typeof priors.models[modelId].updated_at).toBe("string");
+      const prior = priors.models[modelId];
+      expect(prior).toBeDefined();
+      expect(typeof prior.terminal_bench_4_1).toBe("number");
+      for (const metricKey of [
+        "deepswe_v1_1",
+        "osworld_2_1",
+        "frontier_swe_2",
+        "composite_prior",
+      ]) {
+        expect(prior[metricKey] === null || typeof prior[metricKey] === "number").toBe(true);
+      }
+      expect(typeof prior.evidence_kind).toBe("string");
+      expect(typeof prior.source).toBe("string");
+      expect(Array.isArray(prior.strengths)).toBe(true);
+      expect(typeof prior.updated_at).toBe("string");
     }
+    expect(priors.models["claude-opus-5-5"].family).toBe("claude:best");
+    expect(priors.models["openrouter/moonshotai/kimi-k3.1-pro"].family).toBe("kimi:pro");
+
+    const livePriorsOut = await radarCli(["priors"], {
+      priors,
+      telemetry: { groups: [] },
+      width: 140,
+    });
+    expect(livePriorsOut.exitCode).toBe(0);
+    expect(livePriorsOut.stdout).toContain("—");
+    expect(livePriorsOut.stdout).not.toMatch(/(?:^|[\s|(])0\.0%/);
   });
 
   it("identifies new and deprecated models and merges silent-nerf telemetry health", () => {
@@ -162,7 +186,7 @@ describe("ork radar and benchmark priors", () => {
           status: "live",
           models: [
             {
-              id: "gpt-6.1-sol",
+              id: "gpt-6.2-sol",
               vendor: "openai",
               supported_efforts: ["low", "medium", "high"],
             },
@@ -202,11 +226,11 @@ describe("ork radar and benchmark priors", () => {
     expect(refreshCalls).toBe(1);
     const statusData = JSON.parse(statusRes.stdout);
     expect(statusData.diff.newModels).toEqual([
-      "gpt-6.1-sol",
+      "gpt-6.2-sol",
       "gpt-7-unmapped",
       "gemini-3.8-flash-medium",
     ]);
-    const solEntry = statusData.diff.models.find((item) => item.id === "gpt-6.1-sol");
+    const solEntry = statusData.diff.models.find((item) => item.id === "gpt-6.2-sol");
     expect(solEntry.prior).toMatchObject({ family: "gpt:sol" });
     expect(statusData.audit.has_drift).toBe(true);
     expect(statusData.audit.unmapped_models.map((item) => item.id)).toContain("gpt-7-unmapped");
@@ -252,7 +276,7 @@ describe("ork radar and benchmark priors", () => {
       fs.readFileSync(path.join(cacheDir, "models-seen.json"), "utf8"),
     );
     expect(seenPayload.schema).toBe("orkest.models-seen.v1");
-    expect(seenPayload.models.map((item) => item.id)).toContain("gpt-6.1-sol");
+    expect(seenPayload.models.map((item) => item.id)).toContain("gpt-6.2-sol");
 
     const afterAck = await radarCli(["diff", "--json"], {
       cacheDir,
@@ -268,7 +292,7 @@ describe("ork radar and benchmark priors", () => {
     fs.writeFileSync(
       path.join(cacheDir, "models-v1.json"),
       JSON.stringify({
-        platforms: [{ engine: "codex", status: "live", models: [{ id: "gpt-6.1-sol" }] }],
+        platforms: [{ engine: "codex", status: "live", models: [{ id: "gpt-6.2-sol" }] }],
       }),
       "utf8",
     );
