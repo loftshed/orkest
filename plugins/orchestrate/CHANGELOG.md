@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.87.0
+
+- feat(orchestrate): frame swarm footer telemetry and quiet action strip (#214)
+
 ## 0.86.0
 
 - feat(orchestrate): clarify Swarm View hierarchy and fold wave history (#210) (#211)
