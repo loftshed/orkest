@@ -10,13 +10,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs, promisify } from "node:util";
 
-import {
-  ansiToWindowSvg,
-  captures,
-  generatedBlocks,
-  replaceBlocks,
-  SCREENSHOT_FONTS,
-} from "./lib/readme.js";
+import { ansiToWindowSvg, captures, generatedBlocks, replaceBlocks } from "./lib/readme.js";
 
 const execute = promisify(execFile);
 const IMAGES = "docs/images";
@@ -33,20 +27,60 @@ export function staleScreenshots(repo, shots) {
 }
 
 async function requireRasterizer() {
-  let fonts;
+  let tool;
   try {
     await execute("magick", ["-version"]);
+    tool = "magick";
+  } catch {
+    try {
+      await execute("rsvg-convert", ["-v"]);
+      tool = "rsvg-convert";
+    } catch {
+      throw new Error(
+        "drawing screenshots needs ImageMagick (`magick`) or librsvg (`rsvg-convert`), and fontconfig (`fc-list`)",
+      );
+    }
+  }
+  let fonts;
+  try {
     fonts = (await execute("fc-list", [":", "family"])).stdout;
   } catch {
-    throw new Error("drawing screenshots needs ImageMagick (`magick`) and fontconfig (`fc-list`)");
+    throw new Error("drawing screenshots needs fontconfig (`fc-list`)");
   }
-  const missing = SCREENSHOT_FONTS.filter((font) => !fonts.includes(font));
-  if (missing.length > 0)
-    throw new Error(`drawing screenshots needs these fonts installed: ${missing.join(", ")}`);
+  const hasTextFont = fonts.includes("Fira Code") || fonts.includes("BlexMono Nerd Font Mono");
+  const hasIconFont =
+    fonts.includes("Symbols Nerd Font Mono") ||
+    fonts.includes("Symbols Nerd Font") ||
+    fonts.includes("BlexMono Nerd Font Mono");
+  if (!hasTextFont || !hasIconFont) {
+    throw new Error(
+      "drawing screenshots needs either 'Fira Code' or 'BlexMono Nerd Font Mono' and any of 'Symbols Nerd Font Mono', 'Symbols Nerd Font', or 'BlexMono Nerd Font Mono' installed",
+    );
+  }
+  return tool;
+}
+
+async function rasterizeToPng(tool, svgPath, imagePath) {
+  if (tool === "magick") {
+    // Twice the SVG's size for high-density displays, with a 255-colour palette to stay small.
+    await execute("magick", [
+      "-background",
+      "none",
+      "-density",
+      "192",
+      svgPath,
+      "-strip",
+      "-colors",
+      "255",
+      `PNG8:${imagePath}`,
+    ]);
+  } else if (tool === "rsvg-convert") {
+    await execute("rsvg-convert", ["--zoom=2", "-o", imagePath, svgPath]);
+  }
 }
 
 async function drawScreenshots(repo, shots) {
-  await requireRasterizer();
+  const tool = await requireRasterizer();
   const { cellWidth } = await import(
     pathToFileURL(path.join(repo, "plugins/orchestrate/lib/tui-box.mjs")).href
   );
@@ -57,18 +91,7 @@ async function drawScreenshots(repo, shots) {
       const svg = path.join(scratch, `${name}.svg`);
       fs.writeFileSync(svg, ansiToWindowSvg(ansi, { title, cols, cellWidth }));
       const image = path.join(repo, IMAGES, `${name}.png`);
-      // Twice the SVG's size for high-density displays, with a 255-colour palette to stay small.
-      await execute("magick", [
-        "-background",
-        "none",
-        "-density",
-        "192",
-        svg,
-        "-strip",
-        "-colors",
-        "255",
-        `PNG8:${image}`,
-      ]);
+      await rasterizeToPng(tool, svg, image);
       // The source is saved last, so an interrupted run is still reported as stale.
       fs.writeFileSync(path.join(repo, IMAGES, `${name}.ansi`), `${ansi}\n`);
     }

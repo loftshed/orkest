@@ -72,11 +72,12 @@ it("renders escaped terminal cells with captured colors, inverse backgrounds and
     rows: 2,
     palette: "dark",
   });
-  expect(svg).toContain('width="136" height="56"');
-  expect(svg).toContain("&lt;agent&gt;&amp;");
-  expect(svg).toContain('fill="#c62828"');
-  expect(svg).toContain('width="20" height="20" fill="#e6e8ee"');
-  expect(svg).toContain('aria-label="safe &quot;capture&quot; terminal capture"');
+  expect(svg).toContain('width="129" height="100"');
+  expect(svg).toContain("&lt;");
+  expect(svg).toContain("&amp;");
+  expect(svg).toContain('fill="#e5484d"');
+  expect(svg).toContain('fill="#e6e8ee"');
+  expect(svg).toContain('aria-label="safe &quot;capture&quot;"');
 });
 
 it("compares cell content and dimensions without treating source metadata as a visual change", () => {

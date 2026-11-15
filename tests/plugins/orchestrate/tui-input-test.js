@@ -1,6 +1,12 @@
 import { afterEach, expect, it, vi } from "vitest";
 
-import { createTerminalInput } from "../../../plugins/orchestrate/lib/tui-input.mjs";
+import {
+  ALT_SCROLL_DISABLE,
+  ALT_SCROLL_ENABLE,
+  createTerminalInput,
+  TERMINAL_INPUT_DISABLE,
+  TERMINAL_INPUT_ENABLE,
+} from "../../../plugins/orchestrate/lib/tui-input.mjs";
 
 const inputs = [];
 afterEach(() => {
@@ -128,4 +134,11 @@ it("stops delivering input and clears incomplete framing on disposal", async () 
   await vi.advanceTimersByTimeAsync(1100);
   expect(keys).toEqual([{ text: "o", name: "o", ctrl: false }]);
   expect(mouse).toEqual([]);
+});
+
+it("exports terminal control sequences that disable alternate-scroll (?1007l) and restore it (?1007h)", () => {
+  expect(ALT_SCROLL_DISABLE).toBe("\u{1B}[?1007l");
+  expect(ALT_SCROLL_ENABLE).toBe("\u{1B}[?1007h");
+  expect(TERMINAL_INPUT_ENABLE).toContain(ALT_SCROLL_DISABLE);
+  expect(TERMINAL_INPUT_DISABLE).toContain(ALT_SCROLL_ENABLE);
 });

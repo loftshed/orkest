@@ -4,8 +4,10 @@ import { StringDecoder } from "node:string_decoder";
 
 export const MOUSE_ENABLE = "\u{1B}[?1003h\u{1B}[?1006h";
 export const MOUSE_DISABLE = "\u{1B}[?1006l\u{1B}[?1003l";
-export const TERMINAL_INPUT_ENABLE = `${MOUSE_ENABLE}\u{1B}[?2004h`;
-export const TERMINAL_INPUT_DISABLE = `\u{1B}[?2004l${MOUSE_DISABLE}`;
+export const ALT_SCROLL_DISABLE = "\u{1B}[?1007l";
+export const ALT_SCROLL_ENABLE = "\u{1B}[?1007h";
+export const TERMINAL_INPUT_ENABLE = `${MOUSE_ENABLE}\u{1B}[?2004h${ALT_SCROLL_DISABLE}`;
+export const TERMINAL_INPUT_DISABLE = `\u{1B}[?2004l${MOUSE_DISABLE}${ALT_SCROLL_ENABLE}`;
 
 const ESCAPE = "\u{1B}";
 const MOUSE_PREFIX = `${ESCAPE}[<`;

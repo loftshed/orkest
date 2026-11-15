@@ -24,6 +24,8 @@ import {
   shimmerText,
   SPINNER,
   tone,
+  truncateDisplay,
+  truncateStyled,
   wrapText,
 } from "./tui-box.mjs";
 import {
@@ -37,8 +39,6 @@ import {
   quotaAccountLabel,
   quotaAccountScope,
   sectionHeading,
-  statusRow,
-  treeCard,
 } from "./tui-components.mjs";
 import { renderLogLine, renderMarkdown, stripInlineMarkdown } from "./tui-markdown.mjs";
 import { resolveTheme } from "./tui-theme.mjs";
@@ -60,6 +60,8 @@ export {
   shimmerText,
   SPINNER,
   tone,
+  truncateDisplay,
+  truncateStyled,
   wrapText,
 } from "./tui-box.mjs";
 
@@ -133,6 +135,13 @@ function phaseLabel(member) {
   if (member.runtimeState === "idle" && ACTIVE_STATUSES.has(member.status))
     return `idle · last reported ${member.status}`;
   return member.status || "unknown";
+}
+
+function agentPhaseLabel(member, width = 80) {
+  if (memberDisplayState(member) === "reported" && width < 68) {
+    return "review";
+  }
+  return phaseLabel(member);
 }
 
 export function shortAgentName(member) {
@@ -483,12 +492,19 @@ function shortFolder(folderPath) {
   return path.basename(cleaned) || cleaned;
 }
 
+export function formatWorktreeBadge(target) {
+  const label = shortFolder(target);
+  if (/^wt:/iu.test(label)) return label;
+  if (/^wt-/iu.test(label) && label.length > 3) return `wt:${label.slice(3)}`;
+  return `wt:${label}`;
+}
+
 export function worktreeBadge(member, room) {
   const worktree = memberWorktree(member, room);
   if (worktree?.disposable !== true) return "";
   const target =
     worktree.slug || worktree.path || member?.progress?.cwd || member?.cwd || member?.session?.cwd;
-  return `wt:${shortFolder(target)}`;
+  return formatWorktreeBadge(target);
 }
 
 function toAsciiTree(text, tier) {
@@ -496,7 +512,7 @@ function toAsciiTree(text, tier) {
   return text.replaceAll("└", "`").replaceAll("├", "+").replaceAll("─", "-").replaceAll("│", "|");
 }
 
-function folderTreeRails(entries, tier, columns = 1, hasFollowingSection = false) {
+function folderTreeRails(entries, tier, columns = 1, hasFollowingSection = false, width = 80) {
   const inGroup = new Set(entries.map(({ agent }) => agent.id));
   const groupParent = (agent) =>
     agent.parent && agent.parent !== "conductor" && inGroup.has(agent.parent)
@@ -510,6 +526,8 @@ function folderTreeRails(entries, tier, columns = 1, hasFollowingSection = false
     }
     return true;
   };
+  const isNarrow = width < 68;
+  const maxDepth = 4;
   return entries.map(({ agent }, entryIndex) => {
     const ancestors = [];
     let cursor = groupParent(agent);
@@ -519,16 +537,34 @@ function folderTreeRails(entries, tier, columns = 1, hasFollowingSection = false
       ancestors.unshift(parentEntry.agent);
       cursor = groupParent(parentEntry.agent);
     }
-    const indent = ancestors
-      .map((ancestor) => (isLastSibling(ancestor) ? " ".repeat(3) : "│  "))
-      .join("");
+    let indent = "";
+    let continuationIndent = "";
+    if (ancestors.length > maxDepth) {
+      const excess = ancestors.length - maxDepth;
+      indent = `+${excess} `;
+      continuationIndent = " ".repeat(displayWidth(indent));
+    } else {
+      for (const ancestor of ancestors) {
+        const last = isLastSibling(ancestor);
+        const pad = " ".repeat(isNarrow ? 2 : 3);
+        const rail = isNarrow ? "│ " : "│  ";
+        indent += last ? pad : rail;
+        continuationIndent += last ? pad : rail;
+      }
+    }
     const isBottomOfColumn = columns > 1 && entryIndex + columns >= entries.length;
     const isLast = isLastSibling(agent);
     const hasRailBelow = !isLast && (!isBottomOfColumn || hasFollowingSection);
+    const branch = isLast ? "└─" : "├─";
+    const contRail = isNarrow ? "│ " : "│  ";
+    const contSpace = " ".repeat(isNarrow ? 2 : 3);
+    const cont = hasRailBelow ? contRail : contSpace;
+    const tailSpace = " ".repeat(2);
     return {
       topPrefix: toAsciiTree(`${indent}│ `, tier),
-      midPrefix: toAsciiTree(`${indent}${isLast ? "└─" : "├─"}`, tier),
-      tailPrefix: toAsciiTree(`${indent}${hasRailBelow ? "│ " : "  "}`, tier),
+      midPrefix: toAsciiTree(`${indent}${branch}`, tier),
+      continuationPrefix: toAsciiTree(`${continuationIndent}${cont}`, tier),
+      tailPrefix: toAsciiTree(`${indent}${hasRailBelow ? "│ " : tailSpace}`, tier),
     };
   });
 }
@@ -814,8 +850,9 @@ export class HordeView {
       completedMode = "collapsed",
       quotaMode = "collapsed",
       quotaWindow = "5h",
-      servicesMode = "expanded",
+      servicesMode = "collapsed",
       inHerdr = false,
+      mouseEnabled = true,
       onFocusPane,
       onPreview,
       onDiff,
@@ -833,7 +870,7 @@ export class HordeView {
     this.completedMode = COMPLETED_MODES.includes(completedMode) ? completedMode : "collapsed";
     this.quotaWindow = quotaWindow === "weekly" ? "weekly" : "5h";
     this.quotaMode = QUOTA_MODES.has(quotaMode) ? quotaMode : "expanded";
-    this.servicesMode = SERVICES_MODES.has(servicesMode) ? servicesMode : "expanded";
+    this.servicesMode = SERVICES_MODES.has(servicesMode) ? servicesMode : "collapsed";
     this.onFocusPane = typeof onFocusPane === "function" ? onFocusPane : undefined;
     this.onPreview = typeof onPreview === "function" ? onPreview : undefined;
     this.onDiff = typeof onDiff === "function" ? onDiff : undefined;
@@ -848,7 +885,7 @@ export class HordeView {
     this.logOffset = 0;
     this.targets = [];
     this.hovered = undefined;
-    this.mouseEnabled = true;
+    this.mouseEnabled = mouseEnabled !== false;
     this.notice = "";
     this.activityId = undefined;
     this.preview = null;
@@ -910,18 +947,14 @@ export class HordeView {
     if (serviceRows > 0) {
       servicePanelLines = this.servicesMode === "collapsed" ? 1 : serviceRows + 2;
     }
-    let updateBarLines = 0;
-    if (this.showUpdateBar() && this.height >= 14) {
-      updateBarLines = this.height < 18 ? 1 : 3;
-    }
+    const updateBarLines = this.showUpdateBar() && this.height >= 14 ? 1 : 0;
     const base = Math.min(
-      9,
+      16,
       Math.max(
         2,
         Math.floor(
-          (this.height - 10 - extraQuotaRows - servicePanelLines - updateBarLines - footerExtra) /
-            4,
-        ) * 2,
+          (this.height - 8 - extraQuotaRows - servicePanelLines - updateBarLines - footerExtra) / 2,
+        ),
       ),
     );
     const folderCount = new Set(this.room.agents.map((agent) => agentFolder(agent, this.room)))
@@ -935,17 +968,14 @@ export class HordeView {
             : Math.max(1, this.quotaRowLimit()) + 2;
       }
       const available =
-        this.height - 5 - quotaLines - servicePanelLines - updateBarLines - 3 - footerExtra;
-      const capacity = Math.max(
-        1,
-        Math.floor((available - (folderCount > 1 ? 0 : 1)) / (folderCount > 1 ? 5 : 4)),
-      );
+        this.height - 4 - quotaLines - servicePanelLines - updateBarLines - 2 - footerExtra;
+      const capacity = Math.max(1, Math.floor((available - (folderCount > 1 ? 1 : 0)) / 2));
       return Math.min(base, capacity);
     }
     if (this.completedMode === "expanded" || this.height < 24) return base;
     const completedCount = (this.room?.agents || []).filter(isInactive).length;
     if (completedCount <= 1) return base;
-    return Math.min(16, Math.max(base, base + completedCount - 1));
+    return Math.min(16, Math.max(base, base + completedCount));
   }
 
   get pageSize() {
@@ -1387,10 +1417,22 @@ export class HordeView {
         return true;
       }
       if (this.preview) {
-        this.scrollPreview(action === "scroll-up" ? 3 : -3);
+        const delta = action === "scroll-up" ? 3 : -3;
+        this.previewOffset = Math.max(0, this.previewOffset + delta);
+        this.previewFollow = this.preview?.kind === "terminal" && this.previewOffset === 0;
+        if (this.previewFollow && this.preview) this.preview.text = this.previewLatestText;
         return true;
       }
-      return this.handleKey(action === "scroll-up" ? "\u{1B}[A" : "\u{1B}[B");
+      const pages = Math.max(1, Math.ceil(this.room.agents.length / this.pageSize));
+      if (pages > 1) {
+        const delta = action === "scroll-down" ? 1 : -1;
+        const nextPage = Math.max(0, Math.min(pages - 1, this.page + delta));
+        if (nextPage !== this.page) {
+          this.page = nextPage;
+          return true;
+        }
+      }
+      return false;
     }
     const target = hitTest(this.targets, x, y);
     this.hovered = target?.id;
@@ -1425,33 +1467,42 @@ export class HordeView {
         { color: this.appearance, hovered: this.hovered, tier: this.tier },
       );
     }
+    const isNarrow = width < 68;
     if (this.preview) {
       const bar = actionBar(
         [
           { id: "preview-back", label: "Back", key: "\u{1B}", hint: "Esc", primary: true },
-          {
-            id: "preview-open",
-            label: "Open terminal",
-            key: "o",
-            disabled: this.preview.kind !== "terminal",
-          },
-          {
-            id: "preview-follow",
-            label: "Follow",
-            key: "r",
-            active: this.previewFollow,
-            disabled: this.preview.kind === "diff",
-          },
+          ...(isNarrow
+            ? []
+            : [
+                {
+                  id: "preview-open",
+                  label: "Open terminal",
+                  key: "o",
+                  disabled: this.preview.kind !== "terminal",
+                },
+                {
+                  id: "preview-follow",
+                  label: "Follow",
+                  key: "r",
+                  active: this.previewFollow,
+                  disabled: this.preview.kind === "diff",
+                },
+              ]),
           ...(this.preview.kind === "diff"
             ? [
                 { id: "diff-mark", label: "x Mark line", key: "x" },
                 { id: "diff-clear", label: "X Clear marks", key: "X" },
               ]
             : []),
-          { id: "preview-up", label: "Up", key: "\u{1B}[5~", hint: "PgUp" },
-          { id: "preview-down", label: "Down", key: "\u{1B}[6~", hint: "PgDn" },
-          { id: "preview-previous", label: "Prev", key: "[" },
-          { id: "preview-next", label: "Next", key: "]" },
+          ...(isNarrow
+            ? []
+            : [
+                { id: "preview-up", label: "Up", key: "\u{1B}[5~", hint: "PgUp" },
+                { id: "preview-down", label: "Down", key: "\u{1B}[6~", hint: "PgDn" },
+                { id: "preview-previous", label: "Prev", key: "[" },
+                { id: "preview-next", label: "Next", key: "]" },
+              ]),
         ],
         width,
         { color: this.appearance, hovered: this.hovered, tier: this.tier },
@@ -1474,19 +1525,22 @@ export class HordeView {
               },
             ]
           : []),
-        ...(this.preview ||
-        !selected ||
-        this.isCurrentAgent(selected) ||
-        (!selected.herdrPaneId && !selected.paneId)
-          ? []
-          : [
+        ...(!isNarrow &&
+        !this.preview &&
+        selected &&
+        !this.isCurrentAgent(selected) &&
+        (selected.herdrPaneId || selected.paneId)
+          ? [
               {
                 id: "open",
                 label: "Open terminal",
                 key: "o",
               },
-            ]),
-        ...(selected?.resultPath ? [{ id: "diff", label: "Diff", key: "d" }] : []),
+            ]
+          : []),
+        ...(selected?.resultPath && (!isNarrow || width >= 56)
+          ? [{ id: "diff", label: "Diff", key: "d" }]
+          : []),
         ...(hasInactiveAgents
           ? [
               {
@@ -1497,7 +1551,7 @@ export class HordeView {
               },
             ]
           : []),
-        { id: "logs", label: "Log", key: "g" },
+        ...(isNarrow ? [] : [{ id: "logs", label: "Log", key: "g" }]),
         { id: "help", label: "Shortcuts", key: "?" },
       ],
       width,
@@ -1615,7 +1669,7 @@ export class HordeView {
     );
   }
 
-  updateSummaryText() {
+  updateSummaryText(budget = 80) {
     const upd = this.room?.update || this.room?.updateStatus || {};
     const count =
       Number.isFinite(upd.commitsBehind) && upd.commitsBehind > 0 ? upd.commitsBehind : 1;
@@ -1636,9 +1690,14 @@ export class HordeView {
         return `! Update failed: ${msg} · click to retry`;
       }
       default: {
-        return upd.dirty
-          ? `↑ ${count} new ${plural} on origin/main (working tree dirty)`
-          : `↑ ${count} new ${plural} on origin/main · click to update`;
+        if (upd.dirty) {
+          const fullDirty = `↑ ${count} new ${plural} on origin/main (working tree dirty)`;
+          return displayWidth(fullDirty) <= budget
+            ? fullDirty
+            : `↑ ${count} new ${plural} (dirty tree)`;
+        }
+        const full = `↑ ${count} new ${plural} on origin/main · click to update`;
+        return displayWidth(full) <= budget ? full : `↑ ${count} new ${plural} · click to update`;
       }
     }
   }
@@ -1667,45 +1726,12 @@ export class HordeView {
     if (this.hovered === "update-bar") badgeTone = "buttonHover";
     const badge = tone(labelText, badgeTone, this.appearance);
     const budget = Math.max(1, innerWidth - displayWidth(`${labelText}  `));
-    return `${badge}  ${fit(this.updateSummaryText(), budget)}`;
+    return `${badge}  ${truncateDisplay(this.updateSummaryText(budget), budget, this.tier)}`;
   }
 
   updateBlockLines(innerWidth) {
     if (!this.showUpdateBar() || this.height < 14) return [];
-    if (this.height < 18) return [this.updateLine(innerWidth)];
-    const upd = this.room?.update || this.room?.updateStatus || {};
-    let headerTone = "yellow bold";
-    let bodyTone = "warning";
-    let headerRight = upd.dirty ? "working tree dirty" : "Shift+U";
-    switch (upd.status) {
-      case "error": {
-        headerTone = "red bold";
-        bodyTone = "error";
-        headerRight = "retry · Shift+U";
-
-        break;
-      }
-      case "updated": {
-        headerTone = "green bold";
-        bodyTone = "success";
-        headerRight = "up to date";
-
-        break;
-      }
-      case "updating": {
-        headerTone = "running bold";
-        bodyTone = "running";
-        headerRight = "pulling...";
-
-        break;
-      }
-      // No default
-    }
-    if (this.hovered === "update-bar") headerTone = "buttonHover";
-    const title = this.tier === "nerd" ? "\u{F021} Update" : "Update";
-    const rowWidth = Math.max(1, innerWidth - 4);
-    const body = tone(` ${fit(this.updateSummaryText(), rowWidth)}`, bodyTone, this.appearance);
-    return this.panel(title, [body], innerWidth, headerRight, headerTone);
+    return [this.updateLine(innerWidth)];
   }
 
   quotaSummaryLines(innerWidth) {
@@ -1851,7 +1877,7 @@ export class HordeView {
     const hasPort = services.some((svc) => svc?.port || plain(svc?.ports || "").trim());
     const hostPrefix = hasPort ? "localhost " : "";
     const summary = `${services.length} running${items.length > 0 ? ` · ${hostPrefix}${items.join(" · ")}` : ""}`;
-    return `${badge}  ${fit(summary, budget)}`;
+    return `${badge}  ${truncateDisplay(summary, budget, this.tier)}`;
   }
 
   serviceLines(width) {
@@ -1996,7 +2022,7 @@ export class HordeView {
         visible.push(tone(`${ellipsis}and ${omitted} more`, "muted", this.appearance));
       }
     }
-    const paddedBody = visible.map((row) => `${pad}${row}`);
+    const paddedBody = visible.map((row) => `${pad}${truncateStyled(row, bodyWidth, this.tier)}`);
     let headerTone = isPinned ? "warning bold" : "mdSection";
     if (this.hovered === "focus-card") headerTone = "buttonHover";
     const cardLines = this.panel(title, paddedBody, innerWidth, rightHint, headerTone);
@@ -2214,19 +2240,23 @@ export class HordeView {
       : "identity36";
     const leadTitle =
       lead.name || lead.progress?.name
-        ? `${style("ork:", "muted")} ${style(`${leadIcon}${shortAgentName(lead)}`, identityTone)}`
+        ? style(`${leadIcon}${shortAgentName(lead)}`, identityTone)
         : `${style(leadIcon, identityTone)}${style("Coordinator", "bold")}`;
     const leadBranch = plain(
       lead.branch || lead.progress?.branch || lead.worktree?.branch || "",
     ).trim();
     const leadEngine = plain(lead.engine || "").trim();
+    const allShareLead =
+      room.agents.length > 0 && selected.every((agent) => agentFolder(agent, room) === leadFolder);
     const leadLocation =
-      room.agents.length === 0 || selected.every((agent) => agentFolder(agent, room) !== leadFolder)
-        ? `${separator(" · ")}${style("folder:", "muted")} ${style(shortFolder(leadFolder), "bold")}`
+      room.agents.length === 0 ||
+      allShareLead ||
+      selected.every((agent) => agentFolder(agent, room) !== leadFolder)
+        ? `${separator(" · ")}${style(shortFolder(leadFolder), "bold")}`
         : "";
     const leadMetaParts = [
       `${leadTitle}${leadRoleBadge}${leadLocation}${leadBranch ? style(` (${leadBranch})`, "leadBranch") : ""}`,
-      ...(leadEngine ? [`${style("harness:", "muted")} ${style(leadEngine, "leadEngine")}`] : []),
+      ...(leadEngine ? [style(leadEngine, "leadEngine")] : []),
     ];
     const leadGoal = plain(lead.progress?.goal || "").trim();
     const leadTask = cleanProgressTask(lead);
@@ -2243,7 +2273,7 @@ export class HordeView {
     const missionBudget = Math.max(1, innerWidth - (leadRunning ? 5 : 3));
     const fittedMission =
       displayWidth(leadMissionLine) > missionBudget
-        ? fit(leadMissionLine, missionBudget)
+        ? truncateDisplay(leadMissionLine, missionBudget, this.tier)
         : leadMissionLine;
     const renderedMission =
       leadMissionLine && leadRunning
@@ -2376,15 +2406,20 @@ export class HordeView {
       }
       const gap = "  ";
       const lastFolder = folderGroups.keys().toArray().at(-1);
+      const hasWorktrees = visibleAgents.some((agent) => worktreeBadge(agent, room));
+      const hasAllSharingLead =
+        folderGroups.size === 1 && folderGroups.has(leadFolder) && !hasWorktrees;
       for (const [folder, rawEntries] of folderGroups) {
-        const parts = hasHerdrPaneHeader
-          ? activityParts(
-              rawEntries.map(({ agent }) => agent),
-              this.tier,
-            )
-          : [];
-        const folderSummary = parts.length > 0 ? parts : null;
-        lines.push(this.folderHeaderLine(folder, rawEntries.length, innerWidth, folderSummary));
+        if (!hasAllSharingLead || hasHerdrPaneHeader) {
+          const parts = hasHerdrPaneHeader
+            ? activityParts(
+                rawEntries.map(({ agent }) => agent),
+                this.tier,
+              )
+            : [];
+          const folderSummary = parts.length > 0 ? parts : null;
+          lines.push(this.folderHeaderLine(folder, rawEntries.length, innerWidth, folderSummary));
+        }
         const hiddenCompletedCount =
           !isFocusedView && this.completedMode === "hidden"
             ? rawEntries.filter(({ agent }) => isCollapsibleCompleted(agent)).length
@@ -2402,9 +2437,10 @@ export class HordeView {
         const cardWidth =
           columns === 2 ? Math.max(24, Math.floor((innerWidth - gap.length) / 2)) : innerWidth;
         const hasFollowingSection = folder !== lastFolder;
-        const rails = folderTreeRails(entries, this.tier, columns, hasFollowingSection);
+        const rails = folderTreeRails(entries, this.tier, columns, hasFollowingSection, cardWidth);
+        const inGroup = new Set(entries.map(({ agent: a }) => a.id));
         const cards = entries.map(({ agent, index }, entryIndex) => {
-          const { topPrefix, midPrefix, tailPrefix } = rails[entryIndex];
+          const { midPrefix, continuationPrefix } = rails[entryIndex];
           const prefix =
             hiddenCompletedCount > 0 && entryIndex === entries.length - 1
               ? toAsciiTree(midPrefix.replace("└─", "├─"), this.tier)
@@ -2412,10 +2448,11 @@ export class HordeView {
           const wfRole = roleOf(agent);
           const roleBadge = wfRole ? ` [${wfRole}]` : "";
           const isFocused = agent.id === this.focusId;
-          const isHovered = this.hovered === `agent:${agent.id}`;
-          const pointer = this.tier === "ascii" ? ">" : "▸";
-          const chevron = disclosure("", isFocusedView, this.tier);
           const isPinned = agent.id === this.pinnedId;
+          const pointer = this.tier === "ascii" ? ">" : "▸";
+          const focusGlyph = isFocused ? `${pointer} ` : "  ";
+          const glyph = statusGlyph(agent, now, this.tier);
+          const chevron = disclosure("", isFocusedView, this.tier);
           const currentBadge = this.isCurrentAgent(agent) ? " · This chat" : "";
           const locationBadge = worktreeBadge(agent, room);
           const taskText =
@@ -2427,72 +2464,142 @@ export class HordeView {
               ? plain(agent.engine || "agent")
               : rawAgentName;
           const parent = room.agents.find((member) => member.id === agent.parent);
+          const isParentInGroup = agent.parent && inGroup.has(agent.parent);
           const parentBadge =
-            agent.parent && agent.parent !== "conductor"
+            agent.parent && agent.parent !== "conductor" && !isParentInGroup
               ? ` ↳ ${parent ? shortAgentName(parent) : plain(agent.parent)}`
               : "";
-          if (
-            !isFocusedView &&
-            this.completedMode === "collapsed" &&
-            isCollapsibleCompleted(agent)
-          ) {
-            const glyph = statusGlyph(agent, now, this.tier);
-            const badge = ` ${isFocused ? pointer : glyph} ${index + 1} ${displayAgentName} `;
-            const label = `${currentBadge}${parentBadge}${locationBadge ? ` · ${locationBadge}` : ""} · ${model(agent)}${agent.consultation ? "" : ` · ${taskText}`}`;
-            return [
-              statusRow(label, `${outcome(agent) ? `${glyph} ` : ""}${phase(agent)}`, cardWidth, {
-                prefix,
-                color: this.appearance,
-                style: toneForStatus(agent),
-                tier: this.tier,
-                badge,
-                badgeStyle: isFocused ? "agentSelected" : "button",
-                chevron,
-                hovered: isHovered,
-              }),
-            ];
+
+          const isHovered = this.hovered === `agent:${agent.id}`;
+          const isCollapsed =
+            !isFocusedView && this.completedMode === "collapsed" && isCollapsibleCompleted(agent);
+          const statusTone = toneForStatus(agent);
+          const pinBadge = isCollapsed || !isPinned ? "" : " · PIN";
+          const leftBadges = `${roleBadge}${locationBadge ? ` · ${locationBadge}` : ""}${pinBadge}${currentBadge}${parentBadge}`;
+          let nameTone = isCollapsed ? "muted" : `${statusTone} bold`;
+          if (isHovered) {
+            nameTone = "buttonHover";
+          } else if (isFocused || (!isCollapsed && isPinned)) {
+            nameTone = "heading";
           }
-          const stateBadge = isPinned ? "PIN " : "";
-          const cardTitle = `${isFocused ? `${pointer} ` : ""}${index + 1} ${displayAgentName}${agent.role === "lead" ? " (lead)" : ""}`;
-          const rightMeta = `${stateBadge}${locationBadge}${parentBadge}${currentBadge}`.trim();
-          const cardRight = rightMeta ? `${rightMeta} ${chevron}` : chevron;
-          const agentRunning = isExecuting(agent);
-          const cardBodyWidth = Math.max(
-            1,
-            cardWidth - displayWidth(prefix) - (agentRunning ? 5 : 3),
-          );
-          const fittedTaskText =
-            displayWidth(taskText) > cardBodyWidth ? fit(taskText, cardBodyWidth) : taskText;
-          const renderedTask = agentRunning
-            ? `${tone(this.tier === "ascii" ? ">" : SPINNER[Math.floor(now / 120) % SPINNER.length], "shimmerSpinner", this.appearance)} ${shimmerText(fittedTaskText, now, this.appearance)}`
-            : fittedTaskText;
-          const rawStatusLine = `${statusGlyph(agent, now, this.tier)}${roleBadge} ${model(agent)} | ${phase(agent)}${progressSuffix(agent, now)}`;
-          const statusTone = `${toneForStatus(agent)}${isFocused ? " bold" : ""}`;
-          const processSummary = agentProcessSummary(agent, room);
-          let statusLine = tone(rawStatusLine, statusTone, this.appearance);
-          if (processSummary) {
-            const statusWidth = Math.max(1, cardWidth - displayWidth(prefix) - 3);
-            const variants = [processSummary.text, processSummary.compactText];
-            for (const summaryText of variants) {
-              if (displayWidth(rawStatusLine) + 3 + displayWidth(summaryText) > statusWidth)
-                continue;
-              statusLine =
-                tone(rawStatusLine, statusTone, this.appearance) +
-                tone(" · ", "muted", this.appearance) +
-                tone(summaryText, processSummary.tone, this.appearance);
-              break;
+          const badgeTone = isCollapsed || !isFocused ? "muted" : "heading";
+          let rightTone = isFocused ? `${statusTone} bold` : "muted";
+          if (isCollapsed && isHovered) {
+            rightTone = "buttonHover";
+          }
+          const styledPrefix = tone(prefix, "border", this.appearance);
+          const styledStatusGlyph = tone(glyph, statusTone, this.appearance);
+          const styledName = tone(displayAgentName, nameTone, this.appearance);
+          const leftRequired = `${styledPrefix}${focusGlyph}${styledStatusGlyph} ${index + 1} ${styledName}`;
+          const leftOptional = leftBadges ? tone(leftBadges, badgeTone, this.appearance) : "";
+          const elapsed = isCollapsed ? "" : progressSuffix(agent, now);
+          const shortRightRaw = `${model(agent)} · ${agentPhaseLabel(agent, cardWidth)}`;
+          const rightRaw = `${shortRightRaw}${elapsed}`;
+          const chevronTone = isCollapsed && isHovered ? "buttonHover" : "muted";
+          const styledChevron = chevron ? ` ${tone(chevron, chevronTone, this.appearance)}` : "";
+          const chevronCells = chevron ? 1 + displayWidth(chevron) : 0;
+
+          const fitHeaderRow = (leftStyled, leftCells, metaPlain) => {
+            const metaCells = displayWidth(metaPlain);
+            if (leftCells + 1 + metaCells + chevronCells <= cardWidth) {
+              const gapSpaces = " ".repeat(cardWidth - leftCells - metaCells - chevronCells);
+              return `${leftStyled}${gapSpaces}${tone(metaPlain, rightTone, this.appearance)}${styledChevron}`;
+            }
+            return null;
+          };
+
+          const fullLeft = `${leftRequired}${leftOptional}`;
+          const fullLeftCells = displayWidth(plain(fullLeft));
+          const reqLeftCells = displayWidth(plain(leftRequired));
+          let row1 =
+            fitHeaderRow(fullLeft, fullLeftCells, rightRaw) ||
+            (elapsed ? fitHeaderRow(fullLeft, fullLeftCells, shortRightRaw) : null);
+
+          if (!row1 && leftOptional) {
+            const noBadgeFit = fitHeaderRow(leftRequired, reqLeftCells, shortRightRaw);
+            if (noBadgeFit) {
+              const availOptional =
+                cardWidth - reqLeftCells - 1 - displayWidth(shortRightRaw) - chevronCells;
+              if (availOptional >= 4) {
+                const clippedBadge = truncateDisplay(leftBadges, availOptional, this.tier);
+                const combinedLeft = `${leftRequired}${tone(clippedBadge, badgeTone, this.appearance)}`;
+                row1 =
+                  fitHeaderRow(combinedLeft, displayWidth(plain(combinedLeft)), shortRightRaw) ||
+                  noBadgeFit;
+              } else {
+                row1 = noBadgeFit;
+              }
             }
           }
-          return treeCard(cardTitle, [` ${renderedTask}`, ` ${statusLine}`], cardWidth, {
-            emphasized: isFocused || isPinned,
-            hovered: isHovered,
-            topPrefix,
-            midPrefix: prefix,
-            tailPrefix,
-            right: cardRight,
-            color: this.appearance,
-            tier: this.tier,
-          });
+
+          if (!row1) {
+            const availRight = cardWidth - reqLeftCells - 1 - chevronCells;
+            const minRight = displayWidth(this.tier === "ascii" ? "..." : "…") + 1;
+            if (availRight >= minRight) {
+              const clippedRight = truncateDisplay(shortRightRaw, availRight, this.tier);
+              const gapSpaces = Math.max(
+                1,
+                cardWidth - reqLeftCells - displayWidth(clippedRight) - chevronCells,
+              );
+              row1 = `${leftRequired}${" ".repeat(gapSpaces)}${tone(clippedRight, rightTone, this.appearance)}${styledChevron}`;
+            } else {
+              const availLeft = Math.max(1, cardWidth - chevronCells);
+              const clippedLeft = truncateStyled(leftRequired, availLeft, this.tier);
+              const gapSpaces = Math.max(
+                0,
+                cardWidth - displayWidth(plain(clippedLeft)) - chevronCells,
+              );
+              row1 = `${clippedLeft}${" ".repeat(gapSpaces)}${styledChevron}`;
+            }
+          }
+
+          if (isCollapsed) return [row1];
+
+          const styledContinuation = tone(continuationPrefix, "border", this.appearance);
+          const bodyIndent = "  ";
+          const availBody = Math.max(
+            1,
+            cardWidth - displayWidth(plain(continuationPrefix)) - bodyIndent.length,
+          );
+          let row2Content;
+          if (agent.status === "blocked" && agent.question) {
+            const questionText = truncateDisplay(
+              `Question: ${plain(agent.question).trim()}`,
+              availBody,
+              this.tier,
+            );
+            row2Content = tone(questionText, "warning bold", this.appearance);
+          } else if (agent.status === "failed" || agent.error || agent.dispatchError) {
+            const err = plain(agent.error || agent.dispatchError).trim() || "Failed";
+            const errorText = truncateDisplay(`Error: ${err}`, availBody, this.tier);
+            row2Content = tone(errorText, "error bold", this.appearance);
+          } else {
+            const agentRunning = isExecuting(agent);
+            const spinnerWidth = agentRunning ? 2 : 0;
+            const processSummary = agentProcessSummary(agent, room);
+            let procText = "";
+            if (processSummary) {
+              if (availBody - displayWidth(processSummary.text) - 3 > 10) {
+                procText = processSummary.text;
+              } else if (availBody - displayWidth(processSummary.compactText) - 3 > 10) {
+                procText = processSummary.compactText;
+              }
+            }
+            const taskBudget = Math.max(
+              1,
+              availBody - spinnerWidth - (procText ? displayWidth(procText) + 3 : 0),
+            );
+            const fittedTaskText = truncateDisplay(taskText, taskBudget, this.tier);
+            const renderedTask = agentRunning
+              ? `${tone(this.tier === "ascii" ? ">" : SPINNER[Math.floor(now / 120) % SPINNER.length], "shimmerSpinner", this.appearance)} ${shimmerText(fittedTaskText, now, this.appearance)}`
+              : tone(fittedTaskText, isFocused ? "heading" : "muted", this.appearance);
+            row2Content = renderedTask;
+            if (procText) {
+              row2Content += `${tone(" · ", "muted", this.appearance)}${tone(procText, processSummary.tone, this.appearance)}`;
+            }
+          }
+          const row2 = fitStyled(`${styledContinuation}${bodyIndent}${row2Content}`, cardWidth);
+          return [row1, row2];
         });
         let gridRow = lines.length;
         for (let start = 0; start < cards.length; start += columns) {
@@ -2527,7 +2634,7 @@ export class HordeView {
         const detailParts = hiddenStates
           .values()
           .map(({ agent, count }) => ({
-            text: `${statusGlyph(agent, now, this.tier)} ${count} ${phase(agent)}`,
+            text: `${statusGlyph(agent, now, this.tier)} ${count} ${agentPhaseLabel(agent, innerWidth)}`,
             style: toneForStatus(agent),
           }))
           .toArray();
@@ -2563,9 +2670,10 @@ export class HordeView {
         );
       }
     }
+    const hasSlotSummary = !(pages === 1 && room.agents.length < maxAgents * 0.75);
     const updateBlock = this.preview || this.overlay ? [] : this.updateBlockLines(innerWidth);
     const controls = this.controls(innerWidth);
-    const footerHeight = controls.lines.length + 2;
+    const footerHeight = controls.lines.length + 1 + (hasSlotSummary ? 1 : 0);
     const contentHeight = Math.max(0, this.height - footerHeight);
     const mainHeight = Math.max(0, contentHeight - serviceBlock.length - updateBlock.length);
     if (this.overlay) {
@@ -2596,14 +2704,25 @@ export class HordeView {
       lines.push(...this.previewPanelLines(innerWidth, Math.max(1, mainHeight - lines.length)));
     } else {
       const focused = room.agents.find((agent) => agent.id === (this.pinnedId || this.focusId));
-      const focusLines = this.focusCardLines(
-        focused,
-        innerWidth,
-        mainHeight - lines.length,
-        lines.length + 1,
+      const focusedState = focused ? memberDisplayState(focused) : "";
+      const shouldShowFocus = Boolean(
+        focused &&
+        (this.pinnedId ||
+          this.hasExplicitFocus ||
+          focusedState === "blocked" ||
+          focusedState === "failed" ||
+          agentProcessSummary(focused, room) !== null),
       );
-      if (focusLines.length > 0) {
-        lines.push(...focusLines);
+      if (shouldShowFocus) {
+        const focusLines = this.focusCardLines(
+          focused,
+          innerWidth,
+          mainHeight - lines.length,
+          lines.length + 1,
+        );
+        if (focusLines.length > 0) {
+          lines.push(...focusLines);
+        }
       }
       if (room.agents.length === 0) {
         const emptyLines = [];
@@ -2627,13 +2746,15 @@ export class HordeView {
         height: Math.min(target.height, mainHeight - target.y + 1),
       }))
       .filter((target) => target.height > 0);
-    lines.push(
-      tone(
-        `${room.agents.length}/${maxAgents} slots · page ${this.page + 1}/${pages}`,
-        "muted",
-        this.appearance,
-      ),
-    );
+    if (hasSlotSummary) {
+      lines.push(
+        tone(
+          `${room.agents.length}/${maxAgents} slots · page ${this.page + 1}/${pages}`,
+          "muted",
+          this.appearance,
+        ),
+      );
+    }
     if (serviceBlock.length > 0 && contentHeight - mainHeight >= serviceBlock.length) {
       this.addTargets([
         {

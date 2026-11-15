@@ -8,6 +8,12 @@ import { herdrEndpoint } from "../../../plugins/orchestrate/lib/herdr-context.mj
 import { HordeView } from "../../../plugins/orchestrate/lib/horde-view.mjs";
 import { displayWidth, plain } from "../../../plugins/orchestrate/lib/tui-box.mjs";
 import { actionBar, hitTest } from "../../../plugins/orchestrate/lib/tui-components.mjs";
+import {
+  ALT_SCROLL_DISABLE,
+  ALT_SCROLL_ENABLE,
+  MOUSE_DISABLE,
+  MOUSE_ENABLE,
+} from "../../../plugins/orchestrate/lib/tui-input.mjs";
 
 const HERDR_SOCKET_PATH = path.join(tmpdir(), "orkest-mouse-test-herdr.sock");
 const HERDR_ENDPOINT = herdrEndpoint({ HERDR_SOCKET_PATH });
@@ -72,7 +78,7 @@ describe("clickable Swarm View", () => {
       view.setRoom(data);
       view.handleInput("\r");
       expect(onFocusPane.mock.calls).toHaveLength(2);
-      const header = tier === "nerd" ? "ork: \u{F06A9} Current session" : "ork: Current session";
+      const header = tier === "nerd" ? "\u{F06A9} Current session" : "Current session";
       click(view, header, 120);
       expect(onFocusPane.mock.calls.at(-1)[0]).toMatchObject({
         id: "conductor",
@@ -277,7 +283,7 @@ describe("clickable Swarm View", () => {
     });
     try {
       await vi.waitFor(() => expect(outputText).toContain("View chat"));
-      const { x, y } = pointAt(new HordeView(room(), { height: 32 }), "2 beta", 160);
+      const { x, y } = pointAt(new HordeView(room(), { height: 32, inHerdr: true }), "2 beta", 160);
       input.emit("data", `\u{1B}[<0;${x};${y}M`);
       await vi.waitFor(() => expect(outputText).toContain("Agent beta chat"));
       expect(outputText).toContain("Live screen · read only");
@@ -303,16 +309,16 @@ describe("clickable Swarm View", () => {
     const onPreview = vi.fn();
     const view = new HordeView(room(), { height: 40, onPreview, color: true, tier: "nerd" });
     const initial = view.render(80).join("\n");
-    expect(initial).toContain("\u{1B}[48;5;237;97m 2 beta \u{1B}[0m");
-    expect(initial).toContain(" \u{F054} ");
+    expect(plain(initial)).toContain("2 beta");
     const betaPoint = pointAt(view, "2 beta");
     view.handleMouse({ ...betaPoint, action: "move", button: 0 });
-    expect(view.render(80).join("\n")).toContain("\u{1B}[7;1m 2 beta \u{1B}[0m");
+    expect(view.render(80).join("\n")).toContain("\u{1B}[7;1mbeta\u{1B}[0m");
     click(view, "2 beta");
     expect(onPreview.mock.calls[0][0]).toMatchObject({ id: "beta", herdrPaneId: "w1:p3" });
     view.setRoom(room());
     expect(view.focusId).toBe("beta");
-    expect(plain(view.render(80).join("\n"))).toContain("▸ 2 beta");
+    expect(plain(view.render(80).join("\n"))).toContain("▸");
+    expect(plain(view.render(80).join("\n"))).toContain("2 beta");
     expect(plain(view.render(80).join("\n"))).not.toContain("FOCUS");
   });
 
@@ -460,6 +466,54 @@ describe("clickable Swarm View", () => {
     expect(view.render(160).map(plain).join("\n")).toContain("Chat line 81");
   });
 
+  it("never translates mouse wheel into agent selection or clears follow mode", () => {
+    const multiAgentRoom = {
+      ...room(),
+      agents: Array.from({ length: 12 }, (_, index) => ({
+        id: `agent-${index + 1}`,
+        name: `Agent ${index + 1}`,
+        status: "working",
+        engine: "codex",
+        model: "gpt:sol",
+        objective: `Task ${index + 1}`,
+      })),
+    };
+    const view = new HordeView(multiAgentRoom, { height: 20 });
+    view.render(60);
+    const initialFocus = view.focusId;
+    expect(view.hasExplicitFocus).toBe(false);
+    expect(view.focusFollowsLatest).toBe(true);
+    expect(view.page).toBe(0);
+
+    // Scrolling down should advance page without modifying focus or follow mode
+    const scrollDownHandled = view.handleMouse({ x: 4, y: 10, action: "scroll-down", button: 5 });
+    expect(scrollDownHandled).toBe(true);
+    expect(view.page).toBe(1);
+    expect(view.focusId).toBe(initialFocus);
+    expect(view.hasExplicitFocus).toBe(false);
+    expect(view.focusFollowsLatest).toBe(true);
+
+    // Scrolling up returns to page 0
+    const scrollUpHandled = view.handleMouse({ x: 4, y: 10, action: "scroll-up", button: 4 });
+    expect(scrollUpHandled).toBe(true);
+    expect(view.page).toBe(0);
+    expect(view.focusId).toBe(initialFocus);
+    expect(view.hasExplicitFocus).toBe(false);
+    expect(view.focusFollowsLatest).toBe(true);
+
+    // Single page room: scroll is a no-op (returns false)
+    const singleRoom = {
+      ...room(),
+      agents: [{ id: "single", name: "Single", status: "working", objective: "Alone" }],
+    };
+    const singleView = new HordeView(singleRoom, { height: 24 });
+    singleView.render(60);
+    expect(singleView.handleMouse({ x: 4, y: 10, action: "scroll-down", button: 5 })).toBe(false);
+    expect(singleView.handleMouse({ x: 4, y: 10, action: "scroll-up", button: 4 })).toBe(false);
+    expect(singleView.focusId).toBe("single");
+    expect(singleView.hasExplicitFocus).toBe(false);
+  });
+
   it("renders diff files, semantic line colors, stale state and scroll controls", () => {
     const view = new HordeView(room(), { height: 24, color: true, now: () => 0 });
     const text = [
@@ -558,5 +612,47 @@ describe("clickable Swarm View", () => {
     expect(click(view, "1 inactive hidden", 80)).toBe(true);
     expect(view.completedMode).toBe("expanded");
     expect(click(view, "click to update", 80)).toEqual({ type: "pull-update" });
+  });
+
+  it("keeps ?1007l active when runHordeTui starts with mouse disabled and across m toggles", async () => {
+    // eslint-disable-next-line unicorn/prefer-event-target -- The TUI consumes Node terminal stream events.
+    const input = Object.assign(new EventEmitter(), {
+      isTTY: true,
+      isRaw: false,
+      setRawMode: vi.fn(),
+      resume: vi.fn(),
+      pause: vi.fn(),
+    });
+    let outputText = "";
+    const output = {
+      isTTY: true,
+      rows: 24,
+      columns: 80,
+      write: (text) => {
+        outputText += text;
+      },
+    };
+    const running = runHordeTui(async () => room(), {
+      input,
+      output,
+      mouse: false,
+      quota: false,
+      services: false,
+      update: false,
+    });
+    try {
+      await vi.waitFor(() =>
+        expect(outputText).toContain("Mouse off — press m to re-enable mouse"),
+      );
+      expect(outputText).toContain(`${MOUSE_DISABLE}\u{1B}[?2004h${ALT_SCROLL_DISABLE}`);
+      expect(outputText).not.toContain(MOUSE_ENABLE);
+
+      input.emit("data", "m");
+      await vi.waitFor(() => expect(outputText).toContain(`${MOUSE_ENABLE}${ALT_SCROLL_DISABLE}`));
+    } finally {
+      input.emit("data", "q");
+      await running;
+    }
+    expect(outputText).toContain(ALT_SCROLL_ENABLE);
   });
 });

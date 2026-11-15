@@ -236,11 +236,13 @@ describe("HordeView themed activity and inner padding", () => {
   it("renders a framed multi-line Focus card with themed Markdown and formats room logs", () => {
     const view = new HordeView(sampleRoom(), { height: 28, color: true, tier: "unicode" });
     view.focusId = "scout";
+    view.hasExplicitFocus = true;
     const sidebarRendered = view.render(90);
     const sidebarPlain = sidebarRendered.map((line) => stripVTControlCharacters(line)).join("\n");
     expect(sidebarPlain).toContain("┌ Focus · Scout ");
     expect(sidebarPlain).toContain("Enter open · p pin ┐");
-    expect(sidebarPlain).toContain("│ Task: Audit layout spacing");
+    expect(sidebarPlain).toContain("Audit layout spacing");
+    expect(sidebarPlain).not.toContain("│ Task: Audit layout spacing");
     expect(sidebarPlain).toContain("│ Verified grouping.mjs with zero regressions");
     expect(sidebarRendered.join("\n")).toContain(
       `${ESC}${DEFAULT_THEME.mdCode}mgrouping.mjs${ESC}0m`,

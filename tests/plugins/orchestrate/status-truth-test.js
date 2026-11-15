@@ -591,9 +591,9 @@ describe("notification outcomes", () => {
 
 describe("preserved Swarm layout", () => {
   it.each([
-    ["ascii", ">"],
-    ["unicode", "▸"],
-    ["nerd", "▸"],
+    ["ascii", "> +"],
+    ["unicode", "▸ ✓"],
+    ["nerd", "▸ 󰄬"],
   ])("keeps the focused collapsed-row pointer in %s", (tier, pointer) => {
     const room = createRoom(parseTeam("codex:luna"), { id: "truth" });
     Object.assign(room.agents[0], { status: "completed", verdict: "accept" });
@@ -604,13 +604,14 @@ describe("preserved Swarm layout", () => {
 
   it.each([false, true])("keeps activity on the folder header only with Herdr (%s)", (inHerdr) => {
     const room = createRoom(parseTeam("codex:luna"), { id: "truth", cwd: "/workspace/project" });
+    room.conductor.cwd = "/workspace/lead";
     room.agents[0].status = "working";
     const lines = new HordeView(room, { tier: "unicode", inHerdr, now: () => 0 })
       .render(150)
       .map(plain);
     const index = lines.findIndex((line) => line.includes("│ project"));
     expect(lines[index]).toContain(inHerdr ? "1 active" : "1 agent");
-    expect(lines[index + 1]).toContain("┌ ▸ 1 luna-1");
+    expect(lines[index + 1]).toContain("└─▸ ⣾ 1 luna-1");
     expect(lines[index].includes("1 active")).toBe(inHerdr);
   });
 });

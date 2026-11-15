@@ -56,31 +56,43 @@ Every component accepts `tier` (`"nerd"`, `"unicode"`, or `"ascii"`), resolved b
 
 ## 3. Component & Layout Rules
 
-1. **Connected Tree Rails vs. Bottom Bubbles:**
-   - **Connected rail panels** (`rail: "start" | "middle" | "end"`) link the Coordinator header, compact Quota drawer, and folder/agent tree along the left border using `├` junctions.
-   - **Standalone bottom bubbles** (`Services`, `Update`) render as self-contained rounded panels (`this.panel(...)`) directly above the footer `actionBar`.
-2. **Single-Place Controls (No Redundant Footer Buttons):**
+1. **Simplified Hierarchical Tree Rows (No Heavy Box Enclosures):**
+   - Active, blocked, and failed agents render as clean borderless 2-line tree rows instead of 4-line boxed cards:
+     - **Row 1:** tree rail prefix (`├─`, `└─`, `├─▸`, `└─▸`), status glyph (`󰔛`, `󰀪`, `󰄬`), page-local index (`1..N`), concise agent name, and essential badges (`[role]`, `wt:<slug>`, `PIN`, `This chat`) on the left, balanced with model and phase metadata (`<model> · <phase><elapsed>`) on the right.
+     - **Row 2:** continuation rail (4-column `│` continuation or blank indent), followed by the active task summary, `Question: ...` in `warning` tone when blocked, or `Error: ...` in `error` tone when failed.
+   - Redundant `↳ <parent>` badges are omitted when the parent agent is already shown directly above in the same folder or worktree group.
+   - Narrow viewports (`< 68` cols) use compact 2-column rail indentation, capping visual depth at 4 levels so deep hierarchies remain clear without horizontal clipping.
+   - Completed/inactive agents in collapsed mode render as 1-line tree rows with status and outcome summary aligned with active rows.
+   - Single-folder dividers (`│ ── <folder> · N agents ──`) are omitted when the top `Swarm` header is shown and all visible agents share the coordinator's repository root; folder dividers appear when agents span multiple repositories or worktrees, or in Herdr where the pane header replaces the top `Swarm` title and activity summary.
+   - The bottom `Focus · <agent>` card appears only when an agent is pinned (`pinnedId`), explicitly focused (`hasExplicitFocus`), or in an urgent state (`blocked`, `failed`, or has leftover background processes).
+2. **Scroll Wheel & Alternate-Scroll Protection (`?1007l`):**
+   - Touchpad inertial scrolling and mouse wheel ticks **never** alter agent selection, move the cursor, cycle options, or cancel auto-follow mode.
+   - Mouse wheel ticks scroll only genuine viewports: the active overlay (`logOffset`), the preview panel (`previewOffset`), or paginated agent lists (`page` stepping within `[0, pages - 1]` when `pages > 1`). On unscrollable pages (`pages <= 1`), scroll events are harmless no-ops.
+   - Terminal alternate-scroll mode (`\u{1B}[?1007l`) is disabled on entry and kept disabled across mouse-mode toggles (`m`), restoring `\u{1B}[?1007h` only on terminal exit. This prevents terminals from translating mouse scrolls into fake ArrowUp / ArrowDown keystrokes.
+3. **Single-Place Controls (No Redundant Footer Buttons):**
    - If a section has an inline disclosure card or bubble on screen (`Quota` with `u`, `Services` with `v`, `Update` with `U`), clicking the card header toggles or triggers it directly. Do **not** duplicate those toggles as buttons in the bottom `actionBar`.
-   - Hide conditional footer buttons when they have nothing to act on (for example, omit `Inactive` (`c`) when the room has zero inactive agents).
-   - When collapsed summary lines appear in the tree (such as `N inactive hidden (press c to expand)`), register a mouse hit target on that line so clicking it expands in place.
-3. **Consistent Disclosure Chevrons:**
+   - `servicesMode` defaults to `"collapsed"` (1-line inline status strip; `v` or click expands).
+   - The update notification renders as a crisp 1-line banner across all terminal heights instead of a 3-line box.
+   - Footers under 68 columns automatically condense shortcuts to essential actions (`?` help overlay documents full bindings).
+4. **Consistent Disclosure Chevrons:**
    - Every collapsible header (`Quota`, `Services`, focused agent preview card) must show its disclosure state in both collapsed (`▸` / `\u{F054}`) and expanded (`▾` / `\u{F078}`) modes.
-4. **Inline Containers Over Full-Screen Replacement or Pane Zooming:**
+5. **Inline Containers Over Full-Screen Replacement or Pane Zooming:**
    - Opening an agent's log or chat (`Enter` or clicking an agent card) keeps the Swarm pane at its normal split size (`zoom = false`), collapses non-focused agents, and renders the preview in a framed container directly below the focused agent card.
    - Opening reference overlays (`?` Keyboard shortcuts or `g` Room log) also renders in the lower inline container below the Coordinator header and Quota drawer rather than wiping the top of the pane.
    - Dismissal uses a single primary **`Back`** (`Esc`) button in the footer toolbar (plus clicking the focused agent card or pressing `?`/`g` again to toggle), never both `Back` and `Return to chat` at once.
-5. **Cross-Command Framing & Palette Parity:**
+6. **Cross-Command Framing & Palette Parity:**
    - Every tabular or report CLI subcommand (`ork routes`, `ork telemetry`, `ork foundry status`, `ork smelter status`, `ork radar status|diff|priors`) renders through `renderPanel` and `renderTable` with `glyphTier()` so all Orkest terminal output shares the same rounded/square box borders and semantic tokens.
    - `agent_statusline.py`, `monitor/lib/render.mjs`, and `tui-theme.mjs` share identical 256-color codes for identity (`203`, `114`, `221`, `111`, `176`, `80`), model/effort/separators (`117`, `180`, `245`), and quota health (`71`, `179`, `208`, `240`), verified by unit tests.
-6. **Internal Pane IDs Stay Hidden:**
+7. **Internal Pane IDs Stay Hidden:**
    - Raw Herdr or tmux pane identifiers (`wQ:p1`, `%12`) belong on click/focus targets (`herdrPaneId`, `paneId`), never in visible header titles or card labels.
    - Focusing a Herdr pane by ID uses `herdr agent focus <herdrPaneId>` (not `herdr pane focus`, which is directional).
-7. **Width & Injection Safety:**
+8. **Width & Injection Safety:**
    - Treat all model/tool/terminal output as untrusted data: sanitize with `plain()` before applying `tone()`, and clamp every rendered line with `fitStyled(line, width)` so escape codes never leak or wrap across borders.
-8. **Diff Line Marks:**
+9. **Diff Line Marks:**
    - The diff preview keeps a source-line cursor and saved marks in a per-tier gutter; semantic tones add emphasis while gutter glyphs keep both states legible without color.
-9. **Observed Agent Processes:**
-   - Agent cards show a muted process count and an observed listening port when available; completed agents with remaining processes show `left` in the warning tone. The Focus and Pinned panels list each process by PID, age and a redacted command, with `(by directory)` when attribution came from its working directory. The wording remains explicit in monochrome output.
+10. **Observed Agent Processes:**
+
+- Agent cards show a muted process count and an observed listening port when available; completed agents with remaining processes show `left` in the warning tone. The Focus and Pinned panels list each process by PID, age and a redacted command, with `(by directory)` when attribution came from its working directory. The wording remains explicit in monochrome output.
 
 ---
 

@@ -161,8 +161,16 @@ const PADDING = 14;
 const TITLE_BAR = 34;
 const PLAIN_STYLE = Object.freeze({ fg: null, bg: null, bold: false, dim: false, inverse: false });
 
-/** Fonts the screenshots are drawn with; `fc-list` must know both. */
-export const SCREENSHOT_FONTS = ["Fira Code", "Symbols Nerd Font Mono"];
+/** Fonts the screenshots are drawn with; `fc-list` must know text and icon fonts. */
+export const TEXT_FONT_STACK = "'BlexMono Nerd Font Mono','Fira Code',monospace";
+export const ICON_FONT_STACK =
+  "'Symbols Nerd Font Mono','Symbols Nerd Font','BlexMono Nerd Font Mono',monospace";
+export const SCREENSHOT_FONTS = [
+  "Fira Code",
+  "Symbols Nerd Font Mono",
+  "BlexMono Nerd Font Mono",
+  "Symbols Nerd Font",
+];
 
 // Box-drawing characters as [left, right, up, down] strokes (2 = heavy), then "rounded".
 const BOX = new Map(
@@ -238,7 +246,12 @@ function applyStyle(style, parameters) {
   return next;
 }
 
-const xml = (text) => text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+const xml = (text) =>
+  text
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
 const number = (value) => String(Math.round(value * 100) / 100);
 
 function boxStrokes([left, right, up, down, isRounded], x, y, paint) {
@@ -272,8 +285,14 @@ function boxStrokes([left, right, up, down, isRounded], x, y, paint) {
  * characters are strokes, so borders join whatever font the viewer has. `cellWidth` is the
  * renderer's own display-width function.
  */
-export function ansiToWindowSvg(ansi, { title, cols, cellWidth }) {
-  const lines = ansi.replace(/\n+$/u, "").split("\n");
+export function ansiToWindowSvg(ansi, { title, cols, rows, palette, cellWidth } = {}) {
+  let lines = ansi.replace(/\n+$/u, "").split("\n");
+  if (typeof rows === "number" && rows > 0) {
+    lines = lines.slice(0, rows);
+  }
+  const isLight = palette === "light";
+  const fgDefault = isLight ? "#202124" : FOREGROUND;
+  const bgDefault = isLight ? "#ffffff" : BACKGROUND;
   const marks = [];
   let widest = 0;
   for (const [row, line] of lines.entries()) {
@@ -290,8 +309,8 @@ export function ansiToWindowSvg(ansi, { title, cols, cellWidth }) {
       if (width === 0) continue;
       const x = PADDING + column * CELL_WIDTH;
       column += width;
-      const fg = style.inverse ? (style.bg ?? BACKGROUND) : (style.fg ?? FOREGROUND);
-      const bg = style.inverse ? (style.fg ?? FOREGROUND) : style.bg;
+      const fg = style.inverse ? (style.bg ?? bgDefault) : (style.fg ?? fgDefault);
+      const bg = style.inverse ? (style.fg ?? fgDefault) : style.bg;
       const paint = (attribute) => `${attribute}="${fg}"${style.dim ? ' opacity="0.6"' : ""}`;
       if (bg)
         marks.push(
@@ -308,9 +327,9 @@ export function ansiToWindowSvg(ansi, { title, cols, cellWidth }) {
       } else if (character !== " ") {
         // Nerd Font icons live in the private-use areas, U+E000–U+F8FF and from U+F0000.
         const isIcon = (code >= 57_344 && code <= 63_743) || code >= 983_040;
-        const [textFont, iconFont] = SCREENSHOT_FONTS;
+        const fontStack = isIcon ? ICON_FONT_STACK : TEXT_FONT_STACK;
         marks.push(
-          `<text x="${number(x + (CELL_WIDTH * width) / 2)}" y="${y + 14}" text-anchor="middle" font-family="'${isIcon ? iconFont : textFont}',monospace" font-size="${isIcon ? FONT_SIZE + 1 : FONT_SIZE}"${style.bold ? ' font-weight="700"' : ""} ${paint("fill")}>${xml(character)}</text>`,
+          `<text x="${number(x + (CELL_WIDTH * width) / 2)}" y="${y + 14}" text-anchor="middle" font-family="${fontStack}" font-size="${isIcon ? FONT_SIZE + 1 : FONT_SIZE}"${style.bold ? ' font-weight="700"' : ""} ${paint("fill")}>${xml(character)}</text>`,
         );
       }
     }
@@ -318,13 +337,17 @@ export function ansiToWindowSvg(ansi, { title, cols, cellWidth }) {
   }
   const width = Math.ceil(PADDING * 2 + (cols ?? widest) * CELL_WIDTH);
   const height = PADDING * 2 + TITLE_BAR + lines.length * CELL_HEIGHT;
+  const chromeBg = bgDefault;
+  const chromeBorder = isLight ? "#d5d8df" : "#2f3541";
+  const chromeDivider = isLight ? "#e6e8ee" : "#262b35";
+  const chromeTitle = isLight ? "#5f6368" : "#8b93a1";
   const chrome = [
-    `<rect x="0.5" y="0.5" width="${width - 1}" height="${height - 1}" rx="10" fill="${BACKGROUND}" stroke="#2f3541"/>`,
-    `<path d="M0.5 ${TITLE_BAR + 0.5} H${width - 0.5}" stroke="#262b35"/>`,
+    `<rect x="0.5" y="0.5" width="${width - 1}" height="${height - 1}" rx="10" fill="${chromeBg}" stroke="${chromeBorder}"/>`,
+    `<path d="M0.5 ${TITLE_BAR + 0.5} H${width - 0.5}" stroke="${chromeDivider}"/>`,
     ...["#ff5f57", "#febc2e", "#28c840"].map(
       (fill, index) => `<circle cx="${20 + index * 18}" cy="17" r="5.5" fill="${fill}"/>`,
     ),
-    `<text x="${width / 2}" y="22" text-anchor="middle" font-family="sans-serif" font-size="13" fill="#8b93a1">${xml(title)}</text>`,
+    `<text x="${width / 2}" y="22" text-anchor="middle" font-family="sans-serif" font-size="13" fill="${chromeTitle}">${xml(title || "orkest")}</text>`,
   ];
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">${chrome.join("")}${marks.join("")}</svg>\n`;
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" role="img" aria-label="${xml(title || "terminal capture")}">${chrome.join("")}${marks.join("")}</svg>\n`;
 }

@@ -13,9 +13,12 @@ Intentional changes do not fail this comparison mode; capture errors and source
 changes during the run do. A scenario unavailable in the base revision is marked
 `unsupported`, with its reason. It never receives a fabricated baseline.
 
-The nine default cases cover narrow and wide layouts, default and expanded quota,
+The default cases cover narrow and wide layouts, default and expanded quota,
 keyboard shortcuts, read-only preview, dark/light backgrounds, monochrome and Nerd
-icons. Use repeatable `--case NAME` to select cases; `--help` lists their names.
+icons, along with stress-test cascade scenarios (`cascade-deep-56`, `cascade-deep-100`,
+`crowded-all-panels-56`, `multi-worktree-subswarms`). Use repeatable `--case NAME` to
+select cases; `--help` lists their names. Default cases render in the `"nerd"` glyph
+tier (preserving explicit `"unicode"` and `"ascii"` fixtures).
 The fixture uses synthetic data, a fixed clock and explicit terminal dimensions.
 It runs the actual renderer in a private tmux server and cleans up that server only.
 It makes no model or network calls and does not use personal sessions or configuration.
@@ -44,11 +47,14 @@ Capture comparison uses ANSI content/styles and dimensions, not timestamps or SV
 The SVG supports colors, bold, dim and inverse styles; other styling remains in the
 ANSI evidence rather than being reproduced by the SVG viewer.
 
-Nerd icons require an installed compatible Nerd Font when viewing the report. The
-SVG uses public font-family fallbacks and embeds no font assets. Without a matching
-font, the ANSI evidence remains valid but some SVG icons may appear as missing glyphs.
-Font rasterization, terminal-specific palettes, cursor interaction, hover, selection
-and actual app-window layout still need separate interaction checks.
+Nerd icons render via per-cell positioning with font fallback stacks across macOS
+and Linux (`'BlexMono Nerd Font Mono','Fira Code',monospace` for text, and
+`'Symbols Nerd Font Mono','Symbols Nerd Font','BlexMono Nerd Font Mono',monospace`
+for icon glyphs). High-DPI PNGs are automatically emitted alongside SVG captures
+when either `magick` or `rsvg-convert` (`--zoom=2`) is installed. Without a rasterizer
+or matching font installed, the ANSI and SVG evidence remains complete and valid.
+Terminal-specific palettes, cursor interaction, hover, selection and actual app-window
+layout still need separate interaction checks.
 
 CI uploads the report on pull requests. Download the artifact and open `report.html`
 locally. It requires Node 22.18 or newer, Git, tar and tmux, with no npm dependencies.

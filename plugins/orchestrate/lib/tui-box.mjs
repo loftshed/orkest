@@ -172,6 +172,76 @@ export function fit(value, width) {
   return text + " ".repeat(width - used);
 }
 
+export function truncateDisplay(value, width, tier = "unicode") {
+  width = Math.max(0, Math.floor(width));
+  const cleaned = plain(value);
+  if (displayWidth(cleaned) <= width) return cleaned;
+  const mark = tier === "ascii" ? "..." : "…";
+  const markWidth = displayWidth(mark);
+  if (width <= markWidth) return fit(mark, width).trimEnd();
+  const limit = width - markWidth;
+  let text = "";
+  let used = 0;
+  for (const { segment } of segments.segment(cleaned)) {
+    const size = cellWidth(segment);
+    if (used + size > limit) break;
+    text += segment;
+    used += size;
+  }
+  const trimmed = text.replace(/(?:\s*·\s*|\s+)$/u, "") || text.trimEnd();
+  return `${trimmed}${mark}`;
+}
+
+export function truncateStyled(value, width, tier = "unicode") {
+  width = Math.max(0, Math.floor(width));
+  const source = String(value ?? "");
+  if (displayWidth(source) <= width) return source;
+  const mark = tier === "ascii" ? "..." : "…";
+  const markWidth = displayWidth(mark);
+  if (width <= markWidth) return fit(mark, width).trimEnd();
+  const limit = width - markWidth;
+  const tokens = source.match(ANSI_SGR_PATTERN) || [];
+  let output = "";
+  let used = 0;
+  let isStyled = false;
+  let pendingReset = "";
+  let hasOverflowed = false;
+  for (const token of tokens) {
+    if (hasOverflowed) break;
+    if (token.startsWith(`${ESC}[`)) {
+      if (token === `${ESC}[0m`) {
+        if (isStyled) pendingReset = token;
+        isStyled = false;
+      } else {
+        if (pendingReset) {
+          output += pendingReset;
+          pendingReset = "";
+        }
+        output += token;
+        isStyled = true;
+      }
+      continue;
+    }
+    const cleaned = plain(token);
+    for (const { segment } of segments.segment(cleaned)) {
+      const size = cellWidth(segment);
+      if (hasOverflowed || used + size > limit) {
+        hasOverflowed = true;
+        continue;
+      }
+      if (pendingReset) {
+        output += pendingReset;
+        pendingReset = "";
+      }
+      output += segment;
+      used += size;
+    }
+  }
+  output = output.replace(/\s+$/u, "");
+  if (isStyled || pendingReset) output += `${ESC}[0m`;
+  return `${output}${mark}`;
+}
+
 export function wrapText(value, width) {
   width = Math.max(1, Math.floor(width));
   const output = [];

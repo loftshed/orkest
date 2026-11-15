@@ -8,6 +8,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify, stripVTControlCharacters } from "node:util";
 
 import { displayWidth } from "../../plugins/orchestrate/lib/tui-box.mjs";
+import { ansiToWindowSvg } from "./readme.js";
 
 const execute = promisify(execFile);
 const runner = fileURLToPath(new URL("../test-tui-visual.js", import.meta.url));
@@ -20,7 +21,7 @@ export const VISUAL_CASES = Object.freeze([
     cols: 48,
     rows: 32,
     palette: "dark",
-    tier: "unicode",
+    tier: "nerd",
   },
   {
     name: "overview-light-100",
@@ -28,7 +29,7 @@ export const VISUAL_CASES = Object.freeze([
     cols: 100,
     rows: 32,
     palette: "light",
-    tier: "unicode",
+    tier: "nerd",
   },
   {
     name: "overview-mono-100",
@@ -44,7 +45,7 @@ export const VISUAL_CASES = Object.freeze([
     cols: 100,
     rows: 40,
     palette: "dark",
-    tier: "unicode",
+    tier: "nerd",
   },
   {
     name: "shortcuts-dark-48",
@@ -52,7 +53,7 @@ export const VISUAL_CASES = Object.freeze([
     cols: 48,
     rows: 32,
     palette: "dark",
-    tier: "unicode",
+    tier: "nerd",
   },
   {
     name: "preview-dark-160",
@@ -60,7 +61,7 @@ export const VISUAL_CASES = Object.freeze([
     cols: 160,
     rows: 40,
     palette: "dark",
-    tier: "unicode",
+    tier: "nerd",
   },
   {
     name: "preview-mono-48",
@@ -76,7 +77,7 @@ export const VISUAL_CASES = Object.freeze([
     cols: 100,
     rows: 40,
     palette: "dark",
-    tier: "unicode",
+    tier: "nerd",
   },
   {
     name: "diff-marks-dark-100",
@@ -84,7 +85,7 @@ export const VISUAL_CASES = Object.freeze([
     cols: 100,
     rows: 40,
     palette: "dark",
-    tier: "unicode",
+    tier: "nerd",
   },
   {
     name: "overview-nerd-100",
@@ -108,7 +109,7 @@ export const VISUAL_CASES = Object.freeze([
     cols: 160,
     rows: 40,
     palette: "dark",
-    tier: "unicode",
+    tier: "nerd",
   },
   {
     name: "activity-light-100",
@@ -116,7 +117,7 @@ export const VISUAL_CASES = Object.freeze([
     cols: 100,
     rows: 40,
     palette: "light",
-    tier: "unicode",
+    tier: "nerd",
   },
   {
     name: "processes-dark-100",
@@ -124,7 +125,39 @@ export const VISUAL_CASES = Object.freeze([
     cols: 100,
     rows: 40,
     palette: "dark",
-    tier: "unicode",
+    tier: "nerd",
+  },
+  {
+    name: "cascade-deep-56",
+    scenario: "cascade-deep",
+    cols: 56,
+    rows: 32,
+    palette: "dark",
+    tier: "nerd",
+  },
+  {
+    name: "cascade-deep-100",
+    scenario: "cascade-deep",
+    cols: 100,
+    rows: 34,
+    palette: "dark",
+    tier: "nerd",
+  },
+  {
+    name: "crowded-all-panels-56",
+    scenario: "crowded-all-panels",
+    cols: 56,
+    rows: 30,
+    palette: "dark",
+    tier: "nerd",
+  },
+  {
+    name: "multi-worktree-subswarms",
+    scenario: "multi-worktree-subswarms",
+    cols: 68,
+    rows: 32,
+    palette: "dark",
+    tier: "nerd",
   },
 ]);
 
@@ -261,50 +294,404 @@ export async function renderFixture(repo, spec) {
     pathToFileURL(path.join(repo, "plugins/orchestrate/lib/horde-view.mjs")).href
   );
   const room = syntheticRoom();
-  if (spec.scenario === "processes") {
-    room.agents = [
-      {
-        id: "builder",
-        name: "Builder",
-        engine: "codex",
-        model: "gpt-5.1-codex",
-        parent: "conductor",
-        status: "working",
-        progress: { task: "Run the integration suite", stage: "testing" },
-        output: ["The build and tests are running"],
-      },
-    ];
-    room.agentProcesses = {
-      builder: {
-        processes: [
-          {
-            pid: 4121,
-            ppid: 4100,
-            ageSeconds: 42,
-            command: "python3 -m pytest tests/plugins/orchestrate --maxfail=1",
-            via: "tree",
-            ports: [],
+  switch (spec.scenario) {
+    case "cascade-deep": {
+      room.agents = [
+        {
+          id: "search-lead",
+          name: "SearchLead",
+          parent: "conductor",
+          engine: "claude",
+          model: "claude:best",
+          status: "working",
+          role: "lead",
+          objective: "Coordinate search engine revamp",
+          progress: {
+            task: "Overseeing query parser and index pipeline",
+            stage: "working",
+            updatedAt: "2026-01-15T11:59:00Z",
           },
-          {
-            pid: 4125,
-            ppid: 4100,
-            ageSeconds: 420,
-            command: "node node_modules/.bin/vite --port",
-            via: "cwd",
-            ports: [5179],
+        },
+        {
+          id: "parser-lead",
+          name: "ParserLead",
+          parent: "search-lead",
+          engine: "codex",
+          model: "gpt:sol",
+          status: "working",
+          objective: "Build AST parser for queries",
+          progress: {
+            task: "Tokenizing filter operators",
+            stage: "parsing",
+            updatedAt: "2026-01-15T11:59:10Z",
           },
-          {
-            pid: 4130,
-            ppid: 4100,
-            ageSeconds: 7200,
-            command: "npm run build",
-            via: "tree",
-            ports: [],
+        },
+        {
+          id: "ast-builder",
+          name: "AstBuilder",
+          parent: "parser-lead",
+          engine: "codex",
+          model: "gpt:astra",
+          status: "working",
+          objective: "Construct syntax tree nodes",
+          progress: {
+            task: "Generating boolean operator nodes",
+            stage: "ast",
+            updatedAt: "2026-01-15T11:59:20Z",
           },
-        ],
-        more: 1,
-      },
-    };
+        },
+        {
+          id: "opt-pass",
+          name: "OptPass",
+          parent: "ast-builder",
+          engine: "agy",
+          model: "gemini:pro",
+          status: "working",
+          objective: "Constant folding on filters",
+          progress: {
+            task: "Simplifying redundant clauses",
+            stage: "opt",
+            updatedAt: "2026-01-15T11:59:30Z",
+          },
+        },
+        {
+          id: "type-checker",
+          name: "TypeChecker",
+          parent: "ast-builder",
+          engine: "claude",
+          model: "claude:fast",
+          status: "blocked",
+          question: "Should missing schema fields default to nullable?",
+          objective: "Check field types in predicates",
+          progress: {
+            task: "Validating schema types",
+            stage: "blocked",
+            updatedAt: "2026-01-15T11:59:25Z",
+          },
+        },
+        {
+          id: "index-lead",
+          name: "IndexLead",
+          parent: "search-lead",
+          engine: "codex",
+          model: "gpt:sol",
+          status: "starting",
+          objective: "Initialize inverted index partitioner",
+          progress: {
+            task: "Bootstrapping shards",
+            stage: "starting",
+            updatedAt: "2026-01-15T11:59:40Z",
+          },
+        },
+        {
+          id: "bloom-filter",
+          name: "BloomFilter",
+          parent: "index-lead",
+          engine: "agy",
+          model: "gemini:fast",
+          status: "reported",
+          outcome: "reported",
+          objective: "Pre-filter missing terms",
+          answer: "Generated 64k bloom filter with 0.01 error rate.",
+          progress: {
+            task: "Filter evaluation completed",
+            stage: "completed",
+            updatedAt: "2026-01-15T11:58:00Z",
+          },
+        },
+        {
+          id: "cache-sync",
+          name: "CacheSync",
+          parent: "search-lead",
+          engine: "opencode",
+          model: "glm:flash",
+          status: "failed",
+          error: "Connection reset while syncing cache replica",
+          objective: "Sync query cache",
+          progress: {
+            task: "Replicating cache shards",
+            stage: "failed",
+            updatedAt: "2026-01-15T11:57:30Z",
+          },
+        },
+        {
+          id: "benchmarker",
+          name: "Benchmarker",
+          parent: "conductor",
+          engine: "codex",
+          model: "gpt:sol",
+          status: "working",
+          objective: "Measure latency regressions",
+          progress: {
+            task: "Running p99 latency sweeps",
+            stage: "benchmarking",
+            updatedAt: "2026-01-15T11:59:50Z",
+          },
+        },
+        {
+          id: "doc-gen",
+          name: "DocGen",
+          parent: "benchmarker",
+          engine: "claude",
+          model: "claude:fast",
+          status: "reported",
+          outcome: "reported",
+          objective: "Document query syntax grammar",
+          answer: "Grammar specification published to docs/syntax.md",
+          progress: {
+            task: "Writing BNF grammar tables",
+            stage: "completed",
+            updatedAt: "2026-01-15T11:56:00Z",
+          },
+        },
+        {
+          id: "fuzz-tester",
+          name: "FuzzTester",
+          parent: "benchmarker",
+          engine: "codex",
+          model: "gpt:luna",
+          status: "working",
+          objective: "Fuzz query parser inputs",
+          progress: {
+            task: "Fuzzing edge cases (120k queries)",
+            stage: "fuzzing",
+            updatedAt: "2026-01-15T11:59:55Z",
+          },
+        },
+      ];
+
+      break;
+    }
+    case "crowded-all-panels": {
+      room.update = {
+        available: true,
+        commitsBehind: 3,
+        localSha: "e2f1a0c",
+        remoteSha: "b4d9c8e",
+        status: "available",
+      };
+      room.accounts = [
+        {
+          id: "claude-work",
+          label: "Claude work",
+          provider: "claude",
+          short: "CW",
+          fetchedAt: FIXED_TIME,
+          windows: [
+            {
+              id: "session",
+              label: "session",
+              pool: "all",
+              remainingPct: 18,
+              resetsAt: "2026-01-15T15:00:00Z",
+            },
+          ],
+        },
+        {
+          id: "claude-personal",
+          label: "Claude personal",
+          provider: "claude",
+          short: "CP",
+          fetchedAt: FIXED_TIME,
+          windows: [
+            {
+              id: "session",
+              label: "session",
+              pool: "all",
+              remainingPct: 84,
+              resetsAt: "2026-01-15T17:00:00Z",
+            },
+          ],
+        },
+      ];
+      room.services = [{ name: "Dev server", port: 5173, status: "running", uptime: "5m" }];
+      room.agents = [
+        {
+          id: "search-coord",
+          name: "SearchCoord",
+          parent: "conductor",
+          engine: "codex",
+          model: "gpt:sol",
+          status: "working",
+          role: "lead",
+          objective: "Manage search redesign",
+          progress: { task: "Coordinating index and query workers", stage: "working" },
+        },
+        {
+          id: "query-worker",
+          name: "QueryWorker",
+          parent: "search-coord",
+          engine: "claude",
+          model: "claude:best",
+          status: "blocked",
+          question: "Retain legacy query operators?",
+          objective: "Refactor query syntax",
+          progress: { task: "Awaiting answer on operators", stage: "blocked" },
+        },
+        {
+          id: "arch-scout",
+          name: "ArchScout",
+          parent: "search-coord",
+          engine: "agy",
+          model: "gemini:fast",
+          status: "completed",
+          outcome: "completed",
+          objective: "Explore existing search patterns",
+          output: ["Found reusable index abstractions"],
+        },
+      ];
+      room.agentProcesses = {
+        "arch-scout": {
+          processes: [
+            {
+              pid: 9012,
+              ppid: 9000,
+              ageSeconds: 240,
+              command: "python3 -m unittest test_indexer",
+              via: "cwd",
+              ports: [3000],
+            },
+          ],
+          more: 0,
+        },
+      };
+
+      break;
+    }
+    case "multi-worktree-subswarms": {
+      room.agents = [
+        {
+          id: "main-builder",
+          name: "MainBuilder",
+          parent: "conductor",
+          engine: "claude",
+          model: "claude:best",
+          status: "working",
+          objective: "Core search coordination",
+          cwd: "/workspace/demo",
+          progress: { task: "Wiring root index pipeline", stage: "working" },
+        },
+        {
+          id: "query-lead",
+          name: "QueryLead",
+          parent: "main-builder",
+          engine: "codex",
+          model: "gpt:sol",
+          status: "working",
+          cwd: "/workspace/demo/.worktrees/wt-query",
+          worktree: {
+            disposable: true,
+            slug: "wt-query",
+            path: "/workspace/demo/.worktrees/wt-query",
+            parentCwd: "/workspace/demo",
+          },
+          objective: "Build AST streaming parser",
+          progress: { task: "Writing streaming AST lexer", stage: "working" },
+        },
+        {
+          id: "query-worker",
+          name: "QueryWorker",
+          parent: "query-lead",
+          engine: "agy",
+          model: "gemini:fast",
+          status: "working",
+          cwd: "/workspace/demo/.worktrees/wt-query",
+          worktree: {
+            disposable: true,
+            slug: "wt-query",
+            path: "/workspace/demo/.worktrees/wt-query",
+            parentCwd: "/workspace/demo",
+          },
+          objective: "Implement token stream",
+          progress: { task: "Token stream buffer implementation", stage: "working" },
+        },
+        {
+          id: "index-lead",
+          name: "IndexLead",
+          parent: "main-builder",
+          engine: "codex",
+          model: "gpt:astra",
+          status: "blocked",
+          question: "Merge segments before or after compacting?",
+          cwd: "/workspace/demo/.worktrees/wt-indexer",
+          worktree: {
+            disposable: true,
+            slug: "wt-indexer",
+            path: "/workspace/demo/.worktrees/wt-indexer",
+            parentCwd: "/workspace/demo",
+          },
+          objective: "Partition inverted index",
+          progress: { task: "Waiting for compaction policy", stage: "blocked" },
+        },
+        {
+          id: "index-helper",
+          name: "IndexHelper",
+          parent: "index-lead",
+          engine: "opencode",
+          model: "glm:flash",
+          status: "working",
+          cwd: "/workspace/demo/.worktrees/wt-indexer",
+          worktree: {
+            disposable: true,
+            slug: "wt-indexer",
+            path: "/workspace/demo/.worktrees/wt-indexer",
+            parentCwd: "/workspace/demo",
+          },
+          objective: "Hash shard keys",
+          progress: { task: "Partitioning segment keys", stage: "working" },
+        },
+      ];
+
+      break;
+    }
+    case "processes": {
+      room.agents = [
+        {
+          id: "builder",
+          name: "Builder",
+          engine: "codex",
+          model: "gpt-5.1-codex",
+          parent: "conductor",
+          status: "working",
+          progress: { task: "Run the integration suite", stage: "testing" },
+          output: ["The build and tests are running"],
+        },
+      ];
+      room.agentProcesses = {
+        builder: {
+          processes: [
+            {
+              pid: 4121,
+              ppid: 4100,
+              ageSeconds: 42,
+              command: "python3 -m pytest tests/plugins/orchestrate --maxfail=1",
+              via: "tree",
+              ports: [],
+            },
+            {
+              pid: 4125,
+              ppid: 4100,
+              ageSeconds: 420,
+              command: "node node_modules/.bin/vite --port",
+              via: "cwd",
+              ports: [5179],
+            },
+            {
+              pid: 4130,
+              ppid: 4100,
+              ageSeconds: 7200,
+              command: "npm run build",
+              via: "tree",
+              ports: [],
+            },
+          ],
+          more: 1,
+        },
+      };
+
+      break;
+    }
+    // No default
   }
   const view = new HordeView(room, {
     now: () => FIXED_TIME,
@@ -451,6 +838,11 @@ export async function renderFixture(repo, spec) {
       view.hasExplicitFocus = true;
       break;
     }
+    case "crowded-all-panels": {
+      view.focusId = "arch-scout";
+      view.hasExplicitFocus = true;
+      break;
+    }
     // No default
   }
   const lines = view.render(spec.cols).slice(0, spec.rows);
@@ -465,138 +857,53 @@ function xml(text) {
     .replaceAll('"', "&quot;");
 }
 
-const TERMINAL_COLORS = [
-  "#202124",
-  "#c62828",
-  "#2e7d32",
-  "#b07800",
-  "#1565c0",
-  "#8e24aa",
-  "#00838f",
-  "#d5d8df",
-  "#707782",
-  "#ff6b6b",
-  "#69d98c",
-  "#ffe084",
-  "#7baaff",
-  "#d99cff",
-  "#6bdded",
-  "#ffffff",
-];
-
-function indexedColor(code) {
-  if (code < 16) return TERMINAL_COLORS[code];
-  if (code >= 232) {
-    const shade = (8 + (code - 232) * 10).toString(16).padStart(2, "0");
-    return `#${shade.repeat(3)}`;
-  }
-  const offset = code - 16;
-  const channel = (value) => (value === 0 ? 0 : 55 + value * 40).toString(16).padStart(2, "0");
-  return `#${channel(Math.floor(offset / 36))}${channel(Math.floor(offset / 6) % 6)}${channel(offset % 6)}`;
-}
-
-function styleCode(style, values, index, defaults) {
-  const code = values[index];
-  switch (code) {
-    case 0: {
-      Object.assign(style, defaults, { bold: false, dim: false, inverse: false });
-      return 0;
-    }
-    case 1: {
-      Object.assign(style, { bold: true });
-      return 0;
-    }
-    case 2: {
-      Object.assign(style, { dim: true });
-      return 0;
-    }
-    case 7: {
-      Object.assign(style, { inverse: true });
-      return 0;
-    }
-    case 22: {
-      Object.assign(style, { bold: false, dim: false });
-      return 0;
-    }
-    case 27: {
-      Object.assign(style, { inverse: false });
-      return 0;
-    }
-    case 39: {
-      Object.assign(style, { foreground: defaults.foreground });
-      return 0;
-    }
-    case 49: {
-      Object.assign(style, { background: defaults.background });
-      return 0;
-    }
-    default: {
-      if (code >= 30 && code <= 37) style.foreground = indexedColor(code - 30);
-      else if (code >= 90 && code <= 97) style.foreground = indexedColor(code - 90 + 8);
-      else if (code >= 40 && code <= 47) style.background = indexedColor(code - 40);
-      else if (code >= 100 && code <= 107) style.background = indexedColor(code - 100 + 8);
-      else if (code === 38 || code === 48) {
-        const field = code === 38 ? "foreground" : "background";
-        if (values[index + 1] === 5 && values[index + 2] >= 0 && values[index + 2] <= 255) {
-          style[field] = indexedColor(values[index + 2]);
-          return 2;
-        }
-        if (values[index + 1] === 2 && values.slice(index + 2, index + 5).length === 3) {
-          const rgb = values.slice(index + 2, index + 5);
-          if (rgb.every((value) => Number.isSafeInteger(value) && value >= 0 && value <= 255))
-            style[field] = `rgb(${rgb.join(",")})`;
-          return 4;
-        }
+const rasterizerCache = { promise: undefined };
+function detectRasterizer() {
+  rasterizerCache.promise ??= (async () => {
+    try {
+      await execute("magick", ["-version"]);
+      return "magick";
+    } catch {
+      try {
+        await execute("rsvg-convert", ["-v"]);
+        return "rsvg-convert";
+      } catch {
+        return null;
       }
     }
-  }
-  return 0;
+  })();
+  return rasterizerCache.promise;
 }
 
-function updateStyle(style, params, defaults) {
-  const values = params ? params.split(";").map(Number) : [0];
-  for (let index = 0; index < values.length; index++) {
-    index += styleCode(style, values, index, defaults);
+async function rasterizeToPng(svgPath, pngPath) {
+  const tool = await detectRasterizer();
+  if (!tool) return;
+  if (tool === "magick") {
+    await execute("magick", [
+      "-background",
+      "none",
+      "-density",
+      "192",
+      svgPath,
+      "-strip",
+      "-colors",
+      "255",
+      `PNG8:${pngPath}`,
+    ]);
+  } else if (tool === "rsvg-convert") {
+    await execute("rsvg-convert", ["--zoom=2", "-o", pngPath, svgPath]);
   }
 }
 
-/** Visualize captured terminal cells, not pixels from a native application window. */
+/** Visualize captured terminal cells with per-cell positioning, stroked box lines and Nerd Font icons. */
 export function ansiToSvg(ansi, spec) {
-  const defaults =
-    spec.palette === "light"
-      ? { foreground: "#202124", background: "#ffffff" }
-      : { foreground: "#e6e8ee", background: "#171a21" };
-  const style = { ...defaults, bold: false, dim: false, inverse: false };
-  const width = spec.cols * 10 + 16;
-  const height = spec.rows * 20 + 16;
-  const elements = [`<rect width="100%" height="100%" fill="${defaults.background}"/>`];
-  const escape = String.fromCodePoint(27);
-  const tokens = new RegExp(String.raw`${escape}\[([0-9;]*)m|([^${escape}]+)`, "gu");
-  for (const [row, line] of ansi.split("\n").slice(0, spec.rows).entries()) {
-    let column = 0;
-    for (const match of line.matchAll(tokens)) {
-      if (match[1] !== undefined) {
-        updateStyle(style, match[1], defaults);
-        continue;
-      }
-      const text = stripVTControlCharacters(match[2]);
-      const cells = displayWidth(text);
-      const foreground = style.inverse ? style.background : style.foreground;
-      const background = style.inverse ? style.foreground : style.background;
-      const x = 8 + column * 10;
-      const y = 8 + row * 20;
-      if (background !== defaults.background)
-        elements.push(
-          `<rect x="${x}" y="${y}" width="${cells * 10}" height="20" fill="${background}"/>`,
-        );
-      if (cells)
-        elements.push(
-          `<text x="${x}" y="${y + 15}" textLength="${cells * 10}" lengthAdjust="spacingAndGlyphs" fill="${foreground}" opacity="${style.dim ? 0.65 : 1}" font-weight="${style.bold ? 700 : 400}">${xml(text)}</text>`,
-        );
-      column += cells;
-    }
-  }
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" role="img" aria-label="${xml(spec.name)} terminal capture"><style>text{font-family:'BlexMono Nerd Font Mono','JetBrainsMono Nerd Font Mono','FiraCode Nerd Font Mono','Symbols Nerd Font Mono',monospace;font-size:16px;white-space:pre}</style>${elements.join("")}</svg>\n`;
+  return ansiToWindowSvg(ansi, {
+    title: spec.name || spec.title || "terminal capture",
+    cols: spec.cols,
+    rows: spec.rows,
+    palette: spec.palette,
+    cellWidth: displayWidth,
+  });
 }
 
 export function compareCaptures(before, after) {
@@ -755,9 +1062,15 @@ async function writeCapture(output, side, capture, source) {
   if (capture.status === "captured") {
     await writeFile(`${stem}.ansi`, capture.ansi);
     await writeFile(`${stem}.svg`, ansiToSvg(capture.ansi, capture));
+    try {
+      await rasterizeToPng(`${stem}.svg`, `${stem}.png`);
+    } catch {
+      // Gracefully skip .png if rasterizer is unavailable or fails
+    }
   } else {
     await rm(`${stem}.ansi`, { force: true });
     await rm(`${stem}.svg`, { force: true });
+    await rm(`${stem}.png`, { force: true });
   }
   return record;
 }
