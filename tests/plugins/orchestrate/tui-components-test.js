@@ -99,7 +99,8 @@ describe("terminal presentation components", () => {
     const rendered = view.render(152).join("\n");
     expect(plain(rendered)).toContain("│ \u{F06A9} Coordinator · workspace");
     expect(plain(rendered)).not.toContain("folder: workspace");
-    expect(plain(rendered)).toContain("│ \u{F1AD}  \u{EC82} all ━━━─ 80%");
+    expect(plain(rendered)).toContain("\u{F1AD}  \u{EC82} all ━━━─ 80%");
+    expect(plain(rendered)).not.toContain("│ \u{F1AD}  \u{EC82} all ━━━─ 80%");
     expect(rendered).toContain("\u{1B}[38;5;173m\u{EC82}\u{1B}[0m");
     expect(rendered).toContain("\u{1B}[38;5;33m\u{E7F0}\u{1B}[0m");
     expect(rendered).toContain("\u{1B}[37m\u{EC81}\u{1B}[0m");
@@ -297,11 +298,11 @@ describe("terminal presentation components", () => {
     const view = new HordeView(room, { color: true, tier: "nerd", now: () => 840 });
     expect(view.needsAnimation).toBe(true);
     const rendered = view.render(80);
-    expect(plain(rendered[0])).toBe(` ╭${"─".repeat(76)}╮`);
+    expect(plain(rendered[0])).toMatch(/^ ╭ Coordinator ─+╮$/u);
     expect(plain(rendered[0])).not.toContain("Swarm");
-    expect(plain(rendered[3])).toContain("│ ⣷ Inspecting Orkest swarm pane title and card header");
-    expect(rendered[3]).toContain("\u{1B}[38;5;149m⣷\u{1B}[0m");
-    expect(rendered[3]).toContain("\u{1B}[38;5;150;1m");
+    expect(plain(rendered[2])).toContain("│ ⣷ Inspecting Orkest swarm pane title and card header");
+    expect(rendered[2]).toContain("\u{1B}[38;5;149m⣷\u{1B}[0m");
+    expect(rendered[2]).toContain("\u{1B}[38;5;150;1m");
     expect(plain(rendered.join("\n"))).toContain(
       "│ project  ·  󰔛 1 active  ·  󰀪 1 blocked  ·  󰋗 1 reported",
     );

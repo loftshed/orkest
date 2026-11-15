@@ -29,6 +29,7 @@ import {
   validateRoom,
 } from "../../../plugins/orchestrate/lib/horde-room.mjs";
 import {
+  extractAgentFocusMarkdown,
   HordeView,
   normalizeAgent,
   normalizeModelAndEffort,
@@ -234,14 +235,14 @@ describe("tui-box primitives and HordeView unification", () => {
   it("uses two card columns on a wide terminal and stacked cards when narrow", () => {
     const view = new HordeView(fixture(), { now: () => 2000 });
     const wide = view.render(120);
-    expect(wide.some((line) => line.includes("1 luna-1") && line.includes("2 flash-1"))).toBe(true);
+    expect(wide.some((line) => line.includes("1 flash-1") && line.includes("2 luna-1"))).toBe(true);
     expect(wide.some((line) => line.includes(" Shortcuts "))).toBe(true);
     const narrow = view.render(70);
-    expect(narrow.some((line) => line.includes("1 luna-1") && line.includes("2 flash-1"))).toBe(
+    expect(narrow.some((line) => line.includes("1 flash-1") && line.includes("2 luna-1"))).toBe(
       false,
     );
-    expect(narrow.join("\n")).toContain("1 luna-1");
-    expect(narrow.join("\n")).toContain("2 flash-1");
+    expect(narrow.join("\n")).toContain("1 flash-1");
+    expect(narrow.join("\n")).toContain("2 luna-1");
     expect(narrow.join("\n")).toContain("3 haiku-1");
     expect(narrow.join("\n")).not.toContain("3/64 slots · page 1/1");
   });
@@ -249,7 +250,7 @@ describe("tui-box primitives and HordeView unification", () => {
   it("focuses and pins detail while new output arrives", () => {
     const room = fixture("claude:haiku*2,agy:flash*2");
     const view = new HordeView(room, { now: () => 2000 });
-    view.handleInput("2");
+    view.handleInput("3");
     view.handleInput("p");
     view.handleInput("1");
     expect(view.render(90).join("\n")).toContain("PIN ");
@@ -257,7 +258,7 @@ describe("tui-box primitives and HordeView unification", () => {
     changed.agents[2].output.push("Branch selected");
     view.setRoom(changed);
     expect(view.render(90).join("\n")).toContain("Branch selected");
-    view.handleInput("2");
+    view.handleInput("3");
     view.handleInput("p");
     const unpinned = view.render(90).join("\n");
     expect(unpinned).not.toContain("PIN ");
@@ -294,7 +295,7 @@ describe("tui-box primitives and HordeView unification", () => {
     const room = fixture();
     room.agents[2].output = ["\u{1B}[2J界界 👩‍💻 safe\u{7}"];
     const view = new HordeView(room);
-    view.handleKey("1");
+    view.handleKey("2");
     const lines = view.render(32);
     expect(lines.every((line) => displayWidth(line) <= 32)).toBe(true);
     expect(lines.join("\n")).toContain("safe");
@@ -306,7 +307,7 @@ describe("tui-box primitives and HordeView unification", () => {
     room.agents[2].status = "running";
     room.agents[2].output = ["\u{1B}[31munsafe\u{1B}[0m 👩‍💻 界\nnext line"];
     const view = new HordeView(room, { now: () => 2000, height: 28, color: true });
-    view.handleKey("1");
+    view.handleKey("2");
     for (const width of [40, 47, 48, 63, 64, 79, 80, 120]) {
       const lines = view.render(width);
       expect(lines.every((line) => displayWidth(line) <= width)).toBe(true);
@@ -577,7 +578,7 @@ describe("tui-box primitives and HordeView unification", () => {
     expect(lines.filter((line) => line.includes("Quota"))).toHaveLength(0);
   });
 
-  it("renders quota pills from monitor account data right below the coordinator card", () => {
+  it("renders quota pills from monitor account data in the bottom telemetry stack", () => {
     const room = fixture();
     room.accounts = [
       {
@@ -781,8 +782,8 @@ describe("tui-box primitives and HordeView unification", () => {
     expect(rendered).not.toContain("┌ ▸ 1 haiku-2");
     expect(rendered).toMatch(/haiku[^\n]*· idle|idle[^\n]*· haiku/u);
     expect(view.needsAnimation).toBe(true);
-    view.handleInput("1");
-    expect(view.render(100).join("\n")).toContain("├─▸ · 1 haiku-2");
+    view.handleInput("2");
+    expect(view.render(100).join("\n")).toContain("├─▸ · 2 haiku-2");
     room.agents[2].runtimeState = "stopped";
     view.setRoom(room);
     expect(view.needsAnimation).toBe(false);
@@ -791,7 +792,7 @@ describe("tui-box primitives and HordeView unification", () => {
     view.setRoom(room);
     const blocked = view.render(100).join("\n");
     expect(blocked).toContain("1 blocked");
-    expect(blocked).toContain("2 haiku-3");
+    expect(blocked).toContain("1 haiku-3");
   });
 
   it("shows an idle native reviewer without implying an unaccepted executor result", () => {
@@ -817,7 +818,7 @@ describe("tui-box primitives and HordeView unification", () => {
     expect(plain(view.render(100).join("\n"))).toContain("[native]");
   });
 
-  it("joins the coordinator, quota, cards and services with one continuous tree spine", () => {
+  it("joins the coordinator, cards, quota and services cleanly with bottom telemetry ordering", () => {
     const room = fixture("claude:haiku,agy:flash");
     room.quotaError = "Quota unavailable";
     room.services = [{ kind: "port", port: 5017, name: "preview" }];
@@ -826,13 +827,14 @@ describe("tui-box primitives and HordeView unification", () => {
       tier: "unicode",
       quotaMode: "expanded",
     }).render(90);
+    const quotaIndex = lines.findIndex((line) => line.includes("Quota"));
     const serviceIndex = lines.findIndex((line) => line.includes("Services"));
     const firstAgentLine = lines.findIndex((line) => line.includes("flash-1"));
     const lastAgentLine = lines.findLastIndex((line) => line.includes("haiku-1"));
     expect(lines[0][1]).toBe("┌");
-    expect(lines.find((line) => line.includes("Quota"))[1]).toBe("├");
     expect(lines.slice(1, firstAgentLine).every((line) => "│├".includes(line[1]))).toBe(true);
-    expect(serviceIndex).toBeGreaterThan(lastAgentLine);
+    expect(quotaIndex).toBeGreaterThan(lastAgentLine);
+    expect(serviceIndex).toBeGreaterThan(quotaIndex);
     expect(lines.join("\n")).toContain("Awaiting assignment");
     expect(lines.every((line) => displayWidth(line) <= 90)).toBe(true);
   });
@@ -2018,5 +2020,242 @@ describe("terminal lifecycle", () => {
     expect(wideArchRow.match(/\u{F02D7}/gu)).toHaveLength(1);
     expect(wideLines.join("\n")).toContain("wt:indexer");
     expect(wideLines.join("\n")).not.toContain("wt:wt-");
+  });
+
+  it("folds multi-wave accepted scratch history, deduplicates slot names and errors, and stays single-page", () => {
+    const room = fixture();
+    room.cwd = "/workspace/project";
+    room.swarm = { maxAgents: 24, maxDepth: 4 };
+    const acceptedWave = Array.from({ length: 18 }, (_, index) => {
+      if (index === 16) {
+        return {
+          id: "gemini-4-hydrogen-xhigh-2",
+          name: "gemini-4-hydrogen-xhigh-2",
+          engine: "agy",
+          model: "gemini-4-hydrogen-xhigh",
+          status: "completed",
+          verdict: "accept",
+          cwd: "/tmp/waves/wave-1/shadow",
+          dispatch: { taskDir: "/tmp/waves/wave-1" },
+          objective: "Shadow pass",
+          observedAt: "2026-11-10T00:18:00Z",
+        };
+      }
+      if (index === 17) {
+        return {
+          id: "gemini-4-argon-high-3",
+          name: "gemini-4-argon-high-3",
+          engine: "agy",
+          model: "Gemini 4 Argon",
+          status: "completed",
+          verdict: "accept",
+          cwd: "/tmp/waves/wave-1/gemini-4-argon",
+          dispatch: { taskDir: "/tmp/waves/wave-1" },
+          objective: "Argon pass",
+          observedAt: "2026-11-10T00:19:00Z",
+        };
+      }
+      return {
+        id: `wave-slot-${index}`,
+        name: `wave-slot-${index}`,
+        engine: "claude",
+        model: "claude-haiku-4-5",
+        status: "completed",
+        verdict: "accept",
+        cwd: `/tmp/waves/wave-1/slot-${index}`,
+        dispatch: { taskDir: "/tmp/waves/wave-1" },
+        objective: `Accepted wave item ${index}`,
+        observedAt: `2026-11-10T00:${String(index).padStart(2, "0")}:00Z`,
+      };
+    });
+    room.agents = [
+      ...acceptedWave,
+      {
+        id: "gpt-6-1-terra-3",
+        name: "gpt-6-1-terra-3",
+        engine: "codex",
+        model: "gpt-6-1-terra",
+        status: "failed",
+        error: "Failed",
+        cwd: "/tmp/waves/wave-2/tiebreak",
+        dispatch: { taskDir: "/tmp/waves/wave-2" },
+        objective: "Tiebreak verification pass",
+        observedAt: "2026-11-10T01:00:00Z",
+      },
+      {
+        id: "sonnet-4",
+        name: "sonnet-4",
+        engine: "claude",
+        model: "claude-sonnet-4-6",
+        status: "working",
+        cwd: "/workspace/project/packages/ui",
+        progress: { task: "Implement sidebar layout", stage: "working" },
+        observedAt: "2026-11-10T02:00:00Z",
+      },
+    ];
+
+    const view = new HordeView(room, { height: 28, tier: "unicode", color: false, now: () => 0 });
+    expect(view.pageCount()).toBe(1);
+    const collapsedLines = view.render(110).map(plain);
+    const collapsedText = collapsedLines.join("\n");
+    expect(collapsedLines.every((line) => displayWidth(line) <= 110)).toBe(true);
+    expect(collapsedText).toContain("1 terra-3 [tiebreak]");
+    expect(collapsedText).not.toContain("1 gpt-6-1-terra-3");
+    expect(collapsedText).toContain("Tiebreak verification pass");
+    expect(collapsedText).not.toContain("Error: Failed");
+    expect(collapsedText).toContain("2 sonnet-4 [ui]");
+    expect(collapsedText).toContain("18 inactive hidden (press c to expand)");
+    expect(collapsedText).toContain("20/24 slots · page 1/1");
+    expect(extractAgentFocusMarkdown(room.agents[18])).toBe("");
+
+    // Pressing c in collapsed skips hidden when 0 non-resolved collapsible agents exist
+    expect(view.handleKey("c")).toBe(true);
+    expect(view.completedMode).toBe("expanded");
+    const expandedText = view.render(140).map(plain).join("\n");
+    expect(expandedText).toContain("hydrogen-2 [shadow]");
+    expect(expandedText).toContain("argon-3");
+    expect(expandedText).not.toContain("argon-3 [gemini-4-argon]");
+
+    // Clicking inactive-hidden expands directly from collapsed too
+    view.completedMode = "collapsed";
+    const hiddenLines = view.render(110).map(plain);
+    const hiddenIdx = hiddenLines.findIndex((line) => line.includes("18 inactive hidden"));
+    expect(hiddenIdx).toBeGreaterThanOrEqual(0);
+    expect(view.handleMouse({ x: 5, y: hiddenIdx + 1, action: "press", button: 0 })).toBe(true);
+    expect(view.completedMode).toBe("expanded");
+  });
+
+  it("renders connected parent-child vertical stems on row 2 and sub-lead child badges", () => {
+    const room = fixture("codex:luna,claude:haiku,agy:flash,claude:sonnet");
+    room.cwd = "/workspace/project";
+    const [leadAgent, subLead, grandChild, sibling] = room.agents;
+    leadAgent.name = "wave-lead";
+    leadAgent.status = "working";
+    leadAgent.progress = { task: "Coordinating child tasks", stage: "working" };
+
+    subLead.name = "sub-coord";
+    subLead.parent = leadAgent.id;
+    subLead.role = "coordinator";
+    subLead.status = "working";
+    subLead.progress = { task: "Managing leaf task", stage: "working" };
+
+    grandChild.name = "leaf-worker";
+    grandChild.parent = subLead.id;
+    grandChild.status = "working";
+    grandChild.progress = { task: "Running leaf build", stage: "working" };
+
+    sibling.name = "peer-worker";
+    sibling.parent = leadAgent.id;
+    sibling.status = "working";
+    sibling.progress = { task: "Checking sibling lint", stage: "working" };
+
+    const lines = new HordeView(room, { height: 32, tier: "unicode", color: false, now: () => 0 })
+      .render(96)
+      .map(plain);
+    expect(lines.every((line) => displayWidth(line) <= 96)).toBe(true);
+    const joined = lines.join("\n");
+    expect(joined).toContain("1 wave-lead [lead · 2]");
+    expect(joined).toContain("[coordinator · 1 sub]");
+
+    const leadRow2Index = lines.findIndex((line) => line.includes("Coordinating child tasks"));
+    const childRow1Index = leadRow2Index + 1;
+    expect(leadRow2Index).toBeGreaterThan(0);
+    // Parent row 2 stem aligns vertically with child row 1 branch
+    expect(lines[leadRow2Index][4]).toBe("│");
+    expect("├└").toContain(lines[childRow1Index][4]);
+  });
+
+  it("suppresses automatic Focus popup for running agents with active processes", () => {
+    const room = fixture("claude:haiku,agy:flash");
+    const running = room.agents[0];
+    running.status = "working";
+    running.progress = { task: "Running dev server", stage: "working" };
+    room.agents = [running];
+    room.agentProcesses = {
+      [running.id]: {
+        processes: [
+          {
+            pid: 9102,
+            ppid: 9100,
+            ageSeconds: 42,
+            command: "node vite --port 5173",
+            via: "tree",
+            ports: [5173],
+          },
+        ],
+        more: 0,
+      },
+    };
+
+    const view = new HordeView(room, { height: 32, tier: "unicode", color: false, now: () => 0 });
+    const runningText = view.render(100).map(plain).join("\n");
+    expect(runningText).toContain("1 proc · :5173");
+    expect(runningText).not.toContain("Focus · haiku-1");
+
+    // Leftover processes after completion still auto-open Focus
+    running.status = "reported complete";
+    view.setRoom(room);
+    const leftoverText = view.render(100).map(plain).join("\n");
+    expect(leftoverText).toContain("Focus · haiku-1");
+    expect(leftoverText).toContain("1 proc left");
+  });
+
+  it("strips numeric version tokens when deduplicating slot agent names", () => {
+    const room = fixture("claude:sonnet,codex:gpt");
+    room.agents[0].name = "claude-sonnet-4-6-2";
+    room.agents[0].model = "claude-sonnet-4-6";
+    room.agents[1].name = "gpt-6-1-terra-3";
+    room.agents[1].model = "gpt-6-1-terra";
+    const text = new HordeView(room, { height: 24, tier: "unicode", color: false, now: () => 0 })
+      .render(100)
+      .map(plain)
+      .join("\n");
+    expect(text).toContain("sonnet-2");
+    expect(text).toContain("terra-3");
+    expect(text).not.toContain("6-2");
+  });
+
+  it("omits orphan parent row-2 vertical stem when a depth-5 child overflows with +1", () => {
+    const room = fixture("claude:haiku,claude:sonnet,agy:flash,codex:gpt,claude:opus,agy:pro");
+    for (let i = 0; i < room.agents.length; i++) {
+      room.agents[i].id = `depth-${i}`;
+      room.agents[i].name = `depth-${i}`;
+      room.agents[i].parent = i === 0 ? "conductor" : `depth-${i - 1}`;
+      room.agents[i].status = "working";
+      room.agents[i].progress = { task: `Task at depth ${i}`, stage: "working" };
+    }
+    const lines = new HordeView(room, { height: 40, tier: "unicode", color: false, now: () => 0 })
+      .render(96)
+      .map(plain);
+    const depth4TaskLine = lines.find((line) => line.includes("Task at depth 4"));
+    const depth5BranchLine = lines.find((line) => line.includes("+1 └─"));
+    expect(depth4TaskLine).toBeDefined();
+    expect(depth5BranchLine).toBeDefined();
+    // Depth-4 row 2 should omit the vertical child stem when depth-5 uses "+1 └─"
+    expect(depth4TaskLine).not.toContain("│");
+    expect(depth4TaskLine).toMatch(/^\s+\S\s+Task at depth 4/);
+  });
+
+  it("keeps automatic focus on a visible renderable agent when completed waves fold via c", () => {
+    const room = fixture("claude:haiku,claude:sonnet,agy:flash");
+    room.agents[0].name = "done-a";
+    room.agents[0].status = "accepted";
+    room.agents[1].name = "done-b";
+    room.agents[1].status = "accepted";
+    room.agents[2].name = "active-c";
+    room.agents[2].status = "working";
+    room.agents[2].progress = { task: "Still active", stage: "working" };
+
+    const view = new HordeView(room, { height: 32, tier: "unicode", color: false, now: () => 0 });
+    expect(view.focusId).toBe(room.agents[2].id);
+    // Simulate room update initially landing focus on a non-explicit completed agent
+    view.focusId = room.agents[0].id;
+    view.hasExplicitFocus = false;
+    view.pinnedId = undefined;
+    // Toggle c until resolved agents fold
+    view.handleKey("c");
+    expect(view.renderableAgents().some((agent) => agent.id === view.focusId)).toBe(true);
+    view.handleKey("c");
+    expect(view.renderableAgents().some((agent) => agent.id === view.focusId)).toBe(true);
   });
 });

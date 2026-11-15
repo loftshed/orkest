@@ -68,6 +68,8 @@ const INTERNAL_OR_HARNESS_TOKENS = [
 
 const SENSITIVE_NAME_RE = /token|secret|password|passwd|api[_-]?key|auth|bearer|credential/iu;
 const ENV_ASSIGNMENT_RE = /^[A-Za-z_][A-Za-z0-9_]*=/u;
+const MCP_INVOCATION_RE = /(?:^|\s)(?:mcp|--mcp(?:\s|=|$)|mcp-server\b|@modelcontextprotocol\/)/iu;
+const MCP_SCRIPT_RE = /(?:^|[\s/\\])[\w.-]*[-_]mcp\.(?:mjs|cjs|js|ts|py|sh)(?:\s|$)/iu;
 const MAX_PROCESSES_PER_AGENT = 20;
 
 function matchTokenInText(text, tokens) {
@@ -92,7 +94,11 @@ export function isInternalOrHarnessProcess(command = "", comm = "", args = "", p
     const hasExplicitPortFlag = /(?:^|\s)(?:--port(?:\s|=)|\b-p\s+\d+)/iu.test(args);
     if (!knownToken && !hasExplicitPortFlag) return true;
   }
-  return false;
+  return (
+    !matchKnownServiceToken(command, comm, args) &&
+    !(Number.isFinite(port) && port > 0 && port < 49_152) &&
+    (MCP_INVOCATION_RE.test(execIdentity) || MCP_SCRIPT_RE.test(execIdentity))
+  );
 }
 
 export function inferServiceProcessName(command = "", comm = "", args = "") {
