@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.85.3
+
+- perf(orchestrate): add optional crates/ork-fast Rust binary for 1ms hooks, gate, and statusline (#208)
+
 ## 0.85.2
 
 - docs(orchestrate): refresh model capability research, profiles, benchmark priors, and default routes (#200) (#207)
