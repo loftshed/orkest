@@ -41,6 +41,7 @@ import {
   quotaAccountLabel,
   quotaAccountScope,
   sectionHeading,
+  WIDE_NERD_BRANDS,
 } from "./tui-components.mjs";
 import { renderLogLine, renderMarkdown, stripInlineMarkdown } from "./tui-markdown.mjs";
 import { resolveTheme } from "./tui-theme.mjs";
@@ -339,26 +340,33 @@ function summarizePoolWindows(group) {
   return prefix ? `${prefix} · ${metrics}` : metrics;
 }
 
+function brandGap(brand) {
+  return WIDE_NERD_BRANDS.has(brand) ? "  " : " ";
+}
+
 function quotaExpandedLabel(account, tier, width = 80) {
   const base = quotaAccountLabel(account, tier);
   if (tier !== "nerd" || width < 72) return base;
   const short = plain(account.short || account.id || "?").trim();
   const accountScope = quotaAccountScope(account);
   const brand = providerMark(account.provider, tier);
+  const joinWithBrand = (...parts) => {
+    const rest = parts.filter(Boolean).join(" ");
+    if (!brand) return rest;
+    return rest ? `${brand}${brandGap(brand)}${rest}` : brand;
+  };
   if (accountScope === "work") {
-    return [brand, "\u{F1AD} Work", short ? `· ${short}` : ""].filter(Boolean).join(" ");
+    return joinWithBrand("\u{F1AD} Work", short ? `· ${short}` : "");
   }
   if (accountScope === "personal") {
-    return [brand, "\u{F007} Personal", short ? `· ${short}` : ""].filter(Boolean).join(" ");
+    return joinWithBrand("\u{F007} Personal", short ? `· ${short}` : "");
   }
   const provider = String(account.provider || "").toLowerCase();
   if (/^(?:gpt|codex|openai)/u.test(provider)) {
-    return [brand, "\u{F007} Codex", short && short !== "CX" ? `· ${short}` : ""]
-      .filter(Boolean)
-      .join(" ");
+    return joinWithBrand("\u{F007} Codex", short && short !== "CX" ? `· ${short}` : "");
   }
   if (/^(?:gemini|google|agy|antigravity)/u.test(provider)) {
-    return [brand, "\u{F007} Antigravity"].filter(Boolean).join(" ");
+    return joinWithBrand("\u{F007} Antigravity");
   }
   return base;
 }
@@ -374,9 +382,10 @@ function quotaRows(accounts, width, tier, color, now = Date.now()) {
     const refNow =
       Number.isFinite(account.fetchedAt) && now < 1_000_000_000_000 ? account.fetchedAt : now;
     if (windows.length === 0) {
+      const gap = WIDE_NERD_BRANDS.has(expandedShort) ? brandGap(expandedShort) : " ";
       entries.push({
         raw: plain(
-          `${expandedShort} ${renderLine([account]) || "quota unavailable"}${creditSuffix}`,
+          `${expandedShort}${gap}${renderLine([account]) || "quota unavailable"}${creditSuffix}`,
         ),
       });
       continue;
@@ -386,7 +395,8 @@ function quotaRows(accounts, width, tier, color, now = Date.now()) {
       const pct = Number.isFinite(window.remainingPct)
         ? Math.max(0, Math.min(100, window.remainingPct))
         : undefined;
-      const label = plain(`${short} ${window.label || window.id || "quota"}`);
+      const gap = WIDE_NERD_BRANDS.has(short) ? brandGap(short) : " ";
+      const label = plain(`${short}${gap}${window.label || window.id || "quota"}`);
       const resetSuffix = pct === undefined ? "" : formatGroupResetSuffix(windows, refNow);
       const summary =
         pct === undefined ? "unavailable" : `${Math.round(pct)}% left${creditSuffix}${resetSuffix}`;
@@ -503,19 +513,21 @@ function groupFolder(member, room) {
   ) {
     return raw;
   }
-  const sysTmp = os.tmpdir().replace(/\/+$/u, "");
-  const taskDir = plain(member?.dispatch?.taskDir || "")
-    .trim()
-    .replace(/\/+$/u, "");
-  const inRepoSubdir = raw.startsWith(`${rootCwd}${path.sep}`);
-  const inDispatchScratch =
-    Boolean(member?.dispatch) &&
-    (raw.startsWith("/tmp/") ||
-      raw.startsWith("/private/tmp/") ||
-      raw.startsWith("/var/folders/") ||
-      (sysTmp && raw.startsWith(`${sysTmp}${path.sep}`)) ||
-      (taskDir && raw.startsWith(`${taskDir}${path.sep}`)));
-  return inRepoSubdir || inDispatchScratch ? rootCwd : raw;
+  const rawNorm = raw.replace(/\/+$/u, "");
+  const rootNorm = rootCwd.replace(/\/+$/u, "");
+  if (rawNorm === rootNorm) return rootCwd;
+  const xdgCache = (process.env.XDG_CACHE_HOME || path.join(os.homedir(), ".cache")).replace(
+    /\/+$/u,
+    "",
+  );
+  const orchestrateCache = xdgCache ? path.join(xdgCache, "orchestrate") : "";
+  const isInRepoSubdir = rawNorm.startsWith(`${rootNorm}${path.sep}`);
+  const isInOrchestrateCache = Boolean(
+    orchestrateCache &&
+    (rawNorm === orchestrateCache || rawNorm.startsWith(`${orchestrateCache}${path.sep}`)),
+  );
+  const hasWorkerArtifact = Boolean(member?.dispatch || member?.resultPath || member?.consultation);
+  return isInRepoSubdir || hasWorkerArtifact || isInOrchestrateCache ? rootCwd : raw;
 }
 
 function subfolderContext(member, room, groupedFolder) {
@@ -1037,12 +1049,13 @@ export class HordeView {
     this.diffCursor = 0;
     this.diffCursorRows = new Map();
     this.diffPreviewMetrics = null;
+    this.quotaWindowOffset = undefined;
   }
 
   quotaRowLimit() {
     if (!this.room.accounts?.length && !this.room.quotaError) return 0;
     if (this.quotaMode === "collapsed")
-      return this.quotaSummaryLines(Math.max(1, this.renderWidth - 2)).length;
+      return this.quotaSummaryLines(Math.max(1, this.renderWidth - 4)).length;
     let rowCount = 0;
     const accounts = this.room.accounts || [];
     for (const account of accounts) {
@@ -1081,35 +1094,40 @@ export class HordeView {
     );
     const hasQuota =
       Boolean(this.room.accounts?.length || this.room.quotaError) && this.height >= 12;
-    let quotaLines = 0;
-    if (hasQuota) {
-      quotaLines =
-        this.quotaMode === "collapsed"
-          ? this.quotaRowLimit()
-          : Math.max(1, this.quotaRowLimit()) + 2;
-    }
-    const extraQuotaRows =
-      this.quotaMode === "collapsed" ? Math.max(0, quotaLines) : Math.max(0, quotaLines - 2);
+    const quotaRowsCount = hasQuota ? Math.max(1, this.quotaRowLimit()) : 0;
     const serviceRows = this.serviceRowLimit();
-    let servicePanelLines = 0;
-    if (serviceRows > 0) {
-      servicePanelLines = this.servicesMode === "collapsed" ? 1 : serviceRows + 2;
-    }
     const updateBarLines = this.showUpdateBar() && this.height >= 14 ? 1 : 0;
+    const hasTelemetry = hasQuota || serviceRows > 0 || updateBarLines > 0;
+    const hasQuotaServicesDivider =
+      hasQuota &&
+      serviceRows > 0 &&
+      (this.quotaMode === "expanded" || this.servicesMode === "expanded");
+    const hasUpdateDivider =
+      updateBarLines > 0 &&
+      (hasQuota || serviceRows > 0) &&
+      ((hasQuota && this.quotaMode === "expanded") ||
+        (serviceRows > 0 && this.servicesMode === "expanded"));
+    const telemetryLines = hasTelemetry
+      ? 2 +
+        quotaRowsCount +
+        (hasQuotaServicesDivider ? 1 : 0) +
+        serviceRows +
+        (hasUpdateDivider ? 1 : 0) +
+        updateBarLines
+      : 0;
+    const noTelemetryRuleLines = hasTelemetry ? 0 : 1;
     const base = Math.min(
       16,
       Math.max(
         2,
-        Math.floor(
-          (this.height - 8 - extraQuotaRows - servicePanelLines - updateBarLines - footerExtra) / 2,
-        ),
+        Math.floor((this.height - 6 - telemetryLines - noTelemetryRuleLines - footerExtra) / 2),
       ),
     );
-    const folderCount = new Set(this.room.agents.map((agent) => groupFolder(agent, this.room)))
-      .size;
+    const folderCount = new Set(
+      this.renderableAgents().map((agent) => groupFolder(agent, this.room)),
+    ).size;
     if (folderCount > 1 || this.renderWidth < 100) {
-      const available =
-        this.height - 4 - quotaLines - servicePanelLines - updateBarLines - 2 - footerExtra;
+      const available = this.height - 4 - telemetryLines - noTelemetryRuleLines - 2 - footerExtra;
       const capacity = Math.max(1, Math.floor((available - (folderCount > 1 ? 1 : 0)) / 2));
       return Math.min(base, capacity);
     }
@@ -1654,8 +1672,8 @@ export class HordeView {
               ]),
           ...(this.preview.kind === "diff"
             ? [
-                { id: "diff-mark", label: "x Mark line", key: "x" },
-                { id: "diff-clear", label: "X Clear marks", key: "X" },
+                { id: "diff-mark", label: "Mark line", key: "x" },
+                { id: "diff-clear", label: "Clear marks", key: "X" },
               ]
             : []),
           ...(isNarrow
@@ -1741,18 +1759,62 @@ export class HordeView {
       right: detail,
       headerTone,
     });
-    if (detailParts && width >= 4) {
+    if (detailParts && width >= 4 && detail) {
       const tailWidth = Math.min(displayWidth(` ${detail} `), width - 2);
       const tail = fit(` ${detail} `, tailWidth);
-      const separator = tone(" · ", headerTone, this.appearance);
-      const styledParts = detailParts.map((part) =>
-        tone(plain(part.text), `${headerTone} ${part.style}`, this.appearance),
-      );
-      const padding = tone(" ", headerTone, this.appearance);
+      const sepTone = headerTone === "border" || headerTone === "muted" ? "muted" : headerTone;
+      const separator = tone(" · ", sepTone, this.appearance);
+      const styledParts = detailParts
+        .filter((part) => plain(part.text))
+        .map((part) => {
+          let partTone = headerTone;
+          if (part.style && part.style !== headerTone) {
+            partTone =
+              part.style === "muted" &&
+              (!headerTone || headerTone === "border" || headerTone === "muted")
+                ? "muted"
+                : `${headerTone} ${part.style}`;
+          }
+          return tone(plain(part.text), partTone, this.appearance);
+        });
+      const padTone = headerTone === "muted" ? "border" : headerTone;
+      const padding = tone(" ", padTone, this.appearance);
       const styledTail = fitStyled(`${padding}${styledParts.join(separator)}${padding}`, tailWidth);
       lines[0] = lines[0].replace(tone(tail, headerTone, this.appearance), () => styledTail);
     }
     return lines;
+  }
+
+  panelDividerRow(width, title = "", right = "", headerTone) {
+    const glyphs = {
+      ...glyphSet(this.tier),
+      topLeft: this.tier === "ascii" ? "+" : "├",
+      topRight: this.tier === "ascii" ? "+" : "┤",
+    };
+    return frame(title, [], width, {
+      glyphs,
+      color: this.appearance,
+      right,
+      headerTone,
+    })[0];
+  }
+
+  footerRuleLine(width, right = "") {
+    const glyphs = glyphSet(this.tier);
+    const cleanRight = plain(right).trim();
+    if (!cleanRight) {
+      return tone(glyphs.horizontal.repeat(width), "border", this.appearance);
+    }
+    const rightText = ` ${cleanRight}`;
+    const rightCells = displayWidth(rightText);
+    if (rightCells >= width) {
+      return tone(truncateDisplay(cleanRight, width, this.tier), "muted", this.appearance);
+    }
+    const ruleWidth = Math.max(0, width - rightCells);
+    return (
+      tone(glyphs.horizontal.repeat(ruleWidth), "border", this.appearance) +
+      tone(rightText, "muted", this.appearance)
+    );
   }
 
   overlayLines(width, height = this.height - 5) {
@@ -1897,13 +1959,15 @@ export class HordeView {
     return [this.updateLine(innerWidth)];
   }
 
-  quotaSummaryLines(innerWidth) {
-    const chevron = disclosure("", true, this.tier);
+  quotaSummaryLines(boxBodyWidth) {
+    const chevron = disclosure("", false, this.tier);
     const chevronWidth = displayWidth(chevron);
-    const stripWidth = Math.max(1, innerWidth - chevronWidth - 5);
+    const rightPad = boxBodyWidth >= 10 ? " " : "";
+    const stripWidth = Math.max(1, boxBodyWidth - chevronWidth - 5 - rightPad.length);
+    this.quotaWindowOffset = stripWidth + 2;
     const appendChevron = (line, isFirst) => {
       const fitted = fitStyled(` ${line}`, stripWidth + 1);
-      if (!isFirst) return `${fitted}${" ".repeat(chevronWidth + 4)}`;
+      if (!isFirst) return `${fitted}${" ".repeat(chevronWidth + 4 + rightPad.length)}`;
       const mark = tone(
         chevron,
         this.hovered === "quota-heading" ? "quotaHover" : "muted",
@@ -1914,7 +1978,7 @@ export class HordeView {
         this.hovered === "quota-window" ? "buttonHover" : "leadModel",
         this.appearance,
       );
-      return `${fitted} ${period} ${mark}`;
+      return `${fitted} ${period} ${mark}${rightPad}`;
     };
     if (this.room.quotaError) {
       return [appendChevron(`unavailable: ${plain(this.room.quotaError)}`, true)];
@@ -1960,14 +2024,23 @@ export class HordeView {
         const exhausted = measured.some((window) => window.remainingPct <= 0);
         const scope = quotaAccountScope(account);
         const brand = providerMark(account.provider, this.tier);
-        const accountLabel = scope
-          ? [
-              brand || (label ? account.provider : ""),
-              label || (brand ? "" : account.provider || account.short || account.id),
-            ]
-              .filter(Boolean)
-              .join(" ")
-          : [quotaAccountLabel(account, this.tier), label].filter(Boolean).join(" ");
+        let accountLabel;
+        if (scope) {
+          const head = brand || (label ? account.provider : "");
+          const tail = label || (brand ? "" : account.provider || account.short || account.id);
+          if (head && tail) {
+            accountLabel = `${head}${brand && head === brand ? brandGap(brand) : " "}${tail}`;
+          } else {
+            accountLabel = head || tail || "";
+          }
+        } else {
+          const baseLabel = quotaAccountLabel(account, this.tier);
+          if (baseLabel && label) {
+            accountLabel = `${baseLabel}${WIDE_NERD_BRANDS.has(baseLabel) ? brandGap(baseLabel) : " "}${label}`;
+          } else {
+            accountLabel = baseLabel || label;
+          }
+        }
         const remaining =
           active.length > 0 ? Math.min(...active.map((window) => window.remainingPct)) : undefined;
         rows.get(scope).push({
@@ -1993,8 +2066,32 @@ export class HordeView {
         "": { icon: "", accent: "success" },
       }[scope];
       const icon = this.tier === "ascii" ? "" : scopeIcon;
+      let stripMeters = meters;
+      if (
+        meters.length >= 4 &&
+        meterStrip(icon, meters, stripWidth, { tier: this.tier }).length > 1
+      ) {
+        const tier1 = meters.map((meter) => ({
+          ...meter,
+          label: meter.label.replaceAll("Claude/GPT", "CL/GPT"),
+        }));
+        if (meterStrip(icon, tier1, stripWidth, { tier: this.tier }).length === 1) {
+          stripMeters = tier1;
+        } else {
+          const tier2 = meters.map((meter) => ({
+            ...meter,
+            label: meter.label
+              .replaceAll("Claude/GPT", "C/G")
+              .replaceAll("Gemini", "Gem")
+              .replaceAll("fable", "fab"),
+          }));
+          if (meterStrip(icon, tier2, stripWidth, { tier: this.tier }).length === 1) {
+            stripMeters = tier2;
+          }
+        }
+      }
       rawLines.push(
-        ...meterStrip(icon, meters, stripWidth, {
+        ...meterStrip(icon, stripMeters, stripWidth, {
           color: this.appearance,
           tier: this.tier,
           hovered: this.hovered === "quota-heading" && rawLines.length === 0,
@@ -2172,7 +2269,7 @@ export class HordeView {
     const processInfo = agentProcessInfo(focused, this.room);
     if (!markdown && processInfo.count === 0) return [];
 
-    const agentLabel = shortAgentName(focused);
+    const agentLabel = dedupSlotAgentName(shortAgentName(focused), memberModelInfo(focused).model);
     const titlePrefix = isPinned ? "Pinned" : "Focus";
     if (remainingRows < 3) {
       const compactTag = `[${titlePrefix} · ${agentLabel}]`;
@@ -2448,10 +2545,11 @@ export class HordeView {
       const brand =
         providerMark(modelName, this.tier) ||
         providerMark(member.engine || data.harness, this.tier);
+      const gap = brand ? brandGap(brand) : "";
       if (isStyled) {
-        return `${brand ? `${colorProviderMarks(brand, this.appearance)} ` : ""}${style(`${modelName || "default model"}${provenance}`, "leadModel")}${effort && effort !== "—" ? `${separator(" / ")}${style(effort, "leadEffort")}` : ""}`;
+        return `${brand ? `${colorProviderMarks(brand, this.appearance)}${gap}` : ""}${style(`${modelName || "default model"}${provenance}`, "leadModel")}${effort && effort !== "—" ? `${separator(" / ")}${style(effort, "leadEffort")}` : ""}`;
       }
-      return `${brand ? `${brand} ` : ""}${modelName || "default model"}${provenance}${effort && effort !== "—" ? ` / ${effort}` : ""}`;
+      return `${brand ? `${brand}${gap}` : ""}${modelName || "default model"}${provenance}${effort && effort !== "—" ? ` / ${effort}` : ""}`;
     };
     const innerWidth = Math.max(1, width - 2);
     const leadFolder = groupFolder(lead, room);
@@ -2588,38 +2686,34 @@ export class HordeView {
           );
       const folderGroups = new Map();
       const ensureFolderGroup = (folder) => {
-        if (!folderGroups.has(folder)) folderGroups.set(folder, { entries: [], folded: [] });
+        if (!folderGroups.has(folder)) folderGroups.set(folder, []);
         return folderGroups.get(folder);
       };
       for (const [offset, agent] of visibleAgents.entries()) {
         const pageIndex = isFocusedView ? room.agents.findIndex((a) => a.id === agent.id) : offset;
         const folder = groupFolder(agent, room);
-        ensureFolderGroup(folder).entries.push({
+        ensureFolderGroup(folder).push({
           agent,
           index: pageIndex >= 0 ? pageIndex : offset,
         });
       }
-      if (!isFocusedView && this.page === pages - 1) {
-        for (const agent of foldedAgents) {
-          const folder = groupFolder(agent, room);
-          ensureFolderGroup(folder).folded.push(agent);
-        }
+      const hasHiddenSummary = !isFocusedView && this.page === pages - 1 && foldedAgents.length > 0;
+      if (visibleAgents.length === 0 && hasHiddenSummary) {
+        ensureFolderGroup(leadFolder);
       }
       const gap = "  ";
       const lastFolder = folderGroups.keys().toArray().at(-1);
       const hasWorktrees = visibleAgents.some((agent) => worktreeBadge(agent, room));
       const hasAllSharingLead =
         folderGroups.size === 1 && folderGroups.has(leadFolder) && !hasWorktrees;
-      for (const [folder, { entries, folded }] of folderGroups) {
+      for (const [folder, entries] of folderGroups) {
         if (!hasAllSharingLead || hasHerdrPaneHeader) {
-          const allGroupAgents = [...entries.map(({ agent }) => agent), ...folded];
-          const parts = hasHerdrPaneHeader ? activityParts(allGroupAgents, this.tier) : [];
+          const folderAgents =
+            entries.length > 0 ? entries.map(({ agent }) => agent) : foldedAgents;
+          const parts = hasHerdrPaneHeader ? activityParts(folderAgents, this.tier) : [];
           const folderSummary = parts.length > 0 ? parts : null;
-          lines.push(
-            this.folderHeaderLine(folder, allGroupAgents.length, innerWidth, folderSummary),
-          );
+          lines.push(this.folderHeaderLine(folder, folderAgents.length, innerWidth, folderSummary));
         }
-        const hiddenCompletedCount = folded.length;
         const hasCollapsedRows =
           !isFocusedView &&
           this.completedMode === "collapsed" &&
@@ -2628,12 +2722,13 @@ export class HordeView {
           !isFocusedView && !hasCollapsedRows && innerWidth >= 100 && entries.length > 1 ? 2 : 1;
         const cardWidth =
           columns === 2 ? Math.max(24, Math.floor((innerWidth - gap.length) / 2)) : innerWidth;
-        const hasFollowingSection = folder !== lastFolder;
+        const isLastFolder = folder === lastFolder;
+        const hasFollowingSection = !isLastFolder;
         const rails = folderTreeRails(
           entries,
           this.tier,
           columns,
-          hasFollowingSection || hiddenCompletedCount > 0,
+          hasFollowingSection || (isLastFolder && hasHiddenSummary),
           cardWidth,
         );
         const inGroup = new Set(entries.map(({ agent: a }) => a.id));
@@ -2644,7 +2739,7 @@ export class HordeView {
         const cards = entries.map(({ agent, index }, entryIndex) => {
           const { midPrefix, continuationPrefix } = rails[entryIndex];
           const prefix =
-            hiddenCompletedCount > 0 && entryIndex === entries.length - 1
+            isLastFolder && hasHiddenSummary && entryIndex === entries.length - 1
               ? toAsciiTree(midPrefix.replace("└─", "├─"), this.tier)
               : midPrefix;
           const wfRole = roleOf(agent);
@@ -2848,12 +2943,13 @@ export class HordeView {
           gridRow += Math.max(...row.map((card) => card.length));
         }
         lines.push(...joinCardGrid(cards, columns, cardWidth, gap));
-        if (hiddenCompletedCount === 0) continue;
-        const hiddenTargetId = `inactive-hidden:${folder}`;
-        const summaryPrefix = toAsciiTree(hasFollowingSection ? "├─" : "└─", this.tier);
-        const summaryText = ` ${hiddenCompletedCount} inactive hidden (press c to expand)`;
+      }
+      if (hasHiddenSummary) {
+        const hiddenTargetId = "inactive-hidden:all";
+        const summaryPrefix = toAsciiTree("└─ ", this.tier);
+        const summaryText = `${foldedAgents.length} inactive hidden (press c to expand)`;
         const hiddenStates = new Map();
-        for (const agent of folded) {
+        for (const agent of foldedAgents) {
           const state = memberDisplayState(agent);
           const group = hiddenStates.get(state) || { agent, count: 0 };
           group.count++;
@@ -2870,7 +2966,7 @@ export class HordeView {
           { id: hiddenTargetId, key: "c", x: 1, y: lines.length + 1, width: innerWidth, height: 1 },
         ]);
         lines.push(
-          sectionHeading(summaryText.trim(), "", innerWidth, {
+          sectionHeading(summaryText, "", innerWidth, {
             prefix: summaryPrefix,
             color: this.appearance,
             tier: this.tier,
@@ -2879,54 +2975,152 @@ export class HordeView {
         );
       }
     }
-    const quotaBlock = [];
-    let quotaCollapsedRows = 0;
-    if (!this.preview && !this.overlay && hasQuota && this.height >= 12) {
-      if (this.quotaMode === "collapsed") {
-        const rows = this.quotaSummaryLines(innerWidth);
-        quotaCollapsedRows = rows.length;
-        quotaBlock.push(...rows);
-      } else {
-        const quotaLimit = this.quotaRowLimit();
-        quotaBlock.push(
-          ...this.panel(
-            disclosure("Quota", true, this.tier),
-            this.quotaLines(innerWidth).slice(0, quotaLimit),
-            innerWidth,
-            "",
-            this.hovered === "quota-heading" ? "quotaHover" : undefined,
-          ),
-        );
-      }
-    }
-    const serviceLimit = this.preview || this.overlay ? 0 : this.serviceRowLimit();
-    const serviceBlock = [];
-    if (serviceLimit > 0) {
-      if (this.servicesMode === "collapsed") {
-        serviceBlock.push(this.inlineServicesLine(innerWidth));
-      } else {
-        const headerRight = this.serviceHeaderBadge();
-        const serviceTitle = this.tier === "nerd" ? "\u{F233} Services" : "Services";
-        serviceBlock.push(
-          ...this.panel(
-            disclosure(serviceTitle, true, this.tier),
-            this.serviceLines(innerWidth).slice(0, serviceLimit),
-            innerWidth,
-            headerRight,
-            this.hovered === "services-heading" ? "buttonHover" : undefined,
-          ),
-        );
-      }
-    }
+    const isInteractiveMain = !this.preview && !this.overlay;
+    const hasVisibleQuota = isInteractiveMain && hasQuota && this.height >= 12;
+    const serviceLimit = isInteractiveMain ? this.serviceRowLimit() : 0;
+    const hasVisibleServices = serviceLimit > 0;
+    const hasVisibleUpdate = isInteractiveMain && this.showUpdateBar() && this.height >= 14;
     const hasSlotSummary = !(pages === 1 && room.agents.length < maxAgents * 0.75);
-    const updateBlock = this.preview || this.overlay ? [] : this.updateBlockLines(innerWidth);
+    const slotSummaryText = hasSlotSummary
+      ? `${room.agents.length}/${maxAgents} slots · page ${this.page + 1}/${pages}`
+      : "";
     const controls = this.controls(innerWidth);
-    const footerHeight = controls.lines.length + 1 + (hasSlotSummary ? 1 : 0);
-    const contentHeight = Math.max(0, this.height - footerHeight);
-    const mainHeight = Math.max(
+    const hasEligibleTelemetry = hasVisibleQuota || hasVisibleServices || hasVisibleUpdate;
+    const provisionalFooterHeight =
+      controls.lines.length + 1 + (isInteractiveMain && !hasEligibleTelemetry ? 1 : 0);
+    const provisionalContentHeight = Math.max(0, this.height - provisionalFooterHeight);
+    const availableTelemetryHeight = Math.max(
       0,
-      contentHeight - quotaBlock.length - serviceBlock.length - updateBlock.length,
+      provisionalContentHeight - Math.min(provisionalContentHeight, 4),
     );
+    const boxBodyWidth = Math.max(1, innerWidth - 2);
+    const telemetryBodyRows = [];
+    let quotaBoxInfo = null;
+    let servicesBoxInfo = null;
+    let updateBoxInfo = null;
+    let topTitle = "";
+    let topRight = slotSummaryText ? [{ text: slotSummaryText, style: "muted" }] : "";
+    let topHeaderTone = slotSummaryText ? "muted" : undefined;
+
+    if (hasEligibleTelemetry && availableTelemetryHeight >= 3) {
+      const bodyBudget = Math.max(1, availableTelemetryHeight - 2);
+      if (hasVisibleQuota) {
+        if (this.quotaMode === "collapsed") {
+          const rows = this.quotaSummaryLines(boxBodyWidth).slice(0, bodyBudget);
+          if (rows.length > 0) {
+            quotaBoxInfo = {
+              mode: "collapsed",
+              startOffset: telemetryBodyRows.length,
+              count: rows.length,
+              periodStartInBox: this.quotaWindowOffset ?? Math.max(1, boxBodyWidth - 5),
+            };
+            for (const row of rows) telemetryBodyRows.push({ type: "body", text: row });
+          }
+        } else {
+          const quotaLimit = Math.min(this.quotaRowLimit(), bodyBudget);
+          const rows = this.quotaLines(innerWidth).slice(0, quotaLimit);
+          if (rows.length > 0) {
+            topTitle = disclosure("Quota", true, this.tier);
+            topHeaderTone = this.hovered === "quota-heading" ? "quotaHover" : "border";
+            quotaBoxInfo = { mode: "expanded", isTopHeader: true };
+            for (const row of rows) telemetryBodyRows.push({ type: "body", text: row });
+          }
+        }
+      }
+
+      if (hasVisibleServices) {
+        const remaining = bodyBudget - telemetryBodyRows.length;
+        const serviceTitle = this.tier === "nerd" ? "\u{F233} Services" : "Services";
+        if (this.servicesMode === "expanded") {
+          if (telemetryBodyRows.length > 0 && remaining >= 2) {
+            telemetryBodyRows.push({
+              type: "divider",
+              text: this.panelDividerRow(
+                innerWidth,
+                disclosure(serviceTitle, true, this.tier),
+                this.serviceHeaderBadge(),
+                this.hovered === "services-heading" ? "buttonHover" : "border",
+              ),
+            });
+            servicesBoxInfo = { isTopHeader: false, offset: telemetryBodyRows.length - 1 };
+            const svcLimit = Math.min(serviceLimit, bodyBudget - telemetryBodyRows.length);
+            for (const row of this.serviceLines(innerWidth).slice(0, svcLimit)) {
+              telemetryBodyRows.push({ type: "body", text: ` ${row}` });
+            }
+          } else if (telemetryBodyRows.length === 0 && remaining >= 1) {
+            const serviceBadge = this.serviceHeaderBadge();
+            topTitle = disclosure(serviceTitle, true, this.tier);
+            const rightParts = [
+              ...(serviceBadge ? [{ text: serviceBadge, style: "" }] : []),
+              ...(slotSummaryText ? [{ text: slotSummaryText, style: "muted" }] : []),
+            ];
+            topRight = rightParts.length > 0 ? rightParts : "";
+            topHeaderTone = this.hovered === "services-heading" ? "buttonHover" : "border";
+            servicesBoxInfo = { isTopHeader: true };
+            const svcLimit = Math.min(serviceLimit, remaining);
+            for (const row of this.serviceLines(innerWidth).slice(0, svcLimit)) {
+              telemetryBodyRows.push({ type: "body", text: ` ${row}` });
+            }
+          }
+        } else if (remaining >= 1) {
+          if (telemetryBodyRows.length > 0 && this.quotaMode === "expanded" && remaining >= 2) {
+            telemetryBodyRows.push({ type: "divider", text: this.panelDividerRow(innerWidth) });
+          }
+          if (bodyBudget - telemetryBodyRows.length >= 1) {
+            servicesBoxInfo = { isTopHeader: false, offset: telemetryBodyRows.length };
+            const inlineWidth = Math.max(1, boxBodyWidth - 2);
+            telemetryBodyRows.push({
+              type: "body",
+              text: ` ${fitStyled(this.inlineServicesLine(inlineWidth), inlineWidth)} `,
+            });
+          }
+        }
+      }
+
+      if (hasVisibleUpdate) {
+        const remaining = bodyBudget - telemetryBodyRows.length;
+        const hasExpandedBefore =
+          (Boolean(quotaBoxInfo) && this.quotaMode === "expanded") ||
+          (Boolean(servicesBoxInfo) && this.servicesMode === "expanded");
+        if (telemetryBodyRows.length > 0 && hasExpandedBefore && remaining >= 2) {
+          telemetryBodyRows.push({ type: "divider", text: this.panelDividerRow(innerWidth) });
+        }
+        if (bodyBudget - telemetryBodyRows.length >= 1) {
+          updateBoxInfo = { offset: telemetryBodyRows.length };
+          const updateWidth = Math.max(1, boxBodyWidth - 2);
+          telemetryBodyRows.push({
+            type: "body",
+            text: ` ${fitStyled(this.updateLine(updateWidth), updateWidth)} `,
+          });
+        }
+      }
+    }
+
+    const telemetryBlock = [];
+    if (telemetryBodyRows.length > 0) {
+      if (innerWidth < 4) {
+        for (const row of telemetryBodyRows) telemetryBlock.push(fitStyled(row.text, innerWidth));
+      } else {
+        const glyphs = glyphSet(this.tier);
+        const outer = this.panel(topTitle, [], innerWidth, topRight, topHeaderTone);
+        const vert = tone(glyphs.vertical, "border", this.appearance);
+        telemetryBlock.push(
+          outer[0],
+          ...telemetryBodyRows.map((entry) =>
+            entry.type === "divider"
+              ? entry.text
+              : `${vert}${fitStyled(entry.text, boxBodyWidth)}${vert}`,
+          ),
+          outer.at(-1),
+        );
+      }
+    }
+
+    const hasRenderedTelemetry = telemetryBlock.length > 0;
+    const hasNoTelemetryRule = isInteractiveMain && !hasRenderedTelemetry;
+    const footerHeight = controls.lines.length + 1 + (hasNoTelemetryRule ? 1 : 0);
+    const contentHeight = Math.max(0, this.height - footerHeight);
+    const mainHeight = Math.max(0, contentHeight - telemetryBlock.length);
     if (this.overlay) {
       const minOverlayHeight = Math.min(mainHeight, 6);
       if (mainHeight - lines.length < minOverlayHeight) {
@@ -2955,15 +3149,7 @@ export class HordeView {
       lines.push(...this.previewPanelLines(innerWidth, Math.max(1, mainHeight - lines.length)));
     } else {
       const focused = room.agents.find((agent) => agent.id === (this.pinnedId || this.focusId));
-      const focusedState = focused ? memberDisplayState(focused) : "";
-      const shouldShowFocus = Boolean(
-        focused &&
-        (this.pinnedId ||
-          this.hasExplicitFocus ||
-          focusedState === "blocked" ||
-          focusedState === "failed" ||
-          agentProcessSummary(focused, room)?.left === true),
-      );
+      const shouldShowFocus = Boolean(focused && (this.pinnedId || this.hasExplicitFocus));
       if (shouldShowFocus) {
         const focusLines = this.focusCardLines(
           focused,
@@ -2997,75 +3183,69 @@ export class HordeView {
         height: Math.min(target.height, mainHeight - target.y + 1),
       }))
       .filter((target) => target.height > 0);
-    if (hasSlotSummary) {
-      lines.push(
-        tone(
-          `${room.agents.length}/${maxAgents} slots · page ${this.page + 1}/${pages}`,
-          "muted",
-          this.appearance,
-        ),
-      );
-    }
-    if (quotaBlock.length > 0 && contentHeight - mainHeight >= quotaBlock.length) {
-      const quotaStartY = lines.length + 1;
-      if (this.quotaMode === "collapsed") {
-        const chevronWidth = displayWidth(disclosure("", true, this.tier));
+    if (hasRenderedTelemetry && contentHeight - mainHeight >= telemetryBlock.length) {
+      const boxStartY = lines.length + 1;
+      const bodyStartY = innerWidth >= 4 ? boxStartY + 1 : boxStartY;
+      if (quotaBoxInfo) {
+        if (quotaBoxInfo.mode === "collapsed") {
+          const isQuotaOnlyInBox = !servicesBoxInfo && !updateBoxInfo;
+          const firstQuotaBodyRowY = bodyStartY + quotaBoxInfo.startOffset;
+          const headingHeight =
+            (innerWidth >= 4 ? 1 : 0) +
+            quotaBoxInfo.count +
+            (innerWidth >= 4 && isQuotaOnlyInBox ? 1 : 0);
+          this.addTargets([
+            {
+              id: "quota-heading",
+              key: "u",
+              x: 1,
+              y: boxStartY,
+              width: innerWidth,
+              height: headingHeight,
+            },
+            {
+              id: "quota-window",
+              key: "w",
+              x: (innerWidth >= 4 ? 2 : 1) + quotaBoxInfo.periodStartInBox,
+              y: firstQuotaBodyRowY,
+              width: 2,
+              height: 1,
+            },
+          ]);
+        } else {
+          this.addTargets([
+            { id: "quota-heading", key: "u", x: 1, y: boxStartY, width: innerWidth, height: 1 },
+          ]);
+        }
+      }
+      if (servicesBoxInfo) {
         this.addTargets([
           {
-            id: "quota-heading",
-            key: "u",
+            id: "services-heading",
+            key: "v",
             x: 1,
-            y: quotaStartY,
+            y: servicesBoxInfo.isTopHeader ? boxStartY : bodyStartY + servicesBoxInfo.offset,
             width: innerWidth,
-            height: quotaCollapsedRows,
-          },
-          {
-            id: "quota-window",
-            key: "w",
-            x: Math.max(1, innerWidth - chevronWidth - 3),
-            y: quotaStartY,
-            width: 3,
             height: 1,
           },
         ]);
-      } else {
+      }
+      if (updateBoxInfo) {
+        const isUpdateOnlyInBox = !quotaBoxInfo && !servicesBoxInfo;
         this.addTargets([
-          { id: "quota-heading", key: "u", x: 1, y: quotaStartY, width: innerWidth, height: 1 },
+          {
+            id: "update-bar",
+            key: "U",
+            x: 1,
+            y: bodyStartY + updateBoxInfo.offset,
+            width: innerWidth,
+            height: innerWidth >= 4 && isUpdateOnlyInBox ? 2 : 1,
+          },
         ]);
       }
-      lines.push(...quotaBlock);
-    }
-    if (
-      serviceBlock.length > 0 &&
-      contentHeight - mainHeight >= quotaBlock.length + serviceBlock.length
-    ) {
-      this.addTargets([
-        {
-          id: "services-heading",
-          key: "v",
-          x: 1,
-          y: lines.length + 1,
-          width: innerWidth,
-          height: 1,
-        },
-      ]);
-      lines.push(...serviceBlock);
-    }
-    if (
-      updateBlock.length > 0 &&
-      contentHeight - mainHeight >= quotaBlock.length + serviceBlock.length + updateBlock.length
-    ) {
-      this.addTargets([
-        {
-          id: "update-bar",
-          key: "U",
-          x: 1,
-          y: lines.length + 1,
-          width: innerWidth,
-          height: updateBlock.length,
-        },
-      ]);
-      lines.push(...updateBlock);
+      lines.push(...telemetryBlock);
+    } else if (hasNoTelemetryRule) {
+      lines.push(this.footerRuleLine(innerWidth, slotSummaryText));
     }
     this.addTargets(controls.targets, lines.length);
     const footerNotice =

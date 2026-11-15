@@ -2,30 +2,7 @@
 import { allBrandMarks, brandForProvider } from "./families-schema.mjs";
 import { displayWidth, fit, fitStyled, frame, glyphSet, plain, tone } from "./tui-box.mjs";
 
-const CONTROL_ICONS = Object.freeze({
-  preview: "\u{F086}",
-  open: "\u{F120}",
-  inactive: "\u{F1DA}",
-  services: "\u{F233}",
-  update: "\u{F021}",
-  logs: "\u{F03A}",
-  pin: "\u{F08D}",
-  page: "\u{F061}",
-  help: "\u{F11C}",
-  mouse: "\u{F245}",
-  close: "\u{F00D}",
-  dismiss: "\u{F060}",
-  "scroll-up": "\u{F062}",
-  "scroll-down": "\u{F063}",
-  "preview-back": "\u{F060}",
-  "preview-open": "\u{F120}",
-  "preview-follow": "\u{F021}",
-  "preview-up": "\u{F062}",
-  "preview-down": "\u{F063}",
-  "preview-previous": "\u{F060}",
-  "preview-next": "\u{F061}",
-  return: "\u{F060}",
-});
+export const WIDE_NERD_BRANDS = new Set(["\u{EC81}", "\u{EC82}"]);
 
 export function providerMark(provider, tier = "nerd") {
   if (tier !== "nerd") return "";
@@ -68,8 +45,11 @@ export function quotaAccountLabel(account, tier = "nerd") {
   const accountScope = quotaAccountScope(account);
   const scope = { work: "\u{F1AD}", personal: "\u{F007}" }[accountScope] || "";
   const brand = providerMark(account.provider, tier);
-  const name = brand && (label === "AG" || label === "CX") ? "" : label;
-  return [brand, scope, name].filter(Boolean).join(" ");
+  const name = brand && ["AG", "CX", "CL"].includes(label) ? "" : label;
+  const rest = [scope, name].filter(Boolean).join(" ");
+  if (!brand) return rest;
+  if (!rest) return brand;
+  return `${brand}${WIDE_NERD_BRANDS.has(brand) ? "  " : " "}${rest}`;
 }
 
 export function disclosure(label, expanded, tier = "nerd") {
@@ -80,34 +60,91 @@ export function disclosure(label, expanded, tier = "nerd") {
   return text ? `${chevron} ${text}` : chevron;
 }
 
-/** Button geometry and text share one layout, including wrapped and narrow toolbars. */
+function formatActionItem(action, width, tier) {
+  const rawSource = action.hint || action.key || "";
+  let rawHint;
+  if (!action.hint && (rawSource === "\r" || rawSource === "\n")) rawHint = "Enter";
+  else if (!action.hint && rawSource === "\u{1B}") rawHint = "Esc";
+  else rawHint = plain(rawSource).trim();
+  if (tier === "ascii") rawHint = rawHint.replaceAll("↑", "^").replaceAll("↓", "v");
+
+  const labelText = plain(action.label);
+  const prefix = rawHint ? `${rawHint} ` : "";
+  const cleanLabel =
+    prefix && labelText.startsWith(prefix) ? labelText.slice(prefix.length) : labelText;
+  const rawItem = rawHint ? `${rawHint} ${cleanLabel}` : cleanLabel;
+  const text = elide(rawItem, width, tier).trimEnd();
+  let keyPart = "";
+  let labelPart = text;
+  if (rawHint) {
+    if (text.startsWith(rawHint)) {
+      keyPart = rawHint;
+      labelPart = text.slice(rawHint.length);
+    } else {
+      keyPart = text;
+      labelPart = "";
+    }
+  }
+  return { action, text, keyPart, labelPart, cells: displayWidth(text) };
+}
+
+function styleActionItem({ action, text, keyPart, labelPart }, { color, hovered }) {
+  if (action.disabled) return tone(text, "muted", color);
+  if (hovered === action.id) return tone(text, "quotaHover", color);
+  if (action.danger) return tone(text, "error bold", color);
+  let keyTone = "heading";
+  let labelTone = "muted";
+  if (action.active) {
+    keyTone = "accepted bold";
+    labelTone = "accepted";
+  } else if (action.primary) {
+    keyTone = "leadModel";
+    labelTone = "heading";
+  }
+  return (
+    (keyPart ? tone(keyPart, keyTone, color) : "") +
+    (labelPart ? tone(labelPart, labelTone, color) : "")
+  );
+}
+
+/** Key-hint geometry and text share one layout, including wrapped and narrow toolbars. */
 export function actionBar(actions, width, { color = false, hovered, tier = "unicode" } = {}) {
   const lines = [""];
   const targets = [];
   width = Math.max(1, width);
-  for (const action of actions) {
-    const glyph = CONTROL_ICONS[action.id];
-    const icon = tier === "nerd" && glyph ? `${glyph} ` : "";
-    const label = elide(`${icon}${action.label}`, Math.max(1, width - 2), tier).trimEnd();
-    const text = fit(` ${label} `, Math.min(width, displayWidth(` ${label} `)));
-    const cells = displayWidth(text);
+  const items = actions.map((action) => formatActionItem(action, width, tier));
+  const wideSep = tier === "ascii" ? "  |  " : "  ·  ";
+  const compactSep = tier === "ascii" ? " | " : " · ";
+  const wideWidth = displayWidth(wideSep);
+  const compactWidth = displayWidth(compactSep);
+  const itemTotal = items.reduce((sum, item) => sum + item.cells, 0);
+  const gapCount = Math.max(0, items.length - 1);
+  const isCompact =
+    gapCount > 0 &&
+    itemTotal + gapCount * wideWidth > width &&
+    itemTotal + gapCount * compactWidth <= width;
+  const sepPlain = isCompact ? compactSep : wideSep;
+  const sepWidth = displayWidth(sepPlain);
+  const sep = tone(sepPlain, "leadSeparator", color);
+  for (const item of items) {
     let row = lines.length - 1;
     let used = displayWidth(lines[row]);
-    if (used && used + 1 + cells > width) {
+    if (used && used + sepWidth + item.cells > width) {
       lines.push("");
       row++;
       used = 0;
     }
-    const x = used + (used ? 2 : 1);
-    let style = "button";
-    if (action.primary) style = "buttonPrimary";
-    if (action.danger) style = "buttonDanger";
-    if (action.active) style = "buttonActive";
-    if (hovered === action.id) style = "buttonHover";
-    if (action.disabled) style = "buttonDisabled";
-    lines[row] += `${used ? " " : ""}${tone(text, style, color)}`;
-    if (!action.disabled)
-      targets.push({ id: action.id, key: action.key, x, y: row + 1, width: cells, height: 1 });
+    const x = used + (used ? sepWidth + 1 : 1);
+    lines[row] += `${used ? sep : ""}${styleActionItem(item, { color, hovered })}`;
+    if (!item.action.disabled)
+      targets.push({
+        id: item.action.id,
+        key: item.action.key,
+        x,
+        y: row + 1,
+        width: item.cells,
+        height: 1,
+      });
   }
   return { lines, targets };
 }
@@ -141,24 +178,31 @@ export function meterStrip(
   width,
   { color = false, tier = "unicode", hovered = false, accent = "success" } = {},
 ) {
+  const prepared = meters.map((meter) => {
+    const hasValue = Number.isFinite(meter.remaining);
+    const remaining = hasValue
+      ? Math.round(Math.max(0, Math.min(100, meter.remaining)))
+      : undefined;
+    const state = hasValue ? `${remaining}%` : meter.detail || "unavailable";
+    const labelText = plain(meter.label);
+    const labelGap = tier === "nerd" && WIDE_NERD_BRANDS.has([...labelText].at(-1)) ? "  " : " ";
+    return { hasValue, remaining, state, labelText, labelGap };
+  });
   const layouts = [
     { barCells: 4, itemGap: "  ", headGap: label ? "  " : "" },
     { barCells: 3, itemGap: "  ", headGap: label ? "  " : "" },
     { barCells: 3, itemGap: " ", headGap: label ? " " : "" },
     { barCells: 2, itemGap: " ", headGap: label ? " " : "" },
   ];
-  let chosen = layouts[0];
+  let chosen = layouts.at(-1);
   for (const candidate of layouts) {
     const headLen = displayWidth(`${label}${candidate.headGap}`);
     let total = headLen;
-    for (const [idx, meter] of meters.entries()) {
-      const hasVal = Number.isFinite(meter.remaining);
-      const rem = hasVal ? Math.round(Math.max(0, Math.min(100, meter.remaining))) : undefined;
-      const st = hasVal ? `${rem}%` : meter.detail || "unavailable";
-      const br = hasVal
-        ? `${lineGauge(rem / 100, candidate.barCells, { color: false, tier })} `
+    for (const [idx, item] of prepared.entries()) {
+      const br = item.hasValue
+        ? `${lineGauge(item.remaining / 100, candidate.barCells, { color: false, tier })} `
         : "";
-      const itemLen = displayWidth(`${plain(meter.label)} ${br}${st}`);
+      const itemLen = displayWidth(`${item.labelText}${item.labelGap}${br}${item.state}`);
       total += (idx > 0 ? candidate.itemGap.length : 0) + itemLen;
     }
     if (total <= width) {
@@ -169,16 +213,11 @@ export function meterStrip(
   const heading = label ? `${label}${chosen.headGap}` : "";
   const indent = " ".repeat(Math.min(displayWidth(heading), Math.max(0, width - 20)));
   const lines = [heading ? tone(heading, hovered ? "quotaHover" : accent, color) : ""];
-  for (const meter of meters) {
-    const hasValue = Number.isFinite(meter.remaining);
-    const remaining = hasValue
-      ? Math.round(Math.max(0, Math.min(100, meter.remaining)))
-      : undefined;
-    const state = hasValue ? `${remaining}%` : meter.detail || "unavailable";
-    const plainBar = hasValue
-      ? `${lineGauge(remaining / 100, chosen.barCells, { color: false, tier })} `
+  for (const item of prepared) {
+    const plainBar = item.hasValue
+      ? `${lineGauge(item.remaining / 100, chosen.barCells, { color: false, tier })} `
       : "";
-    const content = `${plain(meter.label)} ${plainBar}${state}`;
+    const content = `${item.labelText}${item.labelGap}${plainBar}${item.state}`;
     let row = lines.length - 1;
     const gap =
       displayWidth(lines[row]) > displayWidth(row === 0 ? heading : indent) ? chosen.itemGap : "";
@@ -189,14 +228,14 @@ export function meterStrip(
       lines.push(indent);
       row++;
     } else lines[row] += gap;
-    if (hasValue) {
-      const labelPart = plain(meter.label);
-      const barPart = lineGauge(remaining / 100, chosen.barCells, { color, tier });
+    if (item.hasValue) {
+      const barPart = lineGauge(item.remaining / 100, chosen.barCells, { color, tier });
       let pctTone = "muted";
-      if (remaining <= 10) pctTone = "error";
-      else if (remaining <= 25) pctTone = "quotaLow";
-      else if (remaining <= 50) pctTone = "quotaMid";
-      lines[row] += `${labelPart} ${barPart} ${tone(state, pctTone, color)}`;
+      if (item.remaining <= 10) pctTone = "error";
+      else if (item.remaining <= 25) pctTone = "quotaLow";
+      else if (item.remaining <= 50) pctTone = "quotaMid";
+      lines[row] +=
+        `${item.labelText}${item.labelGap}${barPart} ${tone(item.state, pctTone, color)}`;
     } else {
       lines[row] += tone(content, accent, color);
     }

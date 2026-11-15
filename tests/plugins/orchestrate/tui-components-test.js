@@ -12,12 +12,16 @@ import {
   tone,
 } from "../../../plugins/orchestrate/lib/tui-box.mjs";
 import {
+  actionBar,
   colorProviderMarks,
+  hitTest,
+  meterStrip,
   providerMark,
   quotaAccountLabel,
   sectionHeading,
   statusRow,
   treeCard,
+  WIDE_NERD_BRANDS,
 } from "../../../plugins/orchestrate/lib/tui-components.mjs";
 import { DEFAULT_THEME, resolveTheme } from "../../../plugins/orchestrate/lib/tui-theme.mjs";
 
@@ -35,14 +39,17 @@ describe("terminal presentation components", () => {
     expect(providerMark("gemini-pro-orchestrator")).toBe("\u{E7F0}");
     expect(providerMark("claude:best")).toBe("\u{EC82}");
     expect(providerMark("gpt:sol")).toBe("\u{EC81}");
+    expect(WIDE_NERD_BRANDS.has("\u{EC81}")).toBe(true);
+    expect(WIDE_NERD_BRANDS.has("\u{EC82}")).toBe(true);
     expect(quotaAccountLabel({ id: "claude-work", provider: "claude", short: "CW" })).toBe(
-      "\u{EC82} \u{F1AD} CW",
+      "\u{EC82}  \u{F1AD} CW",
     );
     expect(quotaAccountLabel({ id: "claude-personal", provider: "claude", short: "CP" })).toBe(
-      "\u{EC82} \u{F007} CP",
+      "\u{EC82}  \u{F007} CP",
     );
-    expect(quotaAccountLabel({ id: "custom", provider: "claude", short: "CL" })).toBe(
-      "\u{EC82} CL",
+    expect(quotaAccountLabel({ id: "custom", provider: "claude", short: "CL" })).toBe("\u{EC82}");
+    expect(quotaAccountLabel({ id: "custom", provider: "claude", short: "CUST" })).toBe(
+      "\u{EC82}  CUST",
     );
     expect(quotaAccountLabel({ provider: "antigravity", short: "AG" })).toBe("\u{E7F0}");
     expect(
@@ -91,16 +98,16 @@ describe("terminal presentation components", () => {
     const rows = view.quotaSummaryLines(150);
     expect(rows).toHaveLength(2);
     expect(plain(rows[0]).trimEnd()).toMatch(
-      /^ \u{F1AD} {2}\u{EC82} all ━━━─ 80% {2}\u{EC82} fable ━━── 40% +5h \u{F078}$/u,
+      /^ \u{F1AD} {2}\u{EC82} {2}all ━━━─ 80% {2}\u{EC82} {2}fable ━━── 40% +5h \u{F054}$/u,
     );
     expect(plain(rows[1]).trimEnd()).toBe(
-      " \u{F007}  \u{EC82} ━━── 60%  \u{E7F0} Gemini ━━── 55%  \u{E7F0} Claude/GPT ──── 0%  \u{EC81} ━━━─ 80%",
+      " \u{F007}  \u{EC82}  ━━── 60%  \u{E7F0} Gemini ━━── 55%  \u{E7F0} Claude/GPT ──── 0%  \u{EC81}  ━━━─ 80%",
     );
     const rendered = view.render(152).join("\n");
     expect(plain(rendered)).toContain("│ \u{F06A9} Coordinator · workspace");
     expect(plain(rendered)).not.toContain("folder: workspace");
-    expect(plain(rendered)).toContain("\u{F1AD}  \u{EC82} all ━━━─ 80%");
-    expect(plain(rendered)).not.toContain("│ \u{F1AD}  \u{EC82} all ━━━─ 80%");
+    expect(plain(rendered)).toContain("│ \u{F1AD}  \u{EC82}  all ━━━─ 80%");
+    expect(plain(rendered)).toContain("╭─");
     expect(rendered).toContain("\u{1B}[38;5;173m\u{EC82}\u{1B}[0m");
     expect(rendered).toContain("\u{1B}[38;5;33m\u{E7F0}\u{1B}[0m");
     expect(rendered).toContain("\u{1B}[37m\u{EC81}\u{1B}[0m");
@@ -370,5 +377,84 @@ describe("terminal presentation components", () => {
     expect(styled).toContain(`\u{1B}[${DEFAULT_THEME.brandOpenAI}m\u{EC81}\u{1B}[0m`);
     expect(styled).toContain(`\u{1B}[${DEFAULT_THEME.brandGoogle}m\u{E7F0}\u{1B}[0m`);
     expect(plain(styled)).toBe("\u{EC82} claude \u{EC81} gpt \u{E7F0} gemini");
+  });
+
+  it("falls back to 2-cell compact bars when all meterStrip layouts overflow and pads wide Nerd brands", () => {
+    const lines = meterStrip(
+      "\u{F1AD}",
+      [
+        { label: "\u{EC82}", remaining: 80 },
+        { label: "\u{EC82} fable", remaining: 40 },
+        { label: "\u{EC81}", remaining: Number("unavailable") },
+      ],
+      20,
+      { tier: "nerd", color: false },
+    );
+    expect(lines.length).toBeGreaterThan(1);
+    expect(lines[0]).toContain("\u{EC82}  ━─ 80%");
+    expect(lines[1]).toContain("\u{EC82} fable ━─ 40%");
+    expect(lines[2]).toContain("\u{EC81}  unavailable");
+  });
+
+  it("renders actionBar as a quiet clickable key-hint strip without pill backgrounds", () => {
+    const actions = [
+      { id: "open", label: "Open", key: "\r", primary: true },
+      { id: "diff", label: "Diff", key: "d" },
+      { id: "mark", label: "x Mark line", key: "x" },
+      { id: "follow", label: "Follow", key: "r", active: true },
+      { id: "disabled", label: "Next", key: "n", disabled: true },
+      { id: "close", label: "Close", key: "\u{1B}", danger: true },
+    ];
+    const wide = actionBar(actions, 100, { color: true, hovered: "diff", tier: "unicode" });
+    expect(wide.lines).toHaveLength(1);
+    expect(plain(wide.lines[0])).toBe(
+      "Enter Open  ·  d Diff  ·  x Mark line  ·  r Follow  ·  n Next  ·  Esc Close",
+    );
+    expect(wide.lines[0]).not.toContain("48;5;237");
+    expect(wide.lines[0]).not.toContain("48;5;235");
+    expect(wide.lines[0]).not.toContain("41;97;1");
+    expect(wide.lines[0]).not.toContain("46;30;1");
+    expect(wide.lines[0]).toContain(`\u{1B}[${DEFAULT_THEME.leadModel}mEnter\u{1B}[0m`);
+    expect(wide.lines[0]).toContain(`\u{1B}[${DEFAULT_THEME.quotaHover}md Diff\u{1B}[0m`);
+    expect(wide.lines[0]).toContain(
+      `\u{1B}[${DEFAULT_THEME.error};${DEFAULT_THEME.bold}mEsc Close`,
+    );
+    expect(wide.lines[0]).toContain(
+      `\u{1B}[${DEFAULT_THEME.accepted};${DEFAULT_THEME.bold}mr\u{1B}[0m`,
+    );
+    expect(wide.lines[0]).toContain(`\u{1B}[${DEFAULT_THEME.muted}mn Next\u{1B}[0m`);
+
+    expect(hitTest(wide.targets, 1, 1)).toMatchObject({ id: "open", key: "\r", width: 10 });
+    expect(hitTest(wide.targets, 13, 1)).toBeUndefined();
+    expect(hitTest(wide.targets, 16, 1)).toMatchObject({ id: "diff", key: "d", width: 6 });
+    expect(wide.targets.find((target) => target.id === "disabled")).toBeUndefined();
+
+    const ascii = actionBar(
+      [
+        { id: "open", label: "Open", key: "\r" },
+        { id: "up", label: "Up", key: "\u{1B}[A", hint: "↑" },
+        { id: "down", label: "Down", key: "\u{1B}[B", hint: "↓" },
+      ],
+      60,
+      { tier: "ascii" },
+    );
+    expect(ascii.lines).toEqual(["Enter Open  |  ^ Up  |  v Down"]);
+
+    const compact = actionBar(
+      [
+        { id: "open", label: "Open", key: "\r" },
+        { id: "diff", label: "Diff", key: "d" },
+      ],
+      19,
+      { tier: "unicode" },
+    );
+    expect(compact.lines).toEqual(["Enter Open · d Diff"]);
+
+    const elided = actionBar([{ id: "open", label: "Open", key: "\r" }], 4, {
+      color: true,
+      primary: true,
+    });
+    expect(plain(elided.lines[0])).toBe("Ent…");
+    expect(elided.targets[0]).toMatchObject({ id: "open", x: 1, y: 1, width: 4 });
   });
 });

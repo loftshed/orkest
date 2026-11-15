@@ -157,8 +157,8 @@ describe("clickable Swarm View", () => {
   it("keeps shortcuts in a discoverable menu instead of button labels", () => {
     const view = new HordeView(room(), { height: 24, tier: "nerd" });
     const text = view.render(80).map(plain).join("\n");
-    expect(text).toContain("\u{F11C} Shortcuts");
-    expect(text).toContain("\u{F086} View chat");
+    expect(text).toContain("? Shortcuts");
+    expect(text).toContain("Enter View chat");
     expect(text).not.toContain("View chat Enter");
     expect(text).not.toContain("Close view");
     click(view, "Shortcuts");
@@ -584,20 +584,24 @@ describe("clickable Swarm View", () => {
     expect(rendered()).toContain("Short answer");
   });
 
-  it("renders semantic button colors and retains labels without color", () => {
+  it("renders quiet key-hint colors and retains clickable targets without color", () => {
     const actions = [
       { id: "open", label: "Open", key: "o", primary: true },
       { id: "disabled", label: "Next", key: "n", disabled: true },
       { id: "close", label: "Close", key: "q", danger: true },
     ];
     const colored = actionBar(actions, 80, { color: true });
-    expect(colored.lines.join("")).toContain("\u{1B}[48;5;237;97;1m");
-    expect(colored.lines.join("")).toContain("\u{1B}[41;97;1m");
+    expect(plain(colored.lines.join(""))).toBe("o Open  ·  n Next  ·  q Close");
+    expect(colored.lines.join("")).toContain("\u{1B}[38;5;117;1mo\u{1B}[0m");
+    expect(colored.lines.join("")).toContain("\u{1B}[31;1mq Close\u{1B}[0m");
+    expect(colored.lines.join("")).not.toContain("\u{1B}[48;5;237");
+    const hovered = actionBar(actions, 80, { color: true, hovered: "open" });
+    expect(hovered.lines.join("")).toContain("\u{1B}[97;1mo Open\u{1B}[0m");
     const mono = actionBar(actions, 12);
-    expect(mono.lines).toEqual([" Open ", " Next ", " Close "]);
-    expect(hitTest(mono.targets, 4, 1)).toMatchObject({ id: "open" });
-    expect(hitTest(mono.targets, 4, 2)).toBeUndefined();
-    expect(hitTest(mono.targets, 4, 3)).toMatchObject({ id: "close" });
+    expect(mono.lines).toEqual(["o Open", "n Next", "q Close"]);
+    expect(hitTest(mono.targets, 2, 1)).toMatchObject({ id: "open" });
+    expect(hitTest(mono.targets, 2, 2)).toBeUndefined();
+    expect(hitTest(mono.targets, 2, 3)).toMatchObject({ id: "close" });
   });
 
   it("hides Inactive when no agents are inactive, expands hidden inactive rows on click, and clicks bottom Update bubble", () => {

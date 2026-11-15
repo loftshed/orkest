@@ -167,6 +167,14 @@ export const VISUAL_CASES = Object.freeze([
     palette: "dark",
     tier: "nerd",
   },
+  {
+    name: "multi-wave-footer-76",
+    scenario: "multi-wave-footer",
+    cols: 76,
+    rows: 34,
+    palette: "dark",
+    tier: "nerd",
+  },
 ]);
 
 export function syntheticRoom() {
@@ -699,10 +707,67 @@ export async function renderFixture(repo, spec) {
 
       break;
     }
+    case "multi-wave-footer":
     case "multi-wave-history": {
       room.cwd = "/workspace/chronicle";
       room.herdrCoordinatorPaneId = "w1:p1";
       room.swarm = { maxAgents: 64, maxDepth: 8 };
+      if (spec.scenario === "multi-wave-footer") {
+        room.accounts = [
+          {
+            id: "claude-main",
+            label: "Claude",
+            provider: "claude",
+            short: "CL",
+            fetchedAt: FIXED_TIME,
+            windows: [
+              {
+                id: "session",
+                label: "session",
+                pool: "all",
+                remainingPct: 68,
+                resetsAt: "2026-01-15T15:00:00Z",
+              },
+              {
+                id: "weekly",
+                label: "week",
+                pool: "fable",
+                remainingPct: 44,
+                resetsAt: "2026-01-19T12:00:00Z",
+              },
+            ],
+          },
+          {
+            id: "codex",
+            provider: "codex",
+            short: "CX",
+            fetchedAt: FIXED_TIME,
+            windows: [{ id: "session", label: "session", remainingPct: 82 }],
+          },
+          {
+            id: "antigravity",
+            short: "AG",
+            provider: "antigravity",
+            fetchedAt: FIXED_TIME,
+            windows: [
+              {
+                id: "claude-session",
+                label: "session",
+                pool: "claude-gpt",
+                remainingPct: 33,
+                resetsAt: "2026-01-15T16:00:00Z",
+              },
+              {
+                id: "gemini-session",
+                label: "session",
+                pool: "gemini",
+                remainingPct: 79,
+                resetsAt: "2026-01-15T18:00:00Z",
+              },
+            ],
+          },
+        ];
+      }
       room.conductor = {
         id: "conductor",
         name: "kritor",
@@ -900,9 +965,11 @@ export async function renderFixture(repo, spec) {
           model: "gpt-6.1-terra",
           effort: "max",
           status: "failed",
-          cwd: "/tmp/chronicle-wave-20/tiebreak",
+          consultation: true,
+          cwd: "/Users/dev/.cache/orchestrate/consults-v1/wave-20/tiebreak",
+          resultPath: "/Users/dev/.cache/orchestrate/consults-v1/wave-20/tiebreak/result.json",
           dispatch: {
-            taskDir: "/tmp/tasks/t-20",
+            taskDir: "/Users/dev/.cache/orchestrate/tasks/t-20",
             taskId: "t-20",
             requestId: "req-20",
             transport: "executor",
@@ -911,6 +978,7 @@ export async function renderFixture(repo, spec) {
         },
         ...acceptedSpecs.map(([id, engine, model, effort, wave, dir, objective], index) => {
           const taskNumber = 19 - index;
+          const consultDir = `/Users/dev/.cache/orchestrate/consults-v1/wave-${wave}/${dir}`;
           return {
             id,
             engine,
@@ -918,9 +986,11 @@ export async function renderFixture(repo, spec) {
             effort,
             status: "completed",
             verdict: "accept",
-            cwd: `/tmp/chronicle-wave-${wave}/${dir}`,
+            consultation: true,
+            cwd: consultDir,
+            resultPath: `${consultDir}/result.json`,
             dispatch: {
-              taskDir: `/tmp/tasks/t-${taskNumber}`,
+              taskDir: `/Users/dev/.cache/orchestrate/tasks/t-${taskNumber}`,
               taskId: `t-${taskNumber}`,
               requestId: `req-${taskNumber}`,
               transport: "executor",

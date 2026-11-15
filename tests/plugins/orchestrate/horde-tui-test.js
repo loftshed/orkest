@@ -223,12 +223,12 @@ describe("tui-box primitives and HordeView unification", () => {
     let rendered = plain(new HordeView(room).render(120).join("\n"));
     expect(rendered).toContain("supervisor-model");
     expect(rendered).toContain("[consultant]");
-    expect(rendered).toContain("\u{EC82} worker-model (requested) / high");
+    expect(rendered).toContain("\u{EC82}  worker-model (requested) / high");
     room.agents[0].model = "confirmed-worker";
     room.agents[0].modelSource = "observed";
     rendered = plain(new HordeView(room).render(120).join("\n"));
     expect(rendered).toContain("[consultant]");
-    expect(rendered).toContain("\u{EC82} confirmed-worker / high");
+    expect(rendered).toContain("\u{EC82}  confirmed-worker / high");
     expect(rendered).not.toContain("(requested)");
   });
 
@@ -236,7 +236,7 @@ describe("tui-box primitives and HordeView unification", () => {
     const view = new HordeView(fixture(), { now: () => 2000 });
     const wide = view.render(120);
     expect(wide.some((line) => line.includes("1 flash-1") && line.includes("2 luna-1"))).toBe(true);
-    expect(wide.some((line) => line.includes(" Shortcuts "))).toBe(true);
+    expect(wide.some((line) => line.includes("? Shortcuts"))).toBe(true);
     const narrow = view.render(70);
     expect(narrow.some((line) => line.includes("1 flash-1") && line.includes("2 luna-1"))).toBe(
       false,
@@ -550,7 +550,7 @@ describe("tui-box primitives and HordeView unification", () => {
     expect(lines.filter((line) => line.includes("Quota"))).toHaveLength(0);
     const summary = lines.find((line) => line.includes("C ━━━─ 81%"));
     expect(summary).toContain("C ━━━─ 81%  K ━━━─ 64%");
-    expect(summary).toContain("▾");
+    expect(summary).toContain("▸");
     expect(view.handleKey("u")).toBe(true);
     expect(view.render(100).join("\n")).toContain("▾ Quota");
   });
@@ -574,7 +574,7 @@ describe("tui-box primitives and HordeView unification", () => {
     const summary = lines.find((line) => line.includes("AG Gemini"));
     expect(summary).toContain("AG Gemini ━━━─ 77%");
     expect(summary).toContain("AG Claude/GPT ━─── 10%");
-    expect(summary).toContain("▾");
+    expect(summary).toContain("▸");
     expect(lines.filter((line) => line.includes("Quota"))).toHaveLength(0);
   });
 
@@ -602,7 +602,7 @@ describe("tui-box primitives and HordeView unification", () => {
       .render(100)
       .join("\n");
     expect(rendered).toContain("Quota");
-    expect(rendered).toContain("\u{EC81} Weekly");
+    expect(rendered).toContain("\u{EC81}  Weekly");
     expect(rendered).toContain("80% left");
   });
 
@@ -1621,8 +1621,8 @@ describe("terminal lifecycle", () => {
       /:3004 {2}vite \(pid 4242\) · wt:slice-2a · by haiku-1 +up 04:12/u,
     );
     expect(expandedText).toMatch(/:5432 {2}docker postgres:16 · orkest +up 12 minutes/u);
-    expect(expandedText).toContain(" Log ");
-    expect(expandedText).toContain(" Shortcuts ");
+    expect(expandedText).toContain("g Log");
+    expect(expandedText).toContain("? Shortcuts");
 
     // Toggle quota to collapsed 1-line inline bar with 'u':
     expect(view.handleKey("u")).toBe(true);
@@ -2192,12 +2192,209 @@ describe("terminal lifecycle", () => {
     expect(runningText).toContain("1 proc · :5173");
     expect(runningText).not.toContain("Focus · haiku-1");
 
-    // Leftover processes after completion still auto-open Focus
+    // Leftover processes, blocked, and failed states do not auto-open Focus without explicit focus/pin
     running.status = "reported complete";
     view.setRoom(room);
     const leftoverText = view.render(100).map(plain).join("\n");
-    expect(leftoverText).toContain("Focus · haiku-1");
+    expect(leftoverText).not.toContain("Focus · haiku-1");
     expect(leftoverText).toContain("1 proc left");
+
+    const urgentRoom = fixture("codex:gpt,claude:haiku");
+    urgentRoom.agents[0].id = "gpt-6-1-terra-3";
+    urgentRoom.agents[0].name = "gpt-6-1-terra-3";
+    urgentRoom.agents[0].model = "gpt-6-1-terra";
+    urgentRoom.agents[0].status = "failed";
+    urgentRoom.agents[0].error = "Check failed";
+    urgentRoom.agents[1].status = "blocked";
+    urgentRoom.agents[1].question = "Proceed with fallback?";
+    const urgentView = new HordeView(urgentRoom, {
+      height: 32,
+      tier: "unicode",
+      color: false,
+      now: () => 0,
+    });
+    const autoUrgent = urgentView.render(100).map(plain).join("\n");
+    expect(autoUrgent).not.toContain("Focus ·");
+    expect(autoUrgent).not.toContain("Pinned ·");
+
+    urgentView.focusId = "gpt-6-1-terra-3";
+    urgentView.hasExplicitFocus = true;
+    const explicitFocus = urgentView.render(100).map(plain).join("\n");
+    expect(explicitFocus).toContain("Focus · terra-3");
+    expect(explicitFocus).not.toContain("Focus · gpt-6-1-terra-3");
+
+    urgentView.hasExplicitFocus = false;
+    urgentView.handleInput("p");
+    const pinnedFocus = urgentView.render(100).map(plain).join("\n");
+    expect(pinnedFocus).toContain("Pinned · terra-3");
+  });
+
+  it("groups non-/tmp consultation wave workers under room.cwd and emits one inactive-hidden row across folders", () => {
+    const room = fixture();
+    room.cwd = "/workspace/chronicle";
+    room.swarm = { maxAgents: 24, maxDepth: 4 };
+    const waveConsults = Array.from({ length: 4 }, (_, index) => ({
+      id: `consult-${index}`,
+      name: `consult-${index}`,
+      engine: "claude",
+      model: "claude-haiku-4-5",
+      status: "completed",
+      verdict: "accept",
+      consultation: true,
+      cwd: `/Users/dev/.cache/orchestrate/consults-v1/wave-${index}/shadow_${index}`,
+      resultPath: `/Users/dev/.cache/orchestrate/consults-v1/wave-${index}/shadow_${index}/result.json`,
+      objective: `Consult pass ${index}`,
+      observedAt: `2026-11-10T00:0${index}:00Z`,
+    }));
+    room.agents = [
+      ...waveConsults,
+      {
+        id: "active-main",
+        name: "active-main",
+        engine: "claude",
+        model: "claude-sonnet-4-6",
+        status: "working",
+        cwd: "/workspace/chronicle",
+        progress: { task: "Synthesizing wave results", stage: "working" },
+        observedAt: "2026-11-10T01:00:00Z",
+      },
+    ];
+    const consultView = new HordeView(room, {
+      height: 28,
+      tier: "nerd",
+      color: false,
+      now: () => 0,
+    });
+    const consultText = consultView.render(100).map(plain).join("\n");
+    expect(consultText).not.toContain("shadow_0");
+    expect(consultText).toContain("4 inactive hidden (press c to expand)");
+    expect(consultView.targets.filter((t) => t.id.startsWith("inactive-hidden:"))).toHaveLength(1);
+    expect(consultView.targets.some((t) => t.id === "inactive-hidden:all")).toBe(true);
+
+    // Distinct non-disposable repos with folded agents across them still emit only ONE summary row
+    const multiRepoRoom = fixture();
+    multiRepoRoom.cwd = "/workspace/repo-a";
+    multiRepoRoom.agents = [
+      {
+        id: "a-active",
+        name: "a-active",
+        status: "working",
+        cwd: "/workspace/repo-a",
+        progress: { task: "Active in A", stage: "working" },
+        observedAt: "2026-11-10T02:00:00Z",
+      },
+      {
+        id: "b-active",
+        name: "b-active",
+        status: "working",
+        cwd: "/workspace/repo-b",
+        worktree: { disposable: false, path: "/workspace/repo-b" },
+        progress: { task: "Active in B", stage: "working" },
+        observedAt: "2026-11-10T01:50:00Z",
+      },
+      {
+        id: "b-done-1",
+        name: "b-done-1",
+        status: "completed",
+        verdict: "accept",
+        cwd: "/workspace/repo-b",
+        worktree: { disposable: false, path: "/workspace/repo-b" },
+        observedAt: "2026-11-10T00:10:00Z",
+      },
+      {
+        id: "c-done-only",
+        name: "c-done-only",
+        status: "completed",
+        verdict: "accept",
+        cwd: "/workspace/repo-c",
+        worktree: { disposable: false, path: "/workspace/repo-c" },
+        observedAt: "2026-11-10T00:05:00Z",
+      },
+    ];
+    const multiView = new HordeView(multiRepoRoom, {
+      height: 30,
+      tier: "unicode",
+      color: false,
+      now: () => 0,
+    });
+    const multiLines = multiView.render(100).map(plain);
+    const multiText = multiLines.join("\n");
+    expect(multiText).not.toContain("repo-c");
+    expect(multiLines.filter((line) => line.includes("inactive hidden"))).toHaveLength(1);
+    expect(multiText).toContain("└─ 2 inactive hidden (press c to expand)");
+    expect(multiView.targets.filter((t) => t.id.startsWith("inactive-hidden:"))).toHaveLength(1);
+
+    // 5 unscoped quota pools compact cleanly to 1 row inside the telemetry box at width 76
+    const compactQuotaRoom = fixture();
+    compactQuotaRoom.accounts = [
+      {
+        id: "claude",
+        provider: "claude",
+        short: "CL",
+        windows: [
+          { pool: "all", remainingPct: 68 },
+          { pool: "fable", remainingPct: 44 },
+        ],
+      },
+      { id: "codex", provider: "codex", short: "CX", windows: [{ remainingPct: 82 }] },
+      {
+        id: "agy",
+        provider: "antigravity",
+        short: "AG",
+        windows: [
+          { pool: "claude-gpt", remainingPct: 33 },
+          { pool: "gemini", remainingPct: 79 },
+        ],
+      },
+    ];
+    const compactQuotaView = new HordeView(compactQuotaRoom, {
+      height: 28,
+      tier: "nerd",
+      color: false,
+      now: () => 0,
+    });
+    const rendered76 = compactQuotaView.render(76).map(plain);
+    const quotaBoxRows = rendered76.filter((line) => line.includes("%"));
+    expect(quotaBoxRows).toHaveLength(1);
+    expect(quotaBoxRows[0]).toContain("Gem");
+    expect(quotaBoxRows[0]).toContain("5h \u{F054}");
+  });
+
+  it("frames collapsed telemetry in one rounded footer box and renders a thin rule when telemetry is absent", () => {
+    const withTelemetry = fixture();
+    withTelemetry.swarm = { maxAgents: 4, maxDepth: 2 };
+    withTelemetry.accounts = [
+      { short: "CX", provider: "codex", windows: [{ kind: "5h", remainingPct: 80 }] },
+    ];
+    withTelemetry.services = [{ name: "Dev server", port: 5179, status: "running" }];
+    withTelemetry.update = { available: true, commitsBehind: 2, remoteSha: "abc1234" };
+
+    const boxedLines = new HordeView(withTelemetry, { height: 30, tier: "nerd", now: () => 0 })
+      .render(90)
+      .map(plain);
+    const boxTopIdx = boxedLines.findIndex(
+      (line) => line.trimStart().startsWith("╭") && line.includes("3/4 slots · page 1/1"),
+    );
+    const boxBotIdx = boxedLines.findIndex(
+      (line, idx) => idx > boxTopIdx && line.trimStart().startsWith("╰"),
+    );
+    expect(boxTopIdx).toBeGreaterThan(0);
+    expect(boxBotIdx).toBe(boxTopIdx + 4);
+    expect(boxedLines[boxTopIdx + 1]).toContain("\u{EC81}");
+    expect(boxedLines[boxTopIdx + 1]).toContain("5h \u{F054}");
+    expect(boxedLines[boxTopIdx + 2]).toContain("\u{F054} \u{F233} Services");
+    expect(boxedLines[boxTopIdx + 3]).toContain("Update");
+    expect(boxedLines[boxBotIdx + 1]).toContain("Enter View chat");
+    expect(boxedLines[boxBotIdx + 1]).not.toMatch(/^\s*─+\s*$/u);
+
+    const noTelemetry = fixture();
+    noTelemetry.swarm = { maxAgents: 4, maxDepth: 2 };
+    const ruleLines = new HordeView(noTelemetry, { height: 24, tier: "nerd", now: () => 0 })
+      .render(90)
+      .map(plain);
+    const hintIdx = ruleLines.findIndex((line) => line.includes("Enter View chat"));
+    expect(hintIdx).toBeGreaterThan(0);
+    expect(ruleLines[hintIdx - 1].trim()).toMatch(/^─+ 3\/4 slots · page 1\/1$/u);
   });
 
   it("strips numeric version tokens when deduplicating slot agent names", () => {
