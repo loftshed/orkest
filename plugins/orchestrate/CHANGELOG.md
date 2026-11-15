@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.86.0
+
+- feat(orchestrate): clarify Swarm View hierarchy and fold wave history (#210) (#211)
+
 ## 0.85.4
 
 - refactor(orchestrate): simplify Swarm View TUI hierarchy and scroll handling (#202) (#209)
