@@ -171,6 +171,52 @@ describe("agent process table", () => {
     ]);
   });
 
+  it("excludes MCP stdio server invocations while keeping normal scripts and services", () => {
+    expect(
+      isInternalOrHarnessProcess(
+        "node",
+        "node",
+        "node /home/dev/.local/share/monitor/bin/monitor.mjs mcp",
+      ),
+    ).toBe(true);
+    expect(isInternalOrHarnessProcess("python3", "python3", "python3 ./tools/gen_mcp.py")).toBe(
+      true,
+    );
+    expect(
+      isInternalOrHarnessProcess(
+        "npx",
+        "npx",
+        "npx @modelcontextprotocol/server-filesystem /tmp/repo",
+      ),
+    ).toBe(true);
+    expect(isInternalOrHarnessProcess("node", "node", "foo-mcp.js")).toBe(true);
+    expect(
+      isInternalOrHarnessProcess("python3", "python3", "python3 ./tools/generate_report.py"),
+    ).toBe(false);
+    expect(isInternalOrHarnessProcess("vite", "vite", "vite --port 5173", 5173)).toBe(false);
+
+    const table = parseProcessTable(
+      [
+        " 600 1 10:00 /usr/bin/agent root",
+        " 601 600 00:30 /usr/bin/node /home/dev/.local/share/monitor/bin/monitor.mjs mcp",
+        " 602 600 00:25 /usr/bin/python3 ./tools/gen_mcp.py",
+        " 603 600 00:20 /usr/bin/npx @modelcontextprotocol/server-filesystem /tmp/repo",
+        " 604 600 00:15 /usr/bin/python3 ./tools/generate_report.py",
+        " 605 600 00:10 /usr/bin/node /repo/node_modules/.bin/vite --port 5173",
+      ].join("\n"),
+    );
+    const result = buildAgentProcesses({
+      table,
+      members: [{ id: "worker", pid: 600 }],
+      listeners: [{ pid: 605, port: 5173, command: "node", comm: "node" }],
+    });
+
+    expect(result.get("worker").processes.map(({ pid, ports }) => [pid, ports])).toEqual([
+      [605, [5173]],
+      [604, []],
+    ]);
+  });
+
   it("caps each member at twenty processes and reports the remainder", () => {
     const rows = [" 500 1 10:00 /usr/bin/agent root"];
     for (let index = 0; index < 25; index++) {

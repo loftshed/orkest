@@ -71,7 +71,7 @@ describe("clickable Swarm View", () => {
       const onFocusPane = vi.fn();
       const onPreview = vi.fn();
       const view = new HordeView(data, { height: 40, onFocusPane, onPreview, tier });
-      click(view, "3 alpha", 120);
+      click(view, "2 alpha", 120);
       expect(onFocusPane.mock.calls[0][0]).toMatchObject({ id: "alpha", herdrPaneId: "w1:p2" });
       expect(onPreview).not.toHaveBeenCalled();
       expect(view.render(120).map(plain).join("\n")).not.toContain("Return to chat");
@@ -283,7 +283,7 @@ describe("clickable Swarm View", () => {
     });
     try {
       await vi.waitFor(() => expect(outputText).toContain("View chat"));
-      const { x, y } = pointAt(new HordeView(room(), { height: 32, inHerdr: true }), "2 beta", 160);
+      const { x, y } = pointAt(new HordeView(room(), { height: 32, inHerdr: true }), "1 beta", 160);
       input.emit("data", `\u{1B}[<0;${x};${y}M`);
       await vi.waitFor(() => expect(outputText).toContain("Agent beta chat"));
       expect(outputText).toContain("Live screen · read only");
@@ -309,16 +309,16 @@ describe("clickable Swarm View", () => {
     const onPreview = vi.fn();
     const view = new HordeView(room(), { height: 40, onPreview, color: true, tier: "nerd" });
     const initial = view.render(80).join("\n");
-    expect(plain(initial)).toContain("2 beta");
-    const betaPoint = pointAt(view, "2 beta");
+    expect(plain(initial)).toContain("1 beta");
+    const betaPoint = pointAt(view, "1 beta");
     view.handleMouse({ ...betaPoint, action: "move", button: 0 });
     expect(view.render(80).join("\n")).toContain("\u{1B}[7;1mbeta\u{1B}[0m");
-    click(view, "2 beta");
+    click(view, "1 beta");
     expect(onPreview.mock.calls[0][0]).toMatchObject({ id: "beta", herdrPaneId: "w1:p3" });
     view.setRoom(room());
     expect(view.focusId).toBe("beta");
     expect(plain(view.render(80).join("\n"))).toContain("▸");
-    expect(plain(view.render(80).join("\n"))).toContain("2 beta");
+    expect(plain(view.render(80).join("\n"))).toContain("1 beta");
     expect(plain(view.render(80).join("\n"))).not.toContain("FOCUS");
   });
 
@@ -337,10 +337,10 @@ describe("clickable Swarm View", () => {
         });
       },
     });
-    click(view, "2 beta", 120);
+    click(view, "1 beta", 120);
     click(view, "Back", 120);
     view.handleInput("c");
-    click(view, "1 background", 120);
+    click(view, "3 background", 120);
     expect(opened).toEqual(["beta", "background"]);
     expect(view.render(120).join("\n")).toContain("Review finished");
     expect(view.render(120).join("\n")).toContain("Recorded activity");
@@ -400,9 +400,9 @@ describe("clickable Swarm View", () => {
     const joined = rendered.join("\n");
     expect(joined).toContain("Live screen · read only");
     expect(joined).toContain("Current chat screen");
-    expect(joined).toContain("3 alpha");
-    expect(joined).not.toContain("2 beta");
-    expect(joined).not.toContain("1 background");
+    expect(joined).toContain("2 alpha");
+    expect(joined).not.toContain("1 beta");
+    expect(joined).not.toContain("3 background");
     click(view, "Next", 160);
     expect(onPreview.mock.calls[0][0]).toMatchObject({ id: "background" });
     expect(click(view, "Back", 160)).toEqual({ type: "close-preview" });
@@ -414,7 +414,7 @@ describe("clickable Swarm View", () => {
       text: "Current chat screen",
       loading: false,
     });
-    expect(click(view, "3 alpha", 160)).toEqual({ type: "close-preview" });
+    expect(click(view, "2 alpha", 160)).toEqual({ type: "close-preview" });
     expect(view.preview).toBeNull();
     expect(rendered.every((line) => displayWidth(line) <= 160)).toBe(true);
   });

@@ -56,10 +56,12 @@ Every component accepts `tier` (`"nerd"`, `"unicode"`, or `"ascii"`), resolved b
 
 ## 3. Component & Layout Rules
 
-1. **Simplified Hierarchical Tree Rows (No Heavy Box Enclosures):**
+1. **Direct Coordinator Spine & Simplified Tree Rows:**
+   - The top `Coordinator` block (titled `Coordinator` in Herdr, with a balanced 2-line header on wide viewports) connects directly into the agent tree spine (`│├`), while `Quota` sits in the bottom telemetry stack above `Services` and `Update`.
    - Active, blocked, and failed agents render as clean borderless 2-line tree rows instead of 4-line boxed cards:
-     - **Row 1:** tree rail prefix (`├─`, `└─`, `├─▸`, `└─▸`), status glyph (`󰔛`, `󰀪`, `󰄬`), page-local index (`1..N`), concise agent name, and essential badges (`[role]`, `wt:<slug>`, `PIN`, `This chat`) on the left, balanced with model and phase metadata (`<model> · <phase><elapsed>`) on the right.
-     - **Row 2:** continuation rail (4-column `│` continuation or blank indent), followed by the active task summary, `Question: ...` in `warning` tone when blocked, or `Error: ...` in `error` tone when failed.
+     - **Row 1:** tree rail prefix (`├─`, `└─`, `├─▸`, `└─▸`), status glyph (`󰔛`, `󰀪`, `󰄬`), page-local index (`1..N`), concise agent name, and essential badges (`[role]`, `[lead · N]` / `· N sub` child counts, `wt:<slug>`, `PIN`, `This chat`) on the left, balanced with model and phase metadata (`<model> · <phase><elapsed>`) on the right.
+     - **Row 2:** continuation rail (4-column `│` continuation or blank indent, plus a connected parent → child vertical stem `│` on expanded parent rows with visible children), followed by the active task summary, `Question: ...` in `warning` tone when blocked, or `Error: ...` in `error` tone when failed.
+   - Siblings sort by attention priority (`blocked`/`failed`/`rejected`/`stale` → `active`/`queued` → `reported` → `resolved`), and resolved outcomes (`accepted`, `finished`, `answered`, `cancelled`) fold by default into the inactive summary row when `>= 2` resolved collapsible members exist.
    - Redundant `↳ <parent>` badges are omitted when the parent agent is already shown directly above in the same folder or worktree group.
    - Narrow viewports (`< 68` cols) use compact 2-column rail indentation, capping visual depth at 4 levels so deep hierarchies remain clear without horizontal clipping.
    - Completed/inactive agents in collapsed mode render as 1-line tree rows with status and outcome summary aligned with active rows.
