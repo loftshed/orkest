@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.85.4
+
+- refactor(orchestrate): simplify Swarm View TUI hierarchy and scroll handling (#202) (#209)
+
 ## 0.85.3
 
 - perf(orchestrate): add optional crates/ork-fast Rust binary for 1ms hooks, gate, and statusline (#208)
