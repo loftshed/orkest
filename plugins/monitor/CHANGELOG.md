@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.19.2
+
+- fix(monitor): move reset history and display help into submenus (#212)
+
 ## 0.19.1
 
 - chore: license Orkest under MIT (#180)
