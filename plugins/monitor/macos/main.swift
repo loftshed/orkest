@@ -607,6 +607,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return item
     }
 
+    private func submenuItem(_ title: String, children: [NSMenuItem]) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        let submenu = NSMenu(title: title)
+        children.forEach(submenu.addItem)
+        item.submenu = submenu
+        return item
+    }
+
     private func styleItem(_ title: String, _ style: BarStyle) -> NSMenuItem {
         let item = NSMenuItem(title: title, action: #selector(selectBarStyle(_:)), keyEquivalent: "")
         item.target = self
@@ -687,7 +695,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             status = "Updated \(clock(date))"
         }
         menu.addItem(infoItem(text("Monitor · \(status)", monoBold, .secondaryLabelColor)))
-        menu.addItem(infoItem(text("Menu bar: 5-hour % · weekly % + time to rollover · 🪙 remaining ChatGPT credits after weekly quota · ☠ used up for the week · ⏳ spend before rollover · G Gemini, C Claude & GPT-OSS · double-click the bar to cycle Full / Compact / Icon", mono, .tertiaryLabelColor)))
         if let lastError {
             menu.addItem(infoItem(text("⚠ \(lastError.prefix(120))", mono, .systemRed)))
         }
@@ -727,8 +734,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let reading = CreditReading(text: balance, level: credits["level"] as? String ?? "out")
                 rows.append(infoItem(text("  Credit balance        " + reading.coinText + " left", mono, color(for: reading.level))))
             }
+            if let bank = account["resetCredits"] as? [String: Any], let count = bank["availableCount"] as? Int {
+                let stale = (account["ok"] as? Bool) == false ? " (last reported)" : ""
+                rows.append(infoItem(text("  \(count) banked reset\(count == 1 ? "" : "s") available\(stale)", mono, .secondaryLabelColor)))
+            }
+            // Current quota stays in the main menu; reset history and explanations are available on demand.
+            var resetRows: [NSMenuItem] = []
             for detail in account["resetDetails"] as? [String] ?? [] {
-                rows.append(infoItem(text("  " + detail, mono, .secondaryLabelColor)))
+                resetRows.append(infoItem(text(detail, mono, .secondaryLabelColor)))
             }
             for notice in account["resetAnnouncements"] as? [[String: Any]] ?? [] {
                 guard let title = notice["title"] as? String,
@@ -739,8 +752,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 item.target = self
                 item.representedObject = source
                 item.toolTip = "Eligibility unverified; not used for pacing. " + source
-                rows.append(item)
-                rows.append(infoItem(text("  Eligibility unverified; not used for pacing", mono, .secondaryLabelColor)))
+                resetRows.append(item)
+                resetRows.append(infoItem(text("Eligibility unverified; not used for pacing", mono, .secondaryLabelColor)))
+            }
+            if !resetRows.isEmpty {
+                rows.append(submenuItem("Reset details & history", children: resetRows))
             }
             addSection("account:\(account["id"] as? String ?? label)", heading, summary: windowSummary(account), children: rows)
         }
@@ -789,6 +805,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let styleMenuRow = NSMenuItem(title: "Menu Bar Style", action: nil, keyEquivalent: "")
         styleMenuRow.submenu = styleSubmenu
         menu.addItem(styleMenuRow)
+        menu.addItem(submenuItem("Display Help", children: [
+            infoItem(text("Menu bar: 5-hour % · weekly % + time to rollover")),
+            infoItem(text("🪙 Remaining ChatGPT credits after weekly quota")),
+            infoItem(text("☠ Used up for the week · ⏳ Spend before rollover")),
+            infoItem(text("G: Gemini · C: Claude & GPT-OSS")),
+            infoItem(text("Double-click the bar to cycle Full / Compact / Icon")),
+        ]))
         menu.addItem(actionItem("Refresh Now", #selector(refreshNow), "r"))
         menu.addItem(actionItem("Open Live View in Terminal", #selector(openWatch), "t"))
         menu.addItem(actionItem("Edit Config…", #selector(openConfig), ","))
