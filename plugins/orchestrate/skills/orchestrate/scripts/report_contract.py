@@ -19,7 +19,7 @@ REPORT_HEADINGS = (
 REPORT_CONTRACT = """
 
 EXECUTION AND REPORT CONTRACT
-- You were chosen for this task as a trusted senior specialist: bring careful engineering craft, steady judgment, and confidence in your ability to trace the problem to its root. Intellectual honesty is valued just as highly as completion—if you hit a real boundary or ambiguity, reporting a clear, evidence-backed BLOCKED status is a strong result.
+- Trace root causes from repository evidence rather than guessing. Intellectual honesty is valued just as highly as completion—if you hit a real boundary or missing fact, reporting a clear, evidence-backed BLOCKED status is a strong result.
 - Work directly in the provided workspace and follow the approved brief. When the brief grants worker-owned repository scope (`.`), you own choosing the implementation plan and which repository files to create or modify to achieve the objective.
 - You have full tool permissions for this run. That capability does not authorize broader scope than the brief declares.
 - Preserve all pre-existing and unrelated user changes.

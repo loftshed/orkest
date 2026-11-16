@@ -51,10 +51,12 @@ class BriefRendererTests(unittest.TestCase):
     def test_renders_complete_runner_compliant_brief(self) -> None:
         rendered = RENDERER.render_brief(brief_spec())
         self.assertIn("# Objective\n\nAdd the bounded implementation.", rendered)
-        self.assertIn("senior-specialist craft", rendered)
+        self.assertNotIn("senior-specialist", rendered)
+        self.assertIn("Use independent judgment within the approved scope", rendered)
         self.assertIn("relaxed, friendly, and natural", rendered)
         self.assertIn("do not run full test or visual suites between every individual move", rendered)
-        self.assertIn("trusted senior specialist", RUNNER.REPORT_CONTRACT)
+        self.assertNotIn("trusted senior specialist", RUNNER.REPORT_CONTRACT)
+        self.assertIn("evidence-backed BLOCKED status", RUNNER.REPORT_CONTRACT)
         self.assertEqual(
             RENDERER.REPORT_HEADINGS, ("STATUS", "FILES CHANGED", "COMMANDS RUN", "VERIFICATION", "RISKS OR BLOCKERS")
         )

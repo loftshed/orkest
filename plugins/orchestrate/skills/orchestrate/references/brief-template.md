@@ -90,7 +90,7 @@ match the runner path scope exactly, and comply with the report contract.
 ## Brief-writing checks
 
 - Name real paths, symbols, and commands after inspecting the repository or a scout's findings; when the change is not yet localized and broad write scope is authorized, prefer `"scope_owner": "worker"` with `"scope_hints"` instead of grepping the repository from a swarm coordinator turn.
-- Give the objective a confidence-boosting specialist role framing tailored to the experiment or task (affirming the agent's capability and domain craft while reinforcing that honest, evidence-backed `BLOCKED` reporting is valued over guessing).
+- State the functional role and perspective plainly without persona flattery ("world-class expert", "senior specialist"); reinforce that an honest, evidence-backed `BLOCKED` report beats guessing.
 - State what must remain unchanged; execution agents otherwise tend to broaden cleanup.
 - Separate command-level evidence from broader completion claims; a passing focused check does not complete unrelated gates.
 - Keep deterministic acceptance gates in runner `--verify-command` arguments. The executor may use narrower development checks; the runner observes final gate exit codes outside the model.

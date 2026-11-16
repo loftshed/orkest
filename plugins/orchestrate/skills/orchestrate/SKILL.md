@@ -315,7 +315,7 @@ never blocks OpenCode.
 ## Run
 
 1. Record `git status --short`, branch and `HEAD`. Define the objective, constraints, and acceptance criteria; when the scope is not yet known or in a conversational swarm, discover implementation scope through a read-only scout or delegate file selection with `scope_owner: "worker"` when repository-wide write scope is authorized.
-2. Write a task spec per [references/brief-template.md](references/brief-template.md), outside the repo. Frame the objective with a confidence-boosting specialist role suited to the experiment or task (affirming why the agent's judgment fits the problem while making clear that evidence-backed `BLOCKED` reporting is valued just as highly as completion).
+2. Write a task spec per [references/brief-template.md](references/brief-template.md), outside the repo.
 3. Launch:
 
    ```bash
