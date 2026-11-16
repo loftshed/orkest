@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.87.2
+
+- fix(orchestrate): replace persona flattery with plain role and epistemic rules (closes #219) (#220)
+
 ## 0.87.1
 
 - fix(orchestrate): stop Gemini subagent launches from reopening Swarm View (#216)
