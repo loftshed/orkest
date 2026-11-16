@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.19.3
+
+- fix(monitor): tighten macOS quick menu layout and prune expired reset details (closes #217) (#218)
+
 ## 0.19.2
 
 - fix(monitor): move reset history and display help into submenus (#212)
