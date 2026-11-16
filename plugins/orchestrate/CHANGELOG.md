@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.87.1
+
+- fix(orchestrate): stop Gemini subagent launches from reopening Swarm View (#216)
+
 ## 0.87.0
 
 - feat(orchestrate): frame swarm footer telemetry and quiet action strip (#214)
