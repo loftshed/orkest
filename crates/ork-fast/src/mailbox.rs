@@ -378,6 +378,7 @@ pub fn run(
     }
 
     if peer.get("isSubagent").and_then(|v| v.as_bool()) == Some(true)
+        || peer.get("agySubagentPending").and_then(|v| v.as_bool()) == Some(true)
         || peer.get("delegatedRun").and_then(|v| v.as_bool()) == Some(true)
         || peer.get("run").and_then(|v| v.as_str()).is_some()
     {

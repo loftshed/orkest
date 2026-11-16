@@ -12,6 +12,7 @@ import select
 import shutil
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -1271,6 +1272,406 @@ class HerdrSwarmLaunchTests(unittest.TestCase):
             fb_dir = mailbox.feedback_module().directory(base)
             feedback_files = list(fb_dir.glob("*.json")) if fb_dir and fb_dir.exists() else []
             self.assertEqual(len(feedback_files), 1)
+
+    def test_agy_subagent_launch_never_promotes_or_reopens_swarm_view(self):
+        from unittest import mock
+
+        import agent_statusline_tmux
+        import agent_terminal
+        import mailbox_hooks
+
+        with tempfile.TemporaryDirectory(prefix="ork-agy-subagent-") as tmp:
+            home = Path(tmp).resolve()
+            base = home / "mailbox-v1"
+            account = home / ".gemini"
+            brain_dir = account / "antigravity-cli" / "brain"
+            db_path = account / "antigravity-cli" / "conversation_summaries.db"
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            with sqlite3.connect(db_path) as con:
+                con.execute(
+                    "CREATE TABLE conversation_summaries ("
+                    "conversation_id TEXT PRIMARY KEY, "
+                    "parent_conversation_id TEXT NOT NULL DEFAULT '', "
+                    "nesting_depth INTEGER NOT NULL DEFAULT 0, "
+                    "agent_name TEXT NOT NULL DEFAULT '')"
+                )
+                con.execute(
+                    "CREATE TABLE conversation_parents (conversation_id TEXT PRIMARY KEY, parent_id TEXT NOT NULL)"
+                )
+
+            parent_sid = "11111111-2222-4333-8444-555555555555"
+            room_id = "room-parent-agy"
+            cwd = str(home)
+            mailbox.register(
+                base,
+                session=parent_sid,
+                harness="gemini",
+                cwd=cwd,
+                pid=os.getpid(),
+                state="busy",
+                account=str(account),
+            )
+            mailbox.annotate(
+                base,
+                parent_sid,
+                herdrPaneId="w1:p1",
+                herdrWorkspaceId="w1",
+                herdrEndpoint=str(home / "herdr.sock"),
+            )
+            room_store.put_room(
+                base,
+                {
+                    "schema": "agent-executor.room.v1",
+                    "id": room_id,
+                    "cwd": cwd,
+                    "machine": socket.gethostname(),
+                    "swarm": {"maxAgents": 12, "maxDepth": 3},
+                    "title": "",
+                    "objective": "",
+                    "agents": [],
+                    "herdrCoordinatorPaneId": "w1:p1",
+                    "herdrViewPaneId": "w1:p2",
+                    "herdrEndpoint": str(home / "herdr.sock"),
+                    "conductor": {
+                        "engine": "agy",
+                        "role": "lead",
+                        "status": "working",
+                        "session": {"id": parent_sid, "engine": "agy", "cwd": cwd, "machine": socket.gethostname()},
+                    },
+                },
+            )
+
+            env = {
+                "PATH": os.environ.get("PATH", ""),
+                "HOME": str(home),
+                "AGENT_EXECUTOR_HOME": str(home),
+                "ORCHESTRATE_HOME": str(home),
+                "HERDR_ENV": "1",
+                "HERDR_PANE_ID": "w1:p1",
+                "HERDR_WORKSPACE_ID": "w1",
+                "HERDR_SOCKET_PATH": str(home / "herdr.sock"),
+                "ORKEST_TEST_ALLOW_HERDR": "1",
+                "ORKEST_RESUME_SWARM": "1",
+                "ORKEST_SWARM_ROOM": room_id,
+            }
+
+            with (
+                patch.dict(os.environ, env, clear=True),
+                mock.patch.object(mailbox, "harness_pid", return_value=os.getpid()),
+                mock.patch.object(
+                    agent_statusline_tmux,
+                    "toggle_swarm_view",
+                    return_value={"status": "opened", "room": room_id, "pane": "w1:p9"},
+                ) as toggle_mock,
+                mock.patch.object(agent_terminal, "bind", return_value=True),
+                mock.patch.object(agent_terminal, "refresh_parent_pane", return_value=True) as refresh_mock,
+            ):
+                # A. SQLite parent lineage catches subagent even when transcript only has EPHEMERAL_MESSAGE
+                sub_a = "aaaa1111-2222-4333-8444-555555555551"
+                with sqlite3.connect(db_path) as con:
+                    con.execute(
+                        "INSERT INTO conversation_summaries VALUES (?, ?, 1, 'hyd-worker')",
+                        (sub_a, parent_sid),
+                    )
+                t_a = brain_dir / sub_a / ".system_generated" / "logs" / "transcript.jsonl"
+                t_a.parent.mkdir(parents=True, exist_ok=True)
+                t_a.write_text(
+                    json.dumps({"step_index": 0, "type": "EPHEMERAL_MESSAGE", "content": "hi"}) + "\n",
+                    encoding="utf-8",
+                )
+                mailbox_hooks.hook(
+                    {"conversationId": sub_a, "workspacePaths": [cwd], "transcriptPath": str(t_a)},
+                    harness="gemini",
+                    event="SessionStart",
+                    base=base,
+                )
+                mailbox_hooks.hook(
+                    {
+                        "conversationId": sub_a,
+                        "invocationNum": 1,
+                        "workspacePaths": [cwd],
+                        "transcriptPath": str(t_a),
+                    },
+                    harness="gemini",
+                    event="PreInvocation",
+                    base=base,
+                )
+                peer_a = mailbox.load(mailbox.peer_path(base, sub_a))
+                self.assertTrue(peer_a.get("isSubagent"))
+                self.assertEqual(peer_a.get("parentSession"), parent_sid)
+                self.assertEqual(peer_a.get("focus"), "native hyd-worker")
+                self.assertIsNone(peer_a.get("herdrPaneId"))
+                self.assertIsNone(peer_a.get("agySubagentPending"))
+                prog_a = mailbox.load(base / "progress" / f"{mailbox.session_key(sub_a)}.json")
+                self.assertIsNotNone(prog_a)
+                self.assertEqual(prog_a.get("stage"), "working")
+                self.assertEqual(prog_a.get("goal"), "Native hyd-worker")
+                mailbox_hooks.hook(
+                    {
+                        "conversationId": sub_a,
+                        "terminationReason": "NO_TOOL_CALL",
+                        "workspacePaths": [cwd],
+                        "transcriptPath": str(t_a),
+                    },
+                    harness="gemini",
+                    event="Stop",
+                    base=base,
+                )
+                prog_a_done = mailbox.load(base / "progress" / f"{mailbox.session_key(sub_a)}.json")
+                self.assertEqual(prog_a_done.get("stage"), "complete")
+                self.assertTrue(any(call.args[1] == parent_sid for call in refresh_mock.call_args_list))
+
+                # B. Co-hosted busy parent transcript with invoke_subagent classifies subagent without SQLite
+                sub_b = "bbbb1111-2222-4333-8444-555555555552"
+                parent_t = brain_dir / parent_sid / ".system_generated" / "logs" / "transcript.jsonl"
+                parent_t.parent.mkdir(parents=True, exist_ok=True)
+                parent_t.write_text(
+                    json.dumps({"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "go"})
+                    + "\n"
+                    + json.dumps(
+                        {
+                            "step_index": 1,
+                            "type": "PLANNER_RESPONSE",
+                            "tool_calls": [{"name": "invoke_subagent", "args": {"Role": "Scout"}}],
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                mailbox_hooks.hook(
+                    {"conversationId": sub_b, "workspacePaths": [cwd]},
+                    harness="gemini",
+                    event="SessionStart",
+                    base=base,
+                )
+                peer_b = mailbox.load(mailbox.peer_path(base, sub_b))
+                self.assertTrue(peer_b.get("isSubagent"))
+                self.assertEqual(peer_b.get("parentSession"), parent_sid)
+
+                # C. Delayed transcript without invoke_subagent tool call marks agySubagentPending, then resolves
+                parent_t.write_text(
+                    json.dumps({"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "next"})
+                    + "\n",
+                    encoding="utf-8",
+                )
+                sub_c = "cccc1111-2222-4333-8444-555555555553"
+                t_c = brain_dir / sub_c / ".system_generated" / "logs" / "transcript.jsonl"
+                t_c.parent.mkdir(parents=True, exist_ok=True)
+                t_c.write_text(
+                    json.dumps({"step_index": 0, "type": "EPHEMERAL_MESSAGE", "content": "ephemeral"}) + "\n",
+                    encoding="utf-8",
+                )
+                mailbox_hooks.hook(
+                    {"conversationId": sub_c, "workspacePaths": [cwd], "transcriptPath": str(t_c)},
+                    harness="gemini",
+                    event="SessionStart",
+                    base=base,
+                )
+                peer_c0 = mailbox.load(mailbox.peer_path(base, sub_c))
+                self.assertTrue(peer_c0.get("agySubagentPending"))
+                self.assertFalse(peer_c0.get("isSubagent"))
+
+                with t_c.open("a", encoding="utf-8") as handle:
+                    handle.write(
+                        json.dumps(
+                            {
+                                "step_index": 1,
+                                "type": "SYSTEM_MESSAGE",
+                                "content": (
+                                    "<SYSTEM_MESSAGE>\n"
+                                    f"[Message] timestamp=2026-11-15T00:00:00Z sender={parent_sid} "
+                                    "priority=HIGH content=inspect"
+                                ),
+                            }
+                        )
+                        + "\n"
+                    )
+                mailbox_hooks.hook(
+                    {
+                        "conversationId": sub_c,
+                        "invocationNum": 1,
+                        "workspacePaths": [cwd],
+                        "transcriptPath": str(t_c),
+                    },
+                    harness="gemini",
+                    event="PreInvocation",
+                    base=base,
+                )
+                peer_c1 = mailbox.load(mailbox.peer_path(base, sub_c))
+                self.assertTrue(peer_c1.get("isSubagent"))
+                self.assertEqual(peer_c1.get("parentSession"), parent_sid)
+                self.assertIsNone(peer_c1.get("agySubagentPending"))
+
+                self.assertEqual(toggle_mock.call_count, 0)
+                self.assertEqual([r["id"] for r in room_store.list_rooms(base)], [room_id])
+
+    def test_resumed_agy_parent_records_auto_reconnect_and_respects_closed_marker(self):
+        import agent_statusline_tmux
+        import herdr_swarm_restore
+        import mailbox_hooks
+
+        with tempfile.TemporaryDirectory(prefix="ork-agy-reconnect-") as tmp:
+            home = Path(tmp).resolve()
+            base = home / "mailbox-v1"
+            account = home / ".gemini"
+            state_file = home / "herdr-state.json"
+            herdr_bin = self._write_fake_herdr(home, state_file)
+            parent_sid = "aaaa1111-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+            room_id = "room-agy-resume"
+            cwd = str(home)
+            sock_path = str(home / "herdr.sock")
+
+            parent_t = (
+                account / "antigravity-cli" / "brain" / parent_sid / ".system_generated" / "logs" / "transcript.jsonl"
+            )
+            parent_t.parent.mkdir(parents=True, exist_ok=True)
+            parent_t.write_text(
+                json.dumps({"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "work"})
+                + "\n",
+                encoding="utf-8",
+            )
+            mailbox.register(base, session=parent_sid, harness="gemini", cwd=cwd, pid=os.getpid(), account=str(account))
+            room_store.put_room(
+                base,
+                {
+                    "schema": "agent-executor.room.v1",
+                    "id": room_id,
+                    "cwd": cwd,
+                    "machine": socket.gethostname(),
+                    "swarm": {"maxAgents": 12, "maxDepth": 3},
+                    "title": "New swarm",
+                    "objective": "",
+                    "agents": [],
+                    "herdrCoordinatorPaneId": "w1:p1",
+                    "herdrEndpoint": sock_path,
+                    "conductor": {
+                        "engine": "agy",
+                        "role": "lead",
+                        "status": "working",
+                        "session": {"id": parent_sid, "engine": "agy", "cwd": cwd, "machine": socket.gethostname()},
+                    },
+                },
+            )
+            env = {
+                "PATH": os.environ.get("PATH", ""),
+                "HOME": str(home),
+                "AGENT_EXECUTOR_HOME": str(home),
+                "ORCHESTRATE_HOME": str(home),
+                "HERDR_ENV": "1",
+                "HERDR_PANE_ID": "w1:p1",
+                "HERDR_WORKSPACE_ID": "w1",
+                "HERDR_BIN_PATH": str(herdr_bin),
+                "HERDR_SOCKET_PATH": sock_path,
+                "ORKEST_TEST_ALLOW_HERDR": "1",
+                "ORKEST_RESUME_SWARM": "1",
+                "ORKEST_SWARM_ROOM": room_id,
+            }
+            with (
+                patch.dict(os.environ, env, clear=True),
+                patch.object(mailbox, "harness_pid", return_value=os.getpid()),
+            ):
+                # Turn 1 opens the view pane once and persists swarmAutoReconnected even with empty objective/agents
+                mailbox_hooks.hook(
+                    {"conversationId": parent_sid, "workspacePaths": [cwd], "transcriptPath": str(parent_t)},
+                    harness="gemini",
+                    event="SessionStart",
+                    base=base,
+                )
+                first_calls = json.loads(state_file.read_text())["calls"]
+                open_calls = [c for c in first_calls if c[:3] == ["plugin", "pane", "open"]]
+                self.assertEqual(len(open_calls), 1)
+                peer_after_start = mailbox.load(mailbox.peer_path(base, parent_sid))
+                self.assertEqual(peer_after_start.get("swarmAutoReconnected"), f"{room_id}:w1:p1")
+
+                # Explicit close writes .closed marker
+                closed = agent_statusline_tmux.toggle_swarm_view("close", room=room_id, base=base)
+                self.assertEqual(closed["status"], "closed")
+                view_state = herdr_swarm_restore.state_path(home, room_id, env)
+                self.assertTrue(view_state.with_suffix(".closed").exists())
+
+                # Turn 2 after Stop -> PreInvocation must not reopen view
+                mailbox_hooks.hook(
+                    {
+                        "conversationId": parent_sid,
+                        "terminationReason": "NO_TOOL_CALL",
+                        "workspacePaths": [cwd],
+                        "transcriptPath": str(parent_t),
+                    },
+                    harness="gemini",
+                    event="Stop",
+                    base=base,
+                )
+                mailbox_hooks.hook(
+                    {
+                        "conversationId": parent_sid,
+                        "invocationNum": 2,
+                        "workspacePaths": [cwd],
+                        "transcriptPath": str(parent_t),
+                    },
+                    harness="gemini",
+                    event="PreInvocation",
+                    base=base,
+                )
+                calls_after_wake = json.loads(state_file.read_text())["calls"]
+                self.assertEqual(len([c for c in calls_after_wake if c[:3] == ["plugin", "pane", "open"]]), 1)
+
+                # Even if swarmAutoReconnected is reset, respect_closed=True still honors the user's .closed marker
+                mailbox.annotate(base, parent_sid, swarmAutoReconnected=None)
+                reloaded_peer = mailbox.load(mailbox.peer_path(base, parent_sid))
+                mailbox_hooks.swarm_coordinator_context(base, reloaded_peer, "SessionStart")
+                calls_after_reset = json.loads(state_file.read_text())["calls"]
+                self.assertEqual(len([c for c in calls_after_reset if c[:3] == ["plugin", "pane", "open"]]), 1)
+
+                # Explicit user open clears .closed and reopens the view pane
+                reopened = agent_statusline_tmux.toggle_swarm_view("open", room=room_id, base=base)
+                self.assertEqual(reopened["status"], "opened")
+                calls_after_explicit = json.loads(state_file.read_text())["calls"]
+                self.assertEqual(len([c for c in calls_after_explicit if c[:3] == ["plugin", "pane", "open"]]), 2)
+                self.assertFalse(view_state.with_suffix(".closed").exists())
+
+    def test_herdr_toggle_maps_subagent_pane_session_back_to_parent_room(self):
+        import agent_statusline_tmux
+
+        with tempfile.TemporaryDirectory(prefix="ork-herdr-sub-toggle-") as tmp:
+            home = Path(tmp).resolve()
+            base = home / "mailbox-v1"
+            state_file = home / "herdr-state.json"
+            herdr_bin = self._write_fake_herdr(home, state_file)
+            parent_sid = "parent-agy-1111"
+            sub_sid = "subagent-agy-2222"
+            sock_path = str(home / "herdr.sock")
+
+            mailbox.register(base, session=parent_sid, harness="gemini", cwd=str(home), pid=os.getpid())
+            mailbox.annotate(base, parent_sid, herdrPaneId="w1:p1", herdrEndpoint=sock_path)
+            mailbox.register(base, session=sub_sid, harness="gemini", cwd=str(home), pid=os.getpid())
+            mailbox.annotate(base, sub_sid, isSubagent=True, parentSession=parent_sid)
+
+            env = {
+                "PATH": os.environ.get("PATH", ""),
+                "HOME": str(home),
+                "AGENT_EXECUTOR_HOME": str(home),
+                "ORCHESTRATE_HOME": str(home),
+                "HERDR_ENV": "1",
+                "HERDR_PANE_ID": "w1:p1",
+                "HERDR_WORKSPACE_ID": "w1",
+                "HERDR_BIN_PATH": str(herdr_bin),
+                "HERDR_SOCKET_PATH": sock_path,
+                "ORKEST_TEST_ALLOW_HERDR": "1",
+            }
+            with patch.dict(os.environ, env, clear=True):
+                opened = agent_statusline_tmux.toggle_swarm_view("open", session_id=parent_sid, base=base)
+                self.assertEqual(opened["status"], "opened")
+                parent_room_id = opened["room"]
+
+                # Simulate Herdr hook reporting the subagent conversation ID onto the parent's pane
+                fake_state = json.loads(state_file.read_text())
+                fake_state["agent_session"] = {"kind": "id", "agent": "agy", "value": sub_sid}
+                state_file.write_text(json.dumps(fake_state))
+
+                toggled = agent_statusline_tmux.toggle_swarm_view("toggle", base=base)
+                self.assertEqual(toggled["status"], "closed")
+                self.assertEqual(toggled["room"], parent_room_id)
+                self.assertEqual([r["id"] for r in room_store.list_rooms(base)], [parent_room_id])
 
 
 if __name__ == "__main__":

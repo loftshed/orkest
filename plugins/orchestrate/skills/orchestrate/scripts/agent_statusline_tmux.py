@@ -701,7 +701,17 @@ def _ensure_bound_room(
     engine = {"gemini": "agy", "agy": "agy", "claude": "claude", "codex": "codex", "opencode": "opencode"}.get(
         harness or "", "codex"
     )
+    is_subordinate = False
+    if session_id and base is not None:
+        with contextlib.suppress(Exception):
+            candidate = mailbox.load(mailbox.peer_path(base, session_id))
+            if isinstance(candidate, dict) and (
+                candidate.get("isSubagent") or candidate.get("agySubagentPending") or candidate.get("delegatedRun")
+            ):
+                is_subordinate = True
     if not current_room:
+        if is_subordinate:
+            return None, "subagent cannot own a swarm room"
         target_cwd = cwd or os.getcwd()
         created = subprocess.run(
             [node, str(cli), "horde", "--engine", engine, "--cwd", target_cwd, "--json"],
@@ -713,7 +723,7 @@ def _ensure_bound_room(
         if created.returncode != 0:
             return None, created.stderr.strip() or "could not create swarm room"
         current_room = json.loads(created.stdout)["id"]
-    if session_id and current_room:
+    if session_id and current_room and not is_subordinate:
         already_bound = False
         if base is not None:
             with contextlib.suppress(ValueError):
@@ -764,6 +774,7 @@ def _toggle_herdr_swarm_view(
     harness: str | None = None,
     cwd: str | None = None,
     base: Path,
+    respect_closed: bool = False,
 ) -> dict[str, str]:
     import herdr_swarm_restore as restoration
 
@@ -776,6 +787,7 @@ def _toggle_herdr_swarm_view(
             harness=harness,
             cwd=cwd,
             base=base,
+            respect_closed=respect_closed,
         )
 
 
@@ -788,6 +800,7 @@ def _toggle_herdr_swarm_view_unlocked(
     harness: str | None = None,
     cwd: str | None = None,
     base: Path,
+    respect_closed: bool = False,
 ) -> dict[str, str]:
     coordinator_pane, workspace_id, context_cwd = _resolve_herdr_context()
     import herdr_swarm_restore as restoration
@@ -803,6 +816,12 @@ def _toggle_herdr_swarm_view_unlocked(
             if ref.get("kind") == "id" and isinstance(ref.get("value"), str):
                 session_id = ref["value"]
                 harness = harness or agent_harness(ref.get("agent"))
+    if session_id:
+        with contextlib.suppress(Exception):
+            candidate = mailbox.load(mailbox.peer_path(base, session_id))
+            if isinstance(candidate, dict) and (candidate.get("isSubagent") or candidate.get("agySubagentPending")):
+                parent = candidate.get("parentSession")
+                session_id = parent.strip() if isinstance(parent, str) and parent.strip() else None
     peer = _find_herdr_peer(base, session_id, coordinator_pane, endpoint=current_endpoint)
     if (
         peer
@@ -914,9 +933,10 @@ def _toggle_herdr_swarm_view_unlocked(
                         "room": current_room,
                         "backend": "herdr",
                     }
-                if (
-                    action == "open" or (action == "toggle" and state_path.with_suffix(".closed").exists())
-                ) and restoration.idle_shell(info):
+                closed_marker = state_path.with_suffix(".closed").exists()
+                if action == "open" and respect_closed and closed_marker and restoration.idle_shell(info):
+                    return {"status": "already_closed", "room": current_room, "backend": "herdr"}
+                if (action == "open" or (action == "toggle" and closed_marker)) and restoration.idle_shell(info):
                     state_path.with_suffix(".closed").unlink(missing_ok=True)
                     outcomes = restoration.restore(base.parent, environment, api, locked=True, only_room=current_room)
                     outcome = outcomes[0]["status"] if outcomes else "missing_pane"
@@ -988,6 +1008,8 @@ def _toggle_herdr_swarm_view_unlocked(
         return {"status": "already_closed", "room": current_room, "backend": "herdr"}
     if recorded_view_pane and action == "open":
         return {"status": "already_open", "room": current_room, "backend": "herdr", "pane": recorded_view_pane}
+    if action == "open" and respect_closed and state_path.with_suffix(".closed").exists():
+        return {"status": "already_closed", "room": current_room, "backend": "herdr"}
     pane_id = _open_herdr_swarm_view_unlocked(
         herdr,
         room=current_room,
@@ -1017,6 +1039,7 @@ def toggle_swarm_view(
     harness: str | None = None,
     cwd: str | None = None,
     base: Path | None = None,
+    respect_closed: bool = False,
 ) -> dict[str, str]:
     """Open, close, or toggle the live Swarm View split pane in an Orkest tmux or Herdr session."""
     if action not in ("toggle", "open", "close"):
@@ -1033,6 +1056,7 @@ def toggle_swarm_view(
                 harness=harness,
                 cwd=cwd,
                 base=base,
+                respect_closed=respect_closed,
             )
         return {"status": "unavailable", "reason": "Herdr is not installed on PATH", "backend": "herdr"}
     tmux = shutil.which("tmux")
