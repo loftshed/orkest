@@ -95,7 +95,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     override init() {
         let info = Bundle.main.infoDictionary ?? [:]
-        command = (info["MonitorCommand"] as? String) ?? NSHomeDirectory() + "/.local/bin/monitor"
+        let envCommand = ProcessInfo.processInfo.environment["MONITOR_COMMAND"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+        command = (envCommand?.isEmpty == false ? envCommand : nil) ?? (info["MonitorCommand"] as? String) ?? NSHomeDirectory() + "/.local/bin/monitor"
         let configured = UserDefaults.standard.double(forKey: "refreshSeconds")
         refreshSeconds = configured >= 60 ? configured : 300
         super.init()
@@ -687,6 +688,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return s
     }
 
+    private func compactLaneLabel(_ lane: [String: Any], lanesPerAccount: [String: Int]) -> String {
+        let raw = lane["label"] as? String ?? ""
+        let accountId = lane["accountId"] as? String ?? ""
+        if raw.hasSuffix(" · all models") {
+            return (lanesPerAccount[accountId] ?? 0) <= 1
+                ? String(raw.dropLast(" · all models".count))
+                : String(raw.dropLast(" models".count))
+        }
+        return raw
+    }
+
+    private func compactLaneNote(_ lane: [String: Any]) -> (String, NSColor) {
+        let status = lane["status"] as? String
+        if (lane["resetAwaitingRefresh"] as? Bool) == true { return ("rollover due", .secondaryLabelColor) }
+        if status == "error" { return ("no data", .systemRed) }
+        if status == "blocked" {
+            if let blockedAt = lane["blockedUntil"] as? String, let date = AppDelegate.iso.date(from: blockedAt) {
+                return ("back \(clock(date)) (\(relative(date)))", .secondaryLabelColor)
+            }
+            return ("exhausted", .secondaryLabelColor)
+        }
+        let staleSuffix = (lane["stale"] as? Bool) == true ? " · stale" : ""
+        if status == "credits" { return ("on credits" + staleSuffix, .secondaryLabelColor) }
+        if (lane["expiring"] as? Bool) == true {
+            if let expiresAtString = lane["expiresAt"] as? String, let date = AppDelegate.iso.date(from: expiresAtString) {
+                return ("\(AppDelegate.expiringMark) spend in \(relative(date))" + staleSuffix, .systemOrange)
+            }
+            return ("\(AppDelegate.expiringMark) expiring soon" + staleSuffix, .systemOrange)
+        }
+        if (lane["lowRoom"] as? Bool) == true {
+            let availablePct = Int((lane["availableNowPct"] as? Double ?? 0).rounded(.down))
+            return ("only \(availablePct)% now · small tasks" + staleSuffix, .systemOrange)
+        }
+        if let pts = lane["surplusPts"] as? Int {
+            if pts >= 15 { return ("spend freely" + staleSuffix, .secondaryLabelColor) }
+            if pts <= -10 { return ("conserve" + staleSuffix, .secondaryLabelColor) }
+            return ("on pace" + staleSuffix, .secondaryLabelColor)
+        }
+        return ("available" + staleSuffix, .secondaryLabelColor)
+    }
+
     private func rebuildMenu() {
         menu.removeAllItems()
         sections = [:]
@@ -699,6 +741,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(infoItem(text("⚠ \(lastError.prefix(120))", mono, .systemRed)))
         }
 
+        var allResetItems: [NSMenuItem] = []
         for account in accounts {
             menu.addItem(.separator())
             let label = account["label"] as? String ?? "?"
@@ -732,16 +775,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // The balance is detail: shown whenever it is known, while the pills only switch to it once the week is used up.
             if let credits = account["credits"] as? [String: Any], let balance = credits["text"] as? String {
                 let reading = CreditReading(text: balance, level: credits["level"] as? String ?? "out")
-                rows.append(infoItem(text("  Credit balance        " + reading.coinText + " left", mono, color(for: reading.level))))
+                rows.append(infoItem(text("  " + pad("Credit balance", 20) + reading.coinText + " left", mono, color(for: reading.level))))
             }
-            if let bank = account["resetCredits"] as? [String: Any], let count = bank["availableCount"] as? Int {
+            if let bank = account["resetCredits"] as? [String: Any], let count = bank["availableCount"] as? Int, count > 0 {
                 let stale = (account["ok"] as? Bool) == false ? " (last reported)" : ""
-                rows.append(infoItem(text("  \(count) banked reset\(count == 1 ? "" : "s") available\(stale)", mono, .secondaryLabelColor)))
+                rows.append(infoItem(text("  " + pad("Banked resets", 20) + "\(count) available\(stale)", mono, .secondaryLabelColor)))
             }
-            // Current quota stays in the main menu; reset history and explanations are available on demand.
-            var resetRows: [NSMenuItem] = []
+            // Current quota stays in the main menu; reset history and explanations live under a single footer submenu.
+            var accountResetRows: [NSMenuItem] = []
             for detail in account["resetDetails"] as? [String] ?? [] {
-                resetRows.append(infoItem(text(detail, mono, .secondaryLabelColor)))
+                accountResetRows.append(infoItem(text("  " + detail, mono, .secondaryLabelColor)))
             }
             for notice in account["resetAnnouncements"] as? [[String: Any]] ?? [] {
                 guard let title = notice["title"] as? String,
@@ -752,11 +795,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 item.target = self
                 item.representedObject = source
                 item.toolTip = "Eligibility unverified; not used for pacing. " + source
-                resetRows.append(item)
-                resetRows.append(infoItem(text("Eligibility unverified; not used for pacing", mono, .secondaryLabelColor)))
+                accountResetRows.append(item)
+                accountResetRows.append(infoItem(text("  Eligibility unverified; not used for pacing", mono, .secondaryLabelColor)))
             }
-            if !resetRows.isEmpty {
-                rows.append(submenuItem("Reset details & history", children: resetRows))
+            if !accountResetRows.isEmpty {
+                if !allResetItems.isEmpty { allResetItems.append(.separator()) }
+                allResetItems.append(infoItem(text(label, monoBold, .secondaryLabelColor)))
+                allResetItems.append(contentsOf: accountResetRows)
             }
             addSection("account:\(account["id"] as? String ?? label)", heading, summary: windowSummary(account), children: rows)
         }
@@ -764,6 +809,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let visible = lanes.filter { ($0["redundant"] as? Bool) != true }
         if !visible.isEmpty {
             menu.addItem(.separator())
+            var lanesPerAccount: [String: Int] = [:]
+            for lane in visible {
+                let accountId = lane["accountId"] as? String ?? ""
+                lanesPerAccount[accountId, default: 0] += 1
+            }
             var rows: [NSMenuItem] = []
             var best = NSMutableAttributedString()
             var rank = 0
@@ -779,25 +829,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 } else {
                     line.append(text(" ✗  ", mono, .systemRed))
                 }
-                line.append(text(pad(lane["label"] as? String ?? "", 34), mono, usable ? .labelColor : .secondaryLabelColor))
+                let shortLabel = compactLaneLabel(lane, lanesPerAccount: lanesPerAccount)
+                line.append(text(pad(shortLabel, 28), mono, usable ? .labelColor : .secondaryLabelColor))
                 if available, let pts = lane["surplusPts"] as? Int {
                     let ptsColor: NSColor = pts >= 15 ? .systemGreen : pts <= -10 ? .systemOrange : .secondaryLabelColor
-                    line.append(text(String(format: "%+5d pts  ", pts), mono, ptsColor))
+                    line.append(text(String(format: "%+4d pts  ", pts), mono, ptsColor))
+                } else {
+                    line.append(text(String(repeating: " ", count: 10)))
                 }
-                line.append(text(lane["advice"] as? String ?? "", mono, .secondaryLabelColor))
-                if let route = lane["route"] as? String {
-                    line.append(text("  → \(route)", mono, .systemBlue))
-                }
+                let (note, noteColor) = compactLaneNote(lane)
+                line.append(text(note, mono, noteColor))
                 if usable, rank == 1 {
-                    best = NSMutableAttributedString(attributedString: text("1  " + (lane["label"] as? String ?? ""), mono, .secondaryLabelColor))
+                    best = NSMutableAttributedString(attributedString: text("1  " + shortLabel, mono, .secondaryLabelColor))
                     if available, let pts = lane["surplusPts"] as? Int { best.append(text(String(format: "  %+d pts", pts), mono, .secondaryLabelColor)) }
                 }
-                rows.append(infoItem(line))
+                let rowItem = infoItem(line)
+                let tip = [lane["advice"] as? String, (lane["route"] as? String).map { "Route: \($0)" }]
+                    .compactMap { $0 }
+                    .filter { !$0.isEmpty }
+                    .joined(separator: "\n")
+                if !tip.isEmpty { rowItem.toolTip = tip }
+                rows.append(rowItem)
             }
             addSection("ranking", text("Where to spend next", monoBold, .secondaryLabelColor), summary: best, children: rows)
         }
 
         menu.addItem(.separator())
+        if !allResetItems.isEmpty {
+            menu.addItem(submenuItem("Reset History", children: allResetItems))
+        }
         let styleSubmenu = NSMenu()
         styleSubmenu.addItem(styleItem("Full Pills", .full))
         styleSubmenu.addItem(styleItem("Compact Weekly Numbers", .compact))
