@@ -252,25 +252,79 @@ def transcript_model(payload: dict[str, Any], transcript_path: str | None = None
     return fallback_worker_model
 
 
-def _agy_subagent_info(transcript_path: str | None) -> tuple[bool, str | None]:
-    """Detect an Antigravity subagent from the opening JSONL entries of its transcript."""
+def _agy_sqlite_subagent_info(account: str | None, session: str) -> tuple[bool, str | None, str | None, bool]:
+    """Check Antigravity's conversation_summaries.db for parent linkage: (is_subagent, parent, agent_name, classified)."""
+    if not isinstance(session, str) or not session.strip():
+        return False, None, None, False
+    home = Path(account).expanduser() if isinstance(account, str) and account.strip() else Path.home() / ".gemini"
+    db_path = next(
+        (
+            candidate
+            for candidate in (home / "antigravity-cli/conversation_summaries.db", home / "conversation_summaries.db")
+            if candidate.is_file()
+        ),
+        None,
+    )
+    if db_path is None:
+        return False, None, None, False
+    with (
+        contextlib.suppress(OSError, sqlite3.Error, ValueError),
+        contextlib.closing(
+            sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True, timeout=0.05)
+        ) as connection,
+    ):
+        row = None
+        with contextlib.suppress(sqlite3.Error):
+            row = connection.execute(
+                "SELECT parent_conversation_id, nesting_depth, agent_name "
+                "FROM conversation_summaries WHERE conversation_id = ?",
+                (session,),
+            ).fetchone()
+        agent_name = str(row[2]).strip() if row and isinstance(row[2], str) and str(row[2]).strip() else None
+        if row is not None:
+            parent_id = str(row[0]).strip() if isinstance(row[0], str) and str(row[0]).strip() else None
+            depth = int(row[1]) if isinstance(row[1], int) and not isinstance(row[1], bool) else 0
+            if parent_id or depth > 0:
+                return True, parent_id, agent_name, True
+            parent_row = None
+            with contextlib.suppress(sqlite3.Error):
+                parent_row = connection.execute(
+                    "SELECT parent_id FROM conversation_parents WHERE conversation_id = ?",
+                    (session,),
+                ).fetchone()
+            if parent_row and isinstance(parent_row[0], str) and str(parent_row[0]).strip():
+                return True, str(parent_row[0]).strip(), agent_name, True
+            return False, None, None, True
+        parent_row = None
+        with contextlib.suppress(sqlite3.Error):
+            parent_row = connection.execute(
+                "SELECT parent_id FROM conversation_parents WHERE conversation_id = ?",
+                (session,),
+            ).fetchone()
+        if parent_row and isinstance(parent_row[0], str) and str(parent_row[0]).strip():
+            return True, str(parent_row[0]).strip(), None, True
+    return False, None, None, False
+
+
+def _agy_transcript_classified(transcript_path: str | None) -> tuple[bool, str | None, bool]:
+    """Classify an Antigravity session from its transcript opening entries: (is_subagent, parent, classified)."""
     if not isinstance(transcript_path, str) or not transcript_path.strip():
-        return False, None
+        return False, None, False
     path = Path(transcript_path).expanduser()
     if not path.is_file():
-        return False, None
+        return False, None, False
     sender_uuid: str | None = None
     try:
         with path.open("r", encoding="utf-8", errors="replace") as handle:
-            for _, line in zip(range(12), handle, strict=False):
+            for _, line in zip(range(16), handle, strict=False):
                 try:
                     entry = json.loads(line)
                 except ValueError:
                     continue
                 if not isinstance(entry, dict):
                     continue
-                if entry.get("source") == "USER_EXPLICIT":
-                    return False, None
+                if entry.get("source") == "USER_EXPLICIT" or entry.get("type") == "USER_INPUT":
+                    return False, None, True
                 if sender_uuid is None and entry.get("type") == "SYSTEM_MESSAGE":
                     content = entry.get("content")
                     if not isinstance(content, str) and isinstance(entry.get("message"), dict):
@@ -278,10 +332,69 @@ def _agy_subagent_info(transcript_path: str | None) -> tuple[bool, str | None]:
                     if isinstance(content, str) and (match := _AGY_SUBAGENT_SENDER.search(content)):
                         sender_uuid = match.group(1)
     except OSError:
-        return False, None
+        return False, None, False
     if sender_uuid:
-        return True, sender_uuid
-    return False, None
+        return True, sender_uuid, True
+    return False, None, False
+
+
+def _agy_subagent_info(transcript_path: str | None) -> tuple[bool, str | None]:
+    """Detect an Antigravity subagent from the opening JSONL entries of its transcript."""
+    is_sub, parent, _ = _agy_transcript_classified(transcript_path)
+    return is_sub, parent
+
+
+def _agy_cohosted_active_parent(
+    base: Path, session: str, pid: int | None, account: str | None
+) -> tuple[str | None, bool]:
+    """Check busy co-hosted Gemini peers on the same PID for an active subagent launch in their current turn."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return None, False
+    peers_dir = base / "peers"
+    if not peers_dir.is_dir():
+        return None, False
+    candidates: list[dict[str, Any]] = []
+    with contextlib.suppress(OSError):
+        for path in peers_dir.glob("*.json"):
+            other = _MB.load(path)
+            if (
+                valid_peer(other)
+                and other["session"] != session
+                and other.get("harness") == "gemini"
+                and not other.get("isSubagent")
+                and not other.get("agySubagentPending")
+                and not other.get("delegatedRun")
+                and not _MB.is_run_peer(other)
+                and other.get("pid") == pid
+                and other.get("state") == "busy"
+                and not other.get("lastStopReason")
+                and _MB.is_live(other)
+            ):
+                candidates.append(other)
+    if not candidates:
+        return None, False
+    candidates.sort(key=lambda item: str(item.get("lastSeenAt") or ""), reverse=True)
+    default_home = (
+        Path(account).expanduser() if isinstance(account, str) and account.strip() else Path.home() / ".gemini"
+    )
+    for other in candidates:
+        other_account = other.get("accountHome")
+        other_home = (
+            Path(other_account).expanduser()
+            if isinstance(other_account, str) and other_account.strip()
+            else default_home
+        )
+        t_path = other_home / "antigravity-cli/brain" / other["session"] / ".system_generated/logs/transcript.jsonl"
+        for entry in reversed(_transcript_tail_entries(str(t_path), 65536)):
+            if entry.get("isSidechain"):
+                continue
+            if entry.get("type") in {"USER_INPUT"} or entry.get("source") == "USER_EXPLICIT":
+                break
+            if entry.get("type") == "PLANNER_RESPONSE" and any(
+                _entry_has_tool_call(entry, name) for name in ("invoke_subagent", "swarm", "run_workflow")
+            ):
+                return other["session"], True
+    return None, True
 
 
 def _codex_sqlite_settings(account: str | None, session: str) -> tuple[str | None, str | None]:
@@ -1038,11 +1151,13 @@ def swarm_coordinator_context(
     base: Path, me: dict[str, Any], event: str = "SessionStart", *, mid_turn: bool = False
 ) -> str:
     """Auto-bind the root swarm coordinator (or reconnect a resumed coordinator/lead) and deliver its brief."""
-    if me.get("isSubagent") or me.get("delegatedRun") or _MB.is_run_peer(me):
+    if me.get("isSubagent") or me.get("agySubagentPending") or me.get("delegatedRun") or _MB.is_run_peer(me):
         return ""
     is_turn_start = event in {"SessionStart", "UserPromptSubmit"} or (event == "PreInvocation" and not mid_turn)
     _record_native_swarm_identity(base, me)
     room_id = os.environ.get("ORKEST_SWARM_ROOM", "").strip()
+    toggled_resume_view = False
+    resume_instance_key: str | None = None
     if is_turn_start and os.environ.get("ORKEST_RESUME_SWARM") == "1":
         # A stale inherited room must not make this new process claim another
         # live coordinator's terminal or brief. Resume by target in a fresh room.
@@ -1059,15 +1174,32 @@ def swarm_coordinator_context(
             return ""
         room_id = promoted["id"]
         instance_key = f"{room_id}:{me.get('terminalServer') or me.get('herdrPaneId') or me.get('pid') or ''}"
+        resume_instance_key = instance_key
         if me.get("swarmAutoReconnected") != instance_key and (
             me.get("terminalServer") or os.environ.get("ORKEST_TERMINAL_SERVER") or _herdr_active()
         ):
             import agent_statusline_tmux
 
+            server_sock = (
+                None if _herdr_active() else (me.get("terminalServer") or os.environ.get("ORKEST_TERMINAL_SERVER"))
+            )
             with contextlib.suppress(Exception):
-                agent_statusline_tmux.toggle_swarm_view(
-                    "open", room=room_id, session_id=me["session"], harness=me["harness"], cwd=me.get("cwd"), base=base
+                outcome = agent_statusline_tmux.toggle_swarm_view(
+                    "open",
+                    socket=server_sock,
+                    room=room_id,
+                    session_id=me["session"],
+                    harness=me["harness"],
+                    cwd=me.get("cwd"),
+                    base=base,
+                    respect_closed=True,
                 )
+                toggled_resume_view = isinstance(outcome, dict) and outcome.get("status") in {
+                    "opened",
+                    "already_open",
+                    "starting",
+                    "already_closed",
+                }
     if not room_id:
         if not is_turn_start:
             return ""
@@ -1101,7 +1233,7 @@ def swarm_coordinator_context(
                 None if _herdr_active() else (me.get("terminalServer") or os.environ.get("ORKEST_TERMINAL_SERVER"))
             )
             with contextlib.suppress(Exception):
-                agent_statusline_tmux.toggle_swarm_view(
+                outcome = agent_statusline_tmux.toggle_swarm_view(
                     "open",
                     socket=server_sock,
                     room=room_id,
@@ -1109,8 +1241,14 @@ def swarm_coordinator_context(
                     harness=me["harness"],
                     cwd=me.get("cwd"),
                     base=base,
+                    respect_closed=True,
                 )
-                toggled_view = True
+                toggled_view = isinstance(outcome, dict) and outcome.get("status") in {
+                    "opened",
+                    "already_open",
+                    "starting",
+                    "already_closed",
+                }
         delivered = _deliver_swarm_brief_or_summary(
             base, me, room, room_id, member_id, instance_key, allow_brief=is_turn_start
         )
@@ -1229,8 +1367,14 @@ def swarm_coordinator_context(
             allow_brief=(is_prompt_turn or os.environ.get("ORKEST_RESUME_SWARM") == "1")
             and not cli_launched_with_brief,
         )
+        if toggled_resume_view and resume_instance_key and me.get("swarmAutoReconnected") != resume_instance_key:
+            _MB.annotate(base, me["session"], swarmAutoReconnected=resume_instance_key)
+            me["swarmAutoReconnected"] = resume_instance_key
         if delivered:
             return delivered
+    elif toggled_resume_view and resume_instance_key and me.get("swarmAutoReconnected") != resume_instance_key:
+        _MB.annotate(base, me["session"], swarmAutoReconnected=resume_instance_key)
+        me["swarmAutoReconnected"] = resume_instance_key
     return _swarm_next_advisor(base, me, room, room_id, "conductor") if is_turn_start else ""
 
 
@@ -1550,20 +1694,43 @@ def hook(
         if not runtime_effort_val and db_effort:
             runtime_effort_val = db_effort
     previous = _MB.load(peer_path(base, session))
+    has_transcript = bool(effective_transcript and Path(effective_transcript).expanduser().is_file())
+    subagent_name: str | None = None
+    agy_pending = False
     if gemini:
-        if valid_peer(previous) and previous.get("isSubagent") and previous.get("parentSession"):
-            is_subagent, parent_session = True, str(previous["parentSession"])
+        if valid_peer(previous) and previous.get("isSubagent"):
+            is_subagent = True
+            parent_session = str(previous["parentSession"]) if previous.get("parentSession") else None
         else:
-            is_subagent, parent_session = _agy_subagent_info(effective_transcript)
-            if not is_subagent and valid_peer(previous) and previous.get("isSubagent"):
+            is_subagent, parent_session = False, None
+        db_classified = False
+        if not is_subagent or not parent_session:
+            db_sub, db_parent, db_name, db_classified = _agy_sqlite_subagent_info(account_home_dir, session)
+            if db_sub:
                 is_subagent = True
-                parent_session = parent_session or previous.get("parentSession")
+                if not parent_session and db_parent:
+                    parent_session = db_parent
+            if db_name:
+                subagent_name = db_name
+        tr_sub, tr_parent, tr_classified = _agy_transcript_classified(effective_transcript)
+        if tr_sub:
+            is_subagent = True
+            if tr_parent:
+                parent_session = tr_parent
+        classified = is_subagent or db_classified or tr_classified
+        if not classified:
+            cohosted_parent, saw_busy_cohosted = _agy_cohosted_active_parent(
+                base, session, _MB.harness_pid(harness), account_home_dir
+            )
+            if cohosted_parent:
+                is_subagent, parent_session = True, cohosted_parent
+            elif saw_busy_cohosted or has_transcript:
+                agy_pending = True
     else:
         is_subagent, parent_session = False, None
     phase_handoff, active_orchestrator_model, saw_turn_boundary = (
         _agy_transcript_phase(effective_transcript) if gemini else (False, None, False)
     )
-    has_transcript = bool(effective_transcript and Path(effective_transcript).expanduser().is_file())
     prev_session_model = (previous.get("sessionModel") or previous.get("model")) if valid_peer(previous) else None
     explicit_session_model = _clean_model_value(payload.get("sessionModel") or payload.get("session_model"))
     explicit_step_model = _clean_model_value(
@@ -1634,18 +1801,36 @@ def hook(
     elif me.get("executionModel") is not None:
         me = _MB.annotate(base, session, executionModel=None) or me
     me = _MB.mark_delegated(base, me)
-    if not is_subagent and not me.get("delegatedRun"):
+    suppress_toplevel = is_subagent or bool(me.get("isSubagent")) or agy_pending
+    if not suppress_toplevel and not me.get("delegatedRun"):
         me = _MB.attest_native_sessions(base, session, native_session) or me
+    if agy_pending and not is_subagent:
+        if me.get("agySubagentPending") is not True:
+            me = _MB.annotate(base, session, agySubagentPending=True) or me
+    elif me.get("agySubagentPending") is not None:
+        me = _MB.annotate(base, session, agySubagentPending=None) or me
     if is_subagent:
         subagent_fields: dict[str, Any] = {"isSubagent": True}
         if parent_session:
             subagent_fields["parentSession"] = parent_session
-        for k in ("terminalServer", "herdrPaneId", "herdrWorkspaceId", "herdrEndpoint", "herdrBinary"):
+        if subagent_name and not me.get("focus"):
+            subagent_fields["focus"] = f"native {subagent_name[:60]}"
+        for k in (
+            "terminalServer",
+            "herdrPaneId",
+            "herdrWorkspaceId",
+            "herdrEndpoint",
+            "herdrBinary",
+            "agySubagentPending",
+            "nativeSession",
+            "nativeSessions",
+            "nativeSessionAttestation",
+        ):
             if me.get(k) is not None or (valid_peer(previous) and previous.get(k) is not None):
                 subagent_fields[k] = None
         if any(me.get(k) != v for k, v in subagent_fields.items()):
             me = _MB.annotate(base, session, **subagent_fields) or me
-    if not is_subagent and not me.get("isSubagent") and not me.get("delegatedRun"):
+    if not suppress_toplevel and not me.get("delegatedRun"):
         terminal_server = os.environ.get("ORKEST_TERMINAL_SERVER", "").strip()
         if re.fullmatch(r"orkest-label-[0-9a-f]{12}", terminal_server) and me.get("terminalServer") != terminal_server:
             me = _MB.annotate(base, session, terminalServer=terminal_server) or me
@@ -1694,18 +1879,63 @@ def hook(
                 repo_env.bootstrap_worktree_env(cwd, overwrite=False)
             if harness == "claude" and event == "SessionStart":
                 repo_env.export_claude_env_file(cwd)
-    if event == "SessionStart":
+    if event == "SessionStart" and not suppress_toplevel:
         _maybe_trigger_auto_update(base, me, event)
     # How the last turn ended: wake recovery must not set a conversation going that its own user stopped.
     if gemini and event == "Stop" and payload.get("terminationReason"):
         me = _MB.annotate(base, session, lastStopReason=str(payload["terminationReason"])) or me
     elif me.get("lastStopReason") and event in {"SessionStart", "UserPromptSubmit", "PreInvocation"}:
         me = _MB.annotate(base, session, lastStopReason=None) or me
+    if gemini and (is_subagent or me.get("isSubagent")):
+        with contextlib.suppress(Exception):
+            prog_path = base / "progress" / f"{session_key(session)}.json"
+            existing_prog = _MB.load(prog_path)
+            if event == "Stop" and payload.get("terminationReason"):
+                if isinstance(existing_prog, dict):
+                    existing_prog["stage"] = "complete"
+                    existing_prog["updatedAt"] = _MB.stamp()
+                    _MB.write(prog_path, existing_prog)
+            elif not isinstance(existing_prog, dict) or not existing_prog.get("task"):
+                role_label = subagent_name or str(me.get("focus") or "").removeprefix("native ").strip()
+                sub_role = (existing_prog.get("role") if isinstance(existing_prog, dict) else None) or {
+                    "explore": "scout",
+                    "plan": "planner",
+                    "research": "scout",
+                }.get(role_label.lower())
+                _MB.write(
+                    prog_path,
+                    {
+                        "schema": "orchestrate.progress.v1",
+                        "session": session,
+                        "harness": harness,
+                        "machine": socket.gethostname(),
+                        "accountHome": me.get("accountHome"),
+                        "checkout": me.get("checkout") or cwd,
+                        **({"role": sub_role} if sub_role else {}),
+                        "stage": "working",
+                        "goal": f"Native {role_label or 'subagent'}",
+                        "task": f"Running {role_label or 'subagent'} ({session[:8]})",
+                        "updatedAt": _MB.stamp(),
+                    },
+                )
+            elif (
+                event in {"SessionStart", "UserPromptSubmit", "PreInvocation"}
+                and existing_prog.get("stage") == "complete"
+                and str(existing_prog.get("goal") or "").startswith("Native ")
+            ):
+                existing_prog["stage"] = "working"
+                existing_prog["updatedAt"] = _MB.stamp()
+                _MB.write(prog_path, existing_prog)
     cleared_notice = ""
-    if event == "SessionStart" and payload.get("source") == "clear" and not me.get("delegatedRun"):
+    if (
+        event == "SessionStart"
+        and payload.get("source") == "clear"
+        and not me.get("delegatedRun")
+        and not suppress_toplevel
+    ):
         cleared_notice = _MB.adopt_cleared(base, me)
         me = _MB.load(peer_path(base, session)) or me
-    if not is_subagent and not me.get("isSubagent") and not me.get("delegatedRun"):
+    if not suppress_toplevel and not me.get("delegatedRun"):
         with contextlib.suppress(Exception):
             import agent_terminal
 
@@ -1723,7 +1953,7 @@ def hook(
                 import agent_terminal
 
                 agent_terminal.refresh_parent_pane(base, target_parent)
-    if not me.get("isSubagent") and event in {"SessionStart", "UserPromptSubmit", "PreInvocation", "Stop"}:
+    if not suppress_toplevel and event in {"SessionStart", "UserPromptSubmit", "PreInvocation", "Stop"}:
         with contextlib.suppress(Exception):
             import mailbox_work as _WORK
 
@@ -1773,19 +2003,13 @@ def hook(
         return {}
     import mailbox_channels
 
-    route_hint = (
-        _MB.wake_route_hint(base, me)
-        if event == "SessionStart" and not is_subagent and not me.get("isSubagent")
-        else ""
-    )
+    route_hint = _MB.wake_route_hint(base, me) if event == "SessionStart" and not suppress_toplevel else ""
     swarm_toggle = (
-        _MB.swarm_command_context(base, me, payload, event, mid_turn=mid_turn)
-        if not is_subagent and not me.get("isSubagent")
-        else ""
+        _MB.swarm_command_context(base, me, payload, event, mid_turn=mid_turn) if not suppress_toplevel else ""
     )
     side_notice = (
         getattr(_MB, "side_command_context", side_command_context)(base, me, payload, event, mid_turn=mid_turn)
-        if not is_subagent and not me.get("isSubagent")
+        if not suppress_toplevel
         else ""
     )
     is_swarm_goal = swarm_toggle.startswith("[orkest-swarm-goal] ")
@@ -1809,17 +2033,14 @@ def hook(
             }
     swarm_brief = (
         _MB.swarm_coordinator_context(base, me, event, mid_turn=mid_turn)
-        if not is_subagent
-        and not me.get("isSubagent")
+        if not suppress_toplevel
         and (event in {"SessionStart", "UserPromptSubmit"} or (gemini and event == "PreInvocation" and not mid_turn))
         else ""
     )
     progress_hint = ""
     help_hint = ""
-    if (
-        not is_subagent
-        and not me.get("isSubagent")
-        and (event in {"SessionStart", "UserPromptSubmit"} or (gemini and event == "PreInvocation" and not mid_turn))
+    if not suppress_toplevel and (
+        event in {"SessionStart", "UserPromptSubmit"} or (gemini and event == "PreInvocation" and not mid_turn)
     ):
         import agent_progress
         import mailbox_work
@@ -1852,7 +2073,7 @@ def hook(
                 "Do not call inbox or ack—finish immediately."
             )
     context = _MB.render_all(delivered, me["name"])
-    update_notice = _update_notice(base, me) if event == "SessionStart" else ""
+    update_notice = _update_notice(base, me) if event == "SessionStart" and not suppress_toplevel else ""
     hint = "\n".join(
         value
         for value in (

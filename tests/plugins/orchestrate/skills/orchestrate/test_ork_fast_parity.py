@@ -353,6 +353,81 @@ class TestOrkFastParity(unittest.TestCase):
         self.assertEqual(after_pre["state"], "busy")
         self.assertNotEqual(after_pre["lastSeenAt"], old_stamp)
 
+        # 1b. Gemini peer with agySubagentPending=True delegates to Python until classified; cleared stays fast
+        marker = self.home / "fallback-called.txt"
+        sentinel_fallback = self.home / "sentinel-fallback.py"
+        sentinel_fallback.write_text(
+            f"#!/usr/bin/env python3\nimport pathlib; pathlib.Path({str(marker)!r}).write_text('called')\n",
+            encoding="utf-8",
+        )
+        fast_check_proc = subprocess.run(
+            [
+                str(ORK_FAST_BIN),
+                "mailbox-hook",
+                "--harness",
+                "gemini",
+                "--event",
+                "PreInvocation",
+                "--fallback-script",
+                str(sentinel_fallback),
+            ],
+            input=json.dumps({"conversationId": session_id, "invocationNum": 2}),
+            text=True,
+            capture_output=True,
+            env=self.env,
+        )
+        self.assertEqual(fast_check_proc.returncode, 0)
+        self.assertFalse(marker.exists(), "classified top-level peer should stay on Rust fast path")
+
+        pending_sid = "sess-mailbox-pending-1"
+        pending_key = peer_mailbox.session_key(pending_sid)
+        pending_file = mailbox_root / "peers" / f"{pending_key}.json"
+        pending_record = {**peer_record, "session": pending_sid, "agySubagentPending": True}
+        pending_file.write_text(json.dumps(pending_record), encoding="utf-8")
+        sub_transcript = self.home / "sub-transcript.jsonl"
+        sub_transcript.write_text(
+            json.dumps(
+                {
+                    "step_index": 1,
+                    "type": "SYSTEM_MESSAGE",
+                    "content": (
+                        "<SYSTEM_MESSAGE>\n"
+                        f"[Message] timestamp=2026-11-15T00:00:00Z sender={session_id} priority=HIGH content=work"
+                    ),
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        pending_proc = subprocess.run(
+            [
+                str(ORK_FAST_BIN),
+                "mailbox-hook",
+                "--harness",
+                "gemini",
+                "--event",
+                "PreInvocation",
+                "--fallback-script",
+                str(SCRIPTS / "peer_mailbox.py"),
+            ],
+            input=json.dumps(
+                {
+                    "conversationId": pending_sid,
+                    "invocationNum": 1,
+                    "transcriptPath": str(sub_transcript),
+                    "cwd": str(checkout_dir.resolve()),
+                }
+            ),
+            text=True,
+            capture_output=True,
+            env=self.env,
+        )
+        self.assertEqual(pending_proc.returncode, 0)
+        classified_pending = json.loads(pending_file.read_text(encoding="utf-8"))
+        self.assertTrue(classified_pending.get("isSubagent"))
+        self.assertEqual(classified_pending.get("parentSession"), session_id)
+        self.assertIsNone(classified_pending.get("agySubagentPending"))
+
         # 2. Stop transitions busy -> idle and sets gemini lastStopReason
         stop_proc = subprocess.run(
             [

@@ -8,6 +8,7 @@ import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import time
 from pathlib import Path
@@ -142,6 +143,46 @@ def aggregate_children(base: Path, parent_peer: dict[str, Any]) -> dict[str, Any
     return {"count": count, "summary": summary, "digest": digest, "children": active_children}
 
 
+def _restore_herdr_parent_agent_session(peer_data: dict[str, Any], pane_id: str, endpoint: str) -> None:
+    """Restore a parent Antigravity session ID on its Herdr pane after a child subagent hook overwrote it."""
+    if (
+        peer_data.get("harness") != "gemini"
+        or os.environ.get("HERDR_ENV") != "1"
+        or os.environ.get("HERDR_PANE_ID", "").strip() != pane_id
+    ):
+        return
+    socket_path = os.environ.get("HERDR_SOCKET_PATH", "").strip() or endpoint
+    if not socket_path:
+        return
+    seq = time.time_ns()
+    params: dict[str, Any] = {
+        "pane_id": pane_id,
+        "source": "herdr:antigravity_cli",
+        "agent": "agy",
+        "seq": seq,
+        "agent_session_id": peer_data["session"],
+    }
+    account_home = peer_data.get("accountHome")
+    home_dir = (
+        Path(account_home).expanduser() if isinstance(account_home, str) and account_home else Path.home() / ".gemini"
+    )
+    transcript = home_dir / "antigravity-cli/brain" / peer_data["session"] / ".system_generated/logs/transcript.jsonl"
+    if transcript.is_file():
+        params["agent_session_path"] = str(transcript)
+    request = json.dumps(
+        {
+            "id": f"orkest:antigravity_cli:{seq}",
+            "method": "pane.report_agent_session",
+            "params": params,
+        }
+    )
+    with contextlib.suppress(OSError), socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(0.3)
+        client.connect(socket_path)
+        client.sendall((request + "\n").encode())
+        client.recv(4096)
+
+
 def refresh_parent_pane(base: Path, parent_session: str | None) -> bool:
     """Refresh a parent session's Herdr pane metadata using its own recorded Herdr binding."""
     if not isinstance(parent_session, str) or not parent_session.strip():
@@ -159,6 +200,7 @@ def refresh_parent_pane(base: Path, parent_session: str | None) -> bool:
     binary = _clean_text(peer_data.get("herdrBinary")) or os.environ.get("HERDR_BIN_PATH") or shutil.which("herdr")
     if not pane_id or not endpoint or not harness or not binary:
         return False
+    _restore_herdr_parent_agent_session(peer_data, pane_id, endpoint)
     workspace_id = _clean_text(peer_data.get("herdrWorkspaceId")) or None
     return _sync_herdr_pane(
         base=base,
