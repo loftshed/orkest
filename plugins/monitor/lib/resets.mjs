@@ -73,7 +73,10 @@ export function resetDetails(account, now) {
     if (expiry) details.push(`Next reported banked reset expiry: ${formatClock(expiry, now)}`);
   }
   const recent = (account.resetHistory ?? [])
-    .filter((e) => now - e.observedAt < 30 * DAY)
+    .filter((event) => {
+      const latestDeadline = Math.max(event.resetsAt ?? 0, event.previousResetsAt ?? 0);
+      return now - event.observedAt < 30 * DAY && (latestDeadline === 0 || latestDeadline > now);
+    })
     .slice(-3);
   for (const event of recent) {
     const when = formatClock(event.observedAt, now);
@@ -82,13 +85,15 @@ export function resetDetails(account, now) {
       details.push(
         `Previously ${formatClock(event.previousResetsAt, now)}; then reported ${formatClock(event.resetsAt, now)}`,
       );
-      details.push("Previous dates are history, not confirmed extra refills.");
     } else {
       details.push(
         `${event.label}: remaining rose ${Math.round(event.previousRemainingPct)}% to ${Math.round(event.remainingPct)}%, observed ${when}`,
       );
       details.push(`Reported rollover stayed ${formatClock(event.resetsAt, now)}`);
     }
+  }
+  if (recent.some((event) => event.scheduleChanged)) {
+    details.push("Previous dates are history, not confirmed extra refills.");
   }
   if (account.provider === "codex" && (bank?.availableCount > 0 || recent.length > 0)) {
     details.push(
