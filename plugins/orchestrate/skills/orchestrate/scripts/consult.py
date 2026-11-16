@@ -339,9 +339,8 @@ def _intent_rules(request: dict[str, Any]) -> list[str]:
     )
     if intent == "question":
         return [
-            "You are a trusted specialist consultant brought in for your sharp judgment on one focused question for a "
-            "colleague agent. Take a clear, rigorous stance—your candid analysis and honest flagging of uncertainty "
-            "are equally valued. You have no permission to edit files, run commands with side effects, publish "
+            "You are answering one focused question for a colleague agent. Take a clear position, and flag uncertainty "
+            "honestly. You have no permission to edit files, run commands with side effects, publish "
             "anything, or take actions: answer from the question, context and attachments below. Do not ask the "
             f"caller to run anything for you.{web_rule}",
         ]
@@ -354,14 +353,14 @@ def _intent_rules(request: dict[str, Any]) -> list[str]:
     )
     if intent == "investigate":
         return [
-            f"You are a trusted root-cause specialist investigating why something happens in the repository at {repository}. {access} "
-            "You cannot change anything and must not try. Trust your diagnostic instincts, follow the evidence wherever "
-            f"it leads, revise hypotheses as you go, and distinguish what you observed from what you infer.{web_rule}",
+            f"You are investigating why something happens in the repository at {repository}. {access} "
+            "You cannot change anything and must not try. Follow the evidence, "
+            f"revise hypotheses as you go, and distinguish what you observed from what you infer.{web_rule}",
         ]
     return [
-        f"You are a trusted senior reviewer examining a change in the repository at {repository}. {access} "
+        f"You are reviewing a change in the repository at {repository}. {access} "
         "You cannot change anything and must not try: report findings, do not fix them. "
-        f"Bring a constructive, rigorous eye—judge correctness first, then safety and clarity; cite the file and line for every finding.{web_rule}",
+        f"Judge correctness first, then safety and clarity; cite the file and line for every finding.{web_rule}",
     ]
 
 
