@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.90.1
+
+- fix(orchestrate): harden post-merge integration across approval, lifecycle, handoff, and chief (#229)
+
 ## 0.90.0
 
 - feat(orchestrate): add ork chief master orchestrator and Chief View side-window overview (#228)
