@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.89.0
+
+- fix(orchestrate): unify room index, harden file locks, and align peer liveness (#227)
+- feat(orchestrate): add handoff provenance, room lifecycle, and continuation requests (#226)
+- feat(orchestrate): add Orca IDE host adapter and Swarm View integration (#225)
+- feat(orchestrate): add automatic usage-exhaustion handoff and ork-fast authority delegation (#224)
+
 ## 0.88.0
 
 - feat(orchestrate): add explicit --trust-orkest-commands setup opt-in (#223)
