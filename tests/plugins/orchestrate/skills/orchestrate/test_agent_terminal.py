@@ -30,8 +30,142 @@ import agent_progress as progress  # noqa: E402
 import agent_statusline  # noqa: E402
 import agent_terminal  # noqa: E402
 import mailbox_hooks  # noqa: E402
+import orca_context  # noqa: E402
+import orca_swarm_restore  # noqa: E402
 import peer_mailbox as mailbox  # noqa: E402
 import room_store  # noqa: E402
+
+ORCA_KEYS = (
+    "ORCA_PANE_KEY",
+    "ORCA_AGENT_PANE",
+    "ORCA_TAB_ID",
+    "ORCA_WORKTREE_ID",
+    "ORCA_TERMINAL_HANDLE",
+    "ORCA_ENVIRONMENT",
+    "ORCA_AGENT_LAUNCH_TOKEN",
+    "ORCA_AGENT_LAUNCH",
+    "ORCA_CLI_COMMAND",
+    "ORCA_DEV_REPO_ROOT",
+)
+
+
+class OrcaTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="ork-orca-")
+        self.addCleanup(temporary.cleanup)
+        self.home = Path(temporary.name).resolve()
+        self.base = self.home / "mailbox-v1"
+        environment = {key: value for key, value in os.environ.items() if key not in ORCA_KEYS}
+        for key in ("ORKEST_TERMINAL_SERVER", "ORKEST_TERMINAL_HARNESS", "TMUX", "TMUX_PANE", "HERDR_ENV"):
+            environment.pop(key, None)
+        self.orca = {
+            **environment,
+            "AGENT_EXECUTOR_HOME": str(self.home),
+            "ORCA_PANE_KEY": "pane-key-1",
+            "ORCA_TAB_ID": "tab-1",
+            "ORCA_WORKTREE_ID": "wt-1",
+            "ORCA_TERMINAL_HANDLE": "term_coord",
+            "ORCA_ENVIRONMENT": "",
+        }
+        self.enterContext(mock.patch.dict(os.environ, self.orca, clear=True))
+
+    def peer(self, session, harness="claude"):
+        mailbox.register(self.base, session=session, harness=harness, cwd=str(self.home), pid=os.getpid())
+
+    def test_linux_screen_reader_is_never_the_orca_cli(self):
+        found = {"orca": "/usr/bin/orca", "orca-ide": "/opt/orca/orca-ide", "orca-dev": "/opt/orca/orca-dev"}
+
+        def which(name, path=None):
+            return name if name.startswith("/") else found.get(name)
+
+        self.assertEqual(orca_context.resolve_cli({}, platform="linux", which=which), "/opt/orca/orca-ide")
+        self.assertIsNone(
+            orca_context.resolve_cli({"ORCA_CLI_COMMAND": "/usr/bin/orca"}, platform="linux", which=which)
+        )
+        self.assertIsNone(orca_context.resolve_cli({"ORCA_CLI_COMMAND": "/bin/orca"}, platform="linux", which=which))
+        self.assertEqual(
+            orca_context.resolve_cli({"ORCA_DEV_REPO_ROOT": "/src"}, platform="linux", which=which),
+            "/opt/orca/orca-dev",
+        )
+        self.assertEqual(orca_context.resolve_cli({}, platform="darwin", which=which), "/usr/bin/orca")
+        found["orca"] = "/home/me/.local/bin/orca"
+        self.assertEqual(orca_context.resolve_cli({}, platform="linux", which=which), "/home/me/.local/bin/orca")
+
+    def test_pane_context_accepts_scrub_safe_aliases_and_registry_lookup(self):
+        self.assertIsNone(orca_context.pane_context({}))
+        context = orca_context.pane_context({"ORCA_AGENT_PANE": "pane-2", "ORCA_AGENT_LAUNCH": "token"})
+        self.assertEqual(
+            (context["paneKey"], context["terminalHandle"], context["launchToken"]), ("pane-2", "", "token")
+        )
+        orca_context.save(
+            orca_context.terminals_path(self.home),
+            {
+                "schema": orca_context.TERMINALS_SCHEMA,
+                "terminals": {"term_7": {"terminalId": "term_7", "paneKey": "pane-2", "workspaceId": "ws-host"}},
+            },
+        )
+        self.assertEqual(orca_context.current_terminal({"ORCA_AGENT_PANE": "pane-2"}, self.home), "term_7")
+        self.assertEqual(orca_context.terminal_handle("--bad"), "")
+
+    def test_bind_records_the_orca_terminal_and_clears_stale_herdr_fields(self):
+        self.peer("orca-session")
+        mailbox.annotate(self.base, "orca-session", herdrPaneId="w1:p1", herdrEndpoint="/tmp/herdr.sock")
+        self.assertEqual(agent_terminal.orca_terminal_context("claude")["paneKey"], "pane-key-1")
+        self.assertTrue(agent_terminal.bind("orca-session", "claude", {"model": "claude-sonnet"}, base=self.base))
+        stored = mailbox.load(mailbox.peer_path(self.base, "orca-session"))
+        self.assertEqual(stored["orcaTerminalHandle"], "term_coord")
+        self.assertEqual(stored["orcaPaneKey"], "pane-key-1")
+        self.assertEqual(stored["orcaWorkspaceId"], "wt-1")
+        self.assertIsNone(stored["herdrPaneId"])
+        self.assertNotIn("terminalServer", {key for key, value in stored.items() if value})
+
+        self.peer("shared-codex", "codex")
+        mailbox.annotate(self.base, "shared-codex", sharedProcess=True)
+        self.assertFalse(agent_terminal.bind("shared-codex", "codex", {}, base=self.base))
+        with mock.patch.dict(os.environ, {"HERDR_ENV": "1"}):
+            self.assertIsNone(agent_terminal.orca_terminal_context("claude"))
+
+    def test_toggle_splits_beside_the_coordinator_and_closes_through_the_orca_cli(self):
+        calls = []
+        live = {"term_coord"}
+
+        def run(command, **kwargs):
+            calls.append(command)
+            self.assertNotEqual(command[0], "/usr/bin/orca")
+            verb = command[2]
+            if verb == "list":
+                result = {"terminals": [{"handle": handle} for handle in sorted(live)]}
+            elif verb == "split":
+                live.add("term_view")
+                result = {"split": {"handle": "term_view", "tabId": "t1"}}
+            elif verb == "close":
+                live.discard(command[command.index("--terminal") + 1])
+                result = {"close": {"handle": "term_view"}}
+            else:
+                result = {}
+            return subprocess.CompletedProcess(command, 0, stdout=json.dumps({"result": result}), stderr="")
+
+        with mock.patch.object(orca_context, "resolve_cli", return_value="/opt/orca/orca-ide"):
+            opened = orca_swarm_restore.toggle("toggle", base=self.base, room="room-x", run=run)
+            self.assertEqual(opened["status"], "opened", opened)
+            split = next(command for command in calls if command[2] == "split")
+            self.assertEqual(split[3:7], ["--terminal", "term_coord", "--direction", "vertical"])
+            self.assertIn("horde --attach-room room-x --view", split[8])
+            record = orca_context.load(orca_context.view_path("room-x", self.home))
+            self.assertEqual((record["terminalId"], record["closed"]), ("term_view", False))
+            self.assertEqual(
+                orca_swarm_restore.toggle("open", base=self.base, room="room-x", run=run)["status"], "already_open"
+            )
+            closed = orca_swarm_restore.toggle("toggle", base=self.base, room="room-x", run=run)
+            self.assertEqual(closed["status"], "closed", closed)
+            self.assertNotIn("term_view", live)
+            self.assertTrue(orca_context.load(orca_context.view_path("room-x", self.home))["closed"])
+
+    def test_toggle_refuses_without_a_safe_orca_cli(self):
+        with mock.patch.dict(os.environ, {"ORCA_CLI_COMMAND": "/usr/bin/orca"}):
+            outcome = orca_swarm_restore.toggle("open", base=self.base, room="room-x", run=mock.Mock())
+        self.assertEqual(outcome["status"], "unavailable")
+        self.assertIn("screen reader", outcome["reason"])
 
 
 class HerdrMetadataTests(unittest.TestCase):
@@ -54,7 +188,7 @@ class HerdrMetadataTests(unittest.TestCase):
             "ORKEST_TEST_ALLOW_HERDR": "1",
             "ORK_GLYPHS": "ascii",
         }
-        for key in ("ORKEST_TERMINAL_SERVER", "TMUX", "TMUX_PANE", "ORKEST_SWARM_ROOM", "HERDR_BIN_PATH"):
+        for key in ("ORKEST_TERMINAL_SERVER", "TMUX", "TMUX_PANE", "ORKEST_SWARM_ROOM", "HERDR_BIN_PATH", *ORCA_KEYS):
             environment.pop(key, None)
         self.enterContext(mock.patch.dict(os.environ, environment, clear=True))
         self.metadata = {}
@@ -558,6 +692,7 @@ class TerminalTests(unittest.TestCase):
             "HERDR_WORKSPACE_ID",
             "HERDR_SOCKET_PATH",
             "HERDR_BIN_PATH",
+            *ORCA_KEYS,
         ):
             self.environment.pop(key, None)
         self.native = {

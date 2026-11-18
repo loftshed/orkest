@@ -176,6 +176,51 @@ function checkPathReferences(pluginDirectory, context) {
   }
 }
 
+// The Orca IDE plugin at the repository root: the host API methods it calls need this release.
+export const ORCA_MIN_ENGINE = [1, 4, 259];
+
+function compareVersions(left, right) {
+  for (let index = 0; index < 3; index++) {
+    if (left[index] !== right[index]) return left[index] - right[index];
+  }
+  return 0;
+}
+
+/** Problems with `orca-plugin.json` against the rules Orkest relies on; [] when it is absent. */
+export function checkOrcaManifest(root = REPO_ROOT) {
+  const file = path.join(root, "orca-plugin.json");
+  if (!fs.existsSync(file)) return [];
+  const errors = [];
+  const context = { errors, root };
+  const manifest = readJson(file, context);
+  if (!manifest) return errors;
+  const label = "orca-plugin.json";
+  if (manifest.manifestVersion !== 2) errors.push(`${label}: manifestVersion must be 2`);
+  if (manifest.execution !== "trusted-worker")
+    errors.push(`${label}: execution must be trusted-worker`);
+  if ("publisher" in manifest)
+    errors.push(`${label}: leave out publisher; Orca derives it from the repository owner`);
+  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(manifest.id ?? "") || manifest.id.startsWith("orca-"))
+    errors.push(`${label}: id must be kebab-case and must not start with orca-`);
+  if (!SEMVER.test(manifest.version ?? "")) errors.push(`${label}: version is not semver`);
+  const engine = /^>=(\d+)\.(\d+)\.(\d+)$/u.exec(manifest.engines?.orca ?? "");
+  if (!engine || compareVersions(engine.slice(1).map(Number), ORCA_MIN_ENGINE) < 0)
+    errors.push(`${label}: engines.orca must be >=${ORCA_MIN_ENGINE.join(".")} or newer`);
+  if (!manifest.main || !fs.existsSync(path.join(root, manifest.main)))
+    errors.push(`${label}: main ${manifest.main ?? "(missing)"} does not exist`);
+  const contributes = manifest.contributes ?? {};
+  if ((contributes.hooks ?? []).length > 0)
+    errors.push(`${label}: hooks must stay empty; they run synchronously on every action`);
+  const commands = new Set((contributes.commands ?? []).map((command) => command.id));
+  for (const { command } of [
+    ...(contributes.keybindings ?? []),
+    ...(contributes.statusBarItems ?? []).filter((item) => item.command),
+  ]) {
+    if (!commands.has(command)) errors.push(`${label}: ${command} is not a contributed command`);
+  }
+  return errors;
+}
+
 export function validate(root = REPO_ROOT) {
   const errors = [];
   const context = { errors, root };
@@ -229,6 +274,8 @@ export function validate(root = REPO_ROOT) {
     }
     checkPathReferences(pluginDirectory, context);
   }
+
+  errors.push(...checkOrcaManifest(root));
 
   const looseSkills = listDirectories(path.join(root, "skills"));
   for (const skill of looseSkills) {

@@ -78,6 +78,25 @@ const PROGRESS_STAGES = new Set([
   "complete",
 ]);
 const STATUS_COLORS = [31, 32, 33, 34, 35, 36];
+/** Where an agent runs in the Orca IDE, recorded by agent_terminal.py from Orca's PTY variables. */
+const ORCA_TERMINAL_FIELDS = Object.freeze([
+  "orcaTerminalHandle",
+  "orcaPaneKey",
+  "orcaWorkspaceId",
+  "orcaEnvironment",
+]);
+
+function orcaTerminalFields(...sources) {
+  const fields = {};
+  if (!sources[0]?.orcaTerminalHandle && sources[0] && "orcaTerminalHandle" in sources[0]) {
+    return fields;
+  }
+  for (const field of ORCA_TERMINAL_FIELDS) {
+    const value = cleanLine(sources.map((source) => source?.[field]).find(Boolean));
+    if (value) fields[field] = value;
+  }
+  return fields;
+}
 const SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/u;
 const MAX_PEER_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const UNKNOWN_PID_TTL_MS = 2 * 60 * 60 * 1000;
@@ -1450,6 +1469,15 @@ export async function observeRoom(idOrRoom, options = {}) {
       if (herdrWorkspaceId) member.herdrWorkspaceId = cleanLine(herdrWorkspaceId);
       if (herdrEndpoint) member.herdrEndpoint = cleanLine(herdrEndpoint);
     }
+    const peerClearedOrca =
+      peer && "orcaTerminalHandle" in peer && peer.orcaTerminalHandle === null;
+    for (const field of ORCA_TERMINAL_FIELDS) {
+      if (peerClearedOrca && !snapshot?.orcaTerminalHandle) delete member[field];
+      else {
+        const value = cleanLine(snapshot?.[field] || peer?.[field] || member[field]);
+        if (value) member[field] = value;
+      }
+    }
     const paneId = snapshot?.paneId || peer?.paneId || member.paneId;
     if (paneId) member.paneId = paneId;
     const pid = snapshot?.pid || peer?.pid || member.pid;
@@ -2003,6 +2031,7 @@ async function appendNativePeers(room, snapshots, root) {
     );
     const herdrPaneId = cleanLine(peer.herdrPaneId);
     const herdrEndpoint = cleanLine(peer.herdrEndpoint);
+    const orca = orcaTerminalFields(peer);
     const paneId = cleanLine(peer.paneId);
     const branch = cleanLine(peer.branch);
     const latestActivityIso = subagentMeta?.lastActivityIso || peer.lastSeenAt || null;
@@ -2038,6 +2067,7 @@ async function appendNativePeers(room, snapshots, root) {
       ...(branch && { branch }),
       ...(herdrPaneId && { herdrPaneId }),
       ...(herdrEndpoint && { herdrEndpoint }),
+      ...orca,
       ...(paneId && { paneId }),
       observedAt,
       status,
@@ -2060,6 +2090,7 @@ async function appendNativePeers(room, snapshots, root) {
         ...(branch && { branch }),
         ...(herdrPaneId && { herdrPaneId }),
         ...(herdrEndpoint && { herdrEndpoint }),
+        ...orca,
         ...(paneId && { paneId }),
         goal: goalText,
         task: taskText,
@@ -3009,6 +3040,7 @@ export async function interactiveProgress(room, root = mailboxRoot()) {
     const branch = cleanLine(peer.branch || member.branch);
     const herdrWorkspaceId = cleanLine(peer.herdrWorkspaceId || member.herdrWorkspaceId);
     const herdrEndpoint = cleanLine(peer.herdrEndpoint || member.herdrEndpoint);
+    const orca = orcaTerminalFields(peer, member);
     const person = cleanLine(peer.person);
     const color =
       STATUS_COLORS[createHash("sha256").update(binding.id).digest()[0] % STATUS_COLORS.length];
@@ -3027,6 +3059,7 @@ export async function interactiveProgress(room, root = mailboxRoot()) {
       ...(herdrWorkspaceId && { herdrWorkspaceId }),
       ...(herdrEndpoint && { herdrEndpoint }),
       ...(herdrPaneId && { herdrPaneId }),
+      ...orca,
       ...(paneId && { paneId }),
       goal: goal || "not set",
       task: task || "not set",

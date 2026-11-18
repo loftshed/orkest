@@ -2,6 +2,12 @@ import { execFile } from "node:child_process";
 
 import { readAgentActivity } from "./agent-activity.mjs";
 import { isCurrentHerdrAgent, verifiedHerdrAgentPane } from "./herdr-context.mjs";
+import {
+  agentOrcaTerminal,
+  isCurrentOrcaAgent,
+  orcaTerminalHandle,
+  resolveOrcaCli,
+} from "./orca-context.mjs";
 import { plain } from "./tui-box.mjs";
 
 const PANE_ID = /^[A-Za-z0-9_.:%][A-Za-z0-9_.:%-]{0,63}$/u;
@@ -26,11 +32,41 @@ function terminalTarget(agent, env) {
           boundHerdrPane,
         ])
       : "activity";
+  const orcaTerminal = agentOrcaTerminal(agent);
+  if (orcaTerminal)
+    return isCurrentOrcaAgent(agent, env)
+      ? JSON.stringify([
+          "orca",
+          agent.orcaEnvironment || agent.progress?.orcaEnvironment || "",
+          orcaTerminal,
+        ])
+      : "activity";
   const tmuxPane = identifier(agent.paneId || agent.progress?.paneId);
   if (!tmuxPane) return "activity";
   const server = identifier(agent.terminalServer || agent.progress?.terminalServer);
   if (!ORKEST_TMUX_SERVER.test(server)) return "activity";
   return JSON.stringify(["tmux", server, tmuxPane]);
+}
+
+/** Visible Orca terminal text; `--screen` renders repaints, older Orca builds only have the tail. */
+async function readOrcaTerminal(run, cli, terminal) {
+  let stdout;
+  try {
+    stdout = await run(cli, ["terminal", "read", "--terminal", terminal, "--screen", "--json"]);
+  } catch {
+    stdout = await run(cli, [
+      "terminal",
+      "read",
+      "--terminal",
+      terminal,
+      "--limit",
+      "200",
+      "--json",
+    ]);
+  }
+  const tail = JSON.parse(stdout)?.result?.terminal?.tail;
+  if (!Array.isArray(tail)) throw new Error("Orca returned no terminal output");
+  return tail.map(String).join("\n");
 }
 
 function terminalText(value) {
@@ -47,6 +83,7 @@ export function createAgentPreview({
   exec = execFile,
   onChange = () => {},
   zoom = false,
+  orcaCli,
 } = {}) {
   let active;
   let snapshot = null;
@@ -58,6 +95,7 @@ export function createAgentPreview({
   let pendingRead;
   const currentPane = env.HERDR_ENV === "1" ? identifier(env.HERDR_PANE_ID) : "";
   const herdr = env.HERDR_BIN_PATH || "herdr";
+  const currentOrcaTerminal = orcaTerminalHandle(env.ORCA_TERMINAL_HANDLE);
 
   function run(command, args) {
     return new Promise((resolve, reject) => {
@@ -114,20 +152,29 @@ export function createAgentPreview({
     if (!agent || token !== generation) return null;
     const boundHerdrPane = herdrPaneBinding(agent);
     const herdrPane = env.HERDR_ENV === "1" ? identifier(boundHerdrPane) : "";
+    const orcaTerminal = boundHerdrPane ? "" : agentOrcaTerminal(agent);
+    const orcaPane = orcaTerminal && isCurrentOrcaAgent(agent, env) ? orcaTerminal : "";
     const server = identifier(agent.terminalServer || agent.progress?.terminalServer);
     const tmuxPane =
-      !boundHerdrPane && ORKEST_TMUX_SERVER.test(server)
+      !boundHerdrPane && !orcaTerminal && ORKEST_TMUX_SERVER.test(server)
         ? identifier(agent.paneId || agent.progress?.paneId)
         : "";
     try {
       let text;
-      let kind = herdrPane || tmuxPane ? "terminal" : "activity";
-      if (herdrPane || tmuxPane) {
-        if (herdrPane && herdrPane === currentPane) {
+      let kind = herdrPane || orcaPane || tmuxPane ? "terminal" : "activity";
+      if (herdrPane || orcaPane || tmuxPane) {
+        if (
+          (herdrPane && herdrPane === currentPane) ||
+          (orcaPane && orcaPane === currentOrcaTerminal)
+        ) {
           throw new Error("The agent points to this preview pane");
         }
         try {
-          if (herdrPane) {
+          if (orcaPane) {
+            const cli = orcaCli === undefined ? resolveOrcaCli(env) : orcaCli;
+            if (!cli) throw new Error("The Orca CLI is not available");
+            text = await readOrcaTerminal(run, cli, orcaPane);
+          } else if (herdrPane) {
             if (!isCurrentHerdrAgent(agent, env))
               throw new Error("The agent belongs to another Herdr server");
             const session =

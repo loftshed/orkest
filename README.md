@@ -209,7 +209,7 @@ The repository ships two plugins. Their READMEs cover every flag, routing table 
 | [`monitor`](plugins/monitor/README.md)         | 0.19.3  | Account quota, reset times, credit balances and spending guidance. |
 
 More: [architecture and module map](docs/ARCHITECTURE.md), [Herdr integration](docs/herdr.md),
-[all documentation](docs/README.md).
+[Orca integration](docs/orca.md), [all documentation](docs/README.md).
 
 ## Install
 
