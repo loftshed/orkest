@@ -202,7 +202,7 @@ export function treeSizeBytes(targetPath) {
 }
 
 export function resolveCleanupPaths(context = {}) {
-  const env = context.env || process.env;
+  const env = context.env ?? (context.homeDir ? {} : process.env);
   const homeDir = path.resolve(context.homeDir || env.HOME || os.homedir());
   const xdgCacheBase = path.resolve(
     context.xdgCacheHome || env.XDG_CACHE_HOME || path.join(homeDir, ".cache"),

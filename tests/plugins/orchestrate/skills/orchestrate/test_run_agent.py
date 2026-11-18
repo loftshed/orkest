@@ -2128,8 +2128,14 @@ else:
                 transient_failures=1,
             )
         self.assertEqual((exit_code, result["status"]), (0, "completed"))
-        log_inits = [text for path, text in seen_paths if path == out_dir / "executor.log" and text == ""]
-        final_inits = [text for path, text in seen_paths if path == out_dir / "final-output.txt" and text == ""]
+        log_inits = [
+            text for path, text in seen_paths if path.resolve() == (out_dir / "executor.log").resolve() and text == ""
+        ]
+        final_inits = [
+            text
+            for path, text in seen_paths
+            if path.resolve() == (out_dir / "final-output.txt").resolve() and text == ""
+        ]
         self.assertEqual(len(log_inits), 2)
         self.assertEqual(len(final_inits), 2)
 
