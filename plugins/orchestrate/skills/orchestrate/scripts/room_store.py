@@ -19,6 +19,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+_IMPORT_PATH = os.environ.get("PATH", "")
 _CACHE: dict[Path, dict[str, Any]] = {}
 _RACY_NS = 2_000_000_000
 _MIN_NODE = (26, 8, 0)
@@ -62,12 +63,16 @@ def _direct_rows(base: Path, room_id: str | None = None) -> list[dict[str, Any]]
         connection.close()
 
 
-@functools.cache
 def _node_binary() -> str:
     override = os.environ.get("ORKEST_NODE_BIN", "").strip()
     if override:
         return override
-    found = shutil.which("node")
+    return _discover_node_binary()
+
+
+@functools.cache
+def _discover_node_binary() -> str:
+    found = shutil.which("node") or (shutil.which("node", path=_IMPORT_PATH) if _IMPORT_PATH else None)
     if found:
         match = re.search(r"/v(\d+)\.(\d+)\.(\d+)/", found)
         if match and (int(match[1]), int(match[2]), int(match[3])) >= _MIN_NODE:

@@ -3,6 +3,7 @@
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -27,6 +28,7 @@ class DiscoveryTests(unittest.TestCase):
         self.addCleanup(temp.cleanup)
         self.home = Path(temp.name).resolve()
         self.base = self.home / "mailbox-v1"
+        node_bin = shutil.which("node")
         self.enterContext(
             mock.patch.dict(
                 os.environ,
@@ -36,6 +38,7 @@ class DiscoveryTests(unittest.TestCase):
                     "HERDR_BIN_PATH": "/fake/herdr",
                     "ORKEST_TEST_ALLOW_HERDR": "1",
                     "ORK_GLYPHS": "ascii",
+                    **({"ORKEST_NODE_BIN": node_bin} if node_bin else {}),
                 },
                 clear=True,
             )
