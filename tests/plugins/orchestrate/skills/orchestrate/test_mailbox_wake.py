@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -13,11 +14,15 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
+TESTS = Path(__file__).resolve().parent
 SCRIPTS = Path(__file__).resolve().parents[5] / "plugins/orchestrate/skills/orchestrate/scripts"
-sys.path.insert(0, str(SCRIPTS))
+for _path in (TESTS, SCRIPTS):
+    if str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
 import mailbox_mcp  # noqa: E402
 import mailbox_wake  # noqa: E402
 import peer_mailbox  # noqa: E402
+from _ork_fast_test_helpers import run_mailbox_hook  # noqa: E402
 
 
 class NativeQueue:
@@ -97,7 +102,7 @@ class AntigravityWakeTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.base = Path(self.temporary.name)
+        self.base = Path(self.temporary.name) / "mailbox-v1"
         self.sender = peer_mailbox.register(self.base, session="sender", harness="codex", cwd=str(SCRIPTS))
         self.target = peer_mailbox.register(self.base, session="agy-target", harness="gemini", cwd=str(SCRIPTS))
 
@@ -256,13 +261,14 @@ class AntigravityWakeTests(unittest.TestCase):
 
     def test_session_start_tells_a_conversation_without_a_route_how_to_attach_once(self):
         payload = {"conversationId": "agy-target", "workspacePaths": [str(SCRIPTS)]}
-        with (
-            patch.dict("os.environ", {}, clear=True),
-            patch.object(peer_mailbox, "harness_pid", return_value=None),
-        ):
-            first = peer_mailbox.hook(payload, harness="gemini", event="SessionStart", base=self.base)
-            self.control("127.0.0.1:4555")
-            routed = peer_mailbox.hook(payload, harness="gemini", event="SessionStart", base=self.base)
+        clean_env = {"PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", "")}
+        first = run_mailbox_hook(
+            payload, harness="gemini", event="SessionStart", base=self.base, pid=None, env=clean_env
+        )
+        self.control("127.0.0.1:4555")
+        routed = run_mailbox_hook(
+            payload, harness="gemini", event="SessionStart", base=self.base, pid=None, env=clean_env
+        )
         self.assertIn("attach-wake-route", first["injectSteps"][0]["ephemeralMessage"])
         self.assertNotIn("attach-wake-route", json.dumps(routed))
 
@@ -297,21 +303,30 @@ class AntigravityWakeTests(unittest.TestCase):
             "invocationNum": 1,
             "transcriptPath": str(transcript),
         }
-        with patch.dict("os.environ", {}, clear=True), patch.object(peer_mailbox, "harness_pid", return_value=None):
-            first = peer_mailbox.hook(payload, harness="gemini", event="PreInvocation", base=self.base)
-            peer_mailbox.hook(
-                {**payload, "terminationReason": "NO_TOOL_CALL"}, harness="gemini", event="Stop", base=self.base
+        clean_env = {"PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", "")}
+        first = run_mailbox_hook(
+            payload, harness="gemini", event="PreInvocation", base=self.base, pid=None, env=clean_env
+        )
+        run_mailbox_hook(
+            {**payload, "terminationReason": "NO_TOOL_CALL"},
+            harness="gemini",
+            event="Stop",
+            base=self.base,
+            pid=None,
+            env=clean_env,
+        )
+        transcript.write_text(
+            json.dumps(
+                {
+                    "type": "USER_INPUT",
+                    "content": f"<USER_REQUEST>\n{mailbox_wake.notification(message_id)}\n</USER_REQUEST>",
+                }
             )
-            transcript.write_text(
-                json.dumps(
-                    {
-                        "type": "USER_INPUT",
-                        "content": f"<USER_REQUEST>\n{mailbox_wake.notification(message_id)}\n</USER_REQUEST>",
-                    }
-                )
-                + "\n"
-            )
-            popped = peer_mailbox.hook(payload, harness="gemini", event="PreInvocation", base=self.base)
+            + "\n"
+        )
+        popped = run_mailbox_hook(
+            payload, harness="gemini", event="PreInvocation", base=self.base, pid=None, env=clean_env
+        )
         self.assertIn("handle this during subagent turn", first["injectSteps"][0]["ephemeralMessage"])
         self.assertIn(
             f"Mailbox notification ({message_id}) was already delivered and marked read",
@@ -323,7 +338,7 @@ class AntigravityWakeTests(unittest.TestCase):
 class MailboxWakeTests(unittest.TestCase):
     def test_codex_wakes_reach_the_recipients_own_profile_daemon(self):
         with tempfile.TemporaryDirectory() as temporary:
-            base = Path(temporary) / "mailbox"
+            base = Path(temporary) / "mailbox-v1"
             sender_home, recipient_home = Path(temporary) / "codex-a", Path(temporary) / "codex-b"
             sender_home.mkdir()
             recipient_home.mkdir()
@@ -683,7 +698,7 @@ class MailboxWakeTests(unittest.TestCase):
         import socket
 
         with tempfile.TemporaryDirectory() as temporary:
-            base = Path(temporary) / "mailbox"
+            base = Path(temporary) / "mailbox-v1"
             config_dir = Path(temporary) / "claude-config"
             sessions_dir = config_dir / "sessions"
             sessions_dir.mkdir(parents=True)
@@ -763,7 +778,7 @@ class MailboxWakeTests(unittest.TestCase):
                         },
                     )
                     # Once a turn hook runs, the wake deduplication marker is cleared so a new wake can fire.
-                    peer_mailbox.hook(
+                    run_mailbox_hook(
                         {"hook_event_name": "Stop", "session_id": "claude-interactive", "cwd": str(SCRIPTS)},
                         harness="claude",
                         base=base,
@@ -779,7 +794,7 @@ class MailboxWakeTests(unittest.TestCase):
 
     def test_post_stop_turn_ending_grace_waits_for_native_idle_and_stop_continuation_stays_busy(self):
         with tempfile.TemporaryDirectory() as temporary:
-            base = Path(temporary)
+            base = Path(temporary) / "mailbox-v1"
             sender = peer_mailbox.register(base, session="sender", harness="gemini", cwd=str(SCRIPTS))
             peer_mailbox.register(
                 base, session="target", harness="codex", cwd=str(SCRIPTS), state="idle", cwd_source="hook"
@@ -804,7 +819,7 @@ class MailboxWakeTests(unittest.TestCase):
 
             # When Stop hook delivers unread mail and continues the turn, peer state remains busy.
             peer_mailbox.send(base, sender=sender, to="target", text="Continue turn", wake=False)
-            out = peer_mailbox.hook(
+            out = run_mailbox_hook(
                 {"hook_event_name": "Stop", "session_id": "target", "cwd": str(SCRIPTS)},
                 harness="codex",
                 base=base,
@@ -819,7 +834,7 @@ class MailboxWakeTests(unittest.TestCase):
         import socket
 
         with tempfile.TemporaryDirectory() as temporary:
-            base = Path(temporary) / "mailbox"
+            base = Path(temporary) / "mailbox-v1"
             config_dir = Path(temporary) / "claude-config"
             sessions_dir = config_dir / "sessions"
             sessions_dir.mkdir(parents=True)
@@ -871,7 +886,7 @@ class MailboxWakeTests(unittest.TestCase):
 
     def test_wake_terminal_pane_falls_back_to_herdr_and_tmux_when_primary_adapter_unavailable(self):
         with tempfile.TemporaryDirectory() as temporary:
-            base = Path(temporary) / "mailbox"
+            base = Path(temporary) / "mailbox-v1"
             sender = peer_mailbox.register(base, session="sender", harness="codex", cwd=str(SCRIPTS))
             target = peer_mailbox.register(
                 base, session="claude-pane", harness="claude", cwd=str(SCRIPTS), state="idle"
@@ -959,7 +974,7 @@ class MailboxWakeTests(unittest.TestCase):
 
     def test_herdr_wake_refuses_reused_pane_and_does_not_retry_uncertain_prompt_in_tmux(self):
         with tempfile.TemporaryDirectory() as temporary:
-            base = Path(temporary) / "mailbox"
+            base = Path(temporary) / "mailbox-v1"
             target = peer_mailbox.register(base, session="claude-pane", harness="claude", cwd=temporary, state="idle")
             target = peer_mailbox.annotate(
                 base,
@@ -1003,7 +1018,7 @@ class MailboxWakeTests(unittest.TestCase):
 
     def test_mcp_tool_call_automatically_persists_agy_control_for_gemini_sessions(self):
         with tempfile.TemporaryDirectory() as temporary:
-            base = Path(temporary) / "mailbox"
+            base = Path(temporary) / "mailbox-v1"
             peer_mailbox.register(base, session="agy-mcp-session", harness="gemini", cwd=str(SCRIPTS))
             server = mailbox_mcp.Server(base=base, stdio=False)
             server.harness = "gemini"

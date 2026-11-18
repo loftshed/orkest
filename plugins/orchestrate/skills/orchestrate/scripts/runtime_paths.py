@@ -93,11 +93,9 @@ def set_home_env(env: dict[str, str] | None, path: str | Path) -> dict[str, str]
     return target
 
 
-def ork_fast_bin(env: Mapping[str, str] | None = None, home: Path | None = None) -> Path | None:
-    """Resolve the ork-fast accelerator binary path, honoring ORK_DISABLE_FAST and ORK_FAST_BIN."""
+def ork_fast_bin(env: Mapping[str, str] | None = None, home: Path | None = None) -> Path:
+    """Resolve the ork-fast accelerator binary path, honoring ORK_FAST_BIN."""
     source = os.environ if env is None else env
-    if source.get("ORK_DISABLE_FAST") == "1":
-        return None
     explicit = source.get("ORK_FAST_BIN")
     if explicit:
         return _expand(explicit, home)

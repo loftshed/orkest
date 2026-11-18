@@ -4,12 +4,41 @@
 from __future__ import annotations
 
 import json
+import os
 import socket
+import subprocess
 import sys
 from pathlib import Path
 
-import agent_statusline
 import peer_mailbox as mailbox
+import runtime_paths
+
+
+def _statusline_identity(session: str, harness: str, base: Path) -> dict | None:
+    fast_bin = runtime_paths.ork_fast_bin()
+    if fast_bin is None:
+        return None
+    env = runtime_paths.set_home_env(dict(os.environ), base.parent)
+    try:
+        completed = subprocess.run(
+            [str(fast_bin), "statusline", "--session", session, "--harness", harness, "--json"],
+            env=env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    raw = (completed.stdout or "").strip()
+    if completed.returncode != 0 or not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, dict) and parsed else None
 
 
 def snapshot(room: dict, base: Path) -> dict:
@@ -36,7 +65,7 @@ def snapshot(room: dict, base: Path) -> dict:
                 or (peer_cwd != expected_cwd and peer_cwd != Path(room["cwd"]).resolve())
             ):
                 continue
-            item = agent_statusline.identity(peer["session"], harness, base=base)
+            item = _statusline_identity(peer["session"], harness, base)
             if item:
                 result[member["id"]] = item
         except (OSError, ValueError, mailbox.MailboxError):

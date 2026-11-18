@@ -170,7 +170,9 @@ Delegate substantial, self-contained work so you can advance other authorized pa
 Prepare integration, check evidence, or finish independent work instead of waiting when useful work
 is available (in a conversational swarm, yield your turn after dispatch so you stay responsive to the
 user). Wait only when the next useful action depends on the worker, and keep its leased
-worktree frozen. Batch related moves or structural refactors and run scoped checks (lint, types,
+worktree frozen. Never idle watching pull-request or release CI when independent follow-up work is
+ready: leave the CI watch in the background and open the next worktree immediately, rebasing onto
+main if needed before merge. Batch related moves or structural refactors and run scoped checks (lint, types,
 imports, and narrowly affected tests) during iteration; reserve full test or visual suites for one
 combined integration checkpoint rather than running them between every move. Run that checkpoint
 through `ork gate --heavy -- <command>` so it waits for other agents' heavy runs on the machine.

@@ -15,7 +15,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import test_run_agent as fixtures
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _ork_fast_test_helpers as fast  # noqa: E402
+import test_run_agent as fixtures  # noqa: E402
 
 RUNNER = fixtures.RUNNER
 SUPPORT = RUNNER.bundled_module("execution_support")
@@ -1972,8 +1974,7 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(event_data.get("task_dir"), str(self.directory.resolve()))
 
     def test_subagent_start_and_stop_hooks_register_and_complete_native_subagent(self):
-        hooks = RUNNER.bundled_module("mailbox_hooks")
-        base = self.fixture.external_path / "mailbox-subagents"
+        base = self.fixture.external_path / "subagents" / "mailbox-v1"
         parent_sid = "claude-lead-session-100"
         MAILBOX.register(
             base,
@@ -1982,7 +1983,7 @@ class CoordinatorTests(unittest.TestCase):
             cwd=str(self.fixture.repository.path),
             pid=os.getpid(),
         )
-        start_out = hooks.hook(
+        start_out = fast.run_mailbox_hook(
             {
                 "session_id": parent_sid,
                 "cwd": str(self.fixture.repository.path),
@@ -1994,6 +1995,7 @@ class CoordinatorTests(unittest.TestCase):
             harness="claude",
             event="SubagentStart",
             base=base,
+            cwd=self.fixture.repository.path,
         )
         self.assertEqual(start_out, {})
         sub_sid = "subagent-agent_abc_123456"
@@ -2009,7 +2011,7 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(prog_data.get("goal"), "Native Explore")
         self.assertEqual(prog_data.get("role"), "scout")
 
-        stop_out = hooks.hook(
+        stop_out = fast.run_mailbox_hook(
             {
                 "session_id": parent_sid,
                 "cwd": str(self.fixture.repository.path),
@@ -2020,6 +2022,7 @@ class CoordinatorTests(unittest.TestCase):
             harness="claude",
             event="SubagentStop",
             base=base,
+            cwd=self.fixture.repository.path,
         )
         self.assertEqual(stop_out, {})
         prog_after = MAILBOX.load(prog_path)
@@ -2028,9 +2031,8 @@ class CoordinatorTests(unittest.TestCase):
         self.assertIsNone(sub_peer_after)
 
     def test_subagent_start_derives_roles_and_preserves_existing_progress_role(self):
-        hooks = RUNNER.bundled_module("mailbox_hooks")
         progress = RUNNER.bundled_module("agent_progress")
-        base = self.fixture.external_path / "mailbox-subagent-roles"
+        base = self.fixture.external_path / "subagent-roles" / "mailbox-v1"
         for index, (agent_type, expected) in enumerate(
             (("Explore", "scout"), ("Plan", "planner"), ("general-purpose", None), ("custom-agent", None))
         ):
@@ -2041,7 +2043,13 @@ class CoordinatorTests(unittest.TestCase):
                     "agent_id": f"role-{index}",
                     "agent_type": agent_type,
                 }
-                hooks.hook(payload, harness="claude", event="SubagentStart", base=base)
+                fast.run_mailbox_hook(
+                    payload,
+                    harness="claude",
+                    event="SubagentStart",
+                    base=base,
+                    cwd=self.fixture.repository.path,
+                )
                 peer = MAILBOX.load(MAILBOX.peer_path(base, f"subagent-role-{index}"))
                 record = progress.read(base, peer)
                 self.assertEqual(record.get("role"), expected)
@@ -2049,7 +2057,13 @@ class CoordinatorTests(unittest.TestCase):
                 progress.report(
                     base, peer, goal="Review role handling", task="Review launch", stage="review", role="reviewer"
                 )
-                hooks.hook(payload, harness="claude", event="SubagentStart", base=base)
+                fast.run_mailbox_hook(
+                    payload,
+                    harness="claude",
+                    event="SubagentStart",
+                    base=base,
+                    cwd=self.fixture.repository.path,
+                )
                 self.assertEqual(progress.read(base, peer)["role"], "reviewer")
 
 

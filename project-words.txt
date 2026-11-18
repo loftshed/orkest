@@ -83,3 +83,13 @@ sprad
 zwarxug
 glozor
 sproolel
+blorbo
+feff
+nsec
+opad
+rusqlite
+TIOCGWINSZ
+wxyz
+SETLKW
+UNLCK
+WRLCK

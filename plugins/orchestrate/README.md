@@ -98,7 +98,7 @@ does not already have a status line, add this field to `~/.claude/settings.json`
 {
   "statusLine": {
     "type": "command",
-    "command": "python3 ~/.agents/skills/orchestrate/scripts/agent_statusline.py --harness claude --native-status"
+    "command": "~/.cache/orchestrate/bin/ork-fast statusline --harness claude --native-status"
   }
 }
 ```
@@ -114,8 +114,8 @@ line stays visible above the label:
 {
   "statusLine": {
     "type": "command",
-    "command": "python3 ~/.agents/skills/orchestrate/scripts/agent_statusline.py --harness gemini --native-status",
-    "stack_with_default": true
+    "command": "~/.cache/orchestrate/bin/ork-fast statusline --harness gemini --native-status",
+    "stack_with_default": false
   }
 }
 ```

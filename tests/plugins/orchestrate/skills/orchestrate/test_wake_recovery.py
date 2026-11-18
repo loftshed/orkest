@@ -11,11 +11,15 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+TESTS = Path(__file__).resolve().parent
 SCRIPTS = Path(__file__).resolve().parents[5] / "plugins/orchestrate/skills/orchestrate/scripts"
-sys.path.insert(0, str(SCRIPTS))
+for _path in (TESTS, SCRIPTS):
+    if str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
 import mailbox_wake  # noqa: E402
 import peer_mailbox  # noqa: E402
 import wake_recovery  # noqa: E402
+from _ork_fast_test_helpers import run_mailbox_hook  # noqa: E402
 
 NOT_SENT = {"status": "unavailable", "reason": "offline", "phase": "not-sent"}
 SUBMITTED = {"status": "scheduled", "reason": "taken", "phase": "submitted"}
@@ -36,7 +40,7 @@ class WakeRecoveryTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.base = Path(self.temporary.name)
+        self.base = Path(self.temporary.name) / "mailbox-v1"
         self.sender = peer_mailbox.register(self.base, session="sender", harness="codex", cwd=str(SCRIPTS))
         peer_mailbox.register(
             self.base, session="target", harness="claude", cwd=str(SCRIPTS), pid=os.getpid(), state="idle"
@@ -190,11 +194,23 @@ class WakeRecoveryTests(unittest.TestCase):
 
     def test_antigravity_hooks_record_a_user_cancel_and_clear_it_on_the_next_turn(self):
         payload = {"conversationId": "agy", "workspacePaths": [str(SCRIPTS)]}
-        with patch.dict("os.environ", {}, clear=True), patch.object(peer_mailbox, "harness_pid", return_value=None):
-            peer_mailbox.hook({**payload, "terminationReason": "USER_CANCELED"}, harness="gemini", base=self.base)
-            stopped = peer_mailbox.load(peer_mailbox.peer_path(self.base, "agy"))
-            peer_mailbox.hook({**payload, "invocationNum": 1}, harness="gemini", base=self.base)
-            resumed = peer_mailbox.load(peer_mailbox.peer_path(self.base, "agy"))
+        clean_env = {"PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", "")}
+        run_mailbox_hook(
+            {**payload, "terminationReason": "USER_CANCELED"},
+            harness="gemini",
+            base=self.base,
+            pid=None,
+            env=clean_env,
+        )
+        stopped = peer_mailbox.load(peer_mailbox.peer_path(self.base, "agy"))
+        run_mailbox_hook(
+            {**payload, "invocationNum": 1},
+            harness="gemini",
+            base=self.base,
+            pid=None,
+            env=clean_env,
+        )
+        resumed = peer_mailbox.load(peer_mailbox.peer_path(self.base, "agy"))
         self.assertEqual(stopped["lastStopReason"], "USER_CANCELED")
         self.assertIsNone(resumed["lastStopReason"])
 
@@ -223,22 +239,29 @@ class WakeRecoveryTests(unittest.TestCase):
             "workspacePaths": [str(SCRIPTS)],
             "transcriptPath": str(transcript),
         }
-        with (
-            patch.dict("os.environ", {}, clear=True),
-            patch.object(peer_mailbox, "harness_pid", return_value=os.getpid()),
-            patch.object(mailbox_wake, "wake", return_value=dict(NOT_SENT)),
-        ):
-            peer_mailbox.hook(
-                {**payload, "model": "gemini-pro-orchestrator"}, harness="gemini", event="SessionStart", base=self.base
-            )
+        clean_env = {"PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", "")}
+        run_mailbox_hook(
+            {**payload, "model": "gemini-pro-orchestrator"},
+            harness="gemini",
+            event="SessionStart",
+            base=self.base,
+            pid=os.getpid(),
+            env=clean_env,
+        )
+        with patch.object(mailbox_wake, "wake", return_value=dict(NOT_SENT)):
             sent = peer_mailbox.send(self.base, sender=self.sender, to="agy-orch", text="wake check", wake=True)
-            stop_out = peer_mailbox.hook(
-                {**payload, "terminationReason": "NO_TOOL_CALL"}, harness="gemini", event="Stop", base=self.base
-            )
-            self.assertEqual(stop_out, {})
-            self.assertEqual([m["id"] for m in peer_mailbox.incoming(self.base, "agy-orch")], [sent["id"]])
-            outcome = self.at(3, FakeWake())
-            self.assertEqual(outcome[0]["outcome"], "attempted")
+        stop_out = run_mailbox_hook(
+            {**payload, "terminationReason": "NO_TOOL_CALL"},
+            harness="gemini",
+            event="Stop",
+            base=self.base,
+            pid=os.getpid(),
+            env=clean_env,
+        )
+        self.assertEqual(stop_out, {})
+        self.assertEqual([m["id"] for m in peer_mailbox.incoming(self.base, "agy-orch")], [sent["id"]])
+        outcome = self.at(3, FakeWake())
+        self.assertEqual(outcome[0]["outcome"], "attempted")
 
     def test_the_daemon_loop_reconciles_until_it_stops(self):
         stopping = threading.Event()

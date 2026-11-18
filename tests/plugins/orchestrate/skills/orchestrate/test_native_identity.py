@@ -12,14 +12,17 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+TESTS = Path(__file__).resolve().parent
 SCRIPTS = Path(__file__).resolve().parents[5] / "plugins/orchestrate/skills/orchestrate/scripts"
-sys.path.insert(0, str(SCRIPTS))
+for _path in (TESTS, SCRIPTS):
+    if str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
 import mailbox_daemon  # noqa: E402
-import mailbox_hooks  # noqa: E402
 import mailbox_listener  # noqa: E402
 import native_identity  # noqa: E402
 import peer_mailbox as mailbox  # noqa: E402
 import room_store  # noqa: E402
+from _ork_fast_test_helpers import run_mailbox_hook  # noqa: E402
 
 
 class NativeIdentityTests(unittest.TestCase):
@@ -128,7 +131,6 @@ class NativeIdentityLifecycleTests(unittest.TestCase):
                 clear=True,
             )
         )
-        self.enterContext(patch.object(mailbox, "harness_pid", return_value=os.getpid()))
 
     def register(self, session="owner", **fields):
         return mailbox.register(
@@ -154,11 +156,13 @@ class NativeIdentityLifecycleTests(unittest.TestCase):
         self.assertEqual(set(json.loads(result.stdout)), expected)
         self.assertEqual(mailbox.native_session_ids(peer, self.base), expected)
 
-    def hook(self, session="owner", **payload):
-        return mailbox_hooks.hook(
-            {"session_id": session, "hook_event_name": "SessionStart", "cwd": str(self.cwd), **payload},
+    def hook(self, session="owner", *, event="SessionStart", env=None, **payload):
+        return run_mailbox_hook(
+            {"session_id": session, "hook_event_name": event, "cwd": str(self.cwd), **payload},
             harness="claude",
             base=self.base,
+            pid=os.getpid(),
+            env=env,
         )
 
     def test_bad_tokens_leave_hooks_resume_clear_and_listener_operational_but_unattested(self):
@@ -233,17 +237,15 @@ class NativeIdentityLifecycleTests(unittest.TestCase):
                     owner = mailbox.load(mailbox.peer_path(self.base, "owner"))
                     self.assertIsNone(owner.get("nativeSessionAttestation"))
                     self.assert_identities(owner, {"owner"})
-                    with patch.dict(
-                        os.environ,
-                        {
-                            "CLAUDE_CODE_SESSION_ID": "owner",
-                            "ORKEST_RESUME_SWARM": "1",
-                            "ORKEST_RESUME_TARGET": "owner",
-                            "ORKEST_SWARM_ROOM": promoted["id"],
-                        },
-                    ):
-                        context = mailbox_hooks.swarm_coordinator_context(self.base, owner)
-                    self.assertIn("Keep exact resume working", json.dumps(output) + context)
+                    resume_env = {
+                        **os.environ,
+                        "CLAUDE_CODE_SESSION_ID": "owner",
+                        "ORKEST_RESUME_SWARM": "1",
+                        "ORKEST_RESUME_TARGET": "owner",
+                        "ORKEST_SWARM_ROOM": promoted["id"],
+                    }
+                    resumed_output = self.hook(event="UserPromptSubmit", env=resume_env)
+                    self.assertIn("Keep exact resume working", json.dumps(output) + json.dumps(resumed_output))
                     self.assertEqual(
                         room_store.read_room(self.base, promoted["id"])["conductor"]["session"]["id"], "owner"
                     )
@@ -259,8 +261,8 @@ class NativeIdentityLifecycleTests(unittest.TestCase):
                         self.base / "cleared" / "old.json",
                         {**owner, "session": "old", "clearedAt": mailbox.stamp(), "clearedPid": os.getpid()},
                     )
-                    successor = self.register("successor")
-                    self.assertIn("Your earlier context", mailbox_hooks.adopt_cleared(self.base, successor))
+                    successor_output = self.hook("successor", source="clear")
+                    self.assertIn("Your earlier context", json.dumps(successor_output))
                     successor = mailbox.load(mailbox.peer_path(self.base, "successor"))
                     self.assertEqual(successor["clearedFrom"], "old")
                     self.assertIsNone(successor.get("nativeSessionAttestation"))

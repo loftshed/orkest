@@ -16,12 +16,16 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+TESTS = Path(__file__).resolve().parent
 SCRIPTS = Path(__file__).resolve().parents[5] / "plugins/orchestrate/skills/orchestrate/scripts"
-sys.path.insert(0, str(SCRIPTS))
+for _path in (TESTS, SCRIPTS):
+    if str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
 import mailbox_wake  # noqa: E402
 import peer_mailbox as mailbox  # noqa: E402
 import room_store  # noqa: E402
 import runtime_paths  # noqa: E402
+from _ork_fast_test_helpers import run_mailbox_hook  # noqa: E402
 
 
 class ShortAgentNameTests(unittest.TestCase):
@@ -400,23 +404,25 @@ class PeerAliasAndPruneSafetyTests(unittest.TestCase):
 class MailboxModuleDecompositionTests(unittest.TestCase):
     def test_extracted_modules_reexport_cleanly_through_peer_mailbox(self) -> None:
         import mailbox_cli
-        import mailbox_hooks
         import mailbox_store
 
-        for symbol in ("locked", "load", "write", "base_dir", "peer_path", "inbox_dir", "short_agent_name"):
-            self.assertIs(getattr(mailbox, symbol), getattr(mailbox_store, symbol))
         for symbol in (
-            "adopt_cleared",
-            "offer_cleared_lead",
-            "succession_notice",
-            "swarm_coordinator_context",
-            "swarm_command_context",
-            "hook",
+            "ANTIGRAVITY_NO_CONTINUE",
+            "MAILBOX_SENDER",
+            "OPEN_REQUEST_WINDOW",
+            "locked",
+            "load",
+            "write",
+            "base_dir",
+            "peer_path",
+            "inbox_dir",
+            "short_agent_name",
         ):
-            self.assertIs(getattr(mailbox, symbol), getattr(mailbox_hooks, symbol))
+            self.assertIs(getattr(mailbox, symbol), getattr(mailbox_store, symbol))
         for symbol in ("session_arg", "caller", "table", "render_work", "build_parser"):
             self.assertIs(getattr(mailbox, symbol), getattr(mailbox_cli, symbol))
         self.assertFalse(hasattr(mailbox, "session_identity"))
+        self.assertFalse(hasattr(mailbox, "hook"))
 
 
 class SqliteSharedRoomTests(unittest.TestCase):
@@ -443,7 +449,7 @@ class SqliteSharedRoomTests(unittest.TestCase):
 
     def test_stale_env_swarm_room_falls_back_and_gemini_subagent_progress_locks_and_resolves(self):
         import agent_progress
-        import mailbox_hooks
+        import continuation_requests
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
@@ -453,7 +459,7 @@ class SqliteSharedRoomTests(unittest.TestCase):
             alias = root / "alias"
             alias.symlink_to(checkout)
             subprocess.run(["git", "init", "-q", str(checkout)], check=True)
-            me = mailbox.register(base, session="coord-active", harness="claude", cwd=str(checkout), pid=os.getpid())
+            mailbox.register(base, session="coord-active", harness="claude", cwd=str(checkout), pid=os.getpid())
             room_store.put_room(
                 base,
                 {
@@ -478,17 +484,28 @@ class SqliteSharedRoomTests(unittest.TestCase):
                     "agents": [{"id": "q1", "status": "queued"}],
                 },
             )
-            with patch.dict(os.environ, {"ORKEST_SWARM_ROOM": "archived-room"}):
-                self.assertEqual(mailbox_hooks._active_env_swarm_room(base), "")
-                with patch.object(mailbox, "harness_pid", return_value=os.getpid()):
-                    notice = mailbox_hooks.swarm_coordinator_context(base, me, "SessionStart")
-                self.assertIn("active-room", notice)
-                me = mailbox.load(mailbox.peer_path(base, "coord-active"))
-                me["continuationRoom"] = "active-room"
-                requests = mailbox_hooks._continuation_at_stop(base, me)
-                self.assertEqual([r["room"] for r in requests], ["active-room"])
+            stale_env = {**os.environ, "ORKEST_SWARM_ROOM": "archived-room"}
+            start_out = run_mailbox_hook(
+                {"hook_event_name": "SessionStart", "session_id": "coord-active", "cwd": str(checkout)},
+                harness="claude",
+                base=base,
+                pid=os.getpid(),
+                env=stale_env,
+            )
+            notice = (start_out or {}).get("hookSpecificOutput", {}).get("additionalContext", "")
+            self.assertIn("active-room", notice)
+            mailbox.annotate(base, "coord-active", continuationRoom="active-room")
+            run_mailbox_hook(
+                {"hook_event_name": "Stop", "session_id": "coord-active", "cwd": str(checkout)},
+                harness="claude",
+                base=base,
+                pid=os.getpid(),
+                env=stale_env,
+            )
+            requests = list(continuation_requests.load_all(base).values())
+            self.assertEqual([r["room"] for r in requests], ["active-room"])
 
-            # Gemini subagent progress block locks prog_path, checks SCHEMA, and sets resolved checkout.
+            # Gemini subagent progress writes SCHEMA and sets resolved checkout.
             sub_sid = "gemini-sub-1"
             sub_transcript = root / "sub-tr.jsonl"
             sub_transcript.write_text(
@@ -500,31 +517,21 @@ class SqliteSharedRoomTests(unittest.TestCase):
                 )
                 + "\n"
             )
-            locked_paths = []
-            original_locked = mailbox_hooks._MB.locked
-
-            def recording(path):
-                locked_paths.append(Path(path))
-                return original_locked(path)
-
-            with (
-                patch.dict(os.environ, {}, clear=True),
-                patch.object(mailbox, "harness_pid", return_value=os.getpid()),
-                patch.object(mailbox_hooks._MB, "locked", side_effect=recording),
-            ):
-                mailbox.hook(
-                    {
-                        "conversationId": sub_sid,
-                        "invocationNum": 1,
-                        "workspacePaths": [str(alias)],
-                        "transcriptPath": str(sub_transcript),
-                    },
-                    event="PreInvocation",
-                    harness="gemini",
-                    base=base,
-                )
+            clean_env = {"PATH": os.environ.get("PATH", ""), "HOME": str(root)}
+            run_mailbox_hook(
+                {
+                    "conversationId": sub_sid,
+                    "invocationNum": 1,
+                    "workspacePaths": [str(alias)],
+                    "transcriptPath": str(sub_transcript),
+                },
+                event="PreInvocation",
+                harness="gemini",
+                base=base,
+                pid=os.getpid(),
+                env=clean_env,
+            )
             prog_path = agent_progress.record_path(base, sub_sid)
-            self.assertIn(prog_path, locked_paths)
             saved_prog = json.loads(prog_path.read_text(encoding="utf-8"))
             self.assertEqual(saved_prog["schema"], agent_progress.SCHEMA)
             self.assertEqual(saved_prog["checkout"], str(checkout))
@@ -561,6 +568,24 @@ class AntigravityOrchestratorHookTests(unittest.TestCase):
         )
 
     def test_transcript_model_reads_planner_response_and_settings_change(self):
+        clean_env = {"PATH": os.environ.get("PATH", ""), "HOME": str(self.temp_root / "home")}
+
+        def hook_model(tag: str) -> str | None:
+            sid = f"{self.session}-{tag}"
+            run_mailbox_hook(
+                {
+                    "conversationId": sid,
+                    "workspacePaths": [self.cwd],
+                    "transcriptPath": str(self.transcript),
+                },
+                event="SessionStart",
+                harness="gemini",
+                base=self.base,
+                pid=os.getpid(),
+                env=clean_env,
+            )
+            return mailbox.load(mailbox.peer_path(self.base, sid)).get("model")
+
         self.write_transcript(
             [
                 {"type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "Plan this"},
@@ -576,10 +601,7 @@ class AntigravityOrchestratorHookTests(unittest.TestCase):
                 {"type": "PLANNER_RESPONSE", "model": "gemini-4-hydrogen-xhigh", "source": "MODEL", "tool_calls": []},
             ]
         )
-        self.assertEqual(
-            mailbox.transcript_model({"transcriptPath": str(self.transcript)}),
-            "gemini-pro-orchestrator",
-        )
+        self.assertEqual(hook_model("1"), "gemini-pro-orchestrator")
 
         # A new USER_INPUT before Turn 2 writes a PLANNER_RESPONSE should not leak the Turn 1 worker model.
         self.write_transcript(
@@ -595,10 +617,7 @@ class AntigravityOrchestratorHookTests(unittest.TestCase):
                 {"type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "Follow up"},
             ]
         )
-        self.assertEqual(
-            mailbox.transcript_model({}, str(self.transcript)),
-            "gemini-pro-orchestrator",
-        )
+        self.assertEqual(hook_model("2"), "gemini-pro-orchestrator")
 
         # Once Turn 2 writes a concrete non-orchestrator PLANNER_RESPONSE without exit_plan_mode, honor it.
         self.write_transcript(
@@ -614,10 +633,7 @@ class AntigravityOrchestratorHookTests(unittest.TestCase):
                 {"type": "PLANNER_RESPONSE", "model": "gemini-4-hydrogen-high", "source": "MODEL"},
             ]
         )
-        self.assertEqual(
-            mailbox.transcript_model({"transcriptPath": str(self.transcript)}),
-            "gemini-4-hydrogen-high",
-        )
+        self.assertEqual(hook_model("3"), "gemini-4-hydrogen-high")
 
         # An explicit USER_SETTINGS_CHANGE overrides prior exit_plan_mode.
         self.write_transcript(
@@ -631,10 +647,7 @@ class AntigravityOrchestratorHookTests(unittest.TestCase):
                 {"type": "USER_SETTINGS_CHANGE", "model": "gemini-4-carbon-high"},
             ]
         )
-        self.assertEqual(
-            mailbox.transcript_model({"transcriptPath": str(self.transcript)}),
-            "gemini-4-carbon-high",
-        )
+        self.assertEqual(hook_model("4"), "gemini-4-carbon-high")
 
     def test_sticky_orchestrator_identity_across_worker_steps_and_transcript_fallback(self):
         self.write_transcript(
@@ -643,111 +656,124 @@ class AntigravityOrchestratorHookTests(unittest.TestCase):
                 {"type": "PLANNER_RESPONSE", "model": "gemini-pro-orchestrator", "source": "MODEL"},
             ]
         )
-        env = {"HOME": str(self.temp_root / "home")}
+        env = {"PATH": os.environ.get("PATH", ""), "HOME": str(self.temp_root / "home")}
         base_payload = {"conversationId": self.session, "workspacePaths": [self.cwd]}
-        with (
-            patch.dict(os.environ, env, clear=True),
-            patch.object(mailbox, "harness_pid", return_value=os.getpid()),
-        ):
-            # Payload omits transcriptPath and uses modelName="auto"; fallback resolves transcript before model lookup.
-            mailbox.hook({**base_payload, "modelName": "auto"}, event="SessionStart", harness="gemini", base=self.base)
-            initial = mailbox.load(mailbox.peer_path(self.base, self.session))
-            self.assertEqual(initial["model"], "gemini-pro-orchestrator")
-            self.assertIn("gemini-pro-orchestrator", initial["name"])
-            stable_name = initial["name"]
+        # Payload omits transcriptPath and uses modelName="auto"; fallback resolves transcript before model lookup.
+        run_mailbox_hook(
+            {**base_payload, "modelName": "auto"},
+            event="SessionStart",
+            harness="gemini",
+            base=self.base,
+            pid=os.getpid(),
+            env=env,
+        )
+        initial = mailbox.load(mailbox.peer_path(self.base, self.session))
+        self.assertEqual(initial["model"], "gemini-pro-orchestrator")
+        self.assertIn("gemini-pro-orchestrator", initial["name"])
+        stable_name = initial["name"]
 
-            # Exit plan mode, enter execution phase with transient worker models.
-            self.write_transcript(
-                [
-                    {"type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "Plan task"},
-                    {
-                        "type": "PLANNER_RESPONSE",
-                        "model": "gemini-pro-orchestrator",
-                        "source": "MODEL",
-                        "tool_calls": [{"name": "exit_plan_mode"}],
-                    },
-                    {"type": "GENERIC", "source": "MODEL"},
-                    {"type": "SYSTEM_MESSAGE", "content": "Plan mode is off"},
-                ]
-            )
-            mailbox.hook(
-                {**base_payload, "model": "gemini-flash-worker-agy", "invocationNum": 2},
-                event="PreInvocation",
-                harness="gemini",
-                base=self.base,
-            )
-            mid_flash = mailbox.load(mailbox.peer_path(self.base, self.session))
-            self.assertEqual(mid_flash["model"], "gemini-pro-orchestrator")
-            self.assertEqual(mid_flash["name"], stable_name)
-            self.assertEqual(mid_flash["announcedName"], stable_name)
-            self.assertEqual(mid_flash.get("aliases", []), [])
-            self.assertEqual(mid_flash["executionModel"], "gemini-flash-worker-agy")
+        # Exit plan mode, enter execution phase with transient worker models.
+        self.write_transcript(
+            [
+                {"type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "Plan task"},
+                {
+                    "type": "PLANNER_RESPONSE",
+                    "model": "gemini-pro-orchestrator",
+                    "source": "MODEL",
+                    "tool_calls": [{"name": "exit_plan_mode"}],
+                },
+                {"type": "GENERIC", "source": "MODEL"},
+                {"type": "SYSTEM_MESSAGE", "content": "Plan mode is off"},
+            ]
+        )
+        run_mailbox_hook(
+            {**base_payload, "model": "gemini-flash-worker-agy", "invocationNum": 2},
+            event="PreInvocation",
+            harness="gemini",
+            base=self.base,
+            pid=os.getpid(),
+            env=env,
+        )
+        mid_flash = mailbox.load(mailbox.peer_path(self.base, self.session))
+        self.assertEqual(mid_flash["model"], "gemini-pro-orchestrator")
+        self.assertEqual(mid_flash["name"], stable_name)
+        self.assertEqual(mid_flash["announcedName"], stable_name)
+        self.assertEqual(mid_flash.get("aliases", []), [])
+        self.assertEqual(mid_flash["executionModel"], "gemini-flash-worker-agy")
 
-            mailbox.hook(
-                {**base_payload, "model": "gemini-4-hydrogen-xhigh", "invocationNum": 3},
-                event="PreInvocation",
-                harness="gemini",
-                base=self.base,
-            )
-            mid_hydrogen = mailbox.load(mailbox.peer_path(self.base, self.session))
-            self.assertEqual(mid_hydrogen["model"], "gemini-pro-orchestrator")
-            self.assertEqual(mid_hydrogen["name"], stable_name)
-            self.assertEqual(mid_hydrogen["executionModel"], "gemini-4-hydrogen-xhigh")
+        run_mailbox_hook(
+            {**base_payload, "model": "gemini-4-hydrogen-xhigh", "invocationNum": 3},
+            event="PreInvocation",
+            harness="gemini",
+            base=self.base,
+            pid=os.getpid(),
+            env=env,
+        )
+        mid_hydrogen = mailbox.load(mailbox.peer_path(self.base, self.session))
+        self.assertEqual(mid_hydrogen["model"], "gemini-pro-orchestrator")
+        self.assertEqual(mid_hydrogen["name"], stable_name)
+        self.assertEqual(mid_hydrogen["executionModel"], "gemini-4-hydrogen-xhigh")
 
-            # Long execution turns that push exit_plan_mode out of the tail window preserve orchestrator identity.
-            self.write_transcript(
-                [
-                    {"type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "Plan task"},
-                    {
-                        "type": "PLANNER_RESPONSE",
-                        "model": "gemini-pro-orchestrator",
-                        "source": "MODEL",
-                        "tool_calls": [{"name": "exit_plan_mode"}],
-                    },
-                    {"type": "GENERIC", "source": "MODEL", "content": "x" * (mailbox._TRANSCRIPT_TAIL_BYTES + 2048)},
-                    {"type": "PLANNER_RESPONSE", "model": "gemini-flash-worker-agy", "source": "MODEL"},
-                    {"type": "GENERIC", "source": "MODEL"},
-                ]
-            )
-            mailbox.hook(
-                {**base_payload, "model": "gemini-flash-worker-agy", "invocationNum": 4},
-                event="PreInvocation",
-                harness="gemini",
-                base=self.base,
-            )
-            long_turn = mailbox.load(mailbox.peer_path(self.base, self.session))
-            self.assertEqual(long_turn["model"], "gemini-pro-orchestrator")
-            self.assertEqual(long_turn["name"], stable_name)
-            self.assertEqual(long_turn["executionModel"], "gemini-flash-worker-agy")
+        # Long execution turns that push exit_plan_mode out of the tail window preserve orchestrator identity.
+        self.write_transcript(
+            [
+                {"type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "Plan task"},
+                {
+                    "type": "PLANNER_RESPONSE",
+                    "model": "gemini-pro-orchestrator",
+                    "source": "MODEL",
+                    "tool_calls": [{"name": "exit_plan_mode"}],
+                },
+                {"type": "GENERIC", "source": "MODEL", "content": "x" * (256 * 1024 + 2048)},
+                {"type": "PLANNER_RESPONSE", "model": "gemini-flash-worker-agy", "source": "MODEL"},
+                {"type": "GENERIC", "source": "MODEL"},
+            ]
+        )
+        run_mailbox_hook(
+            {**base_payload, "model": "gemini-flash-worker-agy", "invocationNum": 4},
+            event="PreInvocation",
+            harness="gemini",
+            base=self.base,
+            pid=os.getpid(),
+            env=env,
+        )
+        long_turn = mailbox.load(mailbox.peer_path(self.base, self.session))
+        self.assertEqual(long_turn["model"], "gemini-pro-orchestrator")
+        self.assertEqual(long_turn["name"], stable_name)
+        self.assertEqual(long_turn["executionModel"], "gemini-flash-worker-agy")
 
-            # Returning to planner on the next USER_INPUT clears executionModel.
-            self.write_transcript(
-                [
-                    {"type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "Next request"},
-                ]
-            )
-            mailbox.hook(
-                {**base_payload, "model": "gemini-pro-orchestrator", "invocationNum": 4},
-                event="PreInvocation",
-                harness="gemini",
-                base=self.base,
-            )
-            resumed = mailbox.load(mailbox.peer_path(self.base, self.session))
-            self.assertEqual(resumed["model"], "gemini-pro-orchestrator")
-            self.assertIsNone(resumed.get("executionModel"))
+        # Returning to planner on the next USER_INPUT clears executionModel.
+        self.write_transcript(
+            [
+                {"type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "Next request"},
+            ]
+        )
+        run_mailbox_hook(
+            {**base_payload, "model": "gemini-pro-orchestrator", "invocationNum": 4},
+            event="PreInvocation",
+            harness="gemini",
+            base=self.base,
+            pid=os.getpid(),
+            env=env,
+        )
+        resumed = mailbox.load(mailbox.peer_path(self.base, self.session))
+        self.assertEqual(resumed["model"], "gemini-pro-orchestrator")
+        self.assertIsNone(resumed.get("executionModel"))
 
-            # Minimal hook fallback when no transcript file exists on disk preserves orchestrator model.
-            self.transcript.unlink()
-            mailbox.hook(
-                {**base_payload, "model": "gemini-4-hydrogen-xhigh", "invocationNum": 5},
-                event="PreInvocation",
-                harness="gemini",
-                base=self.base,
-            )
-            no_transcript = mailbox.load(mailbox.peer_path(self.base, self.session))
-            self.assertEqual(no_transcript["model"], "gemini-pro-orchestrator")
-            self.assertEqual(no_transcript["name"], stable_name)
-            self.assertEqual(no_transcript["executionModel"], "gemini-4-hydrogen-xhigh")
+        # Minimal hook fallback when no transcript file exists on disk preserves orchestrator model.
+        self.transcript.unlink()
+        run_mailbox_hook(
+            {**base_payload, "model": "gemini-4-hydrogen-xhigh", "invocationNum": 5},
+            event="PreInvocation",
+            harness="gemini",
+            base=self.base,
+            pid=os.getpid(),
+            env=env,
+        )
+        no_transcript = mailbox.load(mailbox.peer_path(self.base, self.session))
+        self.assertEqual(no_transcript["model"], "gemini-pro-orchestrator")
+        self.assertEqual(no_transcript["name"], stable_name)
+        self.assertEqual(no_transcript["executionModel"], "gemini-4-hydrogen-xhigh")
 
     def test_stop_during_exit_plan_mode_leaves_unread_mail_for_execution_preinvocation(self):
         self.write_transcript(
@@ -761,100 +787,108 @@ class AntigravityOrchestratorHookTests(unittest.TestCase):
             "workspacePaths": [self.cwd],
             "transcriptPath": str(self.transcript),
         }
-        with (
-            patch.dict(os.environ, {}, clear=True),
-            patch.object(mailbox, "harness_pid", return_value=os.getpid()),
-            patch.object(mailbox_wake, "wake", return_value={"status": "queued", "phase": "not-sent"}),
-        ):
-            mailbox.hook(
-                {**base_payload, "model": "gemini-pro-orchestrator"},
-                event="SessionStart",
-                harness="gemini",
-                base=self.base,
-            )
-            mailbox.hook(
-                {**base_payload, "model": "gemini-pro-orchestrator", "invocationNum": 1},
-                event="PreInvocation",
-                harness="gemini",
-                base=self.base,
-            )
+        clean_env = {"PATH": os.environ.get("PATH", ""), "HOME": str(self.temp_root / "home")}
+        run_mailbox_hook(
+            {**base_payload, "model": "gemini-pro-orchestrator"},
+            event="SessionStart",
+            harness="gemini",
+            base=self.base,
+            pid=os.getpid(),
+            env=clean_env,
+        )
+        run_mailbox_hook(
+            {**base_payload, "model": "gemini-pro-orchestrator", "invocationNum": 1},
+            event="PreInvocation",
+            harness="gemini",
+            base=self.base,
+            pid=os.getpid(),
+            env=clean_env,
+        )
+        with patch.object(mailbox_wake, "wake", return_value={"status": "queued", "phase": "not-sent"}):
             mailbox.send(self.base, sender=self.colleague, to=self.session, text="urgent: wait for me")
-            self.write_transcript(
-                [
-                    {"type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "Plan task"},
-                    {
-                        "type": "PLANNER_RESPONSE",
-                        "model": "gemini-pro-orchestrator",
-                        "source": "MODEL",
-                        "tool_calls": [{"name": "exit_plan_mode"}],
-                    },
-                    {"type": "GENERIC", "source": "MODEL"},
-                    {"type": "EPHEMERAL_MESSAGE", "content": "notice"},
-                ]
-            )
-            stop_result = mailbox.hook(
-                {**base_payload, "terminationReason": "NO_TOOL_CALL"},
-                event="Stop",
-                harness="gemini",
-                base=self.base,
-            )
-            self.assertEqual(stop_result, {})
-            self.assertEqual(len(mailbox.incoming(self.base, self.session)), 1)
+        self.write_transcript(
+            [
+                {"type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "Plan task"},
+                {
+                    "type": "PLANNER_RESPONSE",
+                    "model": "gemini-pro-orchestrator",
+                    "source": "MODEL",
+                    "tool_calls": [{"name": "exit_plan_mode"}],
+                },
+                {"type": "GENERIC", "source": "MODEL"},
+                {"type": "EPHEMERAL_MESSAGE", "content": "notice"},
+            ]
+        )
+        stop_result = run_mailbox_hook(
+            {**base_payload, "terminationReason": "NO_TOOL_CALL"},
+            event="Stop",
+            harness="gemini",
+            base=self.base,
+            pid=os.getpid(),
+            env=clean_env,
+        )
+        self.assertEqual(stop_result, {})
+        self.assertEqual(len(mailbox.incoming(self.base, self.session)), 1)
 
-            self.write_transcript(
-                [
-                    {"type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "Plan task"},
-                    {
-                        "type": "PLANNER_RESPONSE",
-                        "model": "gemini-pro-orchestrator",
-                        "source": "MODEL",
-                        "tool_calls": [{"name": "exit_plan_mode"}],
-                    },
-                    {"type": "GENERIC", "source": "MODEL"},
-                    {"type": "SYSTEM_MESSAGE", "content": "Plan mode is off"},
-                ]
-            )
-            exec_step = mailbox.hook(
-                {**base_payload, "model": "gemini-flash-worker-agy", "invocationNum": 2},
-                event="PreInvocation",
-                harness="gemini",
-                base=self.base,
-            )
-            self.assertIn("urgent: wait for me", exec_step["injectSteps"][0]["ephemeralMessage"])
-            self.assertEqual(mailbox.incoming(self.base, self.session), [])
-            peer = mailbox.load(mailbox.peer_path(self.base, self.session))
-            self.assertEqual(peer["model"], "gemini-pro-orchestrator")
-            self.assertEqual(peer["executionModel"], "gemini-flash-worker-agy")
+        self.write_transcript(
+            [
+                {"type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "Plan task"},
+                {
+                    "type": "PLANNER_RESPONSE",
+                    "model": "gemini-pro-orchestrator",
+                    "source": "MODEL",
+                    "tool_calls": [{"name": "exit_plan_mode"}],
+                },
+                {"type": "GENERIC", "source": "MODEL"},
+                {"type": "SYSTEM_MESSAGE", "content": "Plan mode is off"},
+            ]
+        )
+        exec_step = run_mailbox_hook(
+            {**base_payload, "model": "gemini-flash-worker-agy", "invocationNum": 2},
+            event="PreInvocation",
+            harness="gemini",
+            base=self.base,
+            pid=os.getpid(),
+            env=clean_env,
+        )
+        self.assertIn("urgent: wait for me", exec_step["injectSteps"][0]["ephemeralMessage"])
+        self.assertEqual(mailbox.incoming(self.base, self.session), [])
+        peer = mailbox.load(mailbox.peer_path(self.base, self.session))
+        self.assertEqual(peer["model"], "gemini-pro-orchestrator")
+        self.assertEqual(peer["executionModel"], "gemini-flash-worker-agy")
 
-            # Execute -> Plan Review hand-back via enter_plan_mode also suppresses Stop continue.
+        # Execute -> Plan Review hand-back via enter_plan_mode also suppresses Stop continue.
+        with patch.object(mailbox_wake, "wake", return_value={"status": "queued", "phase": "not-sent"}):
             mailbox.send(self.base, sender=self.colleague, to=self.session, text="hold on enter plan mode")
-            self.write_transcript(
-                [
-                    {"type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "Plan task"},
-                    {
-                        "type": "PLANNER_RESPONSE",
-                        "model": "gemini-pro-orchestrator",
-                        "source": "MODEL",
-                        "tool_calls": [{"name": "exit_plan_mode"}],
-                    },
-                    {"type": "GENERIC", "source": "MODEL"},
-                    {
-                        "type": "PLANNER_RESPONSE",
-                        "model": "gemini-flash-worker-agy",
-                        "source": "MODEL",
-                        "tool_calls": [{"name": "enter_plan_mode"}],
-                    },
-                    {"type": "GENERIC", "source": "MODEL"},
-                ]
-            )
-            enter_plan_stop = mailbox.hook(
-                {**base_payload, "terminationReason": "NO_TOOL_CALL"},
-                event="Stop",
-                harness="gemini",
-                base=self.base,
-            )
-            self.assertEqual(enter_plan_stop, {})
-            self.assertEqual(len(mailbox.incoming(self.base, self.session)), 1)
+        self.write_transcript(
+            [
+                {"type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "Plan task"},
+                {
+                    "type": "PLANNER_RESPONSE",
+                    "model": "gemini-pro-orchestrator",
+                    "source": "MODEL",
+                    "tool_calls": [{"name": "exit_plan_mode"}],
+                },
+                {"type": "GENERIC", "source": "MODEL"},
+                {
+                    "type": "PLANNER_RESPONSE",
+                    "model": "gemini-flash-worker-agy",
+                    "source": "MODEL",
+                    "tool_calls": [{"name": "enter_plan_mode"}],
+                },
+                {"type": "GENERIC", "source": "MODEL"},
+            ]
+        )
+        enter_plan_stop = run_mailbox_hook(
+            {**base_payload, "terminationReason": "NO_TOOL_CALL"},
+            event="Stop",
+            harness="gemini",
+            base=self.base,
+            pid=os.getpid(),
+            env=clean_env,
+        )
+        self.assertEqual(enter_plan_stop, {})
+        self.assertEqual(len(mailbox.incoming(self.base, self.session)), 1)
 
     def test_explicit_user_input_model_switch_updates_peer_model(self):
         self.write_transcript(
@@ -873,48 +907,49 @@ class AntigravityOrchestratorHookTests(unittest.TestCase):
             "workspacePaths": [self.cwd],
             "transcriptPath": str(self.transcript),
         }
-        with (
-            patch.dict(os.environ, {}, clear=True),
-            patch.object(mailbox, "harness_pid", return_value=os.getpid()),
-        ):
-            mailbox.hook(
-                {**base_payload, "model": "gemini-pro-orchestrator"},
-                event="SessionStart",
-                harness="gemini",
-                base=self.base,
-            )
-            mailbox.hook(
-                {**base_payload, "model": "gemini-flash-worker-agy", "invocationNum": 1},
-                event="PreInvocation",
-                harness="gemini",
-                base=self.base,
-            )
-            self.assertEqual(
-                mailbox.load(mailbox.peer_path(self.base, self.session))["model"], "gemini-pro-orchestrator"
-            )
+        clean_env = {"PATH": os.environ.get("PATH", ""), "HOME": str(self.temp_root / "home")}
+        run_mailbox_hook(
+            {**base_payload, "model": "gemini-pro-orchestrator"},
+            event="SessionStart",
+            harness="gemini",
+            base=self.base,
+            pid=os.getpid(),
+            env=clean_env,
+        )
+        run_mailbox_hook(
+            {**base_payload, "model": "gemini-flash-worker-agy", "invocationNum": 1},
+            event="PreInvocation",
+            harness="gemini",
+            base=self.base,
+            pid=os.getpid(),
+            env=clean_env,
+        )
+        self.assertEqual(mailbox.load(mailbox.peer_path(self.base, self.session))["model"], "gemini-pro-orchestrator")
 
-            # New USER_INPUT without exit_plan_mode + explicit model change updates the peer model cleanly.
-            self.write_transcript(
-                [
-                    {"type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "Plan task"},
-                    {
-                        "type": "PLANNER_RESPONSE",
-                        "model": "gemini-pro-orchestrator",
-                        "source": "MODEL",
-                        "tool_calls": [{"name": "exit_plan_mode"}],
-                    },
-                    {"type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "/model gemini-4-hydrogen-high"},
-                ]
-            )
-            mailbox.hook(
-                {**base_payload, "model": "gemini-4-hydrogen-high", "invocationNum": 2},
-                event="PreInvocation",
-                harness="gemini",
-                base=self.base,
-            )
-            switched = mailbox.load(mailbox.peer_path(self.base, self.session))
-            self.assertEqual(switched["model"], "gemini-4-hydrogen-high")
-            self.assertIsNone(switched.get("executionModel"))
+        # New USER_INPUT without exit_plan_mode + explicit model change updates the peer model cleanly.
+        self.write_transcript(
+            [
+                {"type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "Plan task"},
+                {
+                    "type": "PLANNER_RESPONSE",
+                    "model": "gemini-pro-orchestrator",
+                    "source": "MODEL",
+                    "tool_calls": [{"name": "exit_plan_mode"}],
+                },
+                {"type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "/model gemini-4-hydrogen-high"},
+            ]
+        )
+        run_mailbox_hook(
+            {**base_payload, "model": "gemini-4-hydrogen-high", "invocationNum": 2},
+            event="PreInvocation",
+            harness="gemini",
+            base=self.base,
+            pid=os.getpid(),
+            env=clean_env,
+        )
+        switched = mailbox.load(mailbox.peer_path(self.base, self.session))
+        self.assertEqual(switched["model"], "gemini-4-hydrogen-high")
+        self.assertIsNone(switched.get("executionModel"))
 
     def test_session_model_and_step_model_separation_across_harnesses(self):
         harness_cases = [
@@ -927,6 +962,7 @@ class AntigravityOrchestratorHookTests(unittest.TestCase):
                 "openrouter/qwen/qwen3-coder",
             ),
         ]
+        clean_env = {"PATH": os.environ.get("PATH", ""), "HOME": str(self.temp_root / "home")}
         for harness, initial_model, transient_model, switched_model in harness_cases:
             with self.subTest(harness=harness):
                 session_id = f"session-{harness}-1"
@@ -935,48 +971,50 @@ class AntigravityOrchestratorHookTests(unittest.TestCase):
                     session_key_field: session_id,
                     "cwd": self.cwd,
                 }
-                with (
-                    patch.dict(os.environ, {}, clear=True),
-                    patch.object(mailbox, "harness_pid", return_value=os.getpid()),
-                ):
-                    mailbox.hook(
-                        {**base_payload, "model": initial_model},
-                        event="SessionStart",
-                        harness=harness,
-                        base=self.base,
-                    )
-                    started = mailbox.load(mailbox.peer_path(self.base, session_id))
-                    initial_name = started["name"]
-                    self.assertEqual(started["model"], initial_model)
-                    self.assertEqual(started["sessionModel"], initial_model)
-                    self.assertEqual(started["stepModel"], initial_model)
+                run_mailbox_hook(
+                    {**base_payload, "model": initial_model},
+                    event="SessionStart",
+                    harness=harness,
+                    base=self.base,
+                    pid=os.getpid(),
+                    env=clean_env,
+                )
+                started = mailbox.load(mailbox.peer_path(self.base, session_id))
+                initial_name = started["name"]
+                self.assertEqual(started["model"], initial_model)
+                self.assertEqual(started["sessionModel"], initial_model)
+                self.assertEqual(started["stepModel"], initial_model)
 
-                    # Mid-turn step model must not rename the peer or overwrite sticky sessionModel.
-                    mailbox.hook(
-                        {**base_payload, "model": transient_model},
-                        event="PreInvocation",
-                        harness=harness,
-                        base=self.base,
-                    )
-                    mid = mailbox.load(mailbox.peer_path(self.base, session_id))
-                    self.assertEqual(mid["name"], initial_name)
-                    self.assertEqual(mid["model"], initial_model)
-                    self.assertEqual(mid["sessionModel"], initial_model)
-                    self.assertEqual(mid["stepModel"], transient_model)
-                    self.assertEqual(mid["executionModel"], transient_model)
+                # Mid-turn step model must not rename the peer or overwrite sticky sessionModel.
+                run_mailbox_hook(
+                    {**base_payload, "model": transient_model},
+                    event="PreInvocation",
+                    harness=harness,
+                    base=self.base,
+                    pid=os.getpid(),
+                    env=clean_env,
+                )
+                mid = mailbox.load(mailbox.peer_path(self.base, session_id))
+                self.assertEqual(mid["name"], initial_name)
+                self.assertEqual(mid["model"], initial_model)
+                self.assertEqual(mid["sessionModel"], initial_model)
+                self.assertEqual(mid["stepModel"], transient_model)
+                self.assertEqual(mid["executionModel"], transient_model)
 
-                    # Explicit new user prompt on switched_model updates sticky sessionModel cleanly.
-                    mailbox.hook(
-                        {**base_payload, "model": switched_model},
-                        event="UserPromptSubmit",
-                        harness=harness,
-                        base=self.base,
-                    )
-                    switched = mailbox.load(mailbox.peer_path(self.base, session_id))
-                    self.assertEqual(switched["model"], switched_model)
-                    self.assertEqual(switched["sessionModel"], switched_model)
-                    self.assertEqual(switched["stepModel"], switched_model)
-                    self.assertIsNone(switched.get("executionModel"))
+                # Explicit new user prompt on switched_model updates sticky sessionModel cleanly.
+                run_mailbox_hook(
+                    {**base_payload, "model": switched_model},
+                    event="UserPromptSubmit",
+                    harness=harness,
+                    base=self.base,
+                    pid=os.getpid(),
+                    env=clean_env,
+                )
+                switched = mailbox.load(mailbox.peer_path(self.base, session_id))
+                self.assertEqual(switched["model"], switched_model)
+                self.assertEqual(switched["sessionModel"], switched_model)
+                self.assertEqual(switched["stepModel"], switched_model)
+                self.assertIsNone(switched.get("executionModel"))
 
     def test_focus_clear_only_if_preserves_presence_and_non_matching_focus(self) -> None:
         mailbox.register(self.base, session="sess-a", harness="claude", cwd=self.cwd, pid=os.getpid())

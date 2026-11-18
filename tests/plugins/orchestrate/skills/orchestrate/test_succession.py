@@ -14,13 +14,17 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import test_run_agent as fixtures
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+
+import _ork_fast_test_helpers as ORK_FAST  # noqa: E402
+import test_run_agent as fixtures  # noqa: E402
 
 RUNNER = fixtures.RUNNER
 SUCCESSION = RUNNER.bundled_module("succession")
 AUTHORITY = SUCCESSION.module("authority")
 MAILBOX = SUCCESSION.module("peer_mailbox")
-SCRIPTS = Path(MAILBOX.__file__).parent
 
 LEAD, DEPUTY = "claude-lead-session", "codex-deputy-session"
 
@@ -336,14 +340,18 @@ class SuccessionTests(unittest.TestCase):
 
     def hook(self, session, harness, cwd=None):
         payload = {"hook_event_name": "UserPromptSubmit", "session_id": session, "cwd": str(cwd or self.repo)}
-        with (
-            mock.patch.object(MAILBOX, "harness_pid", return_value=os.getpid()),
-            mock.patch.object(sys, "path", [str(SCRIPTS), *sys.path]),
-            mock.patch.object(
-                MAILBOX, "account_home", return_value=str(self.claude_home) if harness == "claude" else "/x"
-            ),
-        ):
-            output = MAILBOX.hook(payload, harness=harness, base=MAILBOX.root())
+        output = ORK_FAST.run_mailbox_hook(
+            payload,
+            harness=harness,
+            base=MAILBOX.root(),
+            pid=os.getpid(),
+            env={
+                **os.environ,
+                "CLAUDE_CONFIG_DIR": str(self.claude_home),
+                "CODEX_HOME": "/x",
+                "PYTEST_CURRENT_TEST": "1",
+            },
+        )
         MAILBOX.annotate(MAILBOX.root(), session, successionCheckedAt=None)
         return (output or {}).get("hookSpecificOutput", {}).get("additionalContext", "")
 

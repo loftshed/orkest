@@ -6,6 +6,7 @@ import contextlib
 import io
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -14,7 +15,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import test_mailbox
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+
+import _ork_fast_test_helpers as ORK_FAST  # noqa: E402
+import test_mailbox  # noqa: E402
 
 SCRIPTS = test_mailbox.SCRIPTS
 sys.path.insert(0, str(SCRIPTS))
@@ -29,11 +35,15 @@ class TestMailboxDaemonInstall(unittest.TestCase):
         self.home = Path(self.temp.name) / "home"
         self.home.mkdir()
         self.base = Path(self.temp.name) / "cache/mailbox-v1"
+        self.fast_bin = ORK_FAST.find_ork_fast_bin()
         self.addCleanup(self.temp.cleanup)
         self.environment = mock.patch.dict(
             os.environ,
             {
                 "AGENT_EXECUTOR_HOME": str(self.base.parent),
+                "ORCHESTRATE_HOME": str(self.base.parent),
+                "MONITOR_CACHE_DIR": str(Path(self.temp.name) / "monitor-cache"),
+                "ORK_FAST_BIN": str(self.fast_bin),
                 "XDG_CONFIG_HOME": str(self.home / ".config"),
                 "CODEX_HOME": str(self.home / ".codex"),
             },
@@ -144,6 +154,20 @@ class TestMailboxDaemonInstall(unittest.TestCase):
         self.assertTrue(all(row["configured"] for row in rows.values()), rows)
         hooks = json.loads((self.home / ".gemini/config/hooks.json").read_text())["peer-mailbox"]
         self.assertEqual(set(hooks), set(installer.AGY_EVENTS))
+        self.assertEqual(
+            hooks["Stop"][0]["command"],
+            shlex.join([str(self.fast_bin), "mailbox-hook", "--harness", "gemini", "--event", "Stop"]),
+        )
+        claude_hooks = json.loads((self.home / ".claude/settings.json").read_text())["hooks"]["Stop"][0]["hooks"]
+        self.assertEqual(
+            claude_hooks[0]["command"],
+            shlex.join([str(self.fast_bin), "mailbox-hook", "--harness", "claude"]),
+        )
+        codex_hooks = json.loads((self.home / ".codex/hooks.json").read_text())["hooks"]["Stop"][0]["hooks"]
+        self.assertEqual(
+            codex_hooks[0]["command"],
+            shlex.join([str(self.fast_bin), "mailbox-hook", "--harness", "codex"]),
+        )
         (self.home / ".gemini/config/hooks.json").write_text("{}")
         stale = installer.configuration_status(self.home, {"agy"}, base=self.base)["agy"]
         self.assertIn("Stop mailbox hook missing or stale", stale["issues"])
@@ -229,15 +253,25 @@ class TestMailboxDaemonInstall(unittest.TestCase):
         result, stop = run("stop")
         self.assertEqual((result.returncode, stop["status"]), (0, "stopped"))
 
+    def _hook_env(self):
+        return {**os.environ, "HOME": str(self.home)}
+
     def test_http_hook_identity_hint_is_short_and_not_repeated(self):
         self.install()
         project = Path(self.temp.name) / "project"
         subprocess.run(["git", "init", "-q", str(project)], check=True)
         payload = {"hook_event_name": "SessionStart", "session_id": "native-hook", "cwd": str(project)}
-        with mock.patch.object(mailbox, "harness_pid", return_value=os.getpid()):
-            first = mailbox.hook(payload, harness="codex", base=self.base)
-            current = daemon.owned_state(self.base)
-            later = mailbox.hook({**payload, "hook_event_name": "UserPromptSubmit"}, harness="codex", base=self.base)
+        first = ORK_FAST.run_mailbox_hook(
+            payload, harness="codex", base=self.base, pid=os.getpid(), env=self._hook_env()
+        )
+        current = daemon.owned_state(self.base)
+        later = ORK_FAST.run_mailbox_hook(
+            {**payload, "hook_event_name": "UserPromptSubmit"},
+            harness="codex",
+            base=self.base,
+            pid=os.getpid(),
+            env=self._hook_env(),
+        )
         self.assertIn("HTTP peer mailbox session: native-hook", first["hookSpecificOutput"]["additionalContext"])
         self.assertIsNone(later)
         self.assertEqual(daemon.owned_state(self.base)["pid"], current["pid"])
@@ -245,21 +279,29 @@ class TestMailboxDaemonInstall(unittest.TestCase):
 
     def test_hook_failure_does_not_hide_durable_mail_and_stop_skips_bootstrap(self):
         daemon.set_mode(self.base, "http")
+        # Write malformed state.json so ensure_running inside ork-fast fails with MailboxError immediately.
+        invalid_state = daemon.daemon_base(self.base) / "state.json"
+        invalid_state.write_text("{}\n", encoding="utf-8")
+        invalid_state.chmod(0o600)
         project = Path(self.temp.name) / "project"
         subprocess.run(["git", "init", "-q", str(project)], check=True)
         payload = {"hook_event_name": "UserPromptSubmit", "session_id": "hook-reader", "cwd": str(project)}
         sender = mailbox.register(self.base, session="hook-sender", harness="claude", cwd=str(project), pid=os.getpid())
         mailbox.register(self.base, session="hook-reader", harness="codex", cwd=str(project), pid=os.getpid())
         mailbox.send(self.base, sender=sender, to="hook-reader", text="durable fallback")
-        with (
-            mock.patch.object(mailbox, "harness_pid", return_value=os.getpid()),
-            mock.patch.object(
-                daemon, "ensure_running", side_effect=mailbox.MailboxError("synthetic endpoint conflict")
-            ),
-        ):
-            first = mailbox.hook(payload, harness="codex", base=self.base)
-            second = mailbox.hook(payload, harness="codex", base=self.base)
-            stop = mailbox.hook({**payload, "hook_event_name": "Stop"}, harness="codex", base=self.base)
+        first = ORK_FAST.run_mailbox_hook(
+            payload, harness="codex", base=self.base, pid=os.getpid(), env=self._hook_env()
+        )
+        second = ORK_FAST.run_mailbox_hook(
+            payload, harness="codex", base=self.base, pid=os.getpid(), env=self._hook_env()
+        )
+        stop = ORK_FAST.run_mailbox_hook(
+            {**payload, "hook_event_name": "Stop"},
+            harness="codex",
+            base=self.base,
+            pid=os.getpid(),
+            env=self._hook_env(),
+        )
         self.assertIn("durable fallback", first["hookSpecificOutput"]["additionalContext"])
         self.assertIn("HTTP mailbox is unavailable", first["hookSpecificOutput"]["additionalContext"])
         self.assertIsNone(second)
@@ -271,9 +313,10 @@ class TestMailboxDaemonInstall(unittest.TestCase):
         project = Path(self.temp.name) / "project"
         subprocess.run(["git", "init", "-q", str(project)], check=True)
         payload = {"hook_event_name": "SessionStart", "session_id": "resume-reader", "cwd": str(project)}
-        with mock.patch.object(mailbox, "harness_pid", return_value=os.getpid()):
-            mailbox.hook(payload, harness="codex", base=self.base)
-            resumed = mailbox.hook(payload, harness="codex", base=self.base)
+        ORK_FAST.run_mailbox_hook(payload, harness="codex", base=self.base, pid=os.getpid(), env=self._hook_env())
+        resumed = ORK_FAST.run_mailbox_hook(
+            payload, harness="codex", base=self.base, pid=os.getpid(), env=self._hook_env()
+        )
         self.assertIn("HTTP peer mailbox session: resume-reader", resumed["hookSpecificOutput"]["additionalContext"])
         if sys.platform == "darwin":
             import plistlib

@@ -188,7 +188,6 @@ def build_parser() -> argparse.ArgumentParser:
         "history",
         "focus",
         "prune",
-        "hook",
         "feedback",
         "feedback-summary",
         "name",
@@ -280,8 +279,6 @@ def build_parser() -> argparse.ArgumentParser:
             sub.add_argument("--remaining-steps", nargs="+", dest="remaining_steps", help="handoff remaining steps")
             sub.add_argument("--blockers", nargs="+", dest="handoff_blockers", help="handoff blockers")
             sub.add_argument("--verify-cmd", dest="verification_command_run", help="handoff verification command run")
-        if name == "hook":
-            sub.add_argument("--event", help="lifecycle event, for hosts whose payload does not name it")
         if name == "send":
             sub.add_argument("--no-wake", action="store_true", help="queue mail without waking an idle receiver")
             sub.add_argument(
@@ -368,19 +365,6 @@ def main(argv: list[str] | None = None) -> int:
     base = _MB.root()
 
     try:
-        if args.action == "hook":
-            raw = sys.stdin.read()
-            try:
-                output = _MB.hook(
-                    json.loads(raw) if raw.strip() else {}, harness=args.harness, event=args.event, base=base
-                )
-            except Exception as error:  # noqa: BLE001 -- a mailbox fault must never break the host's turn
-                _MB.record_failure(base, {"harness": args.harness or "unknown"}, "hook", "project", error)
-                print(f"mailbox hook: {error}", file=sys.stderr)
-                return 0
-            if output:
-                print(json.dumps(output, ensure_ascii=True))
-            return 0
         if args.action == "name":
             # A fresh name for a session about to start, e.g. claude --name "$(... mailbox name --model opus-5.5)".
             here = _MB.workspace(os.getcwd())

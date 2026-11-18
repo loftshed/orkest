@@ -12,12 +12,16 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+TESTS = Path(__file__).resolve().parent
 SCRIPTS = Path(__file__).resolve().parents[5] / "plugins/orchestrate/skills/orchestrate/scripts"
-sys.path.insert(0, str(SCRIPTS))
+for _path in (TESTS, SCRIPTS):
+    if str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
 import mailbox_channels as channels  # noqa: E402
 import mailbox_presence as presence  # noqa: E402
 import mailbox_tasks as tasks  # noqa: E402
 import peer_mailbox as mailbox  # noqa: E402
+from _ork_fast_test_helpers import run_mailbox_hook  # noqa: E402
 
 
 class PresenceTests(unittest.TestCase):
@@ -195,21 +199,33 @@ class PresenceTests(unittest.TestCase):
     def test_notices_wait_until_next_turn_and_normal_session_end_still_reports_unread_mail(self):
         self.stop_child()
         presence.reconcile(self.base)
-        with patch.object(mailbox, "harness_pid", return_value=os.getpid()):
-            stopped = mailbox.hook(
-                {"session_id": "reader", "cwd": self.cwd}, harness="codex", event="Stop", base=self.base
-            )
+        stopped = run_mailbox_hook(
+            {"session_id": "reader", "cwd": self.cwd},
+            harness="codex",
+            event="Stop",
+            base=self.base,
+            pid=os.getpid(),
+        )
         self.assertIsNone(stopped)
         self.assertIn("Repair export", self.notice()["text"])
-        with patch.object(mailbox, "harness_pid", return_value=os.getpid()):
-            started = mailbox.hook(
-                {"session_id": "reader", "cwd": self.cwd}, harness="codex", event="UserPromptSubmit", base=self.base
-            )
+        started = run_mailbox_hook(
+            {"session_id": "reader", "cwd": self.cwd},
+            harness="codex",
+            event="UserPromptSubmit",
+            base=self.base,
+            pid=os.getpid(),
+        )
         self.assertIn("Repair export", str(started))
         self.assertEqual(mailbox.incoming(self.base, "reader"), [])
         self.owner = self.peer("author")
         mailbox.send(self.base, sender=self.reader, to="author", text="One more question")
-        mailbox.end_session(self.base, "author", reason="prompt_input_exit", pid=os.getpid())
+        run_mailbox_hook(
+            {"session_id": "author", "cwd": self.cwd, "reason": "prompt_input_exit"},
+            harness="codex",
+            event="SessionEnd",
+            base=self.base,
+            pid=os.getpid(),
+        )
         presence.reconcile(self.base)
         self.assertIn("ended (prompt_input_exit) without reading your message", self.notice()["text"])
 

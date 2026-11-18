@@ -14,7 +14,7 @@ import subprocess
 import sys
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -303,8 +303,73 @@ def ensure_hook_outside_workspaces(hook: Path | None, workspace_roots: list[Path
             raise _runner_error("--completion-hook must be outside every executor workspace", 4)
 
 
+def _hud_status_and_sound(status: str) -> tuple[str, str]:
+    if status == "completed":
+        return "done", "done"
+    if status in {"failed", "timed_out", "error"}:
+        return "failed", "request"
+    if status == "blocked":
+        return "blocked", "request"
+    return "info", "none"
+
+
+def _hud_target(env: Mapping[str, str]) -> dict[str, str] | None:
+    if env.get("HERDR_ENV") == "1":
+        pane_id = (env.get("HERDR_PANE_ID") or "").strip()
+        if pane_id:
+            target: dict[str, str] = {"kind": "herdr", "id": pane_id}
+            herdr_bin = (env.get("HERDR_BIN_PATH") or "").strip()
+            if herdr_bin:
+                target["bin"] = herdr_bin
+            return target
+    orca_id = (env.get("ORCA_TERMINAL_HANDLE") or "").strip()
+    if orca_id:
+        target = {"kind": "orca", "id": orca_id}
+        orca_bin = (env.get("ORCA_CLI_COMMAND") or "").strip()
+        if orca_bin:
+            target["bin"] = orca_bin
+        return target
+    return None
+
+
+def _resolve_macos_hud_binary(
+    *,
+    env: Mapping[str, str],
+    os_mod: Any,
+    shutil_mod: Any,
+    subprocess_mod: Any,
+) -> Path | None:
+    explicit = (env.get("ORKEST_HUD_BIN") or "").strip()
+    if explicit:
+        candidate = Path(explicit).expanduser()
+        return candidate if candidate.is_file() and os_mod.access(candidate, os.X_OK) else None
+
+    app_path = _default_agent_cache_dir() / "macos" / "OrkestHUD.app"
+    hud_bin = app_path / "Contents" / "MacOS" / "OrkestHUD"
+    if hud_bin.is_file() and os_mod.access(hud_bin, os.X_OK):
+        return hud_bin
+
+    build_script = Path(__file__).resolve().parents[3] / "macos" / "build.sh"
+    if not build_script.is_file() or not shutil_mod.which("xcrun"):
+        return None
+
+    try:
+        subprocess_mod.run(
+            ["/bin/sh", str(build_script), str(app_path)],
+            check=False,
+            stdin=subprocess_mod.DEVNULL,
+            capture_output=True,
+            timeout=20,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+    return hud_bin if hud_bin.is_file() and os_mod.access(hud_bin, os.X_OK) else None
+
+
 def send_desktop_notification(event: dict[str, Any]) -> dict[str, Any]:
     runner = _runner()
+    os_mod = getattr(runner, "os", os)
     sys_mod = getattr(runner, "sys", sys)
     shutil_mod = getattr(runner, "shutil", shutil)
     subprocess_mod = getattr(runner, "subprocess", subprocess)
@@ -317,17 +382,31 @@ def send_desktop_notification(event: dict[str, Any]) -> dict[str, Any]:
     details = " · ".join(item for item in (engine, model, repository) if item)
 
     if sys_mod.platform == "darwin":
-        executable = shutil_mod.which("osascript")
-        if not executable:
+        env = os_mod.environ
+        hud_bin = _resolve_macos_hud_binary(
+            env=env,
+            os_mod=os_mod,
+            shutil_mod=shutil_mod,
+            subprocess_mod=subprocess_mod,
+        )
+        if not hud_bin:
             return {"kind": "desktop", "status": "unsupported"}
-        command = [
-            executable,
-            "-e",
-            ("on run argv\ndisplay notification (item 2 of argv) with title (item 1 of argv)\nend run"),
-            title,
-            details,
-        ]
-        provider = "macos"
+        hud_status, sound = _hud_status_and_sound(status)
+        payload: dict[str, Any] = {
+            "title": title,
+            "body": details,
+            "status": hud_status,
+            "sound": sound,
+        }
+        if event.get("repository"):
+            payload["repo"] = repository
+        if engine:
+            payload["agent"] = engine
+        target = _hud_target(env)
+        if target is not None:
+            payload["target"] = target
+        command = [str(hud_bin), "--json", json.dumps(payload)]
+        provider = "macos-hud"
     elif sys_mod.platform.startswith("linux"):
         executable = shutil_mod.which("notify-send")
         if not executable:

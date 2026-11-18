@@ -874,32 +874,177 @@ class ReportingAndArtifactTests(unittest.TestCase):
             self.assertEqual(event["status"], "runner_failed")
             self.assertEqual(event["error"], "worker exploded")
 
-    def test_macos_desktop_notification_uses_argument_safe_osascript(self) -> None:
-        completed = subprocess.CompletedProcess([], 0, b"", b"")
-        with (
-            mock.patch.object(RUNNER.sys, "platform", "darwin"),
-            mock.patch.object(
-                RUNNER.shutil,
-                "which",
-                return_value="/usr/bin/osascript",
-            ),
-            mock.patch.object(
-                RUNNER.subprocess,
-                "run",
-                return_value=completed,
-            ) as run,
-        ):
-            delivery = RUNNER.send_desktop_notification(
+    def test_macos_desktop_notification_uses_orkest_hud_and_never_osascript(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent-hud-test-") as directory:
+            root = Path(directory)
+            hud_bin = root / "OrkestHUD"
+            hud_bin.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            hud_bin.chmod(0o755)
+            completed = subprocess.CompletedProcess([], 0, b"", b"")
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "ORKEST_HUD_BIN": str(hud_bin),
+                        "HERDR_ENV": "1",
+                        "HERDR_PANE_ID": "w1:p3",
+                        "HERDR_BIN_PATH": "/opt/bin/herdr",
+                    },
+                    clear=False,
+                ),
+                mock.patch.object(RUNNER.sys, "platform", "darwin"),
+                mock.patch.object(RUNNER.shutil, "which", return_value="/usr/bin/osascript") as which_mock,
+                mock.patch.object(RUNNER.subprocess, "run", return_value=completed) as run,
+            ):
+                delivery = RUNNER.send_desktop_notification(
+                    {
+                        "status": "completed",
+                        "engine": "agy",
+                        "model": "gemini-test",
+                        "repository": "/tmp/example",
+                    }
+                )
+            self.assertEqual(delivery, {"kind": "desktop", "status": "sent", "provider": "macos-hud"})
+            command = run.call_args.args[0]
+            self.assertEqual(command[0], str(hud_bin))
+            self.assertEqual(command[1], "--json")
+            payload = json.loads(command[2])
+            self.assertEqual(
+                payload,
                 {
-                    "status": "completed",
-                    "engine": "agy",
-                    "model": "gemini-test",
-                    "repository": "/tmp/example",
-                }
+                    "title": "Agent executor: completed",
+                    "body": "agy · gemini-test · example",
+                    "status": "done",
+                    "sound": "done",
+                    "repo": "example",
+                    "agent": "agy",
+                    "target": {"kind": "herdr", "id": "w1:p3", "bin": "/opt/bin/herdr"},
+                },
             )
-        self.assertEqual(delivery["status"], "sent")
-        command = run.call_args.args[0]
-        self.assertEqual(command[-2:], ["Agent executor: completed", "agy · gemini-test · example"])
+            for call in which_mock.call_args_list:
+                self.assertNotEqual(call.args[0], "osascript")
+
+    def test_macos_desktop_notification_resolves_cache_hud_handles_statuses_and_failures(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent-hud-cache-test-") as directory:
+            root = Path(directory)
+            cache_root = root / "cache"
+            hud_bin = cache_root / "orchestrate" / "macos" / "OrkestHUD.app" / "Contents" / "MacOS" / "OrkestHUD"
+            hud_bin.parent.mkdir(parents=True, exist_ok=True)
+            hud_bin.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            hud_bin.chmod(0o755)
+
+            env_patch = {
+                "XDG_CACHE_HOME": str(cache_root),
+                "ORCA_TERMINAL_HANDLE": "term_42",
+                "ORCA_CLI_COMMAND": "/opt/orca/orca-ide",
+            }
+            for clear_key in (
+                "ORKEST_HUD_BIN",
+                "ORCHESTRATE_HOME",
+                "AGENT_EXECUTOR_HOME",
+                "HERDR_ENV",
+                "HERDR_PANE_ID",
+            ):
+                env_patch[clear_key] = ""
+
+            completed = subprocess.CompletedProcess([], 0, b"", b"")
+            with (
+                mock.patch.dict(os.environ, env_patch, clear=False),
+                mock.patch.object(RUNNER.sys, "platform", "darwin"),
+                mock.patch.object(RUNNER.subprocess, "run", return_value=completed) as run,
+            ):
+                for raw_status, expected_status, expected_sound in (
+                    ("failed", "failed", "request"),
+                    ("timed_out", "failed", "request"),
+                    ("error", "failed", "request"),
+                    ("blocked", "blocked", "request"),
+                    ("cancelled", "info", "none"),
+                ):
+                    delivery = RUNNER.send_desktop_notification(
+                        {
+                            "status": raw_status,
+                            "engine": "codex",
+                            "repository": "/tmp/orkest",
+                        }
+                    )
+                    self.assertEqual(delivery["status"], "sent")
+                    self.assertEqual(delivery["provider"], "macos-hud")
+                    payload = json.loads(run.call_args.args[0][2])
+                    self.assertEqual(payload["status"], expected_status)
+                    self.assertEqual(payload["sound"], expected_sound)
+                    self.assertEqual(
+                        payload["target"],
+                        {"kind": "orca", "id": "term_42", "bin": "/opt/orca/orca-ide"},
+                    )
+
+            failed_proc = subprocess.CompletedProcess([], 2, b"", b"hud boom")
+            with (
+                mock.patch.dict(os.environ, env_patch, clear=False),
+                mock.patch.object(RUNNER.sys, "platform", "darwin"),
+                mock.patch.object(RUNNER.subprocess, "run", return_value=failed_proc),
+            ):
+                failed = RUNNER.send_desktop_notification({"status": "completed", "engine": "codex"})
+            self.assertEqual(
+                failed,
+                {
+                    "kind": "desktop",
+                    "status": "failed",
+                    "provider": "macos-hud",
+                    "exit_code": 2,
+                    "error": "hud boom",
+                },
+            )
+
+            with (
+                mock.patch.dict(os.environ, env_patch, clear=False),
+                mock.patch.object(RUNNER.sys, "platform", "darwin"),
+                mock.patch.object(RUNNER.subprocess, "run", side_effect=OSError("spawn failed")),
+            ):
+                errored = RUNNER.send_desktop_notification({"status": "completed", "engine": "codex"})
+            self.assertEqual(errored["status"], "failed")
+            self.assertEqual(errored["provider"], "macos-hud")
+            self.assertIn("spawn failed", errored["error"])
+
+    def test_macos_desktop_notification_lazy_builds_only_when_xcrun_present(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent-hud-build-test-") as directory:
+            root = Path(directory)
+            cache_root = root / "cache"
+            env_patch = {"XDG_CACHE_HOME": str(cache_root)}
+            for clear_key in ("ORKEST_HUD_BIN", "ORCHESTRATE_HOME", "AGENT_EXECUTOR_HOME"):
+                env_patch[clear_key] = ""
+
+            with (
+                mock.patch.dict(os.environ, env_patch, clear=False),
+                mock.patch.object(RUNNER.sys, "platform", "darwin"),
+                mock.patch.object(RUNNER.shutil, "which", return_value=None) as which_mock,
+                mock.patch.object(RUNNER.subprocess, "run") as run,
+            ):
+                delivery = RUNNER.send_desktop_notification({"status": "completed", "engine": "codex"})
+            self.assertEqual(delivery, {"kind": "desktop", "status": "unsupported"})
+            which_mock.assert_called_once_with("xcrun")
+            run.assert_not_called()
+
+            hud_bin = cache_root / "orchestrate" / "macos" / "OrkestHUD.app" / "Contents" / "MacOS" / "OrkestHUD"
+
+            def fake_run(cmd, **_kwargs):
+                if cmd[0] == "/bin/sh":
+                    hud_bin.parent.mkdir(parents=True, exist_ok=True)
+                    hud_bin.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                    hud_bin.chmod(0o755)
+                return subprocess.CompletedProcess(cmd, 0, b"", b"")
+
+            with (
+                mock.patch.dict(os.environ, env_patch, clear=False),
+                mock.patch.object(RUNNER.sys, "platform", "darwin"),
+                mock.patch.object(RUNNER.shutil, "which", return_value="/usr/bin/xcrun"),
+                mock.patch.object(RUNNER.subprocess, "run", side_effect=fake_run) as run,
+            ):
+                delivery = RUNNER.send_desktop_notification({"status": "completed", "engine": "codex"})
+            self.assertEqual(delivery, {"kind": "desktop", "status": "sent", "provider": "macos-hud"})
+            self.assertEqual(run.call_count, 2)
+            self.assertEqual(run.call_args_list[0].args[0][0], "/bin/sh")
+            self.assertTrue(run.call_args_list[0].args[0][1].endswith("macos/build.sh"))
+            self.assertEqual(run.call_args_list[1].args[0][0], str(hud_bin))
 
     def test_safety_violations_override_a_successful_executor_exit(self) -> None:
         status, exit_code = RUNNER.classify_result(

@@ -12,13 +12,19 @@ import stat
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
-import test_run_agent as fixtures
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+
+import _ork_fast_test_helpers as ORK_FAST  # noqa: E402
+import test_run_agent as fixtures  # noqa: E402
 
 RUNNER = fixtures.RUNNER
 HANDOFF = RUNNER.bundled_module("handoff")
@@ -269,21 +275,35 @@ class HandoffTests(unittest.TestCase):
         self.assertFalse(HANDOFF.session_dir(LEAD).joinpath("event.json").exists())
 
     def test_the_hook_records_stop_failure_quietly_and_never_raises(self) -> None:
-        hooks = sys.modules["mailbox_hooks"]
         payload = {"hook_event_name": "StopFailure", "session_id": LEAD, "cwd": str(self.repo), "error": "rate_limit"}
+        env = {**os.environ, "CLAUDE_CONFIG_DIR": str(self.homes["claude-a"]), "PYTEST_CURRENT_TEST": "1"}
         started = time.monotonic()
-        with mock.patch.object(MAILBOX, "harness_pid", return_value=os.getpid()):
-            self.assertIsNone(MAILBOX.hook(payload, harness="claude", base=self.base))
+        self.assertIsNone(
+            ORK_FAST.run_mailbox_hook(payload, harness="claude", base=self.base, pid=os.getpid(), env=env)
+        )
         self.assertLess(time.monotonic() - started, 5)
         self.assertEqual(json.loads((HANDOFF.session_dir(LEAD) / "event.json").read_text())["status"], "recorded")
-        with mock.patch.object(hooks, "handoff_module", side_effect=RuntimeError("boom")):
-            self.assertIsNone(MAILBOX.hook(payload, harness="claude", base=self.base))
-            self.assertIsNone(
-                MAILBOX.hook({**payload, "hook_event_name": "SomethingNew"}, harness="claude", base=self.base)
+
+        broken_scripts = self.root / "broken-scripts"
+        broken_scripts.mkdir(exist_ok=True)
+        (broken_scripts / "handoff.py").write_text('raise RuntimeError("boom")\n')
+        broken_env = {**env, "ORKEST_SCRIPTS_DIR": str(broken_scripts)}
+        self.assertIsNone(
+            ORK_FAST.run_mailbox_hook(payload, harness="claude", base=self.base, pid=os.getpid(), env=broken_env)
+        )
+        self.assertIsNone(
+            ORK_FAST.run_mailbox_hook(
+                {**payload, "hook_event_name": "SomethingNew"},
+                harness="claude",
+                base=self.base,
+                pid=os.getpid(),
+                env=broken_env,
             )
-            turn = {"hook_event_name": "UserPromptSubmit", "session_id": LEAD, "cwd": str(self.repo)}
-            with mock.patch.object(MAILBOX, "harness_pid", return_value=os.getpid()):
-                MAILBOX.hook(turn, harness="claude", base=self.base)  # a broken handoff never costs the turn
+        )
+        turn = {"hook_event_name": "UserPromptSubmit", "session_id": LEAD, "cwd": str(self.repo)}
+        ORK_FAST.run_mailbox_hook(
+            turn, harness="claude", base=self.base, pid=os.getpid(), env=broken_env
+        )  # a broken handoff never costs the turn
 
     def test_codex_and_antigravity_rely_on_the_periodic_quota_check(self) -> None:
         codex = MAILBOX.register(
@@ -575,13 +595,17 @@ class HandoffTests(unittest.TestCase):
         self.assertIn("auto-launch is off", event["reasons"][0])
         self.register("claude-other", "claude-b", state="busy")
         payload = {"hook_event_name": "UserPromptSubmit", "session_id": "claude-other", "cwd": str(self.repo)}
-        with (
-            mock.patch.object(MAILBOX, "harness_pid", return_value=os.getpid()),
-            mock.patch.object(sys, "path", [str(SCRIPTS), *sys.path]),
-            mock.patch.object(MAILBOX, "account_home", return_value=str(self.homes["claude-b"])),
-        ):
-            output = MAILBOX.hook(payload, harness="claude", base=self.base)
-        self.assertIn("was not handed over: no live idle session", output["hookSpecificOutput"]["additionalContext"])
+        output = ORK_FAST.run_mailbox_hook(
+            payload,
+            harness="claude",
+            base=self.base,
+            pid=os.getpid(),
+            env={**os.environ, "CLAUDE_CONFIG_DIR": str(self.homes["claude-b"]), "PYTEST_CURRENT_TEST": "1"},
+        )
+        self.assertIn(
+            "was not handed over: no live idle session",
+            (output or {}).get("hookSpecificOutput", {}).get("additionalContext", ""),
+        )
 
     def test_the_note_holds_facts_only_and_is_private(self) -> None:
         (self.repo / "dirty.txt").write_text("x")
@@ -934,12 +958,44 @@ class HandoffTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"ORKEST_HANDOFF_SUCCESSOR": "handoff-a"}):
             # A delegated Codex successor still runs the periodic check, as itself.
             HANDOFF.poll(self.base, codex, spawn=self.spawn)
-            hooks = sys.modules["mailbox_hooks"]
-            fake = mock.Mock()
-            fake.notices.return_value = ""
-            with mock.patch.object(hooks, "handoff_module", return_value=fake):
-                hooks.handoff_turn(self.base, codex, notify=True)
-            fake.poll.assert_called_once()
+            spy_scripts = self.root / "handoff-spy-scripts"
+            spy_scripts.mkdir(exist_ok=True)
+            spy_log = self.root / "handoff-spy.jsonl"
+            (spy_scripts / "handoff.py").write_text(
+                textwrap.dedent(
+                    f"""\
+                    import json
+                    def poll(base, me, **kwargs):
+                        with open({str(spy_log)!r}, "a", encoding="utf-8") as fh:
+                            fh.write(json.dumps({{"fn": "poll", "session": me.get("session")}}) + "\\n")
+                        return None
+                    def notices(base, me, **kwargs):
+                        return ""
+                    """
+                )
+            )
+            MAILBOX.register(self.base, session="run-1-worker", harness="codex", cwd=str(self.repo), pid=os.getpid())
+            MAILBOX.annotate(self.base, "run-1-worker", run="1", role="worker")
+            turn = {"hook_event_name": "UserPromptSubmit", "session_id": "codex-native", "cwd": str(self.repo)}
+            # Clear the poll cooldown left by HANDOFF.poll() above so the hook evaluates polling directly.
+            MAILBOX.annotate(self.base, "codex-native", handoffCheckedAt=None)
+            # Without ORKEST_HANDOFF_SUCCESSOR, a delegatedRun peer skips handoff.poll on UserPromptSubmit.
+            env_without = {k: v for k, v in os.environ.items() if k != "ORKEST_HANDOFF_SUCCESSOR"} | {
+                "CODEX_HOME": "/x",
+                "AGENT_MAILBOX_SESSION": "run-1-worker",
+                "ORKEST_SCRIPTS_DIR": str(spy_scripts),
+                "PYTEST_CURRENT_TEST": "1",
+            }
+            ORK_FAST.run_mailbox_hook(turn, harness="codex", base=self.base, pid=os.getpid(), env=env_without)
+            self.assertFalse(spy_log.exists())
+            # With ORKEST_HANDOFF_SUCCESSOR, a delegatedRun peer runs handoff.poll on UserPromptSubmit.
+            MAILBOX.annotate(self.base, "codex-native", handoffCheckedAt=None)
+            env_with = {**env_without, "ORKEST_HANDOFF_SUCCESSOR": "handoff-a"}
+            ORK_FAST.run_mailbox_hook(turn, harness="codex", base=self.base, pid=os.getpid(), env=env_with)
+            self.assertTrue(spy_log.is_file())
+            self.assertEqual(
+                [json.loads(line)["session"] for line in spy_log.read_text().splitlines()], ["codex-native"]
+            )
             # A worker of the successor is never taken for it.
             ignored = HANDOFF.record_exhaustion(
                 "run-y-worker", "claude", "rate_limit", source="StopFailure", peer=child

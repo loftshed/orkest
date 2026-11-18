@@ -3,13 +3,19 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
 from pathlib import Path
 from unittest import mock
 
-import test_mailbox
+TESTS = Path(__file__).resolve().parent
+if str(TESTS) not in sys.path:
+    sys.path.insert(0, str(TESTS))
+
+import test_mailbox  # noqa: E402
+from _ork_fast_test_helpers import run_mailbox_hook  # noqa: E402
 
 MAILBOX = test_mailbox.MAILBOX
 FEEDBACK = MAILBOX.feedback_module()
@@ -332,12 +338,12 @@ class MailboxFeedbackTests(unittest.TestCase):
             self.base, session="local-sender", harness="claude", cwd=str(self.repository), pid=os.getpid()
         )
         MAILBOX.send(self.base, sender=other, to=self.peer["session"], text="Useful question")
-        with mock.patch.object(MAILBOX, "harness_pid", return_value=os.getpid()):
-            result = MAILBOX.hook(
-                {"hook_event_name": "Stop", "session_id": self.peer["session"], "cwd": str(self.repository)},
-                harness="codex",
-                base=self.base,
-            )
+        result = run_mailbox_hook(
+            {"hook_event_name": "Stop", "session_id": self.peer["session"], "cwd": str(self.repository)},
+            harness="codex",
+            base=self.base,
+            pid=os.getpid(),
+        )
         self.assertEqual(result["decision"], "block")
         report = self.reports()[0]
         self.assertEqual(report["code"], "turn_extended")

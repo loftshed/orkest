@@ -1240,6 +1240,9 @@ ${goal}
    - Finished: \`--kind done\` with branch, verification run and remaining risks.
 3. Between steps, read Chief instructions:
    \`python3 ${shellQuote(PEER_MAILBOX_PY)} inbox --session ${missionSession}\`
+   If Chief sends \`--kind question\`, answer from the code via \`--kind update\` (or fold it into
+   your active milestone or \`--kind done\` report if mid-step) without making extra edits or
+   expanding scope.
 4. Never push, merge, or spend paid credits unless the Chief tells you the user allowed it.
 `;
 }

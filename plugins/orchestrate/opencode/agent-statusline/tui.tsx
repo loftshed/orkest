@@ -47,22 +47,36 @@ function parseIdentity(output: string): Identity | null {
   }
 }
 
-function resolveDefaultScript(): string {
-  const homeCandidate = path.join(
-    homedir(),
-    ".agents/skills/orchestrate/scripts/agent_statusline.py",
-  );
+function resolveCacheHome(): string {
+  const explicit = process.env.ORCHESTRATE_HOME || process.env.AGENT_EXECUTOR_HOME;
+  if (explicit) return explicit;
+  const cacheRoot = process.env.XDG_CACHE_HOME || path.join(homedir(), ".cache");
+  const primary = path.join(cacheRoot, "orchestrate");
+  if (existsSync(primary)) return primary;
+  const legacy = path.join(cacheRoot, "agent-executor");
+  return existsSync(legacy) ? legacy : primary;
+}
+
+function resolveDefaultFastBin(): string {
+  const explicit = process.env.ORK_FAST_BIN;
+  if (explicit) return explicit;
+  return path.join(resolveCacheHome(), "bin/ork-fast");
+}
+
+function resolveScriptsDir(): string {
+  const homeCandidate = path.join(homedir(), ".agents/skills/orchestrate/scripts");
   if (existsSync(homeCandidate)) return homeCandidate;
   const colocated = path.resolve(
     path.dirname(fileURLToPath(import.meta.url)),
-    "../../skills/orchestrate/scripts/agent_statusline.py",
+    "../../skills/orchestrate/scripts",
   );
   return existsSync(colocated) ? colocated : homeCandidate;
 }
 
-const defaultScript = resolveDefaultScript();
+const defaultFastBin = resolveDefaultFastBin();
+const defaultScriptsDir = resolveScriptsDir();
 
-function Label(props: { sessionID?: string; plainColor: string; script: string }) {
+function Label(props: { sessionID?: string; plainColor: string; fastBin: string }) {
   const [item, setItem] = createSignal<Identity | null>(null);
   const [columns, setColumns] = createSignal(0);
   const terminal = Boolean(process.env.ORKEST_TERMINAL_SERVER || process.env.HERDR_ENV === "1");
@@ -80,7 +94,7 @@ function Label(props: { sessionID?: string; plainColor: string; script: string }
       if (running) return;
       running = true;
       const args = [
-        props.script,
+        "statusline",
         ...(terminal ? ["--native-status"] : []),
         "--session",
         session,
@@ -90,7 +104,7 @@ function Label(props: { sessionID?: string; plainColor: string; script: string }
         String(Math.max(width, 32)),
         "--json",
       ];
-      child = execFile("python3", args, { timeout: 2000 }, (error, output) => {
+      child = execFile(props.fastBin, args, { timeout: 2000 }, (error, output) => {
         running = false;
         child = undefined;
         if (active) setItem(error ? null : parseIdentity(output));
@@ -105,8 +119,8 @@ function Label(props: { sessionID?: string; plainColor: string; script: string }
       child?.kill();
       if (terminal) {
         execFile(
-          "python3",
-          [props.script, "--harness", "opencode", "--clear-terminal", session],
+          props.fastBin,
+          ["statusline", "--harness", "opencode", "--clear-terminal", session],
           { timeout: 2000 },
           () => {},
         );
@@ -152,9 +166,13 @@ function Label(props: { sessionID?: string; plainColor: string; script: string }
 export default Plugin.define({
   id: "orkest.agent-statusline",
   setup(context) {
-    const script =
-      typeof context.options.script === "string" ? context.options.script : defaultScript;
-    const tmuxScript = path.join(path.dirname(script), "agent_statusline_tmux.py");
+    const fastBin =
+      typeof context.options.fastBin === "string" ? context.options.fastBin : defaultFastBin;
+    const scriptsDir =
+      typeof context.options.script === "string"
+        ? path.dirname(context.options.script)
+        : defaultScriptsDir;
+    const tmuxScript = path.join(scriptsDir, "agent_statusline_tmux.py");
     const cmdApi = (
       context as unknown as {
         command?: { register?: (cb: () => unknown[]) => (() => void) | void };
@@ -185,7 +203,7 @@ export default Plugin.define({
     const unregisterSlot = context.ui.slot({
       append: "session.composer.top",
       render: (props) => (
-        <Label sessionID={props.sessionID} plainColor={context.theme.text.base} script={script} />
+        <Label sessionID={props.sessionID} plainColor={context.theme.text.base} fastBin={fastBin} />
       ),
     });
     return () => {

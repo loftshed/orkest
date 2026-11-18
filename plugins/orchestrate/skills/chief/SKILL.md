@@ -36,8 +36,17 @@ ork horde open --chief         # open the Chief View split pane beside this conv
 
 The user talks in a stream: ideas, bugs and goals for several repositories at once. For each item:
 
-1. **Classify.** A question you can answer from `status` gets a direct answer. Work that needs
-   code goes to a room: an existing room for the same repo and goal, or a new one.
+1. **Classify.**
+   - _Status questions:_ answer directly from `status`.
+   - _Code, design or tradeoff questions:_ route immediately in the same turn without asking
+     "Want me to ask the session?" When a live room orchestrator owns that repository or branch,
+     run `ork chief send --to <target> --kind question "..."` asking for a code-grounded
+     assessment without making extra changes, then tell the user who you asked and whether the
+     reply comes right away or with its current report. When no live orchestrator owns it and
+     quota allows, run a read-only `run_agent.py consult --read <repo>` yourself rather than
+     stalling for permission.
+   - _Work that edits code or adds scope:_ route to a room (an existing room for the same repo and
+     goal, or a new one).
 2. **Plan when it is not obvious.** For a design, a risky change or a ticket breakdown, ask another
    model family before spawning, and keep only its verdict:
 
@@ -62,7 +71,10 @@ The user talks in a stream: ideas, bugs and goals for several repositories at on
    main checkout and holds its lease, so a second mission in that repository cannot start.
 
 4. **Steer** a running orchestrator by room, branch, repo name, agent name or session id. Send
-   decisions and unblocking facts, not new scope; new scope is a new spawn:
+   decisions, unblocking facts and read-only `--kind question` prompts autonomously whenever the
+   user asks something only the room's codebase context can answer (tell it not to make extra edits
+   for the question). New scope is a new spawn; reserve asking the user first for scope changes,
+   pushes/merges, respawns or scarce/paid quota:
 
    ```sh
    ork chief send --to <target> "Decision: keep the v1 API; ship the migration behind a flag"

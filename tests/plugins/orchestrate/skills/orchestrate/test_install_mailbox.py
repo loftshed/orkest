@@ -5,22 +5,31 @@ from __future__ import annotations
 import io
 import json
 import os
+import plistlib
 import pty
+import shlex
 import subprocess
 import sys
 import tempfile
+import textwrap
 import tomllib
 import unittest
+import urllib.error
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
 SCRIPTS = Path(__file__).resolve().parents[5] / "plugins/orchestrate/skills/orchestrate/scripts"
 sys.path.insert(0, str(SCRIPTS))
+import _ork_fast_test_helpers as ORK_FAST  # noqa: E402
 import check_mailbox  # noqa: E402 -- exercise the shipped verifier
 import install_mailbox as installer  # noqa: E402 -- exercise the shipped installer
 import mailbox_daemon  # noqa: E402 -- exercise daemon transport mode
 import mailbox_mcp  # noqa: E402 -- the server defines the installed tool catalog
+import peer_mailbox as mailbox  # noqa: E402 -- inspect peer state on disk
 
 
 class InstallMailboxTests(unittest.TestCase):
@@ -29,10 +38,14 @@ class InstallMailboxTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.base = Path(self.temporary.name)
+        self.fast_bin = ORK_FAST.find_ork_fast_bin()
         herdr_patch = mock.patch.object(installer, "_herdr_binary", return_value=None)
         self.herdr_binary = herdr_patch.start()
         self.addCleanup(herdr_patch.stop)
-        environment = mock.patch.dict(installer.os.environ, {"HERDR_ENV": "0", "HERDR_CONFIG_PATH": ""})
+        environment = mock.patch.dict(
+            installer.os.environ,
+            {"HERDR_ENV": "0", "HERDR_CONFIG_PATH": "", "ORK_FAST_BIN": str(self.fast_bin)},
+        )
         environment.start()
         self.addCleanup(environment.stop)
         self.path = self.base / "settings.json"
@@ -129,7 +142,9 @@ class InstallMailboxTests(unittest.TestCase):
             [
                 {
                     "type": "command",
-                    "command": "python3 '/home/example/skill hub/peer_mailbox.py' hook --harness gemini --event PreInvocation",
+                    "command": shlex.join(
+                        [str(self.fast_bin), "mailbox-hook", "--harness", "gemini", "--event", "PreInvocation"]
+                    ),
                     "timeout": 10,
                 }
             ],
@@ -151,7 +166,7 @@ class InstallMailboxTests(unittest.TestCase):
                     "hooks": [
                         {
                             "type": "command",
-                            "command": "python3 '/home/example/skill hub/peer_mailbox.py' hook --harness codex",
+                            "command": shlex.join([str(self.fast_bin), "mailbox-hook", "--harness", "codex"]),
                             "timeout": 10,
                         }
                     ]
@@ -170,6 +185,10 @@ class InstallMailboxTests(unittest.TestCase):
 
     def test_old_mailbox_hooks_are_updated_to_orchestrate_and_preserve_other_hooks(self):
         old = "/home/example/.agents/skills/agent-executor/scripts/peer_mailbox.py"
+        legacy_wrapper = (
+            f"[ -x /tmp/old/ork-fast ] && exec /tmp/old/ork-fast mailbox-hook --harness codex "
+            f"--fallback-script {old}; exec python3 {old} hook --harness codex"
+        )
         new = Path("/home/example/.agents/skills/orchestrate/scripts/peer_mailbox.py")
         original = json.dumps(
             {
@@ -181,7 +200,14 @@ class InstallMailboxTests(unittest.TestCase):
                                 {"type": "command", "command": "other-tool stop"},
                             ]
                         }
-                    ]
+                    ],
+                    "SessionStart": [
+                        {
+                            "hooks": [
+                                {"type": "command", "command": legacy_wrapper},
+                            ]
+                        }
+                    ],
                 }
             }
         )
@@ -189,10 +215,15 @@ class InstallMailboxTests(unittest.TestCase):
 
         installer.install_hooks(self.path, new, "codex")
 
+        expected = shlex.join([str(self.fast_bin), "mailbox-hook", "--harness", "codex"])
         hooks = json.loads(self.path.read_text())["hooks"]
         self.assertEqual(
             [entry["command"] for entry in hooks["Stop"][0]["hooks"]],
-            [f"python3 {new} hook --harness codex", "other-tool stop"],
+            [expected, "other-tool stop"],
+        )
+        self.assertEqual(
+            [entry["command"] for entry in hooks["SessionStart"][0]["hooks"]],
+            [expected],
         )
         self.assertEqual([p.read_text() for p in self.base.glob("settings.json.mailbox-bak.*")], [original])
         self.assertFalse(installer.install_hooks(self.path, new, "codex"))
@@ -371,7 +402,7 @@ class InstallMailboxTests(unittest.TestCase):
         self.assertEqual(self.path.read_bytes(), before)
 
     def test_trust_selects_only_our_four_exact_commands(self):
-        command = "python3 '/home/example/skill hub/peer_mailbox.py' hook --harness codex"
+        command = shlex.join([str(self.fast_bin), "mailbox-hook", "--harness", "codex"])
         hooks = [
             {
                 "key": event,
@@ -402,9 +433,16 @@ class InstallMailboxTests(unittest.TestCase):
                 "sessionEnd": {"trusted_hash": "sha256:sessionEnd"},
             },
         )
-        hooks[0]["command"] += " ; run something else"
-        with self.assertRaisesRegex(ValueError, "exactly four"):
-            installer.mailbox_hook_updates({"data": [{"hooks": hooks}]}, self.script, self.path)
+        for bad_cmd in (
+            command + " ; run something else",
+            f"{command} --fallback-script /tmp/peer_mailbox.py",
+            f"[ -x {self.fast_bin} ] && exec {command}; exec python3 /tmp/peer_mailbox.py hook --harness codex",
+            "python3 /tmp/peer_mailbox.py hook --harness codex",
+        ):
+            mutated = [dict(h) for h in hooks]
+            mutated[0]["command"] = bad_cmd
+            with self.subTest(bad_cmd=bad_cmd), self.assertRaisesRegex(ValueError, "exactly four"):
+                installer.mailbox_hook_updates({"data": [{"hooks": mutated}]}, self.script, self.path)
 
     def test_shell_wrappers_generate_orkest_sh_and_wire_zshrc_idempotently(self):
         ork_cli = self.base / "bin/ork.mjs"
@@ -592,106 +630,148 @@ class InstallMailboxTests(unittest.TestCase):
         self.assertTrue(active_rt.exists())
         self.assertTrue(recent_rt.exists())
 
-    def test_swarm_command_context_toggles_swarm_view_on_slash_command(self):
-        from unittest.mock import patch
-
-        import peer_mailbox as mailbox
-
-        me = {"session": "11111111-2222-4333-8444-555555555555", "harness": "claude", "cwd": str(self.base)}
-        with patch(
-            "agent_statusline_tmux.toggle_swarm_view",
-            return_value={"status": "opened", "room": "room-123", "socket": "orkest-label-abcdef012345"},
-        ) as mocked:
-            out = mailbox.swarm_command_context(self.base, me, {"prompt": "/swarm"}, "UserPromptSubmit", mid_turn=False)
-            self.assertIn("now opened (room room-123)", out)
-            mocked.assert_called_once()
-        with patch(
-            "agent_statusline_tmux.toggle_swarm_view",
-            return_value={"status": "closed", "room": "room-123", "socket": "orkest-label-abcdef012345"},
-        ) as mocked:
-            out = mailbox.swarm_command_context(
-                self.base,
-                me,
-                {"prompt": "[orkest-swarm-command: close]\nIf the `/swarm` turn hook..."},
-                "UserPromptSubmit",
-                mid_turn=False,
+    def _write_swarm_toggle_stub(self) -> tuple[Path, Path]:
+        stub_dir = self.base / "stub-scripts"
+        stub_dir.mkdir(exist_ok=True)
+        log_path = self.base / "swarm-toggle-calls.jsonl"
+        (stub_dir / "agent_statusline_tmux.py").write_text(
+            textwrap.dedent(
+                """\
+                import json, os, sys
+                from pathlib import Path
+                log = Path(os.environ["SWARM_STUB_LOG"])
+                with log.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(sys.argv[1:]) + "\\n")
+                print(os.environ["SWARM_STUB_RESULT"])
+                """
             )
-            self.assertIn("now closed (room room-123)", out)
-            self.assertEqual(mocked.call_args.args[0], "close")
+        )
+        return stub_dir, log_path
+
+    def test_swarm_command_context_toggles_swarm_view_on_slash_command(self):
+        stub_dir, log_path = self._write_swarm_toggle_stub()
+        sid = "11111111-2222-4333-8444-555555555555"
+
+        opened_out = ORK_FAST.run_mailbox_hook(
+            {"hook_event_name": "UserPromptSubmit", "session_id": sid, "cwd": str(self.base), "prompt": "/swarm"},
+            harness="claude",
+            base=self.base,
+            env={
+                "ORKEST_SCRIPTS_DIR": str(stub_dir),
+                "SWARM_STUB_LOG": str(log_path),
+                "SWARM_STUB_RESULT": json.dumps(
+                    {"status": "opened", "room": "room-123", "socket": "orkest-label-abcdef012345"}
+                ),
+            },
+        )
+        self.assertEqual(
+            opened_out, {"decision": "block", "reason": "Orkest Swarm View pane is now opened (room room-123)."}
+        )
+
+        closed_out = ORK_FAST.run_mailbox_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": sid,
+                "cwd": str(self.base),
+                "prompt": "[orkest-swarm-command: close]\nIf the `/swarm` turn hook...",
+            },
+            harness="claude",
+            base=self.base,
+            env={
+                "ORKEST_SCRIPTS_DIR": str(stub_dir),
+                "SWARM_STUB_LOG": str(log_path),
+                "SWARM_STUB_RESULT": json.dumps(
+                    {"status": "closed", "room": "room-123", "socket": "orkest-label-abcdef012345"}
+                ),
+            },
+        )
+        self.assertEqual(
+            closed_out, {"decision": "block", "reason": "Orkest Swarm View pane is now closed (room room-123)."}
+        )
+
+        calls = [json.loads(line) for line in log_path.read_text().splitlines()]
+        self.assertEqual(calls[0][:2], ["--toggle-swarm", "toggle"])
+        self.assertEqual(calls[1][:2], ["--toggle-swarm", "close"])
 
     def test_hook_intercepts_bare_swarm_with_zero_tokens_and_allows_goal(self):
-        from unittest.mock import patch
-
-        import peer_mailbox as mailbox
-
+        stub_dir, log_path = self._write_swarm_toggle_stub()
+        mb_base = self.base / "mailbox-v1"
         claude_sid = "11111111-2222-4333-8444-555555555555"
         agy_sid = "66666666-7777-4888-8999-aaaaaaaaaaaa"
-        with patch(
-            "agent_statusline_tmux.toggle_swarm_view",
-            return_value={"status": "opened", "room": "room-777", "socket": "orkest-label-abcdef012345"},
-        ) as mocked:
-            # 1. Bare /swarm in Claude Code / Codex blocks the turn before calling the model (0 tokens).
-            claude_res = mailbox.hook(
-                {
-                    "hook_event_name": "UserPromptSubmit",
-                    "session_id": claude_sid,
-                    "cwd": str(self.base),
-                    "prompt": "/swarm",
-                },
-                harness="claude",
-                base=self.base,
-            )
-            self.assertEqual(
-                claude_res,
-                {"decision": "block", "reason": "Orkest Swarm View pane is now opened (room room-777)."},
-            )
-            self.assertEqual(mailbox.load(mailbox.peer_path(self.base, claude_sid))["state"], "idle")
+        stub_env = {
+            "ORKEST_SCRIPTS_DIR": str(stub_dir),
+            "SWARM_STUB_LOG": str(log_path),
+            "SWARM_STUB_RESULT": json.dumps(
+                {"status": "opened", "room": "room-777", "socket": "orkest-label-abcdef012345"}
+            ),
+        }
 
-            # 2. Bare /horde in Antigravity (PreInvocation with lastUserInput) terminates before model call.
-            agy_res = mailbox.hook(
-                {
-                    "conversationId": agy_sid,
-                    "invocationNum": 1,
-                    "workspacePaths": [str(self.base)],
-                    "lastUserInput": "/horde",
-                },
-                harness="gemini",
-                base=self.base,
-            )
-            self.assertEqual(
-                agy_res,
-                {
-                    "injectSteps": [
-                        {
-                            "systemMessage": {
-                                "systemMessage": "",
-                                "metadata": {"user_markdown": "Orkest Swarm View pane is now opened (room room-777)."},
-                            }
+        # 1. Bare /swarm in Claude Code / Codex blocks the turn before calling the model (0 tokens).
+        claude_res = ORK_FAST.run_mailbox_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": claude_sid,
+                "cwd": str(self.base),
+                "prompt": "/swarm",
+            },
+            harness="claude",
+            base=mb_base,
+            env=stub_env,
+        )
+        self.assertEqual(
+            claude_res,
+            {"decision": "block", "reason": "Orkest Swarm View pane is now opened (room room-777)."},
+        )
+        self.assertEqual(mailbox.load(mailbox.peer_path(mb_base, claude_sid))["state"], "idle")
+
+        # 2. Bare /horde in Antigravity (PreInvocation with lastUserInput) terminates before model call.
+        agy_res = ORK_FAST.run_mailbox_hook(
+            {
+                "conversationId": agy_sid,
+                "invocationNum": 1,
+                "workspacePaths": [str(self.base)],
+                "lastUserInput": "/horde",
+            },
+            harness="gemini",
+            base=mb_base,
+            env=stub_env,
+        )
+        self.assertEqual(
+            agy_res,
+            {
+                "injectSteps": [
+                    {
+                        "systemMessage": {
+                            "systemMessage": "",
+                            "metadata": {"user_markdown": "Orkest Swarm View pane is now opened (room room-777)."},
                         }
-                    ],
-                    "terminationBehavior": "terminate",
-                },
-            )
-            self.assertEqual(mailbox.load(mailbox.peer_path(self.base, agy_sid))["state"], "idle")
+                    }
+                ],
+                "terminationBehavior": "terminate",
+            },
+        )
+        self.assertEqual(mailbox.load(mailbox.peer_path(mb_base, agy_sid))["state"], "idle")
 
-            # 3. /swarm <goal> opens the pane AND proceeds into the model turn with the goal context.
-            mocked.reset_mock()
-            goal_res = mailbox.hook(
-                {
-                    "hook_event_name": "UserPromptSubmit",
-                    "session_id": claude_sid,
-                    "cwd": str(self.base),
-                    "prompt": "/swarm build the auth module",
-                },
-                harness="claude",
-                base=self.base,
-            )
-            self.assertEqual(mocked.call_args.args[0], "open")
-            self.assertIn("hookSpecificOutput", goal_res)
-            self.assertIn(
-                "Proceed with the user's swarm objective: build the auth module",
-                goal_res["hookSpecificOutput"]["additionalContext"],
-            )
+        # 3. /swarm <goal> opens the pane AND proceeds into the model turn with the goal context.
+        log_path.unlink(missing_ok=True)
+        goal_res = ORK_FAST.run_mailbox_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": claude_sid,
+                "cwd": str(self.base),
+                "prompt": "/swarm build the auth module",
+            },
+            harness="claude",
+            base=mb_base,
+            env=stub_env,
+        )
+        goal_calls = [json.loads(line) for line in log_path.read_text().splitlines()]
+        self.assertEqual(goal_calls[-1][:2], ["--toggle-swarm", "open"])
+        self.assertIn("hookSpecificOutput", goal_res)
+        self.assertIn(
+            "Proceed with the user's swarm objective: build the auth module",
+            goal_res["hookSpecificOutput"]["additionalContext"],
+        )
 
     def test_uninstall_shell_removes_only_links_resolving_to_its_own_checkout(self):
         plugin = self.base / "checkout/plugins/orchestrate"
@@ -951,13 +1031,12 @@ class InstallMailboxTests(unittest.TestCase):
         self.assertTrue(installer.install_agy_statusline(agy_settings, fast_bin=fast_bin, home=self.base))
         agy_updated = json.loads(agy_settings.read_text())
         self.assertIs(agy_updated["statusLine"]["stack_with_default"], False)
-        self.assertIn(
-            f"[ -x {fast_bin} ] && exec {fast_bin} statusline --native-status", agy_updated["statusLine"]["command"]
-        )
-        self.assertIn(
-            f"; exec python3 {self.base}/.agents/skills/orchestrate/scripts/agent_statusline.py --native-status",
+        self.assertEqual(
             agy_updated["statusLine"]["command"],
+            shlex.join([str(fast_bin), "statusline", "--native-status"]),
         )
+        self.assertNotIn("agent_statusline.py", agy_updated["statusLine"]["command"])
+        self.assertNotIn("--fallback-script", agy_updated["statusLine"]["command"])
         self.assertFalse(installer.install_agy_statusline(agy_settings, fast_bin=fast_bin, home=self.base))
 
         claude_settings = self.base / ".claude/settings.json"
@@ -967,15 +1046,106 @@ class InstallMailboxTests(unittest.TestCase):
                 {
                     "statusLine": {
                         "type": "command",
-                        "command": f"python3 {self.base}/.agents/skills/orchestrate/scripts/agent_statusline.py --harness claude",
+                        "command": (
+                            "[ -x /old/ork-fast ] && exec /old/ork-fast statusline --harness claude "
+                            "--fallback-script /old/agent_statusline.py; "
+                            f"exec python3 {self.base}/.agents/skills/orchestrate/scripts/agent_statusline.py --harness claude"
+                        ),
                     }
                 }
             )
         )
         self.assertTrue(installer.install_claude_statusline(claude_settings, fast_bin=fast_bin, home=self.base))
         claude_updated = json.loads(claude_settings.read_text())
-        self.assertIn("ork-fast statusline --harness claude", claude_updated["statusLine"]["command"])
+        self.assertEqual(
+            claude_updated["statusLine"]["command"],
+            shlex.join([str(fast_bin), "statusline", "--harness", "claude"]),
+        )
+        self.assertNotIn("--fallback-script", claude_updated["statusLine"]["command"])
+        self.assertNotIn("[ -x ", claude_updated["statusLine"]["command"])
         self.assertFalse(installer.install_claude_statusline(claude_settings, fast_bin=fast_bin, home=self.base))
+
+    def test_upgrade_statusline_command_preserves_flags_when_stripping_fallback_script(self):
+        fast_bin = self.base / ".cache/orchestrate/bin/ork-fast"
+        self.assertEqual(
+            installer.upgrade_statusline_command(
+                f"{fast_bin} statusline --harness codex --fallback-script /old/agent_statusline.py",
+                fast_bin=fast_bin,
+                home=self.base,
+            ),
+            shlex.join([str(fast_bin), "statusline", "--harness", "codex"]),
+        )
+
+    def test_ensure_ork_fast_is_mandatory_and_ignores_ork_disable_fast(self):
+        cache_dir = self.base / "empty-cache"
+        with (
+            mock.patch.dict(
+                installer.os.environ,
+                {"XDG_CACHE_HOME": str(cache_dir), "ORK_DISABLE_FAST": "1", "ORK_FAST_BIN": ""},
+            ),
+            mock.patch.object(installer, "_build_local_ork_fast", return_value=False),
+            mock.patch("urllib.request.urlopen", side_effect=urllib.error.URLError("offline")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "ork-fast binary is required"):
+                installer.ensure_ork_fast(home=self.base)
+            # runtime_paths.ork_fast_bin still honors ORK_FAST_BIN / compiled bin even if ORK_DISABLE_FAST=1.
+            self.assertEqual(
+                installer.runtime_paths.ork_fast_bin(env={"ORK_DISABLE_FAST": "1", "ORK_FAST_BIN": str(self.fast_bin)}),
+                self.fast_bin,
+            )
+
+    def test_ensure_macos_hud_handles_non_darwin_dry_run_cache_hash_and_missing_xcrun(self):
+        cache_dir = self.base / "hud-cache"
+        env = {"XDG_CACHE_HOME": str(cache_dir)}
+        expected_bin = cache_dir / "orchestrate" / "macos" / "OrkestHUD.app" / "Contents" / "MacOS" / "OrkestHUD"
+
+        with mock.patch.object(installer.sys, "platform", "linux"):
+            self.assertIsNone(installer.ensure_macos_hud(home=self.base, env=env))
+
+        with (
+            mock.patch.object(installer.sys, "platform", "darwin"),
+            redirect_stdout(io.StringIO()) as buf,
+        ):
+            self.assertEqual(installer.ensure_macos_hud(dry_run=True, home=self.base, env=env), expected_bin)
+            self.assertIn("would ensure OrkestHUD.app", buf.getvalue())
+
+        plugin_root = self.base / "plugin"
+        macos_dir = plugin_root / "macos"
+        macos_dir.mkdir(parents=True)
+        build_sh = macos_dir / "build.sh"
+        hud_swift = macos_dir / "hud.swift"
+        build_sh.write_text("#!/bin/sh\necho build\n")
+        hud_swift.write_text("// swift hud v1\n")
+
+        with (
+            mock.patch.object(installer.sys, "platform", "darwin"),
+            mock.patch.object(installer.shutil, "which", return_value=None),
+        ):
+            self.assertIsNone(installer.ensure_macos_hud(plugin_root, home=self.base, env=env))
+
+        def fake_build(argv, **kwargs):
+            expected_bin.parent.mkdir(parents=True, exist_ok=True)
+            expected_bin.write_text("#!/bin/sh\n")
+            expected_bin.chmod(0o755)
+            info_plist = expected_bin.parents[1] / "Info.plist"
+            info_plist.write_bytes(plistlib.dumps({"OrkestHUDBuildHash": kwargs["env"]["ORKEST_HUD_BUILD_HASH"]}))
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+        with (
+            mock.patch.object(installer.sys, "platform", "darwin"),
+            mock.patch.object(installer.shutil, "which", return_value="/usr/bin/xcrun"),
+            mock.patch.object(installer.subprocess, "run", side_effect=fake_build) as run_mock,
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(installer.ensure_macos_hud(plugin_root, home=self.base, env=env), expected_bin)
+            self.assertEqual(run_mock.call_count, 1)
+            # Second call with identical sources hits Info.plist build hash cache and skips rebuild.
+            self.assertEqual(installer.ensure_macos_hud(plugin_root, home=self.base, env=env), expected_bin)
+            self.assertEqual(run_mock.call_count, 1)
+            # Editing hud.swift invalidates the hash and triggers one rebuild.
+            hud_swift.write_text("// swift hud v2\n")
+            self.assertEqual(installer.ensure_macos_hud(plugin_root, home=self.base, env=env), expected_bin)
+            self.assertEqual(run_mock.call_count, 2)
 
     def test_fast_bin_validation_in_install_and_shell_wrappers(self):
         ork_cli = self.base / "bin/ork.mjs"

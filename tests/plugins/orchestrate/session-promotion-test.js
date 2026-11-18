@@ -807,7 +807,15 @@ describe("adopting the running conversation", () => {
     const { cwd, root, directory } = await fixture();
     const result = await promoteSession(
       { session: "live-session", cwd, objective: "Coordinate search work" },
-      { root, env: { PATH: process.env.PATH, HOME: directory } },
+      {
+        root,
+        env: {
+          PATH: process.env.PATH,
+          HOME: directory,
+          ORK_FAST_BIN:
+            process.env.ORK_FAST_BIN || path.resolve("crates/ork-fast/target/release/ork-fast"),
+        },
+      },
     );
     expect(result.nativeMetadata.attempted).toBe(true);
     expect(result.nativeMetadata.error).toBeUndefined();

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -12,7 +13,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import test_run_agent
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+
+import _ork_fast_test_helpers as ORK_FAST  # noqa: E402
+import test_run_agent  # noqa: E402
 
 GATE = test_run_agent.RUNNER.bundled_module("gate")
 SCRIPT = Path(GATE.__file__)
@@ -80,19 +86,42 @@ NOT_HEAVY = [
 
 class ClassificationTests(unittest.TestCase):
     def test_whole_runs_are_heavy_and_focused_ones_are_not(self):
-        for line in HEAVY:
-            with self.subTest(line=line):
-                self.assertTrue(GATE.heavy_runs(line))
-        for line in NOT_HEAVY:
-            with self.subTest(line=line):
-                self.assertFalse(GATE.heavy_runs(line))
+        with tempfile.TemporaryDirectory() as gate_dir:
+            for line in HEAVY:
+                with self.subTest(line=line):
+                    decision = ORK_FAST.run_gate_hook(
+                        {"tool_name": "Bash", "tool_input": {"command": line}},
+                        harness="claude",
+                        gate_dir=gate_dir,
+                    )
+                    self.assertIsNotNone(decision)
+                    self.assertEqual(decision["hookSpecificOutput"]["permissionDecision"], "deny")
+            for line in NOT_HEAVY:
+                with self.subTest(line=line):
+                    decision = ORK_FAST.run_gate_hook(
+                        {"tool_name": "Bash", "tool_input": {"command": line}},
+                        harness="claude",
+                        gate_dir=gate_dir,
+                    )
+                    self.assertIsNone(decision)
 
     def test_many_files_make_type_aware_lint_heavy(self):
         files = " ".join(f"src/f{index}.ts" for index in range(GATE.MANY_FILES + 1))
-        self.assertTrue(GATE.heavy_runs(f"eslint {files}"))
-        self.assertTrue(GATE.heavy_runs(f"vitest related {files}"))
-        self.assertTrue(GATE.heavy_runs(f"jest --findRelatedTests {files}"))
-        self.assertTrue(GATE.heavy_runs(f"yarn test {files}"))
+        with tempfile.TemporaryDirectory() as gate_dir:
+            for line in (
+                f"eslint {files}",
+                f"vitest related {files}",
+                f"jest --findRelatedTests {files}",
+                f"yarn test {files}",
+            ):
+                with self.subTest(line=line):
+                    decision = ORK_FAST.run_gate_hook(
+                        {"tool_name": "Bash", "tool_input": {"command": line}},
+                        harness="claude",
+                        gate_dir=gate_dir,
+                    )
+                    self.assertIsNotNone(decision)
+                    self.assertEqual(decision["hookSpecificOutput"]["permissionDecision"], "deny")
 
     def test_jest_gets_a_worker_cap_unless_it_sets_one(self):
         self.assertEqual(GATE.capped(["npx", "jest", "a"], 2), ["npx", "jest", "a", "--maxWorkers=2"])
@@ -136,16 +165,14 @@ class ClassificationTests(unittest.TestCase):
 
 
 class HookTests(unittest.TestCase):
+    def setUp(self):
+        self.gate_dir = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.gate_dir.cleanup()
+
     def call(self, payload, harness):
-        result = subprocess.run(
-            [sys.executable, "-B", str(SCRIPT), "hook", "--harness", harness],
-            input=json.dumps(payload),
-            capture_output=True,
-            text=True,
-            timeout=20,
-        )
-        self.assertEqual(result.returncode, 0)
-        return json.loads(result.stdout) if result.stdout.strip() else None
+        return ORK_FAST.run_gate_hook(payload, harness=harness, gate_dir=self.gate_dir.name)
 
     def test_each_harness_gets_a_deny_for_a_heavy_run_outside_the_gate(self):
         claude = self.call({"tool_name": "Bash", "tool_input": {"command": "yarn test"}}, "claude")
@@ -168,9 +195,32 @@ class HookTests(unittest.TestCase):
             with self.subTest(payload=payload):
                 self.assertIsNone(self.call(payload, harness))
 
+    def test_heredocs_here_strings_redirects_and_quotes_are_parsed_correctly(self):
+        for cmd in (
+            "cat <<EOF\nyarn test\nEOF",
+            "cat <<-'END'\n\tpytest\n\tEND",
+            'cat <<<"yarn test"\necho ok',
+            "echo hi > yarn\necho 'tsc --noEmit'",
+            'echo "unbalanced quote\nyarn test',
+        ):
+            with self.subTest(allowed=cmd):
+                self.assertIsNone(self.call({"tool_name": "Bash", "tool_input": {"command": cmd}}, "claude"))
+        for cmd in (
+            "cat <<'EOF'\necho ok\nEOF\nyarn build",
+            'cat <<<"ok"\npytest > out.log 2>&1',
+        ):
+            with self.subTest(denied=cmd):
+                decision = self.call({"tool_name": "Bash", "tool_input": {"command": cmd}}, "claude")
+                self.assertIsNotNone(decision)
+                self.assertEqual(decision["hookSpecificOutput"]["permissionDecision"], "deny")
+
     def test_an_unreadable_payload_never_breaks_the_turn(self):
         result = subprocess.run(
-            [sys.executable, "-B", str(SCRIPT), "hook"], input="{not json", capture_output=True, text=True, timeout=20
+            [str(ORK_FAST.find_ork_fast_bin()), "gate-hook"],
+            input="{not json",
+            capture_output=True,
+            text=True,
+            timeout=20,
         )
         self.assertEqual((result.returncode, result.stdout), (0, ""))
 
@@ -483,56 +533,136 @@ class LedgerTests(unittest.TestCase):
     def test_hook_refusal_enriches_from_payload_cwd_and_handles_cd_and_package_flags(self):
         heavy_cmd = f"{sys.executable} -m unittest discover -p probe_*.py"
         self.gate("--heavy", "--", sys.executable, "-m", "unittest", "discover", "-p", "probe_*.py")
-        with mock.patch.dict(os.environ, {"AGENT_GATE_DIR": str(self.gate_dir)}):
-            # Even when the hook process's own cwd is outside the repo, payload cwd resolves the repo.
-            current_cwd = os.getcwd()
-            try:
-                os.chdir(self.root)
-                decision = GATE.hook(
-                    {"tool_name": "Bash", "cwd": str(self.repo_a), "tool_input": {"command": heavy_cmd}},
-                    "claude",
+
+        # Even when the hook process's own cwd is outside the repo, payload cwd resolves the repo.
+        decision = ORK_FAST.run_gate_hook(
+            {"tool_name": "Bash", "cwd": str(self.repo_a), "tool_input": {"command": heavy_cmd}},
+            harness="claude",
+            gate_dir=self.gate_dir,
+            cwd=self.root,
+        )
+        reason = decision["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("Last matching run in this checkout:", reason)
+        self.assertIn("source metadata matched", reason)
+        self.assertIn("status` to see active and recent runs.", reason)
+
+        # tool_input.workdir and tool_input.cwd also resolve the checkout.
+        for key in ("workdir", "cwd"):
+            with self.subTest(tool_input_key=key):
+                workdir_decision = ORK_FAST.run_gate_hook(
+                    {"tool_name": "Bash", "tool_input": {key: str(self.repo_a), "command": heavy_cmd}},
+                    harness="claude",
+                    gate_dir=self.gate_dir,
+                    cwd=self.root,
                 )
-            finally:
-                os.chdir(current_cwd)
-            reason = decision["hookSpecificOutput"]["permissionDecisionReason"]
-            self.assertIn("Last matching run in this checkout:", reason)
-            self.assertIn("source metadata matched", reason)
-            self.assertIn("status` to see active and recent runs.", reason)
+                self.assertIn(
+                    "Last matching run in this checkout:",
+                    workdir_decision["hookSpecificOutput"]["permissionDecisionReason"],
+                )
 
-            # Env-prefixed or different commands do not falsely claim an exact match.
-            prefixed = GATE.hook(
-                {"tool_name": "Bash", "cwd": str(self.repo_a), "tool_input": {"command": f"FOO=1 {heavy_cmd}"}},
-                "claude",
-            )
-            prefixed_reason = prefixed["hookSpecificOutput"]["permissionDecisionReason"]
-            self.assertNotIn("Last matching run in this checkout:", prefixed_reason)
-            self.assertIn("status` to see active and recent runs.", prefixed_reason)
+        # Env-prefixed or different commands do not falsely claim an exact match.
+        prefixed = ORK_FAST.run_gate_hook(
+            {"tool_name": "Bash", "cwd": str(self.repo_a), "tool_input": {"command": f"FOO=1 {heavy_cmd}"}},
+            harness="claude",
+            gate_dir=self.gate_dir,
+            cwd=self.root,
+        )
+        prefixed_reason = prefixed["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertNotIn("Last matching run in this checkout:", prefixed_reason)
+        self.assertIn("status` to see active and recent runs.", prefixed_reason)
 
-            # Antigravity workspacePaths fallback works when cwd is absent.
-            gemini = GATE.hook(
-                {
-                    "workspacePaths": [str(self.repo_a)],
-                    "toolCall": {"name": "run_command", "args": {"CommandLine": heavy_cmd}},
-                },
-                "gemini",
-            )
-            self.assertIn("Last matching run in this checkout:", gemini["reason"])
+        # Package-scoping flags invalidate relativeCwd so exact match is suppressed while history remains.
+        pkg_scoped = ORK_FAST.run_gate_hook(
+            {"tool_name": "Bash", "cwd": str(self.repo_a), "tool_input": {"command": "yarn --filter pkg test"}},
+            harness="claude",
+            gate_dir=self.gate_dir,
+            cwd=self.root,
+        )
+        pkg_reason = pkg_scoped["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertNotIn("Last matching run in this checkout:", pkg_reason)
+        self.assertIn("status` to see active and recent runs.", pkg_reason)
 
-            # cd outside the checkout suppresses repo_a's ledger history.
-            escaped = GATE.hook(
-                {
-                    "tool_name": "Bash",
-                    "cwd": str(self.repo_a),
-                    "tool_input": {"command": f"cd {self.repo_b} && {heavy_cmd}"},
-                },
-                "claude",
+        # Antigravity workspacePaths fallback works when cwd is absent.
+        gemini = ORK_FAST.run_gate_hook(
+            {
+                "workspacePaths": [str(self.repo_a)],
+                "toolCall": {"name": "run_command", "args": {"CommandLine": heavy_cmd}},
+            },
+            harness="gemini",
+            gate_dir=self.gate_dir,
+            cwd=self.root,
+        )
+        self.assertIn("Last matching run in this checkout:", gemini["reason"])
+
+        # cd inside checkout invalidates exact match (relative_cwd=None) but retains status hint.
+        sub = self.repo_a / "sub"
+        sub.mkdir(exist_ok=True)
+        in_repo = ORK_FAST.run_gate_hook(
+            {
+                "tool_name": "Bash",
+                "cwd": str(self.repo_a),
+                "tool_input": {"command": f"cd {sub} && {heavy_cmd}"},
+            },
+            harness="claude",
+            gate_dir=self.gate_dir,
+            cwd=self.root,
+        )
+        in_repo_reason = in_repo["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertNotIn("Last matching run in this checkout:", in_repo_reason)
+        self.assertIn("status` to see active and recent runs.", in_repo_reason)
+
+        # cd outside the checkout suppresses repo_a's ledger history.
+        escaped = ORK_FAST.run_gate_hook(
+            {
+                "tool_name": "Bash",
+                "cwd": str(self.repo_a),
+                "tool_input": {"command": f"cd {self.repo_b} && {heavy_cmd}"},
+            },
+            harness="claude",
+            gate_dir=self.gate_dir,
+            cwd=self.root,
+        )
+        self.assertNotIn(
+            "Last matching run in this checkout:", escaped["hookSpecificOutput"]["permissionDecisionReason"]
+        )
+        self.assertNotIn(
+            "status` to see active and recent runs.", escaped["hookSpecificOutput"]["permissionDecisionReason"]
+        )
+
+        # Active heavy holder in the same checkout adds an Active-holder note.
+        holder = self.gate(
+            "--heavy",
+            "--label",
+            "active-holder",
+            "--",
+            sys.executable,
+            "-m",
+            "unittest",
+            "probe_test",
+            env={"PROBE_SLEEP": "2.0"},
+            wait=False,
+        )
+        try:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                with GATE.runs_locked(self.gate_dir):
+                    if GATE.holders(self.gate_dir):
+                        break
+                time.sleep(0.05)
+            with GATE.runs_locked(self.gate_dir):
+                self.assertTrue(GATE.holders(self.gate_dir))
+            with_active = ORK_FAST.run_gate_hook(
+                {"tool_name": "Bash", "cwd": str(self.repo_a), "tool_input": {"command": heavy_cmd}},
+                harness="claude",
+                gate_dir=self.gate_dir,
+                cwd=self.root,
             )
-            self.assertNotIn(
-                "Last matching run in this checkout:", escaped["hookSpecificOutput"]["permissionDecisionReason"]
-            )
-            self.assertNotIn(
-                "status` to see active and recent runs.", escaped["hookSpecificOutput"]["permissionDecisionReason"]
-            )
+            active_reason = with_active["hookSpecificOutput"]["permissionDecisionReason"]
+            self.assertIn("Active in this checkout:", active_reason)
+            self.assertIn("active-holder", active_reason)
+            self.assertIn("Last matching run in this checkout:", active_reason)
+        finally:
+            holder.communicate(timeout=30)
 
     def test_launch_error_signal_corrupt_ledger_and_log_pruning(self):
         # Corrupt line in runs.jsonl is tolerated.
@@ -609,21 +739,42 @@ class LedgerTests(unittest.TestCase):
 
 
 class InstallTests(unittest.TestCase):
+    def test_hook_command_emits_direct_ork_fast_gate_hook(self):
+        fast_bin = ORK_FAST.find_ork_fast_bin()
+        with mock.patch.dict(os.environ, {"ORK_FAST_BIN": str(fast_bin)}):
+            for harness in ("claude", "codex", "gemini"):
+                cmd = GATE.hook_command(SCRIPT, harness)
+                self.assertEqual(cmd, shlex.join([str(fast_bin), "gate-hook", "--harness", harness]))
+                self.assertTrue(GATE.ours({"type": "command", "command": cmd}))
+                self.assertNotIn("gate.py", cmd)
+
     def test_install_adds_one_hook_per_harness_and_uninstall_removes_only_it(self):
+        fast_bin = ORK_FAST.find_ork_fast_bin()
         with tempfile.TemporaryDirectory() as home_name:
             home = Path(home_name)
             (home / ".claude").mkdir()
             claude = home / ".claude/settings.json"
             other = {"type": "command", "command": "other-hook"}
+            legacy = {"type": "command", "command": f"python3 {SCRIPT} hook --harness claude"}
             claude.write_text(
-                json.dumps({"model": "x", "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [other]}]}})
+                json.dumps(
+                    {
+                        "model": "x",
+                        "hooks": {
+                            "PreToolUse": [
+                                {"matcher": "Bash", "hooks": [other]},
+                                {"matcher": "Bash", "hooks": [legacy]},
+                            ]
+                        },
+                    }
+                )
             )
             gemini = home / ".gemini/config/hooks.json"
             gemini.parent.mkdir(parents=True)
             gemini.write_text(json.dumps({"peer-mailbox": {"Stop": []}}))
             with (
                 mock.patch.object(GATE.shutil, "which", side_effect=lambda name: f"/bin/{name}"),
-                mock.patch.dict(os.environ, {"CODEX_HOME": str(home / ".codex")}),
+                mock.patch.dict(os.environ, {"CODEX_HOME": str(home / ".codex"), "ORK_FAST_BIN": str(fast_bin)}),
             ):
                 GATE.install(home=home)
                 GATE.install(home=home)  # again: nothing changes
@@ -631,12 +782,20 @@ class InstallTests(unittest.TestCase):
                 commands = [h["command"] for g in installed["hooks"]["PreToolUse"] for h in g["hooks"]]
                 self.assertEqual(len(commands), 2)
                 self.assertIn("other-hook", commands)
+                self.assertIn(shlex.join([str(fast_bin), "gate-hook", "--harness", "claude"]), commands)
                 self.assertEqual(installed["model"], "x")
                 codex = json.loads((home / ".codex/hooks.json").read_text())["hooks"]["PreToolUse"][0]
                 self.assertIn("Bash", codex["matcher"])
-                self.assertIn("--harness codex", codex["hooks"][0]["command"])
+                self.assertEqual(
+                    codex["hooks"][0]["command"],
+                    shlex.join([str(fast_bin), "gate-hook", "--harness", "codex"]),
+                )
                 agy = json.loads(gemini.read_text())
                 self.assertEqual(agy["agent-gate"]["PreToolUse"][0]["matcher"], "run_command")
+                self.assertEqual(
+                    agy["agent-gate"]["PreToolUse"][0]["hooks"][0]["command"],
+                    shlex.join([str(fast_bin), "gate-hook", "--harness", "gemini"]),
+                )
                 self.assertIn("peer-mailbox", agy)
                 GATE.install(remove=True, home=home)
                 self.assertEqual(json.loads(claude.read_text())["hooks"]["PreToolUse"][0]["hooks"], [other])

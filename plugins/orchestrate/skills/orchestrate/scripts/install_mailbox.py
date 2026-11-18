@@ -1029,6 +1029,16 @@ def read_json_config(path: Path) -> dict:
     return json.loads(text)
 
 
+def _is_direct_hook_command(cmd: object, exact: str, required_fragment: str) -> bool:
+    if not isinstance(cmd, str):
+        return False
+    if cmd == exact:
+        return True
+    if "peer_mailbox.py" in cmd or "--fallback-script" in cmd or cmd.startswith("[ -x "):
+        return False
+    return "ork-fast" in cmd and "mailbox-hook" in cmd and required_fragment in cmd
+
+
 def configuration_status(
     home: Path | None = None, binaries: set[str] | None = None, *, base: Path | None = None
 ) -> dict:
@@ -1128,40 +1138,28 @@ def configuration_status(
         except (OSError, ValueError):
             issues.append("mailbox configuration could not be read")
         if hooks_path and harness == "agy":
+            fast_bin = runtime_paths.ork_fast_bin(home=home)
             try:
                 group = json.loads(hooks_path.read_text()).get("peer-mailbox", {})
                 for event in AGY_EVENTS:
-                    command = agy_command(expected.with_name("peer_mailbox.py"), event)
+                    command = agy_command(expected.with_name("peer_mailbox.py"), event, fast_bin=fast_bin)
                     if not any(
                         isinstance(entry, dict)
-                        and (
-                            entry.get("command") == command
-                            or (
-                                isinstance(entry.get("command"), str)
-                                and "mailbox-hook" in entry.get("command", "")
-                                and f"--event {event}" in entry.get("command", "")
-                                and expected.with_name("peer_mailbox.py").name in entry.get("command", "")
-                            )
-                        )
+                        and _is_direct_hook_command(entry.get("command"), command, f"--event {event}")
                         for entry in group.get(event, [])
                     ):
                         issues.append(f"{event} mailbox hook missing or stale")
             except (OSError, ValueError, AttributeError):
                 issues.append("mailbox turn hooks missing or unreadable")
         elif hooks_path:
+            fast_bin = runtime_paths.ork_fast_bin(home=home)
             try:
                 hooks = json.loads(hooks_path.read_text()).get("hooks", {})
-                command = hook_command(expected.with_name("peer_mailbox.py"), harness)
+                command = hook_command(expected.with_name("peer_mailbox.py"), harness, fast_bin=fast_bin)
                 expected_events = CLAUDE_EVENTS if harness == "claude" else EVENTS
                 for event in expected_events:
                     if not any(
-                        entry.get("command") == command
-                        or (
-                            isinstance(entry.get("command"), str)
-                            and "mailbox-hook" in entry.get("command", "")
-                            and f"--harness {harness}" in entry.get("command", "")
-                            and expected.with_name("peer_mailbox.py").name in entry.get("command", "")
-                        )
+                        _is_direct_hook_command(entry.get("command"), command, f"--harness {harness}")
                         for group in hooks.get(event, [])
                         for entry in group.get("hooks", [])
                     ):
@@ -1190,86 +1188,71 @@ def ensure_hub(hub: Path, skill: Path, *, dry_run: bool = False) -> None:
     hub.symlink_to(skill, target_is_directory=True)
 
 
-def agy_command(script: Path, event: str, fast_bin: Path | str | None = None) -> str:
-    py_cmd = shlex.join(["python3", str(script), "hook", "--harness", "gemini", "--event", event])
-    if fast_bin is None:
-        return py_cmd
-    fast_cmd = shlex.join(
-        [
-            str(fast_bin),
-            "mailbox-hook",
-            "--harness",
-            "gemini",
-            "--event",
-            event,
-            "--fallback-script",
-            str(script),
-        ]
-    )
-    return f"[ -x {shlex.quote(str(fast_bin))} ] && exec {fast_cmd}; exec {py_cmd}"
+def _resolve_fast_bin(fast_bin: Path | str | None, *, home: Path | None = None) -> Path:
+    return Path(fast_bin) if fast_bin is not None else runtime_paths.ork_fast_bin(home=home)
 
 
-def hook_command(script: Path, harness: str, fast_bin: Path | str | None = None) -> str:
-    py_cmd = shlex.join(["python3", str(script), "hook", "--harness", harness])
-    if fast_bin is None:
-        return py_cmd
-    fast_cmd = shlex.join(
-        [
-            str(fast_bin),
-            "mailbox-hook",
-            "--harness",
-            harness,
-            "--fallback-script",
-            str(script),
-        ]
-    )
-    return f"[ -x {shlex.quote(str(fast_bin))} ] && exec {fast_cmd}; exec {py_cmd}"
+def agy_command(script: Path | None, event: str, fast_bin: Path | str | None = None) -> str:
+    resolved = _resolve_fast_bin(fast_bin)
+    return shlex.join([str(resolved), "mailbox-hook", "--harness", "gemini", "--event", event])
+
+
+def hook_command(script: Path | None, harness: str, fast_bin: Path | str | None = None) -> str:
+    resolved = _resolve_fast_bin(fast_bin)
+    return shlex.join([str(resolved), "mailbox-hook", "--harness", harness])
 
 
 def statusline_command(
-    script: Path | str,
+    script: Path | str | None,
     extra_args: list[str] | None = None,
     *,
     fast_bin: Path | str | None = None,
+    home: Path | None = None,
     py_cmd_tokens: list[str] | None = None,
 ) -> str:
     extra = list(extra_args or ())
-    py_cmd = shlex.join(py_cmd_tokens or ["python3", str(script), *extra])
-    if fast_bin is None:
-        return py_cmd
-    fast_cmd = shlex.join(
-        [
-            str(fast_bin),
-            "statusline",
-            *extra,
-            "--fallback-script",
-            str(script),
-        ]
-    )
-    return f"[ -x {shlex.quote(str(fast_bin))} ] && exec {fast_cmd}; exec {py_cmd}"
+    resolved = _resolve_fast_bin(fast_bin, home=home)
+    return shlex.join([str(resolved), "statusline", *extra])
+
+
+def _strip_fallback_script(tokens: list[str]) -> list[str]:
+    cleaned: list[str] = []
+    idx = 0
+    while idx < len(tokens):
+        if tokens[idx] == "--fallback-script":
+            idx += 2
+            continue
+        cleaned.append(tokens[idx])
+        idx += 1
+    return cleaned
 
 
 def upgrade_statusline_command(cmd: str, *, fast_bin: Path | str | None = None, home: Path | None = None) -> str:
-    if fast_bin is None:
-        return cmd
-    py_part = cmd
+    resolved = _resolve_fast_bin(fast_bin, home=home)
+    part = cmd
     if "&& exec " in cmd and "; exec " in cmd:
-        py_part = cmd.split("; exec ", 1)[1]
+        part = cmd.split("; exec ", 1)[1]
     try:
-        tokens = shlex.split(py_part)
+        tokens = shlex.split(part)
     except ValueError:
         return cmd
+    fast_idx = next(
+        (
+            idx
+            for idx, tok in enumerate(tokens)
+            if Path(tok).name == "ork-fast" and tokens[idx + 1 : idx + 2] == ["statusline"]
+        ),
+        None,
+    )
+    if fast_idx is not None:
+        return statusline_command(None, _strip_fallback_script(tokens[fast_idx + 2 :]), fast_bin=resolved, home=home)
     script_idx = next(
         (idx for idx, tok in enumerate(tokens) if Path(tok).name == "agent_statusline.py"),
         None,
     )
-    if script_idx is None:
-        return cmd
-    script_tok = tokens[script_idx]
-    resolved_script = str((home or Path.home()) / script_tok[2:]) if script_tok.startswith("~/") else script_tok
-    extra_args = tokens[script_idx + 1 :]
-    py_tokens = [*tokens[:script_idx], resolved_script, *extra_args]
-    return statusline_command(resolved_script, extra_args, fast_bin=fast_bin, py_cmd_tokens=py_tokens)
+    if script_idx is not None:
+        return statusline_command(None, tokens[script_idx + 1 :], fast_bin=resolved, home=home)
+    return cmd
 
 
 def install_agy_statusline(
@@ -1313,8 +1296,8 @@ def install_claude_statusline(
     home: Path | None = None,
     dry_run: bool = False,
 ) -> bool:
-    """Upgrade an existing Claude statusLine command to prefer ork-fast with Python fallback."""
-    if fast_bin is None or not path.is_file():
+    """Upgrade an existing Claude statusLine command to direct ork-fast invocation."""
+    if not path.is_file():
         return False
     try:
         settings = json.loads(path.read_text(encoding="utf-8"))
@@ -1530,21 +1513,18 @@ def register(
 
 def mailbox_hook_updates(response: dict, script: Path, hooks_file: Path, *, fast_bin: Path | str | None = None) -> dict:
     """Only the four installer-owned commands qualify for explicit scoped trust."""
-    expected = ["python3", str(script), "hook", "--harness", "codex"]
+    resolved = _resolve_fast_bin(fast_bin)
+    expected_cmd = hook_command(script, "codex", fast_bin=resolved)
     events = {"sessionStart", "userPromptSubmit", "stop", "sessionEnd"}
     matches = []
     for entry in response.get("data", []):
         for hook in entry.get("hooks", []):
             cmd = hook.get("command", "")
-            is_match = (
-                shlex.split(cmd) == expected
-                or (fast_bin is not None and cmd == hook_command(script, "codex", fast_bin=fast_bin))
-                or (
-                    cmd.startswith("[ -x ")
-                    and "mailbox-hook" in cmd
-                    and "--harness codex" in cmd
-                    and str(script.name) in cmd
-                )
+            tokens = shlex.split(cmd) if isinstance(cmd, str) and not cmd.startswith("[ -x ") else []
+            is_match = cmd == expected_cmd or (
+                len(tokens) == 4
+                and Path(tokens[0]).name == "ork-fast"
+                and tokens[1:4] == ["mailbox-hook", "--harness", "codex"]
             )
 
             if (
@@ -1844,10 +1824,8 @@ def ensure_ork_fast(
     base_url: str | None = None,
     force_build: bool = False,
     env: dict | None = None,
-) -> Path | None:
+) -> Path:
     current_env = os.environ if env is None else env
-    if current_env.get("ORK_DISABLE_FAST") == "1":
-        return None
     custom_bin = current_env.get("ORK_FAST_BIN")
     if custom_bin:
         custom_path = Path(custom_bin).expanduser()
@@ -1860,7 +1838,7 @@ def ensure_ork_fast(
 
     if dry_run:
         print(f"would ensure ork-fast accelerator: {dest}")
-        return dest if dest.is_file() and os.access(dest, os.X_OK) else None
+        return dest
 
     crate_dir = None
     cur = Path(__file__).resolve().parent
@@ -1946,8 +1924,57 @@ def ensure_ork_fast(
     if dest.is_file() and os.access(dest, os.X_OK):
         return dest
 
-    print("• ork-fast accelerator not available; using Python reference implementation.")
-    return None
+    raise RuntimeError(f"ork-fast binary is required at {dest}; install a Rust toolchain or pass --fast-bin")
+
+
+def ensure_macos_hud(
+    plugin_root: Path | None = None,
+    *,
+    dry_run: bool = False,
+    home: Path | None = None,
+    env: dict | None = None,
+) -> Path | None:
+    """Compile OrkestHUD.app via macos/build.sh on macOS when xcrun is available."""
+    if sys.platform != "darwin":
+        return None
+    current_env = os.environ if env is None else env
+    cache = runtime_paths.cache_home(env=current_env, home=home)
+    app_dir = cache / "macos" / "OrkestHUD.app"
+    bin_path = app_dir / "Contents" / "MacOS" / "OrkestHUD"
+
+    if dry_run:
+        print(f"would ensure OrkestHUD.app: {app_dir}")
+        return bin_path
+
+    macos_dir = next(
+        (root / "macos" for root in _candidate_plugin_roots(plugin_root) if (root / "macos" / "build.sh").is_file()),
+        Path(__file__).resolve().parents[3] / "macos",
+    )
+    build_sh = macos_dir / "build.sh"
+    hud_swift = macos_dir / "hud.swift"
+    if not shutil.which("xcrun") or not build_sh.is_file() or not hud_swift.is_file():
+        return bin_path if bin_path.is_file() and os.access(bin_path, os.X_OK) else None
+
+    build_hash = hashlib.sha256(hud_swift.read_bytes() + b"\0" + build_sh.read_bytes()).hexdigest()
+    info_plist = app_dir / "Contents" / "Info.plist"
+    if bin_path.is_file() and os.access(bin_path, os.X_OK) and info_plist.is_file():
+        with contextlib.suppress(OSError, plistlib.InvalidFileException, ValueError):
+            meta = plistlib.loads(info_plist.read_bytes())
+            if isinstance(meta, dict) and meta.get("OrkestHUDBuildHash") == build_hash:
+                return bin_path
+
+    completed = subprocess.run(
+        ["/bin/sh", str(build_sh), str(app_dir)],
+        env={**current_env, "ORKEST_HUD_BUILD_HASH": build_hash},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    if completed.returncode == 0 and bin_path.is_file() and os.access(bin_path, os.X_OK):
+        print(f"✓ OrkestHUD installed: {app_dir}")
+        return bin_path
+    return bin_path if bin_path.is_file() and os.access(bin_path, os.X_OK) else None
 
 
 def claude_profiles(home: Path) -> list[Path]:
@@ -2020,6 +2047,7 @@ def install(
 
     if fast_bin is None:
         fast_bin = ensure_ork_fast(dry_run=dry_run, home=home)
+    ensure_macos_hud(dry_run=dry_run, home=home)
 
     daemon_url = ""
     daemon_token = ""

@@ -13,7 +13,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import test_run_agent
+TESTS = Path(__file__).resolve().parent
+if str(TESTS) not in sys.path:
+    sys.path.insert(0, str(TESTS))
+
+import test_run_agent  # noqa: E402
+from _ork_fast_test_helpers import build_test_env, find_ork_fast_bin, run_mailbox_hook  # noqa: E402
 
 # Session names include the runtime effort; keep the host session's own effort out of every test.
 os.environ.pop("CLAUDE_EFFORT", None)
@@ -287,13 +292,11 @@ class MailboxTests(unittest.TestCase):
             "cwd": str(self.repository),
             "model": {"id": "gpt-6-sol"},
         }
-        with mock.patch.object(sys, "path", [str(SCRIPTS), *sys.path]):
-            MAILBOX.hook(payload, harness="codex", base=self.base)
+        run_mailbox_hook(payload, harness="codex", base=self.base, pid=os.getpid())
         observed = MAILBOX.load(MAILBOX.peer_path(self.base, "runtime-model"))
         self.assertEqual(observed["model"], "gpt-6-sol")
         self.assertEqual(observed["modelSource"], "runtime")
-        with mock.patch.object(sys, "path", [str(SCRIPTS), *sys.path]):
-            MAILBOX.hook({**payload, "model": "gpt-6-astra"}, harness="codex", base=self.base)
+        run_mailbox_hook({**payload, "model": "gpt-6-astra"}, harness="codex", base=self.base, pid=os.getpid())
         self.assertEqual(MAILBOX.load(MAILBOX.peer_path(self.base, "runtime-model"))["model"], "gpt-6-astra")
         transcript = Path(self.temporary.name) / "claude-session.jsonl"
         transcript.write_text(
@@ -311,17 +314,17 @@ class MailboxTests(unittest.TestCase):
         )
         subdir = self.repository / "scripts"
         subdir.mkdir(exist_ok=True)
-        with mock.patch.object(sys, "path", [str(SCRIPTS), *sys.path]):
-            MAILBOX.hook(
-                {
-                    "hook_event_name": "UserPromptSubmit",
-                    "session_id": self.claude["session"],
-                    "cwd": str(subdir),
-                    "transcript_path": str(transcript),
-                },
-                harness="claude",
-                base=self.base,
-            )
+        run_mailbox_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": self.claude["session"],
+                "cwd": str(subdir),
+                "transcript_path": str(transcript),
+            },
+            harness="claude",
+            base=self.base,
+            pid=os.getpid(),
+        )
         after_slash = MAILBOX.load(MAILBOX.peer_path(self.base, self.claude["session"]))
         self.assertEqual(after_slash["model"], "Sonnet 5.5")
         self.assertEqual(after_slash["name"], f"{self.claude['person']}-sonnet-5.5-example-app-11")
@@ -337,17 +340,17 @@ class MailboxTests(unittest.TestCase):
                 )
                 + "\n"
             )
-        with mock.patch.object(sys, "path", [str(SCRIPTS), *sys.path]):
-            MAILBOX.hook(
-                {
-                    "hook_event_name": "Stop",
-                    "session_id": self.claude["session"],
-                    "cwd": str(subdir),
-                    "transcript_path": str(transcript),
-                },
-                harness="claude",
-                base=self.base,
-            )
+        run_mailbox_hook(
+            {
+                "hook_event_name": "Stop",
+                "session_id": self.claude["session"],
+                "cwd": str(subdir),
+                "transcript_path": str(transcript),
+            },
+            harness="claude",
+            base=self.base,
+            pid=os.getpid(),
+        )
         after_turn = MAILBOX.load(MAILBOX.peer_path(self.base, self.claude["session"]))
         self.assertEqual(after_turn["model"], "claude-sonnet-5-5")
         self.assertEqual(after_turn["name"], f"{self.claude['person']}-sonnet-5.5-example-app-11")
@@ -819,16 +822,11 @@ class MailboxTests(unittest.TestCase):
 
     def hook(self, session, harness, cwd, event):
         payload = {"hook_event_name": event, "session_id": session, "cwd": str(cwd)}
-        with mock.patch.object(MAILBOX, "harness_pid", return_value=os.getpid()):
-            return MAILBOX.hook(payload, harness=harness, base=self.base)
+        return run_mailbox_hook(payload, harness=harness, base=self.base, pid=os.getpid())
 
     def lifecycle(self, session, event, **extra):
         payload = {"hook_event_name": event, "session_id": session, "cwd": str(self.repository), **extra}
-        with (
-            mock.patch.object(MAILBOX, "harness_pid", return_value=os.getpid()),
-            mock.patch.object(sys, "path", [str(SCRIPTS), *sys.path]),
-        ):
-            return MAILBOX.hook(payload, harness="claude", base=self.base)
+        return run_mailbox_hook(payload, harness="claude", base=self.base, pid=os.getpid())
 
     def test_a_session_that_ends_unread_tells_its_senders(self):
         sent = MAILBOX.send(self.base, sender=self.codex, to=self.claude["name"], text="Can you check the parser?")
@@ -895,7 +893,10 @@ class MailboxTests(unittest.TestCase):
 
     def test_a_cleared_lead_never_redirects_a_handover_it_already_offered(self):
         authority = MAILBOX_AUTHORITY()
-        with mock.patch.dict(os.environ, {"AGENT_EXECUTOR_HOME": str(self.base.parent / "executor")}):
+        with mock.patch.dict(
+            os.environ,
+            {"ORCHESTRATE_HOME": str(self.base.parent), "AGENT_EXECUTOR_HOME": str(self.base.parent)},
+        ):
             authority.appoint("team", authority.member(self.claude["session"], "claude"))
             authority.offer("team", self.claude["session"], 1, authority.member("deputy-session", "codex"))
             self.lifecycle(self.claude["session"], "SessionEnd", reason="clear")
@@ -906,7 +907,10 @@ class MailboxTests(unittest.TestCase):
 
     def test_a_cleared_pending_successor_is_told_only_the_user_can_re_appoint(self):
         authority = MAILBOX_AUTHORITY()
-        with mock.patch.dict(os.environ, {"AGENT_EXECUTOR_HOME": str(self.base.parent / "executor")}):
+        with mock.patch.dict(
+            os.environ,
+            {"ORCHESTRATE_HOME": str(self.base.parent), "AGENT_EXECUTOR_HOME": str(self.base.parent)},
+        ):
             authority.appoint("team", authority.member("old-lead", "codex"), deputy={"harness": "claude"})
             authority.takeover("team", authority.member(self.claude["session"], "claude"), 1, user_approved=True)
             self.lifecycle(self.claude["session"], "SessionEnd", reason="clear")
@@ -917,7 +921,10 @@ class MailboxTests(unittest.TestCase):
 
     def test_a_cleared_lead_has_its_role_offered_not_given(self):
         authority = MAILBOX_AUTHORITY()
-        with mock.patch.dict(os.environ, {"AGENT_EXECUTOR_HOME": str(self.base.parent / "executor")}):
+        with mock.patch.dict(
+            os.environ,
+            {"ORCHESTRATE_HOME": str(self.base.parent), "AGENT_EXECUTOR_HOME": str(self.base.parent)},
+        ):
             authority.appoint("team", authority.member(self.claude["session"], "claude"))
             self.lifecycle(self.claude["session"], "SessionEnd", reason="clear")
             output = self.lifecycle("claude-session-after-clear", "SessionStart", source="clear")
@@ -1364,35 +1371,38 @@ class MailboxTests(unittest.TestCase):
             "cwd": str(self.repository),
             "transcript_path": "/u/.claude/x.jsonl",
         }
-        with mock.patch.object(MAILBOX, "harness_pid", return_value=os.getpid()):
-            started = MAILBOX.hook({**payload, "hook_event_name": "SessionStart"}, base=self.base)
-            self.assertIn("codex", started["hookSpecificOutput"]["additionalContext"])
-            me = MAILBOX.resolve(self.base, "claude-session-5555", sender=self.codex)
-            self.assertEqual((me["harness"], me["state"]), ("claude", "idle"))
-            # The session learns its own full name at start, and is not told again while it stays the same.
-            self.assertIn(f"Your agent name is {me['name']};", started["hookSpecificOutput"]["additionalContext"])
-            # The roster states the naming rule, so the injection carries it once.
-            self.assertEqual(started["hookSpecificOutput"]["additionalContext"].count("never shorten it"), 1)
-            MAILBOX.send(self.base, sender=self.codex, to=me["name"], text="review my diff?")
-            delivered = MAILBOX.hook({**payload, "hook_event_name": "UserPromptSubmit"}, base=self.base)
-            self.assertIn("review my diff?", delivered["hookSpecificOutput"]["additionalContext"])
-            self.assertNotIn("Your agent name is", delivered["hookSpecificOutput"]["additionalContext"])
-            # Every delivered message names its recipient, so the session sees its own name when it replies.
-            self.assertIn(f'recipient="{me["name"]}"', delivered["hookSpecificOutput"]["additionalContext"])
-            self.assertEqual(MAILBOX.resolve(self.base, me["name"], sender=self.codex)["state"], "busy")
-            # A rename on a quiet turn (the model learned late, or an upgrade) is announced on its own, once.
-            quiet = {**payload, "hook_event_name": "UserPromptSubmit", "model": "claude-opus-5-5"}
-            renamed = MAILBOX.hook(quiet, base=self.base)["hookSpecificOutput"]["additionalContext"]
-            me = MAILBOX.resolve(self.base, "claude-session-5555", sender=self.codex)
-            self.assertIn("-opus-5.5-", me["name"])
-            self.assertTrue(renamed.startswith(f"Your agent name is {me['name']};"))
-            self.assertIn("never shorten it", renamed)
-            self.assertIsNone(MAILBOX.hook(quiet, base=self.base))
-            self.assertIsNone(MAILBOX.hook({**payload, "hook_event_name": "Stop"}, base=self.base))
-            MAILBOX.send(self.base, sender=self.codex, to=me["name"], text="also check tests")
-            blocked = MAILBOX.hook({**payload, "hook_event_name": "Stop"}, base=self.base)
-            self.assertEqual(blocked["decision"], "block")
-            self.assertIsNone(MAILBOX.hook({**payload, "hook_event_name": "SessionEnd"}, base=self.base))
+        started = run_mailbox_hook({**payload, "hook_event_name": "SessionStart"}, base=self.base, pid=os.getpid())
+        self.assertIn("codex", started["hookSpecificOutput"]["additionalContext"])
+        me = MAILBOX.resolve(self.base, "claude-session-5555", sender=self.codex)
+        self.assertEqual((me["harness"], me["state"]), ("claude", "idle"))
+        # The session learns its own full name at start, and is not told again while it stays the same.
+        self.assertIn(f"Your agent name is {me['name']};", started["hookSpecificOutput"]["additionalContext"])
+        # The roster states the naming rule, so the injection carries it once.
+        self.assertEqual(started["hookSpecificOutput"]["additionalContext"].count("never shorten it"), 1)
+        MAILBOX.send(self.base, sender=self.codex, to=me["name"], text="review my diff?")
+        delivered = run_mailbox_hook(
+            {**payload, "hook_event_name": "UserPromptSubmit"}, base=self.base, pid=os.getpid()
+        )
+        self.assertIn("review my diff?", delivered["hookSpecificOutput"]["additionalContext"])
+        self.assertNotIn("Your agent name is", delivered["hookSpecificOutput"]["additionalContext"])
+        # Every delivered message names its recipient, so the session sees its own name when it replies.
+        self.assertIn(f'recipient="{me["name"]}"', delivered["hookSpecificOutput"]["additionalContext"])
+        self.assertEqual(MAILBOX.resolve(self.base, me["name"], sender=self.codex)["state"], "busy")
+        # A rename on a quiet turn (the model learned late, or an upgrade) is announced on its own, once.
+        quiet = {**payload, "hook_event_name": "UserPromptSubmit", "model": "claude-opus-5-5"}
+        renamed = run_mailbox_hook(quiet, base=self.base, pid=os.getpid())["hookSpecificOutput"]["additionalContext"]
+        me = MAILBOX.resolve(self.base, "claude-session-5555", sender=self.codex)
+        self.assertIn("-opus-5.5-", me["name"])
+        self.assertTrue(renamed.startswith(f"Your agent name is {me['name']};"))
+        self.assertIn("never shorten it", renamed)
+        self.assertIsNone(run_mailbox_hook(quiet, base=self.base, pid=os.getpid()))
+        self.assertIsNone(run_mailbox_hook({**payload, "hook_event_name": "Stop"}, base=self.base, pid=os.getpid()))
+        MAILBOX.send(self.base, sender=self.codex, to=me["name"], text="also check tests")
+        blocked = run_mailbox_hook({**payload, "hook_event_name": "Stop"}, base=self.base, pid=os.getpid())
+        self.assertEqual(blocked["decision"], "block")
+        self.assertIsNone(
+            run_mailbox_hook({**payload, "hook_event_name": "SessionEnd"}, base=self.base, pid=os.getpid())
+        )
         self.assertFalse(MAILBOX.peer_path(self.base, "claude-session-5555").exists())
 
     def test_antigravity_environment_and_payloads_are_detected(self):
@@ -1434,36 +1444,54 @@ class MailboxTests(unittest.TestCase):
             "transcriptPath": "/u/antigravity/t.jsonl",
             "modelName": "auto",
         }
-        with (
-            mock.patch.dict(os.environ, {}, clear=True),
-            mock.patch.object(MAILBOX, "harness_pid", return_value=os.getpid()),
-        ):
-            start = MAILBOX.hook(payload, event="SessionStart", base=self.base)
-            self.assertIn("codex", start["injectSteps"][0]["ephemeralMessage"])
-            me = MAILBOX.resolve(self.base, "agy-conv-3", sender=self.codex)
-            self.assertEqual((me["harness"], me["state"], me["cwd"]), ("gemini", "idle", str(self.repository)))
-            MAILBOX.send(self.base, sender=self.codex, to=me["name"], text="review my diff?")
-            step = MAILBOX.hook({**payload, "invocationNum": 1}, event="PreInvocation", base=self.base)
-            self.assertIn("review my diff?", step["injectSteps"][0]["ephemeralMessage"])
-            self.assertEqual(MAILBOX.resolve(self.base, me["name"], sender=self.codex)["state"], "busy")
-            self.assertEqual(MAILBOX.hook(payload, event="PreInvocation", base=self.base), {})
-            self.assertEqual(MAILBOX.hook({**payload, "terminationReason": "NO_TOOL_CALL"}, base=self.base), {})
-            MAILBOX.send(self.base, sender=self.codex, to=me["name"], text="also check tests")
-            canceled = MAILBOX.hook({**payload, "terminationReason": "USER_CANCELED"}, event="Stop", base=self.base)
-            self.assertEqual(canceled, {})
-            self.assertEqual(len(MAILBOX.incoming(self.base, "agy-conv-3")), 1)
-            stopped = MAILBOX.hook({**payload, "terminationReason": "NO_TOOL_CALL"}, event="Stop", base=self.base)
-            self.assertEqual(stopped["decision"], "continue")
-            self.assertIn("also check tests", stopped["reason"])
+        clean_env = {"PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", "")}
+        start = run_mailbox_hook(payload, event="SessionStart", base=self.base, pid=os.getpid(), env=clean_env)
+        self.assertIn("codex", start["injectSteps"][0]["ephemeralMessage"])
+        me = MAILBOX.resolve(self.base, "agy-conv-3", sender=self.codex)
+        self.assertEqual((me["harness"], me["state"], me["cwd"]), ("gemini", "idle", str(self.repository)))
+        MAILBOX.send(self.base, sender=self.codex, to=me["name"], text="review my diff?")
+        step = run_mailbox_hook(
+            {**payload, "invocationNum": 1}, event="PreInvocation", base=self.base, pid=os.getpid(), env=clean_env
+        )
+        self.assertIn("review my diff?", step["injectSteps"][0]["ephemeralMessage"])
+        self.assertEqual(MAILBOX.resolve(self.base, me["name"], sender=self.codex)["state"], "busy")
+        self.assertEqual(
+            run_mailbox_hook(payload, event="PreInvocation", base=self.base, pid=os.getpid(), env=clean_env), {}
+        )
+        self.assertEqual(
+            run_mailbox_hook(
+                {**payload, "terminationReason": "NO_TOOL_CALL"}, base=self.base, pid=os.getpid(), env=clean_env
+            ),
+            {},
+        )
+        MAILBOX.send(self.base, sender=self.codex, to=me["name"], text="also check tests")
+        canceled = run_mailbox_hook(
+            {**payload, "terminationReason": "USER_CANCELED"},
+            event="Stop",
+            base=self.base,
+            pid=os.getpid(),
+            env=clean_env,
+        )
+        self.assertEqual(canceled, {})
+        self.assertEqual(len(MAILBOX.incoming(self.base, "agy-conv-3")), 1)
+        stopped = run_mailbox_hook(
+            {**payload, "terminationReason": "NO_TOOL_CALL"},
+            event="Stop",
+            base=self.base,
+            pid=os.getpid(),
+            env=clean_env,
+        )
+        self.assertEqual(stopped["decision"], "continue")
+        self.assertIn("also check tests", stopped["reason"])
 
     def test_hook_cli_never_fails_the_host_turn(self):
         result = subprocess.run(
-            [sys.executable, "-B", str(SCRIPTS / "peer_mailbox.py"), "hook"],
+            [str(find_ork_fast_bin()), "mailbox-hook"],
             input="{not json",
             capture_output=True,
             text=True,
             timeout=10,
-            env={**os.environ, "AGENT_EXECUTOR_HOME": self.temporary.name},
+            env=build_test_env(base=self.base),
         )
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
