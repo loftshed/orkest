@@ -1128,6 +1128,7 @@ export async function runHordeTui(
         color: shouldUseColor(output),
         theme,
         mouseEnabled: mouse,
+        confirmClose: view.confirmClose,
         lastRoomId: homeRoomId,
       })
     : null;
@@ -1135,7 +1136,13 @@ export async function runHordeTui(
     try {
       const status = await chiefOptions.loadStatus();
       chiefView.setStatus(status);
-      liveChief = status?.chief && typeof status.chief === "object" ? status.chief : null;
+      liveChief =
+        status?.chief &&
+        typeof status.chief === "object" &&
+        status.chief.live &&
+        !status.chief.stale
+          ? status.chief
+          : null;
     } catch (error) {
       chiefView.notice = `Could not read Chief status: ${error.message}`;
     }
@@ -1146,21 +1153,36 @@ export async function runHordeTui(
   if (chiefView) {
     const roomInput = view.handleInput.bind(view);
     view.handleInput = (value) => {
-      if (mode === "chief") return chiefView.handleInput(value);
-      if (CHIEF_ROOM_BACK_KEYS.has(value) || (value === "\u{1B}" && !view.preview && !view.overlay))
+      if (mode === "chief") {
+        if (value !== "q") view.closeArmedAt = undefined;
+        return chiefView.handleInput(value);
+      }
+      if (
+        CHIEF_ROOM_BACK_KEYS.has(value) ||
+        (value === "\u{1B}" && !view.preview && !view.overlay)
+      ) {
+        view.closeArmedAt = undefined;
+        chiefView.closeArmedAt = undefined;
         return { type: "chief-mode", mode: "chief" };
+      }
       return roomInput(value);
     };
     const roomMouse = view.handleMouse.bind(view);
-    view.handleMouse = (event) =>
-      mode === "chief" ? chiefView.handleMouse(event) : roomMouse(event);
+    view.handleMouse = (event) => {
+      if (event?.action === "press") {
+        view.closeArmedAt = undefined;
+        chiefView.closeArmedAt = undefined;
+      }
+      return mode === "chief" ? chiefView.handleMouse(event) : roomMouse(event);
+    };
     if (typeof view.requestClose === "function") {
       const roomClose = view.requestClose.bind(view);
       view.requestClose = () => {
-        if (mode === "chief" && !view.confirmClose) return { type: "close-view" };
-        const result = roomClose();
-        if (mode === "chief" && view.notice) chiefView.notice = view.notice;
-        return result;
+        if (mode === "chief") {
+          view.closeArmedAt = undefined;
+          return chiefView.requestClose();
+        }
+        return roomClose();
       };
     }
   }
@@ -1199,10 +1221,10 @@ export async function runHordeTui(
       const room = await loadActiveRoom();
       if (generation !== roomGeneration || mode !== "room") return;
       if (chiefView) {
-        if (liveChief) room.chief = liveChief;
+        if (room && typeof room === "object") room.liveChief = liveChief ?? null;
       } else if (enableChiefHint) {
         const binding = await readLiveChief(env);
-        if (binding) room.chief = binding;
+        if (room && typeof room === "object") room.liveChief = binding ?? null;
       }
       if (quota) {
         try {
@@ -1369,6 +1391,8 @@ export async function runHordeTui(
     drilledRoomId = roomId && roomId !== homeRoomId ? roomId : undefined;
     const generation = ++roomGeneration;
     mode = "room";
+    view.closeArmedAt = undefined;
+    if (chiefView) chiefView.closeArmedAt = undefined;
     lastLines = [];
     diffGeneration++;
     await previewController.close();
@@ -1382,7 +1406,7 @@ export async function runHordeTui(
     try {
       const room = await loadActiveRoom();
       if (isStopped || generation !== roomGeneration) return;
-      if (liveChief) room.chief = liveChief;
+      if (room && typeof room === "object") room.liveChief = liveChief ?? null;
       view.setRoom(room);
       view.notice = "";
     } catch (error) {
@@ -1395,6 +1419,8 @@ export async function runHordeTui(
   const showChief = () => {
     roomGeneration++;
     mode = "chief";
+    view.closeArmedAt = undefined;
+    chiefView.closeArmedAt = undefined;
     lastLines = [];
     diffGeneration++;
     void previewController.close();

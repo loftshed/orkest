@@ -6,12 +6,14 @@ user profile of every installed harness. Later setup runs (`ork update`, `ork se
 refresh those rules from the same state file, so the approval survives a moved checkout or a new
 Python. `--untrust-orkest-commands` removes exactly the rules this module added.
 
-The approved scope is an explicit list of `ork` subcommands and four Orkest scripts at their absolute
-install paths. Generic `python3`, `node` or shell, other scripts, and the Orkest commands that run an
-arbitrary program (`ork gate -- COMMAND`, `ork label -- HARNESS`, `gate.py`, the interactive
-`ork codex|claude|agy|opencode` launchers) still ask. Orkest's own guards are unchanged: `--allow-credits`,
-account selection, worker scopes, repository policy and deletion confirmations are enforced inside
-the commands, not by the harness prompt.
+The approved scope is an explicit list of `ork` subcommands and Orkest coordination scripts at their
+absolute install paths (with read/accept scoping on `authority.py`, `handoff.py`, `ork policy show`,
+and `ork setup --dry-run`). Generic `python3`, `node` or shell, other scripts, and the Orkest commands
+that run an arbitrary program (`ork gate -- COMMAND`, `ork label -- HARNESS`, `gate.py`, the interactive
+`ork codex|claude|agy|opencode` launchers) still ask. `run_agent.py` still enforces `credits.allow=false`
+in `config.json` across all harnesses, while Claude Code and OpenCode also re-prompt on
+`--allow-credits`, `--ignore-quota`, and `--trust-codex-hooks`; account selection, worker scopes,
+repository policy and deletion confirmations are enforced inside the commands.
 """
 
 from __future__ import annotations
@@ -47,13 +49,13 @@ ORK_SUBCOMMANDS: tuple[tuple[str, ...], ...] = (
     ("herdr-status",),
     ("name",),
     ("next",),
-    ("policy",),
+    ("policy", "show"),
     ("progress",),
     ("quota",),
     ("radar",),
     ("rooms",),
     ("routes",),
-    ("setup",),
+    ("setup", "--dry-run"),
     ("side",),
     ("side-mission",),
     ("smelter",),
@@ -73,8 +75,16 @@ ORK_SUBCOMMANDS: tuple[tuple[str, ...], ...] = (
     ("horde", "--fixture"),
 )
 # The coordination, dispatch, mailbox and progress entry points. gate.py is left out because
-# `gate.py -- COMMAND` runs any command, and run_agent.py excludes `probe`, `horde` and `listen`.
-SCRIPTS = ("run_agent.py", "coordinator.py", "agent_progress.py", "peer_mailbox.py")
+# `gate.py -- COMMAND` runs any command, and run_agent.py/authority.py/handoff.py stay subcommand-scoped.
+SCRIPTS = (
+    "run_agent.py",
+    "coordinator.py",
+    "agent_progress.py",
+    "peer_mailbox.py",
+    "context_handoff.py",
+    "continuation_requests.py",
+    "telemetry.py",
+)
 RUN_AGENT_ARGS: tuple[str, ...] = (
     "consult",
     "mailbox",
@@ -101,15 +111,30 @@ RUN_AGENT_ARGS: tuple[str, ...] = (
     "--help",
     "-h",
 )
+SCRIPT_SUBCOMMANDS: dict[str, tuple[str, ...]] = {
+    "run_agent.py": RUN_AGENT_ARGS,
+    "authority.py": ("show", "accept", "offer", "--help", "-h"),
+    "handoff.py": ("status", "show", "--help", "-h"),
+}
+CLAUDE_ASK_RULES = (
+    "Bash(* --allow-credits*)",
+    "Bash(* --ignore-quota*)",
+    "Bash(* --trust-codex-hooks*)",
+)
+OPENCODE_ASK_RULES = (
+    "* --allow-credits*",
+    "* --ignore-quota*",
+    "* --trust-codex-hooks*",
+)
 
 SCOPE_TEXT = """\
 Approving Orkest commands for future agents in every installed harness:
   ork <subcommand>        {ork}
-  ork horde / gate        horde toggle|open|close|spawn|--attach-room|--view|--print|--json|--fixture, gate status
+  ork horde / gate        horde toggle|open|close|spawn|--attach-room|--view|--chief|--print|--json|--fixture, gate status, policy show, setup --dry-run
   node <ork.mjs> ...      the same subcommands through this checkout's CLI
-  python3 <script> ...    {scripts} at their absolute install paths (run_agent.py probe/horde/listen stay prompted)
+  python3 <script> ...    {scripts}, plus scoped authority.py (show|accept|offer) and handoff.py (status|show) at their absolute install paths (run_agent.py probe/horde/listen, mutating authority.py, and handoff.py enable|disable stay prompted)
 Generic python3, node and shell commands, other scripts, ork gate --, ork label and launchers still ask.
-Credits (--allow-credits), account selection, worker scopes and deletion confirmations still apply.
+run_agent.py still enforces credits.allow=false in config.json across all harnesses; Claude Code and OpenCode also re-prompt on --allow-credits, --ignore-quota and --trust-codex-hooks. Account selection, worker scopes and deletion confirmations still apply.
 Undo with --untrust-orkest-commands."""
 
 # Antigravity treats each token inside command(...) as an anchored regex `^(?:token)$`. We keep `.`
@@ -142,11 +167,16 @@ class Scope:
         for node in self.nodes:
             for cli in self.cli_paths:
                 found.extend((node, cli, *sub) for sub in ORK_SUBCOMMANDS)
-        run_agent_paths = self.script_paths(skill_dirs, scripts=("run_agent.py",))
-        other_paths = self.script_paths(skill_dirs, scripts=[name for name in SCRIPTS if name != "run_agent.py"])
+        unscoped_scripts = [name for name in SCRIPTS if name not in SCRIPT_SUBCOMMANDS]
+        other_paths = self.script_paths(skill_dirs, scripts=unscoped_scripts)
+        scoped_paths = [
+            (self.script_paths(skill_dirs, scripts=(name,)), subcommands)
+            for name, subcommands in SCRIPT_SUBCOMMANDS.items()
+        ]
         for python in self.pythons:
-            for script in run_agent_paths:
-                found.extend((python, script, arg) for arg in RUN_AGENT_ARGS)
+            for paths, subcommands in scoped_paths:
+                for script in paths:
+                    found.extend((python, script, arg) for arg in subcommands)
             found.extend((python, script) for script in other_paths)
         return list(dict.fromkeys(found))
 
@@ -160,6 +190,7 @@ class Target:
     kind: str  # "codex", "claude", "agy" or "opencode"
     skill_dirs: list[Path] = field(default_factory=list)
     entries: list[str] = field(default_factory=list)
+    ask_entries: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
 
 
@@ -266,10 +297,11 @@ def codex_rules(scope: Scope, skill_dirs: Iterable[Path]) -> str:
     lines.extend(rule(programs, *sub) for sub in longer)
     lines.append(rule(scope.nodes, scope.cli_paths, single))
     lines.extend(rule(scope.nodes, scope.cli_paths, *sub) for sub in longer)
-    other_scripts = scope.script_paths(skill_dirs, scripts=[name for name in SCRIPTS if name != "run_agent.py"])
-    run_agent_scripts = scope.script_paths(skill_dirs, scripts=("run_agent.py",))
+    other_scripts = scope.script_paths(skill_dirs, scripts=[name for name in SCRIPTS if name not in SCRIPT_SUBCOMMANDS])
     lines.append(rule(scope.pythons, other_scripts))
-    lines.append(rule(scope.pythons, run_agent_scripts, list(RUN_AGENT_ARGS)))
+    for name, subcommands in SCRIPT_SUBCOMMANDS.items():
+        scoped_scripts = scope.script_paths(skill_dirs, scripts=(name,))
+        lines.append(rule(scope.pythons, scoped_scripts, list(subcommands)))
     return "\n".join(lines) + "\n"
 
 
@@ -324,8 +356,8 @@ def _comments_in(text: str, keys: list[str]) -> str:
     return "\n".join(comments) + "\n" if comments else ""
 
 
-def _render(text: str, data: dict, keys: list[str], value: object) -> str:
-    """Plain JSON is rewritten whole; JSONC keeps its comments and only the edited value changes."""
+def _render_updates(text: str, data: dict, updates: list[tuple[list[str], object]]) -> str:
+    """Plain JSON is rewritten whole; JSONC keeps its comments and only the edited values change."""
     if not _strip_jsonc(text).strip():
         prefix = text.rstrip()
         rendered = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
@@ -335,11 +367,17 @@ def _render(text: str, data: dict, keys: list[str], value: object) -> str:
     try:
         json.loads((text or "").strip() or "{}")
     except ValueError:
-        updated = configuration.set_json_path(text, keys, value, preserved_comments=_comments_in(text, keys))
+        updated = text
+        for keys, value in updates:
+            updated = configuration.set_json_path(updated, keys, value, preserved_comments=_comments_in(updated, keys))
     else:
         updated = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
     _parse(updated)
     return updated
+
+
+def _render(text: str, data: dict, keys: list[str], value: object) -> str:
+    return _render_updates(text, data, [(keys, value)])
 
 
 def _write(path: Path, before: str | None, after: str) -> None:
@@ -348,40 +386,58 @@ def _write(path: Path, before: str | None, after: str) -> None:
     configuration.write_private(real, after, expected=before)
 
 
-def _edit_rule_list(
-    target: Target, keys: list[str], previous: list[str], *, dry_run: bool, label: str
-) -> tuple[list[str], int, int]:
-    """Add the wanted rules to a JSON list, drop rules Orkest added earlier that are no longer wanted."""
+def _edit_rule_lists(
+    target: Target,
+    sections: list[tuple[list[str], list[str], list[str]]],
+    *,
+    dry_run: bool,
+    label: str,
+) -> tuple[list[list[str]], int, int]:
+    """Add wanted rules to each JSON list and drop stale rules Orkest added earlier."""
     real = _real(target.path)
     before = real.read_text() if real.exists() else None
     data = _parse(before or "{}")
-    parent = data
-    for key in keys[:-1]:
-        child = parent.setdefault(key, {})
-        if not isinstance(child, dict):
-            raise ValueError(f"{'.'.join(keys[:-1])} is not an object")
-        parent = child
-    current = parent.get(keys[-1], [])
-    if not isinstance(current, list):
-        raise ValueError(f"{'.'.join(keys)} is not a list")
-    wanted = target.entries
-    stale = {entry for entry in previous if entry not in wanted}
-    added = [entry for entry in wanted if entry not in current]
-    removed = [entry for entry in current if entry in stale]
-    owned = [entry for entry in previous if entry in wanted and entry in current] + added
-    if not added and not removed:
-        print(f"• {label}: Orkest commands already approved ({len(wanted)} rules): {target.path}")
-        return owned, 0, 0
+    owned_lists: list[list[str]] = []
+    changed_sections: list[tuple[list[str], object]] = []
+    total_wanted = 0
+    total_added = 0
+    total_removed = 0
+    for keys, wanted, previous in sections:
+        parent = data
+        for key in keys[:-1]:
+            child = parent.setdefault(key, {})
+            if not isinstance(child, dict):
+                raise ValueError(f"{'.'.join(keys[:-1])} is not an object")
+            parent = child
+        current = parent.get(keys[-1], [])
+        if not isinstance(current, list):
+            raise ValueError(f"{'.'.join(keys)} is not a list")
+        stale = {entry for entry in previous if entry not in wanted}
+        added = [entry for entry in wanted if entry not in current]
+        removed = [entry for entry in current if entry in stale]
+        owned = [entry for entry in previous if entry in wanted and entry in current] + added
+        owned_lists.append(owned)
+        total_wanted += len(wanted)
+        total_added += len(added)
+        total_removed += len(removed)
+        if added or removed:
+            updated_list = [entry for entry in current if entry not in stale] + added
+            parent[keys[-1]] = updated_list
+            changed_sections.append((keys, updated_list))
+    if not changed_sections:
+        print(f"• {label}: Orkest commands already approved ({total_wanted} rules): {target.path}")
+        return owned_lists, 0, 0
     if dry_run:
-        print(f"would approve Orkest commands in {label}: +{len(added)} -{len(removed)} rules: {target.path}")
-        return owned, len(added), len(removed)
-    parent[keys[-1]] = [entry for entry in current if entry not in stale] + added
-    _write(target.path, before, _render(before or "{}", data, keys, parent[keys[-1]]))
-    print(f"✓ {label}: approved Orkest commands (+{len(added)} -{len(removed)} rules): {target.path}")
-    return owned, len(added), len(removed)
+        print(f"would approve Orkest commands in {label}: +{total_added} -{total_removed} rules: {target.path}")
+        return owned_lists, total_added, total_removed
+    _write(target.path, before, _render_updates(before or "{}", data, changed_sections))
+    print(f"✓ {label}: approved Orkest commands (+{total_added} -{total_removed} rules): {target.path}")
+    return owned_lists, total_added, total_removed
 
 
-def _edit_opencode(target: Target, previous: list[str], *, dry_run: bool) -> tuple[list[str], int, int]:
+def _edit_opencode(
+    target: Target, previous_allow: list[str], previous_ask: list[str], *, dry_run: bool
+) -> tuple[list[str], list[str], int, int]:
     """OpenCode reads `permission.bash` (or `shell`) patterns and lets the last match win."""
     real = _real(target.path)
     before = real.read_text() if real.exists() else None
@@ -397,21 +453,53 @@ def _edit_opencode(target: Target, previous: list[str], *, dry_run: bool) -> tup
     if rules is not None and not isinstance(rules, (dict, str)):
         raise ValueError(f"permission.{section} is neither an object nor a string")
     current = dict(rules) if isinstance(rules, dict) else ({"*": rules} if isinstance(rules, str) else {})
-    wanted = target.entries
-    stale = {entry for entry in previous if entry not in wanted and current.get(entry) == "allow"}
-    kept_by_user = [entry for entry in wanted if entry in current and current[entry] != "allow"]
-    added = [entry for entry in wanted if entry not in current]
-    owned = [entry for entry in previous if entry in wanted and current.get(entry) == "allow"] + added
+    wanted_allow = target.entries
+    wanted_ask = target.ask_entries
+    ask_set = set(wanted_ask)
+    stale_allow = {
+        entry
+        for entry in previous_allow
+        if entry not in wanted_allow and entry not in ask_set and current.get(entry) == "allow"
+    }
+    stale_ask = {entry for entry in previous_ask if entry not in ask_set and current.get(entry) == "ask"}
+    stale = stale_allow | stale_ask
+    kept_by_user = [entry for entry in wanted_allow if entry in current and current[entry] != "allow"]
+    added_allow = [entry for entry in wanted_allow if entry not in current and entry not in ask_set]
+    owned_allow = [
+        entry
+        for entry in previous_allow
+        if entry in wanted_allow and entry not in ask_set and current.get(entry) == "allow"
+    ] + added_allow
+
+    owned_ask: list[str] = []
+    added_ask_count = 0
+    for entry in wanted_ask:
+        existing = current.get(entry)
+        if existing == "deny":
+            continue
+        if existing == "ask":
+            if entry in previous_ask:
+                owned_ask.append(entry)
+            continue
+        owned_ask.append(entry)
+        added_ask_count += 1
+
+    updated_rules = {key: value for key, value in current.items() if key not in stale and key not in ask_set}
+    for entry in added_allow:
+        updated_rules[entry] = "allow"
+    for entry in wanted_ask:
+        updated_rules[entry] = "deny" if current.get(entry) == "deny" else "ask"
+
     if kept_by_user:
         print(f"• OpenCode: kept {len(kept_by_user)} of your own non-allow rules for Orkest commands")
-    if not added and not stale:
-        print(f"• OpenCode: Orkest commands already approved ({len(wanted)} rules): {target.path}")
-        return owned, 0, 0
+    total_added = len(added_allow) + added_ask_count
+    total_removed = len(stale)
+    if list(updated_rules.items()) == list(current.items()):
+        print(f"• OpenCode: Orkest commands already approved ({len(wanted_allow)} rules): {target.path}")
+        return owned_allow, owned_ask, 0, 0
     if dry_run:
-        print(f"would approve Orkest commands in OpenCode: +{len(added)} -{len(stale)} rules: {target.path}")
-        return owned, len(added), len(stale)
-    updated_rules = {key: value for key, value in current.items() if key not in stale}
-    updated_rules.update(dict.fromkeys(added, "allow"))
+        print(f"would approve Orkest commands in OpenCode: +{total_added} -{total_removed} rules: {target.path}")
+        return owned_allow, owned_ask, total_added, total_removed
     if isinstance(permission, dict):
         permission[section] = updated_rules
         keys, value = ["permission", section], updated_rules
@@ -420,11 +508,11 @@ def _edit_opencode(target: Target, previous: list[str], *, dry_run: bool) -> tup
         data["permission"] = {**base, section: updated_rules}
         keys, value = ["permission"], data["permission"]
     _write(target.path, before, _render(before or "{}", data, keys, value))
-    print(f"✓ OpenCode: approved Orkest commands (+{len(added)} -{len(stale)} rules): {target.path}")
-    return owned, len(added), len(stale)
+    print(f"✓ OpenCode: approved Orkest commands (+{total_added} -{total_removed} rules): {target.path}")
+    return owned_allow, owned_ask, total_added, total_removed
 
 
-def _remove_opencode(path: Path, owned: list[str], *, dry_run: bool) -> int:
+def _remove_opencode(path: Path, owned_allow: list[str], owned_ask: list[str], *, dry_run: bool) -> int:
     real = _real(path)
     if not real.exists():
         return 0
@@ -434,11 +522,17 @@ def _remove_opencode(path: Path, owned: list[str], *, dry_run: bool) -> int:
     if not isinstance(permission, dict):
         return 0
     count = 0
+    allow_set = set(owned_allow)
+    ask_set = set(owned_ask)
     for section in ("bash", "shell"):
         rules = permission.get(section)
         if not isinstance(rules, dict):
             continue
-        remaining = {key: value for key, value in rules.items() if not (key in owned and value == "allow")}
+        remaining = {
+            key: value
+            for key, value in rules.items()
+            if not ((key in allow_set and value == "allow") or (key in ask_set and value == "ask"))
+        }
         count += len(rules) - len(remaining)
         permission[section] = remaining
     if count and not dry_run:
@@ -446,27 +540,37 @@ def _remove_opencode(path: Path, owned: list[str], *, dry_run: bool) -> int:
     return count
 
 
-def _remove_rule_list(path: Path, keys: list[str], owned: list[str], *, dry_run: bool) -> int:
+def _remove_rule_lists(path: Path, sections: list[tuple[list[str], list[str]]], *, dry_run: bool) -> int:
     real = _real(path)
     if not real.exists():
         return 0
     before = real.read_text()
     data = _parse(before)
-    parent = data
-    for key in keys[:-1]:
-        parent = parent.get(key)
-        if not isinstance(parent, dict):
-            return 0
-    current = parent.get(keys[-1])
-    if not isinstance(current, list):
-        return 0
-    remaining = [entry for entry in current if entry not in owned]
-    if remaining == current:
-        return 0
-    if not dry_run:
-        parent[keys[-1]] = remaining
-        _write(path, before, _render(before, data, keys, remaining))
-    return len(current) - len(remaining)
+    changed_sections: list[tuple[list[str], object]] = []
+    removed_count = 0
+    for keys, owned in sections:
+        if not owned:
+            continue
+        parent = data
+        for key in keys[:-1]:
+            parent = parent.get(key)
+            if not isinstance(parent, dict):
+                parent = None
+                break
+        if parent is None:
+            continue
+        current = parent.get(keys[-1])
+        if not isinstance(current, list):
+            continue
+        owned_set = set(owned)
+        remaining = [entry for entry in current if entry not in owned_set]
+        if remaining != current:
+            parent[keys[-1]] = remaining
+            changed_sections.append((keys, remaining))
+            removed_count += len(current) - len(remaining)
+    if removed_count and not dry_run:
+        _write(path, before, _render_updates(before, data, changed_sections))
+    return removed_count
 
 
 def _install_codex(target: Target, content: str, *, dry_run: bool) -> bool:
@@ -535,6 +639,7 @@ def targets(
         for profile in claude_profiles:
             target = Target(f"Claude ({profile.name})", profile / "settings.json", "claude", [profile / skills])
             target.entries = claude_rules(scope.prefixes(target.skill_dirs))
+            target.ask_entries = list(CLAUDE_ASK_RULES)
             found.append(target)
     if "agy" in harnesses and agy_settings is not None:
         dirs = [home / ".gemini/config" / skills, home / ".gemini/antigravity" / skills]
@@ -544,6 +649,7 @@ def targets(
     if "opencode" in harnesses and opencode_config is not None:
         target = Target("OpenCode", opencode_config, "opencode", [opencode_config.parent / skills])
         target.entries, target.skipped = opencode_rules(scope.prefixes(target.skill_dirs))
+        target.ask_entries = list(OPENCODE_ASK_RULES)
         found.append(target)
     return found
 
@@ -579,22 +685,42 @@ def apply(
         key = str(target.path)
         record = files.get(key, {})
         previous = record.get("entries", []) if isinstance(record, dict) else []
+        previous_ask = record.get("ask_entries", []) if isinstance(record, dict) else []
+        owned_ask: list[str] = []
         try:
             if target.kind == "codex":
                 _install_codex(target, codex_rules(scope, target.skill_dirs), dry_run=dry_run)
                 owned: list[str] = []
-            elif target.kind in ("claude", "agy"):
-                owned, _, _ = _edit_rule_list(
-                    target, ["permissions", "allow"], previous, dry_run=dry_run, label=target.harness
+            elif target.kind == "claude":
+                owned_lists, _, _ = _edit_rule_lists(
+                    target,
+                    [
+                        (["permissions", "allow"], target.entries, previous),
+                        (["permissions", "ask"], target.ask_entries, previous_ask),
+                    ],
+                    dry_run=dry_run,
+                    label=target.harness,
                 )
+                owned, owned_ask = owned_lists
+            elif target.kind == "agy":
+                owned_lists, _, _ = _edit_rule_lists(
+                    target,
+                    [(["permissions", "allow"], target.entries, previous)],
+                    dry_run=dry_run,
+                    label=target.harness,
+                )
+                (owned,) = owned_lists
             else:
-                owned, _, _ = _edit_opencode(target, previous, dry_run=dry_run)
+                owned, owned_ask, _, _ = _edit_opencode(target, previous, previous_ask, dry_run=dry_run)
         except (OSError, ValueError) as error:
             print(f"! {target.harness}: left unchanged ({error}): {target.path}")
             continue
         if target.skipped:
             print(f"• {target.harness}: {len(target.skipped)} paths with pattern characters stay prompted")
-        files[key] = {"kind": target.kind, "entries": owned}
+        entry_record: dict[str, object] = {"kind": target.kind, "entries": owned}
+        if target.kind in ("claude", "opencode"):
+            entry_record["ask_entries"] = owned_ask
+        files[key] = entry_record
     if not dry_run:
         state.update(version=STATE_VERSION, enabled=True, files=files)
         save_state(state_path, state)
@@ -607,13 +733,19 @@ def _revoke(state: dict, state_path: Path, *, dry_run: bool) -> bool:
         path = Path(key)
         kind = record.get("kind") if isinstance(record, dict) else None
         owned = record.get("entries", []) if isinstance(record, dict) else []
+        owned_ask = record.get("ask_entries", []) if isinstance(record, dict) else []
         try:
             if kind == "codex":
                 count = int(_retire_codex(path, dry_run=dry_run))
-            elif kind in ("claude", "agy"):
-                count = _remove_rule_list(path, ["permissions", "allow"], owned, dry_run=dry_run)
+            elif kind == "claude":
+                sections = [(["permissions", "allow"], owned)]
+                if owned_ask:
+                    sections.append((["permissions", "ask"], owned_ask))
+                count = _remove_rule_lists(path, sections, dry_run=dry_run)
+            elif kind == "agy":
+                count = _remove_rule_lists(path, [(["permissions", "allow"], owned)], dry_run=dry_run)
             elif kind == "opencode":
-                count = _remove_opencode(path, owned, dry_run=dry_run)
+                count = _remove_opencode(path, owned, owned_ask, dry_run=dry_run)
             else:
                 count = 0
         except (OSError, ValueError) as error:

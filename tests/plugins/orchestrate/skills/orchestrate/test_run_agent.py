@@ -566,6 +566,12 @@ class ReportingAndArtifactTests(unittest.TestCase):
             mode = stat.S_IMODE(target.stat().st_mode)
             self.assertEqual(mode, 0o600)
 
+            nested = Path(directory) / "missing-parent/sub/final-output.txt"
+            RUNNER.write_private_text(nested, "private report\n")
+            self.assertEqual(nested.read_text(encoding="utf-8"), "private report\n")
+            self.assertEqual(stat.S_IMODE(nested.stat().st_mode), 0o600)
+            self.assertTrue(nested.parent.is_dir())
+
     def test_verification_tail_lines_are_bounded(self) -> None:
         self.assertEqual(
             len(RUNNER.nonempty_tail("x" * 2000)[0]),
@@ -1729,6 +1735,10 @@ else:
             result["command"].index("Execute the attached execution brief exactly and return its required report."),
             result["command"].index("--file"),
         )
+        opencode_final = _out_dir / "final-output.txt"
+        self.assertTrue(opencode_final.is_file())
+        self.assertEqual(stat.S_IMODE(opencode_final.stat().st_mode), 0o600)
+        self.assertIn("### STATUS", opencode_final.read_text(encoding="utf-8"))
 
     def test_opencode_deepseek_profile_is_selectable_at_high(self) -> None:
         model = "openrouter/deepseek/deepseek-v4-flash"
@@ -2092,6 +2102,42 @@ else:
         self.assertTrue(Path(first["stderr_path"]).exists())
         self.assertFalse(second["retrying"])
         self.assertEqual(Path(second["stdout_path"]).resolve(), (out_dir / "stdout.txt").resolve())
+        for artifact in (
+            Path(first["final_output_path"]),
+            Path(first["log_path"]),
+            out_dir / "final-output.txt",
+            out_dir / "executor.log",
+        ):
+            self.assertTrue(artifact.is_file(), str(artifact))
+            self.assertEqual(stat.S_IMODE(artifact.stat().st_mode), 0o600)
+
+    def test_retry_reinitializes_empty_final_output_and_log_before_second_attempt(self) -> None:
+        seen_paths: list[tuple[Path, str]] = []
+        original_write = RUNNER.write_private_text
+
+        def recording_write(path: Path, text: str) -> None:
+            seen_paths.append((path, text))
+            original_write(path, text)
+
+        with mock.patch.object(RUNNER, "write_private_text", side_effect=recording_write):
+            exit_code, result, out_dir, _summary, _capture = self.run_main(
+                no_change=True,
+                expect_changes=False,
+                allow_path=None,
+                retry_read_only=1,
+                transient_failures=1,
+            )
+        self.assertEqual((exit_code, result["status"]), (0, "completed"))
+        log_inits = [
+            text for path, text in seen_paths if path.resolve() == (out_dir / "executor.log").resolve() and text == ""
+        ]
+        final_inits = [
+            text
+            for path, text in seen_paths
+            if path.resolve() == (out_dir / "final-output.txt").resolve() and text == ""
+        ]
+        self.assertEqual(len(log_inits), 2)
+        self.assertEqual(len(final_inits), 2)
 
     def test_retry_read_only_rejects_a_mutating_scope(self) -> None:
         args = RUNNER.parse_args(
@@ -2504,6 +2550,27 @@ class NativeRouteAndProviderErrorTests(unittest.TestCase):
                 engine="claude", model="sonnet", expect_changes=False
             )
         self.assertEqual((result["status"], exit_code), ("provider_quota_exhausted", 16))
+
+    def test_claude_and_agy_write_private_final_output_at_0600(self) -> None:
+        for engine, model in (("claude", "sonnet"), ("agy", None)):
+            with self.subTest(engine=engine):
+                exit_code, result, out_dir, _summary, _capture = self.run_main(
+                    engine=engine,
+                    model=model,
+                    fake_output=f"allowed/{engine}-output.txt",
+                    extra_args=["--transport", "executor"],
+                )
+                self.assertEqual((exit_code, result["status"]), (0, "completed"), result.get("error"))
+                final_output = out_dir / "final-output.txt"
+                self.assertTrue(final_output.is_file())
+                self.assertEqual(stat.S_IMODE(final_output.stat().st_mode), 0o600)
+                self.assertIn("### STATUS", final_output.read_text(encoding="utf-8"))
+
+    def test_doctor_rejects_self_trust_codex_hooks_in_delegated_runs(self) -> None:
+        for env in ({"ORKEST_DELEGATED_RUN": "1"}, {"AGENT_EXECUTOR_RUN_ID": "run-123"}):
+            with self.subTest(env=env), mock.patch.dict(os.environ, env):
+                with self.assertRaisesRegex(ValueError, "delegated agent runs cannot self-trust Codex hooks"):
+                    RUNNER.doctor_main(["--repair-messaging", "--trust-codex-hooks"])
 
 
 if __name__ == "__main__":

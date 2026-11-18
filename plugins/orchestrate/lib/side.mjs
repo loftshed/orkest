@@ -7,10 +7,12 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { knownEngines } from "./families-schema.mjs";
 import {
+  isActiveRoom,
   isClosedRoom,
   listRawRooms,
   mailboxRoot,
   readRawRoom,
+  requireActiveRoom,
   updateRoom,
   workforceRoleInfo,
 } from "./horde-room.mjs";
@@ -310,19 +312,28 @@ function roomSessionIds(room) {
  */
 function findTargetRoom(mailboxDir, { roomId, session, cwd }) {
   if (roomId) {
+    let data;
     try {
-      return { root: mailboxDir, data: readRawRoom(roomId, mailboxDir) };
+      data = readRawRoom(roomId, mailboxDir);
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
+      return null;
     }
-    return null;
+    requireActiveRoom(data);
+    if (isClosedRoom(data)) throw new Error(`Room ${data.id} is closed`);
+    return { root: mailboxDir, data };
   }
   // Discovery by session or checkout only considers current rooms; history is never adopted.
   const entries = listRawRooms(mailboxDir, { lifecycle: "active" });
   let cwdMatch = null;
   for (const data of entries) {
     if (!data || typeof data !== "object" || data.schema !== "agent-executor.room.v1") continue;
-    if (isClosedRoom(data) || (data.machine && data.machine !== os.hostname())) continue;
+    if (
+      !isActiveRoom(data) ||
+      isClosedRoom(data) ||
+      (data.machine && data.machine !== os.hostname())
+    )
+      continue;
     if (session && roomSessionIds(data).has(session)) return { root: mailboxDir, data };
     if (!cwdMatch && cwd && sameDirectory(data.cwd, cwd)) cwdMatch = { root: mailboxDir, data };
   }
@@ -343,6 +354,7 @@ async function registerSideMemberInRoom(roomRecord, sideSpec) {
     saved = await updateRoom(
       roomRecord.data.id,
       (room) => {
+        requireActiveRoom(room);
         const agents = Array.isArray(room.agents) ? room.agents : [];
         const existing = agents.find((agent) => agent?.sideId === sideSpec.sideId);
         if (existing) return room;

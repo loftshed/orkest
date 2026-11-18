@@ -341,3 +341,54 @@ class TestMailboxDaemonInstall(unittest.TestCase):
                 result = tomllib.loads(set_toml_server(fixture, desired))
                 self.assertEqual(result["profiles"], before["profiles"])
                 self.assertEqual(result["mcp_servers"]["peer-mailbox"], desired)
+
+    def test_install_verify_defers_codex_hook_trust_when_flag_absent(self):
+        with (
+            mock.patch.object(
+                installer.shutil,
+                "which",
+                side_effect=lambda name: (
+                    "/synthetic/bin/" + name if name in {"claude", "codex", "agy", "opencode"} else None
+                ),
+            ),
+            mock.patch.object(
+                installer,
+                "check",
+                return_value={
+                    "round_trips": ["a -> b"],
+                    "evidence": "/tmp/evidence",
+                    "codex_hook_trust": "pending_review",
+                },
+            ) as mocked_check,
+        ):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                installer.install(stdio=True, verify=True, trust_codex_hooks=False)
+        mocked_check.assert_called_once_with(require_codex_hook_trust=False)
+        self.assertIn("Codex mailbox hooks are pending review", output.getvalue())
+
+        with (
+            mock.patch.object(
+                installer.shutil,
+                "which",
+                side_effect=lambda name: (
+                    "/synthetic/bin/" + name if name in {"claude", "codex", "agy", "opencode"} else None
+                ),
+            ),
+            mock.patch.object(installer, "trust_codex") as mocked_trust,
+            mock.patch.object(
+                installer,
+                "check",
+                return_value={
+                    "round_trips": ["a -> b"],
+                    "evidence": "/tmp/evidence",
+                    "codex_hook_trust": "verified",
+                },
+            ) as mocked_check,
+        ):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                installer.install(stdio=True, verify=True, trust_codex_hooks=True)
+        mocked_trust.assert_called_once()
+        mocked_check.assert_called_once_with(require_codex_hook_trust=True)
+        self.assertNotIn("pending review", output.getvalue())

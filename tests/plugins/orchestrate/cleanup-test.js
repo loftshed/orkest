@@ -16,6 +16,7 @@ import {
   parseCleanupArgs,
   pruneDisposableWorktrees,
   pruneStaleLocks,
+  resolveCleanupPaths,
 } from "../../../plugins/orchestrate/lib/cleanup.mjs";
 import {
   isHarnessAllowed,
@@ -91,6 +92,14 @@ describe("ork cleanup (Slice 1D)", () => {
     expect(parsedStatus.migrateLegacy).toBe(true);
     expect(parsedStatus.graceMinutes).toBe(20);
     expect(parsedStatus.keepBackups).toBe(2);
+  });
+
+  it("isolates resolveCleanupPaths when homeDir is overridden unless env is explicitly provided", () => {
+    const customXdg = path.join(tempRoot, "custom-xdg-cache");
+    const isolated = resolveCleanupPaths({ homeDir: fakeHome });
+    expect(isolated.xdgCacheBase).toBe(path.join(fakeHome, ".cache"));
+    const explicit = resolveCleanupPaths({ homeDir: fakeHome, env: { XDG_CACHE_HOME: customXdg } });
+    expect(explicit.xdgCacheBase).toBe(customXdg);
   });
 
   it("enforces single-GC cleanup.lock and preserves lock inode on reclaim and release", () => {

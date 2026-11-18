@@ -14,6 +14,7 @@ import {
   findExecutable,
   ORCA_TERMINALS_SCHEMA,
   ORCA_VIEW_SCHEMA,
+  ORCA_VIEW_TITLE_PREFIX,
   orcaCacheHome,
   orcaTerminalHandle,
   orcaTerminalsPath,
@@ -25,6 +26,8 @@ import {
   resolveOrcaCli,
   writeJsonState,
 } from "./orca-context.mjs";
+
+const CHIEF_VIEW_KEY = "__chief__";
 
 const LIB = path.dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = path.resolve(LIB, "../../..");
@@ -42,18 +45,23 @@ export function shellQuote(value) {
   return `'${String(value).replaceAll("'", String.raw`'\''`)}'`;
 }
 
-export function swarmViewCommand(room, statePath, { ork = ORK } = {}) {
-  return [
-    "exec",
-    "env",
-    shellQuote(`ORKEST_ORCA_VIEW_STATE=${statePath}`),
-    "node",
-    shellQuote(ork),
-    "horde",
-    "--attach-room",
-    shellQuote(room),
-    "--view",
-  ].join(" ");
+export function swarmViewCommand(room, statePath, { ork = ORK, chief = false } = {}) {
+  const envArgs = [shellQuote(`ORKEST_ORCA_VIEW_STATE=${statePath}`)];
+  if (chief) envArgs.push("ORKEST_CHIEF_VIEW=1");
+  const roomId = typeof room === "string" ? room.trim() : "";
+  const hordeArgs = roomId ? ["--attach-room", shellQuote(roomId), "--view"] : ["--view"];
+  if (chief) hordeArgs.push("--chief");
+  return ["exec", "env", ...envArgs, "node", shellQuote(ork), "horde", ...hordeArgs].join(" ");
+}
+
+function isClosedRoom(room) {
+  const lifecycle = typeof room?.lifecycle === "string" ? room.lifecycle.toLowerCase() : "";
+  const status = typeof room?.status === "string" ? room.status.toLowerCase() : "";
+  return (
+    Boolean(room?.closedAt || room?.archivedAt || room?.cancelledAt) ||
+    ["archived", "cancelled"].includes(lifecycle) ||
+    ["archived", "cancelled", "closed", "completed"].includes(status)
+  );
 }
 
 function lowestRemaining(account) {
@@ -136,7 +144,7 @@ export function matchRoom(rooms, context, registry = {}) {
   );
   let best = null;
   for (const room of rooms) {
-    if (!room || typeof room.id !== "string") continue;
+    if (!room || typeof room.id !== "string" || isClosedRoom(room)) continue;
     const coordinator = room.orcaCoordinatorTerminalId || room.conductor?.orcaTerminalHandle;
     let score = 0;
     if (coordinator && terminals.has(coordinator)) score = 3;
@@ -283,6 +291,7 @@ export function createOrcaWorker(
   }
 
   async function syncContext(next) {
+    if (isStopped) return;
     context = next ?? null;
     const workspaceId = context?.workspaceId;
     if (!workspaceId) return;
@@ -291,7 +300,9 @@ export function createOrcaWorker(
       recordTerminal(terminal?.id, { workspaceId, title: terminal.title || undefined });
     }
     await syncAgents(workspaceId);
+    if (isStopped) return;
     await saveRegistry();
+    if (isStopped) return;
     if (isReady) await noticeClosedViews(workspaceId, terminalIds(context.terminals));
   }
 
@@ -320,7 +331,10 @@ export function createOrcaWorker(
     for (const name of files) {
       const file = path.join(orcaViewsDirectory(env), name);
       const record = await readJsonState(file);
-      if (record?.schema === ORCA_VIEW_SCHEMA && typeof record.room === "string") {
+      if (
+        record?.schema === ORCA_VIEW_SCHEMA &&
+        (typeof record.room === "string" || record.chief)
+      ) {
         records.push({ file, record });
       }
     }
@@ -425,31 +439,41 @@ export function createOrcaWorker(
     return null;
   }
 
-  async function openView({ room, workspaceId, source }) {
-    const statePath = orcaViewPath(room, env);
-    const title = orcaViewTitle(room);
-    const command = swarmViewCommand(room, statePath);
+  async function openView({ room, workspaceId, source, chief = false }) {
+    const roomId = typeof room === "string" ? room.trim() : "";
+    const isChief = Boolean(chief);
+    const statePath = orcaViewPath(roomId || CHIEF_VIEW_KEY, env);
+    const title = roomId ? orcaViewTitle(roomId) : `${ORCA_VIEW_TITLE_PREFIX} · Chief`;
+    const command = swarmViewCommand(roomId, statePath, { chief: isChief });
     let created = await splitView(source, command, title);
-    if (created?.error) return { status: "error", room, reason: created.error };
+    if (created?.error) return { status: "error", room: roomId, reason: created.error };
     if (!created) {
       // Fallback: a new terminal tab in the workspace, when no split is available.
       const result = await call("terminal.create", { workspaceId, title, command });
       const terminalId = orcaTerminalHandle(result?.terminalId);
-      if (!terminalId) return { status: "error", room, reason: "Orca did not return a terminal" };
+      if (!terminalId)
+        return { status: "error", room: roomId, reason: "Orca did not return a terminal" };
       created = { terminalId, method: "create" };
     }
     await writeJsonState(statePath, {
       schema: ORCA_VIEW_SCHEMA,
-      room,
+      room: roomId,
       workspaceId,
       terminalId: created.terminalId,
       sourceTerminalId: source || null,
       title,
       method: created.method,
+      chief: isChief,
       openedAt: new Date(now()).toISOString(),
       closed: false,
     });
-    return { status: "opened", room, terminal: created.terminalId, method: created.method };
+    return {
+      status: "opened",
+      room: roomId,
+      terminal: created.terminalId,
+      method: created.method,
+      ...(isChief && { chief: true }),
+    };
   }
 
   function sourceTerminal(room, focused) {
@@ -487,7 +511,7 @@ export function createOrcaWorker(
     }
   }
 
-  async function swarm(action) {
+  async function swarm(action, { chief = false } = {}) {
     const focused = await readContext();
     const workspaceId = focused?.workspaceId;
     if (!workspaceId) return { status: "unavailable", reason: "Focus an Orca workspace first." };
@@ -500,16 +524,26 @@ export function createOrcaWorker(
     const records = await viewRecords();
     const owned = room
       ? records.find(({ record }) => record.room === room.id)
-      : records.find(({ record }) => !record.closed && record.workspaceId === workspaceId);
+      : records.find(
+          ({ record }) =>
+            !record.closed &&
+            record.workspaceId === workspaceId &&
+            (!chief || Boolean(record.chief)),
+        );
+    const isChief = Boolean(chief || owned?.record?.chief);
     const live = owned?.record.terminalId ? await liveTerminals(owned.record.workspaceId) : null;
     const isOpen = Boolean(owned && !owned.record.closed && live?.has(owned.record.terminalId));
-    const roomId = room?.id || owned?.record.room;
+    const roomId = room?.id || owned?.record.room || "";
     if (action === "close" || (action === "toggle" && isOpen)) {
       if (!isOpen) {
         if (owned && !owned.record.closed) {
           await writeJsonState(owned.file, { ...owned.record, closed: true });
         }
-        return { status: "already_closed", ...(roomId && { room: roomId }) };
+        return {
+          status: "already_closed",
+          ...(roomId && { room: roomId }),
+          ...(isChief && { chief: true }),
+        };
       }
       const closed = await closeTerminal(owned.record.terminalId);
       const after = closed ? null : await liveTerminals(owned.record.workspaceId);
@@ -521,17 +555,37 @@ export function createOrcaWorker(
         closed: true,
         closedAt: new Date(now()).toISOString(),
       });
-      return { status: "closed", room: roomId, terminal: owned.record.terminalId };
+      return {
+        status: "closed",
+        room: roomId,
+        terminal: owned.record.terminalId,
+        ...(isChief && { chief: true }),
+      };
     }
-    if (isOpen) return { status: "already_open", room: roomId, terminal: owned.record.terminalId };
-    if (!room) {
+    if (isOpen) {
+      return {
+        status: "already_open",
+        room: roomId,
+        terminal: owned.record.terminalId,
+        ...(isChief && { chief: true }),
+      };
+    }
+    if (!room && !isChief) {
       return {
         status: "unavailable",
         reason:
           "No Orkest swarm is bound to this workspace. Run `ork swarm open` from the coordinator.",
       };
     }
-    return openView({ room: room.id, workspaceId, source: sourceTerminal(room, focused) });
+    const source = room
+      ? sourceTerminal(room, focused)
+      : [...terminalIds(focused?.terminals)][0] || "";
+    return openView({
+      room: room?.id || "",
+      workspaceId,
+      source,
+      chief: isChief,
+    });
   }
 
   /** Cold restart: reopen views that were open when Orca stopped and whose terminal is gone. */
@@ -539,31 +593,37 @@ export function createOrcaWorker(
     const outcomes = [];
     const records = await viewRecords();
     for (const { record } of records) {
-      if (record.closed || !record.workspaceId) continue;
+      if (isStopped) return outcomes;
+      const room = typeof record.room === "string" ? record.room.trim() : "";
+      const isChief = Boolean(record.chief);
+      if (record.closed || !record.workspaceId || (!room && !isChief)) continue;
       const live = await liveTerminals(record.workspaceId);
+      if (isStopped) return outcomes;
       if (!live) {
-        outcomes.push({ room: record.room, status: "inspection_failed" });
+        outcomes.push({ room, status: "inspection_failed", ...(isChief && { chief: true }) });
         continue;
       }
       if (record.terminalId && live.has(record.terminalId)) {
-        outcomes.push({ room: record.room, status: "already_present" });
+        outcomes.push({ room, status: "already_present", ...(isChief && { chief: true }) });
         continue;
       }
       const source =
         record.sourceTerminalId && live.has(record.sourceTerminalId) ? record.sourceTerminalId : "";
       try {
         const outcome = await openView({
-          room: record.room,
+          room,
           workspaceId: record.workspaceId,
           source,
+          chief: isChief,
         });
         outcomes.push({
-          room: record.room,
+          room,
           status: outcome.status === "opened" ? "restored" : outcome.status,
+          ...(isChief && { chief: true }),
         });
       } catch (error) {
-        log(`orkest: restoring ${record.room} failed: ${error.message}`);
-        outcomes.push({ room: record.room, status: "restore_failed" });
+        log(`orkest: restoring ${room || "chief"} failed: ${error.message}`);
+        outcomes.push({ room, status: "restore_failed", ...(isChief && { chief: true }) });
       }
     }
     return outcomes;
@@ -630,8 +690,13 @@ export function createOrcaWorker(
 
   async function start() {
     registry = await readOrcaTerminals(env);
-    const swarmCommand = (action) => async () =>
-      describe((await serial(() => swarm(action))) ?? { status: "stopped" });
+    if (isStopped) return [];
+    const swarmCommand = (action) => async (args) =>
+      describe(
+        (await serial(() =>
+          swarm(action, args && typeof args === "object" ? args : undefined),
+        )) ?? { status: "stopped" },
+      );
     orca.commands.register("orkest.swarm.toggle", swarmCommand("toggle"));
     orca.commands.register("orkest.swarm.open", swarmCommand("open"));
     orca.commands.register("orkest.swarm.close", swarmCommand("close"));
@@ -647,8 +712,13 @@ export function createOrcaWorker(
     quotaTimer = startTimer(() => void refreshQuota(), quotaIntervalMs);
     quotaTimer?.unref?.();
     return serial(async () => {
-      await syncContext(await readContext());
+      if (isStopped) return [];
+      const initialContext = await readContext();
+      if (isStopped) return [];
+      await syncContext(initialContext);
+      if (isStopped) return [];
       const outcomes = await restore();
+      if (isStopped) return [];
       isReady = true;
       if (outcomes.length > 0) log(`orkest: restore ${JSON.stringify(outcomes)}`);
       return outcomes;

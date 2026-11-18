@@ -121,7 +121,7 @@ def _verify_codex_hook_trust(native: RpcClient, config: Path) -> None:
         )
 
 
-def check() -> dict[str, Any]:
+def check(require_codex_hook_trust: bool = True) -> dict[str, Any]:
     from install_mailbox import configuration_status
 
     configuration = configuration_status()
@@ -133,7 +133,7 @@ def check() -> dict[str, Any]:
     import runtime_paths
 
     if mailbox_daemon.get_mode(peer_mailbox.root()) == "http":
-        return check_http()
+        return check_http(require_codex_hook_trust=require_codex_hook_trust)
     scripts = Path(__file__).resolve().parent
     # Retain evidence; never prune the user's real peer store or send to their active sessions.
     evidence = runtime_paths.cache_home() / "checks" / f"mailbox-{uuid.uuid4().hex}"
@@ -150,6 +150,7 @@ def check() -> dict[str, Any]:
         "gemini": "antigravity",
     }
     native: RpcClient | None = None
+    codex_hook_trust = "not applicable"
     exchanges = []
     try:
         for harness, name in clients_info.items():
@@ -157,7 +158,13 @@ def check() -> dict[str, Any]:
                 native = RpcClient(["codex", "app-server", "--stdio"], env)
                 initialize_codex(native)
                 config = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "config.toml"
-                _verify_codex_hook_trust(native, config)
+                try:
+                    _verify_codex_hook_trust(native, config)
+                    codex_hook_trust = "verified"
+                except RuntimeError as error:
+                    if require_codex_hook_trust or not str(error).startswith("Codex mailbox hooks need review"):
+                        raise
+                    codex_hook_trust = "pending_review"
                 installed = tomllib.loads(config.read_text())
                 # Only the installed mailbox is exercised; no remote servers or providers are contacted.
                 overrides = {
@@ -220,7 +227,7 @@ def check() -> dict[str, Any]:
             "native_codex": native is not None,
             "evidence": str(evidence),
             "configuration": configuration,
-            "codex_hook_trust": "verified" if native else "not applicable",
+            "codex_hook_trust": codex_hook_trust,
         }
         (evidence / "result.json").write_text(json.dumps(report, indent=2) + "\n")
         return report
@@ -241,7 +248,7 @@ def main() -> int:
     return 0
 
 
-def check_http() -> dict[str, Any]:
+def check_http(require_codex_hook_trust: bool = True) -> dict[str, Any]:
     """Qualify one disposable HTTP service with four host identities and optional native Codex."""
     import http.client
     import urllib.parse
@@ -260,6 +267,7 @@ def check_http() -> dict[str, Any]:
     names = {"claude": "claude-code", "codex": "codex-mcp-client", "opencode": "opencode", "gemini": "antigravity"}
     native = None
     native_thread = None
+    codex_hook_trust = "not applicable"
     counter = 0
     exchanges = []
 
@@ -317,7 +325,13 @@ def check_http() -> dict[str, Any]:
             native = RpcClient(["codex", "app-server", "--stdio"], env)
             initialize_codex(native)
             installed_path = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "config.toml"
-            _verify_codex_hook_trust(native, installed_path)
+            try:
+                _verify_codex_hook_trust(native, installed_path)
+                codex_hook_trust = "verified"
+            except RuntimeError as error:
+                if require_codex_hook_trust or not str(error).startswith("Codex mailbox hooks need review"):
+                    raise
+                codex_hook_trust = "pending_review"
             installed = tomllib.loads(installed_path.read_text()) if installed_path.exists() else {}
             overrides = {f"mcp_servers.{key}.enabled": False for key in installed.get("mcp_servers", {})}
             overrides.update({f"plugins.{key}.enabled": False for key in installed.get("plugins", {})})
@@ -374,7 +388,7 @@ def check_http() -> dict[str, Any]:
             "round_trips": exchanges,
             "evidence": str(evidence),
             "native_codex": bool(native),
-            "codex_hook_trust": "verified" if native else "not applicable",
+            "codex_hook_trust": codex_hook_trust,
             "model_generation_calls": 0,
         }
         (evidence / "result.json").write_text(json.dumps(report, indent=2) + "\n")

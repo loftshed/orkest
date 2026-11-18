@@ -220,7 +220,7 @@ def accepted_outcome_cost(state: dict[str, Any], *, brief_bytes: dict[str, int] 
     """Total cost of reaching the task's accepted outcome: every attempt, retry and correction, the context
     handed to workers, and the parent's review. Missing telemetry stays missing; it is never counted as zero."""
     ledger = state.get("cost_ledger") or {}
-    runs = [run for run in state.get("runs") or [] if isinstance(run, dict)]
+    runs = [run for run in state.get("runs") or [] if isinstance(run, dict) and run.get("transport") != "host_checks"]
     decisions = [decision for decision in state.get("decisions") or [] if isinstance(decision, dict)]
     entries = [ledger.get(run.get("run_id")) or {} for run in runs]
     missing: list[str] = []

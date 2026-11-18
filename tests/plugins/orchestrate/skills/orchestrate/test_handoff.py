@@ -1298,6 +1298,124 @@ class HandoffTests(unittest.TestCase):
         event = json.loads((HANDOFF.session_dir(THIRD) / "event.json").read_text())
         self.assertEqual((recorded["status"], event["model"]), ("recorded", OPUS))
 
+    def test_conducted_rooms_skips_inactive_closed_and_remote_rooms(self) -> None:
+        self.store_room("active-local", session=LEAD)
+        self.store_room("archived-room", session=LEAD, lifecycle="archived")
+        self.store_room("cancelled-room", session=LEAD, lifecycle="cancelled")
+        self.store_room("closed-at-room", session=LEAD, closedAt="2026-11-18T00:00:00Z")
+        self.store_room("status-closed-room", session=LEAD, status="closed")
+        self.store_room("status-cancelled-room", session=LEAD, status="cancelled")
+        self.store_room("remote-room", session=LEAD, machine="other-host.local")
+        self.store_room(
+            "remote-binding-room",
+            session=LEAD,
+            conductor={"session": {"id": LEAD, "engine": "claude", "machine": "other-host.local"}},
+        )
+        self.assertEqual([r["id"] for r in HANDOFF.conducted_rooms(self.base, LEAD)], ["active-local"])
+
+    def test_set_enabled_allows_empty_json_object_and_rejects_non_object(self) -> None:
+        config_file = self.root / "orkest-config.json"
+        config_file.write_text("{}\n")
+        settings = HANDOFF.set_enabled(False)
+        self.assertFalse(settings["enabled"])
+        self.assertEqual(json.loads(config_file.read_text()), {"handoff": {"enabled": False}})
+        config_file.write_text("[]\n")
+        with self.assertRaisesRegex(ValueError, "not a JSON object"):
+            HANDOFF.set_enabled(True)
+
+    def test_chained_handoff_preserves_peer_session_for_note_evidence_and_deliver_peer(self) -> None:
+        # A launched successor runs under native peer `native-chain-1` while its authority ID is `handoff-chain1`.
+        native = self.register("native-chain-1", "claude-a")
+        MAILBOX.annotate(self.base, native["session"], delegatedRun="run-launch-1")
+        MAILBOX.write(
+            self.base / "progress" / f"{MAILBOX.session_key(native['session'])}.json",
+            {
+                "schema": "orchestrate.progress.v1",
+                "session": native["session"],
+                "goal": "Chain handoff",
+                "task": "Verify peerSession",
+                "stage": "working",
+            },
+        )
+        HANDOFF.write_private(
+            HANDOFF.root() / "successors" / "handoff-chain1.json",
+            json.dumps(
+                {
+                    "origin": LEAD,
+                    "count": 1,
+                    "team": "t-chain",
+                    "harness": "claude",
+                    "model": OPUS,
+                    "accountHome": str(self.homes["claude-a"]),
+                }
+            ),
+        )
+        AUTHORITY.appoint(
+            "t-chain",
+            {**AUTHORITY.member("handoff-chain1", "claude"), "pool": "claude-a:all"},
+            deputy={"harness": "claude", "pool": "claude-b:all", "account": "claude-b"},
+            standing={"statuses": ["blocked", "credits"], "seconds": 0},
+            repository=self.lead["repo"],
+        )
+        # Peer on claude-b has an unrelated focus/cwd: must still be chosen and woken via scope="cross-project".
+        peer_b = self.register(PEER, "claude-b", state="idle")
+        MAILBOX.annotate(self.base, peer_b["session"], focus="Unrelated focus", cwd=str(self.root / "other-cwd"))
+
+        payload = {
+            "hook_event_name": "StopFailure",
+            "session_id": native["session"],
+            "cwd": str(self.repo),
+            "error": "rate_limit",
+        }
+        with mock.patch.dict(os.environ, {"ORKEST_HANDOFF_SUCCESSOR": "handoff-chain1"}):
+            recorded = HANDOFF.stop_failure(self.base, payload, native["session"], "claude", spawn=self.spawn)
+        self.assertEqual(recorded["status"], "recorded")
+        stored_event = json.loads((HANDOFF.session_dir("handoff-chain1") / "event.json").read_text())
+        self.assertEqual(stored_event.get("peerSession"), native["session"])
+
+        # Real deliver_peer works with cross-project scope & native_unreachable, and on credits sees live native pid.
+        self.set_lane("claude-a", status="credits", usable=0)
+        refused_credits = HANDOFF.run(
+            "handoff-chain1",
+            recorded["event"],
+            base=self.base,
+            rooms=lambda *_: [],
+            sleep=self.sleeps.append,
+        )
+        self.assertEqual(refused_credits["status"], "refused")
+        self.assertIn("process is still running", refused_credits["reasons"][0])
+
+        self.set_lane("claude-a", status="blocked", usable=0)
+        later = HANDOFF.now() + dt.timedelta(seconds=HANDOFF.DEDUPE_SECONDS + 1)
+        with (
+            mock.patch.dict(os.environ, {"ORKEST_HANDOFF_SUCCESSOR": "handoff-chain1"}),
+            mock.patch.object(HANDOFF, "now", return_value=later),
+        ):
+            recorded2 = HANDOFF.record_exhaustion(
+                native["session"],
+                "claude",
+                "rate_limit",
+                source="StopFailure",
+                peer=native,
+                spawn=self.spawn,
+            )
+        # Remove the native peer record before delivery to ensure deliver_peer synthesizes a fallback sender.
+        MAILBOX.peer_path(self.base, native["session"]).unlink()
+        with mock.patch.object(MAILBOX, "delivery_wake", return_value={"status": "scheduled"}) as woken:
+            delivered = HANDOFF.run(
+                "handoff-chain1",
+                recorded2["event"],
+                base=self.base,
+                rooms=lambda *_: [],
+                sleep=self.sleeps.append,
+            )
+        self.assertEqual(delivered["status"], "handed-over", delivered)
+        self.assertEqual(delivered["delivery"]["wake"], "scheduled")
+        woken.assert_called_once()
+        note = (HANDOFF.session_dir("handoff-chain1") / "note.md").read_text()
+        self.assertIn("- goal: Chain handoff", note)
+        self.assertIn("- task: Verify peerSession", note)
+
 
 if __name__ == "__main__":
     unittest.main()

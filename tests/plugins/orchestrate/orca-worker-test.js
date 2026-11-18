@@ -2,13 +2,14 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   isScreenReaderOrca,
   orcaPaneContext,
   orcaTerminalsPath,
   orcaViewPath,
+  readJsonState,
   readOrcaView,
   resolveOrcaCli,
 } from "../../../plugins/orchestrate/lib/orca-context.mjs";
@@ -500,6 +501,108 @@ describe("orca context", () => {
       }
     } finally {
       await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("ignores closed/archived/cancelled rooms, supports Chief View, and respects stop() mid-start", async () => {
+    const chosen = matchRoom(
+      [
+        {
+          id: "room-cancelled",
+          lifecycle: "cancelled",
+          status: "cancelled",
+          cancelledAt: 200,
+          orcaCoordinatorTerminalId: "term_coord",
+          orcaWorkspaceId: "ws1",
+        },
+        {
+          id: "room-archived",
+          lifecycle: "archived",
+          archivedAt: 150,
+          orcaCoordinatorTerminalId: "term_coord",
+          orcaWorkspaceId: "ws1",
+        },
+        {
+          id: "room-live",
+          lifecycle: "active",
+          updatedAt: 50,
+          orcaWorkspaceId: "ws1",
+        },
+      ],
+      { workspaceId: "ws1", terminals: ["term_coord"] },
+      {},
+    );
+    expect(chosen?.id).toBe("room-live");
+
+    expect(
+      swarmViewCommand("room-1", "/tmp/state.json", { ork: "/opt/ork.mjs", chief: true }),
+    ).toContain(
+      "ORKEST_CHIEF_VIEW=1 node '/opt/ork.mjs' horde --attach-room 'room-1' --view --chief",
+    );
+    expect(swarmViewCommand("", "/tmp/chief.json", { ork: "/opt/ork.mjs", chief: true })).toContain(
+      "ORKEST_CHIEF_VIEW=1 node '/opt/ork.mjs' horde --view --chief",
+    );
+    expect(
+      swarmViewCommand("", "/tmp/chief.json", { ork: "/opt/ork.mjs", chief: true }),
+    ).not.toContain("--attach-room");
+
+    const tmp = await mkdtemp(path.join(tmpdir(), "orkest-orca-chief-"));
+    try {
+      const host = mockOrca();
+      const env = { HOME: tmp, ORCHESTRATE_HOME: tmp, PATH: "" };
+      const worker = createOrcaWorker(host.orca, {
+        env,
+        exec: (_c, _a, cb) => cb(null, JSON.stringify({ accounts: [] })),
+        listRooms: async () => [],
+        startTimer: () => ({ unref() {} }),
+        stopTimer: () => {},
+      });
+      await worker.start();
+      const result = await host.commands.get("orkest.swarm.toggle")({ chief: true });
+      expect(result).toContain("Swarm View opened");
+      const chiefView = await readJsonState(orcaViewPath("__chief__", env));
+      expect(chiefView).toMatchObject({ room: "", chief: true, closed: false });
+
+      // Simulate cold restart with terminal missing: Chief View restores cleanly.
+      host.state.terminals = ["term_coord"];
+      await worker.stop();
+      const worker2 = createOrcaWorker(host.orca, {
+        env,
+        exec: (_c, _a, cb) => cb(null, JSON.stringify({ accounts: [] })),
+        listRooms: async () => [],
+        startTimer: () => ({ unref() {} }),
+        stopTimer: () => {},
+      });
+      const outcomes = await worker2.start();
+      expect(outcomes).toEqual([{ room: "", status: "restored", chief: true }]);
+
+      // Stop mid-startup never completes delayed restore/register after stop().
+      let releaseReadContext;
+      const slowHost = mockOrca({
+        extra: {
+          "workspace.readContext": () =>
+            new Promise((resolve) => {
+              releaseReadContext = () =>
+                resolve({ workspaceId: "ws1", terminals: [{ id: "term_coord" }] });
+            }),
+        },
+      });
+      const worker3 = createOrcaWorker(slowHost.orca, {
+        env,
+        exec: (_c, _a, cb) => cb(null, JSON.stringify({ accounts: [] })),
+        listRooms: async () => [],
+        startTimer: () => ({ unref() {} }),
+        stopTimer: () => {},
+      });
+      const starting = worker3.start();
+      await vi.waitFor(() => expect(releaseReadContext).toBeTypeOf("function"));
+      const stopping = worker3.stop();
+      releaseReadContext();
+      const [stoppedOutcomes] = await Promise.all([starting, stopping]);
+      expect(stoppedOutcomes).toEqual([]);
+      expect(worker3.isReady).toBe(false);
+    } finally {
+      await rm(tmp, { recursive: true, force: true });
     }
   });
 });

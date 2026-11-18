@@ -659,4 +659,16 @@ describe("clickable Swarm View", () => {
     }
     expect(outputText).toContain(ALT_SCROLL_ENABLE);
   });
+
+  it("disarms a pending Herdr confirmClose press when a mouse button is clicked", () => {
+    let nowMs = 1000;
+    const view = new HordeView(room(), { height: 32, confirmClose: true, now: () => nowMs });
+    expect(view.requestClose(nowMs)).toBe(true);
+    expect(view.closeArmedAt).toBe(1000);
+    click(view, "Shortcuts", 80);
+    expect(view.closeArmedAt).toBeUndefined();
+    nowMs = 1500;
+    expect(view.requestClose(nowMs)).toBe(true);
+    expect(view.closeArmedAt).toBe(1500);
+  });
 });

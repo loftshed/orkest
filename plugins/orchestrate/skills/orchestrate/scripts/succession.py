@@ -11,6 +11,7 @@ The proposal is advice: appointing, offering and taking over stay with authority
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import functools
 import importlib.util
@@ -321,7 +322,20 @@ def local_evidence(record: dict[str, Any], *, lead_status: str | None, moment: d
     rule = record.get("standing") or {"seconds": 0}
     reasons = []
     mailbox = module("peer_mailbox")
-    lead_peer = mailbox.load(mailbox.peer_path(mailbox.root(), record["lead"]["session"]))
+    lead = record["lead"]
+    lead_session = lead.get("peerSession") or lead["session"]
+    if not lead.get("peerSession"):
+        with contextlib.suppress(OSError, ValueError):
+            event_path = mailbox.root().parent / "handoffs-v1" / mailbox.session_key(lead["session"]) / "event.json"
+            if event_path.is_file():
+                event_data = json.loads(event_path.read_text(encoding="utf-8"))
+                if (
+                    isinstance(event_data, dict)
+                    and isinstance(event_data.get("peerSession"), str)
+                    and event_data["peerSession"]
+                ):
+                    lead_session = event_data["peerSession"]
+    lead_peer = mailbox.load(mailbox.peer_path(mailbox.root(), lead_session))
     seen = parse_time((lead_peer or {}).get("lastSeenAt"))
     if seen is not None and (moment - seen).total_seconds() < rule["seconds"]:
         reasons.append(f"the lead was active {int((moment - seen).total_seconds())} s ago")

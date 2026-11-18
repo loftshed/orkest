@@ -895,10 +895,19 @@ def sync_installed_runtimes_and_caches(home: Path, ork_cli: Path | None = None, 
     return changed
 
 
+def _validate_fast_bin(fast_bin: Path | str) -> Path:
+    resolved = Path(fast_bin).expanduser().resolve()
+    if not resolved.is_file() or not os.access(resolved, os.X_OK) or not resolved.name.startswith("ork-fast"):
+        raise ValueError(f"invalid --fast-bin {fast_bin!s}: expected an existing executable ork-fast file")
+    return resolved
+
+
 def install_shell_wrappers(
     home: Path, ork_cli: Path | None = None, *, fast_bin: Path | str | None = None, dry_run: bool = False
 ) -> bool:
     """Write ~/.config/orchestrate/orkest.sh (with legacy fallback), link ~/.local/bin/ork, and wire ~/.zshrc."""
+    if fast_bin is not None:
+        fast_bin = _validate_fast_bin(fast_bin)
     changed = False
     ork_cli = ork_cli or (Path(__file__).resolve().parents[3] / "bin/ork.mjs")
     bin_link = home / ".local/bin/ork"
@@ -1999,8 +2008,12 @@ def install(
     untrust_orkest_commands: bool = False,
     verify: bool = True,
     stdio: bool = False,
-    fast_bin: Path | None = None,
+    fast_bin: Path | str | None = None,
 ) -> None:
+    if trust_codex_hooks and (os.environ.get("ORKEST_DELEGATED_RUN") == "1" or os.environ.get("AGENT_EXECUTOR_RUN_ID")):
+        raise ValueError("delegated agent runs cannot self-trust Codex hooks")
+    if fast_bin is not None:
+        fast_bin = _validate_fast_bin(fast_bin)
     home = Path.home()
     hub = home / ".agents/skills/orchestrate/scripts"
     ensure_hub(hub.parent, Path(__file__).resolve().parent.parent, dry_run=dry_run)
@@ -2117,8 +2130,13 @@ def install(
     if not dry_run:
         mailbox_daemon.set_mode(mailbox.root(), "stdio" if stdio else "http")
     if verify and not dry_run:
-        report = check()
+        report = check(require_codex_hook_trust=trust_codex_hooks)
         print(f"✓ {len(report['round_trips'])} mailbox message/reply round trips; evidence: {report['evidence']}")
+        if report.get("codex_hook_trust") == "pending_review":
+            print(
+                "• Codex mailbox hooks are pending review: use /hooks in Codex, "
+                "or rerun with --trust-codex-hooks after reviewing them."
+            )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2136,7 +2154,7 @@ def main(argv: list[str] | None = None) -> int:
     approval.add_argument(
         "--trust-orkest-commands",
         action="store_true",
-        help="approve listed ork subcommands and four Orkest scripts in every installed harness, now and on "
+        help="approve listed ork subcommands and listed Orkest coordination scripts in every installed harness, now and on "
         "later setup refreshes; generic python3/node/shell, ork gate --, ork label and other scripts still ask",
     )
     approval.add_argument(

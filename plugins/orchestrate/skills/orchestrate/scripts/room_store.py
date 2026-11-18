@@ -15,10 +15,12 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
 _CACHE: dict[Path, dict[str, Any]] = {}
+_RACY_NS = 2_000_000_000
 _MIN_NODE = (26, 8, 0)
 _ROOM_ID_RE = re.compile(r"[\w-]{1,80}", flags=re.ASCII)
 _SYSTEM_NODE_DIRS = frozenset({"/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"})
@@ -161,6 +163,16 @@ def is_active_room(room: Any) -> bool:
     return room_lifecycle(room) == "active"
 
 
+def _is_racy_signature(signature: tuple) -> bool:
+    """Bypass cache read trust within 2s of any DB/WAL/legacy timestamp (same-tick WAL resets)."""
+    stamps = [
+        max(item[3], item[4])
+        for item in signature
+        if isinstance(item, tuple) and len(item) >= 5 and isinstance(item[3], int) and isinstance(item[4], int)
+    ]
+    return bool(stamps) and abs(time.time_ns() - max(stamps)) < _RACY_NS
+
+
 def list_rooms(base: Path) -> list[dict[str, Any]]:
     base = Path(base).resolve()
     signature = _signature(base)
@@ -168,7 +180,12 @@ def list_rooms(base: Path) -> list[dict[str, Any]]:
         _CACHE.pop(base, None)
         return []
     cached = _CACHE.get(base)
-    if cached is not None and cached["signature"] == signature and cached["all"] is not None:
+    if (
+        cached is not None
+        and cached["signature"] == signature
+        and cached["all"] is not None
+        and not _is_racy_signature(signature)
+    ):
         return copy.deepcopy(cached["all"])
     direct = _direct_rows(base)
     rooms = direct if direct is not None else _invoke(base, "list")
@@ -193,7 +210,7 @@ def read_room(base: Path, room_id: str) -> dict[str, Any] | None:
         _CACHE.pop(base, None)
         return None
     cached = _CACHE.get(base)
-    if cached is not None and cached["signature"] == signature:
+    if cached is not None and cached["signature"] == signature and not _is_racy_signature(signature):
         if room_id in cached["by_id"]:
             hit = cached["by_id"][room_id]
             return copy.deepcopy(hit) if hit is not None else None

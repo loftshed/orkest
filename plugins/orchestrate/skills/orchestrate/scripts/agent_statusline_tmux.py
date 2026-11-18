@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import datetime
 import hashlib
 import json
 import os
@@ -428,19 +429,31 @@ def _update_room_metadata(base: Path, room_id: str, **fields: str | None) -> dic
     return None
 
 
+_UNVERIFIED_CHIEF_GRACE_SEC = 600.0
+
+
 def _chief_session(base: Path) -> str | None:
     """Session ID of the live machine-wide Chief in ``<mailboxRoot>/chief.json``, if any."""
     try:
         data = json.loads((base / "chief.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    if not isinstance(data, dict):
+    if not isinstance(data, dict) or data.get("schema") != "ork.chief.v1":
+        return None
+    machine = data.get("machine")
+    if machine and machine != stdlib_socket.gethostname():
         return None
     session = data.get("session")
     if not isinstance(session, str) or not session.strip():
         return None
+    session = session.strip()
+    peer = None
+    with contextlib.suppress(OSError, ValueError):
+        peer = mailbox.load(mailbox.peer_path(base, session))
+    if isinstance(peer, dict) and mailbox.valid_peer(peer) and mailbox.is_live(peer):
+        return session
     pid = data.get("pid")
-    if isinstance(pid, int) and pid > 0:
+    if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
@@ -449,7 +462,27 @@ def _chief_session(base: Path) -> str | None:
             pass
         except OSError:
             return None
-    return session.strip()
+        pid_birth = data.get("pidBirth")
+        if isinstance(pid_birth, str) and pid_birth:
+            current_birth = mailbox.process_started(pid)
+            if current_birth and current_birth != pid_birth:
+                return None
+        return session
+    if isinstance(peer, dict):
+        return None
+    bound_at = data.get("boundAt")
+    if isinstance(bound_at, str) and bound_at.strip():
+        with contextlib.suppress(ValueError):
+            raw = bound_at.strip()
+            if raw.endswith("Z"):
+                raw = f"{raw[:-1]}+00:00"
+            parsed = datetime.datetime.fromisoformat(raw)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=datetime.UTC)
+            age = (datetime.datetime.now(datetime.UTC) - parsed).total_seconds()
+            if 0 <= age <= _UNVERIFIED_CHIEF_GRACE_SEC:
+                return session
+    return None
 
 
 def _is_chief_session(base: Path, session_id: str | None) -> bool:
@@ -1115,6 +1148,7 @@ def toggle_swarm_view(
                 harness=harness,
                 cwd=cwd,
                 respect_closed=respect_closed,
+                chief=chief,
             )
     tmux = shutil.which("tmux")
     if not tmux:

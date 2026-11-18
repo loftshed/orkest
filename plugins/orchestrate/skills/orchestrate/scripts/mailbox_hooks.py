@@ -735,8 +735,27 @@ def succession_notice(base: Path, me: dict[str, Any]) -> str:
     except (MailboxError, OSError, ValueError, ImportError):
         return ""
     config = succession.monitor_config()
+    notified = dict(me.get("successionNotified") or {})
+    notified_changed = False
+    lines = []
+    # Planned handover offers must reach the offeree even without a monitor snapshot or deputy designation.
+    for record in records:
+        offered = (record.get("offer") or {}).get("to") or {}
+        if offered.get("session") == me["session"]:
+            team = record["team"]
+            told = f"{team}:offer:{record['generation']}"
+            if not notified.get(told):
+                lines.append(
+                    f"Team {team}: the lead offered you the handover. Run authority.py show --team {team} --harness "
+                    f"{me['harness']}, review it, then authority.py accept --team {team} --session {me['session']} "
+                    f"--harness {me['harness']} --expect-generation {record['generation']} --digest DIGEST."
+                )
+                notified[told] = "told"
+                notified_changed = True
     roles = []
     for record in records:
+        if ((record.get("offer") or {}).get("to") or {}).get("session") == me["session"]:
+            continue
         deputy = record.get("deputy") or {}
         if record["lead"]["session"] == me["session"]:
             roles.append(("lead", record))
@@ -752,17 +771,21 @@ def succession_notice(base: Path, me: dict[str, Any]) -> str:
             # Only in the team's own repository: one Codex or Antigravity login serves work and personal repos.
             roles.append(("deputy", record))
     if not roles:
-        return ""
+        if notified_changed:
+            _MB.annotate(base, me["session"], successionNotified=notified)
+        return "\n".join(lines)
     checked = succession.parse_time(me.get("successionCheckedAt"))
     if checked is not None and (_MB.now() - checked).total_seconds() < succession.HOOK_CHECK_SECONDS:
-        return ""
+        if notified_changed:
+            _MB.annotate(base, me["session"], successionNotified=notified)
+        return "\n".join(lines)
     _MB.annotate(base, me["session"], successionCheckedAt=_MB.stamp())
     view = succession.cached_view()
     if view is None:
-        return ""
+        if notified_changed:
+            _MB.annotate(base, me["session"], successionNotified=notified)
+        return "\n".join(lines)
     by_key = {pool["pool"]: pool for pool in succession.pools(view, config)}
-    notified = dict(me.get("successionNotified") or {})
-    lines = []
     for role, record in roles:
         team, lead_pool = record["team"], by_key.get(record["lead"].get("pool") or "")
         if lead_pool is None:
@@ -790,17 +813,6 @@ def succession_notice(base: Path, me: dict[str, Any]) -> str:
                     + "."
                 )
             notified[key] = status
-            continue
-        offered = (record.get("offer") or {}).get("to") or {}
-        if offered.get("session") == me["session"]:
-            told = f"{team}:offer:{record['generation']}"
-            if not notified.get(told):
-                lines.append(
-                    f"Team {team}: the lead offered you the handover. Run authority.py show --team {team} --harness "
-                    f"{me['harness']}, review it, then authority.py accept --team {team} --session {me['session']} "
-                    f"--harness {me['harness']} --expect-generation {record['generation']} --digest DIGEST."
-                )
-                notified[told] = "told"
             continue
         rule = record.get("standing")
         statuses = rule["statuses"] if rule else list(succession.EXHAUSTED)
@@ -1177,6 +1189,27 @@ def _promote_resumed_coordinator(base: Path, me: dict[str, Any]) -> dict[str, An
     return None
 
 
+def _is_open_room(room: Any) -> bool:
+    return (
+        isinstance(room, dict)
+        and room_store.is_active_room(room)
+        and not room.get("closedAt")
+        and str(room.get("status") or "").lower() not in {"archived", "closed", "completed", "cancelled"}
+    )
+
+
+def _active_env_swarm_room(base: Path) -> str:
+    """Return ORKEST_SWARM_ROOM only when it names an active, unclosed room; ignore archived/cancelled/missing."""
+    room_id = os.environ.get("ORKEST_SWARM_ROOM", "").strip()
+    if not room_id or not re.fullmatch(r"[\w-]{1,80}", room_id, flags=re.ASCII):
+        return ""
+    with contextlib.suppress(OSError, ValueError):
+        room = room_store.read_room(base, room_id)
+        if _is_open_room(room):
+            return room_id
+    return ""
+
+
 def swarm_coordinator_context(
     base: Path, me: dict[str, Any], event: str = "SessionStart", *, mid_turn: bool = False
 ) -> str:
@@ -1185,15 +1218,13 @@ def swarm_coordinator_context(
         return ""
     is_turn_start = event in {"SessionStart", "UserPromptSubmit"} or (event == "PreInvocation" and not mid_turn)
     _record_native_swarm_identity(base, me)
-    room_id = os.environ.get("ORKEST_SWARM_ROOM", "").strip()
+    room_id = _active_env_swarm_room(base)
     toggled_resume_view = False
     resume_instance_key: str | None = None
     if is_turn_start and os.environ.get("ORKEST_RESUME_SWARM") == "1":
         # A stale inherited room must not make this new process claim another
         # live coordinator's terminal or brief. Resume by target in a fresh room.
-        inherited = (
-            room_store.read_room(base, room_id) if re.fullmatch(r"[\w-]{1,80}", room_id, flags=re.ASCII) else None
-        )
+        inherited = room_store.read_room(base, room_id) if room_id else None
         if isinstance(inherited, dict) and any(
             owner["session"] != me["session"]
             for owner in _MB.room_session_peers(base, inherited, inherited.get("conductor") or {})
@@ -1291,9 +1322,7 @@ def swarm_coordinator_context(
     if not re.fullmatch(r"[\w-]{1,80}", room_id, flags=re.ASCII):
         return ""
     loaded_room = room_store.read_room(base, room_id)
-    if not isinstance(loaded_room, dict) or not loaded_room.get("swarm"):
-        return ""
-    if not room_store.is_active_room(loaded_room):
+    if not _is_open_room(loaded_room) or not loaded_room.get("swarm"):
         # An inherited ORKEST_SWARM_ROOM may name archived history; it gets no brief or advice.
         return ""
     room = loaded_room
@@ -1451,7 +1480,7 @@ def side_command_context(
         cwd,
         "--json",
     ]
-    room_env = os.environ.get("ORKEST_SWARM_ROOM", "").strip()
+    room_env = _active_env_swarm_room(base)
     if room_env and "--room" not in parsed_tokens:
         cmd.extend(["--room", room_env])
     env = {**os.environ, "ORCHESTRATE_MAILBOX_DIR": str(base)}
@@ -1552,9 +1581,9 @@ def _continuation_at_stop(base: Path, me: dict[str, Any]) -> list[dict[str, Any]
         import continuation_requests
 
         # Only a known coordinator room is read: a Stop never scans the room store.
-        room_id = os.environ.get("ORKEST_SWARM_ROOM", "").strip() or str(me.get("continuationRoom") or "")
+        room_id = _active_env_swarm_room(base) or str(me.get("continuationRoom") or "")
         room = room_store.read_room(base, room_id) if room_id else None
-        if not isinstance(room, dict) or not room.get("swarm") or not room_store.is_active_room(room):
+        if not _is_open_room(room) or not room.get("swarm"):
             return []
         if me["session"] not in _MB.room_owner_sessions(room, room.get("conductor") or {}):
             return []
@@ -1961,44 +1990,50 @@ def hook(
         me = _MB.annotate(base, session, lastStopReason=None) or me
     if gemini and (is_subagent or me.get("isSubagent")):
         with contextlib.suppress(Exception):
-            prog_path = base / "progress" / f"{session_key(session)}.json"
-            existing_prog = _MB.load(prog_path)
-            if event == "Stop" and payload.get("terminationReason"):
-                if isinstance(existing_prog, dict):
-                    existing_prog["stage"] = "complete"
+            import agent_progress
+
+            prog_path = agent_progress.record_path(base, session)
+            with _MB.locked(prog_path):
+                existing_prog = _MB.load(prog_path)
+                valid_prog = isinstance(existing_prog, dict) and existing_prog.get("schema") == agent_progress.SCHEMA
+                if event == "Stop" and payload.get("terminationReason"):
+                    if valid_prog:
+                        existing_prog["stage"] = "complete"
+                        existing_prog["checkout"] = agent_progress.checkout_of(me)
+                        existing_prog["updatedAt"] = _MB.stamp()
+                        _MB.write(prog_path, existing_prog)
+                elif not valid_prog or not existing_prog.get("task"):
+                    role_label = subagent_name or str(me.get("focus") or "").removeprefix("native ").strip()
+                    sub_role = (existing_prog.get("role") if valid_prog else None) or {
+                        "explore": "scout",
+                        "plan": "planner",
+                        "research": "scout",
+                    }.get(role_label.lower())
+                    _MB.write(
+                        prog_path,
+                        {
+                            "schema": agent_progress.SCHEMA,
+                            "session": session,
+                            "harness": harness,
+                            "machine": socket.gethostname(),
+                            "accountHome": me.get("accountHome"),
+                            "checkout": agent_progress.checkout_of(me),
+                            **({"role": sub_role} if sub_role else {}),
+                            "stage": "working",
+                            "goal": f"Native {role_label or 'subagent'}",
+                            "task": f"Running {role_label or 'subagent'} ({session[:8]})",
+                            "updatedAt": _MB.stamp(),
+                        },
+                    )
+                elif (
+                    event in {"SessionStart", "UserPromptSubmit", "PreInvocation"}
+                    and existing_prog.get("stage") == "complete"
+                    and str(existing_prog.get("goal") or "").startswith("Native ")
+                ):
+                    existing_prog["stage"] = "working"
+                    existing_prog["checkout"] = agent_progress.checkout_of(me)
                     existing_prog["updatedAt"] = _MB.stamp()
                     _MB.write(prog_path, existing_prog)
-            elif not isinstance(existing_prog, dict) or not existing_prog.get("task"):
-                role_label = subagent_name or str(me.get("focus") or "").removeprefix("native ").strip()
-                sub_role = (existing_prog.get("role") if isinstance(existing_prog, dict) else None) or {
-                    "explore": "scout",
-                    "plan": "planner",
-                    "research": "scout",
-                }.get(role_label.lower())
-                _MB.write(
-                    prog_path,
-                    {
-                        "schema": "orchestrate.progress.v1",
-                        "session": session,
-                        "harness": harness,
-                        "machine": socket.gethostname(),
-                        "accountHome": me.get("accountHome"),
-                        "checkout": me.get("checkout") or cwd,
-                        **({"role": sub_role} if sub_role else {}),
-                        "stage": "working",
-                        "goal": f"Native {role_label or 'subagent'}",
-                        "task": f"Running {role_label or 'subagent'} ({session[:8]})",
-                        "updatedAt": _MB.stamp(),
-                    },
-                )
-            elif (
-                event in {"SessionStart", "UserPromptSubmit", "PreInvocation"}
-                and existing_prog.get("stage") == "complete"
-                and str(existing_prog.get("goal") or "").startswith("Native ")
-            ):
-                existing_prog["stage"] = "working"
-                existing_prog["updatedAt"] = _MB.stamp()
-                _MB.write(prog_path, existing_prog)
     cleared_notice = ""
     if (
         event == "SessionStart"

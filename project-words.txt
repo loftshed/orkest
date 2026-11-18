@@ -9,6 +9,8 @@ cclsp
 cmbak
 cwds
 clippy
+cloexec
+CLOEXEC
 rustfmt
 libc
 splitn

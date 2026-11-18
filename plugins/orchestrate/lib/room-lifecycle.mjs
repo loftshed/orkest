@@ -15,6 +15,7 @@ import {
   isActiveRoom,
   listRawRooms,
   mailboxRoot,
+  processStarted,
   readRoom,
   roomLifecycle,
   updateRoom,
@@ -66,8 +67,44 @@ function transition(room, to, { now, reason, by }) {
   }
 }
 
+function isPidAlive(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === "EPERM";
+  }
+}
+
+function chiefPidState(room) {
+  const launch = room?.chief?.launch;
+  const pid = launch?.pid;
+  if (!Number.isSafeInteger(pid) || pid <= 0) return { alive: false, reason: "no_pid" };
+  if (room.machine && room.machine !== hostname()) return { alive: false, reason: "remote" };
+  if (!isPidAlive(pid)) return { alive: false, reason: "exited" };
+  if (launch.pidBirth) {
+    const birth = processStarted(pid);
+    if (birth && birth !== launch.pidBirth) return { alive: false, reason: "recycled" };
+  }
+  return { alive: true, pid };
+}
+
+function activeOwnerSessions(room) {
+  return [
+    ...new Set(
+      [
+        room?.conductor?.session?.id ?? room?.conductor?.session,
+        room?.conductor?.mailboxSession,
+        room?.conductor?.nativeSession,
+        room?.promotion?.session,
+      ].filter((id) => typeof id === "string" && id),
+    ),
+  ];
+}
+
 /** Members whose work outlives a lifecycle change: still running, or finished and unreviewed. */
-export function outstandingWork(room) {
+export function outstandingWork(room, { chiefLiveRuns = [] } = {}) {
   const running = [];
   const awaitingAcceptance = [];
   const members = room.agents ?? [];
@@ -94,19 +131,56 @@ export function outstandingWork(room) {
     if (member.role === "lead" && member.session && !hasTerminalDecision(member))
       running.push({ ...entry, transport: "native-lead" });
   }
+  const launch = room.chief?.launch;
+  if (launch) {
+    const pidState = chiefPidState(room);
+    const liveRuns =
+      chiefLiveRuns.length > 0
+        ? chiefLiveRuns
+        : (launch.liveRuns ?? []).filter((entry) => LIVE_RUN_STATES.has(entry.status));
+    if (pidState.alive || liveRuns.length > 0) {
+      running.push({
+        id: room.chief.mission?.session || "chief-orchestrator",
+        engine: launch.engine || room.conductor?.engine,
+        model: launch.model || room.conductor?.model,
+        ...(launch.taskDir && { taskDir: launch.taskDir }),
+        ...(pidState.alive && { pid: pidState.pid }),
+        ...(liveRuns[0]?.run_id && { runId: liveRuns[0].run_id }),
+        transport: launch.taskDir ? "chief-coordinator" : "chief-launch",
+      });
+    }
+  }
   return { running, awaitingAcceptance };
 }
 
 async function observedOutstanding(room, { root, run }) {
+  let chiefLiveRuns = [];
+  let chiefError;
+  if (room.chief?.launch?.taskDir) {
+    try {
+      const task = await run(["show", "--task-dir", room.chief.launch.taskDir]);
+      chiefLiveRuns = (task?.runs ?? []).filter((entry) => LIVE_RUN_STATES.has(entry.status));
+    } catch (error) {
+      chiefError = error.message;
+    }
+  }
   try {
     const observed = await observeRoom(structuredClone(room), {
       root,
       run,
       discoverNativePeers: false,
     });
-    return { ...outstandingWork(observed), observed: true };
+    return {
+      ...outstandingWork(observed, { chiefLiveRuns }),
+      observed: !chiefError,
+      ...(chiefError && { observationError: chiefError }),
+    };
   } catch (error) {
-    return { ...outstandingWork(room), observed: false, observationError: error.message };
+    return {
+      ...outstandingWork(room, { chiefLiveRuns }),
+      observed: false,
+      observationError: chiefError || error.message,
+    };
   }
 }
 
@@ -338,19 +412,23 @@ export async function reactivateRoom(
   if (lifecycle === "cancelled")
     throw new Error(`Room ${id} was cancelled; start a fresh room instead of resuming it`);
   if (stored.authority) {
-    const current = await authority(stored.authority);
+    const current = await authority(stored.authority, { fresh: true });
     if (current?.error)
       throw new Error(`Cannot confirm team ${stored.authority}'s authority: ${current.error}`);
+    if (current?.status !== "active")
+      throw new Error(
+        `Cannot reactivate room ${id}: team ${stored.authority} authority status is ${current?.status || "unknown"}`,
+      );
   }
   if (lifecycle === "active")
     return { room: id, lifecycle, changed: false, outstanding: outstandingWork(stored) };
-  const owners = new Set(roomOwnerSessions(stored));
+  const owners = new Set(activeOwnerSessions(stored));
   const checkout = stored.cwd && (await canonical(stored.cwd));
   const active = listRawRooms(root, { lifecycle: "active" });
   for (const other of active) {
     if (other.id === id || !other.swarm || !other.cwd || (await canonical(other.cwd)) !== checkout)
       continue;
-    if (roomOwnerSessions(other).some((session) => owners.has(session)))
+    if (activeOwnerSessions(other).some((session) => owners.has(session)))
       throw new Error(
         `Room ${other.id} is the current room for this coordinator; archive it before reactivating ${id}`,
       );
@@ -371,6 +449,38 @@ export async function reactivateRoom(
     outstanding: await observedOutstanding(room, { root, run }),
     next: "New dispatch is open again. Pending results still need review; nothing was launched.",
   };
+}
+
+function chiefPidOutcome(room, launch) {
+  const pid = launch?.pid;
+  if (!Number.isSafeInteger(pid) || pid <= 0) return { outcome: "not_running", method: "none" };
+  if (room.machine && room.machine !== hostname()) {
+    return {
+      outcome: "uncertain",
+      method: "remote",
+      pid,
+      detail: `Chief orchestrator runs on ${room.machine}`,
+    };
+  }
+  if (!isPidAlive(pid)) return { outcome: "not_running", method: "none" };
+  if (launch.pidBirth) {
+    const birth = processStarted(pid);
+    if (birth && birth !== launch.pidBirth) {
+      return {
+        outcome: "not_running",
+        method: "pid-recycled",
+        pid,
+        detail: `Process ${pid} exited and PID was recycled`,
+      };
+    }
+  }
+  try {
+    process.kill(pid, "SIGTERM");
+    return { outcome: "cancelled", method: "sigterm", pid };
+  } catch (error) {
+    if (error.code === "ESRCH") return { outcome: "not_running", method: "none" };
+    return { outcome: "uncertain", method: "sigterm", pid, detail: error.message };
+  }
 }
 
 /**
@@ -442,6 +552,50 @@ export async function cancelRoom(
       }
     }
   }
+  let chiefOutcome;
+  if (!only && room.chief?.launch) {
+    const launch = room.chief.launch;
+    if (launch.taskDir) {
+      try {
+        const task = await run(["show", "--task-dir", launch.taskDir]);
+        const live = (task?.runs ?? []).filter((entry) => LIVE_RUN_STATES.has(entry.status));
+        if (live.length === 0) {
+          chiefOutcome = chiefPidOutcome(room, launch);
+        } else {
+          for (const entry of live) {
+            try {
+              const result = await run([
+                "abandon",
+                "--task-dir",
+                launch.taskDir,
+                "--run-id",
+                entry.run_id,
+                "--reason",
+                note,
+              ]);
+              chiefOutcome = {
+                outcome: result?.status === "cancelled" ? "cancelled" : "uncertain",
+                method: "coordinator",
+                runId: entry.run_id,
+                ...(result?.recovery && { detail: result.recovery }),
+              };
+            } catch (error) {
+              chiefOutcome = {
+                outcome: "uncertain",
+                method: "coordinator",
+                runId: entry.run_id,
+                detail: error.message,
+              };
+            }
+          }
+        }
+      } catch (error) {
+        chiefOutcome = { outcome: "uncertain", method: "coordinator", detail: error.message };
+      }
+    } else {
+      chiefOutcome = chiefPidOutcome(room, launch);
+    }
+  }
   const saved = await updateRoom(
     id,
     (current) => {
@@ -449,6 +603,10 @@ export async function cancelRoom(
         const agent = current.agents.find((entry) => entry.id === memberId);
         // A cancelled assignment never turns back into a queued one.
         if (agent) agent.cancellation = { ...outcome, reason: note, requestedAt: now };
+      }
+      if (!only && chiefOutcome && current.chief) {
+        current.chief.cancellation = { ...chiefOutcome, reason: note, requestedAt: now };
+        if (chiefOutcome.outcome === "cancelled") current.chief.state = "cancelled";
       }
       if (!only && roomLifecycle(current) !== "cancelled")
         transition(current, "cancelled", { now, reason: note, by });
@@ -460,9 +618,13 @@ export async function cancelRoom(
     room: id,
     lifecycle: roomLifecycle(saved),
     members: outcomes,
-    uncertain: Object.entries(outcomes)
-      .filter(([, outcome]) => outcome.outcome === "uncertain")
-      .map(([memberId]) => memberId),
+    ...(chiefOutcome && { chief: chiefOutcome }),
+    uncertain: [
+      ...Object.entries(outcomes)
+        .filter(([, outcome]) => outcome.outcome === "uncertain")
+        .map(([memberId]) => memberId),
+      ...(chiefOutcome?.outcome === "uncertain" ? ["chief"] : []),
+    ],
     route: routeBack(saved),
   };
 }

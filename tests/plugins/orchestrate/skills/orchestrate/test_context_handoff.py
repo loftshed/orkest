@@ -157,6 +157,32 @@ class ProvenanceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             HANDOFF.record_observation(self.provenance(), model=None, effort=None, source="host")
 
+    def test_partial_observation_updates_preserve_existing_model_or_effort(self):
+        first = HANDOFF.record_observation(
+            self.provenance(), model="claude-haiku-5-5", effort=None, source="hook", at="2026-11-18T00:01:00Z"
+        )
+        second = HANDOFF.record_observation(
+            first, model=None, effort="medium", source="receipt", at="2026-11-18T00:02:00Z"
+        )
+        self.assertEqual(second["observed"]["model"], "claude-haiku-5-5")
+        self.assertEqual(second["observed"]["effort"], "medium")
+        self.assertEqual(
+            second["mismatch"],
+            [
+                {"field": "model", "resolved": "claude-sonnet-5-5", "observed": "claude-haiku-5-5"},
+                {"field": "effort", "resolved": "high", "observed": "medium"},
+            ],
+        )
+        third = HANDOFF.record_observation(
+            second, model="claude-sonnet-5-5", effort=None, source="receipt", at="2026-11-18T00:03:00Z"
+        )
+        self.assertEqual(third["observed"]["model"], "claude-sonnet-5-5")
+        self.assertEqual(third["observed"]["effort"], "medium")
+        self.assertEqual(
+            third["mismatch"],
+            [{"field": "effort", "resolved": "high", "observed": "medium"}],
+        )
+
 
 class HandoffCliTests(unittest.TestCase):
     def test_cli_prints_capabilities_and_decisions(self):

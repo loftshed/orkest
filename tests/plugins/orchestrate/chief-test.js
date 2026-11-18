@@ -784,4 +784,218 @@ describe("ork chief", () => {
       stdout: out,
     });
   });
+
+  it("propagates Orca terminal fields on bindChief and coordinatorOf", async () => {
+    const writeRawRooms = (dir, items) => {
+      const roomsDir = path.join(dir, "rooms");
+      fs.mkdirSync(roomsDir, { recursive: true });
+      for (const item of items) {
+        fs.writeFileSync(path.join(roomsDir, `${item.id}.json`), JSON.stringify(item));
+      }
+    };
+    const repo = makeRepo(tmp, "orca-chief-repo");
+    const orcaEnv = {
+      ...env,
+      ORCA_TERMINAL_HANDLE: "term_chief_1",
+      ORCA_PANE_KEY: "pane-chief",
+      ORCA_WORKSPACE_ID: "ws-chief",
+      ORCA_TAB_ID: "tab-chief",
+      ORCA_ENVIRONMENT: "ssh:box",
+    };
+    const bound = await bindChief({ root, env: orcaEnv, session: "chief-orca", now: NOW });
+    expect(bound.binding).toMatchObject({
+      orcaTerminalHandle: "term_chief_1",
+      orcaPaneKey: "pane-chief",
+      orcaWorkspaceId: "ws-chief",
+      orcaTabId: "tab-chief",
+      orcaEnvironment: "ssh:box",
+    });
+
+    await writeRawRooms(root, [
+      room("orca-room", repo, {
+        orcaCoordinatorTerminalId: "term_coord_7",
+        orcaWorkspaceId: "ws-room",
+        orcaEnvironment: "ssh:box",
+      }),
+    ]);
+    const status = await chiefStatus({ root, env: orcaEnv, quota: false, now: NOW });
+    expect(status.chief).toMatchObject({
+      orcaTerminalHandle: "term_chief_1",
+      orcaPaneKey: "pane-chief",
+      orcaWorkspaceId: "ws-chief",
+      orcaTabId: "tab-chief",
+      orcaEnvironment: "ssh:box",
+    });
+    expect(status.rooms[0].coordinator).toMatchObject({
+      orcaTerminalHandle: "term_coord_7",
+      orcaWorkspaceId: "ws-room",
+      orcaEnvironment: "ssh:box",
+    });
+  });
+
+  it("rejects recycled Chief PIDs when pidBirth does not match", async () => {
+    fs.writeFileSync(
+      chiefPath(root),
+      JSON.stringify({
+        schema: "ork.chief.v1",
+        session: "chief-recycled",
+        name: "Recycled",
+        engine: "claude",
+        cwd: tmp,
+        machine: os.hostname(),
+        pid: process.pid,
+        pidBirth: "1999-01-01T00:00:00Z",
+        boundAt: new Date(NOW).toISOString(),
+      }),
+    );
+    expect(readChiefBinding({ root, now: NOW })).toBeNull();
+    expect(readChiefBinding({ root, now: NOW, includeStale: true })).toMatchObject({
+      live: false,
+      stale: true,
+      staleReason: expect.stringContaining("recycled"),
+    });
+  });
+
+  it("excludes cancelled rooms from status and keeps peers from inactive rooms standalone", async () => {
+    const writeRawRooms = (dir, items) => {
+      const roomsDir = path.join(dir, "rooms");
+      fs.mkdirSync(roomsDir, { recursive: true });
+      for (const item of items) {
+        fs.writeFileSync(path.join(roomsDir, `${item.id}.json`), JSON.stringify(item));
+      }
+    };
+    const repo = makeRepo(tmp, "cancelled-repo");
+    const repo2 = makeRepo(tmp, "solo-repo");
+    writePeer(root, {
+      session: "coord-cancelled",
+      name: "GoneCoord",
+      cwd: repo,
+      pid: process.pid,
+    });
+    writePeer(root, {
+      session: "solo-from-archived",
+      name: "StillRunning",
+      cwd: repo2,
+      pid: process.pid,
+    });
+    await writeRawRooms(root, [
+      room("room-cancelled", repo, {
+        status: "cancelled",
+        lifecycle: "cancelled",
+        cancelledAt: NOW - 100,
+        conductor: { engine: "claude", status: "running", session: { id: "coord-cancelled" } },
+      }),
+      room("room-archived", repo2, {
+        lifecycle: "archived",
+        archivedAt: NOW - 200,
+        conductor: { engine: "claude", status: "running", session: { id: "solo-from-archived" } },
+      }),
+    ]);
+    const status = await chiefStatus({ root, env, quota: false, now: NOW, all: true });
+    expect(status.rooms).toEqual([]);
+    expect(status.standalone.map((peer) => peer.session)).toEqual(
+      expect.arrayContaining(["coord-cancelled", "solo-from-archived"]),
+    );
+  });
+
+  it("only updates mission state after Chief delivery succeeds and preserves terminal states", async () => {
+    const writeRawRooms = (dir, items) => {
+      const roomsDir = path.join(dir, "rooms");
+      fs.mkdirSync(roomsDir, { recursive: true });
+      for (const item of items) {
+        fs.writeFileSync(path.join(roomsDir, `${item.id}.json`), JSON.stringify(item));
+      }
+    };
+    const repo = makeRepo(tmp, "send-mission");
+    const otherRepo = makeRepo(tmp, "other-peer-repo");
+    await bindChief({ root, env, session: "chief-live", now: NOW });
+    writePeer(root, { session: "chief-live", name: "Chief", cwd: tmp, pid: process.pid });
+    writePeer(root, {
+      session: "other-worker",
+      name: "Other",
+      cwd: otherRepo,
+      pid: process.pid,
+    });
+    const missionRoom = room("chief-mission-1", repo, {
+      chief: { goal: "Ship hardening", state: "running", mission: { session: "mission-1-orch" } },
+      conductor: { engine: "claude", status: "running", mailboxSession: "mission-1-orch" },
+    });
+    await writeRawRooms(root, [missionRoom]);
+
+    // 1. Failing delivery to non-Chief peer leaves mission state untouched.
+    await expect(
+      chiefSend({
+        to: "other-worker",
+        message: "ping",
+        from: "mission-1-orch",
+        root,
+        env,
+        now: NOW,
+        runMailbox: mailboxMock(1, ""),
+      }),
+    ).rejects.toThrow(/failed/u);
+    expect(readRawRoom("chief-mission-1", root).chief.state).toBe("running");
+
+    // 2. Successful delivery to non-Chief peer does NOT hijack mission state even with --kind done.
+    const toPeer = await chiefSend({
+      to: "other-worker",
+      kind: "done",
+      message: "handoff complete",
+      from: "mission-1-orch",
+      root,
+      env,
+      now: NOW,
+      runMailbox: mailboxMock(0),
+    });
+    expect(toPeer.mission).toBeNull();
+    expect(readRawRoom("chief-mission-1", root).chief.state).toBe("running");
+
+    // 3. Report to chief moves state to done; plain follow-up omitting kind preserves done.
+    await chiefSend({
+      to: "chief",
+      kind: "done",
+      message: "all green",
+      from: "mission-1-orch",
+      root,
+      env,
+      now: NOW,
+      runMailbox: mailboxMock(0),
+    });
+    expect(readRawRoom("chief-mission-1", root).chief.state).toBe("done");
+    expect(readRawRoom("chief-mission-1", root).conductor.status).toBe("completed");
+
+    await chiefSend({
+      to: "chief",
+      message: "follow-up note with branch details",
+      from: "mission-1-orch",
+      root,
+      env,
+      now: NOW + 1000,
+      runMailbox: mailboxMock(0),
+    });
+    expect(readRawRoom("chief-mission-1", root).chief.state).toBe("done");
+    expect(readRawRoom("chief-mission-1", root).conductor.status).toBe("completed");
+  });
+
+  it("checks existing room IDs before provisioning a Chief spawn worktree", async () => {
+    const roomsDir = path.join(root, "rooms");
+    fs.mkdirSync(roomsDir, { recursive: true });
+    const repo = makeRepo(tmp, "dup-spawn");
+    fs.writeFileSync(
+      path.join(roomsDir, "chief-taken.json"),
+      JSON.stringify(room("chief-taken", repo)),
+    );
+    const provision = vi.fn();
+    await expect(
+      chiefSpawn({
+        cwd: repo,
+        worktree: "taken",
+        goal: "Should fail before worktree creation",
+        root,
+        env,
+        provision,
+      }),
+    ).rejects.toThrow(/already exists/u);
+    expect(provision).not.toHaveBeenCalled();
+  });
 });

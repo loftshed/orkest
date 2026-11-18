@@ -8,8 +8,10 @@ import { promisify } from "node:util";
 
 import {
   addMembers,
+  clearRoomListCache,
   createRoom,
   detectWorktree,
+  isActiveRoom,
   listRawRooms,
   listRawRoomsCached,
   mailboxRoot,
@@ -28,6 +30,7 @@ import {
 import { hasTerminalDecision, memberDisplayState } from "./member-state.mjs";
 import { verifiedNativeIds } from "./native-identity.mjs";
 import { readDelegatedRunTail } from "./run-activity.mjs";
+import { cacheHome } from "./runtime-paths.mjs";
 import {
   currentBranch,
   provisionWorktree,
@@ -153,6 +156,8 @@ async function readOptionalJson(filePath, maxBytes = 4 * 1024 * 1024) {
 
 export function clearDisplayReadCache() {
   jsonCache.clear();
+  authorityCache.clear();
+  clearRoomListCache();
 }
 
 async function resolveCwd(cwd) {
@@ -426,14 +431,16 @@ const authorityCache = new Map();
 const AUTHORITY_TTL_MS = 5000;
 
 /** The team's current lead and generation; the authority record is written only by authority.py. */
-export async function authorityShow(team) {
+export async function authorityShow(team, { fresh = false, root, env = process.env } = {}) {
   const now = Date.now();
-  const cached = authorityCache.get(team);
+  const cacheKey = `${root || cacheHome(env)}:${team}`;
+  const cached = fresh ? undefined : authorityCache.get(cacheKey);
   if (cached && now - cached.fetchedAt < AUTHORITY_TTL_MS) {
-    return cached.value;
+    return structuredClone(cached.value);
   }
   try {
     const { stdout } = await execute("python3", [authorityPath, "show", "--team", team], {
+      env,
       maxBuffer: 8 * 1024 * 1024,
       timeout: 30_000,
     });
@@ -445,8 +452,8 @@ export async function authorityShow(team) {
       lead: authority.lead,
       offer: authority.offer?.to,
     };
-    authorityCache.set(team, { fetchedAt: now, value });
-    return value;
+    authorityCache.set(cacheKey, { fetchedAt: now, value });
+    return structuredClone(value);
   } catch (error) {
     return { team, error: error.stderr?.trim() || error.message };
   }
@@ -890,6 +897,7 @@ export async function bindSession(
   return updateRoom(
     id,
     async (room) => {
+      requireActiveRoom(room);
       const member = memberOf(room, memberId);
       if (!isLocalSessionBinding(room, member))
         throw new Error("The target binding belongs to a different machine");
@@ -1003,6 +1011,7 @@ export async function createMemberWorktree(id, memberId, options = {}) {
   const { root = mailboxRoot(), run = coordinator, exec } = options;
   if (memberId === "conductor") throw new Error("A worktree can only be assigned to a worker");
   const room = await readRoom(id, root);
+  requireActiveRoom(room);
   const member = memberOf(room, memberId);
   if (member.worktree) throw new Error(`Member ${memberId} already has a worktree`);
   const repositoryRoot = resolveRepositoryRoot(room.cwd, exec);
@@ -1023,6 +1032,7 @@ export async function createMemberWorktree(id, memberId, options = {}) {
   const reserved = await updateRoom(
     id,
     async (current) => {
+      requireActiveRoom(current);
       const currentMember = memberOf(current, memberId);
       if (currentMember.worktree) throw new Error(`Member ${memberId} already has a worktree`);
       await assertMemberDispatchEnded(currentMember, run);
@@ -1187,6 +1197,11 @@ export async function dispatchMember(id, memberId, options = {}) {
         throw new Error(
           `Another dispatch of this member is still launching; wait for it, or retry it with --request-id ${member.dispatch.requestId}`,
         );
+      const hasLaunchedRun =
+        Boolean(member.dispatch) &&
+        !continuing &&
+        task.runs.some((entry) => entry.request_id === member.dispatch.requestId);
+      if (!hasLaunchedRun) requireActiveRoom(current);
       if (member.dispatch && !continuing) {
         // A retry repeats the stored request exactly; the member it runs as is part of it.
         for (const key of [
@@ -1589,14 +1604,17 @@ export async function observeRoom(idOrRoom, options = {}) {
     }
   }
   const shouldDiscoverNative =
-    discoverNativePeers === true ||
-    (discoverNativePeers !== false &&
-      Boolean(room.swarm && room.cwd) &&
-      progress === interactiveProgress &&
-      (typeof idOrRoom === "string" ||
-        options.root !== undefined ||
-        Boolean(room.conductor?.session) ||
-        room.agents.some((agent) => agent.session || agent.mailboxSession || agent.nativeSession)));
+    isActiveRoom(room) &&
+    (discoverNativePeers === true ||
+      (discoverNativePeers !== false &&
+        Boolean(room.swarm && room.cwd) &&
+        progress === interactiveProgress &&
+        (typeof idOrRoom === "string" ||
+          options.root !== undefined ||
+          Boolean(room.conductor?.session) ||
+          room.agents.some(
+            (agent) => agent.session || agent.mailboxSession || agent.nativeSession,
+          ))));
   if (shouldDiscoverNative) {
     await appendNativePeers(room, snapshots, root);
   }
@@ -1741,9 +1759,11 @@ async function appendConsultations(room, root) {
         continue;
       }
       entries.sort((a, b) => a.localeCompare(b));
+      const maxMs = isActiveRoom(room) ? NaN : parseStampMs(room.archivedAt ?? room.cancelledAt);
       for (const entry of entries) {
         if (!entry.endsWith(".json")) continue;
         const job = await readOptionalJson(path.join(directory, entry));
+        const startedMs = Date.parse(job?.started_at);
         if (
           job?.schema !== "orchestrate.consultation-observation.v1" ||
           job.parent_session !== session ||
@@ -1751,8 +1771,9 @@ async function appendConsultations(room, root) {
           job.machine !== hostname() ||
           typeof job.id !== "string" ||
           seen.has(job.id) ||
-          !Number.isFinite(Date.parse(job.started_at)) ||
-          Date.parse(job.started_at) < parseStampMs(room.createdAt) ||
+          !Number.isFinite(startedMs) ||
+          startedMs < parseStampMs(room.createdAt) ||
+          (Number.isFinite(maxMs) && startedMs > maxMs) ||
           typeof job.result_path !== "string"
         )
           continue;
@@ -1867,6 +1888,7 @@ async function appendRoomMessages(room, root) {
   const minMs = Number.isFinite(parseStampMs(room.createdAt))
     ? parseStampMs(room.createdAt) - 60_000
     : -Infinity;
+  const maxMs = isActiveRoom(room) ? NaN : parseStampMs(room.archivedAt ?? room.cancelledAt);
   const agentMatchers = room.agents.map((agent) => {
     const sessions = new Set(
       [
@@ -1916,6 +1938,7 @@ async function appendRoomMessages(room, root) {
       }
       const sentMs = parseStampMs(msg.sentAt);
       if (Number.isFinite(minMs) && Number.isFinite(sentMs) && sentMs < minMs) continue;
+      if (Number.isFinite(maxMs) && Number.isFinite(sentMs) && sentMs > maxMs) continue;
       let fromSession = "";
       if (typeof msg.from?.session === "string") {
         fromSession = msg.from.session;
@@ -2014,8 +2037,11 @@ async function appendNativePeers(room, snapshots, root) {
   if (!roomCwd) return;
   const currentHost = hostname();
   const boundSessions = new Set();
-  const collectRoomSessions = (targetRoom) => {
-    for (const member of [targetRoom?.conductor, ...(targetRoom?.agents || [])]) {
+  const collectRoomSessions = (targetRoom, { includeConductor = true } = {}) => {
+    const members = includeConductor
+      ? [targetRoom?.conductor, ...(targetRoom?.agents || [])]
+      : [...(targetRoom?.agents || [])];
+    for (const member of members) {
       if (!member) continue;
       if (member.session?.id) {
         boundSessions.add(member.session.id);
@@ -2030,7 +2056,9 @@ async function appendNativePeers(room, snapshots, root) {
   };
   collectRoomSessions(room);
   for (const otherRoom of listRawRoomsCached(root)) {
-    if (otherRoom.id !== room.id) collectRoomSessions(otherRoom);
+    if (otherRoom.id !== room.id) {
+      collectRoomSessions(otherRoom, { includeConductor: isActiveRoom(otherRoom) });
+    }
   }
   const existingIds = new Set(["conductor", ...room.agents.map((agent) => agent.id)]);
   const claimedSlots = new Set();
