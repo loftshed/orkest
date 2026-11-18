@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.87.3
+
+- fix(orchestrate): forward explicit --allow-credits through room dispatch and launch (#222)
+
 ## 0.87.2
 
 - fix(orchestrate): replace persona flattery with plain role and epistemic rules (closes #219) (#220)
