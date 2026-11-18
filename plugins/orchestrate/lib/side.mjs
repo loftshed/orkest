@@ -278,7 +278,8 @@ function findTargetRoom(mailboxDir, { roomId, session, cwd }) {
       if (error.code !== "ENOENT") throw error;
     }
   }
-  const entries = listRawRooms(mailboxDir);
+  // Discovery by session or checkout only considers current rooms; history is never adopted.
+  const entries = listRawRooms(mailboxDir, { lifecycle: "active" });
 
   const resolvedCwd = cwd ? path.resolve(cwd) : null;
   let cwdMatch = null;

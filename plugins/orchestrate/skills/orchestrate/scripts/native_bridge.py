@@ -78,6 +78,7 @@ def start(directory: Path, run: dict[str, Any], runner: Any) -> None:
                 "the run mailbox is only a fallback if native messaging is unavailable.",
                 "brief_path": str(folder / "brief.md"),
             }
+            run["native_instructions"]["settings"] = native_settings(run)
             if run.get("required_native_handle"):
                 run["native_instructions"]["session"] = run["required_native_handle"]
                 run["native_instructions"]["dispatch"] = (
@@ -88,6 +89,35 @@ def start(directory: Path, run: dict[str, Any], runner: Any) -> None:
             raise ValueError("native audit guard exited before readiness; inspect guard.stderr")
         time.sleep(0.05)
     raise ValueError("native audit guard did not become ready; recover reservation before native dispatch")
+
+
+def native_settings(run: dict[str, Any]) -> dict[str, Any]:
+    """What to pass to the host's own tool, and how to report what it actually used."""
+    provenance = run.get("settings_provenance") or {}
+    resolved = provenance.get("resolved") or {}
+    host = run.get("host") or run.get("engine")
+    capabilities = {}
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "executor_handoff", Path(__file__).with_name("context_handoff.py")
+        )
+        if spec and spec.loader:
+            handoff = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(handoff)
+            capabilities = {
+                name: handoff.host_capability(str(host), name)["status"]
+                for name in ("request_model", "request_effort", "observe_settings", "intercept_launch")
+            }
+    except (OSError, ImportError, ValueError):
+        capabilities = {}
+    return {
+        "model": resolved.get("model") or run.get("model"),
+        "effort": resolved.get("effort"),
+        "host_capabilities": capabilities,
+        "observation": "Pass the model and effort above to the native tool where the host supports them. "
+        'Report what the host itself used: "observed_settings": {"model", "effort", "source"} on native-attach, '
+        "or observed_model/observed_effort on native-complete. Never copy the requested values as an observation.",
+    }
 
 
 def complete(directory: Path, state: dict[str, Any], run: dict[str, Any], packet: dict[str, Any], runner: Any) -> None:

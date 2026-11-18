@@ -164,5 +164,33 @@ class RepositoryPathTests(unittest.TestCase):
                 RENDERER.normalize_repo_paths([value], "allow_paths", allow_root=True)
 
 
+class MinimumHandoffTests(unittest.TestCase):
+    def test_optional_handoff_fields_leave_existing_briefs_unchanged(self) -> None:
+        plain = RENDERER.render_brief(brief_spec())
+        self.assertNotIn("Source revision", plain)
+        self.assertNotIn("# Evidence references", plain)
+        self.assertNotIn("# Context mode", plain)
+        fresh = RENDERER.render_brief({**brief_spec(), "context_mode": "fresh"})
+        self.assertEqual(fresh, plain)
+
+    def test_brief_carries_source_revision_and_retrievable_evidence(self) -> None:
+        spec = {**brief_spec(), "source_revision": "19ec6f7", "evidence_refs": ["/tmp/artifacts/ci.log"]}
+        brief = RENDERER.render_brief(spec)
+        self.assertIn("- Source revision: 19ec6f7", brief)
+        self.assertIn("# Evidence references", brief)
+        self.assertIn("- /tmp/artifacts/ci.log", brief)
+        self.assertEqual(RENDERER.validate_spec(spec)["source_revision"], "19ec6f7")
+
+    def test_full_history_fork_records_its_reason(self) -> None:
+        with self.assertRaisesRegex(RENDERER.BriefSpecError, "context_reason"):
+            RENDERER.validate_spec({**brief_spec(), "context_mode": "fork"})
+        with self.assertRaisesRegex(RENDERER.BriefSpecError, "context_mode"):
+            RENDERER.validate_spec({**brief_spec(), "context_mode": "partial"})
+        brief = RENDERER.render_brief(
+            {**brief_spec(), "context_mode": "fork", "context_reason": "It must reuse the agreed API decisions."}
+        )
+        self.assertIn("Full-history fork: It must reuse the agreed API decisions.", brief)
+
+
 if __name__ == "__main__":
     unittest.main()

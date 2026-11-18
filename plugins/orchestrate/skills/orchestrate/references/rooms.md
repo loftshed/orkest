@@ -130,3 +130,23 @@ the team's lead and generation, and its `init-task`, `dispatch`, `launch` and `r
 [coordinator.md](coordinator.md#team-lead-and-succession).
 
 Closing a view never cancels work; the coordinator's cancellation stops workers.
+
+## History, archive and cancel
+
+A room is `active`, `archived` or `cancelled`. A room without the field is active; age never
+archives it. Every state keeps its members, dispatch bindings and receipts.
+
+| Command                                     | Effect                                                                                                                      |
+| ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `ork rooms list [--all]`                    | Active rooms; `--all` adds history.                                                                                         |
+| `ork rooms history` / `search --query TEXT` | Read-only stored history. No coordinator or model call.                                                                     |
+| `ork rooms reopen-view --room ID`           | Read-only snapshot and the view command (`ork horde --attach-room ID --view`). Resumes and launches nothing.                |
+| `ork rooms archive --room ID` / `clear`     | Closes new dispatch, leads and members. Running workers stay owned and observable; late results return to their assignment. |
+| `ork rooms start-fresh`                     | Archives the checkout's current room and opens an empty one. The new room adopts none of the old workers.                   |
+| `ork rooms reactivate --room ID`            | Explicit resume of an archived room after checking team authority and that no other active room owns the coordinator.       |
+| `ork rooms cancel --room ID [--member ID]`  | Abandons owned executor runs through the coordinator. A native run's interruption is recorded `uncertain`.                  |
+
+Archive output lists running and unreviewed workers with the command that returns to them.
+Repeating archive keeps the first archive time. A cancelled room cannot be reactivated, and a
+cancelled assignment never turns back into a queued one. Session discovery and hook adoption skip
+archived and cancelled rooms, and the mailbox's 7-day prune keeps them.

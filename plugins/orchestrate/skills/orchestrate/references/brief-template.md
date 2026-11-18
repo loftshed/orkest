@@ -74,6 +74,12 @@ An optional `context_packet` object accepts four string arrays: `decisions`, `fa
 The nine fields above remain required. Keep native reasoning and opaque tool state in their own
 session. For a narrow read-only question, see [coordinator.md](coordinator.md).
 
+Optional handoff fields keep the brief minimal. `source_revision` names the commit or fingerprint the
+worker starts from, so acceptance can check it. `evidence_refs` lists retrievable artifacts (logs,
+prior reports, discussions) instead of pasting them. `context_mode` is `fresh` (the default: the
+brief suffices) or `fork` (a full-history worker); a fork needs `context_reason` naming the
+conversational dependency. Neither cheap models nor fresh context is a universal saving.
+
 An optional `auto_correct` integer (0 to 2) is the default for the runner's `--auto-correct`: the
 rounds it may resume the session to fix a failed `--verify-command` gate. It leaves the brief
 unchanged and does nothing without a gate. An optional `protect_paths` array lists repository-relative

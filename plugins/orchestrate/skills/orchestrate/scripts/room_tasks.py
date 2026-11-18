@@ -27,6 +27,7 @@ RUN_FIELDS = (
     "resumed_from",
     "verification_of",
     "parent_run_id",
+    "settings_provenance",
 )
 STATES = {"reserved": "reserved", "active": "running", "finished": "review", "cancelled": "cancelled"}
 VERDICTS = {"accept": "accepted", "supported": "supported", "reject": "rejected", "takeover": "blocked"}

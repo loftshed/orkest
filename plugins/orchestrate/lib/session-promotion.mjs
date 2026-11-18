@@ -7,7 +7,14 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import { herdrEndpoint } from "./herdr-context.mjs";
-import { createRoom, listRawRooms, mailboxRoot, readRoom, updateRoom } from "./horde-room.mjs";
+import {
+  createRoom,
+  isActiveRoom,
+  listRawRooms,
+  mailboxRoot,
+  readRoom,
+  updateRoom,
+} from "./horde-room.mjs";
 import {
   coordinatorBrief,
   hasOtherLiveOwner,
@@ -153,7 +160,9 @@ export async function promoteSession(
     throw new Error("Objective must contain 1–12000 characters");
   const isResume = env.ORKEST_RESUME_SWARM === "1";
   const resumeTarget = env.ORKEST_RESUME_TARGET;
-  const available = (room) => room && !room.closedAt && room.status !== "closed";
+  // Archived and cancelled rooms are history: promotion never adopts them implicitly.
+  const available = (room) =>
+    room && !room.closedAt && room.status !== "closed" && isActiveRoom(room);
   const sameCheckout = async (room) => {
     if (!isLocalSessionBinding(room)) return false;
     let roomCwd;
@@ -214,7 +223,10 @@ export async function promoteSession(
     if (!(await sameCheckout(room)))
       throw new Error("The target room belongs to a different machine or checkout");
     const binding = room.conductor?.session;
-    if (!available(room)) throw new Error("Cannot promote into a closed room");
+    if (!available(room))
+      throw new Error(
+        "Cannot promote into a closed, archived or cancelled room; reactivate an archived room first",
+      );
     const owned = await ownsSessionBinding(room, peer, root);
     const resuming = await mayResume(room);
     if (binding && !owned && !resuming)

@@ -232,3 +232,14 @@ def run(base: Path, stopping: threading.Event) -> None:
             reconcile(base)
         except Exception as error:  # noqa: BLE001 -- the daemon keeps serving whatever one pass hits
             print(f"wake recovery: {error}", file=sys.stderr, flush=True)
+        try:
+            continuation_pass(base)
+        except Exception as error:  # noqa: BLE001 -- a continuation failure never stops wake recovery
+            print(f"continuation recovery: {error}", file=sys.stderr, flush=True)
+
+
+def continuation_pass(base: Path, *, moment: dt.datetime | None = None) -> list[dict[str, Any]]:
+    """Reconcile continuation requests and send due hints; their wakes then retry through intents above."""
+    import continuation_requests
+
+    return continuation_requests.pass_once(base, moment=moment)

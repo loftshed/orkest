@@ -475,5 +475,61 @@ class TaskArchetypeRouteTests(unittest.TestCase):
                     self.assertTrue(all(isinstance(item, str) and item for item in strengths[tier]))
 
 
+POLICY = load("conductor_policy")
+
+
+class AcceptedOutcomeCostTests(unittest.TestCase):
+    def state(self) -> dict:
+        return {
+            "task_id": "task-1",
+            "status": "accepted",
+            "runs": [
+                {"run_id": "r1", "kind": "implementation"},
+                {"run_id": "r2", "kind": "correction"},
+            ],
+            "cost_ledger": {
+                "r1": {"api_reference_estimate": 0.4, "native_estimate_usd": None, "duration_seconds": 120},
+                "r2": {"api_reference_estimate": 0.1, "native_estimate_usd": None, "duration_seconds": 30},
+            },
+            "decisions": [{"run_id": "r2", "decision": "accept", "review_minutes": 4}],
+        }
+
+    def test_totals_include_retries_review_and_context(self) -> None:
+        cost = POLICY.accepted_outcome_cost(self.state(), brief_bytes={"r1": 900, "r2": 300})
+        self.assertTrue(cost["accepted"])
+        self.assertEqual(cost["attempts"], {"total": 2, "retries": 1, "settled": 2})
+        self.assertEqual(cost["api_reference_estimate_usd"], 0.5)
+        self.assertEqual(cost["duration_seconds"], 150.0)
+        self.assertEqual(cost["context_transfer_bytes"], 1200.0)
+        self.assertEqual(cost["parent_review_minutes"], 4.0)
+
+    def test_missing_telemetry_stays_missing(self) -> None:
+        state = self.state()
+        del state["cost_ledger"]["r2"]
+        state["decisions"][0].pop("review_minutes")
+        cost = POLICY.accepted_outcome_cost(state)
+        self.assertIsNone(cost["api_reference_estimate_usd"])
+        self.assertIsNone(cost["native_estimate_usd"])
+        self.assertIsNone(cost["parent_review_minutes"])
+        self.assertIsNone(cost["context_transfer_bytes"])
+        self.assertIn("api_reference_estimate", cost["missing"])
+        self.assertIn("parent_review_minutes", cost["missing"])
+        self.assertEqual(cost["attempts"]["settled"], 1)
+
+    def test_task_outcome_cost_reads_brief_sizes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            (directory / "task.json").write_text(json.dumps(self.state()))
+            for run_id, text in (("r1", "brief one"), ("r2", "two")):
+                (directory / "runs" / run_id).mkdir(parents=True)
+                (directory / "runs" / run_id / "brief.md").write_text(text)
+            cost = TELEMETRY.task_outcome_cost(directory)
+            self.assertEqual(cost["context_transfer_bytes"], float(len("brief one") + len("two")))
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(TELEMETRY.main(["outcome-cost", "--task-dir", str(directory)]), 0)
+            self.assertEqual(json.loads(output.getvalue())["task_id"], "task-1")
+
+
 if __name__ == "__main__":
     unittest.main()

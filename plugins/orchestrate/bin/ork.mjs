@@ -16,6 +16,7 @@ import {
   mailboxRoot,
   parseTeam,
   readRoom,
+  requireActiveRoom,
   updateRoom,
   validateRoom,
 } from "../lib/horde-room.mjs";
@@ -788,6 +789,8 @@ export async function main(
       room = await readRoom(values["attach-room"], root);
       if (!isSpawning && (values.team || values.preset || values.cwd))
         throw new Error("Use spawn to add agents; --attach-room alone observes the room");
+      // Reattaching a coordinator resumes it; history opens only as a view.
+      if (isSpawning || isInteractive) requireActiveRoom(room);
       if (isSpawning) {
         if (!values.team && !values.preset) throw new Error("spawn requires --team or --preset");
         if (values.cwd && path.resolve(values.cwd) !== room.cwd)
@@ -795,6 +798,7 @@ export async function main(
         room = await updateRoom(
           room.id,
           (current) => {
+            requireActiveRoom(current);
             addMembers(current, members, { workforceRole: values.role });
             return current;
           },

@@ -4,6 +4,16 @@ import { parseArgs } from "node:util";
 import { readDiffMarks } from "../lib/diff-marks.mjs";
 import { loadPresets, mailboxRoot, parseTeam, updateRoom } from "../lib/horde-room.mjs";
 import { integrateMemberWorktree } from "../lib/room-integrate.mjs";
+import {
+  archiveRoom,
+  cancelRoom,
+  clearCurrentRoom,
+  reactivateRoom,
+  reopenRoomView,
+  roomHistory,
+  searchRooms,
+  startFreshRoom,
+} from "../lib/room-lifecycle.mjs";
 import { resumeRoomStatus } from "../lib/room-resume.mjs";
 import {
   assignWorkforceRole,
@@ -25,7 +35,16 @@ import {
 import { promoteSession } from "../lib/session-promotion.mjs";
 import { plain } from "../lib/tui-box.mjs";
 
-export const ROOMS_HELP = `ork rooms list [--json]
+export const ROOMS_HELP = `ork rooms list [--all] [--json]   (current rooms; --all adds archived and cancelled)
+ork rooms history [--cwd PATH] [--lifecycle active|archived|cancelled] [--limit N]   (read-only)
+ork rooms search --query TEXT [--cwd PATH] [--limit N]   (read-only, every lifecycle)
+ork rooms reopen-view --room ID   (read-only; resumes and launches nothing)
+ork rooms archive --room ID [--reason TEXT]   (closes new dispatch; running workers stay owned)
+ork rooms clear [--room ID] [--cwd PATH] [--session ID]   (archive the current room)
+ork rooms start-fresh [--cwd PATH] [--objective TEXT] [--team TEAM] [--engine ENGINE]
+                      (archive the current room, then open an empty one)
+ork rooms reactivate --room ID   (explicit resume of an archived room)
+ork rooms cancel --room ID [--member ID] [--reason TEXT]   (stop owned runs; native interruption is reported uncertain)
 ork hall promote [--session ID] [--room ID] [--objective TEXT] [--cwd PATH]   (adopt this live conversation as coordinator)
 ork rooms resume-status [--cwd PATH] [--json]   (read-only resume history)
 ork rooms show --room ID [--json]
@@ -90,6 +109,7 @@ export async function roomsCommand(
       help: { type: "boolean" },
       json: { type: "boolean" },
       "allow-credits": { type: "boolean" },
+      all: { type: "boolean" },
       "keep-worktree": { type: "boolean" },
       "verify-command": { type: "string", multiple: true },
       "protect-path": { type: "string", multiple: true },
@@ -129,6 +149,10 @@ export async function roomsCommand(
           "auto-correct",
           "max-continues",
           "invocation-allowance",
+          "reason",
+          "query",
+          "limit",
+          "lifecycle",
         ].map((name) => [name, { type: "string" }]),
       ),
     },
@@ -180,7 +204,7 @@ export async function roomsCommand(
       break;
     }
     case "list": {
-      const listing = await listRooms(root);
+      const listing = await listRooms(root, { all: values.all });
       const tasks = new Map();
       const authorities = new Map();
       const rooms = [];
@@ -192,6 +216,75 @@ export async function roomsCommand(
         rooms,
       };
 
+      break;
+    }
+    case "history": {
+      result = await roomHistory({
+        root,
+        cwd: values.cwd,
+        lifecycle: values.lifecycle,
+        ...(values.limit !== undefined && { limit: Number(values.limit) }),
+      });
+      break;
+    }
+    case "search": {
+      result = await searchRooms(requireValue("query"), {
+        root,
+        cwd: values.cwd,
+        ...(values.limit !== undefined && { limit: Number(values.limit) }),
+      });
+      break;
+    }
+    case "reopen-view": {
+      result = await reopenRoomView(requireValue("room"), { root });
+      break;
+    }
+    case "archive": {
+      result = await archiveRoom(requireValue("room"), {
+        root,
+        run,
+        reason: values.reason,
+        by: values.session,
+      });
+      break;
+    }
+    case "clear": {
+      result = await clearCurrentRoom({
+        root,
+        run,
+        room: values.room,
+        cwd: values.cwd,
+        session: values.session,
+        reason: values.reason,
+      });
+      break;
+    }
+    case "start-fresh": {
+      result = await startFreshRoom({
+        root,
+        run,
+        cwd: values.cwd,
+        session: values.session,
+        members: values.team || values.preset ? await team() : [],
+        objective: values.objective,
+        title: values.title,
+        engine: values.engine,
+        id: values.id,
+      });
+      break;
+    }
+    case "reactivate": {
+      result = await reactivateRoom(requireValue("room"), { root, run, by: values.session });
+      break;
+    }
+    case "cancel": {
+      result = await cancelRoom(requireValue("room"), {
+        root,
+        run,
+        member: values.member,
+        reason: values.reason,
+        by: values.session,
+      });
       break;
     }
     case "create": {

@@ -698,9 +698,18 @@ def prepare_consult_dir(requested: Path | None, repository: str | None = None) -
 
 
 def record_consultation(
-    request: dict[str, Any], result: dict[str, Any], result_path: Path, pid: int, session_id: str | None
+    request: dict[str, Any],
+    result: dict[str, Any],
+    result_path: Path,
+    pid: int | None,
+    session_id: str | None,
+    *,
+    transport: str = "executor",
 ) -> None:
-    """An observation index, not room membership or task acceptance. One writer per job."""
+    """An observation index, not room membership or task acceptance. One writer per job.
+
+    The supervisor (the parent session) and the consultant are separate actors: the record carries the
+    consultant's requested model only; the supervisor's own model is never copied into it."""
     parent = request.get("parent_session")
     if not isinstance(parent, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", parent):
         return
@@ -718,13 +727,20 @@ def record_consultation(
         "deadline_ms": int((time.time() + _runner().parse_duration(request["timeout"]) + 60) * 1000),
         "engine": result["engine"],
         "model": result["model"],
-        "effort": result["effort"].get("bound"),
+        "effort": (result.get("effort") or {}).get("bound") or (result.get("effort") or {}).get("requested"),
         "task": request["question"],
         "cwd": request.get("read"),
         "started_at": result["started_at"],
         "result_path": str(result_path),
+        "transport": transport,
+        "model_provenance": {
+            "requested": {"model": request.get("requested_model") or request.get("model"), "source": "consult"},
+            "resolved": {"model": result["model"], "source": "route"},
+            "observed": None,
+        },
     }
     _runner().write_json_atomic(directory / (record["id"] + ".json"), record)
+    return record
 
 
 def codex_mcp_server_names(workspace: Path) -> list[str]:
@@ -1064,6 +1080,10 @@ def native_handoff(request: dict[str, Any], *, out_dir: Path | None, output_form
         "session_id": None,
         "finished_at": runner.utc_now(),
     }
+    # The host launches the native tool itself; record the handoff so the room shows the consultant as its own
+    # actor awaiting the host, with requested (not observed) settings.
+    with contextlib.suppress(OSError, ValueError, KeyError):
+        record_consultation(request, result, directory / "result.json", None, None, transport="native")
     return finish(
         result,
         result_path=directory / "result.json",

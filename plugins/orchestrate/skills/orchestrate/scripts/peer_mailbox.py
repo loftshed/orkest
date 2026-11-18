@@ -1885,6 +1885,9 @@ def _prune_rooms_and_briefs(base: Path, cutoff: dt.datetime) -> None:
                 continue
             if time.time() - timestamp <= max_age_seconds or _room_has_live_member(base, room):
                 continue
+            # Archived and cancelled rooms are kept history with their receipts, never age-pruned.
+            if not room_store.is_active_room(room):
+                continue
             room_store.delete_room(base, room["id"], expected=room)
     brief_roots = [base / "swarm-briefs"]
     if (base / "rooms.db").exists() or (base / "rooms").exists():

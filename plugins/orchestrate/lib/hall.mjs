@@ -7,4 +7,5 @@
  * direct Node.js observation of peer/progress/task JSON state.
  */
 export * from "./horde-room.mjs";
+export * from "./room-lifecycle.mjs";
 export * from "./rooms.mjs";

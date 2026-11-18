@@ -94,6 +94,30 @@ peer; display names and free-form aliases do not establish ownership.
    assignment and acceptance. The room records hierarchy and session bindings, not a second task
    ledger. Never duplicate a coordinator task on the interactive workboard.
 
+### Choose model and context before handoff
+
+Before selecting a worker, record a handoff decision with `context_handoff.py evaluate --packet FILE`: portability,
+independently checkable acceptance, difficulty, handoff value, quota and context needs. Unknown
+classification keeps the task or asks one bounded question; it never permits delegation. Native
+workers are included: matching the host engine must not substitute inherited settings for the
+selected model.
+
+`context_handoff.py capabilities [--host HOST]` states per host whether its native tool can be asked for a model,
+effort, fresh or forked context, whether Orkest can intercept the launch, observe the settings used
+and interrupt the child. Unverified means not qualified. No host lets Orkest intercept a direct
+native launch: the host calls its own tool and Orkest records what it reports. A Claude Code fork
+always runs on the parent's model, so a fork with another model is shown before launch, with an
+executor route under the same account as the alternative. Billing context never switches by itself.
+
+Settings keep `requested`, `resolved` and `observed` apart. The view labels a request or inheritance
+and shows `observed ≠ resolved` on a mismatch; an inherited or requested value is never shown as
+observed. `telemetry.py outcome-cost --task-dir DIR` totals the accepted outcome's attempts, retries,
+handed-over briefs and parent reviews; missing telemetry stays missing.
+
+A `consult` with native transport is recorded under its supervising session and room. The view shows
+the consultant as its own actor with requested settings and a `native handoff` status until the host
+reports a result; the supervisor's model is never relabelled as the consultant's.
+
 A lead runs as a native subagent, outside the audited leaf-job runner. It must not hold a checkout's
 writer lease while waiting for workers to edit it. For concurrent implementation, create a checkout
 for each writing member with `ork hall worktree --room ID --member MEMBER`, set each task spec's
@@ -188,6 +212,28 @@ Notifications use the same outcomes and never announce reported work as complete
 your native handles or coordinator cancellation for your executor runs, then collect the results.
 Never stop unrelated terminals or processes. Retrying a recorded dispatch remains possible while
 paused so its existing result can be recovered without launching another run.
+
+Archive, start-fresh, history and cancellation are in [rooms.md](rooms.md#history-archive-and-cancel).
+
+### Continuation
+
+When a coordinator's turn stops with authorized room work left (queued members or a finished run
+awaiting review), or a worker becomes terminal, Orkest records one durable continuation request per
+room, task, authority generation and input revision. Repeats from Stop, completion and
+reconciliation join that request. The mailbox daemon delivers it as a notice through the existing
+wake path; it never invokes a model.
+
+On the notice, reserve once with `continuation_requests.py reserve --key KEY --session SESSION`,
+then take the ordinary next action (`ork next step` or `ork rooms dispatch`) and record its request
+ID with `continuation_requests.py bind`. Reservation re-reads pause, archive, cancellation, inputs
+and authority; a second host cannot reserve the same request, and a stale input revision is
+superseded. Status shows `awaiting coordinator turn`, reserved, awaiting attachment, running,
+awaiting acceptance, paused, exhausted and recovery needed. A reservation without an observed run is
+recovery work, not proof that nothing started. Hints stop after three reads without a reservation.
+
+Continuation is opt-in per qualified host: list hosts in `ORKEST_CONTINUATION_HOSTS` (for example
+`claude`). Other hosts show the request with a manual resume command. `ORKEST_CONTINUATION=0` stops
+new requests and keeps existing ones.
 
 Use **Ctrl-b Tab** to switch between conversation and tree, **Ctrl-b d** to detach, and
 `ork horde --attach-room ID` to reconnect. `--view` opens only the live tree. Closing a view does not
