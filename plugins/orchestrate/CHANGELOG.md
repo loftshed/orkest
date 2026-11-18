@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.91.0
+
+- feat(orchestrate): complete native ork-fast hooks, companion dismiss, macOS HUD, and autonomous Chief questions (#231)
+
 ## 0.90.2
 
 - fix(orchestrate): restrict chief badge to desk holder and skip broken or stopped docker probes (#230)
