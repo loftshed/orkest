@@ -8,6 +8,7 @@ import { parseArgs, promisify } from "node:util";
 
 import { jsonView, renderLine, renderReport, shouldUseColor } from "../../monitor/lib/render.mjs";
 import { getAccounts } from "../../monitor/lib/store.mjs";
+import { ChiefView } from "../lib/chief-view.mjs";
 import { foundryCommand } from "../lib/foundry.mjs";
 import {
   addMembers,
@@ -31,7 +32,7 @@ import {
 } from "../lib/horde-view.mjs";
 import { coordinatorBrief, newRoom, observeRoom, writeCoordinatorBrief } from "../lib/rooms.mjs";
 import { configPath } from "../lib/runtime-paths.mjs";
-import { cachedQuota, runHordeTui } from "./horde-tui.mjs";
+import { cachedQuota, loadChiefModule, readLiveChief, runHordeTui } from "./horde-tui.mjs";
 import { roomsCommand } from "./rooms.mjs";
 
 const COORDINATORS = new Set(["codex", "claude", "agy", "opencode"]);
@@ -39,7 +40,8 @@ const COORDINATORS = new Set(["codex", "claude", "agy", "opencode"]);
 const HELP = `ork agy|codex|claude [--model <model>] | ork opencode   (open a coordinator; enter your goal in the conversation)
   --harness-arg=<argument>      (pass an argument to the coordinator; repeat as needed)
 ork horde ["objective"] [--engine codex|claude|agy|opencode] [--model <model>] [--max-agents 12] [--max-depth 3]
-ork horde [toggle|open|close]   (open or close the live Horde / Swarm View split pane)
+ork horde [toggle|open|close] [--chief]   (open or close the live Horde / Swarm View split pane)
+ork horde --view --chief [--attach-room <id>] [--print|--json] [--width 120]   (machine-wide Chief overview)
 ork horde [--team "claude:haiku*2@scout,agy:flash*2@builder,codex:luna:max@reviewer"]
 ork horde --preset scout-swarm|bug-court|patch-race|heavy-trifecta
 ork horde spawn --attach-room <id> --team <team> [--role <role>]
@@ -50,12 +52,13 @@ ork next [step|status|settle|loop] [--room <id>] [--approve <slug>] [--dry-run] 
 ork foundry [status|run|groom] [--dry-run] [--json]
 ork smelter [status|run] [--dry-run] [--json]
 ork side [run|status] [--prompt <text>] [--issue <n>] [--dry-run] [--json]
+ork chief [status|bind|send|spawn|desk|view] [--json]   (machine-wide Chief desk; ork chief --help)
 ork cleanup [status|run] [--dry-run] [--json]
 ork policy [show|allow|deny|reset] [--json]
 ork update [run|check|status|enable|disable] [--check|--apply] [--auto] [--force] [--quiet] [--json] [-h|--help]
 ork radar [status|diff|priors|ack] [--refresh] [--ack] [--line|--json]
 ork gate [--heavy] [--label <text>] -- <command>   (also: ork gate status|install|uninstall)
-ork swarm [toggle|open|close]   (alias for ork horde toggle|open|close)
+ork swarm [toggle|open|close] [--chief]   (alias for ork horde toggle|open|close)
 ork factory [status|run|groom] [--dry-run] [--json]   (alias for ork foundry)
 ork rooms --help                (alias for ork hall)
 ork herdr-status                     (focused Herdr pane agent, plain text)
@@ -73,6 +76,7 @@ New members are queued for the coordinator to assign; --print and --json never l
 Use --cwd to choose the room's repository. Closing the view leaves workers running.
 1–9 focus an agent; o opens its Herdr/tmux pane; p pins its detail; n advances the page; q exits the display.
 ? opens key help; g opens the coalesced room log; d previews the focused worker's read-only diff. Set ORK_GLYPHS=ascii|unicode|nerd to choose a glyph tier.
+--chief lists every orchestrator and session on the machine: Enter opens a room, Tab or Backspace returns, f focuses its pane, C the Chief.
 `;
 
 const execute = promisify(execFile);
@@ -643,6 +647,10 @@ export async function main(
       (args, { stdout: out }) => summaryCommand(["quota", ...args], out),
     );
   }
+  if (argv[0] === "chief") {
+    const { chiefCommand } = await import("./chief.mjs");
+    return chiefCommand(argv.slice(1), { stdout, main });
+  }
   if (argv[0] === "rooms" || argv[0] === "hall") return roomsCommand(argv.slice(1), { stdout });
   if (argv[0] === "name") {
     // A readable session name for the current checkout: claude --name "$(ork name --model opus-5.5)".
@@ -676,6 +684,7 @@ export async function main(
       "dangerously-skip-permissions": { type: "boolean" },
       "remote-control": { type: "boolean" },
       view: { type: "boolean" },
+      chief: { type: "boolean" },
       "max-agents": { type: "string" },
       "max-depth": { type: "string" },
     },
@@ -740,6 +749,23 @@ export async function main(
     values["max-agents"] ||
     values["max-depth"],
   );
+  if (values.chief) {
+    if (
+      isSpawning ||
+      objective ||
+      engineShortcut ||
+      values.engine ||
+      model ||
+      harnessArgs.length > 0 ||
+      values["max-agents"] ||
+      values["max-depth"] ||
+      values.team ||
+      values.preset ||
+      values.cwd
+    )
+      throw new Error("--chief is a read-only overview; use ork chief spawn to start work");
+    return chiefView(values, { stdout, width });
+  }
   if (
     values["attach-room"] &&
     (objective ||
@@ -853,8 +879,76 @@ export async function main(
         .map((line) => line.trimEnd())
         .join("\n")}\n`,
     );
-  else await runHordeTui(load, { output: stdout, quota: !values.fixture });
+  else {
+    const chief = values.fixture ? undefined : await roomChiefMode(room, root);
+    await runHordeTui(load, { output: stdout, quota: !values.fixture, ...(chief && { chief }) });
+  }
   return room;
+}
+
+function chiefLoaders(root, fixture) {
+  return {
+    loadRoom: (id) => observeRoom(id, { root }),
+    loadStatus: fixture
+      ? async () => JSON.parse(await readFile(fixture, "utf8"))
+      : async () => {
+          const chief = await loadChiefModule();
+          if (typeof chief?.chiefStatus !== "function")
+            throw new Error("Chief status is unavailable in this Orkest version");
+          return chief.chiefStatus({ root, env: process.env, quota: true });
+        },
+  };
+}
+
+/** Room views offer the Chief overview on Tab; the Chief's own room (or a --chief request) opens on it. */
+async function roomChiefMode(room, root) {
+  const binding = await readLiveChief(process.env);
+  const conductor = room?.conductor;
+  const sessions = [conductor?.session?.id, conductor?.nativeSession].filter(Boolean);
+  const isChiefDesk = Boolean(binding?.session && sessions.includes(binding.session));
+  const isRequested = process.env.ORKEST_CHIEF_VIEW === "1";
+  return {
+    ...chiefLoaders(root),
+    homeRoomId: room?.id,
+    initialMode: isChiefDesk || isRequested ? "chief" : "room",
+  };
+}
+
+/** `ork horde --view --chief` / `ork chief view`: the machine-wide overview, live or printed once. */
+async function chiefView(values, { stdout, width }) {
+  const root = mailboxRoot();
+  const homeRoomId = values["attach-room"] || process.env.ORKEST_SWARM_ROOM?.trim() || undefined;
+  const loaders = chiefLoaders(root, values.fixture);
+  const status = await loaders.loadStatus();
+  if (values.json) {
+    stdout.write(`${JSON.stringify(status, null, 2)}\n`);
+    return status;
+  }
+  if (values.print || !stdout.isTTY) {
+    const rooms = Array.isArray(status?.rooms) ? status.rooms.length : 0;
+    const sessions = Array.isArray(status?.standalone) ? status.standalone.length : 0;
+    const view = new ChiefView(status, {
+      color: shouldUseColor(stdout),
+      tier: glyphTier(),
+      height: Math.max(24, 24 + (rooms + sessions) * 2),
+      fill: false,
+    });
+    stdout.write(
+      `${view
+        .render(width)
+        .map((line) => line.trimEnd())
+        .join("\n")
+        .trimEnd()}\n`,
+    );
+    return status;
+  }
+  const home = homeRoomId && !values.fixture ? () => observeRoom(homeRoomId, { root }) : undefined;
+  await runHordeTui(home, {
+    output: stdout,
+    quota: !values.fixture,
+    chief: { ...loaders, homeRoomId: home ? homeRoomId : undefined, initialMode: "chief" },
+  });
+  return status;
 }
 
 let entry = "";

@@ -25,7 +25,7 @@ import peer_mailbox as mailbox  # noqa: E402 -- native hook identity
 
 class TestMailboxDaemonInstall(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="mailbox-install-")
+        self.temp = tempfile.TemporaryDirectory(prefix="mailbox-install-", ignore_cleanup_errors=True)
         self.home = Path(self.temp.name) / "home"
         self.home.mkdir()
         self.base = Path(self.temp.name) / "cache/mailbox-v1"

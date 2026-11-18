@@ -39,6 +39,7 @@ JUSTIFICATION = "User-approved Orkest command (install_mailbox.py --trust-orkest
 # interactive harness: `gate -- COMMAND`, `label -- HARNESS ...`, `codex|claude|agy|opencode`, and
 # interactive `ork horde` (only non-launching/attached `ork horde` operations are approved).
 ORK_SUBCOMMANDS: tuple[tuple[str, ...], ...] = (
+    ("chief",),
     ("cleanup",),
     ("factory",),
     ("foundry",),
@@ -66,6 +67,7 @@ ORK_SUBCOMMANDS: tuple[tuple[str, ...], ...] = (
     ("horde", "spawn"),
     ("horde", "--attach-room"),
     ("horde", "--view"),
+    ("horde", "--chief"),
     ("horde", "--print"),
     ("horde", "--json"),
     ("horde", "--fixture"),

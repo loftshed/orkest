@@ -260,6 +260,25 @@ Details: [conversational swarms](skills/orchestrate/references/swarm.md),
 [room commands](skills/orchestrate/references/rooms.md) and
 [agent instructions](skills/orchestrate/SKILL.md).
 
+### Machine-wide Chief (`ork chief`, `/chief`)
+
+`/chief` turns one conversation into the machine's Master Orchestrator. It holds the Chief desk,
+sees every room, orchestrator and standalone agent across repositories, and routes a stream of
+multi-repo work to autonomous room orchestrators in their own worktrees. The Chief session never
+reads code itself, so it stays fast through an overnight run.
+
+```sh
+ork chief status [--room <id>] [--json]       # every repo, room, worker count and attention item
+ork chief bind [--clear]                      # take (or release) the machine-wide Chief desk
+ork horde open --chief                        # Chief View split pane; `ork chief view` draws it in this terminal
+ork chief spawn --cwd <repo> --worktree --goal "<outcome and done criteria>" [--dry-run]
+ork chief send --to <room|branch|repo|agent|session> "Decision: …"
+```
+
+Spawned orchestrators report back with `ork chief send --to chief`, which reaches whoever holds
+the desk when the message is sent. Details: [`/chief` skill](skills/chief/SKILL.md) and
+[architecture](../../docs/chief-architecture.md).
+
 ### Heavy-run gate (`ork gate`)
 
 When several agents share one machine, `ork gate` keeps their test suites, builds and project-wide checks from running all at once. A focused run takes one of two slots. A `--heavy` run (whole suite, production build, project-wide typecheck or lint) waits for every slot, and waiters are told who holds the gate. Inside the gate, Vitest and Jest are capped at two workers, the command runs at nice 10, every completed run is recorded in a shared ledger with an advisory source-metadata digest, and a heavy or failed run's full output is saved to a log, so nobody reruns a suite to get back output that scrolled away.

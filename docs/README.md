@@ -7,6 +7,7 @@ Repository-wide architecture maps, operational guides, and design records:
 - **[tui-visual-testing.md](tui-visual-testing.md)** — Deterministic tmux ANSI/SVG visual comparison runner (`scripts/test-tui-visual.js`) and baseline workflow.
 - **[readme.md](readme.md)** — Which parts of the root README are generated (`corepack pnpm readme`), from what, and how the screenshots are drawn.
 - **[orca.md](orca.md)** — The Orca IDE plugin (`orca-plugin.json`): Swarm View split, terminal preview and focus, cold-restart restore, and the quota status bar.
+- **[chief-architecture.md](chief-architecture.md)** — Ork Chief (`ork chief` / `/chief`): machine-wide Master Orchestrator desk, child room/worktree spawning, Chief View side-window overview, and follow-up tickets.
 - **[releases.md](releases.md)** — How conventional commits on `main` drive automatic per-plugin version bumps, changelogs, tags, and GitHub releases via `scripts/release.js`.
 - **Peer mailbox design records:**
   - **[mailbox-daemon-plan.md](mailbox-daemon-plan.md)** — Service contract and architecture for the shared loopback HTTP MCP mailbox daemon (`mailbox_daemon.py`).

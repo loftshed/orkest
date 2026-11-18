@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import pty
@@ -10,6 +11,7 @@ import sys
 import tempfile
 import tomllib
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -489,6 +491,69 @@ class InstallMailboxTests(unittest.TestCase):
         ):
             self.assertTrue(update_link.is_symlink(), f"expected symlink at {update_link}")
             self.assertEqual(update_link.resolve(), hub_update)
+
+    def test_chief_command_and_skill_registration_from_plugin_root(self):
+        plugin_root = self.base / "plugin-root"
+        command = "---\ndescription: Take the Chief desk\n---\n\n[orkest-chief-command: $ARGUMENTS]\n"
+        skill = "---\nname: chief\ndescription: Act as Ork Chief\n---\n\n# Chief\n"
+        (plugin_root / "commands").mkdir(parents=True)
+        (plugin_root / "commands/chief.md").write_text(command)
+        (plugin_root / "skills/chief").mkdir(parents=True)
+        (plugin_root / "skills/chief/SKILL.md").write_text(skill)
+        (self.base / ".claude/skills/chief").mkdir(parents=True)
+        (self.base / ".claude-work/skills").mkdir(parents=True)
+        (self.base / ".claude-work/skills/chief").symlink_to(self.base / ".claude/skills/chief")
+        (self.base / ".gemini/antigravity/skills/chief").mkdir(parents=True)
+        for parent in (".codex/skills", ".gemini/config/skills", ".config/opencode/skills"):
+            (self.base / parent).mkdir(parents=True)
+
+        with redirect_stdout(io.StringIO()):
+            self.assertTrue(installer.install_chief_command(self.base, plugin_root=plugin_root, dry_run=True))
+            self.assertTrue(installer.install_chief_skill(self.base, plugin_root=plugin_root, dry_run=True))
+        self.assertFalse((self.base / ".claude/commands/chief.md").exists())
+        self.assertFalse((self.base / ".agents/skills/chief").exists())
+
+        with redirect_stdout(io.StringIO()):
+            self.assertTrue(installer.install_chief_command(self.base, plugin_root=plugin_root))
+            self.assertTrue(installer.install_chief_skill(self.base, plugin_root=plugin_root))
+        for claude_dir in (".claude", ".claude-work"):
+            self.assertEqual((self.base / claude_dir / "commands/chief.md").read_text(), command)
+        hub = self.base / ".agents/skills/chief"
+        self.assertEqual((hub / "SKILL.md").read_text(), skill)
+        for duplicate in (".claude/skills/chief", ".claude-work/skills/chief", ".gemini/antigravity/skills/chief"):
+            path = self.base / duplicate
+            self.assertFalse(path.exists() or path.is_symlink(), f"expected duplicate removed at {path}")
+        for parent in (".codex/skills", ".gemini/config/skills", ".config/opencode/skills"):
+            link = self.base / parent / "chief"
+            self.assertTrue(link.is_symlink(), f"expected symlink at {link}")
+            self.assertEqual(link.resolve(), hub.resolve())
+
+        with redirect_stdout(io.StringIO()):
+            self.assertFalse(installer.install_chief_command(self.base, plugin_root=plugin_root))
+            self.assertFalse(installer.install_chief_skill(self.base, plugin_root=plugin_root))
+
+    def test_shell_wrappers_install_bundled_chief_command_and_skill(self):
+        plugin_root = Path(installer.__file__).resolve().parents[3]
+        self.assertTrue((plugin_root / "commands/chief.md").is_file())
+        self.assertTrue((plugin_root / "skills/chief/SKILL.md").is_file())
+        (self.base / ".claude").mkdir()
+        (self.base / ".codex").mkdir()
+        ork_cli = self.base / "plugin-without-chief/bin/ork.mjs"
+        ork_cli.parent.mkdir(parents=True)
+        ork_cli.write_text("#!/usr/bin/env node\n")
+
+        with redirect_stdout(io.StringIO()):
+            self.assertTrue(installer.install_shell_wrappers(self.base, ork_cli))
+        self.assertEqual(
+            (self.base / ".claude/commands/chief.md").read_text(),
+            (plugin_root / "commands/chief.md").read_text(encoding="utf-8"),
+        )
+        self.assertEqual(
+            (self.base / ".agents/skills/chief/SKILL.md").read_text(),
+            (plugin_root / "skills/chief/SKILL.md").read_text(encoding="utf-8"),
+        )
+        self.assertEqual((self.base / ".codex/skills/chief").resolve(), (self.base / ".agents/skills/chief").resolve())
+        self.assertFalse((self.base / ".claude/skills/chief").exists())
 
     def test_backup_rotation_keeps_newest_and_prunes_inactive_daemon_runtimes(self):
         import os

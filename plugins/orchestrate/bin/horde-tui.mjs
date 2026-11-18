@@ -14,6 +14,7 @@ import {
   isInternalOrHarnessProcess,
   parseProcessTable,
 } from "../lib/agent-processes.mjs";
+import { ChiefView } from "../lib/chief-view.mjs";
 import { readDiffMarks, writeDiffMarks } from "../lib/diff-marks.mjs";
 import {
   createHerdrLifecycleSubscriber,
@@ -194,6 +195,36 @@ async function runExec(exec, command, args, env = process.env) {
     return false;
   }
 }
+
+const chiefModule = { promise: null };
+
+async function importChiefModule() {
+  try {
+    return await import("../lib/chief.mjs");
+  } catch {
+    return null;
+  }
+}
+
+/** Load `lib/chief.mjs` lazily so plain room views never pay for (or depend on) Chief. */
+export function loadChiefModule() {
+  chiefModule.promise ??= importChiefModule();
+  return chiefModule.promise;
+}
+
+/** The live machine-wide Chief binding, or null when none is bound or it cannot be read. */
+export async function readLiveChief(env = process.env) {
+  const chief = await loadChiefModule();
+  if (typeof chief?.readChiefBinding !== "function") return null;
+  try {
+    const binding = await chief.readChiefBinding({ root: mailboxRoot(env), env });
+    return binding && typeof binding === "object" && !binding.stale ? binding : null;
+  } catch {
+    return null;
+  }
+}
+
+const CHIEF_ROOM_BACK_KEYS = new Set(["\t", "\u{1B}[Z", "\u{7F}", "\b"]);
 
 export async function focusAgentPane(agent, { exec = execFile, env = process.env, orcaCli } = {}) {
   if (!agent || typeof agent !== "object") return false;
@@ -949,12 +980,22 @@ export async function runHordeTui(
     mouse = true,
     exec = execFile,
     herdrConnect,
+    chief,
+    chiefHint,
   } = {},
 ) {
   if (!input.isTTY || !output.isTTY)
     throw new Error("Interactive view needs a terminal; use --print or --json");
   const enableServices = services ?? Boolean(quota && exec === execFile);
   const enableUpdate = update ?? Boolean(quota && exec === execFile);
+  const chiefOptions = chief && typeof chief.loadStatus === "function" ? chief : null;
+  const enableChiefHint = chiefHint ?? Boolean(quota && exec === execFile);
+  const homeRoomId = chiefOptions?.homeRoomId || undefined;
+  let mode = chiefOptions && chiefOptions.initialMode !== "room" ? "chief" : "room";
+  let drilledRoomId;
+  let roomGeneration = 0;
+  let liveChief = null;
+  let chiefRefreshedAt = 0;
   const loadRoom =
     typeof load === "function"
       ? load
@@ -962,7 +1003,12 @@ export async function runHordeTui(
           const roomId = typeof load === "string" && load ? load : env?.ORKEST_ROOM_ID;
           return roomId ? readRoom(roomId, mailboxRoot(env)) : createRoom([]);
         };
+  const loadActiveRoom = () =>
+    drilledRoomId && typeof chiefOptions?.loadRoom === "function"
+      ? chiefOptions.loadRoom(drilledRoomId)
+      : loadRoom();
   const initialRoom = await loadRoom();
+  const currentRoomId = () => view.room?.id || initialRoom.id;
   const notifiedSet = new Set();
   let prevAgents = toNotificationAgents(initialRoom);
   notifyHerdrTransitions(null, prevAgents, notifiedSet, { env, exec });
@@ -1030,7 +1076,7 @@ export async function runHordeTui(
             return;
           let markState = { marks: [], stale: false };
           try {
-            markState = await readDiffMarks(initialRoom.id, agent, { root });
+            markState = await readDiffMarks(currentRoomId(), agent, { root });
           } catch (error) {
             view.notice = `Could not load marks: ${error.message}`;
           }
@@ -1066,7 +1112,7 @@ export async function runHordeTui(
         });
     },
     onMarks: (agent, marks) => {
-      void writeDiffMarks(initialRoom.id, agent, marks, { root: mailboxRoot(env) }).catch(
+      void writeDiffMarks(currentRoomId(), agent, marks, { root: mailboxRoot(env) }).catch(
         (error) => {
           if (isStopped || view.preview?.agentId !== agent.id) return;
           view.notice = `Could not save marks: ${error.message}`;
@@ -1075,6 +1121,49 @@ export async function runHordeTui(
       );
     },
   });
+  view.chiefEnabled = Boolean(chiefOptions);
+  const chiefView = chiefOptions
+    ? new ChiefView(null, {
+        height: output.rows || 32,
+        color: shouldUseColor(output),
+        theme,
+        mouseEnabled: mouse,
+        lastRoomId: homeRoomId,
+      })
+    : null;
+  const refreshChief = async () => {
+    try {
+      const status = await chiefOptions.loadStatus();
+      chiefView.setStatus(status);
+      liveChief = status?.chief && typeof status.chief === "object" ? status.chief : null;
+    } catch (error) {
+      chiefView.notice = `Could not read Chief status: ${error.message}`;
+    }
+    chiefRefreshedAt = Date.now();
+  };
+  if (chiefView) await refreshChief();
+  const activeView = () => (mode === "chief" && chiefView ? chiefView : view);
+  if (chiefView) {
+    const roomInput = view.handleInput.bind(view);
+    view.handleInput = (value) => {
+      if (mode === "chief") return chiefView.handleInput(value);
+      if (CHIEF_ROOM_BACK_KEYS.has(value) || (value === "\u{1B}" && !view.preview && !view.overlay))
+        return { type: "chief-mode", mode: "chief" };
+      return roomInput(value);
+    };
+    const roomMouse = view.handleMouse.bind(view);
+    view.handleMouse = (event) =>
+      mode === "chief" ? chiefView.handleMouse(event) : roomMouse(event);
+    if (typeof view.requestClose === "function") {
+      const roomClose = view.requestClose.bind(view);
+      view.requestClose = () => {
+        if (mode === "chief" && !view.confirmClose) return { type: "close-view" };
+        const result = roomClose();
+        if (mode === "chief" && view.notice) chiefView.notice = view.notice;
+        return result;
+      };
+    }
+  }
   let isBusy = false;
   let errorText = "";
   let isStopped = false;
@@ -1096,8 +1185,25 @@ export async function runHordeTui(
   const refresh = async () => {
     if (isBusy || isStopped) return;
     isBusy = true;
+    if (chiefView && (mode === "chief" || Date.now() - chiefRefreshedAt >= 5000)) {
+      await refreshChief();
+    }
+    if (mode === "chief") {
+      isBusy = false;
+      errorText = "";
+      paint();
+      return;
+    }
+    const generation = roomGeneration;
     try {
-      const room = await loadRoom();
+      const room = await loadActiveRoom();
+      if (generation !== roomGeneration || mode !== "room") return;
+      if (chiefView) {
+        if (liveChief) room.chief = liveChief;
+      } else if (enableChiefHint) {
+        const binding = await readLiveChief(env);
+        if (binding) room.chief = binding;
+      }
       if (quota) {
         try {
           const accounts = await cachedQuota(room?.cwd, { env });
@@ -1133,17 +1239,22 @@ export async function runHordeTui(
         }
       }
       view.setRoom(room);
-      try {
-        await syncHerdrViewLabel(room, { env, exec });
-      } catch {
-        // Pane title sync is best-effort and must never disrupt the TUI.
+      // A drilled-in room is borrowed: the pane label and notifications stay with the home room.
+      if (!drilledRoomId) {
+        try {
+          await syncHerdrViewLabel(room, { env, exec });
+        } catch {
+          // Pane title sync is best-effort and must never disrupt the TUI.
+        }
       }
       const previewAgent = room.agents?.find((agent) => agent.id === view.preview?.agentId);
       if (view.preview && !previewAgent) await previewController.close();
       else await previewController.refresh(previewAgent);
-      const nextAgents = toNotificationAgents(room);
-      notifyHerdrTransitions(prevAgents, nextAgents, notifiedSet, { env, exec });
-      prevAgents = nextAgents;
+      if (!drilledRoomId) {
+        const nextAgents = toNotificationAgents(room);
+        notifyHerdrTransitions(prevAgents, nextAgents, notifiedSet, { env, exec });
+        prevAgents = nextAgents;
+      }
       errorText = "";
     } catch (error) {
       errorText = error.message;
@@ -1155,10 +1266,11 @@ export async function runHordeTui(
   const paint = () => {
     if (isStopped) return;
     try {
-      view.height = height();
-      const lines = view.render(width());
+      const active = activeView();
+      active.height = height();
+      const lines = active.render(width());
       if (errorText && lines.length > 0) lines[lines.length - 1] = fit(errorText, width());
-      const visible = lines.slice(0, Math.max(1, view.height));
+      const visible = lines.slice(0, Math.max(1, active.height));
       // Overwrite in place (\x1b[K clears trailing cells after drawing) inside synchronized output
       // (\x1b[?2026h ... \x1b[?2026l), updating only changed rows to prevent background-bar flicker.
       if (lastLines.length === visible.length) {
@@ -1253,7 +1365,76 @@ export async function runHordeTui(
       cleanup();
     }
   };
+  const openRoom = async (roomId) => {
+    drilledRoomId = roomId && roomId !== homeRoomId ? roomId : undefined;
+    const generation = ++roomGeneration;
+    mode = "room";
+    lastLines = [];
+    diffGeneration++;
+    await previewController.close();
+    view.setPreview(null);
+    view.overlay = undefined;
+    view.page = 0;
+    view.focusFollowsLatest = true;
+    view.hasExplicitFocus = false;
+    view.notice = "Loading room...";
+    paint();
+    try {
+      const room = await loadActiveRoom();
+      if (isStopped || generation !== roomGeneration) return;
+      if (liveChief) room.chief = liveChief;
+      view.setRoom(room);
+      view.notice = "";
+    } catch (error) {
+      if (isStopped || generation !== roomGeneration) return;
+      view.notice = `Could not open room: ${error.message}`;
+    }
+    paint();
+    void refresh();
+  };
+  const showChief = () => {
+    roomGeneration++;
+    mode = "chief";
+    lastLines = [];
+    diffGeneration++;
+    void previewController.close();
+    view.setPreview(null);
+    chiefView.lastRoomId = drilledRoomId || homeRoomId || view.room?.id;
+    paint();
+    void refresh();
+  };
+  const focusChiefTarget = async (action) => {
+    const label = action.label || "pane";
+    chiefView.notice = `Opening ${label}...`;
+    paint();
+    let isOpened;
+    try {
+      isOpened = await focusAgentPane(action.target, { exec, env });
+    } catch {
+      isOpened = false;
+    }
+    if (isStopped) return;
+    chiefView.notice = isOpened
+      ? `Opened ${label}`
+      : "Could not focus that pane. Its terminal may have closed.";
+    paint();
+  };
   const handleAction = (action) => {
+    if (chiefView && action && typeof action === "object") {
+      if (action.type === "chief-drill") {
+        void openRoom(action.roomId);
+        return;
+      }
+      if (action.type === "chief-mode") {
+        if (action.mode === "chief") showChief();
+        else void openRoom(action.roomId);
+        return;
+      }
+      if (action.type === "chief-focus" || action.type === "chief-focus-chief") {
+        void focusChiefTarget(action);
+        return;
+      }
+    }
     if (action && typeof action === "object" && action.type === "close-view") {
       if (closeViewPromise) return;
       closeViewPromise = closeView();
@@ -1262,6 +1443,8 @@ export async function runHordeTui(
         void previewController.close();
       }
       if (action && typeof action === "object" && action.type === "mouse-toggle") {
+        view.mouseEnabled = action.enabled;
+        if (chiefView) chiefView.mouseEnabled = action.enabled;
         output.write(
           action.enabled
             ? `${MOUSE_ENABLE}${ALT_SCROLL_DISABLE}`
@@ -1333,7 +1516,7 @@ export async function runHordeTui(
     await new Promise((resolve) => {
       resolveExit = resolve;
       timer = setInterval(() => {
-        if (view.needsAnimation) paint();
+        if (activeView().needsAnimation) paint();
       }, 120);
       refreshTimer = setInterval(refresh, 1000);
       input.on("data", onData);
