@@ -8,10 +8,11 @@ cd "$(dirname "$0")/.." || exit 1
 
 failed=0
 ./node_modules/.bin/vitest run || failed=1
-python3 -B -m unittest discover -s tests/plugins/orchestrate/skills/orchestrate -p "test_*.py" || failed=1
 if command -v cargo > /dev/null 2>&1; then
+  cargo build --manifest-path crates/ork-fast/Cargo.toml --release || failed=1
   cargo test --manifest-path crates/ork-fast/Cargo.toml --release || failed=1
 else
   echo "test: cargo is not installed; skipping Rust tests (CI still runs it)." >&2
 fi
+python3 -B scripts/run_py_tests.py || failed=1
 exit $failed

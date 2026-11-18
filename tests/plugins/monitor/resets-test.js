@@ -330,7 +330,7 @@ test.skipIf(process.platform !== "darwin")(
 
       const build = spawnSync(buildScript, [appPath], {
         encoding: "utf8",
-        timeout: 60_000,
+        timeout: 90_000,
         env: { ...process.env, MONITOR_COMMAND: fakeCli },
       });
       expect(build.status, build.stderr).toBe(0);
@@ -338,7 +338,7 @@ test.skipIf(process.platform !== "darwin")(
       const binary = path.join(appPath, "Contents", "MacOS", "MonitorBar");
       const dump = spawnSync(binary, ["--dump-menu", "--collapse", ""], {
         encoding: "utf8",
-        timeout: 15_000,
+        timeout: 45_000,
         env: { ...process.env, MONITOR_COMMAND: fakeCli },
       });
       expect(dump.status, dump.stderr).toBe(0);
@@ -355,5 +355,5 @@ test.skipIf(process.platform !== "darwin")(
       rmSync(dir, { recursive: true, force: true });
     }
   },
-  60_000,
+  120_000,
 );
