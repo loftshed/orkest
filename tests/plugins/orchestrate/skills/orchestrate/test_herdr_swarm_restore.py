@@ -1,6 +1,7 @@
 """Herdr cold restore preserves display placement without treating arbitrary panes as owned."""
 
 import json
+import os
 import shlex
 import subprocess
 import sys
@@ -345,6 +346,55 @@ class RestoreTests(unittest.TestCase):
                 "accepted_task": "awaiting_verification",
             },
         )
+
+    def test_plain_view_record_and_command_stay_free_of_chief_mode(self):
+        self.assertNotIn("chief", views.load(self.state))
+        words = shlex.split(views.command(self.cli, "room-a", self.state, self.base, self.env))
+        self.assertNotIn("ORKEST_CHIEF_VIEW=1", words)
+        self.assertEqual(words[-4:], ["horde", "--attach-room", "room-a", "--view"])
+
+    def test_chief_view_restores_in_chief_mode_with_the_exact_view_argv(self):
+        views.prepare(self.base, "room-a", "w1:p2", self.cli, self.env, self.api, chief=True)
+        self.assertIs(views.load(self.state)["chief"], True)
+        self.api.start = False
+        views.restore(self.base, self.env, self.api)
+        words = shlex.split(self.api.runs[0][3])
+        self.assertIn("ORKEST_CHIEF_VIEW=1", words[:5])
+        self.assertEqual(words[-4:], ["horde", "--attach-room", "room-a", "--view"])
+        node = words.index("ORKEST_CHIEF_VIEW=1") + 1
+        info = {"foreground_processes": [{"pid": 200, "name": "node", "argv": words[node:]}]}
+        self.assertTrue(views.view_process(info, self.cli, "room-a"))
+
+
+class ChiefSessionTests(unittest.TestCase):
+    def setUp(self):
+        import agent_statusline_tmux
+
+        self.tmux = agent_statusline_tmux
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+
+    def write(self, data):
+        (self.base / "chief.json").write_text(json.dumps(data))
+
+    def test_live_chief_json_identifies_the_chief_session(self):
+        self.assertIsNone(self.tmux._chief_session(self.base))
+        self.write({"schema": "ork.chief.v1", "session": "chief-1", "pid": os.getpid()})
+        self.assertEqual(self.tmux._chief_session(self.base), "chief-1")
+        self.assertTrue(self.tmux._is_chief_session(self.base, "chief-1"))
+        self.assertFalse(self.tmux._is_chief_session(self.base, "someone-else"))
+        self.assertFalse(self.tmux._is_chief_session(self.base, None))
+
+    def test_dead_or_malformed_chief_json_is_ignored(self):
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        self.write({"session": "chief-1", "pid": dead.pid})
+        self.assertIsNone(self.tmux._chief_session(self.base))
+        (self.base / "chief.json").write_text("{not json")
+        self.assertIsNone(self.tmux._chief_session(self.base))
+        self.write({"session": "   "})
+        self.assertIsNone(self.tmux._chief_session(self.base))
 
 
 if __name__ == "__main__":

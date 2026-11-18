@@ -93,6 +93,14 @@ context or dirtying the checkout:
 /side --issue "support dark mode in the status modal"          # file a GitHub issue
 ```
 
+### Run every repo from one Chief
+
+Type `/chief` in one conversation to make it the machine's Master Orchestrator. It briefs you on
+every room and agent across your repositories, opens the Chief View beside you, and turns a stream
+of goals into autonomous orchestrators, each in its own worktree, that report back when they
+finish or get stuck. The Chief never reads code itself, so it stays responsive overnight.
+Details: [`ork chief`](plugins/orchestrate/README.md#machine-wide-chief-ork-chief-chief).
+
 ### Ask another model
 
 `consult` runs a different vendor's model in its no-write mode, for a review or a root-cause
@@ -156,7 +164,8 @@ Every `ork` command:
 ork agy|codex|claude [--model <model>] | ork opencode   (open a coordinator; enter your goal in the conversation)
   --harness-arg=<argument>      (pass an argument to the coordinator; repeat as needed)
 ork horde ["objective"] [--engine codex|claude|agy|opencode] [--model <model>] [--max-agents 12] [--max-depth 3]
-ork horde [toggle|open|close]   (open or close the live Horde / Swarm View split pane)
+ork horde [toggle|open|close] [--chief]   (open or close the live Horde / Swarm View split pane)
+ork horde --view --chief [--attach-room <id>] [--print|--json] [--width 120]   (machine-wide Chief overview)
 ork horde [--team "claude:haiku*2@scout,agy:flash*2@builder,codex:luna:max@reviewer"]
 ork horde --preset scout-swarm|bug-court|patch-race|heavy-trifecta
 ork horde spawn --attach-room <id> --team <team> [--role <role>]
@@ -167,12 +176,13 @@ ork next [step|status|settle|loop] [--room <id>] [--approve <slug>] [--dry-run] 
 ork foundry [status|run|groom] [--dry-run] [--json]
 ork smelter [status|run] [--dry-run] [--json]
 ork side [run|status] [--prompt <text>] [--issue <n>] [--dry-run] [--json]
+ork chief [status|bind|send|spawn|desk|view] [--json]   (machine-wide Chief desk; ork chief --help)
 ork cleanup [status|run] [--dry-run] [--json]
 ork policy [show|allow|deny|reset] [--json]
 ork update [run|check|status|enable|disable] [--check|--apply] [--auto] [--force] [--quiet] [--json] [-h|--help]
 ork radar [status|diff|priors|ack] [--refresh] [--ack] [--line|--json]
 ork gate [--heavy] [--label <text>] -- <command>   (also: ork gate status|install|uninstall)
-ork swarm [toggle|open|close]   (alias for ork horde toggle|open|close)
+ork swarm [toggle|open|close] [--chief]   (alias for ork horde toggle|open|close)
 ork factory [status|run|groom] [--dry-run] [--json]   (alias for ork foundry)
 ork rooms --help                (alias for ork hall)
 ork herdr-status                     (focused Herdr pane agent, plain text)
@@ -191,6 +201,7 @@ Slash commands, in any harness that loads the plugin:
 
 <!-- generated:slash-commands -->
 
+- `/chief [status|<goal>]`: Take the machine-wide Chief desk, brief every running orchestrator, and route multi-repo work
 - `/cleanup [status|run] [--dry-run] [--migrate-legacy]`: Audit, prune, and migrate legacy Orkest / agent-executor state, worktrees, and backups
 - `/horde [toggle|open|close|<goal>]`: Toggle the Orkest Swarm View split pane or launch a swarm for a goal
 - `/side [--later|--issue|--investigate] <idea>`: Launch or park a side mission from the current tab without derailing your main task

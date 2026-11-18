@@ -96,6 +96,13 @@ Every component accepts `tier` (`"nerd"`, `"unicode"`, or `"ascii"`), resolved b
 
 - Agent cards show a muted process count and an observed listening port when available; completed agents with remaining processes show `left` in the warning tone. The Focus and Pinned panels list each process by PID, age and a redacted command, with `(by directory)` when attribution came from its working directory. The wording remains explicit in monochrome output.
 
+**11. Ork Chief Overview (`lib/chief-view.mjs`):**
+
+- `ork chief view`, `ork horde --view --chief` and `ork horde open --chief` render the machine-wide overview from the `ork.chief.status.v1` snapshot: an `ORK CHIEF` header (bound Chief, `N orchestrators · N working · N blocked · N need you · N solo`, unread Chief mail, compact 5h quota strip), rooms grouped by repository with the most urgent repository and room first, a `Sessions · N not in a room` group, and a framed detail card for the selection (goal, team counts, first attention item, latest message, checkout).
+- Room rows follow the tree-row rhythm: Row 1 is pointer, status glyph, room title, `wt:<slug>` or `(branch)`, `!N` attention badge and, on the right, `<model> · <workers> · <pill>` (wide) or `3▶ 1⚠ 1✓ · <pill>` (under 72 columns). Row 2 is the first attention item in `warning` tone, else `<stage> — <task>`.
+- Keys: `↑/↓` (`j/k`) select, `Enter` opens the room's Swarm View in the same pane (or focuses a standalone session), `Tab` toggles between the overview and the last room, `Backspace` (or `Esc` with no preview or overlay open) returns, `f`/`o` focus the orchestrator pane, `C` focuses the Chief chat, and `m` keeps its mouse-capture meaning in both modes. Clicking selects; clicking the selection opens it.
+- A drilled-in room is borrowed: the Herdr pane label, view-state record and blocked notifications stay with the pane's own room. `/swarm` from the session holding `chief.json` opens directly on the overview; any other room view only gains `Tab` and a subtle `★ chief` title hint while a Chief is live, so default room renders stay byte-identical.
+
 ---
 
 ## 4. Herdr Boundary & Visual Baselines

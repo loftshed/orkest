@@ -154,7 +154,9 @@ def idle_shell(info: dict[str, Any]) -> bool:
     )
 
 
-def prepare(base: Path, room: str, pane: str, cli: Path, env: dict[str, str], api: Herdr) -> Path:
+def prepare(
+    base: Path, room: str, pane: str, cli: Path, env: dict[str, str], api: Herdr, *, chief: bool = False
+) -> Path:
     path = state_path(base, room, env)
     label = swarm_pane_label(base, room)
     renamed = api.call("pane", "rename", pane, label)
@@ -180,6 +182,8 @@ def prepare(base: Path, room: str, pane: str, cli: Path, env: dict[str, str], ap
             "endpoint": endpoint(env),
             "host": socket.gethostname(),
             "cli": str(cli.resolve()),
+            # Chief side windows reopen on the machine-wide overview after a Herdr restart.
+            **({"chief": True} if chief else {}),
         },
     )
     path.with_suffix(".closed").unlink(missing_ok=True)
@@ -187,13 +191,15 @@ def prepare(base: Path, room: str, pane: str, cli: Path, env: dict[str, str], ap
     return path
 
 
-def command(cli: Path, room: str, state: Path, base: Path, env: dict[str, str]) -> str:
+def command(cli: Path, room: str, state: Path, base: Path, env: dict[str, str], *, chief: bool = False) -> str:
     return shlex.join(
         [
             "exec",
             "env",
             f"ORKEST_HERDR_VIEW_STATE={state}",
             f"ORCHESTRATE_HOME={base}",
+            # The view argv stays exact for view_process(); Chief mode rides in the environment.
+            *(["ORKEST_CHIEF_VIEW=1"] if chief else []),
             shutil.which("node", path=env.get("PATH")) or "node",
             str(cli),
             "horde",
@@ -297,7 +303,12 @@ def restore(
                         continue
                     save(pending_path, {"shell_pid": info["shell_pid"]})
                     try:
-                        api.call("pane", "run", pane["pane_id"], command(cli, room, path, base, env))
+                        api.call(
+                            "pane",
+                            "run",
+                            pane["pane_id"],
+                            command(cli, room, path, base, env, chief=record.get("chief") is True),
+                        )
                     except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired):
                         outcomes.append({"room": room, "status": "launch_unknown"})
                         continue
@@ -760,7 +771,7 @@ def main() -> int:
                     if current and locate(current, api.panes()):
                         print(f"Swarm View is already open for room {room}.", file=sys.stderr)
                         return 0
-                    prepare(base, room, pane, cli, env, api)
+                    prepare(base, room, pane, cli, env, api, chief=env.get("ORKEST_CHIEF_VIEW") == "1")
                     room_store.set_metadata(mailbox, room, herdrViewPaneId=pane)
                     env["ORKEST_HERDR_VIEW_STATE"] = str(state)
             except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as error:

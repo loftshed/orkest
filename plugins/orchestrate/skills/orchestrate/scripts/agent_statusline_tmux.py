@@ -428,6 +428,34 @@ def _update_room_metadata(base: Path, room_id: str, **fields: str | None) -> dic
     return None
 
 
+def _chief_session(base: Path) -> str | None:
+    """Session ID of the live machine-wide Chief in ``<mailboxRoot>/chief.json``, if any."""
+    try:
+        data = json.loads((base / "chief.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    session = data.get("session")
+    if not isinstance(session, str) or not session.strip():
+        return None
+    pid = data.get("pid")
+    if isinstance(pid, int) and pid > 0:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return None
+        except PermissionError:
+            pass
+        except OSError:
+            return None
+    return session.strip()
+
+
+def _is_chief_session(base: Path, session_id: str | None) -> bool:
+    return bool(session_id) and _chief_session(base) == session_id
+
+
 def _open_herdr_swarm_view(
     herdr: str,
     *,
@@ -542,6 +570,7 @@ def _open_herdr_swarm_view_unlocked(
     environment: dict[str, str],
     base: Path,
     is_coordinator: bool = True,
+    chief: bool = False,
 ) -> str | None:
     import herdr_swarm_restore as restoration
 
@@ -581,6 +610,7 @@ def _open_herdr_swarm_view_unlocked(
             f"ORKEST_HERDR_VIEW_STATE={state}",
             "--env",
             f"ORCHESTRATE_HOME={base.parent}",
+            *(["--env", "ORKEST_CHIEF_VIEW=1"] if chief else []),
         )
         plugin_pane = opened["plugin_pane"]
         if plugin_pane["plugin_id"] != "orkest.swarms" or plugin_pane["entrypoint"] != "room":
@@ -590,7 +620,7 @@ def _open_herdr_swarm_view_unlocked(
         print(f"Herdr could not open the room view: {error}", file=sys.stderr)
         return None
     try:
-        restoration.prepare(base.parent, room, view_pane_id, cli, environment, api)
+        restoration.prepare(base.parent, room, view_pane_id, cli, environment, api, chief=chief)
         deadline = time.monotonic() + 8
         while not restoration.view_process(api.processes(view_pane_id), cli, room):
             if time.monotonic() >= deadline:
@@ -778,6 +808,7 @@ def _toggle_herdr_swarm_view(
     cwd: str | None = None,
     base: Path,
     respect_closed: bool = False,
+    chief: bool = False,
 ) -> dict[str, str]:
     import herdr_swarm_restore as restoration
 
@@ -791,6 +822,7 @@ def _toggle_herdr_swarm_view(
             cwd=cwd,
             base=base,
             respect_closed=respect_closed,
+            chief=chief,
         )
 
 
@@ -804,6 +836,7 @@ def _toggle_herdr_swarm_view_unlocked(
     cwd: str | None = None,
     base: Path,
     respect_closed: bool = False,
+    chief: bool = False,
 ) -> dict[str, str]:
     coordinator_pane, workspace_id, context_cwd = _resolve_herdr_context()
     import herdr_swarm_restore as restoration
@@ -1022,6 +1055,7 @@ def _toggle_herdr_swarm_view_unlocked(
         environment=environment,
         base=base,
         is_coordinator=not recorded_coord_pane or recorded_coord_pane == coordinator_pane,
+        chief=chief or _is_chief_session(base, session_id),
     )
     if not pane_id:
         return {
@@ -1043,8 +1077,12 @@ def toggle_swarm_view(
     cwd: str | None = None,
     base: Path | None = None,
     respect_closed: bool = False,
+    chief: bool = False,
 ) -> dict[str, str]:
-    """Open, close, or toggle the live Swarm View split pane in an Orkest tmux, Herdr, or Orca session."""
+    """Open, close, or toggle the live Swarm View split pane in an Orkest tmux, Herdr, or Orca session.
+
+    ``chief`` (or a calling session that holds ``chief.json``) opens the machine-wide Chief overview.
+    """
     if action not in ("toggle", "open", "close"):
         raise ValueError(f"Unsupported swarm view action: {action}")
     base = base or mailbox.root()
@@ -1060,6 +1098,7 @@ def toggle_swarm_view(
                 cwd=cwd,
                 base=base,
                 respect_closed=respect_closed,
+                chief=chief,
             )
         return {"status": "unavailable", "reason": "Herdr is not installed on PATH", "backend": "herdr"}
     if not os.environ.get("TMUX") and not socket:
@@ -1199,6 +1238,7 @@ def toggle_swarm_view(
             "--attach-room",
             current_room,
             "--view",
+            *(["--chief"] if chief or _is_chief_session(base, session_id) else []),
         ],
         env=environment,
         check=False,
@@ -1222,6 +1262,7 @@ def main(arguments: list[str]) -> int:
         parser.add_argument("--session")
         parser.add_argument("--harness")
         parser.add_argument("--cwd")
+        parser.add_argument("--chief", action="store_true", help="open the machine-wide Chief overview")
         parser.add_argument("--json", action="store_true")
         args = parser.parse_args(arguments)
         action = args.toggle_swarm if args.toggle_swarm in ("toggle", "open", "close") else "toggle"
@@ -1232,6 +1273,7 @@ def main(arguments: list[str]) -> int:
             session_id=args.session,
             harness=args.harness,
             cwd=args.cwd,
+            chief=args.chief,
         )
         if args.json:
             print(json.dumps(outcome))

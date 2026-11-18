@@ -999,6 +999,17 @@ function propagateUpAncestors(agents, seedIds) {
   return result;
 }
 
+/** Subtle `★ chief` title hint, present only when the runner attached a live Chief binding. */
+function chiefHintLabel(room, lead, tier) {
+  const chief = room?.chief;
+  if (!chief || typeof chief !== "object") return "";
+  const star = tier === "ascii" ? "*" : "★";
+  const leadSession = lead?.session?.id || lead?.nativeSession;
+  return chief.session && leadSession === chief.session
+    ? ` · ${star} chief desk`
+    : ` · ${star} chief`;
+}
+
 function memberModelInfo(member) {
   const data = member.progress || member;
   const rawModel =
@@ -1074,6 +1085,7 @@ export class HordeView {
     this.diffCursorRows = new Map();
     this.diffPreviewMetrics = null;
     this.quotaWindowOffset = undefined;
+    this.chiefEnabled = false;
   }
 
   quotaRowLimit() {
@@ -1885,6 +1897,12 @@ export class HordeView {
         "n           Next page",
         "p           Pin or unpin focused output",
         "g           Open coalesced room log",
+        ...(this.chiefEnabled
+          ? [
+              "Tab         Switch to the machine-wide Chief overview",
+              "Backspace   Return to the Chief overview",
+            ]
+          : []),
         "? or Esc    Close this reference",
         this.confirmClose
           ? "q q/Ctrl-C  Close this pane (q twice); workers continue"
@@ -2685,7 +2703,7 @@ export class HordeView {
     const swarmTitle =
       (room.title === "New swarm" ? "Swarm" : `Swarm · ${plain(room.title || room.id)}`) +
       lifecycleSuffix;
-    const topCardTitle = hasHerdrPaneHeader ? "Coordinator" : swarmTitle;
+    const topCardTitle = `${hasHerdrPaneHeader ? "Coordinator" : swarmTitle}${chiefHintLabel(room, lead, this.tier)}`;
     const lines = [
       ...this.panel(
         topCardTitle,
