@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
+import os
 import re
 import threading
 import time
@@ -12,6 +14,41 @@ from typing import Any
 
 import mailbox_work as work
 import peer_mailbox as mailbox
+
+# Display reads only: parsed peer records reused while (dev, ino, size, mtime_ns) are unchanged. Files changed
+# within the racy window are always re-read, every entry is reconciled periodically, and liveness is always
+# recomputed from the wall clock rather than cached.
+_PEER_CACHE: dict[Path, tuple[tuple[int, int, int, int], float, Any]] = {}
+_RACY_SECONDS = 2.0
+_RECONCILE_SECONDS = 30.0
+_CACHE_LIMIT = 4096
+
+
+def _stat_signature(info: os.stat_result) -> tuple[int, int, int, int]:
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+
+
+def cached_load(path: Path) -> Any:
+    try:
+        info = path.stat()
+    except OSError:
+        _PEER_CACHE.pop(path, None)
+        return None
+    signature = _stat_signature(info)
+    now = time.time()
+    cached = _PEER_CACHE.get(path)
+    if (
+        cached is not None
+        and cached[0] == signature
+        and now - cached[1] < _RECONCILE_SECONDS
+        and info.st_mtime < cached[1] - _RACY_SECONDS
+    ):
+        return copy.deepcopy(cached[2])
+    value = mailbox.load(path)
+    if len(_PEER_CACHE) >= _CACHE_LIMIT:
+        _PEER_CACHE.clear()
+    _PEER_CACHE[path] = (signature, now, copy.deepcopy(value))
+    return value
 
 
 def short(value: Any, maximum: int = 160) -> str:
@@ -41,7 +78,7 @@ def snapshot(
     agents = []
     members = set()
     for path in sorted((base / "peers").glob("*.json")):
-        peer = mailbox.load(path)
+        peer = cached_load(path)
         if not mailbox.valid_peer(peer) or mailbox.is_run_peer(peer) or not mailbox.same_project(me, peer):
             continue
         if agent and not _matches(peer, agent):

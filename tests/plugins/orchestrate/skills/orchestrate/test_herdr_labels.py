@@ -80,9 +80,12 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(report[report.index("--display-agent") + 1], "[C] codex-ivory-elk-49")
         self.assertEqual(report[report.index("--title") + 1], "working · Verify patch")
         self.assertNotIn("--ttl-ms", report)
-        mailbox.annotate(self.base, SESSION, herdrSyncedAt=0)
         self.assertTrue(agent_terminal.bind(SESSION, "codex", {}, base=self.base))
         self.assertEqual([call[:2] for call in self.calls].count(["pane", "report-metadata"]), 1)
+        # Past the resync TTL the label is reported again: a restarted server keeps none.
+        mailbox.annotate(self.base, SESSION, herdrSyncedAt=0)
+        self.assertTrue(agent_terminal.bind(SESSION, "codex", {}, base=self.base))
+        self.assertEqual([call[:2] for call in self.calls].count(["pane", "report-metadata"]), 2)
 
     def test_attested_native_identity_discovers_the_canonical_mailbox_peer(self):
         native = "019a5da8-4321-5678-9abc-123456789012"

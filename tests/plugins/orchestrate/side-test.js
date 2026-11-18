@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { readRawRoom } from "../../../plugins/orchestrate/lib/horde-room.mjs";
+import { readRawRoom, readRoom } from "../../../plugins/orchestrate/lib/horde-room.mjs";
 import {
   checkRepoPolicyForSide,
   classifySideMode,
@@ -33,6 +33,29 @@ describe("ork side (side missions)", () => {
   afterEach(() => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
+
+  /** A legacy room file in the canonical agent-executor.room.v1 shape; the store imports it. */
+  function writeRoom(id, { session, agents = [] } = {}) {
+    const roomPath = path.join(mailboxDir, "rooms", `${id}.json`);
+    fs.writeFileSync(
+      roomPath,
+      JSON.stringify({
+        schema: "agent-executor.room.v1",
+        id,
+        cwd: repoDir,
+        machine: os.hostname(),
+        conductor: {
+          engine: "claude",
+          ...(session && {
+            session: { id: session, engine: "claude", machine: os.hostname(), cwd: repoDir },
+          }),
+        },
+        agents,
+      }),
+      "utf8",
+    );
+    return roomPath;
+  }
 
   describe("classifySideMode & parseSideArgs", () => {
     it("classifies imperative statements as execute mode by default", () => {
@@ -189,17 +212,7 @@ describe("ork side (side missions)", () => {
     });
 
     it("dispatches a read-only background scout in investigate mode and registers side-1 in the room", async () => {
-      const roomPath = path.join(mailboxDir, "rooms", "room-alpha.json");
-      fs.writeFileSync(
-        roomPath,
-        JSON.stringify({
-          id: "room-alpha",
-          cwd: repoDir,
-          parent: { id: "conductor", session: "parent-session-999" },
-          agents: [],
-        }),
-        "utf8",
-      );
+      const roomPath = writeRoom("room-alpha", { session: "parent-session-999" });
 
       const calls = [];
       const res = await sideCommand(
@@ -216,7 +229,11 @@ describe("ork side (side missions)", () => {
               return { status: 0, stdout: `${repoDir}\n`, stderr: "" };
             }
             if (cmd === "python3" && args.includes("init")) {
-              return { status: 0, stdout: JSON.stringify({ status: "active" }), stderr: "" };
+              return {
+                status: 0,
+                stdout: JSON.stringify({ status: "active", task_id: "task-side" }),
+                stderr: "",
+              };
             }
             if (cmd === "python3" && args.includes("dispatch")) {
               return {
@@ -251,46 +268,71 @@ describe("ork side (side missions)", () => {
         expect(call.env.AGENT_MAILBOX_SESSION).toBe("side-coord-inv01");
       }
 
-      // Verify room registration
-      const updatedRoom = readRawRoom(path.basename(roomPath, ".json"), mailboxDir);
+      // Verify room registration: the member satisfies the room schema readers validate against.
+      const updatedRoom = await readRoom(path.basename(roomPath, ".json"), mailboxDir);
       expect(updatedRoom.agents).toHaveLength(1);
-      expect(updatedRoom.agents[0].id).toBe("side-1");
-      expect(updatedRoom.agents[0].role).toBe("side");
-      expect(updatedRoom.agents[0].sideMode).toBe("investigate");
-      expect(updatedRoom.agents[0].isolatedInbox).toBe(true);
-      expect(updatedRoom.agents[0].dispatch.runId).toBe("run-inv-1");
+      expect(updatedRoom.agents[0]).toMatchObject({
+        id: "side-1",
+        role: "worker",
+        workforceRole: "scout",
+        engine: "codex",
+        model: "gpt-5.6-sol",
+        effort: "medium",
+        sideMode: "investigate",
+        isolatedInbox: true,
+        cwd: repoDir,
+        dispatch: {
+          taskDir: path.join(cacheDir, "side-missions", "side-inv01"),
+          taskId: "task-side",
+          requestId: "side-inv01-run-1",
+          transport: "executor",
+          runId: "run-inv-1",
+        },
+      });
     });
 
     it("validates an investigate spec through the real coordinator init", async () => {
       expect(spawnSync("git", ["init", repoDir], { encoding: "utf8" }).status).toBe(0);
-      const result = await sideCommand(["--investigate", "--json", "trace the parser"], {
-        cwd: repoDir,
-        mailboxDir,
-        cacheDir,
-        shortId: "schema",
-        env: {
-          ...process.env,
-          ORCHESTRATE_HOME: cacheDir,
-          AGENT_EXECUTOR_HOME: cacheDir,
-          PYTHONDONTWRITEBYTECODE: "1",
+      writeRoom("room-real", { session: "parent-real" });
+      const result = await sideCommand(
+        ["--investigate", "--session", "parent-real", "--json", "trace the parser"],
+        {
+          cwd: repoDir,
+          mailboxDir,
+          cacheDir,
+          shortId: "schema",
+          env: {
+            ...process.env,
+            ORCHESTRATE_HOME: cacheDir,
+            AGENT_EXECUTOR_HOME: cacheDir,
+            PYTHONDONTWRITEBYTECODE: "1",
+          },
+          runCommand: (cmd, args, opts) => {
+            if (args.includes("dispatch"))
+              return { status: 0, stdout: '{"run_id":"controlled-run"}', stderr: "" };
+            return spawnSync(cmd, args, { ...opts, encoding: "utf8" });
+          },
         },
-        runCommand: (cmd, args, opts) => {
-          if (args.includes("dispatch"))
-            return { status: 0, stdout: '{"run_id":"controlled-run"}', stderr: "" };
-          return spawnSync(cmd, args, { ...opts, encoding: "utf8" });
-        },
-      });
+      );
       expect(result.status).toBe("dispatched");
       const task = JSON.parse(
         fs.readFileSync(path.join(cacheDir, "side-missions", "side-schema", "task.json"), "utf8"),
       );
       expect(task.task_spec.scope_owner).toBe("conductor");
       expect(task.task_spec.effective_scope).toEqual([]);
+      // The registered member names the task the real coordinator created and passes room validation.
+      expect(result.roomId).toBe("room-real");
+      const room = await readRoom("room-real", mailboxDir);
+      expect(room.agents[0].dispatch).toMatchObject({
+        taskId: task.task_id,
+        requestId: "side-schema-run-1",
+        transport: "executor",
+        runId: "controlled-run",
+      });
     });
 
     it("preserves both registrations after two processes discover the same room snapshot", async () => {
-      const roomPath = path.join(mailboxDir, "rooms", "concurrent.json");
-      fs.writeFileSync(roomPath, JSON.stringify({ id: "concurrent", cwd: repoDir, agents: [] }));
+      const roomPath = writeRoom("concurrent");
       const script = `
         import fs from "node:fs";
         import { sideCommand } from ${JSON.stringify(new URL("../../../plugins/orchestrate/lib/side.mjs", import.meta.url).href)};
@@ -308,7 +350,7 @@ describe("ork side (side missions)", () => {
               }
               return { status: 0, stdout: JSON.stringify({ run_id: shortId, engine: "codex", model: "test-model" }), stderr: "" };
             }
-            return { status: 0, stdout: "{}", stderr: "" };
+            return { status: 0, stdout: JSON.stringify({ task_id: "task-" + shortId }), stderr: "" };
           },
         });
         console.log(JSON.stringify(result));
@@ -374,17 +416,12 @@ describe("ork side (side missions)", () => {
     }, 60_000);
 
     it("provisions an isolated git worktree, copies .worktreeinclude, and registers side-1 in execute mode", async () => {
-      const roomPath = path.join(mailboxDir, "rooms", "room-beta.json");
-      fs.writeFileSync(
-        roomPath,
-        JSON.stringify({
-          id: "room-beta",
-          cwd: repoDir,
-          parent: { id: "conductor", session: "parent-session-777" },
-          agents: [{ id: "side-1", role: "side" }],
-        }),
-        "utf8",
-      );
+      const roomPath = writeRoom("room-beta", {
+        session: "parent-session-777",
+        agents: [
+          { id: "side-1", engine: "codex", model: "gpt-5.6-sol", role: "worker", sideId: "old" },
+        ],
+      });
       fs.writeFileSync(path.join(repoDir, ".worktreeinclude"), ".env.local\n", "utf8");
       fs.writeFileSync(path.join(repoDir, ".env.local"), "SECRET_TOKEN=test\n", "utf8");
 
@@ -407,7 +444,11 @@ describe("ork side (side missions)", () => {
               return { status: 0, stdout: "", stderr: "" };
             }
             if (cmd === "python3" && args.includes("init")) {
-              return { status: 0, stdout: JSON.stringify({ status: "active" }), stderr: "" };
+              return {
+                status: 0,
+                stdout: JSON.stringify({ status: "active", task_id: "task-side" }),
+                stderr: "",
+              };
             }
             if (cmd === "python3" && args.includes("dispatch")) {
               return {
@@ -440,21 +481,20 @@ describe("ork side (side missions)", () => {
       expect(updatedRoom.agents[1].worktree).toEqual({
         path: res.worktreePath,
         branch: "ork/side-exec02",
+        disposable: false,
+        parentCwd: repoDir,
+        slug: "wt-side-exec02",
       });
+      expect(updatedRoom.agents[1]).toMatchObject({
+        role: "worker",
+        workforceRole: "builder",
+        cwd: res.worktreePath,
+      });
+      await expect(readRoom("room-beta", mailboxDir)).resolves.toBeTruthy();
     });
 
     it("keeps the detached fallback when the side branch already exists", async () => {
-      const roomPath = path.join(mailboxDir, "rooms", "room-detached.json");
-      fs.writeFileSync(
-        roomPath,
-        JSON.stringify({
-          id: "room-detached",
-          cwd: repoDir,
-          parent: { id: "conductor", session: "parent-session-detached" },
-          agents: [],
-        }),
-        "utf8",
-      );
+      writeRoom("room-detached", { session: "parent-session-detached" });
       spawnSync("git", ["init"], { cwd: repoDir, stdio: "ignore" });
       spawnSync("git", ["config", "user.name", "Side Worktree Tests"], { cwd: repoDir });
       spawnSync("git", ["config", "user.email", "side-worktree@example.invalid"], {

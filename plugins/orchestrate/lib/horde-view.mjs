@@ -81,6 +81,8 @@ const COMPLETED_MODES = ["collapsed", "hidden", "expanded"];
 const QUOTA_MODES = new Set(["expanded", "collapsed"]);
 const SERVICES_MODES = new Set(["expanded", "collapsed"]);
 const ERROR_STATUSES = new Set(["blocked", "failed", "rejected", "session unavailable"]);
+// An embedded Herdr pane retires on close; a bare q must be pressed twice within this window.
+export const CLOSE_CONFIRM_MS = 3000;
 const RESOLVED_STATES = new Set(["accepted", "finished", "answered", "cancelled"]);
 const SLOT_ID_PATTERN = /^[a-z0-9.]+-\d+$/iu;
 const MULTI_HYPHEN_SLOT_PATTERN = /^([a-z0-9]+(?:-[a-z0-9.]+){2,})-(\d+)$/iu;
@@ -1024,6 +1026,7 @@ export class HordeView {
       quotaWindow = "5h",
       servicesMode = "collapsed",
       inHerdr = false,
+      confirmClose = false,
       mouseEnabled = true,
       onFocusPane,
       onPreview,
@@ -1039,6 +1042,8 @@ export class HordeView {
     this.appearance = { enabled: this.color, theme: resolveTheme(theme) };
     this.tier = tier;
     this.inHerdr = Boolean(inHerdr);
+    this.confirmClose = Boolean(confirmClose);
+    this.closeArmedAt = undefined;
     this.completedMode = COMPLETED_MODES.includes(completedMode) ? completedMode : "collapsed";
     this.quotaWindow = quotaWindow === "weekly" ? "weekly" : "5h";
     this.quotaMode = QUOTA_MODES.has(quotaMode) ? quotaMode : "expanded";
@@ -1219,8 +1224,21 @@ export class HordeView {
     /* Projection reads the latest room and clock on each render. */
   }
 
+  /** Bare q: closes at once, or in an embedded Herdr pane only when pressed again promptly. */
+  requestClose(nowMs = Date.now()) {
+    if (!this.confirmClose) return { type: "close-view" };
+    if (Number.isFinite(this.closeArmedAt) && nowMs - this.closeArmedAt <= CLOSE_CONFIRM_MS) {
+      this.closeArmedAt = undefined;
+      return { type: "close-view" };
+    }
+    this.closeArmedAt = nowMs;
+    this.notice = "Press q again to close this pane; workers continue";
+    return true;
+  }
+
   handleKey(key) {
     this.notice = "";
+    if (key !== "q") this.closeArmedAt = undefined;
     if (this.overlay) {
       switch (key) {
         case "\u{1B}":
@@ -1342,7 +1360,7 @@ export class HordeView {
         return { type: "mouse-toggle", enabled: this.mouseEnabled };
       }
       case "q": {
-        return { type: "close-view" };
+        return this.requestClose();
       }
       case "c": {
         const agents = Array.isArray(this.room?.agents) ? this.room.agents : [];
@@ -1868,7 +1886,9 @@ export class HordeView {
         "p           Pin or unpin focused output",
         "g           Open coalesced room log",
         "? or Esc    Close this reference",
-        "q or Ctrl-C Quit the display; workers continue",
+        this.confirmClose
+          ? "q q/Ctrl-C  Close this pane (q twice); workers continue"
+          : "q or Ctrl-C Quit the display; workers continue",
         "Glyphs      Set ORK_GLYPHS=ascii|unicode|nerd",
         "Icons       Nerd Font by default; unicode or ascii selects fallback",
       ];

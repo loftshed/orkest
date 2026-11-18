@@ -974,6 +974,8 @@ export async function runHordeTui(
     theme,
     mouseEnabled: mouse,
     inHerdr: Boolean(env?.HERDR_ENV === "1" || env?.ORKEST_HERDR_VIEW_STATE),
+    // Only the embedded Herdr view pane retires on close; a stray q there must not close it.
+    confirmClose: Boolean(env?.ORKEST_HERDR_VIEW_STATE),
     onFocusPane: (agent) => {
       diffGeneration++;
       if (isNavigationPending) return;
@@ -1299,11 +1301,11 @@ export async function runHordeTui(
   const terminalInput = createTerminalInput({
     onKey: (text, key) => {
       const value = key?.sequence || text || "";
-      handleAction(
-        text === "q" || (key?.ctrl && key.name === "c")
-          ? { type: "close-view" }
-          : view.handleInput(value),
-      );
+      let action;
+      if (key?.ctrl && key.name === "c") action = { type: "close-view" };
+      else if (text === "q") action = view.requestClose();
+      else action = view.handleInput(value);
+      handleAction(action);
     },
     onMouse: (event) => {
       if (view.mouseEnabled) handleAction(view.handleMouse(event));

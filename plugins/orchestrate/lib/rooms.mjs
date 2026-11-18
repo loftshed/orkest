@@ -11,6 +11,7 @@ import {
   createRoom,
   detectWorktree,
   listRawRooms,
+  listRawRoomsCached,
   mailboxRoot,
   normalizeWorkforceRole,
   processStarted,
@@ -100,25 +101,58 @@ function orcaTerminalFields(...sources) {
   return fields;
 }
 const SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/u;
-const MAX_PEER_AGE_MS = 7 * 24 * 60 * 60 * 1000;
-const UNKNOWN_PID_TTL_MS = 2 * 60 * 60 * 1000;
-const SHARED_PROCESS_IDLE_TTL_MS = 3 * 60 * 60 * 1000;
-const SHARED_PROCESS_BUSY_TTL_MS = 30 * 60 * 1000;
+// Peer liveness windows; mailbox_store.py keeps the same values (pinned by a parity test).
+export const MAX_PEER_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+export const UNKNOWN_PID_TTL_MS = 2 * 60 * 60 * 1000;
+export const SHARED_PROCESS_IDLE_TTL_MS = 3 * 60 * 60 * 1000;
+// A shared-process session waiting on input is no more evidenced than an idle one.
+export const SHARED_PROCESS_WAITING_TTL_MS = SHARED_PROCESS_IDLE_TTL_MS;
+export const SHARED_PROCESS_BUSY_TTL_MS = 30 * 60 * 1000;
+// A bound session without presence or a live recorded process awaits its first hook this long.
+export const SESSION_OBSERVATION_GRACE_MS = 10 * 60 * 1000;
 const PROGRESS_STALE_AFTER_MS = 30 * 60 * 1000;
+// Display cache: files modified this recently are re-read (coarse mtime clocks), and every entry
+// is reconciled after JSON_CACHE_RECONCILE_MS whatever its signature says.
+const JSON_CACHE_RACY_MS = 2000;
+const JSON_CACHE_RECONCILE_MS = 30_000;
+const JSON_CACHE_LIMIT = 4096;
+const jsonCache = new Map();
 
 function isPlainObject(value) {
   return Boolean(value && typeof value === "object" && !Array.isArray(value));
 }
 
+/** Parsed JSON reused while (dev, ino, size, mtimeNs) are unchanged; callers get a private copy. */
 async function readOptionalJson(filePath, maxBytes = 4 * 1024 * 1024) {
   try {
-    const info = await stat(filePath);
-    if (!info.isFile() || info.size > maxBytes) return null;
+    const info = await stat(filePath, { bigint: true });
+    if (!info.isFile() || info.size > BigInt(maxBytes)) {
+      jsonCache.delete(filePath);
+      return null;
+    }
+    const signature = `${info.dev}:${info.ino}:${info.size}:${info.mtimeNs}`;
+    const now = Date.now();
+    const cached = jsonCache.get(filePath);
+    if (
+      cached?.signature === signature &&
+      now - cached.cachedAt < JSON_CACHE_RECONCILE_MS &&
+      Number(info.mtimeMs) < cached.cachedAt - JSON_CACHE_RACY_MS
+    ) {
+      return cached.value === null ? null : structuredClone(cached.value);
+    }
     const parsed = JSON.parse(await readFile(filePath, "utf8"));
-    return isPlainObject(parsed) ? parsed : null;
+    const value = isPlainObject(parsed) ? parsed : null;
+    if (jsonCache.size >= JSON_CACHE_LIMIT) jsonCache.clear();
+    jsonCache.set(filePath, { signature, cachedAt: now, value });
+    return value === null ? null : structuredClone(value);
   } catch {
+    jsonCache.delete(filePath);
     return null;
   }
+}
+
+export function clearDisplayReadCache() {
+  jsonCache.clear();
 }
 
 async function resolveCwd(cwd) {
@@ -893,6 +927,7 @@ export async function bindSession(
         engine,
         machine: hostname(),
         cwd: resolvedCwd || member.cwd || room.cwd,
+        boundAt: new Date().toISOString(),
       };
       return room;
     },
@@ -1451,10 +1486,21 @@ export async function observeRoom(idOrRoom, options = {}) {
           cwd: member.session?.cwd || member.cwd || room.cwd,
         })
       : null;
-    if (member !== room.conductor && peer && peer.accountHome) {
+    if (member === room.conductor && peer && peer.accountHome) {
+      // The conductor's account home locates its native subagent transcripts.
+      member.activitySource = {
+        ...member.activitySource,
+        engine: member.engine,
+        session: peer.session,
+        accountHome: peer.accountHome,
+        cwd: member.cwd || room.cwd,
+        startedAt: peer.startedAt || snapshot?.startedAt || member.activitySource?.startedAt,
+      };
+    } else if (member !== room.conductor && peer && peer.accountHome) {
       const memberCwd = member.cwd || room.cwd;
       const parentCwd = room.conductor?.cwd || room.cwd;
       member.activitySource = {
+        ...member.activitySource,
         engine: member.engine,
         session: sessionId,
         accountHome: peer.accountHome,
@@ -1536,7 +1582,9 @@ export async function observeRoom(idOrRoom, options = {}) {
       !hasTerminalDecision(member) &&
       !["completed", "reported complete"].includes(member.status)
     ) {
-      member.status = "session unavailable";
+      member.status = isAwaitingObservation(member)
+        ? "awaiting observation"
+        : "session unavailable";
       member.runtimeState = "unknown";
     }
   }
@@ -1981,7 +2029,7 @@ async function appendNativePeers(room, snapshots, root) {
     }
   };
   collectRoomSessions(room);
-  for (const otherRoom of listRawRooms(root)) {
+  for (const otherRoom of listRawRoomsCached(root)) {
     if (otherRoom.id !== room.id) collectRoomSessions(otherRoom);
   }
   const existingIds = new Set(["conductor", ...room.agents.map((agent) => agent.id)]);
@@ -2534,6 +2582,11 @@ async function readClaudeSubagentFromDir(subagentsDir, agentId) {
   };
 }
 
+function subagentRuntimeState(isStopped, isQuiet) {
+  if (isStopped) return "stopped";
+  return isQuiet ? "unknown" : "running";
+}
+
 // Generic subagents have no workforce preset; the roster uses its existing native label.
 function claudeSubagentRole(agentType) {
   const type = cleanLine(agentType).toLowerCase();
@@ -2692,7 +2745,13 @@ async function appendClaudeProjectSubagentsForParent(
         info.finished ||
         !isParentAlive ||
         Boolean(boundSlot && savedProgress?.stage === "complete");
+      // A live parent is a shared process: it proves nothing about a child whose transcript is quiet.
+      const isQuiet =
+        !isFinished &&
+        !info.interrupted &&
+        (!Number.isFinite(info.mtimeMs) || Date.now() - info.mtimeMs > SHARED_PROCESS_BUSY_TTL_MS);
       let status = isFinished ? "reported complete" : "running";
+      if (isQuiet) status = "unknown";
       if (info.interrupted) status = "cancelled";
       const stage = isFinished ? "complete" : "working";
       const slot = boundSlot || claimReservedSlot(room, info.briefClaims, claimedSlots);
@@ -2741,7 +2800,7 @@ async function appendClaudeProjectSubagentsForParent(
         status,
         ...(isFinished &&
           isUntrackedCompletion({ slot, progress: savedProgress }) && { completion: "untracked" }),
-        runtimeState: isFinished || info.interrupted ? "stopped" : "running",
+        runtimeState: subagentRuntimeState(isFinished || info.interrupted, isQuiet),
         objective: taskText,
         output: [taskText],
         progress: {
@@ -2829,11 +2888,31 @@ export function isPeerLive(peer, nowMs = Date.now()) {
   }
   const ageMs = nowMs - seenMs;
   if (ageMs > MAX_PEER_AGE_MS) return false;
-  if (alive && peer.sharedProcess) {
-    if (peer.state === "idle") return ageMs <= SHARED_PROCESS_IDLE_TTL_MS;
-    if (peer.state === "busy") return ageMs <= SHARED_PROCESS_BUSY_TTL_MS;
-  }
+  // A process hosting several sessions says nothing about any one of them.
+  if (alive && peer.sharedProcess) return ageMs <= sharedProcessTtlMs(peer.state);
   return alive ?? ageMs <= UNKNOWN_PID_TTL_MS;
+}
+
+export function sharedProcessTtlMs(state) {
+  if (state === "busy") return SHARED_PROCESS_BUSY_TTL_MS;
+  if (state === "waiting") return SHARED_PROCESS_WAITING_TTL_MS;
+  return SHARED_PROCESS_IDLE_TTL_MS;
+}
+
+/**
+ * A bound session that has not produced presence yet is pending, not failed, while its recorded
+ * process is alive (and its pid not reused) or the binding is inside its first-observation grace window.
+ */
+export function isAwaitingObservation(member, nowMs = Date.now()) {
+  const alive = pidAlive(member?.pid);
+  if (alive === false) return false;
+  if (alive) {
+    const birth = member.pidBirth && processStarted(member.pid);
+    return !birth || birth === member.pidBirth;
+  }
+  if (member?.progress?.lastSeenAt || member?.observedAt) return false;
+  const boundMs = parseStampMs(member?.session?.boundAt);
+  return Number.isFinite(boundMs) && nowMs - boundMs <= SESSION_OBSERVATION_GRACE_MS;
 }
 
 /** Only MAC-verified hook claims supplement the exact mailbox identity. */
@@ -3101,9 +3180,15 @@ export async function interactiveProgress(room, root = mailboxRoot()) {
     if (member.progress?.stage && member.progress.stage !== "not set") {
       existingStage = cleanLine(member.progress.stage);
     } else if (
-      !["not set", "queued", "idle", "awaiting session", "session unavailable", "unknown"].includes(
-        fallbackStatus,
-      )
+      ![
+        "not set",
+        "queued",
+        "idle",
+        "awaiting session",
+        "awaiting observation",
+        "session unavailable",
+        "unknown",
+      ].includes(fallbackStatus)
     ) {
       existingStage = fallbackStatus;
     }

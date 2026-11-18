@@ -54,6 +54,10 @@ CLEAR_PAIRING = dt.timedelta(minutes=10)
 # Requests a cleared session had read but not answered within this window travel to its successor.
 OPEN_REQUEST_WINDOW = dt.timedelta(hours=24)
 MAILBOX_SENDER = {"session": "mailbox", "name": "mailbox", "harness": "unknown"}
+# Statuses that claim current work. "review" is a finished run awaiting acceptance, never active work.
+ACTIVE_MEMBER_STATUSES = frozenset(
+    {"running", "active", "working", "planning", "testing", "claimed", "reserved", "spawned"}
+)
 
 
 def _transcript_tail_entries(
@@ -438,10 +442,10 @@ def end_session(base: Path, session: str, *, reason: str, pid: int | None) -> No
         _end_session(base, session, reason=reason, pid=pid)
     else:
         with locked(peer_path(base, session)):
-            _end_session(base, session, reason=reason, pid=pid)
+            _end_session(base, session, reason=reason, pid=pid, lock_held=True)
 
 
-def _end_session(base: Path, session: str, *, reason: str, pid: int | None) -> None:
+def _end_session(base: Path, session: str, *, reason: str, pid: int | None, lock_held: bool = False) -> None:
     """A session is going away. A /clear keeps it for its successor; any other end tells its waiting senders."""
     peer = _MB.load(peer_path(base, session))
     if valid_peer(peer) and not _MB.is_run_peer(peer):
@@ -481,7 +485,7 @@ def _end_session(base: Path, session: str, *, reason: str, pid: int | None) -> N
                     f"{', '.join(ids)}. Nobody received it: send it to another session if it still matters."
                 ),
             )
-    _MB.unregister(base, session)
+    _MB.unregister(base, session, lock_held=lock_held)
 
 
 def adopt_cleared(base: Path, me: dict[str, Any]) -> str:
@@ -1013,12 +1017,7 @@ def _format_swarm_reconnection_summary(room: dict[str, Any], room_id: str, membe
                     objective = agent["objective"].strip()
                 break
     agents = [a for a in (room.get("agents") or []) if isinstance(a, dict)]
-    active = sum(
-        1
-        for a in agents
-        if str(a.get("status") or "").lower()
-        in {"running", "active", "working", "planning", "testing", "review", "claimed", "reserved", "spawned"}
-    )
+    active = sum(1 for a in agents if str(a.get("status") or "").lower() in ACTIVE_MEMBER_STATUSES)
     completed = sum(
         1 for a in agents if str(a.get("status") or "").lower() in {"completed", "complete", "done", "merged"}
     )
@@ -1677,25 +1676,30 @@ def hook(
             _MB.annotate(base, sub_sid, **extra_annotations)
             import agent_progress
 
-            previous_progress = agent_progress.read(base, sub_peer) or {}
-            # A generic subagent has no workforce preset. Keep any role it already reported.
-            sub_role = previous_progress.get("role") or {"explore": "scout", "plan": "planner"}.get(agent_type.lower())
-            _MB.write(
-                base / "progress" / f"{session_key(sub_sid)}.json",
-                {
-                    "schema": "orchestrate.progress.v1",
-                    "session": sub_sid,
-                    "harness": harness,
-                    "machine": socket.gethostname(),
-                    "accountHome": sub_peer.get("accountHome"),
-                    "checkout": sub_peer.get("checkout") or cwd,
-                    **({"role": sub_role} if sub_role else {}),
-                    "stage": "working",
-                    "goal": f"Native {agent_type}",
-                    "task": sub_desc or f"Running {agent_type} subagent ({agent_id_clean[:12]})",
-                    "updatedAt": _MB.stamp(),
-                },
-            )
+            progress_path = agent_progress.record_path(base, sub_sid)
+            # Same lock and checkout spelling as agent_progress.report, so the shared reader accepts the record.
+            with _MB.locked(progress_path):
+                previous_progress = agent_progress.read(base, sub_peer) or {}
+                # A generic subagent has no workforce preset. Keep any role it already reported.
+                sub_role = previous_progress.get("role") or {"explore": "scout", "plan": "planner"}.get(
+                    agent_type.lower()
+                )
+                _MB.write(
+                    progress_path,
+                    {
+                        "schema": agent_progress.SCHEMA,
+                        "session": sub_sid,
+                        "harness": harness,
+                        "machine": socket.gethostname(),
+                        "accountHome": sub_peer.get("accountHome"),
+                        "checkout": agent_progress.checkout_of(sub_peer),
+                        **({"role": sub_role} if sub_role else {}),
+                        "stage": "working",
+                        "goal": f"Native {agent_type}",
+                        "task": sub_desc or f"Running {agent_type} subagent ({agent_id_clean[:12]})",
+                        "updatedAt": _MB.stamp(),
+                    },
+                )
             with contextlib.suppress(Exception):
                 import agent_terminal
 
@@ -1710,12 +1714,21 @@ def hook(
         raw_agent_id = payload.get("agent_id") or payload.get("subagent_id")
         if isinstance(raw_agent_id, str) and raw_agent_id.strip():
             sub_sid = re.sub(r"[^A-Za-z0-9_.-]+", "-", f"subagent-{raw_agent_id.strip()}")[:80]
-            prog_path = base / "progress" / f"{session_key(sub_sid)}.json"
-            existing_prog = _MB.load(prog_path)
-            if isinstance(existing_prog, dict):
-                existing_prog["stage"] = "complete"
-                existing_prog["updatedAt"] = _MB.stamp()
-                _MB.write(prog_path, existing_prog)
+            import agent_progress
+
+            prog_path = agent_progress.record_path(base, sub_sid)
+            with _MB.locked(prog_path):
+                existing_prog = _MB.load(prog_path)
+                if isinstance(existing_prog, dict) and existing_prog.get("schema") == agent_progress.SCHEMA:
+                    sub_peer = _MB.load(peer_path(base, sub_sid))
+                    existing_prog["stage"] = "complete"
+                    if valid_peer(sub_peer):
+                        existing_prog["checkout"] = agent_progress.checkout_of(sub_peer)
+                    elif isinstance(existing_prog.get("checkout"), str) and existing_prog["checkout"]:
+                        with contextlib.suppress(OSError):
+                            existing_prog["checkout"] = str(Path(existing_prog["checkout"]).resolve())
+                    existing_prog["updatedAt"] = _MB.stamp()
+                    _MB.write(prog_path, existing_prog)
             _MB.end_session(base, sub_sid, reason="completed", pid=_MB.harness_pid(harness))
             with contextlib.suppress(Exception):
                 import agent_terminal

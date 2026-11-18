@@ -18,10 +18,13 @@ import orca_context
 import peer_mailbox as mailbox
 from herdr_context import canonical_endpoint, verified_agent
 from herdr_context import endpoint as herdr_endpoint
-from herdr_labels import codex_title_session, display_label, work_title
+from herdr_labels import bounded, codex_title_session, display_label, work_title
 
 _SUBAGENT_MAX_STALE_SEC = 1800.0
 ORCA_FIELDS = ("orcaPaneKey", "orcaTerminalHandle", "orcaWorkspaceId", "orcaTabId", "orcaEnvironment")
+# Re-verify and re-report pane metadata at least this often: a restarted Herdr server or an expired
+# overlay keeps no label, and persisted herdrSyncedTitle cannot prove that it still has one.
+HERDR_RESYNC_TTL_SEC = 90.0
 
 
 def _clean_text(value: Any) -> str:
@@ -340,21 +343,35 @@ def _sync_herdr_pane(
     progress = agent_progress.read(base, peer_data) or {}
     title = work_title(progress, structural_role)
     display_agent = display_label(peer_data)
-    sync_key = f"{title}|{display_agent}"
+    # Display only: observed children never make the parent count as working (wake prompts use its own state).
+    children = aggregate_children(base, peer_data)
+    if children["count"]:
+        # Shorten the name before the child summary, so the count and provenance stay visible.
+        suffix = f" · {bounded(children['summary'], 56)}"
+        display_agent = bounded(display_agent, max(16, 80 - len(suffix))) + suffix
+    sync_key = f"{title}|{display_agent}|{children['digest']}"
     endpoint = str(Path(endpoint).expanduser().resolve())
     herdr_env = {**os.environ, "HERDR_SOCKET_PATH": endpoint}
     target = {"endpoint": endpoint, "pane": pane_id}
     previous_target = peer_data.get("herdrSyncedTarget")
     if isinstance(previous_target, dict):
         previous_target = {**previous_target, "endpoint": canonical_endpoint(previous_target.get("endpoint"))}
-    changed = force or peer_data.get("herdrSyncedTitle") != sync_key or previous_target != target
+    synced_at = peer_data.get("herdrSyncedAt")
+    expired = (
+        not isinstance(synced_at, int | float)
+        or isinstance(synced_at, bool)
+        or not 0 <= time.time() - synced_at < HERDR_RESYNC_TTL_SEC
+    )
+    changed = force or expired or peer_data.get("herdrSyncedTitle") != sync_key or previous_target != target
     if occupant is None and changed and binary:
         occupant = verified_agent(
             binary, pane_id, mailbox.native_session_ids(peer_data, base), env=herdr_env, timeout=0.5
         )
+    terminal_id = None
     if occupant:
         pane_id = occupant["pane_id"]
         workspace_id = occupant.get("workspace_id") or pane_id.split(":", 1)[0]
+        terminal_id = occupant.get("terminal_id") if isinstance(occupant.get("terminal_id"), str) else None
     annotations: dict[str, Any] = {
         "terminalServer": None,
         "herdrPaneId": pane_id,
@@ -363,8 +380,17 @@ def _sync_herdr_pane(
         "herdrBinary": binary,
         "herdrDiscoveryMissAt": None,
     }
+    if terminal_id:
+        annotations["herdrTerminalId"] = terminal_id
     target = {"endpoint": endpoint, "pane": pane_id}
-    changed = force or peer_data.get("herdrSyncedTitle") != sync_key or previous_target != target
+    terminal_changed = bool(terminal_id and terminal_id != peer_data.get("herdrTerminalId"))
+    changed = (
+        force
+        or expired
+        or terminal_changed
+        or peer_data.get("herdrSyncedTitle") != sync_key
+        or previous_target != target
+    )
     if not changed:
         annotations["herdrSyncedTarget"] = target
     if changed and binary and occupant:
@@ -543,6 +569,7 @@ def bind(
                 "herdrSyncedTitle",
                 "herdrSyncedTarget",
                 "herdrSyncedAt",
+                "herdrTerminalId",
                 "herdrDiscoveryMissAt",
                 *ORCA_FIELDS,
             ):

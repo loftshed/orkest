@@ -5,7 +5,16 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-import { listRawRooms, readRawRoom, updateRawRoom } from "./horde-room.mjs";
+import { knownEngines } from "./families-schema.mjs";
+import {
+  isClosedRoom,
+  listRawRooms,
+  mailboxRoot,
+  readRawRoom,
+  updateRoom,
+  workforceRoleInfo,
+} from "./horde-room.mjs";
+import { cacheHome, configHome } from "./runtime-paths.mjs";
 import { bootstrapWorktreeInclude } from "./worktree-env.mjs";
 import { provisionWorktree } from "./worktree-provision.mjs";
 
@@ -232,16 +241,15 @@ export function parseSideArgs(argv = []) {
   };
 }
 
+/** The same mailbox root as rooms and peer_mailbox.py; ORCHESTRATE_MAILBOX_DIR pins a test or hook store. */
 function resolveMailboxDir(env = process.env) {
-  const explicit = (env.ORCHESTRATE_MAILBOX_DIR || env.PEER_MAILBOX_DIR || "").trim();
+  const explicit = (env.ORCHESTRATE_MAILBOX_DIR || "").trim();
   if (explicit) return path.resolve(explicit);
-  return path.join(os.homedir(), ".PeerMailbox");
+  return mailboxRoot(env);
 }
 
 function resolveAgentCacheDir(env = process.env) {
-  const xdg = (env.XDG_CACHE_HOME || "").trim();
-  const base = xdg ? path.resolve(xdg) : path.join(os.homedir(), ".cache");
-  return path.join(base, "agent-executor");
+  return cacheHome(env);
 }
 
 function defaultRunCommand(cmd, args, opts = {}) {
@@ -267,8 +275,38 @@ function resolveGitRoot(cwd, runCmd) {
   return path.resolve(cwd);
 }
 
+function sameDirectory(left, right) {
+  if (typeof left !== "string" || typeof right !== "string") return false;
+  const resolve = (value) => {
+    try {
+      return fs.realpathSync(value);
+    } catch {
+      return path.resolve(value);
+    }
+  };
+  return resolve(left) === resolve(right);
+}
+
+/** Session IDs a room records for its conductor and members (agent-executor.room.v1). */
+function roomSessionIds(room) {
+  const ids = new Set();
+  const add = (value) => {
+    if (typeof value === "string" && value) ids.add(value);
+  };
+  for (const member of [room.conductor, ...(Array.isArray(room.agents) ? room.agents : [])]) {
+    if (!member || typeof member !== "object") continue;
+    add(member.session?.id);
+    add(member.mailboxSession);
+    add(member.nativeSession);
+    if (Array.isArray(member.previousSessions)) for (const id of member.previousSessions) add(id);
+  }
+  add(room.promotion?.session);
+  return ids;
+}
+
 /**
- * Locate the active Swarm Room for this session or working directory, if one exists.
+ * Locate the open Swarm Room for this session or checkout. An explicit room ID wins; otherwise a
+ * recorded session binding outranks a checkout match. Closed rooms and other machines are skipped.
  */
 function findTargetRoom(mailboxDir, { roomId, session, cwd }) {
   if (roomId) {
@@ -277,107 +315,96 @@ function findTargetRoom(mailboxDir, { roomId, session, cwd }) {
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
     }
+    return null;
   }
   // Discovery by session or checkout only considers current rooms; history is never adopted.
   const entries = listRawRooms(mailboxDir, { lifecycle: "active" });
-
-  const resolvedCwd = cwd ? path.resolve(cwd) : null;
   let cwdMatch = null;
-
-  for (const entry of entries) {
-    try {
-      const data = entry;
-      if (!data || typeof data !== "object") continue;
-      if (roomId && (data.id === roomId || data.roomId === roomId)) {
-        return { root: mailboxDir, data };
-      }
-      if (session) {
-        const parentSession = data.parent?.session;
-        const memberMatch =
-          Array.isArray(data.agents) &&
-          data.agents.some((agent) => agent && agent.session === session);
-        if (parentSession === session || memberMatch) {
-          return { root: mailboxDir, data };
-        }
-      }
-      if (!cwdMatch && resolvedCwd) {
-        const roomCwd = data.cwd || data.repoRoot || data.parent?.cwd;
-        if (roomCwd && path.resolve(roomCwd) === resolvedCwd) {
-          cwdMatch = { root: mailboxDir, data };
-        }
-      }
-    } catch {
-      // Ignore malformed room file
-    }
+  for (const data of entries) {
+    if (!data || typeof data !== "object" || data.schema !== "agent-executor.room.v1") continue;
+    if (isClosedRoom(data) || (data.machine && data.machine !== os.hostname())) continue;
+    if (session && roomSessionIds(data).has(session)) return { root: mailboxDir, data };
+    if (!cwdMatch && cwd && sameDirectory(data.cwd, cwd)) cwdMatch = { root: mailboxDir, data };
   }
-
   return cwdMatch;
 }
 
 /**
- * Register a `side-<N>` member inside a Swarm Room atomically so
- * `/swarm` and `ork next` track its live progress and completion without touching
- * the parent session's mailbox inbox.
+ * Register a `side-<N>` member under the room's update protocol: the ID is allocated from a fresh
+ * read inside the update, and the member is validated against the room schema before commit.
  */
 async function registerSideMemberInRoom(roomRecord, sideSpec) {
   if (!roomRecord || !roomRecord.root || !roomRecord.data) {
     return { roomId: null, memberId: sideSpec.defaultMemberId };
   }
-  const saved = await updateRawRoom(
-    roomRecord.data.id,
-    (room) => {
-      const agents = Array.isArray(room.agents) ? room.agents : [];
-      const existingSideNums = agents
-        .map((agent) => {
-          const match = String(agent?.id || "").match(/^side-(\d+)$/);
-          return match ? Number(match[1]) : 0;
-        })
-        .filter((n) => Number.isFinite(n) && n > 0);
-      const nextNum = existingSideNums.length > 0 ? Math.max(...existingSideNums) + 1 : 1;
-      const memberId = `side-${nextNum}`;
-      const nowIso = new Date().toISOString();
-
-      const memberEntry = {
-        id: memberId,
-        role: "side",
-        sideMode: sideSpec.mode,
-        sideId: sideSpec.sideId,
-        engine: sideSpec.engine || "auto",
-        model: sideSpec.model || null,
-        effort: sideSpec.effort || null,
-        status: "running",
-        mission: sideSpec.idea,
-        title: sideSpec.title,
-        isolatedInbox: true,
-        keepWorktree: Boolean(sideSpec.worktreePath),
-        createdAt: nowIso,
-        updatedAt: nowIso,
-      };
-
-      if (sideSpec.worktreePath) {
-        memberEntry.worktree = {
-          path: sideSpec.worktreePath,
-          branch: sideSpec.branch,
-        };
-      }
-
-      if (sideSpec.taskDir) {
-        memberEntry.dispatch = {
-          taskDir: sideSpec.taskDir,
-          runId: sideSpec.runId || null,
-          kind: sideSpec.kind,
+  const workforceRole = sideSpec.mode === "investigate" ? "scout" : "builder";
+  let saved;
+  try {
+    saved = await updateRoom(
+      roomRecord.data.id,
+      (room) => {
+        const agents = Array.isArray(room.agents) ? room.agents : [];
+        const existing = agents.find((agent) => agent?.sideId === sideSpec.sideId);
+        if (existing) return room;
+        const existingSideNums = agents
+          .map((agent) => /^side-(\d+)$/u.exec(String(agent?.id || ""))?.[1])
+          .map(Number)
+          .filter((n) => Number.isFinite(n) && n > 0);
+        const nextNum = existingSideNums.length > 0 ? Math.max(...existingSideNums) + 1 : 1;
+        const nowIso = new Date().toISOString();
+        const memberEntry = {
+          id: `side-${nextNum}`,
+          parent: "conductor",
+          role: "worker",
+          ...(workforceRoleInfo(workforceRole) && { workforceRole }),
+          engine: sideSpec.engine,
+          model: sideSpec.model,
+          ...(sideSpec.effort && { effort: sideSpec.effort }),
+          label: `side-${sideSpec.mode}`,
           status: "running",
-          startedAt: nowIso,
+          objective: sideSpec.idea,
+          output: [],
+          sideMode: sideSpec.mode,
+          sideId: sideSpec.sideId,
+          mission: sideSpec.idea,
+          title: sideSpec.title,
+          isolatedInbox: true,
+          keepWorktree: Boolean(sideSpec.worktreePath),
+          ...(sideSpec.cwd && { cwd: path.resolve(sideSpec.cwd) }),
+          createdAt: nowIso,
+          updatedAt: nowIso,
         };
-      }
-
-      room.agents = [...agents, memberEntry];
-      room.updatedAt = nowIso;
-
-      return room;
-    },
-    { root: roomRecord.root },
-  );
+        if (sideSpec.worktreePath) {
+          memberEntry.worktree = {
+            path: path.resolve(sideSpec.worktreePath),
+            ...(sideSpec.branch && { branch: sideSpec.branch }),
+            disposable: false,
+            ...(sideSpec.repoRoot && { parentCwd: path.resolve(sideSpec.repoRoot) }),
+            slug: path.basename(sideSpec.worktreePath),
+          };
+        }
+        if (sideSpec.taskDir && sideSpec.taskId && sideSpec.requestId) {
+          memberEntry.dispatch = {
+            taskDir: path.resolve(sideSpec.taskDir),
+            taskId: sideSpec.taskId,
+            requestId: sideSpec.requestId,
+            transport: "executor",
+            kind: sideSpec.kind,
+            ...(sideSpec.runId && { runId: sideSpec.runId }),
+            startedAt: nowIso,
+          };
+        }
+        room.agents = [...agents, memberEntry];
+        return room;
+      },
+      { root: roomRecord.root },
+    );
+  } catch (error) {
+    throw new Error(
+      `Side mission ${sideSpec.sideId} was dispatched (${sideSpec.taskDir}) but could not join room ${roomRecord.data.id}: ${error.message}`,
+      { cause: error },
+    );
+  }
   const member = saved.agents.find((agent) => agent.sideId === sideSpec.sideId);
   return { roomId: saved.id, memberId: member.id };
 }
@@ -431,9 +458,7 @@ function buildIsolatedEnv(baseEnv = process.env, isolatedCoordSession, mailboxDi
 
 function resolveConfigDir(env = process.env, explicitConfigDir = null) {
   if (explicitConfigDir) return path.resolve(explicitConfigDir);
-  const xdg = (env.XDG_CONFIG_HOME || "").trim();
-  const base = xdg ? path.resolve(xdg) : path.join(os.homedir(), ".config");
-  return path.join(base, "agent-executor");
+  return configHome(env);
 }
 
 function collectDenyEntries(policyObj) {
@@ -600,6 +625,22 @@ export function checkRepoPolicyForSide(repoRoot, engine = null, options = {}) {
     deny: [...denySet],
     error: `All candidate engines are denied by repository policy for ${resolvedRepo}.`,
   };
+}
+
+/** The coordinator task identity, from `init` output or the task record it wrote. */
+function readTaskId(initStdout, taskDir) {
+  for (const read of [
+    () => JSON.parse(String(initStdout || "").trim()),
+    () => JSON.parse(fs.readFileSync(path.join(taskDir, "task.json"), "utf8")),
+  ]) {
+    try {
+      const taskId = read()?.task_id;
+      if (typeof taskId === "string" && taskId) return taskId;
+    } catch {
+      // Try the next source; a side member without a task identity is registered without dispatch.
+    }
+  }
+  return null;
 }
 
 /**
@@ -845,6 +886,7 @@ export async function sideCommand(argv = [], context = {}) {
       `Failed to initialize side-mission coordinator task: ${initRes.stderr || initRes.stdout}`,
     );
   }
+  const taskId = readTaskId(initRes.stdout, taskDir);
 
   const defaultEngine = policyCheck.engine || options.engine || "codex";
   const defaultModelByEngine = {
@@ -898,8 +940,13 @@ export async function sideCommand(argv = [], context = {}) {
   }
 
   const runId = dispatchInfo.run_id || null;
-  const resolvedEngine = dispatchInfo.engine || options.engine || "auto";
-  const resolvedModel = dispatchInfo.model || options.model || null;
+  const resolvedEngine = knownEngines().has(dispatchInfo.engine)
+    ? dispatchInfo.engine
+    : defaultEngine;
+  const resolvedModel =
+    typeof dispatchInfo.model === "string" && dispatchInfo.model
+      ? dispatchInfo.model
+      : selectedModel;
 
   const { roomId, memberId } = await registerSideMemberInRoom(roomRecord, {
     defaultMemberId: sideId,
@@ -909,12 +956,16 @@ export async function sideCommand(argv = [], context = {}) {
     profile: policyCheck.profile || null,
     claudeConfigDir: policyCheck.claudeConfigDir || null,
     model: resolvedModel,
-    effort: options.effort,
+    effort: dispatchInfo.effort || selectedEffort,
     idea: classified.idea,
     title: classified.title,
+    cwd: targetWorkspace,
+    repoRoot,
     worktreePath,
     branch,
     taskDir,
+    taskId,
+    requestId: `${sideId}-run-1`,
     runId,
     kind,
   });

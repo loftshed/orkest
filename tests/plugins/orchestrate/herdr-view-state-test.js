@@ -79,7 +79,8 @@ it.each(["q", "q then close", "close"])(
       pause() {},
       resume() {
         setImmediate(() => {
-          if (event !== "close") input.emit("data", "q");
+          // The embedded view pane closes on a second q, so a stray keystroke cannot retire it.
+          if (event !== "close") input.emit("data", "qq");
           if (event !== "q") input.emit("close");
         });
       },

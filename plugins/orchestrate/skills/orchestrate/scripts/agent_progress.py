@@ -91,6 +91,25 @@ def record_path(base: Path, session: str) -> Path:
     return base / "progress" / f"{mailbox.session_key(session)}.json"
 
 
+def checkout_of(peer: dict[str, Any]) -> str:
+    """The resolved checkout every progress writer records and read() compares."""
+    return str(Path(peer.get("checkout") or peer["cwd"]).resolve())
+
+
+def resolve_peer(base: Path, session: str) -> dict[str, Any] | None:
+    """The mailbox peer for an exact key or a unique native alias (a resumed or renamed session)."""
+    peer = mailbox.load(mailbox.peer_path(base, session))
+    if mailbox.valid_peer(peer):
+        return peer
+    try:
+        resolved = mailbox.session_peer(base, session, harness=mailbox.detect_harness())
+        if resolved is None:
+            resolved = mailbox.session_peer(base, session)
+    except (mailbox.MailboxError, OSError, ValueError):
+        return None
+    return resolved if mailbox.valid_peer(resolved) else None
+
+
 def work_context(assignments: list[dict[str, Any]]) -> str | None:
     """Bind a report to the active work identities, including an empty assignment set."""
     if not assignments:
@@ -112,7 +131,7 @@ def read(base: Path, peer: dict[str, Any]) -> dict[str, Any] | None:
             or row.get("harness") != peer["harness"]
             or row.get("machine") != socket.gethostname()
             or row.get("accountHome") != peer.get("accountHome")
-            or row.get("checkout") != str(Path(peer.get("checkout") or peer["cwd"]).resolve())
+            or row.get("checkout") != checkout_of(peer)
             or row.get("stage") not in STAGES
             or (row.get("role") is not None and row.get("role") not in ROLES)
             or not mailbox.valid_stamp(row.get("updatedAt"))
@@ -168,7 +187,7 @@ def report(
             "harness": peer["harness"],
             "machine": socket.gethostname(),
             "accountHome": peer.get("accountHome"),
-            "checkout": str(Path(peer.get("checkout") or peer["cwd"]).resolve()),
+            "checkout": checkout_of(peer),
             "workContext": context,
             **fields,
             **({"role": effective_role} if effective_role else {}),
@@ -243,7 +262,7 @@ def main() -> int:
         base = mailbox.root()
         if not args.session:
             raise mailbox.MailboxError("pass --session with your native session ID")
-        peer = mailbox.load(mailbox.peer_path(base, args.session))
+        peer = resolve_peer(base, args.session)
         if not mailbox.valid_peer(peer) or mailbox.is_run_peer(peer):
             raise mailbox.MailboxError("register this interactive session with the peer mailbox first")
         refuse_another_agents_session(base, peer)

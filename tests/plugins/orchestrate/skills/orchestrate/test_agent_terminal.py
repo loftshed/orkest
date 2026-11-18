@@ -343,14 +343,71 @@ class HerdrMetadataTests(unittest.TestCase):
         self.assertIn("--seq", self.reports[0])
         self.assertEqual(self.reports[0][self.reports[0].index("--agent") + 1], "codex")
 
-    def test_metadata_needs_no_expiry_refresh_and_skips_a_reused_pane(self):
+    def test_metadata_is_reverified_after_the_resync_ttl_and_skips_a_reused_pane(self):
         self.assertTrue(agent_terminal.bind(self.session, "codex", {"model": "fixture-model"}))
-        mailbox.annotate(self.base, self.session, herdrSyncedAt=0)
         self.assertTrue(agent_terminal.bind(self.session, "codex", {"model": "fixture-model"}))
         self.assertEqual(len(self.reports), 1)
+        # A restarted server keeps no label, so an old sync is re-verified and reported again.
+        mailbox.annotate(self.base, self.session, herdrSyncedAt=time.time() - agent_terminal.HERDR_RESYNC_TTL_SEC - 1)
+        self.assertTrue(agent_terminal.bind(self.session, "codex", {"model": "fixture-model"}))
+        self.assertEqual(len(self.reports), 2)
+        mailbox.annotate(self.base, self.session, herdrSyncedAt=0)
         self.agent_session = "another-session"
         self.assertFalse(agent_terminal.bind(self.session, "codex", {"model": "fixture-model"}, force=True))
-        self.assertEqual(len(self.reports), 1)
+        self.assertEqual(len(self.reports), 2)
+
+    def test_parent_display_agent_carries_child_summary_and_resyncs_on_terminal_change(self):
+        plain = "[C] snorfle-fixture-model-medium-project-aa"
+        mailbox.register(
+            self.base,
+            session="subagent-child-1",
+            harness="codex",
+            cwd=str(self.home),
+            state="busy",
+            account=str(self.home),
+            pid=os.getpid(),
+            model="gpt-6-sol",
+            model_source="runtime",
+            effort="high",
+        )
+        mailbox.annotate(self.base, "subagent-child-1", isSubagent=True, parentSession=self.session)
+        mailbox.annotate(self.base, self.session, state="idle")
+        occupant = {"pane_id": "w1:p1", "agent": "codex", "terminal_id": "term-1"}
+
+        def sync(current=occupant):
+            return agent_terminal._sync_herdr_pane(
+                base=self.base,
+                session=self.session,
+                harness="codex",
+                peer_data=mailbox.load(mailbox.peer_path(self.base, self.session)),
+                payload={},
+                pane_id="w1:p1",
+                workspace_id="w1",
+                endpoint=str(self.home / "server.sock"),
+                binary="/fake/herdr",
+                structural_role="",
+                occupant=current,
+            )
+
+        self.assertTrue(sync())
+        self.assertEqual(self.metadata["w1:p1"]["display_agent"], f"{plain} · 1 child: gpt-6-sol/high observed")
+        stored = mailbox.load(mailbox.peer_path(self.base, self.session))
+        self.assertEqual(stored["herdrTerminalId"], "term-1")
+        self.assertIn("subagent-child-1:gpt-6-sol:high:observed", stored["herdrSyncedTitle"])
+        # Children are display only: the parent keeps its own idle state for wake prompts.
+        self.assertEqual(stored["state"], "idle")
+        reports = len(self.reports)
+        self.assertTrue(sync())
+        self.assertEqual(len(self.reports), reports)
+        self.assertTrue(sync({**occupant, "terminal_id": "term-2"}))
+        self.assertEqual(len(self.reports), reports + 1)
+        self.assertTrue(sync({**occupant, "terminal_id": "term-2"}))
+        self.assertEqual(len(self.reports), reports + 1)
+        # The count clears when the child ends, restoring the ordinary display text.
+        mailbox.unregister(self.base, "subagent-child-1")
+        self.assertTrue(sync({**occupant, "terminal_id": "term-2"}))
+        self.assertEqual(self.metadata["w1:p1"]["display_agent"], plain)
+        self.assertEqual(len(self.reports), reports + 2)
 
     def test_another_endpoint_gets_the_same_session_metadata(self):
         self.assertTrue(agent_terminal.bind(self.session, "codex", {"model": "fixture-model"}))
@@ -1026,7 +1083,8 @@ class TerminalTests(unittest.TestCase):
             self.assertEqual(reports[0][reports[0].index("--title") + 1], "working · Sync title")
             self.assertEqual(reports[0][reports[0].index("--display-agent") + 1], " snorfle-test-high-footer-aa")
             stored = mailbox.load(mailbox.peer_path(self.base, session))
-            self.assertEqual(stored["herdrSyncedTitle"], "working · Sync title| snorfle-test-high-footer-aa")
+            # The trailing field is the (empty) child digest, so a child count change resynchronizes.
+            self.assertEqual(stored["herdrSyncedTitle"], "working · Sync title| snorfle-test-high-footer-aa|")
             self.assertEqual(stored["herdrBinary"], "/usr/local/bin/herdr")
 
             # Herdr labelling the pane must never blank the harness's own bar.
