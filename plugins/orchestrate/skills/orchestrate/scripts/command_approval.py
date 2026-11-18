@@ -182,13 +182,16 @@ def build_scope(
     environ: dict[str, str] | None = None,
 ) -> Scope:
     environ = dict(os.environ) if environ is None else environ
-    source = (source or Path(__file__).resolve().parent).resolve()
-    cli = source.parents[2] / "bin/ork.mjs"
+    raw_source = Path(os.path.abspath(source)) if source is not None else Path(os.path.abspath(__file__)).parent
+    resolved_source = raw_source.resolve()
+    cli_candidates = [
+        *([raw_source.parents[2] / "bin/ork.mjs"] if len(raw_source.parents) >= 3 else []),
+        *([resolved_source.parents[2] / "bin/ork.mjs"] if len(resolved_source.parents) >= 3 else []),
+    ]
     links = [Path(environ.get("ORKEST_BIN_DIR") or home / ".local/bin") / "ork", home / ".local/bin/ork"]
     found_ork = which("ork")
     if found_ork:
         links.append(Path(found_ork))
-    cli_candidates = [cli]
     if found_ork and Path(found_ork).resolve().name == "ork.mjs":
         cli_candidates.append(Path(found_ork).resolve())
     cli_paths = _variants(cli_candidates)
@@ -206,7 +209,7 @@ def build_scope(
         nodes=list(dict.fromkeys(item for item in nodes if item)),
         pythons=list(dict.fromkeys(item for item in pythons if item)),
         hub=hub,
-        source=source,
+        source=raw_source,
     )
 
 

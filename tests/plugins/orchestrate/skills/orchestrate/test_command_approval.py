@@ -374,6 +374,29 @@ class CommandApprovalTests(unittest.TestCase):
         self.assertIn("ork rooms *", self.opencode_rules())
         self.assertIn(f"{real_bin.resolve()}/ork", self.scope().ork_programs)
 
+    def test_symlinked_checkout_parent_preserves_both_raw_and_resolved_paths(self):
+        real_folders = self.root / "private/var/folders"
+        real_folders.mkdir(parents=True)
+        alias_var = self.root / "var"
+        alias_var.symlink_to(self.root / "private/var")
+        alias_checkout = alias_var / "folders/checkout/plugins/orchestrate"
+        (alias_checkout / "bin").mkdir(parents=True)
+        (alias_checkout / "bin/ork.mjs").write_text("#!/usr/bin/env node\n")
+        alias_source = alias_checkout / "skills/orchestrate/scripts"
+        alias_source.mkdir(parents=True)
+        for name in approval.SCRIPTS:
+            (alias_source / name).write_text("#!/usr/bin/env python3\n")
+        self.source = alias_source
+        self.checkout = alias_checkout
+        self.hub.unlink()
+        self.hub.symlink_to(alias_source.parent)
+        self.run_approval(opt_in=True)
+        claude = self.claude_rules()
+        self.assertTrue(claude_allows(claude, f"node {alias_checkout / 'bin/ork.mjs'} hall list"))
+        self.assertTrue(claude_allows(claude, f"node {(alias_checkout / 'bin/ork.mjs').resolve()} hall list"))
+        self.assertTrue(claude_allows(claude, f"python3 {alias_source / 'run_agent.py'} consult"))
+        self.assertTrue(claude_allows(claude, f"python3 {(alias_source / 'run_agent.py').resolve()} consult"))
+
 
 if __name__ == "__main__":
     unittest.main()
