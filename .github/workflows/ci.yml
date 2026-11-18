@@ -38,7 +38,7 @@ jobs:
 
   test:
     # The plugins target macOS (menu bar app, Mac-to-Mac migration).
-    runs-on: macos-latest
+    runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -106,9 +106,9 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
           - target: aarch64-apple-darwin
-            os: macos-latest
+            os: macos-15-intel
           - target: x86_64-apple-darwin
-            os: macos-latest
+            os: macos-15-intel
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write
@@ -127,7 +127,7 @@ jobs:
           fi
           cargo build --manifest-path crates/ork-fast/Cargo.toml --release --target ${{ matrix.target }}
           cp crates/ork-fast/target/${{ matrix.target }}/release/ork-fast ork-fast-${{ matrix.target }}
-          if [ "${{ matrix.os }}" = "macos-latest" ]; then
+          if [ "${{ runner.os }}" = "macOS" ]; then
             codesign --force --sign - ork-fast-${{ matrix.target }}
           fi
       - name: Upload binary asset
