@@ -35,6 +35,10 @@ one-time review. Never trust unrelated hooks. The standalone installer
 and verification without an AI session. See [references/mailbox.md](references/mailbox.md) for
 delivery behavior and hosts without turn hooks.
 
+Pass `--trust-orkest-commands` to setup only when the user asks to stop harness prompts for Orkest
+commands. It approves listed `ork` subcommands and four Orkest scripts in every harness. It never
+grants `--allow-credits` consent and never approves generic shell.
+
 Mailbox `send` also tries to wake an idle Codex daemon or OpenCode v2 session through its native
 queue. For a persistent Claude or Gemini/Antigravity worker that must wake autonomously, launch
 `run_agent.py listen --engine claude|agy --prompt 'Approved task'` in the project. The listener

@@ -2,7 +2,8 @@
 # Install Orkest from this checkout.
 #
 # Usage: ./install.sh [--dry-run] [--no-app] [--no-monitor]
-#        [--no-claude] [--trust-codex-hooks] [--help]
+#        [--no-claude] [--trust-codex-hooks] [--trust-orkest-commands]
+#        [--untrust-orkest-commands] [--help]
 #
 # Options:
 #   --dry-run             preview changes; only the orchestrate installer is run in dry-run mode
@@ -10,6 +11,11 @@
 #   --no-monitor          skip monitor installation and MCP registration
 #   --no-claude           skip orchestrate's Claude skill links
 #   --trust-codex-hooks   trust the four reviewed Codex mailbox hooks
+#   --trust-orkest-commands
+#                         let future agents in every installed harness run listed ork
+#                         subcommands and Orkest's coordination scripts without asking
+#   --untrust-orkest-commands
+#                         remove only the approvals --trust-orkest-commands added
 #   --help                show this help
 #
 # Test hooks (executable paths): ORKEST_INSTALL_ORCHESTRATE,
@@ -28,6 +34,14 @@ Options:
   --no-monitor          skip monitor installation and MCP registration
   --no-claude           skip orchestrate's Claude skill links
   --trust-codex-hooks   trust the four reviewed Codex mailbox hooks
+  --trust-orkest-commands
+                        let future agents in every installed harness run listed ork
+                        subcommands and Orkest's coordination scripts without asking;
+                        kept on later setup refreshes. Generic python3, node and shell,
+                        ork gate --, ork label and other scripts still ask, and
+                        --allow-credits consent is unchanged
+  --untrust-orkest-commands
+                        remove only the approvals --trust-orkest-commands added
   --help                show this help
 USAGE
 }
@@ -37,6 +51,7 @@ no_app=0
 no_monitor=0
 no_claude=0
 trust_codex_hooks=0
+command_approval=
 show_help=0
 
 for arg in "$@"; do
@@ -46,6 +61,13 @@ for arg in "$@"; do
     --no-monitor) no_monitor=1 ;;
     --no-claude) no_claude=1 ;;
     --trust-codex-hooks) trust_codex_hooks=1 ;;
+    --trust-orkest-commands|--untrust-orkest-commands)
+      if [ -n "$command_approval" ] && [ "$command_approval" != "$arg" ]; then
+        printf 'install: choose one of --trust-orkest-commands or --untrust-orkest-commands\n' >&2
+        exit 2
+      fi
+      command_approval=$arg
+      ;;
     -h|--help) show_help=1 ;;
     *)
       printf 'install: unknown option: %s\n' "$arg" >&2
@@ -171,6 +193,7 @@ set --
 if [ "$dry_run" -eq 1 ]; then set -- "$@" --dry-run; fi
 if [ "$no_claude" -eq 1 ]; then set -- "$@" --no-claude; fi
 if [ "$trust_codex_hooks" -eq 1 ]; then set -- "$@" --trust-codex-hooks; fi
+if [ -n "$command_approval" ]; then set -- "$@" "$command_approval"; fi
 if [ "$dry_run" -eq 1 ]; then
   printf '  would run: %s' "$orchestrate_installer"
   for arg in "$@"; do printf ' %s' "$arg"; done

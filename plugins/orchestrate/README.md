@@ -26,6 +26,26 @@ The root `install.sh` also installs the `ork` and monitor CLIs, registers monito
 
 Codex requires one-time approval for command hooks: review them in Codex `/hooks`, or pass `--trust-codex-hooks` to either installer (which trusts only the four reviewed mailbox hook commands).
 
+### Approve Orkest commands for every agent
+
+By default each harness asks before an agent runs `ork` or an Orkest script. To stop those prompts for every future agent, opt in once with `--trust-orkest-commands` on either installer (or `ork setup --trust-orkest-commands`); `--dry-run` previews each file it would change. Later setup refreshes (`ork update`, `ork setup`, `doctor --repair-messaging`) keep the approval current; `--untrust-orkest-commands` removes only the rules it added.
+
+It approves these commands, and nothing else:
+
+- `ork` with one of `cleanup`, `factory`, `foundry`, `hall`, `herdr-status`, `name`, `next`, `policy`, `progress`, `quota`, `radar`, `rooms`, `routes`, `setup`, `side`, `side-mission`, `smelter`, `swarm`, `telemetry`, `update`, `gate status`, or non-launching `horde` subcommands/flags (`toggle`, `open`, `close`, `spawn`, `--attach-room`, `--view`, `--print`, `--json`, `--fixture`); also through the `ork` link's absolute path and `node <checkout>/plugins/orchestrate/bin/ork.mjs`.
+- `python3` (or the installing interpreter) with `coordinator.py`, `agent_progress.py`, `peer_mailbox.py`, and safe `run_agent.py` coordination/consultation subcommands and flags (excluding `probe`, `horde`, and `listen`) at their absolute paths in `~/.agents/skills/orchestrate`, the harness's own skill link, and the checkout.
+
+`ork gate -- COMMAND`, `gate.py`, `ork label`, interactive `ork horde --engine` / `ork codex|claude|agy|opencode` launchers, and `run_agent.py probe|horde|listen` can run arbitrary programs or flags, so they still ask, as do generic `python3`, `node` and shell commands. Sandbox and other tool settings are untouched. Orkest enforces its own guards inside the commands, so `--allow-credits` consent, account selection, worker scopes, repository policy and deletion confirmations still apply. Dispatch does launch workers and run the verification commands it is given.
+
+| Harness     | Where the rules go                                                                                      |
+| ----------- | ------------------------------------------------------------------------------------------------------- |
+| Codex       | `~/.codex/rules/orkest-commands.rules` (`prefix_rule`, managed whole)                                   |
+| Claude Code | `permissions.allow` `Bash(<prefix>:*)` in `settings.json` of `~/.claude` and each `~/.claude-*` profile |
+| Antigravity | `permissions.allow` `command(<prefix>)` in `~/.gemini/antigravity-cli/settings.json`                    |
+| OpenCode    | `permission.bash` `"<prefix> *": "allow"` in `opencode.jsonc`/`opencode.json`, after your own rules     |
+
+Changed files get an adjacent `.orkest-approval-bak.*` copy, symlinked settings are edited at their target, and the opt-in and the rules it added are recorded in `~/.config/orchestrate/command-approval.json`.
+
 `<checkout>/plugins/orchestrate/uninstall.sh` removes this checkout's skill symlinks and Herdr
 registration while leaving configuration, saved state, backups, and other installations untouched.
 See [Herdr setup, upgrades, and swarm restoration](../../docs/herdr.md).
@@ -253,6 +273,8 @@ ork gate install                                    # PreToolUse hook for Claude
 The hook refuses a heavy run started outside the gate and suggests the focused alternative. It leaves every other command to the harness's own permission checks. The gate runs only test, build, typecheck and lint commands, so allowing `ork gate` in a harness does not allow everything. Codex runs the new hook only after you trust it with `/hooks`. `AGENT_GATE_SLOTS` and `AGENT_GATE_DIR` override the slot count and lock directory (default `/tmp/agent-gate-<uid>`).
 
 ## Troubleshooting
+
+- **Orkest commands still prompt after `--trust-orkest-commands`:** the approval covers only the listed subcommands and four scripts at their absolute install paths, so a relative script path or an unlisted interpreter still asks. After moving the checkout or changing Python, run `ork setup` to refresh the rules. Antigravity may read `command(...)` tokens as patterns, so paths containing characters other than letters, digits and `_./@:=~-` are left out there, and setup reports how many. In OpenCode, a rule of yours added after Orkest's wins.
 
 - **`HTTP mailbox is running old code; use mailbox daemon restart after upgrade`:** Restart the background loopback daemon after pulling changes:
 

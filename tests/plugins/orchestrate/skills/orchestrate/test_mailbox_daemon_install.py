@@ -75,7 +75,7 @@ class TestMailboxDaemonInstall(unittest.TestCase):
         with contextlib.suppress(OSError, mailbox.MailboxError):
             daemon.stop_service(self.base)
 
-    def install(self, stdio=False):
+    def install(self, stdio=False, **options):
         with mock.patch.object(
             installer.shutil,
             "which",
@@ -85,8 +85,25 @@ class TestMailboxDaemonInstall(unittest.TestCase):
         ):
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
-                installer.install(stdio=stdio, verify=False)
+                installer.install(stdio=stdio, verify=False, **options)
             return output.getvalue()
+
+    def test_orkest_command_approval_is_opt_in_and_survives_setup_refresh(self):
+        settings = self.home / ".claude/settings.json"
+        rules_file = self.home / ".codex/rules/orkest-commands.rules"
+        self.assertIn("--trust-orkest-commands", self.install(stdio=True))
+        self.assertNotIn("permissions", json.loads(settings.read_text()))
+        self.assertFalse(rules_file.exists())
+        self.install(stdio=True, trust_orkest_commands=True)
+        rules = json.loads(settings.read_text())["permissions"]["allow"]
+        self.assertIn("Bash(ork rooms:*)", rules)
+        self.assertTrue(rules_file.is_file())
+        self.assertIn("ork rooms *", installer.read_json_config(self.paths["opencode"])["permission"]["bash"])
+        self.install(stdio=True)
+        self.assertEqual(json.loads(settings.read_text())["permissions"]["allow"], rules)
+        self.install(stdio=True, untrust_orkest_commands=True)
+        self.assertEqual(json.loads(settings.read_text())["permissions"]["allow"], [])
+        self.assertFalse(rules_file.exists())
 
     def test_actual_four_host_http_config_and_protected_backups(self):
         before = {key: path.read_bytes() for key, path in self.paths.items()}

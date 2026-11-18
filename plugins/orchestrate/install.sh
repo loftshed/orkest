@@ -4,6 +4,8 @@
 #   ./install.sh            link skills and install peer messaging for each installed harness
 #   ./install.sh --dry-run  show what would change
 #   ./install.sh --trust-codex-hooks  trust only the four reviewed mailbox hooks
+#   ./install.sh --trust-orkest-commands  let future agents run ork and Orkest's scripts without asking
+#   ./install.sh --untrust-orkest-commands  remove only those approvals
 #
 # ~/.agents/skills/orchestrate points at this checkout; each harness's skills directory points at the
 # hub, so moving the checkout means re-running
@@ -20,12 +22,16 @@ backups="${XDG_DATA_HOME:-$HOME/.local/share}/orchestrate/backups"
 dry_run=0
 with_claude=1
 trust_hooks=0
+approval=
 for arg in "$@"; do
   case "$arg" in
     --dry-run) dry_run=1 ;;
     --no-claude) with_claude=0 ;;
     --trust-codex-hooks) trust_hooks=1 ;;
-    -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --trust-orkest-commands|--untrust-orkest-commands)
+      [ -z "$approval" ] || [ "$approval" = "$arg" ] || { echo "choose one of --trust-orkest-commands or --untrust-orkest-commands" >&2; exit 2; }
+      approval=$arg ;;
+    -h|--help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option: $arg" >&2; exit 2 ;;
   esac
 done
@@ -113,6 +119,7 @@ fi
 
 set --
 [ "$trust_hooks" = 0 ] || set -- --trust-codex-hooks
+[ -z "$approval" ] || set -- "$@" "$approval"
 if [ "$dry_run" = 1 ]; then
   python3 "$skill/scripts/install_mailbox.py" --dry-run "$@"
   retire_legacy_skills
