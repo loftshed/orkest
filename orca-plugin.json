@@ -1,0 +1,44 @@
+{
+  "$schema": "https://raw.githubusercontent.com/stablyai/orca/main/docs/schemas/plugins/orca-plugin.v2.schema.json",
+  "manifestVersion": 2,
+  "execution": "trusted-worker",
+  "id": "orkest",
+  "name": "Orkest",
+  "version": "0.1.0",
+  "description": "Toggle the Orkest Swarm View beside the coordinator, preview and focus agent terminals, and show quota in the status bar.",
+  "author": { "name": "loftshed", "url": "https://github.com/loftshed" },
+  "repository": "https://github.com/loftshed/orkest",
+  "license": "MIT",
+  "engines": { "orca": ">=1.4.259" },
+  "main": "plugins/orchestrate/lib/orca-worker.mjs",
+  "capabilities": [
+    { "kind": "workspace:read" },
+    { "kind": "workspace:write" },
+    { "kind": "agent:read" },
+    { "kind": "terminal:send" },
+    { "kind": "terminal:read" },
+    { "kind": "storage:own" }
+  ],
+  "contributes": {
+    "commands": [
+      { "id": "orkest.swarm.toggle", "title": "Orkest: Toggle Swarm View", "when": "workspace" },
+      { "id": "orkest.swarm.open", "title": "Orkest: Open Swarm View", "when": "workspace" },
+      { "id": "orkest.swarm.close", "title": "Orkest: Close Swarm View", "when": "workspace" },
+      { "id": "orkest.quota.refresh", "title": "Orkest: Refresh Quota" }
+    ],
+    "keybindings": [
+      { "command": "orkest.swarm.toggle", "key": "Mod+Shift+O", "when": "workspace" }
+    ],
+    "events": [{ "on": "workspace.changed" }, { "on": "agent.status.changed" }],
+    "statusBarItems": [
+      {
+        "id": "orkest-quota",
+        "text": "Quota …",
+        "icon": "gauge",
+        "tooltip": "Orkest quota from monitor json; press to refresh",
+        "command": "orkest.quota.refresh"
+      }
+    ],
+    "hooks": []
+  }
+}

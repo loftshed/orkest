@@ -28,7 +28,8 @@ Codex requires one-time approval for command hooks: review them in Codex `/hooks
 
 `<checkout>/plugins/orchestrate/uninstall.sh` removes this checkout's skill symlinks and Herdr
 registration while leaving configuration, saved state, backups, and other installations untouched.
-See [Herdr setup, upgrades, and swarm restoration](../../docs/herdr.md).
+See [Herdr setup, upgrades, and swarm restoration](../../docs/herdr.md). For the Orca IDE, see
+[Orca integration](../../docs/orca.md).
 
 ## Agent status in terminal footers
 

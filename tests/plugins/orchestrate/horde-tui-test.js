@@ -2455,4 +2455,62 @@ describe("terminal lifecycle", () => {
     view.handleKey("c");
     expect(view.renderableAgents().some((agent) => agent.id === view.focusId)).toBe(true);
   });
+
+  it("focuses an Orca agent terminal through the Orca CLI, never the Linux screen reader", async () => {
+    const calls = [];
+    const exec = (command, args, callback) => {
+      calls.push([command, args]);
+      callback(null, "{}");
+    };
+    const orcaEnv = { ORCA_PANE_KEY: "pane-view", ORCA_TERMINAL_HANDLE: "term_view", PATH: "" };
+    const room = fixture("claude:haiku,agy:flash");
+    room.agents[0].orcaTerminalHandle = "term_haiku";
+    room.agents[1].orcaTerminalHandle = "term_flash";
+    const focused = [];
+    const view = new HordeView(room, {
+      height: 24,
+      tier: "unicode",
+      onFocusPane: (agent) => {
+        focused.push(agent);
+      },
+    });
+    expect(view.handleKey("o")).toBe(true);
+    expect(["term_haiku", "term_flash"]).toContain(focused.at(-1).orcaTerminalHandle);
+
+    expect(
+      await focusAgentPane(
+        { id: "a1", orcaTerminalHandle: "term_agent" },
+        { exec, env: orcaEnv, orcaCli: "/opt/orca/orca-ide" },
+      ),
+    ).toBe(true);
+    expect(calls).toEqual([
+      ["/opt/orca/orca-ide", ["terminal", "switch", "--terminal", "term_agent", "--json"]],
+    ]);
+    // Outside Orca, in another Orca environment, without a CLI, or with an unsafe handle: no call.
+    expect(
+      await focusAgentPane(
+        { id: "a2", orcaTerminalHandle: "term_agent" },
+        { exec, env: { PATH: "" }, orcaCli: "/opt/orca/orca-ide" },
+      ),
+    ).toBe(false);
+    expect(
+      await focusAgentPane(
+        { id: "a3", orcaTerminalHandle: "term_agent", orcaEnvironment: "ssh:box" },
+        { exec, env: orcaEnv, orcaCli: "/opt/orca/orca-ide" },
+      ),
+    ).toBe(false);
+    expect(
+      await focusAgentPane(
+        { id: "a4", orcaTerminalHandle: "term_agent" },
+        { exec, env: { ...orcaEnv, ORCA_CLI_COMMAND: "/usr/bin/orca" } },
+      ),
+    ).toBe(false);
+    expect(
+      await focusAgentPane(
+        { id: "a5", orcaTerminalHandle: "-rf" },
+        { exec, env: orcaEnv, orcaCli: "/opt/orca/orca-ide" },
+      ),
+    ).toBe(false);
+    expect(calls).toHaveLength(1);
+  });
 });

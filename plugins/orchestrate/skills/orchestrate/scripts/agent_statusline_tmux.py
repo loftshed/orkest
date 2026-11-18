@@ -1041,7 +1041,7 @@ def toggle_swarm_view(
     base: Path | None = None,
     respect_closed: bool = False,
 ) -> dict[str, str]:
-    """Open, close, or toggle the live Swarm View split pane in an Orkest tmux or Herdr session."""
+    """Open, close, or toggle the live Swarm View split pane in an Orkest tmux, Herdr, or Orca session."""
     if action not in ("toggle", "open", "close"):
         raise ValueError(f"Unsupported swarm view action: {action}")
     base = base or mailbox.root()
@@ -1059,6 +1059,21 @@ def toggle_swarm_view(
                 respect_closed=respect_closed,
             )
         return {"status": "unavailable", "reason": "Herdr is not installed on PATH", "backend": "herdr"}
+    if not os.environ.get("TMUX") and not socket:
+        import orca_context
+
+        if orca_context.pane_context():
+            import orca_swarm_restore
+
+            return orca_swarm_restore.toggle(
+                action,
+                base=base,
+                room=room,
+                session_id=session_id,
+                harness=harness,
+                cwd=cwd,
+                respect_closed=respect_closed,
+            )
     tmux = shutil.which("tmux")
     if not tmux:
         return {"status": "unavailable", "reason": "tmux is not installed on PATH"}

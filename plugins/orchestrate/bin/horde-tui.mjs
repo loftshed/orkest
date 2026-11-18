@@ -28,6 +28,12 @@ import {
   MEMBER_OUTCOMES,
   memberDisplayState,
 } from "../lib/member-state.mjs";
+import {
+  agentOrcaTerminal,
+  isCurrentOrcaAgent,
+  markOrcaViewClosed,
+  resolveOrcaCli,
+} from "../lib/orca-context.mjs";
 import { configHome } from "../lib/runtime-paths.mjs";
 import {
   ALT_SCROLL_DISABLE,
@@ -189,7 +195,7 @@ async function runExec(exec, command, args, env = process.env) {
   }
 }
 
-export async function focusAgentPane(agent, { exec = execFile, env = process.env } = {}) {
+export async function focusAgentPane(agent, { exec = execFile, env = process.env, orcaCli } = {}) {
   if (!agent || typeof agent !== "object") return false;
   const rawHerdrPaneId = agent.herdrPaneId || agent.progress?.herdrPaneId;
   const herdrPaneId = typeof rawHerdrPaneId === "string" ? rawHerdrPaneId.trim() : "";
@@ -203,6 +209,13 @@ export async function focusAgentPane(agent, { exec = execFile, env = process.env
       runExecOutput(exec, binary, args, env),
     );
     return pane ? runExec(exec, binary, ["agent", "focus", pane], env) : false;
+  }
+  const orcaTerminal = agentOrcaTerminal(agent);
+  if (orcaTerminal) {
+    if (!isCurrentOrcaAgent(agent, env)) return false;
+    const cli = orcaCli === undefined ? resolveOrcaCli(env) : orcaCli;
+    if (!cli) return false;
+    return runExec(exec, cli, ["terminal", "switch", "--terminal", orcaTerminal, "--json"], env);
   }
   const rawPaneId = agent.paneId || agent.progress?.paneId;
   const paneId = typeof rawPaneId === "string" ? rawPaneId.trim() : "";
@@ -1231,6 +1244,7 @@ export async function runHordeTui(
   const closeView = async () => {
     try {
       await markHerdrViewClosed(initialRoom.id, env, exec);
+      if (env.ORKEST_ORCA_VIEW_STATE) await markOrcaViewClosed(env.ORKEST_ORCA_VIEW_STATE);
     } catch (error) {
       terminalError ??= error;
     } finally {

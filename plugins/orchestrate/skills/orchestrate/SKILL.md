@@ -72,6 +72,8 @@ Native tools do not expand delegation authority. A runner worker instructed to r
 its conductor must still do so. Different models, sessions, branches, or worktrees do not by themselves
 create a harness boundary.
 
+Inside Orca, delegate through `ork`, not Orca's orchestration tools.
+
 For example, a Codex agent reporting to a Gemini coordinator sends that report through the mailbox,
 but uses Codex thread messaging or sub-agent tools with other Codex agents. A missing recipient in one
 native tool is a reason to check the host's other native session/thread tools, not to switch to the mailbox.

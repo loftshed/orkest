@@ -1,4 +1,4 @@
-"""Bind a visible native session to its Herdr or private Orkest tmux pane."""
+"""Bind a visible native session to its Herdr pane, Orca terminal, or private Orkest tmux pane."""
 
 from __future__ import annotations
 
@@ -14,12 +14,14 @@ import time
 from pathlib import Path
 from typing import Any
 
+import orca_context
 import peer_mailbox as mailbox
 from herdr_context import canonical_endpoint, verified_agent
 from herdr_context import endpoint as herdr_endpoint
 from herdr_labels import codex_title_session, display_label, work_title
 
 _SUBAGENT_MAX_STALE_SEC = 1800.0
+ORCA_FIELDS = ("orcaPaneKey", "orcaTerminalHandle", "orcaWorkspaceId", "orcaTabId", "orcaEnvironment")
 
 
 def _clean_text(value: Any) -> str:
@@ -423,6 +425,60 @@ def herdr_context(harness: str | None) -> tuple[str, str | None] | None:
     return pane, workspace
 
 
+def orca_terminal_context(harness: str | None) -> dict[str, str] | None:
+    """The Orca IDE terminal this hook runs in; Herdr wins when both are present."""
+    if os.environ.get("HERDR_ENV") == "1":
+        return None
+    context = orca_context.pane_context()
+    if not context:
+        return None
+    expected_harness = os.environ.get("ORKEST_TERMINAL_HARNESS", "").strip()
+    if expected_harness and harness and harness != expected_harness:
+        return None
+    return context
+
+
+def _bind_orca(
+    base: Path, session: str, harness: str | None, peer_data: dict[str, Any] | None, context: dict[str, str]
+) -> bool:
+    if not isinstance(peer_data, dict) or peer_data.get("sharedProcess"):
+        # A shared app-server inherits its launcher's terminal, not this session's.
+        return False
+    cache = base.parent
+    handle = context["terminalHandle"] or orca_context.lookup_terminal(context["paneKey"], cache)
+    entry = orca_context.registry(cache).get(handle) if handle else None
+    workspace = (entry or {}).get("workspaceId") or context["worktreeId"]
+    annotations: dict[str, Any] = {
+        "terminalServer": None,
+        "orcaPaneKey": context["paneKey"],
+        "orcaTerminalHandle": handle or None,
+        "orcaWorkspaceId": workspace or None,
+        "orcaTabId": context["tabId"] or None,
+        "orcaEnvironment": context["environment"] or None,
+    }
+    for key in peer_data:
+        if key.startswith("herdr") and peer_data.get(key) is not None:
+            annotations[key] = None
+    updates = {key: value for key, value in annotations.items() if peer_data.get(key) != value}
+    if updates:
+        mailbox.annotate(base, session, **updates)
+    matched_room_id, _, is_exact_conductor = _resolve_structural_role(
+        base, session, harness, peer_data, only_room=os.environ.get("ORKEST_SWARM_ROOM") or None
+    )
+    if matched_room_id and is_exact_conductor and handle:
+        with contextlib.suppress(Exception):
+            import agent_statusline_tmux
+
+            agent_statusline_tmux._update_room_metadata(
+                base,
+                matched_room_id,
+                orcaCoordinatorTerminalId=handle,
+                **({"orcaWorkspaceId": workspace} if workspace else {}),
+                **({"orcaEnvironment": context["environment"]} if context["environment"] else {}),
+            )
+    return True
+
+
 def bind(
     session: str,
     harness: str | None,
@@ -446,6 +502,9 @@ def bind(
                 session = loaded["session"]
         if isinstance(peer_data, dict) and (peer_data.get("isSubagent") or peer_data.get("delegatedRun")):
             return False
+        orca = None if target else orca_terminal_context(harness)
+        if orca:
+            return _bind_orca(base, session, harness, peer_data, orca)
         occupant = None
         endpoint = herdr_endpoint(dict(os.environ))
         binary = os.environ.get("HERDR_BIN_PATH") or shutil.which("herdr")
@@ -485,6 +544,7 @@ def bind(
                 "herdrSyncedTarget",
                 "herdrSyncedAt",
                 "herdrDiscoveryMissAt",
+                *ORCA_FIELDS,
             ):
                 if peer_data.get(key) is not None:
                     annotations[key] = None

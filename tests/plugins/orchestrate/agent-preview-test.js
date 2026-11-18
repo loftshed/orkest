@@ -672,4 +672,87 @@ describe("agent terminal preview", () => {
     expect(result.text).toContain("Completed verification and reported back.");
     await preview.close();
   });
+
+  describe("Orca terminals", () => {
+    const ORCA_ENV = { ORCA_PANE_KEY: "pane-self", ORCA_TERMINAL_HANDLE: "term_self", PATH: "" };
+
+    function orcaFixture({ screen = true, env = ORCA_ENV } = {}) {
+      const calls = [];
+      const exec = (command, args, options, callback) => {
+        calls.push([command, args]);
+        queueMicrotask(() => {
+          if (args.includes("--screen") && !screen) return callback(new Error("unknown flag"));
+          callback(
+            null,
+            JSON.stringify({
+              result: { terminal: { handle: args[3], tail: [`screen of ${args[3]}`, "ready"] } },
+            }),
+          );
+        });
+      };
+      const preview = createAgentPreview({ env, exec, orcaCli: "/opt/orca/orca-ide" });
+      return { calls, preview };
+    }
+
+    it("reads the rendered screen of an agent's Orca terminal", async () => {
+      const { calls, preview } = orcaFixture();
+      const result = await preview.open({ id: "orca-agent", orcaTerminalHandle: "term_agent" });
+      expect(result.kind).toBe("terminal");
+      expect(result.text).toBe("screen of term_agent\nready");
+      expect(calls).toEqual([
+        [
+          "/opt/orca/orca-ide",
+          ["terminal", "read", "--terminal", "term_agent", "--screen", "--json"],
+        ],
+      ]);
+      await preview.close();
+    });
+
+    it("falls back to the output tail on an Orca build without --screen", async () => {
+      const { calls, preview } = orcaFixture({ screen: false });
+      const result = await preview.open({ id: "orca-agent", orcaTerminalHandle: "term_agent" });
+      expect(result.kind).toBe("terminal");
+      expect(calls.at(-1)[1]).toEqual([
+        "terminal",
+        "read",
+        "--terminal",
+        "term_agent",
+        "--limit",
+        "200",
+        "--json",
+      ]);
+      await preview.close();
+    });
+
+    it("never previews its own terminal, another Orca environment, or outside Orca", async () => {
+      const own = orcaFixture();
+      const self = await own.preview.open({
+        id: "self",
+        orcaTerminalHandle: "term_self",
+        output: ["recorded"],
+      });
+      expect(self.error).toContain("this preview pane");
+      expect(own.calls).toEqual([]);
+
+      const remote = orcaFixture();
+      const other = await remote.preview.open({
+        id: "remote",
+        orcaTerminalHandle: "term_remote",
+        orcaEnvironment: "ssh:box",
+        output: ["recorded remotely"],
+      });
+      expect(other.kind).toBe("activity");
+      expect(remote.calls).toEqual([]);
+
+      const outside = orcaFixture({ env: { PATH: "" } });
+      const result = await outside.preview.open({
+        id: "outside",
+        orcaTerminalHandle: "term_agent",
+        paneId: "%3",
+        output: ["recorded outside"],
+      });
+      expect(result.kind).toBe("activity");
+      expect(outside.calls).toEqual([]);
+    });
+  });
 });

@@ -474,6 +474,8 @@ export function normalizeAgent(agent, room) {
   const herdrPaneId = agent.herdrPaneId || agent.progress?.herdrPaneId;
   const herdrEndpoint = agent.herdrEndpoint || agent.progress?.herdrEndpoint;
   const paneId = agent.paneId || agent.progress?.paneId;
+  const orcaTerminalHandle = agent.orcaTerminalHandle || agent.progress?.orcaTerminalHandle;
+  const orcaEnvironment = agent.orcaEnvironment || agent.progress?.orcaEnvironment;
   return {
     ...agent,
     _cachedWorktree: worktree,
@@ -481,7 +483,14 @@ export function normalizeAgent(agent, room) {
     ...(herdrPaneId && { herdrPaneId }),
     ...(herdrEndpoint && { herdrEndpoint }),
     ...(paneId && { paneId }),
+    ...(orcaTerminalHandle && { orcaTerminalHandle }),
+    ...(orcaEnvironment && { orcaEnvironment }),
   };
+}
+
+/** The agent runs in a terminal pane that `o` can focus: Herdr, Orca or Orkest tmux. */
+function hasTerminalPane(agent) {
+  return Boolean(agent && (agent.herdrPaneId || agent.paneId || agent.orcaTerminalHandle));
 }
 
 export function agentFolder(member, room) {
@@ -1298,7 +1307,7 @@ export class HordeView {
       }
       case "o": {
         const selected = this.selectedAgent();
-        if (selected && (selected.herdrPaneId || selected.paneId)) {
+        if (hasTerminalPane(selected)) {
           this.lastFocusedAgentId = selected.id;
           this.onFocusPane?.(selected);
           return true;
@@ -1433,6 +1442,10 @@ export class HordeView {
         id: "conductor",
         ...(this.room.herdrCoordinatorPaneId && { herdrPaneId: this.room.herdrCoordinatorPaneId }),
         ...(this.room.herdrEndpoint && { herdrEndpoint: this.room.herdrEndpoint }),
+        ...(this.room.orcaCoordinatorTerminalId && {
+          orcaTerminalHandle: this.room.orcaCoordinatorTerminalId,
+        }),
+        ...(this.room.orcaEnvironment && { orcaEnvironment: this.room.orcaEnvironment }),
       };
     return this.room.agents.find((agent) => agent.id === this.focusId);
   }
@@ -1440,8 +1453,11 @@ export class HordeView {
   isCurrentAgent(agent) {
     const pane = this.room.herdrCoordinatorPaneId || this.room.conductor?.herdrPaneId;
     if (pane) return agent.herdrPaneId === pane;
+    const orcaTerminal =
+      this.room.orcaCoordinatorTerminalId || this.room.conductor?.orcaTerminalHandle;
+    if (orcaTerminal) return agent.orcaTerminalHandle === orcaTerminal;
     const session = this.room.conductor?.session?.id;
-    return Boolean(session && agent.session?.id === session && (agent.herdrPaneId || agent.paneId));
+    return Boolean(session && agent.session?.id === session && hasTerminalPane(agent));
   }
 
   toggleQuotaWindow() {
@@ -1710,7 +1726,7 @@ export class HordeView {
         !this.preview &&
         selected &&
         !this.isCurrentAgent(selected) &&
-        (selected.herdrPaneId || selected.paneId)
+        hasTerminalPane(selected)
           ? [
               {
                 id: "open",
@@ -2648,7 +2664,7 @@ export class HordeView {
         hasAgentTree ? "start" : "",
       ),
     ];
-    if (room.herdrCoordinatorPaneId || lead.herdrPaneId || lead.paneId)
+    if (room.herdrCoordinatorPaneId || room.orcaCoordinatorTerminalId || hasTerminalPane(lead))
       this.addTargets([
         {
           id: "current-session",
