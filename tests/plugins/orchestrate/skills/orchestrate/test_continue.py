@@ -460,3 +460,19 @@ class ContinueTests(unittest.TestCase):
             for run in guards:
                 if COORDINATOR.NATIVE.process_state(run) == "active":
                     os.kill(run["pid"], 15)
+
+    def test_continue_does_not_inherit_allow_credits(self):
+        code, first = self.start("first", "implementation", "--allow-credits")
+        self.assertEqual((code, first["runner_status"], first["allow_credits"]), (0, "completed", True))
+        self.assertIn("--allow-credits", first["command"])
+        self.reviewed(first)
+        self.new_spec()
+        with mock.patch.dict(os.environ, {"FAKE_OUTPUT": "followup/output.txt"}):
+            code, second = self.follow("second")
+        self.assertEqual((code, second["runner_status"], second["allow_credits"]), (0, "completed", False))
+        self.assertNotIn("--allow-credits", second["command"])
+        self.reviewed(second)
+        with mock.patch.dict(os.environ, {"FAKE_OUTPUT": "followup/output.txt", "FAKE_CONTENT": "third\n"}):
+            code, third = self.follow("third", "--allow-credits")
+        self.assertEqual((code, third["runner_status"], third["allow_credits"]), (0, "completed", True))
+        self.assertIn("--allow-credits", third["command"])

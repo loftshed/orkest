@@ -812,6 +812,172 @@ describe("room CLI", () => {
     ]);
   });
 
+  it("forwards explicit --allow-credits and launch allowCredits without inheriting across continue", async () => {
+    const { root, room, taskDir, task, run } = await fixture();
+    const calls = [];
+    const record = async (args) => {
+      calls.push(args);
+      return run(args);
+    };
+    const lastDispatch = () => calls.findLast((args) => args[0] === "dispatch");
+    const stdout = { write: () => {} };
+
+    // Default dispatch and explicit false omit --allow-credits and stored allowCredits.
+    await dispatchMember(room.id, "haiku-1", { root, taskDir, run: record, requestId: "plain" });
+    expect(lastDispatch()).not.toContain("--allow-credits");
+    expect((await readRoom(room.id, root)).agents[0].dispatch).not.toHaveProperty("allowCredits");
+    await dispatchMember(room.id, "haiku-1", {
+      root,
+      taskDir,
+      run: record,
+      requestId: "plain",
+      allowCredits: false,
+    });
+
+    // CLI dispatch --allow-credits forwards to coordinator and checks retry idempotency.
+    await roomsCommand(
+      [
+        "dispatch",
+        "--room",
+        room.id,
+        "--member",
+        "luna-1",
+        "--task-dir",
+        taskDir,
+        "--request-id",
+        "luna-credits",
+        "--allow-credits",
+      ],
+      { stdout, root, run: record },
+    );
+    expect(lastDispatch()).toContain("--allow-credits");
+    expect((await readRoom(room.id, root)).agents[1].dispatch.allowCredits).toBe(true);
+    await roomsCommand(
+      [
+        "dispatch",
+        "--room",
+        room.id,
+        "--member",
+        "luna-1",
+        "--task-dir",
+        taskDir,
+        "--request-id",
+        "luna-credits",
+        "--allow-credits",
+      ],
+      { stdout, root, run: record },
+    );
+    await expect(
+      dispatchMember(room.id, "luna-1", {
+        root,
+        taskDir,
+        run: record,
+        requestId: "luna-credits",
+      }),
+    ).rejects.toThrow("Existing dispatch differs: allowCredits");
+    await expect(
+      dispatchMember(room.id, "haiku-1", {
+        root,
+        taskDir,
+        run: record,
+        requestId: "plain",
+        allowCredits: true,
+      }),
+    ).rejects.toThrow("Existing dispatch differs: allowCredits");
+
+    // Validation & transport guards reject non-booleans, native transport, and launch CLI flag.
+    for (const bad of ["true", "false", 1, null]) {
+      await expect(
+        dispatchMember(room.id, "haiku-1", { root, taskDir, run: record, allowCredits: bad }),
+      ).rejects.toThrow("must be a boolean");
+    }
+    await expect(
+      dispatchMember(room.id, "haiku-1", {
+        root,
+        taskDir,
+        run: record,
+        transport: "native",
+        allowCredits: true,
+      }),
+    ).rejects.toThrow("--allow-credits applies to executor runs");
+    const plan = path.join(taskDir, "credits-plan.json");
+    await writeFile(plan, JSON.stringify({ members: [{ id: "luna-1", taskDir }] }));
+    await expect(
+      roomsCommand(["launch", "--room", room.id, "--plan", plan, "--allow-credits"], {
+        stdout,
+        root,
+        run: record,
+      }),
+    ).rejects.toThrow("--allow-credits is only valid on dispatch");
+
+    // Launch plan rejects non-boolean strings and forwards allowCredits: true per member.
+    await roomsCommand(["add", "--room", room.id, "--team", "codex:sol"], { stdout, root });
+    await writeFile(
+      plan,
+      JSON.stringify({ members: [{ id: "sol-1", taskDir, allowCredits: "true" }] }),
+    );
+    await expect(
+      roomsCommand(["launch", "--room", room.id, "--plan", plan], { stdout, root, run: record }),
+    ).rejects.toThrow("must be a boolean");
+    await writeFile(
+      plan,
+      JSON.stringify({ members: [{ id: "sol-1", taskDir, allowCredits: true }] }),
+    );
+    await roomsCommand(["launch", "--room", room.id, "--plan", plan], {
+      stdout,
+      root,
+      run: record,
+    });
+    expect(lastDispatch()).toContain("--allow-credits");
+    expect((await readRoom(room.id, root)).agents[2].dispatch.allowCredits).toBe(true);
+
+    // Continuing without --allow-credits drops the allowance; refusal before launch restores it.
+    task.runs[1].status = "finished";
+    task.decisions.push({ run_id: "run-2", decision: "accept" });
+    const nextSpec = path.join(taskDir, "next-spec.json");
+    await writeFile(nextSpec, JSON.stringify({ objective: "Follow up" }));
+    const failingContinue = async (args) => {
+      if (args[0] === "dispatch") throw new Error("refused before launch");
+      return record(args);
+    };
+    await expect(
+      dispatchMember(room.id, "luna-1", {
+        root,
+        taskDir,
+        taskSpec: nextSpec,
+        kind: "continue",
+        requestId: "luna-continue-refused",
+        run: failingContinue,
+      }),
+    ).rejects.toThrow("refused before launch");
+    expect((await readRoom(room.id, root)).agents[1].dispatch.allowCredits).toBe(true);
+
+    await dispatchMember(room.id, "luna-1", {
+      root,
+      taskDir,
+      taskSpec: nextSpec,
+      kind: "continue",
+      requestId: "luna-continue",
+      run: record,
+    });
+    expect(lastDispatch()).not.toContain("--allow-credits");
+    expect((await readRoom(room.id, root)).agents[1].dispatch).not.toHaveProperty("allowCredits");
+
+    task.runs[3].status = "finished";
+    task.decisions.push({ run_id: "run-4", decision: "accept" });
+    await dispatchMember(room.id, "luna-1", {
+      root,
+      taskDir,
+      taskSpec: nextSpec,
+      kind: "continue",
+      requestId: "luna-continue-credits",
+      allowCredits: true,
+      run: record,
+    });
+    expect(lastDispatch()).toContain("--allow-credits");
+    expect((await readRoom(room.id, root)).agents[1].dispatch.allowCredits).toBe(true);
+  });
+
   it("creates and lists rooms", async () => {
     const root = await directory();
     const cwd = await directory();

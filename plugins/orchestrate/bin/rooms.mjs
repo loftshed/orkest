@@ -45,6 +45,7 @@ ork rooms init-task --task-spec FILE --task-dir DIR (--host codex|claude|agy|ope
 ork rooms dispatch --room ID --member ID --task-dir DIR [--kind investigation|implementation|consultation|challenge|continue]
                    [--transport executor|native] [--packet FILE] [--request-id ID] [--role ROLE] [--cwd PATH]
                    [--timeout DURATION]   (executor runner limit, default 15m; must fit the task deadline)
+                   [--allow-credits]   (Codex credit spend; only with the user's permission)
                    [--verify-command CMD]... [--auto-correct ROUNDS]   (implementation gates; rounds 0-2)
                    [--protect-path PATH]...   (files an auto-correct round may not change)
                    [--task-spec FILE]   (required for continue, in the existing task/session)
@@ -60,7 +61,7 @@ create/add queue members. dispatch/launch use the coordinator and may start bill
 Native dispatch returns a reservation for the conductor's native tools.
 launch plan: {"members":[{"id":"haiku-1","taskDir":"/absolute/task","kind":"investigation","timeout":"25m"}]}
              (an implementation member also takes "verifyCommands":["CMD"], "autoCorrect":1
-              and "protectPaths":["PATH"])
+              and "protectPaths":["PATH"]; add "allowCredits":true only with the user's permission)
 Task specs and task directories use the existing coordinator contract.
 `;
 
@@ -88,6 +89,7 @@ export async function roomsCommand(
     options: {
       help: { type: "boolean" },
       json: { type: "boolean" },
+      "allow-credits": { type: "boolean" },
       "keep-worktree": { type: "boolean" },
       "verify-command": { type: "string", multiple: true },
       "protect-path": { type: "string", multiple: true },
@@ -135,6 +137,11 @@ export async function roomsCommand(
   if (!action || values.help) {
     stdout.write(ROOMS_HELP);
     return;
+  }
+  if (values["allow-credits"] && action !== "dispatch") {
+    throw new Error(
+      "--allow-credits is only valid on dispatch; set allowCredits on each member in a launch plan",
+    );
   }
   const requireValue = (name) => {
     if (values[name] === undefined || values[name] === "") throw new Error(`--${name} is required`);
@@ -350,6 +357,7 @@ export async function roomsCommand(
         packet: values.packet,
         requestId: values["request-id"],
         billingMode: values["billing-mode"],
+        allowCredits: values["allow-credits"],
         workforceRole: values.role,
         cwd: values.cwd,
         timeout: values.timeout,

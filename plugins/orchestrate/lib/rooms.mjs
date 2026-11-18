@@ -1034,6 +1034,10 @@ export async function dispatchMember(id, memberId, options = {}) {
     options.transport || (kind === "continue" && targetMember?.dispatch?.transport) || "executor";
   if (!["executor", "native"].includes(transport))
     throw new Error("Unsupported dispatch transport");
+  if (options.allowCredits !== undefined && typeof options.allowCredits !== "boolean")
+    throw new Error("--allow-credits / allowCredits must be a boolean");
+  if (options.allowCredits === true && transport === "native")
+    throw new Error("--allow-credits applies to executor runs; native work uses the host session");
   // The coordinator validates the duration and checks it against the task deadline.
   if (options.timeout !== undefined && (typeof options.timeout !== "string" || !options.timeout))
     throw new Error("--timeout needs a duration such as 25m");
@@ -1076,6 +1080,7 @@ export async function dispatchMember(id, memberId, options = {}) {
     kind,
     transport,
     billingMode: options.billingMode || "unknown",
+    ...(options.allowCredits === true && { allowCredits: true }),
     ...(options.packet && { packet: await realpath(options.packet) }),
     ...(options.timeout && { timeout: options.timeout }),
     ...(verifyCommands.length > 0 && { verifyCommands }),
@@ -1127,6 +1132,7 @@ export async function dispatchMember(id, memberId, options = {}) {
           "kind",
           "transport",
           "billingMode",
+          "allowCredits",
           "packet",
           "timeout",
           "verifyCommands",
@@ -1203,6 +1209,7 @@ export async function dispatchMember(id, memberId, options = {}) {
   if (binding.maxContinues !== undefined)
     args.push("--max-continues", String(binding.maxContinues));
   if (binding.taskSpec) args.push("--task-spec", binding.taskSpec);
+  if (binding.allowCredits) args.push("--allow-credits");
   let result;
   try {
     result = await run(args);
