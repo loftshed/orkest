@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.90.0
+
+- feat(orchestrate): add ork chief master orchestrator and Chief View side-window overview (#228)
+
 ## 0.89.0
 
 - fix(orchestrate): unify room index, harden file locks, and align peer liveness (#227)
