@@ -308,6 +308,11 @@ pub fn run(
         None => return Ok(()),
     };
 
+    // StopFailure starts an automatic handoff (handoff.py): always Python, before any fast exit.
+    if event == "StopFailure" {
+        return delegate(fb, harness, Some(&event), &raw_stdin);
+    }
+
     // Immediate plan mode suppression
     let tool_name = payload
         .get("tool_name")
@@ -351,7 +356,8 @@ pub fn run(
         _ => return delegate(fb, harness, Some(&event), &raw_stdin),
     };
 
-    let base = paths::cache_home(None, None).join("mailbox-v1");
+    let cache = paths::cache_home(None, None);
+    let base = cache.join("mailbox-v1");
     let s_key = match paths::session_key(&session) {
         Ok(k) => k,
         Err(_) => return delegate(fb, harness, Some(&event), &raw_stdin),
@@ -379,8 +385,11 @@ pub fn run(
 
     if peer.get("isSubagent").and_then(|v| v.as_bool()) == Some(true)
         || peer.get("agySubagentPending").and_then(|v| v.as_bool()) == Some(true)
-        || peer.get("delegatedRun").and_then(|v| v.as_bool()) == Some(true)
+        // peer_mailbox.mark_delegated records the run ID; Python tests it for truth, as here.
+        || peer.get("delegatedRun").is_some_and(is_truthy_json)
         || peer.get("run").and_then(|v| v.as_str()).is_some()
+        // A fresh successor an automatic handoff launched: Python runs its quota check (handoff.poll).
+        || std::env::var_os("ORKEST_HANDOFF_SUCCESSOR").is_some_and(|v| !v.is_empty())
     {
         return delegate(fb, harness, Some(&event), &raw_stdin);
     }
@@ -419,6 +428,15 @@ pub fn run(
 
     // Check rooms for obligations (only active/open rooms referencing this session)
     if paths::has_active_room_for_session(&base, &session) {
+        return delegate(fb, harness, Some(&event), &raw_stdin);
+    }
+
+    // A team's lead or deputy: Python gives succession advice and runs the handoff quota check.
+    let peer_harness = peer
+        .get("harness")
+        .and_then(|v| v.as_str())
+        .unwrap_or(harness);
+    if paths::has_active_authority_for_session(&cache, &session, peer_harness) {
         return delegate(fb, harness, Some(&event), &raw_stdin);
     }
 

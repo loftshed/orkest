@@ -363,6 +363,64 @@ def appoint(
         return record
 
 
+def designate(
+    team: str,
+    lead_session: str,
+    expect_generation: int,
+    *,
+    deputy: dict[str, Any],
+    standing: dict[str, Any],
+    lead_pool: str | None = None,
+) -> dict[str, Any]:
+    """Name a deputy and standing rule for the active lead without changing who leads, so the generation, and
+    the lead's own commands at it, stand. For an automatic handoff from a lead it made; withdraw undoes it."""
+    directory = team_dir(team)
+    with locked(directory, exclusive=False):
+        snapshot = require(directory)
+    pool = lead_pool or snapshot["lead"].get("pool")
+    facts = pool_facts(pool, deputy.get("pool"))
+    if not (pool and deputy.get("pool") and snapshot.get("repository")):
+        raise AuthorityError("a standing takeover rule needs both pools and the team's repository")
+    with locked(directory, exclusive=True):
+        record = require(directory)
+        expect(record, expect_generation)
+        if record["status"] != "active" or record["lead"]["session"] != lead_session:
+            raise AuthorityError("only the active lead's own team can be given a deputy this way")
+        record.update(
+            lead={**record["lead"], "pool": pool},
+            deputy=deputy,
+            standing=standing,
+            contexts={**(record.get("contexts") or {}), **facts.get("contexts", {})},
+            offer=None,
+        )
+        log(record, "designate", deputy=deputy)
+        save(directory, record)
+        return record
+
+
+def withdraw(team: str, lead_session: str, expect_generation: int, *, remove: bool = False) -> dict[str, Any] | None:
+    """Undo an automatic appointment or designation whose takeover never happened, so no deputy that was never
+    started stays named: the deputy and standing rule go and the generation stays, so the lead is not fenced.
+    `remove` deletes a team that appointment alone created."""
+    directory = team_dir(team)
+    with locked(directory, exclusive=True):
+        record = require(directory)
+        expect(record, expect_generation)
+        if record["status"] != "active" or record["lead"]["session"] != lead_session:
+            raise AuthorityError("only the active lead's own appointment can be withdrawn")
+        if remove:
+            if record["generation"] != 1 or any(
+                entry["event"] not in {"appoint", "task", "unregister"} for entry in record["log"]
+            ):
+                raise AuthorityError("this team has a history beyond its appointment; it is not removed")
+            (directory / "authority.json").unlink()
+            return None
+        record.update(deputy=None, standing=None, offer=None)
+        log(record, "withdraw")
+        save(directory, record)
+        return record
+
+
 def offer(team: str, caller: str, generation: int, to: dict[str, str], note: str = "") -> dict[str, Any]:
     """A planned handover: the lead stays in charge until the successor accepts."""
     directory = team_dir(team)
@@ -500,6 +558,21 @@ def register_task(team: str, task_dir: Path, session: str | None, generation: in
         if path not in record["tasks"]:
             record["tasks"].append(path)
             log(record, "task", task_dir=path)
+            save(directory, record)
+        return record
+
+
+def unregister_tasks(team: str, task_dirs: list[str], session: str, generation: int) -> dict[str, Any]:
+    """Undo register_task for tasks an automatic handoff registered for a takeover that never happened."""
+    directory = team_dir(team)
+    with locked(directory, exclusive=True):
+        record = require(directory)
+        check(record, session, generation)
+        paths = {str(Path(task).resolve()) for task in task_dirs}
+        kept = [task for task in record["tasks"] if task not in paths]
+        if kept != record["tasks"]:
+            record["tasks"] = kept
+            log(record, "unregister", task_dirs=sorted(paths))
             save(directory, record)
         return record
 

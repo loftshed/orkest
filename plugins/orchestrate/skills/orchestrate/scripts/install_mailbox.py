@@ -29,7 +29,7 @@ import runtime_paths
 from check_mailbox import RpcClient, check, initialize_codex
 
 EVENTS = ("SessionStart", "UserPromptSubmit", "Stop", "SessionEnd")
-CLAUDE_EVENTS = (*EVENTS, "SubagentStart", "SubagentStop")
+CLAUDE_EVENTS = (*EVENTS, "SubagentStart", "SubagentStop", "StopFailure")
 AGY_EVENTS = ("SessionStart", "PreInvocation", "Stop")
 TOOLS = tuple(sorted(mailbox_mcp.TOOL_NAMES))
 DEFAULT_KEEP_BACKUPS = 1
