@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.90.2
+
+- fix(orchestrate): restrict chief badge to desk holder and skip broken or stopped docker probes (#230)
+
 ## 0.90.1
 
 - fix(orchestrate): harden post-merge integration across approval, lifecycle, handoff, and chief (#229)
