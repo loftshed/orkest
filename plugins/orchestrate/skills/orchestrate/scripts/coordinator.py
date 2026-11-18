@@ -335,6 +335,35 @@ def initialize(args: argparse.Namespace) -> dict[str, Any]:
     return state
 
 
+def adopt_authority(directory: Path, team: str, *, release: bool = False, wait_seconds: float = 30.0) -> bool:
+    """Put an existing task under a team (`release`: take it out again), under the task lease, so the team's
+    fence applies from its next command. For an automatic handoff; waits briefly for a running command.
+    Returns whether task.json changed; refuses a task already under another team."""
+    resolved = directory.expanduser().resolve()
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        try:
+            with SUPPORT.workspace_lease(resolved, RUNNER.default_agent_cache_dir() / "coordinator-locks"):
+                state = load(resolved)
+                current = (state.get("authority") or {}).get("team")
+                if release:
+                    if current != team:
+                        return False
+                    state.pop("authority", None)
+                elif current == team:
+                    return False
+                elif current:
+                    raise CoordinationError(f"task {state.get('task_id')} is already under team {current}")
+                else:
+                    state["authority"] = {"team": team, "store": str(AUTHORITY.team_dir(team))}
+                save(resolved, state)
+                return True
+        except SUPPORT.ContractError:
+            if time.monotonic() >= deadline:
+                raise CoordinationError(f"a coordinator command holds task {resolved}; retry later") from None
+            time.sleep(0.2)
+
+
 def latest_work(state: dict[str, Any]) -> dict[str, Any] | None:
     return next(
         (run for run in reversed(state["runs"]) if run["kind"] in WORK_KINDS | {"verification"}),

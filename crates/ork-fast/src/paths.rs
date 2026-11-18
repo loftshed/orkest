@@ -440,6 +440,61 @@ pub fn has_active_room_for_session(base: &Path, session: &str) -> bool {
     false
 }
 
+/// Return true if a team record under `<cache>/authority-v1/*/authority.json` gives `session` a role the
+/// Python hook acts on (`mailbox_hooks.succession_notice`, `handoff.find_team`): the lead of an active or
+/// pending team, or the deputy of an active one, named by session or (when no session is named) by harness,
+/// since the deputy's account and repository are only known to Python. A record that is unreadable or of
+/// another schema is skipped, as `authority.load` refuses it there.
+#[must_use]
+pub fn has_active_authority_for_session(cache: &Path, session: &str, harness: &str) -> bool {
+    let Ok(entries) = fs::read_dir(cache.join("authority-v1")) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let Ok(content) = fs::read_to_string(entry.path().join("authority.json")) else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(&content) else {
+            continue;
+        };
+        if record.get("schema").and_then(|v| v.as_str()) != Some("orchestrate.authority.v1") {
+            continue;
+        }
+        let status = record.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        let lead = record
+            .get("lead")
+            .and_then(|v| v.get("session"))
+            .and_then(|v| v.as_str());
+        if lead == Some(session) && matches!(status, "active" | "pending") {
+            return true;
+        }
+        if status != "active" {
+            continue;
+        }
+        let Some(deputy) = record.get("deputy").and_then(|v| v.as_object()) else {
+            continue;
+        };
+        match deputy.get("session").and_then(|v| v.as_str()) {
+            Some(named) if !named.is_empty() => {
+                if named == session {
+                    return true;
+                }
+            }
+            _ => {
+                if deputy.get("harness").and_then(|v| v.as_str()) == Some(harness)
+                    && deputy
+                        .get("account")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|a| !a.is_empty())
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -527,5 +582,52 @@ mod tests {
             canonical_dir.join("missing-a").join("leaf")
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn test_has_active_authority_for_session() {
+        let cache = env::temp_dir().join(format!("ork-fast-authority-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&cache);
+        assert!(!has_active_authority_for_session(&cache, "lead", "claude"));
+        let write = |team: &str, record: &serde_json::Value| {
+            let dir = cache.join("authority-v1").join(team);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("authority.json"), record.to_string()).unwrap();
+        };
+        let schema = "orchestrate.authority.v1";
+        write(
+            "a",
+            &serde_json::json!({"schema": schema, "status": "active", "lead": {"session": "lead"},
+                "deputy": {"session": "dep", "harness": "codex", "account": "codex"}}),
+        );
+        write(
+            "b",
+            &serde_json::json!({"schema": schema, "status": "pending", "lead": {"session": "next"},
+                "deputy": {"session": "pending-dep"}}),
+        );
+        write(
+            "c",
+            &serde_json::json!({"schema": schema, "status": "active", "lead": {"session": "other"},
+                "deputy": {"harness": "gemini", "account": "agy"}}),
+        );
+        write(
+            "d",
+            &serde_json::json!({"schema": "other", "status": "active", "lead": {"session": "wrong"}}),
+        );
+        fs::create_dir_all(cache.join("authority-v1").join("e")).unwrap();
+        fs::write(cache.join("authority-v1/e/authority.json"), "{not json").unwrap();
+        assert!(has_active_authority_for_session(&cache, "lead", "claude"));
+        assert!(has_active_authority_for_session(&cache, "dep", "claude"));
+        assert!(has_active_authority_for_session(&cache, "next", "claude"));
+        assert!(!has_active_authority_for_session(
+            &cache,
+            "pending-dep",
+            "claude"
+        ));
+        assert!(has_active_authority_for_session(&cache, "anyone", "gemini"));
+        assert!(!has_active_authority_for_session(
+            &cache, "anyone", "claude"
+        ));
+        assert!(!has_active_authority_for_session(&cache, "wrong", "claude"));
+        let _ = fs::remove_dir_all(&cache);
     }
 }

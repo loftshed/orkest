@@ -343,8 +343,14 @@ class InstallMailboxTests(unittest.TestCase):
         installer.install_hooks(self.path, self.script, "claude")
         self.assertEqual(
             set(json.loads(self.path.read_text())["hooks"]),
-            {"SessionStart", "SessionEnd", "Stop", "UserPromptSubmit", "SubagentStart", "SubagentStop"},
+            {"SessionStart", "SessionEnd", "Stop", "UserPromptSubmit", "SubagentStart", "SubagentStop", "StopFailure"},
         )
+        # StopFailure starts an automatic handoff; a second install changes nothing.
+        stop_failure = json.loads(self.path.read_text())["hooks"]["StopFailure"]
+        self.assertEqual([entry["timeout"] for group in stop_failure for entry in group["hooks"]], [10])
+        before = self.path.read_text()
+        self.assertFalse(installer.install_hooks(self.path, self.script, "claude"))
+        self.assertEqual(self.path.read_text(), before)
 
     def test_wait_timeout_preserves_comments_and_unrelated_configuration(self):
         self.path = self.base / "config.toml"

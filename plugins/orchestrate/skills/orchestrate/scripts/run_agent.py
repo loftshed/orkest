@@ -876,6 +876,10 @@ def executor_environment(
     read_only: bool = False,
 ) -> dict[str, str]:
     environment = {key: value for key, value in os.environ.items() if not HOST_SESSION_ENV.match(key)}
+    # An automatic handoff names the session it launches; that session's own workers must not inherit it.
+    environment.pop("ORKEST_HANDOFF_SUCCESSOR", None)
+    if launched := environment.pop("ORKEST_HANDOFF_LAUNCH", None):
+        environment["ORKEST_HANDOFF_SUCCESSOR"] = launched
     if read_only:
         environment["ORKEST_READONLY_RUN"] = "1"
     else:

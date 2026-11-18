@@ -684,6 +684,34 @@ def succession_module() -> Any:
     return module
 
 
+def handoff_module() -> Any:
+    """handoff.py, loaded by path like succession: automatic handoff when a lead runs out of usage."""
+    path = Path(__file__).with_name("handoff.py")
+    spec = importlib.util.spec_from_file_location("agent_executor_mailbox_handoff", path)
+    if spec is None or spec.loader is None:
+        raise MailboxError("cannot load handoff")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def handoff_turn(base: Path, me: dict[str, Any], *, notify: bool) -> str:
+    """The periodic quota check for harnesses without StopFailure, and handoff notices for this repository.
+    Never raises: a handoff fault must not cost the host its turn. A delegated run is skipped unless it is a
+    fresh successor a handoff launched (named by ORKEST_HANDOFF_SUCCESSOR), so a successor's pool is checked too."""
+    if me.get("isSubagent") or _MB.is_run_peer(me):
+        return ""
+    if me.get("delegatedRun") and not os.environ.get("ORKEST_HANDOFF_SUCCESSOR"):
+        return ""
+    try:
+        handoff = handoff_module()
+        handoff.poll(base, me)
+        return handoff.notices(base, me) if notify else ""
+    except Exception:  # noqa: BLE001 -- best effort: the hook carries on without it
+        return ""
+
+
 def succession_notice(base: Path, me: dict[str, Any]) -> str:
     """Quota advice for a team's lead or deputy: from monitor's cache, at most every few minutes, once per status.
 
@@ -1555,6 +1583,11 @@ def hook(
 
                 agent_terminal.refresh_parent_pane(base, parent_to_refresh)
         return None
+    if event == "StopFailure":
+        # Claude ignores this hook's output: record the exhaustion and let a detached process hand over.
+        with contextlib.suppress(Exception):
+            handoff_module().stop_failure(base, payload, session, harness)
+        return None
     if event == "SubagentStart":
         raw_agent_id = payload.get("agent_id") or payload.get("subagent_id")
         if isinstance(raw_agent_id, str) and raw_agent_id.strip():
@@ -1963,6 +1996,15 @@ def hook(
         if event in {"SessionStart", "UserPromptSubmit", "PreInvocation", "Stop"}
         else ""
     )
+    handoff_notice = (
+        handoff_turn(
+            base,
+            me,
+            notify=event in {"SessionStart", "UserPromptSubmit"} or (event == "PreInvocation" and not mid_turn),
+        )
+        if not is_subagent and event in {"SessionStart", "UserPromptSubmit", "PreInvocation", "Stop"}
+        else ""
+    )
     if event in {"SessionStart", "UserPromptSubmit"} or (event == "PreInvocation" and not mid_turn):
         wake_dir = base / "wakes" / session_key(session)
         for marker_name in ("agy-wake.json", "claude-wake.json"):
@@ -2083,6 +2125,7 @@ def hook(
             cleared_notice,
             update_notice,
             team_notice,
+            handoff_notice,
             identity_hint,
             availability_hint,
             route_hint,

@@ -315,6 +315,43 @@ then `offer`), and tells the deputy when the lead's pool is exhausted and the le
 that is out takes no turns, so its own hook cannot). It reads monitor's cache only, at most every five
 minutes, and says nothing when there is no cache.
 
+#### Automatic handoff
+
+On by default, with no appointment step (`scripts/handoff.py`). It covers a session that leads a team
+or conducts a room.
+
+- **Trigger.** In Claude Code, a turn ending in a `rate_limit` or `billing_error` API error (the
+  `StopFailure` hook, in main sessions only; repeats within 10 minutes count once). Codex and Antigravity
+  have no such event, so only the turn hook's quota check applies there: it reads monitor's cache at most
+  every five minutes, and acts only when the pool is blocked. No handoff happens unless monitor's data,
+  refreshed from the providers (again after 5 and 15 seconds, since it can lag a 429), says the pool is
+  out; a short rate limit with room left does nothing, and stale or unknown data refuses.
+- **Successor.** It must be on another account in the same billing context, on a pool that is
+  `available` (never `low`, `blocked` or `credits`), and never in an excluded account. A live idle session
+  in the same repository with the same or a higher model tier comes first. Without one, Orkest launches
+  one fresh headless agent through `run_agent.py --transport executor`, without `--allow-credits`, on a
+  model as capable as the lead's. A Claude account needs `configDir` in monitor's config to be launched,
+  and the launch is refused while another executor holds the checkout.
+- **Authority.** A room with no team gets one (lead: the exhausted session; deputy: the successor;
+  standing rule `blocked,credits:0`), and the room and its coordinator tasks join it. Then the standing
+  takeover runs; its evidence is checked first, so a refusal leaves no team behind. The old lead is
+  fenced at once, in the room and on its tasks.
+  The successor's generation stays pending until it runs `authority.py show`, then `accept`. A team the
+  user appointed without a standing rule is never taken over this way. A successor that runs out is
+  handed over again, at most three times from the original session.
+- **What the successor gets.** A note of recorded facts only: the progress record, checkout, branch,
+  HEAD and `git status --short`, the room's conductor binding, tasks and live runs, the team, and the
+  previous transcript path. Plus the `show`/`accept` commands. The note is written with mode 0600
+  under `handoffs-v1/` in the cache.
+- **When it cannot.** An unknown billing context, no fitting pool, auto-launch off or the chain limit
+  refuses with a reason. Every live session in the repository shows the outcome once on its next turn
+  (for a day), with the command to continue. If a launch or wake fails after the takeover, the notice says
+  so and gives the `authority.py appoint` command the user runs to name a new lead.
+
+`handoff.py status` lists events; `handoff.py show --session S` prints a note and its event. Opt out
+with `handoff.py disable` (or `enable`), or under `handoff` in `~/.config/orchestrate/config.json`:
+`enabled` (true), `autoLaunch` (true), `excludeAccounts` ([]).
+
 **Not fenced:** session IDs are guard rails against confused or superseded agents, not security; any
 local process can pass any ID. Direct edits, commits and pushes are not checked, and neither are tasks
 created without `--authority`. In a room, `ork rooms create --authority T` makes the room accept only
