@@ -2,6 +2,7 @@ import {
   chmodSync,
   mkdirSync,
   mkdtempSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   utimesSync,
@@ -23,7 +24,7 @@ const tempDirs = [];
 const servers = [];
 
 function makeTempRoot() {
-  const dir = mkdtempSync("/tmp/ork-dkr-");
+  const dir = realpathSync(mkdtempSync("/tmp/ork-dkr-"));
   tempDirs.push(dir);
   return dir;
 }
