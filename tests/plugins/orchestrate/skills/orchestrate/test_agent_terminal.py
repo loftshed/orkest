@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
-import io
 import json
 import os
 import pty
@@ -24,12 +23,13 @@ import uuid
 from pathlib import Path
 from unittest import mock
 
+TESTS_DIR = Path(__file__).resolve().parent
 SCRIPTS = Path(__file__).resolve().parents[5] / "plugins/orchestrate/skills/orchestrate/scripts"
+sys.path.insert(0, str(TESTS_DIR))
 sys.path.insert(0, str(SCRIPTS))
+import _ork_fast_test_helpers as fast  # noqa: E402
 import agent_progress as progress  # noqa: E402
-import agent_statusline  # noqa: E402
 import agent_terminal  # noqa: E402
-import mailbox_hooks  # noqa: E402
 import orca_context  # noqa: E402
 import orca_swarm_restore  # noqa: E402
 import peer_mailbox as mailbox  # noqa: E402
@@ -169,6 +169,30 @@ class OrcaTests(unittest.TestCase):
 
 
 class HerdrMetadataTests(unittest.TestCase):
+    @property
+    def agent_session(self):
+        return self._agent_session
+
+    @agent_session.setter
+    def agent_session(self, value):
+        self._agent_session = value
+        self._session_file.write_text(value, encoding="utf-8")
+
+    @property
+    def metadata(self):
+        if not self._metadata_file.is_file():
+            return {}
+        return json.loads(self._metadata_file.read_text(encoding="utf-8"))
+
+    @property
+    def reports(self):
+        if not self._reports_file.is_file():
+            return []
+        return [json.loads(line) for line in self._reports_file.read_text(encoding="utf-8").splitlines() if line]
+
+    def _clear_metadata(self):
+        self._metadata_file.write_text("{}", encoding="utf-8")
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="ork-herdr-metadata-")
         self.addCleanup(temporary.cleanup)
@@ -176,8 +200,51 @@ class HerdrMetadataTests(unittest.TestCase):
         self.base = self.home / "mailbox-v1"
         (self.home / "server.sock").touch()
         (self.home / "another-server.sock").touch()
+        self._metadata_file = self.home / "herdr-metadata.json"
+        self._reports_file = self.home / "herdr-reports.jsonl"
+        self._session_file = self.home / "herdr-agent-session.txt"
+        self._clear_metadata()
+        self._bin_dir = self.home / "bin"
+        self._bin_dir.mkdir()
+        self.herdr_bin = self._bin_dir / "herdr"
+        self.herdr_bin.write_text(
+            f"#!{sys.executable}\n"
+            "import json, os, sys\n"
+            "from pathlib import Path\n"
+            "args = sys.argv[1:]\n"
+            f"meta_file = Path({str(self._metadata_file)!r})\n"
+            f"reports_file = Path({str(self._reports_file)!r})\n"
+            f"session_file = Path({str(self._session_file)!r})\n"
+            "if len(args) >= 2 and args[0] == 'pane' and args[1] == 'list':\n"
+            "    pane = {\n"
+            "        'pane_id': os.environ['HERDR_PANE_ID'],\n"
+            "        'agent': 'codex',\n"
+            "        'agent_session': None,\n"
+            "        'terminal_title': 'Work | ' + session_file.read_text(encoding='utf-8'),\n"
+            "    }\n"
+            "    print(json.dumps({'result': {'panes': [pane]}}))\n"
+            "    sys.exit(0)\n"
+            "if len(args) >= 2 and args[0] == 'pane':\n"
+            "    with reports_file.open('a', encoding='utf-8') as fh:\n"
+            "        fh.write(json.dumps([sys.argv[0], *args]) + '\\n')\n"
+            "    if args[1] != 'report-metadata' or len(args) < 3 or args[2].startswith('--'):\n"
+            "        sys.stderr.write('unknown option')\n"
+            "        sys.exit(2)\n"
+            "    data = json.loads(meta_file.read_text(encoding='utf-8')) if meta_file.is_file() else {}\n"
+            "    data[args[2]] = {\n"
+            "        'title': args[args.index('--title') + 1],\n"
+            "        'display_agent': args[args.index('--display-agent') + 1],\n"
+            "    }\n"
+            "    meta_file.write_text(json.dumps(data), encoding='utf-8')\n"
+            "    sys.exit(0)\n"
+            "sys.stderr.write('unknown option')\n"
+            "sys.exit(2)\n",
+            encoding="utf-8",
+        )
+        self.herdr_bin.chmod(0o755)
         environment = {
             **os.environ,
+            "PATH": f"{self._bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
             "AGENT_EXECUTOR_HOME": str(self.home),
             "CODEX_HOME": str(self.home),
             "HERDR_ENV": "1",
@@ -191,42 +258,6 @@ class HerdrMetadataTests(unittest.TestCase):
         for key in ("ORKEST_TERMINAL_SERVER", "TMUX", "TMUX_PANE", "ORKEST_SWARM_ROOM", "HERDR_BIN_PATH", *ORCA_KEYS):
             environment.pop(key, None)
         self.enterContext(mock.patch.dict(os.environ, environment, clear=True))
-        self.metadata = {}
-        self.reports = []
-        original_run = subprocess.run
-        original_which = shutil.which
-
-        def fake_run(command, **kwargs):
-            if command[:2] != ["/fake/herdr", "pane"]:
-                return original_run(command, **kwargs)
-            if command[2] == "list":
-                pane = {
-                    "pane_id": os.environ["HERDR_PANE_ID"],
-                    "agent": "codex",
-                    "agent_session": None,
-                    "terminal_title": "Work | " + self.agent_session,
-                }
-                return subprocess.CompletedProcess(
-                    command, 0, stdout=json.dumps({"result": {"panes": [pane]}}), stderr=""
-                )
-            self.reports.append(command)
-            if command[2] != "report-metadata" or command[3].startswith("--"):
-                return subprocess.CompletedProcess(command, 2, stdout="", stderr="unknown option")
-            self.metadata[command[3]] = {
-                "title": command[command.index("--title") + 1],
-                "display_agent": command[command.index("--display-agent") + 1],
-            }
-            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
-
-        self.enterContext(mock.patch.object(agent_terminal.subprocess, "run", side_effect=fake_run))
-        self.enterContext(
-            mock.patch.object(
-                agent_terminal.shutil,
-                "which",
-                side_effect=lambda command: "/fake/herdr" if command == "herdr" else original_which(command),
-            )
-        )
-        self.enterContext(mock.patch.object(mailbox_hooks, "_maybe_trigger_auto_update"))
         self.enterContext(mock.patch.object(mailbox, "harness_pid", return_value=os.getpid()))
         self.session = "019a5da8-1234-5678-9abc-123456789012"
         self.agent_session = self.session
@@ -308,7 +339,9 @@ class HerdrMetadataTests(unittest.TestCase):
             "model": "fixture-model",
             "effort": "medium",
         }
-        mailbox.hook(payload, harness="codex", base=self.base)
+        fast.run_mailbox_hook(
+            payload, harness="codex", base=self.base, cwd=self.home, allow_herdr=True, env=dict(os.environ)
+        )
         self.assertEqual(
             self.metadata.get("w1:p1"),
             {
@@ -316,8 +349,10 @@ class HerdrMetadataTests(unittest.TestCase):
                 "display_agent": "[C] snorfle-fixture-model-medium-project-aa",
             },
         )
-        self.metadata.clear()
-        mailbox.hook(payload, harness="codex", base=self.base)
+        self._clear_metadata()
+        fast.run_mailbox_hook(
+            payload, harness="codex", base=self.base, cwd=self.home, allow_herdr=True, env=dict(os.environ)
+        )
         self.assertEqual(
             self.metadata.get("w1:p1"),
             {
@@ -384,7 +419,7 @@ class HerdrMetadataTests(unittest.TestCase):
                 pane_id="w1:p1",
                 workspace_id="w1",
                 endpoint=str(self.home / "server.sock"),
-                binary="/fake/herdr",
+                binary=str(self.herdr_bin),
                 structural_role="",
                 occupant=current,
             )
@@ -411,7 +446,7 @@ class HerdrMetadataTests(unittest.TestCase):
 
     def test_another_endpoint_gets_the_same_session_metadata(self):
         self.assertTrue(agent_terminal.bind(self.session, "codex", {"model": "fixture-model"}))
-        self.metadata.clear()
+        self._clear_metadata()
         os.environ["HERDR_SOCKET_PATH"] = str(self.home / "another-server.sock")
         self.assertTrue(agent_terminal.bind(self.session, "codex", {"model": "fixture-model"}))
         self.assertEqual(
@@ -433,10 +468,14 @@ class HerdrMetadataTests(unittest.TestCase):
             "effort": "medium",
         }
         mailbox.annotate(self.base, self.session, isSubagent=True)
-        mailbox.hook(payload, harness="codex", base=self.base)
+        fast.run_mailbox_hook(
+            payload, harness="codex", base=self.base, cwd=self.home, allow_herdr=True, env=dict(os.environ)
+        )
         self.assertEqual(self.metadata, {})
         mailbox.annotate(self.base, self.session, isSubagent=False)
-        mailbox.hook(payload, harness="codex", base=self.base)
+        fast.run_mailbox_hook(
+            payload, harness="codex", base=self.base, cwd=self.home, allow_herdr=True, env=dict(os.environ)
+        )
         self.assertEqual(
             self.metadata.get("w1:p1"),
             {
@@ -464,10 +503,14 @@ class HerdrMetadataTests(unittest.TestCase):
             "model": "fixture-model",
             "effort": "medium",
         }
-        mailbox.hook(payload, harness="codex", base=self.base)
+        fast.run_mailbox_hook(
+            payload, harness="codex", base=self.base, cwd=self.home, allow_herdr=True, env=dict(os.environ)
+        )
         self.assertEqual(self.metadata, {})
         os.environ.pop("AGENT_MAILBOX_SESSION")
-        mailbox.hook(payload, harness="codex", base=self.base)
+        fast.run_mailbox_hook(
+            payload, harness="codex", base=self.base, cwd=self.home, allow_herdr=True, env=dict(os.environ)
+        )
         self.assertEqual(
             self.metadata.get("w1:p1"),
             {
@@ -507,8 +550,7 @@ class HerdrMetadataTests(unittest.TestCase):
         another_content = room_store.read_room(self.base, "another-room")
         os.environ["ORKEST_SWARM_ROOM"] = "promoted-room"
         agent_terminal.bind(self.session, "codex", {})
-        argv = [
-            "agent_statusline.py",
+        res = fast.run_statusline(
             "--native-status",
             "--refresh-terminal",
             "--session",
@@ -516,9 +558,11 @@ class HerdrMetadataTests(unittest.TestCase):
             "--harness",
             "codex",
             "--json",
-        ]
-        with mock.patch.object(sys, "argv", argv), mock.patch.object(sys, "stdout", io.StringIO()):
-            self.assertEqual(agent_statusline.main(), 0)
+            base=self.base,
+            env=dict(os.environ),
+            check=True,
+        )
+        self.assertEqual(res.returncode, 0)
         self.assertEqual(
             self.metadata.get("w1:p1"),
             {
@@ -635,7 +679,15 @@ class HerdrMetadataTests(unittest.TestCase):
             "cwd": str(self.home),
             "transcript_path": str(parent_transcript),
         }
-        mailbox.hook(start_payload, harness="codex", event="SubagentStart", base=self.base)
+        fast.run_mailbox_hook(
+            start_payload,
+            harness="codex",
+            event="SubagentStart",
+            base=self.base,
+            cwd=self.home,
+            allow_herdr=True,
+            env=dict(os.environ),
+        )
         sub_peer = mailbox.load(mailbox.peer_path(self.base, "subagent-sub-1"))
         self.assertIsNone(sub_peer.get("model"))
         self.assertEqual(
@@ -659,7 +711,15 @@ class HerdrMetadataTests(unittest.TestCase):
             "model": "gpt-6-sol",
             "effort": "high",
         }
-        mailbox.hook(start_payload_2, harness="codex", event="SubagentStart", base=self.base)
+        fast.run_mailbox_hook(
+            start_payload_2,
+            harness="codex",
+            event="SubagentStart",
+            base=self.base,
+            cwd=self.home,
+            allow_herdr=True,
+            env=dict(os.environ),
+        )
         self.assertEqual(
             self.metadata.get("w1:p1"),
             {
@@ -694,7 +754,7 @@ class HerdrMetadataTests(unittest.TestCase):
 
         # Stop both subagents -> count clears and ordinary display_agent text is restored
         for sub_id in ("sub-1", "sub-2"):
-            mailbox.hook(
+            fast.run_mailbox_hook(
                 {
                     "session_id": self.session,
                     "hook_event_name": "SubagentStop",
@@ -704,6 +764,9 @@ class HerdrMetadataTests(unittest.TestCase):
                 harness="codex",
                 event="SubagentStop",
                 base=self.base,
+                cwd=self.home,
+                allow_herdr=True,
+                env=dict(os.environ),
             )
         self.assertEqual(
             self.metadata.get("w1:p1"),
@@ -764,42 +827,32 @@ class TerminalTests(unittest.TestCase):
         mailbox.annotate(self.base, session, name="snorfle-test-high-footer-aa")
 
     def native_status(self, harness, session, *, clear=False, extra_environment=None):
-        return subprocess.run(
-            [
-                sys.executable,
-                "-B",
-                str(SCRIPTS / "agent_statusline.py"),
-                "--native-status",
-                "--harness",
-                harness,
-                *(["--clear-terminal", session] if clear else []),
-            ],
-            input=json.dumps({"session_id": session, "model": {"id": "runtime-model"}, "effort": {"level": "high"}}),
+        return fast.run_statusline(
+            "--native-status",
+            "--harness",
+            harness,
+            *(["--clear-terminal", session] if clear else []),
+            stdin_data={"session_id": session, "model": {"id": "runtime-model"}, "effort": {"level": "high"}},
+            base=self.base,
             env={**self.native, "ORKEST_TERMINAL_HARNESS": harness, **(extra_environment or {})},
-            capture_output=True,
-            text=True,
             check=True,
         ).stdout
 
     def footer(self, harness):
-        output = subprocess.check_output(
-            [
-                sys.executable,
-                "-B",
-                str(SCRIPTS / "agent_statusline.py"),
-                "--terminal-pane",
-                "%0",
-                "--tmux-server",
-                self.server,
-                "--harness",
-                harness,
-                "--json",
-                "--width",
-                "200",
-            ],
+        output = fast.run_statusline(
+            "--terminal-pane",
+            "%0",
+            "--tmux-server",
+            self.server,
+            "--harness",
+            harness,
+            "--json",
+            "--width",
+            "200",
+            base=self.base,
             env=self.environment,
-            text=True,
-        )
+            check=True,
+        ).stdout
         return json.loads(output) if output else None
 
     def test_native_integrations_are_silent_and_feed_the_same_outer_footer(self):
@@ -843,23 +896,19 @@ class TerminalTests(unittest.TestCase):
 
     def test_plain_launches_keep_the_native_display_without_touching_a_pane(self):
         self.peer("plain", "claude")
-        output = subprocess.check_output(
-            [
-                sys.executable,
-                "-B",
-                str(SCRIPTS / "agent_statusline.py"),
-                "--session",
-                "plain",
-                "--harness",
-                "claude",
-                "--plain",
-                "--native-status",
-                "--width",
-                "200",
-            ],
+        output = fast.run_statusline(
+            "--session",
+            "plain",
+            "--harness",
+            "claude",
+            "--plain",
+            "--native-status",
+            "--width",
+            "200",
+            base=self.base,
             env=self.environment,
-            text=True,
-        )
+            check=True,
+        ).stdout
         self.assertEqual(
             output,
             f"snorfle | — / — | repo : {self.home.name} | stage : not set | goal : not set | task : not set\n",
@@ -871,24 +920,21 @@ class TerminalTests(unittest.TestCase):
         self.peer("inspected", "claude")
         mailbox.annotate(self.base, "inspected", name="other-agent")
         self.native_status("claude", "visible")
-        output = subprocess.check_output(
-            [
-                sys.executable,
-                "-B",
-                str(SCRIPTS / "agent_statusline.py"),
-                "--session",
-                "inspected",
-                "--harness",
-                "claude",
-                "--json",
-            ],
+        output = fast.run_statusline(
+            "--session",
+            "inspected",
+            "--harness",
+            "claude",
+            "--json",
+            base=self.base,
             env={**self.native, "ORKEST_TERMINAL_HARNESS": "claude"},
-            text=True,
-        )
+            check=True,
+        ).stdout
         self.assertEqual(json.loads(output)["name"], "other-agent")
         self.assertEqual(self.footer("claude")["name"], "snorfle")
 
     def test_all_four_launchers_render_the_same_outer_footer(self):
+        fast_bin = str(fast.find_ork_fast_bin())
         for executable, harness in (
             ("codex", "codex"),
             ("claude", "claude"),
@@ -920,8 +966,8 @@ class TerminalTests(unittest.TestCase):
                         else "output = subprocess.check_output("
                         + repr(
                             [
-                                sys.executable,
-                                str(SCRIPTS / "agent_statusline.py"),
+                                fast_bin,
+                                "statusline",
                                 "--native-status",
                                 "--session",
                                 session,
@@ -940,7 +986,12 @@ class TerminalTests(unittest.TestCase):
                     "while os.read(0, 1024): pass\n"
                 )
                 binary.chmod(0o755)
-                environment = {**self.environment, "CODEX_HOME": str(self.home), "TERM": "xterm-256color"}
+                environment = {
+                    **self.environment,
+                    "CODEX_HOME": str(self.home),
+                    "ORK_FAST_BIN": fast_bin,
+                    "TERM": "xterm-256color",
+                }
                 environment.pop("NO_COLOR", None)
                 pid, master = pty.fork()
                 if pid == 0:
@@ -1088,23 +1139,19 @@ class TerminalTests(unittest.TestCase):
             self.assertEqual(stored["herdrBinary"], "/usr/local/bin/herdr")
 
             # Herdr labelling the pane must never blank the harness's own bar.
-            herdr_status_out = subprocess.check_output(
-                [
-                    sys.executable,
-                    "-B",
-                    str(SCRIPTS / "agent_statusline.py"),
-                    "--native-status",
-                    "--session",
-                    session,
-                    "--harness",
-                    "claude",
-                    "--json",
-                    "--width",
-                    "120",
-                ],
+            herdr_status_out = fast.run_statusline(
+                "--native-status",
+                "--session",
+                session,
+                "--harness",
+                "claude",
+                "--json",
+                "--width",
+                "120",
+                base=self.base,
                 env={**herdr_env, "HERDR_BIN_PATH": "/nonexistent/herdr"},
-                text=True,
-            )
+                check=True,
+            ).stdout
             self.assertEqual(json.loads(herdr_status_out)["name"], "snorfle")
 
             # Subagent peer is refused by bind()

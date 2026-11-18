@@ -11,11 +11,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 SCRIPTS = Path(__file__).resolve().parents[5] / "plugins/orchestrate/skills/orchestrate/scripts"
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
 sys.path.insert(0, str(SCRIPTS))
-import agent_statusline  # noqa: E402
+import _ork_fast_test_helpers as ORK_FAST  # noqa: E402
 import agent_statusline_tmux as terminal  # noqa: E402
 import agent_terminal  # noqa: E402
-import mailbox_hooks  # noqa: E402
 import peer_mailbox as mailbox  # noqa: E402
 import room_store  # noqa: E402
 import swarm_status  # noqa: E402
@@ -34,11 +36,43 @@ class ResumeRoomTests(unittest.TestCase):
             HOME=str(home),
             AGENT_EXECUTOR_HOME=str(home),
             ORCHESTRATE_HOME=str(home),
+            CLAUDE_CONFIG_DIR=str(home / ".claude"),
+            CODEX_HOME=str(home / ".codex"),
+            GEMINI_CLI_HOME=str(home / ".gemini"),
             HERDR_ENV="0",
             PYTHONPATH=str(SCRIPTS),
             ORKEST_NODE_BIN=room_store._node_binary(),
+            ORKEST_SCRIPTS_DIR=str(SCRIPTS),
+            ORKEST_PLUGIN_ROOT=str(CLI.parents[1]),
+            ORK_FAST_BIN=str(ORK_FAST.find_ork_fast_bin()),
         )
         return environment
+
+    def _hook_notice(self, base, peer_or_sid, harness="claude", event="SessionStart", *, env=None, cwd=None):
+        sid = peer_or_sid["session"] if isinstance(peer_or_sid, dict) else peer_or_sid
+        peer_cwd = peer_or_sid.get("cwd") if isinstance(peer_or_sid, dict) else None
+        resolved_cwd = str(cwd or peer_cwd or base.parent)
+        if harness == "gemini":
+            payload = {"conversationId": sid, "workspacePaths": [resolved_cwd]}
+            if event == "PreInvocation":
+                payload.update({"invocationNum": 1, "lastUserInput": "hi"})
+        else:
+            payload = {"hook_event_name": event, "session_id": sid, "cwd": resolved_cwd}
+        output = ORK_FAST.run_mailbox_hook(
+            payload,
+            harness=harness,
+            event=event if harness == "gemini" else None,
+            base=base,
+            pid=os.getpid(),
+            env=env,
+        )
+        if not output:
+            return ""
+        if "hookSpecificOutput" in output:
+            return output["hookSpecificOutput"].get("additionalContext", "")
+        if "injectSteps" in output:
+            return "\n".join(step["ephemeralMessage"] for step in output["injectSteps"] if "ephemeralMessage" in step)
+        return ""
 
     def test_new_process_resumes_after_session_end_removed_old_peer(self):
         initial = """
@@ -46,23 +80,47 @@ import json, os, subprocess
 from pathlib import Path
 import peer_mailbox as mailbox, room_store
 base = mailbox.root()
-mailbox.register(base, session='old-native', harness=os.environ['TEST_HARNESS'],
+harness = os.environ['TEST_HARNESS']
+mailbox.register(base, session='old-native', harness=harness,
                  cwd=os.environ['HOME'], pid=os.getpid(), account=os.environ['HOME'])
 result = subprocess.run([room_store._node_binary(), os.environ['TEST_CLI'], 'hall', 'promote',
                          '--session', 'old-native', '--cwd', os.environ['HOME'],
                          '--objective', 'Finish the resume repair'], check=True, capture_output=True, text=True)
 room = json.loads(result.stdout)['room']
-mailbox.end_session(base, 'old-native', pid=os.getpid(), reason='closed')
+end_env = {**os.environ, 'ORKEST_TEST_MODE': '1', 'ORKEST_TEST_HARNESS_PID': str(os.getpid())}
+end_cmd = [os.environ['ORK_FAST_BIN'], 'mailbox-hook', '--harness', harness]
+if harness == 'gemini':
+    end_cmd.extend(['--event', 'SessionEnd'])
+    end_payload = {'conversationId': 'old-native', 'workspacePaths': [os.environ['HOME']], 'reason': 'closed'}
+else:
+    end_payload = {'hook_event_name': 'SessionEnd', 'session_id': 'old-native', 'cwd': os.environ['HOME'], 'reason': 'closed'}
+subprocess.run(end_cmd, input=json.dumps(end_payload), env=end_env, check=True, capture_output=True, text=True)
 print(json.dumps({'room': room['id'], 'oldPeerExists': mailbox.peer_path(base, 'old-native').exists()}))
 """
         resumed = """
 import json, os, subprocess
-import peer_mailbox as mailbox, mailbox_hooks, room_store, swarm_status
+import peer_mailbox as mailbox, room_store, swarm_status
 base = mailbox.root()
-peer = mailbox.register(base, session='new-native', harness=os.environ['TEST_HARNESS'],
+harness = os.environ['TEST_HARNESS']
+peer = mailbox.register(base, session='new-native', harness=harness,
                         cwd=os.environ['HOME'], pid=os.getpid(), account=os.environ['HOME'])
 peer = mailbox.annotate(base, peer['session'], model='resume-model', focus='Restore the coordinator header')
-notice = mailbox_hooks.swarm_coordinator_context(base, peer, 'SessionStart')
+hook_env = {**os.environ, 'ORKEST_TEST_MODE': '1', 'ORKEST_TEST_HARNESS_PID': str(os.getpid())}
+hook_cmd = [os.environ['ORK_FAST_BIN'], 'mailbox-hook', '--harness', harness]
+if harness == 'gemini':
+    hook_cmd.extend(['--event', 'SessionStart'])
+    hook_payload = {'conversationId': 'new-native', 'workspacePaths': [os.environ['HOME']]}
+else:
+    hook_payload = {'hook_event_name': 'SessionStart', 'session_id': 'new-native', 'cwd': os.environ['HOME']}
+hook_proc = subprocess.run(hook_cmd, input=json.dumps(hook_payload), env=hook_env, check=True, capture_output=True, text=True)
+hook_out = json.loads(hook_proc.stdout) if hook_proc.stdout.strip() else {}
+if 'hookSpecificOutput' in hook_out:
+    notice = hook_out['hookSpecificOutput'].get('additionalContext', '')
+elif 'injectSteps' in hook_out:
+    notice = '\\n'.join(s['ephemeralMessage'] for s in hook_out['injectSteps'] if 'ephemeralMessage' in s)
+else:
+    notice = ''
+peer = mailbox.load(mailbox.peer_path(base, 'new-native'))
 rooms = room_store.list_rooms(base)
 room = room_store.read_room(base, os.environ['TEST_ROOM'])
 node_code = '''import { observeRoom } from './plugins/orchestrate/lib/rooms.mjs';
@@ -163,7 +221,8 @@ print(json.dumps({'rooms': [r['id'] for r in rooms], 'room': room, 'notice': not
             self.assertEqual(
                 mailbox.session_peer(base, "native-id", harness="claude", cwd=str(home))["session"], "mailbox-id"
             )
-            self.assertEqual([item[0]["id"] for item in agent_statusline.bound_rooms(base, peer)], ["existing-room"])
+            bound = ORK_FAST.statusline_identity(peer["session"], "claude", base=base, env=self.environment(home))
+            self.assertEqual((bound["fullName"], bound["goal"]), (peer["name"], "Resume repair"))
             self.assertEqual(swarm_status.snapshot(room, base)["conductor"]["name"], peer["person"])
             self.assertTrue(mailbox._room_has_live_member(base, room))
             self.assertTrue(
@@ -177,11 +236,23 @@ print(json.dumps({'rooms': [r['id'] for r in rooms], 'room': room, 'notice': not
                 ("existing-room", "Coordinator", True),
             )
             self.assertEqual(
-                agent_statusline.identity("native-id", "claude", {"cwd": str(home)}, base=base)["model"], "test-model"
+                ORK_FAST.statusline_identity(
+                    "native-id",
+                    "claude",
+                    payload={"cwd": str(home)},
+                    base=base,
+                    env=self.environment(home),
+                )["model"],
+                "test-model",
             )
-            with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "native-id"}, clear=True):
-                other = mailbox.load(mailbox.peer_path(base, "free-alias"))
-                mailbox_hooks._record_native_swarm_identity(base, other)
+            self._hook_notice(
+                base,
+                "free-alias",
+                harness="claude",
+                event="SessionStart",
+                env={**self.environment(home), "CLAUDE_CODE_SESSION_ID": "native-id"},
+                cwd=home,
+            )
             self.assertEqual(
                 mailbox.session_peer(base, "native-id", harness="claude", cwd=str(home))["session"], "mailbox-id"
             )
@@ -206,8 +277,9 @@ print(json.dumps({'rooms': [r['id'] for r in rooms], 'room': room, 'notice': not
                 room = room_store.put_room(base, room)
                 self.assertIsNone(mailbox.session_peer(base, "native-id"))
                 environment = {**self.environment(home), variable: "native-id", "ORKEST_SWARM_ROOM": room["id"]}
-                with patch.dict(os.environ, environment, clear=True):
-                    notice = mailbox_hooks.swarm_coordinator_context(base, legacy, "SessionStart")
+                notice = self._hook_notice(
+                    base, legacy, harness=harness, event="SessionStart", env=environment, cwd=temporary
+                )
                 self.assertIn("Swarm", notice)
                 self.assertEqual(mailbox.session_peer(base, "native-id")["session"], "legacy-mailbox")
                 self.assertIsNone(mailbox.session_peer(base, "forged-history"))
@@ -237,8 +309,11 @@ print(json.dumps({'rooms': [r['id'] for r in rooms], 'room': room, 'notice': not
                 self.assertIsNone(terminal.find_session_swarm_room(base, "attacker", harness="claude", cwd=temporary))
                 self.assertIsNone(terminal.rebind_session_swarm_room(base, room["id"], "conductor", "attacker"))
                 environment = {**self.environment(home), "ORKEST_SWARM_ROOM": room["id"]}
-                with patch.dict(os.environ, environment, clear=True):
-                    self.assertEqual(mailbox_hooks.swarm_coordinator_context(base, attacker), "")
+                attacker_notice = self._hook_notice(
+                    base, attacker, harness="claude", event="SessionStart", env=environment, cwd=temporary
+                )
+                self.assertNotIn("Keep this room", attacker_notice)
+                self.assertNotIn("Resume repair", attacker_notice)
                 self.assertEqual(room_store.read_room(base, room["id"]), room)
 
     def test_stale_room_environment_falls_back_to_live_promotion(self):
@@ -253,8 +328,9 @@ print(json.dumps({'rooms': [r['id'] for r in rooms], 'room': room, 'notice': not
                     room_store.put_room(base, room)
                 environment = self.environment(home)
                 environment.update(ORKEST_RESUME_SWARM="1", ORKEST_SWARM_ROOM="existing-room")
-                with patch.dict(os.environ, environment, clear=True):
-                    notice = mailbox_hooks.swarm_coordinator_context(base, peer)
+                notice = self._hook_notice(
+                    base, peer, harness="claude", event="SessionStart", env=environment, cwd=home
+                )
                 live = [r for r in room_store.list_rooms(base) if r.get("status") != "closed"]
                 self.assertEqual(len(live), 1)
                 self.assertEqual(live[0]["conductor"]["session"]["id"], "new-session")
@@ -288,9 +364,10 @@ print(json.dumps({'rooms': [r['id'] for r in rooms], 'room': room, 'notice': not
                 self.assertIsNone(terminal.rebind_session_swarm_room(base, room["id"], "conductor", "attacker"))
                 environment = self.environment(home)
                 environment.update(ORKEST_RESUME_SWARM="1", ORKEST_SWARM_ROOM=room["id"])
-                with patch.dict(os.environ, environment, clear=True):
-                    notice = mailbox_hooks.swarm_coordinator_context(base, attacker)
-                    self.assertIn("Swarm", notice)
+                notice = self._hook_notice(
+                    base, attacker, harness="claude", event="SessionStart", env=environment, cwd=temporary
+                )
+                self.assertIn("Swarm", notice)
                 self.assertEqual(room_store.read_room(base, room["id"]), room)
                 separate = [r for r in room_store.list_rooms(base) if r["id"] != room["id"]]
                 self.assertEqual(len(separate), 1)
@@ -379,8 +456,9 @@ print(json.dumps({'rooms': [r['id'] for r in rooms], 'room': room, 'notice': not
                 peer = mailbox.register(base, session="resumer", harness="claude", cwd=temporary, pid=os.getpid())
                 # Simulate a stale inherited room too: the hook must safely use a separate room.
                 child_env = {**captured["env"], "ORKEST_SWARM_ROOM": room["id"], "HERDR_ENV": "0"}
-                with patch.dict(os.environ, child_env, clear=True):
-                    notice = mailbox_hooks.swarm_coordinator_context(base, peer)
+                notice = self._hook_notice(
+                    base, peer, harness="claude", event="SessionStart", env=child_env, cwd=temporary
+                )
                 self.assertIn("Swarm", notice)
                 self.assertEqual(room_store.read_room(base, room["id"]), room)
                 self.assertEqual(len(room_store.list_rooms(base)), 2)
@@ -410,7 +488,14 @@ print(json.dumps({'rooms': [r['id'] for r in rooms], 'room': room, 'notice': not
             room = self.room(base, home)
             room["promotion"] = {"session": "owner"}
             room = room_store.put_room(base, room)
-            self.assertEqual([r[0]["id"] for r in agent_statusline.bound_rooms(base, owner)], [room["id"]])
+            owner_ident = ORK_FAST.statusline_identity(
+                owner["session"], "claude", base=base, env=self.environment(home)
+            )
+            self.assertEqual((owner_ident["fullName"], owner_ident["goal"]), (owner["name"], "Resume repair"))
+            self.assertEqual(
+                agent_terminal._resolve_structural_role(base, owner["session"], "claude", owner),
+                (room["id"], "Coordinator", True),
+            )
             self.assertEqual(swarm_status.snapshot(room, base)["conductor"]["model"], "owner-model")
             self.assertTrue(mailbox._room_has_live_member(base, room))
             self.assertIsNone(terminal.find_session_swarm_room(base, "attacker", harness="claude", cwd=temporary))
@@ -418,8 +503,11 @@ print(json.dumps({'rooms': [r['id'] for r in rooms], 'room': room, 'notice': not
                 environment = self.environment(home)
                 if explicit:
                     environment["ORKEST_SWARM_ROOM"] = room["id"]
-                with patch.dict(os.environ, environment, clear=True):
-                    self.assertEqual(mailbox_hooks.swarm_coordinator_context(base, attacker), "")
+                attacker_notice = self._hook_notice(
+                    base, attacker, harness="claude", event="SessionStart", env=environment, cwd=temporary
+                )
+                self.assertNotIn("Keep this room", attacker_notice)
+                self.assertNotIn("Resume repair", attacker_notice)
             self.assertEqual(room_store.read_room(base, room["id"]), room)
             mailbox.attest_native_sessions(base, "attacker", "native-id")
             del room["promotion"]
@@ -453,9 +541,16 @@ print(json.dumps({'rooms': [r['id'] for r in rooms], 'room': room, 'notice': not
             self.assertIsNone(terminal.find_session_swarm_room(base, "attacker", harness="claude", cwd=temporary))
             environment = self.environment(home)
             environment["ORKEST_SWARM_ROOM"] = room["id"]
-            with patch.dict(os.environ, environment, clear=True):
-                self.assertEqual(mailbox_hooks.swarm_coordinator_context(base, attacker), "")
-                self.assertIn("Private lead objective", mailbox_hooks.swarm_coordinator_context(base, lead))
+            self.assertNotIn(
+                "Private lead objective",
+                self._hook_notice(
+                    base, attacker, harness="claude", event="SessionStart", env=environment, cwd=temporary
+                ),
+            )
+            self.assertIn(
+                "Private lead objective",
+                self._hook_notice(base, lead, harness="claude", event="SessionStart", env=environment, cwd=temporary),
+            )
             self.assertEqual(room_store.read_room(base, room["id"]), room)
 
     def test_lead_brief_is_withheld_when_owner_repair_fails(self):
@@ -479,12 +574,25 @@ print(json.dumps({'rooms': [r['id'] for r in rooms], 'room': room, 'notice': not
                 }
             ]
             room = room_store.put_room(base, room)
+            broken_plugin = home / "broken-plugin"
+            (broken_plugin / "skills/orchestrate/scripts").mkdir(parents=True)
+            (broken_plugin / "bin").mkdir(parents=True)
+            (broken_plugin / "bin/room-store.mjs").write_text("if (process.argv[2] === 'rebind') process.exit(1);\n")
             environment = self.environment(home)
             environment["ORKEST_SWARM_ROOM"] = room["id"]
-            with patch.dict(os.environ, environment, clear=True):
-                with patch.object(terminal, "rebind_session_swarm_room", return_value=None):
-                    self.assertEqual(mailbox_hooks.swarm_coordinator_context(base, lead), "")
-                self.assertIn("Private lead objective", mailbox_hooks.swarm_coordinator_context(base, lead))
+            failing_env = {
+                **environment,
+                "ORKEST_PLUGIN_ROOT": str(broken_plugin),
+                "ORKEST_SCRIPTS_DIR": str(broken_plugin / "skills/orchestrate/scripts"),
+            }
+            self.assertNotIn(
+                "Private lead objective",
+                self._hook_notice(base, lead, harness="claude", event="SessionStart", env=failing_env, cwd=temporary),
+            )
+            self.assertIn(
+                "Private lead objective",
+                self._hook_notice(base, lead, harness="claude", event="SessionStart", env=environment, cwd=temporary),
+            )
             self.assertEqual(room_store.read_room(base, room["id"])["agents"][0]["session"]["id"], "lead-owner")
 
     def test_hooks_refuse_foreign_room_and_binding_machines(self):
@@ -499,8 +607,11 @@ print(json.dumps({'rooms': [r['id'] for r in rooms], 'room': room, 'notice': not
                 room = room_store.put_room(base, room)
                 environment = self.environment(home)
                 environment["ORKEST_SWARM_ROOM"] = room["id"]
-                with patch.dict(os.environ, environment, clear=True):
-                    self.assertEqual(mailbox_hooks.swarm_coordinator_context(base, peer), "")
+                foreign_notice = self._hook_notice(
+                    base, peer, harness="claude", event="SessionStart", env=environment, cwd=temporary
+                )
+                self.assertNotIn("Keep this room", foreign_notice)
+                self.assertNotIn("Resume repair", foreign_notice)
                 self.assertIsNone(terminal.find_session_swarm_room(base, "owner", harness="claude", cwd=temporary))
                 self.assertEqual(room_store.read_room(base, room["id"]), room)
 

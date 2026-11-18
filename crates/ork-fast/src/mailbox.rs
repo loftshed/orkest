@@ -1,58 +1,27 @@
-//! Mailbox hook fast path accelerator (<1.5 ms).
-//! Handles the ~95% trivial interactive turns and delegates the ~5% slow paths to python3.
+//! Native peer mailbox hook handler (`ork-fast mailbox-hook`).
+//! Handles the fast path (<1 ms) and full turn lifecycle natively without Python fallback.
 
-use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::io::IntoRawFd;
+use std::env;
+use std::fs;
+use std::io::{self, Read};
 use std::path::Path;
-use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::paths;
+use serde_json::{Value, json};
 
-static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+use crate::{
+    identity, mailbox_lifecycle, mailbox_swarm, mailbox_transcript, paths, rooms_work, sqlite,
+    terminal,
+};
 
-fn delegate(
-    fallback_script: &Path,
-    harness: &str,
-    event_arg: Option<&str>,
-    stdin_bytes: &[u8],
-) -> io::Result<()> {
-    let mut cmd = Command::new("python3");
-    cmd.arg("-B")
-        .arg(fallback_script)
-        .arg("hook")
-        .arg("--harness")
-        .arg(harness);
-    if let Some(ev) = event_arg {
-        cmd.arg("--event").arg(ev);
-    }
-    let mut child = cmd
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
-        .spawn()?;
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(stdin_bytes);
-    }
-    let status = child.wait()?;
-    std::process::exit(status.code().unwrap_or(0));
+fn is_valid_terminal_server(s: &str) -> bool {
+    let Some(hex) = s.strip_prefix("orkest-label-") else {
+        return false;
+    };
+    hex.len() == 12 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-fn is_truthy_json(val: &serde_json::Value) -> bool {
-    match val {
-        serde_json::Value::Null => false,
-        serde_json::Value::Bool(b) => *b,
-        serde_json::Value::Number(n) => n.as_f64().is_some_and(|x| x != 0.0),
-        serde_json::Value::String(s) => !s.is_empty(),
-        serde_json::Value::Array(a) => !a.is_empty(),
-        serde_json::Value::Object(o) => !o.is_empty(),
-    }
-}
-
-fn check_slash_commands(text: &str) -> bool {
-    let lower = text.to_lowercase();
+fn check_slash_or_side_keywords(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
     lower.contains("/side")
         || lower.contains("!side")
         || lower.contains("side:")
@@ -64,31 +33,19 @@ fn check_slash_commands(text: &str) -> bool {
         || lower.contains("/clear")
 }
 
-fn is_pid_live(pid: u64) -> bool {
-    if pid == 0 || pid > i32::MAX as u64 {
-        return false;
-    }
-    unsafe {
-        libc::kill(pid as i32, 0) == 0
-            || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-    }
-}
-
 fn has_unread_mail(inbox_dir: &Path) -> bool {
     if !inbox_dir.is_dir() {
         return false;
     }
-    let entries = match fs::read_dir(inbox_dir) {
-        Ok(e) => e,
-        Err(_) => return false,
+    let Ok(entries) = fs::read_dir(inbox_dir) else {
+        return false;
     };
     for entry in entries.flatten() {
         let p = entry.path();
         if p.extension().and_then(|ext| ext.to_str()) == Some("json")
-            && let Ok(content) = fs::read_to_string(&p)
-            && let Ok(val) = serde_json::from_str::<serde_json::Value>(&content)
-            && val.is_object()
-            && !val.get("readAt").is_some_and(is_truthy_json)
+            && let Some(val) = paths::read_json_file(&p)
+            && paths::valid_message(&val)
+            && !val.get("readAt").is_some_and(paths::is_truthy_json)
         {
             return true;
         }
@@ -96,7 +53,7 @@ fn has_unread_mail(inbox_dir: &Path) -> bool {
     false
 }
 
-fn extract_model_str(val: &serde_json::Value) -> Option<String> {
+fn extract_model_str(val: &Value) -> Option<String> {
     let raw = if let Some(s) = val.as_str() {
         s
     } else {
@@ -105,7 +62,7 @@ fn extract_model_str(val: &serde_json::Value) -> Option<String> {
             .or_else(|| obj.get("model"))
             .or_else(|| obj.get("name"))
             .or_else(|| obj.get("display_name"))
-            .and_then(|v| v.as_str())?
+            .and_then(Value::as_str)?
     };
     let trimmed = raw.trim();
     if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") || trimmed.starts_with('<') {
@@ -115,8 +72,11 @@ fn extract_model_str(val: &serde_json::Value) -> Option<String> {
     }
 }
 
-fn payload_changes_model(payload: &serde_json::Value, peer: &serde_json::Value) -> bool {
-    if payload.get("modelSwitch").is_some_and(is_truthy_json) {
+fn payload_changes_model(payload: &Value, peer: &Value) -> bool {
+    if payload
+        .get("modelSwitch")
+        .is_some_and(paths::is_truthy_json)
+    {
         return true;
     }
     for key in [
@@ -131,174 +91,31 @@ fn payload_changes_model(payload: &serde_json::Value, peer: &serde_json::Value) 
             return true;
         }
     }
+    let peer_model = peer.get("model").and_then(Value::as_str);
     if let Some(m) = payload
         .get("model")
         .or_else(|| payload.get("modelName"))
         .and_then(extract_model_str)
     {
-        let peer_model = peer.get("model").and_then(|v| v.as_str());
         if peer_model != Some(m.as_str()) {
             return true;
         }
+    } else if let Some(tm) = mailbox_transcript::transcript_model(payload, None)
+        && peer_model != Some(tm.as_str())
+    {
+        return true;
     }
     false
-}
-
-fn has_newer_colleague_file(peers_dir: &Path, peer_file: &Path) -> bool {
-    let Ok(peer_mtime) = fs::metadata(peer_file).and_then(|m| m.modified()) else {
-        return true;
-    };
-    let Ok(entries) = fs::read_dir(peers_dir) else {
-        return true;
-    };
-    for entry in entries.flatten() {
-        let p = entry.path();
-        if p.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-        if p.file_name() == peer_file.file_name() {
-            continue;
-        }
-        if let Ok(other_mtime) = entry.metadata().and_then(|m| m.modified())
-            && other_mtime > peer_mtime
-        {
-            return true;
-        }
-    }
-    false
-}
-
-pub(crate) struct FileLockGuard {
-    fd: libc::c_int,
-}
-
-impl Drop for FileLockGuard {
-    fn drop(&mut self) {
-        unsafe {
-            libc::close(self.fd);
-        }
-    }
-}
-
-/// Lock acquisition retries when a pruner unlinked the lock path between open and flock.
-const LOCK_ACQUIRE_ATTEMPTS: usize = 64;
-
-/// Device and inode of an open descriptor, without taking ownership of it.
-fn fd_identity(fd: libc::c_int) -> Option<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt;
-    use std::os::unix::io::FromRawFd;
-    let file = std::mem::ManuallyDrop::new(unsafe { fs::File::from_raw_fd(fd) });
-    let meta = file.metadata().ok()?;
-    Some((meta.dev(), meta.ino()))
-}
-
-/// True when the locked descriptor is still the inode at `lock_path` (same check as `mailbox_store.acquire_lock`).
-fn same_inode(fd: libc::c_int, lock_path: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    let Ok(current) = fs::metadata(lock_path) else {
-        return false;
-    };
-    fd_identity(fd) == Some((current.dev(), current.ino()))
-}
-
-pub(crate) fn lock_path_exclusive(lock_path: &Path) -> io::Result<FileLockGuard> {
-    for _ in 0..LOCK_ACQUIRE_ATTEMPTS {
-        let file = match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_CLOEXEC)
-            .open(lock_path)
-        {
-            Ok(file) => file,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                if let Some(parent) = lock_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                continue;
-            }
-            Err(err) => return Err(err),
-        };
-        let fd = file.into_raw_fd();
-        let guard = FileLockGuard { fd };
-        loop {
-            if unsafe { libc::flock(fd, libc::LOCK_EX) } == 0 {
-                break;
-            }
-            let err = io::Error::last_os_error();
-            if err.kind() != io::ErrorKind::Interrupted {
-                return Err(err);
-            }
-        }
-        // A pruner may have unlinked this inode while we waited; locking it would not exclude a
-        // process that opens the new file at the same path.
-        if same_inode(fd, lock_path) {
-            // Touch the lock so idle-lock reaping sees recent use.
-            unsafe {
-                libc::futimens(fd, std::ptr::null());
-            }
-            return Ok(guard);
-        }
-    }
-    Err(io::Error::new(
-        io::ErrorKind::WouldBlock,
-        "could not acquire a stable peer lock",
-    ))
-}
-
-fn lock_peer(peer_file: &Path) -> io::Result<FileLockGuard> {
-    if let Some(parent) = peer_file.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    lock_path_exclusive(&peer_file.with_extension("lock"))
-}
-
-fn write_json_atomic(path: &Path, value: &serde_json::Value) -> io::Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "peer path has no parent"))?;
-    fs::create_dir_all(parent)?;
-    let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp_path = parent.join(format!(".mail-{}-{seq}.tmp", std::process::id()));
-    let payload =
-        serde_json::to_vec(value).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-    let write_result = (|| -> io::Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp_path)?;
-        file.write_all(&payload)?;
-        file.sync_all()?;
-        Ok(())
-    })();
-
-    if let Err(err) = write_result {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(err);
-    }
-
-    if let Err(err) = fs::rename(&tmp_path, path) {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(err);
-    }
-    Ok(())
 }
 
 fn update_peer_locked<F>(peer_file: &Path, mutate: F) -> bool
 where
-    F: FnOnce(&mut serde_json::Map<String, serde_json::Value>) -> bool,
+    F: FnOnce(&mut serde_json::Map<String, Value>) -> bool,
 {
-    let Ok(_guard) = lock_peer(peer_file) else {
+    let Ok(_guard) = paths::lock_for(peer_file) else {
         return false;
     };
-    let Ok(content) = fs::read_to_string(peer_file) else {
-        return false;
-    };
-    let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&content) else {
+    let Some(mut val) = paths::read_json_file(peer_file) else {
         return false;
     };
     if !paths::valid_peer(&val) {
@@ -310,40 +127,212 @@ where
     if !mutate(obj) {
         return false;
     }
-    write_json_atomic(peer_file, &val).is_ok()
+    paths::write_json_atomic(peer_file, &val).is_ok()
 }
 
-pub fn run(
+fn seen_colleagues_vec(peer: &Value) -> Vec<String> {
+    peer.get("seenColleagues")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Fast path returning `Some(())` when a trivial `Stop` or busy mid-turn `PreInvocation`
+/// completes safely via atomic lock update without extra lookups or git invocations.
+fn try_fast_path(
+    base: &Path,
     harness: &str,
+    gemini: bool,
+    event: &str,
+    session: &str,
+    cwd: &str,
+    payload: &Value,
+) -> Option<()> {
+    if !matches!(event, "Stop" | "PreInvocation") {
+        return None;
+    }
+    if payload.get("source").and_then(Value::as_str) == Some("clear") {
+        return None;
+    }
+    for key in ["lastUserInput", "prompt", "userMessage", "query"] {
+        if let Some(txt) = payload.get(key).and_then(Value::as_str)
+            && check_slash_or_side_keywords(txt)
+        {
+            return None;
+        }
+    }
+    let s_key = paths::session_key(session).ok()?;
+    let peer_file = base.join("peers").join(format!("{s_key}.json"));
+    let peer = paths::read_json_file(&peer_file)?;
+    if !paths::valid_peer(&peer) || peer.get("session").and_then(Value::as_str) != Some(session) {
+        return None;
+    }
+    if peer.get("isSubagent").and_then(Value::as_bool) == Some(true)
+        || peer.get("agySubagentPending").and_then(Value::as_bool) == Some(true)
+        || peer.get("delegatedRun").is_some_and(paths::is_truthy_json)
+        || peer.get("run").and_then(Value::as_str).is_some()
+        || env::var_os("ORKEST_HANDOFF_SUCCESSOR").is_some_and(|v| !v.is_empty())
+    {
+        return None;
+    }
+    if let Some(pid) = peer.get("pid").and_then(Value::as_i64)
+        && !identity::is_pid_live(pid)
+    {
+        return None;
+    }
+    if peer.get("cwd").and_then(Value::as_str) != Some(cwd) {
+        return None;
+    }
+    // Check HTTP daemon mode file: stdio/absent allows fast path.
+    let mode_path = identity::daemon_base(base).join("mode.json");
+    if mode_path.exists() {
+        return None;
+    }
+    let inbox_dir = base.join("inbox").join(&s_key);
+    if has_unread_mail(&inbox_dir) {
+        return None;
+    }
+    if paths::has_active_room_for_session(base, session) {
+        return None;
+    }
+    let cache = base.parent().unwrap_or(base);
+    let peer_harness = peer
+        .get("harness")
+        .and_then(Value::as_str)
+        .unwrap_or(harness);
+    if paths::has_active_authority_for_session(cache, session, peer_harness) {
+        return None;
+    }
+    if peer_harness != "claude" {
+        let now_secs = paths::utc_now_secs();
+        let checked_recently = peer
+            .get("handoffCheckedAt")
+            .and_then(Value::as_str)
+            .and_then(paths::parse_iso8601_utc_secs)
+            .is_some_and(|t| (now_secs - t) < mailbox_lifecycle::HOOK_CHECK_SECONDS);
+        if !checked_recently {
+            return None;
+        }
+    }
+
+    if payload_changes_model(payload, &peer) {
+        return None;
+    }
+
+    if event == "Stop" {
+        let term_reason = if gemini {
+            payload
+                .get("terminationReason")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        } else {
+            None
+        };
+        let updated = update_peer_locked(&peer_file, |obj| {
+            obj.insert("state".to_string(), Value::String("idle".to_string()));
+            obj.insert(
+                "lastSeenAt".to_string(),
+                Value::String(paths::format_utc_iso_z(paths::utc_now_secs())),
+            );
+            if let Some(ref reason) = term_reason {
+                obj.insert("lastStopReason".to_string(), Value::String(reason.clone()));
+            }
+            true
+        });
+        if !updated {
+            return None;
+        }
+        if gemini {
+            println!("{{}}");
+        }
+        return Some(());
+    }
+
+    // PreInvocation fast path: non-gemini mid-turn busy session with unchanged roster & model.
+    if !gemini
+        && peer.get("state").and_then(Value::as_str) == Some("busy")
+        && peer.get("lastStopReason").is_none_or(Value::is_null)
+        && !payload_changes_model(payload, &peer)
+    {
+        let others = identity::colleagues(base, &peer);
+        let (mates, _) = mailbox_lifecycle::split_channels(&peer, &others);
+        let seen = mailbox_lifecycle::roster_key(&peer, &mates);
+        if seen != seen_colleagues_vec(&peer) {
+            return None;
+        }
+        if !others.is_empty()
+            && !identity::is_run_peer(Some(&peer))
+            && peer.get("name").and_then(Value::as_str)
+                != peer.get("announcedName").and_then(Value::as_str)
+        {
+            return None;
+        }
+        let updated = update_peer_locked(&peer_file, |obj| {
+            if obj.get("state").and_then(Value::as_str) != Some("busy")
+                || !obj.get("lastStopReason").is_none_or(Value::is_null)
+            {
+                return false;
+            }
+            obj.insert(
+                "lastSeenAt".to_string(),
+                Value::String(paths::format_utc_iso_z(paths::utc_now_secs())),
+            );
+            true
+        });
+        if updated {
+            return Some(());
+        }
+    }
+    None
+}
+
+/// Entrypoint for `ork-fast mailbox-hook` (`--fallback-script` accepted as a no-op flag).
+pub fn run(
+    harness_arg: Option<&str>,
     event_arg: Option<&str>,
-    fallback_script: Option<&Path>,
+    _fallback_script: Option<&Path>,
 ) -> io::Result<()> {
     let mut raw_stdin = Vec::new();
-    io::stdin().read_to_end(&mut raw_stdin)?;
+    if io::stdin().read_to_end(&mut raw_stdin).is_err() || raw_stdin.is_empty() {
+        return Ok(());
+    }
+    let payload: Value = match serde_json::from_slice::<Value>(&raw_stdin) {
+        Ok(v) if v.is_object() => v,
+        _ => return Ok(()),
+    };
 
-    let default_fb =
-        paths::expand_home("~/.agents/skills/orchestrate/scripts/peer_mailbox.py", None);
-    let fb = fallback_script.unwrap_or(&default_fb);
-
-    if raw_stdin.is_empty() {
+    let tool_name = payload
+        .get("tool_name")
+        .or_else(|| payload.get("toolName"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if tool_name == "ExitPlanMode" || tool_name == "EnterPlanMode" {
         return Ok(());
     }
 
-    let payload: serde_json::Value = match serde_json::from_slice(&raw_stdin) {
-        Ok(v) => v,
-        Err(_) => return delegate(fb, harness, event_arg, &raw_stdin),
-    };
+    let harness = harness_arg
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| identity::detect_harness(&payload));
 
-    let detected_event = event_arg
-        .map(String::from)
+    let event = event_arg
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
         .or_else(|| {
             payload
                 .get("hook_event_name")
                 .or_else(|| payload.get("event"))
                 .or_else(|| payload.get("eventName"))
                 .or_else(|| payload.get("hookEventName"))
-                .and_then(|v| v.as_str())
-                .map(String::from)
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
         })
         .or_else(|| {
             if harness == "gemini" {
@@ -358,217 +347,918 @@ pub fn run(
                 None
             }
         });
-
-    let event = match detected_event {
-        Some(ev) => ev,
-        None => return Ok(()),
+    let Some(event) = event else {
+        return Ok(());
     };
 
-    // StopFailure starts an automatic handoff (handoff.py): always Python, before any fast exit.
-    if event == "StopFailure" {
-        return delegate(fb, harness, Some(&event), &raw_stdin);
+    let session_raw = payload
+        .get("session_id")
+        .or_else(|| payload.get("conversationId"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            env::var("ANTIGRAVITY_CONVERSATION_ID")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        });
+    let Some(native_session) = session_raw else {
+        return Ok(());
+    };
+    let mut session = native_session.clone();
+    let gemini = harness == "gemini";
+
+    let cwd = payload
+        .get("cwd")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            payload
+                .get("workspacePaths")
+                .and_then(Value::as_array)
+                .and_then(|arr| arr.first())
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| {
+            env::current_dir()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| ".".to_string())
+        });
+
+    let base = paths::cache_home(None, None).join("mailbox-v1");
+    if let Some(canonical) =
+        identity::session_peer(&base, &session, Some(&harness), Some(&cwd), false)
+        && let Some(canon_sid) = canonical.get("session").and_then(Value::as_str)
+    {
+        session = canon_sid.to_string();
     }
 
-    // Immediate plan mode suppression
-    let tool_name = payload
-        .get("tool_name")
-        .or_else(|| payload.get("toolName"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if tool_name == "ExitPlanMode" || tool_name == "EnterPlanMode" {
+    match event.as_str() {
+        "SessionEnd" => {
+            let parent_to_refresh = paths::peer_path(&base, &session)
+                .ok()
+                .and_then(|p| paths::read_json_file(&p))
+                .filter(|p| p.get("isSubagent").is_some_and(paths::is_truthy_json))
+                .and_then(|p| {
+                    p.get("parentSession")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .filter(|s| !s.is_empty());
+            let reason = payload.get("reason").and_then(Value::as_str).unwrap_or("");
+            mailbox_lifecycle::end_session(
+                &base,
+                &session,
+                reason,
+                identity::harness_pid(&harness),
+            );
+            if let Some(parent) = parent_to_refresh {
+                let _ = terminal::refresh_parent_pane(&base, Some(&parent));
+            }
+            return Ok(());
+        }
+        "StopFailure" => {
+            mailbox_lifecycle::handle_stop_failure(&base, &payload, &session, &harness);
+            return Ok(());
+        }
+        "SubagentStart" => {
+            let out =
+                mailbox_lifecycle::handle_subagent_start(&base, &payload, &session, &harness, &cwd);
+            println!("{out}");
+            return Ok(());
+        }
+        "SubagentStop" => {
+            let out = mailbox_lifecycle::handle_subagent_stop(&base, &payload, &session, &harness);
+            println!("{out}");
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    let state = match event.as_str() {
+        "SessionStart" => "idle",
+        "UserPromptSubmit" => "busy",
+        "PreInvocation" => "busy",
+        "Stop" => "idle",
+        _ => return Ok(()),
+    };
+
+    if session == native_session
+        && try_fast_path(&base, &harness, gemini, &event, &session, &cwd, &payload).is_some()
+    {
         return Ok(());
     }
 
-    // 1. Lifecycle events that always need Python:
-    if matches!(
-        event.as_str(),
-        "SessionStart" | "SessionEnd" | "SubagentStart" | "SubagentStop"
-    ) {
-        return delegate(fb, harness, Some(&event), &raw_stdin);
+    // Full lifecycle path matching mailbox_hooks.py::hook (lines 1770-2265).
+    let raw_transcript = payload
+        .get("transcript_path")
+        .or_else(|| payload.get("transcriptPath"))
+        .and_then(Value::as_str);
+    let account_home_dir = identity::account_home(&harness, raw_transcript);
+    let mut effective_transcript = raw_transcript
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    if gemini
+        && effective_transcript.is_none()
+        && let Some(candidate) =
+            mailbox_transcript::default_agy_transcript(&session, account_home_dir.as_deref())
+    {
+        effective_transcript = Some(candidate.to_string_lossy().into_owned());
     }
 
-    // 2. Clear command or slash commands in payload:
-    if payload.get("source").and_then(|v| v.as_str()) == Some("clear") {
-        return delegate(fb, harness, Some(&event), &raw_stdin);
+    let mut runtime_model = mailbox_transcript::clean_model_value(
+        payload.get("model").or_else(|| payload.get("modelName")),
+    );
+    if runtime_model.is_none() {
+        runtime_model =
+            mailbox_transcript::transcript_model(&payload, effective_transcript.as_deref());
     }
-    for key in &["lastUserInput", "prompt", "userMessage", "query"] {
-        if let Some(txt) = payload.get(key).and_then(|v| v.as_str())
-            && check_slash_commands(txt)
-        {
-            return delegate(fb, harness, Some(&event), &raw_stdin);
+    let mut runtime_effort_val = identity::runtime_effort(&harness, &payload);
+    if harness == "codex" && (runtime_model.is_none() || runtime_effort_val.is_none()) {
+        let (db_model, db_effort) =
+            mailbox_lifecycle::codex_sqlite_settings(account_home_dir.as_deref(), &session);
+        if runtime_model.is_none() {
+            runtime_model = db_model;
+        }
+        if runtime_effort_val.is_none() {
+            runtime_effort_val = db_effort;
         }
     }
 
-    // 3. Resolve session ID:
-    let session_val = payload
-        .get("session_id")
-        .or_else(|| payload.get("conversationId"))
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .or_else(|| std::env::var("ANTIGRAVITY_CONVERSATION_ID").ok());
+    let previous = paths::peer_path(&base, &session)
+        .ok()
+        .and_then(|p| paths::read_json_file(&p));
+    let previous_valid = previous.as_ref().is_some_and(paths::valid_peer);
+    let has_transcript = effective_transcript
+        .as_deref()
+        .is_some_and(|t| paths::expand_home(t, None).is_file());
 
-    let session = match session_val {
-        Some(s) if !s.is_empty() => s,
-        _ => return delegate(fb, harness, Some(&event), &raw_stdin),
-    };
-
-    let cache = paths::cache_home(None, None);
-    let base = cache.join("mailbox-v1");
-    let s_key = match paths::session_key(&session) {
-        Ok(k) => k,
-        Err(_) => return delegate(fb, harness, Some(&event), &raw_stdin),
-    };
-
-    let peer_file = base.join("peers").join(format!("{s_key}.json"));
-    if !peer_file.is_file() {
-        return delegate(fb, harness, Some(&event), &raw_stdin);
-    }
-
-    let peer_content = match fs::read_to_string(&peer_file) {
-        Ok(c) => c,
-        Err(_) => return delegate(fb, harness, Some(&event), &raw_stdin),
-    };
-    let peer: serde_json::Value = match serde_json::from_str(&peer_content) {
-        Ok(v) => v,
-        Err(_) => return delegate(fb, harness, Some(&event), &raw_stdin),
-    };
-
-    if !paths::valid_peer(&peer)
-        || peer.get("session").and_then(|v| v.as_str()) != Some(session.as_str())
-    {
-        return delegate(fb, harness, Some(&event), &raw_stdin);
-    }
-
-    if peer.get("isSubagent").and_then(|v| v.as_bool()) == Some(true)
-        || peer.get("agySubagentPending").and_then(|v| v.as_bool()) == Some(true)
-        // peer_mailbox.mark_delegated records the run ID; Python tests it for truth, as here.
-        || peer.get("delegatedRun").is_some_and(is_truthy_json)
-        || peer.get("run").and_then(|v| v.as_str()).is_some()
-        // A fresh successor an automatic handoff launched: Python runs its quota check (handoff.poll).
-        || std::env::var_os("ORKEST_HANDOFF_SUCCESSOR").is_some_and(|v| !v.is_empty())
-    {
-        return delegate(fb, harness, Some(&event), &raw_stdin);
-    }
-
-    if let Some(pid) = peer.get("pid").and_then(|v| v.as_u64())
-        && !is_pid_live(pid)
-    {
-        return delegate(fb, harness, Some(&event), &raw_stdin);
-    }
-
-    // Check cwd
-    if let Some(cwd_in) = payload.get("cwd").and_then(|v| v.as_str())
-        && let Some(p_cwd) = peer.get("cwd").and_then(|v| v.as_str())
-        && cwd_in != p_cwd
-    {
-        return delegate(fb, harness, Some(&event), &raw_stdin);
-    }
-
-    // Check daemon health
-    let daemon_file = base.join("daemon.json");
-    if daemon_file.is_file()
-        && let Ok(c) = fs::read_to_string(&daemon_file)
-        && let Ok(d) = serde_json::from_str::<serde_json::Value>(&c)
-        && d.get("mode").and_then(|v| v.as_str()) == Some("http")
-        && let Some(daemon_pid) = d.get("pid").and_then(|v| v.as_u64())
-        && !is_pid_live(daemon_pid)
-    {
-        return delegate(fb, harness, Some(&event), &raw_stdin);
-    }
-
-    // Check unread inbox
-    let inbox_dir = base.join("inbox").join(&s_key);
-    if has_unread_mail(&inbox_dir) {
-        return delegate(fb, harness, Some(&event), &raw_stdin);
-    }
-
-    // Check rooms for obligations (only active/open rooms referencing this session)
-    if paths::has_active_room_for_session(&base, &session) {
-        return delegate(fb, harness, Some(&event), &raw_stdin);
-    }
-
-    // A team's lead or deputy: Python gives succession advice and runs the handoff quota check.
-    let peer_harness = peer
-        .get("harness")
-        .and_then(|v| v.as_str())
-        .unwrap_or(harness);
-    if paths::has_active_authority_for_session(&cache, &session, peer_harness) {
-        return delegate(fb, harness, Some(&event), &raw_stdin);
-    }
-
-    // Fast Path execution:
-    if event == "Stop" {
-        let term_reason = if harness == "gemini" {
-            payload
-                .get("terminationReason")
-                .and_then(|v| v.as_str())
+    let mut subagent_name: Option<String> = None;
+    let mut agy_pending = false;
+    let (is_subagent, parent_session) = if gemini {
+        let prev_is_sub = previous_valid
+            && previous
+                .as_ref()
+                .is_some_and(|p| p.get("isSubagent").is_some_and(paths::is_truthy_json));
+        let mut is_sub = prev_is_sub;
+        let mut parent = if prev_is_sub {
+            previous
+                .as_ref()
+                .and_then(|p| p.get("parentSession"))
+                .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
-                .map(String::from)
+                .map(str::to_string)
         } else {
             None
         };
-        let updated = update_peer_locked(&peer_file, |obj| {
-            obj.insert(
-                "state".to_string(),
-                serde_json::Value::String("idle".to_string()),
-            );
-            obj.insert(
-                "lastSeenAt".to_string(),
-                serde_json::Value::String(paths::format_utc_iso_z(paths::utc_now_secs())),
-            );
-            if let Some(ref reason) = term_reason {
-                obj.insert(
-                    "lastStopReason".to_string(),
-                    serde_json::Value::String(reason.clone()),
-                );
+        let mut db_classified = false;
+        if !is_sub || parent.is_none() {
+            let (db_sub, db_parent, db_name, db_cls) =
+                sqlite::agy_sqlite_subagent_info(account_home_dir.as_deref(), &session);
+            db_classified = db_cls;
+            if db_sub {
+                is_sub = true;
+                if parent.is_none() {
+                    parent = db_parent;
+                }
             }
-            true
-        });
-        if !updated {
-            return delegate(fb, harness, Some(&event), &raw_stdin);
+            if db_name.is_some() {
+                subagent_name = db_name;
+            }
         }
-        return Ok(());
+        let (tr_sub, tr_parent, tr_classified) =
+            mailbox_transcript::agy_transcript_classified(effective_transcript.as_deref());
+        if tr_sub {
+            is_sub = true;
+            if tr_parent.is_some() {
+                parent = tr_parent;
+            }
+        }
+        let classified = is_sub || db_classified || tr_classified;
+        if !classified {
+            let (cohosted_parent, saw_busy_cohosted) =
+                mailbox_transcript::agy_cohosted_active_parent(
+                    &base,
+                    &session,
+                    identity::harness_pid(&harness),
+                    account_home_dir.as_deref(),
+                );
+            if let Some(cp) = cohosted_parent {
+                is_sub = true;
+                parent = Some(cp);
+            } else if saw_busy_cohosted || has_transcript {
+                agy_pending = true;
+            }
+        }
+        (is_sub, parent)
+    } else {
+        (false, None)
+    };
+
+    let (phase_handoff, active_orchestrator_model, saw_turn_boundary) = if gemini {
+        mailbox_transcript::agy_transcript_phase(effective_transcript.as_deref())
+    } else {
+        (false, None, false)
+    };
+
+    let prev_session_model = if previous_valid {
+        previous
+            .as_ref()
+            .and_then(|p| {
+                p.get("sessionModel")
+                    .filter(|v| paths::is_truthy_json(v))
+                    .or_else(|| p.get("model"))
+            })
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    } else {
+        None
+    };
+    let explicit_session_model = mailbox_transcript::clean_model_value(
+        payload
+            .get("sessionModel")
+            .or_else(|| payload.get("session_model")),
+    );
+    let explicit_step_model = mailbox_transcript::clean_model_value(
+        payload
+            .get("stepModel")
+            .or_else(|| payload.get("step_model"))
+            .or_else(|| payload.get("workerModel"))
+            .or_else(|| payload.get("subagentModel")),
+    );
+    let mut primary_model = explicit_session_model
+        .clone()
+        .or_else(|| runtime_model.clone());
+    let mut execution_model: Option<String> = None;
+
+    if gemini {
+        if let Some(ref orch) = active_orchestrator_model
+            && (primary_model.is_none()
+                || mailbox_transcript::agy_is_worker_model(primary_model.as_deref()))
+        {
+            if primary_model.as_deref() != Some(orch.as_str()) {
+                execution_model = primary_model.clone();
+            }
+            primary_model = Some(orch.clone());
+        } else if (!has_transcript || !saw_turn_boundary)
+            && previous_valid
+            && mailbox_transcript::agy_is_orchestrator_model(prev_session_model.as_deref())
+            && mailbox_transcript::agy_is_worker_model(primary_model.as_deref())
+        {
+            execution_model = primary_model.clone();
+            primary_model = prev_session_model.clone();
+        }
+    }
+    if let Some(ref esm) = explicit_step_model {
+        execution_model = Some(esm.clone());
+        if let Some(ref prev_sm) = prev_session_model
+            && matches!(event.as_str(), "PreInvocation" | "Stop")
+            && explicit_session_model.is_none()
+        {
+            primary_model = Some(prev_sm.clone());
+        }
+    } else if !gemini
+        && event == "PreInvocation"
+        && previous_valid
+        && let Some(ref prev_sm) = prev_session_model
+        && let Some(ref pm) = primary_model
+        && pm != prev_sm
+        && explicit_session_model.is_none()
+        && !payload
+            .get("modelSwitch")
+            .is_some_and(paths::is_truthy_json)
+    {
+        execution_model = Some(pm.clone());
+        primary_model = Some(prev_sm.clone());
     }
 
-    if event == "PreInvocation" {
-        let is_busy = peer.get("state").and_then(|v| v.as_str()) == Some("busy");
-        let no_stop_reason = peer.get("lastStopReason").is_none_or(|v| v.is_null());
-        if is_busy
-            && no_stop_reason
-            && !payload_changes_model(&payload, &peer)
-            && !has_newer_colleague_file(&base.join("peers"), &peer_file)
+    let session_model = primary_model.or(prev_session_model);
+    let step_model = execution_model
+        .clone()
+        .or(runtime_model)
+        .or_else(|| session_model.clone());
+    if execution_model.is_some() && execution_model == session_model {
+        execution_model = None;
+    }
+
+    let mid_turn = event == "PreInvocation"
+        && previous_valid
+        && previous
+            .as_ref()
+            .is_some_and(|p| p.get("state").and_then(Value::as_str) == Some("busy"));
+
+    let mut me = match identity::register_peer(
+        &base,
+        identity::RegisterArgs {
+            session: &session,
+            harness: &harness,
+            cwd: &cwd,
+            pid: identity::harness_pid(&harness),
+            state: Some(state),
+            cwd_source: Some("hook"),
+            model: session_model.as_deref(),
+            model_source: "runtime",
+            session_model: session_model.as_deref(),
+            step_model: step_model.as_deref(),
+            account: account_home_dir.as_deref(),
+            effort: runtime_effort_val.as_deref(),
+        },
+    ) {
+        Some(p) => p,
+        None => return Ok(()),
+    };
+
+    let current_session_model = me
+        .get("sessionModel")
+        .filter(|v| paths::is_truthy_json(v))
+        .or_else(|| me.get("model"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    if let Some(ref em) = execution_model
+        && Some(em.as_str()) != current_session_model.as_deref()
+    {
+        if me.get("executionModel").and_then(Value::as_str) != Some(em.as_str())
+            && let Some(upd) =
+                identity::annotate_peer(&base, &session, &[("executionModel", json!(em))])
         {
-            let updated = update_peer_locked(&peer_file, |obj| {
-                if !paths::valid_peer(&serde_json::Value::Object(obj.clone()))
-                    || obj.get("state").and_then(|v| v.as_str()) != Some("busy")
-                    || !obj.get("lastStopReason").is_none_or(|v| v.is_null())
-                {
-                    return false;
-                }
-                obj.insert(
-                    "lastSeenAt".to_string(),
-                    serde_json::Value::String(paths::format_utc_iso_z(paths::utc_now_secs())),
-                );
-                true
-            });
-            if !updated {
-                return delegate(fb, harness, Some(&event), &raw_stdin);
+            me = upd;
+        }
+    } else if me.get("executionModel").is_some_and(|v| !v.is_null())
+        && let Some(upd) =
+            identity::annotate_peer(&base, &session, &[("executionModel", Value::Null)])
+    {
+        me = upd;
+    }
+
+    me = identity::mark_delegated(&base, me);
+    let suppress_toplevel =
+        is_subagent || me.get("isSubagent").is_some_and(paths::is_truthy_json) || agy_pending;
+
+    if !suppress_toplevel
+        && !me.get("delegatedRun").is_some_and(paths::is_truthy_json)
+        && let Some(attested) =
+            identity::attest_native_sessions(&base, &session, &[native_session.as_str()])
+    {
+        me = attested;
+    }
+
+    if agy_pending && !is_subagent {
+        if me.get("agySubagentPending") != Some(&Value::Bool(true))
+            && let Some(upd) =
+                identity::annotate_peer(&base, &session, &[("agySubagentPending", json!(true))])
+        {
+            me = upd;
+        }
+    } else if me.get("agySubagentPending").is_some_and(|v| !v.is_null())
+        && let Some(upd) =
+            identity::annotate_peer(&base, &session, &[("agySubagentPending", Value::Null)])
+    {
+        me = upd;
+    }
+
+    if is_subagent {
+        let mut updates: Vec<(&str, Value)> = vec![("isSubagent", json!(true))];
+        if let Some(ref ps) = parent_session {
+            updates.push(("parentSession", json!(ps)));
+        }
+        if let Some(ref sn) = subagent_name
+            && !me.get("focus").is_some_and(paths::is_truthy_json)
+        {
+            let truncated: String = sn.chars().take(60).collect();
+            updates.push(("focus", json!(format!("native {truncated}"))));
+        }
+        for key in [
+            "terminalServer",
+            "herdrPaneId",
+            "herdrWorkspaceId",
+            "herdrEndpoint",
+            "herdrBinary",
+            "agySubagentPending",
+            "nativeSession",
+            "nativeSessions",
+            "nativeSessionAttestation",
+        ] {
+            let in_me = me.get(key).is_some_and(|v| !v.is_null());
+            let in_prev = previous_valid
+                && previous
+                    .as_ref()
+                    .and_then(|p| p.get(key))
+                    .is_some_and(|v| !v.is_null());
+            if in_me || in_prev {
+                updates.push((key, Value::Null));
             }
+        }
+        let changed = updates.iter().any(|(k, v)| me.get(*k) != Some(v));
+        if changed && let Some(upd) = identity::annotate_peer(&base, &session, &updates) {
+            me = upd;
+        }
+    }
+
+    if !suppress_toplevel && !me.get("delegatedRun").is_some_and(paths::is_truthy_json) {
+        let terminal_server = env::var("ORKEST_TERMINAL_SERVER")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        if is_valid_terminal_server(&terminal_server)
+            && me.get("terminalServer").and_then(Value::as_str) != Some(terminal_server.as_str())
+            && let Some(upd) = identity::annotate_peer(
+                &base,
+                &session,
+                &[("terminalServer", json!(terminal_server))],
+            )
+        {
+            me = upd;
+        }
+        if mailbox_swarm::herdr_active() && harness != "codex" {
+            if me.get("terminalServer").is_some_and(|v| !v.is_null())
+                && let Some(upd) =
+                    identity::annotate_peer(&base, &session, &[("terminalServer", Value::Null)])
+            {
+                me = upd;
+            }
+            let herdr_pane = env::var("HERDR_PANE_ID")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            let herdr_workspace = env::var("HERDR_WORKSPACE_ID")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            let herdr_binary = env::var("HERDR_BIN_PATH")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .or_else(|| paths::find_in_path("herdr").map(|p| p.to_string_lossy().into_owned()));
+            let endpoint = terminal::herdr_endpoint();
+            let mut herdr_fields: Vec<(&str, Value)> = Vec::new();
+            if !herdr_pane.is_empty()
+                && me.get("herdrPaneId").and_then(Value::as_str) != Some(herdr_pane.as_str())
+            {
+                herdr_fields.push(("herdrPaneId", json!(herdr_pane)));
+            }
+            if !herdr_workspace.is_empty()
+                && me.get("herdrWorkspaceId").and_then(Value::as_str)
+                    != Some(herdr_workspace.as_str())
+            {
+                herdr_fields.push(("herdrWorkspaceId", json!(herdr_workspace)));
+            }
+            if !herdr_pane.is_empty()
+                && me.get("herdrEndpoint").and_then(Value::as_str) != Some(endpoint.as_str())
+            {
+                herdr_fields.push(("herdrEndpoint", json!(endpoint)));
+            }
+            if !herdr_pane.is_empty()
+                && let Some(ref hb) = herdr_binary
+                && me.get("herdrBinary").and_then(Value::as_str) != Some(hb.as_str())
+            {
+                herdr_fields.push(("herdrBinary", json!(hb)));
+            }
+            if !herdr_fields.is_empty()
+                && let Some(upd) = identity::annotate_peer(&base, &session, &herdr_fields)
+            {
+                me = upd;
+            }
+        } else if harness != "codex" || !terminal_server.is_empty() {
+            let stale: Vec<(&str, Value)> = [
+                "herdrPaneId",
+                "herdrWorkspaceId",
+                "herdrEndpoint",
+                "herdrBinary",
+                "herdrSyncedTitle",
+                "herdrSyncedTarget",
+                "herdrSyncedAt",
+            ]
+            .into_iter()
+            .filter(|k| me.get(*k).is_some_and(|v| !v.is_null()))
+            .map(|k| (k, Value::Null))
+            .collect();
+            if !stale.is_empty()
+                && let Some(upd) = identity::annotate_peer(&base, &session, &stale)
+            {
+                me = upd;
+            }
+        }
+    }
+
+    if (event == "SessionStart" || (gemini && event == "PreInvocation" && previous.is_none()))
+        && (!me.get("delegatedRun").is_some_and(paths::is_truthy_json)
+            || (harness == "claude" && event == "SessionStart"))
+    {
+        mailbox_lifecycle::bootstrap_repo_env(&cwd, &harness, &event);
+    }
+    if event == "SessionStart" && !suppress_toplevel {
+        mailbox_lifecycle::maybe_trigger_auto_update(&base, &me, &event);
+    }
+
+    if gemini
+        && event == "Stop"
+        && let Some(reason) = payload
+            .get("terminationReason")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+    {
+        if let Some(upd) =
+            identity::annotate_peer(&base, &session, &[("lastStopReason", json!(reason))])
+        {
+            me = upd;
+        }
+    } else if me.get("lastStopReason").is_some_and(paths::is_truthy_json)
+        && matches!(
+            event.as_str(),
+            "SessionStart" | "UserPromptSubmit" | "PreInvocation"
+        )
+        && let Some(upd) =
+            identity::annotate_peer(&base, &session, &[("lastStopReason", Value::Null)])
+    {
+        me = upd;
+    }
+
+    if gemini && (is_subagent || me.get("isSubagent").is_some_and(paths::is_truthy_json)) {
+        mailbox_lifecycle::sync_agy_subagent_progress(
+            &base,
+            &me,
+            &event,
+            &payload,
+            subagent_name.as_deref(),
+        );
+    }
+
+    let mut cleared_notice = String::new();
+    if event == "SessionStart"
+        && payload.get("source").and_then(Value::as_str) == Some("clear")
+        && !me.get("delegatedRun").is_some_and(paths::is_truthy_json)
+        && !suppress_toplevel
+    {
+        cleared_notice = mailbox_lifecycle::adopt_cleared(&base, &mut me);
+        if let Ok(pp) = paths::peer_path(&base, &session)
+            && let Some(reloaded) = paths::read_json_file(&pp)
+        {
+            me = reloaded;
+        }
+    }
+
+    if !suppress_toplevel && !me.get("delegatedRun").is_some_and(paths::is_truthy_json) {
+        let allow_herdr = !mailbox_lifecycle::in_isolated_test_mode()
+            || env::var("ORKEST_TEST_ALLOW_HERDR").as_deref() == Ok("1");
+        let shared_codex = harness == "codex"
+            && allow_herdr
+            && (terminal::discovery_available()
+                || me.get("herdrPaneId").is_some_and(paths::is_truthy_json));
+        if !mid_turn
+            && (mailbox_swarm::herdr_active()
+                || shared_codex
+                || terminal::has_terminal_or_orca_context(Some(&harness)))
+        {
+            terminal::bind_terminal(
+                &base,
+                session.clone(),
+                Some(&harness),
+                &payload,
+                event == "SessionStart",
+            );
+        }
+    } else if (is_subagent || me.get("isSubagent").is_some_and(paths::is_truthy_json)) && !mid_turn
+    {
+        let target_parent = parent_session.as_deref().or_else(|| {
+            me.get("parentSession")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        });
+        if target_parent.is_some() {
+            let _ = terminal::refresh_parent_pane(&base, target_parent);
+        }
+    }
+
+    let lifecycle_turn = matches!(
+        event.as_str(),
+        "SessionStart" | "UserPromptSubmit" | "PreInvocation" | "Stop"
+    );
+    if !suppress_toplevel && lifecycle_turn {
+        let _ = rooms_work::renew_workboard_leases(&base, &me, false);
+    }
+
+    let team_notice = if lifecycle_turn {
+        mailbox_lifecycle::succession_notice(&base, &me)
+    } else {
+        String::new()
+    };
+    let handoff_notice = if !is_subagent && lifecycle_turn {
+        mailbox_lifecycle::handoff_turn(
+            &base,
+            &me,
+            matches!(event.as_str(), "SessionStart" | "UserPromptSubmit")
+                || (event == "PreInvocation" && !mid_turn),
+        )
+    } else {
+        String::new()
+    };
+
+    if (matches!(event.as_str(), "SessionStart" | "UserPromptSubmit")
+        || (event == "PreInvocation" && !mid_turn))
+        && let Ok(s_key) = paths::session_key(&session)
+    {
+        let wake_dir = base.join("wakes").join(s_key);
+        for marker in ["agy-wake.json", "claude-wake.json"] {
+            let _ = fs::remove_file(wake_dir.join(marker));
+        }
+    }
+
+    let (identity_hint, availability_hint) =
+        mailbox_lifecycle::check_http_daemon(&base, &mut me, &event, mid_turn);
+
+    if gemini && event == "Stop" {
+        if let Some(tr) = payload.get("terminationReason").and_then(Value::as_str)
+            && mailbox_lifecycle::ANTIGRAVITY_NO_CONTINUE.contains(&tr)
+        {
+            println!("{{}}");
+            return Ok(());
+        }
+        if phase_handoff {
+            println!("{{}}");
             return Ok(());
         }
     }
 
-    // For any remaining subtlety or first turn context, delegate safely:
-    delegate(fb, harness, Some(&event), &raw_stdin)
+    let route_hint = if event == "SessionStart" && !suppress_toplevel {
+        mailbox_lifecycle::wake_route_hint(&base, &me)
+    } else {
+        String::new()
+    };
+    let swarm_toggle = if !suppress_toplevel {
+        mailbox_swarm::swarm_command_context(&base, &me, &payload, &event, mid_turn)
+    } else {
+        String::new()
+    };
+    let side_notice = if !suppress_toplevel {
+        mailbox_swarm::side_command_context(&base, &me, &payload, &event, mid_turn)
+    } else {
+        String::new()
+    };
+    let is_swarm_goal = swarm_toggle.starts_with("[orkest-swarm-goal] ");
+    let intercept_notice = if !side_notice.is_empty() {
+        side_notice.as_str()
+    } else if !is_swarm_goal {
+        swarm_toggle.as_str()
+    } else {
+        ""
+    };
+    if !intercept_notice.is_empty() && !mid_turn {
+        if event == "UserPromptSubmit" && !gemini {
+            identity::annotate_peer(&base, &session, &[("state", json!("idle"))]);
+            println!(
+                "{}",
+                json!({"decision": "block", "reason": intercept_notice})
+            );
+            return Ok(());
+        }
+        if gemini && event == "PreInvocation" {
+            identity::annotate_peer(&base, &session, &[("state", json!("idle"))]);
+            println!(
+                "{}",
+                json!({
+                    "injectSteps": [{
+                        "systemMessage": {
+                            "systemMessage": "",
+                            "metadata": {"user_markdown": intercept_notice},
+                        }
+                    }],
+                    "terminationBehavior": "terminate",
+                })
+            );
+            return Ok(());
+        }
+    }
+
+    let turn_start_context = matches!(event.as_str(), "SessionStart" | "UserPromptSubmit")
+        || (gemini && event == "PreInvocation" && !mid_turn);
+    let swarm_brief = if !suppress_toplevel && turn_start_context {
+        mailbox_swarm::swarm_coordinator_context(&base, &mut me, &event, mid_turn)
+    } else {
+        String::new()
+    };
+    let mut progress_hint = String::new();
+    let mut help_hint = String::new();
+    if !suppress_toplevel && turn_start_context {
+        progress_hint = rooms_work::progress_reminder(&base, &me, event == "SessionStart");
+        help_hint = rooms_work::help_board_hint(&base, &me, previous.as_ref());
+    }
+
+    let delivered = mailbox_lifecycle::take(&base, &session, event == "Stop" || mid_turn, 20);
+    let mut stale_wake_notice = String::new();
+    if matches!(event.as_str(), "UserPromptSubmit" | "PreInvocation")
+        && !mid_turn
+        && delivered.is_empty()
+        && let Some(notice_id) = mailbox_transcript::wake_notice_id(
+            &payload,
+            &session,
+            me.get("accountHome").and_then(Value::as_str),
+        )
+    {
+        let existing_mail = paths::inbox_dir(&base, &session)
+            .ok()
+            .and_then(|d| paths::read_json_file(&d.join(format!("{notice_id}.json"))));
+        if let Some(read_at) = existing_mail
+            .as_ref()
+            .and_then(|m| m.get("readAt"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            stale_wake_notice = format!(
+                "Mailbox notification ({notice_id}) was already delivered and marked read in an earlier turn \
+                 (at {read_at}); no unread peer messages remain. Do not call inbox or ack—finish immediately."
+            );
+        } else {
+            stale_wake_notice = format!(
+                "Mailbox notification ({notice_id}) has no unread messages waiting in your inbox. \
+                 Do not call inbox or ack—finish immediately."
+            );
+        }
+    }
+
+    let me_name = me
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let mut context = mailbox_lifecycle::render_all(&delivered, Some(&me_name));
+    let update_notice = if event == "SessionStart" && !suppress_toplevel {
+        mailbox_lifecycle::update_notice(&base, &me)
+    } else {
+        String::new()
+    };
+
+    let hint_parts: Vec<&str> = [
+        side_notice.as_str(),
+        swarm_toggle.as_str(),
+        swarm_brief.as_str(),
+        cleared_notice.as_str(),
+        update_notice.as_str(),
+        team_notice.as_str(),
+        handoff_notice.as_str(),
+        identity_hint.as_str(),
+        availability_hint.as_str(),
+        route_hint.as_str(),
+        progress_hint.as_str(),
+        help_hint.as_str(),
+        stale_wake_notice.as_str(),
+    ]
+    .into_iter()
+    .filter(|s| !s.is_empty())
+    .collect();
+    if !hint_parts.is_empty() {
+        let hint = hint_parts.join("\n");
+        context = if context.is_empty() {
+            hint
+        } else {
+            format!("{hint}\n\n{context}")
+        };
+    }
+
+    if event == "Stop" && !suppress_toplevel {
+        mailbox_lifecycle::continuation_at_stop(&base, &me);
+    }
+    if event == "Stop" {
+        if delivered.is_empty() {
+            if gemini {
+                println!("{{}}");
+            }
+            return Ok(());
+        }
+        let msg_ids: Vec<String> = delivered
+            .iter()
+            .filter_map(|m| m.get("id").and_then(Value::as_str).map(str::to_string))
+            .collect();
+        let msg_bytes: usize = delivered
+            .iter()
+            .filter_map(|m| m.get("text").and_then(Value::as_str))
+            .map(str::len)
+            .sum();
+        mailbox_lifecycle::feedback_observe(
+            &base,
+            &me,
+            "turn_extended",
+            "interruption",
+            "hook",
+            "project",
+            &msg_ids,
+            Some(json!({
+                "messageCount": delivered.len(),
+                "messageBytes": msg_bytes,
+            })),
+        );
+        identity::annotate_peer(&base, &session, &[("state", json!("busy"))]);
+        let decision = if gemini { "continue" } else { "block" };
+        println!(
+            "{}",
+            json!({
+                "decision": decision,
+                "reason": format!("Peer messages arrived while you worked:\n\n{context}"),
+            })
+        );
+        return Ok(());
+    }
+
+    let others = if me.get("delegatedRun").is_some_and(paths::is_truthy_json) {
+        Vec::new()
+    } else {
+        identity::colleagues(&base, &me)
+    };
+    let (mates, elsewhere) = mailbox_lifecycle::split_channels(&me, &others);
+    let seen = mailbox_lifecycle::roster_key(&me, &mates);
+    let mut rule_shown = false;
+    if event == "SessionStart" || seen != seen_colleagues_vec(&me) {
+        let mut notice = mailbox_lifecycle::describe_colleagues(&mates, &me, &elsewhere);
+        rule_shown = !mates.is_empty() && !notice.is_empty();
+        if notice.is_empty()
+            && elsewhere.is_empty()
+            && me.get("seenColleagues").is_some_and(paths::is_truthy_json)
+            && !me.get("delegatedRun").is_some_and(paths::is_truthy_json)
+        {
+            notice =
+                "The other agent sessions in this project have ended; none is working here now."
+                    .to_string();
+        }
+        if event == "SessionStart" {
+            let joining = mailbox_lifecycle::join_hint(&me, &others);
+            if !joining.is_empty() {
+                notice = if notice.is_empty() {
+                    joining
+                } else {
+                    format!("{notice}\n{joining}")
+                };
+            }
+        }
+        if !notice.is_empty() {
+            context = if context.is_empty() {
+                notice
+            } else {
+                format!("{notice}\n\n{context}")
+            };
+        }
+        identity::annotate_peer(&base, &session, &[("seenColleagues", json!(seen))]);
+    }
+    if !others.is_empty()
+        && !identity::is_run_peer(Some(&me))
+        && !me_name.is_empty()
+        && (event == "SessionStart"
+            || Some(me_name.as_str()) != me.get("announcedName").and_then(Value::as_str))
+    {
+        let rule = if rule_shown {
+            String::new()
+        } else {
+            format!(" {}.", mailbox_lifecycle::NAME_RULE)
+        };
+        let announcement = format!(
+            "Your agent name is {me_name}; use it when you introduce yourself or sign a message.{rule}"
+        );
+        context = if context.is_empty() {
+            announcement
+        } else {
+            format!("{announcement}\n\n{context}")
+        };
+        identity::annotate_peer(&base, &session, &[("announcedName", json!(me_name))]);
+    }
+
+    if gemini {
+        if context.is_empty() {
+            println!("{{}}");
+        } else {
+            println!(
+                "{}",
+                json!({"injectSteps": [{"ephemeralMessage": context}]})
+            );
+        }
+        return Ok(());
+    }
+    if !context.is_empty() {
+        println!(
+            "{}",
+            json!({
+                "hookSpecificOutput": {
+                    "hookEventName": event,
+                    "additionalContext": context,
+                }
+            })
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::os::unix::fs::MetadataExt;
+    use std::fs;
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
+
+    use crate::paths::{fd_identity, lock_path_exclusive};
+    use std::os::unix::fs::MetadataExt;
 
     #[test]
     fn test_lock_retries_after_pruner_unlinks_inode() {
@@ -586,7 +1276,6 @@ mod tests {
             sender.send(fd_identity(guard.fd).unwrap().1).unwrap();
             drop(guard);
         });
-        // Let the waiter open the original inode and block in flock, then unlink it as a pruner would.
         thread::sleep(Duration::from_millis(100));
         fs::remove_file(&lock_path).unwrap();
         drop(first);

@@ -1,8 +1,9 @@
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { chmodSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, mkdtemp, readFile, realpath, writeFile } from "node:fs/promises";
+import { hostname, tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -37,6 +38,7 @@ import {
   normalizeModelAndEffort,
   shortAgentName,
 } from "../../../plugins/orchestrate/lib/horde-view.mjs";
+import { ORCA_VIEW_SCHEMA, readJsonState } from "../../../plugins/orchestrate/lib/orca-context.mjs";
 import {
   ANSI,
   cellWidth,
@@ -2769,6 +2771,571 @@ describe("terminal lifecycle", () => {
       input.emit("data", "q");
       input.emit("data", "q");
       await running;
+    }
+  });
+
+  it("dispatches macOS HUD notifications from notifyHerdrTransitions on darwin and skips on linux or missing binary", async () => {
+    const root = await realpath(await directory());
+    const hudBin = path.join(root, "OrkestHUD");
+    await writeFile(hudBin, "#!/bin/sh\nexit 0\n");
+    chmodSync(hudBin, 0o755);
+
+    const hudCalls = [];
+    const hudExec = (binary, args, options, callback) => {
+      hudCalls.push({ binary, args, options });
+      callback?.(null, "", "");
+    };
+    const darwinEnv = { ORKEST_HUD_BIN: hudBin, ORCA_TERMINAL_HANDLE: "term_9" };
+
+    const seenInactive = new Set();
+    const prev = [
+      { id: "a1", person: "gribble", stage: "working", summary: "Writing tests" },
+      { id: "a2", person: "snoobix", stage: "working", summary: "Refactoring" },
+    ];
+    const nextBlocked = [
+      { id: "a1", person: "gribble", stage: "blocked", summary: "Need confirmation" },
+      { id: "a2", person: "snoobix", stage: "working", summary: "Refactoring" },
+    ];
+
+    // On linux or missing binary with HERDR_ENV unset, returns false and invokes nothing:
+    expect(
+      notifyHerdrTransitions(prev, nextBlocked, seenInactive, {
+        env: darwinEnv,
+        exec: hudExec,
+        platform: "linux",
+      }),
+    ).toBe(false);
+    expect(
+      notifyHerdrTransitions(prev, nextBlocked, seenInactive, {
+        env: { ORKEST_HUD_BIN: path.join(root, "missing-hud") },
+        exec: hudExec,
+        platform: "darwin",
+      }),
+    ).toBe(false);
+    expect(
+      notifyHerdrTransitions(prev, nextBlocked, seenInactive, {
+        env: darwinEnv,
+        exec: hudExec,
+        exists: () => false,
+        platform: "darwin",
+      }),
+    ).toBe(false);
+    expect(hudCalls).toHaveLength(0);
+
+    // Warm-up with prevAgents = null records initial blocked state without notifying:
+    const seen = new Set();
+    expect(
+      notifyHerdrTransitions(
+        null,
+        [{ id: "a0", person: "seeded", stage: "blocked", summary: "Initial block" }],
+        seen,
+        { env: darwinEnv, exec: hudExec, platform: "darwin" },
+      ),
+    ).toBe(false);
+    expect(seen.has("a0:blocked:Initial block")).toBe(true);
+    expect(hudCalls).toHaveLength(0);
+
+    // Blocked agent transition invokes OrkestHUD --json with blocked status:
+    expect(
+      notifyHerdrTransitions(prev, nextBlocked, seen, {
+        env: darwinEnv,
+        exec: hudExec,
+        platform: "darwin",
+      }),
+    ).toBe(true);
+    expect(hudCalls).toHaveLength(1);
+    expect(hudCalls[0].binary).toBe(hudBin);
+    expect(hudCalls[0].args[0]).toBe("--json");
+    expect(JSON.parse(hudCalls[0].args[1])).toEqual({
+      agent: "gribble",
+      body: "Need confirmation",
+      sound: "request",
+      status: "blocked",
+      target: { id: "term_9", kind: "orca" },
+      title: "gribble blocked",
+    });
+
+    // Deduplicated on repeated poll:
+    expect(
+      notifyHerdrTransitions(prev, nextBlocked, seen, {
+        env: darwinEnv,
+        exec: hudExec,
+        platform: "darwin",
+      }),
+    ).toBe(false);
+    expect(hudCalls).toHaveLength(1);
+
+    // Reported (non-accepted) outcome transition invokes OrkestHUD --json with info status:
+    const nextReported = [
+      { id: "a1", person: "gribble", stage: "completed", summary: "Done" },
+      { id: "a2", person: "snoobix", stage: "completed", summary: "Done" },
+    ];
+    expect(
+      notifyHerdrTransitions(nextBlocked, nextReported, seen, {
+        env: darwinEnv,
+        exec: hudExec,
+        platform: "darwin",
+      }),
+    ).toBe(true);
+    expect(hudCalls).toHaveLength(2);
+    expect(JSON.parse(hudCalls[1].args[1])).toEqual({
+      body: "All 2 agents reported (awaiting review).",
+      sound: "request",
+      status: "info",
+      target: { id: "term_9", kind: "orca" },
+      title: "Swarm reported (awaiting review)",
+    });
+
+    // Accepted outcome transition invokes OrkestHUD --json with done status:
+    const nextAccepted = [
+      { id: "a1", person: "gribble", status: "completed", verdict: "accept" },
+      { id: "a2", person: "snoobix", status: "completed", verdict: "accept" },
+    ];
+    expect(
+      notifyHerdrTransitions(nextReported, nextAccepted, seen, {
+        env: darwinEnv,
+        exec: hudExec,
+        platform: "darwin",
+      }),
+    ).toBe(true);
+    expect(hudCalls).toHaveLength(3);
+    expect(JSON.parse(hudCalls[2].args[1])).toEqual({
+      body: "All 2 agents accepted.",
+      sound: "done",
+      status: "done",
+      target: { id: "term_9", kind: "orca" },
+      title: "Swarm accepted",
+    });
+  });
+
+  it("holds Herdr companion split open while workers run, clears notice on recovery, and auto-dismisses after grace", async () => {
+    const root = await realpath(await directory());
+    const socket = path.join(root, "herdr.sock");
+    const hash = (value) => createHash("sha256").update(value).digest("hex");
+    const stateDir = path.join(root, "herdr-views-v1", hash(socket).slice(0, 24));
+    await mkdir(stateDir, { recursive: true });
+    const stateFile = path.join(stateDir, `${hash("room-a")}.json`);
+    const pendingFile = stateFile.replace(/\.json$/u, ".pending");
+    const closedFile = stateFile.replace(/\.json$/u, ".closed");
+    await writeFile(
+      stateFile,
+      JSON.stringify({
+        schema: "orkest.herdr-view.v1",
+        room: "room-a",
+        pane: "w1:p2",
+        terminal_id: "term-view",
+        endpoint: socket,
+        host: hostname(),
+      }),
+    );
+    await writeFile(pendingFile, "pending\n");
+
+    const waitRealIo = async (check) => {
+      const deadline = process.hrtime.bigint() + 2_000_000_000n;
+      while (!check()) {
+        if (process.hrtime.bigint() > deadline) {
+          throw new Error("Timed out waiting for companion dismiss I/O");
+        }
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+    };
+
+    vi.useFakeTimers({
+      toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"],
+    });
+    // eslint-disable-next-line unicorn/prefer-event-target -- Readline keypress uses the Node stream EventEmitter API.
+    const input = Object.assign(new EventEmitter(), {
+      isTTY: true,
+      isRaw: false,
+      setRawMode: vi.fn((raw) => {
+        input.isRaw = raw;
+      }),
+      resume: vi.fn(),
+      pause: vi.fn(),
+    });
+    let outputText = "";
+    const output = {
+      isTTY: true,
+      rows: 28,
+      columns: 100,
+      write: (chunk) => {
+        outputText += chunk;
+      },
+    };
+    const execCalls = [];
+    const exec = (binary, args, options, callback) => {
+      const cb = typeof options === "function" ? options : callback;
+      execCalls.push([binary, ...args]);
+      if (args[0] === "pane" && args[1] === "current") {
+        cb(
+          null,
+          JSON.stringify({ result: { pane: { pane_id: "w1:p2", terminal_id: "term-view" } } }),
+        );
+        return;
+      }
+      cb(null, "{}");
+    };
+    const room = {
+      id: "room-a",
+      title: "Companion auto-dismiss",
+      conductor: { id: "conductor", status: "running", sessionLive: true, runtimeState: "running" },
+      agents: [{ id: "worker-1", status: "working", runtimeState: "running" }],
+      messages: [],
+    };
+    let clock = 0;
+    let isExited = false;
+    const run = async () => {
+      await runHordeTui(async () => structuredClone(room), {
+        input,
+        output,
+        exec,
+        herdrConnect: () => ({ on() {}, write() {}, destroy() {} }),
+        env: {
+          HERDR_ENV: "1",
+          HERDR_PANE_ID: "w1:p2",
+          HERDR_SOCKET_PATH: socket,
+          ORCHESTRATE_HOME: root,
+          ORKEST_HERDR_VIEW_STATE: stateFile,
+        },
+        mouse: false,
+        quota: false,
+        services: false,
+        update: false,
+        chiefHint: false,
+        companionGraceMs: 4000,
+        now: () => clock,
+        // Production room views attach chief loaders with initialMode: "room".
+        chief: {
+          loadStatus: async () => ({ rooms: [], standalone: [] }),
+          loadRoom: async () => structuredClone(room),
+          homeRoomId: "room-a",
+          initialMode: "room",
+        },
+      });
+      isExited = true;
+    };
+    const running = run();
+
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      await waitRealIo(() => plain(outputText).includes("Coordinator"));
+      expect(isExited).toBe(false);
+
+      // Conductor exits while worker is active -> shows hold notice without closing.
+      room.conductor.sessionLive = false;
+      room.conductor.runtimeState = "unknown";
+      clock = 1000;
+      outputText = "";
+      await vi.advanceTimersByTimeAsync(1000);
+      await waitRealIo(() =>
+        plain(outputText).includes(
+          "Orchestrator exited — keeping Swarm View open while workers finish",
+        ),
+      );
+      expect(isExited).toBe(false);
+      await expect(readFile(closedFile, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+
+      // Conductor returns -> clears hold notice back to default footer notice.
+      room.conductor.sessionLive = true;
+      room.conductor.runtimeState = "running";
+      clock = 2000;
+      outputText = "";
+      await vi.advanceTimersByTimeAsync(1000);
+      await waitRealIo(() => plain(outputText).includes("Mouse off — press m to re-enable mouse"));
+      expect(plain(outputText)).not.toContain(
+        "Orchestrator exited — keeping Swarm View open while workers finish",
+      );
+      expect(isExited).toBe(false);
+
+      // Conductor exits again and worker finishes -> waits graceMs before dismissing.
+      room.conductor.sessionLive = false;
+      room.conductor.runtimeState = "unknown";
+      room.agents[0] = {
+        id: "worker-1",
+        status: "completed",
+        verdict: "accept",
+        runtimeState: "stopped",
+      };
+      clock = 3000;
+      await vi.advanceTimersByTimeAsync(1000);
+      await waitRealIo(() => plain(outputText).includes("accepted"));
+      expect(isExited).toBe(false);
+
+      clock = 6999;
+      await vi.advanceTimersByTimeAsync(1000);
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(isExited).toBe(false);
+      expect(execCalls).not.toContainEqual(["herdr", "pane", "close", "w1:p2"]);
+
+      clock = 7000;
+      await vi.advanceTimersByTimeAsync(1000);
+      await waitRealIo(() => isExited);
+      await running;
+      expect(isExited).toBe(true);
+      expect(await readFile(closedFile, "utf8")).toBe("closed\n");
+      await expect(readFile(pendingFile, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+      expect(execCalls).toContainEqual(["herdr", "pane", "close", "w1:p2"]);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      input.emit("data", "qq");
+      await running;
+      vi.useRealTimers();
+    }
+  });
+
+  it("holds Orca companion split open while workers run, auto-dismisses after grace, and never dismisses Chief views", async () => {
+    const root = await realpath(await directory());
+    const orcaFile = path.join(root, "orca-views-v1", "room-a.json");
+    await mkdir(path.dirname(orcaFile), { recursive: true });
+    await writeFile(
+      orcaFile,
+      JSON.stringify({
+        schema: ORCA_VIEW_SCHEMA,
+        room: "room-a",
+        workspaceId: "ws-1",
+        terminalId: "term_view",
+        sourceTerminalId: "term_coord",
+        chief: false,
+        closed: false,
+      }),
+    );
+    const fakeCli = path.join(root, "orca-ide");
+    await writeFile(fakeCli, "#!/bin/sh\nexit 0\n");
+    chmodSync(fakeCli, 0o755);
+
+    const waitRealIo = async (check) => {
+      const deadline = process.hrtime.bigint() + 2_000_000_000n;
+      while (!check()) {
+        if (process.hrtime.bigint() > deadline) {
+          throw new Error("Timed out waiting for companion dismiss I/O");
+        }
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+    };
+
+    vi.useFakeTimers({
+      toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"],
+    });
+    // eslint-disable-next-line unicorn/prefer-event-target -- Readline keypress uses the Node stream EventEmitter API.
+    const input = Object.assign(new EventEmitter(), {
+      isTTY: true,
+      isRaw: false,
+      setRawMode: vi.fn((raw) => {
+        input.isRaw = raw;
+      }),
+      resume: vi.fn(),
+      pause: vi.fn(),
+    });
+    let outputText = "";
+    const output = {
+      isTTY: true,
+      rows: 28,
+      columns: 100,
+      write: (chunk) => {
+        outputText += chunk;
+      },
+    };
+    const execCalls = [];
+    const exec = (binary, args, options, callback) => {
+      const cb = typeof options === "function" ? options : callback;
+      execCalls.push([binary, args]);
+      cb(null, "{}");
+    };
+    const room = {
+      id: "room-a",
+      title: "Orca companion",
+      conductor: { id: "conductor", status: "running", sessionLive: true, runtimeState: "running" },
+      agents: [{ id: "worker-1", status: "working", runtimeState: "running" }],
+      messages: [],
+    };
+    let clock = 0;
+    let isExited = false;
+    const run = async () => {
+      await runHordeTui(async () => structuredClone(room), {
+        input,
+        output,
+        exec,
+        env: {
+          HOME: root,
+          ORCA_CLI_COMMAND: fakeCli,
+          ORKEST_ORCA_VIEW_STATE: orcaFile,
+          PATH: "",
+        },
+        quota: false,
+        services: false,
+        update: false,
+        chiefHint: false,
+        companionGraceMs: 2500,
+        now: () => clock,
+      });
+      isExited = true;
+    };
+    const running = run();
+
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      await waitRealIo(() => plain(outputText).includes("Orca companion"));
+      expect(isExited).toBe(false);
+
+      room.conductor.sessionLive = false;
+      room.conductor.runtimeState = "unknown";
+      clock = 1000;
+      outputText = "";
+      await vi.advanceTimersByTimeAsync(1000);
+      await waitRealIo(() =>
+        plain(outputText).includes(
+          "Orchestrator exited — keeping Swarm View open while workers finish",
+        ),
+      );
+      expect(isExited).toBe(false);
+
+      room.agents[0] = {
+        id: "worker-1",
+        status: "completed",
+        verdict: "accept",
+        runtimeState: "stopped",
+      };
+      clock = 2000;
+      await vi.advanceTimersByTimeAsync(1000);
+      await waitRealIo(() => plain(outputText).includes("accepted"));
+      expect(isExited).toBe(false);
+
+      clock = 4499;
+      await vi.advanceTimersByTimeAsync(1000);
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(isExited).toBe(false);
+      expect(execCalls).toHaveLength(0);
+
+      clock = 4500;
+      await vi.advanceTimersByTimeAsync(1000);
+      await waitRealIo(() => isExited);
+      await running;
+      expect(isExited).toBe(true);
+      expect(await readJsonState(orcaFile)).toMatchObject({
+        closed: true,
+        autoDismissed: true,
+      });
+      expect(execCalls).toEqual([
+        [fakeCli, ["terminal", "close", "--terminal", "term_view", "--json"]],
+      ]);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      input.emit("data", "q");
+      await running;
+      vi.useRealTimers();
+    }
+
+    // Chief session with initialMode: "chief" must stay open even if drilled into its home room.
+    await writeFile(
+      orcaFile,
+      JSON.stringify({
+        schema: ORCA_VIEW_SCHEMA,
+        room: "room-a",
+        workspaceId: "ws-1",
+        terminalId: "term_view",
+        sourceTerminalId: "term_coord",
+        chief: false,
+        closed: false,
+      }),
+    );
+    vi.useFakeTimers({
+      toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"],
+    });
+    // eslint-disable-next-line unicorn/prefer-event-target -- Readline keypress uses the Node stream EventEmitter API.
+    const chiefInput = Object.assign(new EventEmitter(), {
+      isTTY: true,
+      isRaw: false,
+      setRawMode: vi.fn(),
+      resume: vi.fn(),
+      pause: vi.fn(),
+    });
+    let chiefOutputText = "";
+    const chiefOutput = {
+      isTTY: true,
+      rows: 28,
+      columns: 100,
+      write: (chunk) => {
+        chiefOutputText += chunk;
+      },
+    };
+    const chiefExec = vi.fn((_b, _a, opts, cb) =>
+      (typeof opts === "function" ? opts : cb)(null, "{}"),
+    );
+    const chiefRoom = {
+      id: "room-a",
+      title: "Chief desk",
+      conductor: { id: "conductor", status: "running", sessionLive: true, runtimeState: "running" },
+      agents: [],
+      messages: [],
+    };
+    let chiefClock = 0;
+    let isChiefExited = false;
+    const chiefStatus = {
+      schema: "ork.chief.status.v1",
+      generatedAt: "2026-11-18T06:00:00.000Z",
+      machine: "kahuna",
+      chief: { live: true, stale: false, session: "chief-1", name: "Ork Chief" },
+      summary: { orchestrators: 1, working: 1, blocked: 0, attention: 0, standalone: 0 },
+      rooms: [
+        {
+          id: "room-a",
+          title: "Chief desk",
+          cwd: "/repo",
+          repo: { name: "repo", path: "/repo" },
+          branch: "main",
+          counts: { working: 0, blocked: 0, done: 0, idle: 0, total: 0 },
+          attention: [],
+          coordinator: { session: "c1", name: "C1", engine: "claude", status: "running" },
+        },
+      ],
+      standalone: [],
+      inbox: [],
+      desk: [],
+    };
+    const runChief = async () => {
+      await runHordeTui(async () => structuredClone(chiefRoom), {
+        input: chiefInput,
+        output: chiefOutput,
+        exec: chiefExec,
+        env: { HOME: root, ORCA_CLI_COMMAND: fakeCli, ORKEST_ORCA_VIEW_STATE: orcaFile, PATH: "" },
+        quota: false,
+        services: false,
+        update: false,
+        chiefHint: false,
+        companionGraceMs: 1000,
+        now: () => chiefClock,
+        chief: {
+          loadStatus: async () => structuredClone(chiefStatus),
+          loadRoom: async () => structuredClone(chiefRoom),
+          homeRoomId: "room-a",
+          initialMode: "chief",
+        },
+      });
+      isChiefExited = true;
+    };
+    const chiefRunning = runChief();
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      await waitRealIo(() => plain(chiefOutputText).includes("ORK CHIEF"));
+      // Enter drills into homeRoomId ("room-a"), leaving drilledRoomId undefined.
+      chiefInput.emit("data", "\r");
+      await waitRealIo(() => plain(chiefOutputText).includes("Chief desk"));
+      chiefRoom.conductor.sessionLive = false;
+      chiefRoom.conductor.runtimeState = "unknown";
+      chiefClock = 10_000;
+      await vi.advanceTimersByTimeAsync(2000);
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(isChiefExited).toBe(false);
+      expect(chiefExec).not.toHaveBeenCalled();
+      expect((await readJsonState(orcaFile)).closed).toBe(false);
+      chiefInput.emit("data", "q");
+      await chiefRunning;
+      expect(isChiefExited).toBe(true);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      chiefInput.emit("data", "q");
+      await chiefRunning;
+      vi.useRealTimers();
     }
   });
 });

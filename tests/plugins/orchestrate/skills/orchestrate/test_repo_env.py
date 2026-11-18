@@ -9,13 +9,14 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+TESTS = Path(__file__).resolve().parent
 SCRIPTS = Path(__file__).resolve().parents[5] / "plugins" / "orchestrate" / "skills" / "orchestrate" / "scripts"
-if str(SCRIPTS) not in sys.path:
-    sys.path.insert(0, str(SCRIPTS))
+for _path in (TESTS, SCRIPTS):
+    if str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
 
-import mailbox_hooks  # noqa: E402
-import peer_mailbox  # noqa: E402
 import repo_env  # noqa: E402
+from _ork_fast_test_helpers import run_mailbox_hook  # noqa: E402
 
 SPEC = importlib.util.spec_from_file_location("agent_executor_runner_env_test", SCRIPTS / "run_agent.py")
 assert SPEC and SPEC.loader
@@ -188,18 +189,13 @@ class RepoEnvPropagationTests(unittest.TestCase):
             "agent_type": "Explore",
             "cwd": str(linked),
         }
-        with mock.patch.dict(
-            os.environ,
-            {"ORCHESTRATE_HOME": str(self.root), "ORKEST_READONLY_RUN": "1"},
-            clear=False,
-        ):
-            peer_mailbox.hook(sub_payload, harness="claude", base=mailbox_base)
+        readonly_env = {**os.environ, "ORKEST_READONLY_RUN": "1"}
+        run_mailbox_hook(sub_payload, harness="claude", base=mailbox_base, env=readonly_env)
         self.assertFalse((linked / ".env").exists())
 
         # Writer/interactive SubagentStart materializes missing .env into the native subagent worktree.
-        with mock.patch.dict(os.environ, {"ORCHESTRATE_HOME": str(self.root)}, clear=False):
-            os.environ.pop("ORKEST_READONLY_RUN", None)
-            peer_mailbox.hook(sub_payload, harness="claude", base=mailbox_base)
+        writer_env = {k: v for k, v in os.environ.items() if k != "ORKEST_READONLY_RUN"}
+        run_mailbox_hook(sub_payload, harness="claude", base=mailbox_base, env=writer_env)
         self.assertTrue((linked / ".env").is_file())
         self.assertEqual((linked / ".env").stat().st_mode & 0o777, 0o600)
 
@@ -215,11 +211,7 @@ class RepoEnvPropagationTests(unittest.TestCase):
             "session_id": "session-claude-wt-1",
             "cwd": str(linked),
         }
-        with (
-            mock.patch.dict(os.environ, isolated_env, clear=True),
-            mock.patch.object(mailbox_hooks, "_maybe_trigger_auto_update"),
-        ):
-            peer_mailbox.hook(session_payload, harness="claude", base=mailbox_base)
+        run_mailbox_hook(session_payload, harness="claude", base=mailbox_base, env=isolated_env)
         self.assertEqual(claude_env_file.stat().st_mode & 0o777, 0o600)
         text = claude_env_file.read_text(encoding="utf-8")
         self.assertNotIn("ANTHROPIC_API_KEY", text)

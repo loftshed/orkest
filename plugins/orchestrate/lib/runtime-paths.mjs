@@ -63,7 +63,6 @@ export function setHomeEnv(env, homePath) {
 }
 
 export function orkFastBin(env = process.env, { home = homedir() } = {}) {
-  if (env.ORK_DISABLE_FAST === "1") return null;
   const explicit = env.ORK_FAST_BIN;
   if (explicit) return expandHome(explicit, home);
   return path.join(cacheHome(env, { home }), "bin", "ork-fast");

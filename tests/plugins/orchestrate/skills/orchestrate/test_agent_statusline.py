@@ -17,15 +17,16 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+TESTS_DIR = Path(__file__).resolve().parent
 SCRIPTS = Path(__file__).resolve().parents[5] / "plugins/orchestrate/skills/orchestrate/scripts"
+sys.path.insert(0, str(TESTS_DIR))
 sys.path.insert(0, str(SCRIPTS))
+import _ork_fast_test_helpers as fast  # noqa: E402
 import agent_statusline_tmux as tmux  # noqa: E402
 import mailbox_tasks  # noqa: E402
 import mailbox_work  # noqa: E402
 import peer_mailbox as mailbox  # noqa: E402
 import room_store  # noqa: E402
-
-STATUSLINE = SCRIPTS / "agent_statusline.py"
 
 
 class AgentStatuslineTests(unittest.TestCase):
@@ -36,6 +37,7 @@ class AgentStatuslineTests(unittest.TestCase):
         self.base = self.home / "mailbox-v1"
         self.environment = {**os.environ, "AGENT_EXECUTOR_HOME": str(self.home)}
         self.environment.pop("NO_COLOR", None)
+        self.environment.pop("ORK_GLYPHS", None)
         self.peer("claude-123", "snorfle-opus-high-project-23", "claude")
         self.peer("gemini-456", "snoobix-gemini-low-project-56", "gemini")
 
@@ -59,11 +61,10 @@ class AgentStatuslineTests(unittest.TestCase):
         return peer
 
     def run_status(self, *args, payload=None, environment=None):
-        return subprocess.run(
-            [sys.executable, "-B", str(STATUSLINE), *args],
-            input=json.dumps(payload) if payload is not None else "",
-            capture_output=True,
-            text=True,
+        return fast.run_statusline(
+            *args,
+            stdin_data=payload,
+            base=self.base,
             env=environment or self.environment,
             check=True,
         ).stdout

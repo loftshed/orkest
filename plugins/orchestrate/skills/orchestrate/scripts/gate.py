@@ -3,8 +3,7 @@
 
     gate.py [--heavy] [--label TEXT] -- COMMAND...   run COMMAND once the gate lets it in
     gate.py status [--all] [--json]                  who holds the gate and recent runs
-    gate.py hook --harness claude|codex|gemini       PreToolUse: refuse a heavy run outside the gate
-    gate.py install|uninstall [--dry-run]            add or remove that hook for each installed harness
+    gate.py install|uninstall [--dry-run]            add or remove the PreToolUse gate hook
 
 A focused run takes one of a few slots. A heavy run (a whole suite, a production build, a project-wide
 typecheck or lint) holds every slot, so it never runs beside another gated run, and while it waits no
@@ -254,85 +253,6 @@ def runner(head: str, rest: list[str]) -> tuple[str, bool] | None:
     if head in {"webpack", "rollup", "tsup"}:
         return None if {"serve", "--watch", "-w"} & set(rest) else (head, True)
     return None
-
-
-def drop_heredocs(line: str) -> str:
-    """A here-document's body is data, such as a commit message, not commands."""
-    lines, kept, delimiters = line.split("\n"), [], []
-    for text in lines:
-        if delimiters:
-            if text.strip() == delimiters[0]:
-                delimiters.pop(0)
-            continue
-        kept.append(text)
-        delimiters += [match[1] for match in re.findall(r"(?<!<)<<-?(?!<)\s*(['\"]?)([A-Za-z_]\w*)\1", text)]
-    return "\n".join(kept)
-
-
-def simple_commands(line: str, depth: int = 0) -> list[list[str]]:
-    """The simple commands of a shell line, looking inside sh/bash/zsh -c strings."""
-    lexer = shlex.shlex(drop_heredocs(line), posix=True, punctuation_chars="();<>|&\n")
-    lexer.whitespace = " \t\r"
-    lexer.whitespace_split = True
-    lexer.commenters = ""
-    try:
-        tokens = list(lexer)
-    except ValueError:
-        return []  # unbalanced quotes: leave the call to the harness
-    found: list[list[str]] = []
-    words: list[str] = []
-    redirect = False
-    for token in [*tokens, ";"]:
-        if redirect:
-            redirect = False
-        elif token and set(token) <= set("<>&") and ("<" in token or ">" in token):
-            if words and words[-1].isdigit():
-                words.pop()  # the 2 of 2>&1
-            redirect = True
-        elif token and set(token) <= set("();|&\n"):
-            if words:
-                found.append(words)
-            words = []
-        else:
-            words.append(token)
-    expanded = []
-    for words in found:
-        bare = strip_prefixes(words)
-        script = None
-        if depth < 3 and bare and Path(bare[0]).name in SHELLS:
-            for index, arg in enumerate(bare[1:-1], 1):
-                if re.fullmatch(r"-[a-z]*c[a-z]*", arg):
-                    script = bare[index + 1]
-                    break
-        expanded.extend(simple_commands(script, depth + 1) if script is not None else [words])
-    return expanded
-
-
-def gated(words: list[str]) -> bool:
-    bare = strip_prefixes(words)
-    if not bare:
-        return False
-    head = Path(bare[0]).name
-    if head == "ork" and bare[1:2] == ["gate"]:
-        return True
-    return head == "gate.py" or (head.startswith("python") and len(bare) > 1 and Path(bare[1]).name == "gate.py")
-
-
-def heavy_runs_with_argv(line: str) -> list[tuple[str, str, list[str]]]:
-    """(what runs, stripped command text, raw words) for each heavy run in a shell line outside the gate."""
-    found: list[tuple[str, str, list[str]]] = []
-    for words in simple_commands(line):
-        if gated(words):
-            continue
-        kind = classify(words)
-        if kind and kind[1]:
-            found.append((kind[0], shlex.join(strip_prefixes(words)), list(words)))
-    return found
-
-
-def heavy_runs(line: str) -> list[tuple[str, str]]:
-    """(what runs, its command text) for each heavy run in a shell line that the gate does not wrap."""
-    return [(kind, text) for kind, text, _ in heavy_runs_with_argv(line)]
 
 
 # --- Source metadata observation ------------------------------------------------------------------
@@ -956,168 +876,18 @@ def run(command: list[str], *, heavy: bool, label: str | None, workers: int) -> 
     return exit_code
 
 
-# --- The PreToolUse hook --------------------------------------------------------------------------
-
-
-def gate_command() -> str:
-    return "ork gate" if shutil.which("ork") else shlex.join(["python3", str(Path(__file__).resolve())])
-
-
-def hook_context(payload: dict[str, Any], line: str) -> tuple[str | None, str | None, str | None]:
-    """Resolve (checkout, relative_cwd, current_fp) from the PreToolUse payload, never the hook's own cwd."""
-    raw_cwd: str | None = None
-    tool_input = payload.get("tool_input")
-    if isinstance(tool_input, dict):
-        for key in ("workdir", "cwd"):
-            if isinstance(tool_input.get(key), str) and tool_input[key].strip():
-                raw_cwd = tool_input[key]
-                break
-    if not raw_cwd and isinstance(payload.get("cwd"), str) and payload["cwd"].strip():
-        raw_cwd = payload["cwd"]
-    if not raw_cwd:
-        tool_call = payload.get("toolCall")
-        if isinstance(tool_call, dict) and isinstance(tool_call.get("args"), dict):
-            for key in ("cwd", "workingDirectory", "workdir"):
-                val = tool_call["args"].get(key)
-                if isinstance(val, str) and val.strip():
-                    raw_cwd = val
-                    break
-    if not raw_cwd:
-        spaces = payload.get("workspacePaths")
-        if isinstance(spaces, list) and len(spaces) == 1 and isinstance(spaces[0], str) and spaces[0].strip():
-            raw_cwd = spaces[0]
-    checkout, relative_cwd, _ = inspect_checkout(raw_cwd, include_fingerprint=False)
-    if not checkout or not raw_cwd:
-        return (None, None, None)
-    cur_dir = Path(raw_cwd)
-    for words in simple_commands(line):
-        bare = strip_prefixes(words)
-        if bare[:1] == ["cd"]:
-            if len(bare) != 2 or bare[1].startswith("-"):
-                return (None, None, None)
-            target = (cur_dir / os.path.expanduser(bare[1])) if not os.path.isabs(bare[1]) else Path(bare[1])
-            new_checkout, _, _ = inspect_checkout(target, include_fingerprint=False)
-            if new_checkout != checkout:
-                return (None, None, None)
-            cur_dir = target
-            relative_cwd = None
-        elif any(
-            w in PACKAGE_VALUES or w == "workspace" or w.startswith(tuple(f"{f}=" for f in PACKAGE_VALUES))
-            for w in bare
-        ):
-            relative_cwd = None
-    return (checkout, relative_cwd, None)
-
-
-def refusal(
-    runs: list[tuple[str, str]],
-    *,
-    raw_argv: list[str] | None = None,
-    directory: Path | None = None,
-    checkout: str | None = None,
-    relative_cwd: str | None = None,
-    current_fp: str | None = None,
-) -> str:
-    kind, text = runs[0]
-    base = (
-        f"`{text}` runs a whole {kind} pass, and several agents share this machine. To check whether your "
-        "change broke something, run the tests that exercise it instead: the test file beside the code you "
-        "changed, or `vitest related` / `jest --findRelatedTests` with the source files you changed. If you "
-        f"really need the full run, as the final check, wrap it so it waits for other heavy runs: "
-        f"`{gate_command()} --heavy -- {text}`."
-    )
-    if not directory or not checkout:
-        return base
-    active = [h for h in holders(directory) if h.get("checkout") == checkout and h.get("pid") != os.getpid()]
-    history = [r for r in load_runs(directory) if r.get("checkout") == checkout]
-    if raw_argv is not None:
-        requested = list(raw_argv)
-    else:
-        try:
-            requested = shlex.split(text)
-        except ValueError:
-            requested = []
-    effective = capped(requested, WORKERS) if requested else []
-    exact = (
-        [
-            r
-            for r in history
-            if is_exact_match(
-                r,
-                checkout=checkout,
-                relative_cwd=relative_cwd,
-                requested_argv=requested,
-                effective_argv=effective,
-                workers=WORKERS,
-            )
-        ]
-        if requested
-        else []
-    )
-    notes: list[str] = []
-    if active:
-        notes.append(f"Active in this checkout: {describe(active[0])}.")
-    if exact:
-        fp = current_fp if current_fp is not None else fingerprint(Path(checkout))
-        notes.append(f"Last matching run in this checkout: {describe_run(exact[-1], current_fp=fp)}.")
-    if not notes and not history:
-        return base
-    if len(notes) < 2:
-        notes.append(f"Run `{gate_command()} status` to see active and recent runs.")
-    return "\n".join([base, *notes[:2]])
-
-
-def command_line(payload: dict[str, Any]) -> str | None:
-    """The shell command a PreToolUse payload is about to run: Claude Code, Codex or Antigravity."""
-    tool_input = payload.get("tool_input")
-    if isinstance(tool_input, dict):
-        command = tool_input.get("command")
-        if isinstance(command, list) and all(isinstance(word, str) for word in command):
-            # Codex may pass argv, often ["bash", "-lc", script].
-            return shlex.join(command)
-        return command if isinstance(command, str) else None
-    tool_call = payload.get("toolCall")
-    if isinstance(tool_call, dict) and isinstance(tool_call.get("args"), dict):
-        command = tool_call["args"].get("CommandLine")
-        return command if isinstance(command, str) else None
-    return None
-
-
-def hook(payload: dict[str, Any], harness: str) -> dict[str, Any] | None:
-    """A deny for a heavy run outside the gate; None leaves the harness's own decision alone."""
-    line = command_line(payload)
-    detailed = heavy_runs_with_argv(line) if line else []
-    if not detailed or not line:
-        return None
-    runs = [(kind, text) for kind, text, _ in detailed]
-    checkout, relative_cwd, current_fp = hook_context(payload, line)
-    reason = refusal(
-        runs,
-        raw_argv=detailed[0][2],
-        directory=gate_dir(),
-        checkout=checkout,
-        relative_cwd=relative_cwd,
-        current_fp=current_fp,
-    )
-    if harness == "gemini":
-        return {"decision": "deny", "reason": reason}
-    decision = {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason}
-    return {"hookSpecificOutput": decision}
-
-
 # --- Installing the hook --------------------------------------------------------------------------
 
 HOOK_NAME = "agent-gate"
 SHELL_TOOLS = "Bash|shell|exec_command|local_shell|unified_exec"
 
 
-def hook_command(script: Path, harness: str, fast_bin: Path | None = None) -> str:
-    if fast_bin:
-        return (
-            f"[ -x {shlex.quote(str(fast_bin))} ] && exec {shlex.quote(str(fast_bin))} gate-hook --harness {harness} "
-            f"--fallback-script {shlex.quote(str(script))}; exec python3 {shlex.quote(str(script))} hook --harness {harness}"
-        )
-    return shlex.join(["python3", str(script), "hook", "--harness", harness])
+def hook_command(script: Path | None, harness: str, fast_bin: Path | None = None) -> str:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import runtime_paths
+
+    resolved = Path(fast_bin) if fast_bin is not None else runtime_paths.ork_fast_bin()
+    return shlex.join([str(resolved), "gate-hook", "--harness", harness])
 
 
 def hook_files(home: Path) -> list[tuple[str, Path]]:
@@ -1253,18 +1023,6 @@ def main(argv: list[str] | None = None) -> int:
             parser.add_argument("--all", action="store_true", dest="all_checkouts")
             opts = parser.parse_args(argv[1:])
             return status(as_json=opts.as_json, all_checkouts=opts.all_checkouts)
-        if argv[:1] == ["hook"]:
-            parser = argparse.ArgumentParser(prog="gate.py hook")
-            parser.add_argument("--harness", choices=("claude", "codex", "gemini"), default="claude")
-            harness = parser.parse_args(argv[1:]).harness
-            try:
-                payload = json.loads(sys.stdin.read() or "{}")
-            except ValueError:
-                return 0  # never break a turn over a payload this cannot read
-            decision = hook(payload if isinstance(payload, dict) else {}, harness)
-            if decision:
-                print(json.dumps(decision))
-            return 0
         if argv[:1] in (["install"], ["uninstall"]):
             return install(remove=argv[0] == "uninstall", dry_run="--dry-run" in argv[1:])
         if "--" not in argv:

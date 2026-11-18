@@ -327,11 +327,8 @@ describe("terminal presentation components", () => {
   });
 
   it("keeps statusline, monitor, and DEFAULT_THEME 256-color tokens in parity", () => {
-    const statuslinePy = readFileSync(
-      new URL(
-        "../../../plugins/orchestrate/skills/orchestrate/scripts/agent_statusline.py",
-        import.meta.url,
-      ),
+    const statuslineRs = readFileSync(
+      new URL("../../../crates/ork-fast/src/statusline.rs", import.meta.url),
       "utf8",
     );
     const palettePairs = [
@@ -344,14 +341,14 @@ describe("terminal presentation components", () => {
     ];
     for (const [slot, colorCode] of palettePairs) {
       expect(DEFAULT_THEME[`identity${slot}`]).toBe(`38;5;${colorCode};1`);
-      expect(statuslinePy).toContain(`${slot}: ${colorCode}`);
+      expect(statuslineRs).toContain(`${slot} => ${colorCode}`);
     }
     expect(DEFAULT_THEME.leadModel).toBe("38;5;117;1");
     expect(DEFAULT_THEME.leadEffort).toBe("38;5;180;1");
     expect(DEFAULT_THEME.leadSeparator).toBe("38;5;245");
-    expect(statuslinePy).toContain('"model": 117');
-    expect(statuslinePy).toContain('"effort": 180');
-    expect(statuslinePy).toContain('"separator": 245');
+    expect(statuslineRs).toContain('"model" => Some(117)');
+    expect(statuslineRs).toContain('"effort" => Some(180)');
+    expect(statuslineRs).toContain('"separator" => Some(245)');
 
     expect(MONITOR_ANSI.quotaOk).toBe(`\u{1B}[${DEFAULT_THEME.quotaOk}m`);
     expect(MONITOR_ANSI.quotaMid).toBe(`\u{1B}[${DEFAULT_THEME.quotaMid}m`);

@@ -62,6 +62,31 @@ async function ownedViewPane(record, env, exec) {
   });
 }
 
+function runHerdr(exec, binary, args, env) {
+  return new Promise((resolve) => {
+    exec(binary, args, { timeout: 2000, env }, (error) => resolve(!error));
+  });
+}
+
+async function writeHerdrClosedMarkers(file) {
+  await writeFile(file.replace(/\.json$/u, ".closed"), "closed\n", { mode: 0o600 });
+  try {
+    await unlink(file.replace(/\.json$/u, ".pending"));
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+}
+
+/** Whether this process runs inside a Herdr-managed Swarm View companion split pane. */
+export function isHerdrCompanionView(env = process.env) {
+  return (
+    env?.HERDR_ENV === "1" &&
+    Boolean(env?.HERDR_PANE_ID) &&
+    Boolean(env?.ORKEST_HERDR_VIEW_STATE) &&
+    env?.ORKEST_CHIEF_VIEW !== "1"
+  );
+}
+
 /** Sync the Herdr pane border title with the swarm room title or coordinator goal. */
 export async function syncHerdrViewLabel(room, { env = process.env, exec = execFile } = {}) {
   const roomId = typeof room?.id === "string" ? room.id : "";
@@ -73,11 +98,7 @@ export async function syncHerdrViewLabel(room, { env = process.env, exec = execF
   const paneId = await ownedViewPane(record, env, exec);
   if (!paneId) return false;
   const binary = env.HERDR_BIN_PATH || "herdr";
-  const renamed = await new Promise((resolve) => {
-    exec(binary, ["pane", "rename", paneId, nextLabel], { timeout: 2000, env }, (error) =>
-      resolve(!error),
-    );
-  });
+  const renamed = await runHerdr(exec, binary, ["pane", "rename", paneId, nextLabel], env);
   if (!renamed) return false;
   const updated = { ...record, pane: paneId, label: nextLabel };
   await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
@@ -100,11 +121,24 @@ export async function syncHerdrViewLabel(room, { env = process.env, exec = execF
 export async function markHerdrViewClosed(room, env = process.env, exec = execFile) {
   const resolved = await resolveHerdrStateFile(room, env);
   if (!resolved || !(await ownedViewPane(resolved.record, env, exec))) return;
-  const { file } = resolved;
-  await writeFile(file.replace(/\.json$/u, ".closed"), "closed\n", { mode: 0o600 });
-  try {
-    await unlink(file.replace(/\.json$/u, ".pending"));
-  } catch (error) {
-    if (error.code !== "ENOENT") throw error;
+  await writeHerdrClosedMarkers(resolved.file);
+}
+
+/** Auto-dismiss a Herdr companion split pane after confirming pane ownership. */
+export async function closeHerdrCompanionPane(roomId, { env = process.env, exec = execFile } = {}) {
+  if (!isHerdrCompanionView(env)) return { dismissed: false, reason: "not_companion" };
+  const resolved = await resolveHerdrStateFile(roomId, env);
+  if (!resolved || resolved.record.chief === true) {
+    return { dismissed: false, reason: "not_companion" };
   }
+  const paneId = await ownedViewPane(resolved.record, env, exec);
+  if (!paneId) return { dismissed: false, multiplexerUnavailable: true };
+  // Write closure markers before closing the pane so Herdr killing this PTY never looks accidental.
+  await writeHerdrClosedMarkers(resolved.file);
+  const binary = env.HERDR_BIN_PATH || "herdr";
+  const closed =
+    (await runHerdr(exec, binary, ["pane", "close", paneId], env)) ||
+    (await runHerdr(exec, binary, ["plugin", "pane", "close", paneId], env));
+  if (!closed) return { dismissed: false, paneId, reason: "close_failed" };
+  return { dismissed: true, paneId };
 }

@@ -12,11 +12,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+TESTS_DIR = Path(__file__).resolve().parent
 SCRIPTS = Path(__file__).resolve().parents[5] / "plugins/orchestrate/skills/orchestrate/scripts"
+sys.path.insert(0, str(TESTS_DIR))
 sys.path.insert(0, str(SCRIPTS))
+import _ork_fast_test_helpers as fast  # noqa: E402
 import agent_progress as progress  # noqa: E402
-import agent_statusline as statusline  # noqa: E402
-import mailbox_daemon  # noqa: E402
 import mailbox_work as work  # noqa: E402
 import peer_mailbox as mailbox  # noqa: E402
 
@@ -51,8 +52,7 @@ class ProgressTests(unittest.TestCase):
         )
 
     def fields(self):
-        with patch.object(mailbox, "root", return_value=self.base):
-            return statusline.identity(self.peer["session"], "codex")
+        return fast.statusline_identity(self.peer["session"], "codex", base=self.base)
 
     def report(self, stage="working", task="Fix parser"):
         return progress.report(self.base, self.peer, goal="Ship export", task=task, stage=stage)
@@ -313,18 +313,16 @@ class ProgressTests(unittest.TestCase):
 
     def test_turn_hooks_remind_each_harness_but_never_extend_a_turn_or_mark_it_complete(self):
         for harness in ("claude", "codex", "gemini"):
-            with (
-                self.subTest(harness=harness),
-                patch.object(mailbox, "harness_pid", return_value=os.getpid()),
-                patch.object(mailbox_daemon, "get_mode", return_value="stdio"),
-            ):
+            with self.subTest(harness=harness):
                 session = f"hook-{harness}"
                 payload = {"session_id": session, "cwd": str(self.cwd)}
-                started = mailbox.hook(payload, harness=harness, event="SessionStart", base=self.base)
+                started = fast.run_mailbox_hook(
+                    payload, harness=harness, event="SessionStart", base=self.base, cwd=self.cwd
+                )
                 self.assertIn("--goal 'overall goal' --task 'current task' --stage working", str(started))
                 peer = mailbox.load(mailbox.peer_path(self.base, session))
                 progress.report(self.base, peer, goal="Ship export", task="Fix parser", stage="working")
-                stopped = mailbox.hook(payload, harness=harness, event="Stop", base=self.base)
+                stopped = fast.run_mailbox_hook(payload, harness=harness, event="Stop", base=self.base, cwd=self.cwd)
                 self.assertIn(stopped, (None, {}))
                 self.assertEqual(progress.read(self.base, peer)["stage"], "working")
                 old = mailbox.now() - dt.timedelta(minutes=31)
@@ -332,7 +330,7 @@ class ProgressTests(unittest.TestCase):
                     progress.report(self.base, peer, goal="Ship export", task="Fix parser", stage="working")
                 peer = mailbox.annotate(self.base, session, progressReminderAt=mailbox.stamp(old))
                 event = "PreInvocation" if harness == "gemini" else "UserPromptSubmit"
-                reminded = mailbox.hook(payload, harness=harness, event=event, base=self.base)
+                reminded = fast.run_mailbox_hook(payload, harness=harness, event=event, base=self.base, cwd=self.cwd)
                 self.assertIn("footer progress is stale", str(reminded))
                 self.assertEqual(progress.reminder(self.base, mailbox.load(mailbox.peer_path(self.base, session))), "")
 

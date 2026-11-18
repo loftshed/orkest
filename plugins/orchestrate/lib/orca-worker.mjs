@@ -303,7 +303,7 @@ export function createOrcaWorker(
     if (isStopped) return;
     await saveRegistry();
     if (isStopped) return;
-    if (isReady) await noticeClosedViews(workspaceId, terminalIds(context.terminals));
+    if (isReady) await reconcileViews(workspaceId, terminalIds(context.terminals));
   }
 
   async function onAgentStatus(event) {
@@ -315,6 +315,8 @@ export function createOrcaWorker(
       sessionId: event.sessionId,
     });
     if (recorded) await saveRegistry();
+    const workspaceId = event?.workspaceId || context?.workspaceId;
+    if (isReady && workspaceId) await closeAutoDismissedViews(workspaceId);
   }
 
   async function viewRecords() {
@@ -341,19 +343,54 @@ export function createOrcaWorker(
     return records;
   }
 
+  async function closeAutoDismissedViews(workspaceId, { records, live } = {}) {
+    if (!workspaceId || isStopped) return;
+    const allRecords = records ?? (await viewRecords());
+    const pending = allRecords.filter(
+      ({ record }) =>
+        record.closed &&
+        record.autoDismissed &&
+        !record.terminalClosed &&
+        record.workspaceId === workspaceId &&
+        record.terminalId,
+    );
+    if (pending.length === 0) return;
+    const terminals = live ?? (await liveTerminals(workspaceId, { isStrict: true }));
+    if (!terminals || isStopped) return;
+    for (const { file, record } of pending) {
+      if (isStopped) return;
+      if (!terminals.has(record.terminalId)) {
+        await writeJsonState(file, { ...record, terminalClosed: true });
+        continue;
+      }
+      if (await closeTerminal(record.terminalId)) {
+        await writeJsonState(file, { ...record, terminalClosed: true });
+      }
+    }
+  }
+
   /** A view terminal that vanished while Orca was running was closed by the person. */
-  async function noticeClosedViews(workspaceId, focused) {
-    const missing = (await viewRecords()).filter(
+  async function reconcileViews(workspaceId, focused) {
+    const records = await viewRecords();
+    const missing = records.filter(
       ({ record }) =>
         !record.closed &&
         record.workspaceId === workspaceId &&
         record.terminalId &&
         !focused.has(record.terminalId),
     );
-    if (missing.length === 0) return;
+    const hasPendingDismiss = records.some(
+      ({ record }) =>
+        record.closed &&
+        record.autoDismissed &&
+        !record.terminalClosed &&
+        record.workspaceId === workspaceId &&
+        record.terminalId,
+    );
+    if (missing.length === 0 && !hasPendingDismiss) return;
     // Confirm with the full terminal list: the focused context may omit background terminals.
     const live = await liveTerminals(workspaceId, { isStrict: true });
-    if (!live) return;
+    if (!live || isStopped) return;
     for (const { file, record } of missing) {
       if (live.has(record.terminalId)) continue;
       await writeJsonState(file, {
@@ -362,6 +399,7 @@ export function createOrcaWorker(
         closedAt: new Date(now()).toISOString(),
       });
     }
+    await closeAutoDismissedViews(workspaceId, { records, live });
   }
 
   async function rooms() {
@@ -720,6 +758,7 @@ export function createOrcaWorker(
       const outcomes = await restore();
       if (isStopped) return [];
       isReady = true;
+      await closeAutoDismissedViews(context?.workspaceId);
       if (outcomes.length > 0) log(`orkest: restore ${JSON.stringify(outcomes)}`);
       return outcomes;
     });

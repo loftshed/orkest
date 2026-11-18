@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  closeOrcaCompanionPane,
   isScreenReaderOrca,
   orcaPaneContext,
   orcaTerminalsPath,
@@ -411,6 +412,73 @@ describe("orca worker", () => {
     expect(swarmViewCommand("it's", "/tmp/a b.json", { ork: "/x/ork.mjs" })).toBe(
       String.raw`exec env 'ORKEST_ORCA_VIEW_STATE=/tmp/a b.json' node '/x/ork.mjs' horde --attach-room 'it'\''s' --view`,
     );
+  });
+
+  it("closes auto-dismissed companion split terminals via host RPC without extra terminal.list polling", async () => {
+    const host = mockOrca();
+    const instance = worker(host);
+    await instance.start();
+
+    // Regular workspace/agent events make no terminal.list or terminal.close calls without pending auto-dismissals.
+    host.state.calls.length = 0;
+    await host.emit("workspace.changed", {
+      context: {
+        workspaceId: "ws1",
+        branch: "main",
+        displayName: "repo",
+        terminals: [{ id: "term_coord" }],
+      },
+    });
+    await host.emit("agent.status.changed", {
+      workspaceId: "ws1",
+      paneKey: "pane-coord",
+      terminalId: "term_coord",
+      state: "idle",
+      sessionId: "s-1",
+    });
+    expect(host.methods()).not.toContain("terminal.list");
+    expect(host.methods()).not.toContain("terminal.close");
+
+    // Open the companion view, then auto-dismiss it with no Orca CLI on PATH.
+    expect(await host.commands.get("orkest.swarm.open")()).toContain("opened");
+    expect(host.state.terminals).toEqual(["term_coord", "term_new1"]);
+    const viewFile = orcaViewPath("room-a", env);
+    expect(await closeOrcaCompanionPane(viewFile, { env })).toEqual({
+      dismissed: true,
+      terminalId: "term_new1",
+    });
+
+    // Host worker notices autoDismissed on agent.status.changed and closes the split via host RPC.
+    host.state.calls.length = 0;
+    await host.emit("agent.status.changed", {
+      workspaceId: "ws1",
+      paneKey: "pane-coord",
+      terminalId: "term_coord",
+      state: "stopped",
+      sessionId: "s-1",
+    });
+    expect(host.methods()).toContain("terminal.list");
+    expect(host.methods()).toContain("terminal.close");
+    expect(host.state.terminals).toEqual(["term_coord"]);
+    expect(await readOrcaView("room-a", env)).toMatchObject({
+      closed: true,
+      autoDismissed: true,
+      terminalClosed: true,
+    });
+
+    // Once terminalClosed is stamped, subsequent events do not re-poll terminal.list.
+    host.state.calls.length = 0;
+    await host.emit("workspace.changed", {
+      context: {
+        workspaceId: "ws1",
+        branch: "main",
+        displayName: "repo",
+        terminals: [{ id: "term_coord" }],
+      },
+    });
+    expect(host.methods()).not.toContain("terminal.list");
+    expect(host.methods()).not.toContain("terminal.close");
+    await instance.stop();
   });
 });
 

@@ -2,10 +2,16 @@
 
 use std::collections::HashMap;
 use std::env;
-use std::fs;
-use std::io;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::io::IntoRawFd;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+const MAX_RANDOM_DEV_BYTES: usize = 64;
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Expand a leading `~` or `~/` using the user's home directory.
 #[must_use]
@@ -156,29 +162,394 @@ pub fn config_path(env_map: Option<&HashMap<String, String>>, home: Option<&Path
     primary
 }
 
-/// Resolve the binary path for `ork-fast` or return `None` if disabled or unset.
+/// Resolve the binary path for `ork-fast`, honoring `ORK_FAST_BIN`.
 #[allow(dead_code)]
 #[must_use]
-pub fn ork_fast_bin(
-    env_map: Option<&HashMap<String, String>>,
-    home: Option<&Path>,
-) -> Option<PathBuf> {
-    let disabled = env_map
-        .and_then(|m| m.get("ORK_DISABLE_FAST").cloned())
-        .or_else(|| env::var("ORK_DISABLE_FAST").ok());
-    if disabled.as_deref() == Some("1") {
-        return None;
-    }
-
+pub fn ork_fast_bin(env_map: Option<&HashMap<String, String>>, home: Option<&Path>) -> PathBuf {
     if let Some(explicit) = env_map
         .and_then(|m| m.get("ORK_FAST_BIN").cloned())
         .or_else(|| env::var("ORK_FAST_BIN").ok())
         && !explicit.is_empty()
     {
-        return Some(expand_home(&explicit, home));
+        return expand_home(&explicit, home);
     }
 
-    Some(cache_home(env_map, home).join("bin").join("ork-fast"))
+    cache_home(env_map, home).join("bin").join("ork-fast")
+}
+
+/// Return true if `id` is a valid session identifier matching `mailbox_store.SESSION_ID`.
+#[must_use]
+pub fn valid_session_id(session: &str) -> bool {
+    let bytes = session.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 128
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes
+            .iter()
+            .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'-'))
+}
+
+/// Return true if `room_id` matches `[\w-]{1,80}` ASCII.
+#[must_use]
+pub fn valid_room_id(room_id: &str) -> bool {
+    !room_id.is_empty()
+        && room_id.len() <= 80
+        && room_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// Return true if `id` matches `[0-9a-f]+-[0-9a-f]{6}`.
+#[must_use]
+pub fn valid_message_id(id: &str) -> bool {
+    let Some((prefix, suffix)) = id.split_once('-') else {
+        return false;
+    };
+    !prefix.is_empty()
+        && prefix
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        && suffix.len() == 6
+        && suffix
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Resolve the orchestrate skill `scripts/` directory, preferring overrides, installed hub, then checkout.
+#[must_use]
+pub fn scripts_root() -> Option<PathBuf> {
+    if let Ok(val) = env::var("ORKEST_SCRIPTS_DIR")
+        && !val.trim().is_empty()
+    {
+        let p = expand_home(val.trim(), None);
+        if p.is_dir() {
+            return Some(p);
+        }
+    }
+    if let Ok(plugin_env) = env::var("ORKEST_PLUGIN_ROOT")
+        && !plugin_env.trim().is_empty()
+    {
+        let p = expand_home(plugin_env.trim(), None).join("skills/orchestrate/scripts");
+        if p.is_dir() {
+            return Some(p);
+        }
+    }
+    if let Ok(plugin_env) = env::var("CLAUDE_PLUGIN_ROOT")
+        && !plugin_env.trim().is_empty()
+    {
+        let p = expand_home(plugin_env.trim(), None).join("skills/orchestrate/scripts");
+        if p.is_dir() {
+            return Some(p);
+        }
+    }
+    if let Ok(exe) = env::current_exe() {
+        let resolved_exe = fs::canonicalize(&exe).unwrap_or(exe);
+        for ancestor in resolved_exe.ancestors() {
+            let candidate = ancestor.join("plugins/orchestrate/skills/orchestrate/scripts");
+            if candidate.is_dir() {
+                return Some(candidate);
+            }
+        }
+    }
+    let hub_scripts = expand_home("~/.agents/skills/orchestrate/scripts", None);
+    if hub_scripts.is_dir() {
+        return Some(hub_scripts);
+    }
+    let manifest_candidate = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../plugins/orchestrate/skills/orchestrate/scripts");
+    if manifest_candidate.is_dir() {
+        return fs::canonicalize(&manifest_candidate)
+            .ok()
+            .or(Some(manifest_candidate));
+    }
+    None
+}
+
+/// Resolve the `plugins/orchestrate` root containing `bin/`, `lib/`, and `skills/`.
+#[must_use]
+pub fn plugin_root() -> Option<PathBuf> {
+    if let Ok(val) = env::var("ORKEST_PLUGIN_ROOT")
+        && !val.trim().is_empty()
+    {
+        let p = expand_home(val.trim(), None);
+        if p.is_dir() {
+            return Some(p);
+        }
+    }
+    if let Some(scripts) = scripts_root() {
+        let resolved = fs::canonicalize(&scripts).unwrap_or(scripts);
+        if let Some(plugin) = resolved
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+            && plugin.join("bin/ork.mjs").is_file()
+        {
+            return Some(plugin.to_path_buf());
+        }
+    }
+    let manifest_candidate =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/orchestrate");
+    if manifest_candidate.join("bin/ork.mjs").is_file() {
+        return fs::canonicalize(&manifest_candidate)
+            .ok()
+            .or(Some(manifest_candidate));
+    }
+    None
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|m| m.is_file() && (m.permissions().mode() & 0o111) != 0)
+}
+
+/// Find `cmd` on `PATH` and return its executable path if present.
+#[must_use]
+pub fn find_in_path(cmd: &str) -> Option<PathBuf> {
+    let path_var = env::var_os("PATH")?;
+    for dir in env::split_paths(&path_var) {
+        let candidate = dir.join(cmd);
+        if is_executable_file(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+const MIN_NODE: (u32, u32, u32) = (26, 8, 0);
+
+fn parse_nvm_version(name: &str) -> Option<(u32, u32, u32)> {
+    let stripped = name.strip_prefix('v')?;
+    let mut parts = stripped.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
+}
+
+/// Discover `node` matching `room_store.py::_node_binary()`.
+#[must_use]
+pub fn node_binary() -> String {
+    if let Ok(explicit) = env::var("ORKEST_NODE_BIN")
+        && !explicit.trim().is_empty()
+    {
+        return explicit.trim().to_string();
+    }
+    let system_dirs = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"];
+    let found = find_in_path("node");
+    if let Some(ref p) = found {
+        let s = p.to_string_lossy();
+        if let Some(parent) = p.parent().and_then(|d| d.to_str())
+            && !system_dirs.contains(&parent)
+        {
+            return s.into_owned();
+        }
+        for comp in p.components() {
+            if let Component::Normal(os_name) = comp
+                && let Some(ver) = parse_nvm_version(&os_name.to_string_lossy())
+                && ver >= MIN_NODE
+            {
+                return s.into_owned();
+            }
+        }
+    }
+    let nvm_dir = expand_home("~/.nvm/versions/node", None);
+    if let Ok(entries) = fs::read_dir(&nvm_dir) {
+        let mut best: Option<((u32, u32, u32), PathBuf)> = None;
+        for entry in entries.flatten() {
+            let bin = entry.path().join("bin/node");
+            if let Some(ver) = parse_nvm_version(&entry.file_name().to_string_lossy())
+                && ver >= MIN_NODE
+                && bin.is_file()
+                && best.as_ref().is_none_or(|(b, _)| ver > *b)
+            {
+                best = Some((ver, bin));
+            }
+        }
+        if let Some((_, bin)) = best {
+            return bin.to_string_lossy().into_owned();
+        }
+    }
+    if let Some(p) = found {
+        return p.to_string_lossy().into_owned();
+    }
+    for sys in [
+        "/opt/homebrew/bin/node",
+        "/usr/local/bin/node",
+        "/usr/bin/node",
+    ] {
+        let p = Path::new(sys);
+        if is_executable_file(p) {
+            return sys.to_string();
+        }
+    }
+    "node".to_string()
+}
+
+/// Resolve `python3` executable path.
+#[must_use]
+pub fn python_binary() -> String {
+    find_in_path("python3").map_or_else(
+        || "python3".to_string(),
+        |p| p.to_string_lossy().into_owned(),
+    )
+}
+
+/// Resolve the current host's `hostname`.
+#[must_use]
+pub fn current_hostname() -> Option<String> {
+    let mut buf = [0u8; 256];
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast::<libc::c_char>(), buf.len()) };
+    if rc != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8(buf[..end].to_vec()).ok()
+}
+
+/// Return true when `val` is Python-truthy.
+#[must_use]
+pub fn is_truthy_json(val: &serde_json::Value) -> bool {
+    match val {
+        serde_json::Value::Null => false,
+        serde_json::Value::Bool(b) => *b,
+        serde_json::Value::Number(n) => n.as_f64().is_some_and(|x| x != 0.0),
+        serde_json::Value::String(s) => !s.is_empty(),
+        serde_json::Value::Array(a) => !a.is_empty(),
+        serde_json::Value::Object(o) => !o.is_empty(),
+    }
+}
+
+/// Clean printable whitespace into a bounded single line (`<= max_chars`).
+#[must_use]
+pub fn clean_text(val: &str, max_chars: usize) -> String {
+    let printable: String = val
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    printable
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(max_chars)
+        .collect()
+}
+
+/// POSIX shell-quote a single argument matching Python `shlex.quote`.
+#[must_use]
+pub fn shlex_quote(s: &str) -> String {
+    if s.is_empty() {
+        return "''".to_string();
+    }
+    if s.bytes()
+        .all(|b| matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'@' | b'%' | b'+' | b'=' | b':' | b',' | b'.' | b'/' | b'-'))
+    {
+        return s.to_string();
+    }
+    let escaped = s.replace('\'', "'\"'\"'");
+    format!("'{escaped}'")
+}
+
+/// Join arguments with POSIX shell quoting matching Python `shlex.join`.
+#[must_use]
+pub fn shlex_join<'a>(args: impl IntoIterator<Item = &'a str>) -> String {
+    args.into_iter()
+        .map(shlex_quote)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Run a command and capture output with a strict wall-clock timeout.
+pub fn run_output_with_timeout(
+    cmd: &mut std::process::Command,
+    timeout: std::time::Duration,
+) -> Option<std::process::Output> {
+    use std::io::Read;
+    use std::process::Stdio;
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().ok()?;
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let out_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut s) = stdout_pipe {
+            let _ = s.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let err_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut s) = stderr_pipe {
+            let _ = s.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break Some(st),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    let stdout = out_handle.join().unwrap_or_default();
+    let stderr = err_handle.join().unwrap_or_default();
+    status.map(|st| std::process::Output {
+        status: st,
+        stdout,
+        stderr,
+    })
+}
+
+/// Read random bytes from `/dev/urandom` with clock/pid fallback.
+#[must_use]
+pub fn random_bytes(len: usize) -> Vec<u8> {
+    let bounded = len.min(MAX_RANDOM_DEV_BYTES);
+    let mut out = vec![0u8; bounded];
+    if let Ok(mut file) = fs::File::open("/dev/urandom") {
+        use std::io::Read;
+        if file.read_exact(&mut out).is_ok() {
+            return out;
+        }
+    }
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let mut state = (nanos as u64)
+        ^ ((std::process::id() as u64) << 17)
+        ^ TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    for b in &mut out {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+        *b = (state >> 32) as u8;
+    }
+    out
+}
+
+/// Generate a mailbox message ID matching `<hex_time_ns>-<6hex>`.
+#[must_use]
+pub fn message_id() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let rnd = random_bytes(3);
+    format!("{nanos:x}-{:02x}{:02x}{:02x}", rnd[0], rnd[1], rnd[2])
 }
 
 /// Compute the filename key for a session matching mailbox_store.py::session_key.
@@ -210,6 +581,182 @@ pub fn session_key(session: &str) -> Result<String, String> {
 pub fn peer_path(base: &Path, session: &str) -> Result<PathBuf, String> {
     let key = session_key(session)?;
     Ok(base.join("peers").join(format!("{key}.json")))
+}
+
+/// Return the path to a session's inbox directory `<base>/inbox/<session_key>`.
+pub fn inbox_dir(base: &Path, session: &str) -> Result<PathBuf, String> {
+    let key = session_key(session)?;
+    Ok(base.join("inbox").join(key))
+}
+
+/// Exclusive POSIX flock guard with inode verification (`mailbox_store.acquire_lock`).
+pub struct FileLockGuard {
+    pub(crate) fd: libc::c_int,
+}
+
+impl Drop for FileLockGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.fd);
+        }
+    }
+}
+
+const LOCK_ACQUIRE_ATTEMPTS: usize = 64;
+
+pub(crate) fn fd_identity(fd: libc::c_int) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::io::FromRawFd;
+    let file = std::mem::ManuallyDrop::new(unsafe { fs::File::from_raw_fd(fd) });
+    let meta = file.metadata().ok()?;
+    Some((meta.dev(), meta.ino()))
+}
+
+fn same_inode(fd: libc::c_int, lock_path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(current) = fs::metadata(lock_path) else {
+        return false;
+    };
+    fd_identity(fd) == Some((current.dev(), current.ino()))
+}
+
+pub fn lock_path_exclusive(lock_path: &Path) -> io::Result<FileLockGuard> {
+    for _ in 0..LOCK_ACQUIRE_ATTEMPTS {
+        let file = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC)
+            .open(lock_path)
+        {
+            Ok(file) => file,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                if let Some(parent) = lock_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+        let fd = file.into_raw_fd();
+        let guard = FileLockGuard { fd };
+        loop {
+            if unsafe { libc::flock(fd, libc::LOCK_EX) } == 0 {
+                break;
+            }
+            let err = io::Error::last_os_error();
+            if err.kind() != io::ErrorKind::Interrupted {
+                return Err(err);
+            }
+        }
+        if same_inode(fd, lock_path) {
+            unsafe {
+                libc::futimens(fd, std::ptr::null());
+            }
+            return Ok(guard);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::WouldBlock,
+        "could not acquire a stable lock",
+    ))
+}
+
+pub fn lock_for(target_path: &Path) -> io::Result<FileLockGuard> {
+    if let Some(parent) = target_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    lock_path_exclusive(&target_path.with_extension("lock"))
+}
+
+/// Read JSON from `path`, returning `None` on I/O or parse failure.
+#[must_use]
+pub fn read_json_file(path: &Path) -> Option<serde_json::Value> {
+    let content = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+/// Write a JSON value atomically via temp file + fsync + rename with `0o600` mode.
+pub fn write_json_atomic(path: &Path, value: &serde_json::Value) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
+    fs::create_dir_all(parent)?;
+    let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+    let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = parent.join(format!(".mail-{}-{seq}.tmp", std::process::id()));
+    let payload =
+        serde_json::to_vec(value).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+    let write_result = (|| -> io::Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp_path)?;
+        file.write_all(&payload)?;
+        file.sync_all()?;
+        Ok(())
+    })();
+
+    if let Err(err) = write_result {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+
+    if let Err(err) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// Validate a message JSON object matching `mailbox_store.py::valid_message`.
+#[must_use]
+pub fn valid_message(msg: &serde_json::Value) -> bool {
+    let Some(obj) = msg.as_object() else {
+        return false;
+    };
+    if obj.get("schema").and_then(|v| v.as_str()) != Some("agent-executor.mail.v1") {
+        return false;
+    }
+    if !obj.get("text").is_some_and(|v| v.is_string()) {
+        return false;
+    }
+    if !obj
+        .get("id")
+        .and_then(|v| v.as_str())
+        .is_some_and(valid_message_id)
+    {
+        return false;
+    }
+    if !obj
+        .get("sentAt")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| parse_iso8601_utc_secs(s).is_some())
+    {
+        return false;
+    }
+    let Some(from_obj) = obj.get("from").and_then(|v| v.as_object()) else {
+        return false;
+    };
+    if !from_obj.get("session").is_some_and(|v| v.is_string()) {
+        return false;
+    }
+    if !obj.get("to").is_some_and(|v| v.is_object()) {
+        return false;
+    }
+    for field in ["clientId", "replyTo", "kind", "run"] {
+        if let Some(val) = obj.get(field)
+            && !val.is_null()
+            && !val.is_string()
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// Resolve a path like Python's `Path.resolve(strict=False)`, canonicalizing existing
@@ -618,10 +1165,13 @@ mod tests {
         assert_eq!(cfg_file, fake_home.join("custom-cfg/cfg.json"));
 
         let bin = ork_fast_bin(Some(&map), Some(fake_home));
-        assert_eq!(bin, Some(fake_home.join("custom-cache/bin/ork-fast")));
+        assert_eq!(bin, fake_home.join("custom-cache/bin/ork-fast"));
 
         map.insert("ORK_DISABLE_FAST".to_string(), "1".to_string());
-        assert_eq!(ork_fast_bin(Some(&map), Some(fake_home)), None);
+        assert_eq!(
+            ork_fast_bin(Some(&map), Some(fake_home)),
+            fake_home.join("custom-cache/bin/ork-fast")
+        );
     }
 
     #[test]

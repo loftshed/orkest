@@ -1,6 +1,5 @@
 """Herdr labels survive idle time and safely discover shared-daemon Codex panes."""
 
-import io
 import json
 import os
 import shutil
@@ -12,8 +11,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+TESTS_DIR = Path(__file__).resolve().parent
 SCRIPTS = Path(__file__).resolve().parents[5] / "plugins/orchestrate/skills/orchestrate/scripts"
+sys.path.insert(0, str(TESTS_DIR))
 sys.path.insert(0, str(SCRIPTS))
+import _ork_fast_test_helpers as fast  # noqa: E402
 import agent_progress  # noqa: E402
 import agent_terminal  # noqa: E402
 import herdr_labels  # noqa: E402
@@ -214,6 +216,44 @@ class DiscoveryTests(unittest.TestCase):
         for session in ("run-worker", None):
             self.assertIsNone(agent_statusline_tmux._find_herdr_peer(self.base, session, "w3:p2", endpoint=endpoint))
 
+    def _setup_fake_herdr_cli(self, *, agent_get=None):
+        panes_file = self.home / "fake-panes.json"
+        agent_file = self.home / "fake-agent.json"
+        calls_file = self.home / "fake-calls.jsonl"
+        binary = self.home / "fake-herdr"
+        panes_file.write_text(json.dumps(self.panes), encoding="utf-8")
+        agent_file.write_text(json.dumps(agent_get or {}), encoding="utf-8")
+        binary.write_text(
+            f"#!{sys.executable}\n"
+            "import json, sys\n"
+            "from pathlib import Path\n"
+            f"calls_file = Path({str(calls_file)!r})\n"
+            "with calls_file.open('a', encoding='utf-8') as fh:\n"
+            "    fh.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+            "args = sys.argv[1:]\n"
+            "if args[:2] == ['pane', 'list']:\n"
+            f"    panes = json.loads(Path({str(panes_file)!r}).read_text(encoding='utf-8'))\n"
+            "    print(json.dumps({'result': {'panes': panes}}))\n"
+            "elif args[:2] == ['agent', 'get']:\n"
+            f"    agent = json.loads(Path({str(agent_file)!r}).read_text(encoding='utf-8'))\n"
+            "    print(json.dumps({'result': agent}))\n"
+            "else:\n"
+            "    print('{\"result\":{}}')\n",
+            encoding="utf-8",
+        )
+        binary.chmod(0o755)
+
+        def read_calls():
+            if not calls_file.is_file():
+                return []
+            return [json.loads(line) for line in calls_file.read_text(encoding="utf-8").splitlines() if line]
+
+        def set_panes(panes):
+            self.panes = panes
+            panes_file.write_text(json.dumps(panes), encoding="utf-8")
+
+        return binary, read_calls, set_panes
+
     def test_native_hook_rewrites_an_old_endpoint_alias_to_canonical_form(self):
         alias = self.home / "alias"
         alias.symlink_to(self.home, target_is_directory=True)
@@ -221,18 +261,31 @@ class DiscoveryTests(unittest.TestCase):
         session = "native-gemini"
         mailbox.register(self.base, session=session, harness="gemini", cwd=str(self.home), pid=os.getpid())
         mailbox.annotate(self.base, session, herdrEndpoint=alias_socket)
-        occupant = {
-            "pane_id": "w1:p1",
-            "agent_session": {"agent": "agy", "kind": "id", "value": session},
+        binary, _, _ = self._setup_fake_herdr_cli(
+            agent_get={
+                "type": "agent_info",
+                "agent": {
+                    "pane_id": "w1:p1",
+                    "agent_session": {"agent": "agy", "kind": "id", "value": session},
+                },
+            }
+        )
+        env = {
+            **os.environ,
+            "HERDR_ENV": "1",
+            "HERDR_PANE_ID": "w1:p1",
+            "HERDR_SOCKET_PATH": alias_socket,
+            "HERDR_BIN_PATH": str(binary),
         }
-        with (
-            mock.patch.dict(
-                os.environ, {"HERDR_ENV": "1", "HERDR_PANE_ID": "w1:p1", "HERDR_SOCKET_PATH": alias_socket}
-            ),
-            mock.patch.object(agent_terminal, "verified_agent", return_value=occupant),
-            mock.patch.object(mailbox, "harness_pid", return_value=os.getpid()),
-        ):
-            mailbox.hook({"session_id": session, "cwd": str(self.home)}, harness="gemini", event="Stop", base=self.base)
+        fast.run_mailbox_hook(
+            {"session_id": session, "cwd": str(self.home)},
+            harness="gemini",
+            event="Stop",
+            base=self.base,
+            cwd=self.home,
+            allow_herdr=True,
+            env=env,
+        )
         peer = mailbox.load(mailbox.peer_path(self.base, session))
         self.assertEqual(peer["herdrEndpoint"], str(self.socket))
         self.assertEqual(peer["herdrSyncedTarget"], {"endpoint": str(self.socket), "pane": "w1:p1"})
@@ -390,56 +443,85 @@ class DiscoveryTests(unittest.TestCase):
                     )
 
     def test_hook_misses_wait_until_next_session_start(self):
-        import mailbox_hooks
-        import repo_env
-
         self.panes = []
+        binary, read_calls, set_panes = self._setup_fake_herdr_cli()
         payload = {"session_id": SESSION, "cwd": str(self.home)}
-        with (
-            mock.patch.dict(os.environ, {"HERDR_ENV": "1", "HERDR_PANE_ID": "w1:p1", "HERDR_WORKSPACE_ID": "w1"}),
-            mock.patch.object(mailbox_hooks, "_maybe_trigger_auto_update"),
-            mock.patch.object(repo_env, "bootstrap_worktree_env"),
-            mock.patch.object(mailbox, "harness_pid", return_value=os.getpid()),
-        ):
-            mailbox.hook(payload, harness="codex", event="SessionStart", base=self.base)
-            self.assertTrue(self.peer()["herdrDiscoveryMissAt"])
-            mailbox.hook(payload, harness="codex", event="Stop", base=self.base)
-            mailbox.hook(payload, harness="codex", event="UserPromptSubmit", base=self.base)
-            self.assertEqual(self.calls, [["pane", "list"]])
-            self.assertIsNone(self.peer().get("herdrPaneId"))
-            self.panes = [{"pane_id": "w3:p2", "agent": "codex", "terminal_title": SESSION}]
-            mailbox.hook(payload, harness="codex", event="SessionStart", base=self.base)
-            self.assertEqual(self.peer()["herdrPaneId"], "w3:p2")
-            self.assertEqual(
-                [call[:2] for call in self.calls], [["pane", "list"], ["pane", "list"], ["pane", "report-metadata"]]
-            )
-            mailbox.hook(payload, harness="codex", event="Stop", base=self.base)
-            self.assertEqual([call[:2] for call in self.calls].count(["pane", "report-metadata"]), 1)
+        env = {
+            **os.environ,
+            "HERDR_ENV": "1",
+            "HERDR_PANE_ID": "w1:p1",
+            "HERDR_WORKSPACE_ID": "w1",
+            "HERDR_BIN_PATH": str(binary),
+        }
+        fast.run_mailbox_hook(
+            payload, harness="codex", event="SessionStart", base=self.base, cwd=self.home, allow_herdr=True, env=env
+        )
+        self.assertTrue(self.peer()["herdrDiscoveryMissAt"])
+        fast.run_mailbox_hook(
+            payload, harness="codex", event="Stop", base=self.base, cwd=self.home, allow_herdr=True, env=env
+        )
+        fast.run_mailbox_hook(
+            payload, harness="codex", event="UserPromptSubmit", base=self.base, cwd=self.home, allow_herdr=True, env=env
+        )
+        self.assertEqual(read_calls(), [["pane", "list"]])
+        self.assertIsNone(self.peer().get("herdrPaneId"))
+        set_panes([{"pane_id": "w3:p2", "agent": "codex", "terminal_title": SESSION}])
+        fast.run_mailbox_hook(
+            payload, harness="codex", event="SessionStart", base=self.base, cwd=self.home, allow_herdr=True, env=env
+        )
+        self.assertEqual(self.peer()["herdrPaneId"], "w3:p2")
+        self.assertEqual(
+            [call[:2] for call in read_calls()], [["pane", "list"], ["pane", "list"], ["pane", "report-metadata"]]
+        )
+        fast.run_mailbox_hook(
+            payload, harness="codex", event="Stop", base=self.base, cwd=self.home, allow_herdr=True, env=env
+        )
+        self.assertEqual([call[:2] for call in read_calls()].count(["pane", "report-metadata"]), 1)
 
     def test_mid_turn_antigravity_steps_do_not_report(self):
         session = "gemini-session"
         mailbox.register(
             self.base, session=session, harness="gemini", cwd=str(self.home), pid=os.getpid(), state="busy"
         )
-        occupant = {
-            "pane_id": "w1:p1",
-            "agent_session": {"agent": "agy", "source": "herdr:antigravity_cli", "kind": "id", "value": session},
-        }
-        with (
-            mock.patch.dict(os.environ, {"HERDR_ENV": "1", "HERDR_PANE_ID": "w1:p1"}),
-            mock.patch.object(agent_terminal, "verified_agent", return_value=occupant),
-            mock.patch.object(mailbox, "harness_pid", return_value=os.getpid()),
-        ):
-            for _ in range(5):
-                mailbox.hook(
-                    {"session_id": session, "cwd": str(self.home)},
-                    harness="gemini",
-                    event="PreInvocation",
-                    base=self.base,
-                )
-            self.assertEqual(self.calls, [])
-            mailbox.hook({"session_id": session, "cwd": str(self.home)}, harness="gemini", event="Stop", base=self.base)
-        self.assertEqual([call[:2] for call in self.calls], [["pane", "report-metadata"]])
+        binary, read_calls, _ = self._setup_fake_herdr_cli(
+            agent_get={
+                "type": "agent_info",
+                "agent": {
+                    "pane_id": "w1:p1",
+                    "agent_session": {
+                        "agent": "agy",
+                        "source": "herdr:antigravity_cli",
+                        "kind": "id",
+                        "value": session,
+                    },
+                },
+            }
+        )
+        env = {**os.environ, "HERDR_ENV": "1", "HERDR_PANE_ID": "w1:p1", "HERDR_BIN_PATH": str(binary)}
+        for _ in range(5):
+            fast.run_mailbox_hook(
+                {"session_id": session, "cwd": str(self.home)},
+                harness="gemini",
+                event="PreInvocation",
+                base=self.base,
+                cwd=self.home,
+                allow_herdr=True,
+                env=env,
+            )
+        self.assertEqual(read_calls(), [])
+        fast.run_mailbox_hook(
+            {"session_id": session, "cwd": str(self.home)},
+            harness="gemini",
+            event="Stop",
+            base=self.base,
+            cwd=self.home,
+            allow_herdr=True,
+            env=env,
+        )
+        self.assertEqual(
+            [call[:2] for call in read_calls()],
+            [["agent", "get"], ["pane", "report-metadata"]],
+        )
         self.assertEqual(mailbox.load(mailbox.peer_path(self.base, session))["state"], "idle")
 
     def test_moved_coordinator_updates_room_from_resolved_pane(self):
@@ -476,27 +558,25 @@ class DiscoveryTests(unittest.TestCase):
         )
 
     def test_native_labels_stay_visible_inside_herdr_for_all_native_adapters(self):
-        import agent_statusline
-
         for harness in ("claude", "gemini", "opencode"):
             session = "native-" + harness
             mailbox.register(self.base, session=session, harness=harness, cwd=str(self.home), pid=os.getpid())
             mailbox.annotate(self.base, session, name="snorfle-test-high-footer-aa", person="snorfle")
-            argv = ["agent_statusline.py", "--native-status", "--session", session, "--harness", harness, "--plain"]
-            with (
-                mock.patch.object(sys, "argv", argv),
-                mock.patch.dict(os.environ, {"HERDR_ENV": "1", "HERDR_PANE_ID": "w1:p1"}),
-                mock.patch.object(sys, "stdout", io.StringIO()) as output,
-            ):
-                self.assertEqual(agent_statusline.main(), 0)
-                self.assertTrue(output.getvalue().startswith("snorfle | "), output.getvalue())
-            with (
-                mock.patch.object(sys, "argv", argv),
-                mock.patch.dict(os.environ, {"HERDR_ENV": "0"}),
-                mock.patch.object(sys, "stdout", io.StringIO()) as output,
-            ):
-                self.assertEqual(agent_statusline.main(), 0)
-                self.assertTrue(output.getvalue().startswith("snorfle | "), output.getvalue())
+            args = ("--native-status", "--session", session, "--harness", harness, "--plain")
+            res1 = fast.run_statusline(
+                *args,
+                base=self.base,
+                env={**os.environ, "HERDR_ENV": "1", "HERDR_PANE_ID": "w1:p1"},
+                check=True,
+            )
+            self.assertTrue(res1.stdout.startswith("snorfle | "), res1.stdout)
+            res2 = fast.run_statusline(
+                *args,
+                base=self.base,
+                env={**os.environ, "HERDR_ENV": "0"},
+                check=True,
+            )
+            self.assertTrue(res2.stdout.startswith("snorfle | "), res2.stdout)
 
 
 class LabelTests(unittest.TestCase):
@@ -678,17 +758,18 @@ class HarnessBarInsideHerdrTests(unittest.TestCase):
         session = "bar-" + harness
         mailbox.register(self.base, session=session, harness=harness, cwd=str(self.home), pid=os.getpid())
         mailbox.annotate(self.base, session, name="snorfle-test-high-bar-aa")
-        return subprocess.run(
-            [sys.executable, "-B", str(SCRIPTS / "agent_statusline.py"), "--native-status", "--harness", harness],
-            input=json.dumps({"session_id": session, "model": {"id": "runtime-model"}, "terminal_width": 200}),
+        return fast.run_statusline(
+            "--native-status",
+            "--harness",
+            harness,
+            stdin_data={"session_id": session, "model": {"id": "runtime-model"}, "terminal_width": 200},
+            base=self.base,
             env={
                 **self.env,
                 "ORKEST_TERMINAL_HARNESS": harness,
                 "FAKE_KIND": "agy" if harness == "gemini" else harness,
                 "FAKE_SESSION": session,
             },
-            capture_output=True,
-            text=True,
             check=True,
         ).stdout
 

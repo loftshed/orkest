@@ -2,6 +2,7 @@
 // with the Swarm View. Node built-ins only: this runs inside Orca's plugin worker, whose
 // environment is stripped to PATH, HOME and a few locale and session variables.
 
+import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { accessSync, constants, realpathSync } from "node:fs";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
@@ -186,4 +187,43 @@ export async function markOrcaViewClosed(file, now = Date.now()) {
   if (record?.schema !== ORCA_VIEW_SCHEMA || record.closed) return false;
   await writeJsonState(file, { ...record, closed: true, closedAt: new Date(now).toISOString() });
   return true;
+}
+
+/** Auto-dismiss an Orca companion Swarm View pane by recording closure and calling Orca CLI best-effort. */
+export async function closeOrcaCompanionPane(
+  file,
+  { env = process.env, exec = execFile, now = Date.now } = {},
+) {
+  if (!file || env?.ORKEST_CHIEF_VIEW === "1") {
+    return { dismissed: false, reason: "not_companion" };
+  }
+  const record = await readJsonState(file);
+  const terminalId = orcaTerminalHandle(record?.terminalId);
+  if (
+    record?.schema !== ORCA_VIEW_SCHEMA ||
+    Boolean(record.chief) ||
+    !record.sourceTerminalId ||
+    !terminalId
+  ) {
+    return { dismissed: false, reason: "not_companion" };
+  }
+  const timestamp = typeof now === "function" ? now() : now;
+  await writeJsonState(file, {
+    ...record,
+    closed: true,
+    autoDismissed: true,
+    closedAt: new Date(timestamp).toISOString(),
+  });
+  const cli = resolveOrcaCli(env);
+  if (cli) {
+    await new Promise((resolve) => {
+      exec(
+        cli,
+        ["terminal", "close", "--terminal", terminalId, "--json"],
+        { env, timeout: 5000 },
+        () => resolve(),
+      );
+    });
+  }
+  return { dismissed: true, terminalId };
 }

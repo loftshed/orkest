@@ -53,6 +53,7 @@ import {
 } from "./foundry.mjs";
 import { mailboxRoot, resolveWorktreeMarkerPath } from "./horde-room.mjs";
 import { glyphSet, glyphTier, renderPanel, renderTable } from "./horde-view.mjs";
+import { sendMacosHudToast } from "./macos-hud.mjs";
 import { memberDisplayState } from "./member-state.mjs";
 import { observeRoom, recoverRoom } from "./rooms.mjs";
 import { cacheHome } from "./runtime-paths.mjs";
@@ -957,23 +958,40 @@ async function defaultExecAgent(
   }
 }
 
-function sendHerdrApprovalNotification(title, body, { env = process.env, execFileSyncFn } = {}) {
-  if (env?.HERDR_ENV !== "1") return false;
-  try {
-    const runner = execFileSyncFn || execFileSync;
-    runner(
-      env.HERDR_BIN_PATH || "herdr",
-      ["notification", "show", title, "--body", String(body || ""), "--sound", "request"],
-      {
-        encoding: "utf8",
-        env,
-        stdio: ["ignore", "pipe", "ignore"],
-      },
-    );
-    return true;
-  } catch {
-    return false;
+export function sendHerdrApprovalNotification(
+  title,
+  body,
+  { env = process.env, exec, execFileSyncFn, exists, platform = process.platform } = {},
+) {
+  if (env?.HERDR_ENV === "1") {
+    try {
+      const runner = execFileSyncFn || execFileSync;
+      runner(
+        env.HERDR_BIN_PATH || "herdr",
+        ["notification", "show", title, "--body", String(body || ""), "--sound", "request"],
+        {
+          encoding: "utf8",
+          env,
+          stdio: ["ignore", "pipe", "ignore"],
+        },
+      );
+      return true;
+    } catch {
+      return false;
+    }
   }
+  if (platform === "darwin") {
+    return sendMacosHudToast(
+      {
+        body: String(body || ""),
+        sound: "request",
+        status: "approval",
+        title: String(title || "Orkest"),
+      },
+      { env, exec, exists, platform },
+    );
+  }
+  return false;
 }
 
 function refreshWorktree(wt, { execFileSyncFn = execFileSync, targetBranch = "main" } = {}) {

@@ -1,12 +1,19 @@
 //! Fast native accelerator binary for Orkest hooks, gate, lease, and statusline.
 
 mod gate;
+mod identity;
 mod lease;
 mod mailbox;
+mod mailbox_lifecycle;
+mod mailbox_swarm;
+mod mailbox_transcript;
 mod paths;
+mod rooms_work;
 mod sha1;
 mod sha256;
+mod sqlite;
 mod statusline;
+mod terminal;
 
 use std::env;
 use std::path::PathBuf;
@@ -108,7 +115,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             statusline::run(&args[2..], fallback_script.as_deref())?;
         }
         "mailbox-hook" => {
-            let mut harness = "claude".to_string();
+            let mut harness_opt: Option<String> = None;
             let mut event_opt: Option<String> = None;
             let mut fallback_script: Option<PathBuf> = None;
             let mut idx = 2;
@@ -116,7 +123,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match args[idx].as_str() {
                     "--harness" => {
                         if idx + 1 < args.len() {
-                            harness = args[idx + 1].clone();
+                            harness_opt = Some(args[idx + 1].clone());
                             idx += 1;
                         }
                     }
@@ -134,7 +141,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 idx += 1;
             }
-            mailbox::run(&harness, event_opt.as_deref(), fallback_script.as_deref())?;
+            mailbox::run(
+                harness_opt.as_deref(),
+                event_opt.as_deref(),
+                fallback_script.as_deref(),
+            )?;
         }
         unknown => {
             eprintln!("error: unrecognized subcommand '{unknown}'");

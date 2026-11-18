@@ -1503,6 +1503,16 @@ export async function observeRoom(idOrRoom, options = {}) {
           cwd: member.session?.cwd || member.cwd || room.cwd,
         })
       : null;
+    if (member === room.conductor) {
+      if (member.session || member.mailboxSession) {
+        member.sessionLive = Boolean(snapshot || peer);
+        if (!member.sessionLive && member.runtimeState === "running") {
+          member.runtimeState = "unknown";
+        }
+      } else {
+        delete member.sessionLive;
+      }
+    }
     if (member === room.conductor && peer && peer.accountHome) {
       // The conductor's account home locates its native subagent transcripts.
       member.activitySource = {

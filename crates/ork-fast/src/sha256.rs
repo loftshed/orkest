@@ -216,6 +216,54 @@ pub fn bytes_to_hex(bytes: &[u8]) -> String {
     hex
 }
 
+/// Compute the 32-byte HMAC-SHA256 authentication tag matching RFC 2104 / RFC 4231.
+#[must_use]
+pub fn hmac_sha256_bytes(key: &[u8], message: &[u8]) -> [u8; 32] {
+    let mut normalized_key = [0u8; 64];
+    if key.len() > 64 {
+        let hashed = sha256_digest(key);
+        normalized_key[..32].copy_from_slice(&hashed);
+    } else {
+        normalized_key[..key.len()].copy_from_slice(key);
+    }
+
+    let mut ipad = [0x36u8; 64];
+    let mut opad = [0x5cu8; 64];
+    for i in 0..64 {
+        ipad[i] ^= normalized_key[i];
+        opad[i] ^= normalized_key[i];
+    }
+
+    let mut inner = Sha256::new();
+    inner.update(&ipad);
+    inner.update(message);
+    let inner_digest = inner.finalize();
+
+    let mut outer = Sha256::new();
+    outer.update(&opad);
+    outer.update(&inner_digest);
+    outer.finalize()
+}
+
+/// Format HMAC-SHA256 as lowercase hexadecimal (64 chars).
+#[must_use]
+pub fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
+    bytes_to_hex(&hmac_sha256_bytes(key, message))
+}
+
+/// Constant-time byte-slice comparison for verifying hex digests without early exits.
+#[must_use]
+pub fn ct_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&a, &b) in left.iter().zip(right.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,5 +305,24 @@ mod tests {
             bytes_to_hex(&digest),
             "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
         );
+    }
+
+    #[test]
+    fn test_hmac_sha256_rfc4231() {
+        // Test Case 1 from RFC 4231
+        let key1 = [0x0bu8; 20];
+        let data1 = b"Hi There";
+        assert_eq!(
+            hmac_sha256_hex(&key1, data1),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
+        // Test Case 2 ("Jefe")
+        assert_eq!(
+            hmac_sha256_hex(b"Jefe", b"what do ya want for nothing?"),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+        assert!(ct_eq(b"abcdef", b"abcdef"));
+        assert!(!ct_eq(b"abcdef", b"abcdeg"));
+        assert!(!ct_eq(b"abc", b"abcd"));
     }
 }

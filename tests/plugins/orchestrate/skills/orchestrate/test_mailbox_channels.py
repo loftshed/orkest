@@ -10,11 +10,15 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+TESTS = Path(__file__).resolve().parent
 SCRIPTS = Path(__file__).resolve().parents[5] / "plugins/orchestrate/skills/orchestrate/scripts"
-sys.path.insert(0, str(SCRIPTS))
+for _path in (TESTS, SCRIPTS):
+    if str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
 import mailbox_channels  # noqa: E402
 import mailbox_wake  # noqa: E402
 import peer_mailbox  # noqa: E402
+from _ork_fast_test_helpers import run_mailbox_hook  # noqa: E402
 
 GIT = ["git", "-c", "user.name=test", "-c", "user.email=test@example.invalid"]
 
@@ -206,16 +210,19 @@ class ChannelTests(unittest.TestCase):
         self.peer("worker", harness="claude", channels=["graph"], state="busy")
         payload = {"session_id": "worker", "cwd": str(self.repo)}
         self.post(sender, "graph", "progress note")
-        with patch.object(peer_mailbox, "harness_pid", return_value=os.getpid()):
-            stopped = peer_mailbox.hook({**payload, "hook_event_name": "Stop"}, harness="claude", base=self.base)
-            self.assertIsNone(stopped)
-            self.assertEqual(self.inbox("worker"), ["progress note"])  # still unread for the next turn
-            started = peer_mailbox.hook(
-                {**payload, "hook_event_name": "UserPromptSubmit"}, harness="claude", base=self.base
-            )
-            self.assertIn("progress note", started["hookSpecificOutput"]["additionalContext"])
-            self.post(sender, "graph", "urgent: stop the build", wake=True)
-            urgent = peer_mailbox.hook({**payload, "hook_event_name": "Stop"}, harness="claude", base=self.base)
+        stopped = run_mailbox_hook(
+            {**payload, "hook_event_name": "Stop"}, harness="claude", base=self.base, pid=os.getpid()
+        )
+        self.assertIsNone(stopped)
+        self.assertEqual(self.inbox("worker"), ["progress note"])  # still unread for the next turn
+        started = run_mailbox_hook(
+            {**payload, "hook_event_name": "UserPromptSubmit"}, harness="claude", base=self.base, pid=os.getpid()
+        )
+        self.assertIn("progress note", started["hookSpecificOutput"]["additionalContext"])
+        self.post(sender, "graph", "urgent: stop the build", wake=True)
+        urgent = run_mailbox_hook(
+            {**payload, "hook_event_name": "Stop"}, harness="claude", base=self.base, pid=os.getpid()
+        )
         self.assertEqual(urgent["decision"], "block")
         self.assertIn("urgent: stop the build", urgent["reason"])
 
@@ -223,21 +230,23 @@ class ChannelTests(unittest.TestCase):
         sender = self.peer("sender", channels=["graph"])
         self.peer("worker", harness="gemini", channels=["graph"])
         payload = {"conversationId": "worker", "workspacePaths": [str(self.repo)]}
+        clean_env = {"PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", "")}
 
         def step(event, **extra):
-            out = peer_mailbox.hook({**payload, **extra}, harness="gemini", event=event, base=self.base)
+            out = run_mailbox_hook(
+                {**payload, **extra}, harness="gemini", event=event, base=self.base, pid=os.getpid(), env=clean_env
+            )
             return "\n".join(s["ephemeralMessage"] for s in (out or {}).get("injectSteps", []))
 
-        with patch.object(peer_mailbox, "harness_pid", return_value=os.getpid()):
-            self.post(sender, "graph", "queued while idle")
-            self.assertIn("queued while idle", step("PreInvocation", invocationNum=1))  # a turn starts
-            self.post(sender, "graph", "progress note")
-            self.assertNotIn("progress note", step("PreInvocation", invocationNum=2))  # after a tool call
-            self.post(sender, "graph", "urgent: stop the build", wake=True)
-            self.assertIn("urgent: stop the build", step("PreInvocation", invocationNum=3))
-            self.assertNotIn("progress note", step("Stop", terminationReason="NO_TOOL_CALL"))
-            self.assertEqual(self.inbox("worker"), ["progress note"])
-            self.assertIn("progress note", step("PreInvocation", invocationNum=1))  # the next turn
+        self.post(sender, "graph", "queued while idle")
+        self.assertIn("queued while idle", step("PreInvocation", invocationNum=1))  # a turn starts
+        self.post(sender, "graph", "progress note")
+        self.assertNotIn("progress note", step("PreInvocation", invocationNum=2))  # after a tool call
+        self.post(sender, "graph", "urgent: stop the build", wake=True)
+        self.assertIn("urgent: stop the build", step("PreInvocation", invocationNum=3))
+        self.assertNotIn("progress note", step("Stop", terminationReason="NO_TOOL_CALL"))
+        self.assertEqual(self.inbox("worker"), ["progress note"])
+        self.assertIn("progress note", step("PreInvocation", invocationNum=1))  # the next turn
 
     def test_roster_notices_follow_channel_mates_only(self):
         self.peer("mapper", harness="claude", channels=["graph"])
@@ -245,8 +254,7 @@ class ChannelTests(unittest.TestCase):
         payload = {"session_id": "mapper", "cwd": str(self.repo), "hook_event_name": "UserPromptSubmit"}
 
         def roster():
-            with patch.object(peer_mailbox, "harness_pid", return_value=os.getpid()):
-                out = peer_mailbox.hook(payload, harness="claude", base=self.base)
+            out = run_mailbox_hook(payload, harness="claude", base=self.base, pid=os.getpid())
             return (out or {}).get("hookSpecificOutput", {}).get("additionalContext", "")
 
         first = roster()
@@ -259,12 +267,12 @@ class ChannelTests(unittest.TestCase):
     def test_session_start_points_a_channel_less_agent_at_existing_channels(self):
         self.peer("fetcher", channels=["retrieval"])
         self.peer("mapper", channels=["graph"])
-        with patch.object(peer_mailbox, "harness_pid", return_value=os.getpid()):
-            out = peer_mailbox.hook(
-                {"session_id": "newcomer", "cwd": str(self.repo), "hook_event_name": "SessionStart"},
-                harness="claude",
-                base=self.base,
-            )
+        out = run_mailbox_hook(
+            {"session_id": "newcomer", "cwd": str(self.repo), "hook_event_name": "SessionStart"},
+            harness="claude",
+            base=self.base,
+            pid=os.getpid(),
+        )
         text = out["hookSpecificOutput"]["additionalContext"]
         self.assertIn("Task channels in this project: graph (1), retrieval (1)", text)
         self.assertEqual(
@@ -315,11 +323,24 @@ class ChannelTests(unittest.TestCase):
 
     def test_clear_keeps_the_sessions_channels(self):
         old = self.peer("before-clear", harness="claude", channels=["graph"])
-        peer_mailbox.end_session(self.base, old["session"], reason="clear", pid=os.getpid())
-        successor = peer_mailbox.register(
-            self.base, session="after-clear", harness="claude", cwd=str(self.repo), pid=os.getpid()
+        run_mailbox_hook(
+            {"hook_event_name": "SessionEnd", "session_id": old["session"], "cwd": str(self.repo), "reason": "clear"},
+            harness="claude",
+            base=self.base,
+            pid=os.getpid(),
         )
-        notice = peer_mailbox.adopt_cleared(self.base, successor)
+        out = run_mailbox_hook(
+            {
+                "hook_event_name": "SessionStart",
+                "session_id": "after-clear",
+                "cwd": str(self.repo),
+                "source": "clear",
+            },
+            harness="claude",
+            base=self.base,
+            pid=os.getpid(),
+        )
+        notice = (out or {}).get("hookSpecificOutput", {}).get("additionalContext", "")
         self.assertIn("graph", notice)
         kept = peer_mailbox.load(peer_mailbox.peer_path(self.base, "after-clear"))
         self.assertEqual(mailbox_channels.memberships(kept), ["graph"])
@@ -369,17 +390,16 @@ class ChannelTests(unittest.TestCase):
         (stored,) = peer_mailbox.incoming(self.base, "busy-other")
         self.assertTrue(stored.get("unrelatedTask"))
         self.assertFalse(stored.get("wake"))
-        with patch.object(peer_mailbox, "harness_pid", return_value=os.getpid()):
-            # Unrelated-task direct mail never extends the recipient's active turn at Stop.
-            self.assertIsNone(
-                peer_mailbox.hook({**payload, "hook_event_name": "Stop"}, harness="claude", base=self.base)
-            )
-            self.assertEqual(self.inbox("busy-other"), ["Are you touching graph.py?"])
-            # It is delivered cleanly at the recipient's next turn boundary.
-            started = peer_mailbox.hook(
-                {**payload, "hook_event_name": "UserPromptSubmit"}, harness="claude", base=self.base
-            )
-            self.assertIn("Are you touching graph.py?", started["hookSpecificOutput"]["additionalContext"])
+        # Unrelated-task direct mail never extends the recipient's active turn at Stop.
+        self.assertIsNone(
+            run_mailbox_hook({**payload, "hook_event_name": "Stop"}, harness="claude", base=self.base, pid=os.getpid())
+        )
+        self.assertEqual(self.inbox("busy-other"), ["Are you touching graph.py?"])
+        # It is delivered cleanly at the recipient's next turn boundary.
+        started = run_mailbox_hook(
+            {**payload, "hook_event_name": "UserPromptSubmit"}, harness="claude", base=self.base, pid=os.getpid()
+        )
+        self.assertIn("Are you touching graph.py?", started["hookSpecificOutput"]["additionalContext"])
 
         # Sharing a channel, replying to a message, or continuing an existing thread restores normal wake & Stop behavior.
         teammate = self.peer("teammate", harness="claude", channels=["retrieval"], state="busy")
@@ -390,8 +410,9 @@ class ChannelTests(unittest.TestCase):
             )
             wake.assert_called_once()
         self.assertEqual(shared["wake"]["status"], "scheduled")
-        with patch.object(peer_mailbox, "harness_pid", return_value=os.getpid()):
-            stopped = peer_mailbox.hook({**team_payload, "hook_event_name": "Stop"}, harness="claude", base=self.base)
+        stopped = run_mailbox_hook(
+            {**team_payload, "hook_event_name": "Stop"}, harness="claude", base=self.base, pid=os.getpid()
+        )
         self.assertEqual(stopped["decision"], "block")
         self.assertIn("Need retrieval schema", stopped["reason"])
 
@@ -419,14 +440,15 @@ class ChannelTests(unittest.TestCase):
         (stored,) = peer_mailbox.incoming(self.base, "recipient")
         self.assertIs(stored.get("wake"), False)
         self.assertFalse(mailbox_channels.reads_at_stop(stored))
-        with patch.object(peer_mailbox, "harness_pid", return_value=os.getpid()):
-            stopped = peer_mailbox.hook({**payload, "hook_event_name": "Stop"}, harness="claude", base=self.base)
-            self.assertIsNone(stopped)
-            self.assertEqual(self.inbox("recipient"), ["FYI progress update"])
-            started = peer_mailbox.hook(
-                {**payload, "hook_event_name": "UserPromptSubmit"}, harness="claude", base=self.base
-            )
-            self.assertIn("FYI progress update", started["hookSpecificOutput"]["additionalContext"])
+        stopped = run_mailbox_hook(
+            {**payload, "hook_event_name": "Stop"}, harness="claude", base=self.base, pid=os.getpid()
+        )
+        self.assertIsNone(stopped)
+        self.assertEqual(self.inbox("recipient"), ["FYI progress update"])
+        started = run_mailbox_hook(
+            {**payload, "hook_event_name": "UserPromptSubmit"}, harness="claude", base=self.base, pid=os.getpid()
+        )
+        self.assertIn("FYI progress update", started["hookSpecificOutput"]["additionalContext"])
 
 
 if __name__ == "__main__":

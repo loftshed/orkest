@@ -54,6 +54,8 @@ jobs:
           CI: true
       - name: Type-check Monitor menu bar app
         run: swiftc -typecheck -swift-version 5 -framework AppKit plugins/monitor/macos/main.swift
+      - name: Type-check OrkestHUD toast app
+        run: swiftc -typecheck -swift-version 5 -framework AppKit -framework QuartzCore plugins/orchestrate/macos/hud.swift
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
@@ -124,6 +126,8 @@ jobs:
         run: |
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
             export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+            export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+            export AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar
           fi
           cargo build --manifest-path crates/ork-fast/Cargo.toml --release --target ${{ matrix.target }}
           cp crates/ork-fast/target/${{ matrix.target }}/release/ork-fast ork-fast-${{ matrix.target }}

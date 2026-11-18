@@ -13,10 +13,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+TESTS_DIR = Path(__file__).resolve().parent
 SCRIPTS = Path(__file__).resolve().parents[5] / "plugins/orchestrate/skills/orchestrate/scripts"
+sys.path.insert(0, str(TESTS_DIR))
 sys.path.insert(0, str(SCRIPTS))
+import _ork_fast_test_helpers as fast  # noqa: E402
 import continuation_requests as CR  # noqa: E402
-import mailbox_hooks  # noqa: E402
 import peer_mailbox  # noqa: E402
 import room_store  # noqa: E402
 import wake_recovery  # noqa: E402
@@ -43,7 +45,7 @@ class ContinuationTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.base = Path(self.temporary.name) / "mailbox"
+        self.base = Path(self.temporary.name) / "mailbox-v1"
         self.base.mkdir()
         self.repo = Path(self.temporary.name) / "repo"
         self.repo.mkdir()
@@ -312,10 +314,12 @@ class ContinuationTests(unittest.TestCase):
     def test_stop_with_queued_work_reaches_one_reservation_through_the_real_hook_path(self):
         # Before: a Stop with queued room work and no incoming mail produced no continuation at all.
         self.write_task(runs=[{"run_id": "r1", "request_id": "req-1", "status": "finished"}])
-        me = peer_mailbox.load(peer_mailbox.peer_path(self.base, "coord-1"))
-        with mock.patch.dict(os.environ, {"ORKEST_SWARM_ROOM": "room-a"}):
-            created = mailbox_hooks._continuation_at_stop(self.base, me)
-            again = mailbox_hooks._continuation_at_stop(self.base, me)
+        env = {**os.environ, "ORKEST_SWARM_ROOM": "room-a"}
+        payload = {"session_id": "coord-1", "cwd": str(self.repo)}
+        fast.run_mailbox_hook(payload, harness="claude", event="Stop", base=self.base, cwd=self.repo, env=env)
+        created = list(CR.load_all(self.base).values())
+        fast.run_mailbox_hook(payload, harness="claude", event="Stop", base=self.base, cwd=self.repo, env=env)
+        again = list(CR.load_all(self.base).values())
         self.assertEqual(len(created), 2)  # the queued member, and the finished run awaiting review
         self.assertEqual({entry["key"] for entry in again}, {entry["key"] for entry in created})
         self.assertEqual(len(CR.load_all(self.base)), 2)
@@ -332,22 +336,40 @@ class ContinuationTests(unittest.TestCase):
             CR.reserve(self.base, created[0]["key"], "coord-other")
 
     def test_stop_hook_uses_the_room_remembered_at_turn_start(self):
+        env = {k: v for k, v in os.environ.items() if k != "ORKEST_SWARM_ROOM"}
+        payload = {"session_id": "coord-1", "cwd": str(self.repo)}
+        fast.run_mailbox_hook(payload, harness="claude", event="Stop", base=self.base, cwd=self.repo, env=env)
+        self.assertEqual(CR.load_all(self.base), {})
+        fast.run_mailbox_hook(payload, harness="claude", event="SessionStart", base=self.base, cwd=self.repo, env=env)
+        fast.run_mailbox_hook(
+            payload, harness="claude", event="UserPromptSubmit", base=self.base, cwd=self.repo, env=env
+        )
         me = peer_mailbox.load(peer_mailbox.peer_path(self.base, "coord-1"))
-        with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("ORKEST_SWARM_ROOM", None)
-            self.assertEqual(mailbox_hooks._continuation_at_stop(self.base, me), [])
-            mailbox_hooks._swarm_next_advisor(self.base, me, self.room, "room-a", "conductor")
-            me = peer_mailbox.load(peer_mailbox.peer_path(self.base, "coord-1"))
-            self.assertEqual(me["continuationRoom"], "room-a")
-            self.assertEqual(len(mailbox_hooks._continuation_at_stop(self.base, me)), 1)
+        self.assertEqual(me["continuationRoom"], "room-a")
+        fast.run_mailbox_hook(payload, harness="claude", event="Stop", base=self.base, cwd=self.repo, env=env)
+        self.assertEqual(len(CR.load_all(self.base)), 1)
 
     def test_stop_hook_ignores_archived_rooms_and_non_owners(self):
-        me = peer_mailbox.load(peer_mailbox.peer_path(self.base, "coord-1"))
-        stranger = peer_mailbox.register(self.base, session="stranger", harness="claude", cwd=str(self.repo))
-        with mock.patch.dict(os.environ, {"ORKEST_SWARM_ROOM": "room-a"}):
-            self.assertEqual(mailbox_hooks._continuation_at_stop(self.base, stranger), [])
-            self.set_room(lifecycle="archived")
-            self.assertEqual(mailbox_hooks._continuation_at_stop(self.base, me), [])
+        peer_mailbox.register(self.base, session="stranger", harness="claude", cwd=str(self.repo), pid=os.getpid())
+        env = {**os.environ, "ORKEST_SWARM_ROOM": "room-a"}
+        fast.run_mailbox_hook(
+            {"session_id": "stranger", "cwd": str(self.repo)},
+            harness="claude",
+            event="Stop",
+            base=self.base,
+            cwd=self.repo,
+            env=env,
+        )
+        self.assertEqual(CR.load_all(self.base), {})
+        self.set_room(lifecycle="archived")
+        fast.run_mailbox_hook(
+            {"session_id": "coord-1", "cwd": str(self.repo)},
+            harness="claude",
+            event="Stop",
+            base=self.base,
+            cwd=self.repo,
+            env=env,
+        )
         self.assertEqual(CR.load_all(self.base), {})
 
     def test_finished_requests_expire_after_a_week_but_open_ones_stay(self):

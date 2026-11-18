@@ -3,7 +3,6 @@ import { createHash } from "node:crypto";
 import { readFile, realpath } from "node:fs/promises";
 import { hostname } from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import { herdrEndpoint } from "./herdr-context.mjs";
@@ -29,11 +28,9 @@ import {
   sessionIdentities,
   writeCoordinatorBrief,
 } from "./rooms.mjs";
+import { orkFastBin } from "./runtime-paths.mjs";
 
 const execute = promisify(execFile);
-const statusline = fileURLToPath(
-  new URL("../skills/orchestrate/scripts/agent_statusline.py", import.meta.url),
-);
 const SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/u;
 const ENGINES = new Set(["codex", "claude", "agy", "opencode"]);
 
@@ -100,10 +97,11 @@ async function currentPeer(root, session, cwd, env, now, expectedEngine) {
 }
 
 export async function refreshPromotedTerminal({ peer, room, root, env = process.env }) {
+  const fastBin = orkFastBin(env);
   const { stdout } = await execute(
-    "python3",
+    fastBin,
     [
-      statusline,
+      "statusline",
       "--native-status",
       "--refresh-terminal",
       "--session",

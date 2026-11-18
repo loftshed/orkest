@@ -3360,4 +3360,108 @@ describe("coordination reliability", () => {
       accountHome,
     });
   });
+
+  it("stamps conductor sessionLive from snapshot or peer, including when status is completed", async () => {
+    const root = await directory();
+    const cwd = await realpath(await directory());
+    const room = await newRoom(parseTeam("claude:haiku"), {
+      id: "conductor-liveness",
+      cwd,
+      root,
+      engine: "claude",
+      swarm: { maxAgents: 2, maxDepth: 2 },
+    });
+
+    // Unbound conductor leaves sessionLive undefined.
+    const unbound = await observeRoom(room.id, { root, discoverNativePeers: false });
+    expect(unbound.conductor.sessionLive).toBeUndefined();
+
+    // Live peer stamps sessionLive = true.
+    const stamp = new Date().toISOString();
+    await mkdir(path.join(root, "peers"), { recursive: true });
+    const peerPath = path.join(root, "peers", "conductor-live.json");
+    await writeFile(
+      peerPath,
+      JSON.stringify({
+        schema: "agent-executor.peer.v1",
+        session: "conductor-live",
+        name: "conductor-peer",
+        harness: "claude",
+        cwd,
+        checkout: cwd,
+        pid: process.pid,
+        state: "idle",
+        startedAt: stamp,
+        lastSeenAt: stamp,
+      }),
+    );
+    await updateRoom(
+      room.id,
+      (current) => {
+        current.conductor.engine = "claude";
+        current.conductor.session = {
+          id: "conductor-live",
+          engine: "claude",
+          machine: hostname(),
+          cwd,
+        };
+        return current;
+      },
+      { root },
+    );
+    const live = await observeRoom(room.id, { root, discoverNativePeers: false });
+    expect(live.conductor.sessionLive).toBe(true);
+
+    // Dead peer stamps sessionLive = false even when status is "reported complete" or "completed",
+    // and clears stale runtimeState = "running" on reused room objects.
+    await rm(peerPath);
+    for (const status of ["reported complete", "completed"]) {
+      const reused = structuredClone(live);
+      reused.conductor.status = status;
+      reused.conductor.runtimeState = "running";
+      const dead = await observeRoom(reused, {
+        root,
+        discoverNativePeers: false,
+        progress: async () => ({}),
+      });
+      expect(dead.conductor.sessionLive).toBe(false);
+      expect(dead.conductor.status).toBe(status);
+      expect(dead.conductor.runtimeState).not.toBe("running");
+    }
+
+    // Mailbox-only conductor bindings also stamp sessionLive from snapshot or peer.
+    const mailboxRoom = await observeRoom(
+      {
+        id: "mailbox-room",
+        cwd,
+        swarm: { maxAgents: 2 },
+        conductor: { engine: "claude", mailboxSession: "mb-1", status: "completed" },
+        agents: [],
+      },
+      {
+        root,
+        discoverNativePeers: false,
+        progress: async () => ({
+          conductor: { name: "lead", stage: "complete", runtimeState: "idle" },
+        }),
+      },
+    );
+    expect(mailboxRoom.conductor.sessionLive).toBe(true);
+
+    const deadMailboxRoom = await observeRoom(
+      {
+        id: "mailbox-room",
+        cwd,
+        swarm: { maxAgents: 2 },
+        conductor: { engine: "claude", mailboxSession: "mb-1", status: "completed" },
+        agents: [],
+      },
+      {
+        root,
+        discoverNativePeers: false,
+        progress: async () => ({}),
+      },
+    );
+    expect(deadMailboxRoom.conductor.sessionLive).toBe(false);
+  });
 });

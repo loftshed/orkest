@@ -78,6 +78,17 @@ def extract_resumed_session_id(command: list[str]) -> str | None:
     return None
 
 
+def _is_open_room(room: object) -> bool:
+    """True when `room` is an open, non-archived agent-executor room."""
+    return (
+        isinstance(room, dict)
+        and room.get("schema") == "agent-executor.room.v1"
+        and not room.get("closedAt")
+        and room.get("status") != "closed"
+        and room_store.is_active_room(room)
+    )
+
+
 def find_session_swarm_room(
     base: Path,
     session_id: str,
@@ -104,12 +115,7 @@ def find_session_swarm_room(
     best_score: tuple[int, int, float, int, str] = (-1, -1, -1.0, -1, "")
     with contextlib.suppress(OSError):
         for room in room_store.list_rooms(base):
-            if not isinstance(room, dict) or room.get("schema") != "agent-executor.room.v1" or not room.get("swarm"):
-                continue
-            if room.get("closedAt") or room.get("status") == "closed":
-                continue
-            # Archived and cancelled rooms are history: a fresh session never adopts them by discovery.
-            if not room_store.is_active_room(room):
+            if not _is_open_room(room) or not room.get("swarm"):
                 continue
             if resolved_cwd and isinstance(room.get("cwd"), str) and Path(room["cwd"]).resolve() != resolved_cwd:
                 continue
@@ -427,6 +433,32 @@ def _update_room_metadata(base: Path, room_id: str, **fields: str | None) -> dic
     with contextlib.suppress(OSError, ValueError):
         return room_store.set_metadata(base, room_id, **fields)
     return None
+
+
+def _bound_rooms(base: Path, peer: dict[str, object]) -> list[tuple[dict, dict]]:
+    """Open rooms currently bound to `peer['session']`."""
+    session_id = peer.get("session")
+    if not isinstance(session_id, str) or not session_id:
+        return []
+    found: list[tuple[dict, dict]] = []
+    for room in room_store.list_rooms(base):
+        if not _is_open_room(room):
+            continue
+        candidates = []
+        conductor = room.get("conductor")
+        if isinstance(conductor, dict):
+            candidates.append(conductor)
+        agents = room.get("agents")
+        if isinstance(agents, list):
+            candidates.extend(member for member in agents if isinstance(member, dict))
+        for member in candidates:
+            owner = None
+            with contextlib.suppress(OSError, ValueError, mailbox.MailboxError):
+                owner = mailbox.room_session_peer(base, room, member)
+            if isinstance(owner, dict) and owner.get("session") == session_id:
+                found.append((room, member))
+                break
+    return found
 
 
 _UNVERIFIED_CHIEF_GRACE_SEC = 600.0
@@ -915,9 +947,7 @@ def _toggle_herdr_swarm_view_unlocked(
         if isinstance(matched, dict) and isinstance(matched.get("id"), str):
             current_room = matched["id"]
     if not current_room and isinstance(peer, dict) and mailbox.valid_peer(peer):
-        import agent_statusline
-
-        bound = agent_statusline.bound_rooms(base, peer)
+        bound = _bound_rooms(base, peer)
         if bound:
             current_room = bound[0][0]["id"]
     # Pane IDs survive new conversations; they cannot identify a known session's room.
@@ -1231,9 +1261,7 @@ def toggle_swarm_view(
         if isinstance(matched, dict) and isinstance(matched.get("id"), str):
             current_room = matched["id"]
     if not current_room and isinstance(peer, dict) and mailbox.valid_peer(peer):
-        import agent_statusline
-
-        bound = agent_statusline.bound_rooms(base, peer)
+        bound = _bound_rooms(base, peer)
         if bound:
             current_room = bound[0][0]["id"]
     resolved_room, room_error = _ensure_bound_room(
@@ -1297,6 +1325,7 @@ def main(arguments: list[str]) -> int:
         parser.add_argument("--harness")
         parser.add_argument("--cwd")
         parser.add_argument("--chief", action="store_true", help="open the machine-wide Chief overview")
+        parser.add_argument("--respect-closed", action="store_true")
         parser.add_argument("--json", action="store_true")
         args = parser.parse_args(arguments)
         action = args.toggle_swarm if args.toggle_swarm in ("toggle", "open", "close") else "toggle"
@@ -1308,6 +1337,7 @@ def main(arguments: list[str]) -> int:
             harness=args.harness,
             cwd=args.cwd,
             chief=args.chief,
+            respect_closed=args.respect_closed,
         )
         if args.json:
             print(json.dumps(outcome))
@@ -1604,7 +1634,6 @@ def main(arguments: list[str]) -> int:
         return create.returncode
     coordinator_pane = create.stdout.strip()
 
-    script = Path(__file__).with_name("agent_statusline.py")
     fast_bin = runtime_paths.ork_fast_bin(env=environment)
     codex_args = (
         [
@@ -1614,30 +1643,23 @@ def main(arguments: list[str]) -> int:
         if harness == "codex"
         else []
     )
-    py_renderer = [sys.executable, str(script), "--tmux-server", socket, "--harness", harness, *codex_args]
-    py_invocation = shlex.join(py_renderer).replace("#", "##")
     source = "--codex-pane" if harness == "codex" else "--terminal-pane"
     # A literal %0 in a status format is parsed by strftime. Expand it from an option instead.
     pane = "#{@orkest_coordinator_pane}"
 
     def _status_format(extra_tail: str = "") -> str:
         tail = f"{source} {pane} --width #{{client_width}} --tmux{extra_tail}"
-        if fast_bin and fast_bin.is_file() and os.access(fast_bin, os.X_OK):
-            fast_renderer = [
-                str(fast_bin),
-                "statusline",
-                "--tmux-server",
-                socket,
-                "--harness",
-                harness,
-                "--fallback-script",
-                str(script),
-                *codex_args,
-            ]
-            fast_invocation = shlex.join(fast_renderer).replace("#", "##")
-            quoted_bin = shlex.quote(str(fast_bin)).replace("#", "##")
-            return f"#([ -x {quoted_bin} ] && exec {fast_invocation} {tail}; exec {py_invocation} {tail})"
-        return f"#({py_invocation} {tail})"
+        fast_renderer = [
+            str(fast_bin),
+            "statusline",
+            "--tmux-server",
+            socket,
+            "--harness",
+            harness,
+            *codex_args,
+        ]
+        fast_invocation = shlex.join(fast_renderer).replace("#", "##")
+        return f"#({fast_invocation} {tail})"
 
     status = _status_format()
     status_0 = _status_format(" --line 1")

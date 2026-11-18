@@ -16,27 +16,36 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-REPO_ROOT = Path(__file__).resolve().parents[5]
-ORK_FAST_BIN = REPO_ROOT / "crates/ork-fast/target/release/ork-fast"
-SCRIPTS = REPO_ROOT / "plugins/orchestrate/skills/orchestrate/scripts"
-sys.path.insert(0, str(SCRIPTS))
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
 
+REPO_ROOT = Path(__file__).resolve().parents[5]
+SCRIPTS = REPO_ROOT / "plugins/orchestrate/skills/orchestrate/scripts"
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
+
+import _ork_fast_test_helpers as ORK_FAST  # noqa: E402
 import install_mailbox  # noqa: E402 -- exercise the shipped installer
-import peer_mailbox  # noqa: E402 -- exercise the shipped mailbox hooks
+import peer_mailbox  # noqa: E402 -- exercise shipped peer storage helpers
 import room_store  # noqa: E402 -- rooms written through the shipped Node store
 import runtime_paths  # noqa: E402 -- exercise shipped path helpers
 
+ORK_FAST_BIN = ORK_FAST.find_ork_fast_bin()
 
-class TestOrkFastParity(unittest.TestCase):
+
+class TestOrkFastIntegration(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        if not ORK_FAST_BIN.is_file():
-            # Build release binary if missing
+        global ORK_FAST_BIN
+        candidate = REPO_ROOT / "crates/ork-fast/target/release/ork-fast"
+        if not candidate.is_file() and not ORK_FAST_BIN.is_file():
             subprocess.run(
                 ["cargo", "build", "--manifest-path", str(REPO_ROOT / "crates/ork-fast/Cargo.toml"), "--release"],
                 check=True,
                 capture_output=True,
             )
+        ORK_FAST_BIN = ORK_FAST.find_ork_fast_bin()
         assert ORK_FAST_BIN.is_file(), f"ork-fast binary missing at {ORK_FAST_BIN}"
 
     def setUp(self):
@@ -49,63 +58,83 @@ class TestOrkFastParity(unittest.TestCase):
             "HOME": str(self.home),
             "XDG_CACHE_HOME": str(self.home / ".cache"),
             "XDG_CONFIG_HOME": str(self.home / ".config"),
-            "ORK_DISABLE_FAST": "0",
             "ORK_FAST_BIN": str(ORK_FAST_BIN),
             "ORCHESTRATE_HOME": str(self.home / ".config/orchestrate"),
+            "ORKEST_SCRIPTS_DIR": str(SCRIPTS),
+            "ORKEST_PLUGIN_ROOT": str(REPO_ROOT / "plugins/orchestrate"),
+            "ORKEST_TEST_MODE": "1",
+            "ORKEST_TEST_HARNESS_PID": str(os.getpid()),
+            "PYTEST_CURRENT_TEST": "ork-fast-integration",
         }
         self.env.pop("AGENT_EXECUTOR_HOME", None)
         self.env.pop("NO_COLOR", None)
-        # Set inside a handoff successor's own session: it would send every hook to Python.
         self.env.pop("ORKEST_HANDOFF_SUCCESSOR", None)
 
-    def test_gate_hook_non_heavy_parity(self):
-        """Test non-heavy commands are allowed identically by Python and Rust."""
-        payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": "git status"}})
-        py_proc = subprocess.run(
-            [sys.executable, str(SCRIPTS / "gate.py"), "hook", "--harness", "claude"],
-            input=payload,
-            text=True,
-            capture_output=True,
-            env=self.env,
-        )
-        rust_proc = subprocess.run(
+    def test_gate_hook_non_heavy_heavy_and_fallback_flag(self):
+        """Test gate-hook allows non-heavy commands, denies heavy ones across harnesses, and accepts --fallback-script."""
+        gate_dir = self.home / "gate"
+        env = {**self.env, "AGENT_GATE_DIR": str(gate_dir)}
+        allow_proc = subprocess.run(
             [str(ORK_FAST_BIN), "gate-hook", "--harness", "claude", "--fallback-script", str(SCRIPTS / "gate.py")],
-            input=payload,
+            input=json.dumps({"tool_name": "Bash", "tool_input": {"command": "git status"}}),
             text=True,
             capture_output=True,
-            env=self.env,
+            env=env,
         )
-        self.assertEqual(py_proc.returncode, rust_proc.returncode)
-        self.assertEqual(py_proc.stdout.strip(), rust_proc.stdout.strip())
+        self.assertEqual((allow_proc.returncode, allow_proc.stdout.strip()), (0, ""))
 
-    def test_gate_hook_bypass_parity(self):
-        """Test gated wrapped commands (e.g. ork gate --heavy --) are allowed identically."""
-        payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": "ork gate --heavy -- yarn test"}})
-        py_proc = subprocess.run(
-            [sys.executable, str(SCRIPTS / "gate.py"), "hook", "--harness", "claude"],
-            input=payload,
-            text=True,
-            capture_output=True,
-            env=self.env,
+        claude = ORK_FAST.run_gate_hook(
+            {"tool_name": "Bash", "tool_input": {"command": "yarn test"}},
+            harness="claude",
+            gate_dir=gate_dir,
+            env=env,
         )
-        rust_proc = subprocess.run(
-            [str(ORK_FAST_BIN), "gate-hook", "--harness", "claude", "--fallback-script", str(SCRIPTS / "gate.py")],
-            input=payload,
-            text=True,
-            capture_output=True,
-            env=self.env,
-        )
-        self.assertEqual(py_proc.returncode, 0)
-        self.assertEqual(rust_proc.returncode, 0)
-        self.assertEqual(py_proc.stdout.strip(), "")
-        self.assertEqual(rust_proc.stdout.strip(), "")
+        self.assertEqual(claude["hookSpecificOutput"]["permissionDecision"], "deny")
 
-    def test_lease_holder_parity(self):
+        codex = ORK_FAST.run_gate_hook(
+            {"tool_name": "Bash", "tool_input": {"command": ["bash", "-lc", "npx vitest run"]}},
+            harness="codex",
+            gate_dir=gate_dir,
+            env=env,
+        )
+        self.assertEqual(codex["hookSpecificOutput"]["permissionDecision"], "deny")
+
+        gemini = ORK_FAST.run_gate_hook(
+            {"toolCall": {"name": "run_command", "args": {"CommandLine": "tsc --noEmit"}}},
+            harness="gemini",
+            gate_dir=gate_dir,
+            env=env,
+        )
+        self.assertEqual(gemini["decision"], "deny")
+
+        bad_proc = subprocess.run(
+            [str(ORK_FAST_BIN), "gate-hook", "--harness", "claude"],
+            input="{not valid json",
+            text=True,
+            capture_output=True,
+            env=env,
+        )
+        self.assertEqual((bad_proc.returncode, bad_proc.stdout), (0, ""))
+
+    def test_gate_hook_bypass_commands(self):
+        """Test gated wrapped commands and focused tests are allowed cleanly."""
+        gate_dir = self.home / "gate"
+        for command in ("ork gate --heavy -- yarn test", "vitest related src/a.ts", "git commit -m 'yarn test'"):
+            with self.subTest(command=command):
+                self.assertIsNone(
+                    ORK_FAST.run_gate_hook(
+                        {"tool_name": "Bash", "tool_input": {"command": command}},
+                        harness="claude",
+                        gate_dir=gate_dir,
+                        env=self.env,
+                    )
+                )
+
+    def test_lease_holder_acquisition_exclusion_and_release(self):
         """Test lease-holder acquisition, busy exclusion, and release on stdin EOF."""
         target_dir = self.home / "worktree"
         target_dir.mkdir()
 
-        # 1. Acquire with ork-fast
         proc1 = subprocess.Popen(
             [str(ORK_FAST_BIN), "lease-holder", str(target_dir), "--namespace", "test-ns"],
             stdin=subprocess.PIPE,
@@ -115,11 +144,9 @@ class TestOrkFastParity(unittest.TestCase):
             env=self.env,
         )
         try:
-            line1 = proc1.stdout.readline()
-            data1 = json.loads(line1)
+            data1 = json.loads(proc1.stdout.readline())
             self.assertEqual(data1.get("status"), "acquired")
 
-            # 2. Try second acquire while first holds it -> busy
             proc2 = subprocess.run(
                 [str(ORK_FAST_BIN), "lease-holder", str(target_dir), "--namespace", "test-ns"],
                 capture_output=True,
@@ -127,17 +154,14 @@ class TestOrkFastParity(unittest.TestCase):
                 env=self.env,
             )
             self.assertEqual(proc2.returncode, 0)
-            data2 = json.loads(proc2.stdout)
-            self.assertEqual(data2.get("status"), "busy")
+            self.assertEqual(json.loads(proc2.stdout).get("status"), "busy")
 
-            # 3. Close stdin of first holder -> releases and exits 0
             proc1.stdin.close()
             proc1.stdout.close()
             proc1.stderr.close()
             proc1.wait(timeout=2)
             self.assertEqual(proc1.returncode, 0)
 
-            # 4. Now acquire should succeed again
             proc3 = subprocess.Popen(
                 [str(ORK_FAST_BIN), "lease-holder", str(target_dir), "--namespace", "test-ns"],
                 stdin=subprocess.PIPE,
@@ -147,8 +171,7 @@ class TestOrkFastParity(unittest.TestCase):
                 env=self.env,
             )
             try:
-                line3 = proc3.stdout.readline()
-                data3 = json.loads(line3)
+                data3 = json.loads(proc3.stdout.readline())
                 self.assertEqual(data3.get("status"), "acquired")
             finally:
                 proc3.stdin.close()
@@ -161,7 +184,7 @@ class TestOrkFastParity(unittest.TestCase):
                 proc1.wait()
 
     def test_lease_holder_nonexistent_leaf_parity(self):
-        """Test lease-holder resolves nonexistent leaf paths identically to Python."""
+        """Test lease-holder resolves nonexistent leaf paths identically to lease_holder.py."""
         missing_leaf = self.home / "existing-parent" / "nonexistent-worktree-leaf"
         missing_leaf.parent.mkdir(parents=True)
 
@@ -194,39 +217,27 @@ class TestOrkFastParity(unittest.TestCase):
                 proc1.stderr.close()
             proc1.wait(timeout=2)
 
-    def test_statusline_parity(self):
-        """Test statusline rendering across --plain, --json, --tmux."""
+    def test_statusline_empty_modes(self):
+        """Test ork-fast statusline rendering across --plain, --json, --tmux when unbound."""
         for flag in ("--plain", "--json", "--tmux"):
-            py_proc = subprocess.run(
-                [sys.executable, str(SCRIPTS / "agent_statusline.py"), flag],
-                input="{}",
-                capture_output=True,
-                text=True,
+            proc = ORK_FAST.run_statusline(
+                flag,
+                "--fallback-script",
+                str(self.home / "unused-fallback.py"),
+                stdin_data="{}",
                 env=self.env,
             )
-            rust_proc = subprocess.run(
-                [
-                    str(ORK_FAST_BIN),
-                    "statusline",
-                    flag,
-                    "--fallback-script",
-                    str(SCRIPTS / "agent_statusline.py"),
-                ],
-                input="{}",
-                capture_output=True,
-                text=True,
-                env=self.env,
-            )
-            self.assertEqual(py_proc.returncode, rust_proc.returncode)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
             if flag == "--json":
-                py_out = json.loads(py_proc.stdout) if py_proc.stdout.strip() else {}
-                rust_out = json.loads(rust_proc.stdout) if rust_proc.stdout.strip() else {}
-                self.assertEqual(py_out, rust_out)
+                parsed = json.loads(proc.stdout) if proc.stdout.strip() else {}
+                self.assertEqual(parsed, {})
+            elif flag == "--tmux":
+                self.assertEqual(proc.stdout.strip(), "Orkest: waiting for agent")
             else:
-                self.assertEqual(py_proc.stdout.strip(), rust_proc.stdout.strip())
+                self.assertEqual(proc.stdout.strip(), "")
 
-    def test_statusline_populated_fixture_parity(self):
-        """Compare Python and Rust statusline on populated peer + fresh/stale progress fixtures."""
+    def test_statusline_populated_fixture(self):
+        """Test ork-fast statusline on populated peer + fresh/stale progress fixtures."""
         mailbox_root = runtime_paths.cache_home(env=self.env, home=self.home) / "mailbox-v1"
         (mailbox_root / "peers").mkdir(parents=True)
         (mailbox_root / "progress").mkdir(parents=True)
@@ -275,38 +286,39 @@ class TestOrkFastParity(unittest.TestCase):
                     "updatedAt": stamp,
                 }
                 (mailbox_root / "progress" / f"{s_key}.json").write_text(json.dumps(progress_record), encoding="utf-8")
-                stdin_payload = json.dumps({"session_id": session_id, "terminal_width": 110})
-                for extra_flags in (["--json"], ["--plain"], ["--tmux"], ["--native-status"]):
-                    py_proc = subprocess.run(
-                        [sys.executable, str(SCRIPTS / "agent_statusline.py"), "--harness", "claude", *extra_flags],
-                        input=stdin_payload,
-                        capture_output=True,
-                        text=True,
-                        env=self.env,
-                    )
-                    rust_proc = subprocess.run(
-                        [
-                            str(ORK_FAST_BIN),
-                            "statusline",
-                            "--harness",
-                            "claude",
-                            "--fallback-script",
-                            str(SCRIPTS / "agent_statusline.py"),
-                            *extra_flags,
-                        ],
-                        input=stdin_payload,
-                        capture_output=True,
-                        text=True,
-                        env=self.env,
-                    )
-                    self.assertEqual(py_proc.returncode, rust_proc.returncode)
-                    if "--json" in extra_flags:
-                        self.assertEqual(json.loads(py_proc.stdout), json.loads(rust_proc.stdout))
-                    else:
-                        self.assertEqual(py_proc.stdout, rust_proc.stdout)
+                stdin_payload = {"session_id": session_id, "terminal_width": 110}
 
-    def test_statusline_chief_focus_parity(self):
-        """Compare Python and Rust statusline for live vs stale Chief focus captions."""
+                json_proc = ORK_FAST.run_statusline(
+                    "--harness", "claude", "--json", stdin_data=stdin_payload, env=self.env, check=True
+                )
+                data = json.loads(json_proc.stdout)
+                self.assertEqual(data["name"], "iron-aurora")
+                self.assertEqual(data["fullName"], "iron-aurora-ab")
+                self.assertEqual(data["role"], "builder")
+                self.assertEqual(data["goal"], "Ship issue 201")
+                self.assertEqual(data["task"], "Fix statusline parity")
+                self.assertEqual(data["stage"], f"{stage} (stale)" if label_case == "stale" else stage)
+                self.assertEqual(data["statusHealth"], label_case)
+
+                plain_proc = ORK_FAST.run_statusline(
+                    "--harness", "claude", "--plain", stdin_data=stdin_payload, env=self.env, check=True
+                )
+                self.assertIn("iron-aurora", plain_proc.stdout)
+                self.assertIn("repo : orkest", plain_proc.stdout)
+                self.assertIn("Ship issue", plain_proc.stdout)
+
+                tmux_proc = ORK_FAST.run_statusline(
+                    "--harness", "claude", "--tmux", stdin_data=stdin_payload, env=self.env, check=True
+                )
+                self.assertIn("#[", tmux_proc.stdout)
+
+                native_proc = ORK_FAST.run_statusline(
+                    "--harness", "claude", "--native-status", stdin_data=stdin_payload, env=self.env, check=True
+                )
+                self.assertIn("iron", native_proc.stdout)
+
+    def test_statusline_chief_focus(self):
+        """Test ork-fast statusline resolves live vs stale Chief focus captions."""
         mailbox_root = runtime_paths.cache_home(env=self.env, home=self.home) / "mailbox-v1"
         (mailbox_root / "peers").mkdir(parents=True)
         checkout_dir = self.home / "repo"
@@ -334,7 +346,7 @@ class TestOrkFastParity(unittest.TestCase):
             "lastSeenAt": now_stamp,
         }
         (mailbox_root / "peers" / f"{s_key}.json").write_text(json.dumps(peer_record), encoding="utf-8")
-        stdin_payload = json.dumps({"session_id": session_id, "terminal_width": 120})
+        stdin_payload = {"session_id": session_id, "terminal_width": 120}
 
         scenarios = (
             ("missing_chief_json", None, "not set"),
@@ -348,37 +360,13 @@ class TestOrkFastParity(unittest.TestCase):
                     chief_path.unlink(missing_ok=True)
                 else:
                     chief_path.write_text(json.dumps(chief_doc), encoding="utf-8")
-                py_proc = subprocess.run(
-                    [sys.executable, str(SCRIPTS / "agent_statusline.py"), "--harness", "claude", "--json"],
-                    input=stdin_payload,
-                    capture_output=True,
-                    text=True,
-                    env=self.env,
-                    check=True,
+                rust_json = ORK_FAST.statusline_identity(
+                    session_id, "claude", payload=stdin_payload, base=mailbox_root, env=self.env
                 )
-                rust_proc = subprocess.run(
-                    [
-                        str(ORK_FAST_BIN),
-                        "statusline",
-                        "--harness",
-                        "claude",
-                        "--fallback-script",
-                        str(SCRIPTS / "agent_statusline.py"),
-                        "--json",
-                    ],
-                    input=stdin_payload,
-                    capture_output=True,
-                    text=True,
-                    env=self.env,
-                    check=True,
-                )
-                py_json = json.loads(py_proc.stdout)
-                rust_json = json.loads(rust_proc.stdout)
-                self.assertEqual(py_json["task"], expected_task)
-                self.assertEqual(py_json, rust_json)
+                self.assertEqual(rust_json["task"], expected_task)
 
-    def test_mailbox_hook_stop_preinvocation_and_unread_parity(self):
-        """Test Stop state->idle + gemini lastStopReason, PreInvocation mid-turn, and unread inbox delegation."""
+    def test_mailbox_hook_stop_preinvocation_and_unread_delivery(self):
+        """Test Stop state->idle + gemini lastStopReason, PreInvocation mid-turn + agy pending classification, and unread inbox delivery."""
         mailbox_root = runtime_paths.cache_home(env=self.env, home=self.home) / "mailbox-v1"
         (mailbox_root / "peers").mkdir(parents=True)
         session_id = "sess-mailbox-parity-1"
@@ -406,54 +394,19 @@ class TestOrkFastParity(unittest.TestCase):
         peer_file.write_text(json.dumps(peer_record), encoding="utf-8")
 
         # 1. PreInvocation mid-turn fast-path updates lastSeenAt cleanly
-        pre_proc = subprocess.run(
-            [
-                str(ORK_FAST_BIN),
-                "mailbox-hook",
-                "--harness",
-                "gemini",
-                "--event",
-                "PreInvocation",
-                "--fallback-script",
-                str(SCRIPTS / "peer_mailbox.py"),
-            ],
-            input=json.dumps({"session_id": session_id, "prompt": "continue work"}),
-            text=True,
-            capture_output=True,
+        pre_out = ORK_FAST.run_mailbox_hook(
+            {"session_id": session_id, "prompt": "continue work"},
+            harness="gemini",
+            event="PreInvocation",
+            base=mailbox_root,
             env=self.env,
         )
-        self.assertEqual(pre_proc.returncode, 0)
-        self.assertEqual(pre_proc.stdout.strip(), "")
+        self.assertEqual(pre_out, {})
         after_pre = json.loads(peer_file.read_text(encoding="utf-8"))
         self.assertEqual(after_pre["state"], "busy")
         self.assertNotEqual(after_pre["lastSeenAt"], old_stamp)
 
-        # 1b. Gemini peer with agySubagentPending=True delegates to Python until classified; cleared stays fast
-        marker = self.home / "fallback-called.txt"
-        sentinel_fallback = self.home / "sentinel-fallback.py"
-        sentinel_fallback.write_text(
-            f"#!/usr/bin/env python3\nimport pathlib; pathlib.Path({str(marker)!r}).write_text('called')\n",
-            encoding="utf-8",
-        )
-        fast_check_proc = subprocess.run(
-            [
-                str(ORK_FAST_BIN),
-                "mailbox-hook",
-                "--harness",
-                "gemini",
-                "--event",
-                "PreInvocation",
-                "--fallback-script",
-                str(sentinel_fallback),
-            ],
-            input=json.dumps({"conversationId": session_id, "invocationNum": 2}),
-            text=True,
-            capture_output=True,
-            env=self.env,
-        )
-        self.assertEqual(fast_check_proc.returncode, 0)
-        self.assertFalse(marker.exists(), "classified top-level peer should stay on Rust fast path")
-
+        # 1b. Gemini peer with agySubagentPending=True resolves natively from subagent transcript
         pending_sid = "sess-mailbox-pending-1"
         pending_key = peer_mailbox.session_key(pending_sid)
         pending_file = mailbox_root / "peers" / f"{pending_key}.json"
@@ -474,59 +427,37 @@ class TestOrkFastParity(unittest.TestCase):
             + "\n",
             encoding="utf-8",
         )
-        pending_proc = subprocess.run(
-            [
-                str(ORK_FAST_BIN),
-                "mailbox-hook",
-                "--harness",
-                "gemini",
-                "--event",
-                "PreInvocation",
-                "--fallback-script",
-                str(SCRIPTS / "peer_mailbox.py"),
-            ],
-            input=json.dumps(
-                {
-                    "conversationId": pending_sid,
-                    "invocationNum": 1,
-                    "transcriptPath": str(sub_transcript),
-                    "cwd": str(checkout_dir.resolve()),
-                }
-            ),
-            text=True,
-            capture_output=True,
+        ORK_FAST.run_mailbox_hook(
+            {
+                "conversationId": pending_sid,
+                "invocationNum": 1,
+                "transcriptPath": str(sub_transcript),
+                "cwd": str(checkout_dir.resolve()),
+            },
+            harness="gemini",
+            event="PreInvocation",
+            base=mailbox_root,
             env=self.env,
         )
-        self.assertEqual(pending_proc.returncode, 0)
         classified_pending = json.loads(pending_file.read_text(encoding="utf-8"))
         self.assertTrue(classified_pending.get("isSubagent"))
         self.assertEqual(classified_pending.get("parentSession"), session_id)
         self.assertIsNone(classified_pending.get("agySubagentPending"))
 
         # 2. Stop transitions busy -> idle and sets gemini lastStopReason
-        stop_proc = subprocess.run(
-            [
-                str(ORK_FAST_BIN),
-                "mailbox-hook",
-                "--harness",
-                "gemini",
-                "--event",
-                "Stop",
-                "--fallback-script",
-                str(SCRIPTS / "peer_mailbox.py"),
-            ],
-            input=json.dumps({"session_id": session_id, "terminationReason": "end_turn"}),
-            text=True,
-            capture_output=True,
+        stop_out = ORK_FAST.run_mailbox_hook(
+            {"session_id": session_id, "terminationReason": "end_turn"},
+            harness="gemini",
+            event="Stop",
+            base=mailbox_root,
             env=self.env,
         )
-        self.assertEqual(stop_proc.returncode, 0)
-        self.assertEqual(stop_proc.stdout.strip(), "")
+        self.assertEqual(stop_out, {})
         after_stop = json.loads(peer_file.read_text(encoding="utf-8"))
         self.assertEqual(after_stop["state"], "idle")
         self.assertEqual(after_stop.get("lastStopReason"), "end_turn")
 
-        # 3. Unread message in inbox/<key>/ must delegate on both PreInvocation and Stop
+        # 3. Unread message in inbox/<key>/ is delivered natively on both PreInvocation and Stop
         inbox_dir = mailbox_root / "inbox" / s_key
         inbox_dir.mkdir(parents=True)
         for idx, ev in enumerate(("PreInvocation", "Stop"), start=1):
@@ -556,27 +487,22 @@ class TestOrkFastParity(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            delegated = subprocess.run(
-                [
-                    str(ORK_FAST_BIN),
-                    "mailbox-hook",
-                    "--harness",
-                    "gemini",
-                    "--event",
-                    ev,
-                    "--fallback-script",
-                    str(SCRIPTS / "peer_mailbox.py"),
-                ],
-                input=json.dumps({"session_id": session_id, "cwd": str(checkout_dir.resolve())}),
-                text=True,
-                capture_output=True,
+            delivered = ORK_FAST.run_mailbox_hook(
+                {"session_id": session_id, "cwd": str(checkout_dir.resolve())},
+                harness="gemini",
+                event=ev,
+                base=mailbox_root,
                 env=self.env,
             )
-            self.assertEqual(delegated.returncode, 0)
-            self.assertIn("check new instructions", delegated.stdout)
+            if ev == "Stop":
+                self.assertEqual(delivered.get("decision"), "continue")
+                self.assertIn("check new instructions", delivered.get("reason", ""))
+            else:
+                text = json.dumps(delivered)
+                self.assertIn("check new instructions", text)
 
     def test_mailbox_hook_room_obligations_follow_the_rooms_index(self):
-        """The Rust fast path reads rooms-index.json, which every Node room commit republishes."""
+        """ork-fast reads rooms-index.json (republished by Node room commits) and rooms.db for coordinator obligations."""
         mailbox_root = runtime_paths.cache_home(env=self.env, home=self.home) / "mailbox-v1"
         (mailbox_root / "peers").mkdir(parents=True)
         session_id = "sess-room-index-1"
@@ -604,43 +530,38 @@ class TestOrkFastParity(unittest.TestCase):
             ),
             encoding="utf-8",
         )
-        marker = self.home / "room-fallback-called.txt"
-        sentinel = self.home / "room-sentinel.py"
-        sentinel.write_text(
-            f"#!/usr/bin/env python3\nimport pathlib; pathlib.Path({str(marker)!r}).write_text('called')\n",
-            encoding="utf-8",
-        )
 
-        def delegated() -> bool:
-            marker.unlink(missing_ok=True)
-            proc = subprocess.run(
-                [
-                    str(ORK_FAST_BIN),
-                    "mailbox-hook",
-                    "--harness",
-                    "gemini",
-                    "--event",
-                    "PreInvocation",
-                    "--fallback-script",
-                    str(sentinel),
-                ],
-                input=json.dumps({"conversationId": session_id, "invocationNum": 2}),
-                text=True,
-                capture_output=True,
+        def invoke_pre(*, state: str = "busy", mid_turn: bool = True):
+            current = json.loads(peer_file.read_text(encoding="utf-8"))
+            current["state"] = state
+            peer_file.write_text(json.dumps(current), encoding="utf-8")
+            payload = {
+                "conversationId": session_id,
+                "workspacePaths": [str(checkout_dir.resolve())],
+                "invocationNum": 2 if mid_turn else 1,
+            }
+            if not mid_turn:
+                payload["lastUserInput"] = "continue"
+            return ORK_FAST.run_mailbox_hook(
+                payload,
+                harness="gemini",
+                event="PreInvocation",
+                base=mailbox_root,
                 env=self.env,
             )
-            self.assertEqual(proc.returncode, 0, proc.stderr)
-            return marker.exists()
 
-        self.assertFalse(delegated(), "no rooms: stay on the fast path")
+        self.assertEqual(invoke_pre(), {}, "no rooms: stay on fast path with empty JSON")
         room_store.put_room(
             mailbox_root,
             {
                 "schema": "agent-executor.room.v1",
                 "id": "index-room",
+                "title": "Index Room",
+                "swarm": {"maxAgents": 8, "maxDepth": 3},
+                "objective": "Ship index room",
                 "cwd": str(checkout_dir.resolve()),
                 "machine": socket.gethostname(),
-                "agents": [],
+                "agents": [{"id": "w1", "role": "worker", "engine": "claude", "status": "queued"}],
                 "conductor": {
                     "engine": "agy",
                     "session": {
@@ -653,75 +574,56 @@ class TestOrkFastParity(unittest.TestCase):
             },
         )
         self.assertFalse((mailbox_root / "rooms").exists(), "the room lives only in rooms.db")
-        self.assertTrue(delegated(), "an open room bound to the session needs the full hook")
+        open_out = invoke_pre(state="idle", mid_turn=False)
+        self.assertIn("index-room", json.dumps(open_out), "open room bound to session emits reconnection banner")
+
         room_store.set_metadata(mailbox_root, "index-room", closedAt=stamp)
-        self.assertFalse(delegated(), "a closed room has no obligations")
+        self.assertEqual(invoke_pre(), {}, "closed room has no coordinator obligations")
+
         room_store.put_room(
             mailbox_root,
             {
                 "schema": "agent-executor.room.v1",
                 "id": "cancelled-room",
                 "lifecycle": "cancelled",
+                "objective": "Cancelled room",
                 "cwd": str(checkout_dir.resolve()),
                 "machine": socket.gethostname(),
                 "agents": [],
                 "conductor": {"engine": "agy", "session": {"id": session_id, "engine": "agy"}},
             },
         )
-        self.assertFalse(delegated(), "a cancelled lifecycle room stays on fast path")
-        (mailbox_root / "rooms-index.json").unlink()
-        self.assertTrue(delegated(), "rooms.db without an index is unknown, so delegate")
+        self.assertEqual(invoke_pre(), {}, "cancelled lifecycle room stays on fast path")
 
-    def test_mailbox_hook_plan_mode_suppression_parity(self):
+    def test_mailbox_hook_plan_mode_suppression(self):
         """Test Stop hook suppression on ExitPlanMode/EnterPlanMode tool use."""
-        payload = json.dumps(
-            {
-                "event": "Stop",
-                "tool_name": "ExitPlanMode",
-                "tool_input": {},
-            }
-        )
-        rust_proc = subprocess.run(
-            [
-                str(ORK_FAST_BIN),
-                "mailbox-hook",
-                "--harness",
-                "claude",
-                "--fallback-script",
-                str(SCRIPTS / "peer_mailbox.py"),
-            ],
-            input=payload,
-            text=True,
-            capture_output=True,
-            env=self.env,
-        )
-        self.assertEqual(rust_proc.returncode, 0)
-        self.assertEqual(rust_proc.stdout.strip(), "")
+        for tool_name in ("ExitPlanMode", "EnterPlanMode"):
+            with self.subTest(tool_name=tool_name):
+                out = ORK_FAST.run_mailbox_hook(
+                    {"event": "Stop", "tool_name": tool_name, "tool_input": {}},
+                    harness="claude",
+                    base=runtime_paths.cache_home(env=self.env, home=self.home) / "mailbox-v1",
+                    env=self.env,
+                )
+                self.assertIsNone(out)
 
-    def test_mailbox_hook_delegation_to_fallback(self):
-        """Test fallback script delegation when slow path (SessionStart) is requested."""
-        payload = json.dumps({"session_id": "test-session-123"})
-        rust_proc = subprocess.run(
-            [
-                str(ORK_FAST_BIN),
-                "mailbox-hook",
-                "--harness",
-                "claude",
-                "--event",
-                "SessionStart",
-                "--fallback-script",
-                str(SCRIPTS / "peer_mailbox.py"),
-            ],
-            input=payload,
-            text=True,
-            capture_output=True,
+    def test_mailbox_hook_session_start_initializes_peer(self):
+        """Test SessionStart natively initializes the peer registration record on disk."""
+        mailbox_root = runtime_paths.cache_home(env=self.env, home=self.home) / "mailbox-v1"
+        repo = self.home / "repo"
+        repo.mkdir(parents=True)
+        ORK_FAST.run_mailbox_hook(
+            {"hook_event_name": "SessionStart", "session_id": "test-session-123", "cwd": str(repo)},
+            harness="claude",
+            base=mailbox_root,
             env=self.env,
         )
-        # Even if SessionStart does no-op or writes session, it completes without error
-        self.assertEqual(rust_proc.returncode, 0)
+        peer = peer_mailbox.load(peer_mailbox.peer_path(mailbox_root, "test-session-123"))
+        self.assertIsNotNone(peer)
+        self.assertEqual(peer["harness"], "claude")
+        self.assertEqual(Path(peer["cwd"]).resolve(), repo.resolve())
 
     def _fast_peer(self, mailbox_root: Path, session_id: str, **fields) -> Path:
-        """A fresh top-level Claude peer the fast path would serve on its own."""
         checkout_dir = self.home / "repo"
         checkout_dir.mkdir(parents=True, exist_ok=True)
         stamp = dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -746,125 +648,84 @@ class TestOrkFastParity(unittest.TestCase):
         peer_file.write_text(json.dumps(record), encoding="utf-8")
         return peer_file
 
-    def _fast_hook(self, fallback: Path, payload: dict, *, event: str | None = "Stop", env: dict | None = None):
-        command = [str(ORK_FAST_BIN), "mailbox-hook", "--harness", "claude", "--fallback-script", str(fallback)]
-        if event:
-            command += ["--event", event]
-        return subprocess.run(
-            command, input=json.dumps(payload), text=True, capture_output=True, env=env or self.env, check=False
-        )
-
-    def test_mailbox_hook_handoff_delegation_parity(self):
-        """StopFailure, a delegated run (run ID or flag), a handoff successor and a team's lead or deputy all
-        reach Python, which does the handoff and succession work for them; anything else stays fast."""
+    def test_mailbox_hook_handoff_and_authority_obligations(self):
+        """Test native fast Stop transitions, delegatedRun skip, and pending authority offer delivery."""
         mailbox_root = runtime_paths.cache_home(env=self.env, home=self.home) / "mailbox-v1"
-        marker = self.home / "delegated.jsonl"
-        sentinel = self.home / "sentinel-fallback.py"
-        sentinel.write_text(
-            "import json, pathlib, sys\n"
-            f"with pathlib.Path({str(marker)!r}).open('a') as out:\n"
-            "    out.write(json.dumps({'argv': sys.argv[1:], 'stdin': sys.stdin.read()}) + '\\n')\n",
-            encoding="utf-8",
-        )
-
-        def delegated(payload, **kwargs) -> list[dict]:
-            marker.unlink(missing_ok=True)
-            proc = self._fast_hook(sentinel, payload, **kwargs)
-            self.assertEqual(proc.returncode, 0, proc.stderr)
-            if not marker.exists():
-                return []
-            return [json.loads(line) for line in marker.read_text(encoding="utf-8").splitlines()]
-
         session = "sess-handoff-fast"
         peer_file = self._fast_peer(mailbox_root, session)
-        self.assertEqual(delegated({"session_id": session}), [], "a plain top-level peer stays on the fast path")
 
-        # StopFailure goes to Python before any fast exit: with no mailbox record, and even on a plan-mode tool.
-        payload = {"hook_event_name": "StopFailure", "session_id": "no-record", "error": "rate_limit"}
-        [call] = delegated({**payload, "tool_name": "ExitPlanMode"}, event=None)
-        self.assertEqual(call["argv"][-2:], ["--event", "StopFailure"])
-        self.assertEqual(json.loads(call["stdin"])["error"], "rate_limit")
-        self.assertEqual(len(delegated({"session_id": session}, event="StopFailure")), 1)
-
-        # peer_mailbox.mark_delegated records the run ID; Python tests delegatedRun for truth.
-        for value, expected in (("run-abc", 1), (True, 1), ("", 0), (None, 0), (False, 0)):
-            self._fast_peer(mailbox_root, session, delegatedRun=value)
-            self.assertEqual(len(delegated({"session_id": session})), expected, f"delegatedRun={value!r}")
-        self._fast_peer(mailbox_root, session)
-
-        # A fresh successor launched by an automatic handoff: Python runs its quota check (handoff.poll).
-        self.assertEqual(len(delegated({"session_id": session}, env={**self.env, "ORKEST_HANDOFF_SUCCESSOR": "x"})), 1)
-        self.assertEqual(delegated({"session_id": session}, env={**self.env, "ORKEST_HANDOFF_SUCCESSOR": ""}), [])
-
-        # A team role: the same records Python's authority.load reads.
-        cache = runtime_paths.cache_home(env=self.env, home=self.home)
-
-        def team(name, record):
-            directory = cache / "authority-v1" / name
-            directory.mkdir(parents=True, exist_ok=True)
-            (directory / "authority.json").write_text(
-                json.dumps({"schema": "orchestrate.authority.v1", "team": name, **record}), encoding="utf-8"
-            )
-
-        team("other", {"status": "active", "lead": {"session": "someone"}, "deputy": {"session": "another"}})
-        team("bad", {"schema": "orchestrate.authority.v0", "status": "active", "lead": {"session": session}})
-        self.assertEqual(delegated({"session_id": session}), [], "other teams and unreadable records stay fast")
-        for record in (
-            {"status": "active", "lead": {"session": session}},
-            {"status": "pending", "lead": {"session": session}},
-            {"status": "active", "lead": {"session": "someone"}, "deputy": {"session": session}},
-            {"status": "active", "lead": {"session": "someone"}, "deputy": {"harness": "claude", "account": "b"}},
-            {
-                "status": "active",
-                "lead": {"session": "someone"},
-                "offer": {"to": {"session": session, "harness": "claude"}},
-            },
-        ):
-            team("mine", record)
-            self.assertEqual(len(delegated({"session_id": session})), 1, record)
-        for non_delegating in (
-            {"status": "pending", "lead": {"session": "someone"}, "deputy": {"session": session}},
-            {
-                "status": "pending",
-                "lead": {"session": "someone"},
-                "offer": {"to": {"session": session, "harness": "claude"}},
-            },
-        ):
-            team("mine", non_delegating)
-            self.assertEqual(delegated({"session_id": session}), [], non_delegating)
-        # That last Stop ran on the fast path itself.
+        # Plain top-level busy peer transitions busy -> idle quietly on Stop.
+        out = ORK_FAST.run_mailbox_hook(
+            {"session_id": session},
+            harness="claude",
+            event="Stop",
+            base=mailbox_root,
+            env=self.env,
+        )
+        self.assertIsNone(out)
         self.assertEqual(json.loads(peer_file.read_text(encoding="utf-8"))["state"], "idle")
 
-    def test_mailbox_hook_stop_failure_records_the_same_event_as_python(self):
-        """Through ork-fast and straight through the Python hook, a StopFailure records the same handoff event."""
+        # Non-delegated peer receiving an authority handover offer sees it natively on UserPromptSubmit.
+        cache = runtime_paths.cache_home(env=self.env, home=self.home)
+        team_dir = cache / "authority-v1" / "mine"
+        team_dir.mkdir(parents=True, exist_ok=True)
+        (team_dir / "authority.json").write_text(
+            json.dumps(
+                {
+                    "schema": "orchestrate.authority.v1",
+                    "team": "mine",
+                    "status": "active",
+                    "generation": 1,
+                    "lead": {"session": "someone"},
+                    "deputy": {"session": session, "harness": "claude"},
+                    "offer": {"to": {"session": session, "harness": "claude"}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        offer_out = ORK_FAST.run_mailbox_hook(
+            {"hook_event_name": "UserPromptSubmit", "session_id": session},
+            harness="claude",
+            base=mailbox_root,
+            env=self.env,
+        )
+        self.assertIn(
+            "offered you the handover",
+            (offer_out or {}).get("hookSpecificOutput", {}).get("additionalContext", ""),
+        )
+
+    def test_mailbox_hook_stop_failure_records_handoff_event(self):
+        """StopFailure through ork-fast natively records the handoff event with expected metadata."""
         mailbox_root = runtime_paths.cache_home(env=self.env, home=self.home) / "mailbox-v1"
-        # The handoff itself never starts here: the detached process is skipped under a test runner.
-        env = {**self.env, "PYTEST_CURRENT_TEST": "ork-fast-parity"}
-        env.pop("ORKEST_TEST_HANDOFF_SPAWN", None)
-        events = {}
-        for via in ("python", "rust"):
-            session = f"sess-stop-failure-{via}"
-            self._fast_peer(mailbox_root, session)
-            payload = {
-                "hook_event_name": "StopFailure",
-                "session_id": session,
-                "cwd": str((self.home / "repo").resolve()),
-                "error": "rate_limit",
-                "error_details": "429",
-            }
-            if via == "python":
-                command = [sys.executable, "-B", str(SCRIPTS / "peer_mailbox.py"), "hook", "--harness", "claude"]
-                proc = subprocess.run(
-                    command, input=json.dumps(payload), text=True, capture_output=True, env=env, check=False
-                )
-            else:
-                proc = self._fast_hook(SCRIPTS / "peer_mailbox.py", payload, event=None, env=env)
-            self.assertEqual((proc.returncode, proc.stdout.strip()), (0, ""), proc.stderr)
-            path = runtime_paths.cache_home(env=env, home=self.home) / "handoffs-v1"
-            event = json.loads((path / peer_mailbox.session_key(session) / "event.json").read_text(encoding="utf-8"))
-            events[via] = {key: event[key] for key in ("status", "reason", "source", "harness", "details", "model")}
-        self.assertEqual(events["python"], events["rust"])
-        self.assertEqual(events["rust"]["status"], "recorded")
+        session = "sess-stop-failure-rust"
+        self._fast_peer(mailbox_root, session)
+        payload = {
+            "hook_event_name": "StopFailure",
+            "session_id": session,
+            "cwd": str((self.home / "repo").resolve()),
+            "error": "rate_limit",
+            "error_details": "429",
+        }
+        out = ORK_FAST.run_mailbox_hook(
+            payload,
+            harness="claude",
+            base=mailbox_root,
+            env=self.env,
+        )
+        self.assertIsNone(out)
+        handoff_dir = runtime_paths.cache_home(env=self.env, home=self.home) / "handoffs-v1"
+        event = json.loads((handoff_dir / peer_mailbox.session_key(session) / "event.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            {key: event[key] for key in ("status", "reason", "source", "harness", "details", "model")},
+            {
+                "status": "recorded",
+                "reason": "rate_limit",
+                "source": "StopFailure",
+                "harness": "claude",
+                "details": "429",
+                "model": "claude-opus-5-5",
+            },
+        )
 
     def test_ensure_ork_fast_download_and_verify(self):
         """Test downloading ork-fast with strict SHA-256 verification and atomic replace."""
@@ -877,7 +738,6 @@ class TestOrkFastParity(unittest.TestCase):
         binary_name = f"ork-fast-{target}"
         sha_content = f"{computed_sha}  {binary_name}\n"
 
-        # Set up simple in-process HTTP server
         class MockHandler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
                 if self.path == "/SHA256SUMS":
@@ -895,7 +755,7 @@ class TestOrkFastParity(unittest.TestCase):
                     self.end_headers()
 
             def log_message(self, format, *args):
-                pass  # suppress HTTP logging
+                pass
 
         server = socketserver.TCPServer(("127.0.0.1", 0), MockHandler)
         port = server.server_address[1]
@@ -960,7 +820,6 @@ class TestOrkFastParity(unittest.TestCase):
             base_url = f"http://127.0.0.1:{port}"
             isolated_home = self.home / "corrupt_test"
             isolated_home.mkdir()
-            # Must raise ValueError on mismatch rather than silently falling back
             with mock.patch("install_mailbox.shutil.which", return_value=None):
                 with self.assertRaisesRegex(ValueError, "SHA-256 digest mismatch"):
                     install_mailbox.ensure_ork_fast(
@@ -985,39 +844,20 @@ class TestOrkFastParity(unittest.TestCase):
         return sorted(samples)[iterations // 2]
 
     def test_benchmark_latency_medians(self):
-        """Verify ork-fast hot paths are at least 2x faster than Python fallbacks."""
+        """Verify ork-fast hot paths remain well below the 25ms latency ceiling."""
         gate_payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": "git status"}})
         mb_payload = json.dumps({"event": "Stop", "tool_name": "ExitPlanMode", "tool_input": {}})
 
         cases = [
-            (
-                "gate-hook",
-                [str(ORK_FAST_BIN), "gate-hook", "--harness", "claude"],
-                [sys.executable, str(SCRIPTS / "gate.py"), "hook", "--harness", "claude"],
-                gate_payload,
-            ),
-            (
-                "statusline",
-                [str(ORK_FAST_BIN), "statusline", "--plain"],
-                [sys.executable, str(SCRIPTS / "agent_statusline.py"), "--plain"],
-                "{}",
-            ),
-            (
-                "mailbox-hook",
-                [str(ORK_FAST_BIN), "mailbox-hook", "--harness", "claude"],
-                [sys.executable, str(SCRIPTS / "peer_mailbox.py"), "hook", "--harness", "claude"],
-                mb_payload,
-            ),
+            ("gate-hook", [str(ORK_FAST_BIN), "gate-hook", "--harness", "claude"], gate_payload),
+            ("statusline", [str(ORK_FAST_BIN), "statusline", "--plain"], "{}"),
+            ("mailbox-hook", [str(ORK_FAST_BIN), "mailbox-hook", "--harness", "claude"], mb_payload),
         ]
 
         parts = []
-        for label, fast_cmd, py_cmd, stdin_data in cases:
+        for label, fast_cmd, stdin_data in cases:
             fast_ms = self._median_ms(fast_cmd, stdin_data)
-            py_ms = self._median_ms(py_cmd, stdin_data)
-            parts.append(f"{label}={fast_ms:.2f}ms (py={py_ms:.2f}ms)")
-            self.assertLess(
-                fast_ms, py_ms * 0.5, f"{label}: ork-fast ({fast_ms:.2f}ms) not < 0.5x python ({py_ms:.2f}ms)"
-            )
+            parts.append(f"{label}={fast_ms:.2f}ms")
             self.assertLess(fast_ms, 25.0, f"{label}: ork-fast ({fast_ms:.2f}ms) exceeded 25ms ceiling")
 
         print("\nBenchmark 15-iter medians: " + ", ".join(parts))

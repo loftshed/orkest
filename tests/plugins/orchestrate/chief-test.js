@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { chiefCommand, renderChiefStatus } from "../../../plugins/orchestrate/bin/chief.mjs";
@@ -12,6 +13,7 @@ import {
   chiefSpawn,
   chiefStatus,
   listDesk,
+  missionBrief,
   readChiefBinding,
   resolveChiefTarget,
   sessionKey,
@@ -1053,5 +1055,30 @@ describe("ork chief", () => {
     const oldPeer = status.standalone.find((peer) => peer.session === "chief-old");
     expect(oldPeer).toBeDefined();
     expect(oldPeer.task).toBe("");
+  });
+
+  it("instructs Chief to route code/design questions directly and tells missions how to answer", () => {
+    const pluginRoot = path.resolve(
+      path.dirname(fileURLToPath(import.meta.url)),
+      "../../../plugins/orchestrate",
+    );
+    const skillText = fs.readFileSync(path.join(pluginRoot, "skills/chief/SKILL.md"), "utf8");
+    const commandText = fs.readFileSync(path.join(pluginRoot, "commands/chief.md"), "utf8");
+    expect(skillText).toContain("--kind question");
+    expect(skillText).toMatch(/without asking/u);
+    expect(commandText).toContain("--kind question");
+    expect(commandText).toMatch(/without asking permission first/u);
+
+    const brief = missionBrief({
+      roomId: "chief-demo-1",
+      goal: "Port settings cleanly",
+      workspace: "/tmp/demo",
+      branch: "feat/demo",
+      chief: { name: "chief" },
+      missionSession: "chief-demo-orch",
+      title: "Demo",
+    });
+    expect(brief).toContain("--kind question");
+    expect(brief).toMatch(/without making extra edits or\s+expanding scope/u);
   });
 });

@@ -15,6 +15,7 @@ import {
   parseProcessTable,
 } from "../lib/agent-processes.mjs";
 import { ChiefView } from "../lib/chief-view.mjs";
+import { createCompanionDismissMonitor } from "../lib/companion-dismiss.mjs";
 import { readDiffMarks, writeDiffMarks } from "../lib/diff-marks.mjs";
 import { defaultDockerProbeGuard } from "../lib/docker-probe.mjs";
 import {
@@ -25,6 +26,7 @@ import {
 import { markHerdrViewClosed, syncHerdrViewLabel } from "../lib/herdr-view-state.mjs";
 import { createRoom, mailboxRoot, readRoom } from "../lib/horde-room.mjs";
 import { fit, formatWorktreeBadge, HordeView, shortAgentName } from "../lib/horde-view.mjs";
+import { resolveMacosHudBinary, sendMacosHudToast } from "../lib/macos-hud.mjs";
 import {
   isTerminalDisplayState,
   MEMBER_OUTCOMES,
@@ -338,7 +340,7 @@ export function notifyHerdrTransitions(
   prevAgents,
   nextAgents,
   notifiedSet,
-  { env = process.env, exec = execFile } = {},
+  { env = process.env, exec = execFile, exists, platform = process.platform } = {},
 ) {
   if (!Array.isArray(nextAgents)) return false;
   const seen = notifiedSet instanceof Set ? notifiedSet : new Set();
@@ -355,7 +357,10 @@ export function notifyHerdrTransitions(
     return false;
   }
 
-  if (env?.HERDR_ENV !== "1") return false;
+  const isHerdr = env?.HERDR_ENV === "1";
+  const isMacosHud =
+    !isHerdr && platform === "darwin" && Boolean(resolveMacosHudBinary(env, { exists }));
+  if (!isHerdr && !isMacosHud) return false;
   if (!summary) {
     for (const key of seen) {
       if (key.startsWith("room:outcomes:")) seen.delete(key);
@@ -373,20 +378,33 @@ export function notifyHerdrTransitions(
     if ((prevStage === "blocked" && prev?.summary === agent.summary) || seen.has(key)) continue;
     seen.add(key);
     isTriggered = true;
-    void runExec(
-      exec,
-      env.HERDR_BIN_PATH || "herdr",
-      [
-        "notification",
-        "show",
-        `Orkest: ${agent.person || agent.id} blocked`,
-        "--body",
-        String(agent.summary || "Needs attention"),
-        "--sound",
-        "request",
-      ],
-      env,
-    );
+    if (isHerdr) {
+      void runExec(
+        exec,
+        env.HERDR_BIN_PATH || "herdr",
+        [
+          "notification",
+          "show",
+          `Orkest: ${agent.person || agent.id} blocked`,
+          "--body",
+          String(agent.summary || "Needs attention"),
+          "--sound",
+          "request",
+        ],
+        env,
+      );
+    } else {
+      sendMacosHudToast(
+        {
+          agent: String(agent.person || agent.id),
+          body: String(agent.summary || "Needs attention"),
+          sound: "request",
+          status: "blocked",
+          title: `${agent.person || agent.id} blocked`,
+        },
+        { env, exec, exists, platform },
+      );
+    }
   }
 
   const hadKnownState = prevAgents.some((agent) => memberDisplayState(agent || {}) !== "unknown");
@@ -394,20 +412,32 @@ export function notifyHerdrTransitions(
   if (summary && hadKnownState && summary.key !== previous?.key && !seen.has(summary.key)) {
     seen.add(summary.key);
     isTriggered = true;
-    void runExec(
-      exec,
-      env.HERDR_BIN_PATH || "herdr",
-      [
-        "notification",
-        "show",
-        `Orkest: ${summary.title}`,
-        "--body",
-        summary.body,
-        "--sound",
-        summary.sound,
-      ],
-      env,
-    );
+    if (isHerdr) {
+      void runExec(
+        exec,
+        env.HERDR_BIN_PATH || "herdr",
+        [
+          "notification",
+          "show",
+          `Orkest: ${summary.title}`,
+          "--body",
+          summary.body,
+          "--sound",
+          summary.sound,
+        ],
+        env,
+      );
+    } else {
+      sendMacosHudToast(
+        {
+          body: summary.body,
+          sound: summary.sound,
+          status: summary.sound === "done" ? "done" : "info",
+          title: summary.title,
+        },
+        { env, exec, exists, platform },
+      );
+    }
   }
 
   return isTriggered;
@@ -1042,6 +1072,10 @@ export async function runHordeTui(
     herdrConnect,
     chief,
     chiefHint,
+    companionGraceMs,
+    now,
+    platform,
+    exists,
   } = {},
 ) {
   if (!input.isTTY || !output.isTTY)
@@ -1071,7 +1105,12 @@ export async function runHordeTui(
   const currentRoomId = () => view.room?.id || initialRoom.id;
   const notifiedSet = new Set();
   let prevAgents = toNotificationAgents(initialRoom);
-  notifyHerdrTransitions(null, prevAgents, notifiedSet, { env, exec });
+  notifyHerdrTransitions(null, prevAgents, notifiedSet, {
+    env,
+    exec,
+    ...(exists && { exists }),
+    ...(platform && { platform }),
+  });
   let isNavigationPending = false;
   let diffGeneration = 0;
   const view = new HordeView(initialRoom, {
@@ -1209,6 +1248,17 @@ export async function runHordeTui(
     chiefRefreshedAt = Date.now();
   };
   if (chiefView) await refreshChief();
+  // Room views always create chiefView for Tab switching; only initialMode !== "room" is a Chief session.
+  const isChiefSession = Boolean(chiefOptions && chiefOptions.initialMode !== "room");
+  const companionDismiss = createCompanionDismissMonitor({
+    chiefMode: isChiefSession,
+    env,
+    exec,
+    ...(companionGraceMs !== undefined && { graceMs: companionGraceMs }),
+    hasChiefView: isChiefSession,
+    ...(now && { now }),
+  });
+  if (mode === "room") await companionDismiss.evaluate(initialRoom);
   const activeView = () => (mode === "chief" && chiefView ? chiefView : view);
   if (chiefView) {
     const roomInput = view.handleInput.bind(view);
@@ -1271,6 +1321,7 @@ export async function runHordeTui(
       await refreshChief();
     }
     if (mode === "chief") {
+      await companionDismiss.evaluate(null);
       isBusy = false;
       errorText = "";
       paint();
@@ -1334,8 +1385,26 @@ export async function runHordeTui(
       else await previewController.refresh(previewAgent);
       if (!drilledRoomId) {
         const nextAgents = toNotificationAgents(room);
-        notifyHerdrTransitions(prevAgents, nextAgents, notifiedSet, { env, exec });
+        notifyHerdrTransitions(prevAgents, nextAgents, notifiedSet, {
+          env,
+          exec,
+          ...(exists && { exists }),
+          ...(platform && { platform }),
+        });
         prevAgents = nextAgents;
+      }
+      const dismissDecision = await companionDismiss.evaluate(room, { drilledRoomId });
+      if (isStopped || generation !== roomGeneration || mode !== "room") return;
+      if (dismissDecision.action === "hold") {
+        view.notice = dismissDecision.notice;
+      } else if (
+        dismissDecision.action === "clear-notice" &&
+        view.notice === "Orchestrator exited — keeping Swarm View open while workers finish"
+      ) {
+        view.notice = "";
+      } else if (dismissDecision.action === "dismiss") {
+        cleanup();
+        return;
       }
       errorText = "";
     } catch (error) {

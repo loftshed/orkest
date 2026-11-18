@@ -15,19 +15,20 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import test_run_agent as fixtures
-
+TESTS_DIR = Path(__file__).resolve().parent
 REPO = Path(__file__).resolve().parents[5]
 SCRIPTS = REPO / "plugins/orchestrate/skills/orchestrate/scripts"
 ROOMS_MJS = REPO / "plugins/orchestrate/lib/rooms.mjs"
+sys.path.insert(0, str(TESTS_DIR))
 sys.path.insert(0, str(SCRIPTS))
+import _ork_fast_test_helpers as fast  # noqa: E402
 import agent_progress  # noqa: E402
-import mailbox_hooks  # noqa: E402
 import mailbox_status  # noqa: E402
 import mailbox_store  # noqa: E402
 import peer_mailbox as mailbox  # noqa: E402
 import room_store  # noqa: E402
 import room_tasks  # noqa: E402
+import test_run_agent as fixtures  # noqa: E402
 
 RUNNER = fixtures.RUNNER
 
@@ -402,32 +403,40 @@ class SubagentProgressTests(Scratch):
 
     def hook(self, event: str) -> None:
         payload = {"session_id": "parent-1", "agent_id": "child-1", "agent_type": "Explore", "cwd": str(self.alias)}
-        mailbox.hook(payload, harness="claude", event=event, base=self.base)
+        fast.run_mailbox_hook(payload, harness="claude", event=event, base=self.base, cwd=self.alias)
 
     def test_subagent_progress_is_locked_resolved_and_accepted_by_the_reader(self):
-        locked_paths = []
-        original = mailbox_hooks._MB.locked
-
-        def recording(path):
-            locked_paths.append(Path(path))
-            return original(path)
-
-        with mock.patch.object(mailbox_hooks._MB, "locked", side_effect=recording):
-            self.hook("SubagentStart")
         record = agent_progress.record_path(self.base, "subagent-child-1")
-        self.assertIn(record, locked_paths)
-        row = json.loads(record.read_text(encoding="utf-8"))
-        self.assertEqual(row["checkout"], str(self.checkout))
-        peer = mailbox.load(mailbox.peer_path(self.base, "subagent-child-1"))
-        accepted = agent_progress.read(self.base, peer)
-        self.assertEqual((accepted["stage"], accepted["role"]), ("working", "scout"))
+        for event, expected_stage in (("SubagentStart", "working"), ("SubagentStop", "complete")):
+            with self.subTest(event=event):
+                done = threading.Event()
+                errors = []
 
-        locked_paths.clear()
-        with mock.patch.object(mailbox_hooks._MB, "locked", side_effect=recording):
-            self.hook("SubagentStop")
-        self.assertIn(record, locked_paths)
-        row = json.loads(record.read_text(encoding="utf-8"))
-        self.assertEqual((row["stage"], row["checkout"]), ("complete", str(self.checkout)))
+                def run_hook(
+                    ev: str = event,
+                    errs: list[BaseException] = errors,
+                    finished: threading.Event = done,
+                ) -> None:
+                    try:
+                        self.hook(ev)
+                    except BaseException as exc:  # noqa: BLE001
+                        errs.append(exc)
+                    finally:
+                        finished.set()
+
+                with mailbox.locked(record):
+                    thread = threading.Thread(target=run_hook)
+                    thread.start()
+                    self.assertFalse(done.wait(0.15), f"{event} wrote progress while lock was held")
+                thread.join(5)
+                self.assertTrue(done.is_set())
+                self.assertEqual(errors, [])
+                row = json.loads(record.read_text(encoding="utf-8"))
+                self.assertEqual((row["stage"], row["checkout"]), (expected_stage, str(self.checkout)))
+                if event == "SubagentStart":
+                    peer = mailbox.load(mailbox.peer_path(self.base, "subagent-child-1"))
+                    accepted = agent_progress.read(self.base, peer)
+                    self.assertEqual((accepted["stage"], accepted["role"]), ("working", "scout"))
 
     def test_progress_cli_resolves_a_native_alias_to_its_mailbox_peer(self):
         mailbox.attest_native_sessions(self.base, "parent-1", "native-parent")
@@ -465,8 +474,25 @@ class ActivityTests(Scratch):
         self.assertTrue(room_tasks.is_active(projection))
 
     def test_reconnection_summary_does_not_count_review_as_active(self):
-        room = {"agents": [{"id": "a", "status": "review"}, {"id": "b", "status": "running"}]}
-        summary = mailbox_hooks._format_swarm_reconnection_summary(room, "room-1", "conductor")
+        mailbox.register(self.base, session="coord-1", harness="claude", cwd=str(self.home), pid=os.getpid())
+        room = canonical_room(
+            "room-1",
+            "coord-1",
+            self.home,
+            swarm={"maxAgents": 4, "maxDepth": 2},
+            agents=[{"id": "a", "status": "review"}, {"id": "b", "status": "running"}],
+        )
+        room["conductor"]["engine"] = "claude"
+        room["conductor"]["session"]["engine"] = "claude"
+        room_store.put_room(self.base, room)
+        out = fast.run_mailbox_hook(
+            {"session_id": "coord-1", "cwd": str(self.home)},
+            harness="claude",
+            event="SessionStart",
+            base=self.base,
+            cwd=self.home,
+        )
+        summary = str(((out or {}).get("hookSpecificOutput") or {}).get("additionalContext") or "")
         self.assertIn("(1 active,", summary)
 
 
