@@ -16,6 +16,7 @@ import {
   processStarted,
   readRoom,
   refreshMemberWorktrees,
+  requireActiveRoom,
   resolveWorktreeMarkerPath,
   updateRawRoom,
   updateRoom,
@@ -62,6 +63,7 @@ const RUN_FIELDS = [
   "resumed_from",
   "verification_of",
   "parent_run_id",
+  "settings_provenance",
 ];
 const TASK_STATES = {
   reserved: "reserved",
@@ -137,6 +139,7 @@ export function memberOf(room, id = "conductor") {
 export { memberOf as swarmMember };
 
 export function requireActiveBranch(room, id) {
+  requireActiveRoom(room);
   for (let current = id; current;) {
     const member = memberOf(room, current);
     if (member.paused)
@@ -747,10 +750,13 @@ async function roomTasks(request, options) {
   return { tasks, members };
 }
 
-export async function listRooms(root = mailboxRoot()) {
+/** Current rooms by default; `{ all: true }` includes archived and cancelled history. */
+export async function listRooms(root = mailboxRoot(), { all = false } = {}) {
   const rooms = [];
   const errors = [];
-  const rawRooms = listRawRooms(root).sort((a, b) => a.id.localeCompare(b.id));
+  const rawRooms = listRawRooms(root, all ? {} : { lifecycle: "active" }).sort((a, b) =>
+    a.id.localeCompare(b.id),
+  );
   for (const room of rawRooms) {
     try {
       rooms.push(validateRoom(room));
@@ -830,7 +836,10 @@ export async function growRoom(
   const cwd = options.cwd ? await realpath(options.cwd) : undefined;
   return updateRoom(
     id,
-    (room) => addMembers(room, members, { parent, workforceRole: options.workforceRole, cwd }),
+    (room) => {
+      requireActiveRoom(room);
+      return addMembers(room, members, { parent, workforceRole: options.workforceRole, cwd });
+    },
     { root },
   );
 }
@@ -1384,6 +1393,7 @@ export async function observeRoom(idOrRoom, options = {}) {
       member.mailboxSession = record.mailbox?.worker;
       member.resolvedModel = record.model;
       member.resolvedEffort = record.effort;
+      Object.assign(member, settingsDisplay(record.settings_provenance));
       member.verdict = verdict;
       member.evidenceState = evidenceState;
       member.status = status;
@@ -1544,8 +1554,88 @@ export async function observeRoom(idOrRoom, options = {}) {
   }
   await appendConsultations(room, root);
   await appendRoomMessages(room, root);
+  await appendContinuations(room, root);
   resolveDiscoveredParents(room);
   return refreshMemberWorktrees(room);
+}
+
+const CONTINUATION_LABELS = {
+  requested: "awaiting coordinator turn",
+  reserved: "reserved",
+  awaiting_attachment: "awaiting attachment",
+  running: "running",
+  awaiting_acceptance: "awaiting acceptance",
+  paused: "paused",
+  exhausted: "exhausted",
+  recovery_needed: "recovery needed",
+  superseded: "superseded",
+  cancelled: "cancelled",
+  completed: "completed",
+};
+const OPEN_CONTINUATIONS = new Set([
+  "requested",
+  "reserved",
+  "awaiting_attachment",
+  "running",
+  "awaiting_acceptance",
+  "paused",
+  "recovery_needed",
+]);
+
+/** Continuation requests written by continuation_requests.py; a display projection only. */
+export async function readContinuations(root = mailboxRoot(), roomId) {
+  const store = await readOptionalJson(path.join(root, "continuations", "requests.json"));
+  if (store?.schema !== "orkest.continuation-requests.v1" || !isPlainObject(store.requests))
+    return [];
+  return Object.values(store.requests)
+    .filter((entry) => isPlainObject(entry) && (!roomId || entry.room === roomId))
+    .map((entry) => ({
+      key: entry.key,
+      status: entry.status,
+      label: CONTINUATION_LABELS[entry.status] || entry.status || "unknown",
+      ...(entry.member && { member: entry.member }),
+      ...(entry.task_dir && { taskDir: entry.task_dir }),
+      reasons: Array.isArray(entry.reasons) ? entry.reasons : [],
+      deliveries: entry.deliveries ?? 0,
+      lastAttemptAt: entry.last_attempt_at ?? null,
+      nextAttemptAt: entry.next_attempt_at ?? null,
+      stopReason: entry.stop_reason ?? null,
+      ...(entry.availability && { availability: entry.availability }),
+      ...(entry.manual_resume && { manualResume: entry.manual_resume }),
+    }));
+}
+
+async function appendContinuations(room, root) {
+  const entries = (await readContinuations(root, room.id)).filter((entry) =>
+    OPEN_CONTINUATIONS.has(entry.status),
+  );
+  if (entries.length === 0) return;
+  room.continuations = entries;
+  if (room.conductor && entries.some((entry) => entry.status === "requested"))
+    room.conductor.awaitingTurn = true;
+  for (const entry of entries) {
+    const member = entry.member && room.agents.find((agent) => agent.id === entry.member);
+    if (member) member.continuation = { status: entry.status, label: entry.label };
+  }
+}
+
+/** Which settings to show for a run, and whether they were observed, resolved, requested or inherited. */
+export function settingsDisplay(provenance) {
+  if (!isPlainObject(provenance)) return {};
+  for (const basis of ["observed", "resolved", "requested"]) {
+    const entry = provenance[basis];
+    if (!isPlainObject(entry) || !(entry.model || entry.effort)) continue;
+    const source = basis === "requested" && entry.source === "inherited" ? "inherited" : basis;
+    return {
+      settingsProvenance: provenance,
+      modelSource: source,
+      ...(basis === "observed" && entry.model && { resolvedModel: entry.model }),
+      ...(basis === "observed" && entry.effort && { resolvedEffort: entry.effort }),
+      ...(Array.isArray(provenance.mismatch) &&
+        provenance.mismatch.length > 0 && { settingsMismatch: provenance.mismatch }),
+    };
+  }
+  return { settingsProvenance: provenance, modelSource: "unknown" };
 }
 
 function resolveDiscoveredParents(room) {
@@ -1619,7 +1709,10 @@ async function appendConsultations(room, root) {
         )
           continue;
         const result = await readOptionalJson(job.result_path);
-        const isFinished = result?.schema === "agent-executor.consultation.v1";
+        const isNativeHandoff =
+          job.transport === "native" && (!result || result.status === "native_handoff");
+        const isFinished =
+          result?.schema === "agent-executor.consultation.v1" && result.status !== "native_handoff";
         const isRunning =
           !isFinished &&
           pidAlive(job.pid) === true &&
@@ -1633,6 +1726,8 @@ async function appendConsultations(room, root) {
         let status = isRunning ? "running" : "session unavailable";
         let runtimeState = isRunning ? "running" : "unknown";
         let stage = "working";
+        // Orkest cannot observe a host's own tool: the handoff is recorded, its activity is unknown.
+        if (isNativeHandoff) status = "native handoff";
         if (isFinished) {
           status = result.status === "answered" ? "reported complete" : "failed";
           runtimeState = "stopped";
@@ -1682,6 +1777,12 @@ async function appendConsultations(room, root) {
           model: observed.length > 0 ? observed.join(", ") : job.model,
           requestedModel: job.model,
           modelSource: observed.length > 0 ? "observed" : "requested",
+          transport: job.transport || "executor",
+          supervisor: {
+            session,
+            member: parent === room.conductor ? "conductor" : parent.id,
+            engine: parent?.engine,
+          },
           effort: job.effort,
           cwd: job.cwd || parent.cwd || room.cwd,
           status,

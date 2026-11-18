@@ -45,6 +45,7 @@ QUOTA = module("quota")
 MAILBOX = module("peer_mailbox")
 AUTHORITY = module("authority")
 AUTO_CORRECT = module("auto_correct")
+CONTEXT_HANDOFF = module("context_handoff")
 SCHEMA = "agent-executor.task.v1"
 READ_ONLY_KINDS = {"consultation", "challenge", "investigation"}
 WORK_KINDS = {"implementation", "correction", "continue"}
@@ -192,6 +193,24 @@ def save(directory: Path, state: dict[str, Any]) -> None:
     with committing():
         RUNNER.write_json_atomic(directory / "task.json", state)
     index_work(directory, state)
+    request_continuations(directory, state)
+
+
+def request_continuations(directory: Path, state: dict[str, Any]) -> None:
+    """A run that became terminal asks its owning coordinator for a turn; deduplicated by its inputs."""
+    runs = state.get("runs") or []
+    pending = [run for run in runs if run.get("status") == "finished" and "continuation_key" not in run]
+    if not pending:
+        return
+    try:
+        continuations = module("continuation_requests")
+        for run in pending:
+            created = continuations.request_for_terminal(MAILBOX.root(), directory, state, run)
+            run["continuation_key"] = created["key"] if created else None
+    except Exception:  # noqa: BLE001 -- a continuation hint never fails the saved task transition
+        return
+    with committing():
+        RUNNER.write_json_atomic(directory / "task.json", state)
 
 
 def index_work(directory: Path, state: dict[str, Any]) -> None:
@@ -209,6 +228,24 @@ def load(directory: Path) -> dict[str, Any]:
     # Old arbitrary task directories become discoverable when next opened, without copying state.
     index_work(directory, state)
     return state
+
+
+def observe_settings(run: dict[str, Any], packet: dict[str, Any]) -> None:
+    """Record the model/effort a native host reports for its own tool. Absent means unobserved, not inherited."""
+    observed = packet.get("observed_settings")
+    if observed is None:
+        return
+    if not isinstance(observed, dict) or not isinstance(observed.get("source"), str):
+        raise CoordinationError("observed_settings needs model or effort and the source that reported them")
+    try:
+        run["settings_provenance"] = CONTEXT_HANDOFF.record_observation(
+            run.get("settings_provenance"),
+            model=observed.get("model"),
+            effort=observed.get("effort"),
+            source=observed["source"],
+        )
+    except ValueError as error:
+        raise CoordinationError(str(error)) from error
 
 
 def import_result(run: dict[str, Any], state: dict[str, Any], *, skip_event_publish: bool = False) -> bool:
@@ -231,6 +268,22 @@ def import_result(run: dict[str, Any], state: dict[str, Any], *, skip_event_publ
     )
     if result.get("native_event_id"):
         run["native_event_id"] = result["native_event_id"]
+    observed_effort = (result.get("effort") or {}).get("observed") if isinstance(result.get("effort"), dict) else None
+    observed_models = [model for model in result.get("model_observed") or [] if isinstance(model, str) and model]
+    if (
+        result.get("transport") == "native"
+        and isinstance(result.get("resolved_model"), str)
+        and result["resolved_model"]
+    ):
+        # A native receipt's observed_model lands here; only the host's own report counts as observed.
+        observed_models.append(result["resolved_model"])
+    if observed_effort or observed_models:
+        run["settings_provenance"] = CONTEXT_HANDOFF.record_observation(
+            run.get("settings_provenance"),
+            model=observed_models[-1] if observed_models else None,
+            effort=observed_effort,
+            source="native_receipt" if result.get("transport") == "native" else "executor_result",
+        )
     if (result.get("auto_correct") or {}).get("suggested_correction"):
         # A native run never loops: the host sends this to its own worker as the correction turn.
         run["suggested_correction"] = result["auto_correct"]["suggested_correction"]
@@ -753,6 +806,9 @@ def dispatch(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
             )
     if not engine or not model_id:
         raise CoordinationError("dispatch requires an exact --engine and --model")
+    # What the caller asked for, kept apart from what Orkest resolved and what a host later observes.
+    requested_model, requested_effort = model_id, effort or variant
+    requested_source = "inherited" if previous_result else "dispatch"
     model_id = exact_model(engine, model_id)
     if engine == "codex" and effort is None and args.transport != "native":
         raise CoordinationError("recorded Codex dispatch requires explicit --effort for reproducible correction")
@@ -890,6 +946,14 @@ def dispatch(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
         "required_native_handle": previous_result["session_id"]
         if previous_result and args.transport == "native"
         else None,
+        "settings_provenance": CONTEXT_HANDOFF.settings_provenance(
+            requested_model=requested_model,
+            requested_effort=requested_effort,
+            requested_source=requested_source,
+            resolved_model=model_id,
+            resolved_effort=effort or variant,
+            resolved_source="coordinator",
+        ),
     }
     if "budget" not in state:
         raise CoordinationError(
@@ -1164,12 +1228,14 @@ def host_action(args: argparse.Namespace, directory: Path, state: dict[str, Any]
                 if run["status"] not in {"reserved", "active"}:
                     raise CoordinationError("recover reservation readiness before attaching")
                 run.update(native_handle=handle, status="active", attached_at=RUNNER.utc_now())
+                observe_settings(run, packet)
                 if (run.get("mailbox") or {}).get("run"):
                     # The native worker gets no AGENT_MAILBOX_SESSION; tell presence which session it is.
                     MAILBOX.delegate(MAILBOX.root(), handle, run["mailbox"]["run"])
             else:
                 NATIVE.complete(directory, state, run, packet, RUNNER)
                 import_result(run, state)
+                observe_settings(run, packet)
             result = run
         else:
             raise CoordinationError("unsupported host action")

@@ -137,6 +137,9 @@ An explicit model/effort must match what the host actually sends to its tool.
 --packet receipt.json`. The receipt requires `native_handle`, the actual host `event_id`,
    `terminal: true`, `tool_status` (`completed` or an honest failure), and `report_path`.
    Include `observed_model`/`observed_effort` only when the native tool actually reports them.
+   An attach packet may carry `observed_settings` (`model`, `effort`, `source`) on the same terms.
+   Each run keeps `settings_provenance` with separate `requested`, `resolved` and `observed`
+   entries; a mismatch between resolved and observed is listed, never overwritten.
 5. The guard checks scope/history, runs the declared independent checks once, checks for check
    mutations, and saves the additive result.v2 contract. The task still needs conductor review.
    With `--auto-correct`, the guard does not loop: a failed gate comes back as `suggested_correction`

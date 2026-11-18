@@ -41,6 +41,9 @@ COMMON_CONSTRAINTS = (
 )
 
 
+CONTEXT_MODES = ("fresh", "fork")
+
+
 class BriefSpecError(ValueError):
     """Raised when a task spec cannot produce a safe standalone brief."""
 
@@ -237,6 +240,20 @@ def validate_spec(spec: dict[str, Any]) -> dict[str, Any]:
         if type(value) is not int or not 0 <= value <= 6:
             raise BriefSpecError("max_continues must be an integer from 0 to 6 (hard ceiling 6)")
         result["max_continues"] = value
+    # The minimum handoff: acceptance checks the revision the worker started from, and large logs or prior
+    # discussion travel as retrievable references rather than inline text.
+    if spec.get("source_revision") is not None:
+        result["source_revision"] = require_text(spec, "source_revision")
+    if spec.get("evidence_refs") is not None:
+        result["evidence_refs"] = require_text_list(spec, "evidence_refs")
+    if spec.get("context_mode") is not None:
+        if spec["context_mode"] not in CONTEXT_MODES:
+            raise BriefSpecError("context_mode must be 'fresh' or 'fork'")
+        result["context_mode"] = spec["context_mode"]
+        if spec["context_mode"] == "fork":
+            if spec.get("context_reason") is None:
+                raise BriefSpecError("a fork context_mode needs a context_reason naming its conversational dependency")
+            result["context_reason"] = require_text(spec, "context_reason")
     return result
 
 
@@ -253,6 +270,15 @@ def render_brief(spec: dict[str, Any]) -> str:
             )
             + "\n"
         )
+    revision = f"\n- Source revision: {values['source_revision']}" if values.get("source_revision") else ""
+    if values.get("evidence_refs"):
+        packet += (
+            "\n# Evidence references\n\nRetrieve these artifacts when needed:\n"
+            + markdown_list(values["evidence_refs"])
+            + "\n"
+        )
+    if values.get("context_mode") == "fork":
+        packet += "\n# Context mode\n\nFull-history fork: " + values["context_reason"] + "\n"
     if values.get("scope_owner") == "worker":
         if values["plan"]:
             plan_block = (
@@ -286,7 +312,7 @@ def render_brief(spec: dict[str, Any]) -> str:
 # Repository and current state
 
 - Repository root: {values["repository_root"]}
-- Relevant implementation already present: {values["current_state"]}
+- Relevant implementation already present: {values["current_state"]}{revision}
 - Pre-existing working-tree changes to preserve:
 {markdown_list(values["pre_existing_changes"])}
 {packet}

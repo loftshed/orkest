@@ -2,7 +2,7 @@ import { realpath } from "node:fs/promises";
 import { hostname } from "node:os";
 import path from "node:path";
 
-import { listRawRoomsReadOnly, mailboxRoot } from "./horde-room.mjs";
+import { listRawRoomsReadOnly, mailboxRoot, roomLifecycle } from "./horde-room.mjs";
 import { resolveSessionPeer, roomOwnerSessions } from "./rooms.mjs";
 
 async function canonical(cwd) {
@@ -34,6 +34,7 @@ export async function resumeRoomStatus({ root = mailboxRoot(), cwd } = {}) {
     if (owners.length > 0) state = "unavailable";
     if (live.length > 0) state = "live";
     if (room.closedAt || room.status === "closed") state = "closed";
+    if (roomLifecycle(room) !== "active") state = roomLifecycle(room);
     rooms.push({
       id: room.id,
       title: room.title || room.id,

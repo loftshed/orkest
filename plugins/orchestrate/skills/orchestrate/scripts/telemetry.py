@@ -437,13 +437,40 @@ def rank_candidates_by_telemetry(
     return ranked
 
 
+def _policy() -> Any:
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("telemetry_policy", Path(__file__).with_name("conductor_policy.py"))
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def task_outcome_cost(task_dir: Path | str) -> dict[str, Any]:
+    """Accepted-outcome cost of one coordinator task, including retries, briefs handed over and reviews."""
+    directory = Path(task_dir)
+    state = json.loads((directory / "task.json").read_text(encoding="utf-8"))
+    brief_bytes: dict[str, int] = {}
+    for run in state.get("runs") or []:
+        brief = directory / "runs" / str(run.get("run_id")) / "brief.md"
+        if brief.is_file():
+            brief_bytes[run["run_id"]] = brief.stat().st_size
+    return _policy().accepted_outcome_cost(state, brief_bytes=brief_bytes)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     summarize = commands.add_parser("summarize", help="summarize local result receipts")
     summarize.add_argument("--runs-dir", type=Path, default=default_runs_dir())
     summarize.add_argument("--format", choices=("json",), default="json")
+    outcome = commands.add_parser("outcome-cost", help="accepted-outcome cost of one coordinator task")
+    outcome.add_argument("--task-dir", type=Path, required=True)
     args = parser.parse_args(argv)
+    if args.command == "outcome-cost":
+        print(json.dumps(task_outcome_cost(args.task_dir), indent=2))
+        return 0
     print(json.dumps(summarize_runs(args.runs_dir), indent=2))
     return 0
 

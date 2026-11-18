@@ -107,6 +107,9 @@ def find_session_swarm_room(
                 continue
             if room.get("closedAt") or room.get("status") == "closed":
                 continue
+            # Archived and cancelled rooms are history: a fresh session never adopts them by discovery.
+            if not room_store.is_active_room(room):
+                continue
             if resolved_cwd and isinstance(room.get("cwd"), str) and Path(room["cwd"]).resolve() != resolved_cwd:
                 continue
             if only_room is not None and room.get("id") != only_room:

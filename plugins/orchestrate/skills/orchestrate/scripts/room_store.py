@@ -106,6 +106,19 @@ def _invoke(base: Path, command: str, room_id: str | None = None, payload: Any =
     return json.loads(result.stdout)
 
 
+ROOM_LIFECYCLES = ("active", "archived", "cancelled")
+
+
+def room_lifecycle(room: Any) -> str:
+    """A room without the field is a legacy active room; age never archives it."""
+    value = room.get("lifecycle") if isinstance(room, dict) else None
+    return value if value in ROOM_LIFECYCLES else "active"
+
+
+def is_active_room(room: Any) -> bool:
+    return room_lifecycle(room) == "active"
+
+
 def list_rooms(base: Path) -> list[dict[str, Any]]:
     base = Path(base).resolve()
     signature = _signature(base)

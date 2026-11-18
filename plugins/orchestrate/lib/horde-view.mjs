@@ -130,11 +130,21 @@ function leadStageTone(member) {
   return ACTIVE_STATUSES.has(member.status) ? "leadModel" : "muted";
 }
 
+/** A request or inheritance is labelled as such; only an observation is shown unlabelled. */
+export function settingsProvenanceLabel(member) {
+  if (member.settingsMismatch?.length > 0) return " (observed ≠ resolved)";
+  if (member.modelSource === "requested" && (member.consultation || member.settingsProvenance))
+    return " (requested)";
+  if (member.modelSource === "inherited") return " (inherited)";
+  return "";
+}
+
 function phaseLabel(member) {
   if (outcome(member)) return outcome(member).label;
   if (member.verdict === "takeover" || member.status === "conductor_takeover")
     return "conductor takeover";
   if (member.paused) return "new launches paused";
+  if (member.awaitingTurn && !isExecuting(member)) return "awaiting coordinator turn";
   if (member.dispatch && member.status === "review" && !isExecuting(member))
     return "awaiting review";
   if (member.runtimeState === "idle" && ACTIVE_STATUSES.has(member.status))
@@ -2556,8 +2566,7 @@ export class HordeView {
     const model = (member, isStyled = false) => {
       const data = member.progress || member;
       const { model: modelName, effort } = memberModelInfo(member);
-      const provenance =
-        member.consultation && member.modelSource === "requested" ? " (requested)" : "";
+      const provenance = settingsProvenanceLabel(member);
       const brand =
         providerMark(modelName, this.tier) ||
         providerMark(member.engine || data.harness, this.tier);
@@ -2651,8 +2660,11 @@ export class HordeView {
       this.inHerdr || room.herdrViewPaneId || room.herdrCoordinatorPaneId,
     );
     const activityBadge = swarmActivityBadge(room, maxAgents, this.tier, innerWidth);
+    const lifecycleSuffix =
+      room.lifecycle && room.lifecycle !== "active" ? ` · ${room.lifecycle}` : "";
     const swarmTitle =
-      room.title === "New swarm" ? "Swarm" : `Swarm · ${plain(room.title || room.id)}`;
+      (room.title === "New swarm" ? "Swarm" : `Swarm · ${plain(room.title || room.id)}`) +
+      lifecycleSuffix;
     const topCardTitle = hasHerdrPaneHeader ? "Coordinator" : swarmTitle;
     const lines = [
       ...this.panel(

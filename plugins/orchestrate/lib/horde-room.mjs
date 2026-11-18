@@ -42,6 +42,35 @@ import { cacheHome } from "./runtime-paths.mjs";
 export const ROOM_SCHEMA = "agent-executor.room.v1";
 const ID = /^[\w-]{1,80}$/u;
 
+/**
+ * A room's place in history. Absent means active, so legacy rooms stay current until someone
+ * archives them; age alone never archives a room or accepts its work.
+ */
+export const ROOM_LIFECYCLES = Object.freeze(["active", "archived", "cancelled"]);
+
+export function roomLifecycle(room) {
+  return room?.lifecycle ?? "active";
+}
+
+export function isActiveRoom(room) {
+  return roomLifecycle(room) === "active";
+}
+
+/** Archive and cancellation close new dispatch authority; existing work stays observable. */
+export function requireActiveRoom(room) {
+  const lifecycle = roomLifecycle(room);
+  if (lifecycle === "active") return;
+  throw Object.assign(
+    new Error(
+      `Room ${room.id} is ${lifecycle}; it accepts no new dispatch. Inspect it with ork rooms reopen-view --room ${room.id}` +
+        (lifecycle === "archived"
+          ? `, or resume it with ork rooms reactivate --room ${room.id}`
+          : ""),
+    ),
+    { code: "ROOM_NOT_ACTIVE", lifecycle },
+  );
+}
+
 const sourceRolesPath = new URL(
   "../skills/orchestrate/references/workforce-roles.json",
   import.meta.url,
@@ -394,6 +423,20 @@ export function validateRoom(room) {
     (!room.update || typeof room.update !== "object" || Array.isArray(room.update))
   )
     throw new Error("Invalid room update metadata");
+  if (room.lifecycle !== undefined && !ROOM_LIFECYCLES.includes(room.lifecycle))
+    throw new Error("Room lifecycle must be active, archived or cancelled");
+  if (
+    room.lifecycleHistory !== undefined &&
+    (!Array.isArray(room.lifecycleHistory) ||
+      room.lifecycleHistory.some(
+        (entry) =>
+          !entry ||
+          typeof entry !== "object" ||
+          !ROOM_LIFECYCLES.includes(entry.to) ||
+          !Number.isFinite(entry.at),
+      ))
+  )
+    throw new Error("Invalid room lifecycle history");
   return refreshMemberWorktrees(room);
 }
 
@@ -524,6 +567,13 @@ const ROOMS_MIGRATIONS = [
     CREATE INDEX rooms_updated_at ON rooms (updated_at DESC);
     CREATE INDEX rooms_cwd ON rooms (cwd);
     CREATE TABLE legacy_room_imports (file TEXT PRIMARY KEY, digest TEXT NOT NULL) STRICT;
+  `),
+  // Derived from the stored record, so every writer stays correct without knowing the column.
+  (connection) =>
+    connection.exec(`
+    ALTER TABLE rooms ADD COLUMN lifecycle TEXT
+      GENERATED ALWAYS AS (coalesce(json_extract(data, '$.lifecycle'), 'active')) VIRTUAL;
+    CREATE INDEX rooms_lifecycle ON rooms (lifecycle, updated_at DESC);
   `),
 ];
 
@@ -689,12 +739,18 @@ function readRoomSnapshot(root) {
   }
 }
 
-export function listRawRooms(root = mailboxRoot()) {
+/** Every room, or only those in one lifecycle (`active` includes legacy rooms without the field). */
+export function listRawRooms(root = mailboxRoot(), { lifecycle } = {}) {
+  if (lifecycle !== undefined && !ROOM_LIFECYCLES.includes(lifecycle))
+    throw new Error("Room lifecycle must be active, archived or cancelled");
   if (!existsSync(roomsDbPath(root)) && !existsSync(path.join(root, "rooms"))) return [];
   using db = openRoomsForRead(root);
-  return db.tagStore.all`SELECT data FROM rooms ORDER BY updated_at DESC, id ASC`.map((row) =>
-    JSON.parse(row.data),
-  );
+  const rows =
+    lifecycle === undefined
+      ? db.tagStore.all`SELECT data FROM rooms ORDER BY updated_at DESC, id ASC`
+      : db.tagStore
+          .all`SELECT data FROM rooms WHERE lifecycle = ${lifecycle} ORDER BY updated_at DESC, id ASC`;
+  return rows.map((row) => JSON.parse(row.data));
 }
 
 export async function readRoom(id, root = mailboxRoot()) {

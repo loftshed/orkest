@@ -841,6 +841,9 @@ def _swarm_next_advisor(
     fresh_room = room_store.read_room(base, room_id)
     if isinstance(fresh_room, dict):
         room = fresh_room
+    if member_id == "conductor" and me.get("continuationRoom") != room_id:
+        # Remembered for Stop, so that hook reads one room instead of scanning the store.
+        _MB.annotate(base, me["session"], continuationRoom=room_id)
     agents = [a for a in (room.get("agents") or []) if isinstance(a, dict)]
     if member_id != "conductor":
         scoped = [a for a in agents if a.get("parent") == member_id]
@@ -1291,6 +1294,9 @@ def swarm_coordinator_context(
     loaded_room = room_store.read_room(base, room_id)
     if not isinstance(loaded_room, dict) or not loaded_room.get("swarm"):
         return ""
+    if not room_store.is_active_room(loaded_room):
+        # An inherited ORKEST_SWARM_ROOM may name archived history; it gets no brief or advice.
+        return ""
     room = loaded_room
     if not _MB.local_session_binding(room, room.get("conductor") or {}):
         return ""
@@ -1534,6 +1540,27 @@ def swarm_command_context(
             "Use Ctrl+Option+S in Herdr or an Orkest-wrapped terminal session."
         )
     return ""
+
+
+def _continuation_at_stop(base: Path, me: dict[str, Any]) -> list[dict[str, Any]]:
+    """Record durable continuation requests when a coordinator stops with authorized room work left.
+
+    The request is delivered later by the daemon's reconciler through the mailbox wake path; the hook
+    itself never keeps the turn going or launches anything."""
+    if me.get("isSubagent") or me.get("delegatedRun") or _MB.is_run_peer(me):
+        return []
+    with contextlib.suppress(Exception):
+        import continuation_requests
+
+        # Only a known coordinator room is read: a Stop never scans the room store.
+        room_id = os.environ.get("ORKEST_SWARM_ROOM", "").strip() or str(me.get("continuationRoom") or "")
+        room = room_store.read_room(base, room_id) if room_id else None
+        if not isinstance(room, dict) or not room.get("swarm") or not room_store.is_active_room(room):
+            return []
+        if me["session"] not in _MB.room_owner_sessions(room, room.get("conductor") or {}):
+            return []
+        return continuation_requests.request_at_stop(base, me, room)
+    return []
 
 
 def hook(
@@ -2137,6 +2164,8 @@ def hook(
     )
     if hint:
         context = hint + ("\n\n" + context if context else "")
+    if event == "Stop" and not suppress_toplevel:
+        _continuation_at_stop(base, me)
     if event == "Stop":
         if not delivered:  # a hint or notice alone never keeps a turn going
             return {} if gemini else None

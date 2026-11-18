@@ -852,8 +852,32 @@ class CoordinatorTests(unittest.TestCase):
             with self.assertRaisesRegex(SUPPORT.ContractError, "another executor"):
                 with SUPPORT.workspace_lease(self.fixture.repository.path, RUNNER.default_agent_cache_dir()):
                     self.fail("lease should belong to the native guard")
-            packet.write_text(json.dumps({"native_handle": "native-test-session"}))
+            # Requested and resolved settings are recorded at dispatch; nothing is observed yet.
+            provenance = run["settings_provenance"]
+            self.assertEqual(provenance["requested"]["model"], "claude-sonnet-5")
+            self.assertEqual(provenance["requested"]["source"], "dispatch")
+            self.assertEqual(provenance["resolved"]["model"], run["model"])
+            self.assertIsNone(provenance["observed"])
+            self.assertEqual(instructions["settings"]["model"], run["model"])
+            self.assertEqual(instructions["settings"]["host_capabilities"]["intercept_launch"], "unsupported")
+            bad = self.fixture.external_path / "bad-observed.json"
+            bad.write_text(json.dumps({"native_handle": "native-test-session", "observed_settings": {"model": "x"}}))
+            self.assertNotEqual(self.call("native-attach", "--run-id", run["run_id"], "--packet", str(bad))[0], 0)
+            packet.write_text(
+                json.dumps(
+                    {
+                        "native_handle": "native-test-session",
+                        "observed_settings": {"model": "claude-haiku-5", "source": "host-subagent-start"},
+                    }
+                )
+            )
             self.assertEqual(self.call("native-attach", "--run-id", run["run_id"], "--packet", str(packet))[0], 0)
+            attached = next(entry for entry in self.call("show")[1]["runs"] if entry["run_id"] == run["run_id"])
+            observed = attached["settings_provenance"]
+            self.assertEqual(observed["observed"]["model"], "claude-haiku-5")
+            self.assertEqual(observed["observed"]["source"], "host-subagent-start")
+            self.assertEqual(observed["mismatch"][0]["field"], "model")
+            self.assertEqual(observed["requested"]["model"], "claude-sonnet-5")
             native = MAILBOX.register(
                 MAILBOX.root(), session="native-test-session", harness="codex", cwd=str(self.fixture.repository.path)
             )

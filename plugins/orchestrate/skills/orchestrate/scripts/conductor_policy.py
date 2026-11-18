@@ -209,6 +209,62 @@ def settle(state: dict[str, Any], run: dict[str, Any], result: dict[str, Any]) -
     }
 
 
+def _sum_known(values: list[Any]) -> float | None:
+    """A total only when every part is known: one missing estimate makes the total missing, not lower."""
+    if not values or any(not isinstance(value, int | float) or isinstance(value, bool) for value in values):
+        return None
+    return round(float(sum(values)), 6)
+
+
+def accepted_outcome_cost(state: dict[str, Any], *, brief_bytes: dict[str, int] | None = None) -> dict[str, Any]:
+    """Total cost of reaching the task's accepted outcome: every attempt, retry and correction, the context
+    handed to workers, and the parent's review. Missing telemetry stays missing; it is never counted as zero."""
+    ledger = state.get("cost_ledger") or {}
+    runs = [run for run in state.get("runs") or [] if isinstance(run, dict)]
+    decisions = [decision for decision in state.get("decisions") or [] if isinstance(decision, dict)]
+    entries = [ledger.get(run.get("run_id")) or {} for run in runs]
+    missing: list[str] = []
+
+    def total(field: str, values: list[Any]) -> float | None:
+        value = _sum_known(values)
+        if value is None and runs:
+            missing.append(field)
+        return value
+
+    attempts = {
+        "total": len(runs),
+        "retries": sum(1 for run in runs if run.get("kind") in {"correction", "continue"}),
+        "settled": sum(1 for entry in entries if entry),
+    }
+    context = None
+    if brief_bytes is not None:
+        context = _sum_known([brief_bytes.get(run.get("run_id")) for run in runs])
+        if context is None and runs:
+            missing.append("context_transfer_bytes")
+    review_minutes = _sum_known([decision.get("review_minutes") for decision in decisions])
+    if decisions and review_minutes is None:
+        missing.append("parent_review_minutes")
+    accepted = state.get("status") == "accepted" or any(
+        decision.get("decision") in {"accept", "supported"} for decision in decisions
+    )
+    return {
+        "schema": "orkest.accepted-outcome-cost.v1",
+        "task_id": state.get("task_id"),
+        "accepted": accepted,
+        "attempts": attempts,
+        "api_reference_estimate_usd": total(
+            "api_reference_estimate", [e.get("api_reference_estimate") for e in entries]
+        ),
+        "native_estimate_usd": total("native_estimate_usd", [e.get("native_estimate_usd") for e in entries]),
+        "duration_seconds": total("duration_seconds", [e.get("duration_seconds") for e in entries]),
+        "context_transfer_bytes": context,
+        "parent_reviews": len(decisions),
+        "parent_review_minutes": review_minutes,
+        "missing": missing,
+        "note": "Measure on a small existing workload before making economic claims; missing parts stay missing.",
+    }
+
+
 def next_action(state: dict[str, Any], observation: dict[str, Any], remaining: float) -> dict[str, Any]:
     """Return a host action, not another autonomous model invocation."""
     if state["status"] == "accepted":

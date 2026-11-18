@@ -897,9 +897,15 @@ export async function evaluateNextCandidates({
     }
   }
 
+  // Durable continuation requests are shown, never executed here: the owning coordinator reserves one
+  // (continuation_requests.py reserve) and then takes the ordinary next action.
+  const continuations = Array.isArray(observedRoom?.continuations)
+    ? observedRoom.continuations.map((entry) => ({ ...entry, roomId: observedRoom.id }))
+    : [];
   const candidates = [...tier0, ...tier3, ...tier1, ...tier2, ...busy];
   return {
     candidates,
+    continuations,
     busy,
     tier0,
     tier1,
@@ -1690,7 +1696,15 @@ function renderNextPanel(payload, width, options = {}) {
     tier,
     weights: [0.08, 0.24, 0.18, 0.5],
   });
-  return renderPanel("Next", [nextSummary, ...table], width, {
+  const continuationLines = (payload.continuations ?? []).map(
+    (entry) =>
+      `Continuation ${entry.key} (${entry.roomId}${entry.member ? ` · ${entry.member}` : ""}): ${entry.label}` +
+      (entry.manualResume
+        ? ` — not automated on this host; resume with ${entry.manualResume}`
+        : "") +
+      (entry.stopReason && !entry.manualResume ? ` — ${entry.stopReason}` : ""),
+  );
+  return renderPanel("Next", [nextSummary, ...continuationLines, ...table], width, {
     color: options.color,
     glyphs: glyphSet(tier),
   })
@@ -1823,6 +1837,7 @@ export async function nextCommand(
       status: nextAction ? "ready" : "noop",
       targetBranch,
       tier3Gates: evaluated.tier3.map((c) => stripWorktreeField(c)),
+      ...(evaluated.continuations?.length > 0 && { continuations: evaluated.continuations }),
       worktrees: evaluated.worktrees.map((wt) => ({
         allowPaths: wt.allowPaths,
         blastRadius: wt.blastRadius,
