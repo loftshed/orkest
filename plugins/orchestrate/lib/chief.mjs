@@ -21,7 +21,13 @@ import { hostname } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { listRawRooms, mailboxRoot, updateRawRoom } from "./horde-room.mjs";
+import {
+  isClosedRoom,
+  listRawRooms,
+  mailboxRoot,
+  processStarted,
+  updateRawRoom,
+} from "./horde-room.mjs";
 import { isTerminalDisplayState, memberDisplayState } from "./member-state.mjs";
 import { belongsToRoom, isPeerLive, newRoom, roomOwnerSessions } from "./rooms.mjs";
 import { checkRepoPolicyForSide } from "./side.mjs";
@@ -285,8 +291,13 @@ function paneFields(...sources) {
     return null;
   };
   return {
-    herdrPaneId: pick("herdrPaneId"),
     herdrEndpoint: pick("herdrEndpoint"),
+    herdrPaneId: pick("herdrPaneId"),
+    orcaEnvironment: pick("orcaEnvironment"),
+    orcaPaneKey: pick("orcaPaneKey"),
+    orcaTabId: pick("orcaTabId"),
+    orcaTerminalHandle: pick("orcaTerminalHandle"),
+    orcaWorkspaceId: pick("orcaWorkspaceId"),
     paneId: pick("paneId"),
     terminalServer: pick("terminalServer"),
   };
@@ -306,7 +317,12 @@ function chiefLiveness(binding, peers, now) {
   if (peer?.live) return { live: true, peer };
   const alive = pidAlive(binding.pid);
   if (alive === false) return { live: false, reason: `process ${binding.pid} exited` };
-  if (alive && !peer) return { live: true, peer: null };
+  if (alive) {
+    const currentBirth = binding.pidBirth ? processStarted(binding.pid) : null;
+    if (binding.pidBirth && currentBirth && currentBirth !== binding.pidBirth)
+      return { live: false, reason: `process ${binding.pid} was recycled` };
+    if (!peer) return { live: true, peer: null };
+  }
   if (peer && !peer.live) return { live: false, reason: "mailbox peer is no longer live" };
   const ageMs = now - stampMs(binding.boundAt);
   if (Number.isFinite(ageMs) && ageMs <= UNVERIFIED_BINDING_GRACE_MS) return { live: true, peer };
@@ -379,6 +395,11 @@ export async function bindChief({
   const peer = readPeers(root, { now }).find((candidate) => candidate.session === self) || null;
   const panes = paneFields(peer, {
     herdrPaneId: env.HERDR_PANE_ID,
+    orcaEnvironment: env.ORCA_ENVIRONMENT,
+    orcaPaneKey: env.ORCA_PANE_KEY || env.ORCA_AGENT_PANE,
+    orcaTabId: env.ORCA_TAB_ID,
+    orcaTerminalHandle: env.ORCA_TERMINAL_HANDLE || env.ORCA_TERMINAL_ID,
+    orcaWorkspaceId: env.ORCA_WORKSPACE_ID || env.ORCA_WORKTREE_ID,
     paneId: env.TMUX_PANE,
   });
   const isSame = current?.session === self;
@@ -566,8 +587,13 @@ function coordinatorOf(room, peers) {
     pid: Number.isSafeInteger(pid) ? pid : null,
     live: isLive,
     ...paneFields(peer, conductor, {
-      herdrPaneId: room.herdrCoordinatorPaneId,
       herdrEndpoint: room.herdrEndpoint,
+      herdrPaneId: room.herdrCoordinatorPaneId,
+      orcaEnvironment: room.orcaEnvironment,
+      orcaPaneKey: room.orcaCoordinatorPaneKey,
+      orcaTabId: room.orcaCoordinatorTabId,
+      orcaTerminalHandle: room.orcaCoordinatorTerminalId,
+      orcaWorkspaceId: room.orcaWorkspaceId,
     }),
   };
 }
@@ -727,10 +753,10 @@ export async function chiefStatus({
   const boundSessions = new Set();
   const roomMatchers = [];
   for (const room of rawRooms) {
-    if (room.archivedAt || room.status === "archived" || room.status === "closed") continue;
-    for (const session of roomSessions(room)) boundSessions.add(session);
+    if (isClosedRoom(room)) continue;
     const summary = summarizeRoom(room, { peers, inbox });
     if (!all && !isActiveRoom(summary, room, now)) continue;
+    for (const session of roomSessions(room)) boundSessions.add(session);
     rooms.push(summary);
     const memberPaths = new Set(
       (room.agents || [])
@@ -754,7 +780,7 @@ export async function chiefStatus({
       !peer.live ||
       isRunPeer(peer) ||
       boundSessions.has(peer.session) ||
-      chief?.session === peer.session
+      (chief?.live && chief?.session === peer.session)
     )
       continue;
     const peerCwd = path.resolve(peer.checkout || peer.cwd);
@@ -983,6 +1009,7 @@ const MISSION_STATES = {
   question: "blocked",
   update: "running",
 };
+const TERMINAL_MISSION_STATES = new Set(["cancelled", "done", "failed"]);
 
 /** A child's report moves its mission state, so finished missions stop raising attention. */
 async function recordMissionReport({ rooms, sender, env, kind, text, root, now }) {
@@ -992,20 +1019,25 @@ async function recordMissionReport({ rooms, sender, env, kind, text, root, now }
       ? rooms.find((candidate) => candidate.id === env.ORK_CHIEF_ROOM && candidate.chief)
       : null);
   if (!room) return null;
-  const state = MISSION_STATES[kind || "update"];
+  const nextState = MISSION_STATES[kind || "update"];
+  let effectiveState = nextState;
   await updateRawRoom(
     room.id,
     (current) => {
       if (!current.chief) return current;
-      current.chief.state = state;
+      const shouldPreserveTerminal = !kind && TERMINAL_MISSION_STATES.has(current.chief.state);
+      effectiveState = shouldPreserveTerminal ? current.chief.state : nextState;
+      current.chief.state = effectiveState;
       current.chief.reportedAt = iso(now);
       current.chief.lastReport = { kind: kind || "update", text: oneLine(text, MAX_REPORT_CHARS) };
-      if (current.conductor) current.conductor.status = state === "done" ? "completed" : state;
+      if (current.conductor && !shouldPreserveTerminal) {
+        current.conductor.status = effectiveState === "done" ? "completed" : effectiveState;
+      }
       return current;
     },
     { root },
   );
-  return { roomId: room.id, state };
+  return { roomId: room.id, state: effectiveState };
 }
 
 export async function chiefSend({
@@ -1036,17 +1068,23 @@ export async function chiefSend({
     rooms = [];
   }
   const body = kind ? `[chief:${kind}] ${text}` : text;
-  const mission = await recordMissionReport({ rooms, sender, env, kind, text, root, now });
   let target;
+  let isChiefUnavailable = false;
   try {
     target = resolveChiefTarget(to, { status, rooms, peers });
   } catch (error) {
     if (error.code !== "chief_unavailable") throw error;
+    isChiefUnavailable = true;
+    target = { tier: "chief", session: null, chief: true };
+  }
+  if (target.session && target.session === sender) throw new Error("That target is this session");
+  if (isChiefUnavailable) {
     const record = recordDesk(
       root,
       { from: sender, kind: kind || "update", text: oneLine(text, MAX_REPORT_CHARS * 4) },
       now,
     );
+    const mission = await recordMissionReport({ rooms, sender, env, kind, text, root, now });
     return {
       schema: CHIEF_SEND_SCHEMA,
       mission,
@@ -1056,7 +1094,9 @@ export async function chiefSend({
       woke: false,
     };
   }
-  if (target.session === sender) throw new Error("That target is this session");
+  const isTargetChief =
+    Boolean(target.chief) ||
+    Boolean(status?.chief?.session && target.session === status.chief.session);
   const args = [
     "send",
     "--session",
@@ -1082,6 +1122,9 @@ export async function chiefSend({
         { from: sender, kind: kind || "update", text: oneLine(text, MAX_REPORT_CHARS * 4) },
         now,
       );
+      const mission = isTargetChief
+        ? await recordMissionReport({ rooms, sender, env, kind, text, root, now })
+        : null;
       return {
         schema: CHIEF_SEND_SCHEMA,
         mission,
@@ -1100,6 +1143,9 @@ export async function chiefSend({
   } catch {
     delivery = { raw: result.stdout.trim() };
   }
+  const mission = isTargetChief
+    ? await recordMissionReport({ rooms, sender, env, kind, text, root, now })
+    : null;
   return {
     schema: CHIEF_SEND_SCHEMA,
     mission,
@@ -1211,18 +1257,31 @@ export async function chiefSpawn({
     throw new Error(`Unsupported engine ${engine}; choose ${[...COORDINATOR_ENGINES].join(", ")}`);
   const repoRoot = resolveRepositoryRoot(path.resolve(cwd), exec);
   const missionTitle = oneLine(title || goalText.split(/\r?\n/u, 1)[0], 80);
-  const suffix = randomBytes(2).toString("hex");
+  const isExplicitWorktree = typeof worktree === "string" && Boolean(worktree);
+  let existingRoomIds;
+  try {
+    existingRoomIds = new Set(listRawRooms(root).map((room) => room.id));
+  } catch {
+    existingRoomIds = new Set();
+  }
   const isWorktreeRequested = Boolean(worktree || branch);
   let slug = null;
   let branchName = null;
-  if (isWorktreeRequested) {
-    slug =
-      typeof worktree === "string" && worktree ? worktree : slugify(branch || missionTitle, 40);
-    if (!(typeof worktree === "string" && worktree)) slug = `${slugify(slug, 40)}-${suffix}`;
-    validateWorktreeSlug(slug);
-    branchName = branch || `chief/${slug}`;
+  let roomId = null;
+  for (let attempt = 0; attempt < 16; attempt++) {
+    const suffix = randomBytes(2).toString("hex");
+    if (isWorktreeRequested) {
+      slug = isExplicitWorktree ? worktree : `${slugify(branch || missionTitle, 40)}-${suffix}`;
+      validateWorktreeSlug(slug);
+      branchName = branch || `chief/${slug}`;
+      roomId = `chief-${slug}`.slice(0, 64);
+    } else {
+      roomId = `chief-${slugify(missionTitle, 40)}-${suffix}`.slice(0, 64);
+    }
+    if (!existingRoomIds.has(roomId)) break;
+    if (isExplicitWorktree) throw new Error(`Room ${roomId} already exists`);
   }
-  const roomId = `chief-${slug || `${slugify(missionTitle, 40)}-${suffix}`}`.slice(0, 64);
+  if (existingRoomIds.has(roomId)) throw new Error(`Room ${roomId} already exists`);
   const missionSession = `${roomId}-orch`;
   const plannedWorkspace = isWorktreeRequested ? path.join(repoRoot, ".worktrees", slug) : repoRoot;
   let policy = { ok: true, engine: engine || null, extraArgs: [] };

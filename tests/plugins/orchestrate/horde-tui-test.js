@@ -2565,4 +2565,98 @@ describe("terminal lifecycle", () => {
     ).toBe(false);
     expect(calls).toHaveLength(1);
   });
+
+  it("disarms confirmClose across Chief and Room mode switches and non-q keys in Herdr", async () => {
+    // eslint-disable-next-line unicorn/prefer-event-target -- Readline keypress uses the Node stream EventEmitter API.
+    const input = Object.assign(new EventEmitter(), {
+      isTTY: true,
+      isRaw: false,
+      setRawMode: vi.fn((raw) => {
+        input.isRaw = raw;
+      }),
+      resume() {},
+      pause() {},
+    });
+    const frames = [];
+    const output = {
+      isTTY: true,
+      rows: 30,
+      columns: 80,
+      write: (chunk) => {
+        frames.push(chunk);
+      },
+    };
+    const room = fixture();
+    room.chief = { goal: "Mission stays intact", state: "running" };
+    const status = {
+      schema: "ork.chief.status.v1",
+      generatedAt: "2026-11-18T06:00:00.000Z",
+      machine: "kahuna",
+      chief: {
+        schema: "ork.chief.v1",
+        live: true,
+        stale: false,
+        session: "chief-1",
+        name: "Ork Chief",
+      },
+      summary: { orchestrators: 1, working: 1, blocked: 0, attention: 0, standalone: 0 },
+      rooms: [
+        {
+          id: room.id,
+          title: room.title || "Main",
+          cwd: "/repo",
+          repo: { name: "repo", path: "/repo" },
+          branch: "main",
+          counts: { working: 1, blocked: 0, done: 0, idle: 0, total: 1 },
+          attention: [],
+          coordinator: { session: "c1", name: "C1", engine: "claude", status: "running" },
+        },
+      ],
+      standalone: [],
+      inbox: [],
+      desk: [],
+    };
+    const running = runHordeTui(async () => structuredClone(room), {
+      input,
+      output,
+      env: { ORKEST_HERDR_VIEW_STATE: "/tmp/herdr-state.json" },
+      exec: (_c, _a, cb) => cb(null, ""),
+      quota: false,
+      services: false,
+      update: false,
+      chief: {
+        loadStatus: async () => structuredClone(status),
+        loadRoom: async () => structuredClone(room),
+        initialMode: "chief",
+      },
+    });
+    const text = () => frames.join("");
+    try {
+      await vi.waitFor(() => expect(text()).toContain("ORK CHIEF"));
+      frames.length = 0;
+      input.emit("data", "q");
+      await vi.waitFor(() => expect(text()).toContain("Press q again"));
+
+      // Moving in Chief mode clears the armed notice back to the confirm-close footer hint.
+      frames.length = 0;
+      input.emit("data", "j");
+      await vi.waitFor(() => expect(text()).toContain("Press q twice"));
+      frames.length = 0;
+      input.emit("data", "q");
+      await vi.waitFor(() => expect(text()).toContain("Press q again"));
+
+      // Switching to Room mode cancels armed close and preserves room.chief mission metadata.
+      frames.length = 0;
+      input.emit("data", "\r");
+      await vi.waitFor(() => expect(text()).toContain("★ chief"));
+      frames.length = 0;
+      input.emit("data", "q");
+      await vi.waitFor(() => expect(text()).toContain("Press q again"));
+      expect(room.chief).toEqual({ goal: "Mission stays intact", state: "running" });
+    } finally {
+      input.emit("data", "q");
+      input.emit("data", "q");
+      await running;
+    }
+  });
 });

@@ -357,6 +357,133 @@ class ContinuationTests(unittest.TestCase):
         CR.reconcile(self.base, moment=peer_mailbox.now() + dt.timedelta(days=8))
         self.assertEqual(set(CR.load_all(self.base)), {open_entry["key"]})
 
+    def test_run_id_separates_retries_while_keeping_legacy_key_compatible(self):
+        self.assertEqual(
+            CR.request_key("room-a", str(self.task_dir), 1, self.revision()),
+            CR.request_key("room-a", str(self.task_dir), 1, self.revision(), run_id=None),
+        )
+        run1 = {"run_id": "r1", "generation": 1, "status": "finished"}
+        run2 = {"run_id": "r2", "generation": 1, "status": "finished"}
+        state = {"task_id": "task-a", "task_spec": self.spec, "runs": [run1]}
+        first = CR.request_for_terminal(self.base, self.task_dir, state, run1)
+        CR.reserve(self.base, first["key"], "coord-1")
+        CR.bind(self.base, first["key"], "coord-1", "req-1")
+        self.write_task(
+            runs=[{**run1, "request_id": "req-1"}],
+            decisions=[{"run_id": "r1", "decision": "reject"}],
+        )
+        CR.reconcile(self.base)
+        # Re-open for run 2 (correction) on the same spec: must not collide with run 1.
+        second = CR.request_for_terminal(self.base, self.task_dir, state, run2)
+        self.assertNotEqual(first["key"], second["key"])
+        self.assertEqual(second["status"], "requested")
+
+    def test_task_dir_none_queued_reservation_transitions_cleanly(self):
+        me = peer_mailbox.load(peer_mailbox.peer_path(self.base, "coord-1"))
+        [queued_req] = CR.request_at_stop(self.base, me, self.room)
+        self.assertIsNone(queued_req["task_dir"])
+        CR.reserve(self.base, queued_req["key"], "coord-1")
+
+        # Pausing the room transitions the reserved task_dir=None request to paused rather than recovery_needed.
+        self.set_room(conductor=dict(self.room["conductor"], paused=True))
+        later = peer_mailbox.now() + CR.RESERVATION_TTL + dt.timedelta(seconds=30)
+        CR.reconcile(self.base, moment=later)
+        self.assertEqual(CR.load_all(self.base)[queued_req["key"]]["status"], "paused")
+
+        # Unpausing restores requested, then dispatching haiku-1 completes the reserved request.
+        self.set_room(conductor=self.room["conductor"])
+        CR.reconcile(self.base)
+        self.assertEqual(CR.load_all(self.base)[queued_req["key"]]["status"], "requested")
+        CR.reserve(self.base, queued_req["key"], "coord-1")
+        agents = [
+            {**a, "status": "running", "dispatch": {"taskDir": str(self.task_dir)}} if a["id"] == "haiku-1" else a
+            for a in self.room["agents"]
+        ]
+        self.set_room(agents=agents)
+        CR.reconcile(self.base)
+        self.assertEqual(CR.load_all(self.base)[queued_req["key"]]["status"], "completed")
+
+        # When a room is cancelled while a task_dir=None request is reserved, reconcile cancels it.
+        self.set_room(
+            agents=[
+                {"id": "coord-1", "kind": "conductor", "status": "running", "parent": None},
+                {"id": "sonnet-1", "kind": "agent", "status": "queued", "parent": "conductor"},
+            ]
+        )
+        [second] = CR.request_at_stop(self.base, me, room_store.read_room(self.base, "room-a"))
+        CR.reserve(self.base, second["key"], "coord-1")
+        self.set_room(lifecycle="cancelled")
+        CR.reconcile(self.base)
+        self.assertEqual(CR.load_all(self.base)[second["key"]]["status"], "cancelled")
+
+    def test_team_authority_generation_routing_and_reserve_ownership(self):
+        import authority
+
+        cache_dir = Path(self.temporary.name) / "cache"
+        auth_dir = cache_dir / "authority-v1" / "team-a"
+        auth_dir.mkdir(parents=True)
+        record = {
+            "schema": authority.SCHEMA,
+            "team": "team-a",
+            "generation": 1,
+            "status": "active",
+            "lead": {"session": "coord-1", "harness": "claude"},
+            "tasks": [],
+            "log": [],
+        }
+        authority.save(auth_dir, dict(record))
+        self.set_room(authority="team-a")
+        peer_mailbox.register(
+            self.base, session="coord-2", harness="claude", cwd=str(self.repo), pid=os.getpid(), state="idle"
+        )
+        with mock.patch.dict(os.environ, {"AGENT_EXECUTOR_HOME": str(cache_dir)}):
+            me = peer_mailbox.load(peer_mailbox.peer_path(self.base, "coord-1"))
+            room = room_store.read_room(self.base, "room-a")
+            self.write_task(runs=[{"run_id": "r1", "request_id": "req-1", "status": "finished"}])
+            created = CR.request_at_stop(self.base, me, room)
+            self.assertTrue(all(item["authority_generation"] == 1 for item in created))
+            entry = created[0]
+
+            # Non-lead session cannot reserve.
+            with self.assertRaisesRegex(ValueError, "not the current owner/lead"):
+                CR.reserve(self.base, entry["key"], "coord-2")
+
+            # After authority shifts to coord-2 (generation 2), _owner_peer routes to coord-2 (never coord-1),
+            # old coord-1 cannot reserve, and coord-2 sees the old generation-1 request superseded.
+            authority.save(
+                auth_dir,
+                {**record, "generation": 2, "lead": {"session": "coord-2", "harness": "claude"}},
+            )
+            self.assertEqual(CR._owner_peer(self.base, entry)["session"], "coord-2")
+            with self.assertRaisesRegex(ValueError, "not the current owner/lead"):
+                CR.reserve(self.base, entry["key"], "coord-1")
+            superseded = CR.reserve(self.base, entry["key"], "coord-2")
+            self.assertEqual(superseded["status"], "superseded")
+
+            # If coord-2 goes offline, _owner_peer does NOT fall back to superseded coord-1.
+            peer_mailbox.unregister(self.base, "coord-2")
+            self.assertIsNone(CR._owner_peer(self.base, entry))
+
+            # Withdrawn authority cancels open requests.
+            entry2, _ = CR.request(
+                self.base, room="room-a", generation=2, revision=CR.input_revision(["haiku-1"]), reason="stop"
+            )
+            authority.save(auth_dir, {**record, "generation": 2, "status": "withdrawn"})
+            CR.reconcile(self.base)
+            self.assertEqual(CR.load_all(self.base)[entry2["key"]]["status"], "cancelled")
+
+    def test_room_for_task_prefers_active_room_over_archived(self):
+        archived = {
+            **self.room,
+            "id": "room-archived",
+            "lifecycle": "archived",
+            "updatedAt": 9999999999999,
+        }
+        room_store.put_room(self.base, archived)
+        found = CR._room_for_task(self.base, str(self.task_dir))
+        self.assertIsNotNone(found)
+        self.assertEqual(found[0]["id"], "room-a")
+
 
 class RoomFenceTests(unittest.TestCase):
     """Archived and cancelled rooms are history: not adopted, not pruned by age."""

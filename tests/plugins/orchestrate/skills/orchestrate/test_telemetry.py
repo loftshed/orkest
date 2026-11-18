@@ -530,6 +530,70 @@ class AcceptedOutcomeCostTests(unittest.TestCase):
                 self.assertEqual(TELEMETRY.main(["outcome-cost", "--task-dir", str(directory)]), 0)
             self.assertEqual(json.loads(output.getvalue())["task_id"], "task-1")
 
+    def test_host_checks_reverify_runs_do_not_wipe_accepted_outcome_cost(self) -> None:
+        state = {
+            "task_id": "task-reverify",
+            "status": "accepted",
+            "runs": [
+                {"run_id": "r1", "kind": "implementation", "transport": "executor"},
+                {"run_id": "r2", "kind": "verification", "transport": "host_checks"},
+            ],
+            "cost_ledger": {
+                "r1": {"api_reference_estimate": 0.42, "native_estimate_usd": 0.31, "duration_seconds": 95},
+                "r2": {"api_reference_estimate": None, "native_estimate_usd": 0, "duration_seconds": 3},
+            },
+            "decisions": [{"run_id": "r2", "decision": "accept", "review_minutes": 2}],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            (directory / "task.json").write_text(json.dumps(state))
+            (directory / "runs" / "r1").mkdir(parents=True)
+            (directory / "runs" / "r1" / "brief.md").write_text("brief one")
+            # reverify creates runs/r2 without brief.md
+            (directory / "runs" / "r2" / "artifacts").mkdir(parents=True)
+            cost = TELEMETRY.task_outcome_cost(directory)
+        self.assertEqual(cost["attempts"], {"total": 1, "retries": 0, "settled": 1})
+        self.assertEqual(cost["api_reference_estimate_usd"], 0.42)
+        self.assertEqual(cost["native_estimate_usd"], 0.31)
+        self.assertEqual(cost["duration_seconds"], 95.0)
+        self.assertEqual(cost["context_transfer_bytes"], float(len("brief one")))
+        self.assertEqual(cost["missing"], [])
+
+    def test_summarize_runs_excludes_host_checks_transport(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runs = Path(temporary)
+            for name, payload in (
+                (
+                    "llm-run",
+                    {
+                        "task_archetype": "debug-invariants",
+                        "engine": "codex",
+                        "model": "gpt-6-sol",
+                        "effort": "high",
+                        "status": "COMPLETE",
+                    },
+                ),
+                (
+                    "reverify-run",
+                    {
+                        "task_archetype": "debug-invariants",
+                        "engine": "codex",
+                        "model": "gpt-6-sol",
+                        "effort": "high",
+                        "status": "FAILED",
+                        "transport": "host_checks",
+                    },
+                ),
+            ):
+                (runs / name).mkdir()
+                (runs / name / "result.json").write_text(json.dumps(payload), encoding="utf-8")
+            summary = TELEMETRY.summarize_runs(runs)
+        group = summary["groups"][0]
+        self.assertEqual(group["runs"], 2)
+        self.assertEqual(group["quality_runs"], 1)
+        self.assertEqual(group["accepted_runs"], 1)
+        self.assertEqual(group["accepted_rate"], 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()

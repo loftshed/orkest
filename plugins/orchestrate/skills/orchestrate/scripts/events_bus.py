@@ -130,7 +130,7 @@ def _merge_completion_event(event_path: Path, fields: dict[str, Any], *, initial
         try:
             current = read_completion_event(event_path) or {}
             current.pop("event_path", None)
-            acknowledged_at = current.get("acknowledged_at")
+            acknowledged_at = current.get("acknowledged_at") or fields.get("acknowledged_at")
             payload = {**fields, **current} if initial else {**current, **fields}
             if acknowledged_at is not None:
                 payload["acknowledged_at"] = acknowledged_at

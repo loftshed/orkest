@@ -39,6 +39,8 @@ function status() {
     generatedAt: "2026-11-18T06:00:00.000Z",
     machine: "kahuna",
     chief: {
+      schema: "ork.chief.v1",
+      live: true,
       session: "chief-session-1",
       name: "Ork Chief",
       engine: "claude",
@@ -369,18 +371,97 @@ describe("single-room chief hint", () => {
     expect(text(baseline.render(100))).not.toContain("★");
   });
 
-  it("marks a room view with ★ chief, and the Chief's own room as its desk", () => {
+  it("marks a room view with ★ chief, and the Chief's own room as its desk via liveChief only", () => {
     const other = new HordeView(
-      { ...room(), chief: { session: "someone-else" } },
+      { ...room(), liveChief: { schema: "ork.chief.v1", live: true, session: "someone-else" } },
       { now: () => 5000, tier: "unicode" },
     );
     expect(text(other.render(100))).toContain("★ chief");
     expect(text(other.render(100))).not.toContain("chief desk");
     const desk = new HordeView(
-      { ...room(), chief: { session: "coord-session" } },
+      { ...room(), liveChief: { schema: "ork.chief.v1", live: true, session: "coord-session" } },
       { now: () => 5000, tier: "ascii" },
     );
     expect(text(desk.render(100))).toContain("* chief desk");
+
+    const mailboxDeskRoom = room();
+    delete mailboxDeskRoom.conductor.session;
+    mailboxDeskRoom.conductor.mailboxSession = "chief-desk-mailbox";
+    mailboxDeskRoom.liveChief = {
+      schema: "ork.chief.v1",
+      live: true,
+      session: "chief-desk-mailbox",
+    };
+    expect(
+      text(new HordeView(mailboxDeskRoom, { now: () => 5000, tier: "ascii" }).render(100)),
+    ).toContain("* chief desk");
+
+    const missionMetadataOnly = new HordeView(
+      { ...room(), chief: { goal: "Mission metadata", state: "running" } },
+      { now: () => 5000, tier: "unicode" },
+    );
+    expect(text(missionMetadataOnly.render(100))).not.toContain("★ chief");
+  });
+
+  it("supports Orca pane targets and Herdr confirmClose / mouse-off hints in ChiefView", () => {
+    expect(
+      chiefPaneTarget({
+        id: "orca-only",
+        session: "sess-orca",
+        orcaTerminalHandle: "term_chief",
+        orcaPaneKey: "pane-chief",
+        orcaWorkspaceId: "ws-1",
+        orcaTabId: "tab-1",
+        orcaEnvironment: "ssh:box",
+      }),
+    ).toEqual({
+      id: "sess-orca",
+      name: "",
+      engine: "",
+      herdrPaneId: undefined,
+      herdrEndpoint: undefined,
+      orcaEnvironment: "ssh:box",
+      orcaPaneKey: "pane-chief",
+      orcaTabId: "tab-1",
+      orcaTerminalHandle: "term_chief",
+      orcaWorkspaceId: "ws-1",
+      paneId: undefined,
+      terminalServer: undefined,
+      session: { id: "sess-orca" },
+    });
+
+    let nowMs = 1000;
+    const chief = new ChiefView(status(), {
+      now: () => nowMs,
+      height: 28,
+      confirmClose: true,
+      mouseEnabled: true,
+      tier: "unicode",
+    });
+    expect(plain(chief.render(80).join("\n"))).toContain("Press q twice to close this pane");
+    expect(chief.handleKey("q")).toBe(true);
+    expect(chief.closeArmedAt).toBe(1000);
+    expect(chief.notice).toContain("Press q again");
+    // Non-q key disarms pending close.
+    expect(chief.handleKey("j")).toBe(true);
+    expect(chief.closeArmedAt).toBeUndefined();
+    expect(chief.handleKey("q")).toBe(true);
+    expect(chief.closeArmedAt).toBe(1000);
+    // Mouse button press also disarms pending close.
+    chief.handleMouse({ x: 0, y: 0, button: 0, action: "press" });
+    expect(chief.closeArmedAt).toBeUndefined();
+    expect(chief.handleKey("q")).toBe(true);
+    nowMs = 2000;
+    expect(chief.handleKey("q")).toEqual({ type: "close-view" });
+
+    chief.overlay = "help";
+    expect(plain(chief.render(80).join("\n"))).toContain("q twice");
+    chief.overlay = undefined;
+    chief.mouseEnabled = false;
+    chief.notice = "";
+    expect(plain(chief.render(80).join("\n"))).toContain(
+      "Mouse off (select/copy) — press m to re-enable mouse",
+    );
   });
 });
 

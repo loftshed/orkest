@@ -437,6 +437,96 @@ class SqliteSharedRoomTests(unittest.TestCase):
             room_store.rebind(base, "shared", "conductor", "new")
             self.assertFalse(mailbox.shares_swarm_room(base, {"session": "first"}, {"session": "second"}))
             self.assertTrue(mailbox.shares_swarm_room(base, {"session": "new"}, {"session": "second"}))
+            room_store.set_metadata(base, "shared", lifecycle="archived")
+            self.assertFalse(mailbox.shares_swarm_room(base, {"session": "new"}, {"session": "second"}))
+
+    def test_stale_env_swarm_room_falls_back_and_gemini_subagent_progress_locks_and_resolves(self):
+        import agent_progress
+        import mailbox_hooks
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            base = root / "mailbox-v1"
+            checkout = root / "checkout"
+            checkout.mkdir()
+            alias = root / "alias"
+            alias.symlink_to(checkout)
+            subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+            me = mailbox.register(base, session="coord-active", harness="claude", cwd=str(checkout), pid=os.getpid())
+            room_store.put_room(
+                base,
+                {
+                    "schema": "agent-executor.room.v1",
+                    "id": "archived-room",
+                    "lifecycle": "archived",
+                    "cwd": str(checkout),
+                    "swarm": {"maxAgents": 4, "maxDepth": 2},
+                    "conductor": {"engine": "claude", "session": {"id": "coord-active", "engine": "claude"}},
+                    "agents": [],
+                },
+            )
+            room_store.put_room(
+                base,
+                {
+                    "schema": "agent-executor.room.v1",
+                    "id": "active-room",
+                    "cwd": str(checkout),
+                    "objective": "Active room objective",
+                    "swarm": {"maxAgents": 4, "maxDepth": 2},
+                    "conductor": {"engine": "claude", "session": {"id": "coord-active", "engine": "claude"}},
+                    "agents": [{"id": "q1", "status": "queued"}],
+                },
+            )
+            with patch.dict(os.environ, {"ORKEST_SWARM_ROOM": "archived-room"}):
+                self.assertEqual(mailbox_hooks._active_env_swarm_room(base), "")
+                with patch.object(mailbox, "harness_pid", return_value=os.getpid()):
+                    notice = mailbox_hooks.swarm_coordinator_context(base, me, "SessionStart")
+                self.assertIn("active-room", notice)
+                me = mailbox.load(mailbox.peer_path(base, "coord-active"))
+                me["continuationRoom"] = "active-room"
+                requests = mailbox_hooks._continuation_at_stop(base, me)
+                self.assertEqual([r["room"] for r in requests], ["active-room"])
+
+            # Gemini subagent progress block locks prog_path, checks SCHEMA, and sets resolved checkout.
+            sub_sid = "gemini-sub-1"
+            sub_transcript = root / "sub-tr.jsonl"
+            sub_transcript.write_text(
+                json.dumps(
+                    {
+                        "type": "SYSTEM_MESSAGE",
+                        "content": "<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-18T00:00:00Z sender=coord-active priority=HIGH content=go",
+                    }
+                )
+                + "\n"
+            )
+            locked_paths = []
+            original_locked = mailbox_hooks._MB.locked
+
+            def recording(path):
+                locked_paths.append(Path(path))
+                return original_locked(path)
+
+            with (
+                patch.dict(os.environ, {}, clear=True),
+                patch.object(mailbox, "harness_pid", return_value=os.getpid()),
+                patch.object(mailbox_hooks._MB, "locked", side_effect=recording),
+            ):
+                mailbox.hook(
+                    {
+                        "conversationId": sub_sid,
+                        "invocationNum": 1,
+                        "workspacePaths": [str(alias)],
+                        "transcriptPath": str(sub_transcript),
+                    },
+                    event="PreInvocation",
+                    harness="gemini",
+                    base=base,
+                )
+            prog_path = agent_progress.record_path(base, sub_sid)
+            self.assertIn(prog_path, locked_paths)
+            saved_prog = json.loads(prog_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved_prog["schema"], agent_progress.SCHEMA)
+            self.assertEqual(saved_prog["checkout"], str(checkout))
 
 
 class AntigravityOrchestratorHookTests(unittest.TestCase):

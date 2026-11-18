@@ -21,6 +21,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import re
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -91,9 +92,45 @@ def input_revision(task_spec: Any, *extra: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()[:16]
 
 
-def request_key(room: str | None, task_dir: str | None, generation: Any, revision: str) -> str:
-    material = json.dumps([room, task_dir, generation, revision], sort_keys=True)
+def request_key(
+    room: str | None, task_dir: str | None, generation: Any, revision: str, run_id: str | None = None
+) -> str:
+    material_parts: list[Any] = [room, task_dir, generation, revision]
+    if run_id is not None:
+        material_parts.append(run_id)
+    material = json.dumps(material_parts, sort_keys=True)
     return "cont-" + hashlib.sha256(material.encode()).hexdigest()[:24]
+
+
+def _team_authority(base: Path, room: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(room, dict):
+        return None
+    team = room.get("authority")
+    if not isinstance(team, str) or not team:
+        return None
+    import authority
+
+    if not re.fullmatch(authority.TEAM, team):
+        return None
+    with contextlib.suppress(authority.AuthorityError, OSError, ValueError):
+        local_dir = base.parent / "authority-v1" / team
+        if (local_dir / "authority.json").is_file():
+            return authority.load(local_dir)
+        return authority.load(authority.team_dir(team))
+    return None
+
+
+def _queued_members(room: dict[str, Any]) -> list[str]:
+    return sorted(
+        member["id"]
+        for member in room.get("agents") or []
+        if isinstance(member, dict)
+        and member.get("status") == "queued"
+        and not member.get("dispatch")
+        and not member.get("paused")
+        and member.get("role") != "lead"
+        and isinstance(member.get("id"), str)
+    )
 
 
 def _empty() -> dict[str, Any]:
@@ -149,6 +186,7 @@ def request(
     task_id: str | None = None,
     member: str | None = None,
     generation: Any = None,
+    run_id: str | None = None,
     owner: dict[str, Any] | None = None,
     deadline: str | None = None,
     moment: dt.datetime | None = None,
@@ -158,7 +196,7 @@ def request(
         raise ValueError(f"continuation reason must be one of {', '.join(REASONS)}")
     if not room and not task_dir:
         raise ValueError("a continuation request needs a room or a task")
-    key = request_key(room, task_dir, generation, revision)
+    key = request_key(room, task_dir, generation, revision, run_id=run_id)
     stamp = mailbox.stamp(_now(moment))
     with _store(base) as requests:
         existing = requests.get(key)
@@ -188,6 +226,7 @@ def request(
             "member": member,
             "task_dir": task_dir,
             "task_id": task_id,
+            "run_id": run_id,
             "authority_generation": generation,
             "input_revision": revision,
             "reasons": [reason],
@@ -216,6 +255,16 @@ def _room_stop(base: Path, entry: dict[str, Any]) -> tuple[str, str] | None:
             return "cancelled", "the room was cancelled"
         if lifecycle == "archived":
             return "paused", "the room is archived; new dispatch is closed"
+        auth = _team_authority(base, room)
+        if isinstance(auth, dict):
+            if auth.get("status") == "withdrawn":
+                return "cancelled", "team authority was withdrawn"
+            if (
+                entry.get("authority_generation") is not None
+                and auth.get("generation") is not None
+                and auth.get("generation") != entry["authority_generation"]
+            ):
+                return "superseded", "the team authority generation changed"
         members = {member.get("id"): member for member in room.get("agents") or [] if isinstance(member, dict)}
         current: str | None = entry.get("member")
         if (room.get("conductor") or {}).get("paused"):
@@ -250,6 +299,15 @@ def _room_stop(base: Path, entry: dict[str, Any]) -> tuple[str, str] | None:
     return None
 
 
+def _active_room_owners(room: dict[str, Any]) -> list[str]:
+    conductor = room.get("conductor") or {}
+    if not isinstance(conductor, dict):
+        return []
+    current_id = (conductor.get("session") or {}).get("id") if isinstance(conductor.get("session"), dict) else None
+    former = set(conductor.get("previousSessions") or []) - {current_id}
+    return [sid for sid in mailbox.room_owner_sessions(room, conductor) if sid not in former]
+
+
 def reserve(
     base: Path,
     key: str,
@@ -269,6 +327,20 @@ def reserve(
             if entry.get("reserved_by") == session and entry["status"] in OPEN_STATES:
                 return dict(entry)
             raise ValueError(f"continuation request is {entry['status']}; it cannot be reserved again")
+        room = room_store.read_room(base, entry["room"]) if entry.get("room") else None
+        auth = _team_authority(base, room)
+        if isinstance(auth, dict) and auth.get("status") == "active":
+            lead_session = (auth.get("lead") or {}).get("session")
+            if isinstance(lead_session, str) and lead_session and session != lead_session:
+                raise ValueError("session is not the current owner/lead for this continuation request")
+        else:
+            allowed_owners = _active_room_owners(room) if isinstance(room, dict) else []
+            if not allowed_owners and isinstance(entry.get("owner"), dict):
+                owner_session = entry["owner"].get("session")
+                if isinstance(owner_session, str) and owner_session:
+                    allowed_owners = [owner_session]
+            if allowed_owners and session not in allowed_owners:
+                raise ValueError("session is not the current owner/lead for this continuation request")
         stop = check(base, entry)
         if stop:
             entry.update(status=stop[0], stop_reason=stop[1], updated_at=stamp)
@@ -301,9 +373,24 @@ def cancel(base: Path, key: str, reason: str, *, moment: dt.datetime | None = No
         return dict(entry)
 
 
-def _run_state(entry: dict[str, Any]) -> tuple[str, str | None] | None:
+def _run_state(base: Path, entry: dict[str, Any]) -> tuple[str, str | None] | None:
     """Progress of a reserved request from its task record, by the dispatch request it bound."""
     if not entry.get("task_dir"):
+        if not entry.get("room"):
+            return None
+        room = room_store.read_room(base, entry["room"])
+        if not isinstance(room, dict) or not room_store.is_active_room(room):
+            return "cancelled", "the room is no longer active"
+        queued = _queued_members(room)
+        if not queued:
+            return "completed", None
+        if input_revision(queued) != entry.get("input_revision"):
+            if any(
+                isinstance(member, dict) and member.get("role") != "lead" and member.get("dispatch")
+                for member in room.get("agents") or []
+            ):
+                return "completed", None
+            return "superseded", "queued members changed"
         return None
     task = mailbox.load(Path(entry["task_dir"]) / "task.json")
     if not isinstance(task, dict):
@@ -361,7 +448,14 @@ def reconcile(base: Path, *, moment: dt.datetime | None = None) -> list[dict[str
                     entry.update(status="requested", stop_reason=None, next_attempt_at=stamp, updated_at=stamp)
                     outcomes.append({"key": entry["key"], "status": "requested"})
                 continue
-            progress = _run_state(entry)
+            if not entry.get("task_dir"):
+                stop = _room_stop(base, entry)
+                if stop:
+                    if stop[0] != status:
+                        entry.update(status=stop[0], stop_reason=stop[1], updated_at=stamp)
+                        outcomes.append({"key": entry["key"], "status": stop[0], "reason": stop[1]})
+                    continue
+            progress = _run_state(base, entry)
             if progress is None:
                 reserved = _parse(entry.get("reserved_at"))
                 if status == "reserved" and reserved and moment - reserved > RESERVATION_TTL:
@@ -381,17 +475,29 @@ def reconcile(base: Path, *, moment: dt.datetime | None = None) -> list[dict[str
     return outcomes
 
 
+def _live_peer(base: Path, session: str | None) -> dict[str, Any] | None:
+    if not isinstance(session, str) or not session:
+        return None
+    peer = mailbox.load(mailbox.peer_path(base, session))
+    if mailbox.valid_peer(peer) and not mailbox.is_run_peer(peer) and mailbox.is_live(peer):
+        return peer
+    return None
+
+
 def _owner_peer(base: Path, entry: dict[str, Any]) -> dict[str, Any] | None:
+    room = room_store.read_room(base, entry["room"]) if entry.get("room") else None
+    auth = _team_authority(base, room)
+    if isinstance(auth, dict) and auth.get("status") == "active":
+        lead_session = (auth.get("lead") or {}).get("session")
+        if isinstance(lead_session, str) and lead_session:
+            return _live_peer(base, lead_session)
     sessions: list[str] = []
+    if isinstance(room, dict):
+        sessions.extend(_active_room_owners(room) or mailbox.room_owner_sessions(room, room.get("conductor") or {}))
     if isinstance(entry.get("owner"), dict) and isinstance(entry["owner"].get("session"), str):
         sessions.append(entry["owner"]["session"])
-    if entry.get("room"):
-        room = room_store.read_room(base, entry["room"])
-        if isinstance(room, dict):
-            sessions.extend(mailbox.room_owner_sessions(room, room.get("conductor") or {}))
     for session in dict.fromkeys(sessions):
-        peer = mailbox.load(mailbox.peer_path(base, session)) if isinstance(session, str) else None
-        if mailbox.valid_peer(peer) and not mailbox.is_run_peer(peer) and mailbox.is_live(peer):
+        if peer := _live_peer(base, session):
             return peer
     return None
 
@@ -512,12 +618,17 @@ def for_room(base: Path, room: str) -> list[dict[str, Any]]:
 
 
 def _room_for_task(base: Path, task_dir: str) -> tuple[dict[str, Any], str] | None:
+    inactive_match: tuple[dict[str, Any], str] | None = None
     with contextlib.suppress(OSError, ValueError):
         for room in room_store.list_rooms(base):
             for member in room.get("agents") or []:
                 if isinstance(member, dict) and (member.get("dispatch") or {}).get("taskDir") == task_dir:
-                    return room, member["id"]
-    return None
+                    match = (room, member["id"])
+                    if room_store.is_active_room(room):
+                        return match
+                    if inactive_match is None:
+                        inactive_match = match
+    return inactive_match
 
 
 def request_for_terminal(base: Path, directory: Path, state: dict[str, Any], run: dict[str, Any]) -> dict | None:
@@ -527,14 +638,20 @@ def request_for_terminal(base: Path, directory: Path, state: dict[str, Any], run
     # Only a room names the coordinator that owns the turn; archived rooms take no new continuation.
     if not found or not room_store.is_active_room(found[0]):
         return None
-    room, member = found[0].get("id"), found[1]
+    room_dict, member = found[0], found[1]
+    generation = run.get("generation")
+    if generation is None:
+        auth = _team_authority(base, room_dict)
+        if isinstance(auth, dict):
+            generation = auth.get("generation")
     created, _ = request(
         base,
-        room=room,
+        room=room_dict.get("id"),
         member=member,
         task_dir=task_dir,
         task_id=state.get("task_id"),
-        generation=run.get("generation"),
+        generation=generation,
+        run_id=run.get("run_id"),
         revision=input_revision(state.get("task_spec")),
         reason="worker_terminal",
         deadline=state.get("deadline"),
@@ -547,18 +664,19 @@ def request_at_stop(base: Path, me: dict[str, Any], room: dict[str, Any]) -> lis
     if not room_store.is_active_room(room) or (room.get("conductor") or {}).get("paused"):
         return []
     owner = {"session": me.get("session"), "harness": me.get("harness")}
+    auth = _team_authority(base, room)
+    team_generation = auth.get("generation") if isinstance(auth, dict) else None
     created = []
-    queued = sorted(
-        member["id"]
-        for member in room.get("agents") or []
-        if isinstance(member, dict)
-        and member.get("status") == "queued"
-        and not member.get("dispatch")
-        and not member.get("paused")
-        and member.get("role") != "lead"
-    )
+    queued = _queued_members(room)
     if queued:
-        entry, _ = request(base, room=room["id"], revision=input_revision(queued), reason="stop", owner=owner)
+        entry, _ = request(
+            base,
+            room=room["id"],
+            generation=team_generation,
+            revision=input_revision(queued),
+            reason="stop",
+            owner=owner,
+        )
         if entry:
             created.append(entry)
     for member in room.get("agents") or []:
@@ -571,13 +689,18 @@ def request_at_stop(base: Path, me: dict[str, Any], room: dict[str, Any]) -> lis
         runs = [run for run in task.get("runs") or [] if isinstance(run, dict)]
         decided = {decision.get("run_id") for decision in task.get("decisions") or []}
         if runs and runs[-1].get("status") == "finished" and runs[-1].get("run_id") not in decided:
+            latest_run = runs[-1]
+            generation = latest_run.get("generation")
+            if generation is None:
+                generation = team_generation
             entry, _ = request(
                 base,
                 room=room["id"],
                 member=member["id"],
                 task_dir=dispatch["taskDir"],
                 task_id=task.get("task_id"),
-                generation=runs[-1].get("generation"),
+                generation=generation,
+                run_id=latest_run.get("run_id"),
                 revision=input_revision(task.get("task_spec")),
                 reason="stop",
                 owner=owner,

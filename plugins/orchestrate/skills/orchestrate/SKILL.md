@@ -36,8 +36,11 @@ and verification without an AI session. See [references/mailbox.md](references/m
 delivery behavior and hosts without turn hooks.
 
 Pass `--trust-orkest-commands` to setup only when the user asks to stop harness prompts for Orkest
-commands. It approves listed `ork` subcommands and four Orkest scripts in every harness. It never
-grants `--allow-credits` consent and never approves generic shell.
+commands. It approves listed `ork` subcommands (including `chief`, `horde --chief`, `policy show`,
+and `setup --dry-run`) and listed Orkest coordination scripts (with read/accept scoping on
+`authority.py` and `handoff.py`) in every harness. `run_agent.py` still enforces `credits.allow=false`
+in `config.json` across all harnesses, while Claude Code and OpenCode also re-prompt on
+`--allow-credits`, `--ignore-quota`, and `--trust-codex-hooks`; generic shell stays prompted.
 
 Mailbox `send` also tries to wake an idle Codex daemon or OpenCode v2 session through its native
 queue. For a persistent Claude or Gemini/Antigravity worker that must wake autonomously, launch

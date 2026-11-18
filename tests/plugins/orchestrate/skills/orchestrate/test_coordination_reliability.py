@@ -120,6 +120,21 @@ class RoomStoreReaderTests(Scratch):
         room_store.delete_room(self.base, "room-a")
         self.assertEqual(json.loads(index.read_text(encoding="utf-8"))["rooms"], [])
 
+    def test_racy_ns_guard_bypasses_cache_within_2s_and_trusts_cache_afterward(self):
+        room_store.put_room(self.base, canonical_room("room-racy", "sess-r", self.home, title="Initial"))
+        room_store._CACHE.clear()
+        room_store.list_rooms(self.base)
+        # Within 2s (_RACY_NS), cache trust is bypassed and SQLite is re-read.
+        with mock.patch.object(room_store, "_direct_rows", wraps=room_store._direct_rows) as direct_spy:
+            self.assertEqual(room_store.read_room(self.base, "room-racy")["title"], "Initial")
+            self.assertEqual(direct_spy.call_count, 1)
+            # Once > 2s past file mtime/ctime, _CACHE read trust kicks in and avoids re-reading SQLite.
+            future_ns = time.time_ns() + room_store._RACY_NS + 1_000_000_000
+            with mock.patch.object(room_store.time, "time_ns", return_value=future_ns):
+                self.assertEqual(room_store.read_room(self.base, "room-racy")["title"], "Initial")
+                self.assertEqual(room_store.list_rooms(self.base)[0]["title"], "Initial")
+            self.assertEqual(direct_spy.call_count, 1)
+
 
 class LockIdentityTests(Scratch):
     def test_a_waiter_on_an_unlinked_lock_moves_to_the_inode_at_the_path(self):
@@ -191,6 +206,23 @@ class LockIdentityTests(Scratch):
         self.assertTrue(done.is_set())
         self.assertFalse(path.exists())
 
+    def test_acquire_lock_recreates_deleted_parent_directory(self):
+        lock_path = self.base / "inbox" / "ephemeral-session" / "msg.lock"
+        calls = {"n": 0}
+        real_open = os.open
+
+        def flaky_open(path, flags, mode=0o777):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise FileNotFoundError("reaped parent")
+            return real_open(path, flags, mode)
+
+        with mock.patch.object(mailbox_store.os, "open", side_effect=flaky_open):
+            fd = mailbox_store.acquire_lock(lock_path)
+            os.close(fd)
+        self.assertGreaterEqual(calls["n"], 2)
+        self.assertTrue(lock_path.is_file())
+
 
 class DeliveryTests(unittest.TestCase):
     def setUp(self):
@@ -242,6 +274,14 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(
             self.events.merge_deliveries([sent], [{"kind": "hook", "status": "failed", "path": "/a"}]), [sent]
         )
+
+    def test_merge_completion_event_preserves_acknowledged_at_from_fields_when_current_is_none(self):
+        self.publish()
+        merged = self.events._merge_completion_event(
+            self.path, {"acknowledged_at": "2026-11-18T12:00:00Z"}, initial=True
+        )
+        self.assertEqual(merged["acknowledged_at"], "2026-11-18T12:00:00Z")
+        self.assertEqual(self.events.read_completion_event(self.path)["acknowledged_at"], "2026-11-18T12:00:00Z")
 
 
 class LivenessParityTests(Scratch):

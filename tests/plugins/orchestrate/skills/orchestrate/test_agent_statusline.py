@@ -659,6 +659,28 @@ class RoomStoreTests(unittest.TestCase):
             os.utime(db_path, ns=(before.st_atime_ns, before.st_mtime_ns))
             self.assertEqual(room_store.read_room(base, "alpha")["title"], "Updated!")
 
+    def test_orca_toggle_swarm_view_forwards_chief_flag(self):
+        import orca_swarm_restore
+
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary) / "mailbox-v1"
+            base.mkdir(parents=True, exist_ok=True)
+            with mock.patch.dict(
+                os.environ,
+                {"HERDR_ENV": "0", "ORCA_PANE_KEY": "pane-1", "ORCA_TERMINAL_HANDLE": "term_1"},
+                clear=True,
+            ):
+                with mock.patch.object(orca_swarm_restore, "toggle", return_value={"status": "opened"}) as mocked:
+                    result = tmux.toggle_swarm_view(
+                        "open",
+                        room=None,
+                        session_id="chief-1",
+                        base=base,
+                        chief=True,
+                    )
+            self.assertEqual(result["status"], "opened")
+            self.assertTrue(mocked.call_args.kwargs["chief"])
+
 
 if __name__ == "__main__":
     unittest.main()

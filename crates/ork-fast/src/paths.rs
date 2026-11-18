@@ -413,7 +413,32 @@ fn status_is_closed(status: Option<&serde_json::Value>) -> bool {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    matches!(status.as_str(), "closed" | "archived" | "completed")
+    matches!(
+        status.as_str(),
+        "closed" | "archived" | "completed" | "cancelled"
+    )
+}
+
+fn room_is_closed(room: &serde_json::Value) -> bool {
+    if room
+        .get("closed")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    if room.get("closedAt").is_some_and(|v| !v.is_null()) {
+        return true;
+    }
+    if let Some(lifecycle) = room.get("lifecycle").and_then(|v| v.as_str())
+        && matches!(
+            lifecycle.to_ascii_lowercase().as_str(),
+            "archived" | "cancelled"
+        )
+    {
+        return true;
+    }
+    status_is_closed(room.get("status"))
 }
 
 /// `Some(answer)` from a valid rooms index, `None` when it is missing or unreadable.
@@ -425,11 +450,7 @@ fn index_has_active_session(base: &Path, session: &str) -> Option<bool> {
     }
     let rooms = index.get("rooms")?.as_array()?;
     for room in rooms {
-        let closed = room
-            .get("closed")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-        if closed {
+        if room_is_closed(room) {
             continue;
         }
         let Some(sessions) = room.get("sessions").and_then(|v| v.as_array()) else {
@@ -461,8 +482,7 @@ fn legacy_room_references_session(base: &Path, session: &str) -> bool {
             continue;
         }
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content)
-            && val.get("closedAt").is_none_or(serde_json::Value::is_null)
-            && !status_is_closed(val.get("status"))
+            && !room_is_closed(&val)
         {
             return true;
         }
@@ -472,9 +492,10 @@ fn legacy_room_references_session(base: &Path, session: &str) -> bool {
 
 /// Return true if a team record under `<cache>/authority-v1/*/authority.json` gives `session` a role the
 /// Python hook acts on (`mailbox_hooks.succession_notice`, `handoff.find_team`): the lead of an active or
-/// pending team, or the deputy of an active one, named by session or (when no session is named) by harness,
-/// since the deputy's account and repository are only known to Python. A record that is unreadable or of
-/// another schema is skipped, as `authority.load` refuses it there.
+/// pending team, an active planned handover offeree (`offer.to.session`), or the deputy of an active team,
+/// named by session or (when no session is named) by harness, since the deputy's account and repository are
+/// only known to Python. A record that is unreadable or of another schema is skipped, as `authority.load`
+/// refuses it there.
 #[must_use]
 pub fn has_active_authority_for_session(cache: &Path, session: &str, harness: &str) -> bool {
     let Ok(entries) = fs::read_dir(cache.join("authority-v1")) else {
@@ -500,6 +521,15 @@ pub fn has_active_authority_for_session(cache: &Path, session: &str, harness: &s
         }
         if status != "active" {
             continue;
+        }
+        if record
+            .get("offer")
+            .and_then(|o| o.get("to"))
+            .and_then(|t| t.get("session"))
+            .and_then(serde_json::Value::as_str)
+            == Some(session)
+        {
+            return true;
         }
         let Some(deputy) = record.get("deputy").and_then(|v| v.as_object()) else {
             continue;
@@ -658,6 +688,16 @@ mod tests {
             "d",
             &serde_json::json!({"schema": "other", "status": "active", "lead": {"session": "wrong"}}),
         );
+        write(
+            "f",
+            &serde_json::json!({"schema": schema, "status": "active", "lead": {"session": "lead-f"},
+                "offer": {"to": {"session": "offeree-only", "harness": "claude"}}}),
+        );
+        write(
+            "g",
+            &serde_json::json!({"schema": schema, "status": "pending", "lead": {"session": "lead-g"},
+                "offer": {"to": {"session": "pending-offeree", "harness": "claude"}}}),
+        );
         fs::create_dir_all(cache.join("authority-v1").join("e")).unwrap();
         fs::write(cache.join("authority-v1/e/authority.json"), "{not json").unwrap();
         assert!(has_active_authority_for_session(&cache, "lead", "claude"));
@@ -666,6 +706,16 @@ mod tests {
         assert!(!has_active_authority_for_session(
             &cache,
             "pending-dep",
+            "claude"
+        ));
+        assert!(has_active_authority_for_session(
+            &cache,
+            "offeree-only",
+            "claude"
+        ));
+        assert!(!has_active_authority_for_session(
+            &cache,
+            "pending-offeree",
             "claude"
         ));
         assert!(has_active_authority_for_session(&cache, "anyone", "gemini"));
@@ -691,11 +741,17 @@ mod tests {
             dir.join("rooms-index.json"),
             r#"{"schema":"orkest.rooms-index.v1","rooms":[
               {"id":"open","closed":false,"sessions":["session-open"]},
-              {"id":"done","closed":true,"sessions":["session-closed"]}]}"#,
+              {"id":"done","closed":true,"sessions":["session-closed"]},
+              {"id":"arch","closed":false,"lifecycle":"archived","sessions":["session-archived"]},
+              {"id":"canc-lc","closed":false,"lifecycle":"cancelled","sessions":["session-cancelled-lc"]},
+              {"id":"canc-st","closed":false,"status":"cancelled","sessions":["session-cancelled-st"]}]}"#,
         )
         .unwrap();
         assert!(has_active_room_for_session(&dir, "session-open"));
         assert!(!has_active_room_for_session(&dir, "session-closed"));
+        assert!(!has_active_room_for_session(&dir, "session-archived"));
+        assert!(!has_active_room_for_session(&dir, "session-cancelled-lc"));
+        assert!(!has_active_room_for_session(&dir, "session-cancelled-st"));
         assert!(!has_active_room_for_session(&dir, "session-other"));
         assert!(!has_active_room_for_session(&dir, "session"));
         let _ = fs::remove_dir_all(&dir);
@@ -737,12 +793,24 @@ mod tests {
         )
         .unwrap();
         fs::write(
+            dir.join("rooms/c.json"),
+            r#"{"id":"c","lifecycle":"archived","agents":[{"session":{"id":"session-legacy-arch"}}]}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("rooms/d.json"),
+            r#"{"id":"d","status":"cancelled","agents":[{"session":{"id":"session-legacy-canc"}}]}"#,
+        )
+        .unwrap();
+        fs::write(
             dir.join("rooms-index.json"),
             r#"{"schema":"orkest.rooms-index.v1","rooms":[]}"#,
         )
         .unwrap();
         assert!(has_active_room_for_session(&dir, "session-legacy"));
         assert!(!has_active_room_for_session(&dir, "session-closed"));
+        assert!(!has_active_room_for_session(&dir, "session-legacy-arch"));
+        assert!(!has_active_room_for_session(&dir, "session-legacy-canc"));
         let _ = fs::remove_dir_all(&dir);
     }
 }

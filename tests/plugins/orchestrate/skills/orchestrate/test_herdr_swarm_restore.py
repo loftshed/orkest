@@ -1,8 +1,10 @@
 """Herdr cold restore preserves display placement without treating arbitrary panes as owned."""
 
+import datetime
 import json
 import os
 import shlex
+import socket
 import subprocess
 import sys
 import tempfile
@@ -13,6 +15,10 @@ from unittest import mock
 SCRIPTS = Path(__file__).resolve().parents[5] / "plugins/orchestrate/skills/orchestrate/scripts"
 sys.path.insert(0, str(SCRIPTS))
 import herdr_swarm_restore as views  # noqa: E402
+import orca_context  # noqa: E402
+import orca_swarm_restore  # noqa: E402
+import peer_mailbox as mailbox  # noqa: E402
+import room_store  # noqa: E402
 
 
 class FakeHerdr:
@@ -389,12 +395,141 @@ class ChiefSessionTests(unittest.TestCase):
     def test_dead_or_malformed_chief_json_is_ignored(self):
         dead = subprocess.Popen([sys.executable, "-c", "pass"])
         dead.wait()
-        self.write({"session": "chief-1", "pid": dead.pid})
+        self.write({"schema": "ork.chief.v1", "session": "chief-1", "pid": dead.pid})
         self.assertIsNone(self.tmux._chief_session(self.base))
         (self.base / "chief.json").write_text("{not json")
         self.assertIsNone(self.tmux._chief_session(self.base))
         self.write({"session": "   "})
         self.assertIsNone(self.tmux._chief_session(self.base))
+
+    def test_chief_session_validates_machine_pid_birth_and_bound_at_grace(self):
+        # Foreign machine is never treated as local Chief.
+        self.write(
+            {
+                "schema": "ork.chief.v1",
+                "session": "chief-remote",
+                "machine": "remote-host-other",
+                "pid": os.getpid(),
+            }
+        )
+        self.assertIsNone(self.tmux._chief_session(self.base))
+
+        # Recycled PID (mismatched pidBirth) with no live peer is rejected.
+        self.write(
+            {
+                "schema": "ork.chief.v1",
+                "session": "chief-recycled",
+                "machine": socket.gethostname(),
+                "pid": os.getpid(),
+                "pidBirth": "1999-01-01T00:00:00Z",
+            }
+        )
+        self.assertIsNone(self.tmux._chief_session(self.base))
+
+        # Unverified binding without PID/peer is trusted within 10m boundAt grace, rejected after.
+        now = datetime.datetime.now(datetime.UTC)
+        self.write(
+            {
+                "schema": "ork.chief.v1",
+                "session": "chief-fresh",
+                "boundAt": (now - datetime.timedelta(seconds=60)).isoformat().replace("+00:00", "Z"),
+            }
+        )
+        self.assertEqual(self.tmux._chief_session(self.base), "chief-fresh")
+        self.write(
+            {
+                "schema": "ork.chief.v1",
+                "session": "chief-expired",
+                "boundAt": (now - datetime.timedelta(minutes=20)).isoformat().replace("+00:00", "Z"),
+            }
+        )
+        self.assertIsNone(self.tmux._chief_session(self.base))
+
+
+class OrcaSwarmRestoreHardeningTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.home = Path(self.temp.name).resolve()
+        self.base = self.home / "mailbox-v1"
+        self.base.mkdir(parents=True, exist_ok=True)
+
+    def test_view_command_and_chief_toggle_without_room(self):
+        cmd_room = orca_swarm_restore.view_command("room-1", self.home / "state.json", chief=False)
+        self.assertIn("--attach-room room-1 --view", cmd_room)
+        self.assertNotIn("ORKEST_CHIEF_VIEW=1", cmd_room)
+
+        cmd_chief = orca_swarm_restore.view_command("", self.home / "chief.json", chief=True)
+        self.assertIn("ORKEST_CHIEF_VIEW=1", cmd_chief)
+        self.assertIn("--view --chief", cmd_chief)
+        self.assertNotIn("--attach-room", cmd_chief)
+
+        live = {"term_coord"}
+
+        def run(command, **kwargs):
+            verb = command[2]
+            if verb == "list":
+                result = {"terminals": [{"handle": h} for h in sorted(live)]}
+            elif verb == "split":
+                live.add("term_chief_view")
+                result = {"split": {"handle": "term_chief_view"}}
+            elif verb == "close":
+                live.discard(command[command.index("--terminal") + 1])
+                result = {"close": {"handle": "term_chief_view"}}
+            else:
+                result = {}
+            return subprocess.CompletedProcess(command, 0, stdout=json.dumps({"result": result}), stderr="")
+
+        env = {
+            **os.environ,
+            "HOME": str(self.home),
+            "ORCHESTRATE_HOME": str(self.home),
+            "ORCA_PANE_KEY": "pane-chief",
+            "ORCA_TERMINAL_HANDLE": "term_coord",
+        }
+        with mock.patch.object(orca_context, "resolve_cli", return_value="/opt/orca/orca-ide"):
+            opened = orca_swarm_restore.toggle("toggle", base=self.base, chief=True, env=env, run=run)
+            self.assertEqual(opened["status"], "opened")
+            self.assertTrue(opened["chief"])
+            state = orca_context.load(orca_context.view_path(orca_swarm_restore.CHIEF_VIEW_KEY, self.home))
+            self.assertTrue(state["chief"])
+            self.assertEqual(state["room"], "")
+            live.discard("term_chief_view")
+            restored = orca_swarm_restore.restore(self.home, env=env, run=run)
+            self.assertEqual(restored, [{"room": "", "status": "restored", "chief": True}])
+
+    def test_peer_and_room_for_terminal_filter_stale_run_env_and_inactive_rooms(self):
+        mailbox.register(self.base, session="old-peer", harness="claude", cwd=str(self.home), pid=os.getpid())
+        mailbox.annotate(self.base, "old-peer", orcaTerminalHandle="term_1", orcaEnvironment="ssh:other")
+        mailbox.register(self.base, session="run-r1-worker", harness="claude", cwd=str(self.home), pid=os.getpid())
+        mailbox.annotate(self.base, "run-r1-worker", orcaTerminalHandle="term_1", run="r1")
+        mailbox.register(self.base, session="live-peer", harness="claude", cwd=str(self.home), pid=os.getpid())
+        mailbox.annotate(self.base, "live-peer", orcaTerminalHandle="term_1")
+        chosen = orca_swarm_restore._peer_for_terminal(self.base, "term_1", environment="")
+        self.assertEqual(chosen["session"], "live-peer")
+
+        room_store.put_room(
+            self.base,
+            {
+                "schema": "agent-executor.room.v1",
+                "id": "room-arch",
+                "lifecycle": "archived",
+                "archivedAt": 100,
+                "orcaCoordinatorTerminalId": "term_1",
+                "agents": [],
+            },
+        )
+        room_store.put_room(
+            self.base,
+            {
+                "schema": "agent-executor.room.v1",
+                "id": "room-active",
+                "lifecycle": "active",
+                "orcaCoordinatorTerminalId": "term_1",
+                "agents": [],
+            },
+        )
+        self.assertEqual(orca_swarm_restore._room_for_terminal(self.base, "term_1"), "room-active")
 
 
 if __name__ == "__main__":

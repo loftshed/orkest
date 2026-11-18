@@ -31,6 +31,7 @@ import os
 import re
 import secrets
 import shlex
+import socket
 import subprocess
 import sys
 import time
@@ -175,9 +176,10 @@ def settings() -> dict[str, Any]:
 def set_enabled(enabled: bool) -> dict[str, Any]:
     path = config_path()
     with locked(root()):  # one handoff writer at a time; the rest of the file is kept as read
-        current = load_json(path) or {}
-        if path.exists() and not current:
+        loaded = load_json(path)
+        if path.exists() and loaded is None:
             raise ValueError(f"{path} is not a JSON object; fix it by hand first")
+        current = loaded if loaded is not None else {}
         section = current.get("handoff") if isinstance(current.get("handoff"), dict) else {}
         current["handoff"] = {**section, "enabled": bool(enabled)}
         write_private(path, json.dumps(current, indent=2) + "\n")
@@ -217,7 +219,8 @@ def as_successor(peer: dict[str, Any] | None) -> dict[str, Any] | None:
     if not record:
         return None
     facts = {key: record.get(key) for key in ("harness", "model", "accountHome") if record.get(key)}
-    return {**facts, **(peer or {}), "session": name, "delegatedRun": None}
+    peer_session = peer.get("session") if peer and peer.get("session") else None
+    return {**facts, **(peer or {}), "peerSession": peer_session, "session": name, "delegatedRun": None}
 
 
 def leads_active_team(session: str) -> bool:
@@ -291,10 +294,12 @@ def record_exhaustion(
                     history.write(json.dumps(previous, sort_keys=True) + "\n")
                 os.chmod(directory / "history.jsonl", 0o600)
         peer = peer or {}
+        peer_session = peer.get("peerSession") if isinstance(peer.get("peerSession"), str) else None
         event = {
             "schema": SCHEMA,
             "id": secrets.token_hex(8),
             "session": session,
+            **({"peerSession": peer_session} if peer_session else {}),
             "name": peer.get("name"),
             "harness": harness,
             "reason": reason,
@@ -411,13 +416,26 @@ def git(directory: str | None, *args: str) -> str | None:
 def conducted_rooms(base: Path, session: str) -> list[dict[str, Any]]:
     """Rooms whose current conductor binding names this session (a session it was rebound from does not)."""
     found = []
+    store, m = module("room_store"), mailbox()
     with contextlib.suppress(Exception):
-        for room in module("room_store").list_rooms(base):
-            conductor = room.get("conductor") if isinstance(room, dict) else None
-            if not isinstance(conductor, dict):
+        for room in store.list_rooms(base):
+            if not isinstance(room, dict):
+                continue
+            if (
+                not store.is_active_room(room)
+                or room.get("closedAt")
+                or str(room.get("status") or "").lower() in {"archived", "closed", "completed", "cancelled"}
+            ):
+                continue
+            conductor = room.get("conductor")
+            if not isinstance(conductor, dict) or not isinstance(conductor.get("session"), (dict, type(None))):
+                continue
+            if conductor.get("session") and not m.local_session_binding(room, conductor):
+                continue
+            if room.get("machine") and not m.local_session_binding(room, conductor):
                 continue
             former = set(conductor.get("previousSessions") or []) - {(conductor.get("session") or {}).get("id")}
-            if session in mailbox().room_owner_sessions(room, conductor) and session not in former:
+            if session in m.room_owner_sessions(room, conductor) and session not in former:
                 found.append(room)
     return found
 
@@ -452,7 +470,8 @@ def room_tasks(room: dict[str, Any]) -> list[dict[str, Any]]:
 
 def build_note(event: dict[str, Any], *, base: Path, rooms: list[dict[str, Any]], team: dict[str, Any] | None) -> str:
     """What the successor needs, as recorded facts only: nothing here is written by a model."""
-    progress = mailbox().load(base / "progress" / f"{mailbox().session_key(event['session'])}.json") or {}
+    peer_session = event.get("peerSession") or event["session"]
+    progress = mailbox().load(base / "progress" / f"{mailbox().session_key(peer_session)}.json") or {}
     checkout = event.get("checkout")
     status = git(checkout, "status", "--short")
     status_lines = status.splitlines() if status is not None else None
@@ -875,11 +894,25 @@ def brief(event: dict[str, Any], note: str, team: str, generation: int, successo
 
 def deliver_peer(base: Path, event: dict[str, Any], successor: dict[str, Any], text: str) -> dict[str, Any]:
     m = mailbox()
-    sender = m.load(m.peer_path(base, event["session"])) or {}
+    peer_session = event.get("peerSession") or event["session"]
+    sender = m.load(m.peer_path(base, peer_session)) or {}
     if not sender.get("session"):
-        raise ValueError("the exhausted session's mailbox record is gone: cannot address the successor")
+        sender = {
+            "session": peer_session,
+            "harness": event.get("harness") or "claude",
+            "cwd": event.get("cwd") or os.getcwd(),
+            "pid": os.getpid(),
+            "machine": socket.gethostname(),
+        }
     result = m.send(
-        base, sender=sender, to=successor["session"], text=text, wake=True, idempotency_key=f"handoff-{event['id']}"
+        base,
+        sender=sender,
+        to=successor["session"],
+        text=text,
+        scope="cross-project",
+        wake=True,
+        idempotency_key=f"handoff-{event['id']}",
+        native_unreachable="automatic usage-exhaustion handoff",
     )
     wake = result.get("wake") or {}
     return {"message": result.get("id"), "wake": wake.get("status"), "wakeReason": wake.get("reason")}
@@ -1085,11 +1118,13 @@ def mark_taken_over(session: str, event_id: str, team: str, generation: int) -> 
             save_event(directory, current)
 
 
-def standing_wait(record: dict[str, Any], moment: dt.datetime) -> float:
+def standing_wait(record: dict[str, Any], moment: dt.datetime, *, peer_session: str | None = None) -> float:
     """Seconds until the lead has been quiet as long as the team's standing rule asks (StopFailure fires at
     once); 0 when it already has or the wait is too long to hold a handoff for."""
     seconds = (record.get("standing") or {}).get("seconds") or 0
-    peer = mailbox().load(mailbox().peer_path(mailbox().root(), record["lead"]["session"])) or {}
+    lead = record.get("lead") or {}
+    target_session = peer_session or lead.get("peerSession") or lead.get("session")
+    peer = mailbox().load(mailbox().peer_path(mailbox().root(), target_session)) or {} if target_session else {}
     seen = parse_time(peer.get("lastSeenAt"))
     if not seconds or seen is None:
         return 0
@@ -1202,17 +1237,20 @@ def handoff(
         tasks = list(
             dict.fromkeys([*((record or {}).get("tasks") or []), *(str(Path(task).resolve()) for task in fenced_tasks)])
         )
+        lead_entry = {**((record or {}).get("lead") or {})}
+        if event.get("peerSession"):
+            lead_entry["peerSession"] = event["peerSession"]
         if appointing:
             planned = {
                 **(record or {}),
                 "standing": AUTO_STANDING,
-                "lead": {**((record or {}).get("lead") or {}), "session": session, "pool": choice["pool"]},
+                "lead": {**lead_entry, "session": session, "pool": choice["pool"]},
                 "deputy": deputy,
                 "offer": None,
                 "tasks": tasks,
             }
         else:
-            planned = {**record, "tasks": tasks}
+            planned = {**record, "lead": lead_entry, "tasks": tasks}
         return successor, deputy, planned
 
     # A 429 can come before monitor sees the pool out: re-read it fresh a few times before calling it a burst.
@@ -1231,7 +1269,11 @@ def handoff(
             return final
         successor, deputy, planned = plan(choice)
         reasons, lead_status = s.monitor_evidence(planned, view=view, config=config, moment=s.now())
-        if reasons or waited or not (wait := standing_wait(planned, s.now())):
+        if (
+            reasons
+            or waited
+            or not (wait := standing_wait(planned, s.now(), peer_session=event.get("peerSession") or event["session"]))
+        ):
             break
         # The lead must be quiet a while first; whatever monitor and the peers said may change meanwhile.
         sleep(wait)

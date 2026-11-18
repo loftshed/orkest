@@ -536,8 +536,13 @@ function roomIndexSessions(room) {
 }
 
 export function isClosedRoom(room) {
+  const lifecycle = typeof room?.lifecycle === "string" ? room.lifecycle.toLowerCase() : "";
   const status = typeof room?.status === "string" ? room.status.toLowerCase() : "";
-  return Boolean(room?.closedAt) || ["archived", "closed", "completed"].includes(status);
+  return (
+    Boolean(room?.closedAt || room?.archivedAt || room?.cancelledAt) ||
+    ["archived", "cancelled"].includes(lifecycle) ||
+    ["archived", "cancelled", "closed", "completed"].includes(status)
+  );
 }
 
 export function roomsIndexEntry(room) {

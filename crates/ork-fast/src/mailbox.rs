@@ -1,11 +1,10 @@
 //! Mailbox hook fast path accelerator (<1.5 ms).
 //! Handles the ~95% trivial interactive turns and delegates the ~5% slow paths to python3.
 
-use std::ffi::CString;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::io::IntoRawFd;
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -203,16 +202,35 @@ fn same_inode(fd: libc::c_int, lock_path: &Path) -> bool {
 }
 
 pub(crate) fn lock_path_exclusive(lock_path: &Path) -> io::Result<FileLockGuard> {
-    let c_path = CString::new(lock_path.as_os_str().as_bytes())
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     for _ in 0..LOCK_ACQUIRE_ATTEMPTS {
-        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o600) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        let file = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC)
+            .open(lock_path)
+        {
+            Ok(file) => file,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                if let Some(parent) = lock_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+        let fd = file.into_raw_fd();
         let guard = FileLockGuard { fd };
-        if unsafe { libc::flock(fd, libc::LOCK_EX) } != 0 {
-            return Err(io::Error::last_os_error());
+        loop {
+            if unsafe { libc::flock(fd, libc::LOCK_EX) } == 0 {
+                break;
+            }
+            let err = io::Error::last_os_error();
+            if err.kind() != io::ErrorKind::Interrupted {
+                return Err(err);
+            }
         }
         // A pruner may have unlinked this inode while we waited; locking it would not exclude a
         // process that opens the new file at the same path.
@@ -584,6 +602,23 @@ mod tests {
             locked_inode, orphan,
             "the waiter must not stay on the unlinked inode"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_lock_sets_cloexec_and_recreates_missing_parent() {
+        let dir = std::env::temp_dir().join(format!("ork-fast-cloexec-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let lock_path = dir.join("nested").join("peer.lock");
+        let guard = lock_path_exclusive(&lock_path).unwrap();
+        let flags = unsafe { libc::fcntl(guard.fd, libc::F_GETFD) };
+        assert_ne!(flags, -1);
+        assert_ne!(
+            flags & libc::FD_CLOEXEC,
+            0,
+            "lock file descriptor must have O_CLOEXEC set"
+        );
+        drop(guard);
         let _ = fs::remove_dir_all(&dir);
     }
 }

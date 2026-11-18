@@ -100,9 +100,11 @@ ork progress --session wave-12 --goal "Wave 12" --task "Verifier B phase 2" --st
 The row lasts as long as the process that ran `focus`, and its status follows the reported stage.
 
 `ork rooms launch --room cache-review --plan /absolute/plan.json` dispatches a batch and stops at the
-first error; retry the same plan to recover recorded requests (add `--allow-credits` on `dispatch` or
-`"allowCredits": true` on a launch-plan member only with the user's explicit permission for Codex
-credit spend; it is not inherited by `continue`, and team rooms also require appointment `--allow-credits`):
+first error; retry the same plan to recover recorded requests (add `--allow-credits` on `dispatch`, or
+`"allowCredits": true` on a launch-plan member together with `ork rooms launch ... --allow-credits`,
+only with the user's explicit permission for Codex credit spend; `--allow-credits` on `launch` requires
+a plan member with `"allowCredits": true`, it is not inherited by `continue`, and team rooms also
+require appointment `--allow-credits`):
 
 ```json
 {

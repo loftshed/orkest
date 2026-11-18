@@ -909,6 +909,9 @@ describe("room CLI", () => {
         allowCredits: true,
       }),
     ).rejects.toThrow("--allow-credits applies to executor runs");
+    await expect(
+      roomsCommand(["show", "--room", room.id, "--allow-credits"], { stdout, root, run: record }),
+    ).rejects.toThrow("--allow-credits is only valid on dispatch or launch");
     const plan = path.join(taskDir, "credits-plan.json");
     await writeFile(plan, JSON.stringify({ members: [{ id: "luna-1", taskDir }] }));
     await expect(
@@ -917,9 +920,11 @@ describe("room CLI", () => {
         root,
         run: record,
       }),
-    ).rejects.toThrow("--allow-credits is only valid on dispatch");
+    ).rejects.toThrow(
+      "--allow-credits on launch requires a member in the launch plan with allowCredits: true",
+    );
 
-    // Launch plan rejects non-boolean strings and forwards allowCredits: true per member.
+    // Launch plan rejects non-boolean strings, requires --allow-credits when allowCredits: true, and forwards it.
     await roomsCommand(["add", "--room", room.id, "--team", "codex:sol"], { stdout, root });
     await writeFile(
       plan,
@@ -932,7 +937,10 @@ describe("room CLI", () => {
       plan,
       JSON.stringify({ members: [{ id: "sol-1", taskDir, allowCredits: true }] }),
     );
-    await roomsCommand(["launch", "--room", room.id, "--plan", plan], {
+    await expect(
+      roomsCommand(["launch", "--room", room.id, "--plan", plan], { stdout, root, run: record }),
+    ).rejects.toThrow("pass --allow-credits");
+    await roomsCommand(["launch", "--room", room.id, "--plan", plan, "--allow-credits"], {
       stdout,
       root,
       run: record,

@@ -1303,6 +1303,12 @@ def shares_swarm_room(base: Path, first: dict[str, Any], second: dict[str, Any])
         for room in room_store.list_rooms(base):
             if not isinstance(room, dict) or not isinstance(room.get("agents"), list):
                 continue
+            if (
+                not room_store.is_active_room(room)
+                or room.get("closedAt")
+                or str(room.get("status") or "").lower() in {"archived", "closed", "completed", "cancelled"}
+            ):
+                continue
             members: set[str] = set()
             for member in [room.get("conductor"), *room["agents"]]:
                 if not isinstance(member, dict):

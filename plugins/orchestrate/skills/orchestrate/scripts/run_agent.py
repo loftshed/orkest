@@ -601,6 +601,7 @@ def command_preview(command: list[str]) -> list[str]:
 
 
 def write_private_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
@@ -1878,6 +1879,10 @@ def doctor_main(argv: list[str] | None = None) -> int:
     messaging_check = None
     if args.trust_codex_hooks and not args.repair_messaging:
         parser.error("--trust-codex-hooks requires --repair-messaging")
+    if args.trust_codex_hooks and (
+        os.environ.get("ORKEST_DELEGATED_RUN") == "1" or os.environ.get("AGENT_EXECUTOR_RUN_ID")
+    ):
+        raise ValueError("delegated agent runs cannot self-trust Codex hooks")
     if args.repair_messaging:
         bundled_module("install_mailbox").install(trust_codex_hooks=args.trust_codex_hooks, stdio=args.stdio_messaging)
     elif args.stdio_messaging:
@@ -2821,6 +2826,8 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
                         final_output_path=final_output_path,
                     )
                 )
+                write_private_text(log_path, "")
+                write_private_text(final_output_path, "")
                 executor_attempts.append(attempt_record)
                 if args.engine == "claude" and not segment_resumed:
                     segment_session = str(uuid.uuid4())
@@ -3050,13 +3057,11 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
             candidate_message, session_id = parse_opencode_output(stdout_text)
         elif args.engine == "claude":
             candidate_message, session_id, agy_status, _claude_error = parse_claude_output(stdout_text)
-            final_output_path.write_text(candidate_message, encoding="utf-8")
-            final_output_path.chmod(0o600)
         else:
             candidate_message, session_id, agy_status = parse_agy_output(stdout_text)
             session_id = session_id or parse_agy_session_id(log_path)
-            final_output_path.write_text(candidate_message, encoding="utf-8")
-            final_output_path.chmod(0o600)
+        if args.engine in ("claude", "agy", "opencode"):
+            write_private_text(final_output_path, candidate_message or "")
         session_id = session_id or segment_session
         provider_error = provider_terminal_error(args.engine, stdout_text)
         if (

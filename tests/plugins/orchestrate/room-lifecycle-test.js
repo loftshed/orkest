@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import path from "node:path";
@@ -5,6 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { roomsCommand } from "../../../plugins/orchestrate/bin/rooms.mjs";
 import {
+  isClosedRoom,
   listRawRooms,
   parseTeam,
   readRawRoom,
@@ -31,6 +33,9 @@ import {
   startFreshRoom,
 } from "../../../plugins/orchestrate/lib/room-lifecycle.mjs";
 import {
+  bindSession,
+  clearDisplayReadCache,
+  createMemberWorktree,
   dispatchMember,
   growRoom,
   listRooms,
@@ -146,6 +151,13 @@ describe("room lifecycle", () => {
     ).rejects.toThrow(/archived; it accepts no new dispatch/u);
     await expect(growRoom("room-a", parseTeam("claude:haiku"), root)).rejects.toThrow(/archived/u);
     await expect(reserveLead("room-a", other, "lead it", { root })).rejects.toThrow(/archived/u);
+    await expect(
+      roomsCommand(["objective", "--room", "room-a", "--objective", "Updated objective"], {
+        stdout: silent,
+        root,
+        run,
+      }),
+    ).rejects.toThrow(/archived/u);
 
     // A late completion routes to the original assignment in the archived room.
     task.runs[0].status = "finished";
@@ -429,5 +441,291 @@ describe("continuation and provenance display", () => {
       modelSource: "requested",
       supervisor: { session: "supervisor-a", member: "conductor" },
     });
+  });
+
+  it("treats archived and cancelled rooms as closed and handles chief launch cancellation and authority checks", async () => {
+    expect(isClosedRoom({ lifecycle: "archived" })).toBe(true);
+    expect(isClosedRoom({ lifecycle: "cancelled" })).toBe(true);
+    expect(isClosedRoom({ status: "cancelled" })).toBe(true);
+    expect(isClosedRoom({ lifecycle: "active" })).toBe(false);
+
+    const root = await directory();
+    const cwd = await directory();
+    const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], {
+      stdio: "ignore",
+    });
+    try {
+      const missionRoom = await newRoom(parseTeam("claude:haiku"), {
+        id: "chief-mission-room",
+        cwd,
+        root,
+      });
+      await updateRawRoom(
+        missionRoom.id,
+        (current) => {
+          current.chief = {
+            goal: "Watch process",
+            state: "running",
+            mission: { session: "chief-mission-room-orch" },
+            launch: { engine: "claude", status: "started", pid: child.pid },
+          };
+          return current;
+        },
+        { root },
+      );
+      expect(outstandingWork(readRawRoom(missionRoom.id, root)).running).toEqual([
+        expect.objectContaining({
+          id: "chief-mission-room-orch",
+          pid: child.pid,
+          transport: "chief-launch",
+        }),
+      ]);
+      const cancelled = await cancelRoom(missionRoom.id, { root, run: forbidden, reason: "stop" });
+      expect(cancelled.chief).toMatchObject({
+        outcome: "cancelled",
+        method: "sigterm",
+        pid: child.pid,
+      });
+      expect(readRawRoom(missionRoom.id, root).chief.cancellation).toMatchObject({
+        outcome: "cancelled",
+        method: "sigterm",
+      });
+    } finally {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // Already terminated.
+      }
+    }
+
+    // Recycled PID (mismatched pidBirth) must NOT be treated as live or signalled.
+    const recycled = await newRoom(parseTeam("claude:haiku"), { id: "recycled-chief", cwd, root });
+    await updateRawRoom(
+      recycled.id,
+      (current) => {
+        current.chief = {
+          goal: "Recycled check",
+          state: "running",
+          mission: { session: "recycled-orch" },
+          launch: { pid: process.pid, pidBirth: "1999-01-01T00:00:00Z" },
+        };
+        return current;
+      },
+      { root },
+    );
+    expect(outstandingWork(readRawRoom(recycled.id, root)).running).toEqual([]);
+    const safeCancel = await cancelRoom(recycled.id, { root, run: forbidden });
+    expect(safeCancel.chief).toMatchObject({ outcome: "not_running", method: "pid-recycled" });
+
+    // Coordinator taskDir abandon for Chief launch when taskDir is recorded.
+    const abandonedCalls = [];
+    const coordMission = await newRoom(parseTeam("claude:haiku"), { id: "coord-chief", cwd, root });
+    await updateRawRoom(
+      coordMission.id,
+      (current) => {
+        current.chief = {
+          goal: "Taskdir cancel",
+          state: "running",
+          mission: { session: "coord-chief-orch" },
+          launch: { taskDir: "/tmp/chief-task" },
+        };
+        return current;
+      },
+      { root },
+    );
+    const coordCancelled = await cancelRoom(coordMission.id, {
+      root,
+      run: async (args) => {
+        abandonedCalls.push(args);
+        if (args[0] === "show") return { runs: [{ run_id: "r-chief", status: "active" }] };
+        return { status: "cancelled" };
+      },
+    });
+    expect(coordCancelled.chief).toMatchObject({
+      outcome: "cancelled",
+      method: "coordinator",
+      runId: "r-chief",
+    });
+    expect(abandonedCalls.some((args) => args[0] === "abandon")).toBe(true);
+
+    // reactivateRoom checks authority({ fresh: true }), requires status === "active", and ignores previousSessions.
+    const authRoom = await newRoom(parseTeam("claude:haiku"), {
+      id: "auth-reactivate",
+      cwd,
+      root,
+      authority: "team-a",
+    });
+    await archiveRoom(authRoom.id, { root, run: forbidden });
+    const authorityCalls = [];
+    await expect(
+      reactivateRoom(authRoom.id, {
+        root,
+        run: forbidden,
+        authority: async (team, opts) => {
+          authorityCalls.push([team, opts]);
+          return { team, status: "withdrawn" };
+        },
+      }),
+    ).rejects.toThrow(/withdrawn/u);
+    expect(authorityCalls).toEqual([["team-a", { fresh: true }]]);
+
+    // start-fresh -> owner moves to new session (historical in previousSessions) -> old room reactivates cleanly.
+    const oldRoom = await newRoom(parseTeam("claude:haiku"), { id: "old-room", cwd, root });
+    await updateRawRoom(
+      oldRoom.id,
+      (current) => {
+        current.conductor.session = { id: "sess-1", machine: hostname(), engine: "claude", cwd };
+        current.conductor.previousSessions = ["shared-old-sess"];
+        return current;
+      },
+      { root },
+    );
+    await archiveRoom(oldRoom.id, { root, run: forbidden });
+    const freshRoom = await newRoom(parseTeam("claude:haiku"), { id: "fresh-room", cwd, root });
+    await updateRawRoom(
+      freshRoom.id,
+      (current) => {
+        current.conductor.session = { id: "sess-2", machine: hostname(), engine: "claude", cwd };
+        current.conductor.previousSessions = ["shared-old-sess"];
+        return current;
+      },
+      { root },
+    );
+    const reactivated = await reactivateRoom(oldRoom.id, { root, run: forbidden });
+    expect(reactivated.changed).toBe(true);
+  });
+
+  it("blocks bindSession, createMemberWorktree, and recorded-intent dispatch on archived rooms and bounds observeRoom", async () => {
+    const root = await directory();
+    const cwd = await directory();
+    const taskDir = await directory();
+    const room = await newRoom(parseTeam("claude:haiku"), { id: "frozen-room", cwd, root });
+    const workerId = room.agents[0].id;
+    await updateRawRoom(
+      room.id,
+      (current) => {
+        current.conductor.session = {
+          id: "sup-frozen",
+          machine: hostname(),
+          engine: "claude",
+          cwd,
+        };
+        current.agents[0].dispatch = {
+          taskDir,
+          taskId: "task-f",
+          requestId: "req-f",
+          kind: "investigation",
+          transport: "executor",
+        };
+        return current;
+      },
+      { root },
+    );
+    await archiveRoom(room.id, { root, run: forbidden });
+    const archivedRoom = await readRoom(room.id, root);
+
+    await expect(
+      bindSession(room.id, "conductor", { session: "new-s", engine: "claude", root }),
+    ).rejects.toThrow(/archived/u);
+    await expect(createMemberWorktree(room.id, workerId, { root })).rejects.toThrow(/archived/u);
+    await expect(
+      dispatchMember(room.id, workerId, {
+        root,
+        taskDir,
+        kind: "investigation",
+        run: async () => ({
+          schema: "agent-executor.task.v1",
+          task_id: "task-f",
+          repository: cwd,
+          runs: [],
+        }),
+      }),
+    ).rejects.toThrow(/archived/u);
+
+    // Consultations and inbox messages created AFTER archivedAt are excluded from inactive observeRoom,
+    // and native discovery is skipped for inactive rooms.
+    const postArchiveIso = new Date(archivedRoom.archivedAt + 10_000).toISOString();
+    await mkdir(path.join(root, "consultations", "sup-frozen"), { recursive: true });
+    await writeFile(
+      path.join(root, "consultations", "sup-frozen", "post-c.json"),
+      JSON.stringify({
+        schema: "orchestrate.consultation-observation.v1",
+        id: "post-c",
+        parent_session: "sup-frozen",
+        room_id: room.id,
+        machine: hostname(),
+        pid: process.pid,
+        runner_pid: process.pid,
+        deadline_ms: Date.now() + 60_000,
+        started_at: postArchiveIso,
+        result_path: path.join(root, "post-c-res.json"),
+      }),
+    );
+    await mkdir(path.join(root, "inbox", "sup-frozen"), { recursive: true });
+    await writeFile(
+      path.join(root, "inbox", "sup-frozen", "m-after.json"),
+      JSON.stringify({
+        schema: "agent-executor.mail.v1",
+        id: "m-after",
+        from: { session: workerId, name: workerId },
+        text: "late note after archive",
+        sentAt: postArchiveIso,
+      }),
+    );
+    const observedArchived = await observeRoom(room.id, {
+      root,
+      run: async () => ({ schema: "agent-executor.task.v1", task_id: "task-f", runs: [] }),
+      progress: async () => new Map(),
+      discoverNativePeers: false,
+    });
+    expect(observedArchived.agents.some((a) => a.id === "post-c")).toBe(false);
+    expect(observedArchived.messages).toEqual([]);
+
+    // Active room peer discovery still ignores archived room's conductor lockout while isolating workers.
+    await mkdir(path.join(root, "peers"), { recursive: true });
+    const nowMs = Date.now();
+    const startIso = new Date(nowMs - 1000).toISOString();
+    const seenIso = new Date(nowMs).toISOString();
+    await writeFile(
+      path.join(root, "peers", "reused-cond.json"),
+      JSON.stringify({
+        schema: "agent-executor.peer.v1",
+        session: "sup-frozen",
+        name: "claude-reused",
+        harness: "claude",
+        cwd,
+        pid: process.pid,
+        state: "busy",
+        isSubagent: true,
+        startedAt: startIso,
+        lastSeenAt: seenIso,
+        parentSession: "active-cond",
+      }),
+    );
+    const activeRoom = await newRoom([], { id: "active-next", cwd, root });
+    await updateRawRoom(
+      activeRoom.id,
+      (current) => {
+        current.conductor.session = {
+          id: "active-cond",
+          machine: hostname(),
+          engine: "claude",
+          cwd,
+        };
+        return current;
+      },
+      { root },
+    );
+    clearDisplayReadCache();
+    const observedActive = await observeRoom(activeRoom.id, {
+      root,
+      run: async () => ({ schema: "agent-executor.task.v1", task_id: "task-n", runs: [] }),
+      discoverNativePeers: true,
+    });
+    expect(
+      observedActive.agents.some(
+        (a) => a.nativeSession === "sup-frozen" || a.session?.id === "sup-frozen",
+      ),
+    ).toBe(true);
   });
 });

@@ -597,5 +597,50 @@ describe("ork side (side missions)", () => {
       expect(fallbackPolicy.engine).toBe("agy");
       expect(fallbackPolicy.fallbackFrom).toBe("codex");
     });
+
+    it("refuses archived or cancelled --room targets and skips them during auto-discovery", async () => {
+      const archivedId = "archived-side";
+      fs.writeFileSync(
+        path.join(mailboxDir, "rooms", `${archivedId}.json`),
+        JSON.stringify({
+          schema: "agent-executor.room.v1",
+          id: archivedId,
+          cwd: repoDir,
+          machine: os.hostname(),
+          lifecycle: "archived",
+          archivedAt: Date.now() - 1000,
+          conductor: { engine: "claude" },
+          agents: [],
+        }),
+        "utf8",
+      );
+      await expect(
+        sideCommand(["--room", archivedId, "--dry-run", "audit auth"], {
+          cwd: repoDir,
+          mailboxDir,
+          cacheDir,
+          runCommand: (cmd, args) => {
+            if (cmd === "git" && args[0] === "rev-parse") {
+              return { status: 0, stdout: `${repoDir}\n`, stderr: "" };
+            }
+            return { status: 0, stdout: "", stderr: "" };
+          },
+        }),
+      ).rejects.toThrow(/archived/u);
+
+      // Auto-discovery with no active rooms returns standalone side plan (room: null) instead of adopting archived room.
+      const plan = await sideCommand(["--dry-run", "--json", "standalone check"], {
+        cwd: repoDir,
+        mailboxDir,
+        cacheDir,
+        runCommand: (cmd, args) => {
+          if (cmd === "git" && args[0] === "rev-parse") {
+            return { status: 0, stdout: `${repoDir}\n`, stderr: "" };
+          }
+          return { status: 0, stdout: "", stderr: "" };
+        },
+      });
+      expect(plan.roomId).toBeNull();
+    });
   });
 });

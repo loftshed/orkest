@@ -41,6 +41,7 @@ export const CHIEF_KEYS = Object.freeze({
   mouse: "m",
 });
 
+const CLOSE_CONFIRM_MS = 3000;
 const UP = new Set(["\u{1B}[A", "k"]);
 const DOWN = new Set(["\u{1B}[B", "j"]);
 const ACTIVE = new Set([
@@ -186,17 +187,32 @@ function relativeAge(value, now) {
 export function chiefPaneTarget(member) {
   if (!member || typeof member !== "object") return null;
   const session = typeof member.session === "string" ? member.session : member.session?.id;
+  const orcaTerminalHandle =
+    typeof member.orcaTerminalHandle === "string" ? member.orcaTerminalHandle : undefined;
+  const orcaPaneKey = typeof member.orcaPaneKey === "string" ? member.orcaPaneKey : undefined;
+  const orcaWorkspaceId =
+    typeof member.orcaWorkspaceId === "string" ? member.orcaWorkspaceId : undefined;
+  const orcaTabId = typeof member.orcaTabId === "string" ? member.orcaTabId : undefined;
+  const orcaEnvironment =
+    typeof member.orcaEnvironment === "string" ? member.orcaEnvironment : undefined;
   const target = {
     id: text(session) || text(member.id) || "chief-target",
     name: text(member.name),
     engine: text(member.engine),
     herdrPaneId: typeof member.herdrPaneId === "string" ? member.herdrPaneId : undefined,
     herdrEndpoint: typeof member.herdrEndpoint === "string" ? member.herdrEndpoint : undefined,
+    orcaEnvironment,
+    orcaPaneKey,
+    orcaTabId,
+    orcaTerminalHandle,
+    orcaWorkspaceId,
     paneId: typeof member.paneId === "string" ? member.paneId : undefined,
     terminalServer: typeof member.terminalServer === "string" ? member.terminalServer : undefined,
     ...(session && { session: { id: session } }),
   };
-  return target.herdrPaneId || target.paneId ? target : null;
+  return target.herdrPaneId || target.orcaTerminalHandle || target.orcaPaneKey || target.paneId
+    ? target
+    : null;
 }
 
 /** Selectable rows: rooms grouped by repository (attention first), then standalone sessions. */
@@ -280,6 +296,7 @@ export class ChiefView {
       theme,
       tier = process.env.ORK_GLYPHS ? glyphTier() : "nerd",
       mouseEnabled = true,
+      confirmClose = false,
       lastRoomId,
       fill = true,
     } = {},
@@ -292,6 +309,8 @@ export class ChiefView {
     this.appearance = { enabled: this.color, theme: resolveTheme(theme) };
     this.tier = tier;
     this.mouseEnabled = mouseEnabled !== false;
+    this.confirmClose = Boolean(confirmClose);
+    this.closeArmedAt = undefined;
     this.targets = [];
     this.hovered = undefined;
     this.notice = "";
@@ -371,8 +390,21 @@ export class ChiefView {
     return { type: "chief-focus-chief", target, label: target.name || "Chief" };
   }
 
+  /** Bare q: closes at once, or when confirmClose is set only when pressed again promptly. */
+  requestClose(nowMs = this.now()) {
+    if (!this.confirmClose) return { type: "close-view" };
+    if (Number.isFinite(this.closeArmedAt) && nowMs - this.closeArmedAt <= CLOSE_CONFIRM_MS) {
+      this.closeArmedAt = undefined;
+      return { type: "close-view" };
+    }
+    this.closeArmedAt = nowMs;
+    this.notice = "Press q again to close this pane; agents keep running";
+    return true;
+  }
+
   handleKey(key) {
     this.notice = "";
+    if (key !== "q") this.closeArmedAt = undefined;
     if (this.overlay) {
       if (["\u{1B}", "?", "\u{1B}[O"].includes(key)) this.overlay = undefined;
       return true;
@@ -401,7 +433,7 @@ export class ChiefView {
       this.mouseEnabled = !this.mouseEnabled;
       return { type: "mouse-toggle", enabled: this.mouseEnabled };
     }
-    if (key === "q") return { type: "close-view" };
+    if (key === "q") return this.requestClose();
     return false;
   }
 
@@ -416,6 +448,7 @@ export class ChiefView {
     }
     const target = hitTest(this.targets, x, y);
     this.hovered = target?.id;
+    if (action === "press") this.closeArmedAt = undefined;
     if (action !== "press" || button !== 0 || !target) return false;
     if (target.entryKey) {
       this.notice = "";
@@ -772,7 +805,9 @@ export class ChiefView {
       "Mouse       Click to select; click again to open",
       "m           Toggle mouse capture to select terminal text",
       "? or Esc    Close this reference",
-      "q or Ctrl-C Close the side window; agents keep running",
+      this.confirmClose
+        ? "q q/Ctrl-C  Close the side window (q twice); agents keep running"
+        : "q or Ctrl-C Close the side window; agents keep running",
     ];
     const interior = Math.max(1, inner - 4);
     const wrapped = rows.flatMap((row) =>
@@ -798,6 +833,15 @@ export class ChiefView {
       );
   }
 
+  footerHint() {
+    if (this.notice) return { text: this.notice, tone: "warning" };
+    if (!this.mouseEnabled)
+      return { text: "Mouse off (select/copy) — press m to re-enable mouse", tone: "warning" };
+    if (this.confirmClose)
+      return { text: "Press q twice to close this pane; agents keep running", tone: "muted" };
+    return null;
+  }
+
   render(width) {
     width = Math.max(1, Math.floor(width) || 80);
     this.renderWidth = width;
@@ -811,7 +855,8 @@ export class ChiefView {
     }
     const lines = [...this.headerLines(inner)];
     const controls = this.controls(inner);
-    const footerRows = 1 + controls.lines.length + (this.notice ? 1 : 0);
+    const footer = this.footerHint();
+    const footerRows = 1 + controls.lines.length + (footer ? 1 : 0);
     if (this.overlay === "help") {
       lines.push(...this.helpLines(inner, Math.max(3, this.height - lines.length - footerRows)));
     } else if (this.entries.length === 0) {
@@ -881,7 +926,7 @@ export class ChiefView {
       this.targets.push({ ...target, x: target.x + 1, y: target.y + lines.length });
     }
     lines.push(...controls.lines);
-    if (this.notice) lines.push(this.style(fit(this.notice, inner), "warning"));
+    if (footer) lines.push(this.style(fit(footer.text, inner), footer.tone));
     return this.marginLines(lines, width);
   }
 }

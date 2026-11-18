@@ -186,9 +186,13 @@ class CommandApprovalTests(unittest.TestCase):
         hub = self.hub / "scripts"
         cli = self.checkout / "bin/ork.mjs"
         allowed = [
+            "ork chief status",
             "ork rooms dispatch --room r",
             "ork hall list",
             "ork horde --view --attach-room r",
+            "ork horde --view --chief",
+            "ork policy show",
+            "ork setup --dry-run",
             "ork progress --session s --stage working",
             "ork gate status",
             "ork update",
@@ -197,13 +201,28 @@ class CommandApprovalTests(unittest.TestCase):
             f"{cli} quota --json",
             f"python3 {hub}/run_agent.py mailbox inbox --session s",
             f"python3 {hub}/run_agent.py --cwd /repo --task-spec s.json",
+            f"python3 {hub}/coordinator.py dispatch --task-dir t",
             f"python3 {self.source}/coordinator.py dispatch --task-dir t",
+            f"python3 {hub}/context_handoff.py capabilities",
+            f"python3 {hub}/continuation_requests.py list",
+            f"python3 {hub}/telemetry.py summarize",
+            f"python3 {hub}/authority.py show --team t",
+            f"python3 {hub}/authority.py accept --team t --session s --harness claude --digest d",
+            f"python3 {hub}/authority.py offer --team t --session s --to-session s2 --to-harness codex",
+            f"python3 {hub}/handoff.py status",
+            f"python3 {hub}/handoff.py show --session s",
             f"{EXECUTABLE} {hub}/agent_progress.py --session s",
             f"/usr/bin/python3 {hub}/peer_mailbox.py inbox",
         ]
         own_skill = "python3 {}/skills/orchestrate/scripts/run_agent.py doctor"
         denied = [
             "ork",
+            "ork policy",
+            "ork policy allow codex",
+            "ork policy reset",
+            "ork setup",
+            "ork setup --fast-bin /tmp/x",
+            "ork setup --trust-codex-hooks",
             "ork horde",
             "ork horde --engine claude --harness-arg=--dangerously-skip-permissions",
             "ork gate -- rm -rf /",
@@ -218,15 +237,26 @@ class CommandApprovalTests(unittest.TestCase):
             "bash -c 'ork rooms list'",
             f"python3 {hub}/run_agent.py probe -- rm -rf /",
             f"python3 {hub}/run_agent.py listen --engine claude -- --dangerously-skip-permissions",
+            f"python3 {hub}/authority.py designate --team t",
+            f"python3 {hub}/authority.py appoint --team t",
+            f"python3 {hub}/authority.py withdraw --team t",
+            f"python3 {hub}/authority.py takeover --team t",
+            f"python3 {hub}/handoff.py enable",
+            f"python3 {hub}/handoff.py disable",
             f"python3 {hub}/gate.py -- rm -rf /",
             f"python3 {hub}/consult.py",
             f"python3 {hub}/run_agent.py.evil",
             "python3 plugins/orchestrate/skills/orchestrate/scripts/run_agent.py",
             f"python3 {self.root}/elsewhere/run_agent.py",
         ]
-        claude = self.claude_rules()
+        claude_settings = json.loads(self.claude.read_text())
+        claude = claude_settings["permissions"]["allow"]
+        claude_ask = claude_settings["permissions"]["ask"]
         agy = json.loads(self.agy.read_text())["permissions"]["allow"]
         opencode = self.opencode_rules()
+        for rule in approval.CLAUDE_ASK_RULES:
+            self.assertIn(rule, claude_ask)
+        self.assertEqual(list(opencode.keys())[-len(approval.OPENCODE_ASK_RULES) :], list(approval.OPENCODE_ASK_RULES))
         for command in allowed:
             self.assertTrue(claude_allows(claude, command), command)
             self.assertTrue(agy_allows(agy, command), command)
@@ -235,6 +265,12 @@ class CommandApprovalTests(unittest.TestCase):
             self.assertFalse(claude_allows(claude, command), command)
             self.assertFalse(agy_allows(agy, command), command)
             self.assertFalse(opencode_allows(opencode, command), command)
+        for guarded in (
+            "ork rooms dispatch --room r --allow-credits",
+            f"python3 {hub}/run_agent.py consult --ignore-quota",
+            f"python3 {hub}/run_agent.py doctor --repair-messaging --trust-codex-hooks",
+        ):
+            self.assertFalse(opencode_allows(opencode, guarded), guarded)
         # Each harness also gets the `<skill-directory>` it shows its agents.
         self.assertTrue(claude_allows(claude, own_skill.format(self.home / ".claude")))
         self.assertTrue(agy_allows(agy, own_skill.format(self.home / ".gemini/config")))
@@ -342,8 +378,11 @@ class CommandApprovalTests(unittest.TestCase):
             ".gemini/antigravity-cli/settings.json",
         }
         self.assertEqual(changed, expected)
-        for text in self.snapshot().values():
-            self.assertNotIn("allow-credits", text.replace("--allow-credits)", ""))
+        for rel_path, text in self.snapshot().items():
+            cleaned = text
+            for token in (*approval.CLAUDE_ASK_RULES, *approval.OPENCODE_ASK_RULES):
+                cleaned = cleaned.replace(token, "")
+            self.assertNotIn("allow-credits", cleaned, rel_path)
 
     def test_installer_flags_are_explicit_and_exclusive(self):
         with mock.patch.object(installer, "install") as install:
@@ -396,6 +435,77 @@ class CommandApprovalTests(unittest.TestCase):
         self.assertTrue(claude_allows(claude, f"node {(alias_checkout / 'bin/ork.mjs').resolve()} hall list"))
         self.assertTrue(claude_allows(claude, f"python3 {alias_source / 'run_agent.py'} consult"))
         self.assertTrue(claude_allows(claude, f"python3 {(alias_source / 'run_agent.py').resolve()} consult"))
+
+    def test_ask_guards_preserve_user_rules_stay_last_in_opencode_and_revoke_cleanly(self):
+        self.claude.write_text(
+            json.dumps(
+                {
+                    "permissions": {
+                        "allow": ["Bash(git status:*)"],
+                        "ask": ["Bash(git push:*)", "Bash(* --allow-credits*)"],
+                    }
+                }
+            )
+        )
+        self.opencode.write_text(
+            json.dumps(
+                {
+                    "permission": {
+                        "bash": {
+                            "* --allow-credits*": "deny",
+                            "* --ignore-quota*": "allow",
+                            "* --trust-codex-hooks*": "ask",
+                            "git status *": "allow",
+                        }
+                    }
+                }
+            )
+        )
+        self.run_approval(opt_in=True, harnesses={"claude", "opencode"})
+        claude_perms = json.loads(self.claude.read_text())["permissions"]
+        for rule in approval.CLAUDE_ASK_RULES:
+            self.assertIn(rule, claude_perms["ask"])
+        self.assertEqual(claude_perms["ask"][:2], ["Bash(git push:*)", "Bash(* --allow-credits*)"])
+
+        opencode_bash = self.opencode_rules()
+        self.assertEqual(opencode_bash["* --allow-credits*"], "deny")
+        self.assertEqual(opencode_bash["* --ignore-quota*"], "ask")
+        self.assertEqual(opencode_bash["* --trust-codex-hooks*"], "ask")
+        self.assertEqual(
+            list(opencode_bash.keys())[-len(approval.OPENCODE_ASK_RULES) :],
+            list(approval.OPENCODE_ASK_RULES),
+        )
+        self.assertFalse(opencode_allows(opencode_bash, "ork rooms dispatch --room r --allow-credits"))
+        self.assertFalse(opencode_allows(opencode_bash, "ork rooms dispatch --room r --ignore-quota"))
+
+        # Moving the checkout adds new allow rules; OpenCode ask guards still end up last.
+        moved = self.root / "moved-ask/plugins/orchestrate"
+        shutil.move(self.root / "checkout", self.root / "moved-ask")
+        self.source = moved / "skills/orchestrate/scripts"
+        self.checkout = moved
+        self.hub.unlink()
+        self.hub.symlink_to(self.source.parent)
+        self.run_approval(harnesses={"claude", "opencode"})
+        refreshed_opencode = self.opencode_rules()
+        self.assertEqual(
+            list(refreshed_opencode.keys())[-len(approval.OPENCODE_ASK_RULES) :],
+            list(approval.OPENCODE_ASK_RULES),
+        )
+        self.assertEqual(refreshed_opencode["* --allow-credits*"], "deny")
+
+        # Revoking removes only Orkest-owned allow and ask entries, leaving user rules intact.
+        self.run_approval(revoke=True)
+        revoked_claude = json.loads(self.claude.read_text())["permissions"]
+        self.assertEqual(revoked_claude["allow"], ["Bash(git status:*)"])
+        self.assertEqual(revoked_claude["ask"], ["Bash(git push:*)", "Bash(* --allow-credits*)"])
+        self.assertEqual(
+            self.opencode_rules(),
+            {
+                "git status *": "allow",
+                "* --allow-credits*": "deny",
+                "* --trust-codex-hooks*": "ask",
+            },
+        )
 
 
 if __name__ == "__main__":

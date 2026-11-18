@@ -584,6 +584,19 @@ class TestOrkFastParity(unittest.TestCase):
         self.assertTrue(delegated(), "an open room bound to the session needs the full hook")
         room_store.set_metadata(mailbox_root, "index-room", closedAt=stamp)
         self.assertFalse(delegated(), "a closed room has no obligations")
+        room_store.put_room(
+            mailbox_root,
+            {
+                "schema": "agent-executor.room.v1",
+                "id": "cancelled-room",
+                "lifecycle": "cancelled",
+                "cwd": str(checkout_dir.resolve()),
+                "machine": socket.gethostname(),
+                "agents": [],
+                "conductor": {"engine": "agy", "session": {"id": session_id, "engine": "agy"}},
+            },
+        )
+        self.assertFalse(delegated(), "a cancelled lifecycle room stays on fast path")
         (mailbox_root / "rooms-index.json").unlink()
         self.assertTrue(delegated(), "rooms.db without an index is unknown, so delegate")
 
@@ -729,11 +742,24 @@ class TestOrkFastParity(unittest.TestCase):
             {"status": "pending", "lead": {"session": session}},
             {"status": "active", "lead": {"session": "someone"}, "deputy": {"session": session}},
             {"status": "active", "lead": {"session": "someone"}, "deputy": {"harness": "claude", "account": "b"}},
+            {
+                "status": "active",
+                "lead": {"session": "someone"},
+                "offer": {"to": {"session": session, "harness": "claude"}},
+            },
         ):
             team("mine", record)
             self.assertEqual(len(delegated({"session_id": session})), 1, record)
-        team("mine", {"status": "pending", "lead": {"session": "someone"}, "deputy": {"session": session}})
-        self.assertEqual(delegated({"session_id": session}), [])
+        for non_delegating in (
+            {"status": "pending", "lead": {"session": "someone"}, "deputy": {"session": session}},
+            {
+                "status": "pending",
+                "lead": {"session": "someone"},
+                "offer": {"to": {"session": session, "harness": "claude"}},
+            },
+        ):
+            team("mine", non_delegating)
+            self.assertEqual(delegated({"session_id": session}), [], non_delegating)
         # That last Stop ran on the fast path itself.
         self.assertEqual(json.loads(peer_file.read_text(encoding="utf-8"))["state"], "idle")
 

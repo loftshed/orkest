@@ -492,6 +492,34 @@ class SuccessionTests(unittest.TestCase):
         (Path(os.environ["MONITOR_CACHE_DIR"]) / "snapshot.json").unlink()
         self.assertNotIn("Team team", self.hook(LEAD, "claude"))
 
+    def test_non_deputy_planned_offer_delivered_without_monitor_snapshot(self) -> None:
+        AUTHORITY.appoint("team-no-pool", AUTHORITY.member(LEAD, "claude"), repository=self.git_dir)
+        MAILBOX.register(MAILBOX.root(), session="offeree-1", harness="codex", cwd=str(self.repo), pid=os.getpid())
+        AUTHORITY.offer("team-no-pool", LEAD, 1, AUTHORITY.member("offeree-1", "codex"))
+        (Path(os.environ["MONITOR_CACHE_DIR"]) / "snapshot.json").unlink()
+        notice = self.hook("offeree-1", "codex")
+        self.assertIn("offered you the handover", notice)
+        self.assertIn("authority.py accept --team team-no-pool --session offeree-1", notice)
+        self.assertNotIn("offered you the handover", self.hook("offeree-1", "codex"))
+
+    def test_local_evidence_resolves_peer_session_for_launched_successor(self) -> None:
+        native = MAILBOX.register(
+            MAILBOX.root(), session="native-successor-1", harness="claude", cwd=str(self.repo), pid=os.getpid()
+        )
+        handoff_dir = Path(os.environ["AGENT_EXECUTOR_HOME"]) / "handoffs-v1" / "handoff-e99"
+        handoff_dir.mkdir(parents=True)
+        (handoff_dir / "event.json").write_text(
+            json.dumps({"session": "handoff-e99", "peerSession": native["session"]})
+        )
+        record = {
+            "team": "t",
+            "lead": {"session": "handoff-e99", "harness": "claude"},
+            "standing": {"statuses": ["blocked", "credits"], "seconds": 0},
+            "tasks": [],
+        }
+        reasons = SUCCESSION.local_evidence(record, lead_status="credits", moment=SUCCESSION.now())
+        self.assertIn("still running", reasons[0])
+
 
 if __name__ == "__main__":
     unittest.main()

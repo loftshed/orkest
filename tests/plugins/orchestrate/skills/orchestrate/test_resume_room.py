@@ -503,3 +503,22 @@ print(json.dumps({'rooms': [r['id'] for r in rooms], 'room': room, 'notice': not
                     self.assertEqual(mailbox_hooks.swarm_coordinator_context(base, peer), "")
                 self.assertIsNone(terminal.find_session_swarm_room(base, "owner", harness="claude", cwd=temporary))
                 self.assertEqual(room_store.read_room(base, room["id"]), room)
+
+    def test_cancelled_and_archived_rooms_are_skipped_by_orca_room_lookup(self):
+        import orca_swarm_restore
+
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            base = home / "mailbox-v1"
+            for rid, lifecycle in (("r-arch", "archived"), ("r-canc", "cancelled")):
+                room_store.put_room(
+                    base,
+                    {
+                        "schema": "agent-executor.room.v1",
+                        "id": rid,
+                        "lifecycle": lifecycle,
+                        "orcaCoordinatorTerminalId": "term_shared",
+                        "agents": [],
+                    },
+                )
+            self.assertEqual(orca_swarm_restore._room_for_terminal(base, "term_shared"), "")

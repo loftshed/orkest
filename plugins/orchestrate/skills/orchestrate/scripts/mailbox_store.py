@@ -329,7 +329,11 @@ def acquire_lock(lock_path: Path) -> int:
     still the one at the path and retry otherwise. Touching it keeps idle-lock reaping away from active use.
     """
     for _ in range(LOCK_ACQUIRE_ATTEMPTS):
-        descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        except FileNotFoundError:
+            lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            continue
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX)
             if _same_inode(descriptor, lock_path):

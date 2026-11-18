@@ -17,7 +17,9 @@ from unittest import mock
 
 SCRIPTS = Path(__file__).resolve().parents[5] / "plugins/orchestrate/skills/orchestrate/scripts"
 sys.path.insert(0, str(SCRIPTS))
+import check_mailbox  # noqa: E402 -- exercise the shipped verifier
 import install_mailbox as installer  # noqa: E402 -- exercise the shipped installer
+import mailbox_daemon  # noqa: E402 -- exercise daemon transport mode
 import mailbox_mcp  # noqa: E402 -- the server defines the installed tool catalog
 
 
@@ -974,6 +976,188 @@ class InstallMailboxTests(unittest.TestCase):
         claude_updated = json.loads(claude_settings.read_text())
         self.assertIn("ork-fast statusline --harness claude", claude_updated["statusLine"]["command"])
         self.assertFalse(installer.install_claude_statusline(claude_settings, fast_bin=fast_bin, home=self.base))
+
+    def test_fast_bin_validation_in_install_and_shell_wrappers(self):
+        ork_cli = self.base / "bin/ork.mjs"
+        ork_cli.parent.mkdir(parents=True)
+        ork_cli.write_text("#!/usr/bin/env node\n")
+
+        missing = self.base / "ork-fast-missing"
+        directory = self.base / "ork-fast-dir"
+        directory.mkdir()
+        non_exec = self.base / "ork-fast-nonexec"
+        non_exec.write_text("#!/bin/sh\n")
+        non_exec.chmod(0o644)
+        wrong_name = self.base / "not-ork-fast"
+        wrong_name.write_text("#!/bin/sh\n")
+        wrong_name.chmod(0o755)
+        symlink_wrong_target = self.base / "ork-fast-link"
+        symlink_wrong_target.symlink_to(wrong_name)
+
+        for bad in (missing, directory, non_exec, wrong_name, symlink_wrong_target):
+            with self.subTest(bad=bad.name):
+                with self.assertRaises(ValueError):
+                    installer.install_shell_wrappers(self.base, ork_cli, fast_bin=bad, dry_run=True)
+                with self.assertRaises(ValueError):
+                    installer.install(dry_run=True, verify=False, fast_bin=bad)
+
+        good = self.base / "ork-fast-custom"
+        good.write_text("#!/bin/sh\n")
+        good.chmod(0o755)
+        with (
+            mock.patch.object(Path, "home", return_value=self.base),
+            mock.patch.object(installer.shutil, "which", return_value=None),
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertTrue(installer.install_shell_wrappers(self.base, ork_cli, fast_bin=good, dry_run=True))
+            installer.install(dry_run=True, verify=False, fast_bin=good)
+
+    def test_delegated_run_cannot_self_trust_codex_hooks(self):
+        for env in ({"ORKEST_DELEGATED_RUN": "1"}, {"AGENT_EXECUTOR_RUN_ID": "run-123"}):
+            with self.subTest(env=env), mock.patch.dict(installer.os.environ, env):
+                with self.assertRaisesRegex(ValueError, "delegated agent runs cannot self-trust Codex hooks"):
+                    installer.install(dry_run=True, trust_codex_hooks=True, verify=False)
+                # Without trust_codex_hooks=True, install does not trigger the guard.
+                with (
+                    mock.patch.object(Path, "home", return_value=self.base),
+                    mock.patch.object(installer.shutil, "which", return_value=None),
+                    redirect_stdout(io.StringIO()),
+                ):
+                    installer.install(dry_run=True, trust_codex_hooks=False, verify=False)
+
+    def test_check_mailbox_allows_pending_codex_hook_trust_only_when_not_required(self):
+        cache_dir = self.base / "cache"
+        codex_home = self.base / ".codex"
+        codex_home.mkdir()
+        (codex_home / "config.toml").write_text("[mcp_servers.peer-mailbox]\ncommand = 'python3'\n")
+        inboxes: dict[str, list[dict[str, str | None]]] = {}
+        counter = 0
+
+        def dispatch_tool(session: str, tool: str, args: dict) -> dict:
+            nonlocal counter
+            if tool in ("register", "peers"):
+                return {"content": [{"type": "text", "text": "[]"}], "structuredContent": {"peers": []}}
+            if tool == "send":
+                counter += 1
+                msg_id = f"msg-{counter}"
+                inboxes.setdefault(args["to"], []).append(
+                    {"id": msg_id, "from": session, "text": args["text"], "replyTo": args.get("replyTo")}
+                )
+                return {
+                    "content": [{"type": "text", "text": json.dumps({"id": msg_id})}],
+                    "structuredContent": {"id": msg_id},
+                }
+            if tool == "inbox":
+                msgs = list(inboxes.get(session, []))
+                if not args.get("_http"):
+                    inboxes[session] = []
+                text = (
+                    "\n".join(f"<peer-message>{m['text']}</peer-message>" for m in msgs)
+                    if msgs
+                    else "no unread peer messages"
+                )
+                return {"content": [{"type": "text", "text": text}], "structuredContent": {"messages": msgs}}
+            if tool == "ack":
+                acked = set(args["ids"])
+                inboxes[session] = [m for m in inboxes.get(session, []) if m["id"] not in acked]
+                return {"content": [], "structuredContent": {}}
+            if tool == "wait":
+                matches = [m for m in inboxes.get(session, []) if m.get("replyTo") == args.get("replyTo")]
+                text = "\n".join(f"<peer-message>{m['text']}</peer-message>" for m in matches)
+                return {"content": [{"type": "text", "text": text}], "structuredContent": {"messages": matches}}
+            raise AssertionError(f"unexpected tool {tool}")
+
+        class FakeRpcClient:
+            def __init__(self, command, env=None):
+                self.command = command
+
+            def write(self, _value):
+                pass
+
+            def request(self, method, params):
+                if method == "initialize":
+                    return {}
+                if method == "thread/start":
+                    return {"thread": {"id": "codex-thread"}}
+                if method == "mcpServer/tool/call":
+                    return dispatch_tool(params["threadId"], params["tool"], params["arguments"])
+                if method == "tools/call":
+                    meta = params["_meta"]
+                    sid = meta.get("sessionId") or meta.get("ai.opencode/sessionID")
+                    return dispatch_tool(sid, params["name"], params["arguments"])
+                raise AssertionError(f"unexpected rpc method {method}")
+
+            def close(self):
+                pass
+
+        class FakeHttpConnection:
+            def __init__(self, *_args, **_kwargs):
+                self.payload = b"{}"
+
+            def request(self, _method, _path, body, _headers):
+                req = json.loads(body)
+                params = req["params"]
+                args = {**params["arguments"], "_http": True}
+                res = dispatch_tool(args["session"], params["name"], args)
+                self.payload = json.dumps({"jsonrpc": "2.0", "id": req["id"], "result": res}).encode("utf-8")
+
+            def getresponse(self):
+                return mock.Mock(status=200, read=lambda: self.payload)
+
+            def close(self):
+                pass
+
+        pending_error = RuntimeError(
+            "Codex mailbox hooks need review: use /hooks or doctor --repair-messaging --trust-codex-hooks"
+        )
+        with (
+            mock.patch.dict(os.environ, {"XDG_CACHE_HOME": str(cache_dir), "CODEX_HOME": str(codex_home)}),
+            mock.patch.object(Path, "home", return_value=self.base),
+            mock.patch.object(
+                installer,
+                "configuration_status",
+                return_value={"codex": {"configured": True, "issues": []}},
+            ),
+            mock.patch.object(check_mailbox.shutil, "which", return_value="/usr/bin/codex"),
+            mock.patch.object(check_mailbox, "RpcClient", FakeRpcClient),
+            mock.patch("http.client.HTTPConnection", FakeHttpConnection),
+            mock.patch.object(
+                mailbox_daemon, "ensure_running", return_value={"url": "http://127.0.0.1:49999/mcp", "pid": 1}
+            ),
+            mock.patch.object(mailbox_daemon, "read_token", return_value="tok"),
+            mock.patch.object(mailbox_daemon, "stop_service"),
+        ):
+            with (
+                mock.patch.object(mailbox_daemon, "get_mode", return_value="stdio"),
+                mock.patch.object(check_mailbox, "_verify_codex_hook_trust", side_effect=pending_error),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "Codex mailbox hooks need review"):
+                    check_mailbox.check()
+                stdio_report = check_mailbox.check(require_codex_hook_trust=False)
+                self.assertEqual(stdio_report["codex_hook_trust"], "pending_review")
+                self.assertEqual(len(stdio_report["round_trips"]), 12)
+
+            inboxes.clear()
+            with (
+                mock.patch.object(mailbox_daemon, "get_mode", return_value="http"),
+                mock.patch.object(check_mailbox, "_verify_codex_hook_trust", side_effect=pending_error),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "Codex mailbox hooks need review"):
+                    check_mailbox.check()
+                http_report = check_mailbox.check(require_codex_hook_trust=False)
+                self.assertEqual(http_report["codex_hook_trust"], "pending_review")
+                self.assertEqual(len(http_report["round_trips"]), 12)
+
+            with (
+                mock.patch.object(mailbox_daemon, "get_mode", return_value="stdio"),
+                mock.patch.object(
+                    check_mailbox,
+                    "_verify_codex_hook_trust",
+                    side_effect=ValueError("Expected exactly four mailbox hooks"),
+                ),
+            ):
+                with self.assertRaisesRegex(ValueError, "exactly four"):
+                    check_mailbox.check(require_codex_hook_trust=False)
 
 
 if __name__ == "__main__":

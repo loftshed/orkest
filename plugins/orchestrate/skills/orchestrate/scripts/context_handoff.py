@@ -276,10 +276,18 @@ def record_observation(
     if model is None and effort is None:
         raise ValueError("an observation needs an observed model or effort")
     record = dict(provenance or {"requested": None, "resolved": None})
-    record["observed"] = {"model": model, "effort": effort, "source": source.strip(), "at": _stamp(at)}
+    existing = record.get("observed") if isinstance(record.get("observed"), dict) else {}
+    merged_model = model if model is not None else existing.get("model")
+    merged_effort = effort if effort is not None else existing.get("effort")
+    record["observed"] = {
+        "model": merged_model,
+        "effort": merged_effort,
+        "source": source.strip(),
+        "at": _stamp(at),
+    }
     resolved = record.get("resolved") or {}
     mismatch = []
-    for field, observed in (("model", model), ("effort", effort)):
+    for field, observed in (("model", merged_model), ("effort", merged_effort)):
         expected = resolved.get(field)
         if observed is not None and expected is not None and observed != expected:
             mismatch.append({"field": field, "resolved": expected, "observed": observed})

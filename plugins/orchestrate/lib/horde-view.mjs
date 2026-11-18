@@ -1001,11 +1001,21 @@ function propagateUpAncestors(agents, seedIds) {
 
 /** Subtle `★ chief` title hint, present only when the runner attached a live Chief binding. */
 function chiefHintLabel(room, lead, tier) {
-  const chief = room?.chief;
-  if (!chief || typeof chief !== "object") return "";
+  const chief = room?.liveChief;
+  if (!chief || chief.schema !== "ork.chief.v1" || !chief.live || chief.stale) return "";
   const star = tier === "ascii" ? "*" : "★";
-  const leadSession = lead?.session?.id || lead?.nativeSession;
-  return chief.session && leadSession === chief.session
+  const conductor = room?.conductor;
+  const ownerSessions = new Set(
+    [
+      conductor?.session?.id ?? conductor?.session,
+      conductor?.mailboxSession,
+      conductor?.nativeSession,
+      lead?.session?.id ?? lead?.session,
+      lead?.mailboxSession,
+      lead?.nativeSession,
+    ].filter((value) => typeof value === "string" && value),
+  );
+  return chief.session && ownerSessions.has(chief.session)
     ? ` · ${star} chief desk`
     : ` · ${star} chief`;
 }
@@ -1667,6 +1677,7 @@ export class HordeView {
     }
     const target = hitTest(this.targets, x, y);
     this.hovered = target?.id;
+    if (action === "press") this.closeArmedAt = undefined;
     if (action !== "press" || button !== 0 || !target) return false;
     if (target.id?.startsWith("inactive-hidden:")) {
       this.notice = "";

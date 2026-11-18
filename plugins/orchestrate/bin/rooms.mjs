@@ -2,7 +2,13 @@ import path from "node:path";
 import { parseArgs } from "node:util";
 
 import { readDiffMarks } from "../lib/diff-marks.mjs";
-import { loadPresets, mailboxRoot, parseTeam, updateRoom } from "../lib/horde-room.mjs";
+import {
+  loadPresets,
+  mailboxRoot,
+  parseTeam,
+  requireActiveRoom,
+  updateRoom,
+} from "../lib/horde-room.mjs";
 import { integrateMemberWorktree } from "../lib/room-integrate.mjs";
 import {
   archiveRoom,
@@ -69,7 +75,7 @@ ork rooms dispatch --room ID --member ID --task-dir DIR [--kind investigation|im
                    [--protect-path PATH]...   (files an auto-correct round may not change)
                    [--task-spec FILE]   (required for continue, in the existing task/session)
                    [--max-continues N]   (first dispatch only, hard ceiling 6)
-ork rooms launch --room ID --plan FILE
+ork rooms launch --room ID --plan FILE [--allow-credits]   (--allow-credits required when a plan member sets allowCredits: true)
 ork rooms bind --room ID --member ID|conductor --session ID --engine ENGINE [--role ROLE] [--cwd PATH] [--keep-worktree]
 ork rooms recover --room ID
 
@@ -80,7 +86,7 @@ create/add queue members. dispatch/launch use the coordinator and may start bill
 Native dispatch returns a reservation for the conductor's native tools.
 launch plan: {"members":[{"id":"haiku-1","taskDir":"/absolute/task","kind":"investigation","timeout":"25m"}]}
              (an implementation member also takes "verifyCommands":["CMD"], "autoCorrect":1
-              and "protectPaths":["PATH"]; add "allowCredits":true only with the user's permission)
+              and "protectPaths":["PATH"]; add "allowCredits":true plus launch --allow-credits only with the user's permission)
 Task specs and task directories use the existing coordinator contract.
 `;
 
@@ -162,10 +168,8 @@ export async function roomsCommand(
     stdout.write(ROOMS_HELP);
     return;
   }
-  if (values["allow-credits"] && action !== "dispatch") {
-    throw new Error(
-      "--allow-credits is only valid on dispatch; set allowCredits on each member in a launch plan",
-    );
+  if (values["allow-credits"] && action !== "dispatch" && action !== "launch") {
+    throw new Error("--allow-credits is only valid on dispatch or launch");
   }
   const requireValue = (name) => {
     if (values[name] === undefined || values[name] === "") throw new Error(`--${name} is required`);
@@ -366,6 +370,7 @@ export async function roomsCommand(
       result = await updateRoom(
         requireValue("room"),
         (room) => {
+          requireActiveRoom(room);
           room.objective = objective;
           room.title = objective.replaceAll(/\s+/gu, " ").trim().slice(0, 160);
           return room;
@@ -467,6 +472,22 @@ export async function roomsCommand(
     case "launch": {
       const plan = await readLaunchPlan(requireValue("plan"));
       const roomId = requireValue("room");
+      for (const member of plan.members) {
+        if (member.allowCredits !== undefined && typeof member.allowCredits !== "boolean") {
+          throw new Error("--allow-credits / allowCredits must be a boolean");
+        }
+      }
+      const planUsesCredits = plan.members.some((member) => member.allowCredits === true);
+      if (planUsesCredits && !values["allow-credits"]) {
+        throw new Error(
+          "Launch plan sets allowCredits: true; pass --allow-credits on `ork rooms launch` only with the user's explicit permission",
+        );
+      }
+      if (values["allow-credits"] && !planUsesCredits) {
+        throw new Error(
+          "--allow-credits on launch requires a member in the launch plan with allowCredits: true",
+        );
+      }
       // Stop on first failure. Completed requests are safe to revisit using their persisted IDs.
       result = [];
       for (const member of plan.members)

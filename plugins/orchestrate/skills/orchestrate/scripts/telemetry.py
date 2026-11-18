@@ -85,8 +85,8 @@ def _requested_model(result: dict[str, Any]) -> str | None:
 
 
 def _is_quality_run(result: dict[str, Any]) -> bool:
-    """Exclude dry runs, native handoffs, not-run stubs, preflight failures, and quota exhaustion."""
-    if result.get("dry_run") is True:
+    """Exclude dry runs, host checks, native handoffs, not-run stubs, preflight failures, and quota exhaustion."""
+    if result.get("dry_run") is True or result.get("transport") == "host_checks":
         return False
     review = _mapping(result.get("review"))
     outcomes = (review.get("task_outcome"), result.get("task_outcome"), review.get("status"), result.get("status"))
@@ -453,6 +453,8 @@ def task_outcome_cost(task_dir: Path | str) -> dict[str, Any]:
     state = json.loads((directory / "task.json").read_text(encoding="utf-8"))
     brief_bytes: dict[str, int] = {}
     for run in state.get("runs") or []:
+        if not isinstance(run, dict) or run.get("transport") == "host_checks":
+            continue
         brief = directory / "runs" / str(run.get("run_id")) / "brief.md"
         if brief.is_file():
             brief_bytes[run["run_id"]] = brief.stat().st_size
