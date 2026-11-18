@@ -333,8 +333,14 @@ def build_parser() -> argparse.ArgumentParser:
             sub.add_argument("--model", help="current model ID/name verified from your runtime; omit if unknown")
             sub.add_argument(
                 "--text",
-                required=True,
+                default=None,
                 help="task display name from your actual assignment; update when the task changes (max 200 characters)",
+            )
+            sub.add_argument("--clear", action="store_true", help="clear focus without changing presence fields")
+            sub.add_argument(
+                "--only-if",
+                default=None,
+                help="with --clear, clear only when the current focus matches this exact string",
             )
             sub.add_argument(
                 "--channel", action="append", default=[], help="also join this channel (repeatable); never leaves one"
@@ -390,6 +396,13 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.action == "prune":
             output: Any = _MB.prune(base)
+        elif args.action == "focus" and args.clear:
+            if args.text is not None:
+                raise MailboxError("pass either --text or --clear to focus, not both")
+            session = _MB.session_arg(args)
+            if not session:
+                raise MailboxError("pass --session (or set AGENT_MAILBOX_SESSION / CLAUDE_CODE_SESSION_ID)")
+            output = _MB.clear_focus(base, session, only_if=args.only_if)
         elif args.action == "feedback-summary":
             me = _MB.caller(args, base) if _MB.session_arg(args) else _MB.workspace(os.getcwd())
             output = _MB.feedback_module().summary(base, peer=None if args.scope == "cross-project" else me)
@@ -639,6 +652,8 @@ def main(argv: list[str] | None = None) -> int:
 
                     if _MB.is_run_peer(me):
                         raise MailboxError("focus is for interactive sessions")
+                    if not (args.text and args.text.strip()):
+                        raise MailboxError("pass --text or --clear to focus")
                     output = _MB.set_focus(
                         base,
                         me["session"],

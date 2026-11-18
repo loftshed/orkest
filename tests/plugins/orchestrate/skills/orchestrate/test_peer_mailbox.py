@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import os
@@ -976,6 +977,42 @@ class AntigravityOrchestratorHookTests(unittest.TestCase):
                     self.assertEqual(switched["sessionModel"], switched_model)
                     self.assertEqual(switched["stepModel"], switched_model)
                     self.assertIsNone(switched.get("executionModel"))
+
+    def test_focus_clear_only_if_preserves_presence_and_non_matching_focus(self) -> None:
+        mailbox.register(self.base, session="sess-a", harness="claude", cwd=self.cwd, pid=os.getpid())
+        mailbox.register(self.base, session="sess-b", harness="claude", cwd=self.cwd, pid=os.getpid())
+        chief_focus = "Ork Chief — machine-wide master orchestrator"
+        other_focus = "Fix cache invalidation"
+        mailbox.set_focus(self.base, "sess-a", chief_focus)
+        mailbox.set_focus(self.base, "sess-b", other_focus)
+        before_a = mailbox.load(mailbox.peer_path(self.base, "sess-a"))
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "ORCHESTRATE_HOME": str(self.temp_root),
+                    "AGENT_EXECUTOR_HOME": str(self.temp_root),
+                },
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(
+                mailbox.main(["focus", "--session", "sess-a", "--clear", "--only-if", other_focus]),
+                0,
+            )
+            self.assertEqual(mailbox.load(mailbox.peer_path(self.base, "sess-a"))["focus"], chief_focus)
+
+            self.assertEqual(
+                mailbox.main(["focus", "--session", "sess-a", "--clear", "--only-if", chief_focus]),
+                0,
+            )
+        after_a = mailbox.load(mailbox.peer_path(self.base, "sess-a"))
+        self.assertIsNone(after_a.get("focus"))
+        self.assertEqual(after_a["pid"], before_a["pid"])
+        self.assertEqual(after_a["cwd"], before_a["cwd"])
+        self.assertEqual(after_a["lastSeenAt"], before_a["lastSeenAt"])
+        self.assertEqual(mailbox.load(mailbox.peer_path(self.base, "sess-b"))["focus"], other_focus)
 
 
 if __name__ == "__main__":

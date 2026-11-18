@@ -16,6 +16,7 @@ import {
 } from "../lib/agent-processes.mjs";
 import { ChiefView } from "../lib/chief-view.mjs";
 import { readDiffMarks, writeDiffMarks } from "../lib/diff-marks.mjs";
+import { defaultDockerProbeGuard } from "../lib/docker-probe.mjs";
 import {
   createHerdrLifecycleSubscriber,
   isCurrentHerdrAgent,
@@ -45,6 +46,7 @@ import {
   TERMINAL_INPUT_ENABLE,
 } from "../lib/tui-input.mjs";
 
+export { resetDockerProbeGuard } from "../lib/docker-probe.mjs";
 export { ALT_SCROLL_DISABLE, ALT_SCROLL_ENABLE } from "../lib/tui-input.mjs";
 import {
   checkOrkestUpdate,
@@ -143,7 +145,7 @@ export function resolvePullUpdateOutcome(res, nowMs = Date.now()) {
   };
 }
 
-async function runExecOutput(exec, command, args, env = process.env, timeoutMs = 1500) {
+async function runExecDetailed(exec, command, args, env = process.env, timeoutMs = 1500) {
   try {
     if (exec === execFile) {
       return await new Promise((resolve) => {
@@ -151,29 +153,76 @@ async function runExecOutput(exec, command, args, env = process.env, timeoutMs =
           command,
           args,
           { env, timeout: timeoutMs, maxBuffer: 512 * 1024 },
-          (err, stdout = "") => resolve(err ? "" : String(stdout || "")),
+          (err, stdout = "") =>
+            resolve({ ok: !err, stdout: err ? "" : String(stdout || ""), error: err || null }),
         );
       });
     }
     let callbackStdout = "";
     let callbackErr = null;
     const result = exec(command, args, (err, stdout = "") => {
-      callbackErr = err;
+      callbackErr = err || null;
       callbackStdout = String(stdout || "");
     });
     if (result && typeof result.then === "function") {
       const awaited = await result;
-      if (typeof awaited === "string") return awaited;
-      if (awaited && typeof awaited.stdout === "string") return awaited.stdout;
-    } else if (typeof result === "string") {
-      return result;
-    } else if (result && typeof result.stdout === "string") {
-      return result.stdout;
+      if (typeof awaited === "string") return { ok: true, stdout: awaited, error: null };
+      if (awaited && typeof awaited.stdout === "string") {
+        return { ok: true, stdout: awaited.stdout, error: null };
+      }
+      return {
+        ok: !callbackErr,
+        stdout: callbackErr ? "" : callbackStdout,
+        error: callbackErr,
+      };
     }
-    return callbackErr ? "" : callbackStdout;
-  } catch {
+    if (typeof result === "string") return { ok: true, stdout: result, error: null };
+    if (result && typeof result.stdout === "string") {
+      return { ok: true, stdout: result.stdout, error: null };
+    }
+    return {
+      ok: !callbackErr,
+      stdout: callbackErr ? "" : callbackStdout,
+      error: callbackErr,
+    };
+  } catch (error) {
+    return { ok: false, stdout: "", error };
+  }
+}
+
+async function runExecOutput(exec, command, args, env = process.env, timeoutMs = 1500) {
+  return (await runExecDetailed(exec, command, args, env, timeoutMs)).stdout;
+}
+
+async function probeDockerPs({
+  exec = execFile,
+  env = process.env,
+  now = Date.now,
+  dockerProbe,
+  checkDocker = false,
+} = {}) {
+  const stamp = typeof now === "function" ? now() : now;
+  const shouldGuard = checkDocker || exec === execFile;
+  let binaryKey = "";
+  if (typeof dockerProbe === "function") {
+    const ready = await dockerProbe({ env, now: stamp });
+    if (!ready || ready.ok === false) return "";
+    if (typeof ready.binaryKey === "string") binaryKey = ready.binaryKey;
+  } else if (shouldGuard) {
+    const ready = await defaultDockerProbeGuard.check({ env, now: stamp });
+    if (!ready || ready.ok === false) return "";
+    binaryKey = ready.binaryKey || "";
+  }
+
+  const res = await runExecDetailed(exec, "docker", ["ps", "--format", "{{json .}}"], env);
+  if (!res.ok) {
+    if (shouldGuard) {
+      defaultDockerProbeGuard.recordFailure(res.error, { binaryKey, now: stamp });
+    }
     return "";
   }
+  if (shouldGuard) defaultDockerProbeGuard.recordSuccess();
+  return res.stdout;
 }
 
 async function runExec(exec, command, args, env = process.env) {
@@ -611,7 +660,10 @@ function pathWithin(candidate, rootPath) {
 }
 
 /** Discover room services and the observed process descendants attached to room members. */
-async function probeRoomDiscovery(room, { exec = execFile } = {}) {
+async function probeRoomDiscovery(
+  room,
+  { exec = execFile, env = process.env, now = Date.now, dockerProbe, checkDocker = false } = {},
+) {
   const explicit = Array.isArray(room?.services)
     ? room.services.filter((svc) => svc && typeof svc === "object").map((svc) => ({ ...svc }))
     : [];
@@ -715,7 +767,7 @@ async function probeRoomDiscovery(room, { exec = execFile } = {}) {
     cwdProbePids.length > 0
       ? runExecOutput(exec, "lsof", ["-a", "-p", cwdProbePids.join(","), "-d", "cwd", "-Fn"])
       : "",
-    runExecOutput(exec, "docker", ["ps", "--format", "{{json .}}"]),
+    probeDockerPs({ exec, env, now, dockerProbe, checkDocker }),
   ]);
   const cwdMap = parseLsofCwds(cwdOut);
   for (const listener of listeners) {
@@ -856,7 +908,15 @@ function cloneAgentProcesses(agentProcesses) {
 
 export async function cachedRoomDiscovery(
   room,
-  { exec = execFile, now = Date.now, ttlMs = 5000, force = false } = {},
+  {
+    exec = execFile,
+    env = process.env,
+    now = Date.now,
+    ttlMs = 5000,
+    force = false,
+    dockerProbe,
+    checkDocker = false,
+  } = {},
 ) {
   const key = String(room?.id || room?.cwd || "default");
   const stamp = typeof now === "function" ? now() : now;
@@ -873,7 +933,7 @@ export async function cachedRoomDiscovery(
   }
   let snapshot;
   try {
-    snapshot = await probeRoomDiscovery(room, { exec });
+    snapshot = await probeRoomDiscovery(room, { exec, env, now, dockerProbe, checkDocker });
   } catch {
     snapshot = { services: [], agentProcesses: {} };
   }
@@ -1236,7 +1296,7 @@ export async function runHordeTui(
       }
       if (enableServices) {
         try {
-          const discovered = await cachedRoomDiscovery(room, { exec });
+          const discovered = await cachedRoomDiscovery(room, { exec, env });
           if (discovered.services.length > 0) room.services = discovered.services;
           room.agentProcesses = discovered.agentProcesses;
         } catch {

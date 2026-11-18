@@ -322,6 +322,21 @@ class AgentStatuslineTests(unittest.TestCase):
         self.peer("claude-123", "snorfle-opus-high-project-23", "claude", focus="Build a footer")
         self.assertEqual((self.fields()["task"], self.fields()["stage"]), ("Build a footer", "not set"))
 
+    def test_stale_chief_focus_is_cleared_for_non_chief_session(self):
+        chief_focus = "Ork Chief — machine-wide master orchestrator"
+        self.peer("claude-123", "snorfle-opus-high-project-23", "claude", focus=chief_focus)
+        self.assertEqual(self.fields()["task"], "not set")
+        mailbox.write(
+            self.base / "chief.json",
+            {"schema": "ork.chief.v1", "session": "other-chief"},
+        )
+        self.assertEqual(self.fields()["task"], "not set")
+        mailbox.write(
+            self.base / "chief.json",
+            {"schema": "ork.chief.v1", "session": "claude-123"},
+        )
+        self.assertEqual(self.fields()["task"], chief_focus)
+
     def test_width_and_untrusted_terminal_text_are_safe(self):
         self.peer(
             "claude-123",

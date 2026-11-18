@@ -22,6 +22,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+  CHIEF_FOCUS_TEXT,
+  cleanNonChiefFocus,
   isClosedRoom,
   listRawRooms,
   mailboxRoot,
@@ -41,7 +43,7 @@ export const CHIEF_SCHEMA = "ork.chief.v1";
 export const CHIEF_STATUS_SCHEMA = "ork.chief.status.v1";
 export const CHIEF_SPAWN_SCHEMA = "ork.chief.spawn.v1";
 export const CHIEF_SEND_SCHEMA = "ork.chief.send.v1";
-export const CHIEF_FOCUS_TEXT = "Ork Chief — machine-wide master orchestrator";
+export { CHIEF_FOCUS_TEXT } from "./horde-room.mjs";
 
 const SCRIPTS_DIR = fileURLToPath(new URL("../skills/orchestrate/scripts/", import.meta.url));
 const PEER_MAILBOX_PY = path.join(SCRIPTS_DIR, "peer_mailbox.py");
@@ -367,6 +369,19 @@ export function readChiefBinding({
     : null;
 }
 
+function clearChiefFocus(session, { root, env, runMailbox }) {
+  if (!session || !SESSION_ID_RE.test(session)) return false;
+  const mailboxEnv =
+    runMailbox === defaultRunMailbox && root && !env?.ORCHESTRATE_MAILBOX_DIR
+      ? { ...env, ORCHESTRATE_MAILBOX_DIR: root }
+      : env;
+  const res = runMailbox(
+    ["focus", "--session", session, "--clear", "--only-if", CHIEF_FOCUS_TEXT],
+    { env: mailboxEnv },
+  );
+  return res.status === 0;
+}
+
 export async function bindChief({
   root = mailboxRoot(),
   env = process.env,
@@ -386,13 +401,21 @@ export async function bindChief({
         `The Chief desk is held by live session ${current.name || current.session}; pass --force to clear it`,
       );
     rmSync(file, { force: true });
+    clearChiefFocus(current.session, { root, env, runMailbox });
+    const peers = readPeers(root, { now });
+    for (const candidate of peers) {
+      if (candidate.session !== current.session && candidate.focus === CHIEF_FOCUS_TEXT) {
+        clearChiefFocus(candidate.session, { root, env, runMailbox });
+      }
+    }
     return { action: "cleared", binding: null, previous: current };
   }
   if (!self || !SESSION_ID_RE.test(self))
     throw new Error(
       "Pass --session <id> (or run inside an agent session with AGENT_MAILBOX_SESSION)",
     );
-  const peer = readPeers(root, { now }).find((candidate) => candidate.session === self) || null;
+  const peers = readPeers(root, { now });
+  const peer = peers.find((candidate) => candidate.session === self) || null;
   const panes = paneFields(peer, {
     herdrPaneId: env.HERDR_PANE_ID,
     orcaEnvironment: env.ORCA_ENVIRONMENT,
@@ -427,6 +450,22 @@ export async function bindChief({
   };
   writeJsonAtomic(file, binding);
   const focus = runMailbox(["focus", "--session", self, "--text", CHIEF_FOCUS_TEXT], { env });
+  const clearedSessions = new Set();
+  if (current && !isSame && current.session) {
+    clearChiefFocus(current.session, { root, env, runMailbox });
+    clearedSessions.add(current.session);
+  }
+  for (const candidate of peers) {
+    if (
+      candidate.session === self ||
+      clearedSessions.has(candidate.session) ||
+      candidate.focus !== CHIEF_FOCUS_TEXT
+    ) {
+      continue;
+    }
+    clearChiefFocus(candidate.session, { root, env, runMailbox });
+    clearedSessions.add(candidate.session);
+  }
   let isNotified = false;
   if (current && !isSame && !current.stale) {
     const notice = runMailbox(
@@ -716,7 +755,7 @@ function standaloneOf(peer) {
     model: peer.model || null,
     status: peer.state || "active",
     stage: peer.progress?.stage || peer.taskStatus || "",
-    task: oneLine(peer.focus || peer.progress?.task || "", 160),
+    task: oneLine(cleanNonChiefFocus(peer) || peer.progress?.task || "", 160),
     cwd: peer.checkout || peer.cwd,
     repo: git.repo,
     branch: peer.branch || git.branch || "",

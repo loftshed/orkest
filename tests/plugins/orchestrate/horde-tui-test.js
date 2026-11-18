@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { chmodSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -1887,6 +1888,115 @@ describe("terminal lifecycle", () => {
     expect(cached).toHaveLength(2);
   });
 
+  it("skips spawning docker ps when Docker.app is half-copied and backs off after docker failures", async () => {
+    hordeTuiModule.resetDockerProbeGuard();
+    let root = null;
+    try {
+      root = await mkdtemp(path.join(tmpdir(), "ork-horde-docker-"));
+      const binDir = path.join(root, "bin");
+      mkdirSync(binDir, { recursive: true });
+      const appPath = path.join(root, "Applications", "Docker.app", "Contents");
+      mkdirSync(path.join(appPath, "MacOS"), { recursive: true });
+      mkdirSync(path.join(appPath, "_CodeSignature"), { recursive: true });
+      mkdirSync(path.join(appPath, "Resources", "bin"), { recursive: true });
+      writeFileSync(path.join(appPath, "Info.plist"), "<plist></plist>\n", "utf8");
+      writeFileSync(
+        path.join(appPath, "_CodeSignature", "CodeResources"),
+        "<plist></plist>\n",
+        "utf8",
+      );
+      const desktopExe = path.join(appPath, "MacOS", "Docker Desktop");
+      writeFileSync(desktopExe, "#!/bin/sh\nexit 0\n", "utf8");
+      chmodSync(desktopExe, 0o755);
+      const dockerCli = path.join(appPath, "Resources", "bin", "docker");
+      writeFileSync(dockerCli, "#!/bin/sh\necho '[]'\n", "utf8");
+      chmodSync(dockerCli, 0o755);
+      symlinkSync(dockerCli, path.join(binDir, "docker"));
+
+      const probeRoom = {
+        id: "room-docker-guard",
+        cwd: "/Users/dev/orkest",
+        conductor: { id: "conductor", name: "gribble", pid: 9000 },
+        agents: [{ id: "worker-1", name: "snoobix", pid: 9100 }],
+      };
+      const calls = [];
+      let shouldFailDocker = true;
+      const mockExec = (cmd, args, cb) => {
+        calls.push(cmd);
+        if (cmd === "lsof" && args.includes("-sTCP:LISTEN")) {
+          cb(null, "p9105\nc node\nn127.0.0.1:4173\n");
+          return;
+        }
+        if (cmd === "ps" && args.includes("-axo")) {
+          cb(
+            null,
+            " 9105  9100 02:15 node vite --port 4173\n 9000 1 15:00 agy\n 9100 9000 12:00 codex\n",
+          );
+          return;
+        }
+        if (cmd === "ps" && args.includes("-p")) {
+          cb(null, " 9105  9100 02:15 node vite --port 4173\n");
+          return;
+        }
+        if (cmd === "lsof" && args.includes("cwd")) {
+          cb(null, "p9105\nn/Users/dev/orkest\n");
+          return;
+        }
+        if (cmd === "docker") {
+          if (shouldFailDocker) {
+            cb(Object.assign(new Error("killed"), { signal: "SIGKILL" }), "");
+            return;
+          }
+          cb(null, "");
+          return;
+        }
+        cb(null, "");
+      };
+
+      const damagedEnv = { PATH: binDir, HOME: root, DOCKER_HOST: "tcp://127.0.0.1:2375" };
+      const damagedDiscovery = await hordeTuiModule.cachedRoomDiscovery(probeRoom, {
+        exec: mockExec,
+        env: damagedEnv,
+        now: () => 1000,
+        force: true,
+        checkDocker: true,
+      });
+      expect(calls).not.toContain("docker");
+      expect(damagedDiscovery.services).toHaveLength(1);
+      expect(damagedDiscovery.services[0].kind).toBe("port");
+
+      // Repair Docker.app by restoring Contents/Resources/cli-plugins, then fail once with SIGKILL -> backoff skips next poll.
+      mkdirSync(path.join(appPath, "Resources", "cli-plugins"), { recursive: true });
+      const composePlugin = path.join(appPath, "Resources", "cli-plugins", "docker-compose");
+      writeFileSync(composePlugin, "#!/bin/sh\nexit 0\n", "utf8");
+      chmodSync(composePlugin, 0o755);
+
+      calls.length = 0;
+      await hordeTuiModule.cachedRoomDiscovery(probeRoom, {
+        exec: mockExec,
+        env: damagedEnv,
+        now: () => 2000,
+        force: true,
+        checkDocker: true,
+      });
+      expect(calls.filter((cmd) => cmd === "docker")).toHaveLength(1);
+
+      calls.length = 0;
+      shouldFailDocker = false;
+      await hordeTuiModule.cachedRoomDiscovery(probeRoom, {
+        exec: mockExec,
+        env: damagedEnv,
+        now: () => 5000,
+        force: true,
+        checkDocker: true,
+      });
+      expect(calls).not.toContain("docker");
+    } finally {
+      hordeTuiModule.resetDockerProbeGuard();
+      if (root) rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("subscribes to Herdr lifecycle events, invalidates on pane updates, and reconciles on events_lost", async () => {
     const sockets = [];
     function createFakeSocket() {
@@ -2645,10 +2755,12 @@ describe("terminal lifecycle", () => {
       input.emit("data", "q");
       await vi.waitFor(() => expect(text()).toContain("Press q again"));
 
-      // Switching to Room mode cancels armed close and preserves room.chief mission metadata.
+      // Switching to Room mode cancels armed close, preserves room.chief mission metadata,
+      // and leaves a non-Chief room unbadged.
       frames.length = 0;
       input.emit("data", "\r");
-      await vi.waitFor(() => expect(text()).toContain("★ chief"));
+      await vi.waitFor(() => expect(text()).toContain("Coordinator"));
+      expect(text()).not.toContain("★ chief");
       frames.length = 0;
       input.emit("data", "q");
       await vi.waitFor(() => expect(text()).toContain("Press q again"));

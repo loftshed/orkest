@@ -12,6 +12,20 @@ use crate::sha256;
 const COLORS: [u32; 6] = [31, 32, 33, 34, 35, 36];
 const NERD_AGENT_GLYPH: &str = "󰚩";
 const NERD_TASK_GLYPH: &str = "󰓾";
+const CHIEF_FOCUS_TEXT: &str = "Ork Chief — machine-wide master orchestrator";
+
+fn is_live_chief_session(base: &Path, session: &str) -> bool {
+    let raw = match fs::read_to_string(base.join("chief.json")) {
+        Ok(content) => content,
+        Err(_) => return false,
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(val) => val,
+        Err(_) => return false,
+    };
+    parsed.get("schema").and_then(|v| v.as_str()) == Some("ork.chief.v1")
+        && parsed.get("session").and_then(|v| v.as_str()) == Some(session)
+}
 
 fn palette_color(c: u32) -> u32 {
     match c {
@@ -749,11 +763,14 @@ pub fn run(args: &[String], fallback_script: Option<&Path>) -> io::Result<()> {
             }
         }
         ProgressRead::UnknownRole | ProgressRead::MissingOrInvalid => {
-            let focus = peer
+            let mut focus = peer
                 .get("focus")
                 .and_then(|v| v.as_str())
                 .map(clean_text)
                 .unwrap_or_default();
+            if focus == CHIEF_FOCUS_TEXT && !is_live_chief_session(&base, &session) {
+                focus.clear();
+            }
             (
                 None,
                 "not set".to_string(),
@@ -982,4 +999,45 @@ pub fn run(args: &[String], fallback_script: Option<&Path>) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn live_chief_session_requires_matching_schema_and_session() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = env::temp_dir().join(format!("ork-fast-statusline-test-{nanos}"));
+        fs::create_dir_all(&dir).unwrap();
+
+        assert!(!is_live_chief_session(&dir, "session-1"));
+
+        fs::write(
+            dir.join("chief.json"),
+            r#"{"schema":"ork.chief.v1","session":"other"}"#,
+        )
+        .unwrap();
+        assert!(!is_live_chief_session(&dir, "session-1"));
+
+        fs::write(
+            dir.join("chief.json"),
+            r#"{"schema":"wrong.v1","session":"session-1"}"#,
+        )
+        .unwrap();
+        assert!(!is_live_chief_session(&dir, "session-1"));
+
+        fs::write(
+            dir.join("chief.json"),
+            r#"{"schema":"ork.chief.v1","session":"session-1"}"#,
+        )
+        .unwrap();
+        assert!(is_live_chief_session(&dir, "session-1"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
