@@ -122,7 +122,7 @@ ork chief spawn --cwd <repo> [--worktree [slug] | --branch <branch>] (--goal <te
 - grouped orchestrator rows (repo/worktree badge, coordinator name and model, status pill, `3 working · 1 blocked`, stage or task, attention marker) and a standalone-sessions section,
 - detail of the selected row at the bottom (goal, workers, latest progress or escalation).
 
-Keys: `↑`/`↓` (`j`/`k`) select · `Enter` open the room's Swarm View (or focus a standalone session) · `Tab` toggle Overview ⇄ last room · `Backspace` (or `Esc`) back to Overview · `f`/`o` focus the orchestrator's Herdr, Orca, or tmux pane · `C` focus the Chief pane · `m` mouse capture · `?` help · `q` close (`q twice` when `confirmClose` is enabled in embedded Herdr panes, cleared on mode switch, non-`q` keys, and clicks). Single-room Swarm View reads transient `room.liveChief` (`ork.chief.v1`, distinct from persisted `room.chief` mission metadata) to render `★ chief` / `★ chief desk` while a live Chief is bound, and is otherwise unchanged.
+Keys: `↑`/`↓` (`j`/`k`) select · `Enter` open the room's Swarm View (or focus a standalone session) · `Tab` toggle Overview ⇄ last room · `Backspace` (or `Esc`) back to Overview · `f`/`o` focus the orchestrator's Herdr, Orca, or tmux pane · `C` focus the Chief pane · `m` mouse capture · `?` help · `q` close (`q twice` when `confirmClose` is enabled in embedded Herdr panes, cleared on mode switch, non-`q` keys, and clicks). Single-room Swarm View reads transient `room.liveChief` (`ork.chief.v1`, distinct from persisted `room.chief` mission metadata) to render `★ chief desk` **only on the single Chief's own room**, leaving every other room without a badge.
 
 ## 2. CLI contract (v1)
 

@@ -999,7 +999,7 @@ function propagateUpAncestors(agents, seedIds) {
   return result;
 }
 
-/** Subtle `★ chief` title hint, present only when the runner attached a live Chief binding. */
+/** Subtle `★ chief desk` title hint, present only when this room's coordinator holds the live Chief binding. */
 function chiefHintLabel(room, lead, tier) {
   const chief = room?.liveChief;
   if (!chief || chief.schema !== "ork.chief.v1" || !chief.live || chief.stale) return "";
@@ -1015,9 +1015,7 @@ function chiefHintLabel(room, lead, tier) {
       lead?.nativeSession,
     ].filter((value) => typeof value === "string" && value),
   );
-  return chief.session && ownerSessions.has(chief.session)
-    ? ` · ${star} chief desk`
-    : ` · ${star} chief`;
+  return chief.session && ownerSessions.has(chief.session) ? ` · ${star} chief desk` : "";
 }
 
 function memberModelInfo(member) {

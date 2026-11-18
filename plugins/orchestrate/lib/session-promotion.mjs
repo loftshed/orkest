@@ -8,10 +8,12 @@ import { promisify } from "node:util";
 
 import { herdrEndpoint } from "./herdr-context.mjs";
 import {
+  cleanNonChiefFocus,
   createRoom,
   isActiveRoom,
   listRawRooms,
   mailboxRoot,
+  readLiveChiefSession,
   readRoom,
   updateRoom,
 } from "./horde-room.mjs";
@@ -258,7 +260,7 @@ export async function promoteSession(
       room.objective = objective.trim();
       room.title = objective.replaceAll(/\s+/gu, " ").trim().slice(0, 160);
     }
-    room.title ||= peer.focus || "Current conversation";
+    room.title ||= cleanNonChiefFocus(peer, readLiveChiefSession(root)) || "Current conversation";
     rememberSession(room.conductor, peer.session, [room.promotion?.session]);
     room.conductor = {
       ...room.conductor,

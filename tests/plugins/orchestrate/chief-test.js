@@ -192,6 +192,14 @@ describe("ork chief", () => {
       expect(result.notified).toBe(true);
       const notice = runMailbox.mock.calls.find(([args]) => args[0] === "send")[0];
       expect(notice).toEqual(expect.arrayContaining(["--to", "first", "--no-wake"]));
+      expect(runMailbox.mock.calls.map(([args]) => args)).toContainEqual([
+        "focus",
+        "--session",
+        "first",
+        "--clear",
+        "--only-if",
+        expect.stringContaining("Ork Chief"),
+      ]);
       const again = await bindChief({ root, env, session: "second", runMailbox, now: NOW + 9 });
       expect(again.action).toBe("refreshed");
     });
@@ -203,15 +211,41 @@ describe("ork chief", () => {
         bindChief({ root, env, session: "intruder", clear: true, now: NOW }),
       ).rejects.toThrow(/--force/u);
       expect(fs.existsSync(chiefPath(root))).toBe(true);
-      const forced = await bindChief({ root, env, session: "x", clear: true, force: true });
+      const forced = await bindChief({
+        root,
+        env,
+        session: "x",
+        clear: true,
+        force: true,
+        runMailbox: mailboxMock(),
+      });
       expect(forced.action).toBe("cleared");
       expect(fs.existsSync(chiefPath(root))).toBe(false);
-      expect((await bindChief({ root, env, session: "x", clear: true })).action).toBe("none");
+      expect(
+        (await bindChief({ root, env, session: "x", clear: true, runMailbox: mailboxMock() }))
+          .action,
+      ).toBe("none");
 
       writePeer(root, { session: "dead", name: "dead", cwd: tmp, pid: deadPid() });
       await bindChief({ root, env, session: "dead", runMailbox: mailboxMock(), now: NOW });
-      const cleared = await bindChief({ root, env, session: "someone", clear: true, now: NOW });
+      const clearMailbox = mailboxMock();
+      const cleared = await bindChief({
+        root,
+        env,
+        session: "someone",
+        clear: true,
+        runMailbox: clearMailbox,
+        now: NOW,
+      });
       expect(cleared.action).toBe("cleared");
+      expect(clearMailbox.mock.calls.map(([args]) => args)).toContainEqual([
+        "focus",
+        "--session",
+        "dead",
+        "--clear",
+        "--only-if",
+        expect.stringContaining("Ork Chief"),
+      ]);
     });
   });
 
@@ -997,5 +1031,27 @@ describe("ork chief", () => {
       }),
     ).rejects.toThrow(/already exists/u);
     expect(provision).not.toHaveBeenCalled();
+  });
+
+  it("sweeps stale Chief focus from displaced peers and hides stale Chief focus from non-Chief status", async () => {
+    const repo = makeRepo(tmp, "stale-focus");
+    const chiefFocus = "Ork Chief — machine-wide master orchestrator";
+    writePeer(root, { session: "chief-old", name: "old-chief", cwd: repo, focus: chiefFocus });
+    writePeer(root, { session: "chief-new", name: "new-chief", cwd: repo });
+    const runMailbox = mailboxMock();
+    await bindChief({ root, env, session: "chief-new", runMailbox, now: NOW });
+    expect(runMailbox.mock.calls.map(([args]) => args)).toContainEqual([
+      "focus",
+      "--session",
+      "chief-old",
+      "--clear",
+      "--only-if",
+      chiefFocus,
+    ]);
+    // Even if a legacy peer file still retains the old Chief focus string, non-Chief status ignores it.
+    const status = await chiefStatus({ root, env, now: NOW, quota: false, listRooms: () => [] });
+    const oldPeer = status.standalone.find((peer) => peer.session === "chief-old");
+    expect(oldPeer).toBeDefined();
+    expect(oldPeer.task).toBe("");
   });
 });

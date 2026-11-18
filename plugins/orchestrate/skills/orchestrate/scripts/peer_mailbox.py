@@ -592,6 +592,22 @@ def set_focus(
     return peer
 
 
+def clear_focus(base: Path, session: str, *, only_if: str | None = None) -> dict[str, Any]:
+    """Clear a session's focus without altering its presence, pid, cwd, or lastSeenAt."""
+    path = peer_path(base, session)
+    with locked(path):
+        peer = load(path)
+        if not valid_peer(peer) or is_run_peer(peer):
+            return {"session": session, "cleared": False}
+        if only_if is not None and peer.get("focus") != only_if:
+            return {"session": session, "cleared": False, "focus": peer.get("focus")}
+        if "focus" not in peer or peer.get("focus") is None:
+            return {"session": session, "cleared": False}
+        peer.pop("focus", None)
+        write(path, peer)
+        return {"session": session, "cleared": True}
+
+
 def register(
     base: Path,
     *,

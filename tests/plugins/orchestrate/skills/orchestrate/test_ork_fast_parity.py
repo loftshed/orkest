@@ -305,6 +305,78 @@ class TestOrkFastParity(unittest.TestCase):
                     else:
                         self.assertEqual(py_proc.stdout, rust_proc.stdout)
 
+    def test_statusline_chief_focus_parity(self):
+        """Compare Python and Rust statusline for live vs stale Chief focus captions."""
+        mailbox_root = runtime_paths.cache_home(env=self.env, home=self.home) / "mailbox-v1"
+        (mailbox_root / "peers").mkdir(parents=True)
+        checkout_dir = self.home / "repo"
+        checkout_dir.mkdir(parents=True)
+        resolved_checkout = str(checkout_dir.resolve())
+        session_id = "sess-chief-focus-parity"
+        s_key = peer_mailbox.session_key(session_id)
+        now_stamp = dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        chief_focus = "Ork Chief — machine-wide master orchestrator"
+
+        peer_record = {
+            "schema": "agent-executor.peer.v1",
+            "session": session_id,
+            "name": "iron-aurora-ab",
+            "harness": "claude",
+            "cwd": resolved_checkout,
+            "checkout": resolved_checkout,
+            "repo": str(self.home / "repos" / "orkest"),
+            "sessionModel": "claude-sonnet-4-6",
+            "effort": "high",
+            "state": "busy",
+            "pid": os.getpid(),
+            "focus": chief_focus,
+            "startedAt": now_stamp,
+            "lastSeenAt": now_stamp,
+        }
+        (mailbox_root / "peers" / f"{s_key}.json").write_text(json.dumps(peer_record), encoding="utf-8")
+        stdin_payload = json.dumps({"session_id": session_id, "terminal_width": 120})
+
+        scenarios = (
+            ("missing_chief_json", None, "not set"),
+            ("other_chief_session", {"schema": "ork.chief.v1", "session": "other-session"}, "not set"),
+            ("matching_chief_session", {"schema": "ork.chief.v1", "session": session_id}, chief_focus),
+        )
+        for label_case, chief_doc, expected_task in scenarios:
+            with self.subTest(case=label_case):
+                chief_path = mailbox_root / "chief.json"
+                if chief_doc is None:
+                    chief_path.unlink(missing_ok=True)
+                else:
+                    chief_path.write_text(json.dumps(chief_doc), encoding="utf-8")
+                py_proc = subprocess.run(
+                    [sys.executable, str(SCRIPTS / "agent_statusline.py"), "--harness", "claude", "--json"],
+                    input=stdin_payload,
+                    capture_output=True,
+                    text=True,
+                    env=self.env,
+                    check=True,
+                )
+                rust_proc = subprocess.run(
+                    [
+                        str(ORK_FAST_BIN),
+                        "statusline",
+                        "--harness",
+                        "claude",
+                        "--fallback-script",
+                        str(SCRIPTS / "agent_statusline.py"),
+                        "--json",
+                    ],
+                    input=stdin_payload,
+                    capture_output=True,
+                    text=True,
+                    env=self.env,
+                    check=True,
+                )
+                py_json = json.loads(py_proc.stdout)
+                rust_json = json.loads(rust_proc.stdout)
+                self.assertEqual(py_json["task"], expected_task)
+                self.assertEqual(py_json, rust_json)
+
     def test_mailbox_hook_stop_preinvocation_and_unread_parity(self):
         """Test Stop state->idle + gemini lastStopReason, PreInvocation mid-turn, and unread inbox delegation."""
         mailbox_root = runtime_paths.cache_home(env=self.env, home=self.home) / "mailbox-v1"

@@ -42,7 +42,23 @@ import { migrateSchema, openOrkestSqlite, withImmediateTransaction } from "./ork
 import { cacheHome } from "./runtime-paths.mjs";
 
 export const ROOM_SCHEMA = "agent-executor.room.v1";
+export const CHIEF_FOCUS_TEXT = "Ork Chief — machine-wide master orchestrator";
 const ID = /^[\w-]{1,80}$/u;
+
+export function readLiveChiefSession(root = mailboxRoot()) {
+  try {
+    const raw = JSON.parse(readFileSync(path.join(root, "chief.json"), "utf8"));
+    return raw?.schema === "ork.chief.v1" && typeof raw.session === "string" ? raw.session : null;
+  } catch {
+    return null;
+  }
+}
+
+export function cleanNonChiefFocus(peer, liveChiefSession = null) {
+  const focus = typeof peer?.focus === "string" ? peer.focus.trim() : "";
+  if (focus === CHIEF_FOCUS_TEXT && peer?.session !== liveChiefSession) return "";
+  return focus;
+}
 
 /**
  * A room's place in history. Absent means active, so legacy rooms stay current until someone

@@ -8,6 +8,7 @@ import { promisify } from "node:util";
 
 import {
   addMembers,
+  cleanNonChiefFocus,
   clearRoomListCache,
   createRoom,
   detectWorktree,
@@ -17,6 +18,7 @@ import {
   mailboxRoot,
   normalizeWorkforceRole,
   processStarted,
+  readLiveChiefSession,
   readRoom,
   refreshMemberWorktrees,
   requireActiveRoom,
@@ -2091,6 +2093,7 @@ async function appendNativePeers(room, snapshots, root) {
     .filter((entry) => entry.endsWith(".json"))
     .sort((left, right) => left.localeCompare(right));
   const maxAgents = room.swarm?.maxAgents || 64;
+  const liveChiefSession = readLiveChiefSession(root);
   for (const entry of peerFiles) {
     const peer = await readOptionalJson(path.join(root, "peers", entry), 64 * 1024);
     if (
@@ -2189,17 +2192,16 @@ async function appendNativePeers(room, snapshots, root) {
       status = "running";
     }
     const resolvedModel = cleanLine(subagentMeta?.model || peer.model) || engine;
+    const peerFocus = cleanLine(cleanNonChiefFocus(peer, liveChiefSession));
     const subagentRole =
       peer.harness === "claude" && (peer.isSubagent || peer.session.startsWith("subagent-"))
-        ? claudeSubagentRole(
-            subagentMeta?.agentType || cleanLine(peer.focus).replace(/^native\s+/iu, ""),
-          )
+        ? claudeSubagentRole(subagentMeta?.agentType || peerFocus.replace(/^native\s+/iu, ""))
         : undefined;
     const rawTask = cleanLine(
       subagentMeta?.description ||
         peer.subagentDescription ||
         progressRecord?.task ||
-        peer.focus ||
+        peerFocus ||
         "Native agent session",
     );
     const taskText = rawTask;
@@ -3227,7 +3229,7 @@ export async function interactiveProgress(room, root = mailboxRoot()) {
       stage = progress.stage || existingStage;
       isManual = true;
     } else {
-      task = cleanLine(peer.focus) || existingTask;
+      task = cleanLine(cleanNonChiefFocus(peer, readLiveChiefSession(root))) || existingTask;
       if (peer.state === "busy") {
         stage = "working";
       } else if (

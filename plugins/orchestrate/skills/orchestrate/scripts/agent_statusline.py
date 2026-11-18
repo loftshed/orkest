@@ -35,6 +35,16 @@ EFFORT_LEVELS = frozenset({"minimal", "low", "medium", "high", "xhigh", "max", "
 _TRAILING_EFFORT_RE = re.compile(r"^(.*\S)(?:\s*\(([a-z]+)\)|\s*\[([a-z]+)\]|-([a-z]+))$", re.IGNORECASE)
 NERD_AGENT_GLYPH = "󰚩"
 NERD_TASK_GLYPH = "󰓾"
+CHIEF_FOCUS_TEXT = "Ork Chief — machine-wide master orchestrator"
+
+
+def is_live_chief_session(base: Path, session: str) -> bool:
+    """Return True when base/chief.json currently binds this session as Ork Chief."""
+    try:
+        data = json.loads((base / "chief.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return False
+    return isinstance(data, dict) and data.get("schema") == "ork.chief.v1" and data.get("session") == session
 
 
 def text(value: Any) -> str:
@@ -250,6 +260,8 @@ def identity(
         task, stage, manual = text(progress["task"]), progress["stage"], True
     else:
         task, stage = text(peer.get("focus")), ""
+        if task == CHIEF_FOCUS_TEXT and not is_live_chief_session(base, session):
+            task = ""
         try:
             note = mailbox.load(mailbox_tasks.path_for(base, peer))
             if (

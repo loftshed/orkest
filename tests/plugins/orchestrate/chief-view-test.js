@@ -371,12 +371,14 @@ describe("single-room chief hint", () => {
     expect(text(baseline.render(100))).not.toContain("★");
   });
 
-  it("marks a room view with ★ chief, and the Chief's own room as its desk via liveChief only", () => {
+  it("marks only the bound Chief's own room as ★ chief desk and leaves other rooms unbadged", () => {
+    const baseline = new HordeView(room(), { now: () => 5000, tier: "unicode" });
     const other = new HordeView(
       { ...room(), liveChief: { schema: "ork.chief.v1", live: true, session: "someone-else" } },
       { now: () => 5000, tier: "unicode" },
     );
-    expect(text(other.render(100))).toContain("★ chief");
+    expect(other.render(100)).toEqual(baseline.render(100));
+    expect(text(other.render(100))).not.toContain("★ chief");
     expect(text(other.render(100))).not.toContain("chief desk");
     const desk = new HordeView(
       { ...room(), liveChief: { schema: "ork.chief.v1", live: true, session: "coord-session" } },
@@ -490,6 +492,14 @@ describe("chief side window runner", () => {
       ["room-chief", "room-docs"].map((id) => {
         const value = createRoom(parseTeam("claude:haiku"), { id, now: 1000 });
         value.title = id === "room-chief" ? "Chief window build" : "Docs build";
+        if (id === "room-chief") {
+          value.conductor.session = {
+            id: "chief-session-1",
+            engine: "claude",
+            machine: "kahuna",
+            cwd: "/repo",
+          };
+        }
         return [id, value];
       }),
     );
@@ -515,13 +525,14 @@ describe("chief side window runner", () => {
       await vi.waitFor(() => expect(latest()).toContain("ORK CHIEF"));
       await press("\r", "Chief window build");
       expect(loadRoom).toHaveBeenCalledWith("room-chief");
-      expect(latest()).toContain("★ chief");
+      expect(latest()).toContain("★ chief desk");
       await press("\u{7F}", "ORK CHIEF");
       await press("\t", "Chief window build");
       await press("\u{1B}", "ORK CHIEF");
       await press("\u{1B}[B", "Docs refresh");
       await press("\r", "Docs build");
       expect(loadRoom).toHaveBeenLastCalledWith("room-docs");
+      expect(latest().slice(latest().lastIndexOf("Swarm · Docs build"))).not.toContain("★ chief");
       await press("\t", "ORK CHIEF");
       output.frames = "";
       input.emit("data", "f");

@@ -7,7 +7,8 @@ export default defineConfig({
     outputFile: { junit: "junit.xml" },
     reporters: process.env.CI ? ["default", "junit"] : ["default"],
     // Some suites start real CLIs and hooks in temporary homes.
-    testTimeout: 30_000,
+    testTimeout: 90_000,
+    ...(process.env.CI && process.platform === "darwin" && { maxWorkers: 2 }),
     // Snapshot and ANSI assertions expect colour; tests that need NO_COLOR set it themselves.
     env: { NO_COLOR: "" },
   },
