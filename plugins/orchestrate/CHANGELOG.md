@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.88.0
+
+- feat(orchestrate): add explicit --trust-orkest-commands setup opt-in (#223)
+
 ## 0.87.3
 
 - fix(orchestrate): forward explicit --allow-credits through room dispatch and launch (#222)
