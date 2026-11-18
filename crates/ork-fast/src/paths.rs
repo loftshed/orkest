@@ -405,13 +405,47 @@ pub fn valid_peer(peer: &serde_json::Value) -> bool {
     started_ok && seen_ok
 }
 
-/// Return true if `<base>/rooms/*.json` contains an active/open room referencing `session`.
-#[must_use]
-pub fn has_active_room_for_session(base: &Path, session: &str) -> bool {
-    let rooms_dir = base.join("rooms");
-    if !rooms_dir.is_dir() {
-        return false;
+/// Schema of `<base>/rooms-index.json`, written by `horde-room.mjs` after every room commit.
+pub const ROOMS_INDEX_SCHEMA: &str = "orkest.rooms-index.v1";
+
+fn status_is_closed(status: Option<&serde_json::Value>) -> bool {
+    let status = status
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(status.as_str(), "closed" | "archived" | "completed")
+}
+
+/// `Some(answer)` from a valid rooms index, `None` when it is missing or unreadable.
+fn index_has_active_session(base: &Path, session: &str) -> Option<bool> {
+    let content = fs::read_to_string(base.join("rooms-index.json")).ok()?;
+    let index: serde_json::Value = serde_json::from_str(&content).ok()?;
+    if index.get("schema").and_then(|v| v.as_str()) != Some(ROOMS_INDEX_SCHEMA) {
+        return None;
     }
+    let rooms = index.get("rooms")?.as_array()?;
+    for room in rooms {
+        let closed = room
+            .get("closed")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if closed {
+            continue;
+        }
+        let Some(sessions) = room.get("sessions").and_then(|v| v.as_array()) else {
+            // A malformed entry cannot prove the session is absent.
+            return None;
+        };
+        if sessions.iter().any(|value| value.as_str() == Some(session)) {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+/// Legacy `<base>/rooms/*.json` records not yet imported into `rooms.db`.
+fn legacy_room_references_session(base: &Path, session: &str) -> bool {
+    let rooms_dir = base.join("rooms");
     let Ok(entries) = fs::read_dir(&rooms_dir) else {
         return false;
     };
@@ -426,15 +460,11 @@ pub fn has_active_room_for_session(base: &Path, session: &str) -> bool {
         if !content.contains(session) {
             continue;
         }
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-            let status = val
-                .get("status")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            if !matches!(status.as_str(), "closed" | "archived" | "completed") {
-                return true;
-            }
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content)
+            && val.get("closedAt").is_none_or(serde_json::Value::is_null)
+            && !status_is_closed(val.get("status"))
+        {
+            return true;
         }
     }
     false
@@ -493,6 +523,21 @@ pub fn has_active_authority_for_session(cache: &Path, session: &str, harness: &s
         }
     }
     false
+}
+
+/// Return true if an open room may reference `session`, so the hook must take the full path.
+///
+/// Reads the rooms index first. Unimported legacy room files still count. When `rooms.db`
+/// exists without a valid index, the answer is unknown and therefore conservatively true.
+#[must_use]
+pub fn has_active_room_for_session(base: &Path, session: &str) -> bool {
+    if legacy_room_references_session(base, session) {
+        return true;
+    }
+    match index_has_active_session(base, session) {
+        Some(found) => found,
+        None => base.join("rooms.db").exists(),
+    }
 }
 
 #[cfg(test)]
@@ -629,5 +674,75 @@ mod tests {
         ));
         assert!(!has_active_authority_for_session(&cache, "wrong", "claude"));
         let _ = fs::remove_dir_all(&cache);
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!("ork-fast-rooms-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_rooms_index_answers_for_sqlite_store() {
+        let dir = scratch("index");
+        fs::write(dir.join("rooms.db"), b"").unwrap();
+        fs::write(
+            dir.join("rooms-index.json"),
+            r#"{"schema":"orkest.rooms-index.v1","rooms":[
+              {"id":"open","closed":false,"sessions":["session-open"]},
+              {"id":"done","closed":true,"sessions":["session-closed"]}]}"#,
+        )
+        .unwrap();
+        assert!(has_active_room_for_session(&dir, "session-open"));
+        assert!(!has_active_room_for_session(&dir, "session-closed"));
+        assert!(!has_active_room_for_session(&dir, "session-other"));
+        assert!(!has_active_room_for_session(&dir, "session"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_rooms_index_missing_or_invalid_is_conservative() {
+        let dir = scratch("conservative");
+        assert!(!has_active_room_for_session(&dir, "session-a"));
+        fs::write(dir.join("rooms.db"), b"").unwrap();
+        assert!(has_active_room_for_session(&dir, "session-a"));
+        fs::write(
+            dir.join("rooms-index.json"),
+            r#"{"schema":"other","rooms":[]}"#,
+        )
+        .unwrap();
+        assert!(has_active_room_for_session(&dir, "session-a"));
+        fs::write(
+            dir.join("rooms-index.json"),
+            r#"{"schema":"orkest.rooms-index.v1","rooms":[{"id":"x","closed":false}]}"#,
+        )
+        .unwrap();
+        assert!(has_active_room_for_session(&dir, "session-a"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_legacy_room_files_still_count() {
+        let dir = scratch("legacy");
+        fs::create_dir_all(dir.join("rooms")).unwrap();
+        fs::write(
+            dir.join("rooms/a.json"),
+            r#"{"id":"a","conductor":{"session":{"id":"session-legacy"}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("rooms/b.json"),
+            r#"{"id":"b","closedAt":"2026-01-01T00:00:00Z","agents":[{"session":{"id":"session-closed"}}]}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("rooms-index.json"),
+            r#"{"schema":"orkest.rooms-index.v1","rooms":[]}"#,
+        )
+        .unwrap();
+        assert!(has_active_room_for_session(&dir, "session-legacy"));
+        assert!(!has_active_room_for_session(&dir, "session-closed"));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

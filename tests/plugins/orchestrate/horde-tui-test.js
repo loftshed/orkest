@@ -29,6 +29,7 @@ import {
   validateRoom,
 } from "../../../plugins/orchestrate/lib/horde-room.mjs";
 import {
+  CLOSE_CONFIRM_MS,
   extractAgentFocusMarkdown,
   HordeView,
   normalizeAgent,
@@ -1131,6 +1132,57 @@ describe("terminal lifecycle", () => {
       expect(load).toHaveBeenCalledTimes(loads);
     } finally {
       input.emit("data", "q");
+      await running;
+      vi.useRealTimers();
+    }
+  });
+
+  it("asks for a second q before closing an embedded Herdr view pane", async () => {
+    const view = new HordeView(fixture(), { confirmClose: true });
+    expect(view.requestClose(1000)).toBe(true);
+    expect(view.notice).toContain("Press q again");
+    expect(view.requestClose(1000 + CLOSE_CONFIRM_MS + 1)).toBe(true);
+    expect(view.requestClose(1000 + CLOSE_CONFIRM_MS + 2)).toEqual({ type: "close-view" });
+    view.requestClose(5000);
+    view.handleKey("c");
+    expect(view.closeArmedAt).toBeUndefined();
+    view.overlay = "help";
+    expect(plain(view.render(100).join("\n"))).toContain("Close this pane (q twice)");
+    expect(new HordeView(fixture()).requestClose()).toEqual({ type: "close-view" });
+
+    vi.useFakeTimers();
+    // eslint-disable-next-line unicorn/prefer-event-target -- Node readline requires a stream EventEmitter API.
+    const input = new EventEmitter();
+    Object.assign(input, {
+      isTTY: true,
+      isRaw: false,
+      setRawMode: vi.fn(),
+      resume: vi.fn(),
+      pause: vi.fn(),
+    });
+    const output = { isTTY: true, rows: 24, columns: 80, write: vi.fn() };
+    let isClosed = false;
+    const run = async () => {
+      await runTui(async () => fixture(), {
+        input,
+        output,
+        quota: false,
+        env: { ORKEST_HERDR_VIEW_STATE: path.join(tmpdir(), "absent-view-state.json") },
+      });
+      isClosed = true;
+    };
+    const running = run();
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      input.emit("data", "q");
+      await vi.advanceTimersByTimeAsync(10);
+      expect(isClosed).toBe(false);
+      expect(plain(output.write.mock.calls.flat().join(""))).toContain("Press q again");
+      input.emit("data", "q");
+      await running;
+      expect(isClosed).toBe(true);
+    } finally {
+      input.emit("data", "\u{3}");
       await running;
       vi.useRealTimers();
     }

@@ -552,22 +552,24 @@ class RoomStoreTests(unittest.TestCase):
                 self.assertIsNone(room_store.read_room(base, "missing"))
             legacy = base / "rooms" / "legacy.json"
             mailbox.write(legacy, {"id": "legacy", "agents": [], "title": "Before"})
+            # Legacy files need the Node import first, so Python never reads rooms.db around them.
             with mock.patch.object(sqlite3, "connect", side_effect=AssertionError("Python must not open rooms.db")):
                 self.assertEqual(room_store.read_room(base, "legacy")["title"], "Before")
-                self.assertFalse(legacy.exists())
-                self.assertTrue((base / "rooms.v1-backup" / "legacy.json").exists())
-                room_store.list_rooms(base)
-                with mock.patch.object(room_store.subprocess, "run", side_effect=AssertionError("cache miss")):
-                    cached = room_store.read_room(base, "legacy")
-                    cached["title"] = "Local mutation"
-                    self.assertEqual(room_store.read_room(base, "legacy")["title"], "Before")
-                room_store._invoke(base, "set-meta", "legacy", {"title": "External change"})
-                self.assertEqual(room_store.read_room(base, "legacy")["title"], "External change")
-                self.assertEqual(
-                    tmux._update_room_metadata(base, "legacy", title="Metadata", removed=None)["title"], "Metadata"
-                )
-                self.assertEqual(room_store.read_room(base, "legacy")["title"], "Metadata")
-                self.assertFalse(legacy.exists())
+            self.assertFalse(legacy.exists())
+            self.assertTrue((base / "rooms.v1-backup" / "legacy.json").exists())
+            # After the import, reads may use the read-only sqlite3 reader.
+            room_store.list_rooms(base)
+            with mock.patch.object(room_store.subprocess, "run", side_effect=AssertionError("cache miss")):
+                cached = room_store.read_room(base, "legacy")
+                cached["title"] = "Local mutation"
+                self.assertEqual(room_store.read_room(base, "legacy")["title"], "Before")
+            room_store._invoke(base, "set-meta", "legacy", {"title": "External change"})
+            self.assertEqual(room_store.read_room(base, "legacy")["title"], "External change")
+            self.assertEqual(
+                tmux._update_room_metadata(base, "legacy", title="Metadata", removed=None)["title"], "Metadata"
+            )
+            self.assertEqual(room_store.read_room(base, "legacy")["title"], "Metadata")
+            self.assertFalse(legacy.exists())
 
     def test_rebind_preserves_history_and_wal_changes_invalidate_cached_rooms(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -614,7 +616,9 @@ class RoomStoreTests(unittest.TestCase):
                 _, errors = child.communicate("close", timeout=10)
                 self.assertEqual(child.returncode, 0, errors)
 
+    @mock.patch.dict(os.environ, {"ORKEST_ROOM_STORE_BRIDGE": "1"})
     def test_single_room_lookup_uses_get_and_header_counter_invalidates_restored_mtime(self):
+        # Pins the Node bridge path; the direct sqlite3 reader shares the same signature cache.
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary) / "mailbox-v1"
             room_store.put_room(base, {"id": "alpha", "agents": [], "title": "Initial"})

@@ -251,6 +251,17 @@ it("projects current session status and nesting without treating a lead report a
   expect(output).toContain("Investigate");
   expect(output).toContain("└─  · 3 flash-1");
   expect(output).toContain("runtime-model / high · reported (awaiting review)");
+  // A fresh binding that has produced no presence yet is pending, not failed.
+  const pending = await observeRoom(room.id, { root, progress: async () => ({}) });
+  expect(pending.agents[0].status).toBe("awaiting observation");
+  await updateRoom(
+    room.id,
+    (current) => {
+      current.agents[0].session.boundAt = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+      return current;
+    },
+    { root },
+  );
   const absent = await observeRoom(room.id, { root, progress: async () => ({}) });
   expect(absent.agents[0].status).toBe("session unavailable");
 });

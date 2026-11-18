@@ -23,6 +23,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 import install_mailbox  # noqa: E402 -- exercise the shipped installer
 import peer_mailbox  # noqa: E402 -- exercise the shipped mailbox hooks
+import room_store  # noqa: E402 -- rooms written through the shipped Node store
 import runtime_paths  # noqa: E402 -- exercise shipped path helpers
 
 
@@ -501,6 +502,90 @@ class TestOrkFastParity(unittest.TestCase):
             )
             self.assertEqual(delegated.returncode, 0)
             self.assertIn("check new instructions", delegated.stdout)
+
+    def test_mailbox_hook_room_obligations_follow_the_rooms_index(self):
+        """The Rust fast path reads rooms-index.json, which every Node room commit republishes."""
+        mailbox_root = runtime_paths.cache_home(env=self.env, home=self.home) / "mailbox-v1"
+        (mailbox_root / "peers").mkdir(parents=True)
+        session_id = "sess-room-index-1"
+        checkout_dir = self.home / "repo"
+        checkout_dir.mkdir(parents=True)
+        stamp = dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        peer_file = mailbox_root / "peers" / f"{peer_mailbox.session_key(session_id)}.json"
+        peer_file.write_text(
+            json.dumps(
+                {
+                    "schema": "agent-executor.peer.v1",
+                    "session": session_id,
+                    "name": "cobalt-nova-cd",
+                    "harness": "gemini",
+                    "cwd": str(checkout_dir.resolve()),
+                    "checkout": str(checkout_dir.resolve()),
+                    "repo": str(checkout_dir.resolve()),
+                    "remotes": [],
+                    "model": "gemini-3.8-flash-high",
+                    "state": "busy",
+                    "pid": os.getpid(),
+                    "startedAt": stamp,
+                    "lastSeenAt": stamp,
+                }
+            ),
+            encoding="utf-8",
+        )
+        marker = self.home / "room-fallback-called.txt"
+        sentinel = self.home / "room-sentinel.py"
+        sentinel.write_text(
+            f"#!/usr/bin/env python3\nimport pathlib; pathlib.Path({str(marker)!r}).write_text('called')\n",
+            encoding="utf-8",
+        )
+
+        def delegated() -> bool:
+            marker.unlink(missing_ok=True)
+            proc = subprocess.run(
+                [
+                    str(ORK_FAST_BIN),
+                    "mailbox-hook",
+                    "--harness",
+                    "gemini",
+                    "--event",
+                    "PreInvocation",
+                    "--fallback-script",
+                    str(sentinel),
+                ],
+                input=json.dumps({"conversationId": session_id, "invocationNum": 2}),
+                text=True,
+                capture_output=True,
+                env=self.env,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            return marker.exists()
+
+        self.assertFalse(delegated(), "no rooms: stay on the fast path")
+        room_store.put_room(
+            mailbox_root,
+            {
+                "schema": "agent-executor.room.v1",
+                "id": "index-room",
+                "cwd": str(checkout_dir.resolve()),
+                "machine": socket.gethostname(),
+                "agents": [],
+                "conductor": {
+                    "engine": "agy",
+                    "session": {
+                        "id": session_id,
+                        "engine": "agy",
+                        "machine": socket.gethostname(),
+                        "cwd": str(checkout_dir.resolve()),
+                    },
+                },
+            },
+        )
+        self.assertFalse((mailbox_root / "rooms").exists(), "the room lives only in rooms.db")
+        self.assertTrue(delegated(), "an open room bound to the session needs the full hook")
+        room_store.set_metadata(mailbox_root, "index-room", closedAt=stamp)
+        self.assertFalse(delegated(), "a closed room has no obligations")
+        (mailbox_root / "rooms-index.json").unlink()
+        self.assertTrue(delegated(), "rooms.db without an index is unknown, so delegate")
 
     def test_mailbox_hook_plan_mode_suppression_parity(self):
         """Test Stop hook suppression on ExitPlanMode/EnterPlanMode tool use."""

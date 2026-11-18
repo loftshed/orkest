@@ -39,7 +39,11 @@ UNKNOWN_PID_TTL = dt.timedelta(hours=2)
 # An idle session whose process hosts other sessions too (one daemon, many conversations) counts as live this long
 # after it was last seen; the running process says nothing about it.
 SHARED_PROCESS_IDLE_TTL = dt.timedelta(hours=3)
+# Waiting on input is no more evidence of a shared-process session than idling. rooms.mjs uses the same windows.
+SHARED_PROCESS_WAITING_TTL = SHARED_PROCESS_IDLE_TTL
 SHARED_PROCESS_BUSY_TTL = dt.timedelta(minutes=30)
+# Lock acquisition retries when a pruner unlinked the lock path between open and flock.
+LOCK_ACQUIRE_ATTEMPTS = 64
 HARNESSES = ("claude", "codex", "opencode", "gemini", "unknown")
 # Process names a harness runs under, where they differ from its name: Antigravity's CLI process is agy.
 HARNESS_PROCESSES = {"gemini": ("agy", "antigravity", "gemini")}
@@ -309,12 +313,41 @@ def load(path: Path) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+def _same_inode(descriptor: int, lock_path: Path) -> bool:
+    try:
+        held, current = os.fstat(descriptor), lock_path.stat()
+    except OSError:
+        return False
+    return (held.st_dev, held.st_ino) == (current.st_dev, current.st_ino)
+
+
+def acquire_lock(lock_path: Path) -> int:
+    """Exclusively flock the inode currently at lock_path; the caller closes the descriptor.
+
+    A pruner may unlink an idle lock file while another process holds an open descriptor to it. Locking that
+    orphaned inode would let a second process lock a new file at the same path, so verify the locked inode is
+    still the one at the path and retry otherwise. Touching it keeps idle-lock reaping away from active use.
+    """
+    for _ in range(LOCK_ACQUIRE_ATTEMPTS):
+        descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            if _same_inode(descriptor, lock_path):
+                with contextlib.suppress(OSError):
+                    os.utime(descriptor)
+                return descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
+        os.close(descriptor)
+    raise MailboxError(f"could not acquire a stable lock: {lock_path.name}")
+
+
 @contextlib.contextmanager
 def locked(path: Path):
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    descriptor = os.open(path.with_suffix(".lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    descriptor = acquire_lock(path.with_suffix(".lock"))
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
         yield
     finally:
         os.close(descriptor)
@@ -748,10 +781,20 @@ def harness_pid(harness: str, start: int | None = None) -> int | None:
     return start or os.getppid()
 
 
+def shared_process_ttl(state: Any) -> dt.timedelta:
+    if state == "busy":
+        return SHARED_PROCESS_BUSY_TTL
+    if state == "waiting":
+        return SHARED_PROCESS_WAITING_TTL
+    return SHARED_PROCESS_IDLE_TTL
+
+
 def is_live(peer: dict[str, Any], moment: dt.datetime | None = None) -> bool:
+    """Presence shared with rooms.mjs isPeerLive, except that a peer whose own process still runs stays live
+    past MAX_AGE here so it remains reachable by mail (rooms deliberately stop counting it)."""
     moment = moment or _MB.now()
     try:
-        seen = parse_stamp(peer.get("lastSeenAt") or peer.get("startedAt") or _MB.stamp(moment))
+        seen = parse_stamp(peer.get("lastSeenAt") or peer.get("startedAt"))
     except (AttributeError, TypeError, ValueError):
         return False
     alive = _MB.pid_alive(peer.get("pid"))
@@ -764,10 +807,7 @@ def is_live(peer: dict[str, Any], moment: dt.datetime | None = None) -> bool:
     if moment - seen > MAX_AGE:
         return False
     if alive and peer.get("sharedProcess"):
-        if peer.get("state") == "idle":
-            return moment - seen <= SHARED_PROCESS_IDLE_TTL
-        if peer.get("state") == "busy":
-            return moment - seen <= SHARED_PROCESS_BUSY_TTL
+        return moment - seen <= shared_process_ttl(peer.get("state"))
     return alive if alive is not None else moment - seen <= UNKNOWN_PID_TTL
 
 

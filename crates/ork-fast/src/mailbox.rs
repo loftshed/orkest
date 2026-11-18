@@ -169,7 +169,7 @@ fn has_newer_colleague_file(peers_dir: &Path, peer_file: &Path) -> bool {
     false
 }
 
-struct FileLockGuard {
+pub(crate) struct FileLockGuard {
     fd: libc::c_int,
 }
 
@@ -181,22 +181,60 @@ impl Drop for FileLockGuard {
     }
 }
 
+/// Lock acquisition retries when a pruner unlinked the lock path between open and flock.
+const LOCK_ACQUIRE_ATTEMPTS: usize = 64;
+
+/// Device and inode of an open descriptor, without taking ownership of it.
+fn fd_identity(fd: libc::c_int) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::io::FromRawFd;
+    let file = std::mem::ManuallyDrop::new(unsafe { fs::File::from_raw_fd(fd) });
+    let meta = file.metadata().ok()?;
+    Some((meta.dev(), meta.ino()))
+}
+
+/// True when the locked descriptor is still the inode at `lock_path` (same check as `mailbox_store.acquire_lock`).
+fn same_inode(fd: libc::c_int, lock_path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(current) = fs::metadata(lock_path) else {
+        return false;
+    };
+    fd_identity(fd) == Some((current.dev(), current.ino()))
+}
+
+pub(crate) fn lock_path_exclusive(lock_path: &Path) -> io::Result<FileLockGuard> {
+    let c_path = CString::new(lock_path.as_os_str().as_bytes())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    for _ in 0..LOCK_ACQUIRE_ATTEMPTS {
+        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o600) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let guard = FileLockGuard { fd };
+        if unsafe { libc::flock(fd, libc::LOCK_EX) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // A pruner may have unlinked this inode while we waited; locking it would not exclude a
+        // process that opens the new file at the same path.
+        if same_inode(fd, lock_path) {
+            // Touch the lock so idle-lock reaping sees recent use.
+            unsafe {
+                libc::futimens(fd, std::ptr::null());
+            }
+            return Ok(guard);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::WouldBlock,
+        "could not acquire a stable peer lock",
+    ))
+}
+
 fn lock_peer(peer_file: &Path) -> io::Result<FileLockGuard> {
     if let Some(parent) = peer_file.parent() {
         fs::create_dir_all(parent)?;
     }
-    let lock_path = peer_file.with_extension("lock");
-    let c_path = CString::new(lock_path.as_os_str().as_bytes())
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o600) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let guard = FileLockGuard { fd };
-    if unsafe { libc::flock(fd, libc::LOCK_EX) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(guard)
+    lock_path_exclusive(&peer_file.with_extension("lock"))
 }
 
 fn write_json_atomic(path: &Path, value: &serde_json::Value) -> io::Result<()> {
@@ -504,4 +542,48 @@ pub fn run(
 
     // For any remaining subtlety or first turn context, delegate safely:
     delegate(fb, harness, Some(&event), &raw_stdin)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    #[test]
+    fn test_lock_retries_after_pruner_unlinks_inode() {
+        let dir = std::env::temp_dir().join(format!("ork-fast-lock-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let lock_path = dir.join("peer.lock");
+        let first = lock_path_exclusive(&lock_path).unwrap();
+        let orphan = fs::metadata(&lock_path).unwrap().ino();
+
+        let (sender, receiver) = mpsc::channel();
+        let waiter_path = lock_path.clone();
+        let waiter = thread::spawn(move || {
+            let guard = lock_path_exclusive(&waiter_path).unwrap();
+            sender.send(fd_identity(guard.fd).unwrap().1).unwrap();
+            drop(guard);
+        });
+        // Let the waiter open the original inode and block in flock, then unlink it as a pruner would.
+        thread::sleep(Duration::from_millis(100));
+        fs::remove_file(&lock_path).unwrap();
+        drop(first);
+
+        let locked_inode = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+        waiter.join().unwrap();
+        let current = fs::metadata(&lock_path).unwrap().ino();
+        assert_eq!(
+            locked_inode, current,
+            "the waiter must hold the inode now at the path"
+        );
+        assert_ne!(
+            locked_inode, orphan,
+            "the waiter must not stay on the unlinked inode"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

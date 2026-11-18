@@ -94,8 +94,35 @@ def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _delivery_key(delivery: dict[str, Any]) -> tuple[str, str]:
+    return (str(delivery.get("kind") or ""), str(delivery.get("path") or delivery.get("provider") or ""))
+
+
+def merge_deliveries(existing: Any, new: Any) -> list[dict[str, Any]]:
+    """Keep every recorded attempt's latest outcome per channel; a sent delivery is never replaced by a retry."""
+    merged: dict[tuple[str, str], dict[str, Any]] = {}
+    for delivery in [*(existing if isinstance(existing, list) else []), *(new if isinstance(new, list) else [])]:
+        if not isinstance(delivery, dict):
+            continue
+        key = _delivery_key(delivery)
+        if merged.get(key, {}).get("status") == "sent":
+            continue
+        merged[key] = delivery
+    return list(merged.values())
+
+
+def _delivered(event: dict[str, Any], kind: str, target: str = "") -> bool:
+    return any(
+        isinstance(item, dict)
+        and item.get("status") == "sent"
+        and item.get("kind") == kind
+        and (not target or str(item.get("path") or "") == target)
+        for item in event.get("deliveries") or []
+    )
+
+
 def _merge_completion_event(event_path: Path, fields: dict[str, Any], *, initial: bool = False) -> dict[str, Any]:
-    """Merge under a persistent sidecar flock; acknowledgement can only advance once."""
+    """Merge under a persistent sidecar flock; acknowledgement can only advance once and deliveries accumulate."""
     event_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     # Never unlink this file: every writer must lock the same inode across event replacements.
     with Path(f"{event_path}.lock").open("a", encoding="utf-8") as lock:
@@ -107,6 +134,8 @@ def _merge_completion_event(event_path: Path, fields: dict[str, Any], *, initial
             payload = {**fields, **current} if initial else {**current, **fields}
             if acknowledged_at is not None:
                 payload["acknowledged_at"] = acknowledged_at
+            if "deliveries" in current or "deliveries" in fields:
+                payload["deliveries"] = merge_deliveries(current.get("deliveries"), fields.get("deliveries"))
             _write_json_atomic(event_path, payload)
             return payload
         finally:
@@ -439,11 +468,14 @@ def publish_completion_event(
             coordinator.auto_recover_task(task_dir, skip_event_publish=True)
     event = _merge_completion_event(event_path, event, initial=True)
 
+    # A re-published event keeps its recorded deliveries and never repeats one that was already sent.
     deliveries: list[dict[str, Any]] = []
-    if notification_mode == "desktop":
+    if notification_mode == "desktop" and not _delivered(event, "desktop"):
         deliveries.append(send_desktop_notification(event))
-    if completion_hook is not None:
+    if completion_hook is not None and not _delivered(event, "hook", str(completion_hook)):
         deliveries.append(run_completion_hook(completion_hook, event_path, event))
+    if not deliveries:
+        return event
 
     return _merge_completion_event(event_path, {"deliveries": deliveries})
 

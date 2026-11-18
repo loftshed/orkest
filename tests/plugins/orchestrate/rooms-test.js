@@ -7,13 +7,17 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { roomsCommand } from "../../../plugins/orchestrate/bin/rooms.mjs";
 import {
+  clearRoomListCache,
   createRoom,
   deleteRoom,
   listRawRooms,
+  listRawRoomsCached,
   parseTeam,
   readRawRoom,
   readRoom,
+  ROOMS_INDEX_SCHEMA,
   roomsDbPath,
+  roomsIndexPath,
   updateRawRoom,
   updateRoom,
   withRoomLock,
@@ -25,10 +29,15 @@ import {
   coordinatorBrief,
   dispatchMember,
   growRoom,
+  isAwaitingObservation,
+  isPeerLive,
   listRooms,
   newRoom,
   observeRoom,
   recoverRoom,
+  SESSION_OBSERVATION_GRACE_MS,
+  SHARED_PROCESS_BUSY_TTL_MS,
+  SHARED_PROCESS_WAITING_TTL_MS,
 } from "../../../plugins/orchestrate/lib/rooms.mjs";
 import { retainFixtures } from "../../helpers/retain-fixtures.js";
 
@@ -2096,6 +2105,15 @@ describe("room CLI", () => {
         await utimes(transcript, new Date("2026-01-01"), new Date("2026-01-01"));
       }
       const stored = await readRawRoom(room.id, root);
+      // An unfinished child whose transcript has been quiet past the busy window is not running:
+      // a live (or unknown) parent process proves nothing about it.
+      const isQuiet = !finished && files !== "meta";
+      let expectedStatus = finished ? "reported complete" : "running";
+      let expectedRuntime = finished ? "stopped" : "running";
+      if (isQuiet) {
+        expectedStatus = "unknown";
+        expectedRuntime = "unknown";
+      }
       vi.stubEnv("CLAUDE_CONFIG_DIR", accountHome);
       try {
         const observed = await observeRoom(room.id, { root });
@@ -2108,8 +2126,8 @@ describe("room CLI", () => {
           workforceRole: "reviewer",
           objective: "Review the assigned change",
           model: files === "meta" ? "sonnet" : "claude-sonnet-5-5",
-          status: finished ? "reported complete" : "running",
-          runtimeState: finished ? "stopped" : "running",
+          status: expectedStatus,
+          runtimeState: expectedRuntime,
           progress: {
             role: "reviewer",
             stage: finished ? "complete" : "working",
@@ -3177,5 +3195,161 @@ describe("bounded room continuations", () => {
     });
     expect(codexRoom.conductor.model).toBeUndefined();
     expect(coordinatorBrief(codexRoom)).not.toContain("Antigravity Plan/Execute phases:");
+  });
+});
+
+describe("coordination reliability", () => {
+  async function readIndex(root) {
+    return JSON.parse(await readFile(roomsIndexPath(root), "utf8"));
+  }
+
+  it("republishes the rooms index after every create, mutation, close and delete", async () => {
+    const root = await directory();
+    const cwd = await directory();
+    await newRoom(parseTeam("codex:luna"), { id: "index-a", cwd, root });
+    let index = await readIndex(root);
+    expect(index.schema).toBe(ROOMS_INDEX_SCHEMA);
+    expect(index.rooms).toMatchObject([{ id: "index-a", closed: false, sessions: [] }]);
+    const memberId = (await readRoom("index-a", root)).agents[0].id;
+    await bindSession("index-a", memberId, { session: "native-index", engine: "codex", root });
+    index = await readIndex(root);
+    expect(index.rooms[0].sessions).toEqual(["native-index"]);
+    await updateRawRoom("index-a", (room) => ({ ...room, closedAt: new Date().toISOString() }), {
+      root,
+    });
+    expect((await readIndex(root)).rooms[0].closed).toBe(true);
+    expect(deleteRoom("index-a", root)).toBe(true);
+    expect((await readIndex(root)).rooms).toEqual([]);
+  });
+
+  it("serves display lists from cache until another connection commits", async () => {
+    const root = await directory();
+    const cwd = await directory();
+    await newRoom(parseTeam("codex:luna"), { id: "cache-a", cwd, root });
+    clearRoomListCache();
+    try {
+      const first = listRawRoomsCached(root);
+      expect(first.map((room) => room.id)).toEqual(["cache-a"]);
+      // Callers own their copy.
+      first[0].title = "mutated by a caller";
+      expect(listRawRoomsCached(root)[0].title).not.toBe("mutated by a caller");
+      await newRoom(parseTeam("codex:luna"), { id: "cache-b", cwd, root });
+      expect(
+        listRawRoomsCached(root)
+          .map((room) => room.id)
+          .sort((a, b) => a.localeCompare(b)),
+      ).toEqual(["cache-a", "cache-b"]);
+      await updateRawRoom("cache-a", (room) => ({ ...room, title: "Renamed" }), { root });
+      expect(listRawRoomsCached(root).find((room) => room.id === "cache-a").title).toBe("Renamed");
+      expect(listRawRoomsCached(root)).toEqual(listRawRooms(root));
+    } finally {
+      clearRoomListCache();
+    }
+  });
+
+  it("expires shared-process sessions by state, including waiting", () => {
+    const now = Date.now();
+    const peer = (state, ageMs) => ({
+      pid: process.pid,
+      sharedProcess: true,
+      state,
+      startedAt: new Date(now - ageMs).toISOString(),
+      lastSeenAt: new Date(now - ageMs).toISOString(),
+    });
+    expect(isPeerLive(peer("waiting", SHARED_PROCESS_WAITING_TTL_MS - 1000), now)).toBe(true);
+    expect(isPeerLive(peer("waiting", SHARED_PROCESS_WAITING_TTL_MS + 1000), now)).toBe(false);
+    expect(isPeerLive(peer("busy", SHARED_PROCESS_BUSY_TTL_MS + 1000), now)).toBe(false);
+    expect(isPeerLive(peer(undefined, SHARED_PROCESS_WAITING_TTL_MS + 1000), now)).toBe(false);
+  });
+
+  it("renders a fresh binding without presence as awaiting observation, not unavailable", async () => {
+    const root = await directory();
+    const cwd = await directory();
+    const room = await newRoom(parseTeam("codex:luna"), {
+      id: "awaiting",
+      cwd,
+      root,
+      swarm: { maxAgents: 2, maxDepth: 2 },
+    });
+    const memberId = room.agents[0].id;
+    await bindSession("awaiting", memberId, { session: "never-seen", engine: "codex", root });
+    let observed = await observeRoom("awaiting", { root, discoverNativePeers: false });
+    expect(observed.agents[0]).toMatchObject({
+      status: "awaiting observation",
+      runtimeState: "unknown",
+    });
+    const stale = new Date(Date.now() - SESSION_OBSERVATION_GRACE_MS - 1000).toISOString();
+    await updateRoom(
+      "awaiting",
+      (current) => {
+        current.agents[0].session.boundAt = stale;
+        return current;
+      },
+      { root },
+    );
+    observed = await observeRoom("awaiting", { root, discoverNativePeers: false });
+    expect(observed.agents[0].status).toBe("session unavailable");
+    // A live recorded process keeps the binding pending; a dead one does not.
+    expect(isAwaitingObservation({ pid: process.pid, session: { boundAt: stale } })).toBe(true);
+    expect(isAwaitingObservation({ pid: 2 ** 22 + 7, session: { boundAt: stale } })).toBe(false);
+    expect(
+      isAwaitingObservation({
+        pid: process.pid,
+        pidBirth: "Thu Jan  1 00:00:00 1970",
+        session: { boundAt: new Date().toISOString() },
+      }),
+    ).toBe(false);
+  });
+
+  it("records the conductor's account home so its subagents are found there", async () => {
+    const root = await directory();
+    const cwd = await realpath(await directory());
+    const accountHome = await directory();
+    const room = await newRoom(parseTeam("claude:opus"), {
+      id: "conductor-source",
+      cwd,
+      root,
+      engine: "claude",
+      swarm: { maxAgents: 2, maxDepth: 2 },
+    });
+    const stamp = new Date().toISOString();
+    await mkdir(path.join(root, "peers"), { recursive: true });
+    await writeFile(
+      path.join(root, "peers", "conductor-native.json"),
+      JSON.stringify({
+        schema: "agent-executor.peer.v1",
+        session: "conductor-native",
+        name: "conductor-peer",
+        harness: "claude",
+        cwd,
+        checkout: cwd,
+        accountHome,
+        pid: process.pid,
+        state: "idle",
+        startedAt: stamp,
+        lastSeenAt: stamp,
+      }),
+    );
+    await updateRoom(
+      room.id,
+      (current) => {
+        current.conductor.session = {
+          id: "conductor-native",
+          engine: "claude",
+          machine: hostname(),
+          cwd,
+        };
+        current.conductor.activitySource = { note: "kept" };
+        return current;
+      },
+      { root },
+    );
+    const observed = await observeRoom(room.id, { root, discoverNativePeers: false });
+    expect(observed.conductor.activitySource).toMatchObject({
+      note: "kept",
+      engine: "claude",
+      session: "conductor-native",
+      accountHome,
+    });
   });
 });

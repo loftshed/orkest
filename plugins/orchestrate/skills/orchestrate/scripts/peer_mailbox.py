@@ -91,6 +91,7 @@ from mailbox_store import (  # noqa: E402, F401
     SESSION_ID,
     SHARED_PROCESS_BUSY_TTL,
     SHARED_PROCESS_IDLE_TTL,
+    SHARED_PROCESS_WAITING_TTL,
     STATES,
     UNKNOWN_PID_TTL,
     MailboxError,
@@ -98,6 +99,7 @@ from mailbox_store import (  # noqa: E402, F401
     account_home,
     account_label,
     account_route,
+    acquire_lock,
     base_dir,
     check_deadline,
     check_scope,
@@ -821,8 +823,17 @@ def drop_if_dead(path: Path, moment: dt.datetime) -> bool:
     return True
 
 
-def unregister(base: Path, session: str) -> None:
-    peer_path(base, session).unlink(missing_ok=True)
+def unregister(base: Path, session: str, *, lock_held: bool = False) -> None:
+    """Remove a peer under the lock register and annotate take, so a concurrent write cannot be resurrected.
+
+    A caller that already holds this peer's lock passes lock_held: flock does not nest within one process.
+    """
+    path = peer_path(base, session)
+    if lock_held:
+        path.unlink(missing_ok=True)
+        return
+    with locked(path):
+        path.unlink(missing_ok=True)
 
 
 def peers(base: Path, *, prune_dead: bool = True, include_runs: bool = False) -> list[dict[str, Any]]:
@@ -1961,7 +1972,9 @@ def prune(base: Path) -> dict[str, int]:
                 else []
             )
             for session in expired:
-                peer_path(base, session).unlink(missing_ok=True)
+                expired_path = peer_path(base, session)
+                with locked(expired_path):
+                    expired_path.unlink(missing_ok=True)
                 inbox = inbox_dir(base, session)
                 if inbox.exists():
                     for message_path in inbox.glob("*.json"):

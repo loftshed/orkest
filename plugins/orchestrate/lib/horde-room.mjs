@@ -13,6 +13,8 @@ import {
   renameSync,
   rmSync,
   statSync,
+  unlinkSync,
+  writeFileSync,
 } from "node:fs";
 import {
   link,
@@ -505,6 +507,82 @@ export function roomsDbPath(root = mailboxRoot()) {
   return path.join(root, "rooms.db");
 }
 
+export const ROOMS_INDEX_SCHEMA = "orkest.rooms-index.v1";
+
+/** Display-only sidecar for readers without SQLite (ork-fast). Never coordination authority. */
+export function roomsIndexPath(root = mailboxRoot()) {
+  return path.join(root, "rooms-index.json");
+}
+
+function roomIndexSessions(room) {
+  const found = new Set();
+  const add = (value) => {
+    if (typeof value === "string" && value) found.add(value);
+  };
+  const visit = (member) => {
+    if (!member || typeof member !== "object" || Array.isArray(member)) return;
+    if (typeof member.session === "string") add(member.session);
+    else add(member.session?.id);
+    add(member.mailboxSession);
+    add(member.nativeSession);
+    add(member.activitySource?.session);
+    if (Array.isArray(member.previousSessions)) for (const id of member.previousSessions) add(id);
+  };
+  visit(room.conductor);
+  if (Array.isArray(room.agents)) for (const agent of room.agents) visit(agent);
+  add(room.promotion?.session);
+  add(room.parent?.session);
+  return [...found].sort((a, b) => a.localeCompare(b));
+}
+
+export function isClosedRoom(room) {
+  const status = typeof room?.status === "string" ? room.status.toLowerCase() : "";
+  return Boolean(room?.closedAt) || ["archived", "closed", "completed"].includes(status);
+}
+
+export function roomsIndexEntry(room) {
+  return {
+    id: room.id,
+    ...(typeof room.cwd === "string" && room.cwd && { cwd: room.cwd }),
+    ...(Number.isFinite(room.updatedAt) && { updatedAt: room.updatedAt }),
+    closed: isClosedRoom(room),
+    sessions: roomIndexSessions(room),
+  };
+}
+
+/**
+ * Rebuild the index from committed rows under a write transaction, so concurrent writers serialize
+ * and the last writer always publishes the newest state. On failure, remove the index: readers then
+ * treat the store conservatively instead of trusting an outdated summary.
+ */
+function refreshRoomsIndex(db, root) {
+  const target = roomsIndexPath(root);
+  try {
+    withImmediateTransaction(db, () => {
+      const rooms = db.tagStore.all`SELECT data FROM rooms ORDER BY id ASC`.map((row) =>
+        roomsIndexEntry(JSON.parse(row.data)),
+      );
+      const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
+      try {
+        writeFileSync(
+          temporary,
+          `${JSON.stringify({ schema: ROOMS_INDEX_SCHEMA, generatedAt: Date.now(), rooms })}\n`,
+          { mode: 0o600, flag: "wx" },
+        );
+        renameSync(temporary, target);
+      } finally {
+        rmSync(temporary, { force: true });
+      }
+    });
+  } catch {
+    try {
+      unlinkSync(target);
+    } catch {
+      // A missing index already means "unknown" to its readers.
+    }
+  }
+}
+
 function validateRawRoom(room, id) {
   if (
     !room ||
@@ -592,7 +670,10 @@ function validLegacyRecords(root) {
 /** Commit imports before archiving. The ledger makes interrupted archival safe to resume. */
 function syncLegacyRoomFiles(db, root) {
   const initialRecords = validLegacyRecords(root);
-  if (initialRecords.length === 0) return;
+  if (initialRecords.length === 0) {
+    if (!existsSync(roomsIndexPath(root))) refreshRoomsIndex(db, root);
+    return;
+  }
   withImmediateTransaction(db, () => {
     for (const { file, room, digest, updatedAt } of validLegacyRecords(root)) {
       if (
@@ -623,6 +704,7 @@ function syncLegacyRoomFiles(db, root) {
       chmodSync(target, 0o400);
     }
   });
+  refreshRoomsIndex(db, root);
 }
 
 function openRooms(root) {
@@ -753,6 +835,70 @@ export function listRawRooms(root = mailboxRoot(), { lifecycle } = {}) {
   return rows.map((row) => JSON.parse(row.data));
 }
 
+const roomListCache = new Map();
+
+/** (dev, ino, size, mtimeNs) of the database and its WAL; null marks a missing file. */
+function storeSignature(root) {
+  const dbPath = roomsDbPath(root);
+  return snapshotSignature([dbPath, `${dbPath}-wal`]).map((value) =>
+    value === null ? null : value.split(":").slice(0, 4).join(":"),
+  );
+}
+
+/**
+ * Display reads only: reuse parsed rooms while the store signature and a persistent connection's
+ * PRAGMA data_version are unchanged. Dispatch, archive and acceptance never read through this cache.
+ */
+export function listRawRoomsCached(root = mailboxRoot()) {
+  const key = path.resolve(root);
+  const drop = () => {
+    roomListCache.get(key)?.db.close();
+    roomListCache.delete(key);
+  };
+  if (!existsSync(roomsDbPath(key)) || legacyFiles(key).length > 0) {
+    drop();
+    return listRawRooms(key);
+  }
+  const signature = storeSignature(key);
+  const identity = signature[0]?.split(":").slice(0, 2).join(":");
+  let entry = roomListCache.get(key);
+  if (entry && entry.identity !== identity) {
+    // A replaced database file needs a new connection; data_version only tracks one file.
+    drop();
+    entry = undefined;
+  }
+  if (!entry) {
+    entry = { db: openRoomsForRead(key), identity, signature: [] };
+    roomListCache.set(key, entry);
+  }
+  let dataVersion;
+  try {
+    using query = entry.db.prepare("PRAGMA data_version");
+    dataVersion = query.get().data_version;
+  } catch {
+    drop();
+    return listRawRooms(key);
+  }
+  const isFresh =
+    entry.rooms !== undefined &&
+    entry.dataVersion === dataVersion &&
+    entry.signature.every((value, index) => value === signature[index]);
+  if (!isFresh) {
+    entry.rooms = entry.db.tagStore
+      .all`SELECT data FROM rooms ORDER BY updated_at DESC, id ASC`.map((row) =>
+      JSON.parse(row.data),
+    );
+    entry.dataVersion = dataVersion;
+    entry.signature = signature;
+  }
+  return structuredClone(entry.rooms);
+}
+
+export function clearRoomListCache() {
+  for (const entry of roomListCache.values()) entry.db.close();
+  roomListCache.clear();
+}
+
 export async function readRoom(id, root = mailboxRoot()) {
   return validateRoom(readRawRoom(id, root));
 }
@@ -761,7 +907,7 @@ export function deleteRoom(id, root = mailboxRoot(), expected) {
   roomPath(id, root);
   if (!existsSync(roomsDbPath(root)) && !existsSync(path.join(root, "rooms"))) return false;
   using db = openRooms(root);
-  return withImmediateTransaction(db, () => {
+  const deleted = withImmediateTransaction(db, () => {
     const result =
       expected === undefined
         ? db.tagStore.run`DELETE FROM rooms WHERE id = ${id}`
@@ -769,6 +915,8 @@ export function deleteRoom(id, root = mailboxRoot(), expected) {
             .run`DELETE FROM rooms WHERE id = ${id} AND data = ${JSON.stringify(expected)}`;
     return result.changes === 1;
   });
+  if (deleted) refreshRoomsIndex(db, root);
+  return deleted;
 }
 
 function pidAlive(pid) {
@@ -953,7 +1101,10 @@ async function updateStoredRoom(
             VALUES (${id}, ${typeof room.cwd === "string" ? room.cwd : ""}, ${room.updatedAt}, ${data}) ON CONFLICT(id) DO NOTHING`;
       return result.changes === 1;
     });
-    if (committed) return room;
+    if (committed) {
+      refreshRoomsIndex(db, root);
+      return room;
+    }
     const delayMs = Math.floor(Math.random() * Math.min(5 * 2 ** Math.min(attempt, 5), 100));
     if (delayMs > 0) await sleep(delayMs);
   }

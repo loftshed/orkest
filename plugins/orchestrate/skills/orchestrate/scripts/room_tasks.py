@@ -31,6 +31,13 @@ RUN_FIELDS = (
 )
 STATES = {"reserved": "reserved", "active": "running", "finished": "review", "cancelled": "cancelled"}
 VERDICTS = {"accept": "accepted", "supported": "supported", "reject": "rejected", "takeover": "blocked"}
+# Only these projected statuses count as executing work. "review" is a finished run awaiting acceptance.
+ACTIVE_STATUSES = frozenset({"reserved", "running"})
+RUNTIME_STATES = {"reserved": "running", "active": "running", "finished": "stopped", "cancelled": "stopped"}
+
+
+def is_active(projection: dict[str, Any]) -> bool:
+    return projection.get("status") in ACTIVE_STATUSES and projection.get("runtimeState") == "running"
 
 
 def project(cwd: str, member: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
@@ -85,11 +92,15 @@ def project(cwd: str, member: dict[str, Any], task: dict[str, Any]) -> dict[str,
     state = STATES.get(run.get("status"), "unknown")
     if run.get("status") != "cancelled" and run.get("runner_status") and run["runner_status"] != "completed":
         state = "failed"
+    runtime_state = RUNTIME_STATES.get(run.get("status"), "unknown")
+    if state == "failed":
+        runtime_state = "stopped"
     state = VERDICTS.get(verdict, state)
     spec = run.get("task_spec", task.get("task_spec"))
     return {
         "run": run,
         "status": state,
+        "runtimeState": runtime_state,
         "verdict": verdict,
         "observedAt": task.get("updated_at"),
         "objective": spec.get("objective") if isinstance(spec, dict) else None,

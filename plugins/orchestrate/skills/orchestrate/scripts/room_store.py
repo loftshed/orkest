@@ -1,4 +1,9 @@
-"""Room persistence through the qualified Node SQLite runtime, never Python SQLite."""
+"""Room persistence: writes through the qualified Node SQLite runtime; reads may use Python's sqlite3.
+
+Python never writes rooms.db. A qualified sqlite3 build reads the current schema read-only, which skips a Node
+start per read. Unqualified builds, legacy room files awaiting import, other schema versions and any SQLite
+error fall back to the Node bridge, which also performs migrations and imports.
+"""
 
 from __future__ import annotations
 
@@ -8,6 +13,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -16,6 +22,42 @@ _CACHE: dict[Path, dict[str, Any]] = {}
 _MIN_NODE = (26, 8, 0)
 _ROOM_ID_RE = re.compile(r"[\w-]{1,80}", flags=re.ASCII)
 _SYSTEM_NODE_DIRS = frozenset({"/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"})
+# Must match ROOMS_APPLICATION_ID and ROOMS_MIGRATIONS.length in horde-room.mjs.
+ROOMS_APPLICATION_ID = 1_330_793_298
+ROOMS_SCHEMA_VERSION = 2
+
+
+def sqlite_qualified(version: tuple[int, int, int] = sqlite3.sqlite_version_info) -> bool:
+    """SQLite builds with the WAL-reset fix: 3.51.3 and later, or the 3.50.7 and 3.44.6 backports."""
+    return version >= (3, 51, 3) or (3, 50, 7) <= version < (3, 51, 0) or (3, 44, 6) <= version < (3, 45, 0)
+
+
+def _direct_rows(base: Path, room_id: str | None = None) -> list[dict[str, Any]] | None:
+    """Read committed rows read-only, or None when the Node bridge must answer instead."""
+    database = base / "rooms.db"
+    if os.environ.get("ORKEST_ROOM_STORE_BRIDGE") == "1" or not sqlite_qualified():
+        return None
+    try:
+        if database.is_symlink() or not database.is_file() or any((base / "rooms").glob("*.json")):
+            return None
+        connection = sqlite3.connect(f"{database.resolve().as_uri()}?mode=ro", uri=True, timeout=5)
+    except (OSError, sqlite3.Error):
+        return None
+    try:
+        if (
+            connection.execute("PRAGMA application_id").fetchone()[0] != ROOMS_APPLICATION_ID
+            or connection.execute("PRAGMA user_version").fetchone()[0] != ROOMS_SCHEMA_VERSION
+        ):
+            return None
+        if room_id is None:
+            rows = connection.execute("SELECT data FROM rooms ORDER BY updated_at DESC, id ASC").fetchall()
+        else:
+            rows = connection.execute("SELECT data FROM rooms WHERE id = ?", (room_id,)).fetchall()
+        return [json.loads(row[0]) for row in rows]
+    except (sqlite3.Error, ValueError, TypeError, IndexError):
+        return None
+    finally:
+        connection.close()
 
 
 @functools.cache
@@ -128,7 +170,8 @@ def list_rooms(base: Path) -> list[dict[str, Any]]:
     cached = _CACHE.get(base)
     if cached is not None and cached["signature"] == signature and cached["all"] is not None:
         return copy.deepcopy(cached["all"])
-    rooms = _invoke(base, "list")
+    direct = _direct_rows(base)
+    rooms = direct if direct is not None else _invoke(base, "list")
     after = _signature(base)
     if after == signature:
         _CACHE[base] = {
@@ -156,7 +199,8 @@ def read_room(base: Path, room_id: str) -> dict[str, Any] | None:
             return copy.deepcopy(hit) if hit is not None else None
         if cached["all"] is not None:
             return None
-    room = _invoke(base, "get", room_id)
+    direct = _direct_rows(base, room_id)
+    room = (direct[0] if direct else None) if direct is not None else _invoke(base, "get", room_id)
     after = _signature(base)
     if after == signature:
         entry = _CACHE.get(base)
