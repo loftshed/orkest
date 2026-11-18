@@ -20,6 +20,7 @@ import time
 import tomllib
 from pathlib import Path
 
+import command_approval
 import mailbox_configuration as configuration
 import mailbox_daemon
 import mailbox_mcp
@@ -1912,10 +1913,62 @@ def ensure_ork_fast(
     return None
 
 
+def claude_profiles(home: Path) -> list[Path]:
+    """~/.claude and each ~/.claude-* profile that holds Claude settings."""
+    return [home / ".claude"] + sorted(
+        p
+        for p in home.glob(".claude-*")
+        if p.is_dir() and ((p / "settings.json").is_file() or (p / ".claude.json").is_file())
+    )
+
+
+def opencode_config_path(home: Path) -> Path:
+    directory = Path(os.environ.get("XDG_CONFIG_HOME", str(home / ".config"))) / "opencode"
+    config = directory / "opencode.jsonc"
+    return config if config.exists() else directory / "opencode.json"
+
+
+def approve_orkest_commands(
+    home: Path,
+    hub: Path,
+    *,
+    opt_in: bool = False,
+    revoke: bool = False,
+    dry_run: bool = False,
+    harnesses: set[str] | None = None,
+) -> bool:
+    """Approve (opt-in), refresh (already opted in) or revoke Orkest's own commands per harness."""
+    harnesses = (
+        harnesses
+        if harnesses is not None
+        else {name for name in ("claude", "codex", "agy", "opencode") if shutil.which(name)}
+    )
+    scope = command_approval.build_scope(home, hub)
+    found = command_approval.targets(
+        scope,
+        harnesses=harnesses,
+        claude_profiles=[profile for profile in claude_profiles(home) if profile.is_dir()],
+        codex_home=Path(os.environ.get("CODEX_HOME", str(home / ".codex"))).expanduser(),
+        agy_settings=home / ".gemini/antigravity-cli/settings.json",
+        opencode_config=opencode_config_path(home),
+        home=home,
+    )
+    return command_approval.apply(
+        scope,
+        found,
+        state_path=resolve_config_home(home) / command_approval.STATE_NAME,
+        opt_in=opt_in,
+        revoke=revoke,
+        dry_run=dry_run,
+    )
+
+
 def install(
     *,
     dry_run: bool = False,
     trust_codex_hooks: bool = False,
+    trust_orkest_commands: bool = False,
+    untrust_orkest_commands: bool = False,
     verify: bool = True,
     stdio: bool = False,
     fast_bin: Path | None = None,
@@ -1944,12 +1997,7 @@ def install(
             mailbox_daemon.set_mode(base, "http")
 
     if shutil.which("claude"):
-        profiles = [home / ".claude"] + sorted(
-            p
-            for p in home.glob(".claude-*")
-            if p.is_dir() and ((p / "settings.json").is_file() or (p / ".claude.json").is_file())
-        )
-        for profile in profiles:
+        for profile in claude_profiles(home):
             if not profile.is_dir():
                 continue
             env = dict(os.environ)
@@ -2022,13 +2070,9 @@ def install(
         )
 
     if shutil.which("opencode"):
-        directory = Path(os.environ.get("XDG_CONFIG_HOME", str(home / ".config"))) / "opencode"
-        config = directory / "opencode.jsonc"
-        if not config.exists():
-            config = directory / "opencode.json"
         register(
             "OpenCode",
-            config,
+            opencode_config_path(home),
             "mcp",
             "opencode",
             dry_run=dry_run,
@@ -2037,6 +2081,7 @@ def install(
             daemon_token=daemon_token,
         )
 
+    approve_orkest_commands(home, hub, opt_in=trust_orkest_commands, revoke=untrust_orkest_commands, dry_run=dry_run)
     install_shell_wrappers(home, fast_bin=fast_bin, dry_run=dry_run)
     sync_installed_runtimes_and_caches(home, dry_run=dry_run)
     install_login_startup(home, mailbox.root(), hub / "mailbox_daemon.py", stdio=stdio, dry_run=dry_run)
@@ -2059,6 +2104,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--trust-codex-hooks", action="store_true", help="explicitly trust only the four installed mailbox hooks"
     )
+    approval = parser.add_mutually_exclusive_group()
+    approval.add_argument(
+        "--trust-orkest-commands",
+        action="store_true",
+        help="approve listed ork subcommands and four Orkest scripts in every installed harness, now and on "
+        "later setup refreshes; generic python3/node/shell, ork gate --, ork label and other scripts still ask",
+    )
+    approval.add_argument(
+        "--untrust-orkest-commands",
+        action="store_true",
+        help="remove only the command approvals --trust-orkest-commands added",
+    )
     parser.add_argument("--stdio", action="store_true", help="install using local stdio rather than the daemon")
     parser.add_argument(
         "--fast-bin",
@@ -2074,6 +2131,8 @@ def main(argv: list[str] | None = None) -> int:
         install(
             dry_run=args.dry_run,
             trust_codex_hooks=args.trust_codex_hooks,
+            trust_orkest_commands=args.trust_orkest_commands,
+            untrust_orkest_commands=args.untrust_orkest_commands,
             stdio=args.stdio,
             fast_bin=args.fast_bin,
         )

@@ -134,6 +134,8 @@ it("prints help without running an installer", () =>
     const result = runInstall(["--help"]);
     expect(result.status).toBe(0);
     expect(result.stdout).toContain("--trust-codex-hooks");
+    expect(result.stdout).toContain("--trust-orkest-commands");
+    expect(result.stdout).toContain("--allow-credits consent is unchanged");
     expect(logLines()).toEqual([]);
   }));
 
@@ -216,4 +218,26 @@ it("returns a failing doctor status with a recovery instruction", () =>
     const result = runInstall([], { DOCTOR_EXIT: "23" });
     expect(result.status).toBe(23);
     expect(result.stderr).toContain("Fix the reported checks, then re-run ./install.sh");
+  }));
+
+it("forwards the Orkest command approval opt-in only when asked", () =>
+  withFixture(({ logLines, runInstall }) => {
+    expect(runInstall(["--no-monitor"]).status).toBe(0);
+    expect(runInstall(["--no-monitor", "--trust-orkest-commands"]).status).toBe(0);
+    expect(runInstall(["--dry-run", "--untrust-orkest-commands"]).status).toBe(0);
+    expect(logLines()).toEqual([
+      "orchestrate",
+      "doctor --check-messaging",
+      "orchestrate --trust-orkest-commands",
+      "doctor --check-messaging",
+      "orchestrate --dry-run --untrust-orkest-commands",
+    ]);
+  }));
+
+it("rejects trusting and untrusting Orkest commands together", () =>
+  withFixture(({ logLines, runInstall }) => {
+    const result = runInstall(["--trust-orkest-commands", "--untrust-orkest-commands"]);
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain("choose one of --trust-orkest-commands");
+    expect(logLines()).toEqual([]);
   }));
