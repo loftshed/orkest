@@ -232,6 +232,16 @@ for work that requires a graphical interface or when the user explicitly request
 rule in every delegated brief. The objective authorizes relevant delegation, not unrelated work,
 publication, billing changes, or takeover of another session.
 
+Command boundaries: run each installed ork command (ork rooms add, ork hall worktree, ork progress,
+ork rooms dispatch) as its own standalone command. For host receipt capture, verify-evidence, review
+and correction dispatch use python3 with the exact absolute path of the installed orchestrate skill,
+standalone, for example python3 ${path.join(plugin, "skills/orchestrate/scripts/coordinator.py")} capture
+--task-dir DIR. Relative script paths fail the trust policy and prompt. Inspect files with separate
+read-only commands and a tool's own output limit (--limit, -n, the Read tool's offset and limit), not
+head or tail pipes. Codex judges each segment of a compound command on its own, so one unapproved
+segment (jq, other python, node, a shell wrapper) can prompt; other hosts may judge the whole line.
+Do not request broader trust for arbitrary python, shell or jq. Preserve this rule in every delegated brief.
+
 Read ${path.join(plugin, "skills/orchestrate/references/swarm.md")} now. It describes the commands and
 native supervision contract. Use ${path.join(plugin, "bin/ork.mjs")} through node if ork is not on PATH.
 
