@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { roomsCommand } from "../../../plugins/orchestrate/bin/rooms.mjs";
 import { parseTeam, readRoom, updateRoom } from "../../../plugins/orchestrate/lib/horde-room.mjs";
 import { dispatchMember, newRoom } from "../../../plugins/orchestrate/lib/rooms.mjs";
+import { worktreeLaunchEnv } from "../../../plugins/orchestrate/lib/worktree-env.mjs";
 import { allocateWorktreePorts } from "../../../plugins/orchestrate/lib/worktree-ports.mjs";
 import { provisionWorktree } from "../../../plugins/orchestrate/lib/worktree-provision.mjs";
 import { retainFixtures } from "../../helpers/retain-fixtures.js";
@@ -59,6 +60,13 @@ describe("worktree provisioning", () => {
       branch: "ork/room-haiku-1",
       slug: "haiku-1",
       parentCwd: repo,
+      prepared: {
+        copied: ["local-settings.json"],
+        linked: [],
+        ports: null,
+        setup: { status: "none" },
+        warnings: [],
+      },
     });
     expect(
       execFileSync("git", ["branch", "--show-current"], {
@@ -230,5 +238,72 @@ describe("ork hall worktree", () => {
       dispatchMember(room.id, "haiku-1", { root, taskDir, run, env, kind: "implementation" }),
     ).resolves.toMatchObject({ dispatch: { run_id: "run-1" } });
     expect((await readRoom(room.id, root)).agents[0].dispatch).toBeDefined();
+  });
+});
+
+describe("room worktree preparation failures", () => {
+  it("keeps registered membership and names the failed substage for a preparation failure", async () => {
+    const repo = await gitRepository();
+    await mkdir(path.join(repo, ".orkest"));
+    await writeFile(path.join(repo, ".orkest", "worktree.json"), '{"version":1,"nope":true}');
+    const { root, room } = await roomFor(repo);
+
+    let thrown;
+    try {
+      await roomsCommand(["worktree", "--room", room.id, "--member", "haiku-1"], {
+        root,
+        stdout: { write: () => {} },
+      });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toMatchObject({ stage: "bootstrap", substage: "config" });
+    // stage=bootstrap keeps the reservation because git already created the worktree.
+    const saved = await readRoom(room.id, root);
+    expect(saved.agents[0].worktree).toMatchObject({
+      path: path.join(repo, ".worktrees", "haiku-1"),
+    });
+    expect(execFileSync("git", ["worktree", "list"], { cwd: repo, encoding: "utf8" })).toContain(
+      "haiku-1",
+    );
+  });
+
+  it("drops the reservation for a non-bootstrap failure (branch already exists)", async () => {
+    const repo = await gitRepository();
+    execFileSync("git", ["branch", "ork/room-haiku-1"], { cwd: repo });
+    const { root, room } = await roomFor(repo);
+    await expect(
+      roomsCommand(["worktree", "--room", room.id, "--member", "haiku-1"], {
+        root,
+        stdout: { write: () => {} },
+      }),
+    ).rejects.toMatchObject({ stage: "add" });
+    expect((await readRoom(room.id, root)).agents[0].worktree).toBeUndefined();
+  });
+
+  it("allocates configured ports for a room checkout and exposes them to a launched child", async () => {
+    const repo = await gitRepository();
+    await mkdir(path.join(repo, ".orkest"));
+    await writeFile(
+      path.join(repo, ".orkest", "worktree.json"),
+      JSON.stringify({ version: 1, ports: { names: ["WEB_PORT"] } }),
+    );
+    const cache = await directory();
+    const env = { ...process.env, ORCHESTRATE_HOME: cache };
+    const result = provisionWorktree(repo, {
+      slug: "ported",
+      branch: "ork/room-ported",
+      env,
+    });
+    const port = result.prepared.ports.WEB_PORT;
+    expect(port).toBeGreaterThanOrEqual(31_000);
+
+    const launched = worktreeLaunchEnv(env, { repoRoot: repo, worktreePath: result.path });
+    const out = execFileSync(
+      process.execPath,
+      ["-e", "process.stdout.write(process.env.WEB_PORT)"],
+      { cwd: result.path, env: launched, encoding: "utf8" },
+    );
+    expect(out).toBe(String(port));
   });
 });

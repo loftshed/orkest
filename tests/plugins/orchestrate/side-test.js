@@ -13,6 +13,7 @@ import {
   SIDE_HELP,
   sideCommand,
 } from "../../../plugins/orchestrate/lib/side.mjs";
+import { listWorktreePorts } from "../../../plugins/orchestrate/lib/worktree-ports.mjs";
 
 describe("ork side (side missions)", () => {
   let tmpDir;
@@ -562,6 +563,95 @@ describe("ork side (side missions)", () => {
       });
       expect(branch.stdout.trim()).toBe("");
       expect(branch.status).toBe(0);
+    });
+
+    function initSideRepo() {
+      spawnSync("git", ["init", "-b", "main"], { cwd: repoDir, stdio: "ignore" });
+      spawnSync("git", ["config", "user.name", "Side Worktree Tests"], { cwd: repoDir });
+      spawnSync("git", ["config", "user.email", "side-worktree@example.invalid"], {
+        cwd: repoDir,
+      });
+      fs.writeFileSync(path.join(repoDir, "tracked.txt"), "fixture\n", "utf8");
+      spawnSync("git", ["add", "tracked.txt"], { cwd: repoDir });
+      spawnSync("git", ["commit", "-m", "side fixture"], { cwd: repoDir, stdio: "ignore" });
+    }
+
+    function gitRunner(seen) {
+      return (cmd, args, opts) => {
+        if (cmd === "git") {
+          const result = spawnSync(cmd, args, { cwd: opts.cwd, encoding: "utf8" });
+          return {
+            status: result.status,
+            stdout: result.stdout || "",
+            stderr: result.stderr || "",
+          };
+        }
+        if (cmd === "python3" && args.includes("init")) {
+          seen.initEnv = opts.env;
+          return { status: 0, stdout: JSON.stringify({ status: "active" }), stderr: "" };
+        }
+        if (cmd === "python3" && args.includes("dispatch")) {
+          seen.dispatchEnv = opts.env;
+          return {
+            status: 0,
+            stdout: JSON.stringify({ run_id: "run-ports", engine: "codex", model: "test" }),
+            stderr: "",
+          };
+        }
+        return { status: 0, stdout: "", stderr: "" };
+      };
+    }
+
+    it("prepares the detached fallback like every other path and passes ports to the launch env", async () => {
+      writeRoom("room-prepared", { session: "parent-session-prepared" });
+      initSideRepo();
+      spawnSync("git", ["branch", "ork/side-prep01"], { cwd: repoDir });
+      fs.mkdirSync(path.join(repoDir, ".orkest"));
+      fs.writeFileSync(
+        path.join(repoDir, ".orkest", "worktree.json"),
+        JSON.stringify({ version: 1, copyFiles: ["local.json"], ports: { names: ["WEB_PORT"] } }),
+      );
+      fs.writeFileSync(path.join(repoDir, "local.json"), '{"local":true}\n');
+      const env = { ...process.env, ORCHESTRATE_HOME: path.join(tmpDir, "ports-cache") };
+      const seen = {};
+
+      const res = await sideCommand(["--room", "room-prepared", "--json", "fix a fixture"], {
+        cwd: repoDir,
+        env,
+        mailboxDir,
+        cacheDir,
+        shortId: "prep01",
+        runCommand: gitRunner(seen),
+      });
+
+      expect(res.status).toBe("dispatched");
+      expect(fs.readFileSync(path.join(res.worktreePath, "local.json"), "utf8")).toBe(
+        '{"local":true}\n',
+      );
+      const ports = listWorktreePorts({ repoRoot: repoDir, worktreePath: res.worktreePath, env });
+      expect(ports).toHaveLength(1);
+      expect(seen.initEnv.WEB_PORT).toBe(String(ports[0].port));
+      expect(seen.dispatchEnv.WEB_PORT).toBe(String(ports[0].port));
+    });
+
+    it("keeps the detached worktree and surfaces the stage when its preparation fails", async () => {
+      writeRoom("room-prep-fail", { session: "parent-session-prep-fail" });
+      initSideRepo();
+      spawnSync("git", ["branch", "ork/side-fail01"], { cwd: repoDir });
+      fs.mkdirSync(path.join(repoDir, ".orkest"));
+      fs.writeFileSync(path.join(repoDir, ".orkest", "worktree.json"), '{"version":1,"x":1}');
+
+      await expect(
+        sideCommand(["--room", "room-prep-fail", "--json", "fix a fixture"], {
+          cwd: repoDir,
+          env: { ...process.env, ORCHESTRATE_HOME: path.join(tmpDir, "fail-cache") },
+          mailboxDir,
+          cacheDir,
+          shortId: "fail01",
+          runCommand: gitRunner({}),
+        }),
+      ).rejects.toMatchObject({ stage: "bootstrap", substage: "config" });
+      expect(fs.existsSync(path.join(repoDir, ".worktrees", "wt-side-fail01"))).toBe(true);
     });
 
     it("enforces per-repo harness/tag/account denylist policy and resolves multi-provider N-accounts via Monitor config", async () => {

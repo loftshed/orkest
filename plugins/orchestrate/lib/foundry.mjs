@@ -8,7 +8,7 @@
  * bounded worker runs.
  */
 import { execFile, execFileSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   closeSync,
   existsSync,
@@ -22,6 +22,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { homedir, hostname, tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -40,7 +41,11 @@ import {
 } from "./policy.mjs";
 import { cacheHome, configPath, envFirst } from "./runtime-paths.mjs";
 import { acquireWorkspaceLease, assertWorkspaceLease } from "./workspace-lease.mjs";
-import { bootstrapWorktreeInclude as bootstrapWorktreeIncludeShared } from "./worktree-env.mjs";
+import {
+  bootstrapWorktreeInclude as bootstrapWorktreeIncludeShared,
+  worktreeLaunchEnv,
+} from "./worktree-env.mjs";
+import { prepareWorktree } from "./worktree-provision.mjs";
 
 const execute = promisify(execFile);
 const scriptsDir = fileURLToPath(new URL("../skills/orchestrate/scripts/", import.meta.url));
@@ -1467,12 +1472,119 @@ function preserveFoundryProblem(problem, pinnedTarget = null) {
   throw new FoundryStateError(problem, path.join(stateDir, res.preservedName));
 }
 
+const PR_STATES = new Set(["OPEN", "MERGED", "CLOSED", "UNKNOWN"]);
+const PR_NULLABLE_TEXT = ["url", "repository", "baseBranch", "headBranch", "headOid"];
+const PR_TIMESTAMPS = ["createdAt", "updatedAt"];
+
+/**
+ * Validate the frozen `state.pr` shape: {number,url,state,repository,baseBranch,headBranch,
+ * headOid,createdAt,updatedAt}. Unknown metadata stays null; keys beyond the frozen set are kept.
+ */
+export function normalizeFoundryPr(pr) {
+  const invalid = (message) => {
+    const error = new Error(`Invalid Foundry pr state: ${message}`);
+    error.code = "ORK_FOUNDRY_PR_INVALID";
+    return error;
+  };
+  if (!pr || typeof pr !== "object" || Array.isArray(pr)) throw invalid("must be an object");
+  if (!Number.isSafeInteger(pr.number) || pr.number <= 0) throw invalid("number must be positive");
+  if (!PR_STATES.has(pr.state)) throw invalid("state must be OPEN, MERGED, CLOSED or UNKNOWN");
+  const normalized = { ...pr };
+  for (const key of PR_NULLABLE_TEXT) {
+    const value = pr[key] ?? null;
+    if (value !== null && (typeof value !== "string" || value === "")) {
+      throw invalid(`${key} must be a non-empty string or null`);
+    }
+    normalized[key] = value;
+  }
+  if (normalized.url !== null && !/^https:\/\/[^\s]+$/u.test(normalized.url)) {
+    throw invalid("url must be an https URL");
+  }
+  for (const key of PR_TIMESTAMPS) {
+    const value = pr[key] ?? null;
+    if (
+      value !== null &&
+      (typeof value !== "string" ||
+        !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/u.test(value) ||
+        Number.isNaN(Date.parse(value)))
+    ) {
+      throw invalid(`${key} must be an ISO 8601 timestamp or null`);
+    }
+    normalized[key] = value;
+  }
+  return normalized;
+}
+
+function isSamePr(left, right) {
+  return (
+    Boolean(left && right) &&
+    left.number === right.number &&
+    (left.repository ?? null) === (right.repository ?? null)
+  );
+}
+
+/** Events implied by an old and a new durable PR record. A first MERGED never invents an open. */
+export function foundryPrTransitions(oldPr, newPr) {
+  if (!newPr) return [];
+  const isSame = isSamePr(oldPr, newPr);
+  if (newPr.state === "OPEN" && (!isSame || oldPr.state === "UNKNOWN")) return ["pr_opened"];
+  if (newPr.state === "MERGED" && (!isSame || oldPr.state !== "MERGED")) return ["pr_merged"];
+  return [];
+}
+
+/**
+ * Opaque, deterministic transition key for one PR identity (repository, number, head commit and
+ * event). The bridge derives the external event id from it; the key itself never leaves the process.
+ */
+function prTransitionKey(event, pr) {
+  return createHash("sha256")
+    .update(["ork.foundry.pr", event, pr.repository ?? "", pr.number, pr.headOid ?? ""].join("\0"))
+    .digest("hex");
+}
+
+/** 4C's shared dispatch path; absent module means no optional bridge in this checkout. */
+function loadEmitChiefEvents() {
+  try {
+    return createRequire(import.meta.url)("./chief-bridge.mjs").emitChiefEvents;
+  } catch {
+    return null;
+  }
+}
+
+/** Single emission site for PR events: runs after the pinned write committed, never throws. */
+function emitPrTransitions(oldPr, newPr, { owningRoomId, bridge, env, emitEvents }) {
+  try {
+    if (typeof owningRoomId !== "string" || !owningRoomId) return;
+    const events = foundryPrTransitions(oldPr, newPr).map((event) => ({
+      event,
+      roomId: owningRoomId,
+      key: prTransitionKey(event, newPr),
+      prNumber: newPr.number,
+    }));
+    if (events.length === 0) return;
+    const emit = emitEvents ?? loadEmitChiefEvents();
+    if (typeof emit !== "function") return;
+    // Shared delivery owns bounding, hand-off and error swallowing; nothing here is awaited or locked.
+    void (async () => {
+      try {
+        await emit(events, { env: env ?? process.env, bridge });
+      } catch {
+        // Optional bridge: never surfaces.
+      }
+    })();
+  } catch {
+    // Delivery is best effort; the committed state is already the source of truth.
+  }
+}
+
 export function writeFoundryState(worktreePath, statePatch = {}, options = {}) {
   const resolvedWorktree = path.resolve(worktreePath);
   const target = resolveValidatedFoundryTarget(resolvedWorktree, options);
   const statePath = target.statePath;
   const loaded = loadFoundryState(resolvedWorktree, options);
   if (!["missing", "ok"].includes(loaded.kind)) preserveFoundryProblem(loaded, target.pinnedTarget);
+  if (statePatch.pr !== undefined)
+    statePatch = { ...statePatch, pr: normalizeFoundryPr(statePatch.pr) };
   const merged = buildFoundryState(resolvedWorktree, statePatch, loaded.state);
   const stateDir = path.dirname(statePath);
   const payload = Buffer.from(`${JSON.stringify(merged, null, 2)}\n`, "utf8");
@@ -1486,6 +1598,14 @@ export function writeFoundryState(worktreePath, statePatch = {}, options = {}) {
     },
     target.pinnedTarget,
   );
+  if (statePatch.pr !== undefined) {
+    emitPrTransitions(loaded.state?.pr, merged.pr, {
+      owningRoomId: options.owningRoomId,
+      bridge: options.bridge,
+      emitEvents: options.emitEvents,
+      env: options.env,
+    });
+  }
   return merged;
 }
 
@@ -2020,6 +2140,33 @@ async function defaultExecAgent(
   }
 }
 
+/** True only for a registered worktree on `branch` that Foundry never started (no state, no marker). */
+async function isUnstartedRegisteredWorktree(cwd, worktreePath, branch) {
+  try {
+    const real = realpathSync(worktreePath);
+    const { stdout } = await execute("git", ["worktree", "list", "--porcelain"], { cwd });
+    const registered = stdout.split(/\n\n/u).some((block) => {
+      const lines = block.split("\n");
+      const entry = lines.find((line) => line.startsWith("worktree "))?.slice(9);
+      const checkedOut = lines.find((line) => line.startsWith("branch "))?.slice(7);
+      if (!entry || checkedOut !== `refs/heads/${branch}`) return false;
+      try {
+        return realpathSync(entry) === real;
+      } catch {
+        return false;
+      }
+    });
+    if (!registered) return false;
+    const gitDir = (
+      await execute("git", ["rev-parse", "--absolute-git-dir"], { cwd: worktreePath })
+    ).stdout.trim();
+    if (existsSync(path.join(gitDir, "orkest.json"))) return false;
+    return loadFoundryState(worktreePath).kind === "missing";
+  } catch {
+    return false;
+  }
+}
+
 async function provisionDisposableWorktree(
   cwd,
   worktreeSlug,
@@ -2033,6 +2180,8 @@ async function provisionDisposableWorktree(
   const worktreeBase = path.join(cacheHome(env), "worktrees", repoName);
   const worktreePath = path.join(worktreeBase, worktreeSlug);
   if (existsSync(worktreePath)) {
+    // A preparation failure keeps its worktree (no Foundry state or marker yet); retry resumes it.
+    if (await isUnstartedRegisteredWorktree(resolvedCwd, worktreePath, branch)) return worktreePath;
     throw new Error(`Disposable worktree path already exists: ${worktreePath}`);
   }
   await mkdir(worktreeBase, { recursive: true });
@@ -2162,6 +2311,7 @@ export async function foundryCommand(
     getAccountsFn = getAccounts,
     policy: policyOverride,
     provisionWorktreeFn = provisionDisposableWorktree,
+    prepareWorktreeFn = prepareWorktree,
     runnerScriptPath,
     stdout = process.stdout,
     targetBranch = "main",
@@ -2436,7 +2586,7 @@ export async function foundryCommand(
     if (loadFoundryState(worktreePath).kind !== "missing") {
       throw new Error(`Foundry state already exists: ${worktreePath}`);
     }
-    bootstrapWorktreeInclude(cwd, worktreePath);
+    await prepareWorktreeFn(cwd, worktreePath, { slug: match.worktreeSlug, env });
     await mkdir(path.dirname(specFile), { recursive: true });
     assertWorkspaceLease(initialLease);
     await writeFile(specFile, `${JSON.stringify(match.taskSpec, null, 2)}\n`);
@@ -2492,7 +2642,7 @@ export async function foundryCommand(
   if (match.selectedRoute.effort) agentArgs.push("--effort", match.selectedRoute.effort);
   const { agentResult, outcome } = await runFoundryWorker(execAgentFn, agentArgs, {
     cwd: worktreePath,
-    env,
+    env: worktreeLaunchEnv(env, { repoRoot: cwd, worktreePath }),
     runnerScriptPath,
   });
   const rawAgentStatus = agentResult?.status || outcome;

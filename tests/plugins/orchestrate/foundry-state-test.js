@@ -22,8 +22,11 @@ import {
   collectActiveWorktreeAllowPaths,
   createFoundryAttempt,
   foundryLauncherAlive,
+  foundryPrTransitions,
+  foundryRun,
   FoundryStateError,
   loadFoundryState,
+  normalizeFoundryPr,
   processIdentity,
   readFoundryState,
   resolveFoundryStatePath,
@@ -41,6 +44,8 @@ import {
   smelterCli,
   smeltWorktree,
 } from "../../../plugins/orchestrate/lib/smelter.mjs";
+import { acquireWorkspaceLease } from "../../../plugins/orchestrate/lib/workspace-lease.mjs";
+import { listWorktreePorts } from "../../../plugins/orchestrate/lib/worktree-ports.mjs";
 
 function fixture() {
   const rawRoot = mkdtempSync(path.join(tmpdir(), "orkest-state-"));
@@ -595,5 +600,292 @@ describe("strict Foundry state with retained fixtures", () => {
       /not a registered Git worktree/,
     );
     expect(existsSync(path.join(fakeAdmin, "orkest", "foundry-state.json"))).toBe(false);
+  });
+});
+
+const OPEN_PR = {
+  number: 231,
+  url: "https://github.com/example/widgets/pull/231",
+  state: "OPEN",
+  repository: "example/widgets",
+  baseBranch: "main",
+  headBranch: "ork/feature",
+  headOid: "a".repeat(40),
+  createdAt: "2026-11-19T10:00:00Z",
+  updatedAt: "2026-11-19T10:00:00Z",
+};
+
+// Stands in for 4C's emitChiefEvents: records exactly what the single writer hands to shared delivery.
+function recorder() {
+  const events = [];
+  const calls = [];
+  return {
+    events,
+    calls,
+    emitEvents: (batch, options) => {
+      calls.push(options);
+      events.push(...batch);
+    },
+  };
+}
+
+describe("Foundry state pr record", () => {
+  it("validates the frozen shape, keeps unknown fields and leaves old records untouched", () => {
+    const f = worktreeFixture();
+    const first = writeFoundryState(f.worktree, { status: "verified", custom: { keep: true } });
+    const before = readFileSync(f.file, "utf8");
+    expect(first.pr).toBeUndefined();
+    expect(Object.hasOwn(JSON.parse(before), "pr")).toBe(false);
+
+    const withPr = writeFoundryState(f.worktree, { pr: { ...OPEN_PR, extra: "kept" } });
+    expect(withPr.custom).toEqual({ keep: true });
+    expect(readFoundryState(f.worktree).pr).toMatchObject({ number: 231, extra: "kept" });
+
+    // Later writers that never mention pr must not drop or rewrite it.
+    writeFoundryState(f.worktree, { status: "worker_failed" });
+    expect(readFoundryState(f.worktree).pr).toMatchObject({ number: 231, state: "OPEN" });
+
+    const unknownMetadata = normalizeFoundryPr({ number: 7, state: "UNKNOWN" });
+    expect(unknownMetadata).toMatchObject({ url: null, headOid: null, createdAt: null });
+    for (const bad of [
+      null,
+      [],
+      { ...OPEN_PR, number: 0 },
+      { ...OPEN_PR, number: 1.5 },
+      { ...OPEN_PR, state: "open" },
+      { ...OPEN_PR, url: "ftp://example.com/1" },
+      { ...OPEN_PR, createdAt: "yesterday" },
+      { ...OPEN_PR, headOid: "" },
+    ]) {
+      expect(() => writeFoundryState(f.worktree, { pr: bad })).toThrow(/Invalid Foundry pr state/u);
+    }
+    expect(readFoundryState(f.worktree).pr.number).toBe(231);
+  });
+
+  it("derives opened/merged transitions once, never inventing an open for a first MERGED", () => {
+    expect(foundryPrTransitions(undefined, OPEN_PR)).toEqual(["pr_opened"]);
+    expect(foundryPrTransitions(OPEN_PR, { ...OPEN_PR })).toEqual([]);
+    expect(foundryPrTransitions(OPEN_PR, { ...OPEN_PR, state: "MERGED" })).toEqual(["pr_merged"]);
+    expect(foundryPrTransitions(undefined, { ...OPEN_PR, state: "MERGED" })).toEqual(["pr_merged"]);
+    expect(
+      foundryPrTransitions({ ...OPEN_PR, state: "MERGED" }, { ...OPEN_PR, state: "MERGED" }),
+    ).toEqual([]);
+    expect(foundryPrTransitions(OPEN_PR, { ...OPEN_PR, state: "CLOSED" })).toEqual([]);
+    expect(foundryPrTransitions({ ...OPEN_PR, state: "UNKNOWN" }, OPEN_PR)).toEqual(["pr_opened"]);
+  });
+
+  it("emits at the single pinned writer, after the commit, only for a proven room", () => {
+    const f = worktreeFixture();
+    const bridge = recorder();
+    const options = { emitEvents: bridge.emitEvents, owningRoomId: "room-a" };
+
+    writeFoundryState(f.worktree, { status: "verified" }, options);
+    expect(bridge.events).toEqual([]); // no pr metadata: nothing by itself
+
+    writeFoundryState(f.worktree, { pr: OPEN_PR }, options);
+    expect(bridge.events).toHaveLength(1);
+    expect(bridge.events[0]).toMatchObject({ event: "pr_opened", roomId: "room-a", prNumber: 231 });
+    expect(bridge.events[0].key).toMatch(/^[0-9a-f]{64}$/u);
+    expect(bridge.events[0]).not.toHaveProperty("id");
+    expect(JSON.stringify(bridge.events[0])).not.toContain(f.worktree);
+
+    // The same GitHub answer observed again, or by a restarted process, emits nothing.
+    writeFoundryState(
+      f.worktree,
+      { pr: { ...OPEN_PR, updatedAt: "2026-11-19T11:00:00Z" } },
+      options,
+    );
+    expect(bridge.events).toHaveLength(1);
+
+    writeFoundryState(f.worktree, { pr: { ...OPEN_PR, state: "MERGED" } }, options);
+    expect(bridge.events.map((event) => event.event)).toEqual(["pr_opened", "pr_merged"]);
+    writeFoundryState(f.worktree, { pr: { ...OPEN_PR, state: "MERGED" } }, options);
+    expect(bridge.events).toHaveLength(2);
+    expect(bridge.events[0].key).not.toBe(bridge.events[1].key);
+
+    // A different record for the same PR identity gets the same deterministic id.
+    const other = worktreeFixture();
+    const again = recorder();
+    writeFoundryState(
+      other.worktree,
+      { pr: OPEN_PR },
+      { emitEvents: again.emitEvents, owningRoomId: "room-b" },
+    );
+    expect(again.events[0].key).toBe(bridge.events[0].key);
+
+    // No proven room, a rejected write and a throwing bridge never emit or change the outcome.
+    const standalone = worktreeFixture();
+    const quiet = recorder();
+    writeFoundryState(standalone.worktree, { pr: OPEN_PR }, { emitEvents: quiet.emitEvents });
+    expect(() =>
+      writeFoundryState(
+        standalone.worktree,
+        { pr: { ...OPEN_PR, number: -1 } },
+        { emitEvents: quiet.emitEvents, owningRoomId: "room-a" },
+      ),
+    ).toThrow();
+    expect(quiet.events).toEqual([]);
+    const angry = () => {
+      throw new Error("transport down");
+    };
+    const saved = writeFoundryState(
+      standalone.worktree,
+      { pr: { ...OPEN_PR, state: "MERGED" } },
+      { emitEvents: angry, owningRoomId: "room-a" },
+    );
+    expect(saved.pr.state).toBe("MERGED");
+  });
+});
+
+function foundryRepo({ config } = {}) {
+  const created = mkdtempSync(path.join(tmpdir(), "orkest-foundry-prep-"));
+  const root = realpathSync(created);
+  const repo = path.join(root, "repo");
+  mkdirSync(repo);
+  git(repo, "init", "-b", "main");
+  git(repo, "config", "user.name", "Foundry Prep");
+  git(repo, "config", "user.email", "prep@example.invalid");
+  writeFileSync(path.join(repo, "change.txt"), "base\n");
+  writeFileSync(path.join(repo, ".env"), "LOCAL=1\n");
+  git(repo, "add", "change.txt");
+  git(repo, "commit", "-m", "base");
+  if (config !== undefined) {
+    mkdirSync(path.join(repo, ".orkest"));
+    writeFileSync(path.join(repo, ".orkest", "worktree.json"), JSON.stringify(config));
+  }
+  return { root, repo, env: { ...process.env, ORCHESTRATE_HOME: path.join(root, "cache") } };
+}
+
+function foundryOptions(f, extra = {}) {
+  const now = Date.now();
+  const task = {
+    schema: "agent-executor.task-spec.v1",
+    objective: "Prepare",
+    allow_paths: ["change.txt"],
+    development_checks: ["true"],
+  };
+  return {
+    cwd: f.repo,
+    env: f.env,
+    stdout: { write() {} },
+    execGhFn: async () => [
+      {
+        number: 301,
+        title: "Prepare worktree",
+        labels: [{ name: "agent:ready" }],
+        body: `\`\`\`json task-spec\n${JSON.stringify(task)}\n\`\`\``,
+      },
+    ],
+    getAccountsFn: async () => [
+      {
+        fetchedAt: now,
+        id: "codex-test",
+        label: "Codex",
+        ok: true,
+        provider: "codex",
+        route: "--engine codex",
+        pools: [{ families: ["gpt"], id: "codex", label: "Codex", windowIds: ["week"] }],
+        windows: [
+          {
+            id: "week",
+            label: "Weekly",
+            remainingPct: 85,
+            resetsAt: now + 3 * 24 * 3600 * 1000,
+            windowMins: 10_080,
+          },
+        ],
+      },
+    ],
+    ...extra,
+  };
+}
+
+describe("Foundry disposable worktree preparation", () => {
+  it("prepares the real created worktree under its lease and launches the harness with port env", async () => {
+    const f = foundryRepo({ config: { version: 1, ports: { names: ["WEB_PORT", "API_PORT"] } } });
+    const seen = path.join(f.root, "harness-env.json");
+    const order = [];
+    let leaseBusyDuringPrepare = null;
+    const result = await foundryRun(["--json"], {
+      ...foundryOptions(f),
+      prepareWorktreeFn: async (repoRoot, worktreePath, options) => {
+        order.push("prepare");
+        leaseBusyDuringPrepare = !(await acquireWorkspaceLease(worktreePath, { env: f.env }))
+          .acquired;
+        const { prepareWorktree } =
+          await import("../../../plugins/orchestrate/lib/worktree-provision.mjs");
+        return prepareWorktree(repoRoot, worktreePath, options);
+      },
+      execAgentFn: async (_args, options) => {
+        order.push("launch");
+        // A real child process stands in for the harness and reports the env it was launched with.
+        execFileSync(
+          process.execPath,
+          [
+            "-e",
+            `require("node:fs").writeFileSync(${JSON.stringify(seen)}, JSON.stringify({web: process.env.WEB_PORT, api: process.env.API_PORT, all: process.env.ORKEST_WORKTREE_PORTS, cwd: process.cwd()}))`,
+          ],
+          { cwd: options.cwd, env: options.env },
+        );
+        return { status: "completed" };
+      },
+    });
+    expect(order).toEqual(["prepare", "launch"]);
+    expect(leaseBusyDuringPrepare).toBe(true);
+    const worktreePath = result.worktreePath;
+    expect(readFileSync(path.join(worktreePath, ".env"), "utf8")).toBe("LOCAL=1\n");
+
+    const ports = listWorktreePorts({ repoRoot: f.repo, worktreePath, env: f.env });
+    expect(ports.map((entry) => entry.name)).toEqual(["API_PORT", "WEB_PORT"]);
+    const harness = JSON.parse(readFileSync(seen, "utf8"));
+    expect(harness.web).toBe(String(ports.find((p) => p.name === "WEB_PORT").port));
+    expect(harness.api).toBe(String(ports.find((p) => p.name === "API_PORT").port));
+    expect(JSON.parse(harness.all)).toEqual({
+      API_PORT: ports[0].port,
+      WEB_PORT: ports[1].port,
+    });
+    expect(realpathSync(harness.cwd)).toBe(realpathSync(worktreePath));
+  });
+
+  it("keeps a worktree whose preparation failed and resumes it on retry without duplicate effects", async () => {
+    const f = foundryRepo({ config: { version: 1, surprise: 1 } });
+    let launches = 0;
+    const options = foundryOptions(f, {
+      execAgentFn: async () => {
+        launches += 1;
+        return { status: "completed" };
+      },
+    });
+    const worktrees = () => {
+      const listed = git(f.repo, "worktree", "list", "--porcelain");
+      return listed.split("\n").filter((line) => line.startsWith("worktree ")).length;
+    };
+
+    let thrown;
+    try {
+      await foundryRun(["--json"], options);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toMatchObject({ stage: "bootstrap", substage: "config" });
+    expect(launches).toBe(0);
+    expect(worktrees()).toBe(2);
+    const cacheWorktrees = path.join(f.env.ORCHESTRATE_HOME, "worktrees", "repo");
+    const [slug] = readdirSync(cacheWorktrees);
+    expect(loadFoundryState(path.join(cacheWorktrees, slug)).kind).toBe("missing");
+
+    // Fix the config; the same worktree is resumed rather than rejected or duplicated.
+    writeFileSync(
+      path.join(f.repo, ".orkest", "worktree.json"),
+      JSON.stringify({ version: 1, ports: { names: ["WEB_PORT"] } }),
+    );
+    const retry = await foundryRun(["--json"], options);
+    expect(retry.worktreePath).toBe(path.join(cacheWorktrees, slug));
+    expect(launches).toBe(1);
+    expect(worktrees()).toBe(2);
+    expect(readdirSync(cacheWorktrees)).toEqual([slug]);
+    expect(
+      listWorktreePorts({ repoRoot: f.repo, worktreePath: retry.worktreePath, env: f.env }),
+    ).toHaveLength(1);
   });
 });
