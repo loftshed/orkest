@@ -16,7 +16,6 @@ import {
   runTui,
 } from "../../../plugins/orchestrate/bin/horde-tui.mjs";
 import * as hordeTuiModule from "../../../plugins/orchestrate/bin/horde-tui.mjs";
-import { ChiefView } from "../../../plugins/orchestrate/lib/chief-view.mjs";
 import * as factoryModule from "../../../plugins/orchestrate/lib/factory.mjs";
 import * as foundryModule from "../../../plugins/orchestrate/lib/foundry.mjs";
 import {
@@ -3578,51 +3577,6 @@ function chiefStatusFixture({ rooms = [], desk = [], inbox = [], drawerSnapshot 
   };
 }
 
-/**
- * Stands in for shard 2B's compose, drawer and close bindings until they land: `r` composes to the
- * selected room (printable keys append, Enter emits chief-reply), `A` emits chief-ack-desk and two
- * `x` presses emit chief-close-room. Every other key runs the real ChiefView handler.
- */
-function installChiefStandIn() {
-  const real = ChiefView.prototype.handleInput;
-  /* eslint-disable unicorn/no-this-outside-of-class -- vitest runs the spy with the ChiefView instance as this */
-  return vi.spyOn(ChiefView.prototype, "handleInput").mockImplementation(function standIn(key) {
-    if (this.composing) {
-      const state = this.composing;
-      if (key === "\r") {
-        this.composing = null;
-        const text = state.text.trim();
-        if (!text) return true;
-        return { type: "chief-reply", target: state.target, targetLabel: state.label, text };
-      }
-      if (key === "\u{1B}") {
-        this.composing = null;
-        return true;
-      }
-      if (key === "\u{7F}") state.text = [...state.text].slice(0, -1).join("");
-      else if (key.length === 1 && key >= " ") state.text += key;
-      return true;
-    }
-    const selected = this.entries?.find((entry) => entry.key === this.selectedKey);
-    const roomId = selected?.key?.startsWith("room:") ? selected.data.id : null;
-    if (key === "r" && roomId) {
-      this.composing = { target: roomId, label: selected.data.repo.name, text: "" };
-      return true;
-    }
-    if (key === "A") return { type: "chief-ack-desk" };
-    if (key === "x" && roomId) {
-      if (this.armedRoom !== roomId) {
-        this.armedRoom = roomId;
-        return true;
-      }
-      this.armedRoom = undefined;
-      return { type: "chief-close-room", roomId };
-    }
-    return real.call(this, key);
-  });
-  /* eslint-enable unicorn/no-this-outside-of-class */
-}
-
 function startChiefTui({ status, room, env = {}, exec: execMock = () => {}, chief = {} }) {
   // eslint-disable-next-line unicorn/prefer-event-target -- Readline keypress uses the Node stream EventEmitter API.
   const input = Object.assign(new EventEmitter(), {
@@ -3702,16 +3656,9 @@ function chiefNotifier() {
 }
 
 describe("Chief TUI actions and notifications", () => {
-  let restoreStandIn;
-  afterEach(() => {
-    restoreStandIn?.();
-    restoreStandIn = undefined;
-  });
-
   it("sends a Chief reply from real keys and repaints from an immediate fresh status", async () => {
     const room = chiefRoom("r1", { repo: { name: "repo", path: "/repo" } });
     const send = vi.fn(async () => ({ status: "sent" }));
-    restoreStandIn = installChiefStandIn().mockRestore;
     const tui = startChiefTui({
       status: chiefStatusFixture({ rooms: [room] }),
       room,
@@ -3723,7 +3670,7 @@ describe("Chief TUI actions and notifications", () => {
       tui.type("r");
       for (const key of "quota?") tui.type(key);
       tui.type("\r");
-      await vi.waitFor(() => expect(tui.text()).toContain("Sent to repo"));
+      await vi.waitFor(() => expect(tui.text()).toContain("Sent to C"));
       expect(send).toHaveBeenCalledTimes(1);
       expect(send).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -3747,7 +3694,6 @@ describe("Chief TUI actions and notifications", () => {
     const snapshot = { session: "chief-1", revision: "7", deskIds: ["d1"], inboxIds: ["i1"] };
     const gate = deferred();
     const ack = vi.fn(() => gate.promise);
-    restoreStandIn = installChiefStandIn().mockRestore;
     const tui = startChiefTui({
       status: chiefStatusFixture({ rooms: [room], desk, inbox, drawerSnapshot: snapshot }),
       room,
@@ -3755,6 +3701,8 @@ describe("Chief TUI actions and notifications", () => {
     });
     try {
       await vi.waitFor(() => expect(tui.text()).toContain("repo"));
+      tui.type("i");
+      await vi.waitFor(() => expect(tui.text()).toContain("Which branch?"));
       tui.type("A");
       await vi.waitFor(() => expect(ack).toHaveBeenCalledTimes(1));
       // A second A while the first acknowledgment is pending must not start another one.
@@ -3782,11 +3730,14 @@ describe("Chief TUI actions and notifications", () => {
   });
 
   it("reports a refused room close, then keeps the TUI responsive", async () => {
-    const room = chiefRoom("r1", { repo: { name: "repo", path: "/repo" } });
+    const room = chiefRoom("r1", {
+      repo: { name: "repo", path: "/repo" },
+      counts: { working: 0, blocked: 0, done: 1, idle: 0, total: 1 },
+      coordinator: { session: "r1-c", name: "C", engine: "claude", status: "done" },
+    });
     const close = vi.fn(async () => {
       throw new Error("Room still has running workers");
     });
-    restoreStandIn = installChiefStandIn().mockRestore;
     const tui = startChiefTui({
       status: chiefStatusFixture({ rooms: [room] }),
       room,
@@ -3815,12 +3766,15 @@ describe("Chief TUI actions and notifications", () => {
   });
 
   it("reports a confirmed room close and an already-closed room", async () => {
-    const room = chiefRoom("r1", { repo: { name: "repo", path: "/repo" } });
+    const room = chiefRoom("r1", {
+      repo: { name: "repo", path: "/repo" },
+      counts: { working: 0, blocked: 0, done: 1, idle: 0, total: 1 },
+      coordinator: { session: "r1-c", name: "C", engine: "claude", status: "done" },
+    });
     const close = vi
       .fn()
       .mockResolvedValueOnce({ status: "closed" })
       .mockResolvedValueOnce({ status: "already-closed" });
-    restoreStandIn = installChiefStandIn().mockRestore;
     const tui = startChiefTui({
       status: chiefStatusFixture({ rooms: [room] }),
       room,
@@ -3840,10 +3794,28 @@ describe("Chief TUI actions and notifications", () => {
     }
   });
 
+  it("refuses to close a room with running workers without calling close", async () => {
+    const room = chiefRoom("r1", { repo: { name: "repo", path: "/repo" } });
+    const close = vi.fn(async () => ({ status: "closed" }));
+    const tui = startChiefTui({
+      status: chiefStatusFixture({ rooms: [room] }),
+      room,
+      chief: { close },
+    });
+    try {
+      await vi.waitFor(() => expect(tui.text()).toContain("repo"));
+      tui.type("x");
+      tui.type("x");
+      await vi.waitFor(() => expect(tui.text()).toContain("is still working"));
+      expect(close).not.toHaveBeenCalled();
+    } finally {
+      await tui.stop();
+    }
+  });
+
   it("applies the newer frame when a poll started before a mutation resolves late", async () => {
     const room = chiefRoom("r1", { repo: { name: "old-repo", path: "/repo" } });
     const send = vi.fn(async () => ({ status: "sent" }));
-    restoreStandIn = installChiefStandIn().mockRestore;
     const tui = startChiefTui({
       status: chiefStatusFixture({ rooms: [room] }),
       room,
@@ -3877,7 +3849,6 @@ describe("Chief TUI actions and notifications", () => {
   it("keeps a literal q as compose text instead of closing the Chief view", async () => {
     const room = chiefRoom("r1", { repo: { name: "repo", path: "/repo" } });
     const send = vi.fn(async () => ({ status: "sent" }));
-    restoreStandIn = installChiefStandIn().mockRestore;
     const tui = startChiefTui({
       status: chiefStatusFixture({ rooms: [room] }),
       room,

@@ -136,7 +136,7 @@ function canonicalizeLinkTarget(file) {
 function hasControl(text) {
   for (const ch of String(text)) {
     const code = ch.codePointAt(0);
-    if (code < 0x20 || code === 0x7f) return true;
+    if (code < 32 || code === 127) return true;
   }
   return false;
 }
@@ -148,20 +148,13 @@ function requireSlug(value, what) {
   return value;
 }
 
+const WIDE_RE =
+  /[\u{1100}-\u{115F}\u{2E80}-\u{A4CF}\u{AC00}-\u{D7A3}\u{F900}-\u{FAFF}\u{FE30}-\u{FE6F}\u{FF00}-\u{FF60}\u{FFE0}-\u{FFE6}\u{1F300}-\u{1FAFF}\u{20000}-\u{3FFFD}]/u;
+
 function codePointWidthOne(cp) {
-  if (cp < 0x20 || (cp >= 0x7f && cp < 0xa0)) return false;
-  const isWide =
-    (cp >= 0x11_00 && cp <= 0x11_5f) ||
-    (cp >= 0x2e_80 && cp <= 0xa4_cf) ||
-    (cp >= 0xac_00 && cp <= 0xd7_a3) ||
-    (cp >= 0xf9_00 && cp <= 0xfa_ff) ||
-    (cp >= 0xfe_30 && cp <= 0xfe_6f) ||
-    (cp >= 0xff_00 && cp <= 0xff_60) ||
-    (cp >= 0xff_e0 && cp <= 0xff_e6) ||
-    (cp >= 0x1_f3_00 && cp <= 0x1_fa_ff) ||
-    (cp >= 0x2_00_00 && cp <= 0x3_ff_fd);
-  if (isWide) return false;
+  if (cp < 32 || (cp >= 127 && cp < 160)) return false;
   const ch = String.fromCodePoint(cp);
+  if (WIDE_RE.test(ch)) return false;
   return !/[\p{M}\p{Cf}\p{Cc}\p{Zl}\p{Zp}]/u.test(ch);
 }
 
