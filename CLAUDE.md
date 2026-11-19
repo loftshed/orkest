@@ -4,9 +4,7 @@ Guidance for Claude Code in this repository.
 
 ## The repository
 
-`loftshed/orkest` is a personal Claude Code plugin marketplace. Each plugin is a directory under `plugins/`, an entry in [`.claude-plugin/marketplace.json`](.claude-plugin/marketplace.json), and a row in the README's plugin table.
-
-Reference: [plugin marketplaces](https://code.claude.com/docs/en/plugin-marketplaces), [plugins reference](https://code.claude.com/docs/en/plugins-reference).
+`loftshed/orkest` is one product: the `ork` CLI, the mailbox daemon and coordinator, the Swarm View TUI, quota monitoring, a Rust fast path, and thin adapters for each harness. It is **not** a Claude Code plugin: there is no plugin manifest or plugin cache. `install.sh` links the skills, writes the commands and registers monitor's MCP server for every harness, and everything calls `ork` on `PATH`. `plugins/orchestrate` and `plugins/monitor` are source directories of that one product, released under one version.
 
 ## Commands
 
@@ -18,7 +16,7 @@ corepack pnpm readme    # regenerate the README's command lists and screenshots 
 node scripts/release.js plan   # what the next release would publish
 ```
 
-Both scripts call `./node_modules/.bin` directly, so they work without pnpm on PATH. Single steps: `corepack pnpm validate`, `lint`, `lint:fix`, `format`, `format:check`, `markdownlint`, `spell`.
+Both scripts call `./node_modules/.bin` directly, so they work without pnpm on PATH. Single steps: `corepack pnpm validate` (skills, commands and path references), `lint`, `lint:fix`, `format`, `format:check`, `markdownlint`, `spell`.
 
 ## Workflow
 
@@ -29,11 +27,11 @@ Both scripts call `./node_modules/.bin` directly, so they work without pnpm on P
 
 ## Rules for changes
 
-- **Never edit a plugin version.** Write conventional commit subjects (`feat(monitor): …`, `fix: …`, `refactor!: …`); CI releases on `main` and writes every version, changelog heading and tag. Notes under `## Unreleased` in a plugin's `CHANGELOG.md` replace the generated ones. Details: [docs/releases.md](docs/releases.md).
-- **Tests go in `tests/`**, at the same relative path as the code they cover, never inside `plugins/`: a plugin directory is copied whole on install. JavaScript tests are `*-test.js` files run by Vitest. Files under `tests/**/fixtures/` are captured output; keep them byte-for-byte.
-- **Plugin code is ESM `.mjs`** with Node built-ins only, because it runs from a copied cache with no `package.json` or `node_modules`. Repository tooling in `scripts/` is `.js`. When a script checks whether it is the entry point, compare real paths, since plugins are often started through symlinks.
+- **Never edit the version.** It lives in the root `package.json`. Write conventional commit subjects (`feat(monitor): …`, `fix: …`, `refactor!: …`); CI releases on `main` and writes the version (and its copies), the root `CHANGELOG.md` heading and the `vX.Y.Z` tag. Notes under `## Unreleased` in the root `CHANGELOG.md` replace the generated ones. Details: [docs/releases.md](docs/releases.md).
+- **Tests go in `tests/`**, at the same relative path as the code they cover, never inside `plugins/`, so a source directory holds only what runs. JavaScript tests are `*-test.js` files run by Vitest. Files under `tests/**/fixtures/` are captured output; keep them byte-for-byte.
+- **Runtime code is ESM `.mjs`.** Prefer Node built-ins: `ork update` is a plain git fast-forward and hooks run on every turn, so a dependency would need `install.sh` and `ork update` to install it. Repository tooling in `scripts/` is `.js`. When a script checks whether it is the entry point, compare real paths, since plugins are often started through symlinks.
 - **Let the gate decide style.** ESLint, Prettier, markdownlint, cspell, ruff and shellcheck run on commit and in CI. Fix what a rule reports instead of disabling it; an unavoidable inline disable carries a `-- reason`. New words go in [`project-words.txt`](project-words.txt).
-- **Plugin-relative paths** use `${CLAUDE_PLUGIN_ROOT}` or `${CLAUDE_SKILL_DIR}`, quoted wherever a shell expands them. The validator fails when one points at a missing file.
+- **Harness-facing text calls `ork` (or `monitor`) on `PATH`**, never `${CLAUDE_PLUGIN_ROOT}`, which the validator rejects. `${CLAUDE_SKILL_DIR}` is a skill feature and stays, quoted wherever a shell expands it; the validator fails when it, or a file a command names, points at a missing file.
 - **Regenerate the README, don't hand-edit its generated parts.** The `<!-- generated:… -->` blocks and `docs/images/` come from the code; after changing an `ork` command, a slash command or the terminal UI, run `corepack pnpm readme` and commit the result. The gate fails while they are stale. Details: [docs/readme.md](docs/readme.md).
 - **Keep documentation short.** Say what the reader needs to do or know, once. Put gotchas under a Troubleshooting heading.
 - **Follow the TUI design system.** Terminal UI changes in `plugins/orchestrate/lib/tui-*.mjs` and `horde-view.mjs` follow [docs/terminal-ui.md](docs/terminal-ui.md) and can be visually compared with [docs/tui-visual-testing.md](docs/tui-visual-testing.md).

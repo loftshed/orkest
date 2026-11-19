@@ -1,8 +1,8 @@
 #!/usr/bin/env node
-// Checks the marketplace as a whole and reports every problem it finds in one run:
-// the manifest's shape and order, that each plugin's version agrees wherever it is
-// written down, skill frontmatter, and that ${CLAUDE_PLUGIN_ROOT}/${CLAUDE_SKILL_DIR}
-// paths point at real files.
+// Checks what still matters for a repository of skills and commands, and reports every
+// problem in one run: skill frontmatter and description budget, that ${CLAUDE_SKILL_DIR}
+// paths and the files a command names point at real files, that no retired Claude Code
+// plugin manifest or ${CLAUDE_PLUGIN_ROOT} reference has come back, and the Orca manifest.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -79,55 +79,6 @@ export function parseFrontmatter(text) {
   return { error: null, fields };
 }
 
-/** Version rows of the README plugin table: `| name or [name](link) | 1.2.3 | ... |`. */
-export function readmeVersions(text) {
-  const versions = new Map();
-  for (const match of text.matchAll(
-    /^\|\s*\[?`([\w-]+)`\]?(?:\([^)]*\))?\s*\|\s*([^|\s]+)\s*\|/gmu,
-  )) {
-    versions.set(match[1], match[2]);
-  }
-  return versions;
-}
-
-/** The first `## x.y.z` heading of a changelog, ignoring an `## Unreleased` section. */
-export function latestChangelogVersion(text) {
-  for (const match of text.matchAll(/^##\s+\[?([^\]\s]+)\]?/gmu)) {
-    if (match[1].toLowerCase() !== "unreleased") return match[1];
-  }
-  return null;
-}
-
-export function checkManifest(manifest, pluginDirectories) {
-  const errors = [];
-  if (!manifest.name) errors.push("marketplace.json: missing `name`");
-  if (!manifest.owner?.name) errors.push("marketplace.json: missing `owner.name`");
-  const plugins = Array.isArray(manifest.plugins) ? manifest.plugins : [];
-  if (plugins.length === 0) errors.push("marketplace.json: `plugins` must be a non-empty array");
-
-  const names = plugins.map((plugin) => plugin?.name);
-  const sorted = names.toSorted((left, right) => left.localeCompare(right));
-  if (names.join("\n") !== sorted.join("\n")) {
-    errors.push(`marketplace.json: sort \`plugins\` by name; current order: ${names.join(", ")}`);
-  }
-  const seen = new Set();
-  for (const plugin of plugins) {
-    if (!plugin?.name || !plugin.source || !plugin.description) {
-      errors.push(`marketplace.json: every plugin needs name, source and description`);
-      continue;
-    }
-    if (seen.has(plugin.name)) errors.push(`marketplace.json: duplicate plugin ${plugin.name}`);
-    seen.add(plugin.name);
-    if (plugin.source !== `./plugins/${plugin.name}`) {
-      errors.push(`marketplace.json: ${plugin.name} source should be ./plugins/${plugin.name}`);
-    }
-  }
-  for (const directory of pluginDirectories) {
-    if (!seen.has(directory)) errors.push(`plugins/${directory} is not listed in marketplace.json`);
-  }
-  return errors;
-}
-
 function checkSkill(skillDirectory, context) {
   const { errors } = context;
   const skillFile = path.join(skillDirectory, "SKILL.md");
@@ -154,23 +105,36 @@ function checkSkill(skillDirectory, context) {
 }
 
 function checkPathReferences(pluginDirectory, context) {
-  const pattern = /\$\{(CLAUDE_PLUGIN_ROOT|CLAUDE_SKILL_DIR)\}\/([\w./-]+)/gu;
+  const skillPattern = /\$\{CLAUDE_SKILL_DIR\}\/([\w./-]+)/gu;
+  // A repo-relative path a command names in backticks, e.g. `plugins/orchestrate/lib/x.mjs`.
+  const commandPattern = /`((?:plugins|skills|crates|scripts|docs)\/[\w./-]+)`/gu;
+  const retired = /\$\{CLAUDE_PLUGIN_ROOT[}:]/u;
   for (const filePath of listFiles(pluginDirectory)) {
     if (!TEXT_EXTENSIONS.has(path.extname(filePath))) continue;
     const text = fs.readFileSync(filePath, "utf8");
     const [top, skill] = path.relative(pluginDirectory, filePath).split(path.sep);
-    const references = text.matchAll(pattern);
-    for (const [, variable, reference] of references) {
-      let base = pluginDirectory;
-      if (variable === "CLAUDE_SKILL_DIR") {
-        if (top !== "skills" || !skill) continue;
-        base = path.join(pluginDirectory, "skills", skill);
+    if (retired.test(text) && !filePath.endsWith("CHANGELOG.md")) {
+      context.errors.push(
+        `${relative(context, filePath)}: \${CLAUDE_PLUGIN_ROOT} is retired; call \`ork\` or \`monitor\``,
+      );
+    }
+    if (top === "skills" && skill) {
+      const base = path.join(pluginDirectory, "skills", skill);
+      for (const [, reference] of text.matchAll(skillPattern)) {
+        const target = reference.replace(/[.,]+$/u, "");
+        if (!fs.existsSync(path.join(base, target))) {
+          context.errors.push(
+            `${relative(context, filePath)}: \${CLAUDE_SKILL_DIR}/${target} does not exist`,
+          );
+        }
       }
-      const target = reference.replace(/[.,]+$/u, "");
-      if (!fs.existsSync(path.join(base, target))) {
-        context.errors.push(
-          `${relative(context, filePath)}: \${${variable}}/${target} does not exist`,
-        );
+    }
+    if (top === "commands") {
+      for (const [, reference] of text.matchAll(commandPattern)) {
+        const target = reference.replace(/[.,]+$/u, "");
+        if (!fs.existsSync(path.join(context.root, target))) {
+          context.errors.push(`${relative(context, filePath)}: ${target} does not exist`);
+        }
       }
     }
   }
@@ -224,57 +188,25 @@ export function checkOrcaManifest(root = REPO_ROOT) {
 export function validate(root = REPO_ROOT) {
   const errors = [];
   const context = { errors, root };
+  // Orkest installs through install.sh; a Claude Code plugin manifest or marketplace must not return.
   const pluginsRoot = path.join(root, "plugins");
-  const manifest = readJson(path.join(root, ".claude-plugin", "marketplace.json"), context);
-  if (!manifest) return errors;
-  errors.push(...checkManifest(manifest, listDirectories(pluginsRoot)));
-
-  const readme = fs.readFileSync(path.join(root, "README.md"), "utf8");
-  const listed = readmeVersions(readme);
-
-  const plugins = manifest.plugins ?? [];
-  for (const { name } of plugins) {
-    const pluginDirectory = path.join(pluginsRoot, name ?? "");
-    if (!name || !fs.existsSync(pluginDirectory)) {
-      errors.push(`marketplace.json: plugins/${name} does not exist`);
-      continue;
+  const retired = [".claude-plugin"];
+  for (const name of listDirectories(pluginsRoot)) {
+    retired.push(`plugins/${name}/.claude-plugin`, `plugins/${name}/.mcp.json`);
+  }
+  for (const manifest of retired) {
+    if (fs.existsSync(path.join(root, manifest))) {
+      errors.push(`${manifest}: Orkest is not a Claude Code plugin any more; remove it`);
     }
-    const pluginJson = readJson(
-      path.join(pluginDirectory, ".claude-plugin", "plugin.json"),
-      context,
-    );
-    if (!pluginJson) continue;
-    const { version } = pluginJson;
-    if (pluginJson.name !== name)
-      errors.push(`plugins/${name}: plugin.json name is ${pluginJson.name}`);
-    if (!SEMVER.test(version ?? ""))
-      errors.push(`plugins/${name}: plugin.json version ${version} is not semver`);
-
-    const sources = new Map([["README.md", listed.get(name)]]);
-    const packagePath = path.join(pluginDirectory, "package.json");
-    if (fs.existsSync(packagePath))
-      sources.set("package.json", readJson(packagePath, context)?.version);
-    const changelogPath = path.join(pluginDirectory, "CHANGELOG.md");
-    if (fs.existsSync(changelogPath)) {
-      sources.set("CHANGELOG.md", latestChangelogVersion(fs.readFileSync(changelogPath, "utf8")));
-    }
-    const skills = listDirectories(path.join(pluginDirectory, "skills"));
-    for (const skill of skills) {
-      const fields = checkSkill(path.join(pluginDirectory, "skills", skill), context);
-      if (fields["metadata.version"]) {
-        sources.set(`skills/${skill}/SKILL.md metadata.version`, fields["metadata.version"]);
-      }
-    }
-    for (const [source, found] of sources) {
-      if (found !== version) {
-        errors.push(
-          `plugins/${name}: ${source} says ${found ?? "nothing"}, plugin.json says ${version}`,
-        );
-      }
+  }
+  for (const name of listDirectories(pluginsRoot)) {
+    const pluginDirectory = path.join(pluginsRoot, name);
+    const pluginSkills = listDirectories(path.join(pluginDirectory, "skills"));
+    for (const skill of pluginSkills) {
+      checkSkill(path.join(pluginDirectory, "skills", skill), context);
     }
     checkPathReferences(pluginDirectory, context);
   }
-
   errors.push(...checkOrcaManifest(root));
 
   const looseSkills = listDirectories(path.join(root, "skills"));
@@ -287,12 +219,12 @@ export function validate(root = REPO_ROOT) {
 function main() {
   const errors = validate();
   if (errors.length > 0) {
-    console.error("marketplace validation failed:");
+    console.error("validation failed:");
     for (const error of errors) console.error(`  - ${error}`);
     process.exitCode = 1;
     return;
   }
-  console.log("marketplace validation ok.");
+  console.log("validation ok.");
 }
 
 // Compare real paths: the script may be started through a symlink.

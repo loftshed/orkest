@@ -62,7 +62,7 @@ test("plans a named Claude profile at its resolved directory", () => {
   });
 });
 
-test("uses the enabled monitor plugin instead of adding a duplicate Claude server", () => {
+test("a still-enabled retired monitor plugin is left alone instead of adding a duplicate Claude server", () => {
   const pluginHome = path.join(home, "plugin-case");
   const profile = path.join(pluginHome, ".claude");
   mkdirSync(profile, { recursive: true });
@@ -75,14 +75,17 @@ test("uses the enabled monitor plugin instead of adding a duplicate Claude serve
   const steps = stepsFor(plan, "Claude Code (~/.claude)");
 
   expect(steps).toHaveLength(1);
-  expect(steps[0]).toMatchObject({ kind: "file", note: "provided by the monitor plugin" });
+  expect(steps[0]).toMatchObject({
+    kind: "file",
+    note: "provided by the retired monitor plugin; uninstall it, then rerun to register",
+  });
   expect(steps[0].apply()).toStrictEqual({
     changed: false,
-    note: "provided by the monitor plugin",
+    note: "provided by the retired monitor plugin; uninstall it, then rerun to register",
   });
 });
 
-test("uses the enabled monitor plugin instead of adding a duplicate Codex server", () => {
+test("a still-enabled retired monitor plugin is left alone instead of adding a duplicate Codex server", () => {
   const pluginHome = path.join(home, "codex-plugin-case");
   const codexDir = path.join(pluginHome, ".codex");
   mkdirSync(codexDir, { recursive: true });
@@ -92,28 +95,29 @@ test("uses the enabled monitor plugin instead of adding a duplicate Codex server
   const steps = stepsFor(plan, "Codex (CLI and app)");
 
   expect(steps).toHaveLength(1);
-  expect(steps[0]).toMatchObject({ kind: "file", note: "provided by the monitor plugin" });
+  expect(steps[0]).toMatchObject({
+    kind: "file",
+    note: "provided by the retired monitor plugin; uninstall it, then rerun to register",
+  });
   expect(steps[0].apply()).toStrictEqual({
     changed: false,
-    note: "provided by the monitor plugin",
+    note: "provided by the retired monitor plugin; uninstall it, then rerun to register",
   });
 });
 
-test("deduplicates Claude profiles and skips them when requested", () => {
+test("deduplicates Claude profiles", () => {
   const profile = path.join(home, ".claude-personal");
   const accounts = [
     account("claude", { configDir: profile }),
     account("claude", { command: "/different/claude", configDir: profile }),
   ];
   const plan = registrationPlan(config(accounts), launcher, { home });
-  const skippedPlan = registrationPlan(config(accounts), launcher, { home, skipClaude: true });
 
   expect(stepsFor(plan, "Claude Code (~/.claude-personal)")).toHaveLength(1);
   expect(plan.find((step) => step.target === "Claude Code (~/.claude-personal)").bin).toBe(
     cliPaths.claude,
   );
   expect(plan.some((step) => step.target.startsWith("Claude Code"))).toBe(true);
-  expect(skippedPlan.some((step) => step.target.startsWith("Claude Code"))).toBe(false);
 });
 
 test("plans add and remove commands for each installed CLI", () => {

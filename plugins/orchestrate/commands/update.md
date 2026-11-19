@@ -9,5 +9,5 @@ Run the Orkest updater directly and display its output:
 Use `ork update --help` for the available commands and options.
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/bin/ork.mjs" update $ARGUMENTS
+ork update $ARGUMENTS
 ```

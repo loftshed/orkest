@@ -2353,6 +2353,7 @@ def doctor_main(argv: list[str] | None = None) -> int:
         "stale_copies": [loc for loc, info in installs.items() if not info["same_as_this"]],
         "peer_messaging": bundled_module("install_mailbox").configuration_status(),
         "path_migration": bundled_module("path_migration").summary(),
+        "legacy_plugin": bundled_module("legacy_plugin").discover(),
     }
     if messaging_check is not None:
         report["messaging_check"] = messaging_check
@@ -2381,6 +2382,9 @@ def doctor_main(argv: list[str] | None = None) -> int:
         print(bundled_module("path_migration").render(migration, destinations=5))
         if migration["ready"]:
             print("  Apply with: ork update (backs up first; restore with path_migration.py --restore DIR).")
+    legacy = bundled_module("legacy_plugin").render(report["legacy_plugin"])
+    if legacy:
+        print(f"! {legacy}")
     if any(not row["configured"] for row in report["peer_messaging"].values()):
         print("Repair messaging with: doctor --repair-messaging (add --trust-codex-hooks only after review).")
     return 0

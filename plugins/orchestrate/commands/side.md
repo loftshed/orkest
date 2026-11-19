@@ -10,7 +10,7 @@ When the `/side` turn hook has already dispatched or parked this side mission (s
 If the turn hook did not run (for example, in a harness without `UserPromptSubmit` / `PreInvocation` hooks), run:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT:-plugins/orchestrate}/lib/side.mjs" $ARGUMENTS --cwd "$PWD" --json
+ork side $ARGUMENTS --cwd "$PWD"
 ```
 
 and report the result in one concise line.

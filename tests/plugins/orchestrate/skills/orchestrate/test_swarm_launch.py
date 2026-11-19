@@ -821,11 +821,8 @@ class HerdrSwarmLaunchTests(unittest.TestCase):
                 script = install_mailbox.shell_wrapper_script(home=home)
             self.assertIn("unalias codex claude agy claude-alt codex-alt agy-alt 2>/dev/null", script)
             self.assertIn("claude-alt() {", script)
-            self.assertIn("command ork label -- claude-alt", script)
             self.assertIn("codex-alt() {", script)
-            self.assertIn("command ork label -- codex-alt", script)
             self.assertIn("agy-alt() {", script)
-            self.assertIn("command ork label -- agy-alt --dangerously-skip-permissions", script)
             self.assertNotIn("git() {", script)
             self.assertNotIn("bad alias", script)
 

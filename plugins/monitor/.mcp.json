@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "monitor": {
-      "command": "node",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/bin/monitor.mjs", "mcp"]
-    }
-  }
-}

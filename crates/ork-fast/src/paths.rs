@@ -233,14 +233,6 @@ pub fn scripts_root() -> Option<PathBuf> {
             return Some(p);
         }
     }
-    if let Ok(plugin_env) = env::var("CLAUDE_PLUGIN_ROOT")
-        && !plugin_env.trim().is_empty()
-    {
-        let p = expand_home(plugin_env.trim(), None).join("skills/orchestrate/scripts");
-        if p.is_dir() {
-            return Some(p);
-        }
-    }
     if let Ok(exe) = env::current_exe() {
         let resolved_exe = fs::canonicalize(&exe).unwrap_or(exe);
         for ancestor in resolved_exe.ancestors() {

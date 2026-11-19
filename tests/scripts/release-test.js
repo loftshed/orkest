@@ -9,15 +9,16 @@ import {
   checkRelease,
   gitIn,
   incrementFor,
+  latestPublished,
   planRelease,
+  productTag,
   publishRelease,
   RELEASE_SUBJECT,
   releaseChangelog,
   setFrontmatterVersion,
-  setTableVersion,
   writeRelease,
 } from "../../scripts/release.js";
-import { validate } from "../../scripts/validate-marketplace.js";
+import { validate } from "../../scripts/validate.js";
 
 describe("version arithmetic", () => {
   test.each([
@@ -40,6 +41,41 @@ describe("version arithmetic", () => {
   });
 });
 
+describe("published history", () => {
+  test("the highest version across the new and the earlier tag streams wins", () => {
+    const tags = [
+      "orchestrate--v0.91.1",
+      "orchestrate--v0.9.0",
+      "agent-executor--v0.80.0",
+      "monitor--v0.19.4",
+      "ai-usage--v0.50.0",
+      "v0.92.0",
+      "v0.100.0",
+      "vX.Y.Z",
+      "v1.0",
+    ];
+    expect(latestPublished(tags, ["orchestrate", "agent-executor"])).toEqual({
+      tag: "v0.100.0",
+      version: "0.100.0",
+    });
+    expect(latestPublished(tags.slice(0, 5), ["orchestrate", "agent-executor"])).toEqual({
+      tag: "orchestrate--v0.91.1",
+      version: "0.91.1",
+    });
+  });
+
+  test("the monitor line, which ended, and unrelated tags are not history", () => {
+    expect(latestPublished(["monitor--v0.19.4", "release-1"], ["orchestrate"])).toBe(null);
+    expect(productTag("0.92.0")).toBe("v0.92.0");
+  });
+
+  test("the new tag format wins a tie", () => {
+    expect(latestPublished(["orchestrate--v0.92.0", "v0.92.0"], ["orchestrate"]).tag).toBe(
+      "v0.92.0",
+    );
+  });
+});
+
 describe("generated text", () => {
   test("Unreleased notes become the release section and history is kept", () => {
     const before =
@@ -55,10 +91,11 @@ describe("generated text", () => {
     expect(content).toBe("# Changelog\n\n## 0.1.0\n\n- feat: a\n- fix: b\n");
   });
 
-  test("only the named plugin's README row changes", () => {
-    const readme = "| `a` | 1.0.0 | x |\n| [`ab`](plugins/ab/README.md) | 1.0.0 | y |\n";
-    expect(setTableVersion(readme, "ab", "1.1.0")).toBe(readme.replace("1.0.0 | y", "1.1.0 | y"));
-    expect(() => setTableVersion(readme, "zz", "1.0.0")).toThrow("no plugin table row");
+  test("a changelog that starts with a History section keeps it below the release", () => {
+    const before = "# Changelog\n\n## History\n\nOlder lines live elsewhere.\n";
+    expect(releaseChangelog(before, "0.2.0", ["fix: x"]).content).toBe(
+      "# Changelog\n\n## 0.2.0\n\n- fix: x\n\n## History\n\nOlder lines live elsewhere.\n",
+    );
   });
 
   test("only metadata.version in the frontmatter changes", () => {
@@ -87,7 +124,12 @@ describe("releases in a repository", () => {
     return git(["rev-parse", "HEAD"]);
   };
   const planned = () =>
-    planRelease({ root }).releases.map(({ name, version }) => `${name}@${version}`);
+    planRelease({ root }).releases.map(({ tag, version }) => `${tag}@${version}`);
+  // The last release of the stream that came before the merge: one product continues from it.
+  const publishedBefore = (version = "0.3.0", tag = `one--v${version}`) => {
+    commit("chore(release): publish plugins", "package.json", { name: "orkest", version });
+    git(["tag", tag]);
+  };
 
   beforeEach(() => {
     scratch = fs.mkdtempSync(path.join(os.tmpdir(), "release-test-"));
@@ -103,17 +145,9 @@ describe("releases in a repository", () => {
     ]) {
       git(["config", key, value]);
     }
-    put(".claude-plugin/marketplace.json", {
-      name: "fixture",
-      owner: { name: "tester" },
-      plugins: ["one", "two"].map((name) => ({
-        description: name,
-        name,
-        source: `./plugins/${name}`,
-      })),
-    });
+    put("package.json", { name: "orkest", version: "0.3.0" });
+    put("CHANGELOG.md", "# Changelog\n\n## History\n\n- Before the merge.\n");
     for (const name of ["one", "two"]) {
-      put(`plugins/${name}/.claude-plugin/plugin.json`, { name, version: "0.3.0" });
       put(`plugins/${name}/CHANGELOG.md`, "# Changelog\n\n## 0.3.0\n\n- Earlier.\n");
       put(
         `plugins/${name}/skills/${name}/SKILL.md`,
@@ -121,75 +155,97 @@ describe("releases in a repository", () => {
       );
     }
     put("plugins/two/package.json", { name: "two", version: "0.3.0" });
-    put(
-      "README.md",
-      "| Plugin | Version | About |\n| --- | --- | --- |\n| `one` | 0.3.0 | 1 |\n| [`two`](plugins/two/README.md) | 0.3.0 | 2 |\n",
-    );
     since = commit("chore: start");
-    commit("chore: count releases from here", "release.json", { since });
+    commit("chore: count releases from here", "release.json", {
+      legacyTags: ["one", "ancient"],
+      since,
+    });
   });
   afterEach(() => fs.rmSync(scratch, { force: true, recursive: true }));
 
-  test("each plugin moves by its own commits only", () => {
+  test("a first release goes out at the version package.json declares", () => {
     commit("feat: new skill", "plugins/one/skills/extra/SKILL.md");
+    expect(planned()).toEqual(["v0.3.0@0.3.0"]);
+  });
+
+  test("the first product release continues the earlier stream's line", () => {
+    publishedBefore("0.3.0");
     commit("fix: wording", "plugins/two/skills/two/SKILL.md");
-    commit("docs: repository readme", "README.md", `${read("README.md")}\nMore.\n`);
-    expect(planned()).toEqual(["one@0.4.0", "two@0.3.1"]);
+    commit("feat: new skill", "plugins/one/skills/extra/SKILL.md");
+    const [release] = planRelease({ root }).releases;
+    expect([release.tag, release.previous, release.version]).toEqual(["v0.4.0", "0.3.0", "0.4.0"]);
+    expect(release.notes).toContain("feat: new skill");
+    expect(release.notes).toContain("fix: wording");
+  });
+
+  test("a legacy tag from another stream of the product still counts, the monitor's does not", () => {
+    publishedBefore("0.3.0");
+    git(["tag", "monitor--v9.9.9"]);
+    git(["tag", "ancient--v0.2.0"]);
+    commit("fix: wording", "plugins/two/skills/two/SKILL.md");
+    expect(planned()).toEqual(["v0.3.1@0.3.1"]);
   });
 
   test("tests, repository docs, changelogs and reverted edits release nothing", () => {
+    publishedBefore();
     commit("test: cases", "tests/one-test.js");
-    commit(
-      "docs: history",
-      "plugins/one/CHANGELOG.md",
-      `${read("plugins/one/CHANGELOG.md")}\nNote.\n`,
-    );
+    commit("docs: readme", "README.md");
+    commit("docs: history", "CHANGELOG.md", `${read("CHANGELOG.md")}\nNote.\n`);
+    commit("docs: old history", "plugins/one/CHANGELOG.md", "# Changelog\n\nNote.\n");
     const original = read("plugins/two/skills/two/SKILL.md");
     commit("feat: try something", "plugins/two/skills/two/SKILL.md");
     commit("revert: try something", "plugins/two/skills/two/SKILL.md", original);
     expect(planned()).toEqual([]);
   });
 
-  test("deleting a shipped file and editing a marketplace entry both release", () => {
+  test("the crate, the installer and the host manifests all release", () => {
+    publishedBefore();
+    commit("perf: accelerate", "crates/ork-fast/src/main.rs");
+    expect(planned()).toEqual(["v0.3.1@0.3.1"]);
+    publishedBefore("0.3.1", "v0.3.1");
+    commit("fix: installer", "install.sh");
+    expect(planned()).toEqual(["v0.3.2@0.3.2"]);
+    publishedBefore("0.3.2", "v0.3.2");
     git(["rm", "--quiet", "plugins/one/skills/one/SKILL.md"]);
     commit("remove a skill");
-    const marketplace = json(".claude-plugin/marketplace.json");
-    marketplace.plugins[1].description = "Better description";
-    commit("fix: describe two", ".claude-plugin/marketplace.json", marketplace);
-    expect(planned()).toEqual(["one@0.3.1", "two@0.3.1"]);
+    expect(planned()).toEqual(["v0.3.3@0.3.3"]);
+  });
+
+  test.each([
+    ["feat: new command", "adapters/claude/commands/new.md", "v0.4.0@0.4.0"],
+    ["fix: skill wording", "adapters/skills/new/SKILL.md", "v0.3.1@0.3.1"],
+    ["fix: runtime", "src/lib/thing.mjs", "v0.3.1@0.3.1"],
+    ["feat: data", "references/routes/x.json", "v0.4.0@0.4.0"],
+  ])("%s touching only %s releases %s", (subject, file, expected) => {
+    publishedBefore();
+    commit(subject, file);
+    expect(planned()).toEqual([expected]);
+  });
+
+  test("command-only and skill-only commits in the planned layout each release in turn", () => {
+    publishedBefore();
+    commit("feat(claude): new command", "adapters/claude/commands/new.md");
+    expect(planned()).toEqual(["v0.4.0@0.4.0"]);
+    publishedBefore("0.4.0", "v0.4.0");
+    commit("fix(skills): reword", "adapters/skills/new/SKILL.md");
+    expect(planned()).toEqual(["v0.4.1@0.4.1"]);
+    expect(planRelease({ root }).releases[0].notes).toBe("- fix(skills): reword");
   });
 
   test("a hand-edited version is refused", () => {
-    commit("feat: bump", "plugins/one/.claude-plugin/plugin.json", {
-      name: "one",
-      version: "0.9.0",
-    });
+    publishedBefore();
+    commit("feat: bump", "package.json", { name: "orkest", version: "0.9.0" });
     expect(() => planRelease({ root })).toThrow("edited by hand");
   });
 
-  test("a new plugin is released at the version it declares, keeping its notes", () => {
-    const marketplace = json(".claude-plugin/marketplace.json");
-    marketplace.plugins.push({ description: "three", name: "three", source: "./plugins/three" });
-    put(".claude-plugin/marketplace.json", marketplace);
-    put("plugins/three/.claude-plugin/plugin.json", { name: "three", version: "1.0.0" });
-    put(
-      "plugins/three/CHANGELOG.md",
-      "# Changelog\n\n## Unreleased\n\n- Later.\n\n## 1.0.0\n\n- First.\n",
-    );
-    put("README.md", `${read("README.md")}| \`three\` | 1.0.0 | 3 |\n`);
-    commit(
-      "feat: add three",
-      "plugins/three/skills/three/SKILL.md",
-      "---\nname: three\ndescription: 3.\n---\n",
-    );
-    const plan = planRelease({ root });
-    expect(plan.releases.map(({ name, previous, version }) => [name, previous, version])).toEqual([
-      ["three", null, "1.0.0"],
-    ]);
-    expect(plan.releases[0].notes).toBe("- Later.\n\n- First.");
+  test("a missing version is reported", () => {
+    publishedBefore();
+    commit("feat: no version", "package.json", { name: "orkest" });
+    expect(() => planRelease({ root })).toThrow("needs an x.y.z version");
   });
 
   test("the written release updates every version and passes the validator", () => {
+    publishedBefore();
     commit(
       "fix: two",
       "plugins/two/skills/two/SKILL.md",
@@ -197,60 +253,45 @@ describe("releases in a repository", () => {
     );
     const files = writeRelease(planRelease({ root }), root);
     expect(files).toEqual([
-      "plugins/two/.claude-plugin/plugin.json",
-      "plugins/two/CHANGELOG.md",
+      "CHANGELOG.md",
+      "package.json",
       "plugins/two/package.json",
       "plugins/two/skills/two/SKILL.md",
-      "README.md",
     ]);
+    expect(json("package.json").version).toBe("0.3.1");
     expect(json("plugins/two/package.json").version).toBe("0.3.1");
     expect(read("plugins/two/skills/two/SKILL.md")).toContain("  version: 0.3.1");
-    expect(read("README.md")).toContain("| [`two`](plugins/two/README.md) | 0.3.1 |");
+    expect(read("CHANGELOG.md")).toMatch(/^# Changelog\n\n## 0\.3\.1\n\n- fix: two\n\n## History/u);
     expect(validate(root)).toEqual([]);
   });
 
   test("a tag becomes the next baseline, and a tag off this history is refused", () => {
+    publishedBefore();
     const source = commit("fix: one", "plugins/one/skills/one/SKILL.md");
     writeRelease(planRelease({ root }), root);
     commit(RELEASE_SUBJECT);
-    git(["tag", "one--v0.3.1"]);
+    git(["tag", "v0.3.1"]);
     expect(planned()).toEqual([]);
     commit("fix: again", "plugins/one/skills/one/SKILL.md");
-    expect(planned()).toEqual(["one@0.3.2"]);
+    expect(planned()).toEqual(["v0.3.2@0.3.2"]);
     git(["checkout", "--quiet", "--detach", source]);
     expect(planned()).toEqual([]);
     git(["checkout", "--quiet", "-b", "elsewhere", since]);
-    put("release.json", { since });
+    put("release.json", { legacyTags: ["one"], since });
     commit("fix: unrelated", "plugins/one/skills/one/SKILL.md");
     expect(() => planRelease({ root })).toThrow("not in this branch's history");
   });
 
-  test("a renamed plugin continues version progression from its former tag", () => {
-    commit("fix: one", "plugins/one/skills/one/SKILL.md");
-    writeRelease(planRelease({ root }), root);
-    commit(RELEASE_SUBJECT);
-    git(["tag", "one--v0.3.1"]);
-
-    git(["mv", "plugins/one", "plugins/renamed"]);
-    put("plugins/renamed/.claude-plugin/plugin.json", { name: "renamed", version: "0.3.1" });
-    const marketplace = json(".claude-plugin/marketplace.json");
-    marketplace.plugins[0] = {
-      description: "renamed",
-      name: "renamed",
-      source: "./plugins/renamed",
-    };
-    put(".claude-plugin/marketplace.json", marketplace);
-    put("README.md", read("README.md").replace("`one`", "`renamed`"));
-    put("release.json", { renames: { renamed: "one" }, since });
-    commit("feat: rename one to renamed", "plugins/renamed/skills/one/SKILL.md");
-
-    const plan = planRelease({ root });
-    expect(plan.releases.map(({ name, previous, version }) => [name, previous, version])).toEqual([
-      ["renamed", "0.3.1", "0.4.0"],
-    ]);
+  test("release commits of either subject are not release notes", () => {
+    publishedBefore();
+    commit("chore(release): publish plugins", "plugins/one/skills/one/SKILL.md");
+    commit(`${RELEASE_SUBJECT}\n\n- v0.3.1`, "plugins/two/skills/two/SKILL.md");
+    commit("fix: real change", "plugins/one/skills/one/SKILL.md");
+    expect(planRelease({ root }).releases[0].notes).toBe("- fix: real change");
   });
 
   test("check gates the release in a scratch worktree and leaves the checkout alone", () => {
+    publishedBefore();
     commit("fix: one", "plugins/one/skills/one/SKILL.md");
     put("scratch.txt", "local work\n");
     const status = git(["status", "--porcelain"]);
@@ -258,12 +299,9 @@ describe("releases in a repository", () => {
     const gate = vi.fn((files, dir) => {
       seen = dir;
       expect(dir).not.toBe(root);
-      const manifest = fs.readFileSync(
-        path.join(dir, "plugins/one/.claude-plugin/plugin.json"),
-        "utf8",
-      );
+      const manifest = fs.readFileSync(path.join(dir, "package.json"), "utf8");
       expect(JSON.parse(manifest).version).toBe("0.3.1");
-      expect(files).toContain("plugins/one/CHANGELOG.md");
+      expect(files).toContain("CHANGELOG.md");
     });
     expect(checkRelease({ gate, root }).releases).toHaveLength(1);
     expect(gate).toHaveBeenCalledOnce();
@@ -287,6 +325,7 @@ describe("releases in a repository", () => {
     const branchOnRemote = () => git(["ls-remote", remote, "refs/heads/main"]).split("\t", 1)[0];
 
     beforeEach(() => {
+      publishedBefore();
       const source = commit("fix: ship two", "plugins/two/skills/two/SKILL.md");
       remote = path.join(scratch, "remote.git");
       execFileSync("git", ["init", "--quiet", "--bare", remote]);
@@ -297,11 +336,12 @@ describe("releases in a repository", () => {
         GITHUB_ACTIONS: "true",
         GITHUB_EVENT_NAME: "push",
         GITHUB_REF: "refs/heads/main",
-        GITHUB_REPOSITORY: "someone/plugins",
+        GITHUB_REPOSITORY: "someone/orkest",
         GITHUB_SERVER_URL: "https://github.com",
         GITHUB_SHA: source,
         GITHUB_TOKEN: "token-for-tests",
       };
+      delete env.GITHUB_OUTPUT;
       created = new Map();
       request = vi.fn(async (url, options = {}) => {
         if (options.method === "POST") {
@@ -316,21 +356,28 @@ describe("releases in a repository", () => {
     const publish = (overrides = {}) =>
       publishRelease({ env, gate: vi.fn(), remote, request, root, ...overrides });
 
-    test("pushes the release commit with its tags, then creates GitHub releases", async () => {
-      expect(await publish()).toBe("Released two--v0.3.1.");
+    test("pushes the release commit with its one tag, then creates the GitHub release", async () => {
+      expect(await publish()).toBe("Released v0.3.1.");
       const released = git(["rev-parse", "HEAD"]);
       expect(branchOnRemote()).toBe(released);
-      expect(tagsOnRemote()).toContain("refs/tags/two--v0.3.1");
+      expect(tagsOnRemote()).toContain("refs/tags/v0.3.1");
       expect(git(["show", "-s", "--format=%B", released])).toContain(
         `Release-Of: ${env.GITHUB_SHA}`,
       );
-      expect(created.get("two--v0.3.1")).toMatchObject({
-        name: "two 0.3.1",
+      expect(git(["show", "-s", "--format=%s", released])).toBe(RELEASE_SUBJECT);
+      expect(created.get("v0.3.1")).toMatchObject({
+        name: "Orkest 0.3.1",
         target_commitish: released,
       });
       expect(request.mock.calls[0][0]).toBe(
-        "https://api.github.com/repos/someone/plugins/releases/tags/two--v0.3.1",
+        "https://api.github.com/repos/someone/orkest/releases/tags/v0.3.1",
       );
+    });
+
+    test("earlier tags stay where they were", async () => {
+      const before = git(["rev-parse", "one--v0.3.0"]);
+      await publish();
+      expect(git(["rev-parse", "one--v0.3.0"])).toBe(before);
     });
 
     test("a rerun after a failed GitHub call only restores the missing release", async () => {
@@ -339,19 +386,20 @@ describe("releases in a repository", () => {
       await expect(publish()).rejects.toThrow("HTTP 502");
       git(["checkout", "--quiet", "--detach", env.GITHUB_SHA]);
       expect(await publish()).toContain("Already released");
-      expect(created.keys().toArray()).toEqual(["two--v0.3.1"]);
-      expect(created.get("two--v0.3.1").body).toContain("fix: ship two");
-      expect(git(["tag", "--list"])).toBe("two--v0.3.1");
+      expect(created.keys().toArray()).toEqual(["v0.3.1"]);
+      expect(created.get("v0.3.1").body).toContain("fix: ship two");
+      expect(git(["tag", "--list", "v*"])).toBe("v0.3.1");
     });
 
-    test("a newer push wins and publishes both plugins", async () => {
+    test("a newer push wins and publishes everything since the last release once", async () => {
       const newer = commit("feat: grow one", "plugins/one/skills/one/SKILL.md");
       git(["push", "--quiet", remote, "HEAD:refs/heads/main"]);
       git(["checkout", "--quiet", "--detach", env.GITHUB_SHA]);
       expect(await publish()).toContain("moved on");
       git(["checkout", "--quiet", "--detach", newer]);
       env.GITHUB_SHA = newer;
-      expect(await publish()).toBe("Released one--v0.4.0, two--v0.3.1.");
+      expect(await publish()).toBe("Released v0.4.0.");
+      expect(created.get("v0.4.0").body).toMatch(/feat: grow one[\s\S]*fix: ship two/u);
     });
 
     test.each([
@@ -379,7 +427,7 @@ describe("releases in a repository", () => {
       const straying = vi.fn(() => put("stray.txt", "x\n"));
       await expect(publish({ gate: straying })).rejects.toThrow("stray.txt");
       expect(branchOnRemote()).toBe(head);
-      expect(tagsOnRemote()).toBe("");
+      expect(tagsOnRemote()).not.toContain("refs/tags/v");
     });
 
     test("a push that races the release publishes no tags", async () => {
@@ -388,44 +436,22 @@ describe("releases in a repository", () => {
       const gate = vi.fn(() => git(["push", "--quiet", remote, `${racing}:refs/heads/main`]));
       await expect(publish({ gate })).rejects.toThrow("git push failed");
       expect(branchOnRemote()).toBe(racing);
-      expect(tagsOnRemote()).toBe("");
+      expect(tagsOnRemote()).not.toContain("refs/tags/v");
     });
 
-    test("crates/ork-fast edits trigger orchestrate release and write orchestrate_release_tag to GITHUB_OUTPUT", async () => {
-      put("plugins/orchestrate/.claude-plugin/plugin.json", {
-        name: "orchestrate",
-        version: "0.85.0",
-      });
-      put("plugins/orchestrate/skills/orchestrate/SKILL.md", "---\nname: orchestrate\n---\n");
-      put("plugins/orchestrate/CHANGELOG.md", "# Changelog\n\n## 0.85.0\n\n- Baseline.\n");
-      put("README.md", `${read("README.md")}| \`orchestrate\` | 0.85.0 | orch |\n`);
-      const marketplace = json(".claude-plugin/marketplace.json");
-      marketplace.plugins.push({
-        description: "orchestrate",
-        name: "orchestrate",
-        source: "./plugins/orchestrate",
-      });
-      put(".claude-plugin/marketplace.json", marketplace);
-      commit("feat: orchestrate base");
-      git(["tag", "orchestrate--v0.85.0"]);
-
+    test("crates/ork-fast edits release the product and write release_tag to GITHUB_OUTPUT", async () => {
+      await publish();
+      git(["checkout", "--quiet", "--detach", "main"]);
       put("crates/ork-fast/src/main.rs", "fn main() {}\n");
-      commit("perf(orchestrate): accelerate hooks");
-
-      const plan = planRelease({ root });
-      expect(plan.releases.find((r) => r.name === "orchestrate")?.version).toBe("0.85.1");
+      const edited = commit("perf(orchestrate): accelerate hooks");
+      expect(planned()).toEqual(["v0.3.2@0.3.2"]);
 
       git(["push", "--quiet", remote, "HEAD:refs/heads/main"]);
       const outputFile = path.join(scratch, "github_output.txt");
-      const publishEnv = {
-        ...env,
-        GITHUB_SHA: git(["rev-parse", "HEAD"]),
-        GITHUB_OUTPUT: outputFile,
-      };
-      await publish({ env: publishEnv });
-      expect(fs.readFileSync(outputFile, "utf8")).toContain(
-        "orchestrate_release_tag=orchestrate--v0.85.1",
-      );
+      await publish({ env: { ...env, GITHUB_OUTPUT: outputFile, GITHUB_SHA: edited } });
+      const output = fs.readFileSync(outputFile, "utf8");
+      expect(output).toContain("release_tag=v0.3.2");
+      expect(output).not.toContain("orchestrate_release_tag");
     });
   });
 });

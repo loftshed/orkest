@@ -1,11 +1,12 @@
 {
   "name": "orkest",
+  "version": "0.93.0",
   "private": true,
   "license": "MIT",
   "type": "module",
   "scripts": {
     "postinstall": "husky",
-    "validate": "node scripts/validate-marketplace.js",
+    "validate": "node scripts/validate.js",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "format": "prettier --write .",

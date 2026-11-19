@@ -468,7 +468,9 @@ class InstallMailboxTests(unittest.TestCase):
         self.assertTrue(wrapper.is_file())
         self.assertFalse(legacy_skill.exists())
         canonical = self.base / ".config/orkest/shell.zsh"
-        self.assertIn('command ork label -- agy --dangerously-skip-permissions "$@"', canonical.read_text())
+        self.assertIn(
+            'command ork label -- "${_orkest_cmd[@]}" --dangerously-skip-permissions "$@"', canonical.read_text()
+        )
         self.assertIn('command ork agy --dangerously-skip-permissions "$@"', canonical.read_text())
         self.assertNotIn("--remote-control", canonical.read_text())
         # The installer-owned orkest.sh only sources the canonical file; .zshrc keeps one inclusion.
@@ -500,9 +502,12 @@ class InstallMailboxTests(unittest.TestCase):
         (plugin_root / "commands/side.md").write_text("---\ndescription: Toggle side view\n---\n")
         (plugin_root / "commands/update.md").write_text("---\ndescription: Update Orkest\n---\n")
 
-        (self.base / ".claude/skills/side").mkdir(parents=True, exist_ok=True)
-        (self.base / ".claude-work/skills/side").mkdir(parents=True, exist_ok=True)
-        (self.base / ".gemini/antigravity/skills/side").mkdir(parents=True, exist_ok=True)
+        (self.base / ".claude/skills").mkdir(parents=True, exist_ok=True)
+        (self.base / ".claude/skills/side").symlink_to(self.base / ".agents/skills/side")
+        (self.base / ".claude-work/skills").mkdir(parents=True, exist_ok=True)
+        (self.base / ".claude-work/skills/side").symlink_to(self.base / ".agents/skills/side")
+        (self.base / ".gemini/antigravity/skills").mkdir(parents=True, exist_ok=True)
+        (self.base / ".gemini/antigravity/skills/side").symlink_to(self.base / ".agents/skills/side")
         (self.base / ".codex/skills").mkdir(parents=True, exist_ok=True)
         (self.base / ".gemini/config/skills").mkdir(parents=True, exist_ok=True)
         (self.base / ".config/opencode/skills").mkdir(parents=True, exist_ok=True)
@@ -548,10 +553,12 @@ class InstallMailboxTests(unittest.TestCase):
         (plugin_root / "commands/chief.md").write_text(command)
         (plugin_root / "skills/chief").mkdir(parents=True)
         (plugin_root / "skills/chief/SKILL.md").write_text(skill)
-        (self.base / ".claude/skills/chief").mkdir(parents=True)
+        (self.base / ".claude/skills").mkdir(parents=True, exist_ok=True)
+        (self.base / ".claude/skills/chief").symlink_to(self.base / ".agents/skills/chief")
         (self.base / ".claude-work/skills").mkdir(parents=True)
         (self.base / ".claude-work/skills/chief").symlink_to(self.base / ".claude/skills/chief")
-        (self.base / ".gemini/antigravity/skills/chief").mkdir(parents=True)
+        (self.base / ".gemini/antigravity/skills").mkdir(parents=True, exist_ok=True)
+        (self.base / ".gemini/antigravity/skills/chief").symlink_to(self.base / ".agents/skills/chief")
         for parent in (".codex/skills", ".gemini/config/skills", ".config/opencode/skills"):
             (self.base / parent).mkdir(parents=True)
 
@@ -964,7 +971,7 @@ class InstallMailboxTests(unittest.TestCase):
                 installer.install_herdr_integration(self.base, cli)
         self.assertFalse((self.base / ".config/herdr/config.toml").exists())
 
-    def test_orchestrate_skill_links_cover_installed_harnesses_and_skip_marketplace_claude_cache(self):
+    def test_orchestrate_skill_links_cover_installed_harnesses_including_retired_plugin_profiles(self):
         hub = self.base / ".agents/skills/orchestrate"
         hub.mkdir(parents=True)
         (hub / "SKILL.md").write_text("---\nname: orchestrate\n---\n")
@@ -989,8 +996,27 @@ class InstallMailboxTests(unittest.TestCase):
         ):
             self.assertTrue(linked.is_symlink(), str(linked))
             self.assertEqual(linked.resolve(), hub.resolve())
-        self.assertFalse((self.base / ".claude-plugin-managed/skills/orchestrate").exists())
+        # A profile that still holds the retired plugin cache gets the linked skill like any other.
+        self.assertTrue((self.base / ".claude-plugin-managed/skills/orchestrate").is_symlink())
         self.assertFalse(installer.install_orchestrate_skill_links(self.base))
+
+    def test_plugin_retirement_keeps_local_command_and_skill_edits(self):
+        profile = self.base / ".claude"
+        (profile / "commands").mkdir(parents=True, exist_ok=True)
+        command = profile / "commands/chief.md"
+        hub = self.base / ".agents/skills/chief"
+        hub.mkdir(parents=True, exist_ok=True)
+        skill = hub / "SKILL.md"
+        root = Path(installer.__file__).resolve().parents[3]
+        edited_command = (root / "commands/chief.md").read_bytes() + b"\nProject-specific instruction.\n"
+        edited_skill = (root / "skills/chief/SKILL.md").read_bytes() + b"\nProject-specific instruction.\n"
+        command.write_bytes(edited_command)
+        skill.write_bytes(edited_skill)
+        for _ in range(2):
+            installer.install_chief_command(self.base)
+            installer.install_chief_skill(self.base)
+            self.assertEqual(edited_command, command.read_bytes())
+            self.assertEqual(edited_skill, skill.read_bytes())
 
     def test_install_herdr_skill_links_across_harnesses_with_repo_fallback(self):
         root, cli = self.herdr_source()
@@ -1599,7 +1625,7 @@ class AccountFederationTests(unittest.TestCase):
         (self.base / ".claude-a/.credentials.json").write_text("secret-a")
         for name in (
             "ensure_hub", "ensure_macos_hud", "approve_orkest_commands", "install_shell_wrappers",
-            "sync_installed_runtimes_and_caches", "install_login_startup", "prune_daemon_runtimes",
+            "sync_installed_runtimes", "install_login_startup", "prune_daemon_runtimes",
         ):  # fmt: skip
             self.enterContext(mock.patch.object(installer, name))
         self.enterContext(mock.patch.object(installer, "ensure_ork_fast", return_value=self.fast_bin))

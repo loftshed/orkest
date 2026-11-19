@@ -1,15 +1,16 @@
 # Releases
 
-Plugin versions are never edited by hand. Every push to `main` that passes CI
-runs `scripts/release.js publish`, which works out which plugins changed and
-releases each of them.
+Orkest is one product with one version, kept in the root `package.json`. It is never edited by
+hand. Every push to `main` that passes CI runs `scripts/release.js publish`, which decides
+whether anything shipped changed and, if so, releases the next `vX.Y.Z`.
 
 ## How a version is chosen
 
-For each plugin, the script looks at the commits since its last tag
-(`<plugin>--vX.Y.Z`) that touched `plugins/<plugin>/` or its marketplace entry.
-`CHANGELOG.md` edits do not count, and a change that was later reverted
-releases nothing.
+The script looks at the commits since the highest published tag that touched what a checkout
+ships: `plugins/`, `crates/ork-fast`, `install.sh`, `herdr-plugin.toml`, `orca-plugin.json` and
+`.opencode`, plus `src/`, `adapters/` and `references/` for the layout the later stages of issue 233
+move code to, so a commit that only edits a command or skill text still releases. Changelog edits, documentation, tests and repository tooling do not count, and a
+change that was later reverted releases nothing.
 
 | Commits since the last release              | Next version                             |
 | ------------------------------------------- | ---------------------------------------- |
@@ -17,15 +18,27 @@ releases nothing.
 | any `type!:` or a `BREAKING CHANGE:` footer | major, or minor while the version is 0.x |
 | anything else                               | patch                                    |
 
-A plugin that has never been released goes out at the version its `plugin.json`
-declares. `release.json` names the commit that counting starts from for plugins
-without a tag.
+## Tags and earlier releases
+
+New releases are tagged `vX.Y.Z`. Earlier tags stay where they are and still resolve:
+`orchestrate--vX.Y.Z` (the line the product continues from) and `agent-executor--vX.Y.Z`.
+`release.json` lists those prefixes under `legacyTags`, so the highest version across all of
+them is the baseline. The first product release starts from the last published Orchestrate version.
+The separate `monitor--vX.Y.Z` tags are excluded from version selection. Their history stays in
+`plugins/monitor/CHANGELOG.md`, next to `plugins/orchestrate/CHANGELOG.md`; new entries go in
+the root `CHANGELOG.md`. A product that has never been released goes out at the version
+`package.json` declares, and `release.json` names the commit that counting starts from.
+
+`ork update` is a git fast-forward, so a checkout can sit on any release or between two. The
+installer downloads the `ork-fast` binary from the release named for the checked-out version:
+`vX.Y.Z`, then `orchestrate--vX.Y.Z` for checkouts from before the merge, and falls back to
+compiling from source.
 
 ## Release notes
 
-The commit subjects become the changelog entry. To write the notes yourself, add
-them under a `## Unreleased` heading at the top of the plugin's `CHANGELOG.md`;
-the release turns that heading into the version.
+The commit subjects become the changelog entry. To write the notes yourself, add them under a
+`## Unreleased` heading at the top of the root `CHANGELOG.md`; the release turns that heading
+into the version.
 
 ## Merging
 
@@ -47,31 +60,30 @@ node scripts/release.js plan    # what would be released, as JSON
 node scripts/release.js check   # build it in a scratch worktree and run the lint gate on it
 ```
 
-Run `git fetch --tags` first so the script sees the latest releases. CI runs
-`check` on every push and pull request, so a hand-edited version fails there.
+Run `git fetch --tags` first so the script sees the latest releases. CI runs `check` on every
+push and pull request, so a hand-edited version fails there.
 
 ## What publishing does
 
-1. Confirms it is running in GitHub Actions for a push to the default branch,
-   on the exact commit that was tested.
-2. Writes the new versions into `plugin.json`, the plugin's `package.json`, any
-   SKILL.md `metadata.version` and the README table, and adds the changelog
-   section.
-3. Formats those files and runs the lint gate and all tests again.
-4. Commits them as `chore(release): publish plugins`, with a `Release-Of:`
-   trailer naming the tested commit, and pushes the commit and its tags in one
-   atomic push.
-5. Creates a GitHub release for each tag.
+1. Confirms it is running in GitHub Actions for a push to the default branch, on the exact
+   commit that was tested.
+2. Writes the new version into the root `package.json`, `plugins/monitor/package.json` (the
+   installed monitor copy has no root to read) and any `SKILL.md` `metadata.version`, and adds
+   the changelog section.
+3. Formats those files and runs the lint gate again.
+4. Commits them as `chore(release): publish orkest`, with a `Release-Of:` trailer naming the
+   tested commit, and pushes the commit and its tag in one atomic push.
+5. Creates the GitHub release, then the `release-ork-fast` jobs build the binaries and attach
+   them, with `SHA256SUMS`, to that same `vX.Y.Z` release.
 
-If someone pushes while this runs, the push is rejected and nothing is
-published; the run for the newer commit releases everything. If the tags went
-out but creating a GitHub release failed, rerunning the job creates only the
-missing releases.
+If someone pushes while this runs, the push is rejected and nothing is published; the run for the
+newer commit releases everything. If the tag went out but creating the GitHub release failed,
+rerunning the job creates only the missing release.
 
 ## Repository settings
 
-The job pushes with the workflow's `GITHUB_TOKEN`. Under **Settings → Actions →
-General → Workflow permissions**, choose **Read and write permissions**. If
-`main` is protected, create a fine-grained token with read and write access to
-this repository's contents, allow it to bypass the protection, and store it as
-the `RELEASE_TOKEN` secret; the job uses it instead.
+The job pushes with the workflow's `GITHUB_TOKEN`. Under **Settings → Actions → General →
+Workflow permissions**, choose **Read and write permissions**. If `main` is protected, create a
+fine-grained token with read and write access to this repository's contents, allow it to bypass
+the protection, and store it as the `RELEASE_TOKEN` secret; the job uses it instead. The GitHub
+repository description should describe one coding-agent orchestrator, not a plugin collection.

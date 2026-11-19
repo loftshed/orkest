@@ -18,7 +18,7 @@ if [ "$(uname)" = Darwin ]; then
   echo "✓ removed menu bar app and login agent"
 fi
 
-for link in "$HOME/.gemini/config/skills/monitor" "$HOME/.config/opencode/skills/monitor" "$HOME/.agents/skills/monitor"; do
+for link in "$HOME/.claude/skills/monitor" "$HOME"/.claude-*/skills/monitor "$HOME/.codex/skills/monitor" "$HOME/.gemini/config/skills/monitor" "$HOME/.config/opencode/skills/monitor" "$HOME/.agents/skills/monitor"; do
   [ -L "$link" ] && rm -f "$link"
 done
 echo "✓ removed skill links"

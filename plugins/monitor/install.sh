@@ -4,6 +4,7 @@
 #
 #   ./install.sh            CLI + menu bar app
 #   ./install.sh --mcp      also register the MCP server with Claude Code, Codex and agy
+#                           (the root install.sh always does)
 #   ./install.sh --no-app   CLI only
 set -eu
 
@@ -73,8 +74,8 @@ else
   echo "• config exists: $config"
 fi
 
-# Skill for harnesses without the Claude/Codex plugin system: ~/.agents/skills is the hub (Gemini CLI reads it
-# directly); agy and OpenCode get a link to it. Claude Code and Codex get the skill from the plugin.
+# Skill for every harness: ~/.agents/skills is the hub (Gemini CLI reads it directly); Claude Code profiles,
+# Codex, agy and OpenCode get a link to it where installed.
 # Point $2 at $1. Replaces an old or dangling link (e.g. after moving the checkout), never a real file or directory.
 link() {
   if [ -L "$2" ] || [ ! -e "$2" ]; then
@@ -86,13 +87,12 @@ link() {
 skill_hub="$HOME/.agents/skills/monitor"
 mkdir -p "$HOME/.agents/skills"
 link "$repo/skills/monitor" "$skill_hub"
-for dir in "$HOME/.gemini/config/skills" "$HOME/.config/opencode/skills"; do
-  parent="$(dirname "$dir")"
-  [ -d "$parent" ] || continue
-  mkdir -p "$dir"
-  link "$skill_hub" "$dir/monitor"
+for base in "$HOME/.claude" "$HOME"/.claude-* "$HOME/.codex" "$HOME/.gemini/config" "$HOME/.config/opencode"; do
+  [ -d "$base" ] || continue
+  mkdir -p "$base/skills"
+  link "$skill_hub" "$base/skills/monitor"
 done
-echo "✓ skill linked: $skill_hub (+ agy and OpenCode where installed)"
+echo "✓ skill linked: $skill_hub (+ Claude Code, Codex, agy and OpenCode where installed)"
 
 if [ "$with_app" = 1 ] && [ "$(uname)" != Darwin ]; then
   echo "• skipping the menu bar app (macOS only); use 'monitor watch' instead"

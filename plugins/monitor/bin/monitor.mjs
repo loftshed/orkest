@@ -24,7 +24,6 @@ Usage:
   monitor mcp-install        register the MCP server in Claude Code profiles, Codex, agy,
                              Gemini CLI and OpenCode
                              [--dry-run] [--command <launcher path>]
-                             [--skip-claude] when Claude Code gets it from the monitor plugin
   monitor mcp-uninstall      remove those registrations
   monitor --version
 
@@ -49,7 +48,6 @@ try {
       command: { type: "string" },
       "dry-run": { type: "boolean" },
       force: { type: "boolean" },
-      "skip-claude": { type: "boolean" },
       version: { type: "boolean", short: "v" },
       "no-color": { type: "boolean" },
       help: { type: "boolean", short: "h" },
@@ -209,7 +207,6 @@ try {
           launcher,
           dryRun: values["dry-run"],
           remove: command === "mcp-uninstall",
-          skipClaude: values["skip-claude"],
         });
 
         break;

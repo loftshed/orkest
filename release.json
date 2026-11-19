@@ -1,7 +1,4 @@
 {
-  "renames": {
-    "monitor": "ai-usage",
-    "orchestrate": "agent-executor"
-  },
+  "legacyTags": ["orchestrate", "agent-executor"],
   "since": "1c89c2d2ba1e31fe99dd8f21379ad821bc784127"
 }

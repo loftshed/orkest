@@ -2,14 +2,13 @@
 # Install Orkest from this checkout.
 #
 # Usage: ./install.sh [--dry-run] [--no-app] [--no-monitor]
-#        [--no-claude] [--trust-codex-hooks] [--trust-orkest-commands]
+#        [--trust-codex-hooks] [--trust-orkest-commands]
 #        [--untrust-orkest-commands] [--help]
 #
 # Options:
 #   --dry-run             preview changes; only the orchestrate installer is run in dry-run mode
 #   --no-app              skip the monitor macOS menu bar app
 #   --no-monitor          skip monitor installation and MCP registration
-#   --no-claude           skip orchestrate's Claude skill links
 #   --trust-codex-hooks   trust the four reviewed Codex mailbox hooks
 #   --trust-orkest-commands
 #                         let future agents in every installed harness run listed ork
@@ -32,7 +31,6 @@ Options:
   --dry-run             preview changes without installing monitor or running doctor
   --no-app              skip the monitor macOS menu bar app
   --no-monitor          skip monitor installation and MCP registration
-  --no-claude           skip orchestrate's Claude skill links
   --trust-codex-hooks   trust the four reviewed Codex mailbox hooks
   --trust-orkest-commands
                         let future agents in every installed harness run listed ork
@@ -49,7 +47,6 @@ USAGE
 dry_run=0
 no_app=0
 no_monitor=0
-no_claude=0
 trust_codex_hooks=0
 command_approval=
 show_help=0
@@ -59,7 +56,6 @@ for arg in "$@"; do
     --dry-run) dry_run=1 ;;
     --no-app) no_app=1 ;;
     --no-monitor) no_monitor=1 ;;
-    --no-claude) no_claude=1 ;;
     --trust-codex-hooks) trust_codex_hooks=1 ;;
     --trust-orkest-commands|--untrust-orkest-commands)
       if [ -n "$command_approval" ] && [ "$command_approval" != "$arg" ]; then
@@ -191,7 +187,6 @@ esac
 printf '==> Installing orchestrate\n'
 set --
 if [ "$dry_run" -eq 1 ]; then set -- "$@" --dry-run; fi
-if [ "$no_claude" -eq 1 ]; then set -- "$@" --no-claude; fi
 if [ "$trust_codex_hooks" -eq 1 ]; then set -- "$@" --trust-codex-hooks; fi
 if [ -n "$command_approval" ]; then set -- "$@" "$command_approval"; fi
 if [ "$dry_run" -eq 1 ]; then

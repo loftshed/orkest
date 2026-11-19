@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 import command_approval
+import legacy_plugin
 import mailbox_configuration as configuration
 import mailbox_daemon
 import mailbox_mcp
@@ -256,8 +257,6 @@ def install_orchestrate_skill_links(home: Path, *, dry_run: bool = False) -> boo
     for claude_dir in [home / ".claude", *sorted(home.glob(".claude-*"))]:
         if not claude_dir.is_dir():
             continue
-        if (claude_dir / "plugins/cache/orkest/orchestrate").is_dir():
-            continue
         targets.append(claude_dir)
     for base_dir in targets:
         if not base_dir.is_dir():
@@ -306,36 +305,128 @@ def remove_legacy_skill_links(home: Path, *, dry_run: bool = False) -> list[Path
     return removed
 
 
+# A command or skill file is Orkest's to replace only when its bytes are exactly a body Orkest wrote: the current
+# source, a historical shipped body (SHA-256 digests in `adapters/owned-digests.json`, so no second copy of any body
+# is embedded), or the body this installer last recorded for that path. Anything else is the user's and stays.
+OWNED_DIGESTS_FILE = "adapters/owned-digests.json"
+INSTALLED_DIGESTS = ".local/share/orchestrate/installed-text-digests.json"
+
+
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _known_digests(kind: str, name: str) -> set[str]:
+    for root in _adapter_roots():
+        manifest = root / OWNED_DIGESTS_FILE
+        if manifest.is_file():
+            try:
+                return set(json.loads(manifest.read_text(encoding="utf-8")).get(kind, {}).get(name, ()))
+            except (OSError, ValueError, AttributeError):
+                return set()
+    return set()
+
+
+def _recorded_digests(home: Path) -> dict[str, str]:
+    try:
+        data = json.loads((home / INSTALLED_DIGESTS).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return (
+        {k: v for k, v in data.items() if isinstance(k, str) and isinstance(v, str)} if isinstance(data, dict) else {}
+    )
+
+
+def _record_digest(home: Path, path: Path, digest: str) -> None:
+    recorded = _recorded_digests(home)
+    recorded[str(path)] = digest
+    configuration.write_private(home / INSTALLED_DIGESTS, json.dumps(recorded, indent=2, sort_keys=True) + "\n")
+
+
+def _write_owned_text(home: Path, path: Path, content: str, label: str, kind: str, name: str, *, dry_run: bool) -> bool:
+    """Write `content` to `path` unless it already matches; edited, foreign and symlinked files are left alone."""
+    new = content.encode("utf-8")
+    try:
+        existing = configuration.regular_file_bytes(path)
+    except (ValueError, OSError) as error:
+        print(f"• {label} left unchanged: {error}")
+        return False
+    if existing == new:
+        digest = _sha256(new)
+        if digest not in _known_digests(kind, name) and _recorded_digests(home).get(str(path)) != digest:
+            if not dry_run:
+                _record_digest(home, path, digest)
+            return True
+        return False
+    if existing is not None:
+        digest = _sha256(existing)
+        if digest not in _known_digests(kind, name) and _recorded_digests(home).get(str(path)) != digest:
+            print(f"• {label} left unchanged (edited or not written by Orkest): {path}")
+            return False
+    if dry_run:
+        print(f"would install {label}: {path}")
+        return True
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if existing is None:
+            configuration.write_private(path, content, create_only=True)
+        else:
+            backup(path)
+            configuration.write_private(path, content, expected=existing)
+    except (ValueError, FileExistsError, FileNotFoundError) as error:
+        print(f"• {label} changed during setup; skipped: {error}")
+        return False
+    _record_digest(home, path, _sha256(new))
+    print(f"✓ {label}: {path}")
+    return True
+
+
 def _install_claude_command(home: Path, name: str, content: str, *, dry_run: bool = False) -> bool:
     changed = False
     for claude_dir in [home / ".claude", *sorted(home.glob(".claude-*"))]:
-        if not claude_dir.is_dir():
-            continue
-        cmd_file = claude_dir / f"commands/{name}.md"
-        if not cmd_file.is_file() or cmd_file.read_text(encoding="utf-8") != content:
-            if dry_run:
-                print(f"would install /{name} command: {cmd_file}")
-            else:
-                cmd_file.parent.mkdir(parents=True, exist_ok=True)
-                configuration.write_private(cmd_file, content)
-                print(f"✓ /{name} command: {cmd_file}")
+        if claude_dir.is_dir() and _write_owned_text(
+            home, claude_dir / f"commands/{name}.md", content, f"/{name} command", "commands", name, dry_run=dry_run
+        ):
             changed = True
     return changed
 
 
+def _orkest_owned_link(link: Path, hub: Path) -> bool:
+    """A symlink Orkest created: it leads to this skill in the hub or to its shipped directory."""
+    if not link.is_symlink():
+        return False
+    target = Path(os.path.realpath(link))
+    if target == Path(os.path.realpath(hub)):
+        return True
+    return any(
+        target == (root / directory / hub.name).resolve()
+        for root in _adapter_roots()
+        for directory in ("skills", "adapters/skills", "plugins/orchestrate/skills")
+    )
+
+
 def _install_cross_harness_skill(
-    home: Path, name: str, content: str, *, include_claude: bool = False, dry_run: bool = False
+    home: Path,
+    name: str,
+    content: str,
+    *,
+    include_claude: bool = False,
+    dry_run: bool = False,
 ) -> bool:
     changed = False
     skill_hub = home / f".agents/skills/{name}"
-    skill_file = skill_hub / "SKILL.md"
-    if not skill_file.is_file() or skill_file.read_text(encoding="utf-8") != content:
-        if dry_run:
-            print(f"would install /{name} skill: {skill_file}")
-        else:
-            skill_hub.mkdir(parents=True, exist_ok=True)
-            configuration.write_private(skill_file, content)
-            print(f"✓ /{name} skill: {skill_file}")
+    if skill_hub.is_symlink():
+        print(f"• /{name} skill hub left unchanged (symlink): {skill_hub}")
+        return False
+    if _write_owned_text(
+        home,
+        skill_hub / "SKILL.md",
+        content,
+        f"/{name} skill",
+        "skills",
+        name,
+        dry_run=dry_run,
+    ):
         changed = True
     duplicate_parents: tuple[Path, ...] = (
         (home / ".gemini/antigravity/skills",)
@@ -346,18 +437,25 @@ def _install_cross_harness_skill(
             home / ".gemini/antigravity/skills",
         )
     )
+    owned_duplicates = {}
     for dup_parent in duplicate_parents:
         dup_link = dup_parent / name
-        if dup_link.is_symlink() or dup_link.exists():
-            if dry_run:
-                print(f"would remove duplicate /{name} skill link: {dup_link}")
-            else:
-                if dup_link.is_dir() and not dup_link.is_symlink():
-                    shutil.rmtree(dup_link, ignore_errors=True)
-                else:
-                    dup_link.unlink(missing_ok=True)
-                print(f"✓ removed duplicate /{name} skill link: {dup_link}")
-            changed = True
+        if not (dup_link.is_symlink() or dup_link.exists()):
+            continue
+        if not _orkest_owned_link(dup_link, skill_hub):
+            print(f"• /{name} skill left unchanged (not an Orkest link): {dup_link}")
+            continue
+        owned_duplicates[dup_link] = dup_link.readlink()
+    # A profile can link through another profile. Resolve ownership before either link is removed.
+    for dup_link, original_target in owned_duplicates.items():
+        if not dup_link.is_symlink() or dup_link.readlink() != original_target:
+            continue
+        if dry_run:
+            print(f"would remove duplicate /{name} skill link: {dup_link}")
+        else:
+            dup_link.unlink(missing_ok=True)
+            print(f"✓ removed duplicate /{name} skill link: {dup_link}")
+        changed = True
     skill_parents: tuple[Path, ...] = (
         home / ".codex/skills",
         home / ".gemini/config/skills",
@@ -376,6 +474,9 @@ def _install_cross_harness_skill(
             continue
         skill_link = skill_parent / name
         if not (skill_link.is_symlink() and skill_link.resolve() == skill_hub.resolve()):
+            if (skill_link.exists() or skill_link.is_symlink()) and not _orkest_owned_link(skill_link, skill_hub):
+                print(f"• /{name} skill left unchanged (not an Orkest link): {skill_link}")
+                continue
             if dry_run:
                 print(f"would link /{name} skill: {skill_link} -> {skill_hub}")
             else:
@@ -658,14 +759,30 @@ def install_cleanup_skill(home: Path, *, dry_run: bool = False) -> bool:
     return _install_cross_harness_skill(home, "cleanup", CLEANUP_SKILL_TEXT, dry_run=dry_run)
 
 
+def _adapter_roots(plugin_root: Path | None = None, ork_cli: Path | None = None) -> list[Path]:
+    """Directories that may hold `adapters/`: each candidate root, and the checkout above a `plugins/<name>` root."""
+    roots: list[Path] = []
+    for root in _candidate_plugin_roots(plugin_root, ork_cli):
+        for candidate in (root, root.parent.parent if root.parent.name == "plugins" else root):
+            if candidate not in roots:
+                roots.append(candidate)
+    return roots
+
+
+def install_command_source(
+    home: Path, name: str, *, plugin_root: Path | None = None, ork_cli: Path | None = None, dry_run: bool = False
+) -> bool:
+    for root in _candidate_plugin_roots(plugin_root, ork_cli):
+        source = root / f"commands/{name}.md"
+        if source.is_file():
+            return _install_claude_command(home, name, source.read_text(encoding="utf-8"), dry_run=dry_run)
+    return False
+
+
 def install_side_command(
     home: Path, *, plugin_root: Path | None = None, ork_cli: Path | None = None, dry_run: bool = False
 ) -> bool:
-    for root in _candidate_plugin_roots(plugin_root, ork_cli):
-        side_cmd = root / "commands/side.md"
-        if side_cmd.is_file():
-            return _install_claude_command(home, "side", side_cmd.read_text(encoding="utf-8"), dry_run=dry_run)
-    return False
+    return install_command_source(home, "side", plugin_root=plugin_root, ork_cli=ork_cli, dry_run=dry_run)
 
 
 def install_side_skill(
@@ -911,36 +1028,55 @@ def _render_custom_alias_wrapper(alias: str, engine: str) -> str:
     if engine == "claude":
         return f"""{alias}() {{
   case "${{1:-}}" in
-    agents|attach|auth|auto-mode|doctor|gateway|import|install|logs|mcp|plugin|plugins|purge|remote-control|respawn|rm|setup-token|stop|kill|ultrareview|update|upgrade|-h|--help|-v|--version) command {alias} "$@"; return ;;
+    agents|attach|auth|auto-mode|doctor|gateway|import|install|logs|mcp|plugin|plugins|purge|remote-control|respawn|rm|setup-token|stop|kill|ultrareview|update|upgrade|-h|--help|-v|--version) _orkest_direct {alias} "$@"; return ;;
   esac
   if _orkest_interactive {alias} "$@"; then
-    local -a reply; _claude_mode_flag "$@"
-    command ork label -- {alias} "${{reply[@]}}" "$@"
+    local -a reply _orkest_cmd; _orkest_base {alias}; _claude_mode_flag "${{_orkest_cmd[@]}}" "$@"
+    command ork label -- "${{_orkest_cmd[@]}}" "${{reply[@]}}" "$@"
   else
-    command {alias} "$@"
+    _orkest_direct {alias} "$@"
   fi
 }}"""
     if engine == "codex":
         return f"""{alias}() {{
   case "${{1:-}}" in
-    exec|e|review|login|logout|mcp|plugin|app-server|remote-control|app|completion|update|doctor|sandbox|debug|apply|queue|archive|delete|migrate-rollouts|migrate-nfs-db|unarchive|cloud|exec-server|features|help) command {alias} "$@"; return ;;
+    exec|e|review|login|logout|mcp|plugin|app-server|remote-control|app|completion|update|doctor|sandbox|debug|apply|queue|archive|delete|migrate-rollouts|migrate-nfs-db|unarchive|cloud|exec-server|features|help) _orkest_direct {alias} "$@"; return ;;
   esac
-  if _orkest_interactive {alias} "$@"; then command ork label -- {alias} "$@"; else command {alias} "$@"; fi
+  if _orkest_interactive {alias} "$@"; then
+    local -a _orkest_cmd; _orkest_base {alias}
+    command ork label -- "${{_orkest_cmd[@]}}" "$@"
+  else
+    _orkest_direct {alias} "$@"
+  fi
 }}"""
     if engine == "agy":
         return f"""{alias}() {{
   case "${{1:-}}" in
-    agent|agents|changelog|help|install|mcp|mic-serve|models|plugin|plugins|remote-control|update|-h|--help|-v|--version) command {alias} "$@"; return ;;
+    agent|agents|changelog|help|install|mcp|mic-serve|models|plugin|plugins|remote-control|update|-h|--help|-v|--version) _orkest_direct {alias} "$@"; return ;;
   esac
+  local -a _orkest_cmd; _orkest_base {alias}
   if _orkest_interactive {alias} "$@"; then
-    command ork label -- {alias} --dangerously-skip-permissions "$@"
+    command ork label -- "${{_orkest_cmd[@]}}" --dangerously-skip-permissions "$@"
   else
-    command {alias} --dangerously-skip-permissions "$@"
+    command "${{_orkest_cmd[@]}}" --dangerously-skip-permissions "$@"
   fi
 }}"""
     return f"""{alias}() {{
-  if _orkest_interactive {alias} "$@"; then command ork label -- {alias} "$@"; else command {alias} "$@"; fi
+  if _orkest_interactive {alias} "$@"; then
+    local -a _orkest_cmd; _orkest_base {alias}
+    command ork label -- "${{_orkest_cmd[@]}}" "$@"
+  else
+    _orkest_direct {alias} "$@"
+  fi
 }}"""
+
+
+LEGACY_FOOTERS = {
+    "ocodex": "ork label -- codex",
+    "oclaude": "ork label -- claude",
+    "oagy": "ork label -- agy --dangerously-skip-permissions",
+    "oopencode": "ork label -- opencode",
+}
 
 
 def shell_wrapper_script(home: Path | None = None, *, monitor_config: dict[str, Any] | None = None) -> str:
@@ -955,7 +1091,34 @@ case ":$PATH:" in
 esac
 
 # Interactive harnesses get an Orkest footer; automation and management commands stay direct.
+# A function cannot replace an alias of the same name, so the user's own alias is set aside here,
+# not discarded: _orkest_base puts its expansion (flags and all) back in front of every launch.
+typeset -gA _orkest_user_alias
+for _orkest_name in {unalias_targets}; do
+  (( ${{+aliases[$_orkest_name]}} )) && _orkest_user_alias[$_orkest_name]=${{aliases[$_orkest_name]}}
+done
+unset _orkest_name
 unalias {unalias_targets} 2>/dev/null
+# Complex aliases are restored as native aliases below. Only simple literal argv reach this helper.
+_orkest_base() {{
+  _orkest_cmd=($1)
+  local text=${{_orkest_user_alias[$1]:-}}
+  [[ -n $text ]] || return 0
+  local -a words=( ${{(Q)${{(z)text}}}} )
+  (( ${{#words}} )) || return 0
+  local word
+  for word in $words; do
+    case $word in
+      ';'|'&'|'|'|'&&'|'||'|'<'*|'>'*|'('*|')'*|*'`'*|*'$('*) return 0 ;;
+    esac
+  done
+  [[ $words[1] == *=* ]] && words=(env $words)
+  _orkest_cmd=($words)
+}}
+_orkest_direct() {{
+  local -a _orkest_cmd; _orkest_base $1; shift
+  command "${{_orkest_cmd[@]}}" "$@"
+}}
 _orkest_interactive() {{
   [[ -t 0 && -t 1 && -z ${{ORKEST_TERMINAL_SERVER:-}} ]] || return 1
   command -v ork >/dev/null 2>&1 || return 1
@@ -972,9 +1135,14 @@ _orkest_interactive() {{
 }}
 codex() {{
   case "${{1:-}}" in
-    exec|e|review|login|logout|mcp|plugin|app-server|remote-control|app|completion|update|doctor|sandbox|debug|apply|queue|archive|delete|migrate-rollouts|migrate-nfs-db|unarchive|cloud|exec-server|features|help) command codex "$@"; return ;;
+    exec|e|review|login|logout|mcp|plugin|app-server|remote-control|app|completion|update|doctor|sandbox|debug|apply|queue|archive|delete|migrate-rollouts|migrate-nfs-db|unarchive|cloud|exec-server|features|help) _orkest_direct codex "$@"; return ;;
   esac
-  if _orkest_interactive codex "$@"; then command ork label -- codex "$@"; else command codex "$@"; fi
+  if _orkest_interactive codex "$@"; then
+    local -a _orkest_cmd; _orkest_base codex
+    command ork label -- "${{_orkest_cmd[@]}}" "$@"
+  else
+    _orkest_direct codex "$@"
+  fi
 }}
 # Interactive Claude sessions start in auto mode unless the caller already chose a mode.
 _claude_mode_flag() {{
@@ -988,23 +1156,24 @@ _claude_mode_flag() {{
 }}
 claude() {{
   case "${{1:-}}" in
-    agents|attach|auth|auto-mode|doctor|gateway|import|install|logs|mcp|plugin|plugins|purge|remote-control|respawn|rm|setup-token|stop|kill|ultrareview|update|upgrade|-h|--help|-v|--version) command claude "$@"; return ;;
+    agents|attach|auth|auto-mode|doctor|gateway|import|install|logs|mcp|plugin|plugins|purge|remote-control|respawn|rm|setup-token|stop|kill|ultrareview|update|upgrade|-h|--help|-v|--version) _orkest_direct claude "$@"; return ;;
   esac
   if _orkest_interactive claude "$@"; then
-    local -a reply; _claude_mode_flag "$@"
-    command ork label -- claude "${{reply[@]}}" "$@"
+    local -a reply _orkest_cmd; _orkest_base claude; _claude_mode_flag "${{_orkest_cmd[@]}}" "$@"
+    command ork label -- "${{_orkest_cmd[@]}}" "${{reply[@]}}" "$@"
   else
-    command claude "$@"
+    _orkest_direct claude "$@"
   fi
 }}
 agy() {{
   case "${{1:-}}" in
-    agent|agents|changelog|help|install|mcp|mic-serve|models|plugin|plugins|remote-control|update|-h|--help|-v|--version) command agy "$@"; return ;;
+    agent|agents|changelog|help|install|mcp|mic-serve|models|plugin|plugins|remote-control|update|-h|--help|-v|--version) _orkest_direct agy "$@"; return ;;
   esac
+  local -a _orkest_cmd; _orkest_base agy
   if _orkest_interactive agy "$@"; then
-    command ork label -- agy --dangerously-skip-permissions "$@"
+    command ork label -- "${{_orkest_cmd[@]}}" --dangerously-skip-permissions "$@"
   else
-    command agy --dangerously-skip-permissions "$@"
+    command "${{_orkest_cmd[@]}}" --dangerously-skip-permissions "$@"
   fi
 }}{custom_section}
 ork() {{
@@ -1027,16 +1196,72 @@ ork() {{
   esac
 }}
 
-# Launch each harness with the same outer Orkest footer.
-alias ocodex='ork label -- codex'
-alias oclaude='ork label -- claude'
-alias oagy='ork label -- agy --dangerously-skip-permissions'
-alias oopencode='ork label -- opencode'
+# Restore aliases that need the shell's own expansion and parsing.
+_orkest_alias_uses_executable() {{
+  local name=$1 text=${{_orkest_user_alias[$1]}}
+  local literal='^[a-zA-Z0-9_./=:+@ -]+$' assignment='^[a-zA-Z_][a-zA-Z0-9_]*='
+  [[ $text =~ $literal ]] || return 1
+  local -a words=( ${{(z)text}} )
+  local target
+  for target in $words; do
+    [[ $target =~ $assignment ]] && continue
+    [[ $target == $name && -n ${{commands[$target]:-}} ]] && return 0
+    [[ $target == */* && -x $target ]] && return 0
+    [[ $(whence -w -- "$target") == "$target: command" ]]
+    return
+  done
+  return 1
+}}
+for _orkest_name in {unalias_targets}; do
+  if (( ${{+_orkest_user_alias[$_orkest_name]}} )) && ! _orkest_alias_uses_executable "$_orkest_name"; then
+    unset -f "$_orkest_name" 2>/dev/null
+    aliases[$_orkest_name]=${{_orkest_user_alias[$_orkest_name]}}
+  fi
+done
+unset _orkest_name
+# Preserve personal shortcuts and upgrade only known stock definitions.
+typeset -gA _orkest_stock_footer
+_orkest_footer() {{
+  local engine=$1
+  shift
+  local -a _orkest_cmd
+  _orkest_base "$engine"
+  if [[ $engine == agy ]] && (( ! ${{_orkest_cmd[(Ie)--dangerously-skip-permissions]}} && ! ${{@[(Ie)--dangerously-skip-permissions]}} )); then
+    _orkest_cmd+=(--dangerously-skip-permissions)
+  fi
+  command ork label -- "${{_orkest_cmd[@]}}" "$@"
+}}
+_orkest_set_footer() {{
+  local shortcut=$1 engine=$2 legacy=$3
+  local current=${{aliases[$shortcut]-}}
+  if (( ${{+aliases[$shortcut]}} )) && [[ $current != "$legacy" ]] && {{ (( ! ${{+_orkest_stock_footer[$shortcut]}} )) || [[ $current != "${{_orkest_stock_footer[$shortcut]}}" ]]; }}; then
+    return
+  fi
+  if (( ${{+functions[$shortcut]}} )); then
+    unset "aliases[$shortcut]"
+    return
+  fi
+  local body="_orkest_footer $engine"
+  if (( ${{+_orkest_user_alias[$engine]}} )) && ! _orkest_alias_uses_executable "$engine"; then
+    body=$engine
+  elif [[ $engine == opencode ]] && (( ${{+functions[opencode]}} )); then
+    body=$engine
+  fi
+  aliases[$shortcut]=$body
+  _orkest_stock_footer[$shortcut]=$body
+}}
+if (( ${{+aliases[opencode]}} )); then
+  _orkest_user_alias[opencode]=${{aliases[opencode]}}
+else
+  unset '_orkest_user_alias[opencode]'
+fi
+{chr(10).join(f"_orkest_set_footer {name} {name[1:]} '{body}'" for name, body in LEGACY_FOOTERS.items())}
+unset -f _orkest_set_footer _orkest_alias_uses_executable
 """
 
 
-def sync_installed_runtimes_and_caches(home: Path, ork_cli: Path | None = None, *, dry_run: bool = False) -> bool:
-    """Propagate local plugin changes to ~/.local/share/monitor and installed Claude/Codex plugin caches."""
+def sync_installed_runtimes(home: Path, ork_cli: Path | None = None, *, dry_run: bool = False) -> bool:
+    """Propagate checkout changes to the ~/.local/share/monitor runtime copy."""
     changed = False
     ork_cli = ork_cli or (Path(__file__).resolve().parents[3] / "bin/ork.mjs")
     plugins_dir = ork_cli.resolve().parents[2]
@@ -1061,48 +1286,6 @@ def sync_installed_runtimes_and_caches(home: Path, ork_cli: Path | None = None, 
             print(f"✓ monitor runtime synced: {monitor_runtime}")
         changed = True
 
-    cache_roots = [
-        home / ".claude/plugins/cache/orkest",
-        *(p / "plugins/cache/orkest" for p in sorted(home.glob(".claude-*")) if p.is_dir()),
-        home / ".codex/plugins/cache/orkest",
-    ]
-    seen_real_caches: set[Path] = set()
-    for cache_root in cache_roots:
-        if not cache_root.is_dir():
-            continue
-        real_cache = cache_root.resolve()
-        if real_cache in seen_real_caches:
-            continue
-        seen_real_caches.add(real_cache)
-        for plugin_name in ("orchestrate", "monitor"):
-            src_plugin = plugins_dir / plugin_name
-            plugin_cache_dir = real_cache / plugin_name
-            if not src_plugin.is_dir() or not plugin_cache_dir.is_dir():
-                continue
-            manifest = src_plugin / ".claude-plugin/plugin.json"
-            version = ""
-            if manifest.is_file():
-                try:
-                    version = str(json.loads(manifest.read_text(encoding="utf-8")).get("version") or "")
-                except (OSError, ValueError):
-                    version = ""
-            target_dirs = [d for d in sorted(plugin_cache_dir.iterdir()) if d.is_dir()]
-            if version and (plugin_cache_dir / version) not in target_dirs:
-                target_dirs.append(plugin_cache_dir / version)
-            if not target_dirs:
-                continue
-            target_dir = target_dirs[-1]
-            if dry_run:
-                print(f"would sync cached plugin {plugin_name}: {target_dir}")
-            else:
-                shutil.copytree(
-                    src_plugin,
-                    target_dir,
-                    dirs_exist_ok=True,
-                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
-                )
-                print(f"✓ cached plugin synced ({plugin_name}): {target_dir}")
-            changed = True
     return changed
 
 
@@ -1147,8 +1330,9 @@ def sync_shell_artifacts(home: Path, *, monitor_config: dict[str, Any] | None = 
         if not _owned_shell_file(target):
             raise ValueError(f"refusing to overwrite a file Orkest does not own: {target}")
     status = "current"
+    script_text = shell_wrapper_script(home=home, monitor_config=monitor_config)
     wanted = {
-        canonical: shell_wrapper_script(home=home, monitor_config=monitor_config),
+        canonical: script_text,
         shim: _shell_shim_text(canonical),
     }
     for target, text in wanted.items():
@@ -1176,13 +1360,40 @@ def sync_shell_artifacts(home: Path, *, monitor_config: dict[str, Any] | None = 
         r"[\s\S]*?^alias oopencode='ork label -- opencode'\n?",
         re.MULTILINE,
     )
-    if managed_pattern.search(existing):
-        updated = managed_pattern.sub(MANAGED_ZSHRC_BLOCK, existing, count=1)
-    elif legacy_pattern.search(existing):
-        updated = legacy_pattern.sub(MANAGED_ZSHRC_BLOCK, existing, count=1)
-    else:
-        prefix = "\n" if existing and not existing.endswith("\n") else ""
-        updated = existing + prefix + MANAGED_ZSHRC_BLOCK
+    legacy_block = legacy_pattern.search(existing)
+    # A legacy block is only ours to replace while every line in it is a line Orkest generates. Anything
+    # else between its markers is the user's (an alias, a function body, an edited argument): the block
+    # keeps its user lines and the managed block is added after it.
+    generated = {line.strip() for line in script_text.splitlines()}
+    legacy_aliases = {name: f"alias {name}='{body}'" for name, body in LEGACY_FOOTERS.items()}
+    generated.update(legacy_aliases.values())
+    foreign = (
+        [line for line in legacy_block.group(0).splitlines() if line.strip() and line.strip() not in generated]
+        if legacy_block
+        else []
+    )
+    prefix = "\n" if existing and not existing.endswith("\n") else ""
+    updated = existing
+    if legacy_block and foreign:
+        # Guard historical assignments in retained blocks, including previously migrated profiles.
+        block = legacy_block.group(0)
+        unalias_line = next(line for line in script_text.splitlines() if line.startswith("unalias "))
+        if unalias_line in block.splitlines() and "typeset -gA _orkest_user_alias" not in block.splitlines():
+            start = script_text.index("typeset -gA _orkest_user_alias")
+            capture = script_text[start : script_text.index(unalias_line, start)]
+            block = re.sub(
+                rf"^{re.escape(unalias_line)}$", lambda _: capture + unalias_line, block, count=1, flags=re.M
+            )
+        for name, assignment in legacy_aliases.items():
+            guard = f"(( ${{+aliases[{name}]}} || ${{+functions[{name}]}} )) || {assignment}"
+            block = re.sub(rf"^{re.escape(assignment)}$", guard, block, flags=re.M)
+        updated = existing[: legacy_block.start()] + block + existing[legacy_block.end() :]
+        print(f"• preserved user lines in the edited legacy Orkest block in {zshrc}")
+    if not managed_pattern.search(updated):
+        if legacy_block and not foreign:
+            updated = legacy_pattern.sub(MANAGED_ZSHRC_BLOCK, updated, count=1)
+        else:
+            updated += prefix + MANAGED_ZSHRC_BLOCK
     if updated != existing:
         if dry_run:
             print(f"would configure shell wrappers in: {zshrc}")
@@ -1231,6 +1442,8 @@ def install_shell_wrappers(
     if install_cleanup_command(home, dry_run=dry_run):
         changed = True
     if install_cleanup_skill(home, dry_run=dry_run):
+        changed = True
+    if install_command_source(home, "account", ork_cli=ork_cli, dry_run=dry_run):
         changed = True
     if install_side_command(home, ork_cli=ork_cli, dry_run=dry_run):
         changed = True
@@ -2001,14 +2214,78 @@ def target_triple() -> str | None:
     return None
 
 
-def orchestrate_plugin_version() -> str:
-    plugin_json = Path(__file__).resolve().parents[3] / ".claude-plugin/plugin.json"
-    if plugin_json.is_file():
+def product_root() -> Path | None:
+    """The checkout root: the nearest parent holding the product's package.json."""
+    for parent in Path(__file__).resolve().parents:
+        manifest = parent / "package.json"
+        if manifest.is_file():
+            try:
+                if json.loads(manifest.read_text(encoding="utf-8")).get("name") == "orkest":
+                    return parent
+            except (OSError, ValueError):
+                pass
+    return None
+
+
+def product_version() -> str:
+    """The Orkest release this checkout is: `version` in the root package.json."""
+    root = product_root()
+    if root:
         try:
-            return json.loads(plugin_json.read_text(encoding="utf-8")).get("version", "0.0.0")
+            return str(json.loads((root / "package.json").read_text(encoding="utf-8")).get("version") or "0.0.0")
         except (OSError, ValueError):
             pass
     return "0.0.0"
+
+
+def ork_fast_release_bases(version: str, override: str | None = None) -> list[str]:
+    """Where `ork-fast` for `version` is published: the product tag, then the pre-merge orchestrate tag."""
+    if override:
+        return [override]
+    root = "https://github.com/loftshed/orkest/releases/download"
+    return [f"{root}/v{version}", f"{root}/orchestrate--v{version}"]
+
+
+def _download_ork_fast(base: str, target: str, version: str, dest: Path, meta_path: Path) -> bool:
+    """Fetch, verify and install one release's binary; False when it is absent or does not verify."""
+    import urllib.error
+    import urllib.request
+
+    try:
+        sums_url = f"{base}/SHA256SUMS"
+        req = urllib.request.Request(sums_url, headers={"User-Agent": "orkest-installer"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            sums_text = resp.read().decode("utf-8")
+        expected_sha = None
+        binary_filename = f"ork-fast-{target}"
+        for line in sums_text.splitlines():
+            parts = line.strip().split()
+            if len(parts) >= 2 and parts[1].lstrip("*") == binary_filename:
+                expected_sha = parts[0]
+                break
+        if expected_sha:
+            bin_url = f"{base}/{binary_filename}"
+            req_bin = urllib.request.Request(bin_url, headers={"User-Agent": "orkest-installer"})
+            with urllib.request.urlopen(req_bin, timeout=30) as resp:
+                bin_bytes = resp.read()
+            computed_sha = hashlib.sha256(bin_bytes).hexdigest()
+            if computed_sha.lower() != expected_sha.lower():
+                raise ValueError(
+                    f"SHA-256 digest mismatch for {binary_filename}: expected {expected_sha}, got {computed_sha}"
+                )
+            _install_binary(bin_bytes, dest)
+            meta = {
+                "version": version,
+                "target": target,
+                "sha256": computed_sha,
+                "installed_at": time.time(),
+            }
+            meta_path.write_text(json.dumps(meta, indent=2))
+            print(f"✓ ork-fast accelerator installed: {dest}")
+            return True
+    except (urllib.error.URLError, OSError, TimeoutError, UnicodeDecodeError):
+        pass
+    return False
 
 
 def _codesign_macos(path: Path) -> None:
@@ -2061,7 +2338,7 @@ def _build_local_ork_fast(crate_dir: Path, dest: Path) -> bool:
                 return False
         _install_binary(built_bin.read_bytes(), dest)
         meta = {
-            "version": orchestrate_plugin_version(),
+            "version": product_version(),
             "source": "local-cargo",
             "installed_at": time.time(),
         }
@@ -2117,7 +2394,7 @@ def ensure_ork_fast(
         print(f"✓ ork-fast accelerator compiled from source: {dest}")
         return dest
 
-    version = orchestrate_plugin_version()
+    version = product_version()
     meta_path = dest.with_name("ork-fast.meta.json")
     if dest.is_file() and os.access(dest, os.X_OK) and meta_path.is_file():
         try:
@@ -2127,49 +2404,11 @@ def ensure_ork_fast(
         except (OSError, ValueError):
             pass
 
-    download_url_base = (
-        base_url
-        or current_env.get("ORK_FAST_RELEASE_BASE_URL")
-        or f"https://github.com/loftshed/orkest/releases/download/orchestrate--v{version}"
-    )
-    if target:
-        import urllib.error
-        import urllib.request
-
-        try:
-            sums_url = f"{download_url_base}/SHA256SUMS"
-            req = urllib.request.Request(sums_url, headers={"User-Agent": "orkest-installer"})
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                sums_text = resp.read().decode("utf-8")
-            expected_sha = None
-            binary_filename = f"ork-fast-{target}"
-            for line in sums_text.splitlines():
-                parts = line.strip().split()
-                if len(parts) >= 2 and parts[1].lstrip("*") == binary_filename:
-                    expected_sha = parts[0]
-                    break
-            if expected_sha:
-                bin_url = f"{download_url_base}/{binary_filename}"
-                req_bin = urllib.request.Request(bin_url, headers={"User-Agent": "orkest-installer"})
-                with urllib.request.urlopen(req_bin, timeout=30) as resp:
-                    bin_bytes = resp.read()
-                computed_sha = hashlib.sha256(bin_bytes).hexdigest()
-                if computed_sha.lower() != expected_sha.lower():
-                    raise ValueError(
-                        f"SHA-256 digest mismatch for {binary_filename}: expected {expected_sha}, got {computed_sha}"
-                    )
-                _install_binary(bin_bytes, dest)
-                meta = {
-                    "version": version,
-                    "target": target,
-                    "sha256": computed_sha,
-                    "installed_at": time.time(),
-                }
-                meta_path.write_text(json.dumps(meta, indent=2))
-                print(f"✓ ork-fast accelerator installed: {dest}")
-                return dest
-        except (urllib.error.URLError, OSError, TimeoutError, UnicodeDecodeError):
-            pass
+    override = base_url or current_env.get("ORK_FAST_RELEASE_BASE_URL")
+    if target and any(
+        _download_ork_fast(base, target, version, dest, meta_path) for base in ork_fast_release_bases(version, override)
+    ):
+        return dest
 
     if crate_dir and _build_local_ork_fast(crate_dir, dest):
         print(f"✓ ork-fast accelerator compiled from source: {dest}")
@@ -2724,6 +2963,14 @@ def run_account_sync(*, shell_only: bool, dry_run: bool, fast_bin: Path | str | 
     return result
 
 
+def report_legacy_plugin(home: Path) -> list[dict]:
+    """Print how to remove the retired plugin install. Never uninstalls: that is the user's call."""
+    entries = legacy_plugin.discover(home)
+    if entries:
+        print(legacy_plugin.render(entries))
+    return entries
+
+
 def install(
     *,
     dry_run: bool = False,
@@ -2792,8 +3039,9 @@ def install(
 
     approve_orkest_commands(home, hub, opt_in=trust_orkest_commands, revoke=untrust_orkest_commands, dry_run=dry_run)
     migrate_legacy_paths(home, dry_run=dry_run)
+    report_legacy_plugin(home)
     install_shell_wrappers(home, fast_bin=fast_bin, dry_run=dry_run)
-    sync_installed_runtimes_and_caches(home, dry_run=dry_run)
+    sync_installed_runtimes(home, dry_run=dry_run)
     install_login_startup(home, mailbox.root(), hub / "mailbox_daemon.py", stdio=stdio, dry_run=dry_run)
     prune_daemon_runtimes(mailbox.root(), dry_run=dry_run)
     if not dry_run:

@@ -24,7 +24,7 @@ import activate, {
   summarizeQuota,
   swarmViewCommand,
 } from "../../../plugins/orchestrate/lib/orca-worker.mjs";
-import { checkOrcaManifest } from "../../../scripts/validate-marketplace.js";
+import { checkOrcaManifest } from "../../../scripts/validate.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
 const SCREEN_READER = "/usr/bin/orca";
