@@ -14,7 +14,7 @@ import {
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
-import { setImmediate as yieldTurn } from "node:timers/promises";
+import { setTimeout as sleep } from "node:timers/promises";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -233,11 +233,18 @@ describe("strict Foundry state with retained fixtures", () => {
   });
 
   it("a concurrent real reader observes only complete atomic states", async ({ signal }) => {
+    // Every generation is a real writeFoundryState call (one Python subprocess each), so the wall
+    // budget is explicit and failures name the phase that stalled instead of timing out silently.
+    const generations = 100;
+    const gate = 50;
+    const budgetMs = 60_000;
     const f = fixture();
     writeFileSync(f.file, JSON.stringify({ generation: 0, payload: "0".repeat(100_000) }));
+    const began = performance.now();
+    const elapsed = () => Math.round(performance.now() - began);
     const writer = fork(
       new URL("../../helpers/foundry-state-writer.mjs", import.meta.url),
-      [f.root],
+      [f.root, String(generations), String(gate), String(budgetMs / 2)],
       {
         detached: true,
         execArgv: [],
@@ -246,11 +253,52 @@ describe("strict Foundry state with retained fixtures", () => {
     );
     const closed = new Promise((resolve) => writer.once("close", resolve));
     let childError;
+    const phases = []; // every IPC phase report from the writer
+    let last = { phase: "none (no IPC message received: writer startup or IPC channel)" };
+    let reads = 0;
+    let highestObserved = -1;
     writer.on("error", (error) => {
       childError = error;
     });
+    writer.on("message", (message) => {
+      last = { ...message, receivedAt: elapsed() };
+      phases.push(last);
+      if (phases.length > 20) phases.splice(1, 1); // keep the first and the latest entries
+    });
+    // Bounded snapshot (command, state, CPU time) of the writer's process group: shows whether the
+    // writer or its Python child is running, sleeping or blocked. Taken before the group is killed.
+    let cachedSample;
+    const sampleProcesses = () => {
+      if (cachedSample) return cachedSample;
+      try {
+        const rows = execFileSync(
+          "ps",
+          ["-A", "-o", "pid=,ppid=,pgid=,stat=,etime=,time=,command="],
+          {
+            encoding: "utf8",
+            timeout: 3000,
+            maxBuffer: 4 * 1024 * 1024,
+            stdio: ["ignore", "pipe", "ignore"],
+          },
+        )
+          .split("\n")
+          .filter((row) => row.trim().split(/\s+/u, 3)[2] === String(writer.pid))
+          .slice(0, 10)
+          .map((row) => row.trim().slice(0, 200));
+        cachedSample = rows.length > 0 ? rows : ["(no live process in the writer's group)"];
+      } catch (error) {
+        cachedSample = [`(ps sample unavailable: ${error.code ?? error.message})`];
+      }
+      return cachedSample;
+    };
+    const diagnostics = (why) =>
+      `${why} after ${elapsed()}ms (budget ${budgetMs}ms): writer pid=${writer.pid} ` +
+      `exit=${writer.exitCode}/${writer.signalCode}; reader reads=${reads} highestObserved=${highestObserved}; ` +
+      `last writer phase=${JSON.stringify(last)}; recent phases=${JSON.stringify(phases)}; ` +
+      `process sample [pid ppid pgid stat etime cputime command]=${JSON.stringify(sampleProcesses())}`;
     // Each write synchronously invokes Python. End the private POSIX process group together.
     const stopWriter = () => {
+      if (signal.aborted) sampleProcesses();
       if (!writer.pid || writer.exitCode !== null || writer.signalCode !== null) return;
       try {
         process.kill(-writer.pid, "SIGKILL");
@@ -268,23 +316,36 @@ describe("strict Foundry state with retained fixtures", () => {
         !signal.aborted
       ) {
         if (childError) throw childError;
+        if (elapsed() > budgetMs)
+          throw new Error(diagnostics("concurrent reader exceeded its wall budget"));
         const state = JSON.parse(readFileSync(f.file, "utf8"));
+        reads++;
+        highestObserved = Math.max(highestObserved, state.generation);
         expect(state.payload).toBe(String(state.generation).repeat(100_000));
-        if (!hasObservedIntermediate && state.generation > 0 && state.generation < 100) {
+        if (!hasObservedIntermediate && state.generation > 0 && state.generation < generations) {
           hasObservedIntermediate = true;
           writer.send("observed");
         }
-        await yieldTurn();
+        // Pace the reader: a hot loop starves the writer's Python subprocesses on small CI runners.
+        await sleep(2);
       }
       const code = await closed;
       if (childError) throw childError;
-      expect(code).toBe(0);
-      expect(hasObservedIntermediate).toBe(true);
+      expect(code, diagnostics("writer did not exit cleanly")).toBe(0);
+      expect(
+        hasObservedIntermediate,
+        diagnostics("reader never saw an intermediate generation"),
+      ).toBe(true);
       expect(JSON.parse(readFileSync(f.file, "utf8"))).toMatchObject({
-        generation: 100,
-        payload: "100".repeat(100_000),
+        generation: generations,
+        payload: String(generations).repeat(100_000),
       });
       expect(readdirSync(path.dirname(f.file))).toEqual(["foundry-state.json"]);
+    } catch (error) {
+      if (signal.aborted && !/phase=/u.test(String(error?.message))) {
+        error.message += `\n${diagnostics("aborted by test timeout")}`;
+      }
+      throw error;
     } finally {
       stopWriter();
       signal.removeEventListener("abort", stopWriter);
