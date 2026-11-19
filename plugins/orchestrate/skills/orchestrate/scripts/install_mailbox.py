@@ -26,6 +26,7 @@ import command_approval
 import mailbox_configuration as configuration
 import mailbox_daemon
 import mailbox_mcp
+import path_migration
 import peer_mailbox as mailbox
 import runtime_paths
 from check_mailbox import RpcClient, check, initialize_codex
@@ -2280,6 +2281,24 @@ def approve_orkest_commands(
     )
 
 
+def migrate_legacy_paths(home: Path, *, dry_run: bool = False) -> None:
+    """Issue 233 stage 0: move owned links, commands, hooks and trust rules to the new layout once it exists."""
+    try:
+        report = path_migration.discover(home) if dry_run else path_migration.apply(home)
+    except (OSError, ValueError, RuntimeError) as error:
+        print(f"! path migration skipped: {error}")
+        return
+    if dry_run:
+        if report["total"]:
+            print(path_migration.render(report))
+        return
+    for conflict in report.get("conflicts", []):
+        print(f"! path migration skipped one path: {conflict}")
+    if report.get("applied"):
+        print(f"✓ migrated {report['applied']} legacy path file(s); backup: {report['backup']}")
+        print("  Codex hooks changed by the migration need review again (/hooks).")
+
+
 _ACCOUNT_HARNESS = {
     "claude": "claude",
     "codex": "codex",
@@ -2772,6 +2791,7 @@ def install(
                 )
 
     approve_orkest_commands(home, hub, opt_in=trust_orkest_commands, revoke=untrust_orkest_commands, dry_run=dry_run)
+    migrate_legacy_paths(home, dry_run=dry_run)
     install_shell_wrappers(home, fast_bin=fast_bin, dry_run=dry_run)
     sync_installed_runtimes_and_caches(home, dry_run=dry_run)
     install_login_startup(home, mailbox.root(), hub / "mailbox_daemon.py", stdio=stdio, dry_run=dry_run)
