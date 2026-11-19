@@ -1532,7 +1532,9 @@ class AccountFederationTests(unittest.TestCase):
             )
             self.assertIn("peer-mailbox", json.loads((cfg / "hooks.json").read_text()))
         for name in "abc":
-            found = next((self.base / f".opencode-{name}/config/opencode").glob("opencode.json*"))
+            directory = self.base / f".opencode-{name}/config/opencode"
+            # Backups share the prefix and glob order is filesystem-dependent; read the live config only.
+            found = next(path for path in (directory / "opencode.jsonc", directory / "opencode.json") if path.is_file())
             self.assertIn(self.URL, found.read_text())
             self.assertIn('"monitor"', found.read_text())
         self.assertIn("// keep", (self.base / ".opencode-a/config/opencode/opencode.jsonc").read_text())

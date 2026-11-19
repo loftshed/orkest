@@ -305,12 +305,14 @@ describe("ork account", () => {
     fs.writeFileSync(path.join(later, "taken"), "#!/bin/sh\n", { mode: 0o755 });
     env.PATH = `${env.PATH}:${later}`;
     await expect(add("claude", { profile: "a", alias: "taken" })).rejects.toThrow(/shadow/);
-    // Darwin treats names case-insensitively.
+    // Darwin treats names case-insensitively; pin the platform so the result is independent of the host.
     fs.writeFileSync(path.join(later, "MixedCase"), "#!/bin/sh\n", { mode: 0o755 });
     await expect(
       add("claude", { profile: "a", alias: "mixedcase" }, { platform: "darwin" }),
     ).rejects.toThrow(/shadow/);
-    await expect(add("claude", { profile: "a", alias: "mixedcase" })).resolves.toBeTruthy();
+    await expect(
+      add("claude", { profile: "a", alias: "mixedcase" }, { platform: "linux" }),
+    ).resolves.toBeTruthy();
 
     const local = path.join(home, ".local", "bin");
     fs.mkdirSync(local, { recursive: true });
@@ -502,10 +504,10 @@ describe("ork account", () => {
 
   it("removes accounts without destroying profiles and gates purging", async () => {
     const dir = path.join(home, ".claude-p");
-    await addAccount({ provider: "claude", profile: "p", alias: "pp", noSync: true }, ctx());
+    await addAccount({ provider: "claude", profile: "p", alias: "rmprofile", noSync: true }, ctx());
     fs.writeFileSync(path.join(dir, "keep.txt"), "data");
     // --purge-profile alone never authorizes anything.
-    await expect(removeAccount("pp", { purgeProfile: true }, ctx())).rejects.toThrow(
+    await expect(removeAccount("rmprofile", { purgeProfile: true }, ctx())).rejects.toThrow(
       /confirmation/,
     );
     expect(readConfig().accounts.some((a) => a.id === "claude-p")).toBe(true);
@@ -514,7 +516,7 @@ describe("ork account", () => {
     const original = fs.readFileSync(marker, "utf8");
     fs.writeFileSync(marker, JSON.stringify({ id: "someone-else", provider: "claude", home: dir }));
     await expect(
-      removeAccount("pp", { purgeProfile: true }, ctx({ confirm: () => true })),
+      removeAccount("rmprofile", { purgeProfile: true }, ctx({ confirm: () => true })),
     ).rejects.toThrow(/ownership marker/);
     fs.writeFileSync(marker, original);
     // A populated unrelated directory is never adopted as purgeable.
@@ -531,7 +533,11 @@ describe("ork account", () => {
     ).rejects.toThrow(/ownership marker/);
 
     // Confirmed purge quarantines (recoverable); nothing is deleted.
-    const done = await removeAccount("pp", { purgeProfile: true }, ctx({ confirm: () => true }));
+    const done = await removeAccount(
+      "rmprofile",
+      { purgeProfile: true },
+      ctx({ confirm: () => true }),
+    );
     expect(fs.existsSync(dir)).toBe(false);
     expect(fs.readFileSync(path.join(done.profileQuarantined, "keep.txt"), "utf8")).toBe("data");
     expect(fs.existsSync(done.wrapperQuarantined)).toBe(true);
