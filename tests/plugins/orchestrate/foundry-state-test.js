@@ -1,4 +1,4 @@
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, fork, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   existsSync,
@@ -14,6 +14,7 @@ import {
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
+import { setImmediate as yieldTurn } from "node:timers/promises";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -231,46 +232,60 @@ describe("strict Foundry state with retained fixtures", () => {
     }
   });
 
-  it("a concurrent real reader observes only complete atomic states", async () => {
+  it("a concurrent real reader observes only complete atomic states", async ({ signal }) => {
     const f = fixture();
-    writeFoundryState(f.root, { generation: 0, payload: "0".repeat(100_000) });
-    const child = spawn(
-      process.execPath,
-      [
-        "--input-type=module",
-        "-e",
-        `
-import {readFileSync} from 'node:fs';
-let reading=true, count=0; const errors=[];
-process.stdin.resume();
-process.stdin.on('end',()=>{reading=false;});
-console.log(JSON.stringify({status:'ready'}));
-function read() {
-  try { const state=JSON.parse(readFileSync(process.argv[1],'utf8')); if(state.payload!==String(state.generation).repeat(100000)) errors.push('mixed state'); count++; }
-  catch(error) { errors.push(error.message); }
-  if(reading) setImmediate(read); else console.log(JSON.stringify({count, errors, generation:JSON.parse(readFileSync(process.argv[1],'utf8')).generation}));
-}
-read();
-`,
-        f.file,
-      ],
-      { stdio: ["pipe", "pipe", "pipe"] },
-    );
-    const lines = createInterface({ input: child.stdout })[Symbol.asyncIterator]();
-    const closed = new Promise((resolve) => child.once("close", resolve));
+    writeFileSync(f.file, JSON.stringify({ generation: 0, payload: "0".repeat(100_000) }));
+    const writer = fork(new URL("fixtures/foundry-state-writer.mjs", import.meta.url), [f.root], {
+      detached: true,
+      execArgv: [],
+      stdio: ["ignore", "ignore", "inherit", "ipc"],
+    });
+    const closed = new Promise((resolve) => writer.once("close", resolve));
+    let childError;
+    writer.on("error", (error) => {
+      childError = error;
+    });
+    // Each write synchronously invokes Python. End the private POSIX process group together.
+    const stopWriter = () => {
+      if (!writer.pid || writer.exitCode !== null || writer.signalCode !== null) return;
+      try {
+        process.kill(-writer.pid, "SIGKILL");
+      } catch (error) {
+        if (error.code !== "ESRCH") throw error;
+      }
+    };
+    signal.addEventListener("abort", stopWriter, { once: true });
     try {
-      expect(JSON.parse((await lines.next()).value)).toEqual({ status: "ready" });
-      for (let i = 1; i <= 100; i++)
-        writeFoundryState(f.root, { generation: i, payload: String(i).repeat(100_000) });
-      child.stdin.end();
-      const result = JSON.parse((await lines.next()).value);
-      expect(result).toMatchObject({ errors: [], generation: 100 });
-      expect(result.count).toBeGreaterThan(1);
+      let isObservedIntermediate = false;
+      while (
+        writer.pid &&
+        writer.exitCode === null &&
+        writer.signalCode === null &&
+        !signal.aborted
+      ) {
+        if (childError) throw childError;
+        const state = JSON.parse(readFileSync(f.file, "utf8"));
+        expect(state.payload).toBe(String(state.generation).repeat(100_000));
+        if (!isObservedIntermediate && state.generation > 0 && state.generation < 100) {
+          isObservedIntermediate = true;
+          writer.send("observed");
+        }
+        await yieldTurn();
+      }
+      const code = await closed;
+      if (childError) throw childError;
+      expect(code).toBe(0);
+      expect(isObservedIntermediate).toBe(true);
+      expect(JSON.parse(readFileSync(f.file, "utf8"))).toMatchObject({
+        generation: 100,
+        payload: "100".repeat(100_000),
+      });
+      expect(readdirSync(path.dirname(f.file))).toEqual(["foundry-state.json"]);
     } finally {
-      child.stdin.end();
+      stopWriter();
+      signal.removeEventListener("abort", stopWriter);
       await closed;
     }
-    expect(readdirSync(path.dirname(f.file))).toEqual(["foundry-state.json"]);
   });
 
   it.each([
