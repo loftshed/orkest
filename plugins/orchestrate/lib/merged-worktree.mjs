@@ -1272,13 +1272,14 @@ export async function mergedCleanup({
     platform,
     inspectProcesses,
   });
+  let unreadableProcesses = 0;
+  for (const entry of audit.entries) {
+    unreadableProcesses = Math.max(unreadableProcesses, entry.unreadableProcesses ?? 0);
+  }
   const report = {
     mode: "merged",
     repoRoot: audit.repoRoot,
-    unreadableProcesses: audit.entries.reduce(
-      (highest, entry) => Math.max(highest, entry.unreadableProcesses ?? 0),
-      0,
-    ),
+    unreadableProcesses,
     targetBranch: audit.base,
     dryRun,
     error: audit.error ?? null,
