@@ -53,6 +53,7 @@ import {
 import { belongsToRoom, isPeerLive, newRoom, roomOwnerSessions } from "./rooms.mjs";
 import { cacheHome } from "./runtime-paths.mjs";
 import { applyLauncherAccountEnv, checkRepoPolicyForSide } from "./side.mjs";
+import { worktreePortEnv } from "./worktree-env.mjs";
 import {
   provisionWorktree,
   resolveRepositoryRoot,
@@ -3871,9 +3872,10 @@ export async function chiefSpawn({
   let workspace = repoRoot;
   let worktreeInfo = null;
   if (isWorktreeRequested) {
-    worktreeInfo = provision(repoRoot, { slug, branch: branchName, ...(exec && { exec }) });
+    worktreeInfo = provision(repoRoot, { slug, branch: branchName, env, ...(exec && { exec }) });
     workspace = worktreeInfo.path;
   }
+  const portEnv = worktreeInfo ? worktreePortEnv({ env, repoRoot, worktreePath: workspace }) : {};
   await newRoom([], {
     id: roomId,
     cwd: workspace,
@@ -3946,7 +3948,7 @@ export async function chiefSpawn({
         engine: selectedEngine,
         model: resolvedModel,
         briefPath,
-        accountEnv: policy.accountEnv,
+        accountEnv: { ...policy.accountEnv, ...portEnv },
         root,
       }),
       { mode: 0o700 },
@@ -4047,6 +4049,7 @@ export async function chiefSpawn({
   const launchEnv = applyLauncherAccountEnv(
     {
       ...env,
+      ...portEnv,
       ORK_CHIEF_ROOM: roomId,
       ORK_CHIEF_MISSION_SESSION: missionSession,
     },

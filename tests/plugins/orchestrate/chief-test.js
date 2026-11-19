@@ -810,6 +810,12 @@ describe("ork chief", () => {
     });
 
     it("provisions a worktree, records parentChief in a new room, and launches detached", async () => {
+      fs.mkdirSync(path.join(repo, ".orkest"), { recursive: true });
+      fs.writeFileSync(
+        path.join(repo, ".orkest/worktree.json"),
+        JSON.stringify({ version: 1, ports: { names: ["API_PORT"] } }),
+      );
+
       const launch = vi.fn(() => ({
         status: 0,
         stdout:
@@ -841,6 +847,9 @@ describe("ork chief", () => {
       );
       expect(options.cwd).toBe(worktree);
       expect(options.env.ORK_CHIEF_ROOM).toBe(result.roomId);
+      const port = JSON.parse(options.env.ORKEST_WORKTREE_PORTS).API_PORT;
+      expect(port).toBeGreaterThanOrEqual(31000);
+      expect(options.env.API_PORT).toBe(String(port));
       const stored = readRawRoom(result.roomId, root);
       expect(stored.cwd).toBe(fs.realpathSync(worktree));
       expect(stored.chief).toMatchObject({
