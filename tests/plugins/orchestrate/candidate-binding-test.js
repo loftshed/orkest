@@ -296,13 +296,20 @@ describe("one pinned candidate with retained real Git", () => {
 
   it("pushes the candidate SHA refspec with PR strategy", async () => {
     const f = fixture();
+    git(f.repo, "remote", "add", "origin", "https://example.invalid/owner/test.git");
     const calls = [];
     const result = await smelt(f, {
       strategy: "pr",
       execFileSyncFn: (cmd, args, options) => {
-        if (cmd === "gh" || args[0] === "push") {
+        if (cmd === "gh" && args[0] === "repo")
+          return JSON.stringify({ nameWithOwner: "owner/test" });
+        if (cmd === "gh" && args[1] === "list") return "[]";
+        if (cmd === "gh" && args[1] === "create")
+          return "https://example.invalid/owner/test/pull/1";
+        if (cmd === "gh") throw new Error("Pull request is not visible yet");
+        if (args[0] === "push") {
           calls.push([cmd, ...args]);
-          return "pr-created";
+          return "";
         }
         return execFileSync(cmd, args, options);
       },
