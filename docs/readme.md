@@ -6,7 +6,7 @@
 | Part                                | Source                                                       |
 | ----------------------------------- | ------------------------------------------------------------ |
 | `<!-- generated:commands -->`       | The usage lines of `ork --help`                              |
-| `<!-- generated:slash-commands -->` | Frontmatter of `plugins/orchestrate/commands/*.md`           |
+| `<!-- generated:slash-commands -->` | Frontmatter of `adapters/claude/commands/*.md`               |
 | `<!-- generated:requirements -->`   | `engines.node` in `package.json`                             |
 | `docs/images/*.png`                 | The Swarm View and `monitor` renderers, drawn from demo data |
 | Plugin versions in the table        | The release job, see [releases](releases.md)                 |

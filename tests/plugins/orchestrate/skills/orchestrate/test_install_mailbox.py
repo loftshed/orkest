@@ -498,16 +498,13 @@ class InstallMailboxTests(unittest.TestCase):
         ork_cli = plugin_root / "bin/ork.mjs"
         ork_cli.parent.mkdir(parents=True)
         ork_cli.write_text("#!/usr/bin/env node\n")
-        (plugin_root / "commands").mkdir(parents=True)
-        (plugin_root / "commands/side.md").write_text("---\ndescription: Toggle side view\n---\n")
-        (plugin_root / "commands/update.md").write_text("---\ndescription: Update Orkest\n---\n")
+        (plugin_root / "adapters/claude/commands").mkdir(parents=True)
+        (plugin_root / "adapters/claude/commands/side.md").write_text("---\ndescription: Toggle side view\n---\n")
+        (plugin_root / "adapters/claude/commands/update.md").write_text("---\ndescription: Update Orkest\n---\n")
 
-        (self.base / ".claude/skills").mkdir(parents=True, exist_ok=True)
-        (self.base / ".claude/skills/side").symlink_to(self.base / ".agents/skills/side")
-        (self.base / ".claude-work/skills").mkdir(parents=True, exist_ok=True)
-        (self.base / ".claude-work/skills/side").symlink_to(self.base / ".agents/skills/side")
-        (self.base / ".gemini/antigravity/skills").mkdir(parents=True, exist_ok=True)
-        (self.base / ".gemini/antigravity/skills/side").symlink_to(self.base / ".agents/skills/side")
+        for duplicate in (".claude/skills", ".claude-work/skills", ".gemini/antigravity/skills"):
+            (self.base / duplicate).mkdir(parents=True, exist_ok=True)
+            (self.base / duplicate / "side").symlink_to(self.base / ".agents/skills/side")
         (self.base / ".codex/skills").mkdir(parents=True, exist_ok=True)
         (self.base / ".gemini/config/skills").mkdir(parents=True, exist_ok=True)
         (self.base / ".config/opencode/skills").mkdir(parents=True, exist_ok=True)
@@ -549,28 +546,28 @@ class InstallMailboxTests(unittest.TestCase):
         plugin_root = self.base / "plugin-root"
         command = "---\ndescription: Take the Chief desk\n---\n\n[orkest-chief-command: $ARGUMENTS]\n"
         skill = "---\nname: chief\ndescription: Act as Ork Chief\n---\n\n# Chief\n"
-        (plugin_root / "commands").mkdir(parents=True)
-        (plugin_root / "commands/chief.md").write_text(command)
-        (plugin_root / "skills/chief").mkdir(parents=True)
-        (plugin_root / "skills/chief/SKILL.md").write_text(skill)
-        (self.base / ".claude/skills").mkdir(parents=True, exist_ok=True)
+        (plugin_root / "adapters/claude/commands").mkdir(parents=True)
+        (plugin_root / "adapters/claude/commands/chief.md").write_text(command)
+        (plugin_root / "adapters/skills/chief").mkdir(parents=True)
+        (plugin_root / "adapters/skills/chief/SKILL.md").write_text(skill)
+        (self.base / ".claude/skills").mkdir(parents=True)
         (self.base / ".claude/skills/chief").symlink_to(self.base / ".agents/skills/chief")
         (self.base / ".claude-work/skills").mkdir(parents=True)
         (self.base / ".claude-work/skills/chief").symlink_to(self.base / ".claude/skills/chief")
-        (self.base / ".gemini/antigravity/skills").mkdir(parents=True, exist_ok=True)
+        (self.base / ".gemini/antigravity/skills").mkdir(parents=True)
         (self.base / ".gemini/antigravity/skills/chief").symlink_to(self.base / ".agents/skills/chief")
         for parent in (".codex/skills", ".gemini/config/skills", ".config/opencode/skills"):
             (self.base / parent).mkdir(parents=True)
 
         with redirect_stdout(io.StringIO()):
-            self.assertTrue(installer.install_chief_command(self.base, plugin_root=plugin_root, dry_run=True))
-            self.assertTrue(installer.install_chief_skill(self.base, plugin_root=plugin_root, dry_run=True))
+            self.assertTrue(installer.install_adapter_commands(self.base, plugin_root=plugin_root, dry_run=True))
+            self.assertTrue(installer.install_adapter_skills(self.base, plugin_root=plugin_root, dry_run=True))
         self.assertFalse((self.base / ".claude/commands/chief.md").exists())
         self.assertFalse((self.base / ".agents/skills/chief").exists())
 
         with redirect_stdout(io.StringIO()):
-            self.assertTrue(installer.install_chief_command(self.base, plugin_root=plugin_root))
-            self.assertTrue(installer.install_chief_skill(self.base, plugin_root=plugin_root))
+            self.assertTrue(installer.install_adapter_commands(self.base, plugin_root=plugin_root))
+            self.assertTrue(installer.install_adapter_skills(self.base, plugin_root=plugin_root))
         for claude_dir in (".claude", ".claude-work"):
             self.assertEqual((self.base / claude_dir / "commands/chief.md").read_text(), command)
         hub = self.base / ".agents/skills/chief"
@@ -584,13 +581,13 @@ class InstallMailboxTests(unittest.TestCase):
             self.assertEqual(link.resolve(), hub.resolve())
 
         with redirect_stdout(io.StringIO()):
-            self.assertFalse(installer.install_chief_command(self.base, plugin_root=plugin_root))
-            self.assertFalse(installer.install_chief_skill(self.base, plugin_root=plugin_root))
+            self.assertFalse(installer.install_adapter_commands(self.base, plugin_root=plugin_root))
+            self.assertFalse(installer.install_adapter_skills(self.base, plugin_root=plugin_root))
 
     def test_shell_wrappers_install_bundled_chief_command_and_skill(self):
-        plugin_root = Path(installer.__file__).resolve().parents[3]
-        self.assertTrue((plugin_root / "commands/chief.md").is_file())
-        self.assertTrue((plugin_root / "skills/chief/SKILL.md").is_file())
+        plugin_root = Path(installer.__file__).resolve().parents[5]
+        self.assertTrue((plugin_root / "adapters/claude/commands/chief.md").is_file())
+        self.assertTrue((plugin_root / "adapters/skills/chief/SKILL.md").is_file())
         (self.base / ".claude").mkdir()
         (self.base / ".codex").mkdir()
         ork_cli = self.base / "plugin-without-chief/bin/ork.mjs"
@@ -601,11 +598,11 @@ class InstallMailboxTests(unittest.TestCase):
             self.assertTrue(installer.install_shell_wrappers(self.base, ork_cli))
         self.assertEqual(
             (self.base / ".claude/commands/chief.md").read_text(),
-            (plugin_root / "commands/chief.md").read_text(encoding="utf-8"),
+            (plugin_root / "adapters/claude/commands/chief.md").read_text(encoding="utf-8"),
         )
         self.assertEqual(
             (self.base / ".agents/skills/chief/SKILL.md").read_text(),
-            (plugin_root / "skills/chief/SKILL.md").read_text(encoding="utf-8"),
+            (plugin_root / "adapters/skills/chief/SKILL.md").read_text(encoding="utf-8"),
         )
         self.assertEqual((self.base / ".codex/skills/chief").resolve(), (self.base / ".agents/skills/chief").resolve())
         self.assertFalse((self.base / ".claude/skills/chief").exists())
@@ -1007,14 +1004,14 @@ class InstallMailboxTests(unittest.TestCase):
         hub = self.base / ".agents/skills/chief"
         hub.mkdir(parents=True, exist_ok=True)
         skill = hub / "SKILL.md"
-        root = Path(installer.__file__).resolve().parents[3]
-        edited_command = (root / "commands/chief.md").read_bytes() + b"\nProject-specific instruction.\n"
+        root = Path(installer.__file__).resolve().parents[5] / "adapters"
+        edited_command = (root / "claude/commands/chief.md").read_bytes() + b"\nProject-specific instruction.\n"
         edited_skill = (root / "skills/chief/SKILL.md").read_bytes() + b"\nProject-specific instruction.\n"
         command.write_bytes(edited_command)
         skill.write_bytes(edited_skill)
         for _ in range(2):
-            installer.install_chief_command(self.base)
-            installer.install_chief_skill(self.base)
+            installer.install_adapter_commands(self.base)
+            installer.install_adapter_skills(self.base)
             self.assertEqual(edited_command, command.read_bytes())
             self.assertEqual(edited_skill, skill.read_bytes())
 
@@ -1046,6 +1043,12 @@ class InstallMailboxTests(unittest.TestCase):
             self.assertTrue(linked.is_symlink(), str(linked))
             self.assertEqual(linked.resolve(), hub.resolve())
         self.assertFalse(installer.install_herdr_skill(self.base, ork_cli=cli))
+        installed = hub / "SKILL.md"
+        edited = installed.read_bytes() + b"Local instructions.\n"
+        installed.write_bytes(edited)
+        repo_skill.write_text("# Updated upstream skill\n")
+        self.assertFalse(installer.install_herdr_skill(self.base, ork_cli=cli))
+        self.assertEqual(edited, installed.read_bytes())
 
     def test_statusline_wrappers_upgrade_claude_and_agy_settings(self):
         fast_bin = self.base / ".cache/orchestrate/bin/ork-fast"

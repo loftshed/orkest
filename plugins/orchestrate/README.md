@@ -272,7 +272,7 @@ ork chief send --to <room|branch|repo|agent|session> "Decision: …"
 ```
 
 Spawned orchestrators report back with `ork chief send --to chief`, which reaches whoever holds
-the desk when the message is sent. Details: [`/chief` skill](skills/chief/SKILL.md) and
+the desk when the message is sent. Details: [`/chief` skill](../../adapters/skills/chief/SKILL.md) and
 [architecture](../../docs/chief-architecture.md).
 
 ### Universal accounts (`ork account`, `/account`)

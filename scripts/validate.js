@@ -107,7 +107,7 @@ function checkSkill(skillDirectory, context) {
 function checkPathReferences(pluginDirectory, context) {
   const skillPattern = /\$\{CLAUDE_SKILL_DIR\}\/([\w./-]+)/gu;
   // A repo-relative path a command names in backticks, e.g. `plugins/orchestrate/lib/x.mjs`.
-  const commandPattern = /`((?:plugins|skills|crates|scripts|docs)\/[\w./-]+)`/gu;
+  const commandPattern = /`((?:adapters|plugins|skills|crates|scripts|docs)\/[\w./-]+)`/gu;
   const retired = /\$\{CLAUDE_PLUGIN_ROOT[}:]/u;
   for (const filePath of listFiles(pluginDirectory)) {
     if (!TEXT_EXTENSIONS.has(path.extname(filePath))) continue;
@@ -129,7 +129,7 @@ function checkPathReferences(pluginDirectory, context) {
         }
       }
     }
-    if (top === "commands") {
+    if (top === "commands" || (top === "claude" && skill === "commands")) {
       for (const [, reference] of text.matchAll(commandPattern)) {
         const target = reference.replace(/[.,]+$/u, "");
         if (!fs.existsSync(path.join(context.root, target))) {
@@ -206,6 +206,14 @@ export function validate(root = REPO_ROOT) {
       checkSkill(path.join(pluginDirectory, "skills", skill), context);
     }
     checkPathReferences(pluginDirectory, context);
+  }
+  const adapters = path.join(root, "adapters");
+  if (fs.existsSync(adapters)) {
+    const adapterSkills = listDirectories(path.join(adapters, "skills"));
+    for (const skill of adapterSkills) {
+      checkSkill(path.join(adapters, "skills", skill), context);
+    }
+    checkPathReferences(adapters, context);
   }
   errors.push(...checkOrcaManifest(root));
 

@@ -1126,12 +1126,15 @@ describe("ork chief", () => {
   });
 
   it("instructs Chief to route code/design questions directly and tells missions how to answer", () => {
-    const pluginRoot = path.resolve(
-      path.dirname(fileURLToPath(import.meta.url)),
-      "../../../plugins/orchestrate",
+    const pluginRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+    const skillText = fs.readFileSync(
+      path.join(pluginRoot, "adapters/skills/chief/SKILL.md"),
+      "utf8",
     );
-    const skillText = fs.readFileSync(path.join(pluginRoot, "skills/chief/SKILL.md"), "utf8");
-    const commandText = fs.readFileSync(path.join(pluginRoot, "commands/chief.md"), "utf8");
+    const commandText = fs.readFileSync(
+      path.join(pluginRoot, "adapters/claude/commands/chief.md"),
+      "utf8",
+    );
     expect(skillText).toContain("--kind question");
     expect(skillText).toMatch(/without asking/u);
     expect(commandText).toContain("--kind question");
