@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.94.0
+
+- feat: retire the Claude marketplace and release Orkest as one product (#240)
+
 ## History
 
 Orkest continues the Orchestrate version series. Earlier releases are recorded in
