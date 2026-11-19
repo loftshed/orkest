@@ -1975,8 +1975,10 @@ describe("ork chief", () => {
         generation: "renewed-generation-uuid",
       };
       fs.writeFileSync(chiefFile, JSON.stringify(renewedRecord, null, 2));
-      await new Promise((resolve) => locker.on("close", resolve));
-      await expect(clearPromise).rejects.toThrow(/conflict/u);
+      await Promise.all([
+        new Promise((resolve) => locker.on("close", resolve)),
+        expect(clearPromise).rejects.toThrow(/conflict/u),
+      ]);
       expect(JSON.parse(fs.readFileSync(chiefFile, "utf8")).generation).toBe(
         "renewed-generation-uuid",
       );
