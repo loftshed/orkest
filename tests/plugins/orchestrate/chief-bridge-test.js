@@ -15,6 +15,7 @@ import {
   loadChiefBridgeConfig,
   spawnChiefDelivery,
 } from "../../../plugins/orchestrate/lib/chief-bridge.mjs";
+import { moveFixtureAside, retainFixtures } from "../../helpers/retain-fixtures.js";
 
 const ctx = { tmp: "", configFile: "" };
 
@@ -43,9 +44,7 @@ beforeEach(() => {
   ctx.configFile = path.join(ctx.tmp, "cfg", "chief-bridge.json");
 });
 
-afterEach(() => {
-  fs.rmSync(ctx.tmp, { recursive: true, force: true });
-});
+afterEach(() => retainFixtures([ctx.tmp]));
 
 describe("chief bridge payload", () => {
   it("freezes the payload shape and derives a deterministic opaque id", () => {
@@ -121,17 +120,17 @@ describe("chief bridge configuration", () => {
   it("rejects a loose file mode, loose directory, symlink, bad url and unknown event", () => {
     writeConfig(WEBHOOK, { mode: 0o644 });
     expect(loadChiefBridgeConfig(envFor())).toBeNull();
-    fs.rmSync(path.dirname(ctx.configFile), { recursive: true });
+    moveFixtureAside(path.dirname(ctx.configFile));
     writeConfig(WEBHOOK, { dirMode: 0o755 });
     expect(loadChiefBridgeConfig(envFor())).toBeNull();
-    fs.rmSync(path.dirname(ctx.configFile), { recursive: true });
+    moveFixtureAside(path.dirname(ctx.configFile));
 
     writeConfig(WEBHOOK);
     const real = path.join(ctx.tmp, "cfg", "real.json");
     fs.renameSync(ctx.configFile, real);
     fs.symlinkSync(real, ctx.configFile);
     expect(loadChiefBridgeConfig(envFor())).toBeNull();
-    fs.rmSync(ctx.configFile);
+    moveFixtureAside(ctx.configFile);
     fs.renameSync(real, ctx.configFile);
 
     for (const bad of [
@@ -538,7 +537,7 @@ describe("deadlines, config hazards and sink independence", () => {
         }),
     ];
     for (const plant of attempts) {
-      fs.rmSync(target, { recursive: true, force: true });
+      moveFixtureAside(target);
       const server = await plant();
       const started = Date.now();
       expect(loadChiefBridgeConfig(envFor())).toBeNull();

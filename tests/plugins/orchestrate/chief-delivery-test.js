@@ -15,6 +15,7 @@ import {
   openDeliveryStore,
 } from "../../../plugins/orchestrate/lib/chief-delivery.mjs";
 import { openOrkestSqlite } from "../../../plugins/orchestrate/lib/orkest-sqlite.mjs";
+import { moveFixtureAside, retainFixtures } from "../../helpers/retain-fixtures.js";
 
 const BRIDGE_URL = new URL("../../../plugins/orchestrate/lib/chief-bridge.mjs", import.meta.url)
   .href;
@@ -109,15 +110,13 @@ beforeEach(() => {
   ctx.flag = path.join(ctx.tmp, "healthy.flag");
 });
 
-afterEach(() => {
-  fs.rmSync(ctx.tmp, { recursive: true, force: true });
-});
+afterEach(() => retainFixtures([ctx.tmp]));
 
 describe("independent CLI processes share one delivery", () => {
   it("never overlaps sink contacts across simultaneous senders and delivers each event once", async () => {
     const hook = writeHook(
       "slow.sh",
-      `#!/bin/sh\necho "start $(date +%s%N)" >> '${ctx.log}'\nsleep 0.3\ncat >> '${ctx.recorded}'\necho >> '${ctx.recorded}'\necho "end $(date +%s%N)" >> '${ctx.log}'\n`,
+      `#!/bin/sh\necho start >> '${ctx.log}'\nsleep 0.3\ncat >> '${ctx.recorded}'\necho >> '${ctx.recorded}'\necho end >> '${ctx.log}'\n`,
     );
     writeConfig({ version: 1, enabled: true, command: { path: hook } });
     const keys = Array.from({ length: 8 }, (_, index) => `report:${index}`);
@@ -132,17 +131,8 @@ describe("independent CLI processes share one delivery", () => {
     const ids = payloads().map((item) => item.id);
     expect(ids).toHaveLength(keys.length);
     expect(new Set(ids).size).toBe(keys.length);
-    // Replay the log: at most one hook ever ran at a time.
-    let inFlight = 0;
-    let peak = 0;
-    const entries = lines(ctx.log)
-      .map((entry) => entry.split(" "))
-      .toSorted((left, right) => Number(BigInt(left[1]) - BigInt(right[1])));
-    for (const line of entries) {
-      inFlight += line[0] === "start" ? 1 : -1;
-      peak = Math.max(peak, inFlight);
-    }
-    expect(peak).toBe(1);
+    // Shell appends preserve arrival order, so overlapping hooks produce consecutive starts.
+    expect(lines(ctx.log)).toEqual(keys.flatMap(() => ["start", "end"]));
     expect(counts()).toEqual({ pending: 0, sent: keys.length });
   }, 40_000);
 
@@ -491,7 +481,7 @@ describe("optional state hazards", () => {
     writeConfig(WEBHOOK);
     const foreign = (setup) => {
       const file = statePath();
-      fs.rmSync(file, { force: true });
+      moveFixtureAside(file);
       const db = new DatabaseSync(file);
       setup(db);
       db.close();
@@ -535,9 +525,9 @@ describe("optional state hazards", () => {
     db.exec("PRAGMA user_version = 99");
     db.close();
     expect(() => openDeliveryStore(file)).toThrow(/newer/u);
-    fs.rmSync(file);
-    fs.rmSync(`${file}-wal`, { force: true });
-    fs.rmSync(`${file}-shm`, { force: true });
+    moveFixtureAside(file);
+    moveFixtureAside(`${file}-wal`);
+    moveFixtureAside(`${file}-shm`);
     fs.writeFileSync(file, "", { mode: 0o600 });
     openDeliveryStore(file).close();
   });
