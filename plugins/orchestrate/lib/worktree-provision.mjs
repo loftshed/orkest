@@ -258,6 +258,18 @@ function createExclusive(file, record) {
   }
 }
 
+/** A setup or recovery claim must be reconciled by its owner before moving the checkout. */
+export function hasWorktreeSetupClaim(gitDir) {
+  return [SETUP_LOCK, SETUP_GUARD].some((name) => {
+    try {
+      lstatSync(path.join(gitDir, name));
+      return true;
+    } catch (error) {
+      return error.code !== "ENOENT";
+    }
+  });
+}
+
 /** The owner record, null when the file vanished, or `{ unreadable: true }`. */
 function readOwner(file) {
   try {

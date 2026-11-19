@@ -23,6 +23,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import {
   auditMergedWorktrees,
+  formatMergedCleanupReport,
   listJournals,
   matchPullRequest,
   mergedCleanup,
@@ -722,6 +723,24 @@ describe("cleanup --merged review cases", () => {
       options(recorded, { dryRun: true, targetBranch: undefined }),
     );
     expect(accepted.eligible).toHaveLength(1);
+  });
+
+  it("retains a checkout with an outstanding setup claim during partial process inspection", async () => {
+    const fixture = await makeFixture();
+    writeFileSync(path.join(fixture.gitDir, "orkest-setup.lock"), "incomplete");
+    const report = await mergedCleanup(
+      options(fixture, {
+        dryRun: false,
+        inspectProcesses: () => ({ inspectable: true, active: false, unreadable: 2 }),
+      }),
+    );
+    expect(report.quarantined).toEqual([]);
+    expect(entryFor(report, fixture).reasons).toContain("setup_claim_present");
+    expect(report.unreadableProcesses).toBe(2);
+    expect(formatMergedCleanupReport(report)).toContain(
+      "2 current-user process working directories could not be read",
+    );
+    expect(existsSync(fixture.worktreePath)).toBe(true);
   });
 
   it("keeps a worktree while a live process works inside it, and when process status is unknown", async () => {

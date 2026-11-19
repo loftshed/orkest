@@ -28,6 +28,7 @@ import { cacheHome } from "./runtime-paths.mjs";
 import { acquireWorkspaceLease, assertWorkspaceLease } from "./workspace-lease.mjs";
 import * as worktreePorts from "./worktree-ports.mjs";
 import { lookupPullRequest, originRepository } from "./worktree-pr.mjs";
+import { hasWorktreeSetupClaim } from "./worktree-provision.mjs";
 
 export {
   ensurePullRequest,
@@ -232,8 +233,7 @@ function inspectLinuxProcesses(root) {
   } catch {
     return { inspectable: false, active: false };
   }
-  // Credential-dropping daemons of our own user (agents, compositors) are non-dumpable, so the kernel
-  // refuses their cwd to everyone. They are counted and disclosed; workers Orkest launches are readable.
+  // The kernel can deny cwd inspection for a non-dumpable process owned by the current user.
   let unreadable = 0;
   for (const pid of pids) {
     if (Number(pid) === process.pid) continue;
@@ -243,7 +243,12 @@ function inspectLinuxProcesses(root) {
       }
     } catch (error) {
       if (error?.code === "ENOENT" || error?.code === "ESRCH") continue;
-      // cwd is refused: fall back to the command line, which names a worktree in practice.
+      try {
+        if (statSync(`/proc/${pid}`).uid !== process.getuid()) continue;
+      } catch (statError) {
+        if (statError.code === "ENOENT" || statError.code === "ESRCH") continue;
+      }
+      // A process may name its checkout even when the kernel hides its cwd.
       let cmdline = "";
       try {
         cmdline = readFileSync(`/proc/${pid}/cmdline`, "utf8");
@@ -270,19 +275,21 @@ function inspectLsofProcesses(root, run, env) {
       }) ?? "",
     );
   } catch (error) {
-    // lsof exits 1 when it lists nothing for some users; any other failure is "unknown".
-    if (error?.status === 1 && !error?.stdout) return { inspectable: true, active: false };
+    // lsof can exit 1 with partial records. Empty output gives no visibility.
     output = typeof error?.stdout === "string" && error?.status === 1 ? error.stdout : null;
     if (output === null) return { inspectable: false, active: false };
   }
   let pid = null;
+  let hasCwd = false;
   for (const line of output.split("\n")) {
     if (line.startsWith("p")) pid = Number(line.slice(1));
-    else if (line.startsWith("n") && pid !== process.pid && pathIsAtOrInside(root, line.slice(1))) {
-      return { inspectable: true, active: true, pid };
+    else if (pid && line.startsWith("n/")) {
+      hasCwd = true;
+      if (pid !== process.pid && pathIsAtOrInside(root, line.slice(1)))
+        return { inspectable: true, active: true, pid };
     }
   }
-  return { inspectable: true, active: false };
+  return { inspectable: hasCwd, active: false };
 }
 
 /** Any process whose working directory is inside the worktree keeps it; unknown status keeps it too. */
@@ -476,6 +483,7 @@ export async function evaluateMergedWorktree(entry, ctx) {
   const gitDir = tryGit(run, worktreePath, ["rev-parse", "--absolute-git-dir"], env)?.trim();
   result.gitAdmin = gitDir ? { path: realOrResolved(gitDir), identity: identityOf(gitDir) } : null;
   const marker = gitDir ? readJsonSafe(path.join(gitDir, "orkest.json")) : null;
+  if (gitDir && hasWorktreeSetupClaim(gitDir)) keep("setup_claim_present");
   const loadedState = loadFoundryState(worktreePath);
   const state = loadedState.kind === "ok" ? loadedState.state : null;
   if (!["missing", "ok"].includes(loadedState.kind)) keep("foundry_state_unreadable");
@@ -1267,6 +1275,10 @@ export async function mergedCleanup({
   const report = {
     mode: "merged",
     repoRoot: audit.repoRoot,
+    unreadableProcesses: audit.entries.reduce(
+      (highest, entry) => Math.max(highest, entry.unreadableProcesses ?? 0),
+      0,
+    ),
     targetBranch: audit.base,
     dryRun,
     error: audit.error ?? null,
@@ -1384,6 +1396,10 @@ export function formatMergedCleanupReport(report) {
     `  Quarantined: ${report.quarantined.length}, eligible: ${report.eligible.length}, kept: ${report.kept.length}`,
     "  Bytes reclaimed: 0 (nothing is deleted)",
   ];
+  if (report.unreadableProcesses)
+    lines.push(
+      `  Process inspection was partial: ${report.unreadableProcesses} current-user process working directories could not be read.`,
+    );
   if (report.error) lines.push(`  Error: ${report.error}`);
   for (const item of report.eligible) {
     lines.push(
