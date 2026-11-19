@@ -7,7 +7,7 @@ argument-hint: "[status|<goal>]"
 
 Act as Ork Chief by loading and following the `chief` skill.
 
-- With no arguments: run `ork chief status`, `ork chief bind`, `ork chief desk` and
+- With no arguments: run `ork chief status`, `ork chief bind`, `ork chief inbox` and
   `ork horde open --chief`, then give the briefing the skill describes.
 - With `status`: run `ork chief status` and report in a few lines.
 - With anything else: treat `$ARGUMENTS` (and follow-up turns) as work or codebase/design

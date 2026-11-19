@@ -279,6 +279,31 @@ Spawned orchestrators report back with `ork chief send --to chief`, which reache
 the desk when the message is sent. Details: [`/chief` skill](skills/chief/SKILL.md) and
 [architecture](../../docs/chief-architecture.md).
 
+### Universal accounts (`ork account`, `/account`)
+
+Every account lives in Monitor's `accounts[]`; there are no work/personal slots. Each mutation takes the
+same lock as Monitor's repository-policy writer (`<config target>.lock`, following a symlinked config).
+
+```sh
+ork account add <claude|codex|agy|opencode> --profile <slug> [--id <id>] [--alias <cmd>] [--tag <tag> ...]
+                [--label <text>] [--short <2ch>] [--config-dir <path>] [--no-sync] [--json]
+ork account list [--json]                     # provider, id, alias, tags, home, syncStatus, loginStatus
+ork account tag <id-or-alias> <add|remove|set> <tag...>
+ork account remove <id-or-alias> [--purge-profile] [--json]
+ork account sync [--dry-run] [--json]         # federate mailbox, hooks and Monitor into every profile
+```
+
+- Default profile homes are `~/.claude-<slug>`, `~/.codex-<slug>`, `~/.antigravity-<slug>` and
+  `~/.opencode-<slug>` (OpenCode gets isolated `config`, `data`, `state` and `cache` roots; independent
+  OpenCode logins are not yet verified end to end). Custom `--config-dir` paths must sit under your home.
+- `--alias` installs `~/.local/bin/<alias>`, an Orkest-managed wrapper that clears API-key variables, sets the
+  profile variables and runs the real provider. Orkest replaces only a wrapper it wrote for the same account.
+- `add` prints the exact sign-in command. `loginStatus` is `unknown` unless a credential file exists, since
+  keyring-backed logins leave none; credential contents are never read.
+- If federation fails, the account stays configured, `syncStatus` is `pending`, the exit code is nonzero and
+  rerunning `ork account sync` converges. `remove` keeps the profile; `--purge-profile` only moves an
+  Orkest-created profile to quarantine, and only after you confirm in a terminal.
+
 ### Heavy-run gate (`ork gate`)
 
 When several agents share one machine, `ork gate` keeps their test suites, builds and project-wide checks from running all at once. A focused run takes one of two slots. A `--heavy` run (whole suite, production build, project-wide typecheck or lint) waits for every slot, and waiters are told who holds the gate. Inside the gate, Vitest and Jest are capped at two workers, the command runs at nice 10, every completed run is recorded in a shared ledger with an advisory source-metadata digest, and a heavy or failed run's full output is saved to a log, so nobody reruns a suite to get back output that scrolled away.

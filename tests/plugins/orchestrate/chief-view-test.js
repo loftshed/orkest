@@ -344,12 +344,492 @@ describe("chief overview input", () => {
     expect(chief.handleMouse(click)).toBe(true);
     expect(chief.selectedKey).toBe("room:room-auth");
     expect(chief.handleMouse(click)).toMatchObject({ type: "chief-drill", roomId: "room-auth" });
-    expect(chief.handleMouse({ x: 1, y: 1, action: "scroll-down" })).toBe(true);
-    expect(chief.selectedKey).toBe("session:solo-1");
+    expect(chief.handleMouse({ x: 1, y: 1, action: "scroll-down" })).toBe(false);
+    expect(chief.selectedKey).toBe("room:room-auth");
     chief.render(80);
     const help = chief.targets.find((item) => item.id === "help");
     expect(chief.handleMouse({ x: help.x, y: help.y, button: 0, action: "press" })).toBe(true);
     expect(chief.overlay).toBe("help");
+  });
+});
+
+function keysOf(chief) {
+  return chief.visible.map((entry) => entry.key);
+}
+
+function typeText(chief, value) {
+  for (const character of value) chief.handleKey(character);
+}
+
+function deskItems(count) {
+  return Array.from({ length: count }, (_, index) => ({
+    id: `d-${index}`,
+    kind: "question",
+    from: "Lumen",
+    text: `Desk item ${index}`,
+    at: `2026-11-18T05:${String(10 + index).padStart(2, "0")}:00.000Z`,
+  }));
+}
+
+describe("chief wheel invariant", () => {
+  it("keeps selection, close confirmation and mode on wheel ticks on every main selection", () => {
+    for (const entry of view().visible) {
+      const chief = view({ confirmClose: true, lastRoomId: "room-chief" });
+      chief.selectedKey = entry.key;
+      chief.handleKey("q");
+      chief.render(100);
+      for (const action of ["scroll-up", "scroll-down"]) {
+        expect(chief.handleMouse({ x: 4, y: 4, button: 4, action })).toBe(false);
+      }
+      expect(chief.selectedKey).toBe(entry.key);
+      expect(chief.closeArmedAt).toBe(NOW);
+      expect(chief.lastRoomId).toBe("room-chief");
+      expect(chief.overlay).toBeUndefined();
+    }
+  });
+
+  it("leaves selection and the help overlay untouched on wheel ticks", () => {
+    const chief = view();
+    chief.handleKey("?");
+    chief.render(80);
+    const selected = chief.selectedKey;
+    for (const action of ["scroll-up", "scroll-down"]) {
+      expect(chief.handleMouse({ x: 1, y: 1, action })).toBe(false);
+    }
+    expect(chief.selectedKey).toBe(selected);
+    expect(chief.overlay).toBe("help");
+  });
+});
+
+describe("chief search, attention and selection", () => {
+  it("matches each searchable field case-insensitively and Esc restores the list", () => {
+    const cases = {
+      webapp: ["room:room-auth"],
+      "feat/ork": ["room:room-chief"],
+      PR7: ["room:room-chief"],
+      "docs refresh": ["room:room-docs"],
+      "room-auth": ["room:room-auth"],
+      lumen: ["room:room-chief"],
+      "coord-auth": ["room:room-auth"],
+      scout: ["session:solo-1"],
+      "solo-2": ["session:solo-2"],
+      NOTES: ["session:solo-2"],
+    };
+    for (const [query, expected] of Object.entries(cases)) {
+      const chief = view();
+      chief.handleKey("/");
+      typeText(chief, query);
+      expect(keysOf(chief), query).toEqual(expected);
+      chief.handleKey("\u{1B}");
+      expect(chief.prompt).toBeNull();
+      expect(chief.query).toBe("");
+      expect(keysOf(chief)).toHaveLength(5);
+    }
+  });
+
+  it("treats typed q, a, x, i, / and spaces as filter text and keeps the filter on Enter", () => {
+    const chief = view();
+    chief.handleKey("/");
+    typeText(chief, "auth");
+    expect(chief.handleKey("\r")).toBe(true);
+    expect(chief.prompt).toBeNull();
+    expect(chief.query).toBe("auth");
+    expect(keysOf(chief)).toEqual(["room:room-auth"]);
+    expect(chief.handleKey("\u{7F}")).toBe(false);
+  });
+
+  it("intersects the attention filter with search and reports no match without moving selection", () => {
+    const chief = view();
+    chief.handleKey("a");
+    expect(keysOf(chief)).toEqual(["room:room-chief", "room:room-auth"]);
+    chief.handleKey("/");
+    typeText(chief, "docs");
+    expect(keysOf(chief)).toEqual([]);
+    expect(chief.notice).toContain("No match");
+    expect(chief.selectedKey).toBe("room:room-chief");
+    expect(chief.handleKey("\r")).toBe(true);
+    chief.handleKey("\u{1B}");
+    expect(chief.attentionOnly).toBe(false);
+    expect(keysOf(chief)).toHaveLength(5);
+  });
+
+  it("wraps n once through visible attention entries and reports when nothing matches", () => {
+    const chief = view();
+    expect(chief.selectedKey).toBe("room:room-chief");
+    chief.handleKey("n");
+    expect(chief.selectedKey).toBe("room:room-auth");
+    chief.handleKey("n");
+    expect(chief.selectedKey).toBe("room:room-chief");
+    chief.handleKey("/");
+    typeText(chief, "zzz");
+    chief.handleKey("\r");
+    expect(chief.handleKey("n")).toBe(true);
+    expect(chief.notice).toContain("Nothing");
+    expect(chief.selectedKey).toBe("room:room-chief");
+  });
+});
+
+describe("chief compose line", () => {
+  it("keeps composing keys as text and emits the frozen reply exactly once", () => {
+    const chief = view();
+    expect(chief.handleKey("r")).toBe(true);
+    expect(chief.prompt).toMatchObject({
+      kind: "reply",
+      target: "room-chief",
+      targetLabel: "Ork Chief side window",
+    });
+    typeText(chief, "qax i/ ok");
+    expect(chief.handleKey("\r")).toEqual({
+      type: "chief-reply",
+      target: "room-chief",
+      targetLabel: "Ork Chief side window",
+      text: "qax i/ ok",
+    });
+    expect(chief.prompt).toBeNull();
+    expect(chief.handleKey("\r")).toMatchObject({ type: "chief-drill", roomId: "room-chief" });
+  });
+
+  it("retains the prompt for whitespace Enter and trims a real reply", () => {
+    const chief = view({ lastRoomId: undefined });
+    chief.handleKey("r");
+    typeText(chief, " ".repeat(3));
+    expect(chief.handleKey("\r")).toBe(true);
+    expect(chief.prompt.text).toBe(" ".repeat(3));
+    chief.handleKey("\u{7F}");
+    typeText(chief, " hi ");
+    expect(chief.handleKey("\r")).toMatchObject({ type: "chief-reply", text: "hi" });
+  });
+
+  it("removes whole graphemes on backspace and cancels on Esc", () => {
+    const chief = view();
+    chief.handleKey("r");
+    typeText(chief, "中文");
+    chief.handleKey("\u{7F}");
+    expect(chief.prompt.text).toBe("中");
+    typeText(chief, "👨‍👩‍👧");
+    chief.handleKey("\b");
+    expect(chief.prompt.text).toBe("中");
+    typeText(chief, "x");
+    expect(chief.handleKey("\u{1B}")).toBe(true);
+    expect(chief.prompt).toBeNull();
+    expect(chief.notice).toBe("Reply cancelled.");
+  });
+
+  it("filters terminal control characters out of typed text", () => {
+    const chief = view();
+    chief.handleKey("r");
+    chief.handleKey("\u{7}");
+    chief.handleKey("a\tb\u{1B}[31m");
+    expect(chief.prompt.text).toBe("ab");
+  });
+
+  it("cancels with a notice when a refresh removes the original target", () => {
+    const chief = view();
+    chief.handleKey("r");
+    typeText(chief, "hi");
+    const without = {
+      ...status(),
+      rooms: status().rooms.filter((room) => room.id !== "room-chief"),
+    };
+    chief.setStatus(without);
+    expect(chief.prompt).toBeNull();
+    expect(chief.notice).toContain("no longer listed");
+  });
+
+  it("replies to a standalone session by its raw session ID", () => {
+    const chief = view();
+    chief.handleKey("\u{1B}[B");
+    chief.handleKey("\u{1B}[B");
+    chief.handleKey("\u{1B}[B");
+    expect(chief.selectedKey).toBe("session:solo-1");
+    chief.handleKey("r");
+    typeText(chief, "ok");
+    expect(chief.handleKey("\r")).toEqual({
+      type: "chief-reply",
+      target: "solo-1",
+      targetLabel: "Scout",
+      text: "ok",
+    });
+  });
+});
+
+describe("chief desk drawer", () => {
+  function deskView(extra = {}) {
+    return new ChiefView(
+      {
+        ...status(),
+        desk: [
+          {
+            id: "d-b",
+            kind: "escalation",
+            from: "Vega",
+            text: "Desk beta",
+            at: "2026-11-18T05:55:00.000Z",
+          },
+          {
+            id: "d-c",
+            kind: "done",
+            from: "Quill",
+            text: "Desk gamma",
+            at: "2026-11-18T05:55:00.000Z",
+          },
+        ],
+        inbox: [
+          {
+            id: "i-a",
+            kind: "question",
+            from: "",
+            text: "Inbox alpha",
+            at: "2026-11-18T05:59:00.000Z",
+          },
+        ],
+        ...extra,
+      },
+      { now: () => NOW, tier: "unicode", height: 40 },
+    );
+  }
+
+  it("lists newest first with an ID tie-break and closes on i or Esc", () => {
+    const chief = deskView();
+    chief.handleKey("i");
+    const output = text(chief.render(100));
+    expect(output).toContain("Chief desk & inbox");
+    expect(output.indexOf("Inbox alpha")).toBeLessThan(output.indexOf("Desk beta"));
+    expect(output.indexOf("Desk beta")).toBeLessThan(output.indexOf("Desk gamma"));
+    expect(output).toContain("Unattributed · question");
+    expect(chief.handleKey("\u{1B}")).toBe(true);
+    expect(chief.drawerOpen).toBe(false);
+    chief.handleKey("i");
+    expect(chief.handleKey("i")).toBe(true);
+    expect(chief.drawerOpen).toBe(false);
+  });
+
+  it("acknowledges only while open and only identified items", () => {
+    const chief = deskView();
+    expect(chief.handleKey("A")).toBe(false);
+    chief.handleKey("i");
+    expect(chief.handleKey("A")).toEqual({ type: "chief-ack-desk" });
+    const legacy = new ChiefView(
+      { ...status(), desk: [{ kind: "done", from: "Quill", text: "No id" }] },
+      { now: () => NOW, tier: "unicode" },
+    );
+    legacy.handleKey("i");
+    expect(legacy.handleKey("A")).toBe(true);
+    expect(legacy.notice).toContain("no item IDs");
+    const empty = new ChiefView({ ...status(), desk: [], inbox: [] }, { now: () => NOW });
+    empty.handleKey("i");
+    expect(text(empty.render(80))).toContain("Nothing is waiting for Chief.");
+    expect(empty.handleKey("A")).toBe(true);
+    expect(empty.notice).toContain("Nothing is waiting");
+  });
+
+  it("scrolls a clamped drawer with keys and wheel while selection stays put", () => {
+    const chief = new ChiefView(
+      { ...status(), desk: deskItems(7) },
+      { now: () => NOW, height: 40 },
+    );
+    chief.handleKey("i");
+    chief.render(100);
+    const selected = chief.selectedKey;
+    for (let index = 0; index < 6; index++) chief.handleKey("\u{1B}[B");
+    expect(chief.drawerOffset).toBe(2);
+    expect(chief.handleMouse({ x: 1, y: 1, action: "scroll-up" })).toBe(true);
+    expect(chief.drawerOffset).toBe(1);
+    for (let index = 0; index < 4; index++) chief.handleMouse({ x: 1, y: 1, action: "scroll-up" });
+    expect(chief.drawerOffset).toBe(0);
+    expect(chief.handleMouse({ x: 1, y: 1, action: "scroll-up" })).toBe(false);
+    expect(chief.selectedKey).toBe(selected);
+  });
+
+  it("does not let a click through the drawer reach a list row", () => {
+    const chief = deskView();
+    chief.render(100);
+    chief.handleKey("i");
+    chief.render(100);
+    const drawer = chief.targets.find((target) => target.id === "drawer");
+    expect(drawer).toBeDefined();
+    const selected = chief.selectedKey;
+    expect(
+      chief.handleMouse({ x: drawer.x + 3, y: drawer.y + 1, button: 0, action: "press" }),
+    ).toBe(false);
+    expect(chief.selectedKey).toBe(selected);
+  });
+
+  it("clamps the drawer offset after a resize shrinks the drawer", () => {
+    const chief = new ChiefView(
+      { ...status(), desk: deskItems(7) },
+      { now: () => NOW, height: 40 },
+    );
+    chief.handleKey("i");
+    chief.render(100);
+    chief.handleMouse({ x: 1, y: 1, action: "scroll-down" });
+    chief.handleMouse({ x: 1, y: 1, action: "scroll-down" });
+    expect(chief.drawerOffset).toBe(2);
+    chief.height = 12;
+    const lines = chief.render(100);
+    expect(chief.drawerOffset).toBeLessThanOrEqual(chief.drawerMaxOffset());
+    expect(lines).toHaveLength(12);
+    expect(text(lines)).toContain("of 7");
+  });
+});
+
+describe("chief room close arming", () => {
+  function quietStatus() {
+    const value = status();
+    value.rooms[2].coordinator.status = "idle";
+    value.rooms[2].counts = { working: 0, blocked: 0, done: 0, idle: 3, total: 3 };
+    return value;
+  }
+
+  it("closes on a second x within the interval and only for the armed room", () => {
+    let nowMs = NOW;
+    const chief = new ChiefView(quietStatus(), { now: () => nowMs, tier: "unicode", height: 40 });
+    chief.handleKey("\u{1B}[B");
+    expect(chief.selectedKey).toBe("room:room-docs");
+    expect(chief.handleKey("x")).toBe(true);
+    expect(chief.notice).toContain("Press x again");
+    nowMs += 2000;
+    expect(chief.handleKey("x")).toEqual({ type: "chief-close-room", roomId: "room-docs" });
+    expect(chief.handleKey("x")).toBe(true);
+  });
+
+  it("disarms on timeout and when the selection changes to another room", () => {
+    let nowMs = NOW;
+    const chief = new ChiefView(quietStatus(), { now: () => nowMs, tier: "unicode", height: 40 });
+    chief.handleKey("\u{1B}[B");
+    chief.handleKey("x");
+    nowMs += 3001;
+    expect(chief.handleKey("x")).toBe(true);
+    expect(chief.handleKey("x")).toEqual({ type: "chief-close-room", roomId: "room-docs" });
+    chief.handleKey("x");
+    chief.handleKey("\u{1B}[B");
+    expect(chief.selectedKey).toBe("room:room-auth");
+    expect(chief.roomClose).toBeUndefined();
+    expect(chief.handleKey("x")).toBe(true);
+    expect(chief.roomClose).toMatchObject({ roomId: "room-auth" });
+  });
+
+  it("refuses live rooms, standalone sessions and empty selections without arming", () => {
+    const chief = view();
+    chief.handleKey("x");
+    expect(chief.notice).toContain("still working");
+    expect(chief.roomClose).toBeUndefined();
+    chief.handleKey("x");
+    expect(chief.roomClose).toBeUndefined();
+    chief.selectedKey = "session:solo-1";
+    expect(chief.handleKey("x")).toBe(true);
+    expect(chief.notice).toContain("Only orchestrator rooms");
+    chief.handleKey("/");
+    typeText(chief, "zzz");
+    chief.handleKey("\r");
+    expect(chief.handleKey("x")).toBe(true);
+    expect(chief.roomClose).toBeUndefined();
+  });
+
+  it("disarms on mouse press and when the armed room disappears", () => {
+    const chief = new ChiefView(quietStatus(), { now: () => NOW, tier: "unicode", height: 40 });
+    chief.handleKey("\u{1B}[B");
+    chief.handleKey("x");
+    chief.render(80);
+    const target = chief.targets.find((item) => item.entryKey === "room:room-chief");
+    chief.handleMouse({ x: target.x + 2, y: target.y, button: 0, action: "press" });
+    expect(chief.roomClose).toBeUndefined();
+    chief.selectedKey = "room:room-docs";
+    chief.handleKey("x");
+    chief.setStatus({
+      ...quietStatus(),
+      rooms: quietStatus().rooms.filter((r) => r.id !== "room-docs"),
+    });
+    expect(chief.roomClose).toBeUndefined();
+  });
+});
+
+describe("chief compose and drawer rendering", () => {
+  function hostile() {
+    const value = status();
+    value.rooms[1].title = "数据库迁移 🚀 \u{1B}[31mred\u{1B}[0m\u{7}bell";
+    value.rooms[1].coordinator.name = "Quill 👩🏽‍💻";
+    value.desk = [
+      {
+        id: "h-1",
+        kind: "question",
+        from: "拉丝\u{1B}[2J",
+        text: `${"long reply words ".repeat(20)}END-OF-TEXT`,
+        at: "2026-11-18T05:59:00.000Z",
+      },
+    ];
+    return value;
+  }
+
+  it.each([48, 100, 160])(
+    "fits every line and the height at %i columns with color on and off, Unicode and ASCII",
+    (width) => {
+      for (const color of [false, true]) {
+        for (const tier of ["unicode", "ascii"]) {
+          const chief = new ChiefView(hostile(), { now: () => NOW, tier, color, height: 22 });
+          chief.handleKey("i");
+          chief.handleKey("r");
+          typeText(chief, "a long reply ".repeat(6));
+          const lines = chief.render(width);
+          expect(lines).toHaveLength(22);
+          expectFits(lines, width);
+          expect(text(lines)).not.toContain("\u{7}");
+          expect(text(lines)).not.toContain("[31m");
+        }
+      }
+    },
+  );
+
+  it("shows the editable tail of a long reply and the drawer sender and kind at 48 columns", () => {
+    const chief = new ChiefView(hostile(), { now: () => NOW, tier: "unicode", height: 22 });
+    chief.handleKey("i");
+    chief.handleKey("\u{1B}[B");
+    chief.handleKey("\u{1B}[A");
+    chief.handleKey("r");
+    typeText(chief, "a long reply ".repeat(4));
+    typeText(chief, "tail-marker");
+    const output = text(chief.render(48));
+    expect(output).toContain("Reply to");
+    expect(output).toContain("tail-marker");
+    expect(output).toContain("question");
+    expect(output).toContain("Enter sends");
+  });
+
+  it("keeps the selection and the prompt visible at a short height with long CJK names", () => {
+    const chief = new ChiefView(hostile(), { now: () => NOW, tier: "unicode", height: 14 });
+    chief.lastRoomId = "room-docs";
+    chief.selectedKey = "room:room-docs";
+    chief.handleKey("r");
+    typeText(chief, "short");
+    const lines = chief.render(48);
+    const output = text(lines);
+    expect(lines).toHaveLength(14);
+    expect(output).toContain("▸");
+    expect(output).toContain("Reply to");
+    expect(output).toContain("short▏");
+  });
+
+  it("shows extra room context at wide widths and the full key list in help", () => {
+    const wide = text(view({ lastRoomId: "room-chief" }).render(160));
+    expect(wide).toContain("Goal Ship the machine-wide Chief overview");
+    const chief = view();
+    chief.handleKey("?");
+    const help = text(chief.render(48));
+    for (const word of ["Filter", "attention", "Reply", "Chief desk", "Close the selected"]) {
+      expect(help).toContain(word);
+    }
+  });
+
+  it("hit-tests the rerendered frame after a resize", () => {
+    const chief = view();
+    chief.render(160);
+    chief.render(48);
+    const target = chief.targets.find((item) => item.entryKey === "room:room-auth");
+    expect(target).toBeDefined();
+    const click = { x: target.x + 2, y: target.y, button: 0, action: "press" };
+    expect(chief.handleMouse(click)).toBe(true);
+    expect(chief.selectedKey).toBe("room:room-auth");
+    expect(chief.handleMouse(click)).toMatchObject({ type: "chief-drill", roomId: "room-auth" });
   });
 });
 

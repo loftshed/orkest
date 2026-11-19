@@ -9,20 +9,27 @@ import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import {
   accessSync,
+  closeSync,
   existsSync,
+  fchmodSync,
   constants as fsConstants,
+  lstatSync,
   mkdirSync,
+  openSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   renameSync,
-  rmSync,
   statSync,
+  unlinkSync,
   writeFileSync,
+  writeSync,
 } from "node:fs";
 import { homedir, hostname } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { herdrEndpoint } from "./herdr-context.mjs";
 import {
   CHIEF_FOCUS_TEXT,
   cleanNonChiefFocus,
@@ -30,9 +37,11 @@ import {
   listRawRooms,
   mailboxRoot,
   processStarted,
+  readRawRoom,
   updateRawRoom,
 } from "./horde-room.mjs";
 import { isTerminalDisplayState, memberDisplayState } from "./member-state.mjs";
+import { orcaPaneContext, orcaTerminalHandle, resolveOrcaCli } from "./orca-context.mjs";
 import {
   CANONICAL_HARNESSES,
   loadConfiguredAccounts,
@@ -41,6 +50,7 @@ import {
   resolvePolicyConfigPath,
 } from "./policy.mjs";
 import { belongsToRoom, isPeerLive, newRoom, roomOwnerSessions } from "./rooms.mjs";
+import { cacheHome } from "./runtime-paths.mjs";
 import { applyLauncherAccountEnv, checkRepoPolicyForSide } from "./side.mjs";
 import {
   provisionWorktree,
@@ -907,7 +917,193 @@ function deskDir(root) {
   return path.join(root, "chief", "desk");
 }
 
-export function listDesk(root = mailboxRoot()) {
+const DESK_JOURNAL_VERSION = 1;
+const LEGACY_DESK_PREFIX = "legacy:";
+
+// ---------------------------------------------------------------------------
+// Guarded filesystem helpers: trusted roots, private directories, bounded reads
+
+const ROOM_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/u;
+const EVENT_FILE_RE = /^([0-9a-f]{32})\.json$/u;
+
+export function isValidRoomId(value) {
+  return typeof value === "string" && ROOM_ID_RE.test(value);
+}
+
+/** Canonical absolute path: realpath of the nearest existing ancestor plus the missing components. */
+export function canonicalPath(target) {
+  const absolute = path.resolve(String(target));
+  const missing = [];
+  let current = absolute;
+  for (;;) {
+    try {
+      return path.join(realpathSync(current), ...missing.toReversed());
+    } catch (error) {
+      if (error.code !== "ENOENT" && error.code !== "ENOTDIR") throw error;
+      const parent = path.dirname(current);
+      if (parent === current) return absolute;
+      missing.push(path.basename(current));
+      current = parent;
+    }
+  }
+}
+
+/** Containment by path components: equal paths, or a descendant. Never a string prefix. */
+export function isWithinPath(child, parent) {
+  const relative = path.relative(parent, child);
+  if (relative === "") return true;
+  if (path.isAbsolute(relative)) return false;
+  return relative.split(path.sep)[0] !== "..";
+}
+
+function readBoundedJsonFile(file, maxBytes = 256 * 1024) {
+  let stat;
+  try {
+    stat = lstatSync(file);
+  } catch (error) {
+    if (error.code === "ENOENT") return { missing: true };
+    return { error: "unreadable" };
+  }
+  if (!stat.isFile() || stat.size > maxBytes) return { error: "unsafe" };
+  try {
+    const value = JSON.parse(readFileSync(file, "utf8"));
+    return isPlainObject(value) ? { value } : { error: "malformed" };
+  } catch {
+    return { error: "malformed" };
+  }
+}
+
+function assertPrivateDirectory(directory) {
+  const stat = lstatSync(directory);
+  if (!stat.isDirectory() || stat.isSymbolicLink())
+    throw new Error(`Not a directory: ${directory}`);
+  if (typeof process.getuid === "function" && stat.uid !== process.getuid())
+    throw new Error(`Foreign owner for ${directory}`);
+  if ((stat.mode & 0o022) !== 0) throw new Error(`Writable by others: ${directory}`);
+}
+
+/**
+ * The mailbox client reads `<cache>/mailbox-v1`, where the cache comes from ORCHESTRATE_HOME. A
+ * hook's sanitized environment lacks it, so it is derived from the trusted root. A root with any
+ * other name cannot be reached by that client, so the caller queues instead (null).
+ */
+function mailboxStoreEnv(root, env, runMailbox) {
+  if (runMailbox !== defaultRunMailbox) return env;
+  if (path.basename(root) !== "mailbox-v1") return null;
+  return { ...env, ORCHESTRATE_HOME: path.dirname(root) };
+}
+
+/** Sleeps for a bounded interval; the desk and mission locks poll with it. */
+function sleepMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Exclusive lock file (O_EXCL, no-follow). A holder whose process is dead is broken; a live one
+ * is waited for up to `timeoutMs`. The lock is released even when `fn` throws.
+ */
+async function withExclusiveLock(lockFile, fn, { timeoutMs = 15_000 } = {}) {
+  mkdirSync(path.dirname(lockFile), { recursive: true, mode: 0o700 });
+  const started = Date.now();
+  for (;;) {
+    try {
+      const fd = openSync(
+        lockFile,
+        fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
+        0o600,
+      );
+      writeSync(fd, `${process.pid}\n`);
+      closeSync(fd);
+      break;
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+      const holder = Number(readFileSync(lockFile, "utf8"));
+      if (pidAlive(holder) !== true) {
+        try {
+          unlinkSync(lockFile);
+        } catch {
+          // Another process broke it first.
+        }
+        continue;
+      }
+      if (Date.now() - started > timeoutMs)
+        throw new Error(`Timed out waiting for ${lockFile}`, { cause: error });
+      await sleepMs(10 + Math.floor(Math.random() * 20));
+    }
+  }
+  try {
+    return await fn();
+  } finally {
+    try {
+      unlinkSync(lockFile);
+    } catch {
+      // Already removed.
+    }
+  }
+}
+
+function deskJournalPath(root) {
+  return path.join(root, "chief", "desk.jsonl");
+}
+
+function deskLockPath(root) {
+  return path.join(root, "chief", "desk.lock");
+}
+
+function missionLockPath(root, roomId) {
+  return path.join(root, "chief", "locks", `${roomId}.lock`);
+}
+
+/** Journal records are versioned: put adds an immutable item, ack tombstones IDs. */
+function readDeskJournal(root) {
+  const puts = new Map();
+  const acked = new Set();
+  const links = new Map();
+  let text;
+  try {
+    text = readFileSync(deskJournalPath(root), "utf8");
+  } catch {
+    return { puts, acked };
+  }
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    let record;
+    try {
+      record = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (!isPlainObject(record) || record.v !== DESK_JOURNAL_VERSION) continue;
+    if (
+      record.op === "put" &&
+      typeof record.id === "string" &&
+      isPlainObject(record.item) &&
+      !puts.has(record.id)
+    ) {
+      puts.set(record.id, { ...record.item, id: record.id });
+    } else if (record.op === "ack" && Array.isArray(record.ids)) {
+      for (const id of record.ids) if (typeof id === "string") acked.add(id);
+    } else if (record.op === "link" && isStringId(record.id) && isStringId(record.messageId)) {
+      links.set(record.id, record.messageId);
+    }
+  }
+  return { puts, acked, links };
+}
+
+function appendDeskJournal(root, record) {
+  mkdirSync(path.dirname(deskJournalPath(root)), { recursive: true, mode: 0o700 });
+  writeFileSync(
+    deskJournalPath(root),
+    `${JSON.stringify({ v: DESK_JOURNAL_VERSION, ...record })}\n`,
+    {
+      flag: "a",
+      mode: 0o600,
+    },
+  );
+}
+
+/** Legacy `chief/desk/*.json` items: identity comes from the enumerated filename, never JSON. */
+function readLegacyDesk(root) {
   let entries;
   try {
     entries = readdirSync(deskDir(root));
@@ -917,23 +1113,177 @@ export function listDesk(root = mailboxRoot()) {
   return entries
     .filter((entry) => entry.endsWith(".json"))
     .sort((left, right) => left.localeCompare(right))
-    .map((entry) => ({
-      file: path.join(deskDir(root), entry),
-      ...readJson(path.join(deskDir(root), entry)),
+    .map((entry) => {
+      const file = path.join(deskDir(root), entry);
+      const json = readJson(file);
+      if (!isPlainObject(json) || typeof json.text !== "string") return null;
+      return {
+        ...json,
+        id: `${LEGACY_DESK_PREFIX}${entry.slice(0, -".json".length)}`,
+        file,
+        roomId: null,
+      };
+    })
+    .filter(Boolean);
+}
+
+/** Active desk items: journal puts minus acknowledged IDs, plus unacknowledged legacy files. */
+export function listDesk(root = mailboxRoot()) {
+  const { puts, acked: journalAcked, links } = readDeskJournal(root);
+  const acked = new Set([...journalAcked, ...committedAcknowledgements(root).deskIds]);
+  const items = puts
+    .values()
+    .filter((record) => !acked.has(record.id))
+    .map((item) => ({
+      ...item,
+      roomId: validRoomIdOrNull(item.roomId),
+      mailboxId: links.get(item.id) ?? null,
     }))
-    .filter((item) => typeof item.text === "string");
+    .toArray();
+  for (const legacy of readLegacyDesk(root)) if (!acked.has(legacy.id)) items.push(legacy);
+  return items.sort(
+    (left, right) =>
+      String(left.at).localeCompare(String(right.at)) || left.id.localeCompare(right.id),
+  );
 }
 
-export function ackDesk(root = mailboxRoot()) {
-  const items = listDesk(root);
-  for (const item of items) rmSync(item.file, { force: true });
-  return items.length;
+function validRoomIdOrNull(value) {
+  return isValidRoomId(value) ? value : null;
 }
 
-function recordDesk(root, item, now) {
-  const id = `${now}-${randomBytes(3).toString("hex")}`;
-  const record = { schema: "ork.chief.desk.v1", id, ...item, at: iso(now) };
-  writeJsonAtomic(path.join(deskDir(root), `${id}.json`), record);
+/** Acknowledges every item currently on the desk. Kept for callers that do not take a snapshot. */
+export async function ackDesk(root = mailboxRoot()) {
+  const deskIds = listDesk(root).map((item) => item.id);
+  await commitAcknowledgement({ root, deskIds, inboxIds: [], session: null, runMailbox: null });
+  return deskIds.length;
+}
+
+const ACK_TRANSACTION_SCHEMA = "ork.chief.ack.v1";
+
+function ackTransactionFile(root, id) {
+  return path.join(root, "chief", "ack-transactions", `${id}.json`);
+}
+
+function listAckTransactions(root) {
+  const directory = path.join(root, "chief", "ack-transactions");
+  let entries;
+  try {
+    entries = readdirSync(directory);
+  } catch {
+    return [];
+  }
+  return entries
+    .filter((entry) => /^[0-9a-f]{32}\.json$/u.test(entry))
+    .sort((left, right) => left.localeCompare(right))
+    .map((entry) => readJson(path.join(directory, entry)))
+    .filter((record) => isPlainObject(record) && record.schema === ACK_TRANSACTION_SCHEMA);
+}
+
+/** IDs in committed transactions are hidden from readers now, even before their backing writes finish. */
+function committedAcknowledgements(root) {
+  const deskIds = [];
+  const inboxIds = [];
+  for (const record of listAckTransactions(root)) {
+    if (record.state !== "committed") continue;
+    if (Array.isArray(record.deskIds)) deskIds.push(...record.deskIds.filter(isStringId));
+    if (Array.isArray(record.inboxIds)) inboxIds.push(...record.inboxIds.filter(isStringId));
+  }
+  return { deskIds, inboxIds };
+}
+
+function isStringId(value) {
+  return typeof value === "string" && value.length > 0 && value.length <= 200;
+}
+
+/** Applies the backing writes of a committed transaction. Safe to repeat: every step is idempotent. */
+async function finishAcknowledgement(root, record, { runMailbox, env }) {
+  const { deskIds = [], inboxIds = [], session = null } = record;
+  if (deskIds.length > 0) {
+    await withExclusiveLock(deskLockPath(root), async () => {
+      const { acked } = readDeskJournal(root);
+      const missing = deskIds.filter((id) => !acked.has(id));
+      if (missing.length > 0) appendDeskJournal(root, { op: "ack", ids: missing, tx: record.id });
+    });
+  }
+  if (inboxIds.length > 0) {
+    if (!session || typeof runMailbox !== "function") {
+      const error = new Error("Mailbox acknowledgment needs the Chief session");
+      error.code = "mailbox_ack_unavailable";
+      throw error;
+    }
+    const storeEnv = mailboxStoreEnv(root, env, runMailbox);
+    if (!storeEnv) {
+      const error = new Error("This mailbox root cannot be reached by the mailbox client");
+      error.code = "mailbox_ack_unavailable";
+      throw error;
+    }
+    const result = runMailbox(["ack", "--session", session, ...inboxIds], { env: storeEnv });
+    if (result.status !== 0) {
+      const error = new Error(
+        `Mailbox acknowledgment failed; retry ork chief inbox --ack: ${(result.stderr || result.stdout || "").trim()}`,
+      );
+      error.code = "mailbox_ack_failed";
+      throw error;
+    }
+  }
+  writeJsonAtomic(ackTransactionFile(root, record.id), { ...record, state: "complete" });
+}
+
+/**
+ * Durably commits one acknowledged-ID set under the desk lock, then applies it. Callers pass
+ * explicit IDs only, so mail or desk items that arrive after the snapshot survive.
+ */
+export async function commitAcknowledgement({
+  root = mailboxRoot(),
+  deskIds = [],
+  inboxIds = [],
+  session = null,
+  runMailbox = null,
+  env = process.env,
+  now = Date.now(),
+} = {}) {
+  const desk = [...new Set(deskIds)];
+  const inbox = [...new Set(inboxIds)];
+  if (desk.length === 0 && inbox.length === 0) return { desk: 0, inbox: 0 };
+  const record = {
+    schema: ACK_TRANSACTION_SCHEMA,
+    id: randomBytes(16).toString("hex"),
+    state: "committed",
+    session,
+    deskIds: desk,
+    inboxIds: inbox,
+    at: iso(now),
+  };
+  await withExclusiveLock(deskLockPath(root), async () => {
+    writeJsonAtomic(ackTransactionFile(root, record.id), record);
+  });
+  await finishAcknowledgement(root, record, { runMailbox, env });
+  return { desk: desk.length, inbox: inbox.length };
+}
+
+/** Retries transactions whose backing writes did not finish. Explicit IDs make this idempotent. */
+export async function resumeAcknowledgements(
+  root = mailboxRoot(),
+  { runMailbox = null, env } = {},
+) {
+  let resumed = 0;
+  for (const record of listAckTransactions(root)) {
+    if (record.state !== "committed") continue;
+    await finishAcknowledgement(root, record, { runMailbox, env });
+    resumed++;
+  }
+  return resumed;
+}
+
+function recordDesk(root, item, now, { id } = {}) {
+  const record = {
+    schema: "ork.chief.desk.v1",
+    id: id || `${now}-${randomBytes(3).toString("hex")}`,
+    roomId: validRoomIdOrNull(item.roomId),
+    ...item,
+    at: iso(now),
+  };
+  appendDeskJournal(root, { op: "put", id: record.id, item: record });
   return record;
 }
 
@@ -965,7 +1315,8 @@ function roomSessions(room) {
   return sessions;
 }
 
-function readInbox(root, session, limit = 200) {
+/** Every unread message, honoring committed acknowledgment transactions that are not yet applied. */
+function readUnreadInbox(root, session) {
   const key = sessionKey(session);
   if (!key) return [];
   const directory = path.join(root, "inbox", key);
@@ -975,13 +1326,22 @@ function readInbox(root, session, limit = 200) {
   } catch {
     return [];
   }
+  const hidden = new Set(committedAcknowledgements(root).inboxIds);
   return entries
     .sort((left, right) => left.localeCompare(right))
-    .slice(-limit)
     .map((entry) => readJson(path.join(directory, entry), 64 * 1024))
     .filter(
-      (message) => isPlainObject(message) && !message.readAt && typeof message.text === "string",
+      (message) =>
+        isPlainObject(message) &&
+        !message.readAt &&
+        typeof message.text === "string" &&
+        typeof message.id === "string" &&
+        !hidden.has(message.id),
     );
+}
+
+function readInbox(root, session, limit = 200) {
+  return readUnreadInbox(root, session).slice(-limit);
 }
 
 function messageKind(text) {
@@ -1113,6 +1473,12 @@ function summarizeRoom(room, { peers, inbox }) {
   return {
     id: room.id,
     title: room.title || room.id,
+    mission: isPlainObject(room.chief)
+      ? {
+          state: room.chief.state ?? null,
+          reason: room.chief.exit?.reason ?? room.chief.report?.reason ?? null,
+        }
+      : null,
     objective: oneLine(room.objective || "", 400),
     goal: room.chief?.goal ? oneLine(room.chief.goal, 400) : null,
     cwd: room.cwd || null,
@@ -1144,6 +1510,18 @@ function isActiveRoom(summary, room, now) {
   const spawnedMs = stampMs(room.chief?.spawnedAt);
   if (Number.isFinite(spawnedMs) && now - spawnedMs < RECENT_MISSION_MS) return true;
   return now - summary.updatedMs < RECENT_ROOM_MS;
+}
+
+/** A detached mission whose coordinator is gone reads its exit evidence; the room itself is untouched. */
+function projectDetachedExit(room, { root, now, peers }) {
+  if (room.chief?.launch?.mode !== "detached" || coordinatorOf(room, peers).live) return room;
+  const exit = readMissionExit(room, { root, now });
+  if (!exit.state) return room;
+  const copy = structuredClone(room);
+  copy.chief.state = exit.state;
+  copy.chief.exit = { state: exit.state, reason: exit.reason, eventId: exit.eventId ?? null };
+  if (copy.conductor) copy.conductor.status = exit.state === "done" ? "completed" : "failed";
+  return copy;
 }
 
 function standaloneOf(peer) {
@@ -1191,8 +1569,10 @@ export async function chiefStatus({
   const rooms = [];
   const boundSessions = new Set();
   const roomMatchers = [];
-  for (const room of rawRooms) {
-    if (isClosedRoom(room)) continue;
+  for (const original of rawRooms) {
+    if (isClosedRoom(original)) continue;
+    // Observational projection: a dead detached coordinator reads its own artifacts, never writes.
+    const room = projectDetachedExit(original, { root, now, peers });
     const summary = summarizeRoom(room, { peers, inbox });
     if (!all && !isActiveRoom(summary, room, now)) continue;
     for (const session of roomSessions(room)) boundSessions.add(session);
@@ -1238,6 +1618,7 @@ export async function chiefStatus({
   const unattributed = inbox
     .filter((message) => !message.claimed)
     .map((message) => ({
+      id: message.id,
       kind: messageKind(message.text),
       from: message.from?.name || message.from?.session || "unknown",
       text: oneLine(message.text.replace(/^\[chief:\w+\]\s*/u, "")),
@@ -1280,6 +1661,12 @@ export async function chiefStatus({
     standalone,
     inbox: unattributed,
     desk,
+    drawerSnapshot: {
+      session: chief?.live ? chief.session : null,
+      revision: chief?.live && chief.revision != null ? String(chief.revision) : null,
+      deskIds: desk.map((item) => item.id),
+      inboxIds: unattributed.map((item) => item.id).filter(Boolean),
+    },
     accounts: [],
   };
   if (roomsError) status.roomsError = roomsError;
@@ -1451,7 +1838,7 @@ const MISSION_STATES = {
 const TERMINAL_MISSION_STATES = new Set(["cancelled", "done", "failed"]);
 
 /** A child's report moves its mission state, so finished missions stop raising attention. */
-async function recordMissionReport({ rooms, sender, env, kind, text, root, now }) {
+async function recordMissionReport({ rooms, sender, env, kind, text, root, now, locked = false }) {
   const room =
     rooms.find((candidate) => candidate.chief?.mission?.session === sender) ||
     (env.ORK_CHIEF_MISSION_SESSION === sender && env.ORK_CHIEF_ROOM
@@ -1460,41 +1847,512 @@ async function recordMissionReport({ rooms, sender, env, kind, text, root, now }
   if (!room) return null;
   const nextState = MISSION_STATES[kind || "update"];
   let effectiveState = nextState;
+  const record = () =>
+    updateRawRoom(
+      room.id,
+      (current) => {
+        if (!current.chief) return current;
+        // A terminal mission never reopens: a late update, repeated hook or manual retry keeps it.
+        const isPreserved = TERMINAL_MISSION_STATES.has(current.chief.state);
+        effectiveState = isPreserved ? current.chief.state : nextState;
+        current.chief.state = effectiveState;
+        current.chief.reportedAt = iso(now);
+        current.chief.lastReport = {
+          kind: kind || "update",
+          text: oneLine(text, MAX_REPORT_CHARS),
+        };
+        if (current.conductor && !isPreserved) {
+          current.conductor.status = effectiveState === "done" ? "completed" : effectiveState;
+        }
+        return current;
+      },
+      { root },
+    );
+  if (locked) await record();
+  else await withExclusiveLock(missionLockPath(root, room.id), record);
+  return { roomId: room.id, state: effectiveState };
+}
+
+// ---------------------------------------------------------------------------
+// Detached mission exit: completion hook, read-only classifier, reconciliation
+
+const EXECUTOR_JOB_SCHEMA = "agent-executor.job.v1";
+const EXECUTOR_COMPLETION_SCHEMA = "agent-executor.completion.v1";
+const CHIEF_ENTRY = fileURLToPath(new URL("../bin/chief.mjs", import.meta.url));
+const RESULT_GRACE_MS = 60_000;
+const UNSUCCESSFUL_RESULTS = new Set([
+  "provider_quota_exhausted",
+  "timed_out",
+  "failed",
+  "error",
+  "cancelled",
+  "rejected",
+]);
+
+function missionReportId(roomId, eventId, generation) {
+  const basis = eventId ? `event:${eventId}` : `generation:${generation || "none"}`;
+  return `chief-report-${createHash("sha256").update(`${roomId}\0${basis}`).digest("hex").slice(0, 32)}`;
+}
+
+function shellSingleQuote(value) {
+  if (/[\0\n\r]/u.test(value)) throw new Error("Hook paths cannot contain control characters");
+  return `'${value.replaceAll("'", String.raw`'\''`)}'`;
+}
+
+/** Workspaces the hook must stay out of: the repository, the planned checkout, and any --add-dir. */
+function workspacesOf(command = []) {
+  const found = [];
+  for (let index = 0; index < command.length; index++) {
+    const next = command[index + 1];
+    if (command[index] === "--add-dir" && next) found.push(next);
+    const cwd = command[index + 1];
+    if (command[index] === "--cwd" && cwd) found.push(cwd);
+  }
+  return found;
+}
+
+function assertTrustedExecutable(file, workspaces, label) {
+  const real = realpathSync(file);
+  const stat = statSync(real);
+  if (!stat.isFile()) throw new Error(`${label} is not a file: ${real}`);
+  if ((stat.mode & 0o022) !== 0) throw new Error(`${label} is writable by others: ${real}`);
+  for (const workspace of workspaces) {
+    if (isWithinPath(real, canonicalPath(workspace)))
+      throw new Error(
+        `${label} is inside a writable executor workspace; install Orkest outside it`,
+      );
+  }
+  return real;
+}
+
+/**
+ * Plans the mission's completion hook without writing. The script runs trusted absolute Node and
+ * Chief entry points, embeds the validated room and mailbox root, and forwards "$1" as --event.
+ */
+export function planCompletionHook({
+  root = mailboxRoot(),
+  roomId,
+  workspaces = [],
+  nodePath = process.execPath,
+  entryPath = CHIEF_ENTRY,
+} = {}) {
+  if (!isValidRoomId(roomId)) throw new Error(`Invalid room ID for the completion hook: ${roomId}`);
+  const canonicalRoot = canonicalPath(root);
+  const hooksDir = path.join(canonicalRoot, "chief", "hooks");
+  const hookFile = path.join(hooksDir, roomId);
+  const scopes = workspaces.map((workspace) => canonicalPath(workspace));
+  if (scopes.some((scope) => isWithinPath(hookFile, scope)))
+    throw new Error("The completion hook must be outside every executor workspace");
+  const node = assertTrustedExecutable(nodePath, scopes, "Node");
+  const entry = assertTrustedExecutable(entryPath, scopes, "The Chief entry point");
+  const script = [
+    "#!/bin/sh",
+    "# orkest-chief-completion-hook: v1",
+    `# room: ${roomId}`,
+    `exec ${shellSingleQuote(node)} ${shellSingleQuote(entry)} reconcile ${roomId} --hook --mailbox-root ${shellSingleQuote(canonicalRoot)} --event "$1"`,
+    "",
+  ].join("\n");
+  return { path: hookFile, directory: hooksDir, root: canonicalRoot, node, entry, script };
+}
+
+/** Creates the hook exclusively and without following links. Re-running with the same script is a no-op. */
+export function installCompletionHook(plan) {
+  // The trusted root was canonicalized, so anything below it must be a real directory, never a link.
+  for (const component of [path.join(plan.root, "chief"), plan.directory]) {
+    let stat = null;
+    try {
+      stat = lstatSync(component);
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+    if (stat?.isSymbolicLink()) throw new Error(`Refusing a symlinked mission path: ${component}`);
+  }
+  mkdirSync(path.dirname(plan.directory), { recursive: true, mode: 0o700 });
+  mkdirSync(plan.directory, { recursive: true, mode: 0o700 });
+  assertPrivateDirectory(plan.directory);
+  try {
+    const fd = openSync(
+      plan.path,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
+      0o700,
+    );
+    try {
+      writeSync(fd, plan.script);
+      fchmodSync(fd, 0o700);
+    } finally {
+      closeSync(fd);
+    }
+  } catch (error) {
+    if (error.code !== "EEXIST") throw error;
+    const stat = lstatSync(plan.path);
+    if (!stat.isFile() || stat.isSymbolicLink())
+      throw new Error(`Completion hook path is not a regular file: ${plan.path}`, { cause: error });
+    if (readFileSync(plan.path, "utf8") !== plan.script)
+      throw new Error(`Completion hook already exists with different content: ${plan.path}`, {
+        cause: error,
+      });
+  }
+  return plan.path;
+}
+
+/**
+ * Classifies a detached mission from its owned artifacts. It only reads: no locks, writes, mailbox
+ * calls or hook installation, so chief status can call it safely.
+ */
+export function readMissionExit(
+  room,
+  {
+    root = mailboxRoot(),
+    now = Date.now(),
+    manual = false,
+    eventPath = null,
+    processAlive = pidAlive,
+    processBirth = processStarted,
+  } = {},
+) {
+  const decide = (evidence, extra = {}) => ({ evidence, state: null, reason: null, ...extra });
+  if (!isPlainObject(room) || !isValidRoomId(room.id) || !isPlainObject(room.chief))
+    return decide("none", { reason: "no_mission" });
+  const launch = isPlainObject(room.chief.launch) ? room.chief.launch : {};
+  const jobDir = path.join(canonicalPath(root), "chief", "missions", room.id, "job");
+  if (launch.jobDir && canonicalPath(launch.jobDir) !== canonicalPath(jobDir))
+    return decide("uncertain", { reason: "job_dir_mismatch" });
+  const manifestRead = readBoundedJsonFile(path.join(jobDir, "job.json"));
+  if (manifestRead.missing) return decide("none", { reason: "no_manifest" });
+  if (manifestRead.error) return decide("uncertain", { reason: "manifest_unreadable" });
+  const manifest = manifestRead.value;
+  if (manifest.schema !== EXECUTOR_JOB_SCHEMA)
+    return decide("uncertain", { reason: "manifest_schema" });
+  if (
+    typeof manifest.job_dir !== "string" ||
+    canonicalPath(manifest.job_dir) !== canonicalPath(jobDir)
+  )
+    return decide("uncertain", { reason: "manifest_job_dir" });
+  if (typeof launch.completionDir !== "string")
+    return decide("uncertain", { reason: "completion_store_untrusted" });
+  const completionDir = canonicalPath(launch.completionDir);
+
+  // A steered job's live segment is recorded in steering.json; events of older segments are superseded.
+  const steeringRead = readBoundedJsonFile(path.join(jobDir, "steering.json"));
+  if (steeringRead.error) return decide("uncertain", { reason: "steering_unreadable" });
+  const segment = steeringRead.value ?? manifest;
+  const resultFile = canonicalPath(String(segment.result_path ?? ""));
+  if (steeringRead.value) {
+    if (!isWithinPath(resultFile, jobDir))
+      return decide("uncertain", { reason: "result_outside_job" });
+  } else if (resultFile !== canonicalPath(path.join(jobDir, "run", "result.json"))) {
+    return decide("uncertain", { reason: "result_path_mismatch" });
+  }
+
+  // A PID alone is not identity: a reused PID with a different birth time is treated as not ours.
+  const pid = Number.isSafeInteger(manifest.pid) ? manifest.pid : (launch.pid ?? null);
+  let identity = processAlive(pid) === true ? "unverified" : "dead";
+  if (identity === "unverified" && launch.pidBirth)
+    identity = processBirth(pid) === launch.pidBirth ? "verified" : "reused";
+  const isOwnProcessAlive = identity === "verified" || identity === "unverified";
+
+  const resultRead = readBoundedJsonFile(resultFile, 1024 * 1024);
+  if (resultRead.missing) {
+    if (isOwnProcessAlive) return decide("live", { pid, identity, reason: "running" });
+    const launchedMs = stampMs(launch.launchedAt);
+    const startupFinished = launch.status && launch.status !== "launching";
+    if (
+      manual &&
+      startupFinished &&
+      Number.isFinite(launchedMs) &&
+      now - launchedMs >= RESULT_GRACE_MS
+    )
+      return decide("dead", {
+        pid,
+        identity,
+        state: "failed",
+        reason: "runner_exited_without_result",
+      });
+    return decide("uncertain", { pid, identity, reason: "no_result" });
+  }
+  if (resultRead.error) return decide("uncertain", { reason: "result_unreadable" });
+  const result = resultRead.value;
+
+  const eventFile = canonicalPath(String(segment.completion_event_path ?? ""));
+  const nameMatch = EVENT_FILE_RE.exec(path.basename(eventFile));
+  if (!nameMatch || path.dirname(eventFile) !== completionDir)
+    return decide("uncertain", { reason: "event_outside_store" });
+  const eventId = nameMatch[1];
+  if (steeringRead.value && segment.completion_event_id && segment.completion_event_id !== eventId)
+    return decide("uncertain", { reason: "steering_event_mismatch" });
+  if (eventPath && canonicalPath(eventPath) !== eventFile)
+    return decide("superseded", { reason: "event_not_current" });
+  const eventRead = readBoundedJsonFile(eventFile);
+  if (eventRead.missing) return decide("uncertain", { reason: "event_missing" });
+  if (eventRead.error) return decide("uncertain", { reason: "event_unreadable" });
+  const event = eventRead.value;
+  if (event.schema !== EXECUTOR_COMPLETION_SCHEMA || event.event_id !== eventId)
+    return decide("uncertain", { reason: "event_identity" });
+  if (typeof event.result_path !== "string" || canonicalPath(event.result_path) !== resultFile)
+    return decide("uncertain", { reason: "event_result_mismatch" });
+  if (
+    typeof event.repository !== "string" ||
+    !room.cwd ||
+    canonicalPath(event.repository) !== canonicalPath(room.cwd)
+  )
+    return decide("uncertain", { reason: "repository_mismatch" });
+  if (event.status !== result.status) return decide("uncertain", { reason: "status_mismatch" });
+
+  const base = { pid, identity, eventId, resultPath: resultFile, status: result.status };
+  if (result.status === "completed") {
+    const exitCode = result.exit_code ?? event.exit_code ?? 0;
+    if (exitCode !== 0)
+      return decide("final", { ...base, state: "failed", reason: "exit_code_nonzero" });
+    if (result.task_outcome != null && result.task_outcome !== "complete")
+      return decide("final", {
+        ...base,
+        state: "failed",
+        reason: `task_${oneLine(String(result.task_outcome), 40)}`,
+      });
+    return decide("final", { ...base, state: "done", reason: "completed" });
+  }
+  if (UNSUCCESSFUL_RESULTS.has(result.status))
+    return decide("final", { ...base, state: "failed", reason: result.status });
+  return decide("uncertain", { ...base, reason: "status_not_final" });
+}
+
+function missionBodyOf(roomId, outcome) {
+  return outcome.state === "done"
+    ? `[chief:done] ${roomId} completed; its branch and verification are in the room.`
+    : `[chief:escalation] ${roomId} failed: ${outcome.reason}`;
+}
+
+/** Writes a pending mission outcome once; a repeat or a conflicting late exit never reopens it. */
+async function recordMissionOutcome(root, roomId, outcome, { now = Date.now() } = {}) {
+  let decision = { status: "unchanged" };
+  await updateRawRoom(
+    roomId,
+    (room) => {
+      const chief = room.chief;
+      if (!isPlainObject(chief)) return room;
+      if (isClosedRoom(room)) {
+        decision = { status: "closed" };
+        return room;
+      }
+      const id = missionReportId(roomId, outcome.eventId, chief.launch?.generation);
+      if (TERMINAL_MISSION_STATES.has(chief.state)) {
+        if (chief.state !== outcome.state && chief.state === "done") {
+          chief.exitAfterReport = {
+            state: outcome.state,
+            reason: outcome.reason,
+            eventId: outcome.eventId ?? null,
+            at: iso(now),
+          };
+          decision = { status: "late-failure-recorded" };
+        } else {
+          decision = { status: "already-recorded" };
+        }
+        return room;
+      }
+      chief.state = outcome.state;
+      chief.exit = {
+        state: outcome.state,
+        reason: outcome.reason,
+        eventId: outcome.eventId ?? null,
+      };
+      chief.report = {
+        id,
+        kind: outcome.state === "done" ? "done" : "escalation",
+        reason: outcome.reason,
+        body: missionBodyOf(roomId, outcome),
+        status: "pending",
+        at: iso(now),
+      };
+      if (room.conductor) room.conductor.status = outcome.state === "done" ? "completed" : "failed";
+      decision = { status: "recorded" };
+      return room;
+    },
+    { root },
+  );
+  return decision;
+}
+
+/** Ensures the desk holds one item for the report, then requests delivery if a Chief is live. */
+async function deliverMissionReport(room, { root, env, now, runMailbox }) {
+  const report = room.chief?.report;
+  if (!report || !isStringId(report.id)) return { status: "none" };
+  await withExclusiveLock(deskLockPath(root), async () => {
+    const { puts } = readDeskJournal(root);
+    if (!puts.has(report.id))
+      appendDeskJournal(root, {
+        op: "put",
+        id: report.id,
+        item: {
+          schema: "ork.chief.desk.v1",
+          id: report.id,
+          roomId: room.id,
+          from: room.chief?.mission?.session ?? null,
+          kind: report.kind === "done" ? "done" : "escalation",
+          text: report.body,
+          at: report.at ?? iso(now),
+        },
+      });
+  });
+  if (report.status === "delivered") return { status: "delivered", id: report.id };
+  const chief = readChiefBinding({ root, now });
+  const missionSession = room.chief?.mission?.session;
+  if (!chief || !missionSession) return { status: "queued", id: report.id };
+  const storeEnv = mailboxStoreEnv(root, env, runMailbox);
+  if (!storeEnv) return { status: "queued", id: report.id, error: "mailbox root unreachable" };
+  const result = runMailbox(
+    [
+      "send",
+      "--session",
+      missionSession,
+      "--to",
+      chief.session,
+      "--scope",
+      "cross-project",
+      "--format",
+      "json",
+      "--native-unreachable",
+      NATIVE_UNREACHABLE,
+      "--id",
+      report.id,
+      "--text",
+      report.body,
+    ],
+    { env: storeEnv },
+  );
+  if (result.status !== 0) return { status: "queued", id: report.id, error: "delivery failed" };
+  let messageId = null;
+  try {
+    const delivered = JSON.parse(result.stdout);
+    messageId = isStringId(delivered?.id) ? delivered.id : null;
+  } catch {
+    messageId = null;
+  }
+  if (messageId)
+    await withExclusiveLock(deskLockPath(root), async () => {
+      if (!readDeskJournal(root).links.has(report.id))
+        appendDeskJournal(root, { op: "link", id: report.id, messageId });
+    });
   await updateRawRoom(
     room.id,
     (current) => {
-      if (!current.chief) return current;
-      const shouldPreserveTerminal = !kind && TERMINAL_MISSION_STATES.has(current.chief.state);
-      effectiveState = shouldPreserveTerminal ? current.chief.state : nextState;
-      current.chief.state = effectiveState;
-      current.chief.reportedAt = iso(now);
-      current.chief.lastReport = { kind: kind || "update", text: oneLine(text, MAX_REPORT_CHARS) };
-      if (current.conductor && !shouldPreserveTerminal) {
-        current.conductor.status = effectiveState === "done" ? "completed" : effectiveState;
+      if (current.chief?.report?.id === report.id) {
+        current.chief.report.messageId = messageId;
+        current.chief.report.status = "delivered";
+        current.chief.report.deliveredAt = iso(now);
+        current.chief.report.destination = chief.session;
       }
       return current;
     },
     { root },
   );
-  return { roomId: room.id, state: effectiveState };
+  return { status: "delivered", id: report.id };
 }
 
-export async function chiefSend({
+/**
+ * Reconciles a detached mission. Every decision is written before slow delivery, and a repeat
+ * resumes pending delivery with the same stable report ID.
+ */
+export async function chiefReconcile({
+  roomId,
+  event = null,
+  hook = false,
+  root = mailboxRoot(),
+  env = process.env,
+  now = Date.now(),
+  runMailbox = defaultRunMailbox,
+} = {}) {
+  if (!isValidRoomId(roomId)) throw new Error("Pass a valid room ID");
+  try {
+    readRawRoom(roomId, root);
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+    const missing = new Error(`No room ${roomId}`);
+    missing.code = "not_found";
+    throw missing;
+  }
+  if (event && env.AGENT_EVENT && path.resolve(env.AGENT_EVENT) !== path.resolve(event))
+    throw new Error("AGENT_EVENT does not match the --event argument");
+  return withExclusiveLock(missionLockPath(root, roomId), async () => {
+    const current = readRawRoom(roomId, root);
+    if (isClosedRoom(current))
+      return { schema: "ork.chief.reconcile.v1", roomId, status: "closed", delivery: null };
+    const exit = readMissionExit(current, {
+      root,
+      now,
+      manual: !hook,
+      eventPath: event || env.AGENT_EVENT || null,
+    });
+    if (env.AGENT_RESULT && exit.resultPath && path.resolve(env.AGENT_RESULT) !== exit.resultPath)
+      return {
+        schema: "ork.chief.reconcile.v1",
+        roomId,
+        status: "superseded",
+        evidence: exit.evidence,
+      };
+    let decision = { status: "none" };
+    if (exit.state) decision = await recordMissionOutcome(root, roomId, exit, { now });
+    const latest = readRawRoom(roomId, root);
+    const delivery = latest.chief?.report
+      ? await deliverMissionReport(latest, { root, env, now, runMailbox })
+      : null;
+    if (hook && exit.evidence === "none")
+      return { schema: "ork.chief.reconcile.v1", roomId, status: "retry", reason: exit.reason };
+    return {
+      schema: "ork.chief.reconcile.v1",
+      roomId,
+      status: decision.status,
+      evidence: exit.evidence,
+      state: latest.chief?.state ?? null,
+      decided: exit.state ?? null,
+      reason: exit.reason ?? null,
+      delivery,
+    };
+  });
+}
+
+/**
+ * A child's `done` is decided under its mission lock, so it cannot race a reconcile into two
+ * completion reports. Every other send runs unlocked, as before.
+ */
+export async function chiefSend(options = {}) {
+  const env = options.env ?? process.env;
+  const root = options.root ?? mailboxRoot();
+  const sender = options.from || sessionFromEnv(env);
+  if (options.kind === "done" && sender) {
+    const listRooms = options.listRooms ?? listRawRooms;
+    let owner = null;
+    try {
+      owner = listRooms(root).find((room) => room.chief?.mission?.session === sender) ?? null;
+    } catch {
+      owner = null;
+    }
+    if (owner)
+      return withExclusiveLock(missionLockPath(root, owner.id), () =>
+        chiefSendBody({ ...options, lockedMission: owner.id }),
+      );
+  }
+  return chiefSendBody(options);
+}
+
+async function chiefSendBody({
   to,
   message,
   from,
   kind,
-  noWake = false,
+  noWake: suppliedNoWake,
   root = mailboxRoot(),
   env = process.env,
   now = Date.now(),
   runMailbox = defaultRunMailbox,
   listRooms = listRawRooms,
+  lockedMission = null,
 } = {}) {
   const text = String(message || "").trim();
   if (!text) throw new Error("Message text is empty");
   if (kind !== undefined && kind !== null && !KINDS.has(kind))
     throw new Error(`--kind must be one of ${[...KINDS].join(", ")}`);
+  // Updates are quiet by default; questions, escalations, done reports and sends with no kind still wake.
+  const noWake = suppliedNoWake ?? kind === "update";
   const sender = from || sessionFromEnv(env);
   if (!sender || !SESSION_ID_RE.test(sender))
     throw new Error("Pass --from <session> (or set AGENT_MAILBOX_SESSION)");
@@ -1507,6 +2365,21 @@ export async function chiefSend({
     rooms = [];
   }
   const body = kind ? `[chief:${kind}] ${text}` : text;
+  const ownMission = rooms.find((candidate) => candidate.chief?.mission?.session === sender);
+  // Under the mission lock the state is re-read, so a reconcile that just recorded done is seen.
+  const missionState = lockedMission
+    ? readRawRoom(lockedMission, root).chief?.state
+    : ownMission?.chief?.state;
+  if (kind === "done" && missionState === "done") {
+    // One completion per mission: a repeated or raced done never queues or wakes a second report.
+    return {
+      schema: CHIEF_SEND_SCHEMA,
+      mission: { roomId: ownMission.id, state: "done" },
+      status: "already-reported",
+      target: null,
+      woke: false,
+    };
+  }
   let target;
   let isChiefUnavailable = false;
   try {
@@ -1523,7 +2396,16 @@ export async function chiefSend({
       { from: sender, kind: kind || "update", text: oneLine(text, MAX_REPORT_CHARS * 4) },
       now,
     );
-    const mission = await recordMissionReport({ rooms, sender, env, kind, text, root, now });
+    const mission = await recordMissionReport({
+      rooms,
+      sender,
+      env,
+      kind,
+      text,
+      root,
+      now,
+      locked: lockedMission !== null,
+    });
     return {
       schema: CHIEF_SEND_SCHEMA,
       mission,
@@ -1562,7 +2444,16 @@ export async function chiefSend({
         now,
       );
       const mission = isTargetChief
-        ? await recordMissionReport({ rooms, sender, env, kind, text, root, now })
+        ? await recordMissionReport({
+            rooms,
+            sender,
+            env,
+            kind,
+            text,
+            root,
+            now,
+            locked: lockedMission !== null,
+          })
         : null;
       return {
         schema: CHIEF_SEND_SCHEMA,
@@ -1583,7 +2474,16 @@ export async function chiefSend({
     delivery = { raw: result.stdout.trim() };
   }
   const mission = isTargetChief
-    ? await recordMissionReport({ rooms, sender, env, kind, text, root, now })
+    ? await recordMissionReport({
+        rooms,
+        sender,
+        env,
+        kind,
+        text,
+        root,
+        now,
+        locked: lockedMission !== null,
+      })
     : null;
   return {
     schema: CHIEF_SEND_SCHEMA,
@@ -1598,6 +2498,354 @@ export async function chiefSend({
 
 // ---------------------------------------------------------------------------
 // spawn
+
+// ---------------------------------------------------------------------------
+// Digest, acknowledgment and close
+
+const DIGEST_SCHEMA = "ork.chief.inbox.v1";
+const CLOSE_SCHEMA = "ork.chief.close.v1";
+const DIGEST_TEXT_GROUPS = 5;
+
+function askPriority(kind) {
+  if (kind === "escalation") return 0;
+  if (kind === "question" || kind === "awaiting-input") return 1;
+  return 2;
+}
+
+/** Text mode shows at most five groups; with more, four are shown and the rest are named in a footer. */
+export function displayedDigestGroups(groups) {
+  return groups.length > DIGEST_TEXT_GROUPS
+    ? groups.slice(0, DIGEST_TEXT_GROUPS - 1)
+    : groups.slice(0, DIGEST_TEXT_GROUPS);
+}
+
+function openRoomIndex(rooms) {
+  const bySession = new Map();
+  const byId = new Map();
+  for (const room of rooms) {
+    if (!isPlainObject(room) || !isValidRoomId(room.id) || isClosedRoom(room)) continue;
+    byId.set(room.id, room);
+    for (const session of roomSessions(room)) bySession.set(session, room.id);
+  }
+  return { bySession, byId };
+}
+
+function attributeMessage(message, index) {
+  if (isValidRoomId(message.roomId) && index.byId.has(message.roomId)) return message.roomId;
+  const session = message.from?.session;
+  return (typeof session === "string" && index.bySession.get(session)) || null;
+}
+
+/** Builds the complete digest from every unread Chief message and every desk item. Read-only. */
+function buildDigest({ root, rooms, chief }) {
+  const index = openRoomIndex(rooms);
+  const desk = listDesk(root);
+  const deskById = new Map(desk.map((item) => [item.id, item]));
+  const groups = new Map();
+  const groupFor = (roomId) => {
+    const key = roomId ?? "";
+    if (!groups.has(key)) groups.set(key, { roomId, items: [], deskIds: [], inboxIds: [] });
+    return groups.get(key);
+  };
+  for (const item of desk) {
+    const roomId = item.roomId && index.byId.has(item.roomId) ? item.roomId : null;
+    const group = groupFor(roomId);
+    group.items.push({
+      source: "desk",
+      id: item.id,
+      kind: item.kind,
+      from: item.from || "unknown",
+      text: oneLine(item.text, 200),
+      at: item.at || null,
+    });
+    group.deskIds.push(item.id);
+  }
+  const mail = chief?.live ? readUnreadInbox(root, chief.session) : [];
+  for (const message of mail) {
+    // A mailbox copy of a desk report shares its stable report ID, so the digest shows it once.
+    const linked =
+      (typeof message.clientId === "string" && deskById.get(message.clientId)) ||
+      desk.find((item) => item.mailboxId === message.id);
+    if (linked) {
+      const group = groupFor(linked.roomId);
+      group.inboxIds.push(message.id);
+      continue;
+    }
+    const group = groupFor(attributeMessage(message, index));
+    group.items.push({
+      source: "inbox",
+      id: message.id,
+      kind: messageKind(message.text),
+      from: message.from?.name || message.from?.session || "unknown",
+      text: oneLine(message.text.replace(/^\[chief:\w+\]\s*/u, ""), 200),
+      at: message.sentAt || null,
+    });
+    group.inboxIds.push(message.id);
+  }
+  const ranked = groups
+    .values()
+    .map((group) => {
+      const asks = group.items.toSorted(
+        (left, right) =>
+          askPriority(left.kind) - askPriority(right.kind) ||
+          (stampMs(right.at) || 0) - (stampMs(left.at) || 0),
+      );
+      const room = group.roomId ? index.byId.get(group.roomId) : null;
+      const latestMs = Math.max(0, ...asks.map((ask) => stampMs(ask.at) || 0));
+      return {
+        rank: {
+          escalation: asks.some((ask) => ask.kind === "escalation"),
+          question: asks.some((ask) => askPriority(ask.kind) === 1),
+          latestMs,
+        },
+        group: {
+          roomId: group.roomId,
+          state: room ? room.chief?.state || room.conductor?.status || "open" : "unattributed",
+          latest: latestMs ? iso(latestMs) : null,
+          asks,
+          deskIds: group.deskIds,
+          inboxIds: group.inboxIds,
+        },
+      };
+    })
+    .toArray();
+  ranked.sort(
+    (left, right) =>
+      Number(right.rank.escalation) - Number(left.rank.escalation) ||
+      Number(right.rank.question) - Number(left.rank.question) ||
+      right.rank.latestMs - left.rank.latestMs ||
+      String(left.group.roomId ?? "~").localeCompare(String(right.group.roomId ?? "~")),
+  );
+  return ranked.map(({ group }) => group);
+}
+
+/**
+ * Digest of the machine's Chief queue. With ack, acknowledges every item in the groups returned
+ * (or only the displayed groups for ackScope "displayed"), by explicit ID.
+ */
+export async function chiefInbox({
+  root = mailboxRoot(),
+  env = process.env,
+  now = Date.now(),
+  ack = false,
+  ackScope = "all",
+  runMailbox = defaultRunMailbox,
+  listRooms = listRawRooms,
+  peers: providedPeers,
+} = {}) {
+  const peers = providedPeers || readPeers(root, { now });
+  const chief = readChiefBinding({ root, now, peers });
+  let rooms;
+  try {
+    rooms = listRooms(root).filter(
+      (room) => isPlainObject(room) && (!room.machine || room.machine === hostname()),
+    );
+  } catch {
+    rooms = [];
+  }
+  const groups = buildDigest({ root, rooms, chief });
+  const payload = {
+    schema: DIGEST_SCHEMA,
+    groups,
+    acknowledged: { desk: 0, inbox: 0 },
+  };
+  if (ack) {
+    await resumeAcknowledgements(root, { runMailbox, env });
+    const chosen = ackScope === "displayed" ? displayedDigestGroups(groups) : groups;
+    const deskIds = chosen.flatMap((group) => group.deskIds);
+    const inboxIds = chosen.flatMap((group) => group.inboxIds);
+    if (inboxIds.length > 0 && !chief?.live)
+      throw new Error("No live Chief is bound; mail cannot be acknowledged");
+    payload.acknowledged = await commitAcknowledgement({
+      root,
+      deskIds,
+      inboxIds,
+      session: chief?.live ? chief.session : null,
+      runMailbox,
+      env,
+      now,
+    });
+  }
+  return payload;
+}
+
+/**
+ * Acknowledges exactly the IDs in a drawer snapshot. A changed Chief session or revision, or an ID
+ * that is not currently on the desk or the unattributed queue, fails closed.
+ */
+export async function chiefDesk({
+  root = mailboxRoot(),
+  env = process.env,
+  now = Date.now(),
+  ack = false,
+  snapshot = null,
+  runMailbox = defaultRunMailbox,
+  listRooms = listRawRooms,
+  peers: providedPeers,
+} = {}) {
+  if (!ack) return { schema: "ork.chief.desk.v1", items: listDesk(root) };
+  if (!isPlainObject(snapshot)) throw new Error("Acknowledging the desk needs a snapshot");
+  const peers = providedPeers || readPeers(root, { now });
+  const chief = readChiefBinding({ root, now, peers });
+  const deskIds = Array.isArray(snapshot.deskIds) ? snapshot.deskIds : [];
+  const inboxIds = Array.isArray(snapshot.inboxIds) ? snapshot.inboxIds : [];
+  if (snapshot.session != null) {
+    if (
+      !chief?.live ||
+      chief.session !== snapshot.session ||
+      String(chief.revision) !== String(snapshot.revision)
+    )
+      throw Object.assign(new Error("The Chief changed since this view; refresh and retry"), {
+        code: "snapshot_changed",
+      });
+  } else if (inboxIds.length > 0) {
+    throw Object.assign(new Error("A desk-only snapshot cannot acknowledge mailbox items"), {
+      code: "snapshot_invalid",
+    });
+  }
+  const currentDesk = new Set(listDesk(root).map((item) => item.id));
+  if (deskIds.some((id) => !(typeof id === "string" && currentDesk.has(id))))
+    throw Object.assign(
+      new Error("A desk item in this view is no longer queued; refresh and retry"),
+      {
+        code: "snapshot_stale",
+      },
+    );
+  if (inboxIds.length > 0) {
+    let rooms;
+    try {
+      rooms = listRooms(root);
+    } catch {
+      rooms = [];
+    }
+    const index = openRoomIndex(rooms);
+    const unattributed = new Set(
+      readUnreadInbox(root, chief.session)
+        .filter((message) => !attributeMessage(message, index))
+        .map((message) => message.id),
+    );
+    if (inboxIds.some((id) => !unattributed.has(id)))
+      throw Object.assign(
+        new Error("A mail item in this view is no longer unread; refresh and retry"),
+        {
+          code: "snapshot_stale",
+        },
+      );
+  }
+  const result = await commitAcknowledgement({
+    root,
+    deskIds,
+    inboxIds,
+    session: snapshot.session ?? null,
+    runMailbox,
+    env,
+    now,
+  });
+  return {
+    schema: "ork.chief.desk.v1",
+    items: listDesk(root),
+    acknowledged: result,
+  };
+}
+
+/** Closes tracking for a mission: never kills a process, closes a terminal or deletes files. */
+export async function chiefClose({
+  roomId,
+  target,
+  force = false,
+  root = mailboxRoot(),
+  env = process.env,
+  now = Date.now(),
+  listRooms = listRawRooms,
+  runMailbox = defaultRunMailbox,
+  peers: providedPeers,
+} = {}) {
+  const peers = providedPeers || readPeers(root, { now });
+  let room = null;
+  let resolvedId = null;
+  if (isValidRoomId(roomId)) {
+    try {
+      room = readRawRoom(roomId, root);
+      resolvedId = roomId;
+    } catch {
+      room = null;
+    }
+  }
+  if (!room) {
+    const wanted = target ?? roomId;
+    if (!wanted) throw new Error("Pass the room, branch or session to close");
+    const status = await chiefStatus({ root, env, now, quota: false, all: true, listRooms, peers });
+    const found = resolveChiefTarget(wanted, { status, rooms: listRooms(root), peers });
+    if (!found.roomId) {
+      const error = new Error(`${wanted} is a standalone session, not a Chief mission`);
+      error.code = "not_mission";
+      throw error;
+    }
+    room = readRawRoom(found.roomId, root);
+    resolvedId = found.roomId;
+  }
+  if (!isPlainObject(room.chief)) {
+    const error = new Error(`${resolvedId} is not a Chief mission`);
+    error.code = "not_mission";
+    throw error;
+  }
+  if (room.machine && room.machine !== hostname()) {
+    const error = new Error(`${resolvedId} belongs to another machine`);
+    error.code = "foreign_machine";
+    throw error;
+  }
+  const chief = readChiefBinding({ root, now, peers });
+  // Captured before the room closes, so its mail still attributes to it during cleanup.
+  const ownSessions = roomSessions(room);
+  let status = "closed";
+  await withExclusiveLock(missionLockPath(root, resolvedId), async () => {
+    const current = readRawRoom(resolvedId, root);
+    if (isClosedRoom(current)) {
+      status = "already-closed";
+      return;
+    }
+    const summary = summarizeRoom(current, { peers, inbox: [] });
+    const live = summary.coordinator.live || summary.counts.working > 0;
+    if (live && !force) {
+      const error = new Error(
+        `${resolvedId} is live; stop it first or pass --force to stop tracking it`,
+      );
+      error.code = "room_live";
+      throw error;
+    }
+    await updateRawRoom(
+      resolvedId,
+      (next) => {
+        next.status = "closed";
+        next.closedAt ||= iso(now);
+        return next;
+      },
+      { root },
+    );
+  });
+  // Cleanup repeats on every close, so an interrupted acknowledgment completes now.
+  await resumeAcknowledgements(root, { runMailbox, env });
+  const deskIds = listDesk(root)
+    .filter((item) => item.roomId === resolvedId)
+    .map((item) => item.id);
+  let inboxIds = [];
+  if (chief?.live) {
+    inboxIds = readUnreadInbox(root, chief.session)
+      .filter((message) => message.roomId === resolvedId || ownSessions.has(message.from?.session))
+      .map((message) => message.id);
+  }
+  if (deskIds.length > 0 || inboxIds.length > 0)
+    await commitAcknowledgement({
+      root,
+      deskIds,
+      inboxIds,
+      session: chief?.live ? chief.session : null,
+      runMailbox,
+      env,
+      now,
+    });
+  return { schema: CLOSE_SCHEMA, roomId: resolvedId, status };
+}
 
 function slugify(text, max = 32) {
   return (
@@ -1929,6 +3177,284 @@ function appendClaudeConfigDirOnce(args, claudeConfigDir) {
   return next;
 }
 
+// ---------------------------------------------------------------------------
+// Interactive spawn: the harness runs in a pane of the caller's own multiplexer
+
+const INTERACTIVE_ENGINES = new Set(["claude", "codex"]);
+const TMUX_PANE_RE = /^%\d+$/u;
+
+function interactiveError(message) {
+  return Object.assign(new Error(message), { code: "interactive_unavailable" });
+}
+
+function executableOnPath(name, env = process.env) {
+  const dirs = String(env.PATH || "")
+    .split(path.delimiter)
+    .filter(Boolean);
+  for (const dir of dirs) {
+    if (!dir) continue;
+    const candidate = path.join(dir, name);
+    try {
+      if (statSync(candidate).isFile()) {
+        accessSync(candidate, fsConstants.X_OK);
+        return candidate;
+      }
+    } catch {
+      // Not here; keep searching.
+    }
+  }
+  return null;
+}
+
+function defaultExec(file, args, { env, timeout = 20_000 } = {}) {
+  const result = spawnSync(file, args, { encoding: "utf8", env, timeout });
+  if (result.error) {
+    throw Object.assign(new Error(result.error.message), {
+      code: result.error.code,
+      killed: result.error.code === "ETIMEDOUT",
+    });
+  }
+  if (result.status !== 0) {
+    throw Object.assign(new Error((result.stderr || result.stdout || "command failed").trim()), {
+      status: result.status,
+    });
+  }
+  return result.stdout;
+}
+
+const QUOTA_DECISION_PY = `
+import inspect, json, sys
+sys.path.insert(0, sys.argv[1])
+import quota
+engine, model, payload = sys.argv[2], sys.argv[3], json.loads(sys.argv[4])
+view = quota.snapshot()
+if view is None:
+    print(json.dumps({"status": "unknown", "label": None}))
+    raise SystemExit(0)
+params = inspect.signature(quota.check).parameters
+kwargs = {key: value for key, value in payload.items() if key in params}
+result = quota.check(engine, model, view, **kwargs)
+print(json.dumps({"status": result.get("status") or "unknown", "label": result.get("label")}))
+`;
+
+/**
+ * The same decision run_agent's quota gate makes (quota.check on a live monitor snapshot), so an
+ * interactive route and a detached run agree. Unknown quota is not treated as usable here.
+ */
+function defaultQuotaDecision({ engine, model, policy, env }) {
+  const payload = {
+    account_id: policy.accountId || null,
+    account_alias: policy.accountAlias || null,
+    claude_config_dir: policy.claudeConfigDir || null,
+    codex_home: policy.codexHome || null,
+    agy_home: policy.agyHome || null,
+    tags: policy.tags || null,
+  };
+  const result = spawnSync(
+    "python3",
+    ["-I", "-c", QUOTA_DECISION_PY, SCRIPTS_DIR, engine, model || "", JSON.stringify(payload)],
+    { encoding: "utf8", env, timeout: 120_000 },
+  );
+  try {
+    return JSON.parse(result.stdout.trim().split("\n").at(-1));
+  } catch {
+    return { status: "unknown", label: null };
+  }
+}
+
+/** Refuses what the detached gate refuses (blocked, credits) and what it cannot judge (unknown). */
+function assertInteractiveQuota(decision) {
+  if (decision.status === "blocked" || decision.status === "credits")
+    throw interactiveError(
+      `${decision.label || "The selected account"} is ${decision.status}; an interactive run would bill or stall`,
+    );
+  if (decision.status === "unknown" || !decision.status)
+    throw interactiveError(
+      "Quota for the interactive route cannot be established; start monitor or pick a measured route",
+    );
+  return decision.status;
+}
+
+/** The pane ID tmux reports for TMUX_PANE, or an empty string when tmux cannot answer. */
+function tmuxPaneOrEmpty(env, exec) {
+  try {
+    return exec("tmux", ["display-message", "-p", "-t", env.TMUX_PANE, "#{pane_id}"], {
+      env,
+    }).trim();
+  } catch {
+    return "";
+  }
+}
+
+/** Herdr, then Orca, then tmux. A binary on PATH alone never establishes a session. */
+export function selectInteractiveBackend(env = process.env, { exec = defaultExec } = {}) {
+  if (env.HERDR_ENV === "1") {
+    if (!executableOnPath("herdr", env))
+      throw interactiveError(
+        "Herdr is the active session, but its herdr executable is not on PATH",
+      );
+    return { backend: "herdr", endpoint: herdrEndpoint(env) };
+  }
+  const context = orcaPaneContext(env);
+  if (context) {
+    const cli = resolveOrcaCli(env);
+    if (!cli) throw interactiveError("Orca is the active session, but no Orca CLI is available");
+    return { backend: "orca", cli, context };
+  }
+  if (TMUX_PANE_RE.test(env.TMUX_PANE || "")) {
+    if (!executableOnPath("tmux", env))
+      throw interactiveError("tmux is the active session, but tmux is not on PATH");
+    const current = tmuxPaneOrEmpty(env, exec);
+    if (current !== env.TMUX_PANE)
+      throw interactiveError("TMUX_PANE does not identify a current tmux pane");
+    return { backend: "tmux", pane: env.TMUX_PANE, server: env.TMUX?.split(",", 1)[0] || null };
+  }
+  throw interactiveError("No interactive session: run --interactive inside Herdr, Orca or tmux");
+}
+
+/** The private launcher runs the harness on the child PTY with the account environment and brief. */
+function interactiveLauncher({
+  roomId,
+  missionSession,
+  workspace,
+  engine,
+  model,
+  briefPath,
+  accountEnv,
+  root,
+}) {
+  const exports = Object.entries(accountEnv || {})
+    .filter(([key]) => /^[A-Z_][A-Z0-9_]*$/u.test(key))
+    .map(([key, value]) => `export ${key}=${shellSingleQuote(String(value))}`);
+  const harness = [
+    engine,
+    ...(model && engine === "claude" ? ["--model", model] : []),
+    ...(model && engine === "codex" ? ["-m", model] : []),
+  ];
+  const statusline = fileURLToPath(
+    new URL("../skills/orchestrate/scripts/agent_statusline_tmux.py", import.meta.url),
+  );
+  return [
+    "#!/bin/sh",
+    "# orkest-chief-interactive-launch: v1",
+    `export ORK_CHIEF_ROOM=${shellSingleQuote(roomId)}`,
+    `export ORK_CHIEF_MISSION_SESSION=${shellSingleQuote(missionSession)}`,
+    `export AGENT_MAILBOX_SESSION=${shellSingleQuote(missionSession)}`,
+    ...(path.basename(root) === "mailbox-v1"
+      ? [`export ORCHESTRATE_HOME=${shellSingleQuote(path.dirname(root))}`]
+      : []),
+    ...exports,
+    `cd ${shellSingleQuote(workspace)} || exit 1`,
+    `exec python3 ${shellSingleQuote(statusline)} --room ${shellSingleQuote(roomId)} --cwd ${shellSingleQuote(workspace)} -- ${harness.map((part) => shellSingleQuote(part)).join(" ")} "$(cat ${shellSingleQuote(briefPath)})"`,
+    "",
+  ].join("\n");
+}
+
+/** The argv a backend would run for the split and launch, shown by dry-run without running it. */
+function interactivePreviewArgv(selection, { workspace, launcher }) {
+  if (selection.backend === "herdr")
+    return [
+      "herdr",
+      "pane",
+      "split",
+      "--current",
+      "--direction",
+      "right",
+      "--cwd",
+      workspace,
+      "--no-focus",
+    ];
+  if (selection.backend === "orca")
+    return [
+      selection.cli,
+      "terminal",
+      "split",
+      "--terminal",
+      selection.context.terminalHandle,
+      "--direction",
+      "vertical",
+      "--command",
+      launcher,
+      "--json",
+    ];
+  return [
+    "tmux",
+    "new-window",
+    "-d",
+    "-P",
+    "-F",
+    "#{pane_id}",
+    "-t",
+    selection.pane,
+    "-c",
+    workspace,
+    launcher,
+  ];
+}
+
+/**
+ * Splits the caller's pane (or tab/terminal) and starts the launcher there. Returns the persisted
+ * identity; never retries a launch, since a timed-out split may already have opened a pane.
+ */
+function launchInteractive(selection, { workspace, launcher, exec, env }) {
+  if (selection.backend === "herdr") {
+    const split = JSON.parse(
+      exec(
+        "herdr",
+        ["pane", "split", "--current", "--direction", "right", "--cwd", workspace, "--no-focus"],
+        { env },
+      ),
+    );
+    const paneId = split?.result?.pane?.pane_id;
+    if (typeof paneId !== "string" || !paneId)
+      throw new Error("Herdr split did not return a pane ID");
+    exec("herdr", ["pane", "run", paneId, shellSingleQuote(launcher)], { env });
+    return { herdrPaneId: paneId, herdrEndpoint: selection.endpoint, paneId };
+  }
+  if (selection.backend === "orca") {
+    let stdout;
+    try {
+      stdout = exec(
+        selection.cli,
+        [
+          "terminal",
+          "split",
+          "--terminal",
+          selection.context.terminalHandle,
+          "--direction",
+          "vertical",
+          "--command",
+          launcher,
+          "--json",
+        ],
+        { env },
+      );
+    } catch (error) {
+      if (error.killed)
+        throw new Error("Orca did not confirm the split; check the workspace before retrying", {
+          cause: error,
+        });
+      throw error;
+    }
+    const handle = orcaTerminalHandle(JSON.parse(stdout)?.result?.split?.handle);
+    if (!handle) throw new Error("Orca split the pane without naming its terminal");
+    return {
+      orcaTerminalHandle: handle,
+      orcaWorkspaceId: selection.context.worktreeId,
+      orcaTabId: selection.context.tabId,
+      orcaEnvironment: selection.context.environment,
+      orcaPaneKey: selection.context.paneKey,
+    };
+  }
+  const paneId = exec(
+    "tmux",
+    ["new-window", "-d", "-P", "-F", "#{pane_id}", "-t", selection.pane, "-c", workspace, launcher],
+    { env },
+  ).trim();
+  if (!TMUX_PANE_RE.test(paneId)) throw new Error(`tmux returned an unexpected pane: ${paneId}`);
+  return { tmuxPane: paneId, paneId, terminalServer: selection.server };
+}
+
 export async function chiefSpawn({
   cwd,
   worktree,
@@ -1943,16 +3469,23 @@ export async function chiefSpawn({
   effort,
   route,
   dryRun = false,
-  timeout = "8h",
+  timeout,
+  interactive = false,
+  quotaDecision = defaultQuotaDecision,
   root = mailboxRoot(),
   env = process.env,
   now = Date.now(),
   exec,
+  interactiveExec = defaultExec,
   launch = defaultLaunch,
   provision = provisionWorktree,
   isEngineInstalled = defaultIsEngineInstalled,
 } = {}) {
   if (!cwd) throw new Error("Pass --cwd <repository>");
+  if (interactive && timeout !== undefined)
+    throw interactiveError(
+      "--timeout applies to detached missions; interactive panes have no runner timeout",
+    );
   let goalText = typeof goal === "string" ? goal.trim() : "";
   if (goalFile) {
     if (goalText) throw new Error("Choose --goal or --goal-file");
@@ -2057,6 +3590,22 @@ export async function chiefSpawn({
   if (!isEngineInstalled(selectedEngine, env)) {
     throw new Error(`Engine '${selectedEngine}' is not installed on PATH`);
   }
+  // Preflight: the backend and quota decision are proven before any room, worktree or hook exists.
+  const selection = interactive ? selectInteractiveBackend(env, { exec: interactiveExec }) : null;
+  if (interactive && !INTERACTIVE_ENGINES.has(selectedEngine))
+    throw interactiveError(
+      `Interactive launch supports ${[...INTERACTIVE_ENGINES].join(" and ")}; run ${selectedEngine} detached instead`,
+    );
+  const quotaStatus = interactive
+    ? assertInteractiveQuota(
+        await quotaDecision({
+          engine: selectedEngine,
+          model: model || routeCandidate?.model || "",
+          policy,
+          env,
+        }),
+      )
+    : null;
   const resolvedModel = model || routeCandidate?.model || null;
   const resolvedEffort = effort || routeCandidate?.effort || null;
   const roomEngine = selectedEngine;
@@ -2105,7 +3654,7 @@ export async function chiefSpawn({
     "--allow-path",
     ".",
     "--timeout",
-    timeout,
+    timeout ?? "8h",
     ...(shouldForwardRouteFlag ? ["--route", route] : []),
     "--engine",
     selectedEngine,
@@ -2126,7 +3675,21 @@ export async function chiefSpawn({
     missionSession,
     title: missionTitle,
   });
+  const missionGeneration = randomBytes(8).toString("hex");
+  const completionDir = path.join(cacheHome(env), "completions-v1");
+  // Planning validates the hook location and trusted Node/entry without writing anything.
+  const hookPlan = interactive
+    ? null
+    : planCompletionHook({
+        root,
+        roomId,
+        workspaces: [repoRoot, plannedWorkspace, ...workspacesOf(command)],
+      });
+  if (hookPlan) command.push("--completion-hook", hookPlan.path);
+  const interactiveLauncherPath = path.join(missionDir, "interactive-launch.sh");
   const warnings = [];
+  if (quotaStatus === "low")
+    warnings.push("The selected interactive account is low on included quota");
   if (!chief)
     warnings.push("No live Chief is bound; reports will queue on the Chief desk until one binds");
   if (!isWorktreeRequested)
@@ -2156,7 +3719,14 @@ export async function chiefSpawn({
     effort: resolvedEffort,
     briefPath,
     jobDir,
-    command,
+    completionHook: hookPlan?.path ?? null,
+    backend: selection?.backend ?? null,
+    command: selection
+      ? interactivePreviewArgv(selection, {
+          workspace: plannedWorkspace,
+          launcher: interactiveLauncherPath,
+        })
+      : command,
     ...(dryRun && { brief }),
     warnings,
   };
@@ -2207,6 +3777,13 @@ export async function chiefSpawn({
         state: "launching",
         mission: { session: missionSession, briefPath, jobDir },
         launch: {
+          // Identity the reconciler checks before any launch: expected job and trusted store.
+          mode: interactive ? "interactive" : "detached",
+          status: "launching",
+          roomId,
+          generation: missionGeneration,
+          ...(hookPlan && { jobDir, completionDir, hook: hookPlan.path }),
+          ...(selection && { backend: selection.backend }),
           engine: selectedEngine,
           ...(policy.accountId && { accountId: policy.accountId }),
           ...(policy.accountAlias && { accountAlias: policy.accountAlias }),
@@ -2222,6 +3799,114 @@ export async function chiefSpawn({
   );
   mkdirSync(missionDir, { recursive: true, mode: 0o700 });
   writeFileSync(briefPath, brief, { mode: 0o600 });
+  if (selection) {
+    // Interactive: the harness runs in the pane itself. No detached runner, hook or timeout.
+    writeFileSync(
+      interactiveLauncherPath,
+      interactiveLauncher({
+        roomId,
+        missionSession,
+        workspace,
+        engine: selectedEngine,
+        model: resolvedModel,
+        briefPath,
+        accountEnv: policy.accountEnv,
+        root,
+      }),
+      { mode: 0o700 },
+    );
+    let launchedPane;
+    try {
+      launchedPane = launchInteractive(selection, {
+        workspace,
+        launcher: interactiveLauncherPath,
+        exec: interactiveExec,
+        env,
+      });
+    } catch (error) {
+      const message = oneLine(error.message, 400);
+      await updateRawRoom(
+        roomId,
+        (room) => {
+          room.chief.state = "failed";
+          room.chief.launch = { ...room.chief.launch, status: "failed", error: message };
+          if (room.conductor) room.conductor.status = "failed";
+          return room;
+        },
+        { root },
+      );
+      return {
+        ...plan,
+        status: "failed",
+        workspace,
+        worktree: worktreeInfo
+          ? { slug: worktreeInfo.slug, branch: worktreeInfo.branch, path: worktreeInfo.path }
+          : null,
+        launch: { backend: selection.backend, exitCode: null },
+        error: message,
+      };
+    }
+    await updateRawRoom(
+      roomId,
+      (room) => {
+        room.chief.state = "running";
+        room.chief.launch = {
+          ...room.chief.launch,
+          status: "launched",
+          backend: selection.backend,
+          ...launchedPane,
+          launchedAt: iso(now),
+        };
+        if (room.conductor) {
+          room.conductor.status = "running";
+          Object.assign(room.conductor, launchedPane);
+        }
+        return room;
+      },
+      { root },
+    );
+    return {
+      ...plan,
+      status: "launched",
+      workspace,
+      worktree: worktreeInfo
+        ? { slug: worktreeInfo.slug, branch: worktreeInfo.branch, path: worktreeInfo.path }
+        : null,
+      launch: { backend: selection.backend, ...launchedPane, exitCode: 0 },
+    };
+  }
+  // The hook must exist before the executor starts, because a fast run can publish its event at once.
+  try {
+    installCompletionHook(
+      planCompletionHook({ root, roomId, workspaces: [workspace, ...workspacesOf(command)] }),
+    );
+  } catch (error) {
+    await updateRawRoom(
+      roomId,
+      (room) => {
+        room.chief.state = "failed";
+        room.chief.launch = {
+          ...room.chief.launch,
+          status: "failed",
+          error: oneLine(error.message, 400),
+        };
+        if (room.conductor) room.conductor.status = "failed";
+        return room;
+      },
+      { root },
+    );
+    return {
+      ...plan,
+      status: "failed",
+      workspace,
+      worktree: worktreeInfo
+        ? { slug: worktreeInfo.slug, branch: worktreeInfo.branch, path: worktreeInfo.path }
+        : null,
+      command,
+      launch: { exitCode: null },
+      error: oneLine(error.message, 400),
+    };
+  }
   const finalCommand = command.map((part) => (part === plannedWorkspace ? workspace : part));
   const launchEnv = applyLauncherAccountEnv(
     {
@@ -2243,25 +3928,41 @@ export async function chiefSpawn({
   await updateRawRoom(
     roomId,
     (room) => {
-      room.chief.state = isOk ? "running" : "failed";
+      // An early hook may already have written a terminal state; the launch never overwrites it.
+      const isTerminal = TERMINAL_MISSION_STATES.has(room.chief.state);
+      if (!isTerminal) room.chief.state = isOk ? "running" : "failed";
+      const pidBirth = isOk && info.pid ? processStarted(info.pid) : undefined;
       room.chief.launch = {
         ...room.chief.launch,
         status: isOk ? info.status || "started" : "failed",
         pid: info.pid,
+        ...(pidBirth && { pidBirth }),
         job: info.job,
         result: info.result,
+        event: info.event,
         runMailbox: info.runMailbox,
         launchedAt: iso(now),
         ...(!isOk && {
           error: oneLine(launched.stderr || launched.stdout || "launch failed", 400),
         }),
       };
-      room.conductor.status = isOk ? "running" : "failed";
-      if (info.pid) room.conductor.pid = info.pid;
+      if (!isTerminal && room.conductor) room.conductor.status = isOk ? "running" : "failed";
+      if (info.pid && room.conductor) room.conductor.pid = info.pid;
       return room;
     },
     { root },
   );
+  if (isOk) {
+    // The manifest now exists: publish any exit that a fast hook saw before it did.
+    const reconcileEnv = { ...env };
+    delete reconcileEnv.AGENT_EVENT;
+    delete reconcileEnv.AGENT_RESULT;
+    try {
+      await chiefReconcile({ roomId, hook: true, root, env: reconcileEnv, now });
+    } catch {
+      // The reconcile runs again on the next status or manual reconcile.
+    }
+  }
   return {
     ...plan,
     status: isOk ? "launched" : "failed",
