@@ -357,6 +357,80 @@ describe("ork chief", () => {
       });
     });
 
+    it("projects worktree ports and the saved PR once per path, without any GitHub call", async () => {
+      const readPorts = vi.fn(() => [
+        { name: "api", port: 31_042 },
+        { name: "web", port: 31_043 },
+        { name: "bad", port: "x" },
+      ]);
+      const readPr = vi.fn(() => ({
+        number: 231,
+        state: "merged",
+        url: "https://github.com/o/r/pull/231",
+        headOid: "deadbeef",
+      }));
+      const fetchSpy = vi.fn();
+      vi.stubGlobal("fetch", fetchSpy);
+      const twin = { ...rooms.find((room) => room.id === "room-beta"), id: "room-beta-twin" };
+      const status = await chiefStatus({
+        root,
+        env,
+        now: NOW,
+        quota: false,
+        listRooms: () => [...rooms, twin],
+        readPorts,
+        readPr,
+      });
+      vi.unstubAllGlobals();
+      const beta = status.rooms.find((entry) => entry.id === "room-beta");
+      expect(beta.worktree.ports).toEqual([
+        { name: "api", port: 31_042 },
+        { name: "web", port: 31_043 },
+      ]);
+      expect(beta.worktree.pr).toEqual({
+        number: 231,
+        state: "MERGED",
+        url: "https://github.com/o/r/pull/231",
+      });
+      expect(JSON.stringify(status)).not.toContain("deadbeef");
+      // Two rooms share one worktree path: each source is read once for the snapshot.
+      expect(readPorts).toHaveBeenCalledTimes(1);
+      expect(readPr).toHaveBeenCalledTimes(1);
+      expect(readPorts).toHaveBeenCalledWith({
+        repoRoot: repoB,
+        worktreePath: worktreeB,
+        env,
+      });
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(status.rooms.find((entry) => entry.id === "room-alpha").worktree).toBeNull();
+    });
+
+    it("maps absent, corrupt or throwing sources to [] and null", async () => {
+      for (const sources of [
+        { readPorts: () => {}, readPr: () => {} },
+        { readPorts: () => "bad", readPr: () => ({ number: -4, state: "OPEN" }) },
+        {
+          readPorts: () => {
+            throw new Error("busy");
+          },
+          readPr: () => {
+            throw new Error("corrupt state");
+          },
+        },
+      ]) {
+        const status = await chiefStatus({
+          root,
+          env,
+          now: NOW,
+          quota: false,
+          listRooms: () => rooms,
+          ...sources,
+        });
+        const beta = status.rooms.find((entry) => entry.id === "room-beta");
+        expect(beta.worktree).toMatchObject({ slug: "fix-login", ports: [], pr: null });
+      }
+    });
+
     it("aggregates rooms across repos and worktrees with counts and attention", async () => {
       const quotaReader = vi.fn(async () => [{ id: "claude", short: "C" }]);
       const status = await chiefStatus({
@@ -396,7 +470,7 @@ describe("ork chief", () => {
       const beta = status.rooms.find((entry) => entry.id === "room-beta");
       expect(beta.repo).toEqual({ name: "beta", path: repoB });
       expect(beta.branch).toBe("fix/login");
-      expect(beta.worktree).toEqual({ slug: "fix-login", path: worktreeB });
+      expect(beta.worktree).toEqual({ slug: "fix-login", path: worktreeB, ports: [], pr: null });
       expect(beta.coordinator.live).toBe(false);
       expect(beta.attention.map((item) => item.kind)).toContain("stale-coordinator");
       expect(beta.parentChief).toEqual({ session: "chief-s", name: "the-chief" });
@@ -2914,6 +2988,299 @@ describe("ork chief", () => {
         expect(outcome.status).toMatch(/recorded|already-recorded/u);
         expect(readRawRoom("race-done", root).chief.state).toBe("done");
         expect(deskPuts()).toBe(1);
+      });
+
+      describe("bridge events through fresh ork processes", () => {
+        let recorded;
+        let configFile;
+
+        beforeEach(() => {
+          root = path.join(cache, "mailbox-v1");
+          fs.mkdirSync(root, { recursive: true });
+          const hooks = path.join(tmp, "hooks");
+          fs.mkdirSync(hooks, { mode: 0o700 });
+          recorded = path.join(tmp, "recorded.jsonl");
+          const hook = path.join(hooks, "record.sh");
+          fs.writeFileSync(hook, `#!/bin/sh\ncat >> '${recorded}'\necho >> '${recorded}'\n`, {
+            mode: 0o700,
+          });
+          configFile = path.join(tmp, "bridge", "chief-bridge.json");
+          fs.mkdirSync(path.dirname(configFile), { mode: 0o700 });
+          fs.writeFileSync(
+            configFile,
+            JSON.stringify({ version: 1, enabled: true, command: { path: hook } }),
+            { mode: 0o600 },
+          );
+        });
+
+        const runOrk = (args, extraEnv = {}) =>
+          spawnSync(process.execPath, [ORK_BIN, ...args], {
+            env: {
+              PATH: env.PATH,
+              HOME: tmp,
+              ORCHESTRATE_HOME: cache,
+              ORK_CHIEF_BRIDGE_CONFIG: configFile,
+              ...extraEnv,
+            },
+            encoding: "utf8",
+            timeout: 60_000,
+          });
+        const payloads = () =>
+          fs.existsSync(recorded)
+            ? fs
+                .readFileSync(recorded, "utf8")
+                .split("\n")
+                .filter(Boolean)
+                .map((line) => JSON.parse(line))
+            : [];
+
+        const waitForPayloads = async (count, timeoutMs = 15_000) => {
+          const deadline = Date.now() + timeoutMs;
+          while (payloads().length < count && Date.now() < deadline)
+            await new Promise((resolve) => setTimeout(resolve, 50));
+        };
+
+        it("returns from the CLI before a slow sink finishes, then delivers once even after a restart", async () => {
+          const hooks = path.join(tmp, "hooks");
+          const slow = path.join(hooks, "slow.sh");
+          fs.writeFileSync(
+            slow,
+            `#!/bin/sh\nsleep 2\ncat >> '${recorded}'\necho >> '${recorded}'\n`,
+            { mode: 0o700 },
+          );
+          fs.writeFileSync(
+            configFile,
+            JSON.stringify({ version: 1, enabled: true, command: { path: slow } }),
+          );
+          await writeRooms([missionRoom("p-slow", { launch: { pid: process.pid } })]);
+          writeArtifacts("p-slow", {
+            result: { status: "completed", task_outcome: "complete" },
+            event: true,
+          });
+          const started = Date.now();
+          const first = runOrk(["chief", "reconcile", "p-slow", "--hook", "--json"]);
+          const elapsed = Date.now() - started;
+          expect(first.status, first.stderr).toBe(0);
+          // The sink sleeps 2s; the CLI must not have waited for it, and nothing is recorded yet.
+          expect(elapsed).toBeLessThan(1800);
+          expect(payloads()).toEqual([]);
+          await waitForPayloads(1);
+          expect(payloads().map((item) => [item.event, item.roomId])).toEqual([["done", "p-slow"]]);
+          const again = runOrk(["chief", "reconcile", "p-slow", "--hook", "--json"]);
+          expect(again.status, again.stderr).toBe(0);
+          await new Promise((resolve) => setTimeout(resolve, 3000));
+          expect(payloads()).toHaveLength(1);
+        });
+
+        it("delivers each committed transition once, across restarts, and nothing when disabled", async () => {
+          await writeRooms([
+            missionRoom("p-off", { launch: { pid: process.pid } }),
+            missionRoom("p-off-q"),
+            missionRoom("p-done", { launch: { pid: process.pid } }),
+            missionRoom("p-q"),
+          ]);
+          writeArtifacts("p-off", {
+            result: { status: "completed", task_outcome: "complete" },
+            event: true,
+          });
+          const off = { ORK_CHIEF_BRIDGE: "0" };
+          expect(runOrk(["chief", "reconcile", "p-off", "--hook", "--json"], off).status).toBe(0);
+          expect(
+            runOrk(
+              [
+                "chief",
+                "send",
+                "--to",
+                "chief",
+                "--from",
+                "p-off-q-orch",
+                "--kind",
+                "question",
+                "x?",
+              ],
+              off,
+            ).status,
+          ).toBe(0);
+          expect(readRawRoom("p-off", root).chief.state).toBe("done");
+          expect(payloads()).toEqual([]);
+          writeArtifacts("p-done", {
+            result: { status: "completed", task_outcome: "complete" },
+            event: true,
+          });
+          for (let run = 0; run < 2; run++) {
+            const result = runOrk(["chief", "reconcile", "p-done", "--hook", "--json"]);
+            expect(result.status, result.stderr).toBe(0);
+          }
+          const questions = ["first question?", "second question?"].map((message) =>
+            runOrk([
+              "chief",
+              "send",
+              "--to",
+              "chief",
+              "--from",
+              "p-q-orch",
+              "--kind",
+              "question",
+              message,
+              "--json",
+            ]),
+          );
+          for (const result of questions) expect(result.status, result.stderr).toBe(0);
+          await waitForPayloads(3);
+          const received = payloads();
+          expect(received.map((item) => [item.event, item.roomId])).toEqual([
+            ["done", "p-done"],
+            ["question", "p-q"],
+            ["question", "p-q"],
+          ]);
+          expect(new Set(received.map((item) => item.id)).size).toBe(3);
+          for (const item of received) {
+            expect(Object.keys(item).toSorted((left, right) => left.localeCompare(right))).toEqual([
+              "at",
+              "event",
+              "id",
+              "roomId",
+              "schema",
+            ]);
+          }
+          const raw = JSON.stringify(received);
+          expect(raw).not.toMatch(/first question|second question|\/mailbox|tmp/u);
+        });
+      });
+
+      describe("bridge events", () => {
+        const recorder = () => {
+          const emitted = [];
+          return {
+            emitted,
+            emit: vi.fn(async (event) => {
+              emitted.push(event);
+            }),
+          };
+        };
+        let counter = 0;
+        const uniqueMailbox = () =>
+          vi.fn((args) => ({
+            status: 0,
+            stdout: args[0] === "send" ? JSON.stringify({ id: `msg-${++counter}` }) : "{}",
+            stderr: "",
+          }));
+        const sendKind = (bridge, kind, from, message, extra = {}) =>
+          chiefSend({
+            root,
+            env,
+            to: "chief",
+            kind,
+            message,
+            from,
+            runMailbox: uniqueMailbox(),
+            now: NOW,
+            bridge,
+            listRooms: () => listRawRooms(root),
+            ...extra,
+          });
+
+        it("emits one done and one failed for a recorded detached outcome, once", async () => {
+          const bridge = recorder();
+          await writeRooms([
+            missionRoom("ev-done", { launch: { pid: process.pid } }),
+            missionRoom("ev-fail", { launch: { pid: process.pid } }),
+          ]);
+          writeArtifacts("ev-done", {
+            result: { status: "completed", task_outcome: "complete" },
+            event: true,
+          });
+          await reconcile("ev-done", { hook: true, bridge });
+          await reconcile("ev-done", { hook: true, bridge });
+          writeArtifacts("ev-fail", { result: { status: "failed", exit_code: 1 }, event: true });
+          await reconcile("ev-fail", { hook: true, bridge });
+          await reconcile("ev-fail", { hook: true, bridge });
+          expect(bridge.emitted.map(({ event, roomId }) => [event, roomId])).toEqual([
+            ["done", "ev-done"],
+            ["failed", "ev-fail"],
+          ]);
+          const again = recorder();
+          await reconcile("ev-fail", { hook: true, bridge: again });
+          expect(again.emitted).toEqual([]);
+        });
+
+        it("keeps the same durable key across a restart and ignores late failures", async () => {
+          const bridge = recorder();
+          await writeRooms([missionRoom("ev-late", { launch: { pid: process.pid } })]);
+          writeArtifacts("ev-late", { result: { status: "failed", exit_code: 1 }, event: true });
+          await sendKind(bridge, "done", "ev-late-orch", "done early");
+          expect(bridge.emitted).toHaveLength(1);
+          await reconcile("ev-late", { hook: true, bridge });
+          expect(bridge.emitted).toHaveLength(1);
+          expect(readRawRoom("ev-late", root).chief.exitAfterReport).toBeTruthy();
+        });
+
+        it("emits done, question and escalation from reports, with distinct questions", async () => {
+          const bridge = recorder();
+          await bindLiveChief();
+          await writeRooms([missionRoom("ev-send")]);
+          await sendKind(bridge, "update", "ev-send-orch", "progress");
+          await sendKind(bridge, "question", "ev-send-orch", "first?");
+          await sendKind(bridge, "question", "ev-send-orch", "second?");
+          await sendKind(bridge, "escalation", "ev-send-orch", "stuck");
+          await sendKind(bridge, "done", "ev-send-orch", "finished");
+          await sendKind(bridge, "done", "ev-send-orch", "finished again");
+          await sendKind(bridge, "question", "ev-send-orch", "too late?");
+          expect(bridge.emitted.map((item) => item.event)).toEqual([
+            "question",
+            "question",
+            "escalation",
+            "done",
+          ]);
+          expect(new Set(bridge.emitted.map((item) => item.key)).size).toBe(4);
+          for (const item of bridge.emitted) {
+            expect(Object.keys(item).toSorted((left, right) => left.localeCompare(right))).toEqual([
+              "event",
+              "key",
+              "roomId",
+            ]);
+            expect(item.roomId).toBe("ev-send");
+          }
+        });
+
+        it("emits once when Chief is unavailable and the report falls back to the desk", async () => {
+          const bridge = recorder();
+          await writeRooms([missionRoom("ev-desk")]);
+          const queued = await sendKind(bridge, "question", "ev-desk-orch", "anyone?");
+          expect(queued.status).toBe("queued");
+          expect(bridge.emitted).toHaveLength(1);
+          expect(bridge.emitted[0].key).toBe(`report:desk:${queued.desk.id}`);
+        });
+
+        it("emits nothing for a failed mailbox send that never reached a Chief", async () => {
+          const bridge = recorder();
+          await bindLiveChief();
+          await writeRooms([missionRoom("ev-reject")]);
+          await expect(
+            sendKind(bridge, "done", "ev-reject-orch", "x", { to: "nobody-here" }),
+          ).rejects.toThrow();
+          expect(bridge.emitted).toEqual([]);
+        });
+
+        it("never lets a throwing bridge change the committed outcome", async () => {
+          const bridge = {
+            emit: vi.fn(async () => {
+              throw new Error("boom");
+            }),
+          };
+          await writeRooms([missionRoom("ev-boom")]);
+          const result = await sendKind(bridge, "done", "ev-boom-orch", "ok");
+          expect(result.mission).toEqual({ roomId: "ev-boom", state: "done" });
+          expect(bridge.emit).toHaveBeenCalledTimes(1);
+          expect(readRawRoom("ev-boom", root).chief.state).toBe("done");
+        });
+
+        it("does not emit from status reads", async () => {
+          const bridge = recorder();
+          await writeRooms([missionRoom("ev-read")]);
+          await chiefStatus({ root, env, quota: false, now: NOW });
+          expect(bridge.emit).not.toHaveBeenCalled();
+        });
       });
 
       it("handles a hook that runs before the manifest, then after it", async () => {

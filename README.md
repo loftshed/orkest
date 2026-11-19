@@ -195,6 +195,7 @@ ork factory [status|run|groom] [--dry-run] [--json]   (alias for ork foundry)
 ork rooms --help                (alias for ork hall)
 ork herdr-status                     (focused Herdr pane agent, plain text)
 ork setup [--dry-run] [--trust-codex-hooks] [--trust-orkest-commands|--untrust-orkest-commands]   (install mailbox, hooks and shell wrapper shortcuts)
+ork setup --trust-worktree [--cwd <repo>] [--json]   (review and approve the repository's .orkest/worktree.json setup command)
 ork label [--lines 1|2] -- codex|claude|agy|opencode [arguments]   (direct in Herdr; tmux footer elsewhere)
 ork progress --session ID --goal TEXT --task TEXT --stage working [--role ROLE]
 ork name [--model <model>] [--effort <level>] [--harness <harness>] [--short]

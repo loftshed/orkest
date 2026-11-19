@@ -116,6 +116,71 @@ function locationBadge(item) {
   return branch ? `(${branch})` : "";
 }
 
+function normalizePorts(item) {
+  const ports = item?.worktree?.ports;
+  if (!Array.isArray(ports)) return [];
+  return ports
+    .filter(
+      (entry) =>
+        entry && typeof entry === "object" && Number.isSafeInteger(entry.port) && entry.port > 0,
+    )
+    .filter((entry) => entry.port < 65_536)
+    .map((entry) => ({ name: text(entry.name), port: entry.port }));
+}
+
+const PR_GLYPHS = {
+  OPEN: { unicode: "●", ascii: "o", tone: "running" },
+  MERGED: { unicode: "✓", ascii: "+", tone: "success" },
+  CLOSED: { unicode: "✗", ascii: "x", tone: "warning" },
+  UNKNOWN: { unicode: "?", ascii: "?", tone: "muted" },
+};
+
+function normalizePr(item) {
+  const pr = item?.worktree?.pr;
+  if (!pr || typeof pr !== "object") return null;
+  const number = Number(pr.number);
+  if (!Number.isSafeInteger(number) || number <= 0) return null;
+  const state = text(pr.state).toUpperCase();
+  return { number, state: Object.keys(PR_GLYPHS).includes(state) ? state : "UNKNOWN" };
+}
+
+/** `:31042 (+2)`: the first allocated port and how many more the worktree holds; "" when none. */
+export function chiefPortBadge(item = {}) {
+  const ports = normalizePorts(item);
+  if (ports.length === 0) return "";
+  return `:${ports[0].port}${ports.length > 1 ? ` (+${ports.length - 1})` : ""}`;
+}
+
+/** `● #231 open`: a state glyph, the number and the state word, so colour is never the only signal. */
+export function chiefPrBadge(item = {}, tier = "unicode") {
+  const pr = normalizePr(item);
+  if (!pr) return null;
+  const mark = PR_GLYPHS[pr.state];
+  const glyph = tier === "ascii" ? mark.ascii : mark.unicode;
+  return { text: `${glyph} #${pr.number} ${pr.state.toLowerCase()}`, tone: mark.tone };
+}
+
+/** Splits a string after `cells` display cells without cutting a grapheme. */
+function splitAtCells(value, cells) {
+  let used = 0;
+  let head = "";
+  const parts = [...graphemes.segment(value)];
+  for (const [index, { segment }] of parts.entries()) {
+    const size = cellWidth(segment);
+    if (used + size > cells)
+      return [
+        head,
+        parts
+          .slice(index)
+          .map((part) => part.segment)
+          .join(""),
+      ];
+    head += segment;
+    used += size;
+  }
+  return [head, ""];
+}
+
 function attentionItems(room) {
   return list(room.attention);
 }
@@ -259,7 +324,14 @@ export function chiefEntries(status) {
   const entries = [];
   for (const group of ordered) {
     for (const room of group.members) {
-      entries.push({ kind: "room", key: `room:${room.id}`, repo: group.repo, data: room });
+      entries.push({
+        kind: "room",
+        key: `room:${room.id}`,
+        repo: group.repo,
+        data: room,
+        ports: normalizePorts(room),
+        pr: normalizePr(room),
+      });
     }
   }
   const sessions = list(status?.standalone).toSorted(
@@ -272,6 +344,8 @@ export function chiefEntries(status) {
       key: `session:${session.session || session.name}`,
       repo: chiefRepoName(session),
       data: session,
+      ports: normalizePorts(session),
+      pr: normalizePr(session),
     });
   }
   return entries;
@@ -315,7 +389,13 @@ function chiefRoomLive(room) {
 /** Lowercase text a search matches against: repo, branch, worktree, then the entry's own names. */
 function chiefSearchFields(entry) {
   const data = entry.data;
-  const shared = [chiefRepoName(data), text(data.branch), text(data.worktree?.slug)];
+  const shared = [
+    chiefRepoName(data),
+    text(data.branch),
+    text(data.worktree?.slug),
+    chiefPortBadge(data),
+    normalizePr(data) ? `#${normalizePr(data).number}` : "",
+  ];
   const named =
     entry.kind === "room"
       ? [
@@ -956,25 +1036,45 @@ export class ChiefView {
     const badgeText = badges.length > 0 ? ` · ${badges.join(" · ")}` : "";
     const rightBudget = Math.min(displayWidth(rightPlain), Math.max(0, inner - leftCells - 8));
     const rightText = rightBudget > 0 ? truncateDisplay(rightPlain, rightBudget, this.tier) : "";
-    const nameBudget = Math.max(
+    const prBadge = chiefPrBadge(item, this.tier);
+    const portBadge = chiefPortBadge(item);
+    const attentionWidth = displayWidth(attentionBadge);
+    const cap = Math.max(
       1,
-      inner - leftCells - displayWidth(rightText) - (rightText ? 1 : 0) - attentionBadge.length,
+      inner - leftCells - displayWidth(rightText) - (rightText ? 1 : 0) - attentionWidth,
     );
+    const nameCells = displayWidth(name);
+    // Narrow rows: shorten the name first (down to a stub), then drop the optional port badge; the PR
+    // badge with its state word is kept and only truncated when nothing else is left to give.
+    const stub = Math.min(nameCells, 8);
+    const prTail = prBadge ? ` ${prBadge.text}` : "";
+    let portTail = portBadge ? ` ${portBadge}` : "";
+    let headBudget = cap - displayWidth(portTail) - displayWidth(prTail);
+    if (portTail && headBudget < stub) {
+      portTail = "";
+      headBudget = cap - displayWidth(prTail);
+    }
+    let prShown = prTail;
+    if (prTail && headBudget < stub) {
+      headBudget = Math.min(stub, Math.max(1, cap - 1));
+      prShown = truncateDisplay(prTail, Math.max(0, cap - headBudget), this.tier);
+    }
+    headBudget = Math.max(1, headBudget);
     const fullName = `${name}${badgeText}`;
     const shown =
-      displayWidth(fullName) > nameBudget
-        ? truncateDisplay(fullName, nameBudget, this.tier)
+      displayWidth(fullName) > headBudget
+        ? truncateDisplay(fullName, headBudget, this.tier)
         : fullName;
-    const nameCells = displayWidth(name);
-    const shownName = shown.slice(0, Math.min(shown.length, name.length));
-    const shownBadge = shown.length > name.length ? shown.slice(name.length) : "";
-    const styledName =
-      displayWidth(shown) < nameCells
-        ? this.style(shown, nameTone)
-        : `${this.style(shownName, nameTone)}${this.style(shownBadge, "muted")}`;
+    const [shownName, shownBadge] = splitAtCells(shown, nameCells);
+    const styledName = `${this.style(shownName, nameTone)}${shownBadge ? this.style(shownBadge, "muted") : ""}${portTail ? this.style(portTail, "muted") : ""}${prShown ? this.style(prShown, prBadge.tone) : ""}`;
     const styledAttention = attentionBadge ? this.style(attentionBadge, "warning bold") : "";
     const used =
-      leftCells + displayWidth(shown) + displayWidth(attentionBadge) + displayWidth(rightText);
+      leftCells +
+      displayWidth(shown) +
+      displayWidth(portTail) +
+      displayWidth(prShown) +
+      attentionWidth +
+      displayWidth(rightText);
     const gap = " ".repeat(Math.max(rightText ? 1 : 0, inner - used));
     const rightTone = isSelected ? `${pill.tone} bold` : "muted";
     const row1 = fitStyled(

@@ -275,6 +275,48 @@ Spawned orchestrators report back with `ork chief send --to chief`, which reache
 the desk when the message is sent. Details: [`/chief` skill](../../adapters/skills/chief/SKILL.md) and
 [architecture](../../docs/chief-architecture.md).
 
+#### Worktree badges
+
+A room that runs in a worktree shows `:31042 (+1)` (its first allocated port and how many more) and
+`● #231 open` (the saved pull request: glyph, number and state word) beside its name. Both come from
+saved local state, read once per status snapshot; drawing never calls GitHub, and a worktree with no
+ports or pull request shows neither. At 48 columns the room name is shortened first, then the port
+badge is dropped; the pull request state stays.
+
+#### Chief event bridge (optional, off by default)
+
+Opt in to forward six committed transitions (`done`, `failed`, `escalation`, `question`, `pr_opened`,
+`pr_merged`) to one HTTPS webhook and/or one local executable. Without the file below nothing is sent
+and nothing runs. Create `~/.config/orchestrate/chief-bridge.json` (mode `0600`, in a `0700`
+directory you own, not a symlink; `ORK_CHIEF_BRIDGE_CONFIG=<absolute path>` relocates it,
+`ORK_CHIEF_BRIDGE=0` forces it off):
+
+```json
+{
+  "version": 1,
+  "enabled": true,
+  "events": ["done", "failed"],
+  "webhook": { "url": "https://hooks.example.com/chief", "bearerToken": "…" },
+  "command": { "path": "/home/you/bin/chief-hook", "args": [] }
+}
+```
+
+The body is only `{"schema":"ork.chief.event.v1","id","event","at","roomId","prNumber"?}`: no
+conversation text, paths or credentials. The `id` is derived from the room and the saved record, so a
+repeat after a restart carries the same `id`; delivery is at least once, so de-duplicate on it. The
+webhook must be HTTPS, every resolved address must be public (private, loopback, link-local and
+IPv4-mapped forms are refused), the connection is pinned to the checked address with the host name as
+the TLS name, and redirects are failures. The executable must be an absolute path owned by you or
+root, not writable by others, run without a shell with a minimal environment and the payload on
+stdin. Each delivery is bounded (size, queue, two attempts of 3 seconds, a circuit breaker) and a
+failure never changes the room or the pull request.
+
+#### Approve a repository's worktree setup
+
+`ork setup --trust-worktree --cwd <repo>` shows the repository, the setup command and its hash from
+`.orkest/worktree.json`, then records your approval. Any change to the file, or to the code it runs,
+asks again. It installs nothing else.
+
 ### Universal accounts (`ork account`, `/account`)
 
 Every account lives in Monitor's `accounts[]`; there are no work/personal slots. Each mutation takes the
