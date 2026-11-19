@@ -306,9 +306,9 @@ describe("cleanup --merged audit", () => {
 
   it("never treats the main checkout, the current worktree or paths outside the roots as candidates", async () => {
     const fixture = await makeFixture();
-    const current = await mergedCleanup(
-      options(fixture, { dryRun: true, currentDir: path.join(fixture.worktreePath, "sub") }),
-    );
+    const currentDir = path.join(fixture.worktreePath, "sub");
+    mkdirSync(currentDir);
+    const current = await mergedCleanup(options(fixture, { dryRun: true, currentDir }));
     expect(entryFor(current, fixture).reasons).toContain("current_worktree");
     const narrowed = await mergedCleanup(
       options(fixture, { dryRun: true, scanRoots: [path.join(fixture.root, "elsewhere")] }),
@@ -420,7 +420,7 @@ describe("cleanup --merged quarantine", () => {
     expect(readFileSync(held, "utf8")).toBe("ignored user data\n");
     // Git still registers it, branch intact, marker retained.
     const listing = git(fixture.repoRoot, "worktree", "list", "--porcelain");
-    expect(listing).toContain(`worktree ${moved}`);
+    expect(listing).toContain(`worktree ${realpath(moved)}`);
     expect(git(fixture.repoRoot, "rev-parse", `refs/heads/${fixture.branch}`)).toBe(head);
     expect(existsSync(path.join(fixture.gitDir, "orkest.json"))).toBe(true);
     // Ports released exactly once; the journal is final and private.

@@ -52,7 +52,10 @@ describe("worktree-env bootstrapWorktreeInclude", () => {
     await writeFile(path.join(repoRoot, ".env"), "DATABASE_URL=postgres://localhost/dev\n");
     await writeFile(path.join(repoRoot, ".env.local"), "PORT=4173\n");
 
-    const copied = bootstrapWorktreeInclude(repoRoot, worktreePath);
+    const aliasRoot = await makeTempDir("ork-wt-alias-");
+    const alias = path.join(aliasRoot, "destination");
+    await symlink(worktreePath, alias, "dir");
+    const copied = bootstrapWorktreeInclude(repoRoot, alias);
     expect(copied).toEqual([".env", ".env.local"]);
     expect(await readFile(path.join(repoRoot, ".env"), "utf8")).toBe(
       await readFile(path.join(worktreePath, ".env"), "utf8"),

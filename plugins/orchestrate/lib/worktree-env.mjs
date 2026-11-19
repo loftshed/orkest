@@ -278,10 +278,10 @@ export function bootstrapWorktreeInclude(
   for (const relFile of sortedFiles) {
     if (relFile === ".git" || relFile.startsWith(".git/") || relFile.startsWith("..")) continue;
     const src = path.join(resolvedRoot, relFile);
-    const dest = path.join(resolvedWorktree, relFile);
+    const dest = path.join(realWorktree, relFile);
     if (
       path.relative(resolvedRoot, src).startsWith("..") ||
-      path.relative(resolvedWorktree, dest).startsWith("..")
+      path.relative(realWorktree, dest).startsWith("..")
     ) {
       continue;
     }
