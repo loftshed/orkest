@@ -64,6 +64,16 @@ class BriefRendererTests(unittest.TestCase):
         self.assertEqual(positions, sorted(positions))
         self.assertEqual(sum(rendered.count(f"### {heading}") for heading in RENDERER.REPORT_HEADINGS), 5)
 
+    def test_brief_carries_command_boundary_guidance(self) -> None:
+        brief = RENDERER.render_brief(brief_spec())
+        self.assertIn("Command boundaries:", brief)
+        self.assertIn("its own standalone command", brief)
+        self.assertIn("instead of head/tail pipes", brief)
+        self.assertIn("coordinator.py capture, verify-evidence, review", brief)
+        self.assertIn("exact absolute path of the installed orchestrate skill", brief)
+        self.assertIn("do not ask for broader trust", brief)
+        self.assertIn("pass this rule on", brief)
+
     def test_auto_correct_rounds_are_validated_and_leave_the_brief_unchanged(self) -> None:
         self.assertNotIn("auto_correct", RENDERER.validate_spec(brief_spec()))
         spec = {**brief_spec(), "auto_correct": 2}

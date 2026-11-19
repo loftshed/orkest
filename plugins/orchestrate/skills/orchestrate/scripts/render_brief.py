@@ -37,6 +37,7 @@ COMMON_CONSTRAINTS = (
     "Do not edit checklists, completion plans, or status claims unless an exact file and evidence requirement appear in the approved scope.",
     "Do not commit, push, merge, reset, clean, stash, checkout, switch branches, create worktrees, or share/publish the session.",
     "The allowed paths constrain writes, not relevant read-only investigation. Follow evidence across repository files and applicable documentation within the objective.",
+    "Command boundaries: run each installed ork command, and each coordinator.py capture, verify-evidence, review or correction dispatch, as its own standalone command; invoke scripts as python3 with the exact absolute path of the installed orchestrate skill (relative paths fail the trust policy). Inspect files with separate read-only commands and the tool's own output limits instead of head/tail pipes. Never chain an ork or coordinator command with jq, other python, node or shell through `;`, `&&`, `|` or a wrapper, and do not ask for broader trust for arbitrary python, shell or jq; when you brief further agents, pass this rule on.",
     "Use independent judgment within the approved scope; keep communication with the conductor or peers relaxed, friendly, and natural when asking about missing context or needed scope changes, and continue independent work when possible. Report BLOCKED only when the missing answer prevents useful progress.",
 )
 
