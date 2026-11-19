@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.95.0
+
+- feat: add workspace-aware Orca panels and Herdr actions (#248)
+
 ## 0.94.1
 
 - refactor: install commands and skills from canonical adapter files (#241)
