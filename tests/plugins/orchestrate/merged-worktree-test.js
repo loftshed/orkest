@@ -10,6 +10,7 @@ import {
   readdirSync,
   readFileSync,
   readlinkSync,
+  realpathSync as realpath,
   renameSync,
   statSync,
   symlinkSync,
@@ -144,10 +145,6 @@ function makePorts(initial = {}) {
       `${realpath(fixture.repoRoot)}\0${realpath(worktreePath)}`,
   };
   return api;
-}
-
-function realpath(target) {
-  return execFileSync("realpath", [target], { encoding: "utf8" }).trim();
 }
 
 function treeDigest(root) {
@@ -393,7 +390,8 @@ describe("cleanup --merged quarantine", () => {
     const held = openSync(path.join(worktree, "ignored.log"), "r");
     const inodeBefore = statSync(path.join(worktree, "ignored.log")).ino;
     const ports = makePorts();
-    ports.table.set(ports.key(fixture), [{ name: "WEB_PORT", port: 31_042 }]);
+    const originalPortKey = ports.key(fixture);
+    ports.table.set(originalPortKey, [{ name: "WEB_PORT", port: 31_042 }]);
     const head = git(worktree, "rev-parse", "HEAD");
 
     const report = await mergedCleanup(
@@ -425,7 +423,7 @@ describe("cleanup --merged quarantine", () => {
     expect(git(fixture.repoRoot, "rev-parse", `refs/heads/${fixture.branch}`)).toBe(head);
     expect(existsSync(path.join(fixture.gitDir, "orkest.json"))).toBe(true);
     // Ports released exactly once; the journal is final and private.
-    expect(ports.releases).toEqual([ports.key(fixture)]);
+    expect(ports.releases).toEqual([originalPortKey]);
     const [{ file, journal }] = listJournals(fixture.repoRoot, fixture.env);
     expect(journal.state).toBe("finalized");
     expect(journal.ports).toEqual([{ name: "WEB_PORT", port: 31_042 }]);
@@ -496,7 +494,8 @@ describe("cleanup --merged quarantine", () => {
   it("recovers a crash between the move and the journal update, and resumes port release", async () => {
     const fixture = await makeFixture();
     const ports = makePorts();
-    ports.table.set(ports.key(fixture), [{ name: "API_PORT", port: 31_100 }]);
+    const originalPortKey = ports.key(fixture);
+    ports.table.set(originalPortKey, [{ name: "API_PORT", port: 31_100 }]);
     // Crash: git moved the directory, then the process died before recording anything.
     const crashing = (cmd, args, opts) => {
       const out = execFileSync(cmd, args, opts);
@@ -520,7 +519,7 @@ describe("cleanup --merged quarantine", () => {
       portsApi: ports,
     });
     expect(recovered).toMatchObject([{ status: "quarantined" }]);
-    expect(ports.releases).toEqual([ports.key(fixture)]);
+    expect(ports.releases).toEqual([originalPortKey]);
     expect(listJournals(fixture.repoRoot, fixture.env)[0].journal.state).toBe("finalized");
     // Idempotent: nothing left to do and no second release.
     expect(
@@ -532,7 +531,8 @@ describe("cleanup --merged quarantine", () => {
   it("fences the original identity before the move so a replacement at the old path cannot inherit ports", async () => {
     const fixture = await makeFixture();
     const ports = makePorts();
-    ports.table.set(ports.key(fixture), [{ name: "API_PORT", port: 31_100 }]);
+    const originalPortKey = ports.key(fixture);
+    ports.table.set(originalPortKey, [{ name: "API_PORT", port: 31_100 }]);
     let isFailing = true;
     const flaky = {
       ...ports,
@@ -543,7 +543,7 @@ describe("cleanup --merged quarantine", () => {
     };
     const first = await mergedCleanup(options(fixture, { dryRun: false, portsApi: flaky }));
     // The fence was installed while the source still existed, i.e. before the move.
-    expect(ports.events[0]).toEqual(["fence", ports.key(fixture), true]);
+    expect(ports.events[0]).toEqual(["fence", originalPortKey, true]);
     // The directory already moved: it is reported as moved-pending, not as kept.
     expect(first.kept).toEqual([]);
     expect(first.quarantined).toMatchObject([
@@ -556,7 +556,7 @@ describe("cleanup --merged quarantine", () => {
     expect(first.quarantined[0].recovery.command[4]).toBe("move");
     expect(existsSync(first.quarantined[0].destination)).toBe(true);
     expect(listJournals(fixture.repoRoot, fixture.env)[0].journal.state).toBe("moved");
-    expect(ports.fences.has(ports.key(fixture))).toBe(true);
+    expect(ports.fences.has(originalPortKey)).toBe(true);
 
     // A different worktree at the vacated path cannot allocate, so it cannot inherit or clobber ports.
     git(fixture.repoRoot, "worktree", "add", "-b", "feat/reuse", fixture.worktreePath, "main");
@@ -564,7 +564,7 @@ describe("cleanup --merged quarantine", () => {
     expect(() => ports.allocate(replacementKey, [{ name: "NEW_PORT", port: 31_999 }])).toThrow(
       /FENCED/u,
     );
-    expect(ports.table.get(ports.key(fixture))).toEqual([{ name: "API_PORT", port: 31_100 }]);
+    expect(ports.table.get(originalPortKey)).toEqual([{ name: "API_PORT", port: 31_100 }]);
 
     // Recovery releases exactly the pinned original allocation and only then lifts the fence.
     isFailing = false;
@@ -576,13 +576,13 @@ describe("cleanup --merged quarantine", () => {
     expect(recovered).toMatchObject([{ status: "quarantined" }]);
     expect(ports.events.slice(-2).map((event) => event[0])).toEqual(["release", "unfence"]);
     expect(ports.fences.size).toBe(0);
-    expect(ports.table.has(ports.key(fixture))).toBe(false);
+    expect(ports.table.has(originalPortKey)).toBe(false);
     // The replacement can allocate now, and repeating recovery never touches its ports.
     ports.allocate(replacementKey, [{ name: "NEW_PORT", port: 31_999 }]);
     expect(
       await recoverQuarantines({ repoRoot: fixture.repoRoot, env: fixture.env, portsApi: ports }),
     ).toEqual([]);
-    expect(ports.table.get(ports.key(fixture))).toEqual([{ name: "NEW_PORT", port: 31_999 }]);
+    expect(ports.table.get(originalPortKey)).toEqual([{ name: "NEW_PORT", port: 31_999 }]);
   });
 
   it("fences even a worktree with no allocated ports, and leaves no fence after success", async () => {
@@ -911,13 +911,10 @@ describe("cleanup --merged review cases", () => {
   it("rolls back a move whose links no longer reach what they reached", async () => {
     const fixture = await makeFixture();
     symlinkSync("feature.txt", path.join(fixture.worktreePath, "ignored.log"));
+    const originalWorktree = realpath(fixture.worktreePath);
     const swapping = (cmd, args, opts) => {
       const out = execFileSync(cmd, args, opts);
-      if (
-        args[0] === "worktree" &&
-        args[1] === "move" &&
-        args[2] === realpath(fixture.worktreePath)
-      ) {
+      if (args[0] === "worktree" && args[1] === "move" && args[2] === originalWorktree) {
         // Write the replacement first so it cannot reuse the old inode number, then swap it in.
         writeFileSync(path.join(args[3], "feature.new"), "replaced\n");
         renameSync(path.join(args[3], "feature.new"), path.join(args[3], "feature.txt"));
