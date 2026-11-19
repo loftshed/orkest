@@ -14,6 +14,7 @@ TESTS_DIR = Path("tests/plugins/orchestrate/skills/orchestrate")
 
 
 def run_test_file(test_file: Path, env: dict[str, str]) -> tuple[Path, int, float, str, str]:
+    print(f"[START] {test_file.name}", flush=True)
     started = time.monotonic()
     completed = subprocess.run(
         [sys.executable, "-B", "-m", "unittest", str(test_file)],

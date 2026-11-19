@@ -48,10 +48,21 @@ jobs:
           node-version: "26"
       - run: rustup update stable
       - run: npm install --global corepack@0.36.0
-      - run: corepack pnpm install --frozen-lockfile
-      - run: ./scripts/test.sh
+      - id: install
+        run: corepack pnpm install --frozen-lockfile
+      - name: Build ork-fast in release mode
+        run: ./scripts/test.sh rust-build
+      - name: Run Rust tests
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: ./scripts/test.sh rust-test
+      - name: Run JavaScript tests and write JUnit report
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: ./scripts/test.sh javascript
         env:
           CI: true
+      - name: Run Python tests
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: ./scripts/test.sh python
       - name: Type-check Monitor menu bar app
         run: swiftc -typecheck -swift-version 5 -framework AppKit plugins/monitor/macos/main.swift
       - name: Type-check OrkestHUD toast app
