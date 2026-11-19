@@ -25,6 +25,7 @@ import path from "node:path";
 
 import { foundryLauncherAlive, loadFoundryState, writeFoundryState } from "./foundry.mjs";
 import { cacheHome } from "./runtime-paths.mjs";
+import * as worktreePorts from "./worktree-ports.mjs";
 import { acquireWorkspaceLease, assertWorkspaceLease } from "./workspace-lease.mjs";
 
 export const STRATEGIES = Object.freeze(["local", "pr"]);
@@ -551,17 +552,6 @@ function repoKeyOf(repoRoot) {
 
 export function quarantineRoot(env = process.env) {
   return path.join(cacheHome(env), "worktree-quarantine-v1");
-}
-
-/** Lazily loaded 4A port API (frozen signatures); absent module means no recorded ports. */
-async function loadPortsApi(override) {
-  if (override) return override;
-  try {
-    return await import("./worktree-ports.mjs");
-  } catch (error) {
-    if (error?.code === "ERR_MODULE_NOT_FOUND") return null;
-    throw error;
-  }
 }
 
 const PORT_API_FUNCTIONS = [
@@ -1120,7 +1110,7 @@ export async function auditMergedWorktrees({
   // Everything is keyed to the main checkout, however the command was started.
   const main = parseWorktreeList(listing)[0];
   if (main) root = realOrResolved(main.path);
-  const ports = await loadPortsApi(portsApi);
+  const ports = portsApi ?? worktreePorts;
   const rooms = await loadRoomBindings(env, roomBindings);
   const gh = makeGh(run, { cwd: root, env });
   const repository = (() => {
@@ -1270,7 +1260,7 @@ export async function quarantineMergedWorktree({
   };
   const kept = (...reasons) => ({ status: "kept", path: source, reasons });
   held();
-  const ports = await loadPortsApi(portsApi);
+  const ports = portsApi ?? worktreePorts;
   const { id, journal: journalFile, destination, repoKey } = evaluation.quarantine;
   const keyed = portKeyFor(ports, root, source);
   if (!keyed.ok)
@@ -1468,7 +1458,7 @@ export async function recoverQuarantines({
 }) {
   const run = execFileSyncFn;
   const root = realOrResolved(repoRoot);
-  const ports = await loadPortsApi(portsApi);
+  const ports = portsApi ?? worktreePorts;
   const results = [];
   for (const { file, journal } of listJournals(root, env)) {
     if (!pendingJournal(journal)) continue;
@@ -1579,7 +1569,7 @@ export async function pruneMergedWorktree({
     explicitBase: targetBranch,
     gh: null,
     allowPrLookup: false,
-    portsApi: await loadPortsApi(portsApi),
+    portsApi: portsApi ?? worktreePorts,
     scanRoots: (scanRoots ?? defaultScanRoots(root, env)).map(realOrResolved),
     currentDir: null,
     allowRoomId,
@@ -1702,7 +1692,7 @@ export async function mergedCleanup({
               platform,
               inspectProcesses,
               gh: makeGh(execFileSyncFn, { cwd: audit.repoRoot, env }),
-              portsApi: await loadPortsApi(portsApi),
+              portsApi: portsApi ?? worktreePorts,
               scanRoots: roots,
               currentDir: realOrResolved(currentDir),
               repository: audit.repository,

@@ -29,7 +29,7 @@ import path from "node:path";
 
 import { migrateSchema, openOrkestSqlite, withImmediateTransaction } from "./orkest-sqlite.mjs";
 
-/** Dedicated SQLite application id ("OKCH"): a file carrying any other identity is never touched. */
+/** Dedicated SQLite application id (0x4f4b4348): a file carrying any other identity is never touched. */
 export const DELIVERY_APPLICATION_ID = 1_330_332_488;
 
 export const DELIVERY_LIMITS = Object.freeze({

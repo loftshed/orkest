@@ -848,7 +848,7 @@ describe("ork chief", () => {
       expect(options.cwd).toBe(worktree);
       expect(options.env.ORK_CHIEF_ROOM).toBe(result.roomId);
       const port = JSON.parse(options.env.ORKEST_WORKTREE_PORTS).API_PORT;
-      expect(port).toBeGreaterThanOrEqual(31000);
+      expect(port).toBeGreaterThanOrEqual(31_000);
       expect(options.env.API_PORT).toBe(String(port));
       const stored = readRawRoom(result.roomId, root);
       expect(stored.cwd).toBe(fs.realpathSync(worktree));

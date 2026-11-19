@@ -623,6 +623,48 @@ describe("cleanup --merged quarantine", () => {
     expect(entryFor(report, other).reasons).toContain("ports_fence_unavailable");
   });
 
+  it("retains a changed destination registration while recovering interrupted port release", async () => {
+    const fixture = await makeFixture();
+    const ports = makePorts();
+    const failing = {
+      ...ports,
+      releaseWorktreePorts() {
+        throw new Error("temporarily busy");
+      },
+    };
+    const first = await mergedCleanup(options(fixture, { dryRun: false, portsApi: failing }));
+    const destination = first.quarantined[0].destination;
+    git(destination, "switch", "-c", "other");
+    const recovered = await recoverQuarantines({ ...options(fixture), portsApi: ports });
+    expect(recovered).toMatchObject([{ status: "needs_review", current: { branch: "other" } }]);
+    expect(ports.fences.size).toBe(1);
+    expect(ports.releases).toEqual([]);
+  });
+
+  it("retries an aborted move whose original fence could not be cleared", async () => {
+    const fixture = await makeFixture();
+    const ports = makePorts();
+    const failing = {
+      ...ports,
+      clearWorktreePortFence() {
+        throw new Error("temporarily busy");
+      },
+    };
+    const refusing = (cmd, args, opts) => {
+      if (args[0] === "worktree" && args[1] === "move") throw new Error("move refused");
+      return execFileSync(cmd, args, opts);
+    };
+    await mergedCleanup(
+      options(fixture, { dryRun: false, portsApi: failing, execFileSyncFn: refusing }),
+    );
+    expect(ports.fences.size).toBe(1);
+    const recovered = await recoverQuarantines({ ...options(fixture), portsApi: ports });
+    expect(recovered).toMatchObject([{ status: "aborted" }]);
+    expect(ports.fences.size).toBe(0);
+    expect(ports.releases).toEqual([]);
+    expect(existsSync(fixture.worktreePath)).toBe(true);
+  });
+
   it("leaves an aborted intent alone when git never moved anything", async () => {
     const fixture = await makeFixture();
     const refusing = (cmd, args, opts) => {
