@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -258,6 +258,8 @@ describe("ork next 4-tier waterfall execution", () => {
     });
 
     let wasPrunedMerged = false;
+    const removed = [];
+    const prunedCalls = [];
     const porcelain = () =>
       [
         `worktree ${repoRoot}`,
@@ -280,7 +282,7 @@ describe("ork next 4-tier waterfall execution", () => {
     const execMock = (cmd, args, opts) => {
       if (cmd === "git" && args[0] === "worktree" && args[1] === "list") return porcelain();
       if (cmd === "git" && args[0] === "worktree" && args[1] === "remove") {
-        if (args[2] === wtMerged.path) wasPrunedMerged = true;
+        removed.push(args);
         return "";
       }
       if (cmd === "git" && args[0] === "rev-list") {
@@ -308,6 +310,11 @@ describe("ork next 4-tier waterfall execution", () => {
       cwd: repoRoot,
       env,
       execFileSyncFn: execMock,
+      pruneMergedFn: async (request) => {
+        prunedCalls.push(request);
+        wasPrunedMerged = true;
+        return { pruned: true, status: "quarantined", destination: "/quarantine/wt-100" };
+      },
       smeltWorktreeFn: async (wt) => {
         smeltedSlugs.push(wt.slug);
         writeFoundryState(wt.worktreePath, { status: "merged" });
@@ -318,6 +325,10 @@ describe("ork next 4-tier waterfall execution", () => {
 
     // Tier 0 auto-drained wt-100 prune, then Tier 1 smelted lowest-blast wt-101 first:
     expect(wasPrunedMerged).toBe(true);
+    // The prune is a recoverable quarantine through the common helper: no remove, no branch delete.
+    expect(removed).toEqual([]);
+    expect(prunedCalls).toHaveLength(1);
+    expect(prunedCalls[0]).toMatchObject({ worktreePath: wtMerged.path, targetBranch: "main" });
     expect(stepRes.settledActions).toEqual([
       expect.objectContaining({
         kind: "prune_merged_worktree",
@@ -662,4 +673,334 @@ describe("Next distinguishes verification infrastructure from code repairs", () 
       expect(readFoundryState(wt.path)).toMatchObject({ status, attemptCount: 2 });
     },
   );
+});
+
+describe("ork next --strategy", () => {
+  async function setup(prefix) {
+    const rootDir = await makeTempDir(prefix);
+    const repoRoot = path.join(rootDir, "repo");
+    await mkdir(repoRoot, { recursive: true });
+    const env = { ORCHESTRATE_HOME: path.join(rootDir, "cache") };
+    const wt = await createMockWorktree(rootDir, repoRoot, {
+      allowPaths: ["tests/plugins/orchestrate/next-test.js"],
+      branch: "feat/issue-201",
+      issue: 201,
+      slug: "wt-201",
+      statePatch: {
+        blastRadius: "low",
+        commitsAhead: 1,
+        status: "verified",
+        verification: { candidate: { commit: "3333333" } },
+      },
+    });
+    const gitCalls = [];
+    const ghCalls = [];
+    const gh = { handler: null };
+    const execMock = (cmd, args) => {
+      if (cmd === "gh") {
+        ghCalls.push(args);
+        return gh.handler(args);
+      }
+      gitCalls.push([cmd, ...args]);
+      if (cmd === "git" && args[0] === "remote") return "https://github.com/acme/widgets.git\n";
+      if (cmd === "git" && args[0] === "worktree" && args[1] === "list")
+        return [
+          `worktree ${repoRoot}`,
+          "HEAD 1111111",
+          "branch refs/heads/main",
+          "",
+          `worktree ${wt.path}`,
+          "HEAD 3333333",
+          "branch refs/heads/feat/issue-201",
+          "",
+        ].join("\n");
+      if (cmd === "git" && args[0] === "rev-list") return "1\n";
+      if (cmd === "git" && ["status", "ls-files", "diff"].includes(args[0])) return "";
+      if (cmd === "git" && args[0] === "rev-parse" && args[1] === "HEAD") return "3333333\n";
+      return "main-sha-1\n";
+    };
+    const smelted = [];
+    const results = [];
+    const smeltWorktreeFn = async (_wt, options) => {
+      smelted.push(options.strategy);
+      return (
+        results.shift() ?? { ok: true, status: options.strategy === "pr" ? "pr_opened" : "merged" }
+      );
+    };
+    const run = (argv) =>
+      nextCommand(argv, {
+        cwd: repoRoot,
+        env,
+        execFileSyncFn: execMock,
+        smeltWorktreeFn,
+        stdout: { columns: 120, isTTY: false, write: () => {} },
+      });
+    return { env, gh, ghCalls, gitCalls, repoRoot, results, run, smelted, wt };
+  }
+
+  it("rejects an unknown strategy with exit code 2 before any evaluation or ledger write", async () => {
+    const fixture = await setup("ork-next-strategy-bad-");
+    for (const mode of ["step", "run", "loop", "settle", "status"]) {
+      fixture.gitCalls.length = 0;
+      await expect(fixture.run([mode, "--strategy", "squash", "--json"])).rejects.toMatchObject({
+        exitCode: 2,
+      });
+      expect(fixture.gitCalls).toEqual([]);
+    }
+    expect(fixture.smelted).toEqual([]);
+    expect(readNextLedger(fixture.repoRoot, { env: fixture.env }).worktrees).toEqual({});
+  });
+
+  it("keeps legacy behavior without the flag: local, and no new ledger fields", async () => {
+    const fixture = await setup("ork-next-strategy-legacy-");
+    const payload = await fixture.run(["step", "--json"]);
+    expect(payload.status).toBe("merged");
+    expect(fixture.smelted).toEqual(["local"]);
+    const entry = readNextLedger(fixture.repoRoot, { env: fixture.env }).worktrees["wt-201"];
+    expect(entry).not.toHaveProperty("strategy");
+    expect(entry).not.toHaveProperty("operation");
+  });
+
+  it("forwards pr through step and loop and persists the choice with the operation", async () => {
+    const fixture = await setup("ork-next-strategy-pr-");
+    expect((await fixture.run(["step", "--strategy", "pr", "--json"])).status).toBe("pr_opened");
+    expect(fixture.smelted).toEqual(["pr"]);
+    expect(
+      readNextLedger(fixture.repoRoot, { env: fixture.env }).worktrees["wt-201"],
+    ).toMatchObject({
+      operation: "settled",
+      strategy: "pr",
+    });
+    const loop = await fixture.run(["loop", "--strategy", "pr", "--max-steps", "1", "--json"]);
+    expect(loop.mode).toBe("loop");
+    expect(fixture.smelted).toEqual(["pr", "pr"]);
+    // The stored choice survives later runs that say nothing.
+    await fixture.run(["run", "--json"]);
+    expect(fixture.smelted.at(-1)).toBe("pr");
+  });
+
+  it("never flips an in-progress operation on retry and resumes with the stored choice", async () => {
+    const fixture = await setup("ork-next-strategy-resume-");
+    fixture.results.push({ ok: false, status: "pr_unverified" });
+    const first = await fixture.run(["step", "--strategy", "pr", "--json"]);
+    expect(first.status).toBe("pr_unverified");
+    expect(
+      readNextLedger(fixture.repoRoot, { env: fixture.env }).worktrees["wt-201"],
+    ).toMatchObject({
+      operation: "in_progress",
+      strategy: "pr",
+    });
+    const conflict = await fixture.run(["step", "--strategy", "local", "--json"]);
+    expect(conflict).toMatchObject({ ok: false, status: "strategy_conflict", exitCode: 2 });
+    expect(process.exitCode).toBe(2);
+    expect(fixture.smelted).toEqual(["pr"]);
+    // The conflict released the claim: a retry that omits the flag resumes as pr and settles it.
+    expect((await fixture.run(["step", "--json"])).status).toBe("pr_opened");
+    expect(fixture.smelted).toEqual(["pr", "pr"]);
+    // Once settled, an explicit different choice is allowed.
+    expect((await fixture.run(["step", "--strategy", "local", "--json"])).status).toBe("merged");
+    expect(fixture.smelted.at(-1)).toBe("local");
+  });
+
+  it("settle reports and preserves the stored choice without rewriting it", async () => {
+    const fixture = await setup("ork-next-strategy-settle-");
+    fixture.results.push({ ok: false, status: "pr_unverified" });
+    await fixture.run(["step", "--strategy", "pr", "--json"]);
+    const before = JSON.stringify(readNextLedger(fixture.repoRoot, { env: fixture.env }).worktrees);
+    const settled = await fixture.run(["settle", "--strategy", "local", "--json"]);
+    expect(settled.mode).toBe("settle");
+    expect(JSON.stringify(readNextLedger(fixture.repoRoot, { env: fixture.env }).worktrees)).toBe(
+      before,
+    );
+    expect(fixture.smelted).toEqual(["pr"]);
+  });
+
+  it("retries discovery for an interrupted PR creation without pushing or creating another", async () => {
+    const fixture = await setup("ork-next-reconcile-");
+    const marker = {
+      repository: "acme/widgets",
+      baseBranch: "main",
+      headBranch: "feat/issue-201",
+      headOid: "3333333",
+      phase: "created_unverified",
+      url: "https://github.com/acme/widgets/pull/73",
+    };
+    writeFoundryState(fixture.wt.path, { status: "pr_unverified", prReconcile: marker });
+    await writeNextLedger(
+      fixture.repoRoot,
+      {
+        worktrees: {
+          "wt-201": { operation: "in_progress", status: "pr_unverified", strategy: "pr" },
+        },
+      },
+      { env: fixture.env },
+    );
+    const remote = {
+      number: 73,
+      url: marker.url,
+      state: "OPEN",
+      baseRefName: "main",
+      headRefName: marker.headBranch,
+      headRefOid: "3333333",
+      isCrossRepository: false,
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:05:00Z",
+    };
+    let isListFailing = true;
+    fixture.gh.handler = (args) => {
+      if (args[0] === "repo") return JSON.stringify({ nameWithOwner: "acme/widgets" });
+      if (args[1] === "list") {
+        if (isListFailing) throw new Error("rate limited");
+        return JSON.stringify([remote]);
+      }
+      if (args[1] === "view") throw new Error("rate limited");
+      throw new Error(`unexpected gh ${args.join(" ")}`);
+    };
+    const failing = await fixture.run(["step", "--max-tier", "1", "--json"]);
+    expect(failing.executedAction.kind).toBe("reconcile_pr");
+    expect(failing.status).toBe("pr_lookup_failed");
+    expect(readFoundryState(fixture.wt.path).pr).toBeUndefined();
+
+    isListFailing = false;
+    const refreshed = await fixture.run(["step", "--max-tier", "1", "--json"]);
+    expect(refreshed.status).toBe("pr_opened");
+    expect(refreshed.execution.pr).toMatchObject({ number: 73, state: "OPEN" });
+    const state = readFoundryState(fixture.wt.path);
+    expect(state.pr).toMatchObject({ number: 73, headOid: "3333333" });
+    expect(state.prReconcile).toBeNull();
+    expect(fixture.ghCalls.some((args) => args[1] === "create")).toBe(false);
+    expect(fixture.gitCalls.some((call) => call[1] === "push")).toBe(false);
+    expect(
+      readNextLedger(fixture.repoRoot, { env: fixture.env }).worktrees["wt-201"],
+    ).toMatchObject({
+      operation: "settled",
+      strategy: "pr",
+    });
+    // A settled PR is not a candidate again.
+    expect((await fixture.run(["step", "--max-tier", "1", "--json"])).status).toBe("noop");
+  });
+
+  it("rejects an invalid --strategy through the real ork CLI with exit code 2 and no state", async () => {
+    const rootDir = await makeTempDir("ork-next-cli-");
+    const repoRoot = path.join(rootDir, "repo");
+    await mkdir(repoRoot, { recursive: true });
+    execFileSync("git", ["init", "-q", "-b", "main"], { cwd: repoRoot });
+    const cache = path.join(rootDir, "cache");
+    const env = { ...process.env, HOME: path.join(rootDir, "home"), ORCHESTRATE_HOME: cache };
+    await mkdir(env.HOME, { recursive: true });
+    const ork = path.resolve("plugins/orchestrate/bin/ork.mjs");
+    for (const mode of ["step", "run", "loop", "settle"]) {
+      const result = spawnSync(
+        "node",
+        [ork, "next", mode, "--strategy", "squash", "--json", "--cwd", repoRoot],
+        { cwd: repoRoot, encoding: "utf8", env },
+      );
+      expect(result.status, mode).toBe(2);
+      expect(result.stderr).toMatch(/Unsupported strategy/u);
+    }
+    expect(existsSync(cache)).toBe(false);
+    const good = spawnSync(
+      "node",
+      [ork, "next", "settle", "--strategy", "pr", "--json", "--cwd", repoRoot],
+      { cwd: repoRoot, encoding: "utf8", env },
+    );
+    expect(good.status).toBe(0);
+    expect(JSON.parse(good.stdout)).toMatchObject({ mode: "settle", strategy: "pr" });
+  });
+
+  it("reconciles an interrupted PR through a fresh ork process with no flag and no second creation", async () => {
+    const rootDir = await makeTempDir("ork-next-restart-");
+    const repoRoot = path.join(rootDir, "repo");
+    await mkdir(repoRoot, { recursive: true });
+    const env = {
+      ...process.env,
+      HOME: path.join(rootDir, "home"),
+      ORCHESTRATE_HOME: path.join(rootDir, "cache"),
+    };
+    await mkdir(env.HOME, { recursive: true });
+    const wt = await createMockWorktree(rootDir, repoRoot, {
+      allowPaths: ["tests/plugins/orchestrate/next-test.js"],
+      branch: "feat/issue-301",
+      issue: 301,
+      slug: "wt-301",
+    });
+    execFileSync("git", ["remote", "add", "origin", "https://github.com/acme/widgets.git"], {
+      cwd: repoRoot,
+    });
+    const head = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: wt.path,
+      encoding: "utf8",
+    }).trim();
+    const url = "https://github.com/acme/widgets/pull/73";
+    writeFoundryState(wt.path, {
+      status: "pr_unverified",
+      prReconcile: {
+        repository: "acme/widgets",
+        baseBranch: "main",
+        headBranch: "feat/issue-301",
+        headOid: head,
+        phase: "created_unverified",
+        url,
+      },
+    });
+    await writeNextLedger(
+      repoRoot,
+      {
+        worktrees: {
+          "wt-301": { operation: "in_progress", status: "pr_unverified", strategy: "pr" },
+        },
+      },
+      { env },
+    );
+    // A fake GitHub CLI on PATH: serves one OPEN PR from a JSON file and logs every call.
+    const bin = path.join(rootDir, "bin");
+    await mkdir(bin, { recursive: true });
+    const remoteFile = path.join(rootDir, "remote.json");
+    const callLog = path.join(rootDir, "gh-calls.log");
+    await writeFile(
+      remoteFile,
+      JSON.stringify([
+        {
+          number: 73,
+          url,
+          state: "OPEN",
+          baseRefName: "main",
+          headRefName: "feat/issue-301",
+          headRefOid: head,
+          isCrossRepository: false,
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:05:00Z",
+        },
+      ]),
+    );
+    const script = [
+      "#!/usr/bin/env node",
+      'const fs = require("node:fs");',
+      String.raw`fs.appendFileSync(${JSON.stringify(callLog)}, process.argv.slice(2).join(" ") + "\n");`,
+      "const [a, b] = process.argv.slice(2);",
+      'if (a === "repo") console.log(JSON.stringify({ nameWithOwner: "acme/widgets" }));',
+      `else if (a === "pr" && b === "list") console.log(fs.readFileSync(${JSON.stringify(remoteFile)}, "utf8"));`,
+      "else process.exit(1);",
+    ].join("\n");
+    await writeFile(path.join(bin, "gh"), script, { mode: 0o755 });
+    const ork = path.resolve("plugins/orchestrate/bin/ork.mjs");
+    const run = () =>
+      spawnSync("node", [ork, "next", "step", "--max-tier", "1", "--json", "--cwd", repoRoot], {
+        cwd: repoRoot,
+        encoding: "utf8",
+        env: { ...env, PATH: `${bin}:${process.env.PATH}` },
+      });
+    const first = run();
+    expect(first.status, first.stderr).toBe(0);
+    const payload = JSON.parse(first.stdout);
+    expect(payload.executedAction.kind).toBe("reconcile_pr");
+    expect(payload.status).toBe("pr_opened");
+    expect(payload.execution.pr).toMatchObject({ number: 73, state: "OPEN", headOid: head });
+    expect(readFoundryState(wt.path).pr).toMatchObject({ number: 73, url });
+    const calls = readFileSync(callLog, "utf8");
+    expect(calls).not.toMatch(/pr create/u);
+    // The settled PR is not re-reconciled by yet another fresh process.
+    expect(JSON.parse(run().stdout).status).toBe("noop");
+    expect(readFileSync(callLog, "utf8")).toBe(calls);
+  });
 });

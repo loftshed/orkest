@@ -65,6 +65,7 @@ ork factory [status|run|groom] [--dry-run] [--json]   (alias for ork foundry)
 ork rooms --help                (alias for ork hall)
 ork herdr-status                     (focused Herdr pane agent, plain text)
 ork setup [--dry-run] [--trust-codex-hooks] [--trust-orkest-commands|--untrust-orkest-commands]   (install mailbox, hooks and shell wrapper shortcuts)
+ork setup --trust-worktree [--cwd <repo>] [--json]   (review and approve the repository's .orkest/worktree.json setup command)
 ork label [--lines 1|2] -- codex|claude|agy|opencode [arguments]   (direct in Herdr; tmux footer elsewhere)
 ork progress --session ID --goal TEXT --task TEXT --stage working [--role ROLE]
 ork name [--model <model>] [--effort <level>] [--harness <harness>] [--short]
@@ -559,6 +560,51 @@ export function resumeArguments(engine, args) {
     : null;
 }
 
+function usageError(message) {
+  const error = new Error(message);
+  error.exitCode = 2;
+  return error;
+}
+
+/** `ork setup --trust-worktree --cwd <repo>`: the CLI adapter over the worktree-trust approval. */
+export async function trustWorktreeCommand(
+  args,
+  { stdout = process.stdout, env = process.env, cwd = process.cwd(), approve } = {},
+) {
+  let parsed;
+  try {
+    parsed = parseArgs({
+      args,
+      strict: true,
+      allowPositionals: false,
+      options: {
+        "trust-worktree": { type: "boolean" },
+        cwd: { type: "string" },
+        json: { type: "boolean" },
+      },
+    });
+  } catch (error) {
+    throw usageError(`ork setup --trust-worktree: ${error.message}`);
+  }
+  const { values } = parsed;
+  if (values.cwd !== undefined && values.cwd.trim() === "")
+    throw usageError("ork setup --trust-worktree: --cwd needs a repository path");
+  const repoRoot = path.resolve(cwd, values.cwd ?? ".");
+  const approveSetup = approve ?? (await import("../lib/worktree-trust.mjs")).approveWorktreeSetup;
+  const result = await approveSetup(repoRoot, { env });
+  if (values.json) {
+    stdout.write(`${JSON.stringify(result ?? {}, null, 2)}\n`);
+    return result;
+  }
+  const lines = [
+    `Approved worktree setup for ${result.repo}`,
+    `  argv: ${JSON.stringify(result.argv)}`,
+    `  hash: ${result.configSha256}`,
+  ];
+  stdout.write(`${lines.join("\n")}\n`);
+  return result;
+}
+
 export async function main(
   argv = process.argv.slice(2),
   { stdout = process.stdout, runTerminal = terminalCommand, runFast = fastHerdrStatus } = {},
@@ -571,6 +617,8 @@ export async function main(
   }
   if (engineShortcut) argv = ["horde", ...argv.slice(1)];
   if (argv[0] === "setup") {
+    // Worktree trust is its own action: it never installs, and the installer never sees the flag.
+    if (argv.includes("--trust-worktree")) return trustWorktreeCommand(argv.slice(1), { stdout });
     process.exitCode = await runTerminal("install_mailbox.py", argv.slice(1));
     return;
   }

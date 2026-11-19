@@ -13,7 +13,7 @@ import {
 import { hostname, tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { HALL_HELP, hallCommand } from "../../../plugins/orchestrate/bin/hall.mjs";
 import {
@@ -21,6 +21,7 @@ import {
   main as orkMain,
   resumeArguments,
   trustedOrkFast,
+  trustWorktreeCommand,
 } from "../../../plugins/orchestrate/bin/ork.mjs";
 import {
   extractIssueArchetype,
@@ -1113,4 +1114,83 @@ describe("ork herdr-status", () => {
       expect(await run(withBinary, "--unknown")).toBe("\n");
     },
   );
+});
+
+describe("ork setup --trust-worktree", () => {
+  const capture = () => {
+    let output = "";
+    return { write: (chunk) => (output += chunk), text: () => output };
+  };
+
+  it("lists the trust action in the top-level help", async () => {
+    const out = capture();
+    await orkMain(["--help"], { stdout: out });
+    expect(out.text()).toContain("ork setup --trust-worktree [--cwd <repo>] [--json]");
+  });
+
+  it("calls the approval with the resolved repository and shows repo, argv and hash", async () => {
+    const out = capture();
+    const approve = vi.fn(async () => ({
+      repo: "/canonical/repo",
+      argv: ["pnpm", "install"],
+      configSha256: "abc123",
+    }));
+    const env = { HOME: "/nowhere" };
+    await trustWorktreeCommand(["--trust-worktree", "--cwd", "../repo"], {
+      stdout: out,
+      env,
+      cwd: "/work/here",
+      approve,
+    });
+    expect(approve).toHaveBeenCalledWith("/work/repo", { env });
+    expect(out.text()).toContain("Approved worktree setup for /canonical/repo");
+    expect(out.text()).toContain('argv: ["pnpm","install"]');
+    expect(out.text()).toContain("hash: abc123");
+  });
+
+  it("prints the approval as JSON and propagates a refusal", async () => {
+    const out = capture();
+    const result = { repo: "/r", argv: ["x"], configSha256: "h" };
+    await trustWorktreeCommand(["--trust-worktree", "--json"], {
+      stdout: out,
+      cwd: "/r",
+      approve: async () => result,
+    });
+    expect(JSON.parse(out.text())).toEqual(result);
+    await expect(
+      trustWorktreeCommand(["--trust-worktree"], {
+        stdout: out,
+        approve: async () => {
+          throw new Error("config changed");
+        },
+      }),
+    ).rejects.toThrow("config changed");
+  });
+
+  it("rejects unknown flags and positionals with exit code 2 before approving", async () => {
+    const approve = vi.fn();
+    for (const args of [
+      ["--trust-worktree", "--dry-run"],
+      ["--trust-worktree", "extra"],
+      ["--trust-worktree", "--cwd"],
+      ["--trust-worktree", "--cwd", " "],
+    ]) {
+      await expect(trustWorktreeCommand(args, { approve })).rejects.toMatchObject({ exitCode: 2 });
+    }
+    expect(approve).not.toHaveBeenCalled();
+  });
+
+  it("never runs the installer for a trust request, and still runs it otherwise", async () => {
+    const calls = [];
+    const runTerminal = async (script, args) => {
+      calls.push([script, args]);
+      return 0;
+    };
+    await expect(
+      orkMain(["setup", "--trust-worktree", "--bogus"], { stdout: capture(), runTerminal }),
+    ).rejects.toMatchObject({ exitCode: 2 });
+    expect(calls).toEqual([]);
+    await orkMain(["setup", "--dry-run"], { stdout: capture(), runTerminal });
+    expect(calls).toEqual([["install_mailbox.py", ["--dry-run"]]]);
+  });
 });

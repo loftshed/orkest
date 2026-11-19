@@ -55,6 +55,12 @@ import { mailboxRoot, resolveWorktreeMarkerPath } from "./horde-room.mjs";
 import { glyphSet, glyphTier, renderPanel, renderTable } from "./horde-view.mjs";
 import { sendMacosHudToast } from "./macos-hud.mjs";
 import { memberDisplayState } from "./member-state.mjs";
+import {
+  parseStrategy,
+  pruneMergedWorktree,
+  RECONCILABLE_PR_STATUSES,
+  reconcilePullRequest,
+} from "./merged-worktree.mjs";
 import { observeRoom, recoverRoom } from "./rooms.mjs";
 import { cacheHome } from "./runtime-paths.mjs";
 import {
@@ -62,6 +68,7 @@ import {
   classifyBlastRadius,
   SMELTER_INFRASTRUCTURE_RETRIES,
   smeltWorktree,
+  verifyRoomIntegrationRecord,
 } from "./smelter.mjs";
 import { acquireWorkspaceLease, assertWorkspaceLease } from "./workspace-lease.mjs";
 
@@ -71,11 +78,12 @@ const scriptsDir = fileURLToPath(new URL("../skills/orchestrate/scripts/", impor
 export const NEXT_SCHEMA = "ork.next.v1";
 export const NEXT_LEDGER_SCHEMA = "ork.next.ledger.v1";
 export const EXIT_HUMAN_APPROVAL = 4;
+const STRATEGY_VALUES = new Set(["local", "pr"]);
 
-export const NEXT_HELP = `ork next [step|run] [--room <id>] [--task-dir <dir>] [--max-tier <0|1|2|3>] [--approve <slug>] [--dry-run] [--json] [--cwd <dir>]
+export const NEXT_HELP = `ork next [step|run] [--room <id>] [--task-dir <dir>] [--max-tier <0|1|2|3>] [--approve <slug>] [--strategy local|pr] [--dry-run] [--json] [--cwd <dir>]
 ork next status|plan [--room <id>] [--task-dir <dir>] [--include-github] [--json] [--cwd <dir>] [--width 120]
-ork next settle [--room <id>] [--task-dir <dir>] [--json] [--cwd <dir>]
-ork next loop [--room <id>] [--task-dir <dir>] [--max-tier <0|1|2|3>] [--max-steps 10] [--max-invocations 3] [--max-failures 2] [--json] [--cwd <dir>]
+ork next settle [--room <id>] [--task-dir <dir>] [--strategy local|pr] [--json] [--cwd <dir>]
+ork next loop [--room <id>] [--task-dir <dir>] [--max-tier <0|1|2|3>] [--max-steps 10] [--max-invocations 3] [--max-failures 2] [--strategy local|pr] [--json] [--cwd <dir>]
 `;
 
 const INFRASTRUCTURE_STATES = new Set([
@@ -646,6 +654,21 @@ export async function evaluateNextCandidates({
 
     if (status === "pr_opened") continue;
 
+    if (RECONCILABLE_PR_STATUSES.includes(status)) {
+      // An interrupted PR creation: retry discovery (no push, no create) before anything else.
+      if (wt.foundryState.prReconcile) {
+        tier1.push({
+          blastRadius: wt.blastRadius,
+          id: `tier1:reconcile_pr:${wt.slug}`,
+          kind: "reconcile_pr",
+          tier: 1,
+          target: wt.slug,
+          worktree: wt,
+          summary: `Reconcile the pull request for ${wt.slug} (${status}); lookup only, no push or create`,
+        });
+      }
+      continue;
+    }
     if (INFRASTRUCTURE_STATES.has(status)) {
       const retry = wt.foundryState.infrastructureRetry;
       const failures = retry?.candidateCommit === wt.head ? retry.count : 0;
@@ -1141,6 +1164,7 @@ async function executeTier0Held(
     env = process.env,
     execFileSyncFn = execFileSync,
     execVerifyFn = defaultExecVerify,
+    pruneMergedFn = pruneMergedWorktree,
     recoverRoomFn = recoverRoom,
     workspaceLease,
     targetBranch = "main",
@@ -1201,43 +1225,47 @@ async function executeTier0Held(
 
   if (action.kind === "prune_merged_worktree") {
     const wt = action.worktree;
-    execFileSyncFn("git", ["worktree", "remove", wt.worktreePath], {
-      cwd,
-      encoding: "utf8",
+    // Recoverable only: the common helper quarantines a proven-merged worktree (branch, registration
+    // and links preserved) or retains it. This path never removes a worktree or deletes a branch.
+    const room = verifyRoomIntegrationRecord(wt.marker, wt.foundryState, {
+      worktreePath: wt.worktreePath,
     });
-    if (wt.branch) {
-      try {
-        execFileSyncFn("git", ["branch", "-d", wt.branch], {
-          cwd,
-          encoding: "utf8",
-        });
-      } catch {
-        /* Branch may already be deleted. */
-      }
-    }
+    const pruned = await pruneMergedFn({
+      repoRoot: cwd,
+      worktreePath: wt.worktreePath,
+      targetBranch: wt.foundryState?.targetBranch ?? targetBranch,
+      env,
+      execFileSyncFn,
+      assertHeld: () => assertWorkspaceLease(workspaceLease),
+      allowRoomId: room.ok && room.isRoomIntegrated ? wt.marker.roomId : undefined,
+    });
+    const status = pruned.pruned ? "pruned" : "prune_refused";
     await writeNextLedger(
       cwd,
       {
         historyEntry: {
           actionId: action.id,
           kind: action.kind,
-          status: "pruned",
+          status,
           summary: action.summary,
           target: wt.slug,
           tier: 0,
+          ...(pruned.pruned
+            ? { quarantine: pruned.destination }
+            : { reasons: pruned.reasons ?? [pruned.status] }),
         },
         worktrees: {
           [wt.slug]: {
             attemptCount: wt.foundryState?.attemptCount ?? 1,
             lastAction: action.kind,
-            status: "pruned",
+            status,
             updatedAt: new Date().toISOString(),
           },
         },
       },
       { env },
     );
-    return { action, ok: true, status: "pruned" };
+    return { action, ok: pruned.pruned, status, quarantine: pruned };
   }
 
   if (action.kind === "reconcile_worktree_verify") {
@@ -1295,6 +1323,30 @@ async function executeTier0Held(
   return { action, ok: true, status: "noop" };
 }
 
+async function reconcileClaimedPr(
+  action,
+  { cwd, env, execFileSyncFn, reconcilePrFn, targetBranch },
+) {
+  const wt = action.worktree;
+  const room = verifyRoomIntegrationRecord(wt.marker, wt.foundryState, {
+    worktreePath: wt.worktreePath,
+  });
+  try {
+    return await reconcilePrFn({
+      worktreePath: wt.worktreePath,
+      baseBranch: wt.foundryState?.targetBranch ?? targetBranch,
+      priorState: wt.foundryState,
+      execFileSyncFn,
+      env,
+      assertHeld: () => assertWorkspaceLease(action.claimLease),
+      owningRoomId: room.ok && room.isRoomIntegrated ? wt.marker.roomId : undefined,
+      cwd,
+    });
+  } finally {
+    await action.claimLease?.release();
+  }
+}
+
 async function executePrimaryAction(
   action,
   {
@@ -1310,27 +1362,76 @@ async function executePrimaryAction(
     openIssues,
     policy,
     provisionWorktreeFn,
+    reconcilePrFn = reconcilePullRequest,
     reviewRunner,
     runnerScriptPath,
     smeltWorktreeFn = smeltWorktree,
     stdout = process.stdout,
+    strategy: requestedStrategy,
     targetBranch = "main",
   } = {},
 ) {
   if (action.tier === 1) {
     const wt = action.worktree;
-    try {
-      const smeltRes = await smeltWorktreeFn(wt, {
-        approveHighBlast: action.approveHighBlast,
-        approvedBy: "cli ork next --approve",
-        env,
-        workspaceLease: action.claimLease,
+    // Effective strategy: an in-progress operation keeps its persisted choice; otherwise the explicit
+    // request, then a persisted choice, then local (legacy ledgers have no strategy at all).
+    const prior = readNextLedger(cwd, { env }).worktrees?.[wt.slug];
+    const persisted = STRATEGY_VALUES.has(prior?.strategy) ? prior.strategy : undefined;
+    const isInProgress = prior?.operation === "in_progress" && persisted !== undefined;
+    if (isInProgress && requestedStrategy !== undefined && requestedStrategy !== persisted) {
+      await action.claimLease?.release();
+      const error = `strategy ${persisted} is in progress for ${wt.slug}; retry with --strategy ${persisted} or omit it`;
+      return {
+        action,
+        error,
+        exitCode: 2,
+        ok: false,
+        status: "strategy_conflict",
+      };
+    }
+    const resumed = isInProgress ? persisted : (requestedStrategy ?? persisted ?? "local");
+    const strategy = action.kind === "reconcile_pr" ? "pr" : resumed;
+    const isStrategyStored = requestedStrategy !== undefined || persisted !== undefined;
+    const strategyFields = (operation) =>
+      isStrategyStored || strategy === "pr" ? { operation, strategy } : {};
+    if (strategy === "pr") {
+      await writeNextLedger(
         cwd,
-        execFileSyncFn,
-        gateRunner,
-        reviewRunner,
-        targetBranch,
-      });
+        {
+          worktrees: {
+            [wt.slug]: {
+              ...prior,
+              ...strategyFields("in_progress"),
+              updatedAt: new Date().toISOString(),
+            },
+          },
+        },
+        { env },
+      );
+    }
+    const resumableStatuses = new Set(["pr_creating", "pr_unverified", "pr_lookup_failed"]);
+    try {
+      const smeltRes =
+        action.kind === "reconcile_pr"
+          ? await reconcileClaimedPr(action, {
+              cwd,
+              env,
+              execFileSyncFn,
+              reconcilePrFn,
+              targetBranch,
+            })
+          : await smeltWorktreeFn(wt, {
+              strategy,
+              approveHighBlast: action.approveHighBlast,
+              approvedBy: "cli ork next --approve",
+              env,
+              workspaceLease: action.claimLease,
+              cwd,
+              execFileSyncFn,
+              gateRunner,
+              reviewRunner,
+              targetBranch,
+            });
       const finalStatus = smeltRes.status || (smeltRes.ok ? "merged" : "failed");
       await writeNextLedger(
         cwd,
@@ -1347,6 +1448,7 @@ async function executePrimaryAction(
             [wt.slug]: {
               attemptCount: wt.foundryState?.attemptCount ?? 1,
               lastAction: action.kind,
+              ...strategyFields(resumableStatuses.has(finalStatus) ? "in_progress" : "settled"),
               status: finalStatus,
               updatedAt: new Date().toISOString(),
             },
@@ -1403,6 +1505,8 @@ async function executePrimaryAction(
             [wt.slug]: {
               attemptCount: updatedState?.attemptCount ?? wt.foundryState?.attemptCount ?? 1,
               lastAction: action.kind,
+              // A thrown PR operation may have pushed already, so it stays resumable with its choice.
+              ...strategyFields(strategy === "pr" ? "in_progress" : "settled"),
               status: failureStatus,
               updatedAt: new Date().toISOString(),
             },
@@ -1747,6 +1851,8 @@ export async function nextCommand(
     openIssues,
     policy,
     provisionWorktreeFn,
+    pruneMergedFn,
+    reconcilePrFn,
     recoverRoomFn = recoverRoom,
     reviewRunner,
     room,
@@ -1771,6 +1877,7 @@ export async function nextCommand(
       "max-steps": { type: "string" },
       "max-tier": { type: "string" },
       room: { type: "string" },
+      strategy: { type: "string" },
       target: { type: "string" },
       "task-dir": { type: "string" },
       width: { type: "string" },
@@ -1786,6 +1893,8 @@ export async function nextCommand(
   if (!["step", "run", "status", "plan", "settle", "loop"].includes(mode)) {
     throw new Error(`Unknown next subcommand: ${mode}`);
   }
+  // Parsed once, before any lock or mutation; an invalid value exits with code 2.
+  const requestedStrategy = parseStrategy(values.strategy);
 
   const effectiveCwd = path.resolve(values.cwd || cwd);
   const targetBranch = values.target || defaultTargetBranch || "main";
@@ -1911,6 +2020,7 @@ export async function nextCommand(
             env,
             execFileSyncFn,
             execVerifyFn,
+            pruneMergedFn,
             recoverRoomFn,
             targetBranch,
           });
@@ -1947,6 +2057,8 @@ export async function nextCommand(
           schema: NEXT_SCHEMA,
           settledActions,
           status: settlementStatus(evaluated, settledActions),
+          // Settlement reports and preserves any stored choice; it never rewrites it.
+          strategy: requestedStrategy ?? null,
           targetBranch,
         };
       }
@@ -2021,6 +2133,7 @@ export async function nextCommand(
           schema: NEXT_SCHEMA,
           settledActions,
           status: "dry-run",
+          strategy: requestedStrategy ?? null,
           targetBranch,
         };
       }
@@ -2056,16 +2169,18 @@ export async function nextCommand(
         openIssues,
         policy,
         provisionWorktreeFn,
+        reconcilePrFn,
         reviewRunner,
         runnerScriptPath,
         smeltWorktreeFn,
         stdout,
+        strategy: requestedStrategy,
         targetBranch,
       });
 
       if (execution.exitCode === EXIT_HUMAN_APPROVAL) {
         process.exitCode = EXIT_HUMAN_APPROVAL;
-      } else if (execution.status === "busy") {
+      } else if (execution.status === "busy" || execution.status === "strategy_conflict") {
         process.exitCode = execution.exitCode || 1;
       }
 
@@ -2077,6 +2192,9 @@ export async function nextCommand(
           ...(execution.repairSpec && { repairSpec: execution.repairSpec }),
           ...(execution.dispatched && { dispatched: execution.dispatched }),
           ...(execution.error && { error: execution.error }),
+          ...((execution.result?.pr ?? execution.result?.stages?.smeltAndPrune?.pr) && {
+            pr: execution.result.pr ?? execution.result.stages.smeltAndPrune.pr,
+          }),
           status: execution.status,
         },
         exitCode: execution.exitCode ?? 0,

@@ -29,6 +29,8 @@ import { homedir, hostname } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { emitChiefEvents } from "./chief-bridge.mjs";
+import { readFoundryState } from "./foundry.mjs";
 import { herdrEndpoint } from "./herdr-context.mjs";
 import {
   CHIEF_FOCUS_TEXT,
@@ -52,6 +54,8 @@ import {
 import { belongsToRoom, isPeerLive, newRoom, roomOwnerSessions } from "./rooms.mjs";
 import { cacheHome } from "./runtime-paths.mjs";
 import { applyLauncherAccountEnv, checkRepoPolicyForSide } from "./side.mjs";
+import { worktreePortEnv } from "./worktree-env.mjs";
+import { listWorktreePorts } from "./worktree-ports.mjs";
 import {
   provisionWorktree,
   resolveRepositoryRoot,
@@ -1397,7 +1401,70 @@ function coordinatorOf(room, peers) {
   };
 }
 
-function summarizeRoom(room, { peers, inbox }) {
+const PR_STATES = new Set(["OPEN", "MERGED", "CLOSED", "UNKNOWN"]);
+
+function projectPorts(entries) {
+  if (!Array.isArray(entries)) return [];
+  return entries
+    .filter(
+      (entry) =>
+        isPlainObject(entry) &&
+        typeof entry.name === "string" &&
+        Number.isSafeInteger(entry.port) &&
+        entry.port > 0 &&
+        entry.port < 65_536,
+    )
+    .map((entry) => ({ name: entry.name, port: entry.port }));
+}
+
+function projectPr(pr) {
+  if (!isPlainObject(pr) || !Number.isSafeInteger(pr.number) || pr.number <= 0) return null;
+  const state = typeof pr.state === "string" ? pr.state.toUpperCase() : "UNKNOWN";
+  return {
+    number: pr.number,
+    state: PR_STATES.has(state) ? state : "UNKNOWN",
+    url: typeof pr.url === "string" && /^https:\/\//u.test(pr.url) ? pr.url : null,
+  };
+}
+
+/**
+ * Reads the saved worktree facts once per path for a whole snapshot: ports from the allocation
+ * database and the pull request from the saved Foundry state. Both are local reads; rendering and
+ * status never call GitHub. A missing or unreadable source maps to `[]` / `null`.
+ */
+function createWorktreeProjector({
+  env,
+  readPorts = listWorktreePorts,
+  readPr = (worktreePath) => readFoundryState(worktreePath)?.pr,
+}) {
+  const seen = new Map();
+  return (worktree, repoPath) => {
+    const key = worktree?.path ? path.resolve(worktree.path) : null;
+    if (!key) return { ports: [], pr: null };
+    if (!seen.has(key)) {
+      let projected = { ports: [], pr: null };
+      if (existsSync(key)) {
+        try {
+          projected.ports = projectPorts(
+            readPorts({ repoRoot: repoPath || key, worktreePath: key, env }),
+          );
+        } catch {
+          projected.ports = [];
+        }
+        try {
+          projected.pr = projectPr(readPr(key));
+        } catch {
+          projected.pr = null;
+        }
+      }
+      seen.set(key, projected);
+    }
+    const found = seen.get(key);
+    return { ports: found.ports.map((entry) => ({ ...entry })), pr: found.pr && { ...found.pr } };
+  };
+}
+
+function summarizeRoom(room, { peers, inbox, projectWorktree }) {
   const counts = { working: 0, blocked: 0, done: 0, idle: 0, total: 0 };
   const attention = [];
   const members = room.agents || [];
@@ -1484,7 +1551,9 @@ function summarizeRoom(room, { peers, inbox }) {
     cwd: room.cwd || null,
     repo: git.repo,
     branch: room.conductor?.worktree?.branch || git.branch || "",
-    worktree,
+    worktree: worktree
+      ? { ...worktree, ...(projectWorktree?.(worktree, git.repo?.path) ?? { ports: [], pr: null }) }
+      : worktree,
     coordinator,
     counts,
     stage: conductorStage || room.chief?.state || coordinator.status || "",
@@ -1552,9 +1621,12 @@ export async function chiefStatus({
   listRooms = listRawRooms,
   quotaReader = defaultQuotaReader,
   peers: providedPeers,
+  readPorts,
+  readPr,
 } = {}) {
   const peers = providedPeers || readPeers(root, { now });
   const chief = readChiefBinding({ root, now, includeStale: true, peers });
+  const projectWorktree = createWorktreeProjector({ env, readPorts, readPr });
   const host = hostname();
   let rawRooms = [];
   let roomsError;
@@ -1573,7 +1645,7 @@ export async function chiefStatus({
     if (isClosedRoom(original)) continue;
     // Observational projection: a dead detached coordinator reads its own artifacts, never writes.
     const room = projectDetachedExit(original, { root, now, peers });
-    const summary = summarizeRoom(room, { peers, inbox });
+    const summary = summarizeRoom(room, { peers, inbox, projectWorktree });
     if (!all && !isActiveRoom(summary, room, now)) continue;
     for (const session of roomSessions(room)) boundSessions.add(session);
     rooms.push(summary);
@@ -1838,7 +1910,20 @@ const MISSION_STATES = {
 const TERMINAL_MISSION_STATES = new Set(["cancelled", "done", "failed"]);
 
 /** A child's report moves its mission state, so finished missions stop raising attention. */
-async function recordMissionReport({ rooms, sender, env, kind, text, root, now, locked = false }) {
+const REPORT_EVENTS = new Set(["done", "escalation", "question"]);
+
+async function recordMissionReport({
+  rooms,
+  sender,
+  env,
+  kind,
+  text,
+  root,
+  now,
+  locked = false,
+  sourceId = null,
+  events = null,
+}) {
   const room =
     rooms.find((candidate) => candidate.chief?.mission?.session === sender) ||
     (env.ORK_CHIEF_MISSION_SESSION === sender && env.ORK_CHIEF_ROOM
@@ -1847,13 +1932,16 @@ async function recordMissionReport({ rooms, sender, env, kind, text, root, now, 
   if (!room) return null;
   const nextState = MISSION_STATES[kind || "update"];
   let effectiveState = nextState;
+  let isTransition = false;
   const record = () =>
     updateRawRoom(
       room.id,
       (current) => {
+        isTransition = false;
         if (!current.chief) return current;
         // A terminal mission never reopens: a late update, repeated hook or manual retry keeps it.
         const isPreserved = TERMINAL_MISSION_STATES.has(current.chief.state);
+        isTransition = !isPreserved;
         effectiveState = isPreserved ? current.chief.state : nextState;
         current.chief.state = effectiveState;
         current.chief.reportedAt = iso(now);
@@ -1870,6 +1958,9 @@ async function recordMissionReport({ rooms, sender, env, kind, text, root, now, 
     );
   if (locked) await record();
   else await withExclusiveLock(missionLockPath(root, room.id), record);
+  // The write committed: queue the event for delivery by the caller once its locks are released.
+  if (events && isTransition && sourceId && REPORT_EVENTS.has(kind))
+    events.push({ event: kind, roomId: room.id, key: `report:${sourceId}` });
   return { roomId: room.id, state: effectiveState };
 }
 
@@ -2150,6 +2241,7 @@ async function recordMissionOutcome(root, roomId, outcome, { now = Date.now() } 
         return room;
       }
       chief.state = outcome.state;
+      decision = { status: "recorded", reportId: id, state: outcome.state };
       chief.exit = {
         state: outcome.state,
         reason: outcome.reason,
@@ -2164,7 +2256,6 @@ async function recordMissionOutcome(root, roomId, outcome, { now = Date.now() } 
         at: iso(now),
       };
       if (room.conductor) room.conductor.status = outcome.state === "done" ? "completed" : "failed";
-      decision = { status: "recorded" };
       return room;
     },
     { root },
@@ -2260,6 +2351,7 @@ export async function chiefReconcile({
   env = process.env,
   now = Date.now(),
   runMailbox = defaultRunMailbox,
+  bridge,
 } = {}) {
   if (!isValidRoomId(roomId)) throw new Error("Pass a valid room ID");
   try {
@@ -2272,42 +2364,57 @@ export async function chiefReconcile({
   }
   if (event && env.AGENT_EVENT && path.resolve(env.AGENT_EVENT) !== path.resolve(event))
     throw new Error("AGENT_EVENT does not match the --event argument");
-  return withExclusiveLock(missionLockPath(root, roomId), async () => {
-    const current = readRawRoom(roomId, root);
-    if (isClosedRoom(current))
-      return { schema: "ork.chief.reconcile.v1", roomId, status: "closed", delivery: null };
-    const exit = readMissionExit(current, {
-      root,
-      now,
-      manual: !hook,
-      eventPath: event || env.AGENT_EVENT || null,
-    });
-    if (env.AGENT_RESULT && exit.resultPath && path.resolve(env.AGENT_RESULT) !== exit.resultPath)
+  const events = [];
+  let result;
+  try {
+    result = await withExclusiveLock(missionLockPath(root, roomId), async () => {
+      const current = readRawRoom(roomId, root);
+      if (isClosedRoom(current))
+        return { schema: "ork.chief.reconcile.v1", roomId, status: "closed", delivery: null };
+      const exit = readMissionExit(current, {
+        root,
+        now,
+        manual: !hook,
+        eventPath: event || env.AGENT_EVENT || null,
+      });
+      if (env.AGENT_RESULT && exit.resultPath && path.resolve(env.AGENT_RESULT) !== exit.resultPath)
+        return {
+          schema: "ork.chief.reconcile.v1",
+          roomId,
+          status: "superseded",
+          evidence: exit.evidence,
+        };
+      let decision = { status: "none" };
+      if (exit.state) decision = await recordMissionOutcome(root, roomId, exit, { now });
+      // Only the recorded terminal outcome is an event; its durable report ID is the identity.
+      if (decision.status === "recorded")
+        events.push({
+          event: decision.state === "done" ? "done" : "failed",
+          roomId,
+          key: `outcome:${decision.reportId}`,
+        });
+      const latest = readRawRoom(roomId, root);
+      const delivery = latest.chief?.report
+        ? await deliverMissionReport(latest, { root, env, now, runMailbox })
+        : null;
+      if (hook && exit.evidence === "none")
+        return { schema: "ork.chief.reconcile.v1", roomId, status: "retry", reason: exit.reason };
       return {
         schema: "ork.chief.reconcile.v1",
         roomId,
-        status: "superseded",
+        status: decision.status,
         evidence: exit.evidence,
+        state: latest.chief?.state ?? null,
+        decided: exit.state ?? null,
+        reason: exit.reason ?? null,
+        delivery,
       };
-    let decision = { status: "none" };
-    if (exit.state) decision = await recordMissionOutcome(root, roomId, exit, { now });
-    const latest = readRawRoom(roomId, root);
-    const delivery = latest.chief?.report
-      ? await deliverMissionReport(latest, { root, env, now, runMailbox })
-      : null;
-    if (hook && exit.evidence === "none")
-      return { schema: "ork.chief.reconcile.v1", roomId, status: "retry", reason: exit.reason };
-    return {
-      schema: "ork.chief.reconcile.v1",
-      roomId,
-      status: decision.status,
-      evidence: exit.evidence,
-      state: latest.chief?.state ?? null,
-      decided: exit.state ?? null,
-      reason: exit.reason ?? null,
-      delivery,
-    };
-  });
+    });
+  } finally {
+    // The terminal outcome is already committed, even if slow delivery above failed.
+    await emitChiefEvents(events, { env, bridge });
+  }
+  return result;
 }
 
 /**
@@ -2326,12 +2433,19 @@ export async function chiefSend(options = {}) {
     } catch {
       owner = null;
     }
-    if (owner)
-      return withExclusiveLock(missionLockPath(root, owner.id), () =>
-        chiefSendBody({ ...options, lockedMission: owner.id }),
+    if (owner) {
+      const events = [];
+      const result = await withExclusiveLock(missionLockPath(root, owner.id), () =>
+        chiefSendBody({ ...options, lockedMission: owner.id, events }),
       );
+      await emitChiefEvents(events, { env, bridge: options.bridge });
+      return result;
+    }
   }
-  return chiefSendBody(options);
+  const events = [];
+  const result = await chiefSendBody({ ...options, events });
+  await emitChiefEvents(events, { env, bridge: options.bridge });
+  return result;
 }
 
 async function chiefSendBody({
@@ -2346,6 +2460,7 @@ async function chiefSendBody({
   runMailbox = defaultRunMailbox,
   listRooms = listRawRooms,
   lockedMission = null,
+  events = null,
 } = {}) {
   const text = String(message || "").trim();
   if (!text) throw new Error("Message text is empty");
@@ -2405,6 +2520,8 @@ async function chiefSendBody({
       root,
       now,
       locked: lockedMission !== null,
+      sourceId: `desk:${record.id}`,
+      events,
     });
     return {
       schema: CHIEF_SEND_SCHEMA,
@@ -2453,6 +2570,8 @@ async function chiefSendBody({
             root,
             now,
             locked: lockedMission !== null,
+            sourceId: `desk:${record.id}`,
+            events,
           })
         : null;
       return {
@@ -2483,6 +2602,12 @@ async function chiefSendBody({
         root,
         now,
         locked: lockedMission !== null,
+        sourceId: `msg:${
+          typeof delivery?.id === "string" && delivery.id
+            ? delivery.id
+            : createHash("sha256").update(`${sender}\0${body}\0${now}`).digest("hex").slice(0, 32)
+        }`,
+        events,
       })
     : null;
   return {
@@ -3735,9 +3860,10 @@ export async function chiefSpawn({
   let workspace = repoRoot;
   let worktreeInfo = null;
   if (isWorktreeRequested) {
-    worktreeInfo = provision(repoRoot, { slug, branch: branchName, ...(exec && { exec }) });
+    worktreeInfo = provision(repoRoot, { slug, branch: branchName, env, ...(exec && { exec }) });
     workspace = worktreeInfo.path;
   }
+  const portEnv = worktreeInfo ? worktreePortEnv({ env, repoRoot, worktreePath: workspace }) : {};
   await newRoom([], {
     id: roomId,
     cwd: workspace,
@@ -3810,7 +3936,7 @@ export async function chiefSpawn({
         engine: selectedEngine,
         model: resolvedModel,
         briefPath,
-        accountEnv: policy.accountEnv,
+        accountEnv: { ...policy.accountEnv, ...portEnv },
         root,
       }),
       { mode: 0o700 },
@@ -3911,6 +4037,7 @@ export async function chiefSpawn({
   const launchEnv = applyLauncherAccountEnv(
     {
       ...env,
+      ...portEnv,
       ORK_CHIEF_ROOM: roomId,
       ORK_CHIEF_MISSION_SESSION: missionSession,
     },

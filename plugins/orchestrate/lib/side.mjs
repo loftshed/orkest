@@ -25,8 +25,8 @@ import {
   resolveRepoPolicy,
 } from "./policy.mjs";
 import { cacheHome } from "./runtime-paths.mjs";
-import { bootstrapWorktreeInclude } from "./worktree-env.mjs";
-import { provisionWorktree } from "./worktree-provision.mjs";
+import { worktreeLaunchEnv } from "./worktree-env.mjs";
+import { prepareWorktree, provisionWorktree } from "./worktree-provision.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -451,13 +451,19 @@ async function registerSideMemberInRoom(roomRecord, sideSpec) {
   return { roomId: saved.id, memberId: member.id };
 }
 
-function provisionSideWorktree(repoRoot, shortId, runCmd) {
+function provisionSideWorktree(repoRoot, shortId, runCmd, env = process.env) {
   const worktreesRoot = path.join(repoRoot, ".worktrees");
   const worktreePath = path.join(worktreesRoot, `wt-side-${shortId}`);
   const branch = `ork/side-${shortId}`;
 
+  let prepared;
   try {
-    provisionWorktree(repoRoot, { slug: `wt-side-${shortId}`, branch, exec: runCmd });
+    ({ prepared } = provisionWorktree(repoRoot, {
+      slug: `wt-side-${shortId}`,
+      branch,
+      exec: runCmd,
+      env,
+    }));
   } catch (error) {
     if (!["add", "path-exists"].includes(error.stage)) throw error;
     // Fallback to detached worktree if branch name already exists
@@ -473,10 +479,15 @@ function provisionSideWorktree(repoRoot, shortId, runCmd) {
       );
     }
 
-    bootstrapWorktreeInclude(repoRoot, worktreePath, { overwrite: false });
+    // Same preparation as every other creation path; a failure keeps this worktree and surfaces its stage.
+    prepared = prepareWorktree(repoRoot, worktreePath, {
+      slug: `wt-side-${shortId}`,
+      env,
+      overwrite: false,
+    });
   }
 
-  return { worktreePath, branch };
+  return { worktreePath, branch, prepared };
 }
 
 const RAW_PROVIDER_ENV_KEYS = [
@@ -1423,7 +1434,7 @@ export async function sideCommand(argv = [], context = {}) {
   let kind = "investigation";
 
   if (classified.mode === "execute") {
-    const wt = provisionSideWorktree(repoRoot, shortId, runCmd);
+    const wt = provisionSideWorktree(repoRoot, shortId, runCmd, env);
     worktreePath = wt.worktreePath;
     branch = wt.branch;
     targetWorkspace = worktreePath;
@@ -1468,6 +1479,9 @@ export async function sideCommand(argv = [], context = {}) {
     buildIsolatedEnv(env, isolatedCoordSession, mailboxDir),
     policyCheck.accountEnv,
   );
+  // The worktree's allocated ports reach the launched harness through the same assembled env.
+  if (worktreePath)
+    Object.assign(isolatedEnv, worktreeLaunchEnv(isolatedEnv, { repoRoot, worktreePath }));
   const initRes = runCmd(
     "python3",
     [COORDINATOR_PY, "init", "--task-dir", taskDir, "--task-spec", specPath, "--host", "other"],

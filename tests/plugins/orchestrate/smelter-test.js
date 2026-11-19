@@ -90,6 +90,65 @@ async function createRegisteredWorktree(repoRoot, wtPath, branch) {
   }).trim();
 }
 
+/** Fake GitHub CLI: JSON in, JSON out, with switches for the failure modes under test. */
+function makeFakeGh({
+  head = "feature",
+  oid = "a".repeat(40),
+  base = "main",
+  repository = "acme/widgets",
+  prs = [],
+  failLookups = 0,
+  createThrows = false,
+  missing = false,
+} = {}) {
+  const calls = [];
+  let lookupsToFail = failLookups;
+  const item = (number, state, overrides = {}) => ({
+    number,
+    url: `https://github.com/${repository}/pull/${number}`,
+    state,
+    baseRefName: base,
+    headRefName: head,
+    headRefOid: oid,
+    isCrossRepository: false,
+    createdAt: "2026-01-01T00:00:00Z",
+    updatedAt: "2026-01-02T00:00:00Z",
+    ...overrides,
+  });
+  const api = {
+    calls,
+    prs,
+    item,
+    run(args) {
+      calls.push(args);
+      if (missing) throw Object.assign(new Error("spawn gh ENOENT"), { code: "ENOENT" });
+      if (args[0] === "repo") return JSON.stringify({ nameWithOwner: repository });
+      if (args[0] === "pr" && args[1] === "list") {
+        if (lookupsToFail > 0) {
+          lookupsToFail -= 1;
+          throw new Error("network unreachable");
+        }
+        return JSON.stringify(prs);
+      }
+      if (args[0] === "pr" && args[1] === "view") {
+        const found = prs.find(
+          (entry) => entry.url === args[2] || String(entry.number) === args[2],
+        );
+        if (!found) throw new Error("not found");
+        return JSON.stringify(found);
+      }
+      if (args[0] === "pr" && args[1] === "create") {
+        const created = item(prs.length + 7, "OPEN");
+        prs.push(created);
+        if (createThrows) throw new Error("connection reset after create");
+        return `${created.url}\n`;
+      }
+      throw new Error(`unexpected gh call: ${args.join(" ")}`);
+    },
+  };
+  return api;
+}
+
 afterEach(async () => {
   process.exitCode = 0;
   await retainFixtures(temporary.splice(0));
@@ -1284,6 +1343,7 @@ describe("ork smelter", () => {
       if (args[0] === "rev-parse") return "fixture-head";
       if (args[0] === "symbolic-ref") return "builder";
       if (args[0] === "diff") return "source.mjs\0";
+      if (args[0] === "remote") return "https://github.com/acme/widgets.git\n";
       return "";
     };
     const dry = await smeltWorktree(wt, { dryRun: true, execFileSyncFn: execMock });
@@ -1315,12 +1375,14 @@ describe("ork smelter", () => {
       "fixture-head",
     ]);
     expect(reviews[0].args[reviews[0].args.indexOf("--diff") + 1]).toBe("fixture-head");
+    const fakeGh = makeFakeGh({ head: "builder", oid: "fixture-head" });
     const pr = await smeltWorktree(wt, {
-      execFileSyncFn: execMock,
+      execFileSyncFn: (cmd, args) => (cmd === "gh" ? fakeGh.run(args) : execMock(cmd, args)),
       skipReview: true,
       strategy: "pr",
     });
     expect(pr.status).toBe("pr_opened");
+    expect(pr.stages.smeltAndPrune.pr).toMatchObject({ number: 7, state: "OPEN" });
     expect(commands).toContainEqual(["git", "push", "origin", "fixture-head:refs/heads/builder"]);
     expect(reviews[0].args.at(-1)).toBe(buildColdReviewQuestion(full.evidence));
     expect(reviews[0].args.at(-1)).toContain("tests were not run");
@@ -2536,5 +2598,250 @@ describe("ork smelter", () => {
         encoding: "utf8",
       }).trim(),
     ).toBe("");
+  });
+});
+
+describe("smelter pull request strategy", () => {
+  const exec =
+    (fakeGh, log = []) =>
+    (cmd, args) => {
+      log.push([cmd, ...args]);
+      if (cmd === "gh") return fakeGh.run(args);
+      if (args[0] === "rev-parse") return "fixture-head";
+      if (args[0] === "symbolic-ref") return "builder";
+      if (args[0] === "diff") return "source.mjs\0";
+      if (args[0] === "remote") return "https://github.com/acme/widgets.git\n";
+      return "";
+    };
+  const run = async (root, fakeGh, log, extra = {}) =>
+    smeltWorktree(
+      { path: root, branch: "builder", disposable: false, allowPaths: ["source.mjs"] },
+      { execFileSyncFn: exec(fakeGh, log), skipReview: true, strategy: "pr", ...extra },
+    );
+
+  it("rejects an unknown strategy with exit code 2 before touching anything", async () => {
+    const root = await makeTempDir("ork-smelter-strategy-");
+    const log = [];
+    const executor = exec(makeFakeGh(), log);
+    await expect(
+      smeltWorktree(
+        { path: root, branch: "builder" },
+        { execFileSyncFn: executor, strategy: "squash" },
+      ),
+    ).rejects.toMatchObject({ exitCode: 2 });
+    expect(log).toEqual([]);
+    const stdout = { write() {} };
+    await expect(
+      smelterCli(["run", "--strategy", "bogus"], { cwd: root, stdout, execFileSyncFn: executor }),
+    ).rejects.toMatchObject({ exitCode: 2 });
+    expect(log).toEqual([]);
+  });
+
+  it("dry run plans the operations and never pushes or calls gh", async () => {
+    const root = await makeTempDir("ork-smelter-pr-dry-");
+    const log = [];
+    const result = await run(root, makeFakeGh({ head: "builder", oid: "fixture-head" }), log, {
+      dryRun: true,
+    });
+    expect(result.stages.smeltAndPrune.operations.map((op) => op.join(" ")).join("|")).toMatch(
+      /git push origin fixture-head:refs\/heads\/builder.*gh pr create/su,
+    );
+    expect(log.some((entry) => entry[0] === "gh" || entry[1] === "push")).toBe(false);
+  });
+
+  it("records verified PR identity, and a retry reuses it instead of creating another", async () => {
+    const root = await makeTempDir("ork-smelter-pr-retry-");
+    const fakeGh = makeFakeGh({ head: "builder", oid: "fixture-head" });
+    const first = await run(root, fakeGh, []);
+    expect(first.status).toBe("pr_opened");
+    const state = readFoundryState(root);
+    expect(state.pr).toEqual({
+      number: 7,
+      url: "https://github.com/acme/widgets/pull/7",
+      state: "OPEN",
+      repository: "acme/widgets",
+      baseBranch: "main",
+      headBranch: "builder",
+      headOid: "fixture-head",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-02T00:00:00.000Z",
+    });
+    const second = await run(root, fakeGh, []);
+    expect(second.status).toBe("pr_opened");
+    expect(fakeGh.calls.filter((call) => call[1] === "create")).toHaveLength(1);
+    expect(fakeGh.prs).toHaveLength(1);
+  });
+
+  it("keeps a reconcilable marker when the remote succeeded but verification failed, then finds it on retry", async () => {
+    const root = await makeTempDir("ork-smelter-pr-interrupt-");
+    // First list (pre-create) succeeds empty; the post-create list and the view both fail.
+    const fakeGh = makeFakeGh({ head: "builder", oid: "fixture-head", createThrows: true });
+    const realRun = fakeGh.run;
+    let listCalls = 0;
+    fakeGh.run = (args) => {
+      if (args[0] === "pr" && args[1] === "list") {
+        listCalls += 1;
+        if (listCalls === 2) throw new Error("rate limited");
+      }
+      if (args[0] === "pr" && args[1] === "view") throw new Error("rate limited");
+      return realRun(args);
+    };
+    const first = await run(root, fakeGh, []);
+    expect(first).toMatchObject({ ok: false, status: "pr_unverified" });
+    const interrupted = readFoundryState(root);
+    expect(interrupted.status).toBe("pr_unverified");
+    expect(interrupted.pr).toBeUndefined();
+    expect(interrupted.prReconcile).toMatchObject({
+      headOid: "fixture-head",
+      repository: "acme/widgets",
+    });
+    expect(fakeGh.prs).toHaveLength(1);
+
+    fakeGh.run = realRun;
+    const retried = await run(root, fakeGh, []);
+    expect(retried.status).toBe("pr_opened");
+    expect(fakeGh.calls.filter((call) => call[1] === "create")).toHaveLength(1);
+    const settled = readFoundryState(root);
+    expect(settled.pr.number).toBe(7);
+    expect(settled.prReconcile).toBeNull();
+  });
+
+  it("never creates a PR while the lookup is failing", async () => {
+    const root = await makeTempDir("ork-smelter-pr-lookup-");
+    const fakeGh = makeFakeGh({ head: "builder", oid: "fixture-head", failLookups: 1 });
+    const result = await run(root, fakeGh, []);
+    expect(result).toMatchObject({ ok: false, status: "pr_lookup_failed" });
+    expect(fakeGh.calls.some((call) => call[1] === "create")).toBe(false);
+  });
+
+  it("does not synthesize OPEN for a PR first seen merged, and ignores stale squash heads", async () => {
+    const root = await makeTempDir("ork-smelter-pr-merged-");
+    const fakeGh = makeFakeGh({ head: "builder", oid: "fixture-head" });
+    fakeGh.prs.push(fakeGh.item(3, "MERGED"));
+    // A merged PR for the reused branch name but an older commit is not evidence for this commit.
+    fakeGh.prs.push(fakeGh.item(2, "MERGED", { headRefOid: "old-head" }));
+    const result = await run(root, fakeGh, []);
+    expect(result.status).toBe("merged");
+    expect(readFoundryState(root).pr).toMatchObject({ number: 3, state: "MERGED" });
+    expect(fakeGh.calls.some((call) => call[1] === "create")).toBe(false);
+  });
+
+  it("refuses conflicting, closed, cross-repository and missing-gh situations", async () => {
+    const conflict = makeFakeGh({ head: "builder", oid: "fixture-head" });
+    conflict.prs.push(conflict.item(3, "OPEN"), conflict.item(4, "OPEN"));
+    expect((await run(await makeTempDir("ork-smelter-pr-c-"), conflict, [])).status).toBe(
+      "pr_conflict",
+    );
+
+    const closed = makeFakeGh({ head: "builder", oid: "fixture-head" });
+    closed.prs.push(closed.item(3, "CLOSED"));
+    const closedRoot = await makeTempDir("ork-smelter-pr-x-");
+    expect((await run(closedRoot, closed, [])).status).toBe("pr_closed");
+    expect(readFoundryState(closedRoot).pr).toMatchObject({ number: 3, state: "CLOSED" });
+    expect(closed.calls.some((call) => call[1] === "create")).toBe(false);
+
+    const fork = makeFakeGh({ head: "builder", oid: "fixture-head" });
+    fork.prs.push(fork.item(3, "OPEN", { isCrossRepository: true }));
+    const forked = await run(await makeTempDir("ork-smelter-pr-f-"), fork, []);
+    expect(forked.status).toBe("pr_opened");
+    expect(forked.stages.smeltAndPrune.pr.number).not.toBe(3);
+
+    const missing = makeFakeGh({ missing: true });
+    const log = [];
+    const result = await run(await makeTempDir("ork-smelter-pr-m-"), missing, log);
+    expect(result).toMatchObject({ ok: false, status: "gh_unavailable" });
+    expect(log.some((entry) => entry[1] === "push")).toBe(false);
+  });
+
+  it("stops on an open PR for the same head ref with another commit, and on a foreign origin", async () => {
+    const diverged = makeFakeGh({ head: "builder", oid: "fixture-head" });
+    diverged.prs.push(diverged.item(5, "OPEN", { headRefOid: "someone-elses-commit" }));
+    const log = [];
+    const result = await run(await makeTempDir("ork-smelter-pr-d-"), diverged, log);
+    expect(result).toMatchObject({ ok: false, status: "pr_conflict" });
+    expect(diverged.calls.some((call) => call[1] === "create")).toBe(false);
+    expect(log.some((entry) => entry[1] === "push")).toBe(false);
+
+    const foreign = makeFakeGh({
+      head: "builder",
+      oid: "fixture-head",
+      repository: "other/widgets",
+    });
+    const foreignLog = [];
+    const mismatch = await run(await makeTempDir("ork-smelter-pr-o-"), foreign, foreignLog);
+    expect(mismatch).toMatchObject({ ok: false, status: "repository_unverified" });
+    expect(foreignLog.some((entry) => entry[1] === "push")).toBe(false);
+  });
+
+  it("never reports a PR that is closed right after creation as opened", async () => {
+    const root = await makeTempDir("ork-smelter-pr-closed-");
+    const fakeGh = makeFakeGh({ head: "builder", oid: "fixture-head" });
+    const realRun = fakeGh.run;
+    fakeGh.run = (args) => {
+      const out = realRun(args);
+      if (args[0] === "pr" && args[1] === "create") fakeGh.prs[0].state = "CLOSED";
+      return out;
+    };
+    const result = await run(root, fakeGh, []);
+    expect(result).toMatchObject({ ok: false, status: "pr_closed" });
+    const state = readFoundryState(root);
+    expect(state.status).toBe("pr_closed");
+    // The exact verified metadata is kept, as CLOSED and never as opened.
+    expect(state.pr).toMatchObject({
+      number: 7,
+      state: "CLOSED",
+      headOid: "fixture-head",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-02T00:00:00.000Z",
+    });
+    expect(state.prReconcile).toBeNull();
+  });
+
+  it("prunes a locally merged worktree only through the recoverable quarantine helper", async () => {
+    const root = await makeTempDir("ork-smelter-local-prune-");
+    const log = [];
+    const pruned = [];
+    const executor = (cmd, args) => {
+      log.push([cmd, ...args]);
+      if (args[0] === "rev-parse") return "fixture-head";
+      if (args[0] === "symbolic-ref") return "builder";
+      if (args[0] === "diff") return "source.mjs\0";
+      return "";
+    };
+    const result = await smeltWorktree(
+      { path: root, branch: "builder", disposable: true, allowPaths: ["source.mjs"] },
+      {
+        execFileSyncFn: executor,
+        gateRunner: async () => "passed",
+        skipReview: true,
+        pruneMergedWorktreeFn: async (request) => {
+          pruned.push(request);
+          return { pruned: true, status: "quarantined", destination: "/quarantine/builder" };
+        },
+      },
+    );
+    expect(result).toMatchObject({ ok: true, status: "merged", pruned: true });
+    expect(result.stages.smeltAndPrune.quarantine.destination).toBe("/quarantine/builder");
+    expect(pruned).toHaveLength(1);
+    expect(pruned[0]).toMatchObject({ worktreePath: root, targetBranch: "main" });
+    const text = log.map((entry) => entry.join(" "));
+    expect(
+      text.some((line) => /worktree remove|branch -[dD]|update-ref -d refs\/heads/u.test(line)),
+    ).toBe(false);
+    // A retained (unprovable) worktree is reported as not pruned, never removed.
+    const kept = await smeltWorktree(
+      { path: root, branch: "builder", disposable: true, allowPaths: ["source.mjs"] },
+      {
+        execFileSyncFn: executor,
+        gateRunner: async () => "passed",
+        skipReview: true,
+        pruneMergedWorktreeFn: async () => ({
+          pruned: false,
+          status: "retained",
+          reasons: ["dirty"],
+        }),
+      },
+    );
+    expect(kept).toMatchObject({ ok: true, status: "merged", pruned: false });
   });
 });

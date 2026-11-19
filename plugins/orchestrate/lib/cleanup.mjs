@@ -5,6 +5,9 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { loadFoundryState, writeFoundryState } from "./foundry.mjs";
+import { formatMergedCleanupReport, mergedCleanup, prRecordsEqual } from "./merged-worktree.mjs";
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SCRIPTS_DIR = path.resolve(__dirname, "..", "skills", "orchestrate", "scripts");
 const RUN_AGENT_SCRIPT = path.join(SCRIPTS_DIR, "run_agent.py");
@@ -26,6 +29,9 @@ export function cleanupHelpText() {
     "",
     "Options:",
     "  --dry-run, -n           Preview what would be pruned or migrated without mutating",
+    "  --merged                Quarantine (never delete) clean, disposable worktrees whose branch is merged;",
+    "                          with status or --dry-run it is a read-only report. Cannot combine with other cleanup",
+    "  --target <branch>       Expected base branch for --merged (default: the main checkout's branch)",
     "  --migrate-legacy        Atomically migrate ~/.cache/agent-executor and ~/.config/agent-executor",
     "                          to ~/.cache/orchestrate and ~/.config/orchestrate with symlinks",
     "  --grace-minutes <min>   Minimum age in minutes before pruning locks/worktrees/runtimes (default: 15)",
@@ -42,6 +48,8 @@ export function parseCleanupArgs(argv = [], context = {}) {
   let action = null;
   let isDryRun = false;
   let isMigrateLegacy = false;
+  let isMerged = false;
+  let target = null;
   let graceMinutes = DEFAULT_GRACE_MINUTES;
   let keepBackups = DEFAULT_KEEP_BACKUPS;
   let olderThan = DEFAULT_OLDER_THAN;
@@ -65,6 +73,20 @@ export function parseCleanupArgs(argv = [], context = {}) {
     }
     if (token === "--json") {
       isJson = true;
+      continue;
+    }
+    if (token === "--merged") {
+      isMerged = true;
+      continue;
+    }
+    if (token === "--target" || token.startsWith("--target=")) {
+      const raw = token.includes("=") ? token.slice("--target=".length) : args[++i];
+      if (!raw || !String(raw).trim() || String(raw).startsWith("-")) {
+        const err = new Error("Missing value for --target");
+        err.exitCode = 2;
+        throw err;
+      }
+      target = String(raw).trim();
       continue;
     }
     if (token === "--grace-minutes" || token.startsWith("--grace-minutes=")) {
@@ -123,6 +145,17 @@ export function parseCleanupArgs(argv = [], context = {}) {
     throw err;
   }
 
+  if (isMerged && isMigrateLegacy) {
+    const err = new Error("--merged cannot be combined with --migrate-legacy");
+    err.exitCode = 2;
+    throw err;
+  }
+  if (target !== null && !isMerged) {
+    const err = new Error("--target is only valid with --merged");
+    err.exitCode = 2;
+    throw err;
+  }
+
   const resolvedAction = action || "run";
   const resolvedDryRun = resolvedAction === "status" || isDryRun;
 
@@ -130,6 +163,8 @@ export function parseCleanupArgs(argv = [], context = {}) {
     action: resolvedAction,
     dryRun: resolvedDryRun,
     migrateLegacy: isMigrateLegacy,
+    merged: isMerged,
+    target,
     graceMinutes,
     graceMs: Math.round(graceMinutes * 60 * 1000),
     keepBackups,
@@ -983,8 +1018,15 @@ export function hasActiveWorktreeLease(
   wtDir,
   entryNameOrMeta = null,
   maybeMeta = null,
-  { graceMs = 900_000, nowMs = Date.now() } = {},
+  { graceMs = 900_000, nowMs = Date.now(), ownLeasePaths = [], kernelLeases = false } = {},
 ) {
+  // Lock files of leases the caller itself holds right now: holding one proves nobody else does.
+  const ownStems = new Set(
+    ownLeasePaths.flatMap((leased) => [
+      sha256Hex(path.resolve(leased)),
+      sha256Hex(realpathSafe(leased)),
+    ]),
+  );
   const entryName =
     typeof entryNameOrMeta === "string" && entryNameOrMeta
       ? entryNameOrMeta
@@ -1026,6 +1068,9 @@ export function hasActiveWorktreeLease(
         continue;
       }
       const stem = file.slice(0, -".lock".length);
+      if (subDir === "worktree-locks-v1" && ownStems.has(stem)) {
+        continue;
+      }
       const holder = parseLockHolder(lockPath);
       const isMatchesHash = hashCandidates.has(stem);
       const isMatchesToken =
@@ -1041,10 +1086,12 @@ export function hasActiveWorktreeLease(
             holder.raw.includes(wtReal) ||
             holder.raw.includes(entryName)));
 
-      if (
-        (isMatchesHash || isMatchesToken || matchesPath) &&
-        isLockEntryActive(lockPath, st, { graceMs, nowMs })
-      ) {
+      // Kernel-flock workspace leases leave an empty file behind: only a live flock holder is an owner.
+      const isKernelLease = kernelLeases && subDir === "worktree-locks-v1" && !holder.pid;
+      const isActive = isKernelLease
+        ? isFlockHeldByAnotherProcess(lockPath)
+        : isLockEntryActive(lockPath, st, { graceMs, nowMs });
+      if ((isMatchesHash || isMatchesToken || matchesPath) && isActive) {
         return true;
       }
     }
@@ -1710,6 +1757,41 @@ export function formatCleanupReport(report) {
   return lines.join("\n") + "\n";
 }
 
+/** Records a freshly verified MERGED PR through the pinned writer, only where a PR was already tracked. */
+function recordVerifiedPr(worktreePath, pr) {
+  const loaded = loadFoundryState(worktreePath);
+  if (loaded.kind !== "ok" || !loaded.state.pr || prRecordsEqual(loaded.state.pr, pr)) return;
+  writeFoundryState(worktreePath, { pr, prReconcile: null, status: "merged" });
+}
+
+async function runMergedCleanup(parsed, context, stdout) {
+  const merged = await mergedCleanup({
+    repoRoot: parsed.cwd,
+    env: context.env ?? process.env,
+    targetBranch: parsed.target ?? undefined,
+    dryRun: parsed.dryRun,
+    execFileSyncFn: context.execFileSyncFn,
+    portsApi: context.portsApi,
+    currentDir: parsed.cwd,
+    hasActiveWorktreeLease,
+    recordPr: context.recordPr ?? recordVerifiedPr,
+  });
+  const report = {
+    schema: CLEANUP_SCHEMA,
+    action: parsed.action,
+    dryRun: parsed.dryRun,
+    ...merged,
+    totalBytesReclaimed: 0,
+    exitCode: merged.error ? 1 : 0,
+  };
+  if (!context.silent && stdout?.write) {
+    stdout.write(
+      parsed.json ? `${JSON.stringify(report, null, 2)}\n` : formatMergedCleanupReport(report),
+    );
+  }
+  return report;
+}
+
 export function cleanupCommand(argv = [], context = {}) {
   const parsed = parseCleanupArgs(argv, context);
   const stdout = context.stdout || process.stdout;
@@ -1725,6 +1807,11 @@ export function cleanupCommand(argv = [], context = {}) {
       help: true,
       exitCode: 0,
     };
+  }
+
+  if (parsed.merged) {
+    // Recoverable path only: no legacy pruning runs alongside it, and nothing is ever deleted.
+    return runMergedCleanup(parsed, context, stdout);
   }
 
   const nowMs = typeof context.nowMs === "number" ? context.nowMs : Date.now();

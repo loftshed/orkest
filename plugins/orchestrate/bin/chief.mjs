@@ -336,6 +336,9 @@ export async function chiefCommand(argv = [], context = {}) {
       noWake: values["no-wake"] ? true : !values.wake && undefined,
       ...overrides,
     });
+    if (result.status === "already-reported") {
+      return write(stdout, result, values.json, "This mission has already reported completion.");
+    }
     const text =
       result.status === "queued"
         ? "No live Chief: the report is queued on the Chief desk."

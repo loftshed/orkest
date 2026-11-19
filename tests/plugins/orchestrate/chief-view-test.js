@@ -10,6 +10,8 @@ import { runHordeTui } from "../../../plugins/orchestrate/bin/horde-tui.mjs";
 import {
   chiefEntries,
   chiefPaneTarget,
+  chiefPortBadge,
+  chiefPrBadge,
   chiefRoomPill,
   chiefSummary,
   ChiefView,
@@ -1101,5 +1103,147 @@ describe("ork horde --view --chief", () => {
         env: { ...process.env, ORCHESTRATE_HOME: directory },
       }),
     ).rejects.toMatchObject({ stderr: expect.stringContaining("--chief is a read-only overview") });
+  });
+});
+
+describe("chief worktree badges", () => {
+  const withWorktree = (worktree, title = "Badge room", extra = {}) => {
+    const data = status();
+    data.rooms = [
+      {
+        ...data.rooms[0],
+        id: "room-badge",
+        title,
+        worktree: { slug: "badge", path: "/code/orkest/.worktrees/badge", ...worktree },
+        ...extra,
+      },
+    ];
+    data.standalone = [];
+    return data;
+  };
+  const render = (data, width, options = {}) =>
+    new ChiefView(data, { now: () => NOW, tier: "unicode", height: 20, ...options }).render(width);
+  const ports = [
+    { name: "api", port: 31_042 },
+    { name: "web", port: 31_043 },
+    { name: "db", port: 31_044 },
+  ];
+
+  it("derives :port (+N) and #number state badges, with [] / null for absent data", () => {
+    expect(chiefPortBadge({ worktree: { ports } })).toBe(":31042 (+2)");
+    expect(chiefPortBadge({ worktree: { ports: [ports[0]] } })).toBe(":31042");
+    expect(chiefPortBadge({ worktree: { ports: [] } })).toBe("");
+    expect(chiefPortBadge({ worktree: {} })).toBe("");
+    expect(chiefPortBadge({ worktree: { ports: [{ port: "x" }, null, { port: 70_000 }] } })).toBe(
+      "",
+    );
+    expect(chiefPrBadge({ worktree: { pr: { number: 231, state: "OPEN" } } })).toEqual({
+      text: "● #231 open",
+      tone: "running",
+    });
+    expect(chiefPrBadge({ worktree: { pr: { number: 231, state: "MERGED" } } }, "ascii")).toEqual({
+      text: "+ #231 merged",
+      tone: "success",
+    });
+    expect(chiefPrBadge({ worktree: { pr: { number: 7, state: "weird" } } }).text).toBe(
+      "? #7 unknown",
+    );
+    expect(chiefPrBadge({ worktree: { pr: { number: 0, state: "OPEN" } } })).toBeNull();
+    expect(chiefPrBadge({ worktree: { pr: null } })).toBeNull();
+    expect(chiefPrBadge({})).toBeNull();
+  });
+
+  it("attaches normalized ports and pr to entries and searches them", () => {
+    const entries = chiefEntries(withWorktree({ ports, pr: { number: 231, state: "OPEN" } }));
+    expect(entries[0].ports).toHaveLength(3);
+    expect(entries[0].pr).toEqual({ number: 231, state: "OPEN" });
+    const bare = chiefEntries(status());
+    for (const entry of bare) {
+      expect(entry.ports).toEqual([]);
+      expect(entry.pr).toBeNull();
+    }
+    const chief = new ChiefView(withWorktree({ ports, pr: { number: 231, state: "OPEN" } }), {
+      now: () => NOW,
+      tier: "unicode",
+      height: 20,
+    });
+    chief.handleKey("/");
+    for (const character of "#231") chief.handleKey(character);
+    expect(text(chief.render(100))).toContain("Badge room");
+  });
+
+  it.each([48, 100, 160])("shows both badges within %i columns, Unicode and ASCII", (width) => {
+    for (const tier of ["unicode", "ascii"]) {
+      const data = withWorktree({ ports, pr: { number: 231, state: "MERGED" } });
+      const lines = render(data, width, { tier, color: true });
+      expectFits(lines, width);
+      const output = text(lines);
+      expect(output).toContain(tier === "ascii" ? "+ #231 merged" : "✓ #231 merged");
+      if (width >= 100) expect(output).toContain(":31042 (+2)");
+    }
+  });
+
+  it("shortens the name before dropping the port badge and always keeps the PR state at 48", () => {
+    const long = "A very long room name that must be abbreviated";
+    const both = withWorktree({ ports, pr: { number: 231, state: "OPEN" } }, long);
+    const medium = text(render(both, 60));
+    expect(medium).toContain(":31042 (+2)");
+    expect(medium).toContain("#231 open");
+    expect(medium).toContain("…");
+    const narrow = text(render(both, 48));
+    expect(narrow).toContain("#231 open");
+    for (const state of ["OPEN", "MERGED", "CLOSED", "UNKNOWN"]) {
+      const data = withWorktree({ ports, pr: { number: 231, state } }, long);
+      const lines = render(data, 48);
+      expectFits(lines, 48);
+      expect(text(lines)).toContain(`#231 ${state.toLowerCase()}`);
+    }
+    const portOnly = text(render(withWorktree({ ports }, long), 48));
+    expect(portOnly).toMatch(/:31042|\.\.\.|…/u);
+  });
+
+  it("omits badges entirely for legacy and absent worktree data", () => {
+    for (const worktree of [{}, { ports: [], pr: null }, { ports: undefined }]) {
+      const data = withWorktree(worktree);
+      const output = text(render(data, 100));
+      const hasBadge = /#\d|:\d{4,5}/u.test(output);
+      expect(hasBadge).toBe(false);
+    }
+    const bare = withWorktree(null);
+    expect(text(render(bare, 100))).toContain("Badge room");
+  });
+
+  it("keeps widths with CJK, combining marks and emoji names, selected or not", () => {
+    for (const name of [
+      "日本語のとても長い部屋の名前です",
+      "e\u{301}e\u{301}e\u{301}e\u{301} ñ̃ñ̃ room",
+      "🚀🚀 launch pad deploy room",
+    ]) {
+      for (const width of [48, 100, 160]) {
+        const data = withWorktree({ ports, pr: { number: 231, state: "OPEN" } }, name);
+        const chief = new ChiefView(data, {
+          now: () => NOW,
+          tier: "unicode",
+          height: 20,
+          color: true,
+        });
+        chief.selectedKey = "room:room-badge";
+        const lines = chief.render(width);
+        expectFits(lines, width);
+        expect(text(lines)).toContain("#231 open");
+        expectFits(
+          new ChiefView(data, { now: () => NOW, tier: "unicode", height: 20 }).render(width),
+          width,
+        );
+      }
+    }
+  });
+
+  it("never offers an external call: rendering reads only the snapshot", () => {
+    const fetchSpy = vi.fn();
+    vi.stubGlobal("fetch", fetchSpy);
+    render(withWorktree({ ports, pr: { number: 231, state: "OPEN" } }), 100);
+    vi.unstubAllGlobals();
+    expect(fetchSpy).not.toHaveBeenCalled();
   });
 });

@@ -33,6 +33,7 @@ import { hasTerminalDecision, memberDisplayState } from "./member-state.mjs";
 import { verifiedNativeIds } from "./native-identity.mjs";
 import { readDelegatedRunTail } from "./run-activity.mjs";
 import { cacheHome } from "./runtime-paths.mjs";
+import { worktreePortEnv } from "./worktree-env.mjs";
 import {
   currentBranch,
   provisionWorktree,
@@ -483,9 +484,10 @@ function leadArgs(options) {
   ];
 }
 
-export async function coordinator(args) {
+export async function coordinator(args, { env } = {}) {
   try {
     const { stdout } = await execute("python3", [coordinatorPath, ...args], {
+      env,
       maxBuffer: 8 * 1024 * 1024,
       timeout: 30_000,
     });
@@ -1303,7 +1305,23 @@ export async function dispatchMember(id, memberId, options = {}) {
   if (binding.allowCredits) args.push("--allow-credits");
   let result;
   try {
-    result = await run(args);
+    if (targetMember?.worktree?.path && resolvedMemberCwd === currentMemberCwd) {
+      const env = options.env ?? process.env;
+      let repoRoot;
+      try {
+        repoRoot = resolveRepositoryRoot(targetMember.worktree.parentCwd || room.cwd);
+      } catch {
+        // Older bindings can still launch after their original parent checkout has moved.
+      }
+      const ports = worktreePortEnv({
+        env,
+        repoRoot,
+        worktreePath: resolvedMemberCwd,
+      });
+      result = await run(args, { env: { ...env, ...ports } });
+    } else {
+      result = await run(args);
+    }
   } catch (error) {
     // The coordinator records a run before any side effect, so a refusal with no run for this
     // request launched nothing: clear the intent so the member can be dispatched again.

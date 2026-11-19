@@ -195,6 +195,7 @@ ork factory [status|run|groom] [--dry-run] [--json]   (alias for ork foundry)
 ork rooms --help                (alias for ork hall)
 ork herdr-status                     (focused Herdr pane agent, plain text)
 ork setup [--dry-run] [--trust-codex-hooks] [--trust-orkest-commands|--untrust-orkest-commands]   (install mailbox, hooks and shell wrapper shortcuts)
+ork setup --trust-worktree [--cwd <repo>] [--json]   (review and approve the repository's .orkest/worktree.json setup command)
 ork label [--lines 1|2] -- codex|claude|agy|opencode [arguments]   (direct in Herdr; tmux footer elsewhere)
 ork progress --session ID --goal TEXT --task TEXT --stage working [--role ROLE]
 ork name [--model <model>] [--effort <level>] [--harness <harness>] [--short]
@@ -211,7 +212,7 @@ Slash commands, in every installed harness (`install.sh` writes them; Claude Cod
 
 - `/account [add <provider> --profile <slug>|list|tag|remove|sync] [--json]`: Add, list, tag, remove and sync Claude, Codex, Antigravity and OpenCode accounts
 - `/chief [status|<goal>]`: Take the machine-wide Chief desk, brief every running orchestrator, and route multi-repo work
-- `/cleanup [status|run] [--dry-run] [--migrate-legacy]`: Audit, prune, and migrate legacy Orkest / agent-executor state, worktrees, and backups
+- `/cleanup [status|run] [--dry-run] [--migrate-legacy] [--merged [--target <branch>]]`: Audit, prune, and migrate legacy Orkest / agent-executor state, worktrees, and backups; quarantine merged worktrees recoverably
 - `/horde [toggle|open|close|<goal>]`: Toggle the Orkest Swarm View split pane or launch a swarm for a goal
 - `/side [--later|--issue|--investigate] <idea>`: Launch or park a side mission from the current tab without derailing your main task
 - `/swarm [toggle|open|close|<goal>]`: Toggle the Orkest Swarm View split pane or launch a swarm for a goal

@@ -1129,7 +1129,7 @@ describe("orca panel, host fallbacks and races", () => {
         },
       };
       const page = await mountPanel(null, bridge);
-      expect(page.byId.get("workspace").textContent).toBe("repo");
+      await vi.waitFor(() => expect(page.byId.get("workspace")?.textContent).toBe("repo"));
       expect(page.byId.get("rooms").firstElementChild.firstElementChild.textContent).toBe("room-a");
       expect(page.byId.get("workers").firstElementChild.firstElementChild.textContent).toBe(
         "term_coord (claude)",
