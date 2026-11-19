@@ -1477,6 +1477,9 @@ mod tests {
         });
         thread::sleep(Duration::from_millis(100));
         fs::remove_file(&lock_path).unwrap();
+        // Create the replacement while the original inode is still held, so the filesystem
+        // cannot recycle its number and make two different lock files look identical.
+        fs::File::create_new(&lock_path).unwrap();
         drop(first);
 
         let locked_inode = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
