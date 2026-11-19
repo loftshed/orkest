@@ -179,12 +179,19 @@ describe("ork side (side missions)", () => {
 
     it("creates an open workboard card with the requested scope", async () => {
       expect(spawnSync("git", ["init", repoDir]).status).toBe(0);
-      const parked = await sideCommand(["--later", "--json", "Review retry behavior"], {
-        cwd: repoDir,
-        mailboxDir,
-        cacheDir,
-        shortId: "park-real",
-      });
+      const cli = path.resolve(import.meta.dirname, "../../../plugins/orchestrate/bin/ork.mjs");
+      const run = spawnSync(
+        process.execPath,
+        [cli, "side", "--later", "--json", "Review retry behavior"],
+        {
+          cwd: repoDir,
+          env: { ...process.env, HOME: tmpDir, ORCHESTRATE_MAILBOX_DIR: mailboxDir },
+          encoding: "utf8",
+        },
+      );
+      expect(run.stderr).toBe("");
+      expect(run.status).toBe(0);
+      const parked = JSON.parse(run.stdout);
       expect(parked.workItem.scope).toBe("Review retry behavior");
       expect(parked.workItem.state).toBe("open");
       expect(parked.workId).toBe(parked.workItem.id);
