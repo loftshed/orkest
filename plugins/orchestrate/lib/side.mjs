@@ -1307,8 +1307,10 @@ export async function sideCommand(argv = [], context = {}) {
       sideId,
       "--title",
       workTitle,
-      "--note",
+      "--scope",
       classified.idea,
+      "--acceptance",
+      "Resolve the parked request and record the outcome on this card.",
       "--format",
       "json",
     ];
@@ -1316,17 +1318,11 @@ export async function sideCommand(argv = [], context = {}) {
       cwd,
       env: buildIsolatedEnv(env, isolatedCoordSession, mailboxDir),
     });
-    let workItem = null;
-    if (res.status === 0 && res.stdout.trim()) {
-      try {
-        workItem = JSON.parse(res.stdout.trim());
-      } catch {
-        workItem = { raw: res.stdout.trim() };
-      }
-    } else if (res.status !== 0) {
+    if (res.status !== 0) {
       throw new Error(`Failed to park side mission on workboard: ${res.stderr || res.stdout}`);
     }
-    const workId = workItem?.id || workItem?.work_id || sideId;
+    const { item: workItem } = JSON.parse(res.stdout);
+    const workId = workItem.id;
     const summary = `Parked side mission ${workId} ("${classified.title}") on the workboard — visible in /swarm and ork next.`;
     const payload = {
       schema: "ork.side.v1",
@@ -1628,14 +1624,19 @@ export async function sideCommand(argv = [], context = {}) {
   return payload;
 }
 
+export async function runSideCli(argv, context = {}) {
+  const result = await sideCommand(argv, context);
+  if (argv.includes("--json")) {
+    (context.stdout ?? process.stdout).write(`${JSON.stringify(result, null, 2)}\n`);
+  }
+  return result;
+}
+
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
   const cliArgs = process.argv.slice(2);
   const wantsJson = cliArgs.includes("--json");
   try {
-    const result = await sideCommand(cliArgs);
-    if (wantsJson) {
-      process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
-    }
+    await runSideCli(cliArgs);
   } catch (error) {
     if (wantsJson) {
       process.stdout.write(

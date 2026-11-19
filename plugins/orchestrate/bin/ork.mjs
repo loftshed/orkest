@@ -554,7 +554,7 @@ export async function main(
   if (argv[0] === "side" || argv[0] === "side-mission") {
     return optionalModuleCommand(
       "../lib/side.mjs",
-      "sideCommand",
+      "runSideCli",
       argv.slice(1),
       { stdout },
       (args, { stdout: out }) => {
