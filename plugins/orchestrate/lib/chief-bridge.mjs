@@ -18,9 +18,12 @@
  * Without that file (or with `"enabled": true` missing) nothing is read beyond one lstat, no network is
  * opened and no process is started. ORK_CHIEF_BRIDGE=0 forces the bridge off.
  *
+ * Detached workers share one durable queue (see chief-delivery.mjs): replay, per-sink acknowledgements and
+ * the breaker survive across CLI processes, and one drain lease bounds workers and sink contacts.
+ *
  * Payload (frozen): `{schema:"ork.chief.event.v1", id, event, at, roomId, prNumber?}`. The id is an
  * opaque hash of the event, room and the durable source identity (`key`), so a restarted process derives
- * the same id for the same record. Delivery is at-least-once with bounded in-process replay suppression;
+ * the same id for the same record. Delivery is at-least-once with bounded replay suppression (durable across processes);
  * receivers should de-duplicate on `id`.
  */
 import { spawn } from "node:child_process";
@@ -466,12 +469,14 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
  * @param {() => number} [options.clock] milliseconds
  * @param {{https?: Function, exec?: Function, lookup?: Function, sleep?: Function}} [options.transport]
  * @param {object} [options.limits] test-only tightening of BRIDGE_LIMITS
+ * @param {boolean} [options.isDurable] keep queue, acknowledgements and breaker in the shared state file
  */
 export function createChiefBridge({
   env = process.env,
   clock = Date.now,
   transport = {},
   limits = {},
+  isDurable = false,
 } = {}) {
   const lim = { ...BRIDGE_LIMITS, ...limits };
   const send = {
@@ -590,6 +595,25 @@ export function createChiefBridge({
       : []),
   ];
 
+  /** Contacts only the sinks not yet in `done`, retrying with backoff. False when `renew` refuses. */
+  async function attemptSinks(sinks, done, { onAck, renew } = {}) {
+    for (let tries = 0; tries < lim.attempts; tries++) {
+      const waiting = sinks.filter(([name]) => !done.has(name));
+      if (waiting.length === 0) break;
+      if (tries > 0) await send.sleep(lim.backoffMs * 2 ** (tries - 1));
+      if (renew && !renew()) return false;
+      const outcomes = await Promise.all(
+        waiting.map(async ([name, run]) => [name, await withDeadline(run)]),
+      );
+      for (const [name, isAcknowledged] of outcomes) {
+        if (!isAcknowledged) continue;
+        done.add(name);
+        onAck?.(name);
+      }
+    }
+    return true;
+  }
+
   async function deliver(cfg, payload) {
     if (clock() < openUntil) return { status: "dropped", reason: "breaker-open" };
     const body = JSON.stringify(payload);
@@ -598,15 +622,7 @@ export function createChiefBridge({
     acked.set(payload.id, done);
     if (acked.size > lim.replay) acked.delete(acked.keys().next().value);
     const sinks = sinksOf(cfg, payload, body);
-    for (let tries = 0; tries < lim.attempts; tries++) {
-      const waiting = sinks.filter(([name]) => !done.has(name));
-      if (waiting.length === 0) break;
-      if (tries > 0) await send.sleep(lim.backoffMs * 2 ** (tries - 1));
-      const outcomes = await Promise.all(
-        waiting.map(async ([name, run]) => [name, await withDeadline(run)]),
-      );
-      for (const [name, isAcknowledged] of outcomes) if (isAcknowledged) done.add(name);
-    }
+    await attemptSinks(sinks, done);
     if (sinks.every(([name]) => done.has(name))) {
       failures = 0;
       acked.delete(payload.id);
@@ -620,7 +636,74 @@ export function createChiefBridge({
     return { status: "failed", id: payload.id, delivered: [...done] };
   }
 
+  // Durable mode: queue, replay, acknowledgements and breaker live in the shared state file.
+  let durable = null;
+  const getDurable = async () => {
+    durable ??= (async () => {
+      const { openDeliveryStore, deliveryStatePath } = await import("./chief-delivery.mjs");
+      return openDeliveryStore(deliveryStatePath(chiefBridgeConfigPath(env)), {
+        clock,
+        limits: lim,
+      });
+    })();
+    return durable;
+  };
+
+  const deliverRow =
+    (cfg) =>
+    async (payload, { acked: done, ack, renew }) => {
+      const sinks = sinksOf(cfg, payload, JSON.stringify(payload));
+      const isLive = await attemptSinks(sinks, done, { onAck: ack, renew });
+      return isLive ? sinks.every(([name]) => done.has(name)) : null;
+    };
+
+  async function drain(token) {
+    const cfg = getConfig();
+    if (!cfg) return { lost: false };
+    const { drainQueue } = await import("./chief-delivery.mjs");
+    const store = await getDurable();
+    return drainQueue(store, {
+      token,
+      profile: store.fingerprint(cfg),
+      clock,
+      deliverRow: deliverRow(cfg),
+    });
+  }
+
+  async function emitDurable(cfg, payload) {
+    const { drainQueue } = await import("./chief-delivery.mjs");
+    const store = await getDurable();
+    const profile = store.fingerprint(cfg);
+    const queued = store.enqueue(payload, profile);
+    if (queued.status === "dropped") return queued;
+    const id = queued.payload.id;
+    if (queued.status === "duplicate") return { status: "duplicate", id };
+    const token = store.newToken();
+    // Another holder is draining: the event is durable and its loop (or the next emit) delivers it.
+    if (!store.acquireLease(token)) return { status: "queued", id };
+    const { tried } = await drainQueue(store, {
+      token,
+      profile,
+      clock,
+      deliverRow: deliverRow(cfg),
+    });
+    const state = store.status(id);
+    if (!state) return { status: "failed", id };
+    if (state.state === "sent") return { status: "sent", id };
+    if (tried?.has(id)) return { status: "failed", id, delivered: state.delivered };
+    return { status: "queued", id, ...(store.isBreakerOpen() && { reason: "breaker-open" }) };
+  }
+
   return {
+    drain,
+    async close() {
+      try {
+        (await durable)?.close();
+      } catch {
+        // Never opened, or already closed.
+      }
+      durable = null;
+    },
     /** Best-effort and bounded. Resolves with a status; never rejects and never throws. */
     async emit(input) {
       try {
@@ -631,6 +714,7 @@ export function createChiefBridge({
         if (!payload) return { status: "invalid" };
         const body = JSON.stringify(payload);
         if (Buffer.byteLength(body) > lim.payloadBytes) return { status: "invalid" };
+        if (isDurable) return await emitDurable(cfg, payload);
         if (seen.has(payload.id)) return { status: "duplicate", id: payload.id };
         if (pending >= lim.pending) return { status: "dropped", reason: "queue-full" };
         remember(payload.id);
@@ -685,18 +769,42 @@ function cleanEvent(event) {
   };
 }
 
+const LEASE_ENV = "ORK_CHIEF_DELIVERY_LEASE";
+const LEASE_TOKEN_RE = /^[0-9a-f]{24}$/u;
+
 /**
- * Hands committed events to a short-lived detached worker (`--deliver`) so a slow sink can never hold
- * the caller or a CLI exit. Nothing is started unless the opt-in file is valid. Resolves once the
- * events are written to the worker's pipe (bounded) and never rejects.
+ * Records committed events in the shared durable queue, then hands delivery to the single detached
+ * worker (`--deliver`) so a slow sink can never hold the caller or a CLI exit. Nothing is opened or
+ * started unless the opt-in file is valid. The worker is started only by the process that wins the one
+ * drain lease; any other emitter just queues and returns, so concurrent CLIs never multiply workers.
+ * Resolves once the events are durable and any worker has its hand-off (bounded) and never rejects.
  */
 export async function spawnChiefDelivery(events, { env = process.env, spawnFn = spawn } = {}) {
+  let store = null;
+  let token = null;
   try {
-    if (!loadChiefBridgeConfig(env)) return false;
+    const cfg = loadChiefBridgeConfig(env);
+    if (!cfg) return false;
     const batch = events.map((event) => cleanEvent(event)).filter(Boolean);
     const input = JSON.stringify(batch.slice(0, BRIDGE_LIMITS.pending));
     if (batch.length === 0 || Buffer.byteLength(input) > WORKER_INPUT_BYTES) return false;
-    const workerEnv = {};
+    const { openDeliveryStore, deliveryStatePath, DELIVERY_LIMITS } =
+      await import("./chief-delivery.mjs");
+    // The caller never waits on the optional state file beyond this one small budget.
+    store = openDeliveryStore(deliveryStatePath(chiefBridgeConfigPath(env)), {
+      admissionMs: DELIVERY_LIMITS.admissionMs,
+    });
+    const profile = store.fingerprint(cfg);
+    let isQueued = false;
+    for (const event of batch.slice(0, BRIDGE_LIMITS.pending)) {
+      const payload = cfg.events.has(event.event) ? buildChiefPayload(event) : null;
+      if (payload && store.enqueue(payload, profile).status === "queued") isQueued = true;
+    }
+    if (!isQueued) return false;
+    token = store.newToken();
+    // A live holder drains what was just queued, and cannot release without seeing it.
+    if (!store.acquireLease(token, store.limits.spawnGraceMs)) return true;
+    const workerEnv = { [LEASE_ENV]: token };
     for (const key of WORKER_ENV_KEYS) if (typeof env[key] === "string") workerEnv[key] = env[key];
     const child = spawnFn(process.execPath, [fileURLToPath(import.meta.url), "--deliver"], {
       detached: true,
@@ -713,9 +821,22 @@ export async function spawnChiefDelivery(events, { env = process.env, spawnFn = 
     clearTimeout(timer);
     child.unref();
     child.stdin.unref?.();
+    if (!isWritten) store.abandonLease(token);
     return isWritten;
   } catch {
+    // A worker that never started must not hold the lease for its whole grace period.
+    try {
+      if (token) store?.abandonLease(token);
+    } catch {
+      // Expires on its own.
+    }
     return false;
+  } finally {
+    try {
+      store?.close();
+    } catch {
+      // Nothing left to release.
+    }
   }
 }
 
@@ -751,32 +872,31 @@ export async function emitChiefEvents(
   }
 }
 
-async function readWorkerInput() {
-  const chunks = [];
+/** The batch on stdin is only a wake-up: the parent already queued it durably. Drain, bounded. */
+async function discardWorkerInput() {
   let size = 0;
   for await (const chunk of process.stdin) {
     size += chunk.length;
-    if (size > WORKER_INPUT_BYTES) return [];
-    chunks.push(chunk);
-  }
-  try {
-    const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-    return Array.isArray(parsed) ? parsed.slice(0, BRIDGE_LIMITS.pending) : [];
-  } catch {
-    return [];
+    if (size > WORKER_INPUT_BYTES) break;
   }
 }
 
-/** Entry for the detached worker: delivers one batch through the real bridge, then exits. */
+/** Entry for the detached worker: drains the shared queue under the lease its parent took, then exits. */
 async function runDeliveryWorker() {
   const watchdog = setTimeout(() => process.exit(1), WORKER_LIFESPAN_MS);
-  try {
-    const bridge = createChiefBridge({ env: process.env });
-    const batch = await readWorkerInput();
-    for (const event of batch) await bridge.emit(cleanEvent(event));
-  } finally {
-    clearTimeout(watchdog);
+  const token = process.env[LEASE_ENV];
+  if (typeof token === "string" && LEASE_TOKEN_RE.test(token)) {
+    const bridge = createChiefBridge({ env: process.env, isDurable: true });
+    try {
+      await discardWorkerInput();
+      await bridge.drain(token);
+    } catch {
+      // Best effort: the lease expires and the next emit retries.
+    } finally {
+      await bridge.close();
+    }
   }
+  clearTimeout(watchdog);
   process.exit(0);
 }
 
