@@ -30,6 +30,7 @@ if str(SCRIPTS) not in sys.path:
 
 import _ork_fast_test_helpers as ORK_FAST  # noqa: E402
 import handoff  # noqa: E402 -- exercise shipped Chief liveness parity
+import herdr_status  # noqa: E402 -- compare the reference status command with a controlled clock
 import install_mailbox  # noqa: E402 -- exercise the shipped installer
 import mailbox_store  # noqa: E402 -- exercise shipped process birth helper
 import mailbox_wake  # noqa: E402 -- exercise exact wake notice formatting
@@ -1693,8 +1694,23 @@ class TestHerdrStatusParity(unittest.TestCase):
 
     def test_herdr_status_delayed_cli_is_bounded(self):
         self.peer()
-        env = self.make_env(self.home, FAKE_HERDR_DELAY="0.03")
-        self.assert_parity("[A] ivory-elk-49", env=env)
+        # Compare an on-time 30 ms reply without making process scheduling part of the oracle.
+        clock = [0.0]
+
+        def reply(args, **options):
+            self.assertEqual(options["timeout"], 0.1)
+            clock[0] += 0.03
+            return subprocess.CompletedProcess(args, 0, self.pane_file.read_text(), "")
+
+        with (
+            mock.patch.dict(os.environ, self.env, clear=True),
+            mock.patch.object(herdr_status, "time", mock.Mock(monotonic=lambda: clock[0])),
+            mock.patch.object(herdr_status, "subprocess", mock.Mock(run=reply)),
+        ):
+            expected = herdr_status.status()
+        self.assertEqual(expected, "[A] ivory-elk-49")
+        rust = self.run_rust()
+        self.assertEqual((rust.stdout, rust.returncode), (expected + "\n", 0))
         env = self.make_env(self.home, FAKE_HERDR_DELAY="0.6")
         started = time.monotonic()
         rust = self.run_rust(env=env)

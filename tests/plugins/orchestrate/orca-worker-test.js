@@ -175,6 +175,7 @@ describe("orca worker", () => {
   it("matches the manifest: commands, events, quota item and repository-relative main", async () => {
     const manifest = JSON.parse(await readFile(path.join(ROOT, "orca-plugin.json"), "utf8"));
     expect(manifest.main).toBe("plugins/orchestrate/lib/orca-worker.mjs");
+    expect(findExecutable("node", env, { exists: () => false })).toBeNull();
     expect(REPO_ROOT).toBe(ROOT);
     expect(typeof activate).toBe("function");
     expect(typeof deactivate).toBe("function");
@@ -184,6 +185,7 @@ describe("orca worker", () => {
     const host = mockOrca();
     const instance = worker(host);
     await instance.start();
+    await expect.poll(() => host.state.status.at(-1)?.text).toBe("Quota ?");
     const sorted = (values) => values.toSorted((left, right) => left.localeCompare(right));
     expect(sorted(host.commands.keys().toArray())).toEqual(
       sorted(manifest.contributes.commands.map(({ id }) => id)),
@@ -206,12 +208,16 @@ describe("orca worker", () => {
       for (const key of keys) delete process.env[key];
       process.env.HOME = home;
       process.env.PATH = env.PATH;
+      const bin = path.join(home, ".local", "bin");
+      await mkdir(bin, { recursive: true });
+      const node = path.join(bin, "node");
+      await writeFile(node, `#!/bin/sh\nprintf '%s\\n' '{"accounts":[]}'\n`);
+      await chmod(node, 0o755);
       await activate(host.orca);
       expect(host.commands.has("orkest.swarm.toggle")).toBe(true);
-      // No node on PATH: the quota item says so instead of throwing.
-      await expect.poll(() => host.state.status.at(-1)?.text).toBe("Quota ?");
-      await deactivate();
+      await expect.poll(() => host.state.status.at(-1)?.text).toBe("Quota —");
     } finally {
+      await deactivate();
       for (const [key, value] of Object.entries(previous)) {
         if (value === undefined) delete process.env[key];
         else process.env[key] = value;
