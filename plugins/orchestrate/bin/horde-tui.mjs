@@ -20,10 +20,11 @@ import { ChiefView } from "../lib/chief-view.mjs";
 import { createCompanionDismissMonitor } from "../lib/companion-dismiss.mjs";
 import { readDiffMarks, writeDiffMarks } from "../lib/diff-marks.mjs";
 import { defaultDockerProbeGuard } from "../lib/docker-probe.mjs";
+import { openWorktreePane, resolveAgentPane, showNotification } from "../lib/herdr-cli.mjs";
 import {
   createHerdrLifecycleSubscriber,
+  herdrPaneIdsFromRoom,
   isCurrentHerdrAgent,
-  verifiedHerdrAgentPane,
 } from "../lib/herdr-context.mjs";
 import { markHerdrViewClosed, syncHerdrViewLabel } from "../lib/herdr-view-state.mjs";
 import { createRoom, mailboxRoot, readRoom } from "../lib/horde-room.mjs";
@@ -292,7 +293,42 @@ export async function readLiveChief(env = process.env) {
 
 const CHIEF_ROOM_BACK_KEYS = new Set(["\t", "\u{1B}[Z", "\u{7F}", "\b"]);
 
-export async function focusAgentPane(agent, { exec = execFile, env = process.env, orcaCli } = {}) {
+/**
+ * Open the existing worktree checkout of an agent whose terminal pane is gone. Never creates a
+ * worktree.
+ */
+async function openAgentWorktree(agent, herdrPaneId, { exec, env, root }) {
+  if (!agent.worktree?.path) return false;
+  // The workspace that hosted the pane is only a hint; Herdr-side verification picks the source.
+  const hosted = herdrPaneId.split(":", 1)[0];
+  const workspaceId = hosted && hosted !== herdrPaneId ? hosted : undefined;
+  try {
+    await openWorktreePane(agent, { env, exec, root, workspaceId });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function openFailureNotice(agent) {
+  return agent?.worktree?.path
+    ? "Could not open chat or its worktree. Its terminal may have closed."
+    : "Could not open chat. Its terminal may have closed.";
+}
+
+/** Herdr-native notification with the macOS HUD (when installed) as fallback if Herdr declines. */
+async function sendHerdrNotification(message, hud, { env, exec, exists, platform }) {
+  const isShown = await showNotification(message, { env, exec });
+  if (!isShown && platform === "darwin" && resolveMacosHudBinary(env, { exists })) {
+    sendMacosHudToast(hud, { env, exec, exists, platform });
+  }
+  return isShown;
+}
+
+export async function focusAgentPane(
+  agent,
+  { exec = execFile, env = process.env, orcaCli, root } = {},
+) {
   if (!agent || typeof agent !== "object") return false;
   const rawHerdrPaneId = agent.herdrPaneId || agent.progress?.herdrPaneId;
   const herdrPaneId = typeof rawHerdrPaneId === "string" ? rawHerdrPaneId.trim() : "";
@@ -300,12 +336,13 @@ export async function focusAgentPane(agent, { exec = execFile, env = process.env
     if (!PANE_ID_RE.test(herdrPaneId) || env.HERDR_ENV !== "1" || !isCurrentHerdrAgent(agent, env))
       return false;
     const session = agent.session?.id || agent.nativeSession || agent.activitySource?.session;
-    if (typeof session !== "string" || !session) return false;
     const binary = env.HERDR_BIN_PATH || "herdr";
-    const pane = await verifiedHerdrAgentPane(herdrPaneId, session, (args) =>
-      runExecOutput(exec, binary, args, env),
-    );
-    return pane ? runExec(exec, binary, ["agent", "focus", pane], env) : false;
+    const pane =
+      typeof session === "string" && session
+        ? await resolveAgentPane(herdrPaneId, session, { env, exec })
+        : null;
+    if (pane && (await runExec(exec, binary, ["agent", "focus", pane], env))) return true;
+    return openAgentWorktree(agent, herdrPaneId, { exec, env, root });
   }
   const orcaTerminal = agentOrcaTerminal(agent);
   if (orcaTerminal) {
@@ -394,19 +431,20 @@ export function notifyHerdrTransitions(
     seen.add(key);
     isTriggered = true;
     if (isHerdr) {
-      void runExec(
-        exec,
-        env.HERDR_BIN_PATH || "herdr",
-        [
-          "notification",
-          "show",
-          `Orkest: ${agent.person || agent.id} blocked`,
-          "--body",
-          String(agent.summary || "Needs attention"),
-          "--sound",
-          "request",
-        ],
-        env,
+      void sendHerdrNotification(
+        {
+          title: `Orkest: ${agent.person || agent.id} blocked`,
+          body: String(agent.summary || "Needs attention"),
+          sound: "request",
+        },
+        {
+          agent: String(agent.person || agent.id),
+          body: String(agent.summary || "Needs attention"),
+          sound: "request",
+          status: "blocked",
+          title: `${agent.person || agent.id} blocked`,
+        },
+        { env, exec, exists, platform },
       );
     } else {
       sendMacosHudToast(
@@ -428,19 +466,15 @@ export function notifyHerdrTransitions(
     seen.add(summary.key);
     isTriggered = true;
     if (isHerdr) {
-      void runExec(
-        exec,
-        env.HERDR_BIN_PATH || "herdr",
-        [
-          "notification",
-          "show",
-          `Orkest: ${summary.title}`,
-          "--body",
-          summary.body,
-          "--sound",
-          summary.sound,
-        ],
-        env,
+      void sendHerdrNotification(
+        { title: `Orkest: ${summary.title}`, body: summary.body, sound: summary.sound },
+        {
+          body: summary.body,
+          sound: summary.sound,
+          status: summary.sound === "done" ? "done" : "info",
+          title: summary.title,
+        },
+        { env, exec, exists, platform },
       );
     } else {
       sendMacosHudToast(
@@ -589,11 +623,15 @@ function notifyChief(candidate, { env, exec, exists, platform }) {
   const title = singleLine(`Chief: ${CHIEF_KIND_TITLES[candidate.kind]}`, 80);
   const body = singleLine(`${candidate.label}: ${candidate.text}`, 240);
   if (env?.HERDR_ENV === "1") {
-    void runExec(
-      exec,
-      env.HERDR_BIN_PATH || "herdr",
-      ["notification", "show", title, "--body", body, "--sound", "request"],
-      env,
+    void sendHerdrNotification(
+      { title, body, sound: "request" },
+      {
+        body,
+        sound: "request",
+        status: candidate.kind === "failed" ? "failed" : "blocked",
+        title,
+      },
+      { env, exec, exists, platform },
     );
     return true;
   }
@@ -1427,19 +1465,22 @@ export async function runHordeTui(
       view.notice = `Opening ${shortAgentName(agent)}...`;
       void previewController
         .close()
-        .then((snapshot) => !snapshot?.error && !isStopped && focusAgentPane(agent, { exec, env }))
+        .then(
+          (snapshot) =>
+            !snapshot?.error &&
+            !isStopped &&
+            focusAgentPane(agent, { exec, env, root: view.room?.cwd }),
+        )
         .then((opened) => {
           isNavigationPending = false;
           if (isStopped) return;
-          view.notice = opened
-            ? `Opened ${shortAgentName(agent)}`
-            : "Could not open chat. Its terminal may have closed.";
+          view.notice = opened ? `Opened ${shortAgentName(agent)}` : openFailureNotice(agent);
           paint();
         })
         .catch(() => {
           isNavigationPending = false;
           if (isStopped) return;
-          view.notice = "Could not open chat. Its terminal may have closed.";
+          view.notice = openFailureNotice(agent);
           paint();
         });
     },
@@ -1689,6 +1730,8 @@ export async function runHordeTui(
         }
       }
       view.setRoom(room);
+      // Authoritative snapshot: watch exactly the panes of members still in this room.
+      herdrSubscriber?.setPaneIds(herdrPaneIdsFromRoom(room, env));
       // A drilled-in room is borrowed: the pane label and notifications stay with the home room.
       if (!drilledRoomId) {
         try {
@@ -1782,6 +1825,7 @@ export async function runHordeTui(
           onReconcile: () => {
             if (!isStopped) void refresh();
           },
+          paneIds: herdrPaneIdsFromRoom(initialRoom, env),
         })
       : null;
   const cleanup = () => {
