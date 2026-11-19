@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
-import fs from "node:fs";
+import fs, { readdirSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -8,18 +8,30 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { chiefCommand, renderChiefStatus } from "../../../plugins/orchestrate/bin/chief.mjs";
 import {
   bindChief,
+  chiefClose,
+  chiefDesk,
+  chiefInbox,
   chiefPath,
+  chiefReconcile,
   chiefSend,
   chiefSpawn,
   chiefStatus,
+  installCompletionHook,
+  isWithinPath,
   listDesk,
   missionBrief,
+  planCompletionHook,
   readChiefBinding,
   readPeers,
   resolveChiefTarget,
   sessionKey,
 } from "../../../plugins/orchestrate/lib/chief.mjs";
-import { listRawRooms, readRawRoom } from "../../../plugins/orchestrate/lib/horde-room.mjs";
+import {
+  listRawRooms,
+  readRawRoom,
+  updateRawRoom,
+} from "../../../plugins/orchestrate/lib/horde-room.mjs";
+import { displayWidth } from "../../../plugins/orchestrate/lib/tui-box.mjs";
 
 const NOW = Date.now();
 const deadPid = () => spawnSync("true").pid;
@@ -485,7 +497,7 @@ describe("ork chief", () => {
       ];
     });
 
-    it("resolves a room ID and delivers through peer_mailbox with wake", async () => {
+    it("resolves a room ID and delivers through peer_mailbox with wake when explicitly requested", async () => {
       const runMailbox = mailboxMock();
       const result = await chiefSend({
         root,
@@ -494,6 +506,7 @@ describe("ork chief", () => {
         message: "please rebase",
         from: "me",
         kind: "update",
+        noWake: false,
         runMailbox,
         listRooms: () => rooms,
       });
@@ -504,6 +517,53 @@ describe("ork chief", () => {
       expect(args).toEqual(expect.arrayContaining(["--scope", "cross-project"]));
       expect(args.at(-1)).toBe("[chief:update] please rebase");
       expect(args).not.toContain("--no-wake");
+    });
+
+    it("keeps updates quiet by default and wakes for the other kinds", async () => {
+      const cases = [
+        { kind: "update", wakes: false },
+        { kind: "question", wakes: true },
+        { kind: "escalation", wakes: true },
+        { kind: "done", wakes: true },
+        { kind: undefined, wakes: true },
+      ];
+      for (const { kind, wakes } of cases) {
+        const runMailbox = mailboxMock();
+        const result = await chiefSend({
+          root,
+          env,
+          to: "room-1",
+          message: "note",
+          from: "me",
+          kind,
+          runMailbox,
+          listRooms: () => rooms,
+        });
+        const [args] = runMailbox.mock.calls[0];
+        const body = args[args.indexOf("--text") + 1];
+        expect(body).toBe(kind ? `[chief:${kind}] note` : "note");
+        expect(args.includes("--no-wake")).toBe(!wakes);
+        expect(result.woke).toBe(wakes);
+      }
+    });
+
+    it("routes --wake and --no-wake through the CLI and rejects both together", async () => {
+      const runMailbox = mailboxMock();
+      const base = { root, env, runMailbox, listRooms: () => rooms, stdout: capture() };
+      await chiefCommand(
+        ["send", "--to", "room-1", "--from", "me", "--kind", "update", "--wake", "hi"],
+        base,
+      );
+      expect(runMailbox.mock.calls.at(-1)[0]).not.toContain("--no-wake");
+      await chiefCommand(
+        ["send", "--to", "room-1", "--from", "me", "--kind", "done", "--no-wake", "hi"],
+        base,
+      );
+      expect(runMailbox.mock.calls.at(-1)[0]).toContain("--no-wake");
+      await expect(
+        chiefCommand(["send", "--to", "room-1", "--from", "me", "--wake", "--no-wake", "hi"], base),
+      ).rejects.toThrow(/not both/u);
+      expect(runMailbox).toHaveBeenCalledTimes(2);
     });
 
     it("passes --no-wake and resolves agent names and exact sessions", async () => {
@@ -2216,6 +2276,1448 @@ describe("ork chief", () => {
         pid: process.pid,
         paneId: "%42",
         live: true,
+      });
+    });
+  });
+
+  describe("mission lifecycle, digest, close and interactive launch", () => {
+    const HEX = "a".repeat(32);
+    const OTHER_HEX = "b".repeat(32);
+    const ORK_BIN = fileURLToPath(
+      new URL("../../../plugins/orchestrate/bin/ork.mjs", import.meta.url),
+    );
+    const CHIEF_BIN = fileURLToPath(
+      new URL("../../../plugins/orchestrate/bin/chief.mjs", import.meta.url),
+    );
+    let cache;
+    let repo;
+    let runMailbox;
+
+    beforeEach(() => {
+      cache = path.join(tmp, "cache");
+      env = { ...env, ORCHESTRATE_HOME: cache };
+      repo = makeRepo(tmp, "lifecycle");
+      runMailbox = mailboxMock();
+    });
+
+    const completionDir = () => path.join(cache, "completions-v1");
+
+    async function writeRooms(items) {
+      for (const item of items) await updateRawRoom(item.id, () => item, { root, create: true });
+    }
+
+    function missionRoom(roomId, { launch = {}, chiefState = "running", status } = {}) {
+      const jobDir = path.join(root, "chief", "missions", roomId, "job");
+      return room(roomId, repo, {
+        ...(status && { status }),
+        chief: {
+          goal: "Ship",
+          spawnedAt: new Date(NOW - 120_000).toISOString(),
+          state: chiefState,
+          mission: { session: `${roomId}-orch`, jobDir },
+          launch: {
+            mode: "detached",
+            status: "started",
+            roomId,
+            generation: "gen-1",
+            jobDir,
+            completionDir: completionDir(),
+            pid: deadPid(),
+            launchedAt: new Date(NOW - 120_000).toISOString(),
+            ...launch,
+          },
+        },
+        conductor: { engine: "claude", status: "running", mailboxSession: `${roomId}-orch` },
+      });
+    }
+
+    /** Writes the executor's artifacts for one mission. Pass null to omit an artifact. */
+    function writeArtifacts(
+      roomId,
+      { manifest, result, event, steering, eventHex = HEX, resultOverride } = {},
+    ) {
+      const jobDir = path.join(root, "chief", "missions", roomId, "job");
+      const resultPath = path.join(jobDir, "run", "result.json");
+      const eventPath = path.join(completionDir(), `${eventHex}.json`);
+      fs.mkdirSync(path.dirname(resultPath), { recursive: true });
+      fs.mkdirSync(completionDir(), { recursive: true });
+      if (manifest !== null) {
+        fs.writeFileSync(
+          path.join(jobDir, "job.json"),
+          typeof manifest === "string"
+            ? manifest
+            : JSON.stringify({
+                schema: "agent-executor.job.v1",
+                job_dir: jobDir,
+                result_path: resultPath,
+                completion_event_path: eventPath,
+                completion_event_id: eventHex,
+                pid: deadPid(),
+                status: "started",
+                repository: repo,
+                ...manifest,
+              }),
+        );
+      }
+      if (result)
+        fs.writeFileSync(
+          resultPath,
+          JSON.stringify({ status: "completed", exit_code: 0, ...result }),
+        );
+      if (event)
+        fs.writeFileSync(
+          eventPath,
+          JSON.stringify({
+            schema: "agent-executor.completion.v1",
+            event_id: eventHex,
+            result_path: resultOverride ?? resultPath,
+            repository: repo,
+            status: result?.status,
+            exit_code: result?.exit_code ?? 0,
+            ...event,
+          }),
+        );
+      if (steering) fs.writeFileSync(path.join(jobDir, "steering.json"), JSON.stringify(steering));
+      return { jobDir, resultPath, eventPath };
+    }
+
+    function deskPuts() {
+      const file = path.join(root, "chief", "desk.jsonl");
+      if (!fs.existsSync(file)) return 0;
+      return fs
+        .readFileSync(file, "utf8")
+        .split("\n")
+        .filter((line) => line.includes('"op":"put"')).length;
+    }
+
+    function bindLiveChief() {
+      writePeer(root, { session: "chief-live", name: "Chief", cwd: tmp, pid: process.pid });
+      return bindChief({ root, env, session: "chief-live", runMailbox: mailboxMock(), now: NOW });
+    }
+
+    const quotaOk = async () => ({ status: "available", label: "claude-default" });
+
+    /** A mailbox double whose ack marks the named messages read, as the real mailbox does. */
+    function ackingMailbox() {
+      return vi.fn((args) => {
+        if (args[0] !== "ack")
+          return { status: 0, stdout: '{"id":"m1","wake":{"status":"woken"}}', stderr: "" };
+        const directory = path.join(root, "inbox", sessionKey(args[2]));
+        for (const file of fs.readdirSync(directory)) {
+          const full = path.join(directory, file);
+          const message = JSON.parse(fs.readFileSync(full, "utf8"));
+          if (args.slice(3).includes(message.id))
+            fs.writeFileSync(
+              full,
+              JSON.stringify({ ...message, readAt: new Date(NOW).toISOString() }),
+            );
+        }
+        return { status: 0, stdout: "{}", stderr: "" };
+      });
+    }
+
+    function sends() {
+      return runMailbox.mock.calls.filter(([args]) => args[0] === "send").length;
+    }
+
+    const reconcile = (roomId, extra = {}) =>
+      chiefReconcile({ roomId, root, env, now: NOW, runMailbox, ...extra });
+
+    describe("routing through the real ork dispatcher", () => {
+      const runOrk = (args) =>
+        spawnSync(process.execPath, [ORK_BIN, ...args], {
+          env: { ...process.env, PATH: env.PATH, HOME: tmp, ORCHESTRATE_HOME: cache },
+          encoding: "utf8",
+          timeout: 60_000,
+        });
+
+      it("runs inbox, close and reconcile, rejects unknown verbs and positionals", () => {
+        const inbox = runOrk(["chief", "inbox", "--json"]);
+        expect(inbox.status).toBe(0);
+        expect(JSON.parse(inbox.stdout)).toMatchObject({
+          schema: "ork.chief.inbox.v1",
+          groups: [],
+        });
+        const unknown = runOrk(["chief", "frobnicate"]);
+        expect(unknown.status).not.toBe(0);
+        expect(unknown.stderr).toMatch(/Unknown chief command/u);
+        const extra = runOrk(["chief", "status", "stray"]);
+        expect(extra.status).not.toBe(0);
+        expect(runOrk(["chief", "close"]).status).not.toBe(0);
+        expect(runOrk(["chief", "reconcile"]).status).not.toBe(0);
+        expect(runOrk(["chief", "--help"]).stdout).toMatch(/ork chief inbox/u);
+      });
+
+      it("keeps bare chief as status and forwards view", async () => {
+        const out = capture();
+        const main = vi.fn(async () => "viewed");
+        await chiefCommand([], { stdout: out, root, env, quota: false, main });
+        expect(out.text()).toMatch(/ORK CHIEF/u);
+        await chiefCommand(["view"], { stdout: capture(), main, root, env });
+        expect(main).toHaveBeenCalledWith(["horde", "--view", "--chief"], expect.anything());
+      });
+
+      it("rejects both wake switches and passes --wake as noWake:false", async () => {
+        await bindLiveChief();
+        await writeRooms([missionRoom("route-room")]);
+        await expect(
+          chiefCommand(["send", "--to", "route-room", "--wake", "--no-wake", "x"], { root, env }),
+        ).rejects.toThrow(/not both/u);
+        const sent = capture();
+        await chiefCommand(["send", "--to", "chief", "--wake", "--from", "me", "x"], {
+          stdout: sent,
+          root,
+          env,
+          runMailbox,
+          listRooms: () => [],
+        });
+        expect(runMailbox.mock.calls.at(-1)[0]).not.toContain("--no-wake");
+      });
+    });
+
+    describe("completion hook", () => {
+      it("generates a 0700 hook that forwards the event to a mission reconcile", async () => {
+        const mailboxDir = path.join(tmp, "mail box root");
+        fs.mkdirSync(mailboxDir, { recursive: true });
+        root = fs.realpathSync(mailboxDir);
+        await writeRooms([missionRoom("hook-room")]);
+        writeArtifacts("hook-room", {
+          result: { status: "completed", task_outcome: "complete" },
+          event: true,
+        });
+        const plan = planCompletionHook({ root, roomId: "hook-room", workspaces: [repo] });
+        const hook = installCompletionHook(plan);
+        expect(fs.statSync(hook).mode & 0o777).toBe(0o700);
+        expect(fs.statSync(path.dirname(hook)).mode & 0o777).toBe(0o700);
+        expect(fs.readFileSync(hook, "utf8")).toMatch(/--event "\$1"/u);
+        // The hook runs with the same sanitized environment the executor gives it.
+        const eventPath = path.join(completionDir(), `${HEX}.json`);
+        const hookEnv = {
+          PATH: process.env.PATH,
+          HOME: tmp,
+          LANG: "C",
+          LC_ALL: "C",
+          AGENT_EVENT: eventPath,
+          AGENT_RESULT: path.join(
+            root,
+            "chief",
+            "missions",
+            "hook-room",
+            "job",
+            "run",
+            "result.json",
+          ),
+          AGENT_STATUS: "completed",
+        };
+        const first = spawnSync(hook, [eventPath], {
+          env: hookEnv,
+          encoding: "utf8",
+          timeout: 10_000,
+        });
+        expect(first.status, first.stderr).toBe(0);
+        expect(readRawRoom("hook-room", root).chief.state).toBe("done");
+        const second = spawnSync(hook, [eventPath], {
+          env: hookEnv,
+          encoding: "utf8",
+          timeout: 10_000,
+        });
+        expect(second.status).toBe(0);
+        expect(deskPuts()).toBe(1);
+      });
+
+      it("installs and runs through an aliased temporary root", async () => {
+        const alias = `${root}-alias`;
+        fs.symlinkSync(root, alias);
+        try {
+          const plan = planCompletionHook({
+            root: alias,
+            roomId: "alias-room",
+            workspaces: [repo],
+          });
+          expect(plan.root).toBe(fs.realpathSync(root));
+          const hook = installCompletionHook(plan);
+          expect(fs.statSync(hook).mode & 0o777).toBe(0o700);
+          expect(fs.readFileSync(hook, "utf8")).toContain(fs.realpathSync(root));
+        } finally {
+          fs.unlinkSync(alias);
+        }
+      });
+
+      it("delivers a hook's report through the real local mailbox exactly once", async () => {
+        root = path.join(cache, "mailbox-v1");
+        fs.mkdirSync(root, { recursive: true });
+        await writeRooms([missionRoom("hook-mail")]);
+        writeArtifacts("hook-mail", {
+          result: { status: "timed_out", exit_code: 124 },
+          event: true,
+        });
+        await bindLiveChief();
+        writePeer(root, {
+          session: "hook-mail-orch",
+          name: "hook-mail",
+          cwd: repo,
+          pid: process.pid,
+        });
+        const hook = installCompletionHook(
+          planCompletionHook({ root, roomId: "hook-mail", workspaces: [repo] }),
+        );
+        const eventPath = path.join(completionDir(), `${HEX}.json`);
+        const hookEnv = {
+          PATH: process.env.PATH,
+          HOME: tmp,
+          LANG: "C",
+          LC_ALL: "C",
+          AGENT_EVENT: eventPath,
+          AGENT_RESULT: path.join(
+            root,
+            "chief",
+            "missions",
+            "hook-mail",
+            "job",
+            "run",
+            "result.json",
+          ),
+          AGENT_STATUS: "timed_out",
+        };
+        const first = spawnSync(hook, [eventPath], {
+          env: hookEnv,
+          encoding: "utf8",
+          timeout: 10_000,
+        });
+        expect(first.status, first.stderr).toBe(0);
+        const again = spawnSync(hook, [eventPath], {
+          env: hookEnv,
+          encoding: "utf8",
+          timeout: 10_000,
+        });
+        expect(again.status).toBe(0);
+        const report = readRawRoom("hook-mail", root).chief.report;
+        expect(report).toMatchObject({ status: "delivered", messageId: expect.any(String) });
+        const inbox = path.join(root, "inbox", sessionKey("chief-live"));
+        const copies = fs
+          .readdirSync(inbox)
+          .map((file) => JSON.parse(fs.readFileSync(path.join(inbox, file), "utf8")))
+          .filter((message) => message.text.includes("hook-mail failed: timed_out"));
+        expect(copies).toHaveLength(1);
+        expect(copies[0]).toMatchObject({
+          id: report.messageId,
+          from: { session: "hook-mail-orch" },
+        });
+        expect(copies[0].text).toMatch(/\[chief:escalation\] hook-mail failed: timed_out/u);
+        expect(listDesk(root)).toEqual([
+          expect.objectContaining({ id: report.id, mailboxId: report.messageId }),
+        ]);
+        expect(deskPuts()).toBe(1);
+      });
+
+      it("rejects hooks inside a workspace, traversal IDs and symlinked mission paths", () => {
+        expect(() => planCompletionHook({ root, roomId: "ok-room", workspaces: [root] })).toThrow(
+          /outside every executor workspace/u,
+        );
+        expect(() => planCompletionHook({ root, roomId: "../escape", workspaces: [repo] })).toThrow(
+          /Invalid room ID/u,
+        );
+        const outside = path.join(tmp, "outside-target");
+        fs.mkdirSync(outside, { recursive: true });
+        fs.mkdirSync(root, { recursive: true });
+        fs.symlinkSync(outside, path.join(root, "chief"));
+        expect(() =>
+          installCompletionHook(
+            planCompletionHook({ root, roomId: "link-room", workspaces: [repo] }),
+          ),
+        ).toThrow(/symlinked/u);
+        expect(fs.readdirSync(outside)).toEqual([]);
+      });
+
+      it("refuses a foreign existing script and keeps workspace containment component-based", () => {
+        const plan = planCompletionHook({ root, roomId: "exists-room", workspaces: [repo] });
+        installCompletionHook(plan);
+        fs.writeFileSync(plan.path, "#!/bin/sh\necho other\n", { mode: 0o700 });
+        expect(() => installCompletionHook(plan)).toThrow(/different content/u);
+        expect(isWithinPath(path.join(tmp, "lifecycle-other"), path.join(tmp, "lifecycle"))).toBe(
+          false,
+        );
+        expect(isWithinPath(path.join(tmp, "lifecycle", "x"), path.join(tmp, "lifecycle"))).toBe(
+          true,
+        );
+      });
+
+      it("launches a detached mission with the hook in argv and no notify", async () => {
+        const launch = vi.fn(() => ({
+          status: 0,
+          stdout: `AGENT_JOB_PID=${deadPid()}\nAGENT_EVENT=${completionDir()}/x.json\n`,
+          stderr: "",
+        }));
+        const result = await chiefSpawn({
+          cwd: repo,
+          goal: "Hook it",
+          root,
+          env,
+          launch,
+          now: NOW,
+        });
+        const [command] = launch.mock.calls[0];
+        expect(command).toEqual(expect.arrayContaining(["--notify", "none", "--completion-hook"]));
+        const hookPath = command[command.indexOf("--completion-hook") + 1];
+        expect(hookPath).toBe(path.join(fs.realpathSync(root), "chief", "hooks", result.roomId));
+        expect(fs.statSync(hookPath).mode & 0o777).toBe(0o700);
+        expect(readRawRoom(result.roomId, root).chief.launch).toMatchObject({
+          mode: "detached",
+          completionDir: completionDir(),
+          pid: expect.any(Number),
+        });
+      });
+    });
+
+    describe("exit classification and reconciliation", () => {
+      const cases = [
+        {
+          name: "completed",
+          result: { status: "completed", task_outcome: "complete", exit_code: 0 },
+          expect: { state: "done", reason: "completed", puts: 1, sends: 1 },
+        },
+        {
+          name: "timed out",
+          result: { status: "timed_out", exit_code: 124 },
+          expect: { state: "failed", reason: "timed_out", puts: 1, sends: 1 },
+        },
+        {
+          name: "quota exhausted",
+          result: { status: "provider_quota_exhausted", exit_code: 3 },
+          expect: { state: "failed", reason: "provider_quota_exhausted", puts: 1, sends: 1 },
+        },
+        {
+          name: "generic failure",
+          result: { status: "failed", exit_code: 1 },
+          expect: { state: "failed", reason: "failed", puts: 1, sends: 1 },
+        },
+        {
+          name: "incomplete task outcome",
+          result: { status: "completed", task_outcome: "blocked", exit_code: 0 },
+          expect: { state: "failed", reason: "task_blocked", puts: 1, sends: 1 },
+        },
+      ];
+      for (const [index, testCase] of cases.entries()) {
+        it(`records ${testCase.name} once`, async () => {
+          const roomId = `case-${index}`;
+          await writeRooms([missionRoom(roomId)]);
+          writeArtifacts(roomId, { result: testCase.result, event: true });
+          await bindLiveChief();
+          const outcome = await reconcile(roomId, { hook: true });
+          expect(outcome).toMatchObject({
+            state: testCase.expect.state,
+            reason: testCase.expect.reason,
+          });
+          expect(readRawRoom(roomId, root).chief).toMatchObject({ state: testCase.expect.state });
+          expect(deskPuts()).toBe(testCase.expect.puts);
+          expect(sends()).toBe(testCase.expect.sends);
+        });
+      }
+
+      it("completes a steered job from its current segment and ignores the superseded event", async () => {
+        await writeRooms([missionRoom("steer-done")]);
+        const first = writeArtifacts("steer-done", {
+          result: { status: "failed", exit_code: 1 },
+          event: true,
+        });
+        const segmentResult = path.join(first.jobDir, "run", "segment-2", "result.json");
+        fs.mkdirSync(path.dirname(segmentResult), { recursive: true });
+        fs.writeFileSync(
+          segmentResult,
+          JSON.stringify({ status: "completed", task_outcome: "complete", exit_code: 0 }),
+        );
+        const segmentEvent = path.join(completionDir(), `${OTHER_HEX}.json`);
+        fs.writeFileSync(
+          segmentEvent,
+          JSON.stringify({
+            schema: "agent-executor.completion.v1",
+            event_id: OTHER_HEX,
+            result_path: segmentResult,
+            repository: repo,
+            status: "completed",
+            exit_code: 0,
+          }),
+        );
+        fs.writeFileSync(
+          path.join(first.jobDir, "steering.json"),
+          JSON.stringify({
+            schema: "agent-executor.steering.v1",
+            result_path: segmentResult,
+            completion_event_path: segmentEvent,
+            completion_event_id: OTHER_HEX,
+          }),
+        );
+        const outcome = await reconcile("steer-done", { hook: true });
+        expect(outcome).toMatchObject({ decided: "done", state: "done", reason: "completed" });
+        expect(readRawRoom("steer-done", root).chief).toMatchObject({ state: "done" });
+        expect(deskPuts()).toBe(1);
+      });
+
+      it("keeps a started, positively live executor and records nothing", async () => {
+        await writeRooms([missionRoom("live-room", { launch: { pid: process.pid } })]);
+        writeArtifacts("live-room", { manifest: { pid: process.pid } });
+        const outcome = await reconcile("live-room", { hook: true });
+        expect(outcome).toMatchObject({ decided: null, evidence: "live" });
+        expect(readRawRoom("live-room", root).chief.state).toBe("running");
+        expect(deskPuts()).toBe(0);
+        expect(sends()).toBe(0);
+      });
+
+      it("fails a dead runner without a result only on manual reconcile after the grace", async () => {
+        await writeRooms([missionRoom("dead-room")]);
+        writeArtifacts("dead-room", {});
+        await bindLiveChief();
+        const early = await reconcile("dead-room", { hook: true });
+        expect(early.decided).toBeNull();
+        const fresh = missionRoom("dead-fresh", {
+          launch: { launchedAt: new Date(NOW - 5000).toISOString() },
+        });
+        await writeRooms([fresh]);
+        writeArtifacts("dead-fresh", {});
+        expect((await reconcile("dead-fresh")).decided).toBeNull();
+        const manual = await reconcile("dead-room");
+        expect(manual).toMatchObject({ state: "failed", reason: "runner_exited_without_result" });
+        expect(deskPuts()).toBe(1);
+        expect(sends()).toBe(1);
+      });
+
+      it("ignores a foreign event and a malformed manifest instead of inferring success", async () => {
+        await writeRooms([missionRoom("foreign-room"), missionRoom("bad-room")]);
+        writeArtifacts("foreign-room", {
+          result: { status: "completed", task_outcome: "complete", exit_code: 0 },
+          event: { event_id: HEX, result_path: path.join(tmp, "other-result.json") },
+        });
+        writeArtifacts("bad-room", { manifest: "{not json" });
+        for (const roomId of ["foreign-room", "bad-room"]) {
+          const outcome = await reconcile(roomId, { hook: true });
+          expect(outcome.decided).toBeNull();
+          expect(readRawRoom(roomId, root).chief.state).toBe("running");
+        }
+        expect(deskPuts()).toBe(0);
+      });
+
+      it("ignores events from a superseded steering segment", async () => {
+        await writeRooms([missionRoom("steer-room", { launch: { pid: process.pid } })]);
+        const old = writeArtifacts("steer-room", {
+          result: { status: "completed", task_outcome: "complete", exit_code: 0 },
+          event: true,
+        });
+        writeArtifacts("steer-room", {
+          manifest: { pid: process.pid },
+          eventHex: OTHER_HEX,
+          steering: {
+            schema: "agent-executor.steering.v1",
+            result_path: path.join(old.jobDir, "run", "segment-2", "result.json"),
+            completion_event_path: path.join(completionDir(), `${OTHER_HEX}.json`),
+            completion_event_id: OTHER_HEX,
+          },
+        });
+        const outcome = await reconcile("steer-room", { hook: true });
+        expect(outcome.decided).toBeNull();
+        expect(readRawRoom("steer-room", root).chief.state).toBe("running");
+      });
+
+      it("never duplicates a child done report and records a later failure separately", async () => {
+        await writeRooms([
+          missionRoom("child-done", { launch: { pid: process.pid } }),
+          missionRoom("late-fail"),
+        ]);
+        writeArtifacts("child-done", {
+          result: { status: "completed", task_outcome: "complete" },
+          event: true,
+        });
+        await chiefSend({
+          root,
+          env,
+          to: "chief",
+          kind: "done",
+          message: "all green",
+          from: "child-done-orch",
+          runMailbox,
+          now: NOW,
+          listRooms: () => listRawRooms(root),
+        });
+        const before = sends();
+        const deskBefore = deskPuts();
+        const outcome = await reconcile("child-done", { hook: true });
+        expect(outcome.status).toBe("already-recorded");
+        expect(deskPuts()).toBe(deskBefore);
+        expect(sends()).toBe(before);
+        expect(readRawRoom("child-done", root).chief.state).toBe("done");
+
+        writeArtifacts("late-fail", { result: { status: "failed", exit_code: 1 }, event: true });
+        await chiefSend({
+          root,
+          env,
+          to: "chief",
+          kind: "done",
+          message: "done early",
+          from: "late-fail-orch",
+          runMailbox,
+          now: NOW,
+          listRooms: () => listRawRooms(root),
+        });
+        await reconcile("late-fail", { hook: true });
+        expect(readRawRoom("late-fail", root).chief).toMatchObject({
+          state: "done",
+          exitAfterReport: { state: "failed", reason: "failed" },
+        });
+      });
+
+      it("keeps a racing child done and reconcile to one completion report", async () => {
+        await writeRooms([missionRoom("race-done", { launch: { pid: process.pid } })]);
+        writeArtifacts("race-done", {
+          result: { status: "completed", task_outcome: "complete" },
+          event: true,
+        });
+        const send = chiefSend({
+          root,
+          env,
+          to: "chief",
+          kind: "done",
+          message: "all green",
+          from: "race-done-orch",
+          runMailbox,
+          now: NOW,
+          listRooms: () => listRawRooms(root),
+        });
+        const reconciled = reconcile("race-done", { hook: true });
+        const [sent, outcome] = await Promise.all([send, reconciled]);
+        expect(["sent", "queued", "already-reported"]).toContain(sent.status);
+        expect(outcome.status).toMatch(/recorded|already-recorded/u);
+        expect(readRawRoom("race-done", root).chief.state).toBe("done");
+        expect(deskPuts()).toBe(1);
+      });
+
+      it("handles a hook that runs before the manifest, then after it", async () => {
+        await writeRooms([missionRoom("early-room", { launch: { status: "launching" } })]);
+        expect(await reconcile("early-room", { hook: true })).toMatchObject({ status: "retry" });
+        writeArtifacts("early-room", {
+          result: { status: "completed", task_outcome: "complete" },
+          event: true,
+        });
+        await reconcile("early-room", { hook: true });
+        expect(readRawRoom("early-room", root).chief.state).toBe("done");
+      });
+
+      it("repeats reconciliation without duplicate desk items or wakes", async () => {
+        await writeRooms([missionRoom("repeat-room")]);
+        writeArtifacts("repeat-room", {
+          result: { status: "completed", task_outcome: "complete" },
+          event: true,
+        });
+        await bindLiveChief();
+        await reconcile("repeat-room");
+        await reconcile("repeat-room");
+        expect(deskPuts()).toBe(1);
+        expect(sends()).toBe(1);
+      });
+
+      it("resumes delivery after a crash between the desk commit and mailbox delivery", async () => {
+        await writeRooms([missionRoom("crash-room")]);
+        writeArtifacts("crash-room", {
+          result: { status: "completed", task_outcome: "complete" },
+          event: true,
+        });
+        await bindLiveChief();
+        const crashing = vi.fn(() => {
+          throw new Error("crash after the desk commit");
+        });
+        await expect(reconcile("crash-room", { runMailbox: crashing })).rejects.toThrow(/crash/u);
+        expect(deskPuts()).toBe(1);
+        expect(readRawRoom("crash-room", root).chief.report).toMatchObject({ status: "pending" });
+        const resumed = await reconcile("crash-room");
+        expect(resumed.delivery).toMatchObject({ status: "delivered" });
+        expect(deskPuts()).toBe(1);
+        expect(runMailbox.mock.calls.findLast(([args]) => args[0] === "send")[0]).toEqual(
+          expect.arrayContaining(["--id", expect.stringMatching(/^chief-report-/u)]),
+        );
+      });
+
+      it("serializes two reconcile processes into one desk item", async () => {
+        await writeRooms([missionRoom("race-room")]);
+        writeArtifacts("race-room", {
+          result: { status: "completed", task_outcome: "complete" },
+          event: true,
+        });
+        const run = () =>
+          new Promise((resolve) => {
+            const child = spawn(
+              process.execPath,
+              [
+                CHIEF_BIN,
+                "reconcile",
+                "race-room",
+                "--hook",
+                "--mailbox-root",
+                root,
+                "--event",
+                path.join(completionDir(), `${HEX}.json`),
+              ],
+              { env },
+            );
+            child.on("close", (code) => resolve(code));
+          });
+        const codes = await Promise.all([run(), run()]);
+        expect(codes).toEqual([0, 0]);
+        expect(deskPuts()).toBe(1);
+        expect(readRawRoom("race-room", root).chief.state).toBe("done");
+      });
+
+      it("does not reopen a mission after a forced close", async () => {
+        await writeRooms([missionRoom("closed-room")]);
+        writeArtifacts("closed-room", {
+          result: { status: "completed", task_outcome: "complete" },
+          event: true,
+        });
+        await chiefClose({
+          roomId: "closed-room",
+          force: true,
+          root,
+          env,
+          now: NOW,
+          runMailbox,
+          peers: [],
+        });
+        const outcome = await reconcile("closed-room", { hook: true });
+        expect(outcome.status).toBe("closed");
+        expect(deskPuts()).toBe(0);
+      });
+    });
+
+    describe("status observation", () => {
+      // SQLite opens the room store's WAL and SHM sidecars on read; they are store plumbing, not Chief writes.
+      function treeSnapshot(dir) {
+        const entries = [];
+        const walk = (current) => {
+          const children = fs.readdirSync(current, { withFileTypes: true });
+          for (const entry of children) {
+            const full = path.join(current, entry.name);
+            const stat = fs.lstatSync(full);
+            entries.push([path.relative(dir, full), stat.size, stat.mtimeMs]);
+            if (entry.isDirectory()) walk(full);
+          }
+        };
+        walk(dir);
+        return entries
+          .filter(([name]) => !/^rooms\.db-(?:wal|shm)$/u.test(name))
+          .sort((left, right) => left[0].localeCompare(right[0]));
+      }
+
+      it("projects completed and failed detached exits twice without writing", async () => {
+        await writeRooms([missionRoom("status-done"), missionRoom("status-fail")]);
+        writeArtifacts("status-done", {
+          result: { status: "completed", task_outcome: "complete" },
+          event: true,
+        });
+        writeArtifacts("status-fail", {
+          result: { status: "timed_out", exit_code: 124 },
+          event: true,
+          eventHex: OTHER_HEX,
+        });
+        const before = treeSnapshot(root);
+        const first = await chiefStatus({ root, env, quota: false, now: NOW, all: true });
+        const second = await chiefStatus({ root, env, quota: false, now: NOW, all: true });
+        const stateOf = (status, id) => status.rooms.find((room) => room.id === id)?.mission;
+        expect(stateOf(first, "status-done")).toMatchObject({ state: "done" });
+        expect(stateOf(second, "status-fail")).toMatchObject({
+          state: "failed",
+          reason: "timed_out",
+        });
+        expect(
+          first.rooms.find((room) => room.id === "status-fail").attention.map((item) => item.kind),
+        ).not.toContain("stale-coordinator");
+        expect(treeSnapshot(root)).toEqual(before);
+        expect(readRawRoom("status-done", root).chief.state).toBe("running");
+      });
+    });
+
+    describe("digest, acknowledgment and close", () => {
+      function sessionFor(roomId) {
+        return `${roomId}-orch`;
+      }
+
+      async function setupRooms(count) {
+        const rooms = [];
+        for (let index = 0; index < count; index++) {
+          const roomId = `digest-${index}`;
+          rooms.push(missionRoom(roomId, { chiefState: "running" }));
+        }
+        await writeRooms(rooms);
+        return rooms.map((item) => item.id).slice(0, count);
+      }
+
+      it("renders fifty records across five rooms in fifteen lines and three per room", async () => {
+        await bindLiveChief();
+        const ids = await setupRooms(5);
+        for (const roomId of ids)
+          for (let index = 0; index < 10; index++)
+            writeInbox(root, "chief-live", {
+              from: { session: sessionFor(roomId), name: roomId },
+              text: index % 3 === 0 ? `[chief:question] q${index}` : `[chief:update] u${index}`,
+              sentAt: new Date(NOW - index * 1000).toISOString(),
+            });
+        const out = capture();
+        await chiefCommand(["inbox"], {
+          stdout: out,
+          root,
+          env,
+          listRooms: () => listRawRooms(root),
+        });
+        const lines = out.text().trimEnd().split("\n");
+        expect(lines.length).toBeLessThanOrEqual(15);
+        const headers = lines.filter((line) => !line.startsWith("  ") && !line.startsWith("…"));
+        expect(headers).toHaveLength(5);
+        const payload = await chiefInbox({
+          root,
+          env,
+          listRooms: () => listRawRooms(root),
+          peers: [],
+        });
+        const byName = (left, right) => left.localeCompare(right);
+        expect(payload.groups.map((group) => group.roomId).toSorted(byName)).toEqual(
+          ids.toSorted(byName),
+        );
+        expect(payload.groups.every((group) => group.inboxIds.length === 10)).toBe(true);
+      });
+
+      it("keeps an old unread ask behind two hundred newer read files", async () => {
+        await bindLiveChief();
+        await setupRooms(1);
+        writeInbox(root, "chief-live", {
+          from: { session: sessionFor("digest-0"), name: "old" },
+          text: "[chief:question] needs an answer",
+          sentAt: new Date(NOW - 10 * 86_400_000).toISOString(),
+        });
+        for (let index = 0; index < 250; index++)
+          writeInbox(root, "chief-live", {
+            readAt: new Date(NOW).toISOString(),
+            from: { session: "noise" },
+            text: "old read",
+            sentAt: new Date(NOW).toISOString(),
+          });
+        const payload = await chiefInbox({
+          root,
+          env,
+          listRooms: () => listRawRooms(root),
+          peers: [],
+        });
+        const asks = payload.groups.flatMap((group) => group.asks.map((ask) => ask.text));
+        expect(asks).toContain("needs an answer");
+      });
+
+      it("clips digest lines by terminal cells, including wide text", async () => {
+        await bindLiveChief();
+        await writeRooms([missionRoom("wide-room")]);
+        writeInbox(root, "chief-live", {
+          from: { session: "wide-room-orch", name: "wide-room" },
+          text: `[chief:question] ${"界面問題🙂".repeat(20)}`,
+          sentAt: new Date(NOW).toISOString(),
+        });
+        const out = { ...capture(), columns: 48 };
+        await chiefCommand(["inbox"], {
+          stdout: out,
+          root,
+          env,
+          listRooms: () => listRawRooms(root),
+        });
+        for (const line of out.text().trimEnd().split("\n"))
+          expect(displayWidth(line)).toBeLessThanOrEqual(48);
+      });
+
+      it("collapses six rooms into four groups plus a footer within fifteen lines", async () => {
+        await bindLiveChief();
+        for (let index = 0; index < 6; index++) {
+          await writeRooms([missionRoom(`six-${index}`)]);
+          writeInbox(root, "chief-live", {
+            from: { session: `six-${index}-orch`, name: `six-${index}` },
+            text: "[chief:question] needs you",
+            sentAt: new Date(NOW - index).toISOString(),
+          });
+        }
+        const out = capture();
+        await chiefCommand(["inbox"], {
+          stdout: out,
+          root,
+          env,
+          listRooms: () => listRawRooms(root),
+        });
+        const lines = out.text().trimEnd().split("\n");
+        expect(lines.length).toBeLessThanOrEqual(15);
+        expect(lines.at(-1)).toMatch(/2 more rooms/u);
+      });
+
+      it("shows one logical report for a desk item and its mailbox copy", async () => {
+        await bindLiveChief();
+        await writeRooms([missionRoom("digest-0")]);
+        writeArtifacts("digest-0", {
+          result: { status: "timed_out", exit_code: 124 },
+          event: true,
+        });
+        await reconcile("digest-0");
+        const [desk] = listDesk(root);
+        // The mailbox copy carries the same stable report ID, so the digest shows one logical report.
+        writeInbox(root, "chief-live", {
+          clientId: desk.id,
+          from: { session: "digest-0-orch", name: "digest-0" },
+          text: "[chief:escalation] digest-0 failed: timed_out",
+          sentAt: new Date(NOW).toISOString(),
+        });
+        const payload = await chiefInbox({
+          root,
+          env,
+          listRooms: () => listRawRooms(root),
+          peers: [],
+        });
+        const group = payload.groups.find((item) => item.roomId === "digest-0");
+        expect(group.asks).toHaveLength(1);
+        expect(group.deskIds).toEqual([desk.id]);
+        expect(group.inboxIds).toHaveLength(1);
+      });
+
+      it("places unattributed mail in its own group and never trusts a forged legacy file field", async () => {
+        await bindLiveChief();
+        writeInbox(root, "chief-live", {
+          from: { session: "stranger", name: "stranger" },
+          text: "hello",
+        });
+        const legacy = path.join(root, "chief", "desk");
+        fs.mkdirSync(legacy, { recursive: true });
+        fs.writeFileSync(
+          path.join(legacy, "legacy-1.json"),
+          JSON.stringify({ text: "old", kind: "update", from: "x", file: "/outside" }),
+        );
+        const payload = await chiefInbox({
+          root,
+          env,
+          listRooms: () => listRawRooms(root),
+          peers: [],
+        });
+        expect(payload.groups.map((group) => group.roomId)).toEqual([null]);
+        const items = listDesk(root);
+        expect(items).toEqual([expect.objectContaining({ id: "legacy:legacy-1" })]);
+        expect(items[0].file).toBe(path.join(root, "chief", "desk", "legacy-1.json"));
+        await chiefDesk({
+          root,
+          env,
+          ack: true,
+          snapshot: { session: null, revision: null, deskIds: ["legacy:legacy-1"], inboxIds: [] },
+          runMailbox,
+        });
+        expect(listDesk(root)).toEqual([]);
+      });
+
+      it("acknowledges only the snapshot, survives arrivals, and rejects rebinding or foreign IDs", async () => {
+        const bound = await bindLiveChief();
+        writeInbox(root, "chief-live", {
+          from: { session: "stranger", name: "stranger" },
+          text: "first",
+        });
+        const snapshotDigest = await chiefInbox({
+          root,
+          env,
+          listRooms: () => listRawRooms(root),
+          peers: [],
+        });
+        const inboxIds = snapshotDigest.groups.flatMap((group) => group.inboxIds);
+        writeInbox(root, "chief-live", {
+          from: { session: "stranger", name: "stranger" },
+          text: "arrived later",
+        });
+        const snapshot = {
+          session: "chief-live",
+          revision: String(bound.revision ?? readChiefBinding({ root, now: NOW }).revision),
+          deskIds: [],
+          inboxIds,
+        };
+        await chiefDesk({
+          root,
+          env,
+          ack: true,
+          snapshot,
+          runMailbox: ackingMailbox(),
+          now: NOW,
+          listRooms: () => listRawRooms(root),
+          peers: undefined,
+        });
+        const remaining = await chiefInbox({
+          root,
+          env,
+          listRooms: () => listRawRooms(root),
+          peers: [],
+        });
+        expect(remaining.groups.flatMap((group) => group.asks.map((ask) => ask.text))).toEqual([
+          "arrived later",
+        ]);
+        await expect(
+          chiefDesk({
+            root,
+            env,
+            ack: true,
+            snapshot: { ...snapshot, session: "someone-else" },
+            runMailbox: ackingMailbox(),
+            now: NOW,
+          }),
+        ).rejects.toMatchObject({ code: "snapshot_changed" });
+        await expect(
+          chiefDesk({
+            root,
+            env,
+            ack: true,
+            snapshot: { session: null, revision: null, deskIds: ["forged"], inboxIds: [] },
+            runMailbox: ackingMailbox(),
+            now: NOW,
+          }),
+        ).rejects.toMatchObject({ code: "snapshot_stale" });
+      });
+
+      it("retries a failed mailbox ack without losing items or re-hiding arrivals", async () => {
+        await bindLiveChief();
+        writeInbox(root, "chief-live", {
+          id: "ack-1",
+          from: { session: "stranger", name: "stranger" },
+          text: "retry me",
+        });
+        const failing = mailboxMock(1, "");
+        await expect(
+          chiefInbox({
+            root,
+            env,
+            ack: true,
+            runMailbox: failing,
+            listRooms: () => listRawRooms(root),
+            peers: [],
+          }),
+        ).rejects.toThrow(/Mailbox acknowledgment failed/u);
+        const hidden = await chiefInbox({
+          root,
+          env,
+          listRooms: () => listRawRooms(root),
+          peers: [],
+        });
+        expect(hidden.groups).toEqual([]);
+        const retried = await chiefInbox({
+          root,
+          env,
+          ack: true,
+          runMailbox: ackingMailbox(),
+          listRooms: () => listRawRooms(root),
+          peers: [],
+        });
+        expect(retried.groups).toEqual([]);
+        const transactions = readdirSync(path.join(root, "chief", "ack-transactions")).map((file) =>
+          JSON.parse(fs.readFileSync(path.join(root, "chief", "ack-transactions", file), "utf8")),
+        );
+        expect(transactions.length).toBeGreaterThan(0);
+        expect(transactions.every((record) => record.state === "complete")).toBe(true);
+      });
+
+      it("closes by ID and repeats safely, rejects live and standalone targets, and leaves other rooms visible", async () => {
+        await writeRooms([
+          missionRoom("close-me"),
+          missionRoom("keep-me"),
+          missionRoom("live-one", { launch: { pid: process.pid } }),
+        ]);
+        await bindLiveChief();
+        writePeer(root, {
+          session: "live-one-orch",
+          name: "live-coordinator",
+          cwd: repo,
+          pid: process.pid,
+          state: "busy",
+        });
+        await expect(
+          chiefClose({ roomId: "live-one", root, env, now: NOW, runMailbox, peers: [] }),
+        ).rejects.toMatchObject({ code: "room_live" });
+        const first = await chiefClose({
+          roomId: "close-me",
+          root,
+          env,
+          now: NOW,
+          runMailbox,
+          peers: [],
+        });
+        expect(first).toMatchObject({
+          schema: "ork.chief.close.v1",
+          roomId: "close-me",
+          status: "closed",
+        });
+        expect(readRawRoom("close-me", root)).toMatchObject({
+          status: "closed",
+          closedAt: expect.any(String),
+        });
+        const again = await chiefClose({
+          roomId: "close-me",
+          root,
+          env,
+          now: NOW,
+          runMailbox,
+          peers: [],
+        });
+        expect(again.status).toBe("already-closed");
+        await expect(
+          chiefClose({
+            roomId: "standalone-peer",
+            target: "lead-two",
+            root,
+            env,
+            now: NOW,
+            runMailbox,
+            peers: [],
+          }),
+        ).rejects.toThrow();
+        const status = await chiefStatus({ root, env, quota: false, now: NOW, peers: [] });
+        const ids = status.rooms.map((item) => item.id);
+        expect(ids).toContain("keep-me");
+        expect(ids).not.toContain("close-me");
+        const all = await chiefStatus({ root, env, quota: false, now: NOW, all: true, peers: [] });
+        expect(all.rooms.map((item) => item.id)).not.toContain("close-me");
+      });
+
+      it("clears a closed mission's desk attention by ID", async () => {
+        await writeRooms([missionRoom("desk-room")]);
+        writeArtifacts("desk-room", { result: { status: "failed", exit_code: 1 }, event: true });
+        await reconcile("desk-room");
+        expect(listDesk(root).map((item) => item.roomId)).toEqual(["desk-room"]);
+        await chiefClose({ roomId: "desk-room", root, env, now: NOW, runMailbox, peers: [] });
+        expect(listDesk(root)).toEqual([]);
+      });
+    });
+
+    describe("interactive launch", () => {
+      const tmuxLog = () => path.join(tmp, "tmux.log");
+      const tmuxEnv = (extra = {}) => ({
+        ...env,
+        TMUX_PANE: "%3",
+        TMUX: "/tmp/tmux-socket,1234,0",
+        ...extra,
+      });
+
+      function fakeBinary(name, script) {
+        const file = path.join(tmp, "bin", name);
+        fs.writeFileSync(file, `#!/bin/sh\n${script}\n`);
+        fs.chmodSync(file, 0o755);
+      }
+
+      beforeEach(() => {
+        fakeBinary(
+          "tmux",
+          `if [ "$1" = display-message ]; then echo %3; exit 0; fi\nprintf '%s\\n' "$@" '--' >> '${tmuxLog()}'\nif [ "$1" = new-window ]; then echo %9; fi`,
+        );
+      });
+
+      it("asks the detached gate's own quota check when no decision is injected", async () => {
+        // No monitor answers: the real quota.check reports unknown, so preflight refuses before any mutation.
+        const spawning = chiefSpawn({
+          cwd: repo,
+          goal: "x",
+          interactive: true,
+          root,
+          env: tmuxEnv({ MONITOR_BIN: path.join(tmp, "no-such-monitor") }),
+        });
+        await expect(spawning).rejects.toMatchObject({ code: "interactive_unavailable" });
+        expect(listRawRooms(root)).toEqual([]);
+        expect(fs.existsSync(path.join(root, "chief", "missions"))).toBe(false);
+      });
+
+      it("applies the detached gate's quota decision to the interactive route", async () => {
+        const decide = (decision) => async () => decision;
+        await expect(
+          chiefSpawn({
+            cwd: repo,
+            goal: "x",
+            interactive: true,
+            root,
+            env: tmuxEnv(),
+            quotaDecision: decide({ status: "blocked", label: "claude-default" }),
+          }),
+        ).rejects.toThrow(/blocked/u);
+        await expect(
+          chiefSpawn({
+            cwd: repo,
+            goal: "x",
+            interactive: true,
+            root,
+            env: tmuxEnv(),
+            quotaDecision: decide({ status: "credits", label: "codex" }),
+          }),
+        ).rejects.toThrow(/credits/u);
+        await expect(
+          chiefSpawn({
+            cwd: repo,
+            goal: "x",
+            interactive: true,
+            root,
+            env: tmuxEnv(),
+            quotaDecision: decide({ status: "unknown" }),
+          }),
+        ).rejects.toMatchObject({ code: "interactive_unavailable" });
+        const low = await chiefSpawn({
+          cwd: repo,
+          goal: "x",
+          interactive: true,
+          dryRun: true,
+          root,
+          env: tmuxEnv(),
+          quotaDecision: decide({ status: "low", label: "claude-default" }),
+        });
+        expect(low.warnings.join(" ")).toMatch(/low on included quota/u);
+        expect(listRawRooms(root)).toEqual([]);
+      });
+
+      it("hands the brief to the harness and resolves its reply to the mission session", async () => {
+        const realPython = spawnSync("python3", ["-c", "import sys;print(sys.executable)"], {
+          encoding: "utf8",
+        }).stdout.trim();
+        const briefCopy = path.join(tmp, "harness-brief.txt");
+        const sessionCopy = path.join(tmp, "harness-session.txt");
+        // Deterministic stand-ins: python runs the statusline wrapper's harness argv directly, the harness
+        // records what it received, replies through the real local mailbox, and tmux runs the launcher.
+        fakeBinary(
+          "python3",
+          `case "$1" in *agent_statusline_tmux.py) shift; while [ "$1" != "--" ]; do shift; done; shift; exec "$@";; esac\nexec '${realPython}' "$@"`,
+        );
+        fakeBinary(
+          "claude",
+          `printf '%s' "$1" > '${briefCopy}'\nprintf '%s' "$AGENT_MAILBOX_SESSION" > '${sessionCopy}'\n'${process.execPath}' '${ORK_BIN}' chief send --from "$AGENT_MAILBOX_SESSION" --to chief --kind update 'reply: brief received'`,
+        );
+        fakeBinary(
+          "tmux",
+          `if [ "$1" = display-message ]; then echo %3; exit 0; fi\nfor last; do :; done\nif [ "$1" = new-window ]; then sh "$last" >/dev/null 2>&1; echo %9; fi`,
+        );
+        root = path.join(cache, "mailbox-v1");
+        fs.mkdirSync(root, { recursive: true });
+        await bindLiveChief();
+        writePeer(root, {
+          session: "chief-brief-orch",
+          name: "brief-orch",
+          cwd: repo,
+          pid: process.pid,
+        });
+        const result = await chiefSpawn({
+          cwd: repo,
+          goal: "Trace the flaky parser test",
+          title: "brief",
+          worktree: "brief",
+          interactive: true,
+          quotaDecision: async () => ({ status: "available", label: "claude-default" }),
+          root,
+          env: tmuxEnv({
+            PATH: `${path.join(tmp, "bin")}${path.delimiter}${process.env.PATH}`,
+            ORCHESTRATE_HOME: cache,
+          }),
+          now: NOW,
+        });
+        expect(result).toMatchObject({ status: "launched", roomId: "chief-brief" });
+        expect(fs.readFileSync(briefCopy, "utf8")).toContain("Trace the flaky parser test");
+        expect(fs.readFileSync(sessionCopy, "utf8")).toBe("chief-brief-orch");
+        const inbox = path.join(root, "inbox", sessionKey("chief-live"));
+        const replies = fs
+          .readdirSync(inbox)
+          .map((file) => JSON.parse(fs.readFileSync(path.join(inbox, file), "utf8")))
+          .filter((message) => message.text.includes("reply: brief received"));
+        expect(replies).toHaveLength(1);
+        expect(replies[0].from).toMatchObject({ session: "chief-brief-orch" });
+      });
+
+      it("previews a tmux launch and performs no mutation on dry-run", async () => {
+        const plan = await chiefSpawn({
+          cwd: repo,
+          goal: "Tidy",
+          interactive: true,
+          quotaDecision: quotaOk,
+          dryRun: true,
+          root,
+          env: tmuxEnv(),
+        });
+        expect(plan).toMatchObject({ backend: "tmux", status: "planned" });
+        expect(plan.command.slice(0, 9)).toEqual([
+          "tmux",
+          "new-window",
+          "-d",
+          "-P",
+          "-F",
+          "#{pane_id}",
+          "-t",
+          "%3",
+          "-c",
+        ]);
+        expect(fs.existsSync(path.join(root, "chief"))).toBe(false);
+        expect(listRawRooms(root)).toEqual([]);
+        expect(fs.existsSync(tmuxLog())).toBe(false);
+      });
+
+      it("launches one tmux pane and persists its identity on conductor and launch", async () => {
+        const launch = vi.fn();
+        const result = await chiefSpawn({
+          cwd: repo,
+          goal: "Tidy",
+          interactive: true,
+          quotaDecision: quotaOk,
+          root,
+          env: tmuxEnv(),
+          launch,
+          now: NOW,
+        });
+        expect(result).toMatchObject({
+          status: "launched",
+          launch: {
+            backend: "tmux",
+            paneId: "%9",
+            tmuxPane: "%9",
+            terminalServer: "/tmp/tmux-socket",
+          },
+        });
+        expect(launch).not.toHaveBeenCalled();
+        const log = fs.readFileSync(tmuxLog(), "utf8");
+        expect(log.match(/new-window/gu)).toHaveLength(1);
+        expect(log).toContain(repo);
+        const saved = readRawRoom(result.roomId, root);
+        expect(saved.chief.launch).toMatchObject({
+          mode: "interactive",
+          backend: "tmux",
+          paneId: "%9",
+        });
+        expect(saved.conductor).toMatchObject({
+          tmuxPane: "%9",
+          paneId: "%9",
+          terminalServer: "/tmp/tmux-socket",
+        });
+        expect(fs.existsSync(path.join(root, "chief", "hooks"))).toBe(false);
+      });
+
+      it("fails preflight before any room exists when the multiplexer is unusable", async () => {
+        await expect(
+          chiefSpawn({
+            cwd: repo,
+            goal: "x",
+            interactive: true,
+            quotaDecision: quotaOk,
+            root,
+            env: tmuxEnv({ TMUX_PANE: "%4" }),
+          }),
+        ).rejects.toMatchObject({ code: "interactive_unavailable" });
+        await expect(
+          chiefSpawn({
+            cwd: repo,
+            goal: "x",
+            interactive: true,
+            quotaDecision: quotaOk,
+            root,
+            env: { ...env, PATH: path.join(tmp, "bin"), HERDR_ENV: "1" },
+          }),
+        ).rejects.toMatchObject({ code: "interactive_unavailable" });
+        await expect(
+          chiefSpawn({
+            cwd: repo,
+            goal: "x",
+            interactive: true,
+            quotaDecision: quotaOk,
+            root,
+            env: env,
+          }),
+        ).rejects.toMatchObject({ code: "interactive_unavailable" });
+        await expect(
+          chiefSpawn({
+            cwd: repo,
+            goal: "x",
+            interactive: true,
+            quotaDecision: quotaOk,
+            engine: "agy",
+            root,
+            env: tmuxEnv(),
+          }),
+        ).rejects.toThrow(/Interactive launch supports/u);
+        await expect(
+          chiefSpawn({
+            cwd: repo,
+            goal: "x",
+            interactive: true,
+            quotaDecision: quotaOk,
+            timeout: "1h",
+            root,
+            env: tmuxEnv(),
+          }),
+        ).rejects.toThrow(/--timeout/u);
+        expect(listRawRooms(root)).toEqual([]);
+      });
+
+      it("records a partial launch failure and never retries it", async () => {
+        const exec = vi.fn((file, args) => {
+          if (args[0] === "display-message") return "%3\n";
+          throw new Error("split refused");
+        });
+        const result = await chiefSpawn({
+          cwd: repo,
+          goal: "x",
+          interactive: true,
+          quotaDecision: quotaOk,
+          root,
+          env: tmuxEnv(),
+          interactiveExec: exec,
+          now: NOW,
+        });
+        expect(result).toMatchObject({
+          status: "failed",
+          error: expect.stringMatching(/split refused/u),
+        });
+        expect(readRawRoom(result.roomId, root).chief.state).toBe("failed");
+        expect(exec.mock.calls.filter(([, args]) => args[0] === "new-window")).toHaveLength(1);
+      });
+
+      it("treats a timed-out Orca split as unconfirmed rather than launching again", async () => {
+        const exec = vi.fn((file, args) => {
+          if (args[1] === "split") throw Object.assign(new Error("timeout"), { killed: true });
+          return "";
+        });
+        const orcaEnv = {
+          ...env,
+          ORCA_PANE_KEY: "pane-k",
+          ORCA_TERMINAL_HANDLE: "term_1",
+          ORCA_CLI_COMMAND: "orca",
+        };
+        fakeBinary("orca", "exit 0");
+        const result = await chiefSpawn({
+          cwd: repo,
+          goal: "x",
+          interactive: true,
+          quotaDecision: quotaOk,
+          root,
+          env: orcaEnv,
+          interactiveExec: exec,
+          now: NOW,
+        });
+        expect(result.status).toBe("failed");
+        expect(result.error).toMatch(/did not confirm/u);
+        expect(exec.mock.calls.filter(([, args]) => args[1] === "split")).toHaveLength(1);
+      });
+
+      it("opens a Herdr pane and persists the pane and endpoint", async () => {
+        const exec = vi.fn((file, args) => {
+          if (args[0] === "pane" && args[1] === "split")
+            return JSON.stringify({ result: { pane: { pane_id: "w1-2" } } });
+          return "";
+        });
+        const herdrEnv = { ...env, HERDR_ENV: "1", HERDR_PANE_ID: "w1-1" };
+        fakeBinary("herdr", "exit 0");
+        const result = await chiefSpawn({
+          cwd: repo,
+          goal: "x",
+          interactive: true,
+          quotaDecision: quotaOk,
+          root,
+          env: herdrEnv,
+          interactiveExec: exec,
+          now: NOW,
+        });
+        expect(result).toMatchObject({
+          status: "launched",
+          launch: { backend: "herdr", herdrPaneId: "w1-2" },
+        });
+        expect(
+          exec.mock.calls.some(([, args]) => args.includes(repo) && args.includes("--no-focus")),
+        ).toBe(true);
+        expect(readRawRoom(result.roomId, root).conductor).toMatchObject({ herdrPaneId: "w1-2" });
       });
     });
   });

@@ -4,12 +4,15 @@
  * Ork Chief side window (`ork chief view`, `ork horde --view --chief`): a machine-wide
  * overview of every live orchestrator room and standalone agent session. It renders the
  * `ork.chief.status.v1` snapshot from `lib/chief.mjs` and returns small action objects
- * (`chief-drill`, `chief-focus`, `chief-focus-chief`, `chief-mode`) that the terminal
- * runner in `bin/horde-tui.mjs` turns into room drill-downs and pane focus requests.
+ * (`chief-drill`, `chief-focus`, `chief-focus-chief`, `chief-mode`, `chief-reply`,
+ * `chief-ack-desk`, `chief-close-room`) that the terminal runner in `bin/horde-tui.mjs`
+ * turns into room drill-downs, pane focus requests and Chief mutations.
  */
 import path from "node:path";
+import { stripVTControlCharacters } from "node:util";
 
 import {
+  cellWidth,
   displayWidth,
   fit,
   fitStyled,
@@ -42,6 +45,7 @@ export const CHIEF_KEYS = Object.freeze({
 });
 
 const CLOSE_CONFIRM_MS = 3000;
+const DRAWER_MAX = 5;
 const UP = new Set(["\u{1B}[A", "k"]);
 const DOWN = new Set(["\u{1B}[B", "j"]);
 const ACTIVE = new Set([
@@ -55,6 +59,9 @@ const ACTIVE = new Set([
 ]);
 const WARN = new Set(["blocked", "awaiting-input", "paused", "stale", "stale-coordinator"]);
 const FAILED = new Set(["failed", "error", "rejected"]);
+const ATTENTION_TONES = new Set(["warning", "stale", "error"]);
+const CONTROL_TEXT = /[\p{Cc}\p{Zl}\p{Zp}]|(?![\u{200C}\u{200D}])\p{Cf}/gu;
+const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 
 function text(value) {
   return plain(value ?? "")
@@ -286,6 +293,95 @@ export function chiefSummary(status) {
   };
 }
 
+/** Whether an entry belongs under the attention filter (`a`) and the `n` jump. */
+function chiefAttention(entry) {
+  const data = entry.data;
+  if (entry.kind === "room") {
+    return (
+      attentionItems(data).length > 0 ||
+      count(data.counts?.blocked) > 0 ||
+      ATTENTION_TONES.has(chiefRoomPill(data).tone)
+    );
+  }
+  return list(data.attention).length > 0 || ATTENTION_TONES.has(sessionPill(data).tone);
+}
+
+/** Rooms with work still running cannot be closed from the overview. */
+function chiefRoomLive(room) {
+  const status = text(room.coordinator?.status).toLowerCase();
+  return count(room.counts?.working) > 0 || ACTIVE.has(status);
+}
+
+/** Lowercase text a search matches against: repo, branch, worktree, then the entry's own names. */
+function chiefSearchFields(entry) {
+  const data = entry.data;
+  const shared = [chiefRepoName(data), text(data.branch), text(data.worktree?.slug)];
+  const named =
+    entry.kind === "room"
+      ? [
+          text(data.title),
+          text(data.id),
+          text(data.coordinator?.name),
+          text(data.coordinator?.session),
+        ]
+      : [text(data.name), text(data.session)];
+  return [...shared, ...named].map((field) => field.toLowerCase());
+}
+
+/** Desk and inbox records for the drawer, newest first with a stable ID tie-break. */
+function chiefDrawerItems(status) {
+  const stampOf = (item) => {
+    const raw = item.at ?? item.createdAt ?? item.updatedAt;
+    const value = typeof raw === "number" ? raw : Date.parse(String(raw ?? ""));
+    return Number.isFinite(value) ? value : 0;
+  };
+  const idOf = (item) => (typeof item.id === "string" && item.id ? item.id : "");
+  return [...list(status?.desk), ...list(status?.inbox)]
+    .toSorted((left, right) => {
+      const byTime = stampOf(right) - stampOf(left);
+      if (byTime !== 0) return byTime;
+      return idOf(left).localeCompare(idOf(right));
+    })
+    .map((item) => ({
+      id: idOf(item),
+      from: text(item.from),
+      kind: text(item.kind),
+      text: text(item.text),
+    }));
+}
+
+/** Strip terminal controls from typed input. Newlines and tabs cannot enter a single-line reply. */
+export function chiefInputText(value) {
+  return stripVTControlCharacters(String(value ?? "")).replaceAll(CONTROL_TEXT, "");
+}
+
+function dropLastGrapheme(value) {
+  return [...graphemes.segment(value)]
+    .slice(0, -1)
+    .map((part) => part.segment)
+    .join("");
+}
+
+/** The last characters of a line that fit `width`, with an ellipsis for the cut-off start. */
+function tailText(value, width, tier) {
+  width = Math.max(0, Math.floor(width));
+  const cleaned = plain(value);
+  if (displayWidth(cleaned) <= width) return cleaned;
+  const mark = tier === "ascii" ? "..." : "…";
+  const limit = width - displayWidth(mark);
+  if (limit <= 0) return truncateDisplay(mark, width, tier);
+  const parts = [...graphemes.segment(cleaned)].map((part) => part.segment);
+  let used = 0;
+  let start = parts.length;
+  while (start > 0) {
+    const size = cellWidth(parts[start - 1]);
+    if (used + size > limit) break;
+    used += size;
+    start--;
+  }
+  return `${mark}${parts.slice(start).join("")}`;
+}
+
 export class ChiefView {
   constructor(
     status,
@@ -320,17 +416,61 @@ export class ChiefView {
     this.selectedKey = undefined;
     this.status = null;
     this.entries = [];
+    this.visible = [];
+    this.query = "";
+    this.attentionOnly = false;
+    this.prompt = null;
+    this.drawerOpen = false;
+    this.drawerOffset = 0;
+    this.drawerCapacity = DRAWER_MAX;
+    this.roomClose = undefined;
     this.setStatus(status);
   }
 
   setStatus(status) {
     this.status = status && typeof status === "object" ? status : null;
     this.entries = chiefEntries(this.status);
-    if (this.entries.some((entry) => entry.key === this.selectedKey)) return;
+    this.refreshVisible();
+    if (
+      this.prompt?.kind === "reply" &&
+      this.entries.every((entry) => entry.key !== this.prompt.key)
+    ) {
+      this.notice = `Reply cancelled: ${this.prompt.targetLabel} is no longer listed.`;
+      this.prompt = null;
+    }
+    if (this.roomClose && this.entries.every((entry) => entry.key !== this.roomClose.key))
+      this.roomClose = undefined;
+    this.reconcileSelection();
+    if (this.roomClose && this.roomClose.key !== this.selectedKey) this.roomClose = undefined;
+  }
+
+  /** Recompute the one visible list from the search text and the attention filter. */
+  refreshVisible() {
+    const needle = text(this.query).toLowerCase();
+    this.visible = this.entries.filter(
+      (entry) =>
+        (!needle || chiefSearchFields(entry).some((field) => field.includes(needle))) &&
+        (!this.attentionOnly || chiefAttention(entry)),
+    );
+  }
+
+  /** Keep a selection that is still visible; otherwise choose the last room or the first visible row. */
+  reconcileSelection() {
+    if (this.visible.length === 0 || this.visible.some((entry) => entry.key === this.selectedKey))
+      return;
     const preferred = this.lastRoomId
-      ? this.entries.find((entry) => entry.key === `room:${this.lastRoomId}`)
+      ? this.visible.find((entry) => entry.key === `room:${this.lastRoomId}`)
       : undefined;
-    this.selectedKey = (preferred || this.entries[0])?.key;
+    this.selectedKey = (preferred || this.visible[0]).key;
+  }
+
+  afterFilterChange() {
+    this.refreshVisible();
+    this.reconcileSelection();
+    if (this.visible.length > 0) return;
+    if (this.attentionOnly || text(this.query)) {
+      this.notice = `No match${text(this.query) ? ` for "${text(this.query)}"` : ""}${this.attentionOnly ? " needing attention" : ""}`;
+    }
   }
 
   get needsAnimation() {
@@ -342,19 +482,21 @@ export class ChiefView {
   }
 
   selectedEntry() {
-    return this.entries.find((entry) => entry.key === this.selectedKey);
+    return this.visible.find((entry) => entry.key === this.selectedKey);
   }
 
   selectedIndex() {
-    return this.entries.findIndex((entry) => entry.key === this.selectedKey);
+    return this.visible.findIndex((entry) => entry.key === this.selectedKey);
   }
 
   move(delta) {
-    if (this.entries.length === 0) return false;
+    if (this.visible.length === 0) return false;
     const current = Math.max(0, this.selectedIndex());
-    const next = Math.max(0, Math.min(this.entries.length - 1, current + delta));
+    const next = Math.max(0, Math.min(this.visible.length - 1, current + delta));
     if (next === current && this.selectedIndex() !== -1) return false;
-    this.selectedKey = this.entries[next].key;
+    const key = this.visible[next].key;
+    if (key !== this.selectedKey) this.roomClose = undefined;
+    this.selectedKey = key;
     return true;
   }
 
@@ -402,11 +544,182 @@ export class ChiefView {
     return true;
   }
 
+  /** The armed room close, or undefined once it has timed out or been disarmed. */
+  armedRoomClose() {
+    if (!this.roomClose) return;
+    if (this.now() - this.roomClose.armedAt > CLOSE_CONFIRM_MS) this.roomClose = undefined;
+    return this.roomClose;
+  }
+
+  /** `x` on a room: first press arms that room, a second press within the interval closes it. */
+  closeRoom() {
+    const entry = this.selectedEntry();
+    if (!entry || entry.kind !== "room") {
+      this.roomClose = undefined;
+      this.notice = entry
+        ? "Only orchestrator rooms can be closed here."
+        : "Select an orchestrator room to close it.";
+      return true;
+    }
+    const room = entry.data;
+    const label = roomName(room);
+    if (chiefRoomLive(room)) {
+      this.roomClose = undefined;
+      this.notice = `${label} is still working. Stop its work before closing it.`;
+      return true;
+    }
+    const now = this.now();
+    const armed = this.armedRoomClose();
+    if (armed && armed.key === entry.key && armed.roomId === room.id) {
+      this.roomClose = undefined;
+      return { type: "chief-close-room", roomId: room.id };
+    }
+    this.roomClose = { key: entry.key, roomId: room.id, label, armedAt: now };
+    this.notice = `Press x again within ${Math.round(CLOSE_CONFIRM_MS / 1000)}s to close ${label}`;
+    return true;
+  }
+
+  /** `r`: capture the selected raw target and its display label for the reply prompt. */
+  startReply() {
+    const entry = this.selectedEntry();
+    if (!entry) {
+      this.notice = "Select an orchestrator or session to reply to.";
+      return true;
+    }
+    const data = entry.data;
+    const target = entry.kind === "room" ? data.id : data.session;
+    if (typeof target !== "string" || !target) {
+      this.notice = "This item has no ID to reply to.";
+      return true;
+    }
+    const label = entry.kind === "room" ? roomName(data) : sessionName(data);
+    this.prompt = { kind: "reply", key: entry.key, target, targetLabel: label, text: "" };
+    return true;
+  }
+
+  /** `n`: the next visible attention item after the selection, wrapping once. */
+  nextAttention() {
+    const total = this.visible.length;
+    if (total === 0) {
+      this.notice = "Nothing to step through in this view.";
+      return true;
+    }
+    const start = Math.max(0, this.selectedIndex() + 1);
+    for (let step = 0; step < total; step++) {
+      const entry = this.visible[(start + step) % total];
+      if (chiefAttention(entry)) {
+        this.selectedKey = entry.key;
+        return true;
+      }
+    }
+    this.notice = "Nothing needs attention in this view.";
+    return true;
+  }
+
+  /** `A`: acknowledge the desk and unattributed inbox while the drawer is open. */
+  acknowledgeDesk() {
+    if (!this.drawerOpen) return false;
+    const items = chiefDrawerItems(this.status);
+    if (items.length === 0) {
+      this.notice = "Nothing is waiting for Chief.";
+      return true;
+    }
+    if (items.some((item) => !item.id)) {
+      this.notice = "This status has no item IDs, so these items cannot be acknowledged here.";
+      return true;
+    }
+    return { type: "chief-ack-desk" };
+  }
+
+  drawerMaxOffset() {
+    return Math.max(0, chiefDrawerItems(this.status).length - this.drawerCapacity);
+  }
+
+  scrollDrawer(delta) {
+    const next = Math.max(0, Math.min(this.drawerMaxOffset(), this.drawerOffset + delta));
+    if (next === this.drawerOffset) return false;
+    this.drawerOffset = next;
+    return true;
+  }
+
+  /** Enter, Backspace and printable keys edit the active prompt before any global shortcut. */
+  handlePrompt(key) {
+    const edit = this.prompt;
+    const isFilter = edit.kind === "filter";
+    if (key === "\u{1B}") {
+      this.prompt = null;
+      if (isFilter) {
+        this.query = "";
+        this.afterFilterChange();
+      } else {
+        this.notice = "Reply cancelled.";
+      }
+      return true;
+    }
+    if (key.startsWith("\u{1B}")) return true;
+    if (key === "\r" || key === "\n") {
+      if (isFilter) {
+        this.prompt = null;
+        return true;
+      }
+      const body = edit.text.trim();
+      if (!body) {
+        this.notice = "Type a reply first, or press Esc to cancel.";
+        return true;
+      }
+      this.prompt = null;
+      return {
+        type: "chief-reply",
+        target: edit.target,
+        targetLabel: edit.targetLabel,
+        text: body,
+      };
+    }
+    if (key === "\u{7F}" || key === "\b") {
+      if (isFilter) {
+        this.query = dropLastGrapheme(this.query);
+        this.afterFilterChange();
+      } else {
+        edit.text = dropLastGrapheme(edit.text);
+      }
+      return true;
+    }
+    const value = chiefInputText(key);
+    if (!value) return true;
+    if (isFilter) {
+      this.query += value;
+      this.afterFilterChange();
+    } else {
+      edit.text += value;
+    }
+    return true;
+  }
+
   handleKey(key) {
     this.notice = "";
     if (key !== "q") this.closeArmedAt = undefined;
+    if (key !== "x") this.roomClose = undefined;
+    if (this.prompt) return this.handlePrompt(key);
     if (this.overlay) {
       if (["\u{1B}", "?", "\u{1B}[O"].includes(key)) this.overlay = undefined;
+      return true;
+    }
+    if (this.drawerOpen && (key === "\u{1B}" || key === "i")) {
+      this.drawerOpen = false;
+      return true;
+    }
+    if (this.drawerOpen && UP.has(key)) {
+      this.scrollDrawer(-1);
+      return true;
+    }
+    if (this.drawerOpen && DOWN.has(key)) {
+      this.scrollDrawer(1);
+      return true;
+    }
+    if (key === "\u{1B}" && (this.query || this.attentionOnly)) {
+      this.query = "";
+      this.attentionOnly = false;
+      this.afterFilterChange();
       return true;
     }
     if (key === "?") {
@@ -417,8 +730,8 @@ export class ChiefView {
     if (DOWN.has(key)) return this.move(1);
     if (key === "\u{1B}[5~") return this.move(-5);
     if (key === "\u{1B}[6~") return this.move(5);
-    if (key === "\u{1B}[H" || key === "g") return this.move(-this.entries.length);
-    if (key === "\u{1B}[F" || key === "G") return this.move(this.entries.length);
+    if (key === "\u{1B}[H" || key === "g") return this.move(-this.visible.length);
+    if (key === "\u{1B}[F" || key === "G") return this.move(this.visible.length);
     if (key === CHIEF_KEYS.drill) return this.drill();
     if (CHIEF_KEYS.focus.has(key)) return this.focus();
     if (key === CHIEF_KEYS.chief) return this.focusChief();
@@ -433,6 +746,24 @@ export class ChiefView {
       this.mouseEnabled = !this.mouseEnabled;
       return { type: "mouse-toggle", enabled: this.mouseEnabled };
     }
+    if (key === "/") {
+      this.prompt = { kind: "filter" };
+      return true;
+    }
+    if (key === "a") {
+      this.attentionOnly = !this.attentionOnly;
+      this.afterFilterChange();
+      return true;
+    }
+    if (key === "n") return this.nextAttention();
+    if (key === "r") return this.startReply();
+    if (key === "i") {
+      this.drawerOpen = true;
+      this.drawerOffset = 0;
+      return true;
+    }
+    if (key === "A") return this.drawerOpen ? this.acknowledgeDesk() : false;
+    if (key === "x") return this.closeRoom();
     if (key === "q") return this.requestClose();
     return false;
   }
@@ -443,17 +774,20 @@ export class ChiefView {
 
   handleMouse({ x, y, button, action }) {
     if (action === "scroll-up" || action === "scroll-down") {
-      if (this.overlay) return false;
-      return this.move(action === "scroll-down" ? 1 : -1);
+      if (this.overlay || !this.drawerOpen) return false;
+      return this.scrollDrawer(action === "scroll-down" ? 1 : -1);
     }
     const target = hitTest(this.targets, x, y);
     this.hovered = target?.id;
-    if (action === "press") this.closeArmedAt = undefined;
-    if (action !== "press" || button !== 0 || !target) return false;
+    if (action === "press") {
+      this.closeArmedAt = undefined;
+      this.roomClose = undefined;
+    }
+    if (action !== "press" || button !== 0 || !target || target.id === "drawer") return false;
     if (target.entryKey) {
       this.notice = "";
       if (this.overlay) this.overlay = undefined;
-      const entry = this.entries.find((item) => item.key === target.entryKey);
+      const entry = this.visible.find((item) => item.key === target.entryKey);
       if (!entry) return false;
       if (this.selectedKey === entry.key) return this.drill(entry);
       this.selectedKey = entry.key;
@@ -676,17 +1010,17 @@ export class ChiefView {
     return fitStyled(`${this.style(shown, "mdSection")}${this.style(tail, "muted")}`, inner);
   }
 
-  /** Every list row with the entry key it belongs to, for scrolling and mouse targets. */
+  /** Every visible list row with the entry key it belongs to, for scrolling and mouse targets. */
   listRows(inner) {
     const rows = [];
     let currentRepo;
     let isStandaloneHeadingShown = false;
     const roomCounts = new Map();
-    for (const entry of this.entries) {
+    for (const entry of this.visible) {
       if (entry.kind === "room") roomCounts.set(entry.repo, (roomCounts.get(entry.repo) || 0) + 1);
     }
-    const standaloneCount = this.entries.filter((entry) => entry.kind === "session").length;
-    for (const entry of this.entries) {
+    const standaloneCount = this.visible.filter((entry) => entry.kind === "session").length;
+    for (const entry of this.visible) {
       if (entry.kind === "room" && entry.repo !== currentRepo) {
         currentRepo = entry.repo;
         const total = roomCounts.get(entry.repo) || 0;
@@ -738,6 +1072,13 @@ export class ChiefView {
           "warning",
         );
       }
+      const mission = item.mission && typeof item.mission === "object" ? item.mission : null;
+      if (mission?.state) {
+        label(
+          "Mission",
+          `${text(mission.state)}${text(mission.reason) ? ` — ${text(mission.reason)}` : ""}`,
+        );
+      }
       const latest = item.latest && typeof item.latest === "object" ? item.latest : null;
       if (latest) {
         label("Latest", `${text(latest.from) ? `${text(latest.from)}: ` : ""}${text(latest.text)}`);
@@ -756,6 +1097,53 @@ export class ChiefView {
     return rows.slice(0, maxRows);
   }
 
+  /** One desk or inbox record: sender and kind first, then the text clipped to fit. */
+  drawerRow(item, width) {
+    const head = [item.from || "Unattributed", item.kind].filter(Boolean).join(" · ");
+    const headBudget = Math.min(displayWidth(head), Math.max(8, Math.floor(width / 2)));
+    const shownHead = truncateDisplay(head, headBudget, this.tier);
+    const bodyBudget = width - displayWidth(shownHead) - 2;
+    if (!item.text || bodyBudget < 4) return this.style(shownHead, "warning");
+    return `${this.style(shownHead, "warning")}  ${this.style(truncateDisplay(item.text, bodyBudget, this.tier), "heading")}`;
+  }
+
+  drawerLines(inner, items, rows) {
+    const body = [];
+    if (items.length === 0) body.push(` ${this.style("Nothing is waiting for Chief.", "muted")}`);
+    const shown = items.slice(this.drawerOffset, this.drawerOffset + rows);
+    for (const item of shown) body.push(` ${this.drawerRow(item, inner - 3)}`);
+    while (body.length < rows) body.push("");
+    const shownEnd = Math.min(items.length, this.drawerOffset + rows);
+    let range = "";
+    if (items.length > rows) range = ` ${this.drawerOffset + 1}-${shownEnd} of ${items.length}`;
+    else if (items.length > 0) range = ` ${items.length}`;
+    const right = items.length > 0 ? "A ack · Esc close" : "Esc close";
+    return this.panel(`Chief desk & inbox${range}`, body, inner, right, "mdSection");
+  }
+
+  promptLine(inner) {
+    if (this.prompt) {
+      const isFilter = this.prompt.kind === "filter";
+      const cursor = this.tier === "ascii" ? "_" : "▏";
+      const label = isFilter
+        ? "Find"
+        : `Reply to ${truncateDisplay(this.prompt.targetLabel, Math.max(4, Math.floor(inner / 3)), this.tier)}`;
+      const prefix = `${label}: `;
+      const room = inner - displayWidth(prefix) - displayWidth(cursor);
+      const value = isFilter ? this.query : this.prompt.text;
+      const shown = tailText(value, Math.max(0, room), this.tier);
+      return `${this.style(prefix, "heading bold")}${this.style(shown, "heading")}${this.style(cursor, "warning")}`;
+    }
+    if (this.query || this.attentionOnly) {
+      const parts = [];
+      if (text(this.query)) parts.push(`find "${text(this.query)}"`);
+      if (this.attentionOnly) parts.push("attention only");
+      parts.push(`${this.visible.length}/${this.entries.length} shown`);
+      return this.style(truncateDisplay(parts.join(" · "), inner, this.tier), "muted");
+    }
+    return null;
+  }
+
   controls(width) {
     if (this.overlay) {
       return actionBar(
@@ -770,39 +1158,57 @@ export class ChiefView {
       entry &&
       Boolean(chiefPaneTarget(entry.kind === "room" ? entry.data.coordinator : entry.data));
     const hasChiefPane = Boolean(chiefPaneTarget(this.status?.chief));
-    return actionBar(
-      [
-        {
-          id: "drill",
-          label: entry?.kind === "session" ? "Focus" : "Open room",
-          key: "\r",
-          hint: "Enter",
-          primary: true,
-          disabled: !entry || (entry.kind === "session" && !hasPane),
-        },
-        ...(entry?.kind === "room"
-          ? [{ id: "focus", label: isNarrow ? "Pane" : "Focus pane", key: "f", disabled: !hasPane }]
-          : []),
-        { id: "chief", label: "Chief", key: "C", disabled: !hasChiefPane },
-        ...(this.lastRoomId && !isNarrow
-          ? [{ id: "mode", label: "Room view", key: "\t", hint: "Tab" }]
-          : []),
-        { id: "help", label: isNarrow ? "Keys" : "Shortcuts", key: "?" },
-      ],
-      width,
-      { color: this.appearance, hovered: this.hovered, tier: this.tier },
-    );
+    const actions = [
+      {
+        id: "drill",
+        label: entry?.kind === "session" ? "Focus" : "Open room",
+        key: "\r",
+        hint: "Enter",
+        primary: true,
+        disabled: !entry || (entry.kind === "session" && !hasPane),
+      },
+    ];
+    if (entry?.kind === "room") {
+      actions.push({
+        id: "focus",
+        label: isNarrow ? "Pane" : "Focus pane",
+        key: "f",
+        disabled: !hasPane,
+      });
+    }
+    if (!isNarrow) actions.push({ id: "chief", label: "Chief", key: "C", disabled: !hasChiefPane });
+    if (this.lastRoomId && !isNarrow) {
+      actions.push({ id: "mode", label: "Room view", key: "\t", hint: "Tab" });
+    }
+    actions.push({ id: "desk", label: "Desk", key: "i" });
+    actions.push({ id: "reply", label: "Reply", key: "r", disabled: !entry });
+    actions.push({ id: "find", label: "Find", key: "/" });
+    if (entry?.kind === "room" && !isNarrow) {
+      actions.push({ id: "close", label: "Close room", key: "x" });
+    }
+    actions.push({ id: "help", label: isNarrow ? "Keys" : "Shortcuts", key: "?" });
+    return actionBar(actions, width, {
+      color: this.appearance,
+      hovered: this.hovered,
+      tier: this.tier,
+    });
   }
 
   helpLines(inner, height) {
     const rows = [
-      "↑/↓ j/k     Select an orchestrator or session",
+      "↑/↓ j/k     Select an orchestrator or session (scrolls the desk while it is open)",
       "Enter       Open the selected room's Swarm View",
       "Tab         Switch between Chief overview and the last room",
       "Backspace   Return from a room to the Chief overview (also Esc)",
       "f or o      Focus the selected orchestrator's terminal pane",
       "C           Focus the bound Chief chat pane",
-      "Mouse       Click to select; click again to open",
+      "/           Filter by repo, branch, worktree, title or name (Enter keeps, Esc clears)",
+      "a           Show only items that need attention (toggles)",
+      "n           Jump to the next item that needs attention",
+      "r           Reply to the selected orchestrator or session (Enter sends, Esc cancels)",
+      "i           Chief desk and inbox (A acknowledges, i or Esc closes)",
+      "x x         Close the selected idle room (press x twice within 3 seconds)",
+      "Mouse       Click to select; click again to open; wheel scrolls an open desk",
       "m           Toggle mouse capture to select terminal text",
       "? or Esc    Close this reference",
       this.confirmClose
@@ -835,6 +1241,17 @@ export class ChiefView {
 
   footerHint() {
     if (this.notice) return { text: this.notice, tone: "warning" };
+    if (this.prompt) {
+      const hint =
+        this.prompt.kind === "filter"
+          ? "Enter keeps the filter · Esc clears it"
+          : "Enter sends · Esc cancels";
+      return { text: hint, tone: "muted" };
+    }
+    const armed = this.armedRoomClose();
+    if (armed) {
+      return { text: `Press x again to close ${armed.label}`, tone: "warning" };
+    }
     if (!this.mouseEnabled)
       return { text: "Mouse off (select/copy) — press m to re-enable mouse", tone: "warning" };
     if (this.confirmClose)
@@ -853,24 +1270,30 @@ export class ChiefView {
         width,
       );
     }
+    this.armedRoomClose();
     const lines = [...this.headerLines(inner)];
     const controls = this.controls(inner);
     const footer = this.footerHint();
-    const footerRows = 1 + controls.lines.length + (footer ? 1 : 0);
+    const prompt = this.promptLine(inner);
+    const footerRows = 1 + controls.lines.length + (footer ? 1 : 0) + (prompt ? 1 : 0);
+    const middle = Math.max(0, this.height - lines.length - footerRows);
+    const showDrawer = this.drawerOpen && this.overlay !== "help";
+    const drawerItems = showDrawer ? chiefDrawerItems(this.status) : [];
+    const drawerRows = showDrawer
+      ? Math.max(1, Math.min(DRAWER_MAX, drawerItems.length || 1, middle - 4))
+      : 0;
+    const drawerTotal = showDrawer ? drawerRows + 2 : 0;
     if (this.overlay === "help") {
-      lines.push(...this.helpLines(inner, Math.max(3, this.height - lines.length - footerRows)));
-    } else if (this.entries.length === 0) {
-      const empty = [
-        "No active orchestrators or sessions on this machine.",
-        "Spawn one: ork chief spawn --cwd <repo> --goal <text>",
-      ].flatMap((line) =>
-        wrapText(line, Math.max(1, inner - 4)).map((part) => ` ${this.style(part, "muted")}`),
-      );
-      lines.push(...this.panel("Orchestrators", empty, inner, "", "border"));
+      lines.push(...this.helpLines(inner, Math.max(3, middle)));
+    } else if (this.visible.length === 0) {
+      lines.push(...this.emptyPanel(inner));
     } else {
-      const space = Math.max(2, this.height - lines.length - footerRows);
+      const space = Math.max(2, middle - drawerTotal);
       const hasDetailRoom = space >= 12;
-      const detailBody = hasDetailRoom ? this.detailLines(inner - 2, space >= 20 ? 6 : 3) : [];
+      const detailBody =
+        hasDetailRoom && this.selectedEntry()
+          ? this.detailLines(inner - 2, space >= 20 ? 6 : 3)
+          : [];
       const detailRows = detailBody.length > 0 ? detailBody.length + 2 : 0;
       const listHeight = Math.max(2, space - detailRows);
       const rows = this.listRows(inner);
@@ -886,9 +1309,9 @@ export class ChiefView {
       }
       offset = Math.max(0, Math.min(offset, maxOffset));
       this.listOffset = offset;
-      const visible = rows.slice(offset, offset + listHeight);
+      const shown = rows.slice(offset, offset + listHeight);
       const listTop = lines.length;
-      for (const [index, row] of visible.entries()) {
+      for (const [index, row] of shown.entries()) {
         lines.push(row.line);
         if (row.entryKey) {
           this.targets.push({
@@ -901,8 +1324,8 @@ export class ChiefView {
           });
         }
       }
-      if (rows.length > listHeight && visible.length > 0) {
-        const more = `${offset + visible.length}/${rows.length}`;
+      if (rows.length > listHeight && shown.length > 0) {
+        const more = `${offset + shown.length}/${rows.length}`;
         const last = lines.length - 1;
         if (displayWidth(plain(lines[last])) + more.length + 1 <= inner) {
           lines[last] = fitStyled(
@@ -919,14 +1342,40 @@ export class ChiefView {
         lines.push(...this.panel(heading, detailBody, inner, "", "border"));
       }
     }
+    if (showDrawer) {
+      this.drawerCapacity = drawerRows;
+      this.drawerOffset = Math.min(this.drawerOffset, Math.max(0, drawerItems.length - drawerRows));
+      this.targets.push({ id: "drawer", x: 1, y: lines.length + 1, width, height: drawerTotal });
+      lines.push(...this.drawerLines(inner, drawerItems, drawerRows));
+    }
     const footerTop = Math.max(lines.length, this.height - footerRows);
     while (this.fill && lines.length < footerTop) lines.push("");
     lines.push(this.style(glyphSet(this.tier).horizontal.repeat(inner), "border"));
+    if (prompt) lines.push(prompt);
     for (const target of controls.targets) {
       this.targets.push({ ...target, x: target.x + 1, y: target.y + lines.length });
     }
     lines.push(...controls.lines);
     if (footer) lines.push(this.style(fit(footer.text, inner), footer.tone));
     return this.marginLines(lines, width);
+  }
+
+  emptyPanel(inner) {
+    if (this.entries.length === 0) {
+      const empty = [
+        "No active orchestrators or sessions on this machine.",
+        "Spawn one: ork chief spawn --cwd <repo> --goal <text>",
+      ].flatMap((line) =>
+        wrapText(line, Math.max(1, inner - 4)).map((part) => ` ${this.style(part, "muted")}`),
+      );
+      return this.panel("Orchestrators", empty, inner, "", "border");
+    }
+    const query = text(this.query);
+    const subject = `${query ? ` for "${query}"` : ""}${this.attentionOnly ? " needing attention" : ""}`;
+    const message = [`No match${subject}.`, "/ edits the filter · a toggles attention"];
+    const body = message.flatMap((line) =>
+      wrapText(line, Math.max(1, inner - 4)).map((part) => ` ${this.style(part, "muted")}`),
+    );
+    return this.panel("No matches", body, inner, "", "border");
   }
 }

@@ -53,6 +53,7 @@ ork foundry [status|run|groom] [--dry-run] [--json]
 ork smelter [status|run] [--dry-run] [--json]
 ork side [run|status] [--prompt <text>] [--issue <n>] [--dry-run] [--json]
 ork chief [status|bind|send|spawn|desk|view] [--json]   (machine-wide Chief desk; ork chief --help)
+ork account [add|list|tag|remove|sync] [--json]   (universal accounts and profile federation; ork account --help)
 ork cleanup [status|run] [--dry-run] [--json]
 ork policy [show|allow|deny|reset] [--json]
 ork update [run|check|status|enable|disable] [--check|--apply] [--auto] [--force] [--quiet] [--json] [-h|--help]
@@ -646,6 +647,11 @@ export async function main(
       { stdout },
       (args, { stdout: out }) => summaryCommand(["quota", ...args], out),
     );
+  }
+  if (argv[0] === "account") {
+    const { accountCommand } = await import("../lib/accounts.mjs");
+    process.exitCode = await accountCommand(argv.slice(1), { stdout });
+    return;
   }
   if (argv[0] === "chief") {
     const { chiefCommand } = await import("./chief.mjs");

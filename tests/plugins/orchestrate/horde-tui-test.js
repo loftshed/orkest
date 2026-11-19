@@ -10,11 +10,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   focusAgentPane,
+  notifyChiefTransitions,
   notifyHerdrTransitions,
   runHordeTui,
   runTui,
 } from "../../../plugins/orchestrate/bin/horde-tui.mjs";
 import * as hordeTuiModule from "../../../plugins/orchestrate/bin/horde-tui.mjs";
+import { ChiefView } from "../../../plugins/orchestrate/lib/chief-view.mjs";
 import * as factoryModule from "../../../plugins/orchestrate/lib/factory.mjs";
 import * as foundryModule from "../../../plugins/orchestrate/lib/foundry.mjs";
 import {
@@ -3527,5 +3529,666 @@ describe("terminal lifecycle", () => {
     } finally {
       rmSync(tmpDir, { recursive: true, force: true });
     }
+  });
+});
+
+function deferred() {
+  const { promise, resolve } = Promise.withResolvers();
+  return { promise, resolve };
+}
+
+function chiefRoom(id, patch = {}) {
+  return {
+    id,
+    agents: [],
+    cwd: "/repo",
+    repo: { name: "repo", path: "/repo" },
+    branch: "main",
+    counts: { working: 1, blocked: 0, done: 0, idle: 0, total: 1 },
+    attention: [],
+    coordinator: { session: `${id}-c`, name: "C", engine: "claude", status: "running" },
+    mission: null,
+    ...patch,
+  };
+}
+
+function chiefStatusFixture({ rooms = [], desk = [], inbox = [], drawerSnapshot } = {}) {
+  return {
+    schema: "ork.chief.status.v1",
+    generatedAt: "2026-11-18T06:00:00.000Z",
+    machine: "kahuna",
+    chief: {
+      schema: "ork.chief.v1",
+      live: true,
+      stale: false,
+      session: "chief-1",
+      name: "Ork Chief",
+    },
+    summary: { orchestrators: rooms.length, working: 0, blocked: 0, attention: 0, standalone: 0 },
+    rooms,
+    standalone: [],
+    inbox,
+    desk,
+    drawerSnapshot: drawerSnapshot ?? {
+      session: "chief-1",
+      revision: "7",
+      deskIds: desk.map((item) => item.id),
+      inboxIds: inbox.map((item) => item.id),
+    },
+  };
+}
+
+/**
+ * Stands in for shard 2B's compose, drawer and close bindings until they land: `r` composes to the
+ * selected room (printable keys append, Enter emits chief-reply), `A` emits chief-ack-desk and two
+ * `x` presses emit chief-close-room. Every other key runs the real ChiefView handler.
+ */
+function installChiefStandIn() {
+  const real = ChiefView.prototype.handleInput;
+  /* eslint-disable unicorn/no-this-outside-of-class -- vitest runs the spy with the ChiefView instance as this */
+  return vi.spyOn(ChiefView.prototype, "handleInput").mockImplementation(function standIn(key) {
+    if (this.composing) {
+      const state = this.composing;
+      if (key === "\r") {
+        this.composing = null;
+        const text = state.text.trim();
+        if (!text) return true;
+        return { type: "chief-reply", target: state.target, targetLabel: state.label, text };
+      }
+      if (key === "\u{1B}") {
+        this.composing = null;
+        return true;
+      }
+      if (key === "\u{7F}") state.text = [...state.text].slice(0, -1).join("");
+      else if (key.length === 1 && key >= " ") state.text += key;
+      return true;
+    }
+    const selected = this.entries?.find((entry) => entry.key === this.selectedKey);
+    const roomId = selected?.key?.startsWith("room:") ? selected.data.id : null;
+    if (key === "r" && roomId) {
+      this.composing = { target: roomId, label: selected.data.repo.name, text: "" };
+      return true;
+    }
+    if (key === "A") return { type: "chief-ack-desk" };
+    if (key === "x" && roomId) {
+      if (this.armedRoom !== roomId) {
+        this.armedRoom = roomId;
+        return true;
+      }
+      this.armedRoom = undefined;
+      return { type: "chief-close-room", roomId };
+    }
+    return real.call(this, key);
+  });
+  /* eslint-enable unicorn/no-this-outside-of-class */
+}
+
+function startChiefTui({ status, room, env = {}, exec: execMock = () => {}, chief = {} }) {
+  // eslint-disable-next-line unicorn/prefer-event-target -- Readline keypress uses the Node stream EventEmitter API.
+  const input = Object.assign(new EventEmitter(), {
+    isTTY: true,
+    isRaw: false,
+    setRawMode: vi.fn(),
+    resume() {},
+    pause() {},
+  });
+  const frames = [];
+  const output = {
+    isTTY: true,
+    rows: 30,
+    columns: 100,
+    write: (chunk) => {
+      frames.push(String(chunk));
+    },
+  };
+  const loader = { current: status, delayed: null, delayedStarted: false, failNext: null };
+  const loadStatus = vi.fn(async () => {
+    if (loader.failNext) {
+      const error = loader.failNext;
+      loader.failNext = null;
+      throw error;
+    }
+    if (loader.delayed) {
+      const pending = loader.delayed;
+      loader.delayed = null;
+      loader.delayedStarted = true;
+      return pending.promise;
+    }
+    return structuredClone(loader.current);
+  });
+  let isClosed = false;
+  const running = (async () => {
+    await runHordeTui(async () => structuredClone(room), {
+      input,
+      output,
+      env,
+      exec: execMock,
+      quota: false,
+      services: false,
+      update: false,
+      chief: {
+        loadStatus,
+        loadRoom: async () => structuredClone(room),
+        initialMode: "chief",
+        ...chief,
+      },
+    });
+    isClosed = true;
+  })();
+  return {
+    loader,
+    loadStatus,
+    running,
+    isClosed: () => isClosed,
+    text: () => plain(frames.join("")),
+    frames,
+    type(keys) {
+      for (const key of keys) input.emit("data", key);
+    },
+    async stop() {
+      input.emit("data", "\u{3}");
+      await running;
+    },
+  };
+}
+
+function chiefNotifier() {
+  const calls = [];
+  const exec = vi.fn((command, args, ...rest) => {
+    calls.push({ command, args });
+    rest.at(-1)?.(null, "", "");
+  });
+  return { calls, exec };
+}
+
+describe("Chief TUI actions and notifications", () => {
+  let restoreStandIn;
+  afterEach(() => {
+    restoreStandIn?.();
+    restoreStandIn = undefined;
+  });
+
+  it("sends a Chief reply from real keys and repaints from an immediate fresh status", async () => {
+    const room = chiefRoom("r1", { repo: { name: "repo", path: "/repo" } });
+    const send = vi.fn(async () => ({ status: "sent" }));
+    restoreStandIn = installChiefStandIn().mockRestore;
+    const tui = startChiefTui({
+      status: chiefStatusFixture({ rooms: [room] }),
+      room,
+      chief: { send },
+    });
+    try {
+      await vi.waitFor(() => expect(tui.text()).toContain("repo"));
+      const before = tui.loadStatus.mock.calls.length;
+      tui.type("r");
+      for (const key of "quota?") tui.type(key);
+      tui.type("\r");
+      await vi.waitFor(() => expect(tui.text()).toContain("Sent to repo"));
+      expect(send).toHaveBeenCalledTimes(1);
+      expect(send).toHaveBeenCalledWith(
+        expect.objectContaining({
+          to: "r1",
+          kind: "update",
+          message: "quota?",
+          root: expect.any(String),
+          env: expect.any(Object),
+        }),
+      );
+      expect(tui.loadStatus.mock.calls.length).toBeGreaterThan(before);
+    } finally {
+      await tui.stop();
+    }
+  });
+
+  it("acknowledges only the drawer IDs captured on A and keeps mail that arrives during the ack", async () => {
+    const room = chiefRoom("r1", { repo: { name: "repo", path: "/repo" } });
+    const desk = [{ id: "d1", roomId: null, from: "c1", kind: "question", text: "Which branch?" }];
+    const inbox = [{ id: "i1", from: "lead", kind: "unread", text: "fyi" }];
+    const snapshot = { session: "chief-1", revision: "7", deskIds: ["d1"], inboxIds: ["i1"] };
+    const gate = deferred();
+    const ack = vi.fn(() => gate.promise);
+    restoreStandIn = installChiefStandIn().mockRestore;
+    const tui = startChiefTui({
+      status: chiefStatusFixture({ rooms: [room], desk, inbox, drawerSnapshot: snapshot }),
+      room,
+      chief: { desk: ack },
+    });
+    try {
+      await vi.waitFor(() => expect(tui.text()).toContain("repo"));
+      tui.type("A");
+      await vi.waitFor(() => expect(ack).toHaveBeenCalledTimes(1));
+      // A second A while the first acknowledgment is pending must not start another one.
+      tui.type("A");
+      expect(ack).toHaveBeenCalledTimes(1);
+      expect(tui.text()).toContain("Still finishing the last Chief action");
+      tui.loader.current = chiefStatusFixture({
+        rooms: [room],
+        desk: [...desk, { id: "d2", roomId: null, from: "c2", kind: "question", text: "Late?" }],
+        inbox: [...inbox, { id: "i2", from: "ops", kind: "unread", text: "arrived mid-ack" }],
+      });
+      gate.resolve({ ok: true });
+      await vi.waitFor(() =>
+        expect(tui.text()).toContain("Acknowledged the desk and unattributed inbox"),
+      );
+      expect(ack).toHaveBeenCalledWith({
+        ack: true,
+        snapshot: { session: "chief-1", revision: "7", deskIds: ["d1"], inboxIds: ["i1"] },
+        root: expect.any(String),
+        env: expect.any(Object),
+      });
+    } finally {
+      await tui.stop();
+    }
+  });
+
+  it("reports a refused room close, then keeps the TUI responsive", async () => {
+    const room = chiefRoom("r1", { repo: { name: "repo", path: "/repo" } });
+    const close = vi.fn(async () => {
+      throw new Error("Room still has running workers");
+    });
+    restoreStandIn = installChiefStandIn().mockRestore;
+    const tui = startChiefTui({
+      status: chiefStatusFixture({ rooms: [room] }),
+      room,
+      chief: { close },
+    });
+    try {
+      await vi.waitFor(() => expect(tui.text()).toContain("repo"));
+      tui.type("x");
+      tui.type("x");
+      await vi.waitFor(() =>
+        expect(tui.text()).toContain("Could not close repo: Room still has running workers"),
+      );
+      expect(close).toHaveBeenCalledTimes(1);
+      expect(close).toHaveBeenCalledWith({
+        roomId: "r1",
+        force: false,
+        root: expect.any(String),
+        env: expect.any(Object),
+      });
+      tui.type("?");
+      await vi.waitFor(() => expect(tui.text()).toContain("Close this reference"));
+      expect(tui.isClosed()).toBe(false);
+    } finally {
+      await tui.stop();
+    }
+  });
+
+  it("reports a confirmed room close and an already-closed room", async () => {
+    const room = chiefRoom("r1", { repo: { name: "repo", path: "/repo" } });
+    const close = vi
+      .fn()
+      .mockResolvedValueOnce({ status: "closed" })
+      .mockResolvedValueOnce({ status: "already-closed" });
+    restoreStandIn = installChiefStandIn().mockRestore;
+    const tui = startChiefTui({
+      status: chiefStatusFixture({ rooms: [room] }),
+      room,
+      chief: { close },
+    });
+    try {
+      await vi.waitFor(() => expect(tui.text()).toContain("repo"));
+      tui.type("x");
+      tui.type("x");
+      await vi.waitFor(() => expect(tui.text()).toContain("Closed repo"));
+      tui.type("x");
+      tui.type("x");
+      await vi.waitFor(() => expect(tui.text()).toContain("repo was already closed"));
+      expect(close).toHaveBeenCalledTimes(2);
+    } finally {
+      await tui.stop();
+    }
+  });
+
+  it("applies the newer frame when a poll started before a mutation resolves late", async () => {
+    const room = chiefRoom("r1", { repo: { name: "old-repo", path: "/repo" } });
+    const send = vi.fn(async () => ({ status: "sent" }));
+    restoreStandIn = installChiefStandIn().mockRestore;
+    const tui = startChiefTui({
+      status: chiefStatusFixture({ rooms: [room] }),
+      room,
+      chief: { send },
+    });
+    try {
+      await vi.waitFor(() => expect(tui.text()).toContain("old-repo"));
+      const stale = deferred();
+      tui.loader.delayed = stale;
+      await vi.waitFor(() => expect(tui.loader.delayedStarted).toBe(true), { timeout: 4000 });
+
+      tui.loader.current = chiefStatusFixture({
+        rooms: [{ ...room, repo: { name: "newer-repo", path: "/repo" } }],
+      });
+      tui.type("r");
+      tui.type("ok");
+      tui.type("\r");
+      await vi.waitFor(() => expect(tui.text()).toContain("newer-repo"));
+
+      tui.frames.length = 0;
+      stale.resolve(
+        chiefStatusFixture({ rooms: [{ ...room, repo: { name: "stale-repo", path: "/repo" } }] }),
+      );
+      await new Promise((done) => setTimeout(done, 50));
+      expect(tui.text()).not.toContain("stale-repo");
+    } finally {
+      await tui.stop();
+    }
+  });
+
+  it("keeps a literal q as compose text instead of closing the Chief view", async () => {
+    const room = chiefRoom("r1", { repo: { name: "repo", path: "/repo" } });
+    const send = vi.fn(async () => ({ status: "sent" }));
+    restoreStandIn = installChiefStandIn().mockRestore;
+    const tui = startChiefTui({
+      status: chiefStatusFixture({ rooms: [room] }),
+      room,
+      chief: { send },
+    });
+    try {
+      await vi.waitFor(() => expect(tui.text()).toContain("repo"));
+      tui.type("r");
+      tui.type("q");
+      await new Promise((done) => setTimeout(done, 20));
+      expect(tui.isClosed()).toBe(false);
+      tui.type("\r");
+      await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(1));
+      expect(send).toHaveBeenCalledWith(expect.objectContaining({ message: "q" }));
+      expect(tui.isClosed()).toBe(false);
+    } finally {
+      await tui.stop();
+    }
+  });
+
+  it("notifies a new blocked worker once after a failed load recovers", async () => {
+    const room = chiefRoom("r1", { repo: { name: "repo", path: "/repo" } });
+    const blocked = chiefRoom("r1", {
+      repo: { name: "repo", path: "/repo" },
+      attention: [
+        {
+          kind: "blocked",
+          from: "w1",
+          text: "Need confirmation",
+          at: "2026-11-18T06:01:00.000Z",
+        },
+      ],
+    });
+    const { calls, exec } = chiefNotifier();
+    const tui = startChiefTui({
+      status: chiefStatusFixture({ rooms: [room] }),
+      room,
+      env: { HERDR_ENV: "1", HERDR_BIN_PATH: "herdr-test" },
+      exec,
+    });
+    try {
+      await vi.waitFor(() => expect(tui.text()).toContain("repo"));
+      tui.loader.failNext = new Error("boom");
+      await vi.waitFor(() => expect(tui.text()).toContain("Could not read Chief status: boom"), {
+        timeout: 4000,
+      });
+      tui.loader.current = chiefStatusFixture({ rooms: [blocked] });
+      await vi.waitFor(() => expect(calls).toHaveLength(1), { timeout: 4000 });
+      expect(calls[0]).toEqual({
+        command: "herdr-test",
+        args: [
+          "notification",
+          "show",
+          "Chief: Worker blocked",
+          "--body",
+          "repo: Need confirmation",
+          "--sound",
+          "request",
+        ],
+      });
+      // Later polls return the same blocked worker and must not repeat the notification.
+      await new Promise((done) => setTimeout(done, 1200));
+      expect(calls).toHaveLength(1);
+    } finally {
+      await tui.stop();
+    }
+  });
+});
+
+describe("notifyChiefTransitions", () => {
+  const herdr = { HERDR_ENV: "1", HERDR_BIN_PATH: "herdr" };
+  const hud = { HERDR_ENV: undefined };
+  const question = (text) => ({ kind: "awaiting-input", from: "w1", text, at: "t1" });
+  const roomsOf = (...attention) => [
+    chiefRoom("r1", { title: "alpha", attention: attention[0] ?? [] }),
+    chiefRoom("r2", { title: "beta", attention: attention[1] ?? [] }),
+  ];
+  const seeded = (status) => {
+    const seen = new Set();
+    notifyChiefTransitions(null, status, seen, { env: herdr, platform: "linux" });
+    return seen;
+  };
+
+  it("seeds the first successful snapshot silently", () => {
+    const { calls, exec } = chiefNotifier();
+    const status = chiefStatusFixture({ rooms: roomsOf([question("Need quota?")]) });
+    const seen = new Set();
+    expect(
+      notifyChiefTransitions(null, status, seen, { env: herdr, exec, platform: "darwin" }),
+    ).toBe(false);
+    expect(calls).toHaveLength(0);
+    expect(seen.size).toBe(1);
+    expect(notifyChiefTransitions(status, status, seen, { env: herdr, exec })).toBe(false);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("stays silent for unchanged, reordered, and timestamp-only snapshots", () => {
+    const { calls, exec } = chiefNotifier();
+    const prev = chiefStatusFixture({
+      rooms: roomsOf([question("Need quota?")], [question("Q2")]),
+    });
+    const seen = seeded(prev);
+    const reordered = chiefStatusFixture({
+      rooms: roomsOf([question("Need quota?")], [question("Q2")]).toReversed(),
+      generatedAt: "2026-11-18T07:00:00.000Z",
+    });
+    reordered.rooms[0].attention[0].at = "t9";
+    expect(notifyChiefTransitions(prev, reordered, seen, { env: herdr, exec })).toBe(false);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("notifies the same text once in each of two rooms", () => {
+    const { calls, exec } = chiefNotifier();
+    const prev = chiefStatusFixture({ rooms: roomsOf() });
+    const seen = seeded(prev);
+    const next = chiefStatusFixture({
+      rooms: roomsOf([question("Need quota?")], [question("Need quota?")]),
+    });
+    expect(notifyChiefTransitions(prev, next, seen, { env: herdr, exec })).toBe(true);
+    expect(calls.map((call) => call.args[4])).toEqual(["alpha: Need quota?", "beta: Need quota?"]);
+  });
+
+  it("notifies a changed question but not its repeat", () => {
+    const { calls, exec } = chiefNotifier();
+    const prev = chiefStatusFixture({ rooms: roomsOf([question("Old?")]) });
+    const seen = seeded(prev);
+    const next = chiefStatusFixture({ rooms: roomsOf([question("New?")]) });
+    expect(notifyChiefTransitions(prev, next, seen, { env: herdr, exec })).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].args[4]).toBe("alpha: New?");
+    expect(notifyChiefTransitions(next, next, seen, { env: herdr, exec })).toBe(false);
+    expect(calls).toHaveLength(1);
+  });
+
+  it("notifies a new blocked worker with a sanitized single-line body", () => {
+    const { calls, exec } = chiefNotifier();
+    const prev = chiefStatusFixture({ rooms: roomsOf() });
+    const seen = seeded(prev);
+    const next = chiefStatusFixture({
+      rooms: roomsOf([{ kind: "blocked", from: "w1", text: "Need\u{1B}[31m help\nnow" }]),
+    });
+    expect(
+      notifyChiefTransitions(prev, next, seen, {
+        env: {},
+        exec,
+        exists: () => true,
+        platform: "darwin",
+      }),
+    ).toBe(true);
+    expect(calls).toHaveLength(1);
+    const payload = JSON.parse(calls[0].args[1]);
+    expect(payload).toEqual({
+      body: "alpha: Need [31m help now",
+      sound: "request",
+      status: "blocked",
+      title: "Chief: Worker blocked",
+    });
+  });
+
+  it("notifies a failed mission once, including its synthetic escalation and desk copy", () => {
+    const { calls, exec } = chiefNotifier();
+    const prev = chiefStatusFixture({ rooms: roomsOf() });
+    const seen = seeded(prev);
+    const failed = roomsOf();
+    failed[0] = chiefRoom("r1", {
+      title: "alpha",
+      mission: { state: "failed", reason: "provider_quota_exhausted" },
+      attention: [{ kind: "escalation", from: "C", text: "provider_quota_exhausted" }],
+    });
+    const next = chiefStatusFixture({
+      rooms: failed,
+      desk: [
+        {
+          id: "d1",
+          roomId: "r1",
+          from: "C",
+          kind: "escalation",
+          text: "provider_quota_exhausted",
+        },
+      ],
+    });
+    expect(
+      notifyChiefTransitions(prev, next, seen, {
+        env: {},
+        exec,
+        exists: () => true,
+        platform: "darwin",
+      }),
+    ).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(JSON.parse(calls[0].args[1])).toEqual({
+      body: "alpha: provider_quota_exhausted",
+      sound: "request",
+      status: "failed",
+      title: "Chief: Mission failed",
+    });
+  });
+
+  it("stays silent for updates, completed missions, idle rows, and generic unread mail", () => {
+    const { calls, exec } = chiefNotifier();
+    const prev = chiefStatusFixture({ rooms: roomsOf() });
+    const seen = seeded(prev);
+    const next = chiefStatusFixture({
+      rooms: [
+        chiefRoom("r1", {
+          title: "alpha",
+          mission: { state: "done", reason: null },
+          attention: [
+            { kind: "update", text: "Progress" },
+            { kind: "stale-coordinator", text: "gone" },
+          ],
+        }),
+      ],
+      inbox: [{ id: "i1", from: "lead", kind: "unread", text: "fyi" }],
+      desk: [{ id: "d1", roomId: "r1", from: "C", kind: "done", text: "Finished" }],
+    });
+    expect(notifyChiefTransitions(prev, next, seen, { env: herdr, exec })).toBe(false);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("keys loose mail by its unattributed sender, so a desk copy does not repeat an inbox message", () => {
+    const { calls, exec } = chiefNotifier();
+    const prev = chiefStatusFixture({ rooms: [] });
+    const seen = seeded(prev);
+    const next = chiefStatusFixture({
+      rooms: [],
+      inbox: [{ id: "i1", from: "lead", kind: "awaiting-input", text: "Ready?" }],
+      desk: [{ id: "d1", roomId: null, from: "lead", kind: "question", text: "Ready?" }],
+    });
+    expect(
+      notifyChiefTransitions(prev, next, seen, {
+        env: {},
+        exec,
+        exists: () => true,
+        platform: "darwin",
+      }),
+    ).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(JSON.parse(calls[0].args[1]).body).toBe("Chief inbox: Ready?");
+  });
+
+  it("uses Herdr on Darwin when HERDR_ENV is set, and never the HUD", () => {
+    const { calls, exec } = chiefNotifier();
+    const prev = chiefStatusFixture({ rooms: roomsOf() });
+    const seen = seeded(prev);
+    const next = chiefStatusFixture({ rooms: roomsOf([question("Need quota?")]) });
+    notifyChiefTransitions(prev, next, seen, {
+      env: herdr,
+      exec,
+      exists: () => true,
+      platform: "darwin",
+    });
+    expect(calls).toEqual([
+      {
+        command: "herdr",
+        args: [
+          "notification",
+          "show",
+          "Chief: Question",
+          "--body",
+          "alpha: Need quota?",
+          "--sound",
+          "request",
+        ],
+      },
+    ]);
+  });
+
+  it("uses the HUD on Darwin without Herdr", () => {
+    const { calls, exec } = chiefNotifier();
+    const prev = chiefStatusFixture({ rooms: roomsOf() });
+    const seen = seeded(prev);
+    const next = chiefStatusFixture({ rooms: roomsOf([question("Need quota?")]) });
+    notifyChiefTransitions(prev, next, seen, {
+      env: { ...hud, ORKEST_HUD_BIN: "/opt/OrkestHUD" },
+      exec,
+      exists: (candidate) => candidate === "/opt/OrkestHUD",
+      platform: "darwin",
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0].command).toBe("/opt/OrkestHUD");
+    expect(calls[0].args[0]).toBe("--json");
+    expect(JSON.parse(calls[0].args[1])).toEqual({
+      body: "alpha: Need quota?",
+      sound: "request",
+      status: "blocked",
+      title: "Chief: Question",
+    });
+  });
+
+  it("stays silent on Linux without Herdr and when the HUD is missing", () => {
+    const { calls, exec } = chiefNotifier();
+    const prev = chiefStatusFixture({ rooms: roomsOf() });
+    const seen = seeded(prev);
+    const next = chiefStatusFixture({ rooms: roomsOf([question("Need quota?")]) });
+    expect(
+      notifyChiefTransitions(prev, next, seen, {
+        env: { ORKEST_HUD_BIN: "/opt/OrkestHUD" },
+        exec,
+        exists: () => true,
+        platform: "linux",
+      }),
+    ).toBe(false);
+    expect(
+      notifyChiefTransitions(prev, next, new Set(seen), {
+        env: {},
+        exec,
+        exists: () => false,
+        platform: "darwin",
+      }),
+    ).toBe(false);
+    expect(calls).toHaveLength(0);
   });
 });
