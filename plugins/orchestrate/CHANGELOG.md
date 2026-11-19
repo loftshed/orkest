@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.91.1
+
+- fix(orchestrate,monitor): native HTTP daemon fast-path, subagent filter, clean-commit integrate, and N-account policy (#234)
+
 ## 0.91.0
 
 - feat(orchestrate): complete native ork-fast hooks, companion dismiss, macOS HUD, and autonomous Chief questions (#231)

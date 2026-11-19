@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.19.4
+
+- fix(orchestrate,monitor): native HTTP daemon fast-path, subagent filter, clean-commit integrate, and N-account policy (#234)
+
 ## 0.19.3
 
 - fix(monitor): tighten macOS quick menu layout and prune expired reset details (closes #217) (#218)
