@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import {
   chmod,
@@ -1000,7 +1000,8 @@ describe("ork herdr-status", () => {
     expect(await run({ ...env, ORK_FAST_BIN: bin })).toBe("\n");
     expect(Date.now() - started).toBeLessThan(5000);
     const pid = (await readFile(marker, "utf8")).trim();
-    const state = await exec("ps", ["-o", "stat=", "-p", pid]).catch(() => ({ stdout: "" }));
+    const state = spawnSync("ps", ["-o", "stat=", "-p", pid], { encoding: "utf8" });
+    expect([0, 1]).toContain(state.status);
     expect(state.stdout.trim()).toMatch(/^(?:Z.*)?$/u);
   });
 
