@@ -51,7 +51,12 @@ async function execCommand(exec, command, args, options = {}) {
       execFile(
         command,
         args,
-        { timeout: options.timeout ?? 15_000, maxBuffer: 1024 * 1024, cwd: options.cwd },
+        {
+          timeout: options.timeout ?? 15_000,
+          maxBuffer: 1024 * 1024,
+          cwd: options.cwd,
+          env: options.env,
+        },
         (error, stdout = "", stderr = "") => {
           if (error) {
             error.stdout = stdout;
@@ -498,6 +503,25 @@ export async function runUpdateCli(argv = [], io = {}) {
     default: {
       result = await updateFn(options);
       break;
+    }
+  }
+
+  if (subcommand === "run" && !options.auto && (!isQuiet || result.updated)) {
+    const scanner = fileURLToPath(
+      new URL("../skills/orchestrate/scripts/legacy_plugin.py", import.meta.url),
+    );
+    let notice;
+    try {
+      const response = await execCommand(execFile, "python3", [scanner, "--only-if-present"], {
+        env: options.env,
+      });
+      notice = response.stdout.trim();
+    } catch (error) {
+      notice = `Could not check for retired Orkest plugins (${error.code ?? error.message}). Run ork doctor to retry.`;
+    }
+    if (notice) {
+      result = { ...result, legacyPluginNotice: notice };
+      if (!isJsonOutput) stdout.write(`${notice}\n`);
     }
   }
 

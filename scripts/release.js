@@ -1,12 +1,15 @@
 #!/usr/bin/env node
-// Plugin releases driven by conventional commits.
+// Orkest releases driven by conventional commits: one product, one version.
 //
 //   node scripts/release.js plan      print what the next release would publish
 //   node scripts/release.js check     build that release in a scratch worktree and run the gates on it
 //   node scripts/release.js publish   commit, tag, push and create GitHub releases (GitHub Actions only)
 //
-// Each plugin is released on its own: its commits since its last `<name>--vX.Y.Z`
-// tag (or since release.json's `since` commit) decide whether and how far it moves.
+// The version lives in the root package.json and tags are `vX.Y.Z`. The commits since the
+// highest published tag decide whether and how far it moves. Tags from the two earlier release
+// streams (`orchestrate--vX.Y.Z`, `agent-executor--vX.Y.Z`; release.json `legacyTags`) count as
+// published history, so the first product release continues orchestrate's line. The old
+// `monitor--v` line has ended and is ignored.
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -14,9 +17,11 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
-import { REPO_ROOT } from "./validate-marketplace.js";
+import { REPO_ROOT } from "./validate.js";
 
-export const RELEASE_SUBJECT = "chore(release): publish plugins";
+export const RELEASE_SUBJECT = "chore(release): publish orkest";
+// Release commits from before the streams merged; they are never release notes either.
+const LEGACY_RELEASE_SUBJECT = "chore(release): publish plugins";
 const TRAILER = "Release-Of";
 const VERSION = /^(\d+)\.(\d+)\.(\d+)$/u;
 
@@ -82,44 +87,66 @@ export function bump(version, increment) {
 
 // ── what changed ───────────────────────────────────────────────────────────
 
-function pluginsAt(git, ref) {
-  const marketplace = JSON.parse(fileAt(git, ref, ".claude-plugin/marketplace.json"));
-  return marketplace.plugins.map((entry) => {
-    const manifest = JSON.parse(
-      fileAt(git, ref, `plugins/${entry.name}/.claude-plugin/plugin.json`) ?? "{}",
-    );
-    if (!VERSION.test(manifest.version ?? "")) {
-      throw new Error(`plugins/${entry.name}: plugin.json needs an x.y.z version at ${ref}`);
-    }
-    return { entry, name: entry.name, version: manifest.version };
-  });
-}
+// What a checkout ships. Documentation, tests and repository tooling alone do not release. `src/`,
+// `adapters/` (harness manifests, skill and command text) and `references/` are the planned layout
+// (issue 233 stages 3 to 5); a commit that touches only those must still release.
+const SHIPPED_PATHS = [
+  "plugins",
+  "src",
+  "adapters",
+  "references",
+  "crates/ork-fast",
+  "install.sh",
+  "herdr-plugin.toml",
+  "orca-plugin.json",
+  ".opencode",
+  ":(exclude)plugins/*/CHANGELOG.md",
+  ":(exclude)plugins/*/package.json",
+];
+const CHANGELOG = "CHANGELOG.md";
+const PRODUCT_TAG = /^v(\d+\.\d+\.\d+)$/u;
 
-function latestTag(tags, name) {
-  const prefix = `${name}--v`;
-  const versions = tags
-    .filter((tag) => tag.startsWith(prefix) && VERSION.test(tag.slice(prefix.length)))
-    .map((tag) => tag.slice(prefix.length))
-    .toSorted(compareVersions);
-  return versions.length > 0 ? `${prefix}${versions.at(-1)}` : null;
-}
-
-const shippedPaths = (name) => {
-  const paths = [`plugins/${name}`, `:(exclude)plugins/${name}/CHANGELOG.md`];
-  if (name === "orchestrate") {
-    paths.push("crates/ork-fast");
+/** The product version at `ref`: `version` in the root package.json. */
+export function productVersionAt(git, ref) {
+  let version;
+  try {
+    version = JSON.parse(fileAt(git, ref, "package.json") ?? "{}").version;
+  } catch {
+    // Reported below, like a missing version.
   }
-  return paths;
-};
+  if (!VERSION.test(version ?? "")) {
+    throw new Error(`package.json: needs an x.y.z version at ${ref}`);
+  }
+  return version;
+}
 
-function recordOrchestrateOutput(releases, env = process.env) {
+export const productTag = (version) => `v${version}`;
+
+/**
+ * The highest published version and its tag across `vX.Y.Z` and each earlier stream's
+ * `<name>--vX.Y.Z`. A tie goes to the new format.
+ */
+export function latestPublished(tags, legacyTags = []) {
+  const prefixes = ["v", ...legacyTags.map((name) => `${name}--v`)];
+  let best = null;
+  for (const tag of tags) {
+    for (const prefix of prefixes) {
+      const version = tag.slice(prefix.length);
+      if (!tag.startsWith(prefix) || !VERSION.test(version)) continue;
+      const order = best ? compareVersions(version, best.version) : 1;
+      if (order > 0 || (order === 0 && prefix === "v")) best = { tag, version };
+    }
+  }
+  return best;
+}
+
+/** Tell the workflow which tag to attach the `ork-fast` binaries to. */
+function recordReleaseOutput(releases, env = process.env) {
   const output = env?.GITHUB_OUTPUT;
   if (!output) return;
-  const match = releases.find(
-    (r) => r.name === "orchestrate" || r.tag?.startsWith("orchestrate--v"),
-  );
+  const match = releases.find((release) => PRODUCT_TAG.test(release.tag ?? ""));
   if (match) {
-    fs.appendFileSync(output, `orchestrate_release_tag=${match.tag}\n`);
+    fs.appendFileSync(output, `release_tag=${match.tag}\n`);
   }
 }
 
@@ -176,75 +203,61 @@ export function planRelease({ root = REPO_ROOT, git = gitIn(root), head } = {}) 
   if (!/^[\da-f]{40}$/u.test(config.since ?? "")) {
     throw new Error("release.json needs `since`: the full SHA releases are counted from");
   }
-  const renames = config.renames ?? {};
-  const tags = git(["tag", "--list", "*--v*"]).split("\n").filter(Boolean);
-  const before = new Map(pluginsAt(git, config.since).map((plugin) => [plugin.name, plugin]));
-  const releases = [];
-
-  for (const plugin of pluginsAt(git, head)) {
-    const formerName = renames[plugin.name];
-    const tag = latestTag(tags, plugin.name) ?? (formerName ? latestTag(tags, formerName) : null);
-    const tagPrefix =
-      tag && formerName && tag.startsWith(`${formerName}--v`)
-        ? `${formerName}--v`
-        : `${plugin.name}--v`;
-    const baseline = tag ? git(["rev-list", "-n", "1", tag]) : config.since;
-    if (isAncestor(git, head, baseline)) continue;
-    if (!isAncestor(git, baseline, head)) {
-      throw new Error(`${plugin.name}: ${tag ?? "release.json"} is not in this branch's history`);
-    }
-    const released = tag
-      ? tag.slice(tagPrefix.length)
-      : (before.get(plugin.name) ?? (formerName ? before.get(formerName) : undefined))?.version;
-    if (released && plugin.version !== released) {
-      throw new Error(
-        `${plugin.name}: version ${plugin.version} was edited by hand; the release job sets it (last release ${released})`,
-      );
-    }
-
-    const paths = [...shippedPaths(plugin.name), ...(formerName ? shippedPaths(formerName) : [])];
-    const isContentChanged =
-      git(["diff", "--quiet", baseline, head, "--", ...paths], { allowFailure: true }) === null;
-    const baselinePlugins = pluginsAt(git, baseline);
-    const entryBefore = (
-      baselinePlugins.find(({ name }) => name === plugin.name) ??
-      (formerName ? baselinePlugins.find(({ name }) => name === formerName) : undefined)
-    )?.entry;
-    const isEntryChanged = JSON.stringify(entryBefore ?? null) !== JSON.stringify(plugin.entry);
-    if (!isContentChanged && !isEntryChanged) continue;
-
-    const log = git([
-      "log",
-      "--no-merges",
-      "--format=%B%x1E",
-      `${baseline}..${head}`,
-      "--",
-      ...paths,
-    ]);
-    const messages = log
-      .split("\u{1E}")
-      .map((message) => message.trim())
-      .filter((message) => message && !message.startsWith(RELEASE_SUBJECT));
-    if (messages.length === 0) messages.push(`chore: update ${plugin.name}`);
-
-    const version = released ? bump(released, incrementFor(messages)) : plugin.version;
-    const changelogPath = `plugins/${plugin.name}/CHANGELOG.md`;
-    const { notes, content } = releaseChangelog(
-      fileAt(git, head, changelogPath),
-      version,
-      messages,
-    );
-    releases.push({
-      changelog: content,
-      changelogPath,
-      name: plugin.name,
-      notes,
-      previous: released ?? null,
-      tag: `${plugin.name}--v${version}`,
-      version,
-    });
+  const tags = git(["tag", "--list", "v*", "*--v*"]).split("\n").filter(Boolean);
+  const published = latestPublished(tags, config.legacyTags ?? []);
+  const baseline = published ? git(["rev-list", "-n", "1", published.tag]) : config.since;
+  if (isAncestor(git, head, baseline)) return { head, releases: [] };
+  if (!isAncestor(git, baseline, head)) {
+    throw new Error(`${published?.tag ?? "release.json"} is not in this branch's history`);
   }
-  return { head, releases };
+  const declared = productVersionAt(git, head);
+  const released = published?.version;
+  if (released && declared !== released) {
+    throw new Error(
+      `package.json: version ${declared} was edited by hand; the release job sets it (last release ${released})`,
+    );
+  }
+
+  const isContentChanged =
+    git(["diff", "--quiet", baseline, head, "--", ...SHIPPED_PATHS], { allowFailure: true }) ===
+    null;
+  if (!isContentChanged) return { head, releases: [] };
+
+  const log = git([
+    "log",
+    "--no-merges",
+    "--format=%B%x1E",
+    `${baseline}..${head}`,
+    "--",
+    ...SHIPPED_PATHS,
+  ]);
+  const messages = log
+    .split("\u{1E}")
+    .map((message) => message.trim())
+    .filter(
+      (message) =>
+        message &&
+        !message.startsWith(RELEASE_SUBJECT) &&
+        !message.startsWith(LEGACY_RELEASE_SUBJECT),
+    );
+  if (messages.length === 0) messages.push("chore: update orkest");
+
+  const version = released ? bump(released, incrementFor(messages)) : declared;
+  const { notes, content } = releaseChangelog(fileAt(git, head, CHANGELOG), version, messages);
+  return {
+    head,
+    releases: [
+      {
+        changelog: content,
+        changelogPath: CHANGELOG,
+        name: "orkest",
+        notes,
+        previous: released ?? null,
+        tag: productTag(version),
+        version,
+      },
+    ],
+  };
 }
 
 // ── writing ────────────────────────────────────────────────────────────────
@@ -253,21 +266,6 @@ function setJsonVersion(file, version) {
   const data = JSON.parse(fs.readFileSync(file, "utf8"));
   data.version = version;
   fs.writeFileSync(file, `${JSON.stringify(data, null, 2)}\n`);
-}
-
-/** The README plugin table's version cell for `name`, whether or not the name is a link. */
-export function setTableVersion(readme, name, version) {
-  let isFound = false;
-  const lines = readme.split("\n").map((line) => {
-    const cells = line.split("|");
-    const isPluginCell = /^\s*\[?`[\w-]+`\]?(?:\([^)]*\))?\s*$/u.test(cells[1] ?? "");
-    if (cells.length < 4 || !cells[1].includes(`\`${name}\``) || !isPluginCell) return line;
-    isFound = true;
-    cells[2] = cells[2].replace(/\S+/u, () => version);
-    return cells.join("|");
-  });
-  if (!isFound) throw new Error(`README.md has no plugin table row for ${name}`);
-  return lines.join("\n");
 }
 
 /** `metadata.version` inside a SKILL.md frontmatter; other text is left alone. */
@@ -285,34 +283,37 @@ export function setFrontmatterVersion(markdown, version) {
   return lines.join("\n") + markdown.slice(end);
 }
 
+/** Every version written down in a checkout: the root package.json and the files that copy it. */
 export function writeRelease(plan, root = REPO_ROOT) {
   const written = new Set();
   const write = (relative, content) => {
     fs.writeFileSync(path.join(root, relative), content);
     written.add(relative);
   };
-  let readme = fs.readFileSync(path.join(root, "README.md"), "utf8");
   for (const release of plan.releases) {
-    const plugin = `plugins/${release.name}`;
-    setJsonVersion(path.join(root, plugin, ".claude-plugin/plugin.json"), release.version);
-    written.add(`${plugin}/.claude-plugin/plugin.json`);
-    if (fs.existsSync(path.join(root, plugin, "package.json"))) {
-      setJsonVersion(path.join(root, plugin, "package.json"), release.version);
-      written.add(`${plugin}/package.json`);
-    }
-    const skillsRoot = path.join(root, plugin, "skills");
-    const skills = fs.existsSync(skillsRoot) ? fs.readdirSync(skillsRoot) : [];
-    for (const skill of skills) {
-      const relative = `${plugin}/skills/${skill}/SKILL.md`;
-      if (!fs.existsSync(path.join(root, relative))) continue;
-      const original = fs.readFileSync(path.join(root, relative), "utf8");
-      const updated = setFrontmatterVersion(original, release.version);
-      if (updated !== original) write(relative, updated);
+    setJsonVersion(path.join(root, "package.json"), release.version);
+    written.add("package.json");
+    const pluginsRoot = path.join(root, "plugins");
+    const plugins = fs.existsSync(pluginsRoot) ? fs.readdirSync(pluginsRoot) : [];
+    for (const plugin of plugins) {
+      // monitor's runtime copy under ~/.local/share/monitor has no root package.json to read.
+      const manifest = `plugins/${plugin}/package.json`;
+      if (fs.existsSync(path.join(root, manifest))) {
+        setJsonVersion(path.join(root, manifest), release.version);
+        written.add(manifest);
+      }
+      const skillsRoot = path.join(pluginsRoot, plugin, "skills");
+      const skills = fs.existsSync(skillsRoot) ? fs.readdirSync(skillsRoot) : [];
+      for (const skill of skills) {
+        const relative = `plugins/${plugin}/skills/${skill}/SKILL.md`;
+        if (!fs.existsSync(path.join(root, relative))) continue;
+        const original = fs.readFileSync(path.join(root, relative), "utf8");
+        const updated = setFrontmatterVersion(original, release.version);
+        if (updated !== original) write(relative, updated);
+      }
     }
     write(release.changelogPath, release.changelog);
-    readme = setTableVersion(readme, release.name, release.version);
   }
-  if (plan.releases.length > 0) write("README.md", readme);
   return [...written].toSorted((left, right) => left.localeCompare(right));
 }
 
@@ -333,7 +334,7 @@ export function checkRelease({
   const git = gitIn(root);
   const plan = planRelease({ root, git });
   if (plan.releases.length === 0) return plan;
-  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "plugin-release-check-"));
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "orkest-release-check-"));
   const worktree = path.join(scratch, "tree");
   git(["worktree", "add", "--detach", "--quiet", worktree, plan.head]);
   try {
@@ -399,7 +400,7 @@ export async function createGitHubReleases(
     const created = await request(api, {
       body: JSON.stringify({
         body: release.notes,
-        name: `${release.name} ${release.version}`,
+        name: `Orkest ${release.version}`,
         tag_name: release.tag,
         target_commitish: commit,
       }),
@@ -429,18 +430,20 @@ function existingReleaseCommit(git, head, remoteHead) {
 
 function releasesIn(git, commit) {
   const tags = git(["tag", "--points-at", commit]).split("\n").filter(Boolean);
-  return tags.map((tag) => {
-    const [name, version] = tag.split("--v", 2);
-    const changelog = fileAt(git, commit, `plugins/${name}/CHANGELOG.md`) ?? "";
-    const section = sections(changelog).find(({ heading }) => heading === version);
-    const notes = section
-      ? changelog
-          .slice(section.at, section.end)
-          .replace(/^## .*\n/u, "")
-          .trim()
-      : "";
-    return { name, notes, tag, version };
-  });
+  return tags
+    .filter((tag) => PRODUCT_TAG.test(tag))
+    .map((tag) => {
+      const version = PRODUCT_TAG.exec(tag)[1];
+      const changelog = fileAt(git, commit, CHANGELOG) ?? "";
+      const section = sections(changelog).find(({ heading }) => heading === version);
+      const notes = section
+        ? changelog
+            .slice(section.at, section.end)
+            .replace(/^## .*\n/u, "")
+            .trim()
+        : "";
+      return { name: "orkest", notes, tag, version };
+    });
 }
 
 export async function publishRelease({
@@ -469,7 +472,7 @@ export async function publishRelease({
     const released = existingReleaseCommit(git, head, remoteHead);
     if (!released) return "The default branch has moved on; the newer run will publish.";
     const existing = releasesIn(git, released);
-    recordOrchestrateOutput(existing, env);
+    recordReleaseOutput(existing, env);
     await createGitHubReleases(existing, released, { ...settings, request });
     return `Already released ${head.slice(0, 7)}; GitHub releases are in place.`;
   }
@@ -516,7 +519,7 @@ export async function publishRelease({
     `${commit}:refs/heads/${settings.branch}`,
     ...plan.releases.map((release) => `refs/tags/${release.tag}`),
   ]);
-  recordOrchestrateOutput(plan.releases, env);
+  recordReleaseOutput(plan.releases, env);
   await createGitHubReleases(plan.releases, commit, { ...settings, request });
   return `Released ${plan.releases.map((release) => release.tag).join(", ")}.`;
 }

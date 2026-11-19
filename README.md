@@ -205,7 +205,7 @@ ork telemetry [--runs-dir <directory>] [--json] [--width 120]
 
 <!-- /generated:commands -->
 
-Slash commands, in any harness that loads the plugin:
+Slash commands, in every installed harness (`install.sh` writes them; Claude Code lists each once, with no namespace):
 
 <!-- generated:slash-commands -->
 
@@ -219,14 +219,14 @@ Slash commands, in any harness that loads the plugin:
 
 <!-- /generated:slash-commands -->
 
-## Plugins
+## Parts
 
-The repository ships two plugins. Their READMEs cover every flag, routing table and setup option:
+Orkest is one product with one version. Two READMEs cover every flag, routing table and setup option:
 
-| Plugin                                         | Version | What it does                                                       |
-| ---------------------------------------------- | ------- | ------------------------------------------------------------------ |
-| [`orchestrate`](plugins/orchestrate/README.md) | 0.93.0  | Coordinator conversations, swarms, delegation and shared work.     |
-| [`monitor`](plugins/monitor/README.md)         | 0.19.4  | Account quota, reset times, credit balances and spending guidance. |
+- [`orchestrate`](plugins/orchestrate/README.md): coordinator conversations, swarms, delegation and
+  shared work.
+- [`monitor`](plugins/monitor/README.md): account quota, reset times, credit balances and spending
+  guidance.
 
 More: [architecture and module map](docs/ARCHITECTURE.md), [Herdr integration](docs/herdr.md),
 [Orca integration](docs/orca.md), [all documentation](docs/README.md).
@@ -247,8 +247,11 @@ cd ~/src/orkest
 
 The installer checks the setup when it finishes and warns if `~/.local/bin` is not on your `PATH`.
 Use `--dry-run` to preview, `--no-app` for the monitor CLI without its macOS app, `--no-monitor` to
-skip monitor, `--no-claude` when using the Claude plugin for its skill, or `--trust-codex-hooks` to
-trust the four reviewed Codex mailbox hooks.
+skip monitor, or `--trust-codex-hooks` to trust the four reviewed Codex mailbox hooks. Claude Code
+gets the same skills, commands and monitor MCP server as every other harness; there is no Claude
+Code plugin. If an earlier plugin install is still present, `ork update` and `ork doctor` print the
+exact `claude plugin uninstall` and `claude plugin marketplace remove orkest` commands; they never
+run them for you.
 
 Orkest runs from this checkout, with no build step. `ork update` (or `/update`) fast-forwards it
 and refreshes the hooks; `ork cleanup status` previews stale worktrees, locks and backups.
@@ -261,8 +264,6 @@ Optional setup:
 - **No prompts for Orkest commands:** `./install.sh --trust-orkest-commands` approves `ork` and
   Orkest's coordination scripts in every installed harness, and keeps them approved on later
   updates. See [what it approves](plugins/orchestrate/README.md#approve-orkest-commands-for-every-agent).
-- **Claude Code plugin** instead of linked skills: see the
-  [orchestrate install options](plugins/orchestrate/README.md#install).
 - **Status footer** outside `ork` launches: see
   [terminal footer setup](plugins/orchestrate/README.md#agent-status-in-terminal-footers).
 - **Herdr:** pane labels, the swarm pane and layout restoration are covered in

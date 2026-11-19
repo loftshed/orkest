@@ -2,6 +2,8 @@
 
 Orkest is a cross-harness multi-agent orchestrator and spare-token software factory across Claude Code, Codex, Antigravity (Gemini), and OpenCode.
 
+It is one product with one version, not a Claude Code plugin. `install.sh` links `ork` and `monitor` onto `PATH`, links the skills into each harness's skills directory, writes the commands, and registers monitor's MCP server; every harness calls `ork`. `ork update` fast-forwards the checkout and reruns that wiring. A leftover plugin install from before the change is reported, with the commands to remove it, and never removed automatically.
+
 ## 1. Command & Subsystem Glossary (Orc Stronghold Vocabulary)
 
 Every Orkest command has a plain-English engineering meaning alongside its `ork` name:

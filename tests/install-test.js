@@ -160,10 +160,10 @@ it("reports missing prerequisites and runs no installers", () =>
 
 it("runs installers in order, passes options, and links ork", () =>
   withFixture(({ home, logLines, runInstall }) => {
-    const result = runInstall(["--no-claude", "--trust-codex-hooks", "--no-app"]);
+    const result = runInstall(["--trust-codex-hooks", "--no-app"]);
     expect(result.status).toBe(0);
     expect(logLines()).toEqual([
-      "orchestrate --no-claude --trust-codex-hooks",
+      "orchestrate --trust-codex-hooks",
       "monitor --no-app",
       "monitor-launcher mcp-install",
       "doctor --check-messaging",

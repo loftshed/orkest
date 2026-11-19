@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import tempfile
 import time
 import tomllib
@@ -156,7 +157,22 @@ def backup(path: Path) -> Path | None:
     return target
 
 
-def write_private(path: Path, text: str, *, expected: str | None = None) -> None:
+def regular_file_bytes(path: Path) -> bytes | None:
+    """Read a regular file without following links or blocking on a FIFO swapped into place."""
+    try:
+        if not stat.S_ISREG(path.lstat().st_mode):
+            raise ValueError(f"not a regular file: {path}")
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        os.close(descriptor)
+        raise ValueError(f"not a regular file: {path}")
+    with os.fdopen(descriptor, "rb") as stream:
+        return stream.read()
+
+
+def write_private(path: Path, text: str, *, expected: str | bytes | None = None, create_only: bool = False) -> None:
     if path.is_symlink():
         raise ValueError("credential-bearing configuration cannot replace a symlink")
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -166,7 +182,13 @@ def write_private(path: Path, text: str, *, expected: str | None = None) -> None
             stream.write(text)
             stream.flush()
             os.fsync(stream.fileno())
-        if expected is not None and (path.read_text() if path.exists() else "{}\n") != expected:
+        if create_only:
+            os.link(temporary, path)
+            return
+        if isinstance(expected, bytes):
+            if regular_file_bytes(path) != expected:
+                raise ValueError(f"file changed concurrently: {path}")
+        elif expected is not None and (path.read_text() if path.exists() else "{}\n") != expected:
             raise ValueError("configuration changed concurrently; rerun repair after the other writer finishes")
         os.replace(temporary, path)
     finally:

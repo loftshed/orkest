@@ -30,14 +30,12 @@ jobs:
       - run: rustup update stable && rustup component add rustfmt clippy
       - run: npm install --global corepack@0.36.0
       - run: corepack pnpm install --frozen-lockfile
-      # Lets the gate run `claude plugin validate`, which works offline.
-      - run: npm install -g @anthropic-ai/claude-code
       - run: ./scripts/check.sh
       # Builds the pending release in a scratch worktree and runs the gate on it.
       - run: node scripts/release.js check
 
   test:
-    # The plugins target macOS (menu bar app, Mac-to-Mac migration).
+    # Orkest targets macOS (menu bar app, Mac-to-Mac migration).
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -81,7 +79,7 @@ jobs:
     permissions:
       contents: write
     outputs:
-      orchestrate_release_tag: ${{ steps.publish.outputs.orchestrate_release_tag }}
+      release_tag: ${{ steps.publish.outputs.release_tag }}
     concurrency:
       group: plugin-release
       cancel-in-progress: false
@@ -99,7 +97,6 @@ jobs:
           enable-cache: false
       - run: npm install --global corepack@0.36.0
       - run: corepack pnpm install --frozen-lockfile
-      - run: npm install -g @anthropic-ai/claude-code
       - id: publish
         run: node scripts/release.js publish
         env:
@@ -110,7 +107,7 @@ jobs:
 
   release-ork-fast:
     needs: [release]
-    if: needs.release.outputs.orchestrate_release_tag != ''
+    if: needs.release.outputs.release_tag != ''
     strategy:
       matrix:
         include:
@@ -128,7 +125,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.release.outputs.orchestrate_release_tag }}
+          ref: ${{ needs.release.outputs.release_tag }}
       - run: rustup update stable && rustup target add ${{ matrix.target }}
       - name: Install cross-compilation toolchain on Linux for aarch64
         if: matrix.target == 'aarch64-unknown-linux-gnu'
@@ -148,13 +145,13 @@ jobs:
       - name: Upload binary asset
         env:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
-          TAG: ${{ needs.release.outputs.orchestrate_release_tag }}
+          TAG: ${{ needs.release.outputs.release_tag }}
         run: |
           gh release upload "$TAG" ork-fast-${{ matrix.target }} --clobber
 
   release-ork-fast-sums:
     needs: [release, release-ork-fast]
-    if: needs.release.outputs.orchestrate_release_tag != ''
+    if: needs.release.outputs.release_tag != ''
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -163,7 +160,7 @@ jobs:
       - name: Generate and upload SHA256SUMS
         env:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
-          TAG: ${{ needs.release.outputs.orchestrate_release_tag }}
+          TAG: ${{ needs.release.outputs.release_tag }}
         run: |
           mkdir -p assets
           cd assets

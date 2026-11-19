@@ -7,6 +7,7 @@ import { editJsonSection } from "./harness-files.mjs";
 
 const NAME = "monitor";
 
+/** A retired `monitor@…` Claude Code plugin still enabled: its cached .mcp.json serves the tools. */
 function pluginEnabled(claudeDir) {
   try {
     const settings = JSON.parse(readFileSync(path.join(claudeDir, "settings.json"), "utf8"));
@@ -42,11 +43,7 @@ function binary(name, override) {
  * installed Codex, agy, Gemini CLI and OpenCode. CLIs with an `mcp add` command are driven through it;
  * OpenCode gets a guarded config-file edit.
  */
-export function registrationPlan(
-  config,
-  launcher,
-  { remove = false, skipClaude = false, home = homedir() } = {},
-) {
+export function registrationPlan(config, launcher, { remove = false, home = homedir() } = {}) {
   const plan = [];
   const cli = (target, bin, args, env = {}) => {
     if (bin) plan.push({ kind: "cli", target, bin, args, env });
@@ -55,11 +52,12 @@ export function registrationPlan(
     plan.push({ kind: "file", target, apply });
   };
 
-  // Claude Code profiles with the monitor plugin enabled get the server from its .mcp.json; registering it
-  // again at user scope would show every tool twice.
+  // Every Claude Code profile gets the server at user scope. Only a profile that still has the retired
+  // monitor plugin enabled is left alone, because registering again would show every tool twice;
+  // `ork update` prints how to uninstall that plugin, and rerunning this then registers the server.
   const seenClaudeDirs = new Set();
   for (const account of config.accounts) {
-    if (account.provider !== "claude" || skipClaude) continue;
+    if (account.provider !== "claude") continue;
     const dir = account.configDir
       ? path.resolve(expandHome(account.configDir))
       : path.join(home, ".claude");
@@ -68,7 +66,7 @@ export function registrationPlan(
     const isDefault = dir === path.join(home, ".claude");
     const target = `Claude Code (${isDefault ? "~/.claude" : dir.replace(home, "~")})`;
     if (!remove && pluginEnabled(dir)) {
-      const note = "provided by the monitor plugin";
+      const note = "provided by the retired monitor plugin; uninstall it, then rerun to register";
       plan.push({ kind: "file", target, note, apply: () => ({ changed: false, note }) });
       continue;
     }
@@ -83,7 +81,7 @@ export function registrationPlan(
   }
   const codexTarget = "Codex (CLI and app)";
   if (!remove && codexPluginEnabled(home)) {
-    const note = "provided by the monitor plugin";
+    const note = "provided by the retired monitor plugin; uninstall it, then rerun to register";
     plan.push({
       kind: "file",
       target: codexTarget,
@@ -136,11 +134,8 @@ function fileStepStatus(target, result, remove) {
   return `✓ ${target}: ${remove ? "removed" : "added"}`;
 }
 
-export async function registerMcp(
-  config,
-  { launcher, dryRun = false, remove = false, skipClaude = false } = {},
-) {
-  const plan = registrationPlan(config, launcher, { remove, skipClaude });
+export async function registerMcp(config, { launcher, dryRun = false, remove = false } = {}) {
+  const plan = registrationPlan(config, launcher, { remove });
   for (const step of plan) {
     if (step.kind === "file") {
       if (dryRun) {

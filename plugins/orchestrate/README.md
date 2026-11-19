@@ -10,21 +10,17 @@ Requires Python 3.11+, Node.js 26.13+ (Active LTS; for `ork` and `horde`), `git`
 
 ## Install
 
-Pick one way for Claude Code to load the skill so it does not appear twice:
-
 ```sh
-# Option A: install all of Orkest and link skills into installed harnesses
 <checkout>/install.sh
-
-# Option B: use the Claude Code plugin for Claude, and link the remaining harnesses
-claude plugin marketplace add <checkout>
-claude plugin install orchestrate@orkest --scope user
-<checkout>/install.sh --no-claude
 ```
 
-The root `install.sh` also installs the `ork` and monitor CLIs, registers monitor's MCP server, and runs the messaging doctor. Use `--dry-run` to preview or `--trust-codex-hooks` to trust the four reviewed Codex mailbox hooks. For orchestrate alone, run `plugins/orchestrate/install.sh`; it points `~/.agents/skills/orchestrate` at the checkout, links detected harnesses, initializes config, installs mailbox hooks, and runs `doctor`. To migrate existing `~/.config/agent-executor` and `~/.cache/agent-executor` directories into `~/.config/orchestrate` and `~/.cache/orchestrate` with compatibility symlinks, run `ork cleanup run --migrate-legacy`.
+Orkest is not a Claude Code plugin. Claude Code gets the same linked skills, `~/.claude*/commands` and monitor MCP server as every other harness, and the commands call `ork` on `PATH`. The root `install.sh` also installs the `ork` and monitor CLIs, registers monitor's MCP server, and runs the messaging doctor. Use `--dry-run` to preview or `--trust-codex-hooks` to trust the four reviewed Codex mailbox hooks. For orchestrate alone, run `plugins/orchestrate/install.sh`; it points `~/.agents/skills/orchestrate` at the checkout, links detected harnesses, initializes config, installs mailbox hooks, and runs `doctor`. To migrate existing `~/.config/agent-executor` and `~/.cache/agent-executor` directories into `~/.config/orchestrate` and `~/.cache/orchestrate` with compatibility symlinks, run `ork cleanup run --migrate-legacy`.
 
 Codex requires one-time approval for command hooks: review them in Codex `/hooks`, or pass `--trust-codex-hooks` to either installer (which trusts only the four reviewed mailbox hook commands).
+
+### Shell wrappers and your own aliases
+
+`ork setup` writes `~/.config/orchestrate/orkest.sh` and sources it from `~/.zshrc` inside a managed block. The wrappers for `codex`, `claude`, `agy` and your monitor account aliases replace a same-named shell alias, so the alias is set aside, not discarded: its plain command line (`alias claude='claude --my-flag'`, `alias codex='FOO=1 codex'`, an alias that names another command) is put back in front of every launch, with or without the footer. An alias that is not a plain command line (pipes, redirects, substitutions) is not replayed. Define an alias before the managed block; one defined after it wins as usual. Setup never edits lines it did not write: an older Orkest block in `~/.zshrc` whose lines were edited stays exactly as written and the managed block is added after it, so delete that block by hand when you no longer need it.
 
 ### Approve Orkest commands for every agent
 
@@ -328,7 +324,7 @@ The hook refuses a heavy run started outside the gate and suggests the focused a
   ```
 
 - **Missing MCP registration or untrusted hooks:** Run `python3 <scripts>/run_agent.py doctor --check-messaging`. Repair with `python3 <scripts>/run_agent.py doctor --repair-messaging` (add `--trust-codex-hooks` after reviewing the four Codex mailbox hooks).
-- **Duplicate `orchestrate` skill in Claude Code:** If `orchestrate@orkest` is installed as a Claude Code plugin and `~/.claude/skills/orchestrate` is also linked, run `<checkout>/plugins/orchestrate/uninstall.sh` followed by `<checkout>/plugins/orchestrate/install.sh --no-claude`.
+- **Duplicate commands or skills in Claude Code (`orchestrate:chief` next to `chief`):** A retired `orchestrate@orkest` or `monitor@orkest` plugin install is still present. `ork doctor` lists it, and `ork update` prints the removal commands: `claude plugin uninstall orchestrate@orkest`, `claude plugin uninstall monitor@orkest` and `claude plugin marketplace remove orkest` (prefix each with `CLAUDE_CONFIG_DIR=<profile>` for a non-default profile). Orkest never runs them itself. The old `orchestrate--vX.Y.Z` and `monitor--vX.Y.Z` release tags still resolve.
 - **Claude Code holds a "peer mailbox notification" (`Held peer message … did not attest its permission mode`):** Claude Code holds cross-session messages that do not declare a permission mode while a session bypasses permission prompts, and Orkest's wake-up nudge is one of them. The mail itself is unaffected; only the "check your inbox" nudge waits. Approve the held message, or set `"crossSessionInbound": "accept"` in `~/.claude/settings.json` to deliver them without asking. That applies to every cross-session message in every session; `"hold"` restores the prompt.
 - **Automatic handoff never starts in Claude Code:** It needs the `StopFailure` mailbox hook, which older installs lack. `run_agent.py doctor --check-messaging` reports it missing; `--repair-messaging` adds it. `handoff.py status` lists what was recorded.
 - **Exit 15, 18, or 19 (quota or credits):** Exit 15 means the target quota pool is blocked; exit 18 means the pool is on paid credits at launch; exit 19 (`stopped_credits`) means a Codex run began spending credits mid-run and was stopped with partial work preserved. Check `run_agent.py quota` and pass `--allow-credits` only when the user explicitly authorizes credit spend.

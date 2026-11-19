@@ -14,12 +14,8 @@ tools=./node_modules/.bin
 status=0
 step() { "$@" || status=1; }
 
-step node scripts/validate-marketplace.js
+step node scripts/validate.js
 step node scripts/readme.js --check
-if command -v claude > /dev/null 2>&1; then
-  # Quiet on success, full report on failure.
-  claude plugin validate . > /dev/null 2>&1 || step claude plugin validate .
-fi
 step "$tools/eslint" .
 step "$tools/prettier" --check --log-level warn .
 "$tools/markdownlint-cli2" > /dev/null 2>&1 || step "$tools/markdownlint-cli2"

@@ -38,18 +38,6 @@
       }
     ]
   },
-  "enabledPlugins": {
-    "monitor@orkest": true,
-    "orchestrate@orkest": true
-  },
-  "extraKnownMarketplaces": {
-    "orkest": {
-      "source": {
-        "source": "directory",
-        "path": "."
-      }
-    }
-  },
   "skillOverrides": {
     "herdr": "on",
     "monitor": "on",

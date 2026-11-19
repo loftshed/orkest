@@ -2723,8 +2723,9 @@ if __name__ == "__main__":
 
 
 class RunnerVersionTests(unittest.TestCase):
-    def test_version_is_the_released_plugin_version(self) -> None:
-        manifest = json.loads((SKILL_DIR.parents[1] / ".claude-plugin" / "plugin.json").read_text())
+    def test_version_is_the_released_product_version(self) -> None:
+        manifest = json.loads((SKILL_DIR.parents[3] / "package.json").read_text())
+        self.assertEqual(manifest["name"], "orkest")
         self.assertEqual(RUNNER.RUNNER_VERSION, manifest["version"])
 
     def test_only_metadata_version_counts(self) -> None:

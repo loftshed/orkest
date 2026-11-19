@@ -45,6 +45,27 @@ afterEach(async () => {
 });
 
 describe("Orkest auto-update (update.mjs)", () => {
+  it("prints the precise removal command during a manual update in an existing profile", async () => {
+    const home = await makeTempDir();
+    const directory = path.join(home, ".claude", "plugins");
+    await mkdir(directory, { recursive: true });
+    const market = path.join(directory, "known_marketplaces.json");
+    const before = JSON.stringify({ orkest: {} });
+    await writeFile(market, before);
+    let printed = "";
+    await runUpdateCli([], {
+      env: { HOME: home, PATH: process.env.PATH },
+      stdout: {
+        write: (text) => {
+          printed += text;
+        },
+      },
+      updateFn: async () => ({ ok: true, status: "up_to_date", branch: "main" }),
+    });
+    expect(printed).toContain("claude plugin marketplace remove orkest");
+    expect(await readFile(market, "utf8")).toBe(before);
+  });
+
   it("prints help and rejects unknown arguments before calling update, config, state, or exec functions", async () => {
     const configDir = await makeTempDir();
     const cacheDir = await makeTempDir();

@@ -10,8 +10,7 @@
 # ~/.agents/skills/orchestrate points at this checkout; each harness's skills directory points at the
 # hub, so moving the checkout means re-running
 # this script once. A real directory where a link belongs (an old hand-copied install) is moved to
-# ~/.local/share/orchestrate/backups, never deleted. Harnesses that load skills from a Claude plugin
-# instead can skip the links with --no-claude.
+# ~/.local/share/orchestrate/backups, never deleted.
 set -eu
 
 repo="$(cd "$(dirname "$0")" && pwd -P)"
@@ -20,13 +19,11 @@ hub="$HOME/.agents/skills/orchestrate"
 legacy_hub="$HOME/.agents/skills/agent-executor"
 backups="${XDG_DATA_HOME:-$HOME/.local/share}/orchestrate/backups"
 dry_run=0
-with_claude=1
 trust_hooks=0
 approval=
 for arg in "$@"; do
   case "$arg" in
     --dry-run) dry_run=1 ;;
-    --no-claude) with_claude=0 ;;
     --trust-codex-hooks) trust_hooks=1 ;;
     --trust-orkest-commands|--untrust-orkest-commands)
       [ -z "$approval" ] || [ "$approval" = "$arg" ] || { echo "choose one of --trust-orkest-commands or --untrust-orkest-commands" >&2; exit 2; }
@@ -82,40 +79,30 @@ retire_legacy_skills() {
     "$HOME/.gemini/config/skills/agent-executor" \
     "$HOME/.gemini/antigravity/skills/agent-executor" \
     "${XDG_DATA_HOME:-$HOME/.local/share}/agent-executor"; do
-    case "$place" in
-      "$HOME/.claude/skills/"*|"$HOME/.claude-personal/skills/"*) [ "$with_claude" = 1 ] || continue ;;
-    esac
     retire_legacy "$place"
   done
-  if [ "$with_claude" = 1 ]; then
-    for claude_dir in "$HOME"/.claude-*; do
-      [ -d "$claude_dir" ] || continue
-      retire_legacy "$claude_dir/skills/agent-executor"
-    done
-  fi
+  for claude_dir in "$HOME"/.claude-*; do
+    [ -d "$claude_dir" ] || continue
+    retire_legacy "$claude_dir/skills/agent-executor"
+  done
 }
 
 link "$skill" "$hub"
 
 # Harness skill directories, linked only when that harness is installed (its config dir exists).
 for entry in \
-  "$HOME/.claude:skills:claude" \
-  "$HOME/.codex:skills:codex" \
-  "$HOME/.config/opencode:skills:opencode" \
-  "$HOME/.gemini/config:skills:gemini" \
-  "$HOME/.gemini/antigravity:skills:gemini"; do
-  base="${entry%%:*}" rest="${entry#*:}"
-  sub="${rest%%:*}" kind="${rest#*:}"
-  [ -d "$base" ] || continue
-  if [ "$kind" = claude ] && [ "$with_claude" = 0 ]; then continue; fi
-  link "$hub" "$base/$sub/orchestrate"
+  "$HOME/.claude" \
+  "$HOME/.codex" \
+  "$HOME/.config/opencode" \
+  "$HOME/.gemini/config" \
+  "$HOME/.gemini/antigravity"; do
+  [ -d "$entry" ] || continue
+  link "$hub" "$entry/skills/orchestrate"
 done
-if [ "$with_claude" = 1 ]; then
-  for claude_dir in "$HOME"/.claude-*; do
-    [ -d "$claude_dir" ] || continue
-    link "$hub" "$claude_dir/skills/orchestrate"
-  done
-fi
+for claude_dir in "$HOME"/.claude-*; do
+  [ -d "$claude_dir" ] || continue
+  link "$hub" "$claude_dir/skills/orchestrate"
+done
 
 set --
 [ "$trust_hooks" = 0 ] || set -- --trust-codex-hooks

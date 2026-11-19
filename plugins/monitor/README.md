@@ -105,27 +105,19 @@ Pools are the independently limited groups inside an account: Antigravity's Gemi
 
 ## Install
 
-Part of the private [orkest](../../README.md) marketplace. Requires Node 22+ and the CLIs of the providers you use. Nothing is installed from npm.
+Part of [Orkest](../../README.md). Requires Node 22+ and the CLIs of the providers you use. Nothing is installed from npm.
 
-From the repository root, `./install.sh` installs Orkest, the monitor CLI, and its MCP server. Use `--no-app` for the CLI without the macOS menu bar app or `--no-monitor` to skip monitor. The marketplace is added from the local path, so plugin installs follow the checkout without a push.
+From the repository root, `./install.sh` installs Orkest, the monitor CLI, and its MCP server. Use `--no-app` for the CLI without the macOS menu bar app or `--no-monitor` to skip monitor.
 
 ```sh
 gh repo clone loftshed/orkest ~/Documents/personal/orkest
 cd ~/Documents/personal/orkest
 ./install.sh
-
-# Plugin (MCP server + skill) in each Claude Code profile: once plain, once with CLAUDE_CONFIG_DIR=~/.claude-personal
-claude plugin marketplace add ~/Documents/personal/orkest
-claude plugin install monitor@orkest --scope user
-
-# Plugin (skill) in Codex
-codex plugin marketplace add ~/Documents/personal/orkest
-codex plugin add monitor@orkest
 ```
 
-The root installer runs `monitor mcp-install` for you. The monitor skill tells agents when to check quota and how to act on it. Claude Code and Codex get it from the plugin, Gemini CLI reads `~/.agents/skills`, and agy and OpenCode get links to that directory. agy can import Claude plugins but leaves `${CLAUDE_PLUGIN_ROOT}` unexpanded, so it uses the link and `mcp-install` instead. For a standalone monitor install, run `plugins/monitor/install.sh` and then `monitor mcp-install`.
+The root installer runs `monitor mcp-install` for you. The monitor skill tells agents when to check quota and how to act on it. `~/.agents/skills/monitor` is the hub (Gemini CLI reads it directly), and each Claude Code profile, Codex, agy and OpenCode get a link to it. There is no Claude Code or Codex plugin; a leftover `monitor@orkest` plugin is reported by `ork update`. For a standalone monitor install, run `plugins/monitor/install.sh` and then `monitor mcp-install`.
 
-`mcp-install` registers the server in Codex (CLI and desktop app share a config), agy, Gemini CLI and OpenCode (an orchestrate engine), plus any Claude Code profile without the plugin enabled (profiles with it are skipped so tools do not appear twice). Harnesses with an `mcp add` command are driven through it; OpenCode gets a config-file edit that backs the file up to `<file>.bak-monitor` and re-parses the result. It is safe to re-run. For a standalone monitor install, `plugins/monitor/install.sh --mcp` does the same including Claude Code.
+`mcp-install` registers the server in Codex (CLI and desktop app share a config), agy, Gemini CLI and OpenCode (an orchestrate engine), plus every Claude Code profile in the monitor config (one with the retired `monitor@orkest` plugin still enabled is left alone so tools do not appear twice, with a note to uninstall it and rerun). Harnesses with an `mcp add` command are driven through it; OpenCode gets a config-file edit that backs the file up to `<file>.bak-monitor` and re-parses the result. It is safe to re-run. For a standalone monitor install, `plugins/monitor/install.sh --mcp` does the same.
 
 Gemini CLI disables every MCP server in folders it does not trust.
 
