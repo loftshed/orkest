@@ -1624,14 +1624,19 @@ export async function sideCommand(argv = [], context = {}) {
   return payload;
 }
 
+export async function runSideCli(argv, context = {}) {
+  const result = await sideCommand(argv, context);
+  if (argv.includes("--json")) {
+    (context.stdout ?? process.stdout).write(`${JSON.stringify(result, null, 2)}\n`);
+  }
+  return result;
+}
+
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
   const cliArgs = process.argv.slice(2);
   const wantsJson = cliArgs.includes("--json");
   try {
-    const result = await sideCommand(cliArgs);
-    if (wantsJson) {
-      process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
-    }
+    await runSideCli(cliArgs);
   } catch (error) {
     if (wantsJson) {
       process.stdout.write(
