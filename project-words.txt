@@ -92,3 +92,4 @@ wxyz
 SETLKW
 UNLCK
 WRLCK
+gmtime
