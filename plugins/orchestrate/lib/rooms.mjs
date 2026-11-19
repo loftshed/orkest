@@ -1307,9 +1307,15 @@ export async function dispatchMember(id, memberId, options = {}) {
   try {
     if (targetMember?.worktree?.path && resolvedMemberCwd === currentMemberCwd) {
       const env = options.env ?? process.env;
+      let repoRoot;
+      try {
+        repoRoot = resolveRepositoryRoot(targetMember.worktree.parentCwd || room.cwd);
+      } catch {
+        // Older bindings can still launch after their original parent checkout has moved.
+      }
       const ports = worktreePortEnv({
         env,
-        repoRoot: resolveRepositoryRoot(targetMember.worktree.parentCwd || room.cwd),
+        repoRoot,
         worktreePath: resolvedMemberCwd,
       });
       result = await run(args, { env: { ...env, ...ports } });
