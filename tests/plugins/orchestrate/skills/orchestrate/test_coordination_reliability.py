@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import datetime as dt
+import fcntl
 import json
 import os
 import socket
@@ -141,35 +143,37 @@ class LockIdentityTests(Scratch):
     def test_a_waiter_on_an_unlinked_lock_moves_to_the_inode_at_the_path(self):
         path = self.base / "peers" / "peer.json"
         lock = path.with_suffix(".lock")
-        holder_entered = threading.Event()
+        attempting = threading.Event()
+        acquired = threading.Event()
         release = threading.Event()
-        observed = {}
+        flock = fcntl.flock
 
-        def holder():
-            with mailbox.locked(path):
-                holder_entered.set()
-                release.wait(5)
+        def announce_attempt(fd, operation):
+            attempting.set()  # the waiter's descriptor already points to the original lock
+            return flock(fd, operation)
 
         def waiter():
             with mailbox.locked(path):
-                observed["inode"] = os.stat(lock).st_ino
-                observed["entered"] = time.monotonic()
+                acquired.set()
+                release.wait(5)
 
-        first = threading.Thread(target=holder)
-        first.start()
-        self.assertTrue(holder_entered.wait(5))
-        orphan = os.stat(lock).st_ino
-        second = threading.Thread(target=waiter)
-        second.start()
-        time.sleep(0.1)
-        lock.unlink()  # a pruner removing the idle-looking file while the waiter blocks on its inode
-        release.set()
-        first.join(5)
-        second.join(5)
-        self.assertIn("inode", observed)
-        self.assertTrue(lock.exists())
-        self.assertEqual(observed["inode"], os.stat(lock).st_ino)
-        self.assertNotEqual(observed["inode"], orphan)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            with mailbox.locked(path):
+                with mock.patch.object(fcntl, "flock", announce_attempt):
+                    future = executor.submit(waiter)
+                    self.assertTrue(attempting.wait(5))
+                lock.unlink()
+                lock.touch()  # another caller can now open this replacement at the same path
+            try:
+                self.assertTrue(acquired.wait(5))
+                with lock.open("rb") as contender:
+                    with self.assertRaises(BlockingIOError):
+                        flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    release.set()
+                    future.result(timeout=5)
+                    flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                release.set()
 
     def test_stale_lock_reaping_cannot_remove_a_held_lock_and_acquisition_touches_it(self):
         path = self.base / "peers" / "peer.json"
