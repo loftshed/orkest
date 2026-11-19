@@ -22,9 +22,17 @@ import base64, errno, fcntl, hashlib, json, os, re, sys, time, uuid
 DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
 NOFOLLOW_RDONLY = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
 NOFOLLOW_EXCL_WR = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-LOCK_FLAGS = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+LOCK_FLAGS = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
 TX_ID_RE = re.compile(r"^[A-Za-z0-9-]+$")
 TX_JOURNAL_RE = re.compile(r"^integrate-tx-([A-Za-z0-9-]+)\.json$")
+
+
+def open_lock(dir_fd, name):
+    # Darwin openat(O_CREAT) can report ENOENT when two workers create the same lock.
+    try:
+        return os.open(name, LOCK_FLAGS | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=dir_fd)
+    except FileExistsError:
+        return os.open(name, LOCK_FLAGS, dir_fd=dir_fd)
 
 
 def validated_tx_filename(tx_name=None, integration_id=None):
@@ -53,7 +61,7 @@ if (st.st_dev, st.st_ino) != (expected_dev, expected_ino):
     sys.stderr.write("Worktree Git metadata directory identity changed\n")
     sys.exit(12)
 
-lock_fd = os.open("orkest.integrate.lock", LOCK_FLAGS, 0o600, dir_fd=git_dir_fd)
+lock_fd = open_lock(git_dir_fd, "orkest.integrate.lock")
 try:
     fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 except BlockingIOError:
@@ -227,7 +235,7 @@ def handle_op(req):
         task_dir = req["task_dir"]
         task_dir_fd = os.open(task_dir, DIR_FLAGS)
         try:
-            task_lock_fd = os.open("task.json.lock", LOCK_FLAGS, 0o600, dir_fd=task_dir_fd)
+            task_lock_fd = open_lock(task_dir_fd, "task.json.lock")
         finally:
             os.close(task_dir_fd)
         deadline = time.monotonic() + 30.0
