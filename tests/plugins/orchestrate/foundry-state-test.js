@@ -15,6 +15,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
 import { setTimeout as sleep } from "node:timers/promises";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -125,6 +126,15 @@ describe("strict Foundry state with retained fixtures", () => {
     expect(() => readFoundryState(f.root)).toThrow(FoundryStateError);
   });
 
+  it("round trips state larger than a synchronous child-process output buffer", () => {
+    const f = fixture();
+    for (const size of [200_000, 850_000, 1_200_000]) {
+      const payload = "x".repeat(size);
+      const saved = writeFoundryState(f.root, { payload });
+      expect(readFoundryState(f.root)).toEqual(saved);
+    }
+  });
+
   it.each([
     ["corrupt", Buffer.from([255, 0, 123])],
     ["corrupt", Buffer.concat([Buffer.from('{"note":"'), Buffer.from([255]), Buffer.from('"}')])],
@@ -233,7 +243,7 @@ describe("strict Foundry state with retained fixtures", () => {
   });
 
   it("a concurrent real reader observes only complete atomic states", async ({ signal }) => {
-    // Every generation is a real writeFoundryState call (one Python subprocess each), so the wall
+    // Every writeFoundryState call reads and writes through Python, so the wall
     // budget is explicit and failures name the phase that stalled instead of timing out silently.
     const generations = 100;
     const gate = 50;
@@ -247,6 +257,11 @@ describe("strict Foundry state with retained fixtures", () => {
       [f.root, String(generations), String(gate), String(budgetMs / 2)],
       {
         detached: true,
+        env: {
+          ...process.env,
+          ORK_FOUNDRY_TEST_TRACE: f.root,
+          PYTHONPATH: fileURLToPath(new URL("../../helpers/foundry-trace", import.meta.url)),
+        },
         execArgv: [],
         stdio: ["ignore", "ignore", "inherit", "ipc"],
       },
@@ -291,11 +306,17 @@ describe("strict Foundry state with retained fixtures", () => {
       }
       return cachedSample;
     };
+    const pythonTrace = () =>
+      ["read_state", "write_state"].flatMap((op) => {
+        const file = path.join(f.root, `${op}.trace`);
+        const stack = existsSync(file) ? readFileSync(file, "utf8").trim() : "";
+        return stack ? [`${op}: ${stack}`] : [];
+      });
     const diagnostics = (why) =>
       `${why} after ${elapsed()}ms (budget ${budgetMs}ms): writer pid=${writer.pid} ` +
       `exit=${writer.exitCode}/${writer.signalCode}; reader reads=${reads} highestObserved=${highestObserved}; ` +
       `last writer phase=${JSON.stringify(last)}; recent phases=${JSON.stringify(phases)}; ` +
-      `process sample [pid ppid pgid stat etime cputime command]=${JSON.stringify(sampleProcesses())}`;
+      `process sample [pid ppid pgid stat etime cputime command]=${JSON.stringify(sampleProcesses())}; Python stacks: ${pythonTrace().join("\n")}`;
     // Each write synchronously invokes Python. End the private POSIX process group together.
     const stopWriter = () => {
       if (signal.aborted) sampleProcesses();
@@ -331,11 +352,9 @@ describe("strict Foundry state with retained fixtures", () => {
       }
       const code = await closed;
       if (childError) throw childError;
-      expect(code, diagnostics("writer did not exit cleanly")).toBe(0);
-      expect(
-        hasObservedIntermediate,
-        diagnostics("reader never saw an intermediate generation"),
-      ).toBe(true);
+      if (code !== 0) throw new Error(diagnostics(`writer exited with code ${code}`));
+      if (!hasObservedIntermediate)
+        throw new Error(diagnostics("reader never saw an intermediate generation"));
       expect(JSON.parse(readFileSync(f.file, "utf8"))).toMatchObject({
         generation: generations,
         payload: String(generations).repeat(100_000),

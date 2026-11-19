@@ -18,9 +18,11 @@ import {
   openSync,
   readFileSync,
   realpathSync,
+  unlinkSync,
+  writeFileSync,
 } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { homedir, hostname } from "node:os";
+import { homedir, hostname, tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs, promisify } from "node:util";
@@ -1102,7 +1104,7 @@ function resolveValidatedFoundryTarget(worktreePath, options = {}) {
 }
 
 const FOUNDRY_DIRFD_PY = String.raw`
-import base64, errno, hashlib, json, os, stat, sys, uuid
+import hashlib, json, os, stat, sys, uuid
 
 DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
 NOFOLLOW_RDONLY = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
@@ -1165,8 +1167,8 @@ def open_pinned_dir(base_dir, expected_dev, expected_ino, rel_parts=None, create
                 pass
         raise
 
-req = json.loads(sys.stdin.read())
-op = req["op"]
+op = sys.argv[1]
+req = json.loads(sys.argv[2])
 base_dir = req["base_dir"]
 expected_dev = int(req["expected_dev"])
 expected_ino = int(req["expected_ino"])
@@ -1201,9 +1203,14 @@ try:
             raw = read_all_fd(fd)
         finally:
             os.close(fd)
-        sys.stdout.write(json.dumps({"ok": True, "missing": False, "b64": base64.b64encode(raw).decode("ascii")}) + "\n")
+        with os.fdopen(3, "wb") as transfer:
+            transfer.write(raw)
+            transfer.seek(0)
+        sys.stdout.write(json.dumps({"ok": True, "missing": False}) + "\n")
     elif op == "write_state":
-        payload = base64.b64decode(req["b64"])
+        with os.fdopen(3, "rb") as transfer:
+            transfer.seek(0)
+            payload = transfer.read()
         exclusive = bool(req.get("exclusive"))
         tmp_name = f".{filename}.tmp-{uuid.uuid4().hex}"
         tmp_fd = os.open(tmp_name, NOFOLLOW_EXCL_WR, 0o600, dir_fd=dir_fd)
@@ -1309,21 +1316,32 @@ function pinExistingAncestorDir(targetDir, pinnedTarget = null) {
   return pinDirHandle(cursor, relParts);
 }
 
-function runFoundryDirFdOp(targetDir, payload, pinnedTarget = null) {
+function runFoundryDirFdOp(targetDir, { op, bytes, ...metadata }, pinnedTarget = null) {
   const pinned = pinExistingAncestorDir(targetDir, pinnedTarget);
+  const request = JSON.stringify({
+    ...metadata,
+    base_dir: pinned.baseDir,
+    expected_dev: pinned.expectedDev,
+    expected_ino: pinned.expectedIno,
+    rel_parts: pinned.relParts,
+  });
+  let transferFd;
   try {
-    const out = execFileSync("python3", ["-B", "-c", FOUNDRY_DIRFD_PY], {
-      input: JSON.stringify({
-        ...payload,
-        base_dir: pinned.baseDir,
-        expected_dev: pinned.expectedDev,
-        expected_ino: pinned.expectedIno,
-        rel_parts: pinned.relParts,
-      }),
+    if (op === "write_state" || op === "read_state") {
+      // Bulk state travels over an inherited regular file. Unlink our empty file before
+      // writing any bytes so it has no pathname and both processes can close it safely.
+      const spool = path.join(tmpdir(), `orkest-foundry-${randomUUID()}`);
+      transferFd = openSync(spool, "wx+", 0o600);
+      unlinkSync(spool);
+      if (bytes) writeFileSync(transferFd, bytes);
+    }
+    const out = execFileSync("python3", ["-B", "-c", FOUNDRY_DIRFD_PY, op, request], {
       encoding: "utf8",
-      stdio: ["pipe", "pipe", "pipe"],
+      stdio: ["ignore", "pipe", "pipe", transferFd ?? "ignore"],
     });
-    return JSON.parse(out);
+    const result = JSON.parse(out);
+    if (op === "read_state" && !result.missing) result.bytes = readFileSync(transferFd);
+    return result;
   } catch (error) {
     const stderr = String(error.stderr || error.message || "").trim();
     const errnoMatch = /^ERRNO:(\d+):(.*)$/mu.exec(stderr);
@@ -1351,6 +1369,8 @@ function runFoundryDirFdOp(targetDir, payload, pinnedTarget = null) {
       throw fsErr;
     }
     throw new Error(stderr || "Foundry dir_fd operation failed", { cause: error });
+  } finally {
+    if (transferFd !== undefined) closeSync(transferFd);
   }
 }
 
@@ -1398,7 +1418,7 @@ export function loadFoundryState(worktreePath, options = {}) {
       target.pinnedTarget,
     );
     if (readRes.missing) return result;
-    bytes = Buffer.from(readRes.b64, "base64");
+    bytes = readRes.bytes;
   } catch (error) {
     if (error.code === "ENOENT") return result;
     return { ...result, kind: "corrupt", error: error.message };
@@ -1461,7 +1481,7 @@ export function writeFoundryState(worktreePath, statePatch = {}, options = {}) {
     {
       op: "write_state",
       filename: path.basename(statePath),
-      b64: payload.toString("base64"),
+      bytes: payload,
       exclusive: Boolean(options.exclusive),
     },
     target.pinnedTarget,
