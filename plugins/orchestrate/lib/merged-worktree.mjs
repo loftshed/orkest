@@ -25,8 +25,8 @@ import path from "node:path";
 
 import { foundryLauncherAlive, loadFoundryState, writeFoundryState } from "./foundry.mjs";
 import { cacheHome } from "./runtime-paths.mjs";
-import * as worktreePorts from "./worktree-ports.mjs";
 import { acquireWorkspaceLease, assertWorkspaceLease } from "./workspace-lease.mjs";
+import * as worktreePorts from "./worktree-ports.mjs";
 
 export const STRATEGIES = Object.freeze(["local", "pr"]);
 export const PR_STATES = Object.freeze(["OPEN", "MERGED", "CLOSED", "UNKNOWN"]);
