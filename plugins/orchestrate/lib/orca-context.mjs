@@ -58,11 +58,39 @@ function isExecutable(file) {
   }
 }
 
-/** The absolute path of an executable on `env.PATH`, or null. */
+/**
+ * A derived PATH for `env`: every explicit entry in its original order, then `~/.local/bin`,
+ * `/opt/homebrew/bin` and `/usr/local/bin` when they are not already there. Orca hands plugin
+ * workers a reduced PATH that often lacks these. Pure: it never touches `process.env`.
+ */
+export function enrichedPath(env = process.env) {
+  const explicit = String(env?.PATH || "");
+  const entries = explicit === "" ? [] : explicit.split(path.delimiter);
+  const home = text(env?.HOME) || homedir();
+  const present = new Set(entries);
+  const extra = [];
+  for (const directory of [
+    home && path.join(home, ".local/bin"),
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+  ]) {
+    if (!directory || present.has(directory)) continue;
+    present.add(directory);
+    extra.push(directory);
+  }
+  return [...entries, ...extra].join(path.delimiter);
+}
+
+/** `env` with the enriched PATH, for spawning children; `env` itself is left as it was. */
+export function enrichedEnv(env = process.env) {
+  return { ...env, PATH: enrichedPath(env) };
+}
+
+/** The absolute path of an executable on the enriched `env.PATH`, or null. */
 export function findExecutable(name, env = process.env, { exists = isExecutable } = {}) {
   if (!name) return null;
   if (name.includes("/") || name.includes("\\")) return exists(name) ? name : null;
-  const directories = String(env.PATH || "").split(path.delimiter);
+  const directories = enrichedPath(env).split(path.delimiter);
   for (const directory of directories) {
     if (!directory) continue;
     const candidate = path.join(directory, name);
@@ -220,7 +248,7 @@ export async function closeOrcaCompanionPane(
       exec(
         cli,
         ["terminal", "close", "--terminal", terminalId, "--json"],
-        { env, timeout: 5000 },
+        { env: enrichedEnv(env), timeout: 5000 },
         () => resolve(),
       );
     });

@@ -1824,6 +1824,7 @@ mod tests {
         fs::create_dir_all(&cwd).unwrap();
         let cwd_str = cwd.to_string_lossy().into_owned();
         let mut env = EnvGuard::new();
+        env.remove("ORKEST_RESUME_SWARM");
         env.set("ORKEST_TEST_MODE", "1");
         env.set("ORKEST_TEST_HARNESS_PID", std::process::id().to_string());
         env.set("ORCHESTRATE_HOME", &cache_dir);

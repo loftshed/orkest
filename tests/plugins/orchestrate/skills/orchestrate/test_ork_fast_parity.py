@@ -9,6 +9,7 @@ import os
 import socket
 import socketserver
 import sqlite3
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -29,6 +30,7 @@ if str(SCRIPTS) not in sys.path:
 
 import _ork_fast_test_helpers as ORK_FAST  # noqa: E402
 import handoff  # noqa: E402 -- exercise shipped Chief liveness parity
+import herdr_status  # noqa: E402 -- compare the reference status command with a controlled clock
 import install_mailbox  # noqa: E402 -- exercise the shipped installer
 import mailbox_store  # noqa: E402 -- exercise shipped process birth helper
 import mailbox_wake  # noqa: E402 -- exercise exact wake notice formatting
@@ -1317,6 +1319,591 @@ class TestOrkFastIntegration(unittest.TestCase):
             self.assertLess(fast_ms, 25.0, f"{label}: ork-fast ({fast_ms:.2f}ms) exceeded 25ms ceiling")
 
         print("\nBenchmark 15-iter medians: " + ", ".join(parts))
+
+
+UUID_SESSION = "019a5da8-4321-5678-9abc-123456789012"
+FAKE_HERDR = """#!/bin/sh
+[ -n "$FAKE_HERDR_LOG" ] && echo "$@" >> "$FAKE_HERDR_LOG"
+[ -n "$FAKE_HERDR_DELAY" ] && sleep "$FAKE_HERDR_DELAY"
+[ "$1 $2" = "pane current" ] || exit 2
+[ "$3" = "--pane" ] || exit 2
+cat "$FAKE_HERDR_PANE"
+"""
+
+
+class TestHerdrStatusParity(unittest.TestCase):
+    """`ork-fast herdr-status` must match scripts/herdr_status.py byte for byte, with exit zero."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.binary = ORK_FAST.find_ork_fast_bin()
+        cls.python_script = SCRIPTS / "herdr_status.py"
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        self.home = self.root / "home"
+        self.home.mkdir()
+        self.checkout = self.root / "repo"
+        self.checkout.mkdir()
+        self.socket = self.root / "herdr" / "herdr.sock"
+        self.socket.parent.mkdir()
+        self.socket.touch()
+        self.herdr = self.root / "bin" / "herdr"
+        self.herdr.parent.mkdir()
+        self.herdr.write_text(FAKE_HERDR)
+        self.herdr.chmod(0o755)
+        self.pane_file = self.root / "pane.json"
+        self.base = self.base_for(self.home)
+        for sub in ("peers", "progress", "rooms"):
+            (self.base / sub).mkdir(parents=True)
+        self.env = self.make_env(self.home)
+        self.set_pane({"pane_id": "w1:p1", "agent": "claude", "agent_session": self.ref("claude", "sess-a")})
+
+    # -- fixtures ---------------------------------------------------------------------------------
+
+    @staticmethod
+    def base_for(home: Path) -> Path:
+        return home / ".config/orchestrate/mailbox-v1"
+
+    def make_env(self, home: Path, **extra) -> dict[str, str]:
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith(("HERDR_", "ORKEST_SWARM", "ORK_GLYPHS", "FAKE_HERDR"))
+        }
+        env.update(
+            HOME=str(home),
+            XDG_CACHE_HOME=str(home / ".cache"),
+            XDG_CONFIG_HOME=str(home / ".config"),
+            ORCHESTRATE_HOME=str(home / ".config/orchestrate"),
+            ORKEST_SCRIPTS_DIR=str(SCRIPTS),
+            ORKEST_PLUGIN_ROOT=str(REPO_ROOT / "plugins/orchestrate"),
+            ORKEST_TEST_MODE="1",
+            ORKEST_TEST_HARNESS_PID=str(os.getpid()),
+            HERDR_ACTIVE_PANE_ID="w1:p1",
+            HERDR_BIN_PATH=str(self.herdr),
+            HERDR_SOCKET_PATH=str(self.socket),
+            FAKE_HERDR_PANE=str(self.pane_file),
+            ORK_GLYPHS="ascii",
+        )
+        env.pop("AGENT_EXECUTOR_HOME", None)
+        env.pop("PYTHONPATH", None)
+        env.update(extra)
+        return env
+
+    @staticmethod
+    def ref(agent: str, value: str) -> dict:
+        return {"kind": "id", "agent": agent, "value": value}
+
+    def set_pane(self, pane, *, raw: str | None = None):
+        self.pane_file.write_text(raw if raw is not None else json.dumps({"result": {"pane": pane}}))
+
+    def peer(self, session="sess-a", *, harness="claude", name="ivory-elk-49", base=None, filename=None, **fields):
+        stamp = dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        record = {
+            "schema": "agent-executor.peer.v1",
+            "session": session,
+            "name": name,
+            "harness": harness,
+            "cwd": str(self.checkout),
+            "checkout": str(self.checkout),
+            "pid": os.getpid(),
+            "startedAt": stamp,
+            "lastSeenAt": stamp,
+            "herdrPaneId": "w1:p1",
+            "herdrEndpoint": str(self.socket),
+        }
+        record.update(fields)
+        record = {key: value for key, value in record.items() if value is not ...}
+        target = (base or self.base) / "peers" / (filename or peer_mailbox.session_key(session) + ".json")
+        target.write_text(json.dumps(record), encoding="utf-8")
+        return record
+
+    def progress(self, peer, *, stage="working", task="Verify patch", base=None):
+        stamp = dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        record = {
+            "schema": "orchestrate.progress.v1",
+            "session": peer["session"],
+            "harness": peer["harness"],
+            "machine": socket.gethostname(),
+            "accountHome": None,
+            "checkout": str(self.checkout),
+            "goal": "Ship it",
+            "task": task,
+            "stage": stage,
+            "updatedAt": stamp,
+        }
+        path = (base or self.base) / "progress" / (peer_mailbox.session_key(peer["session"]) + ".json")
+        path.write_text(json.dumps(record), encoding="utf-8")
+
+    def room(self, room_id, session, harness="claude", member="conductor", base=None, bound=None):
+        bound = str(bound or self.checkout)
+        engine = {"claude": "claude", "codex": "codex"}[harness]
+        record = {
+            "schema": "agent-executor.room.v1",
+            "id": room_id,
+            "cwd": str(self.checkout),
+            "machine": socket.gethostname(),
+            "swarm": {"maxAgents": 4, "maxDepth": 2},
+            "conductor": {"engine": engine, "session": {"id": session, "cwd": bound}},
+            "agents": [],
+        }
+        if member != "conductor":
+            record["conductor"] = {"engine": engine, "session": {"id": "someone-else"}}
+            record["agents"] = [
+                {"id": member, "role": "lead", "engine": engine, "session": {"id": session, "cwd": bound}}
+            ]
+        (base or self.base).joinpath("rooms", f"{room_id}.json").write_text(json.dumps(record), encoding="utf-8")
+
+    # -- runners ----------------------------------------------------------------------------------
+
+    def run_python(self, *args, env=None):
+        return subprocess.run(
+            [sys.executable, "-B", str(self.python_script), *args],
+            env=env or self.env,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+
+    def run_rust(self, *args, env=None):
+        return subprocess.run(
+            [str(self.binary), "herdr-status", *args],
+            env=env or self.env,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+
+    def assert_parity(self, expected: str | None = None, *, env=None):
+        python, rust = self.run_python(env=env), self.run_rust(env=env)
+        self.assertEqual((rust.stdout, rust.returncode), (python.stdout, python.returncode), rust.stderr)
+        self.assertEqual(rust.returncode, 0)
+        self.assertEqual(rust.stdout.count("\n"), 1)
+        if expected is not None:
+            self.assertEqual(rust.stdout, expected + "\n")
+        return rust.stdout
+
+    # -- tests ------------------------------------------------------------------------------------
+
+    def test_herdr_status_explicit_ref_label_and_work_title(self):
+        peer = self.peer()
+        self.progress(peer)
+        self.assert_parity("[A] ivory-elk-49 · working · Verify patch")
+
+    def test_herdr_status_without_progress_is_just_the_label(self):
+        self.peer()
+        self.assert_parity("[A] ivory-elk-49")
+
+    def test_herdr_status_glyph_tiers_and_harness_mapping(self):
+        self.peer()
+        for tier, glyph in (("ascii", "[A]"), ("unicode", "✳"), ("nerd", ""), ("bogus", "✳")):
+            with self.subTest(tier=tier):
+                self.assert_parity(f"{glyph} ivory-elk-49", env=self.make_env(self.home, ORK_GLYPHS=tier))
+        self.set_pane({"pane_id": "w1:p1", "agent": "agy", "agent_session": self.ref("agy", "sess-g")})
+        self.peer("sess-g", harness="gemini", name="gem-1")
+        self.assert_parity("[G] gem-1")
+        self.set_pane({"pane_id": "w1:p1", "agent": "agy", "agent_session": self.ref("agy", "sess-a")})
+        self.assert_parity("")
+
+    def test_herdr_status_no_active_pane_or_missing_cli(self):
+        self.peer()
+        env = self.make_env(self.home, HERDR_ACTIVE_PANE_ID="  ")
+        self.assert_parity("", env=env)
+        env = self.make_env(self.home)
+        del env["HERDR_ACTIVE_PANE_ID"]
+        self.assert_parity("", env=env)
+        for binary in (str(self.root / "missing" / "herdr"), str(self.root)):
+            with self.subTest(binary=binary):
+                self.assert_parity(
+                    "", env=self.make_env(self.home, HERDR_BIN_PATH=binary, PATH=str(self.root / "none"))
+                )
+        env = self.make_env(self.home, PATH=f"{self.herdr.parent}:/usr/bin:/bin")
+        del env["HERDR_BIN_PATH"]
+        self.assert_parity("[A] ivory-elk-49", env=env)
+        env["PATH"] = str(self.root / "none")
+        self.assert_parity("", env=env)
+
+    def test_herdr_status_malformed_or_odd_cli_output(self):
+        self.peer()
+        for raw in (
+            "",
+            "not json",
+            "[]",
+            "null",
+            '{"result": null}',
+            '{"result": []}',
+            '{"result": {"pane": []}}',
+            '{"result": {"pane": {"agent": "claude", "agent_session": "x"}}}',
+            "{" * 5000,
+        ):
+            with self.subTest(raw=raw[:20]):
+                self.set_pane(None, raw=raw)
+                self.assert_parity("")
+
+    def test_herdr_status_missing_agent_or_wrong_ref(self):
+        self.peer()
+        for pane in (
+            {"pane_id": "w1:p1"},
+            {"pane_id": "w1:p1", "agent": None},
+            {"pane_id": "w1:p1", "agent": "claude"},
+            {
+                "pane_id": "w1:p1",
+                "agent": "claude",
+                "agent_session": {"kind": "name", "agent": "claude", "value": "sess-a"},
+            },
+            {"pane_id": "w1:p1", "agent": "claude", "agent_session": self.ref("codex", "sess-a")},
+            {"pane_id": "w1:p1", "agent": "claude", "agent_session": self.ref("claude", "other")},
+            {
+                "pane_id": "w1:p1",
+                "agent": "claude",
+                "agent_session": {"kind": "id", "agent": "claude", "value": ["sess-a"]},
+            },
+            {"pane_id": "w1:p1", "agent": ["claude"], "agent_session": self.ref("claude", "sess-a")},
+            {"pane_id": "w9:p9", "agent": "claude", "agent_session": self.ref("claude", "sess-a")},
+        ):
+            with self.subTest(pane=pane):
+                self.set_pane(pane)
+                self.assert_parity("")
+
+    def test_herdr_status_ambiguous_matches_print_nothing(self):
+        self.peer(filename="one.json")
+        self.assert_parity("[A] ivory-elk-49")
+        self.peer(name="other-name", filename="two.json")
+        self.assert_parity("")
+
+    def test_herdr_status_delegated_subagent_expired_and_bad_records(self):
+        base = self.peer()
+        cases = {
+            "delegated": {"delegatedRun": True},
+            "subagent": {"isSubagent": True},
+            "dead pid": {"pid": self.dead_pid()},
+            "stale seen": {"pid": ..., "lastSeenAt": "2020-01-01T00:00:00Z"},
+            "other pane": {"herdrPaneId": "w1:p2"},
+            "no pane": {"herdrPaneId": ...},
+            "no endpoint": {"herdrEndpoint": ...},
+            "bad name": {"name": 5},
+            "bad stamp": {"lastSeenAt": "yesterday"},
+        }
+        for label, fields in cases.items():
+            with self.subTest(case=label):
+                self.peer(**fields)
+                self.assert_parity("")
+        self.peer(delegatedRun=False, isSubagent=False)
+        self.assert_parity("[A] ivory-elk-49")
+        (self.base / "peers" / "garbage.json").write_text("{not json")
+        (self.base / "peers" / "list.json").write_text("[]")
+        self.assert_parity("[A] ivory-elk-49")
+        self.assertIsNotNone(base)
+
+    @staticmethod
+    def dead_pid() -> int:
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        child.wait()
+        return child.pid
+
+    def test_herdr_status_codex_title_fallback_unicode_and_ascii_ellipsis(self):
+        self.peer(UUID_SESSION, harness="codex", name="codex-ivory-elk-49")
+        pane = {"pane_id": "w1:p1", "agent": "codex"}
+        expected = "[C] codex-ivory-elk-49"
+        titles = {
+            "full": f"Resumed | {UUID_SESSION}",
+            "bare": UUID_SESSION,
+            "unicode ellipsis": f"Some | pipes | {UUID_SESSION[: 36 - 7]}…",
+            "ascii ellipsis": f"Some work | {UUID_SESSION[: 36 - 7]}...",
+            "wrong prefix": "Work | 019a5da8-4321-5678-9abc-99999...",
+            "no session": "just a title",
+            "uppercase": f"Work | {UUID_SESSION.upper()}",
+        }
+        misses = {"wrong prefix", "no session", "uppercase"}
+        for label, title in titles.items():
+            with self.subTest(title=label):
+                self.set_pane({**pane, "terminal_title": title})
+                self.assert_parity("" if label in misses else expected)
+        # An explicit reference disables the title fallback entirely.
+        self.set_pane({**pane, "terminal_title": titles["full"], "agent_session": self.ref("codex", "other")})
+        self.assert_parity("")
+        # A second Codex peer sharing the prefix makes the short title ambiguous.
+        self.peer("019a5da8-4321-5678-9abc-123450000000", harness="codex", name="codex-other", herdrPaneId="w9:p9")
+        self.set_pane({**pane, "terminal_title": titles["unicode ellipsis"]})
+        self.assert_parity("")
+
+    def test_herdr_status_endpoint_symlinks_and_mismatches(self):
+        alias = self.root / "alias"
+        alias.symlink_to(self.socket.parent)
+        self.peer(herdrEndpoint=str(alias / "herdr.sock"))
+        self.assert_parity("[A] ivory-elk-49")
+        self.peer(herdrEndpoint=str(self.root / "elsewhere" / "herdr.sock"))
+        self.assert_parity("")
+        self.peer(herdrEndpoint=str(self.socket) + "/../herdr.sock")
+        self.assert_parity("[A] ivory-elk-49")
+        self.peer(herdrEndpoint=7)
+        self.assert_parity("")
+        # With no socket variable the default endpoint comes from XDG_CONFIG_HOME and HERDR_SESSION.
+        session_sock = self.home / ".config/herdr/sessions/work/herdr.sock"
+        session_sock.parent.mkdir(parents=True)
+        self.peer(herdrEndpoint=str(session_sock))
+        env = self.make_env(self.home, HERDR_SESSION="work")
+        del env["HERDR_SOCKET_PATH"]
+        self.assert_parity("[A] ivory-elk-49", env=env)
+        del env["HERDR_SESSION"]
+        self.assert_parity("", env=env)
+
+    def test_herdr_status_room_scope_and_structural_roles(self):
+        peer = self.peer()
+        self.progress(peer)
+        self.room("room-a", "sess-a")
+        self.assert_parity("[A] ivory-elk-49 · Coordinator · working · Verify patch")
+        env = self.make_env(self.home, ORKEST_SWARM_ROOM="room-a")
+        self.assert_parity("[A] ivory-elk-49 · Coordinator · working · Verify patch", env=env)
+        # Scoping to another room removes the role but is not a peer rejection rule.
+        env = self.make_env(self.home, ORKEST_SWARM_ROOM="room-b")
+        self.assert_parity("[A] ivory-elk-49 · working · Verify patch", env=env)
+        self.room("room-a", "sess-a", member="builder")
+        self.assert_parity("[A] ivory-elk-49 · Lead · working · Verify patch")
+        # A room bound from a different checkout confers no role.
+        self.room("room-a", "sess-a", member="builder", bound=self.root / "else")
+        self.assert_parity("[A] ivory-elk-49 · working · Verify patch")
+
+    def test_herdr_status_progress_filtering_and_sanitising(self):
+        peer = self.peer(name="x\x1b[31mred\x1b[0m​ name")
+        self.progress(peer, task="a\tb\nc " + "z" * 100)
+        self.assert_parity()
+        self.progress(peer, stage="complete", task="done")
+        self.assert_parity("[A] x red name · complete · done".replace("x red", "xred"))
+        path = self.base / "progress" / (peer_mailbox.session_key("sess-a") + ".json")
+        path.write_text("x" * 9000)
+        self.assert_parity("[A] xred name")
+
+    def test_herdr_status_independent_profiles(self):
+        other_home = self.root / "home2"
+        other_base = self.base_for(other_home)
+        for sub in ("peers", "progress", "rooms"):
+            (other_base / sub).mkdir(parents=True)
+        self.peer(name="profile-one")
+        self.peer(name="profile-two", base=other_base)
+        self.assert_parity("[A] profile-one")
+        self.assert_parity("[A] profile-two", env=self.make_env(other_home))
+        empty = self.root / "home3"
+        (empty / ".config/orchestrate/mailbox-v1").mkdir(parents=True)
+        self.assert_parity("", env=self.make_env(empty))
+
+    def test_herdr_status_delayed_cli_is_bounded(self):
+        self.peer()
+        # Compare an on-time 30 ms reply without making process scheduling part of the oracle.
+        clock = [0.0]
+
+        def reply(args, **options):
+            self.assertEqual(options["timeout"], 0.1)
+            clock[0] += 0.03
+            return subprocess.CompletedProcess(args, 0, self.pane_file.read_text(), "")
+
+        with (
+            mock.patch.dict(os.environ, self.env, clear=True),
+            mock.patch.object(herdr_status, "time", mock.Mock(monotonic=lambda: clock[0])),
+            mock.patch.object(herdr_status, "subprocess", mock.Mock(run=reply)),
+        ):
+            expected = herdr_status.status()
+        self.assertEqual(expected, "[A] ivory-elk-49")
+        rust = self.run_rust()
+        self.assertEqual((rust.stdout, rust.returncode), (expected + "\n", 0))
+        env = self.make_env(self.home, FAKE_HERDR_DELAY="0.6")
+        started = time.monotonic()
+        rust = self.run_rust(env=env)
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertEqual((rust.stdout, rust.returncode), ("\n", 0))
+        self.assert_parity("", env=env)
+
+    def test_herdr_status_stalled_pid_lookup_reaps_its_process_group(self):
+        self.peer(pidBirth="unused")
+        marker = self.root / "probe-pid"
+        ps = self.herdr.parent / "ps"
+        ps.write_text('#!/bin/sh\necho $$ > "$PROBE_PID"\nexec sleep 20\n')
+        ps.chmod(0o755)
+        env = self.make_env(self.home, PATH=f"{ps.parent}:{os.environ['PATH']}", PROBE_PID=str(marker))
+        started = time.monotonic()
+        rust = self.run_rust(env=env)
+        elapsed = time.monotonic() - started
+        self.assertEqual((rust.stdout, rust.returncode), ("\n", 0))
+        self.assertLess(elapsed, 0.5)
+        self.assertTrue(marker.exists())
+        # The probe is a grandchild. It may briefly await reaping by the host init.
+        state = subprocess.run(
+            ["ps", "-o", "stat=", "-p", marker.read_text().strip()], capture_output=True, text=True, check=False
+        ).stdout.strip()
+        self.assertTrue(not state or state.startswith("Z"), state)
+
+    def test_herdr_status_never_writes(self):
+        self.peer()
+        before = sorted((p, p.stat().st_mtime_ns) for p in self.root.rglob("*") if p.is_file())
+        self.run_rust()
+        after = sorted((p, p.stat().st_mtime_ns) for p in self.root.rglob("*") if p.is_file())
+        self.assertEqual(before, after)
+
+    def test_herdr_status_fifo_peer_file_does_not_block(self):
+        self.peer()
+        os.mkfifo(self.base / "peers" / "pipe.json")
+        started = time.monotonic()
+        rust = self.run_rust()
+        self.assertLess(time.monotonic() - started, 1)
+        self.assertEqual(rust.returncode, 0)
+        self.assertEqual(rust.stdout.count("\n"), 1)
+
+    def test_herdr_status_unknown_flags_use_python_exactly_once(self):
+        self.peer()
+        log = self.root / "herdr.log"
+        env = self.make_env(self.home, FAKE_HERDR_LOG=str(log))
+        for args in (["--wat"], ["--fallback-script", str(self.python_script), "--wat"], ["extra"]):
+            with self.subTest(args=args):
+                log.write_text("")
+                rust = self.run_rust(*args, env=env)
+                python = self.run_python(*args, env=env)
+                self.assertEqual((rust.stdout, rust.returncode), ("[A] ivory-elk-49\n", 0))
+                self.assertEqual((rust.stdout, rust.returncode), (python.stdout, python.returncode))
+                # One Rust-driven fallback plus one direct Python run: a single CLI call each.
+                self.assertEqual(len(log.read_text().splitlines()), 2)
+        # With no script reachable the answer is still exactly one line, success.
+        env["ORKEST_SCRIPTS_DIR"] = str(self.root / "no-scripts")
+        env["ORKEST_PLUGIN_ROOT"] = str(self.root / "no-plugin")
+        rust = subprocess.run(
+            [str(self.binary), "herdr-status", "--fallback-script", str(self.root / "missing.py"), "--wat"],
+            env=env,
+            cwd=self.root,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        self.assertEqual(rust.returncode, 0)
+        self.assertEqual(rust.stdout.count("\n"), 1)
+
+    def test_herdr_status_native_fallback_is_byte_exact_and_runs_python_once(self):
+        runs = self.root / "runs"
+        script = self.root / "fallback" / "herdr_status.py"
+        script.parent.mkdir()
+        script.write_text(
+            f"import sys\nopen({str(runs)!r}, 'a').write('x')\n"
+            "print('usage: one'); print('two', *sys.argv[1:]); sys.stderr.write('oops\\n'); sys.exit(3)\n"
+        )
+        rust = subprocess.run(
+            [str(self.binary), "herdr-status", "--fallback-script", str(script), "--wat", "x y"],
+            env=self.env,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        self.assertEqual((rust.stdout, rust.stderr, rust.returncode), ("usage: one\ntwo --wat x y\n", "oops\n", 3))
+        self.assertEqual(runs.read_text(), "x")
+
+    def test_herdr_status_native_fallback_script_must_be_trusted(self):
+        runs = self.root / "runs"
+        body = f"open({str(runs)!r}, 'a').write('x')\nprint('PYTHON')\n"
+        good = self.root / "good" / "herdr_status.py"
+        good.parent.mkdir()
+        good.write_text(body)
+        writable = self.root / "writable" / "herdr_status.py"
+        writable.parent.mkdir()
+        writable.write_text(body)
+        writable.chmod(0o666)
+        linked = self.root / "linked" / "herdr_status.py"
+        linked.parent.mkdir()
+        linked.symlink_to(good)
+        misnamed = self.root / "good" / "other.py"
+        misnamed.write_text(body)
+        env = {**self.env, "ORKEST_SCRIPTS_DIR": str(self.root / "none"), "ORKEST_PLUGIN_ROOT": str(self.root / "none")}
+        for bad in (writable, linked, misnamed):
+            with self.subTest(script=bad.name, parent=bad.parent.name):
+                proc = subprocess.run(
+                    [str(self.binary), "herdr-status", "--fallback-script", str(bad), "--wat"],
+                    env=env,
+                    cwd=self.root,
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                    check=False,
+                )
+                self.assertEqual((proc.stdout, proc.returncode), ("\n", 0))
+        self.assertFalse(runs.exists())
+        proc = subprocess.run(
+            [str(self.binary), "herdr-status", "--fallback-script", str(good), "--wat"],
+            env=env,
+            cwd=self.root,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        self.assertEqual(proc.stdout, "PYTHON\n")
+
+    def test_herdr_status_timeout_samples_stay_under_the_ceiling(self):
+        """Wall time of timed-out lookups: 180 ms budget plus cold start, far below any caller timeout."""
+        self.peer()
+        hung = self.root / "bin" / "hung"
+        hung.write_text("#!/bin/sh\nsleep 30\n")
+        hung.chmod(0o755)
+        results = {}
+        for label, extra in (
+            ("cli sleeps 0.6s", {"FAKE_HERDR_DELAY": "0.6"}),
+            ("cli sleeps 30s", {"HERDR_BIN_PATH": str(hung)}),
+            ("cli sleeps 0.09s (within 100ms cap)", {"FAKE_HERDR_DELAY": "0.09"}),
+        ):
+            env = self.make_env(self.home, **extra)
+            values = []
+            for _ in range(10):
+                started = time.perf_counter()
+                proc = self.run_rust(env=env)
+                values.append(time.perf_counter() - started)
+                self.assertEqual(proc.returncode, 0)
+            results[label] = values
+        for label, values in results.items():
+            print(
+                f"\nherdr-status {label}: min {min(values) * 1000:.0f} ms, "
+                f"median {statistics.median(values) * 1000:.0f} ms, max {max(values) * 1000:.0f} ms"
+            )
+        for label in ("cli sleeps 0.6s", "cli sleeps 30s"):
+            self.assertGreater(min(results[label]), 0.09, label)
+            self.assertLess(max(results[label]), 0.18, label)
+
+    def test_herdr_status_ordinary_misses_never_start_python(self):
+        marker = self.root / "python-ran"
+        fake = self.root / "fallback" / "herdr_status.py"
+        fake.parent.mkdir()
+        fake.write_text(f"open({str(marker)!r}, 'w').close()\nprint('PYTHON')\n")
+        self.set_pane({"pane_id": "w1:p1"})
+        rust = self.run_rust("--fallback-script", str(fake))
+        self.assertEqual((rust.stdout, rust.returncode), ("\n", 0))
+        self.assertFalse(marker.exists())
+
+    def test_herdr_status_old_binary_lacks_the_subcommand(self):
+        """Pre-Wave-3 binaries print usage to stdout and exit 1: the signal ork.mjs uses to choose Python."""
+        proc = subprocess.run(
+            [str(self.binary), "no-such-subcommand"], capture_output=True, text=True, timeout=20, check=False
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("unrecognized subcommand", proc.stderr)
+        self.assertIn("herdr-status", proc.stdout)
+
+    def test_herdr_status_cold_launch_overhead_is_separate_from_the_internal_budget(self):
+        self.peer()
+        samples = {"hit": [], "miss": []}
+        miss_env = self.make_env(self.home, HERDR_ACTIVE_PANE_ID="")
+        for _ in range(15):
+            for label, env in (("hit", self.env), ("miss", miss_env)):
+                started = time.perf_counter()
+                proc = self.run_rust(env=env)
+                samples[label].append(time.perf_counter() - started)
+                self.assertEqual(proc.returncode, 0)
+        for label, values in samples.items():
+            median = statistics.median(values)
+            print(f"\nherdr-status {label}: median {median * 1000:.1f} ms, max {max(values) * 1000:.1f} ms")
+            # Process start-up plus the lookup stays far below the 180 ms operation budget.
+            self.assertLess(median, 0.18, label)
+            self.assertLess(max(values), 0.6, label)
 
 
 if __name__ == "__main__":

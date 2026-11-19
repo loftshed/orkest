@@ -1263,6 +1263,166 @@ describe("terminal lifecycle", () => {
     }
   });
 
+  it("reopens an existing worktree when an agent's Herdr pane is gone, and reports failure cleanly", async () => {
+    const root = await realpath(await directory());
+    const parent = path.join(root, "my repo");
+    const worktree = path.join(parent, ".worktrees", "wt one");
+    mkdirSync(worktree, { recursive: true });
+    writeFileSync(path.join(worktree, ".git"), "gitdir: elsewhere\n");
+    const env = { HERDR_ENV: "1", HERDR_SOCKET_PATH: path.join(root, "herdr.sock") };
+    const endpoint = herdrEndpoint(env);
+    const agent = {
+      id: "a1",
+      herdrPaneId: "w4:p2",
+      herdrEndpoint: endpoint,
+      session: { id: "native-1" },
+      worktree: { path: worktree, parentCwd: parent, disposable: true, slug: "wt one" },
+    };
+    const calls = [];
+    const exec = (binary, args, options, callback) => {
+      calls.push({ binary, args, options });
+      if (args[0] === "workspace") {
+        callback(
+          null,
+          JSON.stringify({
+            result: {
+              type: "workspace_info",
+              workspace: {
+                workspace_id: "w4",
+                worktree: {
+                  repo_root: parent,
+                  checkout_path: parent,
+                  is_linked_worktree: false,
+                },
+              },
+            },
+          }),
+        );
+      } else if (args[0] === "worktree") {
+        callback(
+          null,
+          JSON.stringify({
+            result: {
+              type: "worktree_opened",
+              workspace: { workspace_id: "w4" },
+              tab: { tab_id: "w4:t1" },
+              root_pane: { pane_id: "w4:p9" },
+              worktree: { path: worktree },
+              already_open: false,
+            },
+          }),
+        );
+      } else {
+        // agent get / pane current: the terminal no longer exists.
+        callback(new Error("pane not found"));
+      }
+    };
+
+    expect(await focusAgentPane(agent, { exec, env, root: parent })).toBe(true);
+    const opened = calls.filter((call) => call.args[0] === "worktree");
+    expect(opened).toHaveLength(1);
+    expect(opened[0].args).toEqual([
+      "worktree",
+      "open",
+      "--workspace",
+      "w4",
+      "--path",
+      await realpath(worktree),
+      "--focus",
+    ]);
+    expect(opened[0].options.cwd).toBe(await realpath(parent));
+    expect(calls.some((call) => call.args.includes("create"))).toBe(false);
+    expect(calls.findIndex((call) => call.args[0] === "workspace")).toBeLessThan(
+      calls.findIndex((call) => call.args[0] === "worktree"),
+    );
+
+    // A failed workspace lookup drops the hint and uses the explicit root instead.
+    calls.length = 0;
+    const noWorkspace = (binary, args, options, callback) =>
+      args[0] === "workspace" ? callback(new Error("gone")) : exec(binary, args, options, callback);
+    expect(await focusAgentPane(agent, { exec: noWorkspace, env, root: parent })).toBe(true);
+    const fallbackArgs = calls.find((call) => call.args[0] === "worktree").args;
+    expect(fallbackArgs).not.toContain("--workspace");
+    expect(fallbackArgs.slice(2, 4)).toEqual(["--cwd", await realpath(parent)]);
+
+    // Another endpoint, an untrusted path or a rejecting Herdr all report failure; nothing opens.
+    calls.length = 0;
+    expect(
+      await focusAgentPane(
+        { ...agent, herdrEndpoint: path.join(root, "other.sock") },
+        { exec, env, root: parent },
+      ),
+    ).toBe(false);
+    expect(
+      await focusAgentPane(
+        { ...agent, worktree: { ...agent.worktree, path: root } },
+        { exec, env, root: parent },
+      ),
+    ).toBe(false);
+    expect(await focusAgentPane(agent, { exec, env, root: path.join(root, "unrelated") })).toBe(
+      false,
+    );
+    expect(calls.filter((call) => call.args[0] === "worktree")).toHaveLength(0);
+    const rejecting = (binary, args, options, callback) =>
+      args[0] === "worktree"
+        ? callback(new Error("rejected"))
+        : exec(binary, args, options, callback);
+    expect(await focusAgentPane(agent, { exec: rejecting, env, root: parent })).toBe(false);
+    // Without a worktree the original behaviour is unchanged.
+    expect(await focusAgentPane({ ...agent, worktree: undefined }, { exec, env })).toBe(false);
+  });
+
+  it("sends one Herdr notification per event and falls back to the macOS HUD only when Herdr rejects", async () => {
+    const root = await realpath(await directory());
+    const hudBin = path.join(root, "OrkestHUD");
+    await writeFile(hudBin, "#!/bin/sh\nexit 0\n");
+    chmodSync(hudBin, 0o755);
+    const calls = [];
+    const makeExec = (isHerdrRejecting) => (binary, args, options, callback) => {
+      calls.push({ binary, args });
+      const cb = typeof options === "function" ? options : callback;
+      cb?.(binary === "herdr" && isHerdrRejecting ? new Error("rejected") : null, "", "");
+    };
+    const prev = [{ id: "a1", person: "gribble", stage: "working", summary: "Writing" }];
+    const next = [{ id: "a1", person: "gribble", stage: "blocked", summary: "-- Need input" }];
+    const env = { HERDR_ENV: "1", ORKEST_HUD_BIN: hudBin };
+
+    notifyHerdrTransitions(prev, next, new Set(), {
+      env,
+      exec: makeExec(false),
+      platform: "darwin",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(calls.map((call) => call.binary)).toEqual(["herdr"]);
+    expect(calls[0].args).toEqual([
+      "notification",
+      "show",
+      "Orkest: gribble blocked",
+      "--body",
+      "-- Need input",
+      "--sound",
+      "request",
+    ]);
+
+    calls.length = 0;
+    notifyHerdrTransitions(prev, next, new Set(), {
+      env,
+      exec: makeExec(true),
+      platform: "darwin",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(calls.map((call) => call.binary)).toEqual(["herdr", hudBin]);
+
+    calls.length = 0;
+    notifyHerdrTransitions(prev, next, new Set(), {
+      env,
+      exec: makeExec(true),
+      platform: "linux",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(calls.map((call) => call.binary)).toEqual(["herdr"]);
+  });
+
   it("supports o-key pane focus, focusAgentPane, notifyHerdrTransitions, and primary module exports", async () => {
     expect(runTui).toBe(runHordeTui);
     expect(factoryModule.foundryCommand).toBe(foundryModule.foundryCommand);

@@ -547,7 +547,7 @@ fn herdr_context(harness: Option<&str>) -> Option<(String, Option<String>)> {
     Some((pane, workspace))
 }
 
-fn canonical_endpoint(path: Option<&str>) -> Option<String> {
+pub(crate) fn canonical_endpoint(path: Option<&str>) -> Option<String> {
     let p = path.filter(|s| !s.is_empty())?;
     paths::resolve_path(&paths::expand_home(p, None))
         .ok()
@@ -701,7 +701,7 @@ fn orca_lookup_terminal(pane_key: &str, reg: &Map<String, Value>) -> String {
     }
 }
 
-fn resolve_structural_role(
+pub(crate) fn resolve_structural_role(
     base: &Path,
     session: &str,
     harness: Option<&str>,

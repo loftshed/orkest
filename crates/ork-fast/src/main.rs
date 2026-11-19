@@ -1,6 +1,7 @@
 //! Fast native accelerator binary for Orkest hooks, gate, lease, and statusline.
 
 mod gate;
+mod herdr_status;
 mod identity;
 mod lease;
 mod mailbox;
@@ -28,7 +29,8 @@ SUBCOMMANDS:\n\
     lease-holder <path> [--read-only] [--namespace <ns>]\n\
     gate-hook --harness <claude|codex|gemini> [--fallback-script <gate.py>]\n\
     statusline [OPTIONS] [--fallback-script <agent_statusline.py>]\n\
-    mailbox-hook --harness <claude|codex|gemini> [--event <Event>] [--fallback-script <peer_mailbox.py>]\n\n\
+    mailbox-hook --harness <claude|codex|gemini> [--event <Event>] [--fallback-script <peer_mailbox.py>]\n\
+    herdr-status [--fallback-script <herdr_status.py>]\n\n\
 FLAGS:\n\
     -h, --help       Print help information\n\
     -V, --version    Print version information",
@@ -146,6 +148,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 event_opt.as_deref(),
                 fallback_script.as_deref(),
             )?;
+        }
+        "herdr-status-read-pane" => herdr_status::read_pane()?,
+        "herdr-status" => {
+            let mut fallback_script: Option<PathBuf> = None;
+            for (idx, arg) in args[2..].iter().enumerate() {
+                if arg == "--fallback-script" && idx + 1 < args[2..].len() {
+                    fallback_script = Some(PathBuf::from(&args[2..][idx + 1]));
+                    break;
+                }
+            }
+            herdr_status::run(&args[2..], fallback_script.as_deref())?;
         }
         unknown => {
             eprintln!("error: unrecognized subcommand '{unknown}'");

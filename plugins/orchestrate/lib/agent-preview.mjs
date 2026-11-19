@@ -1,7 +1,8 @@
 import { execFile } from "node:child_process";
 
 import { readAgentActivity } from "./agent-activity.mjs";
-import { isCurrentHerdrAgent, verifiedHerdrAgentPane } from "./herdr-context.mjs";
+import { resolveAgentPane } from "./herdr-cli.mjs";
+import { isCurrentHerdrAgent } from "./herdr-context.mjs";
 import {
   agentOrcaTerminal,
   isCurrentOrcaAgent,
@@ -179,9 +180,7 @@ export function createAgentPreview({
               throw new Error("The agent belongs to another Herdr server");
             const session =
               agent.session?.id || agent.nativeSession || agent.activitySource?.session;
-            const pane = await verifiedHerdrAgentPane(herdrPane, session, (args) =>
-              run(herdr, args),
-            );
+            const pane = await resolveAgentPane(herdrPane, session, { env, exec });
             if (!pane || pane === currentPane)
               throw new Error("The agent in this pane has changed");
             text = await run(herdr, [

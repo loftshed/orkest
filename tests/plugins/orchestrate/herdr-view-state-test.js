@@ -3,9 +3,15 @@ import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node
 import { hostname, tmpdir } from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 
 import { runHordeTui } from "../../../plugins/orchestrate/bin/horde-tui.mjs";
+import {
+  createHerdrLifecycleSubscriber,
+  herdrEndpoint,
+  herdrPaneIdsFromRoom,
+  normalizePaneIds,
+} from "../../../plugins/orchestrate/lib/herdr-context.mjs";
 import {
   herdrSwarmPaneLabel,
   markHerdrViewClosed,
@@ -170,4 +176,330 @@ it("keeps a managed view open when a separate viewer of the same room quits", as
     );
   await markHerdrViewClosed("room-a", { ...env, HERDR_PANE_ID: "w2:p8" }, exec);
   await expect(readFile(closed, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+});
+
+function fakeSocketFactory() {
+  const sockets = [];
+  const connect = () => {
+    const handlers = new Map();
+    const socket = {
+      written: [],
+      destroyed: false,
+      on(event, fn) {
+        handlers.set(event, [...(handlers.get(event) || []), fn]);
+      },
+      emit(event, ...args) {
+        const listeners = handlers.get(event) || [];
+        for (const fn of listeners) fn(...args);
+      },
+      write(chunk) {
+        socket.written.push(JSON.parse(String(chunk)));
+      },
+      destroy() {
+        socket.destroyed = true;
+      },
+      /** Complete the connect + subscribe handshake as the Herdr server would. */
+      acknowledge() {
+        socket.emit("connect");
+        const request = socket.written.at(-1);
+        socket.emit(
+          "data",
+          `${JSON.stringify({ id: request.id, result: { type: "subscription_started" } })}\n`,
+        );
+      },
+      watched() {
+        return socket.written
+          .at(-1)
+          .params.subscriptions.filter((item) => item.type === "pane.agent_status_changed")
+          .map((item) => item.pane_id);
+      },
+    };
+    sockets.push(socket);
+    return socket;
+  };
+  return { sockets, connect };
+}
+
+function lifecycle(options = {}) {
+  const factory = fakeSocketFactory();
+  const events = [];
+  const subscriber = createHerdrLifecycleSubscriber({
+    env: { HERDR_ENV: "1", HERDR_SOCKET_PATH: "/tmp/fake-herdr.sock" },
+    connect: factory.connect,
+    onInvalidate: (event) => void events.push(["invalidate", event.reason]),
+    onReconcile: (event) => void events.push(["reconcile", event.reason]),
+    reconnectDelayMs: 5,
+    maxReconnectDelayMs: 20,
+    ...options,
+  });
+  return { ...factory, events, subscriber };
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+it("normalizes pane IDs to a sorted set of valid host identifiers", () => {
+  expect(normalizePaneIds(["w1:p2", " w1:p1 ", "w1:p2", "", "--x", "a b", 7, null])).toEqual([
+    "w1:p1",
+    "w1:p2",
+  ]);
+  expect(normalizePaneIds(new Set(["b", "a"]))).toEqual(["a", "b"]);
+  expect(normalizePaneIds("w1:p1")).toEqual([]);
+});
+
+it("collects only this endpoint's member pane IDs from a snapshot", () => {
+  const env = { HERDR_ENV: "1", HERDR_SOCKET_PATH: "/tmp/fake-herdr.sock" };
+  const endpoint = herdrEndpoint(env);
+  const room = {
+    conductor: { herdrPaneId: "w1:p0", herdrEndpoint: endpoint },
+    agents: [
+      { herdrPaneId: "w1:p2", herdrEndpoint: endpoint },
+      { progress: { herdrPaneId: "w1:p1", herdrEndpoint: endpoint } },
+      { herdrPaneId: "w9:p1", herdrEndpoint: "/tmp/another.sock" },
+      { herdrPaneId: "--bad", herdrEndpoint: endpoint },
+      { id: "no-pane" },
+    ],
+  };
+  expect(herdrPaneIdsFromRoom(room, env)).toEqual(["w1:p0", "w1:p1", "w1:p2"]);
+  expect(herdrPaneIdsFromRoom(room, {})).toEqual([]);
+  expect(herdrPaneIdsFromRoom(null, env)).toEqual([]);
+});
+
+it("setPaneIds does no I/O for unchanged sets and only records state before start", () => {
+  const { sockets, subscriber } = lifecycle({ paneIds: ["w1:p1"] });
+  expect(subscriber.setPaneIds(["w1:p1", "w1:p1"])).toBe(false);
+  expect(subscriber.setPaneIds(["w1:p2"])).toBe(true);
+  expect(sockets).toHaveLength(0);
+  expect(subscriber.paneIds).toEqual(["w1:p2"]);
+  subscriber.start();
+  sockets[0].acknowledge();
+  expect(sockets[0].watched()).toEqual(["w1:p2"]);
+  expect(subscriber.setPaneIds(["w1:p2", "bad id", ""])).toBe(false);
+  expect(subscriber.setPaneIds(new Set(["w1:p2"]))).toBe(false);
+  expect(sockets).toHaveLength(1);
+  expect(sockets[0].written).toHaveLength(1);
+  subscriber.stop();
+});
+
+it("replaces the watched set on a concurrent stream and retires the old one after promotion", () => {
+  const { sockets, events, subscriber } = lifecycle({ paneIds: ["w1:p1"] });
+  subscriber.start();
+  sockets[0].acknowledge();
+  expect(subscriber.generation).toBe(1);
+
+  expect(subscriber.setPaneIds(["w1:p2"])).toBe(true);
+  expect(sockets).toHaveLength(2);
+  // The established stream stays live and keeps delivering hints until the replacement is promoted.
+  expect(sockets[0].destroyed).toBe(false);
+  expect(subscriber.isSubscribed).toBe(true);
+  sockets[0].emit("data", `${JSON.stringify({ event: "pane_updated" })}\n`);
+  expect(events.at(-1)).toEqual(["invalidate", "pane_updated"]);
+  // No repeated events.subscribe on the live stream (Herdr resets the connection if one is sent).
+  expect(sockets[0].written).toHaveLength(1);
+
+  sockets[1].acknowledge();
+  expect(sockets[0].destroyed).toBe(true);
+  expect(sockets[1].watched()).toEqual(["w1:p2"]);
+  expect(subscriber.generation).toBe(2);
+  expect(events.slice(-2)).toEqual([
+    ["invalidate", "subscription_started"],
+    ["reconcile", "subscription_started"],
+  ]);
+  // Superseded callbacks from the retired stream are discarded.
+  const before = events.length;
+  sockets[0].emit("data", `${JSON.stringify({ event: "pane_closed" })}\n`);
+  sockets[0].emit("close");
+  expect(events).toHaveLength(before);
+  expect(subscriber.isSubscribed).toBe(true);
+  subscriber.stop();
+});
+
+it("never promotes a superseded set when A→B→C happens before acknowledgment", () => {
+  const { sockets, events, subscriber } = lifecycle({ paneIds: ["a:p1"] });
+  subscriber.start();
+  sockets[0].acknowledge();
+  subscriber.setPaneIds(["b:p1"]);
+  subscriber.setPaneIds(["c:p1"]);
+  expect(sockets).toHaveLength(3);
+  expect(sockets[1].destroyed).toBe(true);
+  expect(sockets[2].destroyed).toBe(false);
+
+  // A late acknowledgment for B must not win.
+  sockets[1].emit("connect");
+  sockets[1].emit(
+    "data",
+    `${JSON.stringify({ id: "x", result: { type: "subscription_started" } })}\n`,
+  );
+  expect(subscriber.generation).toBe(1);
+  expect(sockets[0].destroyed).toBe(false);
+
+  sockets[2].acknowledge();
+  expect(sockets[2].watched()).toEqual(["c:p1"]);
+  expect(sockets[0].destroyed).toBe(true);
+  expect(subscriber.generation).toBe(2);
+  expect(events.filter(([kind]) => kind === "reconcile")).toHaveLength(2);
+  subscriber.stop();
+});
+
+it("supersedes the first stream when the set changes before it is acknowledged", () => {
+  const { sockets, subscriber } = lifecycle({ paneIds: ["w1:p1"] });
+  subscriber.start();
+  subscriber.setPaneIds(["w1:p2"]);
+  expect(sockets).toHaveLength(2);
+  expect(sockets[0].destroyed).toBe(true);
+  sockets[1].acknowledge();
+  expect(sockets[1].watched()).toEqual(["w1:p2"]);
+  subscriber.stop();
+});
+
+it("keeps the old live stream when the replacement handshake fails, then retries", async () => {
+  const { sockets, subscriber } = lifecycle({ paneIds: ["w1:p1"] });
+  subscriber.start();
+  sockets[0].acknowledge();
+  subscriber.setPaneIds(["w1:p2"]);
+  sockets[1].emit("connect");
+  sockets[1].emit("data", `${JSON.stringify({ error: { code: "bad_request" } })}\n`);
+  expect(sockets[1].destroyed).toBe(true);
+  expect(sockets[0].destroyed).toBe(false);
+  expect(subscriber.isSubscribed).toBe(true);
+  expect(subscriber.generation).toBe(1);
+
+  await sleep(30);
+  expect(sockets).toHaveLength(3);
+  sockets[2].acknowledge();
+  expect(sockets[2].watched()).toEqual(["w1:p2"]);
+  expect(sockets[0].destroyed).toBe(true);
+  subscriber.stop();
+});
+
+it("recovers from a silent subscription, including after losing the previous socket", () => {
+  vi.useFakeTimers();
+  const { sockets, subscriber } = lifecycle({ handshakeTimeoutMs: 50 });
+  try {
+    subscriber.start();
+    vi.advanceTimersByTime(55);
+    expect(sockets[0].destroyed).toBe(true);
+    sockets[1].acknowledge();
+    subscriber.setPaneIds(["w1:p2"]);
+    sockets[2].emit("connect");
+    sockets[1].emit("end");
+    vi.advanceTimersByTime(55);
+    expect(sockets[2].destroyed).toBe(true);
+    sockets[3].acknowledge();
+    vi.advanceTimersByTime(500);
+    expect(subscriber.isSubscribed).toBe(true);
+    expect(sockets).toHaveLength(4);
+  } finally {
+    subscriber.stop();
+    vi.useRealTimers();
+  }
+});
+
+it("reconnects with the latest desired set after the live stream is lost", async () => {
+  const { sockets, subscriber } = lifecycle({ paneIds: ["w1:p1"] });
+  subscriber.start();
+  sockets[0].acknowledge();
+  sockets[0].emit("data", `${JSON.stringify({ error: { code: "events_lost" } })}\n`);
+  expect(subscriber.isSubscribed).toBe(false);
+  // Changed while disconnected: only desired state moves, no new socket yet.
+  subscriber.setPaneIds(["w1:p9"]);
+  expect(sockets).toHaveLength(1);
+  await sleep(20);
+  expect(sockets).toHaveLength(2);
+  sockets[1].acknowledge();
+  expect(sockets[1].watched()).toEqual(["w1:p9"]);
+  subscriber.stop();
+});
+
+it("promotes the replacement even when the old stream dies first", () => {
+  const { sockets, subscriber } = lifecycle({ paneIds: ["w1:p1"] });
+  subscriber.start();
+  sockets[0].acknowledge();
+  subscriber.setPaneIds(["w1:p2"]);
+  sockets[0].emit("close");
+  expect(subscriber.isSubscribed).toBe(false);
+  expect(sockets).toHaveLength(2);
+  sockets[1].acknowledge();
+  expect(subscriber.isSubscribed).toBe(true);
+  expect(sockets[1].watched()).toEqual(["w1:p2"]);
+  subscriber.stop();
+});
+
+it("stops all work on stop: sockets destroyed, timers cleared, later changes ignored", async () => {
+  const { sockets, subscriber } = lifecycle({ paneIds: ["w1:p1"] });
+  subscriber.start();
+  sockets[0].acknowledge();
+  subscriber.setPaneIds(["w1:p2"]);
+  subscriber.stop();
+  expect(sockets.map((socket) => socket.destroyed)).toEqual([true, true]);
+  expect(subscriber.isSubscribed).toBe(false);
+  expect(subscriber.setPaneIds(["w1:p3"])).toBe(false);
+  sockets[1].emit("connect");
+  expect(sockets[1].written).toHaveLength(0);
+  await sleep(30);
+  expect(sockets).toHaveLength(2);
+
+  const failing = lifecycle();
+  failing.subscriber.start();
+  failing.sockets[0].emit("close");
+  failing.subscriber.stop();
+  await sleep(30);
+  expect(failing.sockets).toHaveLength(1);
+});
+
+it("wires every authoritative snapshot of the Swarm View to the lifecycle subscription", async () => {
+  const { env } = await fixture();
+  const herdrEnv = { HERDR_ENV: "1", HERDR_SOCKET_PATH: env.HERDR_SOCKET_PATH };
+  const endpoint = herdrEndpoint(herdrEnv);
+  const member = (id, pane) => ({
+    id,
+    status: "working",
+    herdrPaneId: pane,
+    herdrEndpoint: endpoint,
+  });
+  let agents = [member("a1", "w1:p1"), member("a2", "w1:p2")];
+  const { sockets, connect } = fakeSocketFactory();
+  const input = Object.assign(new PassThrough(), { isTTY: true, setRawMode() {} });
+  const output = Object.assign(new PassThrough(), { isTTY: true, rows: 24, columns: 100 });
+  output.resume();
+  const running = runHordeTui(
+    async () => ({ id: "room-a", conductor: {}, agents: structuredClone(agents), messages: [] }),
+    {
+      env: herdrEnv,
+      input,
+      output,
+      exec: (_binary, _args, _options, callback) => callback(null, "{}"),
+      herdrConnect: connect,
+      quota: false,
+      services: false,
+      update: false,
+      chiefHint: false,
+      mouse: false,
+    },
+  );
+  const waitFor = async (check) => {
+    for (let index = 0; index < 400 && !check(); index += 1) await sleep(10);
+    expect(check()).toBe(true);
+  };
+  try {
+    await waitFor(() => sockets.length === 1);
+    sockets[0].acknowledge();
+    expect(sockets[0].watched()).toEqual(["w1:p1", "w1:p2"]);
+
+    // A member leaves: the next snapshot narrows the watched set on a replacement stream.
+    agents = [member("a1", "w1:p1")];
+    await waitFor(() => sockets.length === 2);
+    sockets[1].acknowledge();
+    expect(sockets[1].watched()).toEqual(["w1:p1"]);
+    expect(sockets[0].destroyed).toBe(true);
+
+    // Everyone left: the set is cleared.
+    agents = [];
+    await waitFor(() => sockets.length === 3);
+    sockets[2].acknowledge();
+    expect(sockets[2].watched()).toEqual([]);
+  } finally {
+    input.emit("data", "qq");
+    await running;
+  }
+  expect(sockets.every((socket) => socket.destroyed)).toBe(true);
 });

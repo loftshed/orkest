@@ -3,6 +3,7 @@ import {
   buildLanes,
   creditBalance,
   durationLabel,
+  effectiveWindow,
   effectiveWindows,
   headline,
   level,
@@ -305,4 +306,154 @@ export function jsonView(accounts, now = Date.now()) {
       score: Math.round(l.score * 10) / 10,
     })),
   };
+}
+
+const QUOTA_NAME_MAX = 16;
+const EXHAUSTED_QUOTA_PCT = 0.5;
+const quotaNumber = (value) => (typeof value === "number" && Number.isFinite(value) ? value : null);
+const quotaPct = (value) => Math.max(0, Math.min(100, value));
+
+/** One account of a `monitor.snapshot.v1` document, reduced to what a one-line quota item needs. */
+function quotaEntry(account, lanes, now) {
+  const label = String(account?.label || account?.short || account?.id || "?");
+  const windows = (Array.isArray(account?.windows) ? account.windows : []).flatMap((w) => {
+    const remaining = quotaNumber(w?.remainingPct);
+    if (remaining === null) return [];
+    const resetsAt = w.resetsAt ? Date.parse(w.resetsAt) : NaN;
+    // Monitor's own rollover rule: a passed reset keeps the last measurement but cannot confirm it.
+    const effective = effectiveWindow(
+      { ...w, resetsAt: Number.isFinite(resetsAt) ? resetsAt : null },
+      now,
+    );
+    return [
+      {
+        label: String(w.label || w.id || "window"),
+        pct: quotaPct(remaining),
+        resetsAt: effective.resetsAt,
+        rollover: Boolean(effective.resetAwaitingRefresh || w.resetAwaitingRefresh),
+      },
+    ];
+  });
+  const isFailed = account?.ok === false;
+  const stale = isFailed || windows.some((w) => w.rollover) || lanes.some((lane) => lane.stale);
+  return {
+    id: account?.id == null ? "" : String(account.id),
+    label,
+    short: String(account?.short || ""),
+    provider: account?.provider ? String(account.provider) : "",
+    windows,
+    stale,
+    failed: isFailed,
+    error: isFailed ? String(account.error || "unavailable").slice(0, 120) : "",
+    age:
+      quotaNumber(account?.ageMinutes) === null
+        ? ""
+        : formatDuration(Math.max(0, account.ageMinutes) * 60_000),
+    pools: (Array.isArray(account?.pills) ? account.pills : []).filter((p) => p?.tag),
+  };
+}
+
+function quotaTooltipLine(entry, now) {
+  const head = entry.provider ? `${entry.label} (${entry.provider})` : entry.label;
+  if (entry.windows.length === 0) {
+    return `${head}: ${entry.failed ? entry.error : "no quota data"}`;
+  }
+  const windows = entry.windows
+    .map((w) => {
+      const reset = w.rollover
+        ? "rollover due; awaiting provider refresh"
+        : timeLeft(w.resetsAt, now);
+      const when = reset
+        ? ` (${reset === "now" || w.rollover ? reset : `resets in ${reset}`})`
+        : "";
+      return `${w.label} ${Math.floor(w.pct)}%${when}`;
+    })
+    .join(" · ");
+  const notes = [];
+  if (entry.failed) notes.push(`refresh failed: ${entry.error}`);
+  else if (entry.stale) notes.push("stale");
+  if (entry.age && entry.stale) notes.push(`data ${entry.age} old`);
+  const suffix = notes.length > 0 ? ` [${notes.join("; ")}]` : "";
+  const pools = entry.pools
+    .map(
+      (p) =>
+        `  ${p.tag} ${p.poolLabel}: ${[p.short, p.weekly]
+          .filter(Boolean)
+          .map((g) => `${Math.floor(quotaPct(quotaNumber(g.pct) ?? 0))}%`)
+          .join(" · ")}`,
+    )
+    .join("\n");
+  return `${head}: ${windows}${suffix}${pools ? `\n${pools}` : ""}`;
+}
+
+/**
+ * Status bar text, tone and tooltip for a `monitor json` snapshot, shared by hosts that show one quota
+ * item. Freshness, rollover and account identity come from Monitor's own lanes, windows and labels:
+ * a stale or rolled-over figure is marked "!" and never sets a danger tone or proves exhaustion, an
+ * account with no numbers shows "?", and a fresh zero is a real, exhausted limit (☠).
+ * Accounts sharing a provider tag are told apart by label.
+ */
+export function summarizeQuota(snapshot, { now, maxShown = 4, stale = false } = {}) {
+  const accounts = Array.isArray(snapshot?.accounts) ? snapshot.accounts : [];
+  const lanes = Array.isArray(snapshot?.lanes) ? snapshot.lanes : [];
+  const generated = Date.parse(snapshot?.generatedAt ?? "");
+  const at = quotaNumber(now) ?? (Number.isFinite(generated) ? generated : Date.now());
+  const entries = accounts.map((account) =>
+    quotaEntry(
+      account,
+      account?.id == null
+        ? []
+        : lanes.filter((lane) => lane?.accountId === account.id && !lane.redundant),
+      at,
+    ),
+  );
+  if (stale) for (const entry of entries) entry.stale = true;
+  const tagCount = new Map();
+  for (const entry of entries) tagCount.set(entry.short, (tagCount.get(entry.short) ?? 0) + 1);
+  const nameOf = (entry) =>
+    (entry.short && tagCount.get(entry.short) === 1 ? entry.short : entry.label || entry.id).slice(
+      0,
+      QUOTA_NAME_MAX,
+    );
+
+  const tooltip = entries.map((entry) => quotaTooltipLine(entry, at));
+  const known = entries
+    .filter((entry) => entry.windows.length > 0)
+    .map((entry) => {
+      const binding = entry.windows.toSorted((left, right) => left.pct - right.pct)[0];
+      return { entry, name: nameOf(entry), binding, pct: binding.pct };
+    })
+    .toSorted((left, right) => {
+      if (left.entry.stale !== right.entry.stale) return left.entry.stale ? 1 : -1;
+      return left.pct - right.pct;
+    });
+
+  if (known.length === 0) {
+    return {
+      text: "Quota —",
+      tone: tooltip.length > 0 ? "warning" : "neutral",
+      tooltip: tooltip.join("\n") || "No quota accounts reported by monitor",
+    };
+  }
+  const unknown = entries.filter((entry) => entry.windows.length === 0);
+  const cells = known.map(({ entry, name, binding, pct }) => {
+    if (!entry.stale && pct <= EXHAUSTED_QUOTA_PCT) {
+      return `${name} ${SKULL}${timeLeft(binding.resetsAt, at)}`;
+    }
+    return `${name} ${Math.floor(pct)}%${entry.stale ? "!" : ""}`;
+  });
+  for (const entry of unknown) cells.push(`${nameOf(entry)} ?`);
+  const shown = cells.slice(0, maxShown);
+  if (cells.length > maxShown) shown.push(`+${cells.length - maxShown}`);
+
+  const fresh = known.filter(({ entry }) => !entry.stale);
+  const lowest = fresh.length > 0 ? Math.min(...fresh.map(({ pct }) => pct)) : null;
+  let tone = "neutral";
+  if (lowest !== null && lowest < 10) tone = "danger";
+  else if (lowest !== null && lowest < 25) tone = "warning";
+  if (tone === "neutral" && (unknown.length > 0 || known.some(({ entry }) => entry.stale))) {
+    tone = "warning";
+  }
+  if (snapshot?.generatedAt) tooltip.push(`Updated ${snapshot.generatedAt}`);
+  return { text: shown.join(" · "), tone, tooltip: tooltip.join("\n") };
 }

@@ -48,6 +48,46 @@ export function herdrEndpoint(env = process.env) {
   }
 }
 
+/** Herdr workspace, tab and pane identifiers (`w1`, `w1:p2`, `%3`): never lead with a dash. */
+export const HERDR_ID_RE = /^[A-Za-z0-9_.:%][A-Za-z0-9_.:%-]{0,63}$/u;
+
+export function isHerdrId(value) {
+  return typeof value === "string" && HERDR_ID_RE.test(value);
+}
+
+/** Valid pane IDs only, deduplicated and sorted so equal sets compare equal. */
+export function normalizePaneIds(ids) {
+  const unique = new Set();
+  const list = Array.isArray(ids) || ids instanceof Set ? ids : [];
+  for (const id of list) {
+    const trimmed = typeof id === "string" ? id.trim() : "";
+    if (isHerdrId(trimmed)) unique.add(trimmed);
+  }
+  return [...unique].sort((a, b) => a.localeCompare(b, "en"));
+}
+
+/** Canonical form of an endpoint recorded by another process, or "" when unusable. */
+export function canonicalHerdrEndpoint(endpoint) {
+  if (typeof endpoint !== "string" || !path.isAbsolute(endpoint)) return "";
+  try {
+    return herdrEndpoint({ HERDR_SOCKET_PATH: endpoint });
+  } catch {
+    return "";
+  }
+}
+
+/** Pane IDs of room members bound to this process's own Herdr endpoint. */
+export function herdrPaneIdsFromRoom(room, env = process.env) {
+  if (env?.HERDR_ENV !== "1" || !room || typeof room !== "object") return [];
+  const members = [room.conductor, ...(Array.isArray(room.agents) ? room.agents : [])];
+  const ids = [];
+  for (const member of members) {
+    if (!member || typeof member !== "object" || !isCurrentHerdrAgent(member, env)) continue;
+    ids.push(member.herdrPaneId || member.progress?.herdrPaneId);
+  }
+  return normalizePaneIds(ids);
+}
+
 export function isCurrentHerdrAgent(agent, env = process.env) {
   const endpoint = agent?.herdrEndpoint || agent?.progress?.herdrEndpoint;
   if (env.HERDR_ENV !== "1" || typeof endpoint !== "string") return false;
@@ -84,6 +124,11 @@ export async function verifiedHerdrAgentPane(pane, session, query) {
  * Subscribe to Herdr lifecycle events over the server Unix socket to invalidate cached snapshots.
  * Events are non-durable invalidation signals: on connect, reconnect, or `events_lost`, callers
  * reconcile through an authoritative snapshot read rather than replaying event payloads.
+ *
+ * Herdr protocol 22 has no unsubscribe verb, and a repeated `events.subscribe` on an established
+ * stream resets the connection (verified against a disposable isolated server), so changing the
+ * watched pane set opens a replacement stream beside the live one. It is promoted on
+ * `subscription_started`, then the old stream is retired. A failed switch keeps the live stream.
  */
 export function createHerdrLifecycleSubscriber({
   env = process.env,
@@ -91,17 +136,24 @@ export function createHerdrLifecycleSubscriber({
   onInvalidate,
   onReconcile,
   paneIds = [],
+  handshakeTimeoutMs = 5000,
   reconnectDelayMs = 500,
   maxReconnectDelayMs = 5000,
 } = {}) {
-  let socket = null;
+  let live = null; // promoted stream: events are delivered from here
+  let candidate = null; // replacement or first stream awaiting subscription_started
+  let desiredIds = normalizePaneIds(paneIds);
+  let isStarted = false;
   let isStopped = false;
-  let isSubscribed = false;
   let generation = 0;
   let invalidations = 0;
   let reconnectTimer = null;
+  let switchTimer = null;
   let attempts = 0;
-  let buffer = "";
+  let switchAttempts = 0;
+
+  const backoff = (count) =>
+    Math.min(maxReconnectDelayMs, reconnectDelayMs * 2 ** Math.min(count, 5));
 
   const notifyInvalidate = (reason, detail = null) => {
     if (isStopped) return;
@@ -122,155 +174,226 @@ export function createHerdrLifecycleSubscriber({
     }
   };
 
-  const buildSubscriptions = () => {
-    const subs = HERDR_LIFECYCLE_SUBSCRIPTIONS.map((item) => ({ ...item }));
-    for (const paneId of paneIds) {
-      if (typeof paneId === "string" && paneId.trim()) {
-        subs.push({ type: "pane.agent_status_changed", pane_id: paneId.trim() });
-      }
+  const buildSubscriptions = (ids) => [
+    ...HERDR_LIFECYCLE_SUBSCRIPTIONS.map((item) => ({ ...item })),
+    ...ids.map((paneId) => ({ type: "pane.agent_status_changed", pane_id: paneId })),
+  ];
+
+  const retire = (stream) => {
+    if (!stream || stream.isDead) return;
+    stream.isDead = true;
+    clearTimeout(stream.handshakeTimer);
+    try {
+      stream.socket?.destroy?.();
+    } catch {
+      // Ignore socket teardown errors.
     }
-    return subs;
+  };
+
+  const clearTimers = () => {
+    clearTimeout(reconnectTimer);
+    clearTimeout(switchTimer);
+    reconnectTimer = null;
+    switchTimer = null;
   };
 
   const scheduleReconnect = (reason) => {
-    if (isStopped || reconnectTimer) return;
-    isSubscribed = false;
+    if (isStopped || reconnectTimer || candidate) return;
+    clearTimeout(switchTimer);
+    switchTimer = null;
     notifyInvalidate(reason);
-    const delay = Math.min(maxReconnectDelayMs, reconnectDelayMs * 2 ** Math.min(attempts, 5));
+    const delay = backoff(attempts);
     attempts += 1;
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
-      openSocket();
+      openStream();
     }, delay);
     reconnectTimer.unref?.();
   };
 
-  const handleMessage = (msg) => {
-    if (!msg || typeof msg !== "object" || isStopped) return;
+  /** A replacement stream failed: the old one still delivers hints, so retry later. */
+  const scheduleSwitchRetry = () => {
+    if (isStopped || switchTimer || reconnectTimer) return;
+    const delay = backoff(switchAttempts);
+    switchAttempts += 1;
+    switchTimer = setTimeout(() => {
+      switchTimer = null;
+      if (!isStopped && live && !candidate && !sameIds(live.ids, desiredIds)) openStream();
+    }, delay);
+    switchTimer.unref?.();
+  };
+
+  const sameIds = (a, b) => a.length === b.length && a.every((id, index) => id === b[index]);
+
+  const fail = (stream, reason) => {
+    if (stream.isDead || isStopped) return;
+    retire(stream);
+    if (stream === candidate) {
+      candidate = null;
+      if (live) scheduleSwitchRetry();
+      else scheduleReconnect(reason);
+    } else if (stream === live) {
+      live = null;
+      if (candidate) notifyInvalidate(reason);
+      else scheduleReconnect(reason);
+    }
+  };
+
+  const promote = (stream) => {
+    clearTimeout(stream.handshakeTimer);
+    const previous = live;
+    live = stream;
+    candidate = null;
+    attempts = 0;
+    switchAttempts = 0;
+    generation += 1;
+    retire(previous);
+    notifyInvalidate("subscription_started");
+    notifyReconcile("subscription_started");
+  };
+
+  const handleMessage = (stream, msg) => {
+    if (!msg || typeof msg !== "object" || stream.isDead || isStopped) return;
     if (
       msg.error?.code === "events_lost" ||
       msg.event === "events_lost" ||
       msg.data?.type === "events_lost" ||
       msg.error
     ) {
-      if (socket) {
-        const current = socket;
-        socket = null;
-        current.destroy();
-      }
-      scheduleReconnect(
+      fail(
+        stream,
         msg.error && msg.error?.code !== "events_lost" ? "subscribe_error" : "events_lost",
       );
       return;
     }
     if (msg.result?.type === "subscription_started") {
-      isSubscribed = true;
-      attempts = 0;
-      generation += 1;
-      notifyInvalidate("subscription_started");
-      notifyReconcile("subscription_started");
+      if (stream === candidate) promote(stream);
       return;
     }
-    if (typeof msg.event === "string" && msg.event) {
+    if (stream === live && typeof msg.event === "string" && msg.event) {
       notifyInvalidate(msg.event, msg.data || null);
     }
   };
 
-  const openSocket = () => {
-    if (isStopped || env?.HERDR_ENV !== "1") return;
+  function openStream() {
+    if (isStopped || !isStarted || env?.HERDR_ENV !== "1") return;
     let socketPath;
     try {
       socketPath = herdrEndpoint(env);
     } catch {
-      scheduleReconnect("endpoint_error");
+      if (live) scheduleSwitchRetry();
+      else scheduleReconnect("endpoint_error");
       return;
     }
-    let current;
+    let socket;
     try {
-      current = connect(socketPath);
+      socket = connect(socketPath);
     } catch {
-      scheduleReconnect("connect_error");
+      if (live) scheduleSwitchRetry();
+      else scheduleReconnect("connect_error");
       return;
     }
-    socket = current;
-    buffer = "";
-    const reqId = `ork-sub-${generation + 1}`;
-    const onConnect = () => {
-      if (isStopped || socket !== current) return;
+    const stream = {
+      socket,
+      ids: desiredIds,
+      isDead: false,
+      reqId: `ork-sub-${generation + 1}`,
+      pending: "",
+    };
+    candidate = stream;
+    stream.handshakeTimer = setTimeout(() => fail(stream, "handshake_timeout"), handshakeTimeoutMs);
+    stream.handshakeTimer.unref?.();
+    socket.on?.("connect", () => {
+      if (stream.isDead || isStopped) return;
       const payload = JSON.stringify({
-        id: reqId,
+        id: stream.reqId,
         method: "events.subscribe",
-        params: { subscriptions: buildSubscriptions() },
+        params: { subscriptions: buildSubscriptions(stream.ids) },
       });
       try {
-        current.write(`${payload}\n`);
+        socket.write(`${payload}\n`);
       } catch {
-        scheduleReconnect("write_error");
+        fail(stream, "write_error");
       }
-    };
-    const onData = (chunk) => {
-      if (isStopped || socket !== current) return;
-      buffer += String(chunk || "");
-      let newlineIdx = buffer.indexOf("\n");
+    });
+    socket.on?.("data", (chunk) => {
+      if (stream.isDead || isStopped) return;
+      stream.pending += String(chunk || "");
+      let newlineIdx = stream.pending.indexOf("\n");
       while (newlineIdx !== -1) {
-        const line = buffer.slice(0, newlineIdx).trim();
-        buffer = buffer.slice(newlineIdx + 1);
+        const line = stream.pending.slice(0, newlineIdx).trim();
+        stream.pending = stream.pending.slice(newlineIdx + 1);
         if (line) {
           try {
-            handleMessage(JSON.parse(line));
+            handleMessage(stream, JSON.parse(line));
           } catch {
             // Ignore malformed lines on the stream.
           }
         }
-        newlineIdx = buffer.indexOf("\n");
+        if (stream.isDead) return;
+        newlineIdx = stream.pending.indexOf("\n");
       }
-    };
-    const onCloseOrError = () => {
-      if (isStopped || socket !== current) return;
-      socket = null;
-      scheduleReconnect("disconnected");
-    };
-    current.on?.("connect", onConnect);
-    current.on?.("data", onData);
-    current.on?.("error", onCloseOrError);
-    current.on?.("close", onCloseOrError);
-    current.on?.("end", onCloseOrError);
-  };
+    });
+    const onCloseOrError = () => fail(stream, "disconnected");
+    socket.on?.("error", onCloseOrError);
+    socket.on?.("close", onCloseOrError);
+    socket.on?.("end", onCloseOrError);
+  }
 
   const start = () => {
-    if (isStopped || socket || env?.HERDR_ENV !== "1") return;
-    openSocket();
+    if (isStopped || isStarted || env?.HERDR_ENV !== "1") return;
+    isStarted = true;
+    openStream();
+  };
+
+  /**
+   * Replace the watched pane set. Unchanged sets do no I/O; a changed set before start or while
+   * disconnected only records the desired state. Otherwise a newer request supersedes any pending
+   * replacement so an older set can never be promoted after a newer one.
+   */
+  const setPaneIds = (nextIds) => {
+    if (isStopped) return false;
+    const next = normalizePaneIds(nextIds);
+    if (sameIds(next, desiredIds)) return false;
+    desiredIds = next;
+    if (!isStarted) return true;
+    if (candidate) {
+      retire(candidate);
+      candidate = null;
+      openStream();
+    } else if (live) {
+      clearTimeout(switchTimer);
+      switchTimer = null;
+      openStream();
+    }
+    return true;
   };
 
   const stop = () => {
     if (isStopped) return;
     isStopped = true;
-    isSubscribed = false;
-    if (reconnectTimer) {
-      clearTimeout(reconnectTimer);
-      reconnectTimer = null;
-    }
-    if (!socket) return;
-    const current = socket;
-    socket = null;
-    try {
-      current.destroy?.();
-    } catch {
-      // Ignore socket teardown errors.
-    }
+    clearTimers();
+    const streams = [live, candidate];
+    live = null;
+    candidate = null;
+    for (const stream of streams) retire(stream);
   };
 
   return {
     start,
     stop,
+    setPaneIds,
     get isSubscribed() {
-      return isSubscribed;
+      return live !== null;
     },
     get generation() {
       return generation;
     },
     get invalidations() {
       return invalidations;
+    },
+    get paneIds() {
+      return [...desiredIds];
     },
   };
 }
