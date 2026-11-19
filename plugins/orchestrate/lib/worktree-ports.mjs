@@ -8,6 +8,7 @@ import {
   mkdirSync,
   openSync,
   readdirSync,
+  readFileSync,
   realpathSync,
   renameSync,
   unlinkSync,
@@ -387,6 +388,9 @@ export function fenceWorktreePorts({
         if (!isOwnPrivateFile(existing)) {
           throw portsError("ORK_PORTS_FENCE_UNSAFE", `${file} is not a private file you own`);
         }
+        if (reason && JSON.parse(readFileSync(file, "utf8")).reason !== reason) {
+          throw portsError("ORK_PORTS_FENCED", "Port fence belongs to another operation");
+        }
         return { fenced: true, path: file };
       }
       const temporary = path.join(
@@ -418,7 +422,7 @@ export function fenceWorktreePorts({
   }
 }
 
-export function clearWorktreePortFence({ repoRoot, worktreePath, key, env = process.env }) {
+export function clearWorktreePortFence({ repoRoot, worktreePath, key, env = process.env, reason }) {
   const resolved = resolveKey({ repoRoot, worktreePath, key });
   const file = fencePath(resolved, env);
   let info;
@@ -434,6 +438,9 @@ export function clearWorktreePortFence({ repoRoot, worktreePath, key, env = proc
   const db = openWritable(env);
   try {
     return withImmediateTransaction(db, () => {
+      if (reason && JSON.parse(readFileSync(file, "utf8")).reason !== reason) {
+        throw portsError("ORK_PORTS_FENCED", "Port fence belongs to another operation");
+      }
       // Rename rather than delete so the record survives for inspection.
       const done = path.join(
         path.dirname(file),

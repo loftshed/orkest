@@ -31,7 +31,12 @@ export const STRATEGIES = Object.freeze(["local", "pr"]);
 export const PR_STATES = Object.freeze(["OPEN", "MERGED", "CLOSED", "UNKNOWN"]);
 export const QUARANTINE_SCHEMA = "ork.cleanup.quarantine.v1";
 const MAX_SCAN_ENTRIES = 500_000;
-const NON_TERMINAL_JOURNAL = new Set(["intent", "moved", "ports_released"]);
+function pendingJournal(journal) {
+  return (
+    ["intent", "moved", "ports_released"].includes(journal.state) ||
+    (journal.state === "aborted" && journal.fenced)
+  );
+}
 
 function exitError(message, exitCode = 2, code = "usage") {
   const error = new Error(message);
@@ -853,6 +858,7 @@ export async function evaluateMergedWorktree(entry, ctx) {
 
   // Ownership evidence: Orkest's own disposable marker, positively matching this checkout and branch.
   const gitDir = tryGit(run, worktreePath, ["rev-parse", "--absolute-git-dir"], env)?.trim();
+  result.gitAdmin = gitDir ? { path: realOrResolved(gitDir), identity: identityOf(gitDir) } : null;
   const marker = gitDir ? readJsonSafe(path.join(gitDir, "orkest.json")) : null;
   const loadedState = loadFoundryState(worktreePath);
   const state = loadedState.kind === "ok" ? loadedState.state : null;
@@ -1293,9 +1299,10 @@ export async function quarantineMergedWorktree({
     base: evaluation.base,
     evidence: evaluation.evidence,
     identity: evaluation.identity,
+    gitAdmin: evaluation.gitAdmin,
     ports: portRecords.ports,
     portKey,
-    fenced: false,
+    fenced: Boolean(ports),
     createdAt: now().toISOString(),
     updatedAt: now().toISOString(),
   };
@@ -1314,7 +1321,11 @@ export async function quarantineMergedWorktree({
   const liftFence = () => {
     if (!journal.fenced || !ports) return true;
     try {
-      ports.clearWorktreePortFence({ key: journal.portKey, env });
+      ports.clearWorktreePortFence({
+        key: journal.portKey,
+        env,
+        reason: `quarantine ${journal.id}`,
+      });
       update({ fenced: false });
       return true;
     } catch {
@@ -1324,7 +1335,7 @@ export async function quarantineMergedWorktree({
   if (ports) {
     try {
       ports.fenceWorktreePorts({ key: portKey, env, reason: `quarantine ${id}` });
-      update({ fenced: true });
+      // The intent already records the fence before installation.
     } catch (error) {
       update({ state: "aborted", error: String(error?.message ?? error).slice(0, 500) });
       return kept("ports_fence_failed");
@@ -1368,10 +1379,28 @@ function finishMoved({ journal, journalFile, update, ports, env, run, root }) {
   const isMoved = isSameIdentity(identityOf(journal.destination), journal.identity);
   const registered = parseWorktreeList(
     git(run, root, ["worktree", "list", "--porcelain"], env),
-  ).some((entry) => realOrResolved(entry.path) === realOrResolved(journal.destination));
+  ).find((entry) => realOrResolved(entry.path) === realOrResolved(journal.destination));
   if (!isMoved || !registered) {
     update({ state: "intent", error: "post_move_verification_failed" });
     return { status: "move_unverified", path: journal.source, journal: journalFile };
+  }
+  const gitDir = tryGit(run, journal.destination, ["rev-parse", "--absolute-git-dir"], env)?.trim();
+  if (
+    registered.branch !== journal.branch ||
+    registered.head !== journal.head ||
+    !journal.gitAdmin ||
+    !gitDir ||
+    realOrResolved(gitDir) !== journal.gitAdmin.path ||
+    !isSameIdentity(identityOf(gitDir), journal.gitAdmin.identity)
+  ) {
+    return {
+      status: "needs_review",
+      reason: "destination_registration_changed",
+      path: journal.source,
+      destination: journal.destination,
+      journal: journalFile,
+      current: { branch: registered.branch, head: registered.head, gitDir },
+    };
   }
   const pending = (error, extra = {}) => ({
     status: "quarantined_ports_pending",
@@ -1400,7 +1429,11 @@ function finishMoved({ journal, journalFile, update, ports, env, run, root }) {
   update({ state: "ports_released", released });
   if (journal.fenced && ports) {
     try {
-      ports.clearWorktreePortFence({ key: journal.portKey, env });
+      ports.clearWorktreePortFence({
+        key: journal.portKey,
+        env,
+        reason: `quarantine ${journal.id}`,
+      });
       update({ fenced: false });
     } catch (error) {
       return pending(error?.message || String(error), { pendingFence: true });
@@ -1438,7 +1471,7 @@ export async function recoverQuarantines({
   const ports = await loadPortsApi(portsApi);
   const results = [];
   for (const { file, journal } of listJournals(root, env)) {
-    if (!NON_TERMINAL_JOURNAL.has(journal.state)) continue;
+    if (!pendingJournal(journal)) continue;
     const update = (patch) => {
       Object.assign(journal, patch, { updatedAt: now().toISOString() });
       writeJournal(file, journal);
@@ -1450,14 +1483,24 @@ export async function recoverQuarantines({
       results.push({ id: journal.id, status: "needs_review", reason: "ports_api_unavailable" });
       continue;
     }
-    if (journal.state === "intent" && isAtSource && !identityOf(journal.destination)) {
+    if (
+      ["intent", "aborted"].includes(journal.state) &&
+      isAtSource &&
+      !identityOf(journal.destination)
+    ) {
       update({ state: "aborted", error: "move_never_happened" });
-      if (journal.fenced && isNeedsPorts) {
+      if (isNeedsPorts) {
         try {
-          ports.clearWorktreePortFence({ key: journal.portKey, env });
+          ports.clearWorktreePortFence({
+            key: journal.portKey,
+            env,
+            reason: `quarantine ${journal.id}`,
+          });
           update({ fenced: false });
         } catch {
-          /* The fence stays visible; it blocks reuse until cleared. */
+          update({ fenced: true });
+          results.push({ id: journal.id, status: "needs_review", reason: "fence_release_pending" });
+          continue;
         }
       }
       results.push({ id: journal.id, status: "aborted" });
@@ -1550,17 +1593,26 @@ export async function pruneMergedWorktree({
   if (!evaluation.eligible) {
     return { pruned: false, status: "retained", reasons: evaluation.reasons, path: target };
   }
-  const outcome = await quarantineMergedWorktree({
-    repoRoot: root,
-    evaluation,
-    env,
-    execFileSyncFn,
-    portsApi,
-    lease,
-    assertHeld,
-  });
-  const isMoved = ["quarantined", "quarantined_ports_pending"].includes(outcome.status);
-  return { pruned: isMoved, ...outcome };
+  const repoLease = await acquireWorkspaceLease(root, { env, namespace: "cleanup-merged" });
+  if (!repoLease.acquired) return { pruned: false, status: "retained", reasons: ["cleanup_busy"] };
+  try {
+    const outcome = await quarantineMergedWorktree({
+      repoRoot: root,
+      evaluation,
+      env,
+      execFileSyncFn,
+      portsApi,
+      lease,
+      assertHeld: () => {
+        assertWorkspaceLease(repoLease);
+        assertHeld?.();
+      },
+    });
+    const isMoved = ["quarantined", "quarantined_ports_pending"].includes(outcome.status);
+    return { pruned: isMoved, ...outcome };
+  } finally {
+    await repoLease.release();
+  }
 }
 
 /**
@@ -1607,7 +1659,7 @@ export async function mergedCleanup({
     quarantined: [],
     recovered: [],
     pendingJournals: audit.journals
-      .filter(({ journal }) => NON_TERMINAL_JOURNAL.has(journal.state))
+      .filter(({ journal }) => pendingJournal(journal))
       .map(({ journal }) => ({ id: journal.id, state: journal.state, source: journal.source })),
     bytesReclaimed: 0,
   };
