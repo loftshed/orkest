@@ -33,6 +33,16 @@ test("a repository without any manifest or version bookkeeping needs none", () =
   expect(validate(root)).toStrictEqual([]);
 });
 
+test("validates relocated adapter skills and command references", () => {
+  const root = fixtureRepo();
+  write(root, "adapters/skills/demo/SKILL.md", "---\nname: other\ndescription: Test\n---\n");
+  write(root, "adapters/claude/commands/go.md", "See `adapters/missing.md`.\n");
+  expect(validate(root)).toStrictEqual([
+    "adapters/skills/demo/SKILL.md: name should be demo",
+    "adapters/claude/commands/go.md: adapters/missing.md does not exist",
+  ]);
+});
+
 test("a skill whose name differs from its directory is reported", () => {
   const errors = validate(fixtureRepo({ skillName: "other" }));
   expect(errors.length).toBe(1);

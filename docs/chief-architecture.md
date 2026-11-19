@@ -6,7 +6,7 @@
 | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------- |
 | Runtime and CLI           | [`lib/chief.mjs`](../plugins/orchestrate/lib/chief.mjs), [`bin/chief.mjs`](../plugins/orchestrate/bin/chief.mjs), `ork chief` hook in [`bin/ork.mjs`](../plugins/orchestrate/bin/ork.mjs)                                            | `chief-arch`  |
 | Chief View (side window)  | [`lib/chief-view.mjs`](../plugins/orchestrate/lib/chief-view.mjs), `--chief` mode in `bin/horde-tui.mjs`, `lib/horde-view.mjs`, `lib/orca-worker.mjs`, `agent_statusline_tmux.py`, `herdr_swarm_restore.py`, `orca_swarm_restore.py` | `chief-tui`   |
-| Skill, command, installer | [`skills/chief/SKILL.md`](../plugins/orchestrate/skills/chief/SKILL.md), [`commands/chief.md`](../plugins/orchestrate/commands/chief.md), `install_mailbox.py`                                                                       | `chief-skill` |
+| Skill, command, installer | [`skills/chief/SKILL.md`](../adapters/skills/chief/SKILL.md), [`commands/chief.md`](../adapters/claude/commands/chief.md), `install_mailbox.py`                                                                                      | `chief-skill` |
 | Tests                     | `tests/plugins/orchestrate/chief-test.js`, `tests/plugins/orchestrate/chief-view-test.js`, `test_install_mailbox.py`                                                                                                                 | all           |
 
 ## 1. Model

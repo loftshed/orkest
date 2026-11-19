@@ -50,90 +50,6 @@ MANAGED_ZSHRC_BLOCK = (
     f"{MANAGED_ZSHRC_END}\n"
 )
 
-SWARM_COMMAND_TEXT = (
-    "---\n"
-    "description: Toggle the Orkest Swarm View split pane or launch a swarm for a goal (/swarm [toggle|open|close|<goal>])\n"
-    'argument-hint: "[toggle|open|close|<goal>]"\n'
-    "---\n\n"
-    "[orkest-swarm-command: $ARGUMENTS]\n"
-    "If the `/swarm` turn hook already opened or closed the Orkest Swarm View pane (or if no goal was given), "
-    "confirm the result in one short line and do not call any tools. If a goal was given, coordinate the swarm "
-    "for `$ARGUMENTS`.\n"
-)
-
-HORDE_COMMAND_TEXT = (
-    "---\n"
-    "description: Toggle the Orkest Swarm View split pane or launch a swarm for a goal (/horde [toggle|open|close|<goal>])\n"
-    'argument-hint: "[toggle|open|close|<goal>]"\n'
-    "---\n\n"
-    "[orkest-swarm-command: $ARGUMENTS]\n"
-    "If the `/horde` turn hook already opened or closed the Orkest Swarm View pane (or if no goal was given), "
-    "confirm the result in one short line and do not call any tools. If a goal was given, coordinate the swarm "
-    "for `$ARGUMENTS`.\n"
-)
-
-SWARM_SKILL_TEXT = (
-    "---\n"
-    "name: swarm\n"
-    "description: Toggle (open or close) the live Orkest Swarm View split pane in the current terminal when the user types /swarm or /horde.\n"
-    "metadata:\n"
-    "  version: 0.50.0\n"
-    "---\n\n"
-    "[orkest-swarm-command]\n"
-    "If the `/swarm` turn hook already opened or closed the Orkest Swarm View pane, confirm the result in one "
-    "short line and do not call any tools. Otherwise run `ork swarm` (`ork swarm open` or `ork swarm close`) "
-    "and report the result in one short line.\n"
-)
-
-CLEANUP_COMMAND_TEXT = (
-    "---\n"
-    "description: Audit, prune, and migrate legacy Orkest / agent-executor state, worktrees, and backups\n"
-    'argument-hint: "[status|run] [--dry-run] [--migrate-legacy]"\n'
-    "---\n\n"
-    "[orkest-cleanup-command: $ARGUMENTS]\n"
-    "Run `ork cleanup $ARGUMENTS` (use `ork cleanup status --json` first if you want to preview before mutating, "
-    "or `ork cleanup run --migrate-legacy` when the user asks to clean up and migrate legacy paths) and report "
-    "the reclaimed artifacts, worktrees, backups, and legacy path migration status concisely.\n"
-)
-
-CLEANUP_SKILL_TEXT = (
-    "---\n"
-    "name: cleanup\n"
-    "description: Audit, prune, and migrate legacy Orkest and agent-executor caches, disposable worktrees, staged daemon runtimes, and configuration backups when the user types /cleanup or asks to clean up old Orkest versions.\n"
-    "metadata:\n"
-    "  version: 0.50.0\n"
-    "---\n\n"
-    "[orkest-cleanup-command]\n"
-    "Run `ork cleanup status --json` to inspect reclaimable Orkest state, or `ork cleanup run [--migrate-legacy] --json` "
-    "to prune stale runs, disposable worktrees, staged daemon runtimes, and backups (and optionally migrate legacy "
-    "`~/.cache/agent-executor` and `~/.config/agent-executor` paths).\n"
-)
-
-SIDE_SKILL_TEXT = (
-    "---\n"
-    "name: side\n"
-    'description: Dispatch or park a side mission from the current tab without derailing the active task or cluttering the main conversation context. Triggers on "/side", "ork side", "side:", or "!side".\n'
-    "metadata:\n"
-    "  version: 0.50.0\n"
-    "---\n\n"
-    "[orkest-side-command]\n"
-    "When the `/side` turn hook has already dispatched or parked this side mission, confirm the result in one short line "
-    "and do not call any tools. Otherwise run `ork side <idea>` (`--execute`, `--investigate`, `--later`, or `--issue`) "
-    "and report the result in one short line.\n"
-)
-
-UPDATE_SKILL_TEXT = (
-    "---\n"
-    "name: update\n"
-    "description: Check for and apply fast-forward Orkest repository updates, re-run mailbox installation, and migrate legacy agent-executor state when the user runs /update or ork update.\n"
-    "metadata:\n"
-    "  version: 0.50.0\n"
-    "---\n\n"
-    "[orkest-update-command]\n"
-    "Run `ork update` (`ork update check`, `ork update status`, `ork update enable`, or `ork update disable`) "
-    "and report the update status concisely.\n"
-)
-
 
 def resolve_config_home(home: Path) -> Path:
     if home.resolve() == Path.home().resolve():
@@ -504,13 +420,6 @@ def _candidate_plugin_roots(plugin_root: Path | None = None, ork_cli: Path | Non
     return unique
 
 
-def install_swarm_command(home: Path, *, dry_run: bool = False) -> bool:
-    changed = _install_claude_command(home, "swarm", SWARM_COMMAND_TEXT, dry_run=dry_run)
-    if _install_claude_command(home, "horde", HORDE_COMMAND_TEXT, dry_run=dry_run):
-        changed = True
-    return changed
-
-
 HERDR_PLUGIN_ID = "orkest.swarms"
 HERDR_SHORTCUT_BLOCK = (
     "\n[[keys.command]]\n"
@@ -747,18 +656,6 @@ def install_herdr_skill(
     return _install_cross_harness_skill(home, "herdr", content, include_claude=True, dry_run=dry_run)
 
 
-def install_swarm_skill(home: Path, *, dry_run: bool = False) -> bool:
-    return _install_cross_harness_skill(home, "swarm", SWARM_SKILL_TEXT, dry_run=dry_run)
-
-
-def install_cleanup_command(home: Path, *, dry_run: bool = False) -> bool:
-    return _install_claude_command(home, "cleanup", CLEANUP_COMMAND_TEXT, dry_run=dry_run)
-
-
-def install_cleanup_skill(home: Path, *, dry_run: bool = False) -> bool:
-    return _install_cross_harness_skill(home, "cleanup", CLEANUP_SKILL_TEXT, dry_run=dry_run)
-
-
 def _adapter_roots(plugin_root: Path | None = None, ork_cli: Path | None = None) -> list[Path]:
     """Directories that may hold `adapters/`: each candidate root, and the checkout above a `plugins/<name>` root."""
     roots: list[Path] = []
@@ -769,80 +666,55 @@ def _adapter_roots(plugin_root: Path | None = None, ork_cli: Path | None = None)
     return roots
 
 
-def install_command_source(
-    home: Path, name: str, *, plugin_root: Path | None = None, ork_cli: Path | None = None, dry_run: bool = False
-) -> bool:
-    for root in _candidate_plugin_roots(plugin_root, ork_cli):
-        source = root / f"commands/{name}.md"
+def _adapter_source(relative: str, plugin_root: Path | None = None, ork_cli: Path | None = None) -> str | None:
+    """Read the one tracked source for a command or skill, from `adapters/<relative>`."""
+    for root in _adapter_roots(plugin_root, ork_cli):
+        source = root / "adapters" / relative
         if source.is_file():
-            return _install_claude_command(home, name, source.read_text(encoding="utf-8"), dry_run=dry_run)
-    return False
+            return source.read_text(encoding="utf-8")
+    return None
 
 
-def install_side_command(
+def _install_command_source(
+    home: Path, name: str, plugin_root: Path | None, ork_cli: Path | None, dry_run: bool
+) -> bool:
+    content = _adapter_source(f"claude/commands/{name}.md", plugin_root, ork_cli)
+    return content is not None and _install_claude_command(home, name, content, dry_run=dry_run)
+
+
+def _install_skill_source(home: Path, name: str, plugin_root: Path | None, ork_cli: Path | None, dry_run: bool) -> bool:
+    content = _adapter_source(f"skills/{name}/SKILL.md", plugin_root, ork_cli)
+    return content is not None and _install_cross_harness_skill(home, name, content, dry_run=dry_run)
+
+
+# Every command and skill Orkest writes, each read from exactly one file under `adapters/`.
+ADAPTER_COMMANDS = ("account", "swarm", "horde", "cleanup", "side", "update", "chief")
+ADAPTER_SKILLS = ("swarm", "cleanup", "side", "update", "chief")
+
+
+def install_adapter_commands(
     home: Path, *, plugin_root: Path | None = None, ork_cli: Path | None = None, dry_run: bool = False
 ) -> bool:
-    return install_command_source(home, "side", plugin_root=plugin_root, ork_cli=ork_cli, dry_run=dry_run)
+    """Write each `adapters/claude/commands/*.md` into every Claude profile's commands directory."""
+    changed = False
+    for name in ADAPTER_COMMANDS:
+        if _install_command_source(home, name, plugin_root, ork_cli, dry_run):
+            changed = True
+    return changed
 
 
-def install_side_skill(
+def install_adapter_skills(
     home: Path, *, plugin_root: Path | None = None, ork_cli: Path | None = None, dry_run: bool = False
 ) -> bool:
-    for root in _candidate_plugin_roots(plugin_root, ork_cli):
-        side_skill = root / "skills/side/SKILL.md"
-        if side_skill.is_file():
-            return _install_cross_harness_skill(home, "side", side_skill.read_text(encoding="utf-8"), dry_run=dry_run)
-        if (root / "commands/side.md").is_file():
-            return _install_cross_harness_skill(home, "side", SIDE_SKILL_TEXT, dry_run=dry_run)
-    return False
+    """Copy each `adapters/skills/<name>/SKILL.md` to ~/.agents/skills and link it into the other harnesses.
 
-
-def install_update_command(
-    home: Path, *, plugin_root: Path | None = None, ork_cli: Path | None = None, dry_run: bool = False
-) -> bool:
-    for root in _candidate_plugin_roots(plugin_root, ork_cli):
-        update_cmd = root / "commands/update.md"
-        if update_cmd.is_file():
-            return _install_claude_command(home, "update", update_cmd.read_text(encoding="utf-8"), dry_run=dry_run)
-    return False
-
-
-def install_update_skill(
-    home: Path, *, plugin_root: Path | None = None, ork_cli: Path | None = None, dry_run: bool = False
-) -> bool:
-    for root in _candidate_plugin_roots(plugin_root, ork_cli):
-        update_skill = root / "skills/update/SKILL.md"
-        if update_skill.is_file():
-            return _install_cross_harness_skill(
-                home, "update", update_skill.read_text(encoding="utf-8"), dry_run=dry_run
-            )
-        if (root / "commands/update.md").is_file():
-            return _install_cross_harness_skill(home, "update", UPDATE_SKILL_TEXT, dry_run=dry_run)
-    return False
-
-
-def install_chief_command(
-    home: Path, *, plugin_root: Path | None = None, ork_cli: Path | None = None, dry_run: bool = False
-) -> bool:
-    for root in _candidate_plugin_roots(plugin_root, ork_cli):
-        chief_cmd = root / "commands/chief.md"
-        if chief_cmd.is_file():
-            return _install_claude_command(home, "chief", chief_cmd.read_text(encoding="utf-8"), dry_run=dry_run)
-    return False
-
-
-def install_chief_skill(
-    home: Path, *, plugin_root: Path | None = None, ork_cli: Path | None = None, dry_run: bool = False
-) -> bool:
-    """Copy the plugin's `/chief` skill to ~/.agents/skills and link it into Codex, Antigravity, and OpenCode.
-
-    Claude Code loads the skill from the plugin itself, so Claude skill directories only lose stale duplicates.
+    Claude Code loads these as commands, so its skill directories only lose stale duplicates.
     """
-    for root in _candidate_plugin_roots(plugin_root, ork_cli):
-        chief_skill = root / "skills/chief/SKILL.md"
-        if chief_skill.is_file():
-            return _install_cross_harness_skill(home, "chief", chief_skill.read_text(encoding="utf-8"), dry_run=dry_run)
-    return False
+    changed = False
+    for name in ADAPTER_SKILLS:
+        if _install_skill_source(home, name, plugin_root, ork_cli, dry_run):
+            changed = True
+    return changed
 
 
 _ALIAS_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
@@ -1435,27 +1307,9 @@ def install_shell_wrappers(
         changed = True
     if install_orchestrate_skill_links(home, dry_run=dry_run):
         changed = True
-    if install_swarm_command(home, dry_run=dry_run):
+    if install_adapter_commands(home, ork_cli=ork_cli, dry_run=dry_run):
         changed = True
-    if install_swarm_skill(home, dry_run=dry_run):
-        changed = True
-    if install_cleanup_command(home, dry_run=dry_run):
-        changed = True
-    if install_cleanup_skill(home, dry_run=dry_run):
-        changed = True
-    if install_command_source(home, "account", ork_cli=ork_cli, dry_run=dry_run):
-        changed = True
-    if install_side_command(home, ork_cli=ork_cli, dry_run=dry_run):
-        changed = True
-    if install_side_skill(home, ork_cli=ork_cli, dry_run=dry_run):
-        changed = True
-    if install_update_command(home, ork_cli=ork_cli, dry_run=dry_run):
-        changed = True
-    if install_update_skill(home, ork_cli=ork_cli, dry_run=dry_run):
-        changed = True
-    if install_chief_command(home, ork_cli=ork_cli, dry_run=dry_run):
-        changed = True
-    if install_chief_skill(home, ork_cli=ork_cli, dry_run=dry_run):
+    if install_adapter_skills(home, ork_cli=ork_cli, dry_run=dry_run):
         changed = True
     if install_herdr_skill(home, ork_cli=ork_cli, dry_run=dry_run):
         changed = True

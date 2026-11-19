@@ -75,7 +75,7 @@ export async function generatedBlocks(repo) {
   return {
     commands: commandReference(help.stdout),
     requirements: requirements(JSON.parse(manifest)),
-    "slash-commands": slashCommands(path.join(orchestrate, "commands")),
+    "slash-commands": slashCommands(path.join(repo, "adapters/claude/commands")),
   };
 }
 
