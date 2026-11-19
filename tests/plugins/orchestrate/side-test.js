@@ -544,7 +544,66 @@ describe("ork side (side missions)", () => {
       expect(branch.status).toBe(0);
     });
 
-    it("enforces per-repo harness denylist policy and routes personal Claude to ~/.claude-personal", async () => {
+    it("enforces per-repo harness/tag/account denylist policy and resolves multi-provider N-accounts via Monitor config", async () => {
+      const fakeHome = path.join(tmpDir, "home-multi");
+      fs.mkdirSync(fakeHome, { recursive: true });
+      const monitorCfgPath = path.join(tmpDir, "monitor-multi.json");
+      const claudeWorkDir = path.join(fakeHome, ".claude");
+      const claudeP1Dir = path.join(fakeHome, ".claude-p1");
+      const claudeP2Dir = path.join(fakeHome, ".claude-p2");
+      const claudeAcmeDir = path.join(fakeHome, ".claude-acme");
+      const codexPersHome = path.join(fakeHome, ".codex-personal");
+      const agyPersHome = path.join(fakeHome, ".gemini-personal");
+      fs.writeFileSync(
+        monitorCfgPath,
+        JSON.stringify({
+          accounts: [
+            { id: "claude-work-1", provider: "claude", tags: ["work"] },
+            {
+              id: "claude-work-2",
+              provider: "claude",
+              configDir: "~/.claude-w2",
+              tags: ["work"],
+            },
+            {
+              id: "claude-p1",
+              alias: "claude-alt",
+              provider: "claude",
+              configDir: claudeP1Dir,
+              tags: ["personal"],
+            },
+            {
+              id: "claude-p2",
+              provider: "claude",
+              configDir: claudeP2Dir,
+              tags: ["personal"],
+            },
+            {
+              id: "claude-acme",
+              provider: "claude",
+              configDir: claudeAcmeDir,
+              tags: ["client-acme"],
+            },
+            { id: "codex-work", provider: "codex", tags: ["work"] },
+            {
+              id: "codex-p1",
+              alias: "codex-pers",
+              provider: "codex",
+              codexHome: codexPersHome,
+              tags: ["personal"],
+            },
+            {
+              id: "agy-p1",
+              alias: "agy-pers",
+              provider: "antigravity",
+              agyHome: agyPersHome,
+              tags: ["personal"],
+            },
+          ],
+        }),
+        "utf8",
+      );
+
       const configDir = path.join(tmpDir, "config");
       fs.mkdirSync(configDir, { recursive: true });
       fs.writeFileSync(
@@ -552,12 +611,17 @@ describe("ork side (side missions)", () => {
         JSON.stringify({
           repo_policies: {
             [repoDir]: {
-              deny: ["opencode", "claude-work"],
+              deny: ["opencode", "work", "client-acme"],
             },
           },
         }),
         "utf8",
       );
+      const baseEnv = {
+        PATH: process.env.PATH,
+        HOME: fakeHome,
+        MONITOR_CONFIG: monitorCfgPath,
+      };
 
       // 1. Explicit denied engine ("opencode") returns policy_denied
       const denied = await sideCommand(["--engine", "opencode", "--json", "fix pagination"], {
@@ -565,6 +629,7 @@ describe("ork side (side missions)", () => {
         mailboxDir,
         cacheDir,
         configDir,
+        env: baseEnv,
         runCommand: (cmd, args) => {
           if (cmd === "git" && args[0] === "rev-parse") {
             return { status: 0, stdout: `${repoDir}\n`, stderr: "" };
@@ -575,27 +640,315 @@ describe("ork side (side missions)", () => {
       expect(denied.status).toBe("policy_denied");
       expect(denied.error).toContain("opencode");
 
-      // 2. Explicit --engine claude when claude-work is denied routes to ~/.claude-personal (plaude)
-      const claudePolicy = checkRepoPolicyForSide(repoDir, "claude", { configDir });
+      // 2. Explicit --engine claude when work accounts are denied: refuses with ORCHESTRATE_AUTO_ACCOUNT off, reroutes to first allowed personal account when on
+      const claudeFlagOff = checkRepoPolicyForSide(repoDir, "claude", {
+        configDir,
+        env: baseEnv,
+      });
+      expect(claudeFlagOff.ok).toBe(false);
+      expect(claudeFlagOff.status).toBe("policy_denied");
+
+      const claudePolicy = checkRepoPolicyForSide(repoDir, "claude", {
+        configDir,
+        env: { ...baseEnv, ORCHESTRATE_AUTO_ACCOUNT: "1" },
+      });
       expect(claudePolicy.ok).toBe(true);
-      expect(claudePolicy.profile).toBe("plaude");
-      expect(claudePolicy.claudeConfigDir).toBe(path.join(os.homedir(), ".claude-personal"));
+      expect(claudePolicy.accountId).toBe("claude-p1");
+      expect(claudePolicy.accountAlias).toBe("claude-alt");
+      expect(claudePolicy.claudeConfigDir).toBe(claudeP1Dir);
       expect(claudePolicy.extraArgs).toEqual([
         "--claude-config-dir",
-        path.join(os.homedir(), ".claude-personal"),
+        claudeP1Dir,
+        "--account",
+        "claude-p1",
       ]);
 
-      // 3. Default engine fallback when codex is denied in .orkest/policy.json
+      // 3. Explicit --account across Codex and Antigravity resolves codexHome / agyHome / accountEnv
+      const codexPers = checkRepoPolicyForSide(repoDir, null, {
+        configDir,
+        account: "codex-pers",
+        env: baseEnv,
+      });
+      expect(codexPers).toMatchObject({
+        ok: true,
+        engine: "codex",
+        accountId: "codex-p1",
+        accountAlias: "codex-pers",
+        codexHome: codexPersHome,
+        accountEnv: { CODEX_HOME: codexPersHome },
+        extraArgs: ["--account", "codex-p1"],
+      });
+
+      const agyPers = checkRepoPolicyForSide(repoDir, null, {
+        configDir,
+        account: "agy-pers",
+        env: baseEnv,
+      });
+      expect(agyPers).toMatchObject({
+        ok: true,
+        engine: "agy",
+        accountId: "agy-p1",
+        accountAlias: "agy-pers",
+        agyHome: agyPersHome,
+        accountEnv: { GEMINI_CLI_HOME: agyPersHome },
+        extraArgs: ["--account", "agy-p1"],
+      });
+
+      // 4. Default engine fallback when codex and agy are denied selects allowed personal Claude account, skipping denied work/client-acme accounts
       fs.mkdirSync(path.join(repoDir, ".orkest"), { recursive: true });
       fs.writeFileSync(
         path.join(repoDir, ".orkest", "policy.json"),
-        JSON.stringify({ deny: ["codex"] }),
+        JSON.stringify({ deny: ["codex", "agy", "claude-p1"] }),
         "utf8",
       );
-      const fallbackPolicy = checkRepoPolicyForSide(repoDir, null, { configDir });
-      expect(fallbackPolicy.ok).toBe(true);
-      expect(fallbackPolicy.engine).toBe("agy");
-      expect(fallbackPolicy.fallbackFrom).toBe("codex");
+      const fallbackPolicy = checkRepoPolicyForSide(repoDir, null, { configDir, env: baseEnv });
+      expect(fallbackPolicy).toMatchObject({
+        ok: true,
+        engine: "claude",
+        accountId: "claude-p2",
+        claudeConfigDir: claudeP2Dir,
+        fallbackFrom: "codex",
+      });
+
+      // 5. Client-tagged account is denied when its tag is in policy.deny
+      const acmeDenied = checkRepoPolicyForSide(repoDir, null, {
+        configDir,
+        account: "claude-acme",
+        env: baseEnv,
+      });
+      expect(acmeDenied.ok).toBe(false);
+      expect(acmeDenied.status).toBe("policy_denied");
+      expect(fs.existsSync(claudeWorkDir)).toBe(false);
+    });
+
+    it("covers custom aliases via --engine/--account, env config file vs configDir, fallback order, all denied, and contradiction checks", async () => {
+      const fakeHome = path.join(tmpDir, "home");
+      fs.mkdirSync(fakeHome, { recursive: true });
+      const expectedPersonalDir = path.join(fakeHome, ".claude-p1");
+      const secondPersonalDir = path.join(fakeHome, ".claude-p2");
+      const monitorCfgPath = path.join(tmpDir, "monitor-custom.json");
+      fs.writeFileSync(
+        monitorCfgPath,
+        JSON.stringify({
+          accounts: [
+            { id: "claude-work", provider: "claude", tags: ["work"] },
+            {
+              id: "claude-p1",
+              alias: "claude-alt",
+              provider: "claude",
+              configDir: expectedPersonalDir,
+              tags: ["personal"],
+            },
+            {
+              id: "claude-p2",
+              provider: "claude",
+              configDir: secondPersonalDir,
+              tags: ["personal"],
+            },
+          ],
+        }),
+        "utf8",
+      );
+      const explicitCfgFile = path.join(tmpDir, "custom-orchestrate.json");
+      fs.writeFileSync(
+        explicitCfgFile,
+        JSON.stringify({
+          repo_policies: {
+            [repoDir]: {
+              deny: ["codex", "agy", "claude-work"],
+            },
+          },
+        }),
+        "utf8",
+      );
+      const envWithCfg = {
+        PATH: process.env.PATH,
+        HOME: fakeHome,
+        ORCHESTRATE_CONFIG: explicitCfgFile,
+        MONITOR_CONFIG: monitorCfgPath,
+      };
+
+      // 1. Auto-selection evaluates all configured accounts and picks claude-p1 when codex, agy, and claude-work are denied
+      const fallbackAuto = checkRepoPolicyForSide(repoDir, null, { env: envWithCfg });
+      expect(fallbackAuto).toMatchObject({
+        ok: true,
+        engine: "claude",
+        accountId: "claude-p1",
+        accountAlias: "claude-alt",
+        fallbackFrom: "codex",
+        claudeConfigDir: expectedPersonalDir,
+        extraArgs: ["--claude-config-dir", expectedPersonalDir, "--account", "claude-p1"],
+      });
+
+      // 2. When all personal Claude accounts are also denied, auto-selection falls back to opencode
+      fs.writeFileSync(
+        explicitCfgFile,
+        JSON.stringify({
+          repo_policies: {
+            [repoDir]: {
+              deny: ["codex", "agy", "claude-work", "personal"],
+            },
+          },
+        }),
+        "utf8",
+      );
+      const fallbackOpencode = checkRepoPolicyForSide(repoDir, null, { env: envWithCfg });
+      expect(fallbackOpencode).toMatchObject({
+        ok: true,
+        engine: "opencode",
+        fallbackFrom: "codex",
+      });
+
+      // Restore deny list to allow personal accounts
+      fs.writeFileSync(
+        explicitCfgFile,
+        JSON.stringify({
+          repo_policies: {
+            [repoDir]: {
+              deny: ["codex", "agy", "claude-work"],
+            },
+          },
+        }),
+        "utf8",
+      );
+
+      // 3. Explicit work claude ("claude-work" or claude with ~/.claude) refuses even when ORCHESTRATE_AUTO_ACCOUNT=1
+      const explicitWork = checkRepoPolicyForSide(repoDir, "claude-work", {
+        env: { ...envWithCfg, ORCHESTRATE_AUTO_ACCOUNT: "1" },
+      });
+      expect(explicitWork.ok).toBe(false);
+      expect(explicitWork.status).toBe("policy_denied");
+
+      const explicitWorkDir = checkRepoPolicyForSide(repoDir, "claude", {
+        claudeConfigDir: path.join(fakeHome, ".claude"),
+        env: { ...envWithCfg, ORCHESTRATE_AUTO_ACCOUNT: "1" },
+      });
+      expect(explicitWorkDir.ok).toBe(false);
+
+      // 4. Explicit custom alias "claude-alt" via --engine or --account succeeds and injects exact extraArgs once in sideCommand
+      const explicitAlias = checkRepoPolicyForSide(repoDir, "claude-alt", { env: envWithCfg });
+      expect(explicitAlias).toMatchObject({
+        ok: true,
+        engine: "claude",
+        accountId: "claude-p1",
+        accountAlias: "claude-alt",
+        claudeConfigDir: expectedPersonalDir,
+        extraArgs: ["--claude-config-dir", expectedPersonalDir, "--account", "claude-p1"],
+      });
+
+      let recordedDispatchArgs = [];
+      const sideRes = await sideCommand(
+        ["--account", "claude-alt", "--investigate", "--json", "check auth"],
+        {
+          cwd: repoDir,
+          mailboxDir,
+          cacheDir,
+          env: envWithCfg,
+          shortId: "alt01",
+          runCommand: (cmd, args) => {
+            if (cmd === "git" && args[0] === "rev-parse") {
+              return { status: 0, stdout: `${repoDir}\n`, stderr: "" };
+            }
+            if (cmd === "python3" && args.includes("init")) {
+              return { status: 0, stdout: JSON.stringify({ task_id: "t-1" }), stderr: "" };
+            }
+            if (cmd === "python3" && args.includes("dispatch")) {
+              recordedDispatchArgs = args;
+              return {
+                status: 0,
+                stdout: JSON.stringify({ run_id: "run-alt", engine: "claude", model: "sonnet" }),
+                stderr: "",
+              };
+            }
+            return { status: 0, stdout: "", stderr: "" };
+          },
+        },
+      );
+      expect(sideRes.status).toBe("dispatched");
+      expect(sideRes.accountId).toBe("claude-p1");
+      expect(sideRes.accountAlias).toBe("claude-alt");
+      expect(recordedDispatchArgs.filter((token) => token === "--claude-config-dir")).toHaveLength(
+        1,
+      );
+      expect(recordedDispatchArgs.filter((token) => token === "--account")).toHaveLength(1);
+      expect(recordedDispatchArgs).toContain(expectedPersonalDir);
+      expect(recordedDispatchArgs).toContain("claude-p1");
+
+      // 5. Explicit configDir overrides env ORCHESTRATE_CONFIG
+      const injectedConfigDir = path.join(tmpDir, "injected-cfg");
+      fs.mkdirSync(injectedConfigDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(injectedConfigDir, "config.json"),
+        JSON.stringify({
+          repo_policies: {
+            [repoDir]: { deny: ["all"] },
+          },
+        }),
+        "utf8",
+      );
+      const allDenied = checkRepoPolicyForSide(repoDir, null, {
+        configDir: injectedConfigDir,
+        env: { ...envWithCfg, ORCHESTRATE_AUTO_ACCOUNT: "1" },
+      });
+      expect(allDenied.ok).toBe(false);
+      expect(allDenied.status).toBe("policy_denied");
+
+      const explicitAliasAllDenied = checkRepoPolicyForSide(repoDir, "claude-alt", {
+        configDir: injectedConfigDir,
+        env: envWithCfg,
+      });
+      expect(explicitAliasAllDenied.ok).toBe(false);
+
+      // 6. Contradictory account/alias vs claudeConfigDir or --engine is rejected before room/worktree creation
+      const cleanConfigDir = path.join(tmpDir, "clean-cfg");
+      fs.mkdirSync(cleanConfigDir, { recursive: true });
+      fs.writeFileSync(path.join(cleanConfigDir, "config.json"), JSON.stringify({}), "utf8");
+      const aliasWithWorkDir = checkRepoPolicyForSide(repoDir, "claude-alt", {
+        configDir: cleanConfigDir,
+        claudeConfigDir: path.join(fakeHome, ".claude"),
+        env: { ...envWithCfg, HOME: fakeHome },
+      });
+      expect(aliasWithWorkDir.ok).toBe(false);
+      expect(aliasWithWorkDir.status).toBe("profile_mismatch");
+      expect(aliasWithWorkDir.error).toContain("contradicts");
+
+      const workWithPersonalDir = checkRepoPolicyForSide(repoDir, "claude-work", {
+        configDir: cleanConfigDir,
+        claudeConfigDir: expectedPersonalDir,
+        env: { ...envWithCfg, HOME: fakeHome },
+      });
+      expect(workWithPersonalDir.ok).toBe(false);
+      expect(workWithPersonalDir.status).toBe("profile_mismatch");
+      expect(workWithPersonalDir.error).toContain("contradicts");
+
+      const engineVsAccountMismatch = checkRepoPolicyForSide(repoDir, "codex", {
+        configDir: cleanConfigDir,
+        account: "claude-alt",
+        env: { ...envWithCfg, HOME: fakeHome },
+      });
+      expect(engineVsAccountMismatch.ok).toBe(false);
+      expect(engineVsAccountMismatch.status).toBe("profile_mismatch");
+      expect(engineVsAccountMismatch.error).toContain("contradicts");
+
+      const sideMismatch = await sideCommand(
+        ["--account", "claude-alt", "--json", "check profile mismatch"],
+        {
+          cwd: repoDir,
+          mailboxDir,
+          cacheDir,
+          configDir: cleanConfigDir,
+          claudeConfigDir: path.join(fakeHome, ".claude"),
+          env: { ...envWithCfg, HOME: fakeHome },
+          runCommand: (cmd, args) => {
+            if (cmd === "git" && args[0] === "rev-parse") {
+              return { status: 0, stdout: `${repoDir}\n`, stderr: "" };
+            }
+            throw new Error(`Unexpected command ${cmd} after profile mismatch`);
+          },
+        },
+      );
+      expect(sideMismatch.status).toBe("profile_mismatch");
+      expect(fs.readdirSync(path.join(mailboxDir, "rooms"))).toEqual([]);
     });
 
     it("refuses archived or cancelled --room targets and skips them during auto-discovery", async () => {
@@ -641,6 +994,413 @@ describe("ork side (side missions)", () => {
         },
       });
       expect(plan.roomId).toBeNull();
+    });
+
+    it("fails closed on malformed policy rules, rejects personal-named symlinks to ~/.claude, and preserves explicit claudeConfigDir during fallback", async () => {
+      const fakeHome = path.join(tmpDir, "side-home");
+      const workDir = path.join(fakeHome, ".claude");
+      const personalDir = path.join(fakeHome, ".claude-p1");
+      const personalSymlinkToWork = path.join(fakeHome, ".claude-personal-alias");
+      fs.mkdirSync(workDir, { recursive: true });
+      fs.mkdirSync(personalDir, { recursive: true });
+      fs.symlinkSync(workDir, personalSymlinkToWork);
+
+      const monitorCfgPath = path.join(tmpDir, "side-strict-monitor.json");
+      fs.writeFileSync(
+        monitorCfgPath,
+        JSON.stringify({
+          accounts: [
+            { id: "claude-work", provider: "claude", tags: ["work"] },
+            {
+              id: "claude-p1",
+              alias: "claude-alt",
+              provider: "claude",
+              configDir: personalDir,
+              tags: ["personal"],
+            },
+          ],
+        }),
+        "utf8",
+      );
+
+      const cfgFile = path.join(tmpDir, "side-strict-cfg.json");
+      // 1. Malformed policy ("deny": "all") fails closed in strict mode before provisioning
+      fs.writeFileSync(
+        cfgFile,
+        JSON.stringify({ repo_policies: [{ path: repoDir, deny: "all" }] }),
+        "utf8",
+      );
+      expect(() =>
+        checkRepoPolicyForSide(repoDir, "codex", {
+          configPath: cfgFile,
+          homeDir: fakeHome,
+          env: { PATH: process.env.PATH, HOME: fakeHome, MONITOR_CONFIG: monitorCfgPath },
+        }),
+      ).toThrow(/expected array/u);
+      await expect(
+        sideCommand(["--engine", "codex", "--json", "malformed policy test"], {
+          cwd: repoDir,
+          mailboxDir,
+          cacheDir,
+          env: {
+            PATH: process.env.PATH,
+            HOME: fakeHome,
+            ORCHESTRATE_CONFIG: cfgFile,
+            MONITOR_CONFIG: monitorCfgPath,
+          },
+          runCommand: (cmd, args) => {
+            if (cmd === "git" && args[0] === "rev-parse") {
+              return { status: 0, stdout: `${repoDir}\n`, stderr: "" };
+            }
+            throw new Error(`Unexpected command ${cmd} on malformed policy`);
+          },
+        }),
+      ).rejects.toThrow(/expected array/u);
+
+      // 2. Personal-named symlink pointing to ~/.claude cannot bypass claude-work denial
+      fs.writeFileSync(
+        cfgFile,
+        JSON.stringify({
+          repo_policies: [{ path: repoDir, deny: ["codex", "agy", "claude-work"] }],
+        }),
+        "utf8",
+      );
+      const symlinkAttempt = checkRepoPolicyForSide(repoDir, "claude", {
+        configPath: cfgFile,
+        homeDir: fakeHome,
+        claudeConfigDir: personalSymlinkToWork,
+        env: { PATH: process.env.PATH, HOME: fakeHome, MONITOR_CONFIG: monitorCfgPath },
+      });
+      expect(symlinkAttempt.ok).toBe(false);
+      expect(symlinkAttempt.status).toBe("policy_denied");
+
+      // 3. Automatic engine selection preserves explicit personal claudeConfigDir on fallback to claude
+      const autoFallbackPersonal = checkRepoPolicyForSide(repoDir, null, {
+        configPath: cfgFile,
+        homeDir: fakeHome,
+        claudeConfigDir: personalDir,
+        env: { PATH: process.env.PATH, HOME: fakeHome, MONITOR_CONFIG: monitorCfgPath },
+      });
+      expect(autoFallbackPersonal).toMatchObject({
+        ok: true,
+        engine: "claude",
+        accountId: "claude-p1",
+        accountAlias: "claude-alt",
+        fallbackFrom: "codex",
+        claudeConfigDir: personalDir,
+        extraArgs: ["--claude-config-dir", personalDir, "--account", "claude-p1"],
+      });
+
+      // 4. Contradictory explicit work claudeConfigDir with ORCHESTRATE_AUTO_ACCOUNT=1 is not silently swapped to personal
+      const workDeniedFallback = checkRepoPolicyForSide(repoDir, null, {
+        configPath: cfgFile,
+        homeDir: fakeHome,
+        claudeConfigDir: workDir,
+        candidates: ["codex", "agy", "claude"],
+        env: {
+          PATH: process.env.PATH,
+          HOME: fakeHome,
+          MONITOR_CONFIG: monitorCfgPath,
+          ORCHESTRATE_AUTO_ACCOUNT: "1",
+        },
+      });
+      expect(workDeniedFallback.ok).toBe(false);
+      expect(workDeniedFallback.status).toBe("policy_denied");
+    });
+
+    it("allows --engine codex --account codex-blue when an id:'codex' account exists, and preserves caller HOME on coordinator.py env", async () => {
+      const callerHome = path.join(tmpDir, "caller-home");
+      const customClaudeHome = path.join(tmpDir, "custom-claude-home");
+      const customCodexHome = path.join(tmpDir, "custom-codex-home");
+      const customAgyHome = path.join(tmpDir, "custom-agy-home");
+      fs.mkdirSync(callerHome, { recursive: true });
+      fs.mkdirSync(customClaudeHome, { recursive: true });
+      fs.mkdirSync(customCodexHome, { recursive: true });
+      fs.mkdirSync(customAgyHome, { recursive: true });
+
+      const monitorCfgPath = path.join(tmpDir, "monitor-collision-home.json");
+      fs.writeFileSync(
+        monitorCfgPath,
+        JSON.stringify({
+          accounts: [
+            { id: "codex", provider: "codex", tags: ["work"] },
+            {
+              id: "codex-blue",
+              provider: "codex",
+              codexHome: path.join(callerHome, ".codex-blue"),
+              tags: ["personal"],
+            },
+            {
+              id: "claude-alt-home",
+              provider: "claude",
+              env: { HOME: customClaudeHome },
+              tags: ["personal"],
+            },
+            {
+              id: "codex-alt-home",
+              provider: "codex",
+              env: { HOME: customCodexHome },
+              tags: ["personal"],
+            },
+            {
+              id: "agy-alt-home",
+              provider: "antigravity",
+              env: { HOME: customAgyHome },
+              tags: ["personal"],
+            },
+          ],
+        }),
+        "utf8",
+      );
+
+      const cleanCfgDir = path.join(tmpDir, "clean-collision-cfg");
+      fs.mkdirSync(cleanCfgDir, { recursive: true });
+      fs.writeFileSync(path.join(cleanCfgDir, "config.json"), JSON.stringify({}), "utf8");
+      const testEnv = {
+        PATH: process.env.PATH,
+        HOME: callerHome,
+        MONITOR_CONFIG: monitorCfgPath,
+      };
+
+      // 1. Canonical engine token "codex" does not collide with an account whose id is "codex"
+      const codexBluePolicy = checkRepoPolicyForSide(repoDir, "codex", {
+        configDir: cleanCfgDir,
+        account: "codex-blue",
+        env: testEnv,
+      });
+      expect(codexBluePolicy).toMatchObject({
+        ok: true,
+        engine: "codex",
+        accountId: "codex-blue",
+      });
+
+      const codexBlueSide = await sideCommand(
+        ["--engine", "codex", "--account", "codex-blue", "--investigate", "--json", "check codex"],
+        {
+          cwd: repoDir,
+          mailboxDir,
+          cacheDir,
+          configDir: cleanCfgDir,
+          env: testEnv,
+          shortId: "blue01",
+          runCommand: (cmd, args) => {
+            if (cmd === "git" && args[0] === "rev-parse") {
+              return { status: 0, stdout: `${repoDir}\n`, stderr: "" };
+            }
+            if (cmd === "python3" && args.includes("init")) {
+              return { status: 0, stdout: JSON.stringify({ task_id: "t-blue" }), stderr: "" };
+            }
+            if (cmd === "python3" && args.includes("dispatch")) {
+              return {
+                status: 0,
+                stdout: JSON.stringify({
+                  run_id: "run-blue",
+                  engine: "codex",
+                  model: "gpt-5.6-sol",
+                }),
+                stderr: "",
+              };
+            }
+            return { status: 0, stdout: "", stderr: "" };
+          },
+        },
+      );
+      expect(codexBlueSide.status).toBe("dispatched");
+      expect(codexBlueSide.accountId).toBe("codex-blue");
+
+      // 2. Mismatched canonical engine still rejects with profile_mismatch
+      const engineMismatch = checkRepoPolicyForSide(repoDir, "claude", {
+        configDir: cleanCfgDir,
+        account: "codex-blue",
+        env: testEnv,
+      });
+      expect(engineMismatch.ok).toBe(false);
+      expect(engineMismatch.status).toBe("profile_mismatch");
+
+      // 3. Account env.HOME translates to ORKEST_*_ACCOUNT_HOME and never overrides HOME on coordinator.py
+      const claudeHomePolicy = checkRepoPolicyForSide(repoDir, "claude", {
+        configDir: cleanCfgDir,
+        account: "claude-alt-home",
+        env: testEnv,
+      });
+      expect(claudeHomePolicy.ok).toBe(true);
+      expect(claudeHomePolicy.accountEnv).toEqual({
+        ORKEST_CLAUDE_ACCOUNT_HOME: customClaudeHome,
+      });
+      expect(claudeHomePolicy.accountEnv.HOME).toBeUndefined();
+      expect(claudeHomePolicy.extraArgs).toEqual(["--account", "claude-alt-home"]);
+
+      const codexHomePolicy = checkRepoPolicyForSide(repoDir, "codex", {
+        configDir: cleanCfgDir,
+        account: "codex-alt-home",
+        env: testEnv,
+      });
+      expect(codexHomePolicy.ok).toBe(true);
+      expect(codexHomePolicy.accountEnv).toEqual({
+        ORKEST_CODEX_ACCOUNT_HOME: path.join(customCodexHome, ".codex"),
+      });
+      expect(codexHomePolicy.accountEnv.HOME).toBeUndefined();
+
+      const agyHomePolicy = checkRepoPolicyForSide(repoDir, "agy", {
+        configDir: cleanCfgDir,
+        account: "agy-alt-home",
+        env: testEnv,
+      });
+      expect(agyHomePolicy.ok).toBe(true);
+      expect(agyHomePolicy.accountEnv).toEqual({
+        ORKEST_AGY_ACCOUNT_HOME: path.join(customAgyHome, ".gemini"),
+      });
+      expect(agyHomePolicy.accountEnv.HOME).toBeUndefined();
+
+      const coordCalls = [];
+      const sideHomeRes = await sideCommand(
+        ["--account", "claude-alt-home", "--investigate", "--json", "verify home isolation"],
+        {
+          cwd: repoDir,
+          mailboxDir,
+          cacheDir,
+          configDir: cleanCfgDir,
+          env: testEnv,
+          shortId: "home01",
+          runCommand: (cmd, args, opts) => {
+            if (cmd === "git" && args[0] === "rev-parse") {
+              return { status: 0, stdout: `${repoDir}\n`, stderr: "" };
+            }
+            if (cmd === "python3") {
+              coordCalls.push({ args, env: opts.env });
+              if (args.includes("init")) {
+                return { status: 0, stdout: JSON.stringify({ task_id: "t-home" }), stderr: "" };
+              }
+              if (args.includes("dispatch")) {
+                return {
+                  status: 0,
+                  stdout: JSON.stringify({ run_id: "run-home", engine: "claude", model: "sonnet" }),
+                  stderr: "",
+                };
+              }
+            }
+            return { status: 0, stdout: "", stderr: "" };
+          },
+        },
+      );
+      expect(sideHomeRes.status).toBe("dispatched");
+      expect(coordCalls).toHaveLength(2);
+      for (const call of coordCalls) {
+        expect(call.env.HOME).toBe(callerHome);
+        expect(call.env.ORKEST_CLAUDE_ACCOUNT_HOME).toBe(customClaudeHome);
+      }
+      const dispatchCall = coordCalls.find((call) => call.args.includes("dispatch"));
+      expect(dispatchCall.args).toEqual(expect.arrayContaining(["--account", "claude-alt-home"]));
+    });
+
+    it("forwards --account for codex and agy, strips raw provider env from coordinator.py, and fails closed on malformed monitor config", async () => {
+      const callerHome = path.join(tmpDir, "side-env-home");
+      const codexBlueHome = path.join(callerHome, ".codex-blue");
+      const agyBlueHome = path.join(callerHome, ".gemini-blue");
+      fs.mkdirSync(codexBlueHome, { recursive: true });
+      fs.mkdirSync(agyBlueHome, { recursive: true });
+
+      const monitorCfgPath = path.join(tmpDir, "monitor-provider-strip.json");
+      fs.writeFileSync(
+        monitorCfgPath,
+        JSON.stringify({
+          accounts: [
+            { id: "codex-blue", provider: "codex", codexHome: codexBlueHome, tags: ["personal"] },
+            { id: "agy-blue", provider: "antigravity", agyHome: agyBlueHome, tags: ["personal"] },
+          ],
+        }),
+        "utf8",
+      );
+
+      const cleanCfgDir = path.join(tmpDir, "provider-strip-cfg");
+      fs.mkdirSync(cleanCfgDir, { recursive: true });
+      fs.writeFileSync(path.join(cleanCfgDir, "config.json"), JSON.stringify({}), "utf8");
+
+      const pollutedEnv = {
+        PATH: process.env.PATH,
+        HOME: callerHome,
+        MONITOR_CONFIG: monitorCfgPath,
+        CODEX_HOME: "/stale/codex",
+        GEMINI_CLI_HOME: "/stale/gemini",
+        ANTIGRAVITY_APP_DATA_DIR: "/stale/agy",
+        CLAUDE_CONFIG_DIR: "/stale/claude",
+      };
+
+      const runSideForAccount = async (account, engine, shortId) => {
+        const coordCalls = [];
+        const res = await sideCommand(
+          ["--engine", engine, "--account", account, "--investigate", "--json", `check ${engine}`],
+          {
+            cwd: repoDir,
+            mailboxDir,
+            cacheDir,
+            configDir: cleanCfgDir,
+            env: pollutedEnv,
+            shortId,
+            runCommand: (cmd, args, opts) => {
+              if (cmd === "git" && args[0] === "rev-parse") {
+                return { status: 0, stdout: `${repoDir}\n`, stderr: "" };
+              }
+              if (cmd === "python3") {
+                coordCalls.push({ args, env: opts.env });
+                if (args.includes("init")) {
+                  return {
+                    status: 0,
+                    stdout: JSON.stringify({ task_id: `t-${shortId}` }),
+                    stderr: "",
+                  };
+                }
+                if (args.includes("dispatch")) {
+                  return {
+                    status: 0,
+                    stdout: JSON.stringify({ run_id: `run-${shortId}`, engine, model: "m1" }),
+                    stderr: "",
+                  };
+                }
+              }
+              return { status: 0, stdout: "", stderr: "" };
+            },
+          },
+        );
+        return { res, coordCalls };
+      };
+
+      const codexRun = await runSideForAccount("codex-blue", "codex", "cx01");
+      expect(codexRun.res.status).toBe("dispatched");
+      expect(codexRun.coordCalls).toHaveLength(2);
+      for (const call of codexRun.coordCalls) {
+        expect(call.env.HOME).toBe(callerHome);
+        expect(call.env.ORKEST_CODEX_ACCOUNT_HOME).toBe(codexBlueHome);
+        expect(call.env.CODEX_HOME).toBeUndefined();
+        expect(call.env.GEMINI_CLI_HOME).toBeUndefined();
+        expect(call.env.ANTIGRAVITY_APP_DATA_DIR).toBeUndefined();
+        expect(call.env.CLAUDE_CONFIG_DIR).toBeUndefined();
+      }
+      const codexDispatch = codexRun.coordCalls.find((call) => call.args.includes("dispatch"));
+      expect(codexDispatch.args).toEqual(expect.arrayContaining(["--account", "codex-blue"]));
+
+      const agyRun = await runSideForAccount("agy-blue", "agy", "ag01");
+      expect(agyRun.res.status).toBe("dispatched");
+      expect(agyRun.coordCalls).toHaveLength(2);
+      for (const call of agyRun.coordCalls) {
+        expect(call.env.HOME).toBe(callerHome);
+        expect(call.env.ORKEST_AGY_ACCOUNT_HOME).toBe(agyBlueHome);
+        expect(call.env.CODEX_HOME).toBeUndefined();
+        expect(call.env.GEMINI_CLI_HOME).toBeUndefined();
+        expect(call.env.ANTIGRAVITY_APP_DATA_DIR).toBeUndefined();
+        expect(call.env.CLAUDE_CONFIG_DIR).toBeUndefined();
+      }
+      const agyDispatch = agyRun.coordCalls.find((call) => call.args.includes("dispatch"));
+      expect(agyDispatch.args).toEqual(expect.arrayContaining(["--account", "agy-blue"]));
+
+      const badMonitorCfg = path.join(tmpDir, "malformed-monitor.json");
+      fs.writeFileSync(badMonitorCfg, "{ not valid json", "utf8");
+      expect(() =>
+        checkRepoPolicyForSide(repoDir, "codex", {
+          configDir: cleanCfgDir,
+          env: { PATH: process.env.PATH, HOME: callerHome, MONITOR_CONFIG: badMonitorCfg },
+        }),
+      ).toThrow(/Failed to parse policy JSON/);
     });
   });
 });

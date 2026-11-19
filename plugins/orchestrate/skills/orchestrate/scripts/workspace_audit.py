@@ -8,8 +8,10 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -31,6 +33,7 @@ def _load_repo_paths() -> Any:
 _REPO_PATHS = _load_repo_paths()
 
 
+FINGERPRINT_VERSION = 2
 MAX_VERIFICATION_TAIL_BYTES = 64 * 1024
 MAX_VERIFICATION_TAIL_LINE_CHARS = 500
 REVIEW_FLAG_PATTERN = re.compile(r"\b(?:TODO|FIXME|HACK)\b|@ts-ignore|eslint-disable|console\.(?:log|warn|error)\(")
@@ -228,6 +231,102 @@ def git_path_fingerprint(repo: Path, relative: str, index_entries: dict[str, str
     return state
 
 
+def _git_with_env(repo: Path, *args: str, env: dict[str, str] | None = None) -> bytes:
+    run_chk = _attr("run_checked")
+    if run_chk is not None:
+        return run_chk(["git", *args], cwd=repo, environment=env).stdout
+    completed = subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.decode("utf-8", errors="replace").strip()
+        raise _runner_error(f"git command failed ({completed.returncode}): {' '.join(args)}\n{detail}", 11)
+    return completed.stdout
+
+
+def git_tree_oid(repo: Path) -> str:
+    """Compute the working tree's Git tree OID via a private index and temporary object dir without mutating the repo."""
+    git_out = _attr("git_output")
+    rel_index = git_out(repo, "rev-parse", "--git-path", "index").decode("utf-8", errors="surrogateescape").strip()
+    live_index = Path(rel_index) if Path(rel_index).is_absolute() else (repo / rel_index)
+    real_objects_raw = (
+        git_out(repo, "rev-parse", "--git-path", "objects").decode("utf-8", errors="surrogateescape").strip()
+    )
+    real_objects = (
+        Path(real_objects_raw) if Path(real_objects_raw).is_absolute() else (repo / real_objects_raw)
+    ).resolve()
+    with tempfile.TemporaryDirectory(prefix="ork-git-index-") as tmp_dir:
+        tmp_root = Path(tmp_dir)
+        private_index = tmp_root / "index"
+        tmp_objects = tmp_root / "objects"
+        tmp_objects.mkdir(mode=0o700)
+        if live_index.is_file() and not live_index.is_symlink() and live_index.stat().st_size > 0:
+            shutil.copyfile(live_index, private_index)
+        existing_alternates = os.environ.get("GIT_ALTERNATE_OBJECT_DIRECTORIES", "")
+        alternates = f"{real_objects}{os.pathsep}{existing_alternates}" if existing_alternates else str(real_objects)
+        env = {
+            **os.environ,
+            "GIT_INDEX_FILE": str(private_index),
+            "GIT_OBJECT_DIRECTORY": str(tmp_objects),
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": alternates,
+        }
+        _git_with_env(repo, "add", "-A", env=env)
+        tree_oid = _git_with_env(repo, "write-tree", env=env).decode("utf-8", errors="replace").strip()
+    if not tree_oid:
+        raise _runner_error("could not compute git_after.tree_oid", 11)
+    return tree_oid
+
+
+def is_legacy_pre_tree_state(recorded: dict[str, Any] | None) -> bool:
+    """True when `recorded` is a v1 git_state receipt produced before `tree_oid` existed."""
+    if not isinstance(recorded, dict) or not isinstance(recorded.get("fingerprint"), str):
+        return False
+    version = recorded.get("fingerprint_version")
+    if isinstance(version, int) and version >= 2:
+        return False
+    return not (recorded.get("tree_oid") or recorded.get("tree"))
+
+
+def git_state_matches(
+    current: dict[str, Any],
+    recorded: dict[str, Any] | None,
+    *,
+    require_tree: bool = False,
+) -> bool:
+    """Compare current git_state against a recorded receipt, enforcing `tree_oid` on v2/new receipts."""
+    if not isinstance(current, dict) or not isinstance(recorded, dict):
+        return False
+    if current.get("fingerprint") != recorded.get("fingerprint"):
+        return False
+    version = recorded.get("fingerprint_version")
+    recorded_tree = recorded.get("tree_oid") or recorded.get("tree")
+    if require_tree or (isinstance(version, int) and version >= 2) or recorded_tree is not None:
+        return (
+            isinstance(recorded_tree, str)
+            and bool(recorded_tree.strip())
+            and current.get("tree_oid") == recorded_tree.strip()
+        )
+    return True
+
+
+def reverify_legacy_git_state(
+    repo: Path,
+    recorded: dict[str, Any],
+    tracked_paths: list[str] | None = None,
+) -> dict[str, Any]:
+    """Verify an unchanged pre-tree v1 git_state receipt and return an upgraded v2 tree-bound receipt."""
+    current = _attr("git_state")(repo, tracked_paths)
+    if not git_state_matches(current, recorded, require_tree=False):
+        raise _runner_error("workspace changed since legacy receipt; cannot re-verify", 4)
+    return current
+
+
 def git_state(repo: Path, tracked_paths: list[str] | None = None) -> dict[str, Any]:
     git_out = _attr("git_output")
     nul = _attr("nul_paths")
@@ -244,6 +343,7 @@ def git_state(repo: Path, tracked_paths: list[str] | None = None) -> dict[str, A
         path_fingerprints[relative] = _attr("git_path_fingerprint")(repo, relative, index_entries)
 
     tracked_fingerprints = {relative: _attr("path_fingerprint")(repo / relative) for relative in (tracked_paths or [])}
+    tree_oid = _attr("git_tree_oid")(repo)
     digest = hashlib.sha256()
     digest.update(status_bytes)
     digest.update(
@@ -257,9 +357,11 @@ def git_state(repo: Path, tracked_paths: list[str] | None = None) -> dict[str, A
     status_text = git_out(repo, "status", "--short", "--untracked-files=all").decode("utf-8", errors="replace")
     return {
         "fingerprint": digest.hexdigest(),
+        "fingerprint_version": FINGERPRINT_VERSION,
         "status": [line for line in status_text.splitlines() if line],
         "path_fingerprints": path_fingerprints,
         "tracked_path_fingerprints": tracked_fingerprints,
+        "tree_oid": tree_oid,
     }
 
 

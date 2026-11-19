@@ -231,6 +231,12 @@ export function jsonView(accounts, now = Date.now()) {
       plan: a.plan ?? null,
       billing: a.billing ?? null,
       configDir: a.configDir ?? null,
+      accountHome: a.accountHome ?? null,
+      ...(a.claudeConfigDir !== undefined && { claudeConfigDir: a.claudeConfigDir ?? null }),
+      ...(a.unsetClaudeConfigDir !== undefined && {
+        unsetClaudeConfigDir: Boolean(a.unsetClaudeConfigDir),
+      }),
+      ...(a.accountEnv && typeof a.accountEnv === "object" && { accountEnv: a.accountEnv }),
       credits: creditBalance(a),
       ok: a.ok !== false,
       error: a.ok === false ? a.error : null,

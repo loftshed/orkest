@@ -3,6 +3,7 @@
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, UNIX_EPOCH};
@@ -151,12 +152,24 @@ pub fn codex_thread_settings_newest(
 
 fn has_legacy_room_files(base: &Path) -> bool {
     let dir = base.join("rooms");
-    let Ok(entries) = fs::read_dir(dir) else {
-        return false;
+    match fs::symlink_metadata(&dir) {
+        Err(e) if e.kind() == ErrorKind::NotFound => return false,
+        Err(_) => return true,
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => return true,
+        Ok(_) => {}
+    }
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return true;
     };
-    entries
-        .flatten()
-        .any(|e| e.path().extension().and_then(|x| x.to_str()) == Some("json"))
+    for entry_res in entries {
+        let Ok(entry) = entry_res else {
+            return true;
+        };
+        if entry.path().extension().and_then(|x| x.to_str()) == Some("json") {
+            return true;
+        }
+    }
+    false
 }
 
 fn query_rooms_db(base: &Path, room_id: Option<&str>) -> Option<Vec<Value>> {
@@ -167,8 +180,11 @@ fn query_rooms_db(base: &Path, room_id: Option<&str>) -> Option<Vec<Value>> {
         return None;
     }
     let db = base.join("rooms.db");
-    if !db.exists() {
-        return Some(Vec::new());
+    match fs::symlink_metadata(&db) {
+        Err(e) if e.kind() == ErrorKind::NotFound => return Some(Vec::new()),
+        Err(_) => return None,
+        Ok(meta) if meta.file_type().is_symlink() => return None,
+        Ok(_) => {}
     }
     let conn = open_readonly(&db, 5000)?;
     let app_id: i64 = conn
@@ -184,20 +200,32 @@ fn query_rooms_db(base: &Path, room_id: Option<&str>) -> Option<Vec<Value>> {
     if let Some(id) = room_id {
         let mut stmt = conn.prepare("SELECT data FROM rooms WHERE id = ?1").ok()?;
         let mut rows = stmt.query([id]).ok()?;
-        while let Ok(Some(row)) = rows.next() {
-            let text: String = row.get(0).ok()?;
-            let parsed: Value = serde_json::from_str(&text).ok()?;
-            rooms.push(parsed);
+        loop {
+            match rows.next() {
+                Ok(Some(row)) => {
+                    let text: String = row.get(0).ok()?;
+                    let parsed: Value = serde_json::from_str(&text).ok()?;
+                    rooms.push(parsed);
+                }
+                Ok(None) => break,
+                Err(_) => return None,
+            }
         }
     } else {
         let mut stmt = conn
             .prepare("SELECT data FROM rooms ORDER BY updated_at DESC, id ASC")
             .ok()?;
         let mut rows = stmt.query([]).ok()?;
-        while let Ok(Some(row)) = rows.next() {
-            let text: String = row.get(0).ok()?;
-            let parsed: Value = serde_json::from_str(&text).ok()?;
-            rooms.push(parsed);
+        loop {
+            match rows.next() {
+                Ok(Some(row)) => {
+                    let text: String = row.get(0).ok()?;
+                    let parsed: Value = serde_json::from_str(&text).ok()?;
+                    rooms.push(parsed);
+                }
+                Ok(None) => break,
+                Err(_) => return None,
+            }
         }
     }
     Some(rooms)
@@ -262,30 +290,60 @@ pub fn invoke_room_store_bridge(
     serde_json::from_slice(&output.stdout).ok()
 }
 
-/// List all room records under `<base>`, preferring direct read-only SQLite access.
+/// List all room records under `<base>`, returning `(rooms, complete)` where `complete` is
+/// `false` if SQLite query/row iteration failed or the fallback could only partially read legacy files.
 #[must_use]
-pub fn list_rooms(base: &Path) -> Vec<Value> {
+pub fn list_rooms_checked(base: &Path) -> (Vec<Value>, bool) {
     if let Some(rooms) = query_rooms_db(base, None) {
-        return rooms;
+        return (rooms, true);
     }
     if let Some(Value::Array(arr)) = invoke_room_store_bridge(base, "list", None, None) {
-        return arr;
+        return (arr, true);
     }
     // Last-resort fallback if bridge script or node is unavailable in an isolated unit test:
     // read valid JSON room files directly from `<base>/rooms/*.json`.
+    let mut complete = matches!(
+        fs::symlink_metadata(base.join("rooms.db")),
+        Err(ref e) if e.kind() == ErrorKind::NotFound
+    );
     let mut legacy = Vec::new();
-    if let Ok(entries) = fs::read_dir(base.join("rooms")) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.extension().and_then(|e| e.to_str()) == Some("json")
-                && let Some(val) = paths::read_json_file(&p)
-                && val.is_object()
-            {
-                legacy.push(val);
+    let rooms_dir = base.join("rooms");
+    match fs::symlink_metadata(&rooms_dir) {
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(_) => complete = false,
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => complete = false,
+        Ok(_) => match fs::read_dir(&rooms_dir) {
+            Err(_) => complete = false,
+            Ok(entries) => {
+                for entry_res in entries {
+                    let Ok(entry) = entry_res else {
+                        complete = false;
+                        continue;
+                    };
+                    let p = entry.path();
+                    if p.extension().and_then(|e| e.to_str()) == Some("json") {
+                        let is_reg = fs::symlink_metadata(&p)
+                            .is_ok_and(|m| !m.file_type().is_symlink() && m.is_file());
+                        if is_reg
+                            && let Some(val) = paths::read_json_file(&p)
+                            && val.is_object()
+                        {
+                            legacy.push(val);
+                        } else {
+                            complete = false;
+                        }
+                    }
+                }
             }
-        }
+        },
     }
-    legacy
+    (legacy, complete)
+}
+
+/// List all room records under `<base>`, preferring direct read-only SQLite access.
+#[must_use]
+pub fn list_rooms(base: &Path) -> Vec<Value> {
+    list_rooms_checked(base).0
 }
 
 /// Read a single room record by ID from `<base>`.
@@ -304,15 +362,29 @@ pub fn read_room(base: &Path, room_id: &str) -> Option<Value> {
         .filter(Value::is_object)
 }
 
-/// Read Antigravity's `conversation_summaries.db` for subagent parent linkage.
-/// Returns `(is_subagent, parent_session, agent_name, classified)`.
+/// Result of querying Antigravity's `conversation_summaries.db` for subagent linkage.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AgySqliteSubagentState {
+    pub is_subagent: bool,
+    pub parent_session: Option<String>,
+    pub agent_name: Option<String>,
+    pub classified: bool,
+    pub db_available: bool,
+}
+
+fn is_missing_row_or_table(err: &rusqlite::Error) -> bool {
+    match err {
+        rusqlite::Error::QueryReturnedNoRows => true,
+        rusqlite::Error::SqliteFailure(_, Some(msg)) => msg.contains("no such table"),
+        _ => false,
+    }
+}
+
+/// Read Antigravity's `conversation_summaries.db` for subagent parent linkage with DB availability.
 #[must_use]
-pub fn agy_sqlite_subagent_info(
-    account: Option<&str>,
-    session: &str,
-) -> (bool, Option<String>, Option<String>, bool) {
+pub fn agy_sqlite_subagent_state(account: Option<&str>, session: &str) -> AgySqliteSubagentState {
     if session.trim().is_empty() {
-        return (false, None, None, false);
+        return AgySqliteSubagentState::default();
     }
     let home = account
         .map(str::trim)
@@ -328,13 +400,13 @@ pub fn agy_sqlite_subagent_info(
     .into_iter()
     .find(|p| p.is_file());
     let Some(db) = db_path else {
-        return (false, None, None, false);
+        return AgySqliteSubagentState::default();
     };
     let Some(conn) = open_readonly(&db, 50) else {
-        return (false, None, None, false);
+        return AgySqliteSubagentState::default();
     };
 
-    let summary_row: Option<(Option<String>, i64, Option<String>)> = conn
+    let summary_res: Result<(Option<String>, i64, Option<String>), rusqlite::Error> = conn
         .query_row(
             "SELECT parent_conversation_id, nesting_depth, agent_name FROM conversation_summaries WHERE conversation_id = ?1",
             [session],
@@ -344,10 +416,9 @@ pub fn agy_sqlite_subagent_info(
                 let a: Option<String> = row.get(2).ok().flatten();
                 Ok((p, d, a))
             },
-        )
-        .ok();
+        );
 
-    let query_parent_table = || -> Option<String> {
+    let query_parent_table = || -> Result<Option<String>, rusqlite::Error> {
         conn.query_row(
             "SELECT parent_id FROM conversation_parents WHERE conversation_id = ?1",
             [session],
@@ -356,43 +427,127 @@ pub fn agy_sqlite_subagent_info(
                     .map(Option::unwrap_or_default)
             },
         )
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+        .map(|s| {
+            let trimmed = s.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        })
     };
 
-    if let Some((parent_raw, depth, name_raw)) = summary_row {
-        let agent_name = name_raw
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-        let parent_id = parent_raw
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-        if parent_id.is_some() || depth > 0 {
-            return (true, parent_id, agent_name, true);
+    match summary_res {
+        Ok((parent_raw, depth, name_raw)) => {
+            let agent_name = name_raw
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let parent_id = parent_raw
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            if parent_id.is_some() || depth > 0 {
+                return AgySqliteSubagentState {
+                    is_subagent: true,
+                    parent_session: parent_id,
+                    agent_name,
+                    classified: true,
+                    db_available: true,
+                };
+            }
+            match query_parent_table() {
+                Ok(Some(p_id)) => AgySqliteSubagentState {
+                    is_subagent: true,
+                    parent_session: Some(p_id),
+                    agent_name,
+                    classified: true,
+                    db_available: true,
+                },
+                Ok(None) => AgySqliteSubagentState {
+                    is_subagent: false,
+                    parent_session: None,
+                    agent_name: None,
+                    classified: true,
+                    db_available: true,
+                },
+                Err(ref err) if is_missing_row_or_table(err) => AgySqliteSubagentState {
+                    is_subagent: false,
+                    parent_session: None,
+                    agent_name: None,
+                    classified: true,
+                    db_available: true,
+                },
+                Err(_) => AgySqliteSubagentState::default(),
+            }
         }
-        if let Some(p_id) = query_parent_table() {
-            return (true, Some(p_id), agent_name, true);
-        }
-        return (false, None, None, true);
+        Err(ref err) if is_missing_row_or_table(err) => match query_parent_table() {
+            Ok(Some(p_id)) => AgySqliteSubagentState {
+                is_subagent: true,
+                parent_session: Some(p_id),
+                agent_name: None,
+                classified: true,
+                db_available: true,
+            },
+            Ok(None) => AgySqliteSubagentState {
+                is_subagent: false,
+                parent_session: None,
+                agent_name: None,
+                classified: false,
+                db_available: true,
+            },
+            Err(ref parent_err) if is_missing_row_or_table(parent_err) => AgySqliteSubagentState {
+                is_subagent: false,
+                parent_session: None,
+                agent_name: None,
+                classified: false,
+                db_available: true,
+            },
+            Err(_) => AgySqliteSubagentState::default(),
+        },
+        Err(_) => AgySqliteSubagentState::default(),
     }
+}
 
-    if let Some(p_id) = query_parent_table() {
-        return (true, Some(p_id), None, true);
-    }
-
-    (false, None, None, false)
+/// Read Antigravity's `conversation_summaries.db` for subagent parent linkage.
+/// Returns `(is_subagent, parent_session, agent_name, classified)`.
+#[cfg(test)]
+#[must_use]
+pub fn agy_sqlite_subagent_info(
+    account: Option<&str>,
+    session: &str,
+) -> (bool, Option<String>, Option<String>, bool) {
+    let state = agy_sqlite_subagent_state(account, session);
+    (
+        state.is_subagent,
+        state.parent_session,
+        state.agent_name,
+        state.classified,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::SystemTime;
+
+    fn make_exclusive_test_dir(prefix: &str) -> PathBuf {
+        let root = env::temp_dir();
+        let pid = std::process::id();
+        let base_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0u64, |d| d.as_nanos() as u64);
+        for attempt in 0..64u64 {
+            let tag = base_nanos
+                .wrapping_add(attempt)
+                .wrapping_mul(6_364_136_223_846_793_005);
+            let dir = root.join(format!("{prefix}-{pid}-{tag:016x}"));
+            match fs::create_dir(&dir) {
+                Ok(()) => return dir,
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+                Err(e) => panic!("failed to create test dir {}: {e}", dir.display()),
+            }
+        }
+        panic!("exhausted test dir creation attempts");
+    }
 
     #[test]
     fn test_codex_settings_and_rooms_db_and_agy_db() {
-        let dir = env::temp_dir().join(format!("ork-fast-sqlite-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let dir = make_exclusive_test_dir("ork-fast-sqlite");
 
         // 1. Codex state_1.sqlite
         let codex_db = dir.join("state_1.sqlite");
@@ -474,6 +629,149 @@ mod tests {
                 true
             )
         );
+        assert_eq!(
+            agy_sqlite_subagent_state(Some(gemini_home.to_str().unwrap()), "sub-1"),
+            AgySqliteSubagentState {
+                is_subagent: true,
+                parent_session: Some("parent-1".to_string()),
+                agent_name: Some("research".to_string()),
+                classified: true,
+                db_available: true,
+            }
+        );
+        assert_eq!(
+            agy_sqlite_subagent_state(Some(gemini_home.to_str().unwrap()), "missing-session"),
+            AgySqliteSubagentState {
+                is_subagent: false,
+                parent_session: None,
+                agent_name: None,
+                classified: false,
+                db_available: true,
+            }
+        );
+        {
+            let conn =
+                Connection::open(gemini_home.join("antigravity-cli/conversation_summaries.db"))
+                    .unwrap();
+            conn.execute(
+                "INSERT INTO conversation_summaries VALUES ('top-1', NULL, 0, NULL)",
+                [],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            agy_sqlite_subagent_state(Some(gemini_home.to_str().unwrap()), "top-1"),
+            AgySqliteSubagentState {
+                is_subagent: false,
+                parent_session: None,
+                agent_name: None,
+                classified: true,
+                db_available: true,
+            }
+        );
+
+        let missing_home = dir.join("missing-gemini-home");
+        assert_eq!(
+            agy_sqlite_subagent_state(Some(missing_home.to_str().unwrap()), "sub-1"),
+            AgySqliteSubagentState::default()
+        );
+        fs::create_dir_all(missing_home.join("antigravity-cli")).unwrap();
+        fs::write(
+            missing_home.join("antigravity-cli/conversation_summaries.db"),
+            "not-sqlite",
+        )
+        .unwrap();
+        assert_eq!(
+            agy_sqlite_subagent_state(Some(missing_home.to_str().unwrap()), "sub-1"),
+            AgySqliteSubagentState::default()
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_list_rooms_checked_completeness_on_partial_or_corrupt_stores() {
+        let _lock = crate::mailbox_lifecycle::tests::TEST_ENV_LOCK
+            .lock()
+            .unwrap();
+        let mut env = crate::mailbox_lifecycle::tests::EnvGuard::new();
+        env.set("ORKEST_NODE_BIN", "/nonexistent/node");
+
+        let dir = make_exclusive_test_dir("ork-fast-sqlite-checked");
+        let empty_base = dir.join("empty");
+        fs::create_dir_all(&empty_base).unwrap();
+        assert_eq!(list_rooms_checked(&empty_base), (Vec::new(), true));
+
+        // Partial rooms.db (1 valid row + 1 corrupt JSON row) must fail rather than returning partial Some.
+        let partial_db_base = dir.join("partial-db");
+        fs::create_dir_all(&partial_db_base).unwrap();
+        {
+            let conn = Connection::open(partial_db_base.join("rooms.db")).unwrap();
+            conn.pragma_update(None, "application_id", ROOMS_APPLICATION_ID)
+                .unwrap();
+            conn.pragma_update(None, "user_version", ROOMS_SCHEMA_VERSION)
+                .unwrap();
+            conn.execute(
+                "CREATE TABLE rooms (id TEXT PRIMARY KEY, cwd TEXT NOT NULL, updated_at INTEGER NOT NULL, revision INTEGER NOT NULL DEFAULT 1, data TEXT NOT NULL)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO rooms (id, cwd, updated_at, data) VALUES ('r1', '/tmp', 100, '{\"id\":\"r1\"}')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO rooms (id, cwd, updated_at, data) VALUES ('r2', '/tmp', 99, '{corrupt')",
+                [],
+            )
+            .unwrap();
+        }
+        assert!(query_rooms_db(&partial_db_base, None).is_none());
+        let (rooms, complete) = list_rooms_checked(&partial_db_base);
+        assert!(rooms.is_empty());
+        assert!(!complete);
+
+        // Partial legacy rooms dir (1 valid + 1 corrupt json) returns nonempty list with complete = false.
+        let partial_legacy = dir.join("partial-legacy");
+        fs::create_dir_all(partial_legacy.join("rooms")).unwrap();
+        fs::write(
+            partial_legacy.join("rooms/r1.json"),
+            r#"{"id":"r1","title":"Valid"}"#,
+        )
+        .unwrap();
+        fs::write(partial_legacy.join("rooms/r2.json"), "{corrupt").unwrap();
+        let (rooms, complete) = list_rooms_checked(&partial_legacy);
+        assert_eq!(rooms.len(), 1);
+        assert_eq!(rooms[0]["id"], "r1");
+        assert!(!complete);
+
+        // Clean legacy rooms dir returns complete = true.
+        fs::remove_file(partial_legacy.join("rooms/r2.json")).unwrap();
+        let (rooms, complete) = list_rooms_checked(&partial_legacy);
+        assert_eq!(rooms.len(), 1);
+        assert!(complete);
+
+        // Non-dir/symlinked legacy rooms dir alongside valid rooms.db forces complete = false.
+        let symlink_rooms_base = dir.join("symlink-rooms");
+        fs::create_dir_all(&symlink_rooms_base).unwrap();
+        {
+            let conn = Connection::open(symlink_rooms_base.join("rooms.db")).unwrap();
+            conn.pragma_update(None, "application_id", ROOMS_APPLICATION_ID)
+                .unwrap();
+            conn.pragma_update(None, "user_version", ROOMS_SCHEMA_VERSION)
+                .unwrap();
+            conn.execute(
+                "CREATE TABLE rooms (id TEXT PRIMARY KEY, cwd TEXT NOT NULL, updated_at INTEGER NOT NULL, revision INTEGER NOT NULL DEFAULT 1, data TEXT NOT NULL)",
+                [],
+            )
+            .unwrap();
+        }
+        fs::write(symlink_rooms_base.join("rooms"), "not-a-dir").unwrap();
+        assert!(has_legacy_room_files(&symlink_rooms_base));
+        assert!(query_rooms_db(&symlink_rooms_base, None).is_none());
+        let (_, complete) = list_rooms_checked(&symlink_rooms_base);
+        assert!(!complete);
 
         let _ = fs::remove_dir_all(&dir);
     }

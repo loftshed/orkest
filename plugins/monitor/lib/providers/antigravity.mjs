@@ -1,4 +1,6 @@
 import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
 import { childEnv, expandHome, resolveBinary, run } from "../exec.mjs";
@@ -82,7 +84,40 @@ export function parseAntigravityUsage(payload) {
 }
 
 const SSH_MARKERS = ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"];
-const LOGIN_FILE = "~/.gemini/antigravity-cli/antigravity-oauth-token";
+const LOOPBACK_SSH_CONNECTION = "127.0.0.1 0 127.0.0.1 22";
+
+function resolvePathForHome(value, baseDir = homedir()) {
+  const trimmed = String(value).trim();
+  let expanded;
+  if (trimmed === "~") {
+    expanded = baseDir;
+  } else if (trimmed.startsWith("~/")) {
+    expanded = path.join(baseDir, trimmed.slice(2));
+  } else {
+    expanded = expandHome(trimmed);
+  }
+  return path.isAbsolute(expanded) ? path.resolve(expanded) : path.resolve(baseDir, expanded);
+}
+
+export function hasAccountLoginFile(env = {}) {
+  const baseHome =
+    typeof env.HOME === "string" && env.HOME.trim() ? resolvePathForHome(env.HOME) : homedir();
+  if (typeof env.ANTIGRAVITY_APP_DATA_DIR === "string" && env.ANTIGRAVITY_APP_DATA_DIR.trim()) {
+    const appDataDir = resolvePathForHome(env.ANTIGRAVITY_APP_DATA_DIR, baseHome);
+    return (
+      existsSync(path.join(appDataDir, "antigravity-oauth-token")) ||
+      existsSync(path.join(appDataDir, "antigravity-cli", "antigravity-oauth-token"))
+    );
+  }
+  if (typeof env.GEMINI_CLI_HOME === "string" && env.GEMINI_CLI_HOME.trim()) {
+    const geminiCliHome = resolvePathForHome(env.GEMINI_CLI_HOME, baseHome);
+    return (
+      existsSync(path.join(geminiCliHome, "antigravity-cli", "antigravity-oauth-token")) ||
+      existsSync(path.join(geminiCliHome, "antigravity-oauth-token"))
+    );
+  }
+  return existsSync(path.join(baseHome, ".gemini", "antigravity-cli", "antigravity-oauth-token"));
+}
 
 // On Linux agy keeps its sign-in in one of two places: the file above or the desktop keyring (KWallet).
 // It picks the file when it sees an SSH session and the keyring otherwise, and each place holds its own
@@ -92,21 +127,39 @@ const LOGIN_FILE = "~/.gemini/antigravity-cli/antigravity-oauth-token";
 // it with a superseded refresh token, and Google revokes the grant: every agy session is signed out a
 // minute or two later. Presenting the probe as an SSH session makes it read, and refresh, the file the
 // other sessions use. Without a sign-in file the keyring stays in charge.
-export function probeEnv(
-  extra = {},
-  { platform = process.platform, hasLoginFile = () => existsSync(expandHome(LOGIN_FILE)) } = {},
-) {
-  const env = childEnv(extra);
+export function probeEnv(extra = {}, { platform = process.platform, hasLoginFile } = {}) {
+  const hasExtraHome = typeof extra.HOME === "string" && extra.HOME.trim().length > 0;
+  const baseHome = hasExtraHome ? resolvePathForHome(extra.HOME) : homedir();
+  const resolvedExtra = { ...extra };
+  if (hasExtraHome) {
+    resolvedExtra.HOME = baseHome;
+  }
+  for (const key of ["GEMINI_CLI_HOME", "ANTIGRAVITY_APP_DATA_DIR"]) {
+    if (typeof resolvedExtra[key] === "string" && resolvedExtra[key].trim()) {
+      resolvedExtra[key] = resolvePathForHome(resolvedExtra[key], baseHome);
+    }
+  }
+  const env = childEnv(resolvedExtra);
   // A null in the account's env removes a variable; for these it also opts out of the marker.
   const isOptedOut = SSH_MARKERS.some((name) => extra[name] === null);
+  const loginFilePresent = hasLoginFile ? hasLoginFile(env) : hasAccountLoginFile(env);
+  if (
+    platform === "linux" &&
+    !loginFilePresent &&
+    env.SSH_CONNECTION === LOOPBACK_SSH_CONNECTION &&
+    !env.SSH_CLIENT &&
+    !env.SSH_TTY
+  ) {
+    delete env.SSH_CONNECTION;
+  }
   if (
     platform !== "linux" ||
     isOptedOut ||
     SSH_MARKERS.some((name) => env[name]) ||
-    !hasLoginFile()
+    !loginFilePresent
   )
     return env;
-  return { ...env, SSH_CONNECTION: "127.0.0.1 0 127.0.0.1 22" };
+  return { ...env, SSH_CONNECTION: LOOPBACK_SSH_CONNECTION };
 }
 
 async function runUsage(bin, account) {
@@ -114,6 +167,7 @@ async function runUsage(bin, account) {
     env: probeEnv(account.env ?? {}),
     timeoutMs: account.timeoutMs ?? 60_000,
     maxBytes: 1024 * 1024,
+    abortOnOutput: /Authentication required\.|Waiting for authentication/i,
   });
   try {
     return JSON.parse(stdout);

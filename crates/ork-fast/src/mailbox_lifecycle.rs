@@ -2,14 +2,19 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::env;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::ffi::CString;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, ErrorKind, Read, Write};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use rusqlite::{Connection, OpenFlags};
 use serde_json::{Value, json};
 
 use crate::{
@@ -836,23 +841,43 @@ pub fn feedback_observe(
 // =========================================================================
 
 #[must_use]
-pub fn messages(base: &Path, session: &str, unread_only: bool) -> Vec<Value> {
+pub fn messages_checked(base: &Path, session: &str, unread_only: bool) -> (Vec<Value>, bool) {
     let Ok(dir) = paths::inbox_dir(base, session) else {
-        return Vec::new();
+        return (Vec::new(), true);
     };
-    let Ok(entries) = fs::read_dir(dir) else {
-        return Vec::new();
+    let entries = match fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return (Vec::new(), false),
+        Err(_) => return (Vec::new(), true),
     };
-    let mut json_paths: Vec<PathBuf> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|ext| ext.to_str()) == Some("json"))
-        .collect();
+    let mut incomplete = false;
+    let mut json_paths: Vec<PathBuf> = Vec::new();
+    for entry_res in entries {
+        match entry_res {
+            Ok(entry) => {
+                let p = entry.path();
+                if p.extension().and_then(|ext| ext.to_str()) == Some("json") {
+                    json_paths.push(p);
+                }
+            }
+            Err(_) => {
+                incomplete = true;
+            }
+        }
+    }
     json_paths.sort();
 
     let mut out = Vec::new();
     for path in json_paths {
-        let Some(msg) = paths::read_json_file(&path) else {
+        let content = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                incomplete = true;
+                continue;
+            }
+        };
+        let Ok(msg) = serde_json::from_str::<Value>(&content) else {
             continue;
         };
         if !paths::valid_message(&msg) {
@@ -867,7 +892,12 @@ pub fn messages(base: &Path, session: &str, unread_only: bool) -> Vec<Value> {
         }
         out.push(msg);
     }
-    out
+    (out, incomplete)
+}
+
+#[must_use]
+pub fn messages(base: &Path, session: &str, unread_only: bool) -> Vec<Value> {
+    messages_checked(base, session, unread_only).0
 }
 
 #[must_use]
@@ -1382,64 +1412,482 @@ fn offer_cleared_lead(base: &Path, old_session: &str, me: &Value) -> Vec<String>
     notes
 }
 
-/// Transfer unread mail, open requests, focus, channels, progress, board, and lead offer across `/clear`.
-pub fn adopt_cleared(base: &Path, me: &mut Value) -> String {
-    let my_session = match me.get("session").and_then(Value::as_str) {
-        Some(s) => s.to_string(),
-        None => return String::new(),
+const CHIEF_SCHEMA: &str = "ork.chief.v1";
+
+fn open_dir_any_uid(path: &Path) -> io::Result<OwnedFd> {
+    let c_path = CString::new(path.as_os_str().as_encoded_bytes())
+        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "invalid directory path"))?;
+    let fd = unsafe {
+        libc::open(
+            c_path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    let st = fstat_fd(owned.as_fd())?;
+    if (st.st_mode as libc::mode_t & libc::S_IFMT) != libc::S_IFDIR {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "path is not a directory",
+        ));
+    }
+    Ok(owned)
+}
+
+fn map_chief_read_result(res: io::Result<Option<Value>>) -> Result<Option<Value>, ()> {
+    match res {
+        Ok(val) => Ok(val),
+        Err(err)
+            if err.raw_os_error() == Some(libc::ELOOP)
+                || matches!(err.kind(), ErrorKind::InvalidInput | ErrorKind::InvalidData) =>
+        {
+            Ok(None)
+        }
+        Err(_) => Err(()),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExpectedChiefTuple {
+    session: String,
+    revision: u64,
+    generation: Option<String>,
+}
+
+fn chief_binding_revision_value(val: &Value) -> Option<u64> {
+    if val.is_null() {
+        return Some(0);
+    }
+    if let Some(num) = val.as_number() {
+        if let Some(u) = num.as_u64() {
+            return Some(u);
+        }
+        if let Some(i) = num.as_i64() {
+            return Some(if i < 0 { 0 } else { i as u64 });
+        }
+        return None;
+    }
+    Some(0)
+}
+
+fn chief_binding_revision(obj: &serde_json::Map<String, Value>) -> Option<u64> {
+    match obj.get("revision") {
+        Some(val) => chief_binding_revision_value(val),
+        None => Some(0),
+    }
+}
+
+fn expected_chief_tuple_from_stash(record: &Value) -> Option<Result<ExpectedChiefTuple, ()>> {
+    let session = record
+        .get("expectedChiefSession")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())?;
+    let Some(rev) = record.get("expectedChiefRevision").and_then(Value::as_u64) else {
+        return Some(Err(()));
+    };
+    let generation = match record.get("expectedChiefGeneration") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(_) => return Some(Err(())),
+    };
+    Some(Ok(ExpectedChiefTuple {
+        session: session.to_string(),
+        revision: rev,
+        generation,
+    }))
+}
+
+fn observe_chief_tuple_in_dir_fd(
+    base_fd: BorrowedFd<'_>,
+    old_session: &str,
+) -> Result<Option<ExpectedChiefTuple>, ()> {
+    let Some(pre) = map_chief_read_result(paths::read_chief_json_in_dir_fd(base_fd))? else {
+        return Ok(None);
+    };
+    let Some(pre_obj) = pre.as_object() else {
+        return Ok(None);
+    };
+    if pre_obj.get("schema").and_then(Value::as_str) != Some(CHIEF_SCHEMA)
+        || pre_obj.get("session").and_then(Value::as_str) != Some(old_session)
+    {
+        return Ok(None);
+    }
+    let observed_rev = chief_binding_revision(pre_obj).ok_or(())?;
+    let observed_gen = pre_obj
+        .get("generation")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Ok(Some(ExpectedChiefTuple {
+        session: old_session.to_string(),
+        revision: observed_rev,
+        generation: observed_gen,
+    }))
+}
+
+fn observe_chief_tuple_for_base(
+    base: &Path,
+    old_session: &str,
+) -> Result<Option<ExpectedChiefTuple>, ()> {
+    let base_fd = match open_dir_any_uid(base) {
+        Ok(fd) => fd,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(()),
+    };
+    observe_chief_tuple_in_dir_fd(base_fd.as_fd(), old_session)
+}
+
+fn new_chief_generation(avoid: Option<&str>) -> String {
+    for _ in 0..4 {
+        let hex: String = paths::random_bytes(12)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        if Some(hex.as_str()) != avoid {
+            return hex;
+        }
+    }
+    let seq = DIR_FD_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{}-{seq:x}", std::process::id())
+}
+
+/// Transfer `<base>/chief.json` across `/clear` only when `chief.lock` confirms the old Chief session
+/// still holds the observed `(session, revision, generation)` binding and live process birth matches
+/// every recorded birth.
+/// Returns `Ok(true)` if transferred, `Ok(false)` on definitive mismatch/refusal,
+/// and `Err(())` on transient read/lock/write errors so the intended successor can retry.
+#[cfg(test)]
+fn transfer_chief_on_clear(base: &Path, old: &Value, me: &Value) -> Result<bool, ()> {
+    transfer_chief_on_clear_internal(base, old, me, None, identity::process_started_fresh)
+}
+
+#[cfg(test)]
+fn transfer_chief_on_clear_with_lookup<F>(
+    base: &Path,
+    old: &Value,
+    me: &Value,
+    lookup_birth: F,
+) -> Result<bool, ()>
+where
+    F: FnOnce(i64) -> Option<String>,
+{
+    transfer_chief_on_clear_internal(base, old, me, None, lookup_birth)
+}
+
+fn transfer_chief_on_clear_expected_with_lookup<F>(
+    base: &Path,
+    old: &Value,
+    me: &Value,
+    expected: &ExpectedChiefTuple,
+    lookup_birth: F,
+) -> Result<bool, ()>
+where
+    F: FnOnce(i64) -> Option<String>,
+{
+    transfer_chief_on_clear_internal(base, old, me, Some(expected), lookup_birth)
+}
+
+fn transfer_chief_on_clear_internal<F>(
+    base: &Path,
+    old: &Value,
+    me: &Value,
+    expected: Option<&ExpectedChiefTuple>,
+    lookup_birth: F,
+) -> Result<bool, ()>
+where
+    F: FnOnce(i64) -> Option<String>,
+{
+    let base_fd = match open_dir_any_uid(base) {
+        Ok(fd) => fd,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err(()),
+    };
+    if !paths::valid_peer(old) || !paths::valid_peer(me) {
+        return Ok(false);
+    }
+    if identity::is_run_peer(Some(old))
+        || identity::is_run_peer(Some(me))
+        || old.get("isSubagent").is_some_and(paths::is_truthy_json)
+        || me.get("isSubagent").is_some_and(paths::is_truthy_json)
+        || old.get("delegatedRun").is_some_and(paths::is_truthy_json)
+        || me.get("delegatedRun").is_some_and(paths::is_truthy_json)
+    {
+        return Ok(false);
+    }
+    let Some(old_session) = old
+        .get("session")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(false);
+    };
+    let Some(my_session) = me
+        .get("session")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(false);
+    };
+    if old_session == my_session {
+        return Ok(false);
+    }
+    let host = paths::current_hostname();
+    if let Some(m) = old
+        .get("machine")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        && host.as_deref() != Some(m)
+    {
+        return Ok(false);
+    }
+    if let Some(m) = me
+        .get("machine")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        && host.as_deref() != Some(m)
+    {
+        return Ok(false);
+    }
+
+    let Some(new_pid) = me.get("pid").and_then(Value::as_i64).filter(|&p| p > 0) else {
+        return Ok(false);
+    };
+    let old_pid = old
+        .get("clearedPid")
+        .or_else(|| old.get("pid"))
+        .and_then(Value::as_i64)
+        .filter(|&p| p > 0);
+    if old_pid != Some(new_pid) || !identity::is_pid_live(new_pid) {
+        return Ok(false);
+    }
+
+    let old_birth = old
+        .get("pidBirth")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    let me_birth = me
+        .get("pidBirth")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+
+    let observed = if let Some(exp) = expected {
+        if exp.session != old_session {
+            return Ok(false);
+        }
+        exp.clone()
+    } else {
+        let Some(obs) = observe_chief_tuple_in_dir_fd(base_fd.as_fd(), old_session)? else {
+            return Ok(false);
+        };
+        obs
+    };
+    let observed_rev = observed.revision;
+    let observed_gen = observed.generation;
+
+    let _guard = match lock_in_dir_fd(base_fd.as_fd(), "chief.lock") {
+        Ok(guard) => guard,
+        Err(err)
+            if err.raw_os_error() == Some(libc::ELOOP) || err.kind() == ErrorKind::InvalidInput =>
+        {
+            return Ok(false);
+        }
+        Err(_) => return Err(()),
+    };
+    let Some(mut chief) = map_chief_read_result(paths::read_chief_json_in_dir_fd(base_fd.as_fd()))?
+    else {
+        return Ok(false);
+    };
+    let Some(chief_obj) = chief.as_object() else {
+        return Ok(false);
+    };
+    if chief_obj.get("schema").and_then(Value::as_str) != Some(CHIEF_SCHEMA)
+        || chief_obj.get("session").and_then(Value::as_str) != Some(old_session)
+        || chief_binding_revision(chief_obj) != Some(observed_rev)
+        || chief_obj.get("generation").and_then(Value::as_str) != observed_gen.as_deref()
+    {
+        return Ok(false);
+    }
+    if let Some(cm) = chief_obj
+        .get("machine")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        && host.as_deref() != Some(cm)
+    {
+        return Ok(false);
+    }
+    if let Some(chief_pid) = chief_obj
+        .get("pid")
+        .and_then(Value::as_i64)
+        .filter(|&p| p > 0)
+        && chief_pid != new_pid
+    {
+        return Ok(false);
+    }
+    if !identity::is_pid_live(new_pid) {
+        return Ok(false);
+    }
+    // Always query the live process birth under chief.lock rather than trusting stale peer JSON.
+    let live_birth = lookup_birth(new_pid);
+    let chief_birth = chief_obj
+        .get("pidBirth")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    if old_birth.is_some() || chief_birth.is_some() || me_birth.is_some() {
+        let Some(ref lb) = live_birth else {
+            return Err(());
+        };
+        if old_birth.is_some_and(|ob| ob != lb.as_str())
+            || chief_birth.as_deref().is_some_and(|cb| cb != lb.as_str())
+            || me_birth.is_some_and(|mb| mb != lb.as_str())
+        {
+            return Ok(false);
+        }
+    }
+
+    let next_rev = observed_rev.checked_add(1).ok_or(())?;
+    let next_gen = new_chief_generation(observed_gen.as_deref());
+    let Some(obj) = chief.as_object_mut() else {
+        return Ok(false);
+    };
+    obj.insert("session".to_string(), Value::String(my_session.to_string()));
+    if let Some(name) = me
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        obj.insert("name".to_string(), Value::String(name.to_string()));
+    }
+    obj.insert("pid".to_string(), json!(new_pid));
+    if let Some(lb) = live_birth {
+        obj.insert("pidBirth".to_string(), Value::String(lb));
+    } else if !obj.contains_key("pidBirth") {
+        obj.insert("pidBirth".to_string(), Value::Null);
+    }
+    if let Some(cwd) = me
+        .get("checkout")
+        .or_else(|| me.get("cwd"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        obj.insert("cwd".to_string(), Value::String(cwd.to_string()));
+    }
+    if let Some(harness) = me
+        .get("harness")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        let engine = if harness == "gemini" { "agy" } else { harness };
+        obj.insert("engine".to_string(), Value::String(engine.to_string()));
+    }
+    if let Some(model) = me
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        obj.insert("model".to_string(), Value::String(model.to_string()));
+    }
+    obj.insert("revision".to_string(), json!(next_rev));
+    obj.insert("generation".to_string(), Value::String(next_gen));
+    write_json_atomic_in_dir_fd(base_fd.as_fd(), "chief.json", &chief).map_err(|_| ())?;
+    Ok(true)
+}
+
+fn sync_pending_chief_marker(base: &Path, me: &mut Value, still_pending: bool) {
+    let Some(my_session) = me
+        .get("session")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
+        return;
+    };
+    if still_pending {
+        if me.get("pendingChiefTransfer") != Some(&Value::Bool(true))
+            && let Some(upd) =
+                identity::annotate_peer(base, &my_session, &[("pendingChiefTransfer", json!(true))])
+        {
+            *me = upd;
+        }
+    } else if me
+        .get("pendingChiefTransfer")
+        .is_some_and(paths::is_truthy_json)
+        && let Some(upd) =
+            identity::annotate_peer(base, &my_session, &[("pendingChiefTransfer", Value::Null)])
+    {
+        *me = upd;
+    }
+}
+
+fn matching_positive_pid(a: Option<i64>, b: Option<i64>) -> bool {
+    matches!((a, b), (Some(pa), Some(pb)) if pa > 0 && pa == pb)
+}
+
+fn is_stale_claimed_stash(base: &Path, record: &Value, target_sid: &str) -> bool {
+    if let Some(pid) = record.get("clearedPid").and_then(Value::as_i64)
+        && pid > 0
+        && !identity::is_pid_live(pid)
+    {
+        return true;
+    }
+    let successor_live = paths::peer_path(base, target_sid)
+        .ok()
+        .and_then(|pp| paths::read_json_file(&pp))
+        .filter(paths::valid_peer)
+        .is_some_and(|peer| identity::is_live_peer(&peer, None));
+    if !successor_live {
+        return true;
+    }
+    if record.get("adoptionCompleted").and_then(Value::as_bool) == Some(true)
+        && let Some(Ok(exp)) = expected_chief_tuple_from_stash(record)
+        && let Ok(chief_opt) = map_chief_read_result(paths::read_chief_json_bounded(base))
+    {
+        let matches = chief_opt
+            .as_ref()
+            .and_then(Value::as_object)
+            .is_some_and(|obj| {
+                obj.get("schema").and_then(Value::as_str) == Some(CHIEF_SCHEMA)
+                    && obj.get("session").and_then(Value::as_str) == Some(exp.session.as_str())
+                    && chief_binding_revision(obj) == Some(exp.revision)
+                    && obj.get("generation").and_then(Value::as_str) == exp.generation.as_deref()
+            });
+        if !matches {
+            return true;
+        }
+    }
+    false
+}
+
+fn complete_adoption_from_stash<W>(
+    base: &Path,
+    cleared_file: &Path,
+    old: &Value,
+    me: &mut Value,
+    write_claim: &mut W,
+) -> (String, bool)
+where
+    W: FnMut(&Path, &Value) -> io::Result<()>,
+{
+    let Some(my_session) = me
+        .get("session")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
+        return (String::new(), false);
     };
     let my_harness = me
         .get("harness")
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    let my_pid = me.get("pid").and_then(Value::as_i64);
     let my_cwd = me
         .get("cwd")
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-
     let now_secs = paths::utc_now_secs();
-    let mut stashed: Vec<(String, PathBuf, Value)> = Vec::new();
-    if let Ok(entries) = fs::read_dir(base.join("cleared")) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            let Some(record) = paths::read_json_file(&p).filter(paths::valid_peer) else {
-                continue;
-            };
-            if record.get("session").and_then(Value::as_str) == Some(my_session.as_str()) {
-                continue;
-            }
-            let Some(cleared_at) = record.get("clearedAt").and_then(Value::as_str) else {
-                continue;
-            };
-            let Some(cleared_secs) = paths::parse_iso8601_utc_secs(cleared_at) else {
-                continue;
-            };
-            if now_secs - cleared_secs > CLEAR_PAIRING_SECS {
-                let _ = fs::remove_file(&p);
-            } else if record.get("harness").and_then(Value::as_str) == Some(my_harness.as_str())
-                && record.get("clearedPid").and_then(Value::as_i64) == my_pid
-            {
-                stashed.push((cleared_at.to_string(), p, record));
-            }
-        }
-    }
-    if stashed.is_empty() {
-        let stamp = paths::format_utc_iso_z(now_secs);
-        identity::annotate_peer(
-            base,
-            &my_session,
-            &[("awaitingClear", Value::String(stamp))],
-        );
-        return String::new();
-    }
-    stashed.sort_by(|a, b| a.0.cmp(&b.0));
-    let (_, cleared_file, old) = stashed.pop().expect("stashed non-empty");
+
     let old_session = old
         .get("session")
         .and_then(Value::as_str)
@@ -1528,13 +1976,59 @@ pub fn adopt_cleared(base: &Path, me: &mut Value) -> String {
     }
 
     let existing_native = identity::native_session_ids(Some(me), Some(base));
+    let mut adopted_set: HashSet<String> = me
+        .get("adoptedNativeIds")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .filter(|s| paths::valid_session_id(s))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
     let current_native = me
         .get("nativeSession")
         .and_then(Value::as_str)
-        .filter(|ns| existing_native.contains(*ns))
+        .filter(|ns| existing_native.contains(*ns) && !adopted_set.contains(*ns))
         .unwrap_or(&my_session)
         .to_string();
-    let old_native_set = identity::native_session_ids(Some(&old), Some(base));
+    let mut own_native = existing_native;
+    own_native.retain(|id| !adopted_set.contains(id));
+    own_native.insert(my_session.clone());
+    own_native.insert(current_native.clone());
+
+    let old_native_set = identity::native_session_ids(Some(old), Some(base));
+    if let Some(arr) = old.get("adoptedNativeIds").and_then(Value::as_array) {
+        for item in arr {
+            if let Some(s) = item.as_str()
+                && paths::valid_session_id(s)
+            {
+                adopted_set.insert(s.to_string());
+            }
+        }
+    }
+    for id in &old_native_set {
+        adopted_set.insert(id.clone());
+    }
+    adopted_set.retain(|id| !own_native.contains(id));
+    let mut adopted_list: Vec<String> = adopted_set.into_iter().collect();
+    adopted_list.sort();
+    if adopted_list.len() > 64 {
+        let start = adopted_list.len() - 64;
+        adopted_list.drain(..start);
+    }
+    if let Some(annotated) = identity::annotate_peer(
+        base,
+        &my_session,
+        &[(
+            "adoptedNativeIds",
+            Value::Array(adopted_list.into_iter().map(Value::String).collect()),
+        )],
+    ) {
+        *me = annotated;
+    }
+
     let mut observed: Vec<String> = old_native_set.into_iter().collect();
     observed.sort();
     observed.push(current_native);
@@ -1547,9 +2041,11 @@ pub fn adopt_cleared(base: &Path, me: &mut Value) -> String {
     let my_name_str = my_name.as_str().map(str::to_string);
     let mut carried = Vec::new();
     let mut orphaned = 0usize;
+    let mut mail_copy_failed = false;
     let replied = replied_to(base, &old_session);
 
-    for mut msg in messages(base, &old_session, false) {
+    let (old_messages, mail_scan_incomplete) = messages_checked(base, &old_session, false);
+    for mut msg in old_messages {
         let Some(sent_secs) = msg
             .get("sentAt")
             .and_then(Value::as_str)
@@ -1597,16 +2093,21 @@ pub fn adopt_cleared(base: &Path, me: &mut Value) -> String {
                     }),
                 );
             }
-            if let Ok(new_dir) = paths::inbox_dir(base, &my_session) {
-                let _ = paths::write_json_atomic(&new_dir.join(format!("{msg_id}.json")), &msg);
+            let published = paths::inbox_dir(base, &my_session).is_ok_and(|new_dir| {
+                paths::write_json_atomic(&new_dir.join(format!("{msg_id}.json")), &msg).is_ok()
+            });
+            if published {
+                if let Ok(old_dir) = paths::inbox_dir(base, &old_session) {
+                    let _ = fs::remove_file(old_dir.join(format!("{msg_id}.json")));
+                }
+                carried.push(msg);
+            } else {
+                mail_copy_failed = true;
             }
-            if let Ok(old_dir) = paths::inbox_dir(base, &old_session) {
-                let _ = fs::remove_file(old_dir.join(format!("{msg_id}.json")));
-            }
-            carried.push(msg);
         }
     }
 
+    let mut progress_copy_failed = false;
     if let (Ok(old_key), Ok(new_key)) = (
         paths::session_key(&old_session),
         paths::session_key(&my_session),
@@ -1632,10 +2133,13 @@ pub fn adopt_cleared(base: &Path, me: &mut Value) -> String {
                     Value::String(new_acct.to_string()),
                 );
             }
-            let _ = paths::write_json_atomic(&new_prog_path, &prog);
+            if paths::write_json_atomic(&new_prog_path, &prog).is_err() {
+                progress_copy_failed = true;
+            }
         }
     }
 
+    let mut board_write_failed = false;
     let board_path = base.join("work").join("board.json");
     if board_path.is_file()
         && let Ok(_guard) = paths::lock_for(&board_path)
@@ -1646,8 +2150,9 @@ pub fn adopt_cleared(base: &Path, me: &mut Value) -> String {
             &my_session,
             my_name_str.as_deref(),
         )
+        && paths::write_json_atomic(&board_path, &board).is_err()
     {
-        let _ = paths::write_json_atomic(&board_path, &board);
+        board_write_failed = true;
     }
 
     let my_label = peer_display_label(me);
@@ -1660,7 +2165,24 @@ pub fn adopt_cleared(base: &Path, me: &mut Value) -> String {
         )
     });
     let offers = offer_cleared_lead(base, &old_session, me);
-    let _ = fs::remove_file(cleared_file);
+
+    let mut adoption_completed =
+        !mail_scan_incomplete && !mail_copy_failed && !progress_copy_failed && !board_write_failed;
+    if adoption_completed {
+        if let Ok(_guard) = paths::lock_for(cleared_file) {
+            let mut latest = paths::read_json_file(cleared_file).unwrap_or_else(|| old.clone());
+            if let Some(obj) = latest.as_object_mut() {
+                obj.insert("adoptionCompleted".to_string(), Value::Bool(true));
+                obj.entry("chiefTransferPending".to_string())
+                    .or_insert(Value::Bool(true));
+            }
+            if write_claim(cleared_file, &latest).is_err() {
+                adoption_completed = false;
+            }
+        } else {
+            adoption_completed = false;
+        }
+    }
 
     let mut lines = vec![format!(
         "Your earlier context in this process was cleared (previous session {old_session}, {old_name})."
@@ -1672,7 +2194,7 @@ pub fn adopt_cleared(base: &Path, me: &mut Value) -> String {
     {
         lines.push(format!("Before that you were working on: {old_focus}."));
     }
-    let old_channels = memberships(&old);
+    let old_channels = memberships(old);
     if !old_channels.is_empty() {
         lines.push(format!(
             "You are still in channel {}; leave it if your task changed.",
@@ -1692,7 +2214,407 @@ pub fn adopt_cleared(base: &Path, me: &mut Value) -> String {
         ));
     }
     lines.extend(offers);
-    lines.join("\n")
+    (lines.join("\n"), adoption_completed)
+}
+
+fn resolve_claimed_stash_chief_transfer<W>(
+    base: &Path,
+    cleared_file: &Path,
+    record: &Value,
+    me: &Value,
+    write_claim: &mut W,
+) -> Result<bool, ()>
+where
+    W: FnMut(&Path, &Value) -> io::Result<()>,
+{
+    resolve_claimed_stash_chief_transfer_with_lookup(
+        base,
+        cleared_file,
+        record,
+        me,
+        write_claim,
+        identity::process_started_fresh,
+    )
+}
+
+fn resolve_claimed_stash_chief_transfer_with_lookup<W, F>(
+    base: &Path,
+    cleared_file: &Path,
+    record: &Value,
+    me: &Value,
+    write_claim: &mut W,
+    lookup_birth: F,
+) -> Result<bool, ()>
+where
+    W: FnMut(&Path, &Value) -> io::Result<()>,
+    F: FnOnce(i64) -> Option<String>,
+{
+    let remove_stash = || {
+        if let Ok(_guard) = paths::lock_for(cleared_file) {
+            let _ = fs::remove_file(cleared_file);
+        }
+    };
+    if record.get("chiefTransferPending") == Some(&Value::Bool(false)) {
+        remove_stash();
+        return Ok(false);
+    }
+    let Some(old_session) = record
+        .get("session")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    else {
+        remove_stash();
+        return Ok(false);
+    };
+
+    let expected = match expected_chief_tuple_from_stash(record) {
+        Some(Ok(exp)) => exp,
+        Some(Err(())) => {
+            remove_stash();
+            return Ok(false);
+        }
+        None => {
+            let Some(observed) = observe_chief_tuple_for_base(base, old_session)? else {
+                remove_stash();
+                return Ok(false);
+            };
+            let Ok(_guard) = paths::lock_for(cleared_file) else {
+                return Err(());
+            };
+            let mut latest = paths::read_json_file(cleared_file).unwrap_or_else(|| record.clone());
+            if let Some(existing_exp) = expected_chief_tuple_from_stash(&latest) {
+                match existing_exp {
+                    Ok(exp) => exp,
+                    Err(()) => {
+                        let _ = fs::remove_file(cleared_file);
+                        return Ok(false);
+                    }
+                }
+            } else {
+                if let Some(obj) = latest.as_object_mut() {
+                    obj.insert(
+                        "expectedChiefSession".to_string(),
+                        Value::String(observed.session.clone()),
+                    );
+                    obj.insert(
+                        "expectedChiefRevision".to_string(),
+                        json!(observed.revision),
+                    );
+                    obj.insert(
+                        "expectedChiefGeneration".to_string(),
+                        observed
+                            .generation
+                            .as_ref()
+                            .map_or(Value::Null, |g| Value::String(g.clone())),
+                    );
+                }
+                if write_claim(cleared_file, &latest).is_err() {
+                    return Err(());
+                }
+                observed
+            }
+        }
+    };
+
+    let res =
+        transfer_chief_on_clear_expected_with_lookup(base, record, me, &expected, lookup_birth)?;
+    remove_stash();
+    Ok(res)
+}
+
+/// Retry any pending adoption or Chief desk transfer claimed by `me` across ordinary lifecycle
+/// hooks without replaying already-completed mail, focus, aliases, or workboard adoption.
+pub fn retry_pending_chief_transfer(base: &Path, me: &mut Value) {
+    let cleared_dir = base.join("cleared");
+    if !cleared_dir.is_dir() {
+        sync_pending_chief_marker(base, me, false);
+        return;
+    }
+    let Some(my_session) = me
+        .get("session")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+    else {
+        return;
+    };
+    let my_harness = me
+        .get("harness")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let my_pid = me.get("pid").and_then(Value::as_i64);
+    let now_secs = paths::utc_now_secs();
+    let mut still_pending = false;
+    let mut my_claimed: Vec<(PathBuf, Value)> = Vec::new();
+
+    if let Ok(entries) = fs::read_dir(&cleared_dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(_guard) = paths::lock_for(&p) else {
+                continue;
+            };
+            let Some(record) = paths::read_json_file(&p).filter(paths::valid_peer) else {
+                continue;
+            };
+            let intended = record
+                .get("intendedChiefSuccessor")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty());
+            if let Some(target_sid) = intended {
+                if target_sid != my_session.as_str() {
+                    if is_stale_claimed_stash(base, &record, target_sid) {
+                        let _ = fs::remove_file(&p);
+                    }
+                    continue;
+                }
+                if record.get("harness").and_then(Value::as_str) != Some(my_harness.as_str())
+                    || !matching_positive_pid(
+                        record.get("clearedPid").and_then(Value::as_i64),
+                        my_pid,
+                    )
+                {
+                    continue;
+                }
+                my_claimed.push((p, record));
+            } else if let Some(cleared_secs) = record
+                .get("clearedAt")
+                .and_then(Value::as_str)
+                .and_then(paths::parse_iso8601_utc_secs)
+                && now_secs - cleared_secs > CLEAR_PAIRING_SECS
+            {
+                let _ = fs::remove_file(&p);
+            }
+        }
+    }
+
+    let mut write_claim = paths::write_json_atomic;
+    for (p, mut record) in my_claimed {
+        let adoption_completed = record
+            .get("adoptionCompleted")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !adoption_completed {
+            let (_notice, ok) =
+                complete_adoption_from_stash(base, &p, &record, me, &mut write_claim);
+            if !ok {
+                still_pending = true;
+                continue;
+            }
+            if let Some(reloaded) = paths::read_json_file(&p).filter(paths::valid_peer) {
+                record = reloaded;
+            }
+        }
+        if resolve_claimed_stash_chief_transfer(base, &p, &record, me, &mut write_claim).is_err() {
+            still_pending = true;
+        }
+    }
+    sync_pending_chief_marker(base, me, still_pending);
+}
+
+/// Transfer unread mail, open requests, focus, channels, progress, board, and lead offer across `/clear`.
+pub fn adopt_cleared(base: &Path, me: &mut Value) -> String {
+    adopt_cleared_with_claim_writer(base, me, paths::write_json_atomic)
+}
+
+fn adopt_cleared_with_claim_writer<W>(base: &Path, me: &mut Value, mut write_claim: W) -> String
+where
+    W: FnMut(&Path, &Value) -> io::Result<()>,
+{
+    let my_session = match me.get("session").and_then(Value::as_str) {
+        Some(s) => s.to_string(),
+        None => return String::new(),
+    };
+    let my_harness = me
+        .get("harness")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let my_pid = me.get("pid").and_then(Value::as_i64);
+
+    let now_secs = paths::utc_now_secs();
+    let mut retries: Vec<PathBuf> = Vec::new();
+    let mut fresh_candidates: Vec<(String, PathBuf)> = Vec::new();
+    if let Ok(entries) = fs::read_dir(base.join("cleared")) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(_guard) = paths::lock_for(&p) else {
+                continue;
+            };
+            let Some(record) = paths::read_json_file(&p).filter(paths::valid_peer) else {
+                continue;
+            };
+            if record.get("session").and_then(Value::as_str) == Some(my_session.as_str()) {
+                continue;
+            }
+            let intended = record
+                .get("intendedChiefSuccessor")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty());
+            if let Some(target_sid) = intended {
+                if target_sid == my_session {
+                    if record.get("harness").and_then(Value::as_str) == Some(my_harness.as_str())
+                        && matching_positive_pid(
+                            record.get("clearedPid").and_then(Value::as_i64),
+                            my_pid,
+                        )
+                    {
+                        retries.push(p);
+                    }
+                } else if is_stale_claimed_stash(base, &record, target_sid) {
+                    let _ = fs::remove_file(&p);
+                }
+                continue;
+            }
+            let Some(cleared_at) = record.get("clearedAt").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(cleared_secs) = paths::parse_iso8601_utc_secs(cleared_at) else {
+                continue;
+            };
+            if now_secs - cleared_secs > CLEAR_PAIRING_SECS {
+                let _ = fs::remove_file(&p);
+                continue;
+            }
+            if record.get("harness").and_then(Value::as_str) != Some(my_harness.as_str())
+                || !matching_positive_pid(record.get("clearedPid").and_then(Value::as_i64), my_pid)
+            {
+                continue;
+            }
+            fresh_candidates.push((cleared_at.to_string(), p));
+        }
+    }
+
+    let mut notices: Vec<String> = Vec::new();
+    let mut retried_chief = false;
+    let mut still_pending_chief = false;
+    for p in retries {
+        let record_opt = {
+            let Ok(_guard) = paths::lock_for(&p) else {
+                still_pending_chief = true;
+                continue;
+            };
+            paths::read_json_file(&p).filter(paths::valid_peer)
+        };
+        let Some(mut record) = record_opt else {
+            continue;
+        };
+        if record.get("intendedChiefSuccessor").and_then(Value::as_str) != Some(my_session.as_str())
+        {
+            continue;
+        }
+        retried_chief = true;
+        if record.get("adoptionCompleted").and_then(Value::as_bool) != Some(true) {
+            let (resumed_notice, ok) =
+                complete_adoption_from_stash(base, &p, &record, me, &mut write_claim);
+            if !resumed_notice.is_empty() {
+                notices.push(resumed_notice);
+            }
+            if !ok {
+                still_pending_chief = true;
+                continue;
+            }
+            if let Some(reloaded) = paths::read_json_file(&p).filter(paths::valid_peer) {
+                record = reloaded;
+            }
+        }
+        if resolve_claimed_stash_chief_transfer(base, &p, &record, me, &mut write_claim).is_err() {
+            still_pending_chief = true;
+        }
+    }
+
+    fresh_candidates.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut claimed_stash: Option<(PathBuf, Value)> = None;
+    while let Some((_, p)) = fresh_candidates.pop() {
+        let Ok(_guard) = paths::lock_for(&p) else {
+            continue;
+        };
+        let Some(record) = paths::read_json_file(&p).filter(paths::valid_peer) else {
+            continue;
+        };
+        if record.get("session").and_then(Value::as_str) == Some(my_session.as_str()) {
+            continue;
+        }
+        if record
+            .get("intendedChiefSuccessor")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty())
+        {
+            continue;
+        }
+        let Some(cleared_secs) = record
+            .get("clearedAt")
+            .and_then(Value::as_str)
+            .and_then(paths::parse_iso8601_utc_secs)
+        else {
+            continue;
+        };
+        if now_secs - cleared_secs > CLEAR_PAIRING_SECS {
+            let _ = fs::remove_file(&p);
+            continue;
+        }
+        if record.get("harness").and_then(Value::as_str) != Some(my_harness.as_str())
+            || !matching_positive_pid(record.get("clearedPid").and_then(Value::as_i64), my_pid)
+        {
+            continue;
+        }
+        let mut bound = record.clone();
+        if let Some(obj) = bound.as_object_mut() {
+            obj.insert(
+                "intendedChiefSuccessor".to_string(),
+                Value::String(my_session.clone()),
+            );
+            obj.insert("adoptionCompleted".to_string(), Value::Bool(false));
+            obj.insert("chiefTransferPending".to_string(), Value::Bool(true));
+        }
+        if write_claim(&p, &bound).is_err() {
+            sync_pending_chief_marker(base, me, still_pending_chief);
+            return notices.join("\n");
+        }
+        claimed_stash = Some((p, bound));
+        break;
+    }
+
+    let Some((cleared_file, old)) = claimed_stash else {
+        sync_pending_chief_marker(base, me, still_pending_chief);
+        if !retried_chief && my_pid.is_some_and(|p| p > 0) {
+            let stamp = paths::format_utc_iso_z(now_secs);
+            identity::annotate_peer(
+                base,
+                &my_session,
+                &[("awaitingClear", Value::String(stamp))],
+            );
+        }
+        return notices.join("\n");
+    };
+
+    let (notice, adoption_ok) =
+        complete_adoption_from_stash(base, &cleared_file, &old, me, &mut write_claim);
+    if !notice.is_empty() {
+        notices.push(notice);
+    }
+    if !adoption_ok {
+        sync_pending_chief_marker(base, me, true);
+        return notices.join("\n");
+    }
+    let latest_stash = paths::read_json_file(&cleared_file)
+        .filter(paths::valid_peer)
+        .unwrap_or(old);
+    let chief_res = resolve_claimed_stash_chief_transfer(
+        base,
+        &cleared_file,
+        &latest_stash,
+        me,
+        &mut write_claim,
+    );
+    sync_pending_chief_marker(base, me, still_pending_chief || chief_res.is_err());
+    notices.join("\n")
 }
 
 /// Handle `SessionEnd`: stash cleared session or notify senders + unregister peer.
@@ -1701,72 +2623,121 @@ pub fn end_session(base: &Path, session: &str, reason: &str, pid: Option<i64>) {
         return;
     };
     if reason == "clear" {
-        let Some(peer) = paths::read_json_file(&pp).filter(paths::valid_peer) else {
+        let Some(raw_peer) = paths::read_json_file(&pp) else {
+            // Preserve existing unreadable/unparseable peer records (or any non-NotFound
+            // metadata error) so retries can recover; only genuine NotFound needs no preservation.
+            if !matches!(fs::metadata(&pp), Err(e) if e.kind() == ErrorKind::NotFound) {
+                return;
+            }
             identity::unregister_peer(base, session);
             return;
         };
-        if !identity::is_run_peer(Some(&peer))
-            && let Ok(s_key) = paths::session_key(session)
-        {
-            let mut cleared = peer.clone();
-            if let Some(obj) = cleared.as_object_mut() {
-                obj.insert(
-                    "clearedAt".to_string(),
-                    Value::String(paths::format_utc_iso_z(paths::utc_now_secs())),
-                );
-                obj.insert(
-                    "clearedPid".to_string(),
-                    pid.map_or(Value::Null, |p| json!(p)),
-                );
-            }
-            let _ = paths::write_json_atomic(
-                &base.join("cleared").join(format!("{s_key}.json")),
-                &cleared,
+        if !paths::valid_peer(&raw_peer) {
+            identity::unregister_peer(base, session);
+            return;
+        }
+        let peer = raw_peer;
+        if identity::is_run_peer(Some(&peer)) {
+            identity::unregister_peer(base, session);
+            return;
+        }
+        let Ok(s_key) = paths::session_key(session) else {
+            return;
+        };
+        let mut cleared = peer.clone();
+        if let Some(obj) = cleared.as_object_mut() {
+            obj.insert(
+                "clearedAt".to_string(),
+                Value::String(paths::format_utc_iso_z(paths::utc_now_secs())),
             );
-            let now_secs = paths::utc_now_secs();
-            if let Ok(entries) = fs::read_dir(base.join("peers")) {
-                for entry in entries.flatten() {
-                    let p = entry.path();
-                    if p.extension().and_then(|e| e.to_str()) != Some("json") {
-                        continue;
-                    }
-                    let Some(mut waiting) = paths::read_json_file(&p).filter(paths::valid_peer)
-                    else {
-                        continue;
-                    };
-                    let w_sid = waiting.get("session").and_then(Value::as_str).unwrap_or("");
-                    if w_sid == session {
-                        continue;
-                    }
-                    if waiting.get("harness") == peer.get("harness")
-                        && waiting.get("pid").and_then(Value::as_i64) == pid
-                        && let Some(ac) = waiting.get("awaitingClear").and_then(Value::as_str)
-                        && let Some(ac_secs) = paths::parse_iso8601_utc_secs(ac)
-                        && now_secs - ac_secs <= CLEAR_PAIRING_SECS
-                    {
-                        let w_sid_owned = w_sid.to_string();
-                        let mut notice = adopt_cleared(base, &mut waiting);
-                        if let Some(reloaded) = reload_peer(base, &w_sid_owned) {
-                            waiting = reloaded;
+            obj.insert(
+                "clearedPid".to_string(),
+                pid.map_or(Value::Null, |p| json!(p)),
+            );
+        }
+        let stash_path = base.join("cleared").join(format!("{s_key}.json"));
+        let stash_confirmed = if let Ok(_stash_guard) = paths::lock_for(&stash_path) {
+            let existing = paths::read_json_file(&stash_path);
+            let already_published = existing.as_ref().is_some_and(|ex| {
+                paths::valid_peer(ex)
+                    && ex.get("session").and_then(Value::as_str) == Some(session)
+                    && ex
+                        .get("clearedAt")
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| !s.is_empty())
+            });
+            if already_published {
+                true
+            } else {
+                if let Some(ex_obj) = existing
+                    .as_ref()
+                    .filter(|ex| ex.get("session").and_then(Value::as_str) == Some(session))
+                    .and_then(Value::as_object)
+                    && let Some(obj) = cleared.as_object_mut()
+                {
+                    for key in [
+                        "intendedChiefSuccessor",
+                        "adoptionCompleted",
+                        "chiefTransferPending",
+                        "expectedChiefSession",
+                        "expectedChiefRevision",
+                        "expectedChiefGeneration",
+                    ] {
+                        if let Some(val) = ex_obj.get(key) {
+                            obj.insert(key.to_string(), val.clone());
                         }
-                        let swarm_notice = mailbox_swarm::swarm_coordinator_context(
-                            base,
-                            &mut waiting,
-                            "SessionStart",
-                            false,
-                        );
-                        if !swarm_notice.is_empty() {
-                            if notice.is_empty() {
-                                notice = swarm_notice;
-                            } else {
-                                notice = format!("{notice}\n\n{swarm_notice}");
-                            }
-                        }
-                        if !notice.is_empty() {
-                            notify(base, &waiting, &notice, None, "cross-project");
-                        }
-                        break;
                     }
+                }
+                paths::write_json_atomic(&stash_path, &cleared).is_ok()
+            }
+        } else {
+            false
+        };
+        if !stash_confirmed {
+            return;
+        }
+        let now_secs = paths::utc_now_secs();
+        if let Ok(entries) = fs::read_dir(base.join("peers")) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                let Some(mut waiting) = paths::read_json_file(&p).filter(paths::valid_peer) else {
+                    continue;
+                };
+                let w_sid = waiting.get("session").and_then(Value::as_str).unwrap_or("");
+                if w_sid == session {
+                    continue;
+                }
+                if waiting.get("harness") == peer.get("harness")
+                    && matching_positive_pid(waiting.get("pid").and_then(Value::as_i64), pid)
+                    && let Some(ac) = waiting.get("awaitingClear").and_then(Value::as_str)
+                    && let Some(ac_secs) = paths::parse_iso8601_utc_secs(ac)
+                    && now_secs - ac_secs <= CLEAR_PAIRING_SECS
+                {
+                    let w_sid_owned = w_sid.to_string();
+                    let mut notice = adopt_cleared(base, &mut waiting);
+                    if let Some(reloaded) = reload_peer(base, &w_sid_owned) {
+                        waiting = reloaded;
+                    }
+                    let swarm_notice = mailbox_swarm::swarm_coordinator_context(
+                        base,
+                        &mut waiting,
+                        "SessionStart",
+                        false,
+                    );
+                    if !swarm_notice.is_empty() {
+                        if notice.is_empty() {
+                            notice = swarm_notice;
+                        } else {
+                            notice = format!("{notice}\n\n{swarm_notice}");
+                        }
+                    }
+                    if !notice.is_empty() {
+                        notify(base, &waiting, &notice, None, "cross-project");
+                    }
+                    break;
                 }
             }
         }
@@ -1808,30 +2779,622 @@ pub fn codex_sqlite_settings(
     sqlite::codex_thread_settings_newest(&account_path, session)
 }
 
-pub fn bootstrap_repo_env(cwd: &str, harness: &str, event: &str) {
+// cspell:ignore mkdirat unlinkat fstatat
+const BOOTSTRAP_MARKER_SCHEMA: &str = "ork.bootstrap-marker.v1";
+const HANDOFF_EVENT_MAX_BYTES: usize = 512 * 1024;
+static DIR_FD_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn fstat_fd(fd: BorrowedFd<'_>) -> io::Result<libc::stat> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(st)
+}
+
+fn open_dir_allow_parent_symlinks(path: &Path) -> io::Result<OwnedFd> {
+    let c_path = CString::new(path.as_os_str().as_encoded_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid directory path"))?;
+    let fd = unsafe {
+        libc::open(
+            c_path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    let st = fstat_fd(owned.as_fd())?;
+    let uid = unsafe { libc::getuid() };
+    if (st.st_mode as libc::mode_t & libc::S_IFMT) != libc::S_IFDIR || st.st_uid != uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "directory ownership mismatch",
+        ));
+    }
+    Ok(owned)
+}
+
+fn openat_dir_nofollow(
+    parent: BorrowedFd<'_>,
+    name: &str,
+    forbidden_mode_bits: u32,
+    create_mode: Option<libc::mode_t>,
+) -> io::Result<OwnedFd> {
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid directory component",
+        ));
+    }
+    let c_name = CString::new(name)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid directory component"))?;
+    if let Some(mode) = create_mode {
+        let rc = unsafe { libc::mkdirat(parent.as_raw_fd(), c_name.as_ptr(), mode) };
+        if rc != 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EEXIST) {
+                return Err(err);
+            }
+        }
+    }
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            c_name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    let st = fstat_fd(owned.as_fd())?;
+    let uid = unsafe { libc::getuid() };
+    if (st.st_mode as libc::mode_t & libc::S_IFMT) != libc::S_IFDIR
+        || st.st_uid != uid
+        || ((st.st_mode as u32) & forbidden_mode_bits) != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "unsafe directory permissions or ownership",
+        ));
+    }
+    Ok(owned)
+}
+
+fn read_file_capped_in_dir_fd(
+    dir_fd: BorrowedFd<'_>,
+    name: &str,
+    max_bytes: usize,
+    forbidden_mode_bits: u32,
+) -> Option<Vec<u8>> {
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+        return None;
+    }
+    let c_name = CString::new(name).ok()?;
+    let fd = unsafe {
+        libc::openat(
+            dir_fd.as_raw_fd(),
+            c_name.as_ptr(),
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    let file = unsafe { File::from_raw_fd(fd) };
+    let meta = file.metadata().ok()?;
+    let uid = unsafe { libc::getuid() };
+    if !meta.file_type().is_file()
+        || meta.uid() != uid
+        || (meta.mode() & forbidden_mode_bits) != 0
+        || meta.len() > max_bytes as u64
+    {
+        return None;
+    }
+    let mut buf = Vec::with_capacity(meta.len() as usize);
+    file.take((max_bytes + 1) as u64)
+        .read_to_end(&mut buf)
+        .ok()?;
+    (buf.len() <= max_bytes).then_some(buf)
+}
+
+fn write_json_atomic_in_dir_fd(
+    dir_fd: BorrowedFd<'_>,
+    name: &str,
+    value: &Value,
+) -> io::Result<()> {
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid filename",
+        ));
+    }
+    let target_c = CString::new(name)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid filename"))?;
+    let seq = DIR_FD_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp_name = format!(".ork-{}-{seq}.tmp", std::process::id());
+    let tmp_c = CString::new(tmp_name)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid tmp name"))?;
+    let payload =
+        serde_json::to_vec(value).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+    let fd = unsafe {
+        libc::openat(
+            dir_fd.as_raw_fd(),
+            tmp_c.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    let write_res = (|| -> io::Result<()> {
+        file.write_all(&payload)?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    drop(file);
+    if let Err(err) = write_res {
+        unsafe {
+            libc::unlinkat(dir_fd.as_raw_fd(), tmp_c.as_ptr(), 0);
+        }
+        return Err(err);
+    }
+    if unsafe {
+        libc::renameat(
+            dir_fd.as_raw_fd(),
+            tmp_c.as_ptr(),
+            dir_fd.as_raw_fd(),
+            target_c.as_ptr(),
+        )
+    } != 0
+    {
+        let err = io::Error::last_os_error();
+        unsafe {
+            libc::unlinkat(dir_fd.as_raw_fd(), tmp_c.as_ptr(), 0);
+        }
+        return Err(err);
+    }
+    Ok(())
+}
+
+struct DirFdLockGuard {
+    fd: i32,
+}
+
+impl Drop for DirFdLockGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::flock(self.fd, libc::LOCK_UN);
+            libc::close(self.fd);
+        }
+    }
+}
+
+fn lock_in_dir_fd(dir_fd: BorrowedFd<'_>, lock_name: &str) -> io::Result<DirFdLockGuard> {
+    let c_lock = CString::new(lock_name)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid lock name"))?;
+    for _ in 0..64 {
+        let fd = unsafe {
+            libc::openat(
+                dir_fd.as_raw_fd(),
+                c_lock.as_ptr(),
+                libc::O_CREAT
+                    | libc::O_RDWR
+                    | libc::O_NOFOLLOW
+                    | libc::O_NONBLOCK
+                    | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let guard = DirFdLockGuard { fd };
+        let mut fd_st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd, &mut fd_st) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if (fd_st.st_mode as libc::mode_t & libc::S_IFMT) != libc::S_IFREG {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "lock target is not a regular file",
+            ));
+        }
+        loop {
+            if unsafe { libc::flock(fd, libc::LOCK_EX) } == 0 {
+                break;
+            }
+            let err = io::Error::last_os_error();
+            if err.kind() != io::ErrorKind::Interrupted {
+                return Err(err);
+            }
+        }
+        let mut path_st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd, &mut fd_st) } == 0
+            && unsafe {
+                libc::fstatat(
+                    dir_fd.as_raw_fd(),
+                    c_lock.as_ptr(),
+                    &mut path_st,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } == 0
+            && (fd_st.st_mode as libc::mode_t & libc::S_IFMT) == libc::S_IFREG
+            && (path_st.st_mode as libc::mode_t & libc::S_IFMT) == libc::S_IFREG
+            && fd_st.st_dev == path_st.st_dev
+            && fd_st.st_ino == path_st.st_ino
+        {
+            unsafe {
+                libc::futimens(fd, std::ptr::null());
+            }
+            return Ok(guard);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::WouldBlock,
+        "could not acquire directory-relative lock",
+    ))
+}
+
+fn read_regular_file_capped(path: &Path, max_bytes: usize) -> Option<Vec<u8>> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.file_type().is_file() || meta.len() > max_bytes as u64 {
+        return None;
+    }
+    let mut buf = Vec::with_capacity(meta.len() as usize);
+    file.take((max_bytes + 1) as u64)
+        .read_to_end(&mut buf)
+        .ok()?;
+    (buf.len() <= max_bytes).then_some(buf)
+}
+
+fn read_private_file_capped(path: &Path, max_bytes: usize) -> Option<Vec<u8>> {
+    let parent = path.parent()?;
+    let parent_meta = fs::symlink_metadata(parent).ok()?;
+    let uid = unsafe { libc::getuid() };
+    if parent_meta.file_type().is_symlink()
+        || !parent_meta.is_dir()
+        || parent_meta.uid() != uid
+        || (parent_meta.mode() & 0o077) != 0
+    {
+        return None;
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.file_type().is_file()
+        || meta.uid() != uid
+        || (meta.mode() & 0o077) != 0
+        || meta.len() > max_bytes as u64
+    {
+        return None;
+    }
+    let mut buf = Vec::with_capacity(meta.len() as usize);
+    file.take((max_bytes + 1) as u64)
+        .read_to_end(&mut buf)
+        .ok()?;
+    if buf.len() > max_bytes {
+        return None;
+    }
+    Some(buf)
+}
+
+fn stat_stamp_json(meta: &fs::Metadata) -> Value {
+    let mtime_ns = i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec());
+    let ctime_ns = i128::from(meta.ctime()) * 1_000_000_000 + i128::from(meta.ctime_nsec());
+    json!({
+        "st_dev": meta.dev().to_string(),
+        "st_ino": meta.ino().to_string(),
+        "st_size": meta.size().to_string(),
+        "st_mtime_ns": mtime_ns.to_string(),
+        "st_ctime_ns": ctime_ns.to_string(),
+    })
+}
+
+fn stat_regular_readable_file(path: &Path) -> Option<Value> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .ok()?;
+    let meta = file.metadata().ok()?;
+    meta.file_type().is_file().then(|| stat_stamp_json(&meta))
+}
+
+struct GitRootsFast {
+    main_root: PathBuf,
+    linked_root: PathBuf,
+    main_git_dir: PathBuf,
+    linked_git_dir: PathBuf,
+}
+
+fn resolve_git_roots_fast(canon_cwd: &Path) -> Option<GitRootsFast> {
+    for ancestor in canon_cwd.ancestors() {
+        let dot_git = ancestor.join(".git");
+        let Ok(link_meta) = fs::symlink_metadata(&dot_git) else {
+            continue;
+        };
+        if link_meta.is_dir() && !link_meta.file_type().is_symlink() {
+            let root = fs::canonicalize(ancestor).ok()?;
+            let git_dir = fs::canonicalize(&dot_git).ok()?;
+            return Some(GitRootsFast {
+                main_root: root.clone(),
+                linked_root: root,
+                main_git_dir: git_dir.clone(),
+                linked_git_dir: git_dir,
+            });
+        }
+        if link_meta.is_file() && !link_meta.file_type().is_symlink() {
+            let raw_bytes = read_regular_file_capped(&dot_git, 4096)?;
+            let raw = std::str::from_utf8(&raw_bytes).ok()?;
+            let gitdir_rel = raw
+                .lines()
+                .find_map(|line| line.strip_prefix("gitdir:"))?
+                .trim();
+            if gitdir_rel.is_empty() {
+                return None;
+            }
+            let linked_git_raw = Path::new(gitdir_rel);
+            let linked_git_dir = fs::canonicalize(if linked_git_raw.is_absolute() {
+                linked_git_raw.to_path_buf()
+            } else {
+                ancestor.join(linked_git_raw)
+            })
+            .ok()?;
+            let common_bytes = read_regular_file_capped(&linked_git_dir.join("commondir"), 4096)?;
+            let common_raw = std::str::from_utf8(&common_bytes).ok()?;
+            let common_trimmed = common_raw.trim();
+            if common_trimmed.is_empty() {
+                return None;
+            }
+            let common_path = Path::new(common_trimmed);
+            let main_git_dir = fs::canonicalize(if common_path.is_absolute() {
+                common_path.to_path_buf()
+            } else {
+                linked_git_dir.join(common_path)
+            })
+            .ok()?;
+            if main_git_dir.file_name().and_then(|n| n.to_str()) != Some(".git") {
+                return None;
+            }
+            if !linked_git_dir.starts_with(main_git_dir.join("worktrees")) {
+                return None;
+            }
+            let main_root = fs::canonicalize(main_git_dir.parent()?).ok()?;
+            let linked_root = fs::canonicalize(ancestor).ok()?;
+            return Some(GitRootsFast {
+                main_root,
+                linked_root,
+                main_git_dir,
+                linked_git_dir,
+            });
+        }
+        return None;
+    }
+    None
+}
+
+fn is_root_env_filename(name: &str) -> bool {
+    name == ".env" || (name.starts_with(".env.") && name.len() > 5 && !name.contains('/'))
+}
+
+fn is_env_template_filename(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(".env.") else {
+        return false;
+    };
+    let is_tag = |s: &str| {
+        matches!(
+            s.to_ascii_lowercase().as_str(),
+            "defaults" | "dist" | "example" | "sample" | "schema" | "template"
+        )
+    };
+    if let Some((tag, after_dot)) = rest.split_once('.') {
+        is_tag(tag) && !after_dot.is_empty() && !after_dot.contains('\n')
+    } else {
+        is_tag(rest)
+    }
+}
+
+fn is_sensitive_env_filename(name: &str) -> bool {
+    is_root_env_filename(name) && !is_env_template_filename(name)
+}
+
+fn worktreeinclude_absent(roots: &GitRootsFast) -> bool {
+    matches!(
+        fs::symlink_metadata(roots.main_root.join(".worktreeinclude")),
+        Err(ref e) if e.kind() == ErrorKind::NotFound
+    ) && matches!(
+        fs::symlink_metadata(roots.linked_root.join(".worktreeinclude")),
+        Err(ref e) if e.kind() == ErrorKind::NotFound
+    )
+}
+
+fn has_git_env_override() -> bool {
+    [
+        "GIT_INDEX_FILE",
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+    ]
+    .iter()
+    .any(|var| env::var_os(var).is_some_and(|v| !v.is_empty()))
+}
+
+fn collect_bootstrap_snapshot(session: &str, cwd: &str) -> Option<(String, Value)> {
+    if session.is_empty() || has_git_env_override() {
+        return None;
+    }
+    let s_key = paths::session_key(session).ok()?;
+    let canon_cwd = fs::canonicalize(Path::new(cwd)).ok()?;
+    let roots = resolve_git_roots_fast(&canon_cwd)?;
+    if !worktreeinclude_absent(&roots) {
+        return None;
+    }
+    let main_index = stat_regular_readable_file(&roots.main_git_dir.join("index"))?;
+    let linked_index = stat_regular_readable_file(&roots.linked_git_dir.join("index"))?;
+
+    let mut env_names = Vec::new();
+    let entries = fs::read_dir(&roots.main_root).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if is_root_env_filename(&name) {
+            env_names.push(name);
+        }
+    }
+    env_names.sort();
+
+    let mut env_manifest = Vec::with_capacity(env_names.len());
+    let mut sensitive_names = Vec::new();
+    for name in &env_names {
+        let path = roots.main_root.join(name);
+        let link_meta = fs::symlink_metadata(&path).ok()?;
+        if link_meta.file_type().is_symlink() {
+            return None;
+        }
+        let kind = if link_meta.is_file() {
+            if is_sensitive_env_filename(name) {
+                sensitive_names.push(name.clone());
+            }
+            "file"
+        } else if link_meta.is_dir() {
+            "dir"
+        } else {
+            return None;
+        };
+        env_manifest.push(json!({
+            "name": name,
+            "kind": kind,
+            "stamp": stat_stamp_json(&link_meta),
+        }));
+    }
+
+    let expected_destinations = if roots.main_root == roots.linked_root {
+        Vec::new()
+    } else {
+        let mut destinations = Vec::with_capacity(sensitive_names.len());
+        for name in &sensitive_names {
+            let dest = roots.linked_root.join(name);
+            let meta = fs::symlink_metadata(&dest).ok()?;
+            if meta.file_type().is_symlink() || !meta.is_file() {
+                return None;
+            }
+            destinations.push(json!({
+                "name": name,
+                "present": true,
+                "isFile": true,
+                "isSymlink": false,
+            }));
+        }
+        destinations
+    };
+
+    let cwd_hash = sha256::sha256_hex(canon_cwd.to_string_lossy().as_bytes());
+    let marker_name = format!("{s_key}-{}.json", &cwd_hash[..16]);
+
+    let snapshot = json!({
+        "schema": BOOTSTRAP_MARKER_SCHEMA,
+        "priorSuccess": true,
+        "session": session,
+        "cwd": canon_cwd.to_string_lossy(),
+        "mainRoot": roots.main_root.to_string_lossy(),
+        "linkedRoot": roots.linked_root.to_string_lossy(),
+        "worktreeIncludeAbsent": true,
+        "mainIndex": main_index,
+        "linkedIndex": linked_index,
+        "mainEnvManifest": env_manifest,
+        "expectedDestinations": expected_destinations,
+    });
+    Some((marker_name, snapshot))
+}
+
+fn can_skip_subagent_bootstrap(base: &Path, session: &str, cwd: &str) -> bool {
+    let Some((marker_name, live_snapshot)) = collect_bootstrap_snapshot(session, cwd) else {
+        return false;
+    };
+    let Ok(base_fd) = open_dir_allow_parent_symlinks(base) else {
+        return false;
+    };
+    let Ok(cache_fd) = openat_dir_nofollow(base_fd.as_fd(), "bootstrap-cache", 0o077, None) else {
+        return false;
+    };
+    let Some(raw) = read_file_capped_in_dir_fd(cache_fd.as_fd(), &marker_name, 256 * 1024, 0o077)
+    else {
+        return false;
+    };
+    let Ok(cached) = serde_json::from_slice::<Value>(&raw) else {
+        return false;
+    };
+    cached == live_snapshot
+}
+
+fn write_bootstrap_marker(base: &Path, session: &str, cwd: &str) {
+    let Some((marker_name, snapshot)) = collect_bootstrap_snapshot(session, cwd) else {
+        return;
+    };
+    if fs::create_dir_all(base).is_err() {
+        return;
+    }
+    let Ok(base_fd) = open_dir_allow_parent_symlinks(base) else {
+        return;
+    };
+    let Ok(cache_fd) = openat_dir_nofollow(base_fd.as_fd(), "bootstrap-cache", 0o077, Some(0o700))
+    else {
+        return;
+    };
+    let _ = write_json_atomic_in_dir_fd(cache_fd.as_fd(), &marker_name, &snapshot);
+}
+
+pub fn bootstrap_repo_env(base: &Path, session: &str, cwd: &str, harness: &str, event: &str) {
     let readonly = env::var("ORKEST_READONLY_RUN").as_deref() == Ok("1");
-    let export_claude =
-        harness == "claude" && event == "SessionStart" && env::var_os("CLAUDE_ENV_FILE").is_some();
+    let has_claude_env = env::var_os("CLAUDE_ENV_FILE").is_some_and(|v| !v.is_empty());
+    let export_claude = harness == "claude" && event == "SessionStart" && has_claude_env;
     if readonly && !export_claude {
+        return;
+    }
+    if event == "SubagentStart"
+        && !export_claude
+        && !(harness == "claude" && has_claude_env)
+        && can_skip_subagent_bootstrap(base, session, cwd)
+    {
         return;
     }
     let ro_flag = if readonly { "1" } else { "0" };
     let ec_flag = if export_claude { "1" } else { "0" };
-    let _ = run_scripts_python(
+    let res = run_scripts_python(
         concat!(
             "import sys\n",
             "sys.path.insert(0, sys.argv[1])\n",
             "import repo_env\n",
+            "failed = []\n",
             "if sys.argv[3] != '1':\n",
-            "    repo_env.bootstrap_worktree_env(sys.argv[2], overwrite=False)\n",
+            "    _, failed = repo_env.bootstrap_worktree_env_checked(sys.argv[2], overwrite=False)\n",
             "if sys.argv[4] == '1':\n",
             "    repo_env.export_claude_env_file(sys.argv[2])\n",
+            "if failed:\n",
+            "    sys.exit(2)\n",
         ),
         &[cwd, ro_flag, ec_flag],
         None,
         Duration::from_secs(6),
         None,
     );
+    if matches!(res, Some((true, _))) && !readonly && event != "SubagentStart" {
+        write_bootstrap_marker(base, session, cwd);
+    }
 }
 
 pub fn handle_stop_failure(base: &Path, payload: &Value, session: &str, harness: &str) {
@@ -2034,7 +3597,7 @@ pub fn handle_subagent_start(
         }
     }
     if env::var("ORKEST_READONLY_RUN").as_deref() != Ok("1") {
-        bootstrap_repo_env(cwd, harness, "SubagentStart");
+        bootstrap_repo_env(base, session, cwd, harness, "SubagentStart");
     }
     json!({})
 }
@@ -2514,6 +4077,244 @@ fn handoff_enabled() -> bool {
         != Some(&Value::Bool(false))
 }
 
+fn is_team_lead_for_handoff(base: &Path, session: &str) -> bool {
+    let auth_root = cache_dir_for_base(base).join("authority-v1");
+    let Ok(entries) = fs::read_dir(auth_root) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let Some(record) = paths::read_json_file(&entry.path().join("authority.json")) else {
+            continue;
+        };
+        if record.get("schema").and_then(Value::as_str) != Some(AUTHORITY_SCHEMA) {
+            continue;
+        }
+        let lead_sid = record
+            .get("lead")
+            .and_then(|l| l.get("session"))
+            .and_then(Value::as_str);
+        let status = record.get("status").and_then(Value::as_str).unwrap_or("");
+        if lead_sid == Some(session) && matches!(status, "active" | "pending") {
+            return true;
+        }
+    }
+    false
+}
+
+fn rooms_db_is_readable_and_empty(base: &Path) -> bool {
+    let db = base.join("rooms.db");
+    match fs::symlink_metadata(&db) {
+        Err(e) if e.kind() == ErrorKind::NotFound => return true,
+        Err(_) => return false,
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_file() => return false,
+        Ok(_) => {}
+    }
+    if sqlite::db_has_symlink(&db) {
+        return false;
+    }
+    let Ok(canon) = fs::canonicalize(&db) else {
+        return false;
+    };
+    let Ok(meta) = fs::symlink_metadata(&canon) else {
+        return false;
+    };
+    if !meta.is_file() || meta.file_type().is_symlink() {
+        return false;
+    }
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let Ok(conn) = Connection::open_with_flags(&canon, flags) else {
+        return false;
+    };
+    let _ = conn.busy_timeout(Duration::from_millis(200));
+    let Ok(app_id): Result<i64, _> = conn.query_row("PRAGMA application_id", [], |r| r.get(0))
+    else {
+        return false;
+    };
+    let Ok(user_ver): Result<i64, _> = conn.query_row("PRAGMA user_version", [], |r| r.get(0))
+    else {
+        return false;
+    };
+    if app_id != sqlite::ROOMS_APPLICATION_ID || user_ver != sqlite::ROOMS_SCHEMA_VERSION {
+        return false;
+    }
+    let Ok(count): Result<i64, _> = conn.query_row("SELECT COUNT(*) FROM rooms", [], |r| r.get(0))
+    else {
+        return false;
+    };
+    count == 0
+}
+
+fn is_room_conductor_for_handoff(base: &Path, session: &str) -> bool {
+    if !paths::has_active_room_for_session(base, session) {
+        return false;
+    }
+    let (rooms, complete) = sqlite::list_rooms_checked(base);
+    if !complete || (rooms.is_empty() && !rooms_db_is_readable_and_empty(base)) {
+        return true;
+    }
+    let host = paths::current_hostname().unwrap_or_default();
+    for room in rooms {
+        if !rooms_work::is_open_room(&room) {
+            continue;
+        }
+        let Some(conductor_val) = room.get("conductor").filter(|c| c.is_object()) else {
+            continue;
+        };
+        if conductor_val
+            .get("session")
+            .is_some_and(|v| !v.is_null() && !v.is_object())
+        {
+            continue;
+        }
+        if conductor_val.get("session").is_some_and(|v| !v.is_null())
+            && !rooms_work::local_session_binding(&room, conductor_val, &host)
+        {
+            continue;
+        }
+        if room.get("machine").is_some_and(paths::is_truthy_json)
+            && !rooms_work::local_session_binding(&room, conductor_val, &host)
+        {
+            continue;
+        }
+        let current_sid = conductor_val
+            .get("session")
+            .and_then(|s| s.get("id"))
+            .and_then(Value::as_str);
+        let in_previous = conductor_val
+            .get("previousSessions")
+            .and_then(Value::as_array)
+            .is_some_and(|arr| arr.iter().any(|v| v.as_str() == Some(session)));
+        let is_former_only = in_previous && current_sid != Some(session);
+        if !is_former_only
+            && rooms_work::room_owner_sessions(&room, conductor_val, true)
+                .iter()
+                .any(|s| s == session)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Return true if `me` is an eligible lead for quota handoff polling (Chief, team lead, or room conductor).
+#[must_use]
+pub fn is_handoff_poll_eligible(base: &Path, me: &Value, now_secs: i64) -> bool {
+    let my_sid = me.get("session").and_then(Value::as_str).unwrap_or("");
+    if my_sid.is_empty() {
+        return false;
+    }
+    identity::is_live_chief_binding(base, Some(my_sid), None, Some(now_secs))
+        || is_team_lead_for_handoff(base, my_sid)
+        || is_room_conductor_for_handoff(base, my_sid)
+}
+
+fn open_handoffs_dir_fd(base: &Path) -> Option<(OwnedFd, Vec<String>)> {
+    let cache_dir = cache_dir_for_base(base);
+    let cache_fd = open_dir_allow_parent_symlinks(&cache_dir).ok()?;
+    let handoff_fd = openat_dir_nofollow(cache_fd.as_fd(), "handoffs-v1", 0o022, None).ok()?;
+    let handoff_st = fstat_fd(handoff_fd.as_fd()).ok()?;
+    let handoff_root = cache_dir.join("handoffs-v1");
+    let meta = fs::symlink_metadata(&handoff_root).ok()?;
+    if meta.file_type().is_symlink()
+        || !meta.is_dir()
+        || meta.dev() != handoff_st.st_dev as u64
+        || meta.ino() != handoff_st.st_ino as u64
+    {
+        return None;
+    }
+    let mut names: Vec<String> = fs::read_dir(&handoff_root)
+        .ok()?
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+    names.sort();
+    Some((handoff_fd, names))
+}
+
+fn deliver_non_repo_chief_notices(base: &Path, session: &str, now_secs: i64) -> String {
+    let Some((handoff_fd, dir_names)) = open_handoffs_dir_fd(base) else {
+        return String::new();
+    };
+    let mut lines = Vec::new();
+    for dir_name in dir_names {
+        let Ok(ev_fd) = openat_dir_nofollow(handoff_fd.as_fd(), &dir_name, 0o022, None) else {
+            continue;
+        };
+        let Some(ev_bytes) =
+            read_file_capped_in_dir_fd(ev_fd.as_fd(), "event.json", HANDOFF_EVENT_MAX_BYTES, 0o022)
+        else {
+            continue;
+        };
+        let Ok(ev) = serde_json::from_slice::<Value>(&ev_bytes) else {
+            continue;
+        };
+        let Some(ev_id) = ev.get("id").cloned() else {
+            continue;
+        };
+        if !ev.get("notice").is_some_and(paths::is_truthy_json)
+            || ev
+                .get("toldSessions")
+                .and_then(Value::as_array)
+                .is_some_and(|a| a.iter().any(|v| v.as_str() == Some(session)))
+        {
+            continue;
+        }
+        let Some(noticed_secs) = ev
+            .get("noticedAt")
+            .or_else(|| ev.get("noticeAt"))
+            .or_else(|| ev.get("updatedAt"))
+            .and_then(Value::as_str)
+            .and_then(paths::parse_iso8601_utc_secs)
+        else {
+            continue;
+        };
+        if now_secs - noticed_secs > HANDOFF_NOTICE_SECS {
+            continue;
+        }
+        let Ok(_guard) = lock_in_dir_fd(ev_fd.as_fd(), "handoff.lock") else {
+            continue;
+        };
+        let Some(cur_bytes) =
+            read_file_capped_in_dir_fd(ev_fd.as_fd(), "event.json", HANDOFF_EVENT_MAX_BYTES, 0o022)
+        else {
+            continue;
+        };
+        let Ok(mut current) = serde_json::from_slice::<Value>(&cur_bytes) else {
+            continue;
+        };
+        if current.get("id") != Some(&ev_id)
+            || current
+                .get("toldSessions")
+                .and_then(Value::as_array)
+                .is_some_and(|a| a.iter().any(|v| v.as_str() == Some(session)))
+        {
+            continue;
+        }
+        let Some(notice_text) = current
+            .get("notice")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let Some(obj) = current.as_object_mut() else {
+            continue;
+        };
+        let mut told = obj
+            .get("toldSessions")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        told.push(Value::String(session.to_string()));
+        obj.insert("toldSessions".to_string(), Value::Array(told));
+        if write_json_atomic_in_dir_fd(ev_fd.as_fd(), "event.json", &current).is_ok() {
+            lines.push(notice_text);
+        }
+    }
+    lines.join("\n")
+}
+
 #[must_use]
 pub fn handoff_turn(base: &Path, me: &Value, notify_user: bool) -> String {
     if me.get("isSubagent").is_some_and(paths::is_truthy_json)
@@ -2534,7 +4335,11 @@ pub fn handoff_turn(base: &Path, me: &Value, notify_user: bool) -> String {
     }
 
     let harness = me.get("harness").and_then(Value::as_str).unwrap_or("");
+    let my_sid = me.get("session").and_then(Value::as_str).unwrap_or("");
     let now_secs = paths::utc_now_secs();
+    let is_live_chief = !my_sid.is_empty()
+        && identity::is_live_chief_binding(base, Some(my_sid), None, Some(now_secs));
+
     let poll_due = (harness != "claude" || has_handoff_successor)
         && !me
             .get("handoffCheckedAt")
@@ -2549,19 +4354,36 @@ pub fn handoff_turn(base: &Path, me: &Value, notify_user: bool) -> String {
             || paths::expand_home("~/.cache/monitor", None),
             |s| paths::expand_home(&s, None),
         );
-    let need_poll = poll_due && monitor_cache.join("snapshot.json").is_file();
+    let poll_eligible = if poll_due && monitor_cache.join("snapshot.json").is_file() {
+        has_handoff_successor
+            || is_live_chief
+            || (!my_sid.is_empty()
+                && (is_team_lead_for_handoff(base, my_sid)
+                    || is_room_conductor_for_handoff(base, my_sid)))
+    } else {
+        false
+    };
+    let need_poll = poll_eligible;
 
-    let handoff_root = cache_dir_for_base(base).join("handoffs-v1");
+    let has_repo = me.get("repo").is_some_and(paths::is_truthy_json);
     let mut need_notices = false;
     if notify_user
-        && me.get("repo").is_some_and(paths::is_truthy_json)
-        && handoff_root.is_dir()
-        && let Ok(entries) = fs::read_dir(&handoff_root)
+        && (has_repo || is_live_chief)
+        && let Some((handoff_fd, dir_names)) = open_handoffs_dir_fd(base)
     {
-        let my_sid = me.get("session").and_then(Value::as_str).unwrap_or("");
-        for entry in entries.flatten() {
-            let ev_path = entry.path().join("event.json");
-            let Some(ev) = paths::read_json_file(&ev_path) else {
+        for dir_name in dir_names {
+            let Ok(ev_fd) = openat_dir_nofollow(handoff_fd.as_fd(), &dir_name, 0o022, None) else {
+                continue;
+            };
+            let Some(ev_bytes) = read_file_capped_in_dir_fd(
+                ev_fd.as_fd(),
+                "event.json",
+                HANDOFF_EVENT_MAX_BYTES,
+                0o022,
+            ) else {
+                continue;
+            };
+            let Ok(ev) = serde_json::from_slice::<Value>(&ev_bytes) else {
                 continue;
             };
             if ev.get("notice").is_some_and(paths::is_truthy_json)
@@ -2587,10 +4409,20 @@ pub fn handoff_turn(base: &Path, me: &Value, notify_user: bool) -> String {
         return String::new();
     }
 
+    let chief_non_repo_notices = if need_notices && is_live_chief && !has_repo {
+        deliver_non_repo_chief_notices(base, my_sid, now_secs)
+    } else {
+        String::new()
+    };
+    let python_notices = need_notices && has_repo;
+    if !need_poll && !python_notices {
+        return chief_non_repo_notices;
+    }
+
     let base_str = base.to_string_lossy().into_owned();
     let me_bytes = serde_json::to_vec(me).unwrap_or_else(|_| b"{}".to_vec());
     let poll_flag = if need_poll { "1" } else { "0" };
-    let notice_flag = if need_notices { "1" } else { "0" };
+    let notice_flag = if python_notices { "1" } else { "0" };
     let res = run_scripts_python(
         concat!(
             "import json, pathlib, sys\n",
@@ -2607,113 +4439,769 @@ pub fn handoff_turn(base: &Path, me: &Value, notify_user: bool) -> String {
         Duration::from_secs(5),
         Some(&cache_dir_for_base(base)),
     );
-    match res {
+    let python_text = match res {
         Some((true, text)) => text,
         _ => String::new(),
+    };
+    match (chief_non_repo_notices.is_empty(), python_text.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => chief_non_repo_notices,
+        (true, false) => python_text,
+        (false, false) => format!("{chief_non_repo_notices}\n{python_text}"),
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DaemonMode {
+    Stdio,
+    Http,
+    NeedsFullCheck,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HttpProbeOutcome {
+    CurrentHttp,
+    NeedsFullCheck,
+}
+
+const HTTP_PROBE_BUDGET: Duration = Duration::from_millis(250);
+const HTTP_HEADER_CAP: usize = 16 * 1024;
+const HTTP_BODY_CAP: usize = 256 * 1024;
+const DAEMON_RESERVED_PORTS: &[u16] = &[3000, 3001, 3002, 4001, 4002, 8080, 9222];
+const REVISION_CACHE_SCHEMA: &str = "ork.mailbox-revision.v1";
+const REVISION_FOLDERS: &[&str] = &["scripts", "references", "templates", "bin", "lib"];
+
+#[must_use]
+pub fn classify_daemon_mode(base: &Path) -> DaemonMode {
+    let db = identity::daemon_base(base);
+    let uid = unsafe { libc::getuid() };
+    match fs::symlink_metadata(&db) {
+        Err(e) if e.kind() == ErrorKind::NotFound => return DaemonMode::Stdio,
+        Err(_) => return DaemonMode::NeedsFullCheck,
+        Ok(meta) => {
+            if meta.file_type().is_symlink()
+                || !meta.is_dir()
+                || meta.uid() != uid
+                || (meta.mode() & 0o077) != 0
+            {
+                return DaemonMode::NeedsFullCheck;
+            }
+        }
+    }
+    let mode_path = db.join("mode.json");
+    match fs::symlink_metadata(&mode_path) {
+        Err(e) if e.kind() == ErrorKind::NotFound => return DaemonMode::Stdio,
+        Err(_) => return DaemonMode::NeedsFullCheck,
+        Ok(_) => {}
+    }
+    let Some(bytes) = read_private_file_capped(&mode_path, 16 * 1024) else {
+        return DaemonMode::NeedsFullCheck;
+    };
+    let Ok(mode_val) = serde_json::from_slice::<Value>(&bytes) else {
+        return DaemonMode::NeedsFullCheck;
+    };
+    match mode_val.get("mode").and_then(Value::as_str) {
+        Some("stdio") => DaemonMode::Stdio,
+        Some("http") => DaemonMode::Http,
+        _ => DaemonMode::NeedsFullCheck,
+    }
+}
+
+fn parse_strict_daemon_url(url: &str) -> Option<u16> {
+    let rest = url.strip_prefix("http://127.0.0.1:")?;
+    let port_str = rest.strip_suffix("/mcp")?;
+    if port_str.is_empty()
+        || port_str.len() > 5
+        || port_str.starts_with('0')
+        || !port_str.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let port: u16 = port_str.parse().ok()?;
+    if port == 0 || DAEMON_RESERVED_PORTS.contains(&port) {
+        return None;
+    }
+    Some(port)
+}
+
+fn valid_store_ids(base: &Path) -> Vec<String> {
+    let resolved = paths::resolve_path(base).unwrap_or_else(|_| base.to_path_buf());
+    let mut ids = vec![sha256::sha256_hex(resolved.to_string_lossy().as_bytes())];
+    if let Some(orchestrate_dir) = resolved.parent()
+        && orchestrate_dir.file_name().and_then(|n| n.to_str()) == Some("orchestrate")
+        && let Some(grand) = orchestrate_dir.parent()
+        && let Some(base_name) = resolved.file_name()
+    {
+        let legacy_parent = grand.join("agent-executor");
+        if fs::symlink_metadata(&legacy_parent).is_ok_and(|m| m.file_type().is_symlink())
+            && fs::canonicalize(&legacy_parent).ok().as_deref() == Some(orchestrate_dir)
+        {
+            let legacy_base = legacy_parent.join(base_name);
+            ids.push(sha256::sha256_hex(legacy_base.to_string_lossy().as_bytes()));
+        }
+    }
+    ids
+}
+
+// cspell:ignore fdopendir readdir closedir dirent
+struct DirStreamGuard(*mut libc::DIR);
+
+impl Drop for DirStreamGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                libc::closedir(self.0);
+            }
+        }
+    }
+}
+
+fn open_regular_within_canon_dir(
+    canon_dir_fd: BorrowedFd<'_>,
+    canon_dir: &Path,
+    target_canon: &Path,
+) -> Option<File> {
+    let rel = target_canon.strip_prefix(canon_dir).ok()?;
+    let mut owned_dir: Option<OwnedFd> = None;
+    let mut comps = rel.components().peekable();
+    while let Some(comp) = comps.next() {
+        let std::path::Component::Normal(part) = comp else {
+            return None;
+        };
+        let c_part = CString::new(part.as_encoded_bytes()).ok()?;
+        let cur_fd = owned_dir.as_ref().map_or(canon_dir_fd, AsFd::as_fd);
+        if comps.peek().is_some() {
+            let next_fd = unsafe {
+                libc::openat(
+                    cur_fd.as_raw_fd(),
+                    c_part.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if next_fd < 0 {
+                return None;
+            }
+            let next_owned = unsafe { OwnedFd::from_raw_fd(next_fd) };
+            let st = fstat_fd(next_owned.as_fd()).ok()?;
+            if (st.st_mode as libc::mode_t & libc::S_IFMT) != libc::S_IFDIR {
+                return None;
+            }
+            owned_dir = Some(next_owned);
+        } else {
+            let file_fd = unsafe {
+                libc::openat(
+                    cur_fd.as_raw_fd(),
+                    c_part.as_ptr(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                )
+            };
+            if file_fd < 0 {
+                return None;
+            }
+            let file = unsafe { File::from_raw_fd(file_fd) };
+            let meta = file.metadata().ok()?;
+            return meta.file_type().is_file().then_some(file);
+        }
+    }
+    None
+}
+
+fn clear_os_errno() {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        *libc::__errno_location() = 0;
+    }
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    unsafe {
+        *libc::__error() = 0;
+    }
+}
+
+fn collect_dir_files_recursive_fd(
+    canon_dir_fd: BorrowedFd<'_>,
+    canon_dir: &Path,
+    dir_fd: BorrowedFd<'_>,
+    rel_dir: &Path,
+    folder: &str,
+    entries: &mut Vec<(PathBuf, File, Value)>,
+    cacheable: &mut bool,
+) {
+    use std::ffi::{CStr, OsStr};
+    use std::os::unix::ffi::OsStrExt;
+
+    let dup_fd = unsafe { libc::fcntl(dir_fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if dup_fd < 0 {
+        *cacheable = false;
+        return;
+    }
+    let dir_ptr = unsafe { libc::fdopendir(dup_fd) };
+    if dir_ptr.is_null() {
+        unsafe {
+            libc::close(dup_fd);
+        }
+        *cacheable = false;
+        return;
+    }
+    let _dir_guard = DirStreamGuard(dir_ptr);
+
+    loop {
+        clear_os_errno();
+        let ent = unsafe { libc::readdir(dir_ptr) };
+        if ent.is_null() {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error().unwrap_or(0) != 0 {
+                *cacheable = false;
+            }
+            break;
+        }
+        let c_name = unsafe { CStr::from_ptr((*ent).d_name.as_ptr()) };
+        let name_bytes = c_name.to_bytes();
+        if name_bytes == b"." || name_bytes == b".." || name_bytes == b"__pycache__" {
+            continue;
+        }
+        let name_os = OsStr::from_bytes(name_bytes);
+        let rel_sub = rel_dir.join(name_os);
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe {
+            libc::fstatat(
+                dir_fd.as_raw_fd(),
+                c_name.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            *cacheable = false;
+            continue;
+        }
+        let fmt = st.st_mode as libc::mode_t & libc::S_IFMT;
+        if fmt == libc::S_IFLNK {
+            let link_path = canon_dir.join(&rel_sub);
+            match fs::canonicalize(&link_path) {
+                Ok(target_canon) if target_canon.starts_with(canon_dir) => {
+                    let Some(file) =
+                        open_regular_within_canon_dir(canon_dir_fd, canon_dir, &target_canon)
+                    else {
+                        *cacheable = false;
+                        continue;
+                    };
+                    let Ok(meta) = file.metadata() else {
+                        *cacheable = false;
+                        continue;
+                    };
+                    if Path::new(name_os).extension().and_then(|e| e.to_str()) != Some("pyc") {
+                        let rel = PathBuf::from(folder).join(&rel_sub);
+                        let mut row = stat_stamp_json(&meta);
+                        if let Some(obj) = row.as_object_mut() {
+                            obj.insert(
+                                "path".to_string(),
+                                Value::String(rel.to_string_lossy().into_owned()),
+                            );
+                        }
+                        entries.push((rel, file, row));
+                    }
+                }
+                _ => {
+                    *cacheable = false;
+                }
+            }
+            continue;
+        }
+        if fmt == libc::S_IFDIR {
+            let sub_fd = unsafe {
+                libc::openat(
+                    dir_fd.as_raw_fd(),
+                    c_name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if sub_fd < 0 {
+                *cacheable = false;
+                continue;
+            }
+            let sub_owned = unsafe { OwnedFd::from_raw_fd(sub_fd) };
+            let Ok(sub_st) = fstat_fd(sub_owned.as_fd()) else {
+                *cacheable = false;
+                continue;
+            };
+            if (sub_st.st_mode as libc::mode_t & libc::S_IFMT) != libc::S_IFDIR {
+                *cacheable = false;
+                continue;
+            }
+            collect_dir_files_recursive_fd(
+                canon_dir_fd,
+                canon_dir,
+                sub_owned.as_fd(),
+                &rel_sub,
+                folder,
+                entries,
+                cacheable,
+            );
+        } else if fmt == libc::S_IFREG {
+            if Path::new(name_os).extension().and_then(|e| e.to_str()) == Some("pyc") {
+                continue;
+            }
+            let file_fd = unsafe {
+                libc::openat(
+                    dir_fd.as_raw_fd(),
+                    c_name.as_ptr(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                )
+            };
+            if file_fd < 0 {
+                *cacheable = false;
+                continue;
+            }
+            let file = unsafe { File::from_raw_fd(file_fd) };
+            let Ok(meta) = file.metadata() else {
+                *cacheable = false;
+                continue;
+            };
+            if !meta.file_type().is_file() {
+                *cacheable = false;
+                continue;
+            }
+            let rel = PathBuf::from(folder).join(&rel_sub);
+            let mut row = stat_stamp_json(&meta);
+            if let Some(obj) = row.as_object_mut() {
+                obj.insert(
+                    "path".to_string(),
+                    Value::String(rel.to_string_lossy().into_owned()),
+                );
+            }
+            entries.push((rel, file, row));
+        } else {
+            *cacheable = false;
+        }
+    }
+}
+
+pub(crate) fn current_runtime_revision(base: &Path) -> Option<String> {
+    let scripts_dir = paths::scripts_root()?;
+    let scripts_canon = fs::canonicalize(&scripts_dir).unwrap_or(scripts_dir);
+    let skill = scripts_canon.parent()?;
+    let plugin = if skill.join("lib").is_dir() {
+        skill
+    } else {
+        skill.parent().and_then(Path::parent)?
+    };
+
+    let mut roots_json = Vec::with_capacity(REVISION_FOLDERS.len());
+    let mut files_meta = Vec::new();
+    let mut file_handles: Vec<(String, File)> = Vec::new();
+    let mut cacheable = true;
+
+    for &folder in REVISION_FOLDERS {
+        let dir = match folder {
+            "scripts" | "references" | "templates" => skill.join(folder),
+            _ => plugin.join(folder),
+        };
+        if !dir.is_dir() {
+            roots_json.push(json!({"name": folder, "path": Value::Null}));
+            continue;
+        }
+        let canon_dir = fs::canonicalize(&dir).ok()?;
+        let Ok(canon_dir_fd) = open_dir_any_uid(&canon_dir) else {
+            return None;
+        };
+        roots_json.push(json!({"name": folder, "path": canon_dir.to_string_lossy()}));
+        let mut dir_entries = Vec::new();
+        collect_dir_files_recursive_fd(
+            canon_dir_fd.as_fd(),
+            &canon_dir,
+            canon_dir_fd.as_fd(),
+            Path::new(""),
+            folder,
+            &mut dir_entries,
+            &mut cacheable,
+        );
+        dir_entries.sort_by(|a, b| a.0.cmp(&b.0));
+        for (rel, file, row) in dir_entries {
+            file_handles.push((rel.to_string_lossy().into_owned(), file));
+            files_meta.push(row);
+        }
+    }
+
+    if !cacheable {
+        return None;
+    }
+
+    let scripts_hash = sha256::sha256_hex(scripts_canon.to_string_lossy().as_bytes());
+    let cache_path = identity::daemon_base(base).join(format!("revision-{scripts_hash}.json"));
+    if let Some(raw) = read_private_file_capped(&cache_path, 2 * 1024 * 1024)
+        && let Ok(cached) = serde_json::from_slice::<Value>(&raw)
+        && cached.get("schema").and_then(Value::as_str) == Some(REVISION_CACHE_SCHEMA)
+        && let Some(rev) = cached.get("revision").and_then(Value::as_str)
+        && rev.len() == 16
+        && rev.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        && cached.get("roots").and_then(Value::as_array) == Some(&roots_json)
+        && cached.get("files").and_then(Value::as_array) == Some(&files_meta)
+    {
+        return Some(rev.to_string());
+    }
+
+    let mut hasher = sha256::Sha256::new();
+    let mut buf = [0u8; 8192];
+    for (rel, mut file) in file_handles {
+        hasher.update(rel.as_bytes());
+        loop {
+            match file.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => hasher.update(&buf[..n]),
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(_) => return None,
+            }
+        }
+    }
+    let digest = hasher.finalize();
+    let hex: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    Some(hex)
+}
+
+fn remaining_budget(deadline: Instant) -> Option<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|d| !d.is_zero())
+}
+
+fn is_http_token_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+fn parse_http_headers(header_bytes: &[u8]) -> Option<usize> {
+    let header_str = std::str::from_utf8(header_bytes).ok()?;
+    let mut lines = header_str.split("\r\n");
+    let status_line = lines.next()?;
+    if status_line
+        .bytes()
+        .any(|b| b == b'\r' || b == b'\n' || b < 0x20 || b == 0x7f)
+    {
+        return None;
+    }
+    let after_proto = status_line
+        .strip_prefix("HTTP/1.1 ")
+        .or_else(|| status_line.strip_prefix("HTTP/1.0 "))?;
+    if after_proto.split(' ').next() != Some("200") {
+        return None;
+    }
+    let mut content_length: Option<usize> = None;
+    for line in lines {
+        if line.is_empty()
+            || line
+                .bytes()
+                .any(|b| b == b'\r' || b == b'\n' || (b < 0x20 && b != b'\t') || b == 0x7f)
+        {
+            return None;
+        }
+        let (name, val) = line.split_once(':')?;
+        if name.is_empty() || !name.bytes().all(is_http_token_char) {
+            return None;
+        }
+        let name_lower = name.to_ascii_lowercase();
+        let val_trimmed = val.trim_matches(|c| c == ' ' || c == '\t');
+        if name_lower == "transfer-encoding" {
+            return None;
+        }
+        if name_lower == "content-length" {
+            if content_length.is_some()
+                || val_trimmed.is_empty()
+                || !val_trimmed.bytes().all(|b| b.is_ascii_digit())
+            {
+                return None;
+            }
+            let len: usize = val_trimmed.parse().ok()?;
+            if len == 0 || len > HTTP_BODY_CAP {
+                return None;
+            }
+            content_length = Some(len);
+        }
+    }
+    content_length
+}
+
+fn fetch_http_health(port: u16, token: &str) -> Option<Value> {
+    let deadline = Instant::now() + HTTP_PROBE_BUDGET;
+    let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
+    let connect_timeout = remaining_budget(deadline)?;
+    let mut stream = TcpStream::connect_timeout(&addr, connect_timeout).ok()?;
+    let _ = stream.set_nodelay(true);
+
+    let req = format!(
+        "GET /health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+    );
+    let write_timeout = remaining_budget(deadline)?;
+    stream.set_write_timeout(Some(write_timeout)).ok()?;
+    stream.write_all(req.as_bytes()).ok()?;
+
+    let mut raw = Vec::with_capacity(1024);
+    let mut header_end: Option<usize> = None;
+    let mut expected_len: Option<usize> = None;
+    let mut chunk = [0u8; 4096];
+
+    loop {
+        let read_timeout = remaining_budget(deadline)?;
+        stream.set_read_timeout(Some(read_timeout)).ok()?;
+        let n = stream.read(&mut chunk).ok()?;
+        if n == 0 {
+            let h_end = header_end?;
+            let c_len = expected_len?;
+            if raw.len() != h_end + 4 + c_len {
+                return None;
+            }
+            break;
+        }
+        raw.extend_from_slice(&chunk[..n]);
+        if header_end.is_none() {
+            if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                if pos > HTTP_HEADER_CAP {
+                    return None;
+                }
+                let len = parse_http_headers(&raw[..pos])?;
+                header_end = Some(pos);
+                expected_len = Some(len);
+            } else if raw.len() > HTTP_HEADER_CAP + 4 {
+                return None;
+            }
+        }
+        if let (Some(h_end), Some(c_len)) = (header_end, expected_len) {
+            let target = h_end + 4 + c_len;
+            if raw.len() > target {
+                return None;
+            }
+        }
+    }
+
+    let body_start = header_end? + 4;
+    let parsed: Value = serde_json::from_slice(&raw[body_start..]).ok()?;
+    parsed.is_object().then_some(parsed)
+}
+
+#[must_use]
+pub fn probe_http_daemon(base: &Path) -> HttpProbeOutcome {
+    if classify_daemon_mode(base) != DaemonMode::Http {
+        return HttpProbeOutcome::NeedsFullCheck;
+    }
+    let db = identity::daemon_base(base);
+    let Some(state_bytes) = read_private_file_capped(&db.join("state.json"), 64 * 1024) else {
+        return HttpProbeOutcome::NeedsFullCheck;
+    };
+    let Ok(state) = serde_json::from_slice::<Value>(&state_bytes) else {
+        return HttpProbeOutcome::NeedsFullCheck;
+    };
+    let Some(state_pid) = state.get("pid").and_then(Value::as_i64).filter(|&p| p > 0) else {
+        return HttpProbeOutcome::NeedsFullCheck;
+    };
+    let Some(state_instance) = state
+        .get("instance")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    else {
+        return HttpProbeOutcome::NeedsFullCheck;
+    };
+    let Some(state_url) = state.get("url").and_then(Value::as_str) else {
+        return HttpProbeOutcome::NeedsFullCheck;
+    };
+    let Some(port) = parse_strict_daemon_url(state_url) else {
+        return HttpProbeOutcome::NeedsFullCheck;
+    };
+    let store_ids = valid_store_ids(base);
+    let Some(state_store_id) = state.get("storeId").and_then(Value::as_str) else {
+        return HttpProbeOutcome::NeedsFullCheck;
+    };
+    if !store_ids.iter().any(|id| id == state_store_id) {
+        return HttpProbeOutcome::NeedsFullCheck;
+    }
+    let Some(live_rev) = current_runtime_revision(base) else {
+        return HttpProbeOutcome::NeedsFullCheck;
+    };
+    if state.get("runtimeRevision").and_then(Value::as_str) != Some(live_rev.as_str()) {
+        return HttpProbeOutcome::NeedsFullCheck;
+    }
+
+    let Some(token_bytes) = read_private_file_capped(&db.join("token.txt"), 4096) else {
+        return HttpProbeOutcome::NeedsFullCheck;
+    };
+    let Ok(token_raw) = std::str::from_utf8(&token_bytes) else {
+        return HttpProbeOutcome::NeedsFullCheck;
+    };
+    let token = token_raw.trim();
+    if !(32..=100).contains(&token.len())
+        || !token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return HttpProbeOutcome::NeedsFullCheck;
+    }
+
+    let Some(health) = fetch_http_health(port, token) else {
+        return HttpProbeOutcome::NeedsFullCheck;
+    };
+    if health.get("pid").and_then(Value::as_i64) != Some(state_pid)
+        || health.get("instance").and_then(Value::as_str) != Some(state_instance)
+        || health.get("url").and_then(Value::as_str) != Some(state_url)
+        || health
+            .get("storeId")
+            .and_then(Value::as_str)
+            .is_none_or(|id| !store_ids.iter().any(|s| s == id))
+        || health.get("runtimeRevision").and_then(Value::as_str) != Some(live_rev.as_str())
+        || health.get("activeWaits").and_then(Value::as_u64) != Some(0)
+    {
+        return HttpProbeOutcome::NeedsFullCheck;
+    }
+
+    HttpProbeOutcome::CurrentHttp
+}
+
+fn record_http_availability_issue(base: &Path, me: &mut Value, issue: &str) -> String {
+    let session = me.get("session").and_then(Value::as_str).unwrap_or("");
+    if me
+        .get("httpAvailabilityIssue")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        != issue
+    {
+        if let Some(updated) =
+            identity::annotate_peer(base, session, &[("httpAvailabilityIssue", json!(issue))])
+        {
+            *me = updated;
+        }
+        return issue.to_string();
+    }
+    String::new()
+}
+
+pub fn check_http_daemon_with_probe(
+    base: &Path,
+    me: &mut Value,
+    event: &str,
+    mid_turn: bool,
+    cached_probe: &mut Option<HttpProbeOutcome>,
+) -> (String, String) {
+    match classify_daemon_mode(base) {
+        DaemonMode::Stdio => (String::new(), String::new()),
+        DaemonMode::NeedsFullCheck => {
+            let issue = "HTTP mailbox is unavailable; queued mail is delivered locally. Use mailbox daemon start or repair before HTTP tools.";
+            (
+                String::new(),
+                record_http_availability_issue(base, me, issue),
+            )
+        }
+        DaemonMode::Http => {
+            if event == "Stop" {
+                return (String::new(), String::new());
+            }
+            let outcome = *cached_probe.get_or_insert_with(|| probe_http_daemon(base));
+            if outcome == HttpProbeOutcome::CurrentHttp {
+                let session = me.get("session").and_then(Value::as_str).unwrap_or("");
+                let mut updates: Vec<(&str, Value)> = Vec::new();
+                if !me
+                    .get("httpAvailabilityIssue")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .is_empty()
+                {
+                    updates.push(("httpAvailabilityIssue", json!("")));
+                }
+                let mut identity_hint = String::new();
+                if matches!(event, "SessionStart" | "UserPromptSubmit" | "PreInvocation")
+                    && (event == "SessionStart"
+                        || me.get("httpIdentityAnnounced").and_then(Value::as_bool) != Some(true))
+                {
+                    identity_hint = format!(
+                        "HTTP peer mailbox session: {session}. Pass this session on tool calls; ack received mail and reuse send idempotencyKey only for identical retries."
+                    );
+                    updates.push(("httpIdentityAnnounced", json!(true)));
+                }
+                if !updates.is_empty()
+                    && let Some(updated) = identity::annotate_peer(base, session, &updates)
+                {
+                    *me = updated;
+                }
+                return (identity_hint, String::new());
+            }
+
+            let base_str = base.to_string_lossy().into_owned();
+            let me_bytes = serde_json::to_vec(me).unwrap_or_else(|_| b"{}".to_vec());
+            let mid_flag = if mid_turn { "1" } else { "0" };
+            let res = run_scripts_python(
+                concat!(
+                    "import contextlib, json, pathlib, sys\n",
+                    "sys.path.insert(0, sys.argv[1])\n",
+                    "import mailbox_daemon, peer_mailbox as _MB\n",
+                    "base = pathlib.Path(sys.argv[2])\n",
+                    "me = json.loads(sys.stdin.read())\n",
+                    "event = sys.argv[3]; mid_turn = sys.argv[4] == '1'\n",
+                    "session = me['session']\n",
+                    "identity_hint = ''\n",
+                    "availability_hint = ''\n",
+                    "try:\n",
+                    "    http_mode = mailbox_daemon.get_mode(base) == 'http'\n",
+                    "    if http_mode and event != 'Stop':\n",
+                    "        live = mailbox_daemon.ensure_running(base, startup_timeout=0.5)\n",
+                    "        try:\n",
+                    "            rev = mailbox_daemon.runtime_revision_for(base)\n",
+                    "        except (OSError, RecursionError):\n",
+                    "            rev = None\n",
+                    "        stale = rev is not None and live.get('runtimeRevision') != rev\n",
+                    "        if stale and not mid_turn and type(live.get('activeWaits')) is int and live.get('activeWaits') == 0:\n",
+                    "            with contextlib.suppress(_MB.MailboxError, OSError):\n",
+                    "                if mailbox_daemon.stop_service(base, if_idle=True, expected_instance=live.get('instance')):\n",
+                    "                    live = mailbox_daemon.ensure_running(base, startup_timeout=2.0)\n",
+                    "                    stale = live.get('runtimeRevision') != rev\n",
+                    "        issue = 'HTTP mailbox is running old code; use mailbox daemon restart after upgrade.' if stale else ''\n",
+                    "        if issue != me.get('httpAvailabilityIssue', ''):\n",
+                    "            availability_hint = issue\n",
+                    "            _MB.annotate(base, session, httpAvailabilityIssue=issue)\n",
+                    "    if http_mode and event in {'SessionStart', 'UserPromptSubmit', 'PreInvocation'} and (event == 'SessionStart' or not me.get('httpIdentityAnnounced')):\n",
+                    "        identity_hint = f'HTTP peer mailbox session: {session}. Pass this session on tool calls; ack received mail and reuse send idempotencyKey only for identical retries.'\n",
+                    "        _MB.annotate(base, session, httpIdentityAnnounced=True)\n",
+                    "except (_MB.MailboxError, OSError, ValueError):\n",
+                    "    issue = 'HTTP mailbox is unavailable; queued mail is delivered locally. Use mailbox daemon start or repair before HTTP tools.'\n",
+                    "    if issue != me.get('httpAvailabilityIssue', ''):\n",
+                    "        availability_hint = issue\n",
+                    "        _MB.annotate(base, session, httpAvailabilityIssue=issue)\n",
+                    "print(json.dumps([identity_hint, availability_hint]))\n",
+                ),
+                &[&base_str, event, mid_flag],
+                Some(&me_bytes),
+                Duration::from_secs(6),
+                Some(&cache_dir_for_base(base)),
+            );
+            if let Some((true, out)) = res
+                && let Ok(pair) = serde_json::from_str::<(String, String)>(&out)
+            {
+                return pair;
+            }
+            (String::new(), String::new())
+        }
+    }
+}
+
+#[allow(dead_code)]
 pub fn check_http_daemon(
     base: &Path,
     me: &mut Value,
     event: &str,
     mid_turn: bool,
 ) -> (String, String) {
-    let db = identity::daemon_base(base);
-    let mode_path = db.join("mode.json");
-    if !mode_path.exists() {
-        return (String::new(), String::new());
-    }
-    let Some(mode_val) = paths::read_json_file(&mode_path) else {
-        let session = me.get("session").and_then(Value::as_str).unwrap_or("");
-        let issue = "HTTP mailbox is unavailable; queued mail is delivered locally. Use mailbox daemon start or repair before HTTP tools.";
-        if me
-            .get("httpAvailabilityIssue")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            != issue
-        {
-            if let Some(updated) =
-                identity::annotate_peer(base, session, &[("httpAvailabilityIssue", json!(issue))])
-            {
-                *me = updated;
-            }
-            return (String::new(), issue.to_string());
-        }
-        return (String::new(), String::new());
-    };
-    let mode = mode_val.get("mode").and_then(Value::as_str).unwrap_or("");
-    if mode == "stdio" {
-        return (String::new(), String::new());
-    }
-    if mode != "http" {
-        let session = me.get("session").and_then(Value::as_str).unwrap_or("");
-        let issue = "HTTP mailbox is unavailable; queued mail is delivered locally. Use mailbox daemon start or repair before HTTP tools.";
-        if me
-            .get("httpAvailabilityIssue")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            != issue
-        {
-            if let Some(updated) =
-                identity::annotate_peer(base, session, &[("httpAvailabilityIssue", json!(issue))])
-            {
-                *me = updated;
-            }
-            return (String::new(), issue.to_string());
-        }
-        return (String::new(), String::new());
-    }
-
-    let base_str = base.to_string_lossy().into_owned();
-    let me_bytes = serde_json::to_vec(me).unwrap_or_else(|_| b"{}".to_vec());
-    let mid_flag = if mid_turn { "1" } else { "0" };
-    let res = run_scripts_python(
-        concat!(
-            "import contextlib, json, pathlib, sys\n",
-            "sys.path.insert(0, sys.argv[1])\n",
-            "import mailbox_daemon, peer_mailbox as _MB\n",
-            "base = pathlib.Path(sys.argv[2])\n",
-            "me = json.loads(sys.stdin.read())\n",
-            "event = sys.argv[3]; mid_turn = sys.argv[4] == '1'\n",
-            "session = me['session']\n",
-            "identity_hint = ''\n",
-            "availability_hint = ''\n",
-            "try:\n",
-            "    http_mode = mailbox_daemon.get_mode(base) == 'http'\n",
-            "    if http_mode and event != 'Stop':\n",
-            "        live = mailbox_daemon.ensure_running(base, startup_timeout=0.5)\n",
-            "        stale = live.get('runtimeRevision') != mailbox_daemon.runtime_revision()\n",
-            "        if stale and not mid_turn and not live.get('activeWaits'):\n",
-            "            with contextlib.suppress(_MB.MailboxError, OSError):\n",
-            "                if mailbox_daemon.stop_service(base):\n",
-            "                    live = mailbox_daemon.ensure_running(base, startup_timeout=2.0)\n",
-            "                    stale = live.get('runtimeRevision') != mailbox_daemon.runtime_revision()\n",
-            "        issue = 'HTTP mailbox is running old code; use mailbox daemon restart after upgrade.' if stale else ''\n",
-            "        if issue != me.get('httpAvailabilityIssue', ''):\n",
-            "            availability_hint = issue\n",
-            "            _MB.annotate(base, session, httpAvailabilityIssue=issue)\n",
-            "    if http_mode and event in {'SessionStart', 'UserPromptSubmit', 'PreInvocation'} and (event == 'SessionStart' or not me.get('httpIdentityAnnounced')):\n",
-            "        identity_hint = f'HTTP peer mailbox session: {session}. Pass this session on tool calls; ack received mail and reuse send idempotencyKey only for identical retries.'\n",
-            "        _MB.annotate(base, session, httpIdentityAnnounced=True)\n",
-            "except (_MB.MailboxError, OSError, ValueError):\n",
-            "    issue = 'HTTP mailbox is unavailable; queued mail is delivered locally. Use mailbox daemon start or repair before HTTP tools.'\n",
-            "    if issue != me.get('httpAvailabilityIssue', ''):\n",
-            "        availability_hint = issue\n",
-            "        _MB.annotate(base, session, httpAvailabilityIssue=issue)\n",
-            "print(json.dumps([identity_hint, availability_hint]))\n",
-        ),
-        &[&base_str, event, mid_flag],
-        Some(&me_bytes),
-        Duration::from_secs(6),
-        Some(&cache_dir_for_base(base)),
-    );
-    if let Some((true, out)) = res
-        && let Ok(pair) = serde_json::from_str::<(String, String)>(&out)
-    {
-        return pair;
-    }
-    (String::new(), String::new())
+    check_http_daemon_with_probe(base, me, event, mid_turn, &mut None)
 }
 
 fn is_loopback_address(addr: &str) -> bool {
@@ -2861,4 +5349,2771 @@ pub fn continuation_at_stop(base: &Path, me: &Value) {
         Duration::from_secs(5),
         Some(&cache_dir_for_base(base)),
     );
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    pub(crate) static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
+    static TEST_DIR_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) struct TestDir {
+        pub path: PathBuf,
+    }
+
+    impl TestDir {
+        pub fn new(prefix: &str) -> Self {
+            let root = fs::canonicalize(env::temp_dir()).unwrap_or_else(|_| env::temp_dir());
+            let pid = std::process::id();
+            let mut rand_bytes = [0u8; 8];
+            let mut seed = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0u64, |d| d.as_nanos() as u64);
+            if let Ok(mut f) = fs::File::open("/dev/urandom") {
+                let _ = f.read_exact(&mut rand_bytes);
+                seed ^= u64::from_le_bytes(rand_bytes);
+            }
+            for attempt in 0..64u64 {
+                let seq = TEST_DIR_SEQ.fetch_add(1, Ordering::Relaxed);
+                let tag = seed
+                    .wrapping_add(attempt)
+                    .wrapping_mul(6_364_136_223_846_793_005);
+                let dir = root.join(format!("{prefix}-{pid}-{seq}-{tag:016x}"));
+                match fs::create_dir(&dir) {
+                    Ok(()) => return Self { path: dir },
+                    Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+                    Err(e) => panic!("failed to create test dir {}: {e}", dir.display()),
+                }
+            }
+            panic!("exhausted attempts creating exclusive test dir");
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    pub(crate) struct EnvGuard {
+        saved: Vec<(String, Option<std::ffi::OsString>)>,
+    }
+
+    impl EnvGuard {
+        pub fn new() -> Self {
+            Self { saved: Vec::new() }
+        }
+
+        pub fn set(&mut self, key: &str, val: impl AsRef<std::ffi::OsStr>) {
+            if !self.saved.iter().any(|(k, _)| k == key) {
+                self.saved.push((key.to_string(), env::var_os(key)));
+            }
+            unsafe {
+                env::set_var(key, val);
+            }
+        }
+
+        pub fn remove(&mut self, key: &str) {
+            if !self.saved.iter().any(|(k, _)| k == key) {
+                self.saved.push((key.to_string(), env::var_os(key)));
+            }
+            unsafe {
+                env::remove_var(key);
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, orig) in self.saved.iter().rev() {
+                unsafe {
+                    match orig {
+                        Some(v) => env::set_var(key, v),
+                        None => env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn install_counting_python(
+        dir: &Path,
+        count_file: &Path,
+        stdout_text: &str,
+    ) -> PathBuf {
+        let bin_dir = dir.join("fake-bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let py = bin_dir.join("python3");
+        let escaped_count = count_file.to_string_lossy().replace('\'', "'\"'\"'");
+        let escaped_out = stdout_text.replace('\'', "'\"'\"'");
+        let script = format!(
+            "#!/bin/sh\nprintf '1\\n' >> '{escaped_count}'\ncat >/dev/null || true\nprintf '%s' '{escaped_out}'\n"
+        );
+        fs::write(&py, script).unwrap();
+        fs::set_permissions(&py, fs::Permissions::from_mode(0o700)).unwrap();
+        bin_dir
+    }
+
+    pub(crate) fn spawn_count(count_file: &Path) -> usize {
+        fs::read_to_string(count_file)
+            .map(|s| s.lines().count())
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn write_private_file(path: &Path, content: &[u8]) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        fs::write(path, content).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    pub(crate) fn make_peer(session: &str, harness: &str, cwd: &str) -> Value {
+        let now = paths::format_utc_iso_z(paths::utc_now_secs());
+        json!({
+            "schema": "agent-executor.peer.v1",
+            "session": session,
+            "name": format!("{harness}-test-peer"),
+            "harness": harness,
+            "cwd": cwd,
+            "pid": i64::from(std::process::id()),
+            "state": "idle",
+            "startedAt": now,
+            "lastSeenAt": now,
+        })
+    }
+
+    pub(crate) fn save_peer(base: &Path, peer: &Value) {
+        let sid = peer.get("session").and_then(Value::as_str).unwrap();
+        let pp = paths::peer_path(base, sid).unwrap();
+        paths::write_json_atomic(&pp, peer).unwrap();
+    }
+
+    fn setup_minimal_scripts_dir(dir: &Path) -> PathBuf {
+        let skill = dir.join("fake-plugin/skills/orchestrate");
+        let scripts = skill.join("scripts");
+        let lib = dir.join("fake-plugin/lib");
+        fs::create_dir_all(&scripts).unwrap();
+        fs::create_dir_all(&lib).unwrap();
+        fs::write(scripts.join("mailbox_daemon.py"), "# stub\n").unwrap();
+        fs::write(lib.join("chief.mjs"), "// stub\n").unwrap();
+        scripts
+    }
+
+    fn spawn_single_http_server(
+        response_bytes: Vec<u8>,
+        delay: Option<Duration>,
+    ) -> (u16, Arc<Mutex<Vec<String>>>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let cap_clone = Arc::clone(&captured);
+        let handle = thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+                let mut buf = [0u8; 4096];
+                let mut req = Vec::new();
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            req.extend_from_slice(&buf[..n]);
+                            if req.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                    }
+                }
+                cap_clone
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&req).into_owned());
+                if let Some(d) = delay {
+                    thread::sleep(d);
+                }
+                let _ = stream.write_all(&response_bytes);
+                let _ = stream.flush();
+            }
+        });
+        (port, captured, handle)
+    }
+
+    fn http_json_response(status: &str, body: &str, extra_headers: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{extra_headers}Connection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn test_http_probe_health_request_cache_and_issue_recovery() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let td = TestDir::new("ork-http-probe");
+        let cache_dir = td.path.join("orchestrate");
+        let base = cache_dir.join("mailbox-v1");
+        fs::create_dir_all(&base).unwrap();
+        let scripts = setup_minimal_scripts_dir(&td.path);
+        let count_file = td.path.join("py-count");
+        let fake_bin = install_counting_python(&td.path, &count_file, "[\"\", \"\"]");
+
+        let mut env = EnvGuard::new();
+        env.set("ORKEST_SCRIPTS_DIR", &scripts);
+        env.set("ORCHESTRATE_HOME", &cache_dir);
+        let old_path = env::var("PATH").unwrap_or_default();
+        env.set("PATH", format!("{}:{old_path}", fake_bin.display()));
+
+        let rev = current_runtime_revision(&base).unwrap();
+        assert_eq!(rev.len(), 16);
+        let db = identity::daemon_base(&base);
+        write_private_file(&db.join("mode.json"), br#"{"mode":"http"}"#);
+        let token = "abcdefghijklmnopqrstuvwxyz0123456789ABCD";
+        write_private_file(&db.join("token.txt"), format!("{token}\n").as_bytes());
+        let store_id = sha256::sha256_hex(base.to_string_lossy().as_bytes());
+
+        // Populate ork.mailbox-revision.v1 cache and verify cache hit works.
+        let scripts_canon = fs::canonicalize(&scripts).unwrap();
+        let scripts_hash = sha256::sha256_hex(scripts_canon.to_string_lossy().as_bytes());
+        let skill_dir = scripts_canon.parent().unwrap();
+        let lib_dir = skill_dir.parent().unwrap().parent().unwrap().join("lib");
+        let mut files_rows = Vec::new();
+        for (folder, root_dir, rel) in [
+            ("scripts", &scripts_canon, "scripts/mailbox_daemon.py"),
+            ("lib", &lib_dir, "lib/chief.mjs"),
+        ] {
+            let p = root_dir.join(rel.strip_prefix(&format!("{folder}/")).unwrap());
+            let meta = fs::metadata(&p).unwrap();
+            let mut row = stat_stamp_json(&meta);
+            row.as_object_mut()
+                .unwrap()
+                .insert("path".to_string(), Value::String(rel.to_string()));
+            files_rows.push(row);
+        }
+        let rev_cache = json!({
+            "schema": "ork.mailbox-revision.v1",
+            "roots": [
+                {"name": "scripts", "path": scripts_canon.to_string_lossy()},
+                {"name": "references", "path": Value::Null},
+                {"name": "templates", "path": Value::Null},
+                {"name": "bin", "path": Value::Null},
+                {"name": "lib", "path": lib_dir.to_string_lossy()},
+            ],
+            "files": files_rows,
+            "revision": rev,
+        });
+        write_private_file(
+            &db.join(format!("revision-{scripts_hash}.json")),
+            serde_json::to_string(&rev_cache).unwrap().as_bytes(),
+        );
+        assert_eq!(
+            current_runtime_revision(&base).as_deref(),
+            Some(rev.as_str())
+        );
+
+        let health_body = serde_json::to_string(&json!({
+            "pid": 4242,
+            "instance": "inst-1",
+            "url": "http://127.0.0.1:0/mcp", // placeholder updated below
+            "storeId": store_id,
+            "runtimeRevision": rev,
+            "activeWaits": 0,
+        }))
+        .unwrap();
+        let _ = health_body;
+
+        // Start real capturing TcpListener.
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}/mcp");
+        let body = serde_json::to_string(&json!({
+            "pid": 4242,
+            "instance": "inst-1",
+            "url": url,
+            "storeId": store_id,
+            "runtimeRevision": rev,
+            "activeWaits": 0,
+        }))
+        .unwrap();
+        let resp = http_json_response("200 OK", &body, "");
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let cap_clone = Arc::clone(&captured);
+        let handle = thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                cap_clone
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                let _ = stream.write_all(&resp);
+            }
+        });
+
+        write_private_file(
+            &db.join("state.json"),
+            serde_json::to_string(&json!({
+                "pid": 4242,
+                "instance": "inst-1",
+                "url": url,
+                "storeId": store_id,
+                "runtimeRevision": rev,
+            }))
+            .unwrap()
+            .as_bytes(),
+        );
+
+        let mut me = make_peer("http-session-1", "codex", "/tmp");
+        me.as_object_mut().unwrap().insert(
+            "httpAvailabilityIssue".to_string(),
+            json!("stale prior issue"),
+        );
+        save_peer(&base, &me);
+
+        let (id_hint, avail_hint) = check_http_daemon(&base, &mut me, "PreInvocation", false);
+        handle.join().unwrap();
+
+        assert_eq!(spawn_count(&count_file), 0);
+        assert!(id_hint.contains("HTTP peer mailbox session: http-session-1"));
+        assert!(avail_hint.is_empty());
+        assert_eq!(me.get("httpIdentityAnnounced"), Some(&Value::Bool(true)));
+        assert_eq!(me.get("httpAvailabilityIssue"), Some(&json!("")));
+
+        let expected_req = format!(
+            "GET /health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+        );
+        assert_eq!(captured.lock().unwrap().as_slice(), &[expected_req]);
+
+        // Subsequent PreInvocation with httpIdentityAnnounced=true emits no identity hint.
+        let listener2 = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port2 = listener2.local_addr().unwrap().port();
+        let url2 = format!("http://127.0.0.1:{port2}/mcp");
+        let resp2 = http_json_response(
+            "200 OK",
+            &serde_json::to_string(&json!({
+                "pid": 4242,
+                "instance": "inst-1",
+                "url": url2,
+                "storeId": store_id,
+                "runtimeRevision": rev,
+                "activeWaits": 0,
+            }))
+            .unwrap(),
+            "",
+        );
+        let cap2 = Arc::new(Mutex::new(Vec::new()));
+        let cap2_clone = Arc::clone(&cap2);
+        let handle2 = thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener2.accept() {
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                cap2_clone
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                let _ = stream.write_all(&resp2);
+                let _ = stream.flush();
+            }
+        });
+        write_private_file(
+            &db.join("state.json"),
+            serde_json::to_string(&json!({
+                "pid": 4242,
+                "instance": "inst-1",
+                "url": url2,
+                "storeId": store_id,
+                "runtimeRevision": rev,
+            }))
+            .unwrap()
+            .as_bytes(),
+        );
+        let (id_hint2, avail_hint2) = check_http_daemon(&base, &mut me, "PreInvocation", false);
+        handle2.join().unwrap();
+        assert!(id_hint2.is_empty());
+        assert!(avail_hint2.is_empty());
+        assert_eq!(cap2.lock().unwrap().len(), 1);
+        assert_eq!(spawn_count(&count_file), 0);
+
+        // HTTP Stop does zero socket connections and zero Python calls.
+        let mut stop_probe = None;
+        let (stop_id, stop_avail) =
+            check_http_daemon_with_probe(&base, &mut me, "Stop", false, &mut stop_probe);
+        assert!(stop_id.is_empty());
+        assert!(stop_avail.is_empty());
+        assert!(stop_probe.is_none());
+        assert_eq!(spawn_count(&count_file), 0);
+    }
+
+    #[test]
+    fn test_http_probe_rejects_bad_urls_ports_perms_and_falls_back_on_failures() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let td = TestDir::new("ork-http-reject");
+        let cache_dir = td.path.join("orchestrate");
+        let base = cache_dir.join("mailbox-v1");
+        fs::create_dir_all(&base).unwrap();
+        let scripts = setup_minimal_scripts_dir(&td.path);
+        let count_file = td.path.join("py-count");
+        let fake_bin = install_counting_python(&td.path, &count_file, "[\"\", \"\"]");
+
+        let mut env = EnvGuard::new();
+        env.set("ORKEST_SCRIPTS_DIR", &scripts);
+        env.set("ORCHESTRATE_HOME", &cache_dir);
+        let old_path = env::var("PATH").unwrap_or_default();
+        env.set("PATH", format!("{}:{old_path}", fake_bin.display()));
+
+        // Absent mode.json -> Stdio, zero Python.
+        assert_eq!(classify_daemon_mode(&base), DaemonMode::Stdio);
+        let mut me = make_peer("s1", "codex", "/tmp");
+        assert_eq!(
+            check_http_daemon(&base, &mut me, "PreInvocation", false),
+            (String::new(), String::new())
+        );
+        assert_eq!(spawn_count(&count_file), 0);
+
+        let db = identity::daemon_base(&base);
+        write_private_file(&db.join("mode.json"), br#"{"mode":"stdio"}"#);
+        assert_eq!(classify_daemon_mode(&base), DaemonMode::Stdio);
+        assert_eq!(spawn_count(&count_file), 0);
+
+        // Symlink or loose perms on mode.json -> NeedsFullCheck and availability issue.
+        fs::set_permissions(db.join("mode.json"), fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(classify_daemon_mode(&base), DaemonMode::NeedsFullCheck);
+        let (_, issue) = check_http_daemon(&base, &mut me, "PreInvocation", false);
+        assert!(issue.contains("HTTP mailbox is unavailable"));
+        assert_eq!(spawn_count(&count_file), 0);
+
+        // Restore valid http mode.
+        write_private_file(&db.join("mode.json"), br#"{"mode":"http"}"#);
+        let rev = current_runtime_revision(&base).unwrap();
+        let token = "abcdefghijklmnopqrstuvwxyz0123456789ABCD";
+        write_private_file(&db.join("token.txt"), token.as_bytes());
+        let store_id = sha256::sha256_hex(base.to_string_lossy().as_bytes());
+
+        // URL rejection checks (zero socket opened: bind a listener and prove 0 connections).
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let live_port = listener.local_addr().unwrap().port();
+        for bad_url in [
+            format!("https://127.0.0.1:{live_port}/mcp"),
+            format!("http://localhost:{live_port}/mcp"),
+            format!("http://127.0.0.2:{live_port}/mcp"),
+            format!("http://[::1]:{live_port}/mcp"),
+            format!("http://user@127.0.0.1:{live_port}/mcp"),
+            format!("http://127.0.0.1:{live_port}/mcp/extra"),
+            format!("http://127.0.0.1:{live_port}/mcp?x=1"),
+            format!("http://127.0.0.1:{live_port}/mcp#frag"),
+            format!("http://127.0.0.1:0{live_port}/mcp"),
+            "http://127.0.0.1:3000/mcp".to_string(),
+            "http://127.0.0.1:3001/mcp".to_string(),
+            "http://127.0.0.1:3002/mcp".to_string(),
+            "http://127.0.0.1:4001/mcp".to_string(),
+            "http://127.0.0.1:4002/mcp".to_string(),
+            "http://127.0.0.1:8080/mcp".to_string(),
+            "http://127.0.0.1:9222/mcp".to_string(),
+        ] {
+            write_private_file(
+                &db.join("state.json"),
+                serde_json::to_string(&json!({
+                    "pid": 100,
+                    "instance": "i1",
+                    "url": bad_url,
+                    "storeId": store_id,
+                    "runtimeRevision": rev,
+                }))
+                .unwrap()
+                .as_bytes(),
+            );
+            assert_eq!(probe_http_daemon(&base), HttpProbeOutcome::NeedsFullCheck);
+        }
+        assert!(
+            listener.accept().is_err(),
+            "rejected URLs must never connect"
+        );
+        drop(listener);
+
+        // Passing control fixture proves every negative test below isolates exactly one mutated field.
+        {
+            let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let p = l.local_addr().unwrap().port();
+            let u = format!("http://127.0.0.1:{p}/mcp");
+            let body = serde_json::to_string(&json!({
+                "pid": 100,
+                "instance": "i1",
+                "url": u,
+                "storeId": store_id,
+                "runtimeRevision": rev,
+                "activeWaits": 0,
+            }))
+            .unwrap();
+            let resp_bytes = http_json_response("200 OK", &body, "");
+            let h = thread::spawn(move || {
+                if let Ok((mut s, _)) = l.accept() {
+                    let mut buf = [0u8; 1024];
+                    let _ = s.read(&mut buf);
+                    let _ = s.write_all(&resp_bytes);
+                }
+            });
+            write_private_file(
+                &db.join("state.json"),
+                serde_json::to_string(&json!({
+                    "pid": 100,
+                    "instance": "i1",
+                    "url": u,
+                    "storeId": store_id,
+                    "runtimeRevision": rev,
+                }))
+                .unwrap()
+                .as_bytes(),
+            );
+            assert_eq!(
+                probe_http_daemon(&base),
+                HttpProbeOutcome::CurrentHttp,
+                "control fixture must pass before single-field mutations"
+            );
+            h.join().unwrap();
+        }
+
+        // Failure cases that must fall back cleanly to NeedsFullCheck -> Python shim:
+        enum NegResp {
+            Json {
+                status: &'static str,
+                pid: i64,
+                instance: &'static str,
+                override_url: Option<&'static str>,
+                store_id: String,
+                rev: String,
+                active_waits: Option<i64>,
+            },
+            Raw(Vec<u8>),
+            ValidHealthCustomHeader {
+                header_template: &'static str,
+                cl_delta: usize,
+            },
+        }
+        let bad_cases = vec![
+            (
+                "401",
+                NegResp::Raw(http_json_response(
+                    "401 Unauthorized",
+                    r#"{"error":"no"}"#,
+                    "",
+                )),
+            ),
+            (
+                "wrong_pid",
+                NegResp::Json {
+                    status: "200 OK",
+                    pid: 999,
+                    instance: "i1",
+                    override_url: None,
+                    store_id: store_id.clone(),
+                    rev: rev.clone(),
+                    active_waits: Some(0),
+                },
+            ),
+            (
+                "wrong_instance",
+                NegResp::Json {
+                    status: "200 OK",
+                    pid: 100,
+                    instance: "other",
+                    override_url: None,
+                    store_id: store_id.clone(),
+                    rev: rev.clone(),
+                    active_waits: Some(0),
+                },
+            ),
+            (
+                "wrong_url",
+                NegResp::Json {
+                    status: "200 OK",
+                    pid: 100,
+                    instance: "i1",
+                    override_url: Some("http://127.0.0.1:65432/mcp"),
+                    store_id: store_id.clone(),
+                    rev: rev.clone(),
+                    active_waits: Some(0),
+                },
+            ),
+            (
+                "wrong_store",
+                NegResp::Json {
+                    status: "200 OK",
+                    pid: 100,
+                    instance: "i1",
+                    override_url: None,
+                    store_id: "deadbeef".to_string(),
+                    rev: rev.clone(),
+                    active_waits: Some(0),
+                },
+            ),
+            (
+                "stale_rev",
+                NegResp::Json {
+                    status: "200 OK",
+                    pid: 100,
+                    instance: "i1",
+                    override_url: None,
+                    store_id: store_id.clone(),
+                    rev: "0000000000000000".to_string(),
+                    active_waits: Some(0),
+                },
+            ),
+            (
+                "active_waits_nonzero",
+                NegResp::Json {
+                    status: "200 OK",
+                    pid: 100,
+                    instance: "i1",
+                    override_url: None,
+                    store_id: store_id.clone(),
+                    rev: rev.clone(),
+                    active_waits: Some(1),
+                },
+            ),
+            (
+                "legacy_missing_waits",
+                NegResp::Json {
+                    status: "200 OK",
+                    pid: 100,
+                    instance: "i1",
+                    override_url: None,
+                    store_id: store_id.clone(),
+                    rev: rev.clone(),
+                    active_waits: None,
+                },
+            ),
+            (
+                "chunked",
+                NegResp::ValidHealthCustomHeader {
+                    header_template: "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: {len}\r\n\r\n",
+                    cl_delta: 0,
+                },
+            ),
+            (
+                "duplicate_cl",
+                NegResp::ValidHealthCustomHeader {
+                    header_template: "HTTP/1.1 200 OK\r\nContent-Length: {len}\r\nContent-Length: {len}\r\n\r\n",
+                    cl_delta: 0,
+                },
+            ),
+            (
+                "truncated",
+                NegResp::ValidHealthCustomHeader {
+                    header_template: "HTTP/1.1 200 OK\r\nContent-Length: {len}\r\n\r\n",
+                    cl_delta: 20,
+                },
+            ),
+            (
+                "bad_header_name_space",
+                NegResp::ValidHealthCustomHeader {
+                    header_template: "HTTP/1.1 200 OK\r\nContent-Length : {len}\r\nConnection: close\r\n\r\n",
+                    cl_delta: 0,
+                },
+            ),
+            (
+                "bare_lf_in_header",
+                NegResp::ValidHealthCustomHeader {
+                    header_template: "HTTP/1.1 200 OK\r\nX-Foo: bar\nbaz\r\nContent-Length: {len}\r\n\r\n",
+                    cl_delta: 0,
+                },
+            ),
+        ];
+
+        for (label, spec) in bad_cases {
+            let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let p = l.local_addr().unwrap().port();
+            let u = format!("http://127.0.0.1:{p}/mcp");
+            let resp_bytes = match spec {
+                NegResp::Raw(raw) => raw,
+                NegResp::ValidHealthCustomHeader {
+                    header_template,
+                    cl_delta,
+                } => {
+                    let body = serde_json::to_string(&json!({
+                        "pid": 100,
+                        "instance": "i1",
+                        "url": u,
+                        "storeId": store_id,
+                        "runtimeRevision": rev,
+                        "activeWaits": 0,
+                    }))
+                    .unwrap();
+                    let head =
+                        header_template.replace("{len}", &(body.len() + cl_delta).to_string());
+                    let mut raw = head.into_bytes();
+                    raw.extend_from_slice(body.as_bytes());
+                    raw
+                }
+                NegResp::Json {
+                    status,
+                    pid,
+                    instance,
+                    override_url,
+                    store_id: sid,
+                    rev: r,
+                    active_waits,
+                } => {
+                    let mut obj = json!({
+                        "pid": pid,
+                        "instance": instance,
+                        "url": override_url.unwrap_or(&u),
+                        "storeId": sid,
+                        "runtimeRevision": r,
+                    });
+                    if let Some(w) = active_waits {
+                        obj.as_object_mut()
+                            .unwrap()
+                            .insert("activeWaits".to_string(), json!(w));
+                    }
+                    http_json_response(status, &serde_json::to_string(&obj).unwrap(), "")
+                }
+            };
+            let h = thread::spawn(move || {
+                if let Ok((mut s, _)) = l.accept() {
+                    let mut buf = [0u8; 1024];
+                    let _ = s.read(&mut buf);
+                    let _ = s.write_all(&resp_bytes);
+                }
+            });
+            write_private_file(
+                &db.join("state.json"),
+                serde_json::to_string(&json!({
+                    "pid": 100,
+                    "instance": "i1",
+                    "url": u,
+                    "storeId": store_id,
+                    "runtimeRevision": rev,
+                }))
+                .unwrap()
+                .as_bytes(),
+            );
+            assert_eq!(
+                probe_http_daemon(&base),
+                HttpProbeOutcome::NeedsFullCheck,
+                "case {label} must fall back"
+            );
+            h.join().unwrap();
+        }
+
+        // Segmented trailing garbage arriving in a second write must still be rejected.
+        {
+            let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let p = l.local_addr().unwrap().port();
+            let u = format!("http://127.0.0.1:{p}/mcp");
+            let body = serde_json::to_string(&json!({
+                "pid": 100,
+                "instance": "i1",
+                "url": u,
+                "storeId": store_id,
+                "runtimeRevision": rev,
+                "activeWaits": 0,
+            }))
+            .unwrap();
+            let head_and_body = http_json_response("200 OK", &body, "");
+            let h = thread::spawn(move || {
+                if let Ok((mut s, _)) = l.accept() {
+                    let mut buf = [0u8; 1024];
+                    let _ = s.read(&mut buf);
+                    let _ = s.write_all(&head_and_body);
+                    let _ = s.flush();
+                    thread::sleep(Duration::from_millis(20));
+                    let _ = s.write_all(b"TRAILING");
+                    let _ = s.flush();
+                }
+            });
+            write_private_file(
+                &db.join("state.json"),
+                serde_json::to_string(&json!({
+                    "pid": 100,
+                    "instance": "i1",
+                    "url": u,
+                    "storeId": store_id,
+                    "runtimeRevision": rev,
+                }))
+                .unwrap()
+                .as_bytes(),
+            );
+            assert_eq!(
+                probe_http_daemon(&base),
+                HttpProbeOutcome::NeedsFullCheck,
+                "segmented trailing garbage must be rejected"
+            );
+            h.join().unwrap();
+        }
+
+        // Timeout > 250ms budget falls back cleanly and invokes Python shim once.
+        let before_spawns = spawn_count(&count_file);
+        let (_slow_port, _slow_cap, slow_h) = spawn_single_http_server(
+            http_json_response("200 OK", r#"{"pid":100}"#, ""),
+            Some(Duration::from_millis(400)),
+        );
+        let slow_url = format!("http://127.0.0.1:{_slow_port}/mcp");
+        write_private_file(
+            &db.join("state.json"),
+            serde_json::to_string(&json!({
+                "pid": 100,
+                "instance": "i1",
+                "url": slow_url,
+                "storeId": store_id,
+                "runtimeRevision": rev,
+            }))
+            .unwrap()
+            .as_bytes(),
+        );
+        check_http_daemon(&base, &mut me, "PreInvocation", false);
+        assert_eq!(spawn_count(&count_file), before_spawns + 1);
+        slow_h.join().unwrap();
+    }
+
+    #[test]
+    fn test_http_probe_legacy_agent_executor_store_id_and_symlink_base() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let td = TestDir::new("ork-http-alias");
+        let orchestrate = td.path.join("orchestrate");
+        let base = orchestrate.join("mailbox-v1");
+        fs::create_dir_all(&base).unwrap();
+        let legacy_parent = td.path.join("agent-executor");
+        symlink(&orchestrate, &legacy_parent).unwrap();
+        let legacy_base = legacy_parent.join("mailbox-v1");
+
+        let scripts = setup_minimal_scripts_dir(&td.path);
+        let mut env = EnvGuard::new();
+        env.set("ORKEST_SCRIPTS_DIR", &scripts);
+
+        let rev = current_runtime_revision(&base).unwrap();
+        let legacy_store_id = sha256::sha256_hex(legacy_base.to_string_lossy().as_bytes());
+        let db = identity::daemon_base(&base);
+        let token = "abcdefghijklmnopqrstuvwxyz0123456789ABCD";
+        write_private_file(&db.join("mode.json"), br#"{"mode":"http"}"#);
+        write_private_file(&db.join("token.txt"), token.as_bytes());
+
+        let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = l.local_addr().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}/mcp");
+        let body = serde_json::to_string(&json!({
+            "pid": 55,
+            "instance": "inst-alias",
+            "url": url,
+            "storeId": legacy_store_id,
+            "runtimeRevision": rev,
+            "activeWaits": 0,
+        }))
+        .unwrap();
+        let resp = http_json_response("200 OK", &body, "");
+        let h = thread::spawn(move || {
+            if let Ok((mut s, _)) = l.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(&resp);
+            }
+        });
+        write_private_file(
+            &db.join("state.json"),
+            serde_json::to_string(&json!({
+                "pid": 55,
+                "instance": "inst-alias",
+                "url": url,
+                "storeId": legacy_store_id,
+                "runtimeRevision": rev,
+            }))
+            .unwrap()
+            .as_bytes(),
+        );
+        assert_eq!(probe_http_daemon(&base), HttpProbeOutcome::CurrentHttp);
+        h.join().unwrap();
+
+        // Replace agent-executor symlink with unrelated directory -> rejected.
+        fs::remove_file(&legacy_parent).unwrap();
+        fs::create_dir_all(&legacy_parent).unwrap();
+        assert_eq!(probe_http_daemon(&base), HttpProbeOutcome::NeedsFullCheck);
+    }
+
+    #[test]
+    fn test_handoff_turn_quota_gate_roles_and_notices() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let td = TestDir::new("ork-handoff-gate");
+        let cache_dir = td.path.join("orchestrate");
+        let base = cache_dir.join("mailbox-v1");
+        fs::create_dir_all(&base).unwrap();
+        let monitor_dir = td.path.join("monitor-cache");
+        fs::create_dir_all(&monitor_dir).unwrap();
+        fs::write(monitor_dir.join("snapshot.json"), "{}").unwrap();
+        let count_file = td.path.join("py-count");
+        let fake_bin = install_counting_python(&td.path, &count_file, "handoff-notice-out");
+        let scripts = setup_minimal_scripts_dir(&td.path);
+
+        let mut env = EnvGuard::new();
+        env.set("ORKEST_SCRIPTS_DIR", &scripts);
+        env.set("ORCHESTRATE_HOME", &cache_dir);
+        env.set("MONITOR_CACHE_DIR", &monitor_dir);
+        env.remove("ORKEST_HANDOFF_SUCCESSOR");
+        let old_path = env::var("PATH").unwrap_or_default();
+        env.set("PATH", format!("{}:{old_path}", fake_bin.display()));
+
+        // 1. Solo non-lead with missing/stale handoffCheckedAt: zero Python spawns, no fabricated timestamp.
+        let mut solo = make_peer("solo-codex", "codex", "/tmp/proj");
+        solo.as_object_mut()
+            .unwrap()
+            .insert("repo".to_string(), json!("/tmp/proj"));
+        save_peer(&base, &solo);
+        assert_eq!(handoff_turn(&base, &solo, true), "");
+        assert_eq!(spawn_count(&count_file), 0);
+        let reloaded = reload_peer(&base, "solo-codex").unwrap();
+        assert!(reloaded.get("handoffCheckedAt").is_none());
+
+        // 2. Non-lead with repo still receives applicable unread notice (without polling).
+        let now_iso = paths::format_utc_iso_z(paths::utc_now_secs());
+        let ev_dir = cache_dir.join("handoffs-v1/prev-session");
+        fs::create_dir_all(&ev_dir).unwrap();
+        fs::write(
+            ev_dir.join("event.json"),
+            serde_json::to_string(&json!({
+                "id": "ev-1",
+                "notice": "Previous session handed off.",
+                "toldSessions": [],
+                "noticedAt": now_iso,
+                "repo": "/tmp/proj",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let out = handoff_turn(&base, &solo, true);
+        assert_eq!(out, "handoff-notice-out");
+        assert_eq!(spawn_count(&count_file), 1);
+        let _ = fs::remove_dir_all(&ev_dir);
+
+        // 3. Team active & pending lead triggers poll.
+        let auth_dir = cache_dir.join("authority-v1/team-alpha");
+        fs::create_dir_all(&auth_dir).unwrap();
+        for status in ["active", "pending"] {
+            fs::write(
+                auth_dir.join("authority.json"),
+                serde_json::to_string(&json!({
+                    "schema": AUTHORITY_SCHEMA,
+                    "team": "team-alpha",
+                    "status": status,
+                    "lead": {"session": "solo-codex"},
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let before = spawn_count(&count_file);
+            let _ = handoff_turn(&base, &solo, false);
+            assert_eq!(spawn_count(&count_file), before + 1);
+        }
+        let _ = fs::remove_dir_all(cache_dir.join("authority-v1"));
+
+        // 4. Room conductor: open local room triggers poll; former-only and closed do not; corrupt index/DB triggers poll.
+        let rooms_dir = base.join("rooms");
+        fs::create_dir_all(&rooms_dir).unwrap();
+        fs::write(
+            rooms_dir.join("r1.json"),
+            serde_json::to_string(&json!({
+                "id": "r1",
+                "lifecycle": "active",
+                "status": "active",
+                "conductor": {"session": {"id": "solo-codex"}, "previousSessions": ["old-s"]},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let before = spawn_count(&count_file);
+        let _ = handoff_turn(&base, &solo, false);
+        assert_eq!(spawn_count(&count_file), before + 1);
+
+        // Former-only conductor does not poll.
+        fs::write(
+            rooms_dir.join("r1.json"),
+            serde_json::to_string(&json!({
+                "id": "r1",
+                "lifecycle": "active",
+                "status": "active",
+                "conductor": {"session": {"id": "new-cond"}, "previousSessions": ["solo-codex"]},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let before = spawn_count(&count_file);
+        let _ = handoff_turn(&base, &solo, false);
+        assert_eq!(spawn_count(&count_file), before);
+
+        // Closed room does not poll.
+        fs::write(
+            rooms_dir.join("r1.json"),
+            serde_json::to_string(&json!({
+                "id": "r1",
+                "lifecycle": "archived",
+                "status": "closed",
+                "conductor": {"session": {"id": "solo-codex"}},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let before = spawn_count(&count_file);
+        let _ = handoff_turn(&base, &solo, false);
+        assert_eq!(spawn_count(&count_file), before);
+        let _ = fs::remove_dir_all(&rooms_dir);
+
+        // Malformed rooms-index + corrupt rooms.db conservatively polls.
+        fs::write(base.join("rooms-index.json"), "{corrupt").unwrap();
+        fs::write(base.join("rooms.db"), "not-sqlite").unwrap();
+        let before = spawn_count(&count_file);
+        let _ = handoff_turn(&base, &solo, false);
+        assert_eq!(spawn_count(&count_file), before + 1);
+        let _ = fs::remove_file(base.join("rooms-index.json"));
+        let _ = fs::remove_file(base.join("rooms.db"));
+
+        // 5. Live local Chief triggers poll even solo and delivers unread notices even in non-repo cwd.
+        let mut chief_peer = make_peer("chief-session", "codex", "/tmp/nonrepo");
+        chief_peer.as_object_mut().unwrap().remove("repo");
+        save_peer(&base, &chief_peer);
+        fs::write(
+            base.join("chief.json"),
+            serde_json::to_string(&json!({
+                "schema": "ork.chief.v1",
+                "session": "chief-session",
+                "pid": i64::from(std::process::id()),
+                "boundAt": now_iso,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let before = spawn_count(&count_file);
+        let _ = handoff_turn(&base, &chief_peer, false);
+        assert_eq!(spawn_count(&count_file), before + 1);
+
+        // Chief in non-repo cwd receives unread handoff notices directly (even when throttled from polling).
+        chief_peer
+            .as_object_mut()
+            .unwrap()
+            .insert("handoffCheckedAt".to_string(), json!(now_iso));
+        fs::create_dir_all(&ev_dir).unwrap();
+        fs::write(
+            ev_dir.join("event.json"),
+            serde_json::to_string(&json!({
+                "id": "ev-chief",
+                "notice": "Chief notice in non-repo cwd",
+                "toldSessions": [],
+                "noticedAt": now_iso,
+                "repo": "/other/repo",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let before = spawn_count(&count_file);
+        let chief_notice = handoff_turn(&base, &chief_peer, true);
+        assert_eq!(chief_notice, "Chief notice in non-repo cwd");
+        assert_eq!(spawn_count(&count_file), before);
+
+        // Stale Chief (dead PID) does not poll.
+        fs::write(
+            base.join("chief.json"),
+            serde_json::to_string(&json!({
+                "schema": "ork.chief.v1",
+                "session": "chief-session",
+                "pid": 2_147_483_647,
+                "boundAt": "2020-01-01T00:00:00Z",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut stale_chief = make_peer("chief-session", "codex", "/tmp");
+        stale_chief
+            .as_object_mut()
+            .unwrap()
+            .insert("pid".to_string(), json!(2_147_483_647));
+        save_peer(&base, &stale_chief);
+        let before = spawn_count(&count_file);
+        let _ = handoff_turn(&base, &stale_chief, false);
+        assert_eq!(spawn_count(&count_file), before);
+    }
+
+    #[test]
+    fn test_bootstrap_repo_env_marker_cache_and_invalidation() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let td = TestDir::new("ork-bootstrap-cache");
+        let base = td.path.join("cache/mailbox-v1");
+        fs::create_dir_all(&base).unwrap();
+        let main_repo = td.path.join("main-repo");
+        fs::create_dir_all(&main_repo).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&main_repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(&main_repo)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(&main_repo)
+            .status()
+            .unwrap();
+        fs::write(main_repo.join("README.md"), "hi\n").unwrap();
+        Command::new("git")
+            .args(["add", "README.md"])
+            .current_dir(&main_repo)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-q", "-m", "init"])
+            .current_dir(&main_repo)
+            .status()
+            .unwrap();
+        fs::write(main_repo.join(".env"), "SECRET_KEY=top-secret-value\n").unwrap();
+
+        let wt1 = td.path.join("wt1");
+        let wt2 = td.path.join("wt2");
+        assert!(
+            Command::new("git")
+                .args(["worktree", "add", "-q", wt1.to_str().unwrap()])
+                .current_dir(&main_repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["worktree", "add", "-q", wt2.to_str().unwrap()])
+                .current_dir(&main_repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let scripts = setup_minimal_scripts_dir(&td.path);
+        let count_file = td.path.join("py-count");
+        let fake_bin = install_counting_python(&td.path, &count_file, "");
+        let mut env = EnvGuard::new();
+        env.set("ORKEST_SCRIPTS_DIR", &scripts);
+        env.remove("ORKEST_READONLY_RUN");
+        env.remove("CLAUDE_ENV_FILE");
+        let old_path = env::var("PATH").unwrap_or_default();
+        env.set("PATH", format!("{}:{old_path}", fake_bin.display()));
+
+        // Simulate SessionStart copying .env into wt1 before marker is saved.
+        fs::write(wt1.join(".env"), "SECRET_KEY=top-secret-value\n").unwrap();
+        let wt1_str = wt1.to_string_lossy().into_owned();
+        let wt2_str = wt2.to_string_lossy().into_owned();
+
+        bootstrap_repo_env(&base, "parent-1", &wt1_str, "codex", "SessionStart");
+        assert_eq!(spawn_count(&count_file), 1);
+
+        // Verify marker does not store secret values.
+        let marker_files: Vec<_> = fs::read_dir(base.join("bootstrap-cache"))
+            .unwrap()
+            .flatten()
+            .map(|e| fs::read_to_string(e.path()).unwrap())
+            .collect();
+        assert_eq!(marker_files.len(), 1);
+        assert!(!marker_files[0].contains("top-secret-value"));
+
+        // SubagentStart in same cwd skips Python!
+        bootstrap_repo_env(&base, "parent-1", &wt1_str, "codex", "SubagentStart");
+        assert_eq!(spawn_count(&count_file), 1);
+
+        // Sibling linked worktree spawns Python.
+        bootstrap_repo_env(&base, "parent-1", &wt2_str, "codex", "SubagentStart");
+        assert_eq!(spawn_count(&count_file), 2);
+
+        // Missing destination file in wt1 triggers Python.
+        fs::remove_file(wt1.join(".env")).unwrap();
+        bootstrap_repo_env(&base, "parent-1", &wt1_str, "codex", "SubagentStart");
+        assert_eq!(spawn_count(&count_file), 3);
+        fs::write(wt1.join(".env"), "SECRET_KEY=top-secret-value\n").unwrap();
+        assert_eq!(spawn_count(&count_file), 3);
+
+        // New .env.local in main_repo triggers Python.
+        fs::write(main_repo.join(".env.local"), "EXTRA=1\n").unwrap();
+        bootstrap_repo_env(&base, "parent-1", &wt1_str, "codex", "SubagentStart");
+        assert_eq!(spawn_count(&count_file), 4);
+        fs::remove_file(main_repo.join(".env.local")).unwrap();
+
+        // .worktreeinclude present triggers Python.
+        fs::write(main_repo.join(".worktreeinclude"), ".env\n").unwrap();
+        bootstrap_repo_env(&base, "parent-1", &wt1_str, "codex", "SubagentStart");
+        assert_eq!(spawn_count(&count_file), 5);
+        fs::remove_file(main_repo.join(".worktreeinclude")).unwrap();
+
+        // CLAUDE_ENV_FILE on SessionStart is never skipped, and ORKEST_READONLY_RUN skips non-export.
+        let claude_env = td.path.join("claude.env");
+        env.set("CLAUDE_ENV_FILE", &claude_env);
+        bootstrap_repo_env(&base, "parent-1", &wt1_str, "claude", "SessionStart");
+        assert_eq!(spawn_count(&count_file), 6);
+
+        env.remove("CLAUDE_ENV_FILE");
+        env.set("ORKEST_READONLY_RUN", "1");
+        bootstrap_repo_env(&base, "parent-1", &wt1_str, "claude", "SessionStart");
+        assert_eq!(spawn_count(&count_file), 6);
+    }
+
+    #[test]
+    fn test_adopt_cleared_transfers_chief_safely_and_refuses_invalid_pairings() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let td = TestDir::new("ork-chief-clear");
+        let base = td.path.join("cache/mailbox-v1");
+        fs::create_dir_all(base.join("cleared")).unwrap();
+
+        let my_pid = i64::from(std::process::id());
+        let my_birth = identity::process_started_fresh(my_pid);
+        let now_iso = paths::format_utc_iso_z(paths::utc_now_secs());
+        let host = paths::current_hostname().unwrap_or_default();
+
+        let write_cleared_old =
+            |sid: &str, pid: Option<i64>, birth: Option<&str>, machine: Option<&str>| {
+                let mut old = json!({
+                    "schema": "agent-executor.peer.v1",
+                    "session": sid,
+                    "name": "codex-old-martian",
+                    "harness": "codex",
+                    "cwd": "/tmp/proj",
+                    "pid": pid,
+                    "clearedPid": pid,
+                    "clearedAt": now_iso,
+                    "startedAt": now_iso,
+                    "lastSeenAt": now_iso,
+                    "focus": "Ork Chief · machine-wide coordinator",
+                });
+                if let Some(b) = birth {
+                    old.as_object_mut()
+                        .unwrap()
+                        .insert("pidBirth".to_string(), json!(b));
+                }
+                if let Some(m) = machine {
+                    old.as_object_mut()
+                        .unwrap()
+                        .insert("machine".to_string(), json!(m));
+                }
+                let key = paths::session_key(sid).unwrap();
+                paths::write_json_atomic(&base.join("cleared").join(format!("{key}.json")), &old)
+                    .unwrap();
+            };
+
+        // 1. Valid transfer preserves boundAt/previous/pane/unknown fields & updates session/name/pid/pidBirth/cwd/engine/model.
+        write_cleared_old("old-chief", Some(my_pid), my_birth.as_deref(), Some(&host));
+        let chief_path = base.join("chief.json");
+        paths::write_json_atomic(
+            &chief_path,
+            &json!({
+                "schema": "ork.chief.v1",
+                "session": "old-chief",
+                "name": "codex-old-martian",
+                "engine": "codex",
+                "model": "gpt-old",
+                "cwd": "/tmp/old",
+                "machine": host,
+                "pid": my_pid,
+                "pidBirth": my_birth,
+                "herdrPaneId": "pane-42",
+                "boundAt": "2026-01-01T00:00:00Z",
+                "previous": {"session": "ancient"},
+                "customExtraField": {"keep": true},
+            }),
+        )
+        .unwrap();
+
+        let mut me = make_peer("new-chief", "codex", "/tmp/new-proj");
+        me.as_object_mut()
+            .unwrap()
+            .insert("name".to_string(), json!("codex-new-martian"));
+        me.as_object_mut()
+            .unwrap()
+            .insert("model".to_string(), json!("gpt-5.4"));
+        if let Some(ref b) = my_birth {
+            me.as_object_mut()
+                .unwrap()
+                .insert("pidBirth".to_string(), json!(b));
+        }
+        save_peer(&base, &me);
+
+        let notice = adopt_cleared(&base, &mut me);
+        assert!(notice.contains("old-chief"));
+        let updated = paths::read_json_file(&chief_path).unwrap();
+        assert_eq!(updated["session"], "new-chief");
+        assert_eq!(updated["name"], "codex-new-martian");
+        assert_eq!(updated["pid"], my_pid);
+        assert_eq!(
+            updated["pidBirth"],
+            my_birth.as_deref().map_or(Value::Null, |b| json!(b))
+        );
+        assert_eq!(updated["cwd"], "/tmp/new-proj");
+        assert_eq!(updated["engine"], "codex");
+        assert_eq!(updated["model"], "gpt-5.4");
+        assert_eq!(updated["boundAt"], "2026-01-01T00:00:00Z");
+        assert_eq!(updated["previous"], json!({"session": "ancient"}));
+        assert_eq!(updated["herdrPaneId"], "pane-42");
+        assert_eq!(updated["customExtraField"], json!({"keep": true}));
+        assert_eq!(updated["revision"], json!(1));
+
+        // Repeat no-op: calling transfer_chief_on_clear again returns Ok(false) and leaves chief.json intact.
+        let old_val = make_peer("old-chief", "codex", "/tmp/proj");
+        assert_eq!(transfer_chief_on_clear(&base, &old_val, &me), Ok(false));
+
+        // 2. Concurrent rebind wins CAS without clobbering.
+        write_cleared_old("old-chief-2", Some(my_pid), my_birth.as_deref(), None);
+        paths::write_json_atomic(
+            &chief_path,
+            &json!({
+                "schema": "ork.chief.v1",
+                "session": "old-chief-2",
+                "pid": my_pid,
+                "boundAt": "2026-01-01T00:00:00Z",
+            }),
+        )
+        .unwrap();
+        let guard = paths::lock_for(&chief_path).unwrap();
+        let cp_clone = chief_path.clone();
+        let mut me2 = make_peer("new-chief-2", "codex", "/tmp");
+        save_peer(&base, &me2);
+        let base_clone = base.clone();
+        let t = thread::spawn(move || adopt_cleared(&base_clone, &mut me2));
+        thread::sleep(Duration::from_millis(50));
+        // Concurrent writer rebinds chief.json to "winner-session" while holding lock!
+        paths::write_json_atomic(
+            &cp_clone,
+            &json!({
+                "schema": "ork.chief.v1",
+                "session": "winner-session",
+                "pid": my_pid,
+                "boundAt": "2026-01-02T00:00:00Z",
+            }),
+        )
+        .unwrap();
+        drop(guard);
+        t.join().unwrap();
+        assert_eq!(
+            paths::read_json_file(&chief_path).unwrap()["session"],
+            "winner-session"
+        );
+
+        // 3. Refuses remote machine, recycled pidBirth, mismatched PID, and two absent PIDs.
+        for (case, old_pid, new_pid, old_birth, machine) in [
+            (
+                "remote",
+                Some(my_pid),
+                Some(my_pid),
+                my_birth.as_deref(),
+                Some("other-host.invalid"),
+            ),
+            (
+                "recycled_birth",
+                Some(my_pid),
+                Some(my_pid),
+                Some("Thu Jan  1 00:00:00 1970"),
+                None,
+            ),
+            ("mismatched_pid", Some(my_pid), Some(my_pid + 1), None, None),
+            ("absent_pids", None, None, None, None),
+        ] {
+            paths::write_json_atomic(
+                &chief_path,
+                &json!({
+                    "schema": "ork.chief.v1",
+                    "session": "old-refuse",
+                    "pid": old_pid,
+                    "boundAt": "2026-01-01T00:00:00Z",
+                }),
+            )
+            .unwrap();
+            let mut old_rec = make_peer("old-refuse", "codex", "/tmp");
+            old_rec
+                .as_object_mut()
+                .unwrap()
+                .insert("pid".to_string(), json!(old_pid));
+            if let Some(b) = old_birth {
+                old_rec
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("pidBirth".to_string(), json!(b));
+            }
+            if let Some(m) = machine {
+                old_rec
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("machine".to_string(), json!(m));
+            }
+            let mut new_rec = make_peer("new-refuse", "codex", "/tmp");
+            new_rec
+                .as_object_mut()
+                .unwrap()
+                .insert("pid".to_string(), json!(new_pid));
+            if let Some(ref b) = my_birth {
+                new_rec
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("pidBirth".to_string(), json!(b));
+            }
+            assert_eq!(
+                transfer_chief_on_clear(&base, &old_rec, &new_rec),
+                Ok(false),
+                "case {case} must refuse transfer"
+            );
+            assert_eq!(
+                paths::read_json_file(&chief_path).unwrap()["session"],
+                "old-refuse"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dir_fd_symlink_and_fifo_safety_guards() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let td = TestDir::new("ork-dir-fd-fifo");
+        let cache_dir = td.path.join("orchestrate");
+        let base = cache_dir.join("mailbox-v1");
+        fs::create_dir_all(&base).unwrap();
+
+        // 1. Symlinked bootstrap-cache target must never be chmod 0700 or written into.
+        let outside = td.path.join("outside-target");
+        fs::create_dir_all(&outside).unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&outside, base.join("bootstrap-cache")).unwrap();
+
+        let main_repo = td.path.join("repo");
+        fs::create_dir_all(&main_repo).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&main_repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        Command::new("git")
+            .args(["config", "user.email", "t@example.com"])
+            .current_dir(&main_repo)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "T"])
+            .current_dir(&main_repo)
+            .status()
+            .unwrap();
+        fs::write(main_repo.join("a.txt"), "a\n").unwrap();
+        Command::new("git")
+            .args(["add", "a.txt"])
+            .current_dir(&main_repo)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-qm", "init"])
+            .current_dir(&main_repo)
+            .status()
+            .unwrap();
+
+        write_bootstrap_marker(&base, "s1", main_repo.to_str().unwrap());
+        assert_eq!(fs::metadata(&outside).unwrap().mode() & 0o777, 0o755);
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+        fs::remove_file(base.join("bootstrap-cache")).unwrap();
+
+        // 2. Symlinked handoffs-v1 / event dir is ignored without error or chmod.
+        symlink(&outside, cache_dir.join("handoffs-v1")).unwrap();
+        assert_eq!(deliver_non_repo_chief_notices(&base, "s1", 1000), "");
+        assert_eq!(fs::metadata(&outside).unwrap().mode() & 0o777, 0o755);
+        fs::remove_file(cache_dir.join("handoffs-v1")).unwrap();
+
+        // 3. FIFO at mode.json or commondir never blocks.
+        // cspell:ignore mkfifo
+        let db = identity::daemon_base(&base);
+        fs::create_dir_all(&db).unwrap();
+        fs::set_permissions(&db, fs::Permissions::from_mode(0o700)).unwrap();
+        let fifo_path = db.join("mode.json");
+        let c_fifo = CString::new(fifo_path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+        assert_eq!(classify_daemon_mode(&base), DaemonMode::NeedsFullCheck);
+
+        let wt_git = td.path.join("linked/.git");
+        let linked_git_dir = main_repo.join(".git/worktrees/wt");
+        fs::create_dir_all(wt_git.parent().unwrap()).unwrap();
+        fs::create_dir_all(&linked_git_dir).unwrap();
+        fs::write(&wt_git, format!("gitdir: {}\n", linked_git_dir.display())).unwrap();
+        let commondir_fifo = linked_git_dir.join("commondir");
+        let c_common = CString::new(commondir_fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_common.as_ptr(), 0o600) }, 0);
+        let canon_wt = fs::canonicalize(wt_git.parent().unwrap()).unwrap();
+        assert!(resolve_git_roots_fast(&canon_wt).is_none());
+    }
+
+    #[test]
+    fn test_bootstrap_declines_cache_on_missing_dest_or_bad_index_or_git_env() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let td = TestDir::new("ork-boot-decline");
+        let base = td.path.join("cache/mailbox-v1");
+        fs::create_dir_all(&base).unwrap();
+        let main_repo = td.path.join("main-repo");
+        fs::create_dir_all(&main_repo).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&main_repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        Command::new("git")
+            .args(["config", "user.email", "t@example.com"])
+            .current_dir(&main_repo)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "T"])
+            .current_dir(&main_repo)
+            .status()
+            .unwrap();
+        fs::write(main_repo.join("README.md"), "hi\n").unwrap();
+        Command::new("git")
+            .args(["add", "README.md"])
+            .current_dir(&main_repo)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-qm", "init"])
+            .current_dir(&main_repo)
+            .status()
+            .unwrap();
+        fs::write(main_repo.join(".env"), "SECRET=1\n").unwrap();
+
+        let wt = td.path.join("wt");
+        assert!(
+            Command::new("git")
+                .args(["worktree", "add", "-q", wt.to_str().unwrap()])
+                .current_dir(&main_repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let wt_str = wt.to_string_lossy().into_owned();
+
+        // Missing destination .env in wt -> declines snapshot (never records present: false).
+        assert!(collect_bootstrap_snapshot("p1", &wt_str).is_none());
+
+        // Present destination .env -> snapshot succeeds.
+        fs::write(wt.join(".env"), "SECRET=1\n").unwrap();
+        assert!(collect_bootstrap_snapshot("p1", &wt_str).is_some());
+
+        // GIT_INDEX_FILE / GIT_DIR / GIT_WORK_TREE env overrides decline snapshot.
+        for var in ["GIT_INDEX_FILE", "GIT_DIR", "GIT_WORK_TREE"] {
+            let mut env = EnvGuard::new();
+            env.set(var, "/tmp/override");
+            assert!(
+                collect_bootstrap_snapshot("p1", &wt_str).is_none(),
+                "{var} must decline caching"
+            );
+        }
+
+        // Symlinked .git/index declines snapshot.
+        let wt_git_file = fs::read_to_string(wt.join(".git")).unwrap();
+        let wt_git_dir = PathBuf::from(wt_git_file.trim().strip_prefix("gitdir:").unwrap().trim());
+        let wt_index = wt_git_dir.join("index");
+        let real_index = wt_git_dir.join("index.real");
+        fs::rename(&wt_index, &real_index).unwrap();
+        symlink(&real_index, &wt_index).unwrap();
+        assert!(collect_bootstrap_snapshot("p1", &wt_str).is_none());
+    }
+
+    #[test]
+    fn test_escaping_symlink_in_runtime_sources_forces_needs_full_check() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let td = TestDir::new("ork-escape-rev");
+        let cache_dir = td.path.join("orchestrate");
+        let base = cache_dir.join("mailbox-v1");
+        fs::create_dir_all(&base).unwrap();
+        let scripts = setup_minimal_scripts_dir(&td.path);
+        let outside = td.path.join("outside.py");
+        fs::write(&outside, "print('outside')\n").unwrap();
+        symlink(&outside, scripts.join("escape.py")).unwrap();
+
+        let mut env = EnvGuard::new();
+        env.set("ORKEST_SCRIPTS_DIR", &scripts);
+        env.set("ORCHESTRATE_HOME", &cache_dir);
+
+        let db = identity::daemon_base(&base);
+        write_private_file(&db.join("mode.json"), br#"{"mode":"http"}"#);
+        assert!(current_runtime_revision(&base).is_none());
+        assert_eq!(probe_http_daemon(&base), HttpProbeOutcome::NeedsFullCheck);
+    }
+
+    #[test]
+    fn test_failed_chief_transfer_affinity_and_stale_birth_rejection() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let td = TestDir::new("ork-chief-affinity");
+        let base = td.path.join("cache/mailbox-v1");
+        fs::create_dir_all(base.join("cleared")).unwrap();
+
+        let my_pid = i64::from(std::process::id());
+        let my_birth = identity::process_started_fresh(my_pid);
+        let now_iso = paths::format_utc_iso_z(paths::utc_now_secs());
+        let host = paths::current_hostname().unwrap_or_default();
+
+        // 1. Both old and me carrying identical stale pidBirth must STILL be refused via fresh lookup.
+        let chief_path = base.join("chief.json");
+        paths::write_json_atomic(
+            &chief_path,
+            &json!({
+                "schema": "ork.chief.v1",
+                "session": "old-stale",
+                "pid": my_pid,
+                "pidBirth": "Thu Jan  1 00:00:00 1970",
+                "boundAt": "2026-01-01T00:00:00Z",
+                "revision": 3,
+            }),
+        )
+        .unwrap();
+        let mut old_stale = make_peer("old-stale", "codex", "/tmp");
+        old_stale
+            .as_object_mut()
+            .unwrap()
+            .insert("pidBirth".to_string(), json!("Thu Jan  1 00:00:00 1970"));
+        let mut me_stale = make_peer("new-stale", "codex", "/tmp");
+        me_stale
+            .as_object_mut()
+            .unwrap()
+            .insert("pidBirth".to_string(), json!("Thu Jan  1 00:00:00 1970"));
+        assert_eq!(
+            transfer_chief_on_clear(&base, &old_stale, &me_stale),
+            Ok(false)
+        );
+        assert_eq!(
+            paths::read_json_file(&chief_path).unwrap()["session"],
+            "old-stale"
+        );
+
+        // 2. Transient chief.json error retains stash bound to s1; s2 cannot steal it; s1 retries and wins.
+        let mut old_chief = make_peer("chief-0", "codex", "/tmp");
+        old_chief
+            .as_object_mut()
+            .unwrap()
+            .insert("clearedAt".to_string(), json!(now_iso));
+        old_chief
+            .as_object_mut()
+            .unwrap()
+            .insert("clearedPid".to_string(), json!(my_pid));
+        old_chief
+            .as_object_mut()
+            .unwrap()
+            .insert("machine".to_string(), json!(host));
+        if let Some(ref b) = my_birth {
+            old_chief
+                .as_object_mut()
+                .unwrap()
+                .insert("pidBirth".to_string(), json!(b));
+        }
+        let stash_path = base.join("cleared").join("chief-0.json");
+        paths::write_json_atomic(&stash_path, &old_chief).unwrap();
+        paths::write_json_atomic(
+            &chief_path,
+            &json!({
+                "schema": "ork.chief.v1",
+                "session": "chief-0",
+                "machine": host,
+                "pid": my_pid,
+                "pidBirth": my_birth,
+                "boundAt": "2026-01-01T00:00:00Z",
+                "revision": 4,
+            }),
+        )
+        .unwrap();
+        // Temporarily replace chief.json with a directory -> deterministic transient Err(()) regardless of UID.
+        let chief_backup = base.join("chief.json.bak");
+        fs::rename(&chief_path, &chief_backup).unwrap();
+        fs::create_dir(&chief_path).unwrap();
+
+        let mut s1 = make_peer("chief-1", "codex", "/tmp");
+        save_peer(&base, &s1);
+        let _ = adopt_cleared(&base, &mut s1);
+        // Stash retained with intendedChiefSuccessor = chief-1 and pendingChiefTransfer marked.
+        let retained = paths::read_json_file(&stash_path).unwrap();
+        assert_eq!(retained["intendedChiefSuccessor"], "chief-1");
+        assert_eq!(s1["pendingChiefTransfer"], json!(true));
+
+        // Restore chief.json; a different session s2 in same process must NOT inherit chief-0!
+        fs::remove_dir(&chief_path).unwrap();
+        fs::rename(&chief_backup, &chief_path).unwrap();
+        let mut s2 = make_peer("other-2", "codex", "/tmp");
+        save_peer(&base, &s2);
+        let _ = adopt_cleared(&base, &mut s2);
+        assert_eq!(
+            paths::read_json_file(&chief_path).unwrap()["session"],
+            "chief-0"
+        );
+        assert!(stash_path.exists());
+
+        // Original intended successor s1 retries and succeeds, incrementing revision to 5, writing generation, and consuming stash.
+        let _ = adopt_cleared(&base, &mut s1);
+        let final_chief = paths::read_json_file(&chief_path).unwrap();
+        assert_eq!(final_chief["session"], "chief-1");
+        assert_eq!(final_chief["revision"], json!(5));
+        assert!(
+            final_chief["generation"]
+                .as_str()
+                .is_some_and(|g| !g.is_empty())
+        );
+        assert!(!stash_path.exists());
+        assert!(s1.get("pendingChiefTransfer").is_none_or(Value::is_null));
+    }
+
+    #[test]
+    fn test_incomplete_room_list_keeps_handoff_conductor_gate_conservative() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let mut env = EnvGuard::new();
+        env.set("ORKEST_NODE_BIN", "/nonexistent/node");
+
+        let td = TestDir::new("ork-room-incomplete");
+        let base = td.path.join("cache/mailbox-v1");
+        fs::create_dir_all(base.join("rooms")).unwrap();
+        // Both rooms.db (corrupt/unreadable) and 1 legacy room for another conductor:
+        // list_rooms_checked returns a nonempty list AND complete = false, so gate must stay conservative.
+        fs::write(base.join("rooms.db"), "not-sqlite").unwrap();
+        fs::write(
+            base.join("rooms/r1.json"),
+            r#"{"id":"r1","lifecycle":"active","status":"active","conductor":{"session":{"id":"someone-else"}}}"#,
+        )
+        .unwrap();
+        let (rooms, complete) = sqlite::list_rooms_checked(&base);
+        assert_eq!(rooms.len(), 1);
+        assert!(!complete);
+        assert!(is_room_conductor_for_handoff(&base, "probe-session"));
+
+        // Corrupt legacy room file without rooms.db also keeps gate conservative via legacy scan.
+        fs::remove_file(base.join("rooms.db")).unwrap();
+        fs::write(base.join("rooms/r2.json"), "{corrupt").unwrap();
+        assert!(is_room_conductor_for_handoff(&base, "probe-session"));
+    }
+
+    #[test]
+    fn test_env_template_trailing_dot_treated_as_sensitive() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        assert!(!is_env_template_filename(".env.template."));
+        assert!(!is_env_template_filename(".env.example."));
+        assert!(is_sensitive_env_filename(".env.template."));
+        assert!(is_sensitive_env_filename(".env.example."));
+        assert!(is_env_template_filename(".env.template"));
+        assert!(is_env_template_filename(".env.EXAMPLE.local"));
+        assert!(!is_sensitive_env_filename(".env.template"));
+        assert!(!is_sensitive_env_filename(".env.EXAMPLE.local"));
+
+        let td = TestDir::new("ork-env-trailing-dot");
+        let main_repo = td.path.join("main");
+        fs::create_dir_all(&main_repo).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&main_repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        Command::new("git")
+            .args(["config", "user.email", "t@example.com"])
+            .current_dir(&main_repo)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "T"])
+            .current_dir(&main_repo)
+            .status()
+            .unwrap();
+        fs::write(main_repo.join("README.md"), "hi\n").unwrap();
+        Command::new("git")
+            .args(["add", "README.md"])
+            .current_dir(&main_repo)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-qm", "init"])
+            .current_dir(&main_repo)
+            .status()
+            .unwrap();
+        fs::write(main_repo.join(".env.template."), "SECRET=1\n").unwrap();
+        fs::write(main_repo.join(".env.example."), "SECRET=2\n").unwrap();
+        let wt = td.path.join("wt");
+        assert!(
+            Command::new("git")
+                .args(["worktree", "add", "-q", wt.to_str().unwrap()])
+                .current_dir(&main_repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let wt_str = wt.to_string_lossy().into_owned();
+        // Missing .env.template. and .env.example. in linked worktree -> must decline bootstrap marker.
+        assert!(collect_bootstrap_snapshot("p1", &wt_str).is_none());
+        fs::write(wt.join(".env.template."), "SECRET=1\n").unwrap();
+        assert!(collect_bootstrap_snapshot("p1", &wt_str).is_none());
+        fs::write(wt.join(".env.example."), "SECRET=2\n").unwrap();
+        assert!(collect_bootstrap_snapshot("p1", &wt_str).is_some());
+    }
+
+    #[test]
+    fn test_chief_cas_same_session_revision_generation_overflow_and_birth_none() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let td = TestDir::new("ork-chief-cas-gen");
+        let base = td.path.join("cache/mailbox-v1");
+        fs::create_dir_all(base.join("cleared")).unwrap();
+
+        let my_pid = i64::from(std::process::id());
+        let my_birth = identity::process_started_fresh(my_pid);
+        let chief_path = base.join("chief.json");
+
+        // 1. Same-session rebind changing revision or generation under chief.lock must conflict -> Ok(false).
+        for (label, next_rev, next_gen) in [
+            ("same_session_new_revision", 2_u64, "gen-a"),
+            ("same_session_new_generation", 1_u64, "gen-b"),
+        ] {
+            paths::write_json_atomic(
+                &chief_path,
+                &json!({
+                    "schema": "ork.chief.v1",
+                    "session": "old-same",
+                    "pid": my_pid,
+                    "pidBirth": my_birth,
+                    "revision": 1,
+                    "generation": "gen-a",
+                }),
+            )
+            .unwrap();
+            let mut old_rec = make_peer("old-same", "codex", "/tmp");
+            if let Some(ref b) = my_birth {
+                old_rec
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("pidBirth".to_string(), json!(b));
+            }
+            let mut me_rec = make_peer("new-same", "codex", "/tmp");
+            if let Some(ref b) = my_birth {
+                me_rec
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("pidBirth".to_string(), json!(b));
+            }
+
+            let guard = paths::lock_for(&chief_path).unwrap();
+            let base_clone = base.clone();
+            let old_clone = old_rec.clone();
+            let me_clone = me_rec.clone();
+            let t =
+                thread::spawn(move || transfer_chief_on_clear(&base_clone, &old_clone, &me_clone));
+            thread::sleep(Duration::from_millis(50));
+            paths::write_json_atomic(
+                &chief_path,
+                &json!({
+                    "schema": "ork.chief.v1",
+                    "session": "old-same",
+                    "pid": my_pid,
+                    "pidBirth": my_birth,
+                    "revision": next_rev,
+                    "generation": next_gen,
+                }),
+            )
+            .unwrap();
+            drop(guard);
+            assert_eq!(
+                t.join().unwrap(),
+                Ok(false),
+                "case {label} must detect same-session conflict"
+            );
+            assert_eq!(
+                paths::read_json_file(&chief_path).unwrap()["session"],
+                "old-same"
+            );
+        }
+
+        // 2. u64::MAX revision returns Err(()) without mutating chief.json.
+        paths::write_json_atomic(
+            &chief_path,
+            &json!({
+                "schema": "ork.chief.v1",
+                "session": "old-max",
+                "pid": my_pid,
+                "pidBirth": my_birth,
+                "revision": u64::MAX,
+                "generation": "gen-max",
+            }),
+        )
+        .unwrap();
+        let mut old_max = make_peer("old-max", "codex", "/tmp");
+        let mut me_max = make_peer("new-max", "codex", "/tmp");
+        if let Some(ref b) = my_birth {
+            old_max
+                .as_object_mut()
+                .unwrap()
+                .insert("pidBirth".to_string(), json!(b));
+            me_max
+                .as_object_mut()
+                .unwrap()
+                .insert("pidBirth".to_string(), json!(b));
+        }
+        assert_eq!(transfer_chief_on_clear(&base, &old_max, &me_max), Err(()));
+        let after_max = paths::read_json_file(&chief_path).unwrap();
+        assert_eq!(after_max["session"], "old-max");
+        assert_eq!(after_max["revision"], json!(u64::MAX));
+
+        // 3. Unavailable live birth lookup returns retryable Err(()) whenever old, chief, or me supplies pidBirth.
+        for case in ["old_only", "chief_only", "me_only"] {
+            let mut old_b = make_peer("old-b", "codex", "/tmp");
+            let mut me_b = make_peer("new-b", "codex", "/tmp");
+            let mut chief_doc = json!({
+                "schema": "ork.chief.v1",
+                "session": "old-b",
+                "pid": my_pid,
+                "revision": 1,
+            });
+            match case {
+                "old_only" => {
+                    old_b
+                        .as_object_mut()
+                        .unwrap()
+                        .insert("pidBirth".to_string(), json!("birth-1"));
+                }
+                "chief_only" => {
+                    chief_doc
+                        .as_object_mut()
+                        .unwrap()
+                        .insert("pidBirth".to_string(), json!("birth-1"));
+                }
+                "me_only" => {
+                    me_b.as_object_mut()
+                        .unwrap()
+                        .insert("pidBirth".to_string(), json!("birth-1"));
+                }
+                _ => unreachable!(),
+            }
+            paths::write_json_atomic(&chief_path, &chief_doc).unwrap();
+            assert_eq!(
+                transfer_chief_on_clear_with_lookup(&base, &old_b, &me_b, |_| None),
+                Err(()),
+                "case {case} must return Err(()) when live birth lookup is unavailable"
+            );
+            assert_eq!(
+                paths::read_json_file(&chief_path).unwrap()["session"],
+                "old-b"
+            );
+        }
+
+        // 4. FIFO or symlink at chief.json / chief.lock never blocks or follows target.
+        let outside = td.path.join("outside-chief.json");
+        fs::write(&outside, r#"{"keep":true}"#).unwrap();
+        fs::remove_file(&chief_path).unwrap();
+        symlink(&outside, &chief_path).unwrap();
+        let old_s = make_peer("old-sym", "codex", "/tmp");
+        let me_s = make_peer("new-sym", "codex", "/tmp");
+        assert_eq!(transfer_chief_on_clear(&base, &old_s, &me_s), Ok(false));
+        assert_eq!(fs::read_to_string(&outside).unwrap(), r#"{"keep":true}"#);
+
+        fs::remove_file(&chief_path).unwrap();
+        let c_chief_fifo = CString::new(chief_path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_chief_fifo.as_ptr(), 0o600) }, 0);
+        assert_eq!(transfer_chief_on_clear(&base, &old_s, &me_s), Ok(false));
+    }
+
+    #[test]
+    fn test_clear_stash_claim_lock_and_abort_on_claim_write_failure() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let td = TestDir::new("ork-clear-stash-lock");
+        let base = td.path.join("cache/mailbox-v1");
+        fs::create_dir_all(base.join("cleared")).unwrap();
+
+        let my_pid = i64::from(std::process::id());
+        let now_iso = paths::format_utc_iso_z(paths::utc_now_secs());
+        let mut old = make_peer("old-clear", "codex", "/tmp");
+        old.as_object_mut()
+            .unwrap()
+            .insert("clearedAt".to_string(), json!(now_iso));
+        old.as_object_mut()
+            .unwrap()
+            .insert("clearedPid".to_string(), json!(my_pid));
+        old.as_object_mut()
+            .unwrap()
+            .insert("focus".to_string(), json!("old-focus"));
+        let stash_path = base.join("cleared/old-clear.json");
+        paths::write_json_atomic(&stash_path, &old).unwrap();
+
+        let old_inbox = paths::inbox_dir(&base, "old-clear").unwrap();
+        let msg_id = paths::message_id();
+        let msg = json!({
+            "schema": MAIL_SCHEMA,
+            "id": msg_id,
+            "sentAt": now_iso,
+            "from": {"session": "sender-1", "name": "sender"},
+            "to": {"session": "old-clear", "name": "old"},
+            "text": "hello",
+            "readAt": Value::Null,
+        });
+        paths::write_json_atomic(&old_inbox.join(format!("{msg_id}.json")), &msg).unwrap();
+
+        // 1. Failing to persist the claim aborts cleanly without transferring mail, focus, or aliases.
+        let mut me_fail = make_peer("succ-fail", "codex", "/tmp");
+        save_peer(&base, &me_fail);
+        let notice_fail = adopt_cleared_with_claim_writer(&base, &mut me_fail, |_, _| {
+            Err(io::Error::other("simulated disk full"))
+        });
+        assert!(notice_fail.is_empty());
+        assert!(old_inbox.join(format!("{msg_id}.json")).exists());
+        assert!(
+            !paths::inbox_dir(&base, "succ-fail")
+                .unwrap()
+                .join(format!("{msg_id}.json"))
+                .exists()
+        );
+        let me_fail_saved =
+            paths::read_json_file(&paths::peer_path(&base, "succ-fail").unwrap()).unwrap();
+        assert!(me_fail_saved.get("clearedFrom").is_none());
+        assert!(me_fail_saved.get("focus").is_none());
+
+        // 2. Concurrent successors racing for one stash: only one wins the stash and mail.
+        let mut s1 = make_peer("succ-1", "codex", "/tmp");
+        let mut s2 = make_peer("succ-2", "codex", "/tmp");
+        save_peer(&base, &s1);
+        save_peer(&base, &s2);
+        let b1 = base.clone();
+        let b2 = base.clone();
+        let t1 = thread::spawn(move || adopt_cleared(&b1, &mut s1));
+        let t2 = thread::spawn(move || adopt_cleared(&b2, &mut s2));
+        let n1 = t1.join().unwrap();
+        let n2 = t2.join().unwrap();
+        assert_ne!(
+            n1.is_empty(),
+            n2.is_empty(),
+            "exactly one concurrent successor must adopt the stash (n1={n1:?}, n2={n2:?})"
+        );
+        let in1 = paths::inbox_dir(&base, "succ-1")
+            .unwrap()
+            .join(format!("{msg_id}.json"))
+            .exists();
+        let in2 = paths::inbox_dir(&base, "succ-2")
+            .unwrap()
+            .join(format!("{msg_id}.json"))
+            .exists();
+        assert_ne!(in1, in2);
+    }
+
+    #[test]
+    fn test_clear_unread_mail_write_failure_preserves_source_and_retries() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let td = TestDir::new("ork-clear-mail-loss");
+        let base = td.path.join("cache/mailbox-v1");
+        fs::create_dir_all(base.join("cleared")).unwrap();
+
+        let my_pid = i64::from(std::process::id());
+        let now_iso = paths::format_utc_iso_z(paths::utc_now_secs());
+        let mut old = make_peer("old-mail", "codex", "/tmp");
+        old.as_object_mut()
+            .unwrap()
+            .insert("clearedAt".to_string(), json!(now_iso));
+        old.as_object_mut()
+            .unwrap()
+            .insert("clearedPid".to_string(), json!(my_pid));
+        let stash_path = base.join("cleared/old-mail.json");
+        paths::write_json_atomic(&stash_path, &old).unwrap();
+
+        let sender = make_peer("sender-mail", "codex", "/tmp");
+        save_peer(&base, &sender);
+
+        let old_inbox = paths::inbox_dir(&base, "old-mail").unwrap();
+        let msg_id = paths::message_id();
+        let msg = json!({
+            "schema": MAIL_SCHEMA,
+            "id": msg_id,
+            "sentAt": now_iso,
+            "from": {"session": "sender-mail", "name": sender["name"]},
+            "to": {"session": "old-mail", "name": old["name"]},
+            "text": "important unread",
+            "readAt": Value::Null,
+        });
+        let old_msg_path = old_inbox.join(format!("{msg_id}.json"));
+        paths::write_json_atomic(&old_msg_path, &msg).unwrap();
+
+        // Block successor inbox path with a regular file so write_json_atomic fails deterministically.
+        let succ_inbox = paths::inbox_dir(&base, "succ-mail").unwrap();
+        fs::create_dir_all(succ_inbox.parent().unwrap()).unwrap();
+        fs::write(&succ_inbox, "blocker").unwrap();
+
+        let mut succ = make_peer("succ-mail", "codex", "/tmp");
+        save_peer(&base, &succ);
+        let notice = adopt_cleared(&base, &mut succ);
+        assert!(!notice.contains("1 message(s) addressed to you"));
+        assert!(
+            old_msg_path.exists(),
+            "source unread mail must be preserved on write failure"
+        );
+        assert!(
+            messages(&base, "sender-mail", true).is_empty(),
+            "sender must not receive false delivery notice"
+        );
+        let retained = paths::read_json_file(&stash_path).unwrap();
+        assert_eq!(retained["adoptionCompleted"], json!(false));
+        assert_eq!(succ["pendingChiefTransfer"], json!(true));
+
+        // Remove blocker and retry via ordinary hook path -> mail is moved and stash consumed.
+        fs::remove_file(&succ_inbox).unwrap();
+        retry_pending_chief_transfer(&base, &mut succ);
+        assert!(!old_msg_path.exists());
+        assert!(succ_inbox.join(format!("{msg_id}.json")).exists());
+        assert!(!stash_path.exists());
+        assert!(succ.get("pendingChiefTransfer").is_none_or(Value::is_null));
+    }
+
+    #[test]
+    fn test_interrupted_claim_resumes_adoption_and_session_end_clear_is_idempotent() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let td = TestDir::new("ork-interrupted-claim");
+        let base = td.path.join("cache/mailbox-v1");
+        fs::create_dir_all(base.join("cleared")).unwrap();
+
+        let my_pid = i64::from(std::process::id());
+        let now_iso = paths::format_utc_iso_z(paths::utc_now_secs());
+        let mut old = make_peer("old-int", "codex", "/tmp");
+        old.as_object_mut()
+            .unwrap()
+            .insert("clearedAt".to_string(), json!(now_iso));
+        old.as_object_mut()
+            .unwrap()
+            .insert("clearedPid".to_string(), json!(my_pid));
+        old.as_object_mut()
+            .unwrap()
+            .insert("focus".to_string(), json!("Resume me"));
+        old.as_object_mut()
+            .unwrap()
+            .insert("intendedChiefSuccessor".to_string(), json!("succ-int"));
+        old.as_object_mut()
+            .unwrap()
+            .insert("adoptionCompleted".to_string(), json!(false));
+        old.as_object_mut()
+            .unwrap()
+            .insert("chiefTransferPending".to_string(), json!(true));
+        let stash_path = base.join("cleared/old-int.json");
+        paths::write_json_atomic(&stash_path, &old).unwrap();
+
+        // Duplicate SessionEnd(clear) while peer still exists must NOT overwrite claim fields.
+        let old_peer = make_peer("old-int", "codex", "/tmp");
+        save_peer(&base, &old_peer);
+        end_session(&base, "old-int", "clear", Some(my_pid));
+        let after_dup = paths::read_json_file(&stash_path).unwrap();
+        assert_eq!(after_dup["intendedChiefSuccessor"], json!("succ-int"));
+        assert_eq!(after_dup["adoptionCompleted"], json!(false));
+        assert_eq!(after_dup["chiefTransferPending"], json!(true));
+
+        let old_inbox = paths::inbox_dir(&base, "old-int").unwrap();
+        let msg_id = paths::message_id();
+        paths::write_json_atomic(
+            &old_inbox.join(format!("{msg_id}.json")),
+            &json!({
+                "schema": MAIL_SCHEMA,
+                "id": msg_id,
+                "sentAt": now_iso,
+                "from": {"session": "sender-int", "name": "sender"},
+                "to": {"session": "old-int", "name": old["name"]},
+                "text": "carry on resume",
+                "readAt": Value::Null,
+            }),
+        )
+        .unwrap();
+        fs::create_dir_all(base.join("work")).unwrap();
+        paths::write_json_atomic(
+            &base.join("work/board.json"),
+            &json!({
+                "schema": "ork.board.v1",
+                "items": [{"id": "item-1", "owner": {"session": "old-int", "name": old["name"]}}]
+            }),
+        )
+        .unwrap();
+
+        // Ordinary non-Chief retry must resume adoption (mail, focus, aliases, board) before deleting stash.
+        let mut succ = make_peer("succ-int", "codex", "/tmp");
+        save_peer(&base, &succ);
+        retry_pending_chief_transfer(&base, &mut succ);
+        assert_eq!(succ["focus"], json!("Resume me"));
+        assert_eq!(succ["clearedFrom"], json!("old-int"));
+        assert!(
+            paths::inbox_dir(&base, "succ-int")
+                .unwrap()
+                .join(format!("{msg_id}.json"))
+                .exists()
+        );
+        let board = paths::read_json_file(&base.join("work/board.json")).unwrap();
+        assert_eq!(board["items"][0]["owner"]["session"], json!("succ-int"));
+        assert!(!stash_path.exists());
+    }
+
+    #[test]
+    fn test_claimed_chief_retry_never_expires_on_ttl_and_locks_first_observed_tuple() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let td = TestDir::new("ork-chief-ttl-tuple");
+        let base = td.path.join("cache/mailbox-v1");
+        fs::create_dir_all(base.join("cleared")).unwrap();
+
+        let my_pid = i64::from(std::process::id());
+        let my_birth = identity::process_started_fresh(my_pid);
+        let host = paths::current_hostname().unwrap_or_default();
+        let expired_iso = paths::format_utc_iso_z(paths::utc_now_secs() - CLEAR_PAIRING_SECS - 600);
+
+        // 1. Unclaimed expired stash IS deleted, while claimed expired stash is NOT deleted by clearedAt TTL.
+        let mut unclaimed_old = make_peer("unclaimed-old", "codex", "/tmp");
+        unclaimed_old
+            .as_object_mut()
+            .unwrap()
+            .insert("clearedAt".to_string(), json!(expired_iso));
+        unclaimed_old
+            .as_object_mut()
+            .unwrap()
+            .insert("clearedPid".to_string(), json!(my_pid));
+        let unclaimed_path = base.join("cleared/unclaimed-old.json");
+        paths::write_json_atomic(&unclaimed_path, &unclaimed_old).unwrap();
+
+        let mut claimed_old = make_peer("chief-ttl-old", "codex", "/tmp");
+        claimed_old
+            .as_object_mut()
+            .unwrap()
+            .insert("clearedAt".to_string(), json!(expired_iso));
+        claimed_old
+            .as_object_mut()
+            .unwrap()
+            .insert("clearedPid".to_string(), json!(my_pid));
+        claimed_old
+            .as_object_mut()
+            .unwrap()
+            .insert("machine".to_string(), json!(host));
+        if let Some(ref b) = my_birth {
+            claimed_old
+                .as_object_mut()
+                .unwrap()
+                .insert("pidBirth".to_string(), json!(b));
+        }
+        claimed_old.as_object_mut().unwrap().insert(
+            "intendedChiefSuccessor".to_string(),
+            json!("chief-ttl-succ"),
+        );
+        claimed_old
+            .as_object_mut()
+            .unwrap()
+            .insert("adoptionCompleted".to_string(), json!(true));
+        claimed_old
+            .as_object_mut()
+            .unwrap()
+            .insert("chiefTransferPending".to_string(), json!(true));
+        claimed_old
+            .as_object_mut()
+            .unwrap()
+            .insert("expectedChiefSession".to_string(), json!("chief-ttl-old"));
+        claimed_old
+            .as_object_mut()
+            .unwrap()
+            .insert("expectedChiefRevision".to_string(), json!(2));
+        claimed_old
+            .as_object_mut()
+            .unwrap()
+            .insert("expectedChiefGeneration".to_string(), json!("gen-2"));
+        let claimed_path = base.join("cleared/chief-ttl-old.json");
+        paths::write_json_atomic(&claimed_path, &claimed_old).unwrap();
+
+        let chief_path = base.join("chief.json");
+        paths::write_json_atomic(
+            &chief_path,
+            &json!({
+                "schema": "ork.chief.v1",
+                "session": "chief-ttl-old",
+                "machine": host,
+                "pid": my_pid,
+                "pidBirth": my_birth,
+                "revision": 2,
+                "generation": "gen-2",
+            }),
+        )
+        .unwrap();
+
+        let mut succ = make_peer("chief-ttl-succ", "codex", "/tmp");
+        if let Some(ref b) = my_birth {
+            succ.as_object_mut()
+                .unwrap()
+                .insert("pidBirth".to_string(), json!(b));
+        }
+        save_peer(&base, &succ);
+        retry_pending_chief_transfer(&base, &mut succ);
+        assert!(!unclaimed_path.exists());
+        assert!(!claimed_path.exists());
+        assert_eq!(
+            paths::read_json_file(&chief_path).unwrap()["session"],
+            json!("chief-ttl-succ")
+        );
+
+        // 2. First observed Chief tuple is persisted on stash; same-session rebind between attempts is refused on retry.
+        let now_iso = paths::format_utc_iso_z(paths::utc_now_secs());
+        let mut old_rebind = make_peer("old-rebind", "codex", "/tmp");
+        old_rebind
+            .as_object_mut()
+            .unwrap()
+            .insert("clearedAt".to_string(), json!(now_iso));
+        old_rebind
+            .as_object_mut()
+            .unwrap()
+            .insert("clearedPid".to_string(), json!(my_pid));
+        old_rebind
+            .as_object_mut()
+            .unwrap()
+            .insert("machine".to_string(), json!(host));
+        old_rebind
+            .as_object_mut()
+            .unwrap()
+            .insert("intendedChiefSuccessor".to_string(), json!("succ-rebind"));
+        old_rebind
+            .as_object_mut()
+            .unwrap()
+            .insert("adoptionCompleted".to_string(), json!(true));
+        old_rebind
+            .as_object_mut()
+            .unwrap()
+            .insert("chiefTransferPending".to_string(), json!(true));
+        let rebind_stash = base.join("cleared/old-rebind.json");
+        paths::write_json_atomic(&rebind_stash, &old_rebind).unwrap();
+
+        paths::write_json_atomic(
+            &chief_path,
+            &json!({
+                "schema": "ork.chief.v1",
+                "session": "old-rebind",
+                "machine": host,
+                "pid": my_pid,
+                "pidBirth": "birth-1",
+                "revision": 1,
+                "generation": "gen-a",
+            }),
+        )
+        .unwrap();
+        let mut succ_rebind = make_peer("succ-rebind", "codex", "/tmp");
+        save_peer(&base, &succ_rebind);
+
+        // Attempt 1 fails during birth lookup -> persists (old-rebind, 1, gen-a) on stash.
+        let mut wc = paths::write_json_atomic;
+        let first = resolve_claimed_stash_chief_transfer_with_lookup(
+            &base,
+            &rebind_stash,
+            &old_rebind,
+            &succ_rebind,
+            &mut wc,
+            |_| None,
+        );
+        assert_eq!(first, Err(()));
+        let saved_stash = paths::read_json_file(&rebind_stash).unwrap();
+        assert_eq!(saved_stash["expectedChiefSession"], json!("old-rebind"));
+        assert_eq!(saved_stash["expectedChiefRevision"], json!(1));
+        assert_eq!(saved_stash["expectedChiefGeneration"], json!("gen-a"));
+
+        // External rebind bumps same session to revision 2 / gen-b.
+        paths::write_json_atomic(
+            &chief_path,
+            &json!({
+                "schema": "ork.chief.v1",
+                "session": "old-rebind",
+                "machine": host,
+                "pid": my_pid,
+                "pidBirth": my_birth,
+                "revision": 2,
+                "generation": "gen-b",
+            }),
+        )
+        .unwrap();
+        if let Some(ref b) = my_birth {
+            succ_rebind
+                .as_object_mut()
+                .unwrap()
+                .insert("pidBirth".to_string(), json!(b));
+        }
+        // Retry must compare against original (1, gen-a) and refuse transfer of newer (2, gen-b).
+        retry_pending_chief_transfer(&base, &mut succ_rebind);
+        assert!(!rebind_stash.exists());
+        let after_retry = paths::read_json_file(&chief_path).unwrap();
+        assert_eq!(after_retry["session"], json!("old-rebind"));
+        assert_eq!(after_retry["revision"], json!(2));
+        assert_eq!(after_retry["generation"], json!("gen-b"));
+    }
+
+    #[test]
+    fn test_check_http_daemon_keeps_identity_and_defers_restart_when_revision_read_fails() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let td = TestDir::new("ork-http-rev-fail");
+        let cache_dir = td.path.join("orchestrate");
+        let base = cache_dir.join("mailbox-v1");
+        fs::create_dir_all(&base).unwrap();
+        let scripts = setup_minimal_scripts_dir(&td.path);
+        // Add an escaping symlink in scripts so Rust probe returns NeedsFullCheck,
+        // AND have Python stub runtime_revision_for raise OSError after ensure_running succeeds.
+        let outside = td.path.join("outside.py");
+        fs::write(&outside, "x = 1\n").unwrap();
+        symlink(&outside, scripts.join("escape.py")).unwrap();
+
+        let db = identity::daemon_base(&base);
+        write_private_file(&db.join("mode.json"), br#"{"mode":"http"}"#);
+        let token = "abcdefghijklmnopqrstuvwxyz0123456789ABCD";
+        write_private_file(&db.join("token.txt"), token.as_bytes());
+        let store_id = sha256::sha256_hex(base.to_string_lossy().as_bytes());
+
+        // Start mock HTTP health server so real mailbox_daemon.ensure_running authenticates cleanly.
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}/mcp");
+        let body = serde_json::to_string(&json!({
+            "pid": std::process::id(),
+            "instance": "inst-rev-fail",
+            "url": url,
+            "storeId": store_id,
+            "runtimeRevision": "0123456789abcdef",
+            "activeWaits": 0,
+        }))
+        .unwrap();
+        let resp = http_json_response("200 OK", &body, "");
+        let handle = thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(&resp);
+            }
+        });
+        write_private_file(
+            &db.join("state.json"),
+            serde_json::to_string(&json!({
+                "pid": std::process::id(),
+                "instance": "inst-rev-fail",
+                "url": url,
+                "storeId": store_id,
+                "runtimeRevision": "0123456789abcdef",
+            }))
+            .unwrap()
+            .as_bytes(),
+        );
+
+        // Provide a minimal mailbox_daemon.py + peer_mailbox.py in scripts that succeeds on ensure_running
+        // and raises OSError on runtime_revision_for.
+        fs::write(
+            scripts.join("peer_mailbox.py"),
+            "import json, pathlib\nclass MailboxError(Exception): pass\ndef annotate(base, sid, **kw):\n  p = pathlib.Path(base) / 'peers' / f'{sid}.json'\n  d = json.loads(p.read_text())\n  d.update(kw)\n  p.write_text(json.dumps(d))\n",
+        )
+        .unwrap();
+        fs::write(
+            scripts.join("mailbox_daemon.py"),
+            "import json, pathlib, urllib.request\nfrom pathlib import Path\ndef get_mode(base): return 'http'\ndef ensure_running(base, startup_timeout=0.5):\n  st = json.loads((Path(base).parent / 'mailbox-daemon-v1/state.json').read_text())\n  tok = (Path(base).parent / 'mailbox-daemon-v1/token.txt').read_text().strip()\n  req = urllib.request.Request(st['url'].replace('/mcp', '/health'), headers={'Authorization': 'Bearer ' + tok})\n  with urllib.request.urlopen(req, timeout=1) as r: return json.loads(r.read())\ndef runtime_revision_for(base=None): raise OSError('vanished source')\ndef stop_service(*a, **kw): raise AssertionError('restart must be deferred')\n",
+        )
+        .unwrap();
+
+        let mut env = EnvGuard::new();
+        env.set("ORKEST_SCRIPTS_DIR", &scripts);
+        env.set("ORCHESTRATE_HOME", &cache_dir);
+
+        let mut me = make_peer("http-rev-fail", "codex", "/tmp");
+        me.as_object_mut()
+            .unwrap()
+            .insert("httpAvailabilityIssue".to_string(), json!("prior stale"));
+        save_peer(&base, &me);
+
+        let (id_hint, avail_hint) = check_http_daemon(&base, &mut me, "PreInvocation", false);
+        handle.join().unwrap();
+
+        assert!(id_hint.contains("HTTP peer mailbox session: http-rev-fail"));
+        assert!(
+            avail_hint.is_empty(),
+            "must not emit unavailable: {avail_hint:?}"
+        );
+        let saved =
+            paths::read_json_file(&paths::peer_path(&base, "http-rev-fail").unwrap()).unwrap();
+        assert_eq!(saved["httpIdentityAnnounced"], json!(true));
+        assert_eq!(saved["httpAvailabilityIssue"], json!(""));
+    }
+
+    #[test]
+    fn test_clear_requires_positive_matching_pid() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let td = TestDir::new("ork-clear-pos-pid");
+        let base = td.path.join("cache/mailbox-v1");
+        fs::create_dir_all(base.join("cleared")).unwrap();
+
+        let now_iso = paths::format_utc_iso_z(paths::utc_now_secs());
+        for (idx, bad_pid) in [Value::Null, json!(0), json!(-1)].into_iter().enumerate() {
+            let old_sid = format!("old-no-pid-{idx}");
+            let succ_sid = format!("succ-no-pid-{idx}");
+            let mut old = make_peer(&old_sid, "codex", "/tmp");
+            old.as_object_mut()
+                .unwrap()
+                .insert("clearedAt".to_string(), json!(now_iso));
+            old.as_object_mut()
+                .unwrap()
+                .insert("clearedPid".to_string(), bad_pid.clone());
+            old.as_object_mut()
+                .unwrap()
+                .insert("focus".to_string(), json!("Do not steal"));
+            let stash_path = base.join("cleared").join(format!("{old_sid}.json"));
+            paths::write_json_atomic(&stash_path, &old).unwrap();
+
+            let old_inbox = paths::inbox_dir(&base, &old_sid).unwrap();
+            let msg_id = paths::message_id();
+            let msg_path = old_inbox.join(format!("{msg_id}.json"));
+            paths::write_json_atomic(
+                &msg_path,
+                &json!({
+                    "schema": MAIL_SCHEMA,
+                    "id": msg_id,
+                    "sentAt": now_iso,
+                    "from": {"session": "sender-x", "name": "sender"},
+                    "to": {"session": old_sid, "name": old["name"]},
+                    "text": "keep private",
+                    "readAt": Value::Null,
+                }),
+            )
+            .unwrap();
+
+            let mut succ = make_peer(&succ_sid, "codex", "/tmp");
+            succ.as_object_mut()
+                .unwrap()
+                .insert("pid".to_string(), bad_pid);
+            save_peer(&base, &succ);
+
+            let notice = adopt_cleared(&base, &mut succ);
+            assert!(
+                notice.is_empty(),
+                "must not claim stash without positive PID: {notice}"
+            );
+            assert!(stash_path.exists());
+            assert!(msg_path.exists());
+            assert!(succ.get("clearedFrom").is_none());
+            assert!(succ.get("focus").is_none());
+            assert!(
+                paths::read_json_file(&stash_path)
+                    .unwrap()
+                    .get("intendedChiefSuccessor")
+                    .is_none()
+            );
+        }
+
+        // Reverse ordering via end_session(..., "clear", None) must also refuse None/None pairing.
+        let mut waiting = make_peer("waiting-no-pid", "codex", "/tmp");
+        waiting
+            .as_object_mut()
+            .unwrap()
+            .insert("pid".to_string(), Value::Null);
+        waiting
+            .as_object_mut()
+            .unwrap()
+            .insert("awaitingClear".to_string(), json!(now_iso));
+        save_peer(&base, &waiting);
+        let clearing = make_peer("clearing-no-pid", "codex", "/tmp");
+        save_peer(&base, &clearing);
+        end_session(&base, "clearing-no-pid", "clear", None);
+        let waiting_after =
+            paths::read_json_file(&paths::peer_path(&base, "waiting-no-pid").unwrap()).unwrap();
+        assert!(waiting_after.get("clearedFrom").is_none());
+        assert!(base.join("cleared/clearing-no-pid.json").exists());
+    }
+
+    #[test]
+    fn test_end_session_clear_preserves_peer_when_stash_lock_or_write_fails() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let td = TestDir::new("ork-clear-stash-fail");
+        let base = td.path.join("cache/mailbox-v1");
+        fs::create_dir_all(base.join("cleared")).unwrap();
+
+        let my_pid = i64::from(std::process::id());
+        let peer = make_peer("predecessor-fail", "codex", "/tmp");
+        save_peer(&base, &peer);
+        let pp = paths::peer_path(&base, "predecessor-fail").unwrap();
+
+        // 1. Stash write failure (destination path is a directory -> EISDIR on atomic rename) preserves peer.
+        let stash_path = base.join("cleared/predecessor-fail.json");
+        fs::create_dir_all(&stash_path).unwrap();
+        end_session(&base, "predecessor-fail", "clear", Some(my_pid));
+        assert!(
+            pp.exists(),
+            "peer record must be preserved when stash write fails"
+        );
+        fs::remove_dir(&stash_path).unwrap();
+
+        // 2. Stash lock failure (lock path is a directory -> EISDIR on lock_for) preserves peer.
+        let lock_path = stash_path.with_extension("lock");
+        let _ = fs::remove_file(&lock_path);
+        fs::create_dir_all(&lock_path).unwrap();
+        end_session(&base, "predecessor-fail", "clear", Some(my_pid));
+        assert!(
+            pp.exists(),
+            "peer record must be preserved when stash lock fails"
+        );
+        fs::remove_dir(&lock_path).unwrap();
+
+        // 3. Valid existing stash already published -> unregister succeeds and preserves existing stash.
+        let mut existing = peer.clone();
+        existing
+            .as_object_mut()
+            .unwrap()
+            .insert("clearedAt".to_string(), json!("2026-01-01T00:00:00Z"));
+        existing
+            .as_object_mut()
+            .unwrap()
+            .insert("clearedPid".to_string(), json!(my_pid));
+        paths::write_json_atomic(&stash_path, &existing).unwrap();
+        end_session(&base, "predecessor-fail", "clear", Some(my_pid));
+        assert!(
+            !pp.exists(),
+            "peer record must unregister once valid stash is confirmed"
+        );
+        assert_eq!(
+            paths::read_json_file(&stash_path).unwrap()["clearedAt"],
+            json!("2026-01-01T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn test_clear_checked_inbox_scan_keeps_claim_retryable_on_unreadable_inbox_or_entry() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let td = TestDir::new("ork-clear-checked-scan");
+        let base = td.path.join("cache/mailbox-v1");
+        fs::create_dir_all(base.join("cleared")).unwrap();
+
+        // 1. Missing inbox directory -> NotFound -> empty, incomplete = false.
+        let (missing_msgs, missing_incomplete) = messages_checked(&base, "no-such-inbox", false);
+        assert!(missing_msgs.is_empty());
+        assert!(!missing_incomplete);
+
+        // 2. Unreadable inbox path (regular file instead of directory -> ENOTDIR) -> incomplete = true.
+        let broken_inbox = paths::inbox_dir(&base, "broken-dir").unwrap();
+        fs::create_dir_all(broken_inbox.parent().unwrap()).unwrap();
+        fs::write(&broken_inbox, "not a directory").unwrap();
+        let (broken_msgs, broken_incomplete) = messages_checked(&base, "broken-dir", false);
+        assert!(broken_msgs.is_empty());
+        assert!(broken_incomplete);
+
+        // 3. Unreadable entry inside old inbox keeps adoptionCompleted = false until readable, then completes.
+        let my_pid = i64::from(std::process::id());
+        let now_iso = paths::format_utc_iso_z(paths::utc_now_secs());
+        let mut old = make_peer("old-scan", "codex", "/tmp");
+        old.as_object_mut()
+            .unwrap()
+            .insert("clearedAt".to_string(), json!(now_iso));
+        old.as_object_mut()
+            .unwrap()
+            .insert("clearedPid".to_string(), json!(my_pid));
+        let stash_path = base.join("cleared/old-scan.json");
+        paths::write_json_atomic(&stash_path, &old).unwrap();
+
+        let old_inbox = paths::inbox_dir(&base, "old-scan").unwrap();
+        fs::create_dir_all(&old_inbox).unwrap();
+        let good_id = paths::message_id();
+        paths::write_json_atomic(
+            &old_inbox.join(format!("{good_id}.json")),
+            &json!({
+                "schema": MAIL_SCHEMA,
+                "id": good_id,
+                "sentAt": now_iso,
+                "from": {"session": "sender-scan", "name": "sender"},
+                "to": {"session": "old-scan", "name": old["name"]},
+                "text": "readable entry",
+                "readAt": Value::Null,
+            }),
+        )
+        .unwrap();
+        // Directory named <valid_id>.json triggers EISDIR on fs::read_to_string even under any UID.
+        let blocked_id = paths::message_id();
+        let blocked_entry = old_inbox.join(format!("{blocked_id}.json"));
+        fs::create_dir_all(&blocked_entry).unwrap();
+
+        let (partial_msgs, partial_incomplete) = messages_checked(&base, "old-scan", false);
+        assert_eq!(partial_msgs.len(), 1);
+        assert!(partial_incomplete);
+
+        let mut succ = make_peer("succ-scan", "codex", "/tmp");
+        save_peer(&base, &succ);
+        let _notice = adopt_cleared(&base, &mut succ);
+        let retained = paths::read_json_file(&stash_path).unwrap();
+        assert_eq!(retained["adoptionCompleted"], json!(false));
+        assert_eq!(retained["intendedChiefSuccessor"], json!("succ-scan"));
+        assert_eq!(succ["pendingChiefTransfer"], json!(true));
+
+        // Replace directory blocker with readable message file and retry -> completes and deletes stash.
+        fs::remove_dir(&blocked_entry).unwrap();
+        paths::write_json_atomic(
+            &blocked_entry,
+            &json!({
+                "schema": MAIL_SCHEMA,
+                "id": blocked_id,
+                "sentAt": now_iso,
+                "from": {"session": "sender-scan", "name": "sender"},
+                "to": {"session": "old-scan", "name": old["name"]},
+                "text": "now readable",
+                "readAt": Value::Null,
+            }),
+        )
+        .unwrap();
+        retry_pending_chief_transfer(&base, &mut succ);
+        assert!(!stash_path.exists());
+        assert!(succ.get("pendingChiefTransfer").is_none_or(Value::is_null));
+        let succ_inbox = paths::inbox_dir(&base, "succ-scan").unwrap();
+        assert!(succ_inbox.join(format!("{good_id}.json")).exists());
+        assert!(succ_inbox.join(format!("{blocked_id}.json")).exists());
+    }
+
+    #[test]
+    fn test_end_session_clear_preserves_unreadable_predecessor_peer_for_retry() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let td = TestDir::new("ork-clear-unreadable-peer");
+        let base = td.path.join("cache/mailbox-v1");
+        fs::create_dir_all(base.join("cleared")).unwrap();
+
+        let my_pid = i64::from(std::process::id());
+        let mut peer = make_peer("predecessor-unreadable", "codex", "/tmp");
+        peer.as_object_mut()
+            .unwrap()
+            .insert("focus".to_string(), json!("Preserve me across read errors"));
+        save_peer(&base, &peer);
+        let pp = paths::peer_path(&base, "predecessor-unreadable").unwrap();
+        let stash_path = base.join("cleared/predecessor-unreadable.json");
+
+        // 1. Corrupt/partial JSON (read_json_file returns None while peer_path exists):
+        // must preserve the peer file without unregistering or creating a stash.
+        fs::write(&pp, "{truncated-json").unwrap();
+        end_session(&base, "predecessor-unreadable", "clear", Some(my_pid));
+        assert!(
+            pp.exists(),
+            "existing unparseable peer record must be preserved for retry"
+        );
+        assert!(!stash_path.exists());
+
+        // 2. Restore valid peer JSON; if chmod 0o000 blocks reading (non-root), end_session
+        // must still preserve the peer record rather than unlinking it.
+        save_peer(&base, &peer);
+        let orig_perms = fs::metadata(&pp).unwrap().permissions();
+        fs::set_permissions(&pp, fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable_under_uid = fs::read_to_string(&pp).is_err();
+        if unreadable_under_uid {
+            end_session(&base, "predecessor-unreadable", "clear", Some(my_pid));
+            assert!(
+                pp.exists(),
+                "unreadable existing peer record must not be unlinked"
+            );
+            assert!(!stash_path.exists());
+        }
+        fs::set_permissions(&pp, orig_perms).unwrap();
+
+        // 3. Once readable again, retry succeeds: stashes with focus and unregisters peer.
+        end_session(&base, "predecessor-unreadable", "clear", Some(my_pid));
+        assert!(
+            !pp.exists(),
+            "retry after recovery should stash and unregister"
+        );
+        assert!(stash_path.exists());
+        assert_eq!(
+            paths::read_json_file(&stash_path).unwrap()["focus"],
+            json!("Preserve me across read errors")
+        );
+
+        // 4. Genuine NotFound (already absent peer) returns cleanly without creating a stash.
+        end_session(&base, "already-absent-peer", "clear", Some(my_pid));
+        assert!(!base.join("cleared/already-absent-peer.json").exists());
+    }
 }

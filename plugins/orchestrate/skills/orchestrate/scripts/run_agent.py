@@ -245,6 +245,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "profile. Choosing an account chooses its billing: follow the user's rules",
     )
     parser.add_argument(
+        "--account",
+        help="Configured Monitor account ID or alias to execute under",
+    )
+    parser.add_argument(
         "--ignore-quota",
         action="store_true",
         help="Launch even when monitor reports the route's subscription quota as exhausted",
@@ -875,12 +879,58 @@ def executor_environment(
     session_id: str | None = None,
     *,
     read_only: bool = False,
+    claude_account_home: Path | str | None = None,
+    codex_home: Path | str | None = None,
+    agy_home: Path | str | None = None,
+    agy_app_data_dir: Path | str | None = None,
+    pinned_account: bool = False,
 ) -> dict[str, str]:
+    inherited_agy_app_data_dir = (os.environ.get("ANTIGRAVITY_APP_DATA_DIR") or "").strip()
+    inherited_gemini_cli_home = (os.environ.get("GEMINI_CLI_HOME") or "").strip()
     environment = {key: value for key, value in os.environ.items() if not HOST_SESSION_ENV.match(key)}
     # An automatic handoff names the session it launches; that session's own workers must not inherit it.
     environment.pop("ORKEST_HANDOFF_SUCCESSOR", None)
     if launched := environment.pop("ORKEST_HANDOFF_LAUNCH", None):
         environment["ORKEST_HANDOFF_SUCCESSOR"] = launched
+    pinned_claude_account = environment.pop("ORKEST_PINNED_CLAUDE_ACCOUNT", None) == "1"
+    pinned_codex_account = environment.pop("ORKEST_PINNED_CODEX_ACCOUNT", None) == "1"
+    pinned_agy_account = environment.pop("ORKEST_PINNED_AGY_ACCOUNT", None) == "1"
+    env_claude_account_home = (environment.pop("ORKEST_CLAUDE_ACCOUNT_HOME", None) or "").strip()
+    env_codex_account_home = (environment.pop("ORKEST_CODEX_ACCOUNT_HOME", None) or "").strip()
+    env_agy_account_home = (environment.pop("ORKEST_AGY_ACCOUNT_HOME", None) or "").strip()
+
+    def _resolve_against_caller_home(raw: Path | str) -> Path:
+        path = Path(raw).expanduser()
+        return path if path.is_absolute() else (Path.home() / path).resolve()
+
+    allow_env_home_fallback = not pinned_account
+    effective_claude_home = (
+        str(_resolve_against_caller_home(claude_account_home))
+        if claude_account_home is not None
+        else (
+            ""
+            if (not allow_env_home_fallback or claude_config_dir is not None)
+            else (str(_resolve_against_caller_home(env_claude_account_home)) if env_claude_account_home else "")
+        )
+    )
+    effective_codex_home = (
+        str(_resolve_against_caller_home(codex_home))
+        if codex_home is not None
+        else (
+            ""
+            if not allow_env_home_fallback
+            else (str(_resolve_against_caller_home(env_codex_account_home)) if env_codex_account_home else "")
+        )
+    )
+    effective_agy_home = (
+        str(_resolve_against_caller_home(agy_home))
+        if agy_home is not None
+        else (
+            ""
+            if (not allow_env_home_fallback or agy_app_data_dir is not None)
+            else (str(_resolve_against_caller_home(env_agy_account_home)) if env_agy_account_home else "")
+        )
+    )
     if read_only:
         environment["ORKEST_READONLY_RUN"] = "1"
     else:
@@ -888,13 +938,60 @@ def executor_environment(
     if repo is not None:
         bundled_module("repo_env").apply_repo_dotenv(environment, repo)
     if engine == "claude":
-        if claude_config_dir is not None:
+        if claude_config_dir is not None or pinned_claude_account or pinned_account or effective_claude_home:
             for key in CLAUDE_AUTH_ENV_OVERRIDES:
                 environment.pop(key, None)
+        if claude_config_dir is not None:
             # Chooses the Claude account. Unset means Claude Code's default profile (~/.claude).
-            environment["CLAUDE_CONFIG_DIR"] = str(Path(claude_config_dir).expanduser())
+            environment["CLAUDE_CONFIG_DIR"] = str(_resolve_against_caller_home(claude_config_dir))
+        elif pinned_claude_account or pinned_account or effective_claude_home:
+            environment.pop("CLAUDE_CONFIG_DIR", None)
+        if effective_claude_home:
+            environment["HOME"] = effective_claude_home
         if session_id:
             environment["CLAUDE_CODE_SESSION_ID"] = session_id
+    if engine == "codex":
+        if effective_codex_home:
+            environment["CODEX_HOME"] = effective_codex_home
+        elif pinned_codex_account or pinned_account:
+            environment.pop("CODEX_HOME", None)
+    if engine == "agy":
+        if effective_agy_home or agy_app_data_dir is not None:
+            environment.pop("GEMINI_CLI_HOME", None)
+            environment.pop("ANTIGRAVITY_APP_DATA_DIR", None)
+            if effective_agy_home:
+                agy_path = _resolve_against_caller_home(effective_agy_home)
+                if agy_app_data_dir is not None:
+                    gemini_home = agy_path
+                    app_data = _resolve_against_caller_home(agy_app_data_dir)
+                elif agy_path.name.startswith("antigravity"):
+                    gemini_home = agy_path.parent
+                    app_data = agy_path
+                else:
+                    gemini_home = agy_path
+                    app_data = agy_path / "antigravity-cli"
+                environment["GEMINI_CLI_HOME"] = str(gemini_home)
+                environment["ANTIGRAVITY_APP_DATA_DIR"] = str(app_data)
+            else:
+                app_data = _resolve_against_caller_home(agy_app_data_dir)
+                environment["ANTIGRAVITY_APP_DATA_DIR"] = str(app_data)
+                if app_data.name.startswith("antigravity"):
+                    environment["GEMINI_CLI_HOME"] = str(app_data.parent)
+        elif pinned_agy_account or pinned_account:
+            environment.pop("GEMINI_CLI_HOME", None)
+            environment.pop("ANTIGRAVITY_APP_DATA_DIR", None)
+        elif inherited_agy_app_data_dir or inherited_gemini_cli_home:
+            if inherited_agy_app_data_dir:
+                app_data = _resolve_against_caller_home(inherited_agy_app_data_dir)
+                environment["ANTIGRAVITY_APP_DATA_DIR"] = str(app_data)
+                if inherited_gemini_cli_home:
+                    environment["GEMINI_CLI_HOME"] = str(_resolve_against_caller_home(inherited_gemini_cli_home))
+                elif app_data.name.startswith("antigravity"):
+                    environment["GEMINI_CLI_HOME"] = str(app_data.parent)
+            else:
+                gemini_home = _resolve_against_caller_home(inherited_gemini_cli_home)
+                environment["GEMINI_CLI_HOME"] = str(gemini_home)
+                environment["ANTIGRAVITY_APP_DATA_DIR"] = str(gemini_home / "antigravity-cli")
     if repo is not None:
         environment["PWD"] = str(repo)
     if engine == "agy":
@@ -1392,8 +1489,54 @@ def archive_executor_attempt_artifacts(
     return archived
 
 
-detached_runner_command = _JOB_STEERING_MOD.detached_runner_command
-launch_detached = _JOB_STEERING_MOD.launch_detached
+def detached_runner_command(args: argparse.Namespace, **kwargs: Any) -> list[str]:
+    command = _JOB_STEERING_MOD.detached_runner_command(args, **kwargs)
+    account = getattr(args, "account", None) or getattr(args, "account_id", None)
+    if account and "--account" not in command:
+        command.extend(["--account", str(account)])
+    return command
+
+
+def launch_detached(args: argparse.Namespace) -> int:
+    overrides: dict[str, str] = {}
+    unset_keys: list[str] = []
+    if getattr(args, "explicit_account", False):
+        if args.engine == "claude":
+            overrides["ORKEST_PINNED_CLAUDE_ACCOUNT"] = "1"
+        elif args.engine == "codex":
+            overrides["ORKEST_PINNED_CODEX_ACCOUNT"] = "1"
+        elif args.engine == "agy":
+            overrides["ORKEST_PINNED_AGY_ACCOUNT"] = "1"
+        if not getattr(args, "claude_account_home", None):
+            unset_keys.append("ORKEST_CLAUDE_ACCOUNT_HOME")
+        if not getattr(args, "codex_home", None):
+            unset_keys.append("ORKEST_CODEX_ACCOUNT_HOME")
+        if not getattr(args, "agy_app_data_dir", None) and not getattr(args, "agy_home", None):
+            unset_keys.append("ORKEST_AGY_ACCOUNT_HOME")
+    if getattr(args, "claude_account_home", None):
+        overrides["ORKEST_CLAUDE_ACCOUNT_HOME"] = str(args.claude_account_home)
+    if getattr(args, "codex_home", None):
+        overrides["ORKEST_CODEX_ACCOUNT_HOME"] = str(args.codex_home)
+    if getattr(args, "agy_app_data_dir", None):
+        overrides["ORKEST_AGY_ACCOUNT_HOME"] = str(args.agy_app_data_dir)
+    elif getattr(args, "agy_home", None):
+        overrides["ORKEST_AGY_ACCOUNT_HOME"] = str(args.agy_home)
+    if not overrides and not unset_keys:
+        return _JOB_STEERING_MOD.launch_detached(args)
+    previous = {key: os.environ.get(key) for key in (set(overrides) | set(unset_keys))}
+    for key in unset_keys:
+        os.environ.pop(key, None)
+    os.environ.update(overrides)
+    try:
+        return _JOB_STEERING_MOD.launch_detached(args)
+    finally:
+        for key, old in previous.items():
+            if old is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old
+
+
 executor_session_so_far = _JOB_STEERING_MOD.executor_session_so_far
 steering_brief = _JOB_STEERING_MOD.steering_brief
 JobSteering = _JOB_STEERING_MOD.JobSteering
@@ -1725,6 +1868,13 @@ def detect_host() -> str | None:
 def decide_transport(args: argparse.Namespace, host: str | None) -> str:
     if args.transport == "executor":
         return "executor"
+    account_boundary = bool(
+        getattr(args, "account", None)
+        or (args.engine == "claude" and (args.claude_config_dir or getattr(args, "claude_account_home", None)))
+        or (args.engine == "codex" and getattr(args, "codex_home", None))
+        or (args.engine == "agy" and (getattr(args, "agy_home", None) or getattr(args, "agy_app_data_dir", None)))
+        or _MODEL_ROUTING_MOD._child_marker_switches_host_profile(args.engine)
+    )
     executor_boundary = any(
         (
             args.detach,
@@ -1734,14 +1884,14 @@ def decide_transport(args: argparse.Namespace, host: str | None) -> str:
             args.completion_event,
             args.mailbox_run_id,
             args.dry_run,
-            args.engine == "claude" and args.claude_config_dir,
+            account_boundary,
         )
     )
     if args.transport == "native":
         if host != args.engine or executor_boundary or args.claude_config_dir:
             raise RunnerError(
                 "--transport native requires the calling harness to match --engine and a fresh task without "
-                "CLI session, profile, detached, completion, mailbox, or dry-run options; use --transport executor",
+                "CLI session, profile, account, detached, completion, mailbox, or dry-run options; use --transport executor",
                 4,
             )
         return "native"
@@ -1752,15 +1902,232 @@ def enforce_repo_policy(
     cwd: Path | str,
     engine: str,
     claude_config_dir: Path | str | None = None,
+    *,
+    account_id: str | None = None,
+    provider: str | None = None,
+    billing_mode: str | None = None,
+    tags: list[str] | tuple[str, ...] | None = None,
+    account_alias: str | None = None,
+    codex_home: Path | str | None = None,
+    agy_home: Path | str | None = None,
+    agy_app_data_dir: Path | str | None = None,
 ) -> Path | None:
-    allowed, reason, auto_claude_dir = bundled_module("repo_policy").check_execution_allowed(
-        cwd,
-        engine,
-        claude_config_dir,
-    )
+    import inspect
+
+    repo_policy = bundled_module("repo_policy")
+    params = inspect.signature(repo_policy.check_execution_allowed).parameters
+    accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    optional = {
+        "account_id": account_id,
+        "provider": provider,
+        "billing_mode": billing_mode,
+        "tags": list(tags) if tags is not None else None,
+        "account_alias": account_alias,
+        "codex_home": codex_home,
+        "agy_home": agy_home,
+        "agy_app_data_dir": agy_app_data_dir,
+        "strict": True,
+    }
+    kwargs = optional if accepts_kwargs else {k: v for k, v in optional.items() if k in params}
+    try:
+        allowed, reason, auto_claude_dir = repo_policy.check_execution_allowed(
+            cwd,
+            engine,
+            claude_config_dir,
+            **kwargs,
+        )
+    except repo_policy.PolicyConfigError as exc:
+        raise RunnerError(str(exc), 2) from exc
     if not allowed:
         raise RunnerError(reason or f"Harness {engine!r} is denied by repository policy", 2)
     return auto_claude_dir
+
+
+def _effective_claude_profile_dir(value: str | Path | None) -> Path:
+    if not value:
+        return (Path.home() / ".claude").resolve()
+    return Path(value).expanduser().resolve()
+
+
+def _claude_profile_dirs_match(first: str | Path | None, second: str | Path | None) -> bool:
+    return _effective_claude_profile_dir(first) == _effective_claude_profile_dir(second)
+
+
+def _apply_resolved_account(args: argparse.Namespace, acct: dict[str, Any]) -> None:
+    args.explicit_account = True
+    args.account_id = acct.get("account_id")
+    args.account_alias = acct.get("account_alias")
+    args.account_provider = acct.get("provider")
+    args.account_tags = list(acct.get("tags") or [])
+    args.account_billing = acct.get("billing_mode")
+    for field in ("claude_config_dir", "claude_account_home", "codex_home", "agy_home", "agy_app_data_dir"):
+        setattr(args, field, None)
+        setattr(args, f"effective_{field}", None)
+    if args.engine == "claude":
+        if acct.get("claude_config_dir") is not None:
+            args.claude_config_dir = acct["claude_config_dir"]
+            args.effective_claude_config_dir = acct["claude_config_dir"]
+        if acct.get("claude_account_home") is not None:
+            args.claude_account_home = acct["claude_account_home"]
+            args.effective_claude_account_home = acct["claude_account_home"]
+    elif args.engine == "codex" and acct.get("codex_home") is not None:
+        args.codex_home = acct["codex_home"]
+        args.effective_codex_home = acct["codex_home"]
+    elif args.engine == "agy":
+        if acct.get("agy_home") is not None:
+            args.agy_home = acct["agy_home"]
+            args.effective_agy_home = acct["agy_home"]
+        if acct.get("agy_app_data_dir") is not None:
+            args.agy_app_data_dir = acct["agy_app_data_dir"]
+            args.effective_agy_app_data_dir = acct["agy_app_data_dir"]
+        elif acct.get("agy_typed_gemini_home") and acct.get("agy_home") is not None:
+            args.effective_agy_app_data_dir = acct["agy_home"] / "antigravity-cli"
+
+
+def _account_switches_host_profile(
+    engine: str,
+    acct: dict[str, Any],
+    *,
+    host_claude_dir: str | None = None,
+) -> bool:
+    if engine == "claude":
+        target = acct.get("claude_config_dir")
+        if target is None and acct.get("claude_account_home") is not None:
+            target = Path(acct["claude_account_home"]) / ".claude"
+        return not _claude_profile_dirs_match(target, host_claude_dir)
+    if engine == "codex":
+        host_codex = os.environ.get("CODEX_HOME") or str(Path.home() / ".codex")
+        target = acct.get("codex_home") or (Path.home() / ".codex")
+        return Path(target).expanduser().resolve() != Path(host_codex).expanduser().resolve()
+    if engine == "agy":
+        acct_app = acct.get("agy_app_data_dir") or (
+            (acct["agy_home"] / "antigravity-cli")
+            if acct.get("agy_typed_gemini_home") and acct.get("agy_home") is not None
+            else None
+        )
+        return not _MODEL_ROUTING_MOD._agy_paths_match(acct.get("agy_home"), acct_app)
+    return False
+
+
+def _enforce_policy_with_auto_account(
+    cwd: Path | str,
+    args: argparse.Namespace,
+    *,
+    policy_claude_dir: Path | str | None = None,
+    policy_codex_home: Path | str | None = None,
+    policy_agy_home: Path | str | None = None,
+    is_native: bool = False,
+    forbid_switch: bool = False,
+    host_claude_dir: str | None = None,
+) -> tuple[Path | None, bool]:
+    explicit_pin = _MODEL_ROUTING_MOD._has_explicit_account_pin(
+        args.engine,
+        explicit_account=getattr(args, "explicit_account", False),
+        account=getattr(args, "account", None),
+        claude_config_dir=getattr(args, "claude_config_dir", None),
+        claude_account_home=getattr(args, "claude_account_home", None),
+        codex_home=getattr(args, "codex_home", None),
+        agy_home=getattr(args, "agy_home", None),
+        agy_app_data_dir=getattr(args, "agy_app_data_dir", None),
+        resume_result=getattr(args, "resume_result", None),
+        include_child_markers=not is_native,
+    )
+    matched_account: dict[str, Any] | None = None
+    native_agy_gemini = ((os.environ.get("GEMINI_CLI_HOME") or "").strip() or None) if is_native else None
+    native_agy_app = ((os.environ.get("ANTIGRAVITY_APP_DATA_DIR") or "").strip() or None) if is_native else None
+    try:
+        if is_native and not explicit_pin:
+            matched_account = _MODEL_ROUTING_MOD.resolve_account_by_home(
+                args.engine,
+                claude_config_dir=policy_claude_dir,
+                codex_home=policy_codex_home,
+                agy_home=native_agy_gemini if args.engine == "agy" else policy_agy_home,
+                agy_app_data_dir=native_agy_app if args.engine == "agy" else None,
+                include_child_markers=False,
+                strict=True,
+            )
+            account_id = (matched_account or {}).get("account_id")
+            account_alias = (matched_account or {}).get("account_alias")
+            provider = (matched_account or {}).get("provider")
+            billing_mode = (matched_account or {}).get("billing_mode")
+            tags = (matched_account or {}).get("tags")
+        else:
+            if not getattr(args, "account_id", None):
+                matched_account = _MODEL_ROUTING_MOD.resolve_account_by_home(
+                    args.engine,
+                    claude_config_dir=policy_claude_dir,
+                    claude_account_home=getattr(args, "claude_account_home", None),
+                    codex_home=policy_codex_home,
+                    agy_home=native_agy_gemini if (is_native and args.engine == "agy") else policy_agy_home,
+                    agy_app_data_dir=(
+                        native_agy_app
+                        if (is_native and args.engine == "agy")
+                        else (
+                            getattr(args, "agy_app_data_dir", None) or getattr(args, "effective_agy_app_data_dir", None)
+                        )
+                    ),
+                    include_child_markers=not is_native,
+                    strict=True,
+                )
+            account_id = getattr(args, "account_id", None) or (matched_account or {}).get("account_id")
+            account_alias = getattr(args, "account_alias", None) or (matched_account or {}).get("account_alias")
+            provider = getattr(args, "account_provider", None) or (matched_account or {}).get("provider")
+            billing_mode = getattr(args, "account_billing", None) or (matched_account or {}).get("billing_mode")
+            tags = getattr(args, "account_tags", None) or (matched_account or {}).get("tags")
+    except ValueError as exc:
+        raise RunnerError(str(exc), 2) from exc
+    try:
+        auto_claude_dir = enforce_repo_policy(
+            cwd,
+            args.engine,
+            policy_claude_dir,
+            account_id=account_id,
+            provider=provider,
+            billing_mode=billing_mode,
+            tags=tags,
+            account_alias=account_alias,
+            codex_home=policy_codex_home,
+            agy_home=(native_agy_gemini if (is_native and args.engine == "agy") else policy_agy_home),
+            agy_app_data_dir=(
+                native_agy_app
+                if (is_native and args.engine == "agy")
+                else (
+                    (getattr(args, "agy_app_data_dir", None) or getattr(args, "effective_agy_app_data_dir", None))
+                    if args.engine == "agy"
+                    else None
+                )
+            ),
+        )
+        return auto_claude_dir, False
+    except RunnerError as exc:
+        if (
+            exc.exit_code != 2
+            or explicit_pin
+            or os.environ.get("ORCHESTRATE_AUTO_ACCOUNT") != "1"
+            or isinstance(exc.__cause__, bundled_module("repo_policy").PolicyConfigError)
+        ):
+            raise
+        try:
+            auto_acct = _MODEL_ROUTING_MOD.select_auto_account(
+                cwd,
+                args.engine,
+                model=getattr(args, "model", None),
+                strict=True,
+            )
+        except ValueError as cfg_exc:
+            raise RunnerError(str(cfg_exc), 2) from cfg_exc
+        if auto_acct is None:
+            raise
+        switched_native = is_native and _account_switches_host_profile(
+            args.engine, auto_acct, host_claude_dir=host_claude_dir
+        )
+        if is_native and (forbid_switch or getattr(args, "transport", None) == "native") and switched_native:
+            raise RunnerError(
+                "--transport native cannot switch to a different account/profile; use --transport executor",
+                4,
+            ) from exc
+        _apply_resolved_account(args, auto_acct)
+        return auto_acct.get("claude_config_dir"), switched_native
 
 
 def native_handoff(args: argparse.Namespace, host: str) -> int:
@@ -1772,9 +2139,60 @@ def native_handoff(args: argparse.Namespace, host: str) -> int:
     repo = git_root(cwd)
     if cwd != repo:
         raise RunnerError(f"--cwd must be the Git repository root: {repo}", 4)
-    auto_claude_dir = enforce_repo_policy(repo, args.engine, getattr(args, "claude_config_dir", None))
-    if auto_claude_dir is not None and getattr(args, "claude_config_dir", None) is None:
-        args.claude_config_dir = auto_claude_dir
+    host_claude_dir = os.environ.get("CLAUDE_CONFIG_DIR") or None
+    explicit_claude_dir = getattr(args, "claude_config_dir", None)
+    if (
+        args.engine == "claude"
+        and explicit_claude_dir is not None
+        and not _claude_profile_dirs_match(explicit_claude_dir, host_claude_dir)
+    ):
+        raise RunnerError(
+            "--transport native cannot switch to a different Claude profile; use --transport executor",
+            4,
+        )
+    if _MODEL_ROUTING_MOD._child_marker_switches_host_profile(args.engine):
+        raise RunnerError(
+            "--transport native cannot switch to a different account/profile; use --transport executor",
+            4,
+        )
+    policy_claude_dir = (
+        (explicit_claude_dir or host_claude_dir or str(Path.home() / ".claude")) if args.engine == "claude" else None
+    )
+    policy_codex_home = (
+        (getattr(args, "codex_home", None) or os.environ.get("CODEX_HOME") or str(Path.home() / ".codex"))
+        if args.engine == "codex"
+        else None
+    )
+    policy_agy_home = (
+        (
+            getattr(args, "agy_app_data_dir", None)
+            or getattr(args, "agy_home", None)
+            or (os.environ.get("ANTIGRAVITY_APP_DATA_DIR") or "").strip()
+            or (os.environ.get("GEMINI_CLI_HOME") or "").strip()
+            or str(Path.home() / ".gemini")
+        )
+        if args.engine == "agy"
+        else None
+    )
+    auto_claude_dir, switched_native = _enforce_policy_with_auto_account(
+        repo,
+        args,
+        policy_claude_dir=policy_claude_dir,
+        policy_codex_home=policy_codex_home,
+        policy_agy_home=policy_agy_home,
+        is_native=True,
+        forbid_switch=True,
+        host_claude_dir=host_claude_dir,
+    )
+    if switched_native or (
+        args.engine == "claude"
+        and auto_claude_dir is not None
+        and not _claude_profile_dirs_match(auto_claude_dir, host_claude_dir)
+    ):
+        raise RunnerError(
+            "--transport native cannot switch to a different account/profile; use --transport executor",
+            4,
+        )
     brief, task_spec = resolve_execution_brief(args, repo=repo)
     _, add_dirs, allowed, tracked, enforced, _, _ = validated_run_options(args, task_spec=task_spec)
     brief, task_spec, allowed, enforced, scope_info = apply_upward_delegation_policy(
@@ -1905,7 +2323,7 @@ def doctor_main(argv: list[str] | None = None) -> int:
     for location in (
         "~/.agents/skills",
         "~/.claude/skills",
-        "~/.claude-personal/skills",
+        *(f"~/{entry.name}/skills" for entry in sorted(Path.home().glob(".claude-*")) if entry.is_dir()),
         "~/.codex/skills",
         "~/.config/opencode/skills",
         "~/.gemini/config/skills",
@@ -1969,6 +2387,11 @@ def quota_gate(
     ignore: bool,
     claude_config_dir: Path | str | None = None,
     allow_credits: bool = False,
+    account_id: str | None = None,
+    account_alias: str | None = None,
+    codex_home: Path | str | None = None,
+    agy_home: Path | str | None = None,
+    tags: list[str] | tuple[str, ...] | None = None,
 ) -> None:
     """Refuse to launch into an exhausted subscription pool and warn when little is usable now.
 
@@ -1977,11 +2400,24 @@ def quota_gate(
     used up but that has a credit balance (Codex) would bill that balance: refused unless the user
     allows credits, and then the run goes ahead and says so.
     """
+    import inspect
+
     if ignore and allow_credits:
         return
     quota = bundled_module("quota")
     view = quota.snapshot()
-    result = quota.check(engine, model, view, claude_config_dir=claude_config_dir)
+    check_params = inspect.signature(quota.check).parameters
+    accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in check_params.values())
+    optional = {
+        "claude_config_dir": claude_config_dir,
+        "account_id": account_id,
+        "account_alias": account_alias,
+        "codex_home": codex_home,
+        "agy_home": agy_home,
+        "tags": tags,
+    }
+    check_kwargs = optional if accepts_kwargs else {k: v for k, v in optional.items() if k in check_params}
+    result = quota.check(engine, model, view, **check_kwargs)
     # --ignore-quota launches into an exhausted pool; it never implies permission to bill credits.
     if result["status"] == "credits" and not allow_credits:
         raise RunnerError(quota.credits_message(engine, model, result), EXIT_POOL_ON_CREDITS)
@@ -2034,7 +2470,8 @@ def quota_main(argv: list[str] | None = None) -> int:
         if row["engine"] == "opencode" or row["status"] in ("not_applicable", "unknown"):
             print(f"{head} {row['status']}: {row.get('detail', '')}")
             continue
-        billing = " [personal]" if row.get("billing") == "personal" else ""
+        row_tags = list(dict.fromkeys([*(row.get("tags") or []), *([row["billing"]] if row.get("billing") else [])]))
+        billing = f" [{', '.join(row_tags)}]" if row_tags else ""
         if row["status"] == "credits":
             print(f"{head} {row['status']:<9} {quota.credits_text(row)}  {row['label']}{billing}: {row['advice']}")
             continue
@@ -2104,8 +2541,52 @@ def main() -> int:
         return doctor_main(argv[1:])
     args = resolve_route(parse_args(argv))
     host = args.host or detect_host()
-    if decide_transport(args, host) == "native":
-        return native_handoff(args, host)
+    transport = decide_transport(args, host)
+    if transport == "native":
+        if args.transport == "auto" and not (args.job_dir or args.notify or args.completion_hook or args.steer_dir):
+            cwd_resolved = args.cwd.expanduser().resolve()
+            if cwd_resolved.is_dir():
+                repo_for_policy = git_root(cwd_resolved)
+                if cwd_resolved == repo_for_policy:
+                    host_claude_dir = os.environ.get("CLAUDE_CONFIG_DIR") or None
+                    policy_claude_dir = (
+                        (host_claude_dir or str(Path.home() / ".claude")) if args.engine == "claude" else None
+                    )
+                    policy_codex_home = (
+                        (os.environ.get("CODEX_HOME") or str(Path.home() / ".codex"))
+                        if args.engine == "codex"
+                        else None
+                    )
+                    policy_agy_home = (
+                        (
+                            (os.environ.get("ANTIGRAVITY_APP_DATA_DIR") or "").strip()
+                            or (os.environ.get("GEMINI_CLI_HOME") or "").strip()
+                            or str(Path.home() / ".gemini")
+                        )
+                        if args.engine == "agy"
+                        else None
+                    )
+                    auto_claude_dir, switched_native = _enforce_policy_with_auto_account(
+                        repo_for_policy,
+                        args,
+                        policy_claude_dir=policy_claude_dir,
+                        policy_codex_home=policy_codex_home,
+                        policy_agy_home=policy_agy_home,
+                        is_native=True,
+                        host_claude_dir=host_claude_dir,
+                    )
+                    if switched_native:
+                        transport = "executor"
+                    elif (
+                        args.engine == "claude"
+                        and auto_claude_dir is not None
+                        and not _claude_profile_dirs_match(auto_claude_dir, host_claude_dir)
+                    ):
+                        args.claude_config_dir = auto_claude_dir
+                        args.effective_claude_config_dir = auto_claude_dir
+                        transport = "executor"
+        if transport == "native":
+            return native_handoff(args, host)
     auto_prune()
     if args.detach:
         return execute(args)
@@ -2181,9 +2662,38 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
         raise RunnerError("--notify and --completion-hook are only valid with --detach", 4)
     cwd_initial = args.cwd.expanduser().resolve()
     if cwd_initial.is_dir():
-        auto_claude_dir = enforce_repo_policy(cwd_initial, args.engine, getattr(args, "claude_config_dir", None))
-        if auto_claude_dir is not None and getattr(args, "claude_config_dir", None) is None:
+        auto_claude_dir, _ = _enforce_policy_with_auto_account(
+            cwd_initial,
+            args,
+            policy_claude_dir=(
+                (getattr(args, "claude_config_dir", None) or getattr(args, "effective_claude_config_dir", None))
+                if args.engine == "claude"
+                else None
+            ),
+            policy_codex_home=(
+                (getattr(args, "codex_home", None) or getattr(args, "effective_codex_home", None))
+                if args.engine == "codex"
+                else None
+            ),
+            policy_agy_home=(
+                (
+                    getattr(args, "agy_app_data_dir", None)
+                    or getattr(args, "effective_agy_app_data_dir", None)
+                    or getattr(args, "agy_home", None)
+                    or getattr(args, "effective_agy_home", None)
+                )
+                if args.engine == "agy"
+                else None
+            ),
+            is_native=False,
+        )
+        if (
+            auto_claude_dir is not None
+            and getattr(args, "claude_config_dir", None) is None
+            and not _claude_profile_dirs_match(auto_claude_dir, None)
+        ):
             args.claude_config_dir = auto_claude_dir
+            args.effective_claude_config_dir = auto_claude_dir
     if args.detach:
         return launch_detached(args)
     completion_event_path = normalize_completion_event_path(args.completion_event) if args.completion_event else None
@@ -2303,8 +2813,13 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
             args.engine,
             model,
             ignore=args.ignore_quota or args.dry_run,
-            claude_config_dir=args.claude_config_dir,
+            claude_config_dir=(args.claude_config_dir or getattr(args, "effective_claude_config_dir", None)),
             allow_credits=args.allow_credits or args.dry_run,
+            account_id=getattr(args, "account_id", None),
+            account_alias=getattr(args, "account_alias", None),
+            codex_home=(getattr(args, "codex_home", None) or getattr(args, "effective_codex_home", None)),
+            agy_home=(getattr(args, "agy_home", None) or getattr(args, "effective_agy_home", None)),
+            tags=getattr(args, "account_tags", None),
         )
         support = bundled_module("execution_support")
         try:
@@ -2577,9 +3092,16 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
     environment = executor_environment(
         args.engine,
         repo,
-        args.claude_config_dir,
+        args.claude_config_dir or getattr(args, "effective_claude_config_dir", None),
         session_id=segment_session,
         read_only=not enforced_paths,
+        claude_account_home=(
+            getattr(args, "claude_account_home", None) or getattr(args, "effective_claude_account_home", None)
+        ),
+        codex_home=getattr(args, "codex_home", None) or getattr(args, "effective_codex_home", None),
+        agy_home=getattr(args, "agy_home", None) or getattr(args, "effective_agy_home", None),
+        agy_app_data_dir=(getattr(args, "agy_app_data_dir", None) or getattr(args, "effective_agy_app_data_dir", None)),
+        pinned_account=bool(getattr(args, "explicit_account", False)),
     )
     # A delegated worker owns its own mailbox identity, even when its conductor is a listener.
     environment.pop("AGENT_MAILBOX_LISTENER_SESSION", None)

@@ -55,7 +55,7 @@ export function demoAccounts() {
       "claude-personal",
       "Claude · personal",
       "CP",
-      "plaude",
+      "CLAUDE_CONFIG_DIR=~/.claude-personal claude",
       "personal",
       [100, 5 * HOUR],
       [89, 3.2 * DAY],

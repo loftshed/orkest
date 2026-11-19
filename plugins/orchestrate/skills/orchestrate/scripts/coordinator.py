@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as dt
+import fcntl
 import functools
 import hashlib
 import importlib.util
@@ -22,6 +23,7 @@ import sys
 import threading
 import time
 import uuid
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +39,7 @@ def module(name: str) -> Any:
 
 
 RUNNER = module("run_agent")
+WORKSPACE_AUDIT = module("workspace_audit")
 SUPPORT = module("execution_support")
 EVIDENCE = module("evidence")
 POLICY = module("conductor_policy")
@@ -188,9 +191,53 @@ def check_evidence(path: Path, *, now: dt.datetime | None = None) -> dict[str, A
     }
 
 
+_TASK_LOCK_GUARD = threading.Lock()
+_TASK_LOCK_HELD: dict[Path, tuple[int, int]] = {}
+
+
+@contextlib.contextmanager
+def task_json_lock(directory: Path) -> Iterator[None]:
+    """Advisory per-task flock on `<directory>/task.json.lock`, shared with room-integrate.mjs."""
+    directory_path = Path(directory)
+    directory_path.mkdir(parents=True, exist_ok=True)
+    lock_path = (directory_path / "task.json.lock").resolve()
+    with _TASK_LOCK_GUARD:
+        entry = _TASK_LOCK_HELD.get(lock_path)
+        if entry is not None:
+            fd, depth = entry
+            _TASK_LOCK_HELD[lock_path] = (fd, depth + 1)
+            reentered = True
+        else:
+            reentered = False
+    if not reentered:
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+            raise
+        with _TASK_LOCK_GUARD:
+            _TASK_LOCK_HELD[lock_path] = (fd, 1)
+    try:
+        yield
+    finally:
+        to_close: int | None = None
+        with _TASK_LOCK_GUARD:
+            fd, depth = _TASK_LOCK_HELD[lock_path]
+            if depth <= 1:
+                del _TASK_LOCK_HELD[lock_path]
+                to_close = fd
+            else:
+                _TASK_LOCK_HELD[lock_path] = (fd, depth - 1)
+        if to_close is not None:
+            with contextlib.suppress(OSError):
+                os.close(to_close)
+
+
 def save(directory: Path, state: dict[str, Any]) -> None:
     state["updated_at"] = RUNNER.utc_now()
-    with committing():
+    with task_json_lock(directory), committing():
         RUNNER.write_json_atomic(directory / "task.json", state)
     index_work(directory, state)
     request_continuations(directory, state)
@@ -209,7 +256,7 @@ def request_continuations(directory: Path, state: dict[str, Any]) -> None:
             run["continuation_key"] = created["key"] if created else None
     except Exception:  # noqa: BLE001 -- a continuation hint never fails the saved task transition
         return
-    with committing():
+    with task_json_lock(directory), committing():
         RUNNER.write_json_atomic(directory / "task.json", state)
 
 
@@ -222,7 +269,8 @@ def index_work(directory: Path, state: dict[str, Any]) -> None:
 
 
 def load(directory: Path) -> dict[str, Any]:
-    state = read(directory / "task.json")
+    with task_json_lock(directory):
+        state = read(directory / "task.json")
     if state.get("schema") != SCHEMA:
         raise CoordinationError("unsupported task schema")
     # Old arbitrary task directories become discoverable when next opened, without copying state.
@@ -248,7 +296,19 @@ def observe_settings(run: dict[str, Any], packet: dict[str, Any]) -> None:
         raise CoordinationError(str(error)) from error
 
 
-def import_result(run: dict[str, Any], state: dict[str, Any], *, skip_event_publish: bool = False) -> bool:
+def import_result(
+    run: dict[str, Any],
+    state: dict[str, Any],
+    *,
+    skip_event_publish: bool = False,
+    directory: Path | None = None,
+) -> bool:
+    ctx = task_json_lock(directory) if directory is not None else contextlib.nullcontext()
+    with ctx:
+        return _import_result_unlocked(run, state, skip_event_publish=skip_event_publish)
+
+
+def _import_result_unlocked(run: dict[str, Any], state: dict[str, Any], *, skip_event_publish: bool = False) -> bool:
     path = Path(run["result_path"])
     if not path.is_file():
         return False
@@ -300,24 +360,25 @@ def import_result(run: dict[str, Any], state: dict[str, Any], *, skip_event_publ
 
 
 def recover(directory: Path, state: dict[str, Any], *, skip_event_publish: bool = False) -> dict[str, Any]:
-    for run in state["runs"]:
-        # import_result runs only for runs that may still be live.
-        if run["status"] in {"dispatching", "uncertain", "active", "reserved"} and not import_result(
-            run, state, skip_event_publish=skip_event_publish
-        ):
-            if run.get("transport") == "native" and not run.get("process_identity"):
-                ready = directory / "runs" / run["run_id"] / "ready.json"
-                if ready.is_file():
-                    checkpoint = read(ready)
-                    if checkpoint.get("run_id") == run["run_id"]:
-                        run.update(pid=checkpoint["pid"], process_identity=checkpoint["process_identity"])
-            run["process_state"] = NATIVE.process_state(run)
-            run["status"] = "active" if run["process_state"] == "active" else "uncertain"
-            run["recovery"] = (
-                "Use the recorded native handle or process; no terminal result yet. Never relaunch this request ID."
-            )
-    save(directory, state)
-    return state
+    with task_json_lock(directory):
+        for run in state["runs"]:
+            # import_result runs only for runs that may still be live.
+            if run["status"] in {"dispatching", "uncertain", "active", "reserved"} and not import_result(
+                run, state, skip_event_publish=skip_event_publish, directory=directory
+            ):
+                if run.get("transport") == "native" and not run.get("process_identity"):
+                    ready = directory / "runs" / run["run_id"] / "ready.json"
+                    if ready.is_file():
+                        checkpoint = read(ready)
+                        if checkpoint.get("run_id") == run["run_id"]:
+                            run.update(pid=checkpoint["pid"], process_identity=checkpoint["process_identity"])
+                run["process_state"] = NATIVE.process_state(run)
+                run["status"] = "active" if run["process_state"] == "active" else "uncertain"
+                run["recovery"] = (
+                    "Use the recorded native handle or process; no terminal result yet. Never relaunch this request ID."
+                )
+        save(directory, state)
+        return state
 
 
 def auto_recover_task(directory: Path, *, skip_event_publish: bool = False) -> dict[str, Any] | None:
@@ -328,7 +389,10 @@ def auto_recover_task(directory: Path, *, skip_event_publish: bool = False) -> d
     deadline = time.monotonic() + 0.5
     while True:
         try:
-            with SUPPORT.workspace_lease(resolved, RUNNER.default_agent_cache_dir() / "coordinator-locks"):
+            with (
+                SUPPORT.workspace_lease(resolved, RUNNER.default_agent_cache_dir() / "coordinator-locks"),
+                task_json_lock(resolved),
+            ):
                 state = load(resolved)
                 return recover(resolved, state, skip_event_publish=skip_event_publish)
         except Exception:
@@ -396,7 +460,10 @@ def adopt_authority(directory: Path, team: str, *, release: bool = False, wait_s
     deadline = time.monotonic() + wait_seconds
     while True:
         try:
-            with SUPPORT.workspace_lease(resolved, RUNNER.default_agent_cache_dir() / "coordinator-locks"):
+            with (
+                SUPPORT.workspace_lease(resolved, RUNNER.default_agent_cache_dir() / "coordinator-locks"),
+                task_json_lock(resolved),
+            ):
                 state = load(resolved)
                 current = (state.get("authority") or {}).get("team")
                 if release:
@@ -450,8 +517,7 @@ def reverify(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
     work = next((run for run in state["runs"] if run["run_id"] == args.run_id), None)
     later = state["runs"][state["runs"].index(work) + 1 :] if work else []
     if (
-        state["status"] != "active"
-        or not work
+        not work
         or work["kind"] not in WORK_KINDS | {"verification"}
         or any(run["kind"] != "verification" for run in later)
         or any(run["status"] != "finished" for run in state["runs"])
@@ -461,6 +527,10 @@ def reverify(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
     if digest(path) != work["result_sha256"]:
         raise CoordinationError("previous result changed")
     previous = read(path)
+    is_legacy = WORKSPACE_AUDIT.is_legacy_pre_tree_state(previous.get("git_after"))
+    was_accepted_legacy = state["status"] == "accepted" and is_legacy
+    if state["status"] != "active" and not was_accepted_legacy:
+        raise CoordinationError("reverify requires the latest finished work and no active invocation")
     converted = (previous.get("auto_correct") or {}).get("converted_from")
     if converted:
         raise CoordinationError(
@@ -502,7 +572,10 @@ def reverify(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
     repository = Path(state["repository"])
     with SUPPORT.workspace_lease(repository, RUNNER.default_agent_cache_dir()) as lease:
         before, identity = RUNNER.git_state(repository, previous["tracked_paths"]), RUNNER.git_identity(repository)
-        if before["fingerprint"] != previous["git_after"]["fingerprint"] or identity != previous["git_identity_after"]:
+        if (
+            not WORKSPACE_AUDIT.git_state_matches(before, previous["git_after"])
+            or identity != previous["git_identity_after"]
+        ):
             raise CoordinationError("work changed since the prior audit; investigate before rechecking")
         state["runs"].append(run)
         save(directory, state)
@@ -512,7 +585,7 @@ def reverify(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
         )
         after, after_identity = RUNNER.git_state(repository, previous["tracked_paths"]), RUNNER.git_identity(repository)
         history = RUNNER.find_history_violations(identity, after_identity)
-        changed = before["fingerprint"] != after["fingerprint"]
+        changed = not WORKSPACE_AUDIT.git_state_matches(after, before, require_tree=True)
         delta = RUNNER.state_delta(previous["git_before"], after)
         scope = RUNNER.find_scope_violations(delta, previous["allowed_paths"])
         status = (
@@ -564,8 +637,11 @@ def reverify(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
             "model_invoked": False,
         }
         RUNNER.write_run_result(Path(run["result_path"]), result)
-    import_result(run, state)
-    save(directory, state)
+    with task_json_lock(directory):
+        import_result(run, state, directory=directory)
+        if was_accepted_legacy:
+            state["status"] = "active"
+        save(directory, state)
     return run
 
 
@@ -713,6 +789,12 @@ def dispatch(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
     billing = args.billing_mode
     timeout = args.timeout
     rounds = args.auto_correct
+    req_account = getattr(args, "account", None)
+    account = req_account.strip() if isinstance(req_account, str) and req_account.strip() else None
+    req_claude_dir = getattr(args, "claude_config_dir", None)
+    claude_config_dir = (
+        str(Path(req_claude_dir).expanduser()) if req_claude_dir is not None and str(req_claude_dir).strip() else None
+    )
     previous_result = None
     evidence_record = None
     if kind == "continue":
@@ -720,15 +802,22 @@ def dispatch(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
         if digest(Path(work["result_path"])) != work["result_sha256"] or not previous_result.get("session_id"):
             raise CoordinationError("previous result changed or has no exact session id")
         SUPPORT.validate_resume(previous_result, {"repository": state["repository"]})
-        if any(value is not None for value in (args.engine, args.model, args.effort, args.variant)):
-            raise CoordinationError("continue inherits engine, model, effort and variant; omit overrides")
-        if args.transport != session_work(state)["transport"]:
+        if (
+            any(value is not None for value in (args.engine, args.model, args.effort, args.variant))
+            or account is not None
+            or claude_config_dir is not None
+        ):
+            raise CoordinationError("continue inherits engine, model, effort, variant, and account; omit overrides")
+        prior_session = session_work(state) or {}
+        if args.transport != prior_session["transport"]:
             raise CoordinationError("continue inherits the previous run's transport")
         engine, model_id = previous_result["engine"], previous_result["model"]
         effort, variant = previous_result.get("effort", {}).get("bound"), previous_result.get("variant")
         billing = previous_result.get("billing_mode", "unknown")
+        account = prior_session.get("account")
+        claude_config_dir = prior_session.get("claude_config_dir")
         if timeout is None and args.transport != "native":
-            timeout = session_work(state).get("timeout")
+            timeout = prior_session.get("timeout")
     if kind == "correction":
         if not work or work["status"] != "finished" or any(run["kind"] == "correction" for run in state["runs"]):
             raise CoordinationError("one correction requires a finished implementation")
@@ -738,13 +827,14 @@ def dispatch(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
         if digest(Path(work["result_path"])) != work["result_sha256"] or not previous_result.get("session_id"):
             raise CoordinationError("previous result changed or has no exact session")
         SUPPORT.validate_resume(previous_result, {"repository": state["repository"]})
+        prior_impl = implementation_work(state) or {}
         engine, model_id = previous_result["engine"], previous_result["model"]
         effort, variant = previous_result.get("effort", {}).get("bound"), previous_result.get("variant")
         verification = previous_result.get("verification_commands", [])
         billing = previous_result.get("billing_mode", "unknown")
         if timeout is None and args.transport != "native":
             # The resumed session keeps the runner limit it was given; an explicit --timeout replaces it.
-            timeout = (implementation_work(state) or {}).get("timeout")
+            timeout = prior_impl.get("timeout")
         if rounds is None:
             # Like the timeout, the auto-correct rounds carry over unless the correction sets its own.
             inherited = implementation_work(state) if work["kind"] == "verification" else work
@@ -754,10 +844,14 @@ def dispatch(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
         if (
             any(value is not None for value in (args.engine, args.model, args.effort, args.variant))
             or args.verify_command
+            or account is not None
+            or claude_config_dir is not None
         ):
             raise CoordinationError(
-                "correction inherits engine, model, effort, variant, and verification; omit overrides"
+                "correction inherits engine, model, effort, variant, verification, and account; omit overrides"
             )
+        account = prior_impl.get("account")
+        claude_config_dir = prior_impl.get("claude_config_dir")
         if state.get("evidence_policy") == "host_receipts_required":
             proof = EVIDENCE.receipt(state, args.review_id, RUNNER)
             evidence_record = {"review_id": proof["review_id"]}
@@ -893,6 +987,10 @@ def dispatch(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
         command += ["--effort", effort]
     if variant:
         command += ["--variant", variant]
+    if account:
+        command += ["--account", account]
+    if claude_config_dir:
+        command += ["--claude-config-dir", claude_config_dir]
     if args.allow_credits:
         command += ["--allow-credits"]
     if kind in WORK_KINDS:
@@ -929,6 +1027,8 @@ def dispatch(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
         "transport": args.transport,
         "effort": effort,
         "variant": variant,
+        **({"account": account} if account else {}),
+        **({"claude_config_dir": claude_config_dir} if claude_config_dir else {}),
         "billing_mode": billing,
         **({"timeout": timeout} if timeout else {}),
         # An explicit 0 is kept too, so a correction inherits the opt-out instead of the spec's default.
@@ -1004,12 +1104,13 @@ def dispatch(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
             threading.Thread(target=process.wait, daemon=True).start()
             return run
         run["process_exit_code"] = process.wait()
-    if not import_result(run, state):
-        run["status"] = "uncertain"
-        run["recovery"] = (
-            "Runner exited without a terminal result; inspect artifacts before taking over. No automatic retry."
-        )
-    save(directory, state)
+    with task_json_lock(directory):
+        if not import_result(run, state, directory=directory):
+            run["status"] = "uncertain"
+            run["recovery"] = (
+                "Runner exited without a terminal result; inspect artifacts before taking over. No automatic retry."
+            )
+        save(directory, state)
     return run
 
 
@@ -1045,8 +1146,11 @@ def abandon(args: argparse.Namespace, directory: Path, state: dict[str, Any]) ->
                     raise CoordinationError("the native guard is still auditing; recover this run shortly")
                 time.sleep(0.1)
             run["abandoned"] = note
-            if not import_result(run, state):
-                run.update(status="uncertain", recovery="guard exited without an abandoned result; inspect artifacts")
+            with task_json_lock(directory):
+                if not import_result(run, state, directory=directory):
+                    run.update(
+                        status="uncertain", recovery="guard exited without an abandoned result; inspect artifacts"
+                    )
         else:
             run.update(status="cancelled", abandoned=note, recovery="guard not running; nothing was audited")
     elif alive:
@@ -1065,17 +1169,18 @@ def abandon(args: argparse.Namespace, directory: Path, state: dict[str, Any]) ->
             if NATIVE.process_state(run) != "active":
                 break
         run["abandoned"] = {**note, "signals": sent}
-        if not import_result(run, state):
-            if NATIVE.process_state(run) == "active":
-                run["recovery"] = (
-                    f"runner {run['pid']} survived {', '.join(sent)}; inspect it before the checkout is used"
-                )
-            else:
-                run.update(
-                    status="cancelled",
-                    recovery="abandoned: the runner stopped its executor without an audit; partial changes stay "
-                    "in the worktree (authority show lists them)",
-                )
+        with task_json_lock(directory):
+            if not import_result(run, state, directory=directory):
+                if NATIVE.process_state(run) == "active":
+                    run["recovery"] = (
+                        f"runner {run['pid']} survived {', '.join(sent)}; inspect it before the checkout is used"
+                    )
+                else:
+                    run.update(
+                        status="cancelled",
+                        recovery="abandoned: the runner stopped its executor without an audit; partial changes stay "
+                        "in the worktree (authority show lists them)",
+                    )
     else:
         run.update(status="cancelled", abandoned=note, recovery="runner not running; recover its result if any")
     save(directory, state)
@@ -1122,11 +1227,23 @@ def review(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -> 
                     and evidence.get("criteria") != review_state["task_spec"]["acceptance_criteria"]
                 ):
                     raise CoordinationError("evidence must list every original acceptance criterion in order")
-                fingerprint = RUNNER.git_state(repository, result["tracked_paths"])["fingerprint"]
+                current_state = RUNNER.git_state(repository, result["tracked_paths"])
                 git_identity = RUNNER.git_identity(repository)
-                if fingerprint != result["git_after"]["fingerprint"] or git_identity != result["git_identity_after"]:
+                if WORKSPACE_AUDIT.is_legacy_pre_tree_state(result.get("git_after")):
+                    raise CoordinationError(
+                        "accepted result has a legacy pre-tree receipt without git_after.tree_oid; run coordinator reverify first"
+                    )
+                if (
+                    not WORKSPACE_AUDIT.git_state_matches(current_state, result["git_after"], require_tree=True)
+                    or git_identity != result["git_identity_after"]
+                ):
                     raise CoordinationError("workspace changed since verification")
-                record["candidate"] = {"fingerprint": fingerprint, "git_identity": git_identity}
+                record["candidate"] = {
+                    "fingerprint": current_state["fingerprint"],
+                    "fingerprint_version": current_state.get("fingerprint_version", 2),
+                    "tree_oid": current_state["tree_oid"],
+                    "git_identity": git_identity,
+                }
                 state["status"] = "accepted"
                 state["decisions"].append(record)
                 save(directory, state)
@@ -1234,7 +1351,7 @@ def host_action(args: argparse.Namespace, directory: Path, state: dict[str, Any]
                     MAILBOX.delegate(MAILBOX.root(), handle, run["mailbox"]["run"])
             else:
                 NATIVE.complete(directory, state, run, packet, RUNNER)
-                import_result(run, state)
+                import_result(run, state, directory=directory)
                 observe_settings(run, packet)
             result = run
         else:
@@ -1303,6 +1420,15 @@ def main(argv: list[str] | None = None) -> int:
             sub.add_argument("--model")
             sub.add_argument("--effort")
             sub.add_argument("--variant")
+            sub.add_argument(
+                "--account",
+                help="Configured Monitor account ID or alias to execute under",
+            )
+            sub.add_argument(
+                "--claude-config-dir",
+                type=Path,
+                help="Claude account profile (CLAUDE_CONFIG_DIR) for --engine claude",
+            )
             sub.add_argument(
                 "--conductor-model",
                 help="Calling conductor model ID or selector (auto-detected when omitted)",
@@ -1421,7 +1547,8 @@ def main(argv: list[str] | None = None) -> int:
                     elif args.action == "recover":
                         output = recover(directory, state)
                     elif args.action == "review":
-                        output = review(args, directory, state)
+                        with task_json_lock(directory):
+                            output = review(args, directory, state)
                     elif args.action == "reverify":
                         output = reverify(args, directory, state)
                     elif args.action == "abandon":
@@ -1429,7 +1556,8 @@ def main(argv: list[str] | None = None) -> int:
                     elif args.action == "show":
                         output = state
                     else:
-                        output = host_action(args, directory, state)
+                        with task_json_lock(directory):
+                            output = host_action(args, directory, state)
                 finally:
                     FENCE = None
         print(json.dumps(output, indent=2, ensure_ascii=True))

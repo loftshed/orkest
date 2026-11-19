@@ -16,7 +16,7 @@ When ChatGPT's weekly allowance is exhausted, its full pill shows the remaining 
    weekly                 ████████████▌·  89% left   resets Mon 4:59 PM (in 3d 4h)
 
  Where to spend next  (pts = weekly % left minus what even use would leave)
-  1  Claude · personal · all models      +44 pts   under-used, spend freely       plaude
+  1  Claude · personal · all models      +44 pts   under-used, spend freely       CLAUDE_CONFIG_DIR=~/.claude-personal claude
   2  Antigravity · Claude & GPT           +9 pts   on pace                        agy --model …
   4  Codex · ChatGPT                     −19 pts   ahead of pace, conserve        codex
   ✗  Claude · work · all models                    out until 9:00 PM today        claude

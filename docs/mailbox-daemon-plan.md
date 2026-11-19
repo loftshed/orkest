@@ -97,7 +97,7 @@ following implementation and both requested reviews.
    files and their tests. Use a separate worktree if running concurrently; otherwise keep the writer
    lease exclusive and run this phase after the backend handoff.
 3. The conductor reviews both full diffs and requirement evidence, integrates, and fixes understood
-   gaps. Then Opus 5.5 through the personal `plaude` wrapper performs a read-only review of the final
+   gaps. Then Opus 5.5 through an isolated personal Claude profile (`CLAUDE_CONFIG_DIR`) performs a read-only review of the final
    implementation. Preserve all findings and verify accepted corrections.
 
 ## Acceptance evidence

@@ -151,13 +151,42 @@ class RepoEnvPropagationTests(unittest.TestCase):
             self.assertNotIn("ANTHROPIC_BASE_URL", codex_env)
             self.assertNotIn("OPENAI_BASE_URL", codex_env)
 
-            plaude_env = RUNNER.executor_environment(
+            alt_claude_env = RUNNER.executor_environment(
                 "claude",
                 linked,
-                claude_config_dir=self.root / ".claude-personal",
+                claude_config_dir=self.root / ".claude-alt",
             )
-            self.assertEqual(plaude_env["APP_PORT"], "4200")
-            self.assertNotIn("ANTHROPIC_API_KEY", plaude_env)
+            self.assertEqual(alt_claude_env["APP_PORT"], "4200")
+            self.assertNotIn("ANTHROPIC_API_KEY", alt_claude_env)
+
+            # Child-only isolated homes via ORKEST_*_ACCOUNT_HOME never leak across engines.
+            with mock.patch.dict(
+                os.environ,
+                {
+                    **clean_env,
+                    "ORKEST_CODEX_ACCOUNT_HOME": str(self.root / ".codex-alt"),
+                    "ORKEST_AGY_ACCOUNT_HOME": str(self.root / ".gemini-alt"),
+                },
+                clear=True,
+            ):
+                codex_isolated = RUNNER.executor_environment("codex", linked)
+                self.assertEqual(codex_isolated["CODEX_HOME"], str(self.root / ".codex-alt"))
+                self.assertNotIn("ORKEST_CODEX_ACCOUNT_HOME", codex_isolated)
+                self.assertNotIn("ORKEST_AGY_ACCOUNT_HOME", codex_isolated)
+
+                agy_isolated = RUNNER.executor_environment("agy", linked)
+                self.assertEqual(agy_isolated["GEMINI_CLI_HOME"], str(self.root / ".gemini-alt"))
+                self.assertEqual(
+                    agy_isolated["ANTIGRAVITY_APP_DATA_DIR"],
+                    str(self.root / ".gemini-alt" / "antigravity-cli"),
+                )
+                self.assertNotIn("ORKEST_AGY_ACCOUNT_HOME", agy_isolated)
+                self.assertNotIn("ORKEST_CODEX_ACCOUNT_HOME", agy_isolated)
+
+                claude_other = RUNNER.executor_environment("claude", linked)
+                self.assertNotIn("CODEX_HOME", claude_other)
+                self.assertNotIn("GEMINI_CLI_HOME", claude_other)
+                self.assertNotIn("ANTIGRAVITY_APP_DATA_DIR", claude_other)
 
             out_dir = self.root / "verify-out"
             out_dir.mkdir()
@@ -226,6 +255,100 @@ class RepoEnvPropagationTests(unittest.TestCase):
 
         # Second call is idempotent and appends nothing.
         self.assertEqual(repo_env.export_claude_env_file(linked, environ=isolated_env), [])
+
+    def test_bootstrap_worktree_env_checked_reports_copy_failures_and_withholds_marker(self) -> None:
+        (self.main_repo / ".env").write_text("OK_VAR=1\n", encoding="utf-8")
+        (self.main_repo / ".env.fail").write_text("FAIL_VAR=1\n", encoding="utf-8")
+        linked = self.root / "wt-fail"
+        _git(self.main_repo, "worktree", "add", "-q", "-b", "feat/fail", str(linked), "HEAD")
+
+        real_copyfileobj = repo_env.shutil.copyfileobj
+
+        def flaky_copyfileobj(src_fh, dst_fh, *args: object, **kwargs: object) -> object:
+            if Path(src_fh.name).name == ".env.fail":
+                dst_fh.write(b"PARTIAL=")
+                raise OSError("simulated partial disk error")
+            return real_copyfileobj(src_fh, dst_fh, *args, **kwargs)
+
+        with mock.patch.object(repo_env.shutil, "copyfileobj", side_effect=flaky_copyfileobj):
+            copied, failed = repo_env.bootstrap_worktree_env_checked(linked)
+        self.assertEqual(copied, [".env"])
+        self.assertEqual(failed, [".env.fail"])
+        self.assertTrue((linked / ".env").is_file())
+        self.assertFalse((linked / ".env.fail").exists())
+        self.assertFalse((linked / ".env.fail").is_symlink())
+        self.assertEqual(list(linked.glob(".env.fail.*.tmp")), [])
+
+        # Remove .env and replace destination .env.fail with a non-empty directory so bootstrap withholds marker.
+        (linked / ".env").unlink()
+        (linked / ".env.fail").mkdir()
+        (linked / ".env.fail" / "blocker").write_text("x", encoding="utf-8")
+        mailbox_base = self.root / "fail-home" / "mailbox-v1"
+        env = {k: v for k, v in os.environ.items() if k != "ORKEST_READONLY_RUN"}
+        run_mailbox_hook(
+            {"hook_event_name": "SessionStart", "session_id": "fail-sess", "cwd": str(linked)},
+            harness="codex",
+            base=mailbox_base,
+            env=env,
+        )
+        cache_dir = mailbox_base / "bootstrap-cache"
+        self.assertFalse(cache_dir.exists() and any(cache_dir.iterdir()))
+
+        # Positive control: removing the blocker allows bootstrap to succeed and write marker in mailbox-v1.
+        (linked / ".env.fail" / "blocker").unlink()
+        (linked / ".env.fail").rmdir()
+        run_mailbox_hook(
+            {"hook_event_name": "SessionStart", "session_id": "fail-sess", "cwd": str(linked)},
+            harness="codex",
+            base=mailbox_base,
+            env=env,
+        )
+        self.assertTrue((linked / ".env.fail").is_file())
+        self.assertEqual((linked / ".env.fail").stat().st_mode & 0o777, 0o600)
+        self.assertTrue(cache_dir.is_dir() and any(cache_dir.iterdir()))
+
+    def test_trailing_dot_env_templates_are_sensitive_and_restored_after_deletion(self) -> None:
+        self.assertTrue(repo_env._is_sensitive_env_name(".env.template."))
+        self.assertTrue(repo_env._is_sensitive_env_name(".env.example."))
+        self.assertFalse(repo_env._is_sensitive_env_name(".env.template"))
+        self.assertFalse(repo_env._is_sensitive_env_name(".env.EXAMPLE.local"))
+
+        (self.main_repo / ".env.template.").write_text("SECRET_T=1\n", encoding="utf-8")
+        (self.main_repo / ".env.example.").write_text("SECRET_E=2\n", encoding="utf-8")
+        (self.main_repo / ".env.template").write_text("TEMPLATE_ONLY=1\n", encoding="utf-8")
+        linked = self.root / "wt-trailing-dot"
+        _git(self.main_repo, "worktree", "add", "-q", "-b", "feat/trailing-dot", str(linked), "HEAD")
+
+        copied, failed = repo_env.bootstrap_worktree_env_checked(linked)
+        self.assertEqual(failed, [])
+        self.assertEqual(copied, [".env.example.", ".env.template."])
+        self.assertFalse((linked / ".env.template").exists())
+        self.assertEqual((linked / ".env.template.").stat().st_mode & 0o777, 0o600)
+
+        mailbox_base = self.root / "trailing-home" / "mailbox-v1"
+        writer_env = {k: v for k, v in os.environ.items() if k != "ORKEST_READONLY_RUN"}
+        run_mailbox_hook(
+            {"hook_event_name": "SessionStart", "session_id": "parent-td", "cwd": str(linked)},
+            harness="claude",
+            base=mailbox_base,
+            env=writer_env,
+        )
+        self.assertTrue((mailbox_base / "bootstrap-cache").is_dir())
+        (linked / ".env.template.").unlink()
+        run_mailbox_hook(
+            {
+                "hook_event_name": "SubagentStart",
+                "session_id": "parent-td",
+                "agent_id": "sub-td",
+                "agent_type": "Explore",
+                "cwd": str(linked),
+            },
+            harness="claude",
+            base=mailbox_base,
+            env=writer_env,
+        )
+        self.assertTrue((linked / ".env.template.").is_file())
+        self.assertEqual((linked / ".env.template.").stat().st_mode & 0o777, 0o600)
 
 
 if __name__ == "__main__":

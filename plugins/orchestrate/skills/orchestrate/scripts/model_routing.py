@@ -1504,26 +1504,843 @@ def executor_preflight(
     )
 
 
+_ROUTE_ENGINE_ALIASES = {
+    "claude": "claude",
+    "gemini": "agy",
+    "antigravity": "agy",
+    "openai": "codex",
+    "openrouter": "opencode",
+}
+_PROVIDER_TO_ENGINE = {
+    "claude": "claude",
+    "codex": "codex",
+    "antigravity": "agy",
+    "agy": "agy",
+    "gemini": "agy",
+    "opencode": "opencode",
+}
+_SINGLE_WORD_ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_RESERVED_ROUTE_ALIAS_NAMES = frozenset({"claude", "codex", "agy", "gemini", "opencode", "antigravity", "all"})
+
+
+_CLAUDE_PROFILE_MARKERS = (".claude.json", "projects")
+_CODEX_PROFILE_MARKERS = ("auth.json", "config.toml", "sessions", "history.jsonl")
+_AGY_PROFILE_MARKERS = (
+    "antigravity-oauth-token",
+    "antigravity",
+    "antigravity-cli",
+    "settings.json",
+    "User",
+    "antigravity-cli/antigravity-oauth-token",
+)
+_DISCOVERED_PROFILE_SPECS = (
+    ("claude", "claude", "claude", _CLAUDE_PROFILE_MARKERS),
+    ("codex", "codex", "codex", _CODEX_PROFILE_MARKERS),
+    ("antigravity", "antigravity", "agy", _AGY_PROFILE_MARKERS),
+)
+
+
+def _resolve_path_against_home(raw: str | Path, *, home: Path | None = None) -> Path:
+    base = Path(os.path.expanduser(str(home))) if home is not None else Path.home()
+    text = str(raw).strip()
+    if text == "~":
+        expanded = base
+    elif text.startswith("~/"):
+        expanded = base / text[2:]
+    else:
+        expanded = Path(os.path.expanduser(text))
+        if not expanded.is_absolute():
+            expanded = base / expanded
+    try:
+        return expanded.resolve()
+    except OSError:
+        return Path(os.path.abspath(str(expanded)))
+
+
+def _normalize_tags(*values: Any) -> list[str]:
+    tags: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        items = value if isinstance(value, (list, tuple, set)) else [value]
+        for item in items:
+            if not isinstance(item, str):
+                continue
+            cleaned = item.strip().lower()
+            if cleaned and cleaned not in seen:
+                seen.add(cleaned)
+                tags.append(cleaned)
+    return tags
+
+
+def monitor_config_path() -> Path:
+    raw = os.environ.get("MONITOR_CONFIG")
+    if isinstance(raw, str) and raw.strip():
+        return Path(raw.strip()).expanduser()
+    return Path.home() / ".config" / "monitor" / "config.json"
+
+
+def _load_raw_monitor_config(*, strict: bool = False) -> dict[str, Any]:
+    cfg_path = monitor_config_path()
+    try:
+        raw = cfg_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        if isinstance(exc, FileNotFoundError):
+            if not strict:
+                return {}
+            try:
+                repo_policy = _bundled_module("repo_policy")
+                is_missing = getattr(repo_policy, "_is_missing_policy_file_error", None)
+                if callable(is_missing) and is_missing(cfg_path, exc):
+                    return {}
+            except Exception:
+                return {}
+            raise ValueError(f"cannot read Monitor config {cfg_path}: {exc}") from exc
+        if strict:
+            raise ValueError(f"cannot read Monitor config {cfg_path}: {exc}") from exc
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        if strict:
+            raise ValueError(f"invalid JSON in Monitor config {cfg_path}: {exc}") from exc
+        return {}
+    if not isinstance(data, dict):
+        if strict:
+            raise ValueError(f"invalid Monitor config {cfg_path}: expected JSON object")
+        return {}
+    return data
+
+
+def _first_nonempty_str(*values: Any) -> str | None:
+    return next((v.strip() for v in values if isinstance(v, str) and v.strip()), None)
+
+
+def _merged_account_env(account: dict[str, Any], global_env: dict[str, Any] | None) -> dict[str, str]:
+    merged: dict[str, str] = {}
+    for mapping in (global_env, account.get("env")):
+        if not isinstance(mapping, dict):
+            continue
+        for key, value in mapping.items():
+            if not isinstance(key, str):
+                continue
+            if value is None:
+                merged.pop(key, None)
+            elif isinstance(value, str) and value.strip():
+                merged[key] = value.strip()
+    return merged
+
+
+def _normalize_account_record(
+    raw: dict[str, Any], *, global_env: dict[str, Any] | None = None
+) -> dict[str, Any] | None:
+    provider = str(raw.get("provider") or "").strip().lower()
+    engine = str(raw.get("engine") or "").strip().lower() or _PROVIDER_TO_ENGINE.get(provider, "")
+    if not engine:
+        return None
+    if not provider:
+        provider = {"claude": "claude", "codex": "codex", "agy": "antigravity", "opencode": "opencode"}.get(engine, "")
+    account_id = str(raw.get("id") or raw.get("account_id") or raw.get("accountId") or "").strip()
+    raw_alias = raw.get("alias") or raw.get("account_alias") or raw.get("accountAlias")
+    account_alias = raw_alias.strip() if isinstance(raw_alias, str) and raw_alias.strip() else None
+
+    aliases: list[str] = []
+    seen_aliases: set[str] = set()
+
+    def add_alias(candidate: Any) -> None:
+        if isinstance(candidate, str) and candidate.strip():
+            cleaned = candidate.strip()
+            if cleaned.lower() not in seen_aliases:
+                seen_aliases.add(cleaned.lower())
+                aliases.append(cleaned)
+
+    add_alias(account_id)
+    add_alias(account_alias)
+    for extra in raw.get("aliases") or ():
+        add_alias(extra)
+    raw_route = raw.get("route")
+    if isinstance(raw_route, str):
+        route_tok = raw_route.strip()
+        if (
+            route_tok
+            and _SINGLE_WORD_ALIAS_RE.fullmatch(route_tok)
+            and route_tok.lower() not in _RESERVED_ROUTE_ALIAS_NAMES
+        ):
+            add_alias(route_tok)
+            if account_alias is None:
+                account_alias = route_tok
+
+    merged_env = _merged_account_env(raw, global_env)
+    billing_raw = raw.get("billing") or raw.get("billing_mode")
+    billing_mode = billing_raw.strip() if isinstance(billing_raw, str) and billing_raw.strip() else None
+    tags = _normalize_tags(raw.get("tags"), raw.get("category"))
+
+    claude_config_dir: Path | None = None
+    claude_account_home: Path | None = None
+    codex_home: Path | None = None
+    agy_home: Path | None = None
+    agy_app_data_dir: Path | None = None
+
+    caller_home = _resolve_path_against_home(Path.home())
+    raw_home = merged_env.get("HOME")
+    resolved_home = (
+        _resolve_path_against_home(raw_home, home=caller_home)
+        if isinstance(raw_home, str) and raw_home.strip()
+        else None
+    )
+    base_home = resolved_home if resolved_home is not None else caller_home
+
+    agy_typed_gemini_home = False
+    if engine == "claude":
+        default_claude_dir = base_home / ".claude"
+        raw_cfg = _first_nonempty_str(
+            raw.get("claudeConfigDir"),
+            raw.get("claude_config_dir"),
+            raw.get("configDir"),
+            merged_env.get("CLAUDE_CONFIG_DIR"),
+        )
+        if resolved_home is not None and resolved_home != caller_home:
+            claude_account_home = resolved_home
+        if raw_cfg is not None:
+            resolved_cfg = _resolve_path_against_home(raw_cfg, home=base_home)
+            if resolved_cfg != default_claude_dir:
+                claude_config_dir = resolved_cfg
+        elif isinstance(raw.get("accountHome"), str) and raw["accountHome"].strip():
+            resolved_acct = _resolve_path_against_home(raw["accountHome"], home=base_home)
+            if resolved_acct != default_claude_dir:
+                if resolved_acct.name == ".claude" and resolved_acct.parent != caller_home:
+                    claude_account_home = claude_account_home or resolved_acct.parent
+                else:
+                    claude_config_dir = resolved_acct
+    elif engine == "codex":
+        raw_codex = _first_nonempty_str(raw.get("codexHome"), raw.get("codex_home"), merged_env.get("CODEX_HOME"))
+        raw_acct = _first_nonempty_str(raw.get("accountHome"), raw.get("account_home"))
+        if raw_codex is not None:
+            codex_home = _resolve_path_against_home(raw_codex, home=base_home)
+        elif resolved_home is not None:
+            codex_home = resolved_home / ".codex"
+        elif raw_acct is not None:
+            codex_home = _resolve_path_against_home(raw_acct, home=base_home)
+    elif engine == "agy":
+        raw_agy_home = _first_nonempty_str(raw.get("agyHome"), raw.get("agy_home"))
+        raw_env_gemini = _first_nonempty_str(merged_env.get("GEMINI_CLI_HOME"))
+        raw_gemini = raw_agy_home or raw_env_gemini
+        raw_app = _first_nonempty_str(
+            raw.get("agyAppDataDir"), raw.get("agy_app_data_dir"), merged_env.get("ANTIGRAVITY_APP_DATA_DIR")
+        )
+        raw_acct = _first_nonempty_str(raw.get("accountHome"), raw.get("account_home"))
+        if raw_gemini is not None:
+            agy_home = _resolve_path_against_home(raw_gemini, home=base_home)
+            agy_typed_gemini_home = bool(not raw_agy_home and raw_env_gemini)
+            if raw_app is not None:
+                agy_app_data_dir = _resolve_path_against_home(raw_app, home=base_home)
+        elif raw_app is not None:
+            app_path = _resolve_path_against_home(raw_app, home=base_home)
+            agy_app_data_dir = app_path
+            agy_home = app_path.parent if app_path.name.startswith("antigravity") else app_path
+        elif resolved_home is not None:
+            agy_home = resolved_home / ".gemini"
+        elif raw_acct is not None:
+            agy_home = _resolve_path_against_home(raw_acct, home=base_home)
+
+    return {
+        "account_id": account_id or account_alias or "",
+        "account_alias": account_alias,
+        "aliases": aliases,
+        "provider": provider,
+        "engine": engine,
+        "billing_mode": billing_mode,
+        "tags": tags,
+        "claude_config_dir": claude_config_dir,
+        "claude_account_home": claude_account_home,
+        "codex_home": codex_home,
+        "agy_home": agy_home,
+        "agy_app_data_dir": agy_app_data_dir,
+        "agy_typed_gemini_home": agy_typed_gemini_home,
+    }
+
+
+def _synthesized_account_record(
+    account_id: str,
+    *,
+    provider: str,
+    engine: str,
+    claude_config_dir: Path | None = None,
+    codex_home: Path | None = None,
+    agy_home: Path | None = None,
+    agy_app_data_dir: Path | None = None,
+) -> dict[str, Any]:
+    return {
+        "account_id": account_id,
+        "account_alias": None,
+        "aliases": [],
+        "provider": provider,
+        "engine": engine,
+        "billing_mode": None,
+        "tags": [],
+        "claude_config_dir": claude_config_dir,
+        "claude_account_home": None,
+        "codex_home": codex_home,
+        "agy_home": agy_home,
+        "agy_app_data_dir": agy_app_data_dir,
+        "agy_typed_gemini_home": False,
+    }
+
+
+def _discover_synthesized_accounts() -> list[dict[str, Any]]:
+    discovered: list[dict[str, Any]] = [
+        _synthesized_account_record("claude", provider="claude", engine="claude"),
+        _synthesized_account_record("codex", provider="codex", engine="codex"),
+        _synthesized_account_record("antigravity", provider="antigravity", engine="agy"),
+    ]
+    home_dir = _resolve_path_against_home(Path.home())
+    if not home_dir.is_dir():
+        return discovered
+    try:
+        entries = [entry for entry in home_dir.iterdir() if entry.is_dir()]
+    except OSError:
+        return discovered
+    for prefix, provider, engine, markers in _DISCOVERED_PROFILE_SPECS:
+        pattern = re.compile(rf"^\.{re.escape(prefix)}-([\w-]+)$", re.ASCII)
+        matched: list[tuple[str, Path]] = []
+        for entry in entries:
+            match = pattern.fullmatch(entry.name)
+            if not match:
+                continue
+            if any((entry / marker).exists() for marker in markers):
+                matched.append((match.group(1), _resolve_path_against_home(entry)))
+        for name, resolved_entry in sorted(matched, key=lambda item: item[0]):
+            acct_id = f"{prefix}-{name}"
+            if engine == "claude":
+                discovered.append(
+                    _synthesized_account_record(
+                        acct_id,
+                        provider=provider,
+                        engine=engine,
+                        claude_config_dir=resolved_entry,
+                    )
+                )
+            elif engine == "codex":
+                discovered.append(
+                    _synthesized_account_record(
+                        acct_id,
+                        provider=provider,
+                        engine=engine,
+                        codex_home=resolved_entry,
+                    )
+                )
+            elif engine == "agy":
+                discovered.append(
+                    _synthesized_account_record(
+                        acct_id,
+                        provider=provider,
+                        engine=engine,
+                        agy_home=resolved_entry,
+                        agy_app_data_dir=resolved_entry,
+                    )
+                )
+    return discovered
+
+
+def load_monitor_accounts(*, strict: bool = False) -> list[dict[str, Any]]:
+    raw_cfg = _load_raw_monitor_config(strict=strict)
+    global_env = raw_cfg.get("env") if isinstance(raw_cfg.get("env"), dict) else None
+    raw_accounts = raw_cfg.get("accounts")
+    if "accounts" in raw_cfg and not isinstance(raw_accounts, list):
+        if strict:
+            raise ValueError(f"invalid accounts list in Monitor config {monitor_config_path()}: expected array")
+        raw_accounts = None
+    accounts: list[dict[str, Any]] = []
+    if isinstance(raw_accounts, list):
+        for entry in raw_accounts:
+            if not isinstance(entry, dict):
+                continue
+            normalized = _normalize_account_record(entry, global_env=global_env)
+            if normalized is not None:
+                accounts.append(normalized)
+    if accounts:
+        return accounts
+    try:
+        repo_policy = _bundled_module("repo_policy")
+        loader = getattr(repo_policy, "load_configured_accounts", None)
+        if callable(loader):
+            loaded = loader(strict=strict)
+            if isinstance(loaded, list):
+                for entry in loaded:
+                    if isinstance(entry, dict):
+                        normalized = _normalize_account_record(entry, global_env=global_env)
+                        if normalized is not None:
+                            accounts.append(normalized)
+    except Exception as exc:
+        if strict:
+            raise ValueError(str(exc)) from exc
+    return accounts
+
+
+def resolve_configured_account(identifier: str | None, *, strict: bool = False) -> dict[str, Any] | None:
+    if not isinstance(identifier, str) or not identifier.strip():
+        return None
+    target = identifier.strip()
+    lowered = target.lower()
+    accounts = load_monitor_accounts(strict=strict)
+    for acct in accounts:
+        if acct["account_id"] == target or (acct["account_alias"] and acct["account_alias"] == target):
+            return acct
+    for acct in accounts:
+        if target in acct["aliases"]:
+            return acct
+    for acct in accounts:
+        if acct["account_id"].lower() == lowered or any(alias.lower() == lowered for alias in acct["aliases"]):
+            return acct
+    try:
+        repo_policy = _bundled_module("repo_policy")
+        resolver = getattr(repo_policy, "resolve_configured_account", None)
+        if callable(resolver):
+            found = resolver(target, strict=strict)
+            if isinstance(found, dict):
+                return _normalize_account_record(found)
+    except Exception as exc:
+        if strict:
+            raise ValueError(str(exc)) from exc
+    if not monitor_config_path().exists():
+        synthesized = _discover_synthesized_accounts()
+        for acct in synthesized:
+            if acct["account_id"] == target:
+                return acct
+        for acct in synthesized:
+            if acct["account_id"].lower() == lowered:
+                return acct
+    return None
+
+
+_ENGINE_PIN_ENV_VARS: dict[str, tuple[str, str]] = {
+    "claude": ("ORKEST_PINNED_CLAUDE_ACCOUNT", "ORKEST_CLAUDE_ACCOUNT_HOME"),
+    "codex": ("ORKEST_PINNED_CODEX_ACCOUNT", "ORKEST_CODEX_ACCOUNT_HOME"),
+    "agy": ("ORKEST_PINNED_AGY_ACCOUNT", "ORKEST_AGY_ACCOUNT_HOME"),
+}
+
+
+def _has_explicit_account_pin(
+    engine: str,
+    *,
+    explicit_account: Any = False,
+    account: Any = None,
+    claude_config_dir: Any = None,
+    claude_account_home: Any = None,
+    codex_home: Any = None,
+    agy_home: Any = None,
+    agy_app_data_dir: Any = None,
+    resume_result: Any = None,
+    include_child_markers: bool = True,
+) -> bool:
+    """Return True when the run has an explicit account/profile pin for the active engine."""
+    if explicit_account or account or resume_result:
+        return True
+    if engine == "claude" and (claude_config_dir or claude_account_home):
+        return True
+    if engine == "codex" and codex_home:
+        return True
+    if engine == "agy" and (agy_home or agy_app_data_dir):
+        return True
+    if include_child_markers:
+        markers = _ENGINE_PIN_ENV_VARS.get(engine)
+        if markers:
+            pinned_key, home_key = markers
+            if os.environ.get(pinned_key) == "1" or (os.environ.get(home_key) or "").strip():
+                return True
+    return False
+
+
+def _derive_agy_profile_pair(
+    gemini_home: Path | str | None,
+    app_data_dir: Path | str | None,
+    *,
+    default_home: Path | None = None,
+    infer_gemini_basename: bool = False,
+) -> tuple[Path, Path]:
+    """Derive the effective (GEMINI_CLI_HOME, ANTIGRAVITY_APP_DATA_DIR) pair using executor semantics."""
+    fallback_home = _resolve_path_against_home(default_home or (Path.home() / ".gemini"))
+    g_str = str(gemini_home).strip() if gemini_home is not None else ""
+    a_str = str(app_data_dir).strip() if app_data_dir is not None else ""
+    if g_str and a_str:
+        return (_resolve_path_against_home(g_str), _resolve_path_against_home(a_str))
+    if g_str:
+        gp = Path(g_str).expanduser()
+        if infer_gemini_basename and gp.name.startswith("antigravity"):
+            return (_resolve_path_against_home(gp.parent), _resolve_path_against_home(gp))
+        return (_resolve_path_against_home(gp), _resolve_path_against_home(gp / "antigravity-cli"))
+    if a_str:
+        ap = Path(a_str).expanduser()
+        resolved_a = _resolve_path_against_home(ap)
+        resolved_g = _resolve_path_against_home(ap.parent) if ap.name.startswith("antigravity") else fallback_home
+        return (resolved_g, resolved_a)
+    return (fallback_home, _resolve_path_against_home(fallback_home / "antigravity-cli"))
+
+
+def _agy_paths_match(target_home: Path | str | None, target_app: Path | str | None) -> bool:
+    """Return True when the given Antigravity home/app_data_dir resolves to the live host profile."""
+    host_app = (os.environ.get("ANTIGRAVITY_APP_DATA_DIR") or "").strip() or None
+    host_gemini = (os.environ.get("GEMINI_CLI_HOME") or "").strip() or None
+    return _derive_agy_profile_pair(
+        target_home,
+        target_app,
+        infer_gemini_basename=True,
+    ) == _derive_agy_profile_pair(
+        host_gemini,
+        host_app,
+        infer_gemini_basename=False,
+    )
+
+
+def _child_marker_switches_host_profile(engine: str) -> bool:
+    """Return True when child-only ORKEST_* account markers select a profile different from the live host."""
+    if engine == "claude":
+        marker_home = (os.environ.get("ORKEST_CLAUDE_ACCOUNT_HOME") or "").strip()
+        pinned = os.environ.get("ORKEST_PINNED_CLAUDE_ACCOUNT") == "1"
+        if not marker_home and not pinned:
+            return False
+        target = (
+            _resolve_path_against_home(marker_home) / ".claude"
+            if marker_home
+            else _resolve_path_against_home(Path.home() / ".claude")
+        )
+        host_raw = (os.environ.get("CLAUDE_CONFIG_DIR") or "").strip() or (Path.home() / ".claude")
+        return target != _resolve_path_against_home(host_raw)
+    if engine == "codex":
+        marker_home = (os.environ.get("ORKEST_CODEX_ACCOUNT_HOME") or "").strip()
+        pinned = os.environ.get("ORKEST_PINNED_CODEX_ACCOUNT") == "1"
+        if not marker_home and not pinned:
+            return False
+        target = _resolve_path_against_home(marker_home or (Path.home() / ".codex"))
+        host_raw = (os.environ.get("CODEX_HOME") or "").strip() or (Path.home() / ".codex")
+        return target != _resolve_path_against_home(host_raw)
+    if engine == "agy":
+        marker_home = (os.environ.get("ORKEST_AGY_ACCOUNT_HOME") or "").strip()
+        pinned = os.environ.get("ORKEST_PINNED_AGY_ACCOUNT") == "1"
+        if not marker_home and not pinned:
+            return False
+        return not _agy_paths_match(marker_home or (Path.home() / ".gemini"), None)
+    return False
+
+
+def resolve_account_by_home(
+    engine: str,
+    *,
+    claude_config_dir: Path | str | None = None,
+    claude_account_home: Path | str | None = None,
+    codex_home: Path | str | None = None,
+    agy_home: Path | str | None = None,
+    agy_app_data_dir: Path | str | None = None,
+    include_child_markers: bool = True,
+    strict: bool = False,
+) -> dict[str, Any] | None:
+    accounts = [acct for acct in load_monitor_accounts(strict=strict) if acct["engine"] == engine]
+    if not accounts:
+        return None
+    caller_home = _resolve_path_against_home(Path.home())
+    if engine == "claude":
+        orkest_claude_home = (os.environ.get("ORKEST_CLAUDE_ACCOUNT_HOME") or "").strip()
+        env_claude_dir = (os.environ.get("CLAUDE_CONFIG_DIR") or "").strip()
+        if claude_config_dir is not None:
+            target_dir = _resolve_path_against_home(claude_config_dir)
+        elif claude_account_home is not None:
+            target_dir = _resolve_path_against_home(claude_account_home) / ".claude"
+        elif include_child_markers and orkest_claude_home:
+            target_dir = _resolve_path_against_home(orkest_claude_home) / ".claude"
+        elif include_child_markers and os.environ.get("ORKEST_PINNED_CLAUDE_ACCOUNT") == "1":
+            target_dir = caller_home / ".claude"
+        elif env_claude_dir:
+            target_dir = _resolve_path_against_home(env_claude_dir)
+        else:
+            target_dir = caller_home / ".claude"
+        for acct in accounts:
+            acct_dir = (
+                acct["claude_config_dir"]
+                or ((acct["claude_account_home"] / ".claude") if acct["claude_account_home"] else None)
+                or (caller_home / ".claude")
+            )
+            if _resolve_path_against_home(acct_dir) == target_dir:
+                return acct
+        return None
+    if engine == "codex":
+        orkest_codex_home = (os.environ.get("ORKEST_CODEX_ACCOUNT_HOME") or "").strip()
+        if codex_home is not None and str(codex_home).strip():
+            raw_codex: Path | str = codex_home
+        elif include_child_markers and orkest_codex_home:
+            raw_codex = orkest_codex_home
+        elif include_child_markers and os.environ.get("ORKEST_PINNED_CODEX_ACCOUNT") == "1":
+            raw_codex = caller_home / ".codex"
+        else:
+            raw_codex = (os.environ.get("CODEX_HOME") or "").strip() or (caller_home / ".codex")
+        target_dir = _resolve_path_against_home(raw_codex)
+        for acct in accounts:
+            acct_dir = acct["codex_home"] or (caller_home / ".codex")
+            if _resolve_path_against_home(acct_dir) == target_dir:
+                return acct
+        return None
+    if engine == "agy":
+        orkest_agy_home = (os.environ.get("ORKEST_AGY_ACCOUNT_HOME") or "").strip()
+        default_agy_home = caller_home / ".gemini"
+        explicit_home = str(agy_home).strip() if agy_home is not None and str(agy_home).strip() else ""
+        explicit_app = (
+            str(agy_app_data_dir).strip() if agy_app_data_dir is not None and str(agy_app_data_dir).strip() else ""
+        )
+        if explicit_home or explicit_app:
+            sel_gemini: Path | str | None = explicit_home or None
+            sel_app: Path | str | None = explicit_app or None
+            target_infer = include_child_markers and bool(explicit_home) and not explicit_app
+        elif include_child_markers and orkest_agy_home:
+            sel_gemini = orkest_agy_home
+            sel_app = None
+            target_infer = True
+        elif include_child_markers and os.environ.get("ORKEST_PINNED_AGY_ACCOUNT") == "1":
+            sel_gemini = default_agy_home
+            sel_app = None
+            target_infer = False
+        else:
+            sel_gemini = (os.environ.get("GEMINI_CLI_HOME") or "").strip() or None
+            sel_app = (os.environ.get("ANTIGRAVITY_APP_DATA_DIR") or "").strip() or None
+            target_infer = False
+
+        target_pair = _derive_agy_profile_pair(
+            sel_gemini,
+            sel_app,
+            default_home=default_agy_home,
+            infer_gemini_basename=target_infer,
+        )
+        acct_pairs = [
+            (
+                acct,
+                _derive_agy_profile_pair(
+                    acct.get("agy_home"),
+                    acct.get("agy_app_data_dir"),
+                    default_home=default_agy_home,
+                    infer_gemini_basename=(
+                        include_child_markers
+                        and acct.get("agy_app_data_dir") is None
+                        and acct.get("agy_home") is not None
+                        and not acct.get("agy_typed_gemini_home")
+                    ),
+                ),
+            )
+            for acct in accounts
+        ]
+        for acct, acct_pair in acct_pairs:
+            if acct_pair == target_pair:
+                return acct
+        for acct, acct_pair in acct_pairs:
+            if acct_pair[1] == target_pair[1]:
+                return acct
+        if explicit_home and not explicit_app:
+            resolved_explicit = _resolve_path_against_home(explicit_home)
+            for acct, _acct_pair in acct_pairs:
+                app_dir = acct.get("agy_app_data_dir")
+                if app_dir is not None and _resolve_path_against_home(app_dir) == resolved_explicit:
+                    return acct
+        if not sel_app:
+            for acct, acct_pair in acct_pairs:
+                if acct.get("agy_app_data_dir") is None and acct_pair[0] == target_pair[0]:
+                    return acct
+        return None
+    return None
+
+
+def _check_policy_allowed(repo_policy: Any, cwd: Path | str, engine: str, acct: dict[str, Any]) -> bool:
+    import inspect
+
+    params = inspect.signature(repo_policy.check_execution_allowed).parameters
+    accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    optional = {
+        "account_id": acct.get("account_id") or None,
+        "provider": acct.get("provider") or None,
+        "billing_mode": acct.get("billing_mode") or None,
+        "tags": acct.get("tags") or None,
+        "account_alias": acct.get("account_alias") or None,
+        "codex_home": acct.get("codex_home"),
+        "agy_home": acct.get("agy_home"),
+        "agy_app_data_dir": acct.get("agy_app_data_dir"),
+        "strict": True,
+    }
+    kwargs = optional if accepts_kwargs else {k: v for k, v in optional.items() if k in params}
+    allowed, _reason, _auto_dir = repo_policy.check_execution_allowed(
+        cwd,
+        engine,
+        acct.get("claude_config_dir"),
+        **kwargs,
+    )
+    return bool(allowed)
+
+
+def select_auto_account(
+    cwd: Path | str,
+    engine: str,
+    *,
+    model: str | None = None,
+    strict: bool = False,
+) -> dict[str, Any] | None:
+    """Select the highest-quota configured Monitor account for `engine` allowed by repository policy."""
+    repo_policy = _bundled_module("repo_policy")
+    candidates = [acct for acct in load_monitor_accounts(strict=strict) if acct["engine"] == engine]
+    allowed_accounts = [acct for acct in candidates if _check_policy_allowed(repo_policy, cwd, engine, acct)]
+    if not allowed_accounts:
+        return None
+    if len(allowed_accounts) == 1:
+        return allowed_accounts[0]
+    quota = _bundled_module("quota")
+    view = quota.snapshot()
+    if view is None:
+        return allowed_accounts[0]
+    lanes = quota.pool_lanes(engine, model or engine, view)
+    if not lanes:
+        return allowed_accounts[0]
+    allowed_ids = {acct["account_id"] for acct in allowed_accounts if acct.get("account_id")}
+    best_lane = quota.route_account_lane(
+        lanes,
+        engine=engine,
+        model=model,
+        allowed_account_ids=allowed_ids or None,
+    )
+    if best_lane is not None:
+        best_id = str(best_lane.get("accountId") or "").strip()
+        matched = next((acct for acct in allowed_accounts if acct.get("account_id") == best_id), None)
+        if matched is not None:
+            return matched
+    return allowed_accounts[0]
+
+
+def _normalize_route_engine(raw_engine: Any, *, strict: bool = False) -> str | None:
+    if not isinstance(raw_engine, str):
+        return None
+    cleaned = raw_engine.strip().lower()
+    if not cleaned:
+        return None
+    if cleaned in _ROUTE_ENGINE_ALIASES:
+        return _ROUTE_ENGINE_ALIASES[cleaned]
+    if cleaned in EXECUTION_ENGINES:
+        return cleaned
+    acct = resolve_configured_account(raw_engine.strip(), strict=strict)
+    if acct is not None:
+        return acct["engine"]
+    return cleaned
+
+
+def _route_account(route: dict[str, Any], *, strict: bool = False) -> tuple[dict[str, Any] | None, str | None]:
+    for key in ("account", "alias", "accountId", "account_id", "accountAlias", "account_alias"):
+        val = route.get(key)
+        if isinstance(val, str) and val.strip():
+            acct = resolve_configured_account(val.strip(), strict=strict)
+            return acct, val.strip()
+    raw_engine = route.get("engine")
+    if isinstance(raw_engine, str) and raw_engine.strip():
+        cleaned = raw_engine.strip().lower()
+        if cleaned not in _ROUTE_ENGINE_ALIASES and cleaned not in EXECUTION_ENGINES:
+            acct = resolve_configured_account(raw_engine.strip(), strict=strict)
+            if acct is not None:
+                return acct, raw_engine.strip()
+    return None, None
+
+
+def _route_claude_config_dir(route: dict[str, Any]) -> Path | None:
+    explicit = route.get("claudeConfigDir") or route.get("claude_config_dir")
+    if isinstance(explicit, str) and explicit.strip():
+        return Path(explicit.strip()).expanduser()
+    acct, _ = _route_account(route)
+    if acct is not None and acct["engine"] == "claude":
+        return acct["claude_config_dir"]
+    return None
+
+
+def _route_codex_home(route: dict[str, Any]) -> Path | None:
+    explicit = route.get("codexHome") or route.get("codex_home")
+    if isinstance(explicit, str) and explicit.strip():
+        return Path(explicit.strip()).expanduser()
+    acct, _ = _route_account(route)
+    if acct is not None and acct["engine"] == "codex":
+        return acct["codex_home"]
+    return None
+
+
+def _route_agy_home(route: dict[str, Any]) -> Path | None:
+    explicit = route.get("agyHome") or route.get("agy_home")
+    if isinstance(explicit, str) and explicit.strip():
+        return Path(explicit.strip()).expanduser()
+    acct, _ = _route_account(route)
+    if acct is not None and acct["engine"] == "agy":
+        return acct["agy_home"]
+    return None
+
+
 def resolve_route(args: argparse.Namespace) -> argparse.Namespace:
-    """Fill engine, model, effort and variant from --route, or from the engine's default route."""
+    """Fill engine, model, effort, variant, and account settings from --account, --route, or defaults."""
     module = _attr("routes_module")()
     try:
         routes = module.load_routes()
     except (OSError, ValueError) as error:
         raise _runner_error(f"cannot load routes: {error}", 4) from error
+
+    requested_account = getattr(args, "account", None)
+    explicit_account: dict[str, Any] | None = None
+    if isinstance(requested_account, str) and requested_account.strip():
+        try:
+            explicit_account = resolve_configured_account(requested_account.strip(), strict=True)
+        except ValueError as error:
+            raise _runner_error(str(error), 2) from error
+        if explicit_account is None:
+            raise _runner_error(
+                f"unknown --account {requested_account!r}: not found in Monitor config {monitor_config_path()}",
+                4,
+            )
+        if args.engine and args.engine != explicit_account["engine"]:
+            raise _runner_error(
+                f"--account {requested_account!r} belongs to engine {explicit_account['engine']!r}, "
+                f"not {args.engine!r}",
+                4,
+            )
+
     route = None
     if args.route:
         if args.route not in routes:
             raise _runner_error(f"unknown --route {args.route!r}; configured: {', '.join(sorted(routes))}", 4)
         route = routes[args.route]
-        if args.engine and args.engine != route["engine"]:
+        try:
+            route_exec_engine = _normalize_route_engine(route.get("engine"), strict=True)
+            route_acct_check, route_acct_ref = _route_account(route, strict=True)
+        except ValueError as error:
+            raise _runner_error(str(error), 2) from error
+        if route_acct_ref and route_acct_check is None:
+            raise _runner_error(
+                f"route {args.route!r} references unknown account {route_acct_ref!r}",
+                4,
+            )
+        if route_acct_check is not None:
+            if route_exec_engine and route_exec_engine != route_acct_check["engine"]:
+                raise _runner_error(
+                    f"route {args.route!r} engine {route.get('engine')!r} contradicts account "
+                    f"{route_acct_ref!r} ({route_acct_check['engine']!r})",
+                    4,
+                )
+            route_exec_engine = route_acct_check["engine"]
+        if args.engine and args.engine != route_exec_engine:
             route = None  # an explicit engine overrides the route entirely
-        elif not args.engine and not args.model and route.get("engine") and not shutil.which(route["engine"]):
+        elif explicit_account is not None and explicit_account["engine"] != route_exec_engine:
+            route = None  # an explicit account of another engine overrides the route
+        elif (
+            not args.engine
+            and not args.model
+            and explicit_account is None
+            and route_exec_engine
+            and not shutil.which(route_exec_engine)
+        ):
             for alt in route.get("alternates") or ():
-                if isinstance(alt, dict) and alt.get("engine") and shutil.which(str(alt["engine"])):
+                try:
+                    alt_exec_engine = (
+                        _normalize_route_engine(alt.get("engine"), strict=True) if isinstance(alt, dict) else None
+                    )
+                except ValueError as error:
+                    raise _runner_error(str(error), 2) from error
+                if alt_exec_engine and shutil.which(alt_exec_engine):
                     route = alt
                     break
-    if args.model and not args.engine and not args.route:
+    if args.model and not args.engine and not args.route and explicit_account is None:
         base_model, _ = split_opencode_model(None, args.model)
         families = _attr("load_model_families")()
         parsed = _attr("families_module")().parse_selector(base_model, families)
@@ -1536,17 +2353,140 @@ def resolve_route(args: argparse.Namespace) -> argparse.Namespace:
                 inferred = _attr("native_engine_for")(base_model)
                 if inferred:
                     args.engine = inferred
-    args.engine = args.engine or (route or {}).get("engine") or _attr("DEFAULT_ENGINE", DEFAULT_ENGINE)
+    try:
+        args.engine = (
+            args.engine
+            or (explicit_account["engine"] if explicit_account else None)
+            or _normalize_route_engine((route or {}).get("engine"), strict=True)
+            or _attr("DEFAULT_ENGINE", DEFAULT_ENGINE)
+        )
+    except ValueError as error:
+        raise _runner_error(str(error), 2) from error
     route = route or module.engine_default(args.engine, routes)
     route_variant = None
-    if route and route.get("engine") == args.engine:
+    route_account: dict[str, Any] | None = None
+    try:
+        route_engine_norm = _normalize_route_engine(route.get("engine"), strict=True) if route else None
+    except ValueError as error:
+        raise _runner_error(str(error), 2) from error
+    if route and route_engine_norm == args.engine:
         if args.model is None and args.route:
             args.model = route.get("model")
         model, _ = split_opencode_model(args.engine, args.model or route.get("model"))
         route_model, _ = split_opencode_model(args.engine, route.get("model"))
         if args.effort is None and route.get("effort") and model == route_model:
             args.effort = route["effort"]
+        try:
+            route_account, route_acct_ref = _route_account(route, strict=True)
+        except ValueError as error:
+            raise _runner_error(str(error), 2) from error
+        if route_acct_ref and route_account is None:
+            raise _runner_error(f"route {args.route or args.engine!r} references unknown account {route_acct_ref!r}", 4)
+        if explicit_account is None:
+            if args.engine == "claude" and getattr(args, "claude_config_dir", None) is None:
+                route_claude_dir = _route_claude_config_dir(route)
+                if route_claude_dir is not None:
+                    args.claude_config_dir = route_claude_dir
+            if args.engine == "codex" and getattr(args, "codex_home", None) is None:
+                route_codex_dir = _route_codex_home(route)
+                if route_codex_dir is not None:
+                    args.codex_home = route_codex_dir
+            if args.engine == "agy" and getattr(args, "agy_home", None) is None:
+                route_agy_dir = _route_agy_home(route)
+                if route_agy_dir is not None:
+                    args.agy_home = route_agy_dir
         route_variant = route.get("variant")
+
+    effective_account = explicit_account or route_account
+    explicit_claude_dir = getattr(args, "claude_config_dir", None)
+    if explicit_account is not None:
+        if args.engine == "claude":
+            acct_claude_dir = explicit_account["claude_config_dir"]
+            if explicit_claude_dir is not None:
+                expected_dir = (
+                    acct_claude_dir
+                    or (
+                        (explicit_account["claude_account_home"] / ".claude")
+                        if explicit_account["claude_account_home"]
+                        else None
+                    )
+                    or (_resolve_path_against_home(Path.home()) / ".claude")
+                )
+                if _resolve_path_against_home(explicit_claude_dir) != _resolve_path_against_home(expected_dir):
+                    raise _runner_error(
+                        f"--account {requested_account!r} profile ({expected_dir}) contradicts "
+                        f"--claude-config-dir '{explicit_claude_dir}'",
+                        4,
+                    )
+            elif acct_claude_dir is not None:
+                args.claude_config_dir = acct_claude_dir
+        elif args.engine == "codex" and getattr(args, "codex_home", None) is None:
+            args.codex_home = explicit_account["codex_home"]
+        elif args.engine == "agy" and getattr(args, "agy_home", None) is None:
+            args.agy_home = explicit_account["agy_home"]
+
+    args.explicit_account = _has_explicit_account_pin(
+        args.engine,
+        explicit_account=(explicit_account is not None or route_account is not None),
+        claude_config_dir=getattr(args, "claude_config_dir", None),
+        claude_account_home=getattr(args, "claude_account_home", None),
+        codex_home=getattr(args, "codex_home", None),
+        agy_home=getattr(args, "agy_home", None),
+        agy_app_data_dir=getattr(args, "agy_app_data_dir", None),
+        include_child_markers=False,
+    )
+
+    if effective_account is None:
+        try:
+            effective_account = resolve_account_by_home(
+                args.engine,
+                claude_config_dir=getattr(args, "claude_config_dir", None),
+                claude_account_home=getattr(args, "claude_account_home", None),
+                codex_home=getattr(args, "codex_home", None),
+                agy_home=getattr(args, "agy_home", None),
+                agy_app_data_dir=getattr(args, "agy_app_data_dir", None),
+                strict=True,
+            )
+        except ValueError as error:
+            raise _runner_error(str(error), 2) from error
+
+    if args.explicit_account and effective_account is not None:
+        if args.engine == "claude" and getattr(args, "claude_account_home", None) is None:
+            args.claude_account_home = effective_account["claude_account_home"]
+        elif args.engine == "codex" and getattr(args, "codex_home", None) is None:
+            args.codex_home = effective_account["codex_home"]
+        elif args.engine == "agy":
+            if getattr(args, "agy_home", None) is None:
+                args.agy_home = effective_account["agy_home"]
+            if getattr(args, "agy_app_data_dir", None) is None:
+                args.agy_app_data_dir = effective_account["agy_app_data_dir"]
+    else:
+        args.claude_account_home = getattr(args, "claude_account_home", None)
+        args.codex_home = getattr(args, "codex_home", None)
+        args.agy_home = getattr(args, "agy_home", None)
+        args.agy_app_data_dir = getattr(args, "agy_app_data_dir", None)
+    for field in ("claude_config_dir", "claude_account_home", "codex_home", "agy_home", "agy_app_data_dir"):
+        explicit_val = getattr(args, field, None)
+        effective_val = (
+            explicit_val
+            if explicit_val is not None
+            else (effective_account.get(field) if effective_account is not None else None)
+        )
+        setattr(args, f"effective_{field}", effective_val)
+    if (
+        args.engine == "agy"
+        and getattr(args, "effective_agy_app_data_dir", None) is None
+        and effective_account is not None
+        and effective_account.get("agy_typed_gemini_home")
+        and getattr(args, "effective_agy_home", None) is not None
+    ):
+        args.effective_agy_app_data_dir = args.effective_agy_home / "antigravity-cli"
+    args.account_id = effective_account["account_id"] if effective_account else None
+    args.account_alias = effective_account["account_alias"] if effective_account else None
+    args.account_provider = effective_account["provider"] if effective_account else None
+    args.account_tags = list(effective_account["tags"]) if effective_account else []
+    args.account_billing = effective_account["billing_mode"] if effective_account else None
+
     if args.engine == "opencode":
         args.model, inline_variant = split_opencode_model("opencode", args.model)
         args.variant = (

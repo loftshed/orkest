@@ -1,6 +1,6 @@
 ---
 name: monitor
-description: Check how much subscription quota is left on the user's AI accounts (Claude Code profiles, Codex/ChatGPT, Antigravity/Gemini) and where it is best spent. Use before delegating work to another agent, model or CLI (claude, plaude, codex, agy, orchestrate), when choosing between accounts, before a large or long-running task, when a "usage limit" or rate-limit error appears, or when the user asks how much usage is left.
+description: Check how much subscription quota is left on the user's AI accounts (Claude Code profiles, Codex/ChatGPT, Antigravity/Gemini) and where it is best spent. Use before delegating work to another agent, model or CLI (claude, codex, agy, opencode, orchestrate), when choosing between accounts, before a large or long-running task, when a "usage limit" or rate-limit error appears, or when the user asks how much usage is left.
 ---
 
 # monitor

@@ -6,6 +6,7 @@ import concurrent.futures
 import contextlib
 import datetime as dt
 import http.client
+import io
 import json
 import os
 import shutil
@@ -802,3 +803,374 @@ d.serve(base)
                     self.assertEqual(responses[1]["error"]["code"], -32000)
                 self.assertEqual(len(mailbox.messages(self.base, "receiver")), 1)
                 child.wait(timeout=5)
+
+    def test_health_reports_active_waits_without_persisting_to_state(self):
+        self.start()
+        self.peer("waiter")
+        token = daemon.read_token(self.base)
+        idle_health = daemon.check_daemon(self.state["url"], token)
+        self.assertEqual(idle_health["activeWaits"], 0)
+        persisted_state = daemon.load_state(self.base)
+        self.assertNotIn("activeWaits", persisted_state)
+
+        parsed = urllib.parse.urlparse(self.state["url"])
+        connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=4)
+        body = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "wait",
+                "arguments": {"session": "waiter", "timeoutSeconds": 10},
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+            },
+        }
+        try:
+            connection.request(
+                "POST",
+                "/mcp",
+                json.dumps(body),
+                {
+                    "Authorization": "Bearer " + token,
+                    "Content-Type": "application/json",
+                    "MCP-Protocol-Version": "2026-07-28",
+                    "Mcp-Method": "tools/call",
+                    "Mcp-Name": "wait",
+                },
+            )
+            until = time.monotonic() + 3
+            active_health = None
+            while time.monotonic() < until:
+                active_health = daemon.check_daemon(self.state["url"], token)
+                if active_health and active_health.get("activeWaits", 0) >= 1:
+                    break
+                time.sleep(0.02)
+            self.assertIsNotNone(active_health)
+            self.assertEqual(active_health["activeWaits"], 1)
+            self.assertNotIn("activeWaits", daemon.load_state(self.base))
+        finally:
+            connection.close()
+
+        until = time.monotonic() + 3
+        while time.monotonic() < until:
+            settled = daemon.check_daemon(self.state["url"], token)
+            if settled and settled.get("activeWaits") == 0:
+                break
+            time.sleep(0.02)
+        self.assertEqual(daemon.check_daemon(self.state["url"], token)["activeWaits"], 0)
+
+    def test_runtime_revision_cache_hit_miss_recovery_and_concurrency(self):
+        plugin = Path(self.temp.name) / "plugin-tree"
+        for folder in ("scripts", "references", "templates", "bin", "lib"):
+            (plugin / folder).mkdir(parents=True)
+        daemon_copy = plugin / "scripts" / "mailbox_daemon.py"
+        daemon_copy.write_text("# daemon placeholder\n", encoding="utf-8")
+        helper = plugin / "scripts" / "helper.py"
+        helper.write_text("VALUE = 1234\n", encoding="utf-8")
+        lib_file = plugin / "lib" / "room.mjs"
+        lib_file.write_text("export const x = 1;\n", encoding="utf-8")
+
+        base_resolved = self.base.resolve()
+        with (
+            mock.patch.object(daemon, "__file__", str(daemon_copy)),
+            mock.patch.dict(os.environ, {"ORCHESTRATE_HOME": str(base_resolved.parent)}),
+        ):
+            daemon.runtime_revision.cache_clear()
+            try:
+                rev1 = daemon.runtime_revision()
+                self.assertEqual(len(rev1), 16)
+                cache_files = list(daemon.daemon_base(base_resolved).glob("revision-*.json"))
+                self.assertEqual(len(cache_files), 1)
+                cache_path = cache_files[0]
+                self.assertEqual(cache_path.stat().st_mode & 0o777, 0o600)
+                cached_json = json.loads(cache_path.read_text(encoding="utf-8"))
+                self.assertEqual(cached_json["schema"], "ork.mailbox-revision.v1")
+                self.assertEqual(cached_json["revision"], rev1)
+                self.assertIsInstance(cached_json["files"][0]["st_mtime_ns"], str)
+
+                # Cold cache hit after cache_clear() performs zero read_bytes calls.
+                daemon.runtime_revision.cache_clear()
+                with mock.patch.object(Path, "read_bytes", side_effect=AssertionError("unexpected file read")):
+                    rev_hit = daemon.runtime_revision()
+                self.assertEqual(rev_hit, rev1)
+
+                # Ignored .pyc and __pycache__ files do not invalidate cache hit.
+                pycache = plugin / "scripts" / "__pycache__"
+                pycache.mkdir()
+                (pycache / "helper.cpython-315.pyc").write_bytes(b"pyc-bytes")
+                (plugin / "scripts" / "stray.pyc").write_bytes(b"stray-pyc")
+                daemon.runtime_revision.cache_clear()
+                with mock.patch.object(Path, "read_bytes", side_effect=AssertionError("pyc should be ignored")):
+                    self.assertEqual(daemon.runtime_revision(), rev1)
+
+                # Equal-size edit with restored mtime still misses via ctime change.
+                st_before = helper.stat()
+                helper.write_text("VALUE = 5678\n", encoding="utf-8")
+                os.utime(helper, ns=(st_before.st_atime_ns, st_before.st_mtime_ns))
+                daemon.runtime_revision.cache_clear()
+                rev2 = daemon.runtime_revision()
+                self.assertNotEqual(rev2, rev1)
+
+                # Add, rename, and remove all invalidate cache.
+                added = plugin / "references" / "guide.md"
+                added.write_text("# guide\n", encoding="utf-8")
+                daemon.runtime_revision.cache_clear()
+                rev3 = daemon.runtime_revision()
+                self.assertNotEqual(rev3, rev2)
+
+                renamed = plugin / "references" / "guide-renamed.md"
+                added.rename(renamed)
+                daemon.runtime_revision.cache_clear()
+                rev4 = daemon.runtime_revision()
+                self.assertNotEqual(rev4, rev3)
+
+                renamed.unlink()
+                daemon.runtime_revision.cache_clear()
+                self.assertEqual(daemon.runtime_revision(), rev2)
+
+                # Corrupt cache JSON and loose permissions recover cleanly.
+                cache_path.write_text("{corrupt", encoding="utf-8")
+                daemon.runtime_revision.cache_clear()
+                self.assertEqual(daemon.runtime_revision(), rev2)
+                self.assertEqual(json.loads(cache_path.read_text(encoding="utf-8"))["revision"], rev2)
+
+                os.chmod(cache_path, 0o644)
+                daemon.runtime_revision.cache_clear()
+                self.assertEqual(daemon.runtime_revision(), rev2)
+                self.assertEqual(cache_path.stat().st_mode & 0o777, 0o600)
+
+                # Escaping symlink is never cached.
+                outside = Path(self.temp.name) / "outside.txt"
+                outside.write_text("external", encoding="utf-8")
+                escape_link = plugin / "templates" / "escape.txt"
+                escape_link.symlink_to(outside)
+                cache_path.unlink()
+                daemon.runtime_revision.cache_clear()
+                rev_escape = daemon.runtime_revision()
+                self.assertFalse(cache_path.exists())
+                escape_link.unlink()
+
+                # Concurrent cache writes remain valid and consistent.
+                with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+                    results = list(pool.map(lambda _: daemon.runtime_revision_for(base_resolved), range(12)))
+                self.assertEqual(set(results), {rev2})
+                self.assertEqual(json.loads(cache_path.read_text(encoding="utf-8"))["revision"], rev2)
+                self.assertNotEqual(rev_escape, rev2)
+            finally:
+                daemon.runtime_revision.cache_clear()
+
+    def test_read_revision_cache_closes_fd_enforces_cap_and_rejects_fifo(self):
+        cache_dir = daemon.daemon_base(self.base)
+        daemon.private_directory(cache_dir)
+        cache_path = cache_dir / "revision-test.json"
+
+        # 1. Repeated fstat rejections (loose perms) must not leak file descriptors.
+        cache_path.write_text('{"schema":"ork.mailbox-revision.v1"}', encoding="utf-8")
+        os.chmod(cache_path, 0o644)
+        open_fds = []
+        real_open = os.open
+        real_close = os.close
+
+        def track_open(path, flags, *args, **kwargs):
+            fd = real_open(path, flags, *args, **kwargs)
+            if Path(path) == cache_path:
+                open_fds.append(fd)
+            return fd
+
+        def track_close(fd):
+            if fd in open_fds:
+                open_fds.remove(fd)
+            return real_close(fd)
+
+        with (
+            mock.patch.object(os, "open", side_effect=track_open),
+            mock.patch.object(os, "close", side_effect=track_close),
+        ):
+            for _ in range(5):
+                self.assertIsNone(daemon._read_revision_cache(cache_path, [], []))
+        self.assertEqual(open_fds, [])
+
+        # 2. Enforces MAX_REVISION_CACHE_BYTES + 1 read cap before json.loads.
+        os.chmod(cache_path, 0o600)
+        cache_path.write_text('{"schema":"ork.mailbox-revision.v1","revision":"0123456789abcdef"}', encoding="utf-8")
+        with mock.patch.object(daemon, "MAX_REVISION_CACHE_BYTES", 16):
+            self.assertIsNone(daemon._read_revision_cache(cache_path, [], []))
+
+        # 3. FIFO at cache_path never blocks.
+        cache_path.unlink()
+        os.mkfifo(cache_path, 0o600)
+        self.assertIsNone(daemon._read_revision_cache(cache_path, [], []))
+
+        # 4. Deeply nested JSON within byte cap returns None instead of raising RecursionError.
+        cache_path.unlink()
+        cache_path.write_text("[" * 2000 + "]" * 2000, encoding="utf-8")
+        os.chmod(cache_path, 0o600)
+        self.assertIsNone(daemon._read_revision_cache(cache_path, [], []))
+
+    def test_explicit_base_never_touches_default_store_and_warm_failure_keeps_daemon_healthy(self):
+        default_home = Path(self.temp.name) / "default-home"
+        default_home.mkdir()
+        disposable = Path(self.temp.name) / "disposable" / "mailbox-v1"
+        with mock.patch.dict(os.environ, {"ORCHESTRATE_HOME": str(default_home)}):
+            entry = daemon.runtime_bundle(disposable)
+            self.assertTrue(entry.is_file())
+            server = daemon.HTTPDaemon(("127.0.0.1", 0), disposable, "t" * 32)
+            try:
+                self.assertEqual(server.info["storeId"], daemon.store_id(disposable))
+            finally:
+                server.server_close()
+            self.assertFalse((default_home / "mailbox-daemon-v1").exists())
+
+        # Warm failure (OSError) after starting/authenticating daemon still returns live daemon.
+        self.start()
+        lock_held_during_warm = []
+        original_rev_for = daemon.runtime_revision_for
+
+        def fail_warm(base_arg=None):
+            lock_path = daemon.daemon_base(self.base) / "startup.lock"
+            fd = os.open(lock_path, os.O_RDWR)
+            try:
+                import fcntl as _fcntl
+
+                try:
+                    _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+                    lock_held_during_warm.append(False)
+                    _fcntl.flock(fd, _fcntl.LOCK_UN)
+                except BlockingIOError:
+                    lock_held_during_warm.append(True)
+            finally:
+                os.close(fd)
+            raise OSError("transient source vanish")
+
+        with mock.patch.object(daemon, "runtime_revision_for", side_effect=fail_warm):
+            live = daemon.ensure_running(self.base, startup_timeout=2)
+        self.assertEqual(live["instance"], self.state["instance"])
+        self.assertEqual(lock_held_during_warm, [False])
+        with mock.patch.object(daemon, "runtime_revision_for", side_effect=RecursionError("deep json")):
+            live_rec = daemon.ensure_running(self.base, startup_timeout=2)
+        self.assertEqual(live_rec["instance"], self.state["instance"])
+        _ = original_rev_for
+
+    def test_status_cli_separates_health_reachability_from_revision_read_failure(self):
+        self.start()
+        for err in (OSError("vanished source"), RecursionError("deep json")):
+            with (
+                mock.patch.object(daemon, "runtime_revision_for", side_effect=err),
+                contextlib.redirect_stdout(io.StringIO()) as out,
+            ):
+                rc = daemon.main(["status", "--root", str(self.base), "--json"])
+            self.assertEqual(rc, 0)
+            payload = json.loads(out.getvalue())
+            self.assertEqual(payload["status"], "running")
+            self.assertEqual(payload["instance"], self.state["instance"])
+            self.assertEqual(payload["url"], self.state["url"])
+            self.assertFalse(payload["staleImplementation"])
+
+    def test_zero_wait_legacy_batch_reports_zero_active_waits_and_conditional_stop_respects_waits(self):
+        self.peer("sender")
+        self.peer("receiver", "claude")
+        counter, child = self.fault_service(delay=0.6)
+        self.children.append(child)
+        token = daemon.read_token(self.base)
+        _, _, init_headers = self.rpc("initialize", {"protocolVersion": "2025-03-26"}, modern=False)
+        session_hdr = init_headers["Mcp-Session-Id"]
+        parsed = urllib.parse.urlparse(self.state["url"])
+
+        def send_batch(batch_body):
+            conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=4)
+            try:
+                conn.request(
+                    "POST",
+                    "/mcp",
+                    json.dumps(batch_body),
+                    {
+                        "Authorization": "Bearer " + daemon.read_token(self.base),
+                        "Content-Type": "application/json",
+                        "Mcp-Session-Id": session_hdr,
+                    },
+                )
+                resp = conn.getresponse()
+                return resp.status, resp.read()
+            finally:
+                conn.close()
+
+        zero_wait_batch = [
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "send",
+                    "arguments": {"session": "sender", "to": "receiver", "text": "zero wait", "idempotencyKey": "zw-1"},
+                },
+            },
+            {"jsonrpc": "2.0", "id": 2, "method": "ping"},
+        ]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            fut = pool.submit(send_batch, zero_wait_batch)
+            deadline = time.monotonic() + 3
+            while not counter.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(counter.exists())
+            health = daemon.check_daemon(self.state["url"], daemon.read_token(self.base))
+            self.assertEqual(health["activeWaits"], 0)
+            status, _ = fut.result(timeout=4)
+            self.assertEqual(status, 200)
+
+        # Wait-bearing legacy batch must report activeWaits == 1 and refuse conditional idle stop.
+        wait_batch = [
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {"name": "wait", "arguments": {"session": "sender", "timeoutSeconds": 3}},
+            }
+        ]
+        conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=4)
+        try:
+            conn.request(
+                "POST",
+                "/mcp",
+                json.dumps(wait_batch),
+                {
+                    "Authorization": "Bearer " + token,
+                    "Content-Type": "application/json",
+                    "Mcp-Session-Id": session_hdr,
+                },
+            )
+            until = time.monotonic() + 3
+            active_health = None
+            while time.monotonic() < until:
+                active_health = daemon.check_daemon(self.state["url"], token)
+                if active_health and active_health.get("activeWaits", 0) >= 1:
+                    break
+                time.sleep(0.02)
+            self.assertEqual(active_health["activeWaits"], 1)
+            self.assertFalse(daemon.stop_service(self.base, if_idle=True, expected_instance=self.state["instance"]))
+            self.assertEqual(
+                daemon._stop_daemon_status(
+                    self.state["url"],
+                    token,
+                    expected_instance=self.state["instance"],
+                    if_idle=True,
+                ),
+                "declined",
+            )
+            self.assertEqual(
+                daemon._stop_daemon_status(
+                    self.state["url"],
+                    token,
+                    expected_instance="wrong-instance",
+                    if_idle=False,
+                ),
+                "declined",
+            )
+            # Daemon is still alive; explicit stop_service(base) succeeds.
+            self.assertIsNotNone(daemon.check_daemon(self.state["url"], token))
+        finally:
+            conn.close()
+        self.assertTrue(daemon.stop_service(self.base))
+        child.wait(timeout=5)

@@ -8,6 +8,7 @@ import datetime as dt
 import io
 import json
 import os
+import socket
 import stat
 import subprocess
 import sys
@@ -64,7 +65,7 @@ def room(room_id="r1", session=LEAD, agents=None, authority=None):
 class HandoffTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name).resolve()
         self.homes = {name: self.root / name for name in ("claude-a", "claude-b", "claude-c", "claude-w")}
         for home in self.homes.values():
             home.mkdir()
@@ -1471,6 +1472,903 @@ class HandoffTests(unittest.TestCase):
         note = (HANDOFF.session_dir("handoff-chain1") / "note.md").read_text()
         self.assertIn("- goal: Chain handoff", note)
         self.assertIn("- task: Verify peerSession", note)
+
+    # Chief quota exhaustion handover & OpenCode parity
+
+    def write_chief(self, session=LEAD, **overrides):
+        binding = {
+            "schema": "ork.chief.v1",
+            "session": session,
+            "name": self.lead["name"],
+            "engine": "claude",
+            "model": OPUS,
+            "cwd": str(self.repo),
+            "machine": socket.gethostname(),
+            "pid": os.getpid(),
+            "pidBirth": MAILBOX.process_started(os.getpid()),
+            "boundAt": HANDOFF.stamp(HANDOFF.now()),
+            **overrides,
+        }
+        (self.base / "chief.json").write_text(json.dumps(binding) + "\n")
+        return binding
+
+    def test_blocked_chief_alone_produces_brief_ready_without_touching_chief_or_teams(self) -> None:
+        self.assertEqual(HANDOFF.HARNESS_ENGINE.get("opencode"), "opencode")
+        binding = self.write_chief()
+        chief_before = (self.base / "chief.json").read_text()
+        MAILBOX.write(
+            self.base / "progress" / f"{MAILBOX.session_key(LEAD)}.json",
+            {
+                "schema": "orchestrate.progress.v1",
+                "session": LEAD,
+                "goal": "Coordinate wave1 rooms",
+                "task": "Supervise builds",
+                "stage": "working",
+            },
+        )
+        event = self.handoff(rooms=[])
+        self.assertEqual(event["status"], "brief-ready", event)
+        self.assertIn("brief-ready", HANDOFF.FINAL)
+        self.assertIsNone(event.get("team"))
+        self.assertEqual(self.launched, [])
+        self.assertEqual(self.delivered, [])
+        self.assertEqual((self.base / "chief.json").read_text(), chief_before)
+        authority_dir = AUTHORITY.cache_dir() / "authority-v1"
+        self.assertEqual(list(authority_dir.glob("*")) if authority_dir.exists() else [], [])
+
+        brief_path = Path(event["brief"])
+        self.assertEqual(brief_path, HANDOFF.session_dir(LEAD) / "brief.md")
+        self.assertEqual(stat.S_IMODE(brief_path.stat().st_mode), 0o600)
+        brief_text = brief_path.read_text()
+        for expected in (
+            event["id"],
+            event["recordedAt"],
+            LEAD,
+            binding["name"],
+            binding["machine"],
+            binding["boundAt"],
+            str(self.repo.resolve()),
+            OPUS,
+            "claude-a",
+            "claude-a:all",
+            "blocked",
+            "Coordinate wave1 rooms",
+            "ork chief bind",
+        ):
+            self.assertIn(expected, brief_text)
+
+        self.assertIn("Chief desk", event["notice"])
+        self.assertIn("ork chief bind", event["notice"])
+        self.assertIn(str(brief_path), event["notice"])
+        other = self.register("claude-observer", "claude-b", state="busy")
+        self.assertIn("ork chief bind", HANDOFF.notices(self.base, other))
+        self.assertEqual(HANDOFF.notices(self.base, other), "")
+
+        # Deduped retry within DEDUPE_SECONDS records only one event.
+        self.assertEqual(self.stop_failure()["status"], "duplicate")
+
+    def test_chief_preserves_available_stale_unknown_missing_billing_excluded_and_ambiguous(self) -> None:
+        self.write_chief()
+        # Available -> not-exhausted, no brief, no notice.
+        self.set_lane("claude-a", status="available", usable=80)
+        available = self.handoff(rooms=[])
+        self.assertEqual(available["status"], "not-exhausted")
+        self.assertNotIn("notice", available)
+        self.assertFalse((HANDOFF.session_dir(LEAD) / "brief.md").exists())
+
+        # Stale -> refused with notice.
+        self.set_lane("claude-a", status="blocked", usable=0, stale=True)
+        later = HANDOFF.now() + dt.timedelta(seconds=HANDOFF.DEDUPE_SECONDS + 1)
+        with mock.patch.object(HANDOFF, "now", return_value=later):
+            stale = self.handoff(rooms=[])
+        self.assertEqual(stale["status"], "refused")
+        self.assertIn("stale or unknown", stale["reasons"][0])
+        self.assertIn("notice", stale)
+
+        # Unknown (monitor missing) -> refused.
+        self.set_lane("claude-a", status="blocked", usable=0, stale=False)
+        later = later + dt.timedelta(seconds=HANDOFF.DEDUPE_SECONDS + 1)
+        with mock.patch.object(HANDOFF, "now", return_value=later):
+            unknown = self.handoff(rooms=[], fetch=lambda: None)
+        self.assertEqual(unknown["status"], "refused")
+        self.assertIn("quota is unknown", unknown["reasons"][0])
+
+        # Missing billing -> refused.
+        self.config["accounts"][0]["billing"] = None
+        self.write()
+        later = later + dt.timedelta(seconds=HANDOFF.DEDUPE_SECONDS + 1)
+        with mock.patch.object(HANDOFF, "now", return_value=later):
+            no_billing = self.handoff(rooms=[])
+        self.assertEqual(no_billing["status"], "refused")
+        self.assertIn("billing context", no_billing["reasons"][0])
+
+        # Excluded account leaves no eligible pool -> refused.
+        self.config["accounts"][0]["billing"] = "personal"
+        self.write()
+        later = later + dt.timedelta(seconds=HANDOFF.DEDUPE_SECONDS + 1)
+        with (
+            mock.patch.object(HANDOFF, "now", return_value=later),
+            mock.patch.object(
+                HANDOFF,
+                "settings",
+                return_value={"enabled": True, "autoLaunch": True, "excludeAccounts": ["claude-b", "codex"]},
+            ),
+        ):
+            excluded = self.handoff(rooms=[])
+        self.assertEqual(excluded["status"], "refused")
+        self.assertIn("no pool on another personal account", excluded["reasons"][0])
+
+        # Multiple distinct Codex accounts with distinct CODEX_HOME pick highest-surplus allowed account.
+        cx1 = self.root / "cx1"
+        cx2 = self.root / "cx2"
+        cx1.mkdir(exist_ok=True)
+        cx2.mkdir(exist_ok=True)
+        self.config["accounts"] = [
+            {"id": "claude-a", "provider": "claude", "billing": "personal", "configDir": str(self.homes["claude-a"])},
+            {
+                "id": "codex-1",
+                "provider": "codex",
+                "billing": "personal",
+                "tags": ["personal"],
+                "env": {"CODEX_HOME": str(cx1)},
+            },
+            {
+                "id": "codex-2",
+                "provider": "codex",
+                "billing": "personal",
+                "tags": ["personal"],
+                "env": {"CODEX_HOME": str(cx2)},
+            },
+        ]
+        self.lanes = [
+            lane("claude-a", status="blocked", usable=0),
+            lane("codex-1", "codex", usable=90, surplus=30),
+            lane("codex-2", "codex", usable=80, surplus=20),
+        ]
+        self.write()
+        view_distinct = json.loads((self.root / "view.json").read_text())
+        view_distinct["accounts"][1]["accountHome"] = str(cx1.resolve())
+        view_distinct["accounts"][2]["accountHome"] = str(cx2.resolve())
+        (self.root / "view.json").write_text(json.dumps(view_distinct))
+        later = later + dt.timedelta(seconds=HANDOFF.DEDUPE_SECONDS + 1)
+        with mock.patch.object(HANDOFF, "now", return_value=later):
+            multi_codex = self.handoff(rooms=[])
+        self.assertEqual(multi_codex["status"], "brief-ready", multi_codex)
+        self.assertIn("codex-1", Path(multi_codex["brief"]).read_text())
+
+        # Ambiguous fresh launch (two Codex accounts sharing the same CODEX_HOME) -> refused.
+        self.config["accounts"][2]["env"]["CODEX_HOME"] = str(cx1)
+        self.write()
+        view_ambig = json.loads((self.root / "view.json").read_text())
+        view_ambig["accounts"][1]["accountHome"] = str(cx1.resolve())
+        view_ambig["accounts"][2]["accountHome"] = str(cx1.resolve())
+        (self.root / "view.json").write_text(json.dumps(view_ambig))
+        later = later + dt.timedelta(seconds=HANDOFF.DEDUPE_SECONDS + 1)
+        with mock.patch.object(HANDOFF, "now", return_value=later):
+            ambiguous = self.handoff(rooms=[])
+        self.assertEqual(ambiguous["status"], "refused")
+        self.assertIn("no pool on another personal account", ambiguous["reasons"][0])
+
+    def test_stale_foreign_and_replaced_chief_bindings_are_ignored_and_grace_window_is_honored(self) -> None:
+        # Foreign machine -> ignored.
+        self.write_chief(machine="other-machine.local")
+        self.assertEqual(self.handoff(rooms=[])["status"], "ignored")
+
+        # Another session holds Chief -> ignored.
+        self.write_chief(session="other-session")
+        later = HANDOFF.now() + dt.timedelta(seconds=HANDOFF.DEDUPE_SECONDS + 1)
+        with mock.patch.object(HANDOFF, "now", return_value=later):
+            self.assertEqual(self.handoff(rooms=[])["status"], "ignored")
+
+        # Recycled PID (fresh lstart mismatch) -> ignored.
+        self.write_chief(pidBirth="Thu Jan 01 00:00:00 1970")
+        later = later + dt.timedelta(seconds=HANDOFF.DEDUPE_SECONDS + 1)
+        with mock.patch.object(HANDOFF, "now", return_value=later):
+            self.assertEqual(self.handoff(rooms=[])["status"], "ignored")
+
+        # Unverified binding without PID/peer: within 600s grace -> brief-ready; after 600s -> ignored.
+        MAILBOX.unregister(self.base, LEAD)
+        later = later + dt.timedelta(seconds=HANDOFF.DEDUPE_SECONDS + 1)
+        with mock.patch.object(HANDOFF, "now", return_value=later):
+            self.write_chief(pid=None, pidBirth=None, boundAt=HANDOFF.stamp(later - dt.timedelta(seconds=120)))
+            within_grace = HANDOFF.run(
+                LEAD,
+                HANDOFF.record_exhaustion(LEAD, "claude", "rate_limit", source="t", peer=self.lead, spawn=self.spawn)[
+                    "event"
+                ],
+                base=self.base,
+                rooms=lambda *_: [],
+                sleep=self.sleeps.append,
+            )
+        self.assertEqual(within_grace["status"], "brief-ready", within_grace)
+
+        later = later + dt.timedelta(seconds=HANDOFF.DEDUPE_SECONDS + 1)
+        with mock.patch.object(HANDOFF, "now", return_value=later):
+            self.write_chief(pid=None, pidBirth=None, boundAt=HANDOFF.stamp(later - dt.timedelta(seconds=601)))
+            expired_grace = HANDOFF.run(
+                LEAD,
+                HANDOFF.record_exhaustion(LEAD, "claude", "rate_limit", source="t", peer=self.lead, spawn=self.spawn)[
+                    "event"
+                ],
+                base=self.base,
+                rooms=lambda *_: [],
+                sleep=self.sleeps.append,
+            )
+        self.assertEqual(expired_grace["status"], "ignored")
+
+        # Re-read right before publishing prevents a superseded Chief from emitting a stale notice.
+        self.lead = self.register(LEAD, "claude-a")
+        self.write_chief()
+
+        def supersede_during_fetch():
+            self.write_chief(session="new-chief")
+            return SUCCESSION.fresh_view()
+
+        later = later + dt.timedelta(seconds=HANDOFF.DEDUPE_SECONDS + 1)
+        with mock.patch.object(HANDOFF, "now", return_value=later):
+            superseded = self.handoff(rooms=[], fetch=supersede_during_fetch)
+        self.assertEqual(superseded["status"], "ignored")
+        self.assertNotIn("notice", superseded)
+
+    def test_chief_plus_team_preserves_team_outcome_and_includes_chief_instructions(self) -> None:
+        self.register(PEER, "claude-b")
+        self.write_chief()
+        chief_before = (self.base / "chief.json").read_text()
+        event = self.handoff()
+        self.assertEqual(event["status"], "handed-over", event)
+        self.assertEqual(event["team"], "room-r1")
+        self.assertEqual((self.base / "chief.json").read_text(), chief_before)
+        record = AUTHORITY.load(AUTHORITY.team_dir("room-r1"))
+        self.assertEqual((record["status"], record["lead"]["session"]), ("pending", PEER))
+        brief_text = (HANDOFF.session_dir(LEAD) / "brief.md").read_text()
+        self.assertIn("authority.py", brief_text)
+        self.assertIn("## Chief desk", brief_text)
+        self.assertIn("ork chief bind", brief_text)
+        self.assertIn("Team room-r1 is pending", event["notice"])
+        self.assertIn("ork chief bind", event["notice"])
+
+    def test_existing_peer_successor_respects_repository_policy_for_authority_and_chief_brief(self) -> None:
+        # Idle Codex peer has higher surplus than claude-b, but repo policy denies codex.
+        self.set_lane("codex", status="available", usable=99, surplus=90)
+        MAILBOX.register(
+            self.base,
+            session="codex-idle-peer",
+            harness="codex",
+            cwd=str(self.repo),
+            pid=os.getpid(),
+            model="gpt-6-luna",
+            state="idle",
+            account="/x",
+        )
+        self.register(PEER, "claude-b", state="idle")
+        policy_path = self.root / "repo-policy.json"
+        policy_path.write_text(
+            json.dumps({"schema": "ork.policy.v1", "rules": [{"repo": str(self.repo), "deny": ["codex"]}]})
+        )
+        with mock.patch.dict(os.environ, {"ORKEST_POLICY_CONFIG": str(policy_path)}):
+            # Authority handoff skips denied codex peer and chooses allowed claude-b peer.
+            event = self.handoff()
+            self.assertEqual(event["status"], "handed-over", event)
+            self.assertEqual(event["successor"]["session"], PEER)
+
+            # Chief brief also skips denied codex peer when choosing recommendation.
+            chief_lead = "chief-policy-lead"
+            chief_peer = self.register(chief_lead, "claude-a")
+            self.write_chief(session=chief_lead)
+            later = HANDOFF.now() + dt.timedelta(seconds=HANDOFF.DEDUPE_SECONDS + 1)
+            with mock.patch.object(HANDOFF, "now", return_value=later):
+                recorded = HANDOFF.record_exhaustion(
+                    chief_lead, "claude", "rate_limit", source="test", peer=chief_peer, spawn=self.spawn
+                )
+                self.assertEqual(recorded["status"], "recorded", recorded)
+                chief_event = HANDOFF.run(
+                    chief_lead,
+                    recorded["event"],
+                    base=self.base,
+                    rooms=lambda *_: [],
+                    sleep=self.sleeps.append,
+                )
+            self.assertEqual(chief_event["status"], "brief-ready", chief_event)
+            brief_text = Path(chief_event["brief"]).read_text()
+            self.assertNotIn("codex-idle-peer", brief_text)
+            self.assertIn(PEER, brief_text)
+
+    def test_live_chief_binding_parity_dead_pid_and_same_pid_replacement(self) -> None:
+        # 1. Dead binding PID overrides a stale live-looking exact peer record.
+        dead_pid = 99999999
+        self.write_chief(pid=dead_pid, pidBirth=None)
+        self.assertIsNone(HANDOFF.live_chief_binding(self.base, LEAD))
+
+        # 2. Live PID with no exact peer past 600s grace: subagent/run peer does NOT replace,
+        # while a live top-level peer (even sharedProcess=True) DOES replace.
+        MAILBOX.unregister(self.base, LEAD)
+        moment = HANDOFF.now()
+        old_bound = HANDOFF.stamp(moment - dt.timedelta(seconds=700))
+        self.write_chief(boundAt=old_bound)
+        base_peer = {
+            "schema": "agent-executor.peer.v1",
+            "harness": "claude",
+            "cwd": str(self.repo),
+            "pid": os.getpid(),
+            "startedAt": old_bound,
+            "lastSeenAt": HANDOFF.stamp(moment),
+        }
+        sub_peer = {**base_peer, "session": "sub-1", "name": "sub", "isSubagent": True, "sharedProcess": True}
+        run_peer = {**base_peer, "session": "run-1-worker", "name": "worker", "run": "1", "role": "worker"}
+        self.assertIsNotNone(HANDOFF.live_chief_binding(self.base, LEAD, peers=[sub_peer, run_peer], moment=moment))
+
+        replacement_peer = {
+            **base_peer,
+            "session": "new-top-level",
+            "name": "new-chief",
+            "sharedProcess": True,
+        }
+        self.assertIsNone(
+            HANDOFF.live_chief_binding(self.base, LEAD, peers=[sub_peer, replacement_peer], moment=moment)
+        )
+
+    def test_midflight_rebind_between_brief_generation_and_publication_aborts_notice(self) -> None:
+        # Case A: Rebind to another session right after brief.md is written, before publication under chief.lock.
+        self.write_chief(revision=1)
+        orig_write_private = HANDOFF.write_private
+
+        def rebind_after_brief(path: Path, text: str) -> None:
+            orig_write_private(path, text)
+            if path.name == "brief.md":
+                self.write_chief(session="new-chief", revision=2)
+
+        with mock.patch.object(HANDOFF, "write_private", side_effect=rebind_after_brief):
+            superseded = self.handoff(rooms=[])
+        self.assertEqual(superseded["status"], "ignored", superseded)
+        self.assertNotIn("notice", superseded)
+        self.assertFalse((HANDOFF.session_dir(LEAD) / "brief.md").exists())
+
+        # Case B: Same session rebinds with bumped revision right after brief.md is written.
+        self.write_chief(session=LEAD, revision=1)
+
+        def bump_revision_after_brief(path: Path, text: str) -> None:
+            orig_write_private(path, text)
+            if path.name == "brief.md":
+                self.write_chief(session=LEAD, revision=2)
+
+        later = HANDOFF.now() + dt.timedelta(seconds=HANDOFF.DEDUPE_SECONDS + 1)
+        with (
+            mock.patch.object(HANDOFF, "now", return_value=later),
+            mock.patch.object(HANDOFF, "write_private", side_effect=bump_revision_after_brief),
+        ):
+            bumped = self.handoff(rooms=[])
+        self.assertEqual(bumped["status"], "ignored", bumped)
+        self.assertNotIn("notice", bumped)
+        self.assertFalse((HANDOFF.session_dir(LEAD) / "brief.md").exists())
+
+    def test_chief_generation_survives_clear_rebind_for_brief_and_team_notice(self) -> None:
+        # Clear + rebind same session with reused revision=1 but new generation UUID aborts brief-ready (#18).
+        self.write_chief(session=LEAD, revision=1, generation="gen-uuid-1")
+        orig_write_private = HANDOFF.write_private
+
+        def clear_rebind_after_brief(path: Path, text: str) -> None:
+            orig_write_private(path, text)
+            if path.name == "brief.md":
+                self.write_chief(session=LEAD, revision=1, generation="gen-uuid-2")
+
+        with mock.patch.object(HANDOFF, "write_private", side_effect=clear_rebind_after_brief):
+            superseded = self.handoff(rooms=[])
+        self.assertEqual(superseded["status"], "ignored", superseded)
+        self.assertNotIn("notice", superseded)
+        self.assertFalse((HANDOFF.session_dir(LEAD) / "brief.md").exists())
+
+        # Team handoff notice strips Chief recovery instructions if Chief cleared/rebound mid-flight (#18).
+        self.register(PEER, "claude-b")
+        self.write_chief(session=LEAD, revision=1, generation="gen-team-1")
+        later = HANDOFF.now() + dt.timedelta(seconds=HANDOFF.DEDUPE_SECONDS + 1)
+
+        def rebind_during_deliver(base, event, successor, text):
+            self.write_chief(session="other-chief", revision=1, generation="gen-team-2")
+            return self.deliver(base, event, successor, text)
+
+        with mock.patch.object(HANDOFF, "now", return_value=later):
+            team_event = self.handoff(deliver=rebind_during_deliver)
+        self.assertEqual(team_event["status"], "handed-over", team_event)
+        self.assertNotIn("chief", team_event)
+        self.assertNotIn("chief.json", team_event["notice"])
+
+    def test_aged_chief_peer_and_missing_pid_birth_respect_7day_and_600s_parity(self) -> None:
+        # 1. Peer heartbeat older than 7 days with live non-shared PID is NOT live (#17).
+        moment = HANDOFF.now()
+        old_seen = HANDOFF.stamp(moment - dt.timedelta(days=8))
+        self.write_chief(session=LEAD, pid=os.getpid(), pidBirth=MAILBOX.process_started(os.getpid()))
+        aged_peer = {
+            "schema": "agent-executor.peer.v1",
+            "session": LEAD,
+            "harness": "claude",
+            "cwd": str(self.repo),
+            "pid": os.getpid(),
+            "pidBirth": MAILBOX.process_started(os.getpid()),
+            "startedAt": old_seen,
+            "lastSeenAt": old_seen,
+        }
+        self.assertIsNone(HANDOFF.live_chief_binding(self.base, LEAD, peers=[aged_peer], moment=moment))
+
+        # 2. Exact-peer PID or pidBirth contradiction rejects binding (#17).
+        fresh_seen = HANDOFF.stamp(moment - dt.timedelta(seconds=10))
+        contradict_peer = {**aged_peer, "pid": os.getpid() + 1, "lastSeenAt": fresh_seen}
+        self.assertIsNone(HANDOFF.live_chief_binding(self.base, LEAD, peers=[contradict_peer], moment=moment))
+
+        # 3. Binding with pid & pidBirth when fresh process_started returns None expires after 600s grace.
+        self.write_chief(
+            session=LEAD,
+            pid=os.getpid(),
+            pidBirth="Mon Jan 01 00:00:00 2024",
+            boundAt=HANDOFF.stamp(moment - dt.timedelta(seconds=700)),
+        )
+        with mock.patch.object(MAILBOX, "process_started", return_value=None):
+            self.assertIsNone(HANDOFF.live_chief_binding(self.base, LEAD, peers=[aged_peer], moment=moment))
+
+    def test_strict_policy_kwargs_and_non_claude_launcher_home_binding(self) -> None:
+        # #8: choose_successor passes account_id, provider, billing_mode, strict=True to repo_policy.
+        self.register(PEER, "claude-b")
+        seen_calls: list[dict[str, object]] = []
+
+        def strict_policy(cwd, engine, config_dir=None, **kwargs):
+            seen_calls.append({"engine": engine, "config_dir": config_dir, **kwargs})
+            if kwargs.get("account_id") == "claude-b":
+                return (False, "denied by account_id", None)
+            return (True, None, None)
+
+        policy_mod = HANDOFF.module("repo_policy")
+        with mock.patch.object(policy_mod, "check_execution_allowed", side_effect=strict_policy):
+            event = self.handoff()
+        self.assertTrue(any(c.get("strict") is True and c.get("account_id") == "claude-b" for c in seen_calls))
+        # claude-b peer was denied by account_id; fell back to codex launch.
+        self.assertEqual(event["status"], "handed-over", event)
+        self.assertEqual(event["successor"]["account"], "codex")
+
+        # #9: Codex launch binds CODEX_HOME to verified accountHome even when os.environ differs.
+        private_codex = self.root / "private-codex-home"
+        private_codex.mkdir()
+        self.config["accounts"] = [
+            {"id": "claude-a", "provider": "claude", "billing": "personal", "configDir": str(self.homes["claude-a"])},
+            {"id": "codex", "provider": "codex", "billing": "personal", "env": {"CODEX_HOME": str(private_codex)}},
+        ]
+        self.lanes = [
+            lane("claude-a", status="blocked", usable=0),
+            lane("codex", "codex", usable=50, surplus=10),
+        ]
+        self.write()
+        view_data = json.loads((self.root / "view.json").read_text())
+        view_data["accounts"][1]["accountHome"] = str(private_codex)
+        (self.root / "view.json").write_text(json.dumps(view_data))
+        self.launched.clear()
+        lead_codex_test = "lead-codex-launch"
+        self.register(lead_codex_test, "claude-a")
+        self.write_chief(session=lead_codex_test)
+        codex_room = [
+            {
+                "id": "room-codex-launch",
+                "title": "t",
+                "objective": "o",
+                "conductor": {"session": {"id": lead_codex_test}},
+            }
+        ]
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(self.root / "wrong-codex")}):
+            codex_event = self.handoff(session=lead_codex_test, rooms=codex_room)
+        self.assertEqual(codex_event["status"], "handed-over", codex_event)
+        self.assertEqual(self.launched[-1][1]["CODEX_HOME"], str(private_codex.resolve()))
+
+        # #9: Explicit accountHome: None in Monitor view refuses non-Claude launch before takeover.
+        view_data["accounts"][1]["accountHome"] = None
+        (self.root / "view.json").write_text(json.dumps(view_data))
+        lead_unverified = "lead-codex-unverified"
+        self.register(lead_unverified, "claude-a")
+        self.write_chief(session=lead_unverified)
+        unverified_room = [
+            {"id": "room-unverified", "title": "t", "objective": "o", "conductor": {"session": {"id": lead_unverified}}}
+        ]
+        refused_event = self.handoff(session=lead_unverified, rooms=unverified_room)
+        self.assertEqual(refused_event["status"], "refused", refused_event)
+
+    def test_claude_launch_profile_parity_chief_generation_capture_and_1d7_order(self) -> None:
+        # #5: Relative configDir resolves against homedir, and default ~/.claude / unsetClaudeConfigDir strips CLAUDE_CONFIG_DIR.
+        fake_home = self.root / "fake-home"
+        default_claude = fake_home / ".claude"
+        rel_claude = fake_home / "claude-b"
+        default_claude.mkdir(parents=True)
+        rel_claude.mkdir(parents=True)
+        self.config["accounts"] = [
+            {"id": "claude-a", "provider": "claude", "billing": "personal", "configDir": str(self.homes["claude-a"])},
+            {"id": "claude-b", "provider": "claude", "billing": "personal", "configDir": "claude-b"},
+        ]
+        self.lanes = [
+            lane("claude-a", status="blocked", usable=0),
+            lane("claude-b", status="available", usable=90, surplus=50),
+        ]
+        self.write()
+        view_rel = json.loads((self.root / "view.json").read_text())
+        view_rel["accounts"][1]["configDir"] = str(rel_claude.resolve())
+        (self.root / "view.json").write_text(json.dumps(view_rel))
+        with mock.patch.object(Path, "home", return_value=fake_home):
+            rel_choice = self.choose()
+        self.assertEqual(rel_choice["successor"]["account"], "claude-b")
+        self.assertEqual(rel_choice["successor"]["configDir"], str(rel_claude.resolve()))
+        rel_cmd = HANDOFF.launch_command(
+            {"checkout": str(self.repo), "cwd": str(self.repo)}, rel_choice["successor"], self.root / "b.md"
+        )
+        self.assertEqual(rel_cmd[rel_cmd.index("--claude-config-dir") + 1], str(rel_claude.resolve()))
+
+        # Default ~/.claude (or unsetClaudeConfigDir: True) omits --claude-config-dir and pops CLAUDE_CONFIG_DIR from launch env.
+        self.config["accounts"][0]["billing"] = "work"
+        self.config["accounts"][1]["billing"] = "work"
+        self.config["accounts"][1]["configDir"] = "~/.claude"
+        self.write()
+        view_data = json.loads((self.root / "view.json").read_text())
+        view_data["accounts"][1]["unsetClaudeConfigDir"] = True
+        view_data["lanes"] = [
+            {**lane("claude-a", status="blocked", usable=0), "label": "claude-personal · all"},
+            lane("claude-b", status="available", usable=90, surplus=50),
+        ]
+        (self.root / "view.json").write_text(json.dumps(view_data))
+        with (
+            mock.patch.object(Path, "home", return_value=fake_home),
+            mock.patch.dict(os.environ, {"HOME": str(fake_home), "CLAUDE_CONFIG_DIR": "/stale/override"}),
+        ):
+            def_choice = self.choose()
+            self.assertNotIn("configDir", def_choice["successor"])
+            self.assertTrue(def_choice["successor"]["unsetClaudeConfigDir"])
+            def_cmd = HANDOFF.launch_command(
+                {"checkout": str(self.repo), "cwd": str(self.repo)},
+                def_choice["successor"],
+                self.root / "b.md",
+            )
+            self.assertNotIn("--claude-config-dir", def_cmd)
+            self.launched.clear()
+            self.register("lead-def-claude", "claude-a")
+            def_room = [
+                {
+                    "id": "room-def-claude",
+                    "title": "t",
+                    "objective": "o",
+                    "conductor": {"session": {"id": "lead-def-claude"}},
+                }
+            ]
+            def_event = self.handoff(session="lead-def-claude", rooms=def_room)
+        self.assertEqual(def_event["status"], "handed-over", def_event)
+        self.assertNotIn("CLAUDE_CONFIG_DIR", self.launched[-1][1])
+
+        # #3: Distinct account HOME on default-profile Claude carries HOME + ORKEST_PINNED_CLAUDE_ACCOUNT,
+        # unsets CLAUDE_CONFIG_DIR, and scrubs caller ANTHROPIC_API_KEY / OAuth overrides in run_agent.
+        second_home = self.root / "second-claude-home"
+        (second_home / ".claude").mkdir(parents=True, exist_ok=True)
+        self.config["accounts"][1] = {
+            "id": "claude-b",
+            "provider": "claude",
+            "billing": "work",
+            "configDir": "~/.claude",
+            "env": {"HOME": str(second_home)},
+        }
+        self.write()
+        view_data["accounts"][1] = {
+            "id": "claude-b",
+            "provider": "claude",
+            "accountHome": str((second_home / ".claude").resolve()),
+            "unsetClaudeConfigDir": True,
+            "accountEnv": {"HOME": str(second_home.resolve())},
+        }
+        (self.root / "view.json").write_text(json.dumps(view_data))
+        with (
+            mock.patch.object(Path, "home", return_value=fake_home),
+            mock.patch.dict(
+                os.environ,
+                {
+                    "HOME": str(fake_home),
+                    "CLAUDE_CONFIG_DIR": "/stale/override",
+                    "ANTHROPIC_API_KEY": "sk-ant-caller",
+                    "CLAUDE_CODE_OAUTH_TOKEN": "oauth-caller",
+                },
+            ),
+        ):
+            distinct_choice = self.choose()
+            self.assertNotIn("configDir", distinct_choice["successor"])
+            self.assertTrue(distinct_choice["successor"]["unsetClaudeConfigDir"])
+            self.assertEqual(
+                distinct_choice["successor"]["launchEnv"],
+                {
+                    "CLAUDE_CONFIG_DIR": None,
+                    "ORKEST_CLAUDE_ACCOUNT_HOME": str(second_home.resolve()),
+                    "ORKEST_PINNED_CLAUDE_ACCOUNT": "1",
+                },
+            )
+            distinct_cmd = HANDOFF.launch_command(
+                {"checkout": str(self.repo), "cwd": str(self.repo)},
+                distinct_choice["successor"],
+                self.root / "b.md",
+            )
+            self.assertNotIn("--claude-config-dir", distinct_cmd)
+            self.launched.clear()
+            self.register("lead-distinct-home", "claude-a")
+            distinct_room = [
+                {
+                    "id": "room-distinct-home",
+                    "title": "t",
+                    "objective": "o",
+                    "conductor": {"session": {"id": "lead-distinct-home"}},
+                }
+            ]
+            distinct_event = self.handoff(session="lead-distinct-home", rooms=distinct_room)
+        self.assertEqual(distinct_event["status"], "handed-over", distinct_event)
+        launched_env = self.launched[-1][1]
+        self.assertEqual(launched_env["HOME"], str(fake_home))
+        self.assertEqual(launched_env["ORKEST_CLAUDE_ACCOUNT_HOME"], str(second_home.resolve()))
+        self.assertEqual(launched_env["ORKEST_PINNED_CLAUDE_ACCOUNT"], "1")
+        self.assertNotIn("CLAUDE_CONFIG_DIR", launched_env)
+        with mock.patch.dict(os.environ, launched_env, clear=True):
+            exec_env = RUNNER.executor_environment("claude", self.repo)
+        self.assertEqual(exec_env["HOME"], str(second_home.resolve()))
+        self.assertNotIn("CLAUDE_CONFIG_DIR", exec_env)
+        self.assertNotIn("ORKEST_CLAUDE_ACCOUNT_HOME", exec_env)
+        self.assertNotIn("ORKEST_PINNED_CLAUDE_ACCOUNT", exec_env)
+        for key in RUNNER.CLAUDE_AUTH_ENV_OVERRIDES:
+            self.assertNotIn(key, exec_env)
+
+        # Restore default test config for remaining assertions.
+        self.config["accounts"] = [
+            {"id": "claude-a", "provider": "claude", "billing": "personal", "configDir": str(self.homes["claude-a"])},
+            {"id": "claude-b", "provider": "claude", "billing": "personal", "configDir": str(self.homes["claude-b"])},
+        ]
+        self.write()
+
+        # #14: Chief-only handoff captures original generation once and never adopts a replacement generation after quota retries.
+        chief_only_lead = "lead-chief-rebind-retry"
+        self.register(chief_only_lead, "claude-a")
+        self.write_chief(session=chief_only_lead, revision=1, generation="gen-orig")
+        fetch_calls = 0
+
+        def fetch_with_rebind():
+            nonlocal fetch_calls
+            fetch_calls += 1
+            if fetch_calls == 1:
+                self.write_chief(session=chief_only_lead, revision=2, generation="gen-rebound")
+            return json.loads((self.root / "view.json").read_text())
+
+        rebound_chief_res = self.handoff(
+            session=chief_only_lead,
+            rooms=[],
+            fetch=fetch_with_rebind,
+            sleep=lambda _: None,
+        )
+        self.assertEqual(rebound_chief_res["status"], "ignored", rebound_chief_res)
+        self.assertFalse((HANDOFF.session_dir(chief_only_lead) / "brief.md").exists())
+
+        # #13: Team handoff strips stale Chief instructions from brief.md, note.md, AND event.json when Chief rebounds right after brief write.
+        self.register(PEER, "claude-b")
+        team_chief_lead = "lead-team-chief-strip"
+        self.register(team_chief_lead, "claude-a")
+        self.write_chief(session=team_chief_lead, revision=1, generation="gen-team-strip-1")
+        strip_room = [
+            {"id": "room-strip", "title": "t", "objective": "o", "conductor": {"session": {"id": team_chief_lead}}}
+        ]
+
+        def rebind_right_before_deliver(base, event, successor, text):
+            self.write_chief(session="someone-else", revision=2, generation="gen-team-strip-2")
+            return self.deliver(base, event, successor, text)
+
+        team_res = self.handoff(
+            session=team_chief_lead,
+            rooms=strip_room,
+            fetch=lambda: json.loads((self.root / "view.json").read_text()),
+            deliver=rebind_right_before_deliver,
+            sleep=lambda _: None,
+        )
+        self.assertEqual(team_res["status"], "handed-over", team_res)
+        self.assertNotIn("chief", team_res)
+        self.assertNotIn("ork chief bind", (HANDOFF.session_dir(team_chief_lead) / "brief.md").read_text())
+        self.assertNotIn("ork chief bind", (HANDOFF.session_dir(team_chief_lead) / "note.md").read_text())
+
+        # 1D #7: When PID birth cannot be verified after 600s grace, live_chief_binding returns None even with a live exact peer.
+        moment = HANDOFF.now()
+        self.write_chief(
+            session=LEAD,
+            pid=os.getpid(),
+            pidBirth="Mon Jan 01 00:00:00 2024",
+            boundAt=HANDOFF.stamp(moment - dt.timedelta(seconds=601)),
+        )
+        live_exact_peer = {
+            "schema": "agent-executor.peer.v1",
+            "session": LEAD,
+            "harness": "claude",
+            "cwd": str(self.repo),
+            "pid": os.getpid(),
+            "pidBirth": "Mon Jan 01 00:00:00 2024",
+            "startedAt": HANDOFF.stamp(moment - dt.timedelta(seconds=10)),
+            "lastSeenAt": HANDOFF.stamp(moment - dt.timedelta(seconds=5)),
+            "live": True,
+        }
+        with mock.patch.object(MAILBOX, "process_started", return_value=None):
+            self.assertIsNone(HANDOFF.live_chief_binding(self.base, LEAD, peers=[live_exact_peer], moment=moment))
+
+    def test_claude_provider_home_keeps_workspace_lease_in_caller_home_and_json_view_binds_default_account(
+        self,
+    ) -> None:
+        # #2: Monitor render.mjs jsonView preserves unsetClaudeConfigDir / claudeConfigDir / accountEnv into choose_successor.
+        repo_root = Path(__file__).resolve().parents[5]
+        render_mjs = repo_root / "plugins" / "monitor" / "lib" / "render.mjs"
+        second_home = (self.root / "acct-second-home").resolve()
+        (second_home / ".claude").mkdir(parents=True, exist_ok=True)
+        caller_home = (self.root / "caller-real-home").resolve()
+        caller_home.mkdir(parents=True, exist_ok=True)
+        now_ms = int(time.time() * 1000)
+        resets_ms = now_ms + 3600 * 1000
+        raw_accounts = [
+            {
+                "id": "claude-a",
+                "label": "claude-personal",
+                "short": "CP",
+                "provider": "claude",
+                "billing": "personal",
+                "configDir": str(self.homes["claude-a"]),
+                "claudeConfigDir": str(self.homes["claude-a"]),
+                "unsetClaudeConfigDir": False,
+                "accountHome": str(self.homes["claude-a"]),
+                "ok": True,
+                "fetchedAt": now_ms,
+                "windows": [
+                    {
+                        "id": "5h",
+                        "label": "5h",
+                        "kind": "short",
+                        "usedPct": 100,
+                        "remainingPct": 0,
+                        "resetsAt": resets_ms,
+                    }
+                ],
+                "pools": [{"id": "all", "label": "all", "families": ["claude"], "windowIds": ["5h"]}],
+            },
+            {
+                "id": "claude-auto",
+                "label": "claude-auto",
+                "short": "CB",
+                "provider": "claude",
+                "billing": "personal",
+                "configDir": None,
+                "claudeConfigDir": None,
+                "unsetClaudeConfigDir": True,
+                "accountHome": str(second_home / ".claude"),
+                "accountEnv": {"HOME": str(second_home)},
+                "ok": True,
+                "fetchedAt": now_ms,
+                "windows": [
+                    {
+                        "id": "5h",
+                        "label": "5h",
+                        "kind": "short",
+                        "usedPct": 10,
+                        "remainingPct": 90,
+                        "resetsAt": resets_ms,
+                    }
+                ],
+                "pools": [{"id": "all", "label": "all", "families": ["claude"], "windowIds": ["5h"]}],
+            },
+        ]
+        rendered = subprocess.run(
+            [
+                "node",
+                "--input-type=module",
+                "-e",
+                (
+                    f"import {{ jsonView }} from {json.dumps(render_mjs.as_uri())};"
+                    "const accts = JSON.parse(process.argv[1]);"
+                    "console.log(JSON.stringify(jsonView(accts)));"
+                ),
+                json.dumps(raw_accounts),
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        serialized_view = json.loads(rendered.stdout)
+        self.config["accounts"] = [
+            {"id": "claude-a", "provider": "claude", "billing": "personal", "configDir": str(self.homes["claude-a"])},
+            {"id": "claude-auto", "provider": "claude", "billing": "personal"},
+        ]
+        self.write()
+        (self.root / "view.json").write_text(json.dumps(serialized_view))
+        choice = self.choose()
+        self.assertIsNotNone(choice["successor"], choice)
+        self.assertEqual(choice["successor"]["account"], "claude-auto")
+        self.assertTrue(choice["successor"]["unsetClaudeConfigDir"])
+        self.assertEqual(
+            choice["successor"]["launchEnv"],
+            {
+                "CLAUDE_CONFIG_DIR": None,
+                "ORKEST_CLAUDE_ACCOUNT_HOME": str(second_home),
+                "ORKEST_PINNED_CLAUDE_ACCOUNT": "1",
+            },
+        )
+
+        # #1: run_agent.py acquires workspace_lease under caller HOME while claude child receives account HOME.
+        bin_dir = self.root / "fake-bin"
+        bin_dir.mkdir(exist_ok=True)
+        captured_env_path = self.root / "captured-claude-env.json"
+        fake_claude = bin_dir / "claude"
+        fake_claude.write_text(
+            textwrap.dedent(
+                f"""\
+                #!{sys.executable}
+                import json, os
+                from pathlib import Path
+                Path({json.dumps(str(captured_env_path))}).write_text(
+                    json.dumps(dict(os.environ)), encoding="utf-8"
+                )
+                report = (
+                    "### STATUS\\n\\nCOMPLETE\\n\\n### FILES CHANGED\\n\\n- none\\n\\n"
+                    "### COMMANDS RUN\\n\\n- none\\n\\n### VERIFICATION\\n\\n- ok\\n\\n"
+                    "### RISKS OR BLOCKERS\\n\\n- none"
+                )
+                print(json.dumps({{"type": "result", "subtype": "success", "session_id": "s1", "result": report}}))
+                """
+            ),
+            encoding="utf-8",
+        )
+        fake_claude.chmod(0o755)
+        brief_file = self.root / "brief.md"
+        brief_file.write_text("Inspect workspace only.", encoding="utf-8")
+        child_env = {
+            key: value
+            for key, value in os.environ.items()
+            if key
+            not in {
+                "ORCHESTRATE_HOME",
+                "AGENT_EXECUTOR_HOME",
+                "XDG_CACHE_HOME",
+                "CLAUDE_CONFIG_DIR",
+                "ANTHROPIC_API_KEY",
+            }
+        }
+        child_env.update(
+            {
+                "HOME": str(caller_home),
+                "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+                "CLAUDE_CONFIG_DIR": "/stale/host/config",
+                "ANTHROPIC_API_KEY": "sk-ant-stale",
+                "ORKEST_PINNED_CLAUDE_ACCOUNT": "1",
+                "ORKEST_CLAUDE_ACCOUNT_HOME": str(second_home),
+            }
+        )
+        caller_cache = caller_home / ".cache" / "orchestrate"
+        cmd = [
+            sys.executable,
+            str(SCRIPTS / "run_agent.py"),
+            "--cwd",
+            str(self.repo),
+            "--brief",
+            str(brief_file),
+            "--engine",
+            "claude",
+            "--model",
+            OPUS,
+            "--transport",
+            "executor",
+            "--ignore-quota",
+            "--out-dir",
+            str(self.root / "run-out"),
+        ]
+        # Holding workspace_lease in caller_home blocks run_agent.py with LEASE_BUSY_EXIT (27).
+        support = RUNNER.bundled_module("execution_support")
+        with support.workspace_lease(self.repo, caller_cache):
+            blocked = subprocess.run(cmd, env=child_env, capture_output=True, text=True, check=False)
+        self.assertEqual(blocked.returncode, HANDOFF.LEASE_BUSY_EXIT, blocked.stderr)
+
+        # Without contention, run_agent.py succeeds, writes lease under caller_home, and passes second_home to claude.
+        succeeded = subprocess.run(cmd, env=child_env, capture_output=True, text=True, check=False)
+        self.assertEqual(succeeded.returncode, 0, succeeded.stderr)
+        self.assertTrue((caller_cache / "worktree-locks-v1").is_dir())
+        self.assertFalse((second_home / ".cache").exists())
+        claude_env = json.loads(captured_env_path.read_text(encoding="utf-8"))
+        self.assertEqual(claude_env["HOME"], str(second_home))
+        self.assertNotIn("CLAUDE_CONFIG_DIR", claude_env)
+        self.assertNotIn("ORKEST_CLAUDE_ACCOUNT_HOME", claude_env)
+        self.assertNotIn("ORKEST_PINNED_CLAUDE_ACCOUNT", claude_env)
+        for key in RUNNER.CLAUDE_AUTH_ENV_OVERRIDES:
+            self.assertNotIn(key, claude_env)
 
 
 if __name__ == "__main__":

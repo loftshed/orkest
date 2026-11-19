@@ -1,6 +1,9 @@
 /** Composable terminal presentation, built on the width-safe text and frame helpers. */
 import { allBrandMarks, brandForProvider } from "./families-schema.mjs";
+import { normalizeAccountTags } from "./policy.mjs";
 import { displayWidth, fit, fitStyled, frame, glyphSet, plain, tone } from "./tui-box.mjs";
+
+const SCOPE_TAGS = new Set(["business", "personal", "work"]);
 
 export const WIDE_NERD_BRANDS = new Set(["\u{EC81}", "\u{EC82}"]);
 
@@ -9,13 +12,32 @@ export function providerMark(provider, tier = "nerd") {
   return brandForProvider(provider)?.glyph || "";
 }
 
-/** Only explicit account identity determines ownership. */
+/** Only explicit account identity or tags determine ownership. */
 export function quotaAccountScope(account) {
-  const identity = `${account.id || ""} ${account.label || ""}`.toLowerCase();
+  if (!account || typeof account !== "object") return "";
+  const tags = normalizeAccountTags(account);
+  if (tags.includes("work") || tags.includes("business")) return "work";
+  if (tags.includes("personal") || account.personal === true) return "personal";
+  const identity =
+    `${account.id || ""} ${account.alias || ""} ${account.label || ""}`.toLowerCase();
   if (/(?:^|[\s·_-])(?:work|business)(?:$|[\s·_-])/u.test(identity) || account.short === "CW")
     return "work";
-  if (/(?:^|[\s·_-])(?:personal|plaude)(?:$|[\s·_-])/u.test(identity) || account.short === "CP")
+  if (/(?:^|[\s·_-])personal(?:$|[\s·_-])/u.test(identity) || account.short === "CP")
     return "personal";
+  return "";
+}
+
+/** Format explicit non-scope tags (or fallback category/billing) as a compact badge. */
+export function quotaAccountTagBadge(account) {
+  if (!account || typeof account !== "object") return "";
+  const tags = normalizeAccountTags(account);
+  const customTags = tags.filter((tag) => !SCOPE_TAGS.has(tag));
+  if (customTags.length > 0) return customTags.map((tag) => `[${tag}]`).join(" ");
+  const category =
+    typeof account.category === "string" ? account.category.trim().toLowerCase() : "";
+  if (category) return `[${category}]`;
+  const scope = quotaAccountScope(account);
+  if (scope) return `[${scope}]`;
   return "";
 }
 
@@ -44,9 +66,11 @@ export function quotaAccountLabel(account, tier = "nerd") {
   if (tier !== "nerd") return label;
   const accountScope = quotaAccountScope(account);
   const scope = { work: "\u{F1AD}", personal: "\u{F007}" }[accountScope] || "";
+  const customTags = normalizeAccountTags(account).filter((tag) => !SCOPE_TAGS.has(tag));
+  const tagBadge = customTags.map((tag) => `[${tag}]`).join(" ");
   const brand = providerMark(account.provider, tier);
   const name = brand && ["AG", "CX", "CL"].includes(label) ? "" : label;
-  const rest = [scope, name].filter(Boolean).join(" ");
+  const rest = [scope, name, tagBadge].filter(Boolean).join(" ");
   if (!brand) return rest;
   if (!rest) return brand;
   return `${brand}${WIDE_NERD_BRANDS.has(brand) ? "  " : " "}${rest}`;

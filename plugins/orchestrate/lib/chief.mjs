@@ -5,10 +5,12 @@
  * observes every room and standalone session on the machine, routes messages to them, and
  * spawns autonomous room orchestrators that report back to it. Reads never mutate state.
  */
-import { spawnSync } from "node:child_process";
-import { createHash, randomBytes } from "node:crypto";
+import { spawn, spawnSync } from "node:child_process";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import {
+  accessSync,
   existsSync,
+  constants as fsConstants,
   mkdirSync,
   readdirSync,
   readFileSync,
@@ -17,7 +19,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { hostname } from "node:os";
+import { homedir, hostname } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -31,8 +33,15 @@ import {
   updateRawRoom,
 } from "./horde-room.mjs";
 import { isTerminalDisplayState, memberDisplayState } from "./member-state.mjs";
+import {
+  CANONICAL_HARNESSES,
+  loadConfiguredAccounts,
+  normalizeAccountTags,
+  resolveConfiguredAccount,
+  resolvePolicyConfigPath,
+} from "./policy.mjs";
 import { belongsToRoom, isPeerLive, newRoom, roomOwnerSessions } from "./rooms.mjs";
-import { checkRepoPolicyForSide } from "./side.mjs";
+import { applyLauncherAccountEnv, checkRepoPolicyForSide } from "./side.mjs";
 import {
   provisionWorktree,
   resolveRepositoryRoot,
@@ -46,11 +55,14 @@ export const CHIEF_SEND_SCHEMA = "ork.chief.send.v1";
 export { CHIEF_FOCUS_TEXT } from "./horde-room.mjs";
 
 const SCRIPTS_DIR = fileURLToPath(new URL("../skills/orchestrate/scripts/", import.meta.url));
+const ROUTES_DEFAULTS_PATH = fileURLToPath(
+  new URL("../skills/orchestrate/references/routes.default.json", import.meta.url),
+);
 const PEER_MAILBOX_PY = path.join(SCRIPTS_DIR, "peer_mailbox.py");
 const RUN_AGENT_PY = path.join(SCRIPTS_DIR, "run_agent.py");
 const SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/u;
 const KINDS = new Set(["done", "escalation", "question", "update"]);
-const COORDINATOR_ENGINES = new Set(["agy", "claude", "codex", "opencode"]);
+const COORDINATOR_ENGINES = new Set(CANONICAL_HARNESSES);
 const NATIVE_UNREACHABLE =
   "ork chief routes between independent top-level sessions; native subagent tools cannot address them";
 /** Without a PID we trust a fresh binding briefly, then require a live peer record. */
@@ -154,7 +166,7 @@ export function sessionFromEnv(env = process.env) {
 }
 
 function engineOf(harness) {
-  if (harness === "gemini") return "agy";
+  if (harness === "gemini" || harness === "antigravity") return "agy";
   return typeof harness === "string" && harness ? harness : null;
 }
 
@@ -253,6 +265,20 @@ function describeCheckout(directory, dotGit, isDirectory) {
 // ---------------------------------------------------------------------------
 // Peers
 
+const canonicalPeerRecords = new WeakSet();
+
+function findPeerForSession(peers, session, predicate = null) {
+  if (!Array.isArray(peers) || !session) return null;
+  let fallback = null;
+  for (const candidate of peers) {
+    if (!candidate || candidate.session !== session) continue;
+    if (predicate && !predicate(candidate)) continue;
+    if (canonicalPeerRecords.has(candidate)) return candidate;
+    fallback ??= candidate;
+  }
+  return fallback;
+}
+
 export function readPeers(root = mailboxRoot(), { now = Date.now() } = {}) {
   let entries;
   try {
@@ -261,7 +287,7 @@ export function readPeers(root = mailboxRoot(), { now = Date.now() } = {}) {
     return [];
   }
   const host = hostname();
-  const peers = [];
+  const bySession = new Map();
   const sorted = entries.toSorted((left, right) => left.localeCompare(right));
   for (const entry of sorted) {
     if (!entry.endsWith(".json")) continue;
@@ -275,9 +301,18 @@ export function readPeers(root = mailboxRoot(), { now = Date.now() } = {}) {
     )
       continue;
     if (peer.machine && peer.machine !== host) continue;
-    peers.push({ ...peer, live: isPeerLive(peer, now) });
+    const key = sessionKey(peer.session);
+    const isCanonical = key !== null && entry === `${key}.json`;
+    const existing = bySession.get(peer.session);
+    if (existing && (!isCanonical || existing.isCanonical)) continue;
+    const record = { ...peer, live: isPeerLive(peer, now) };
+    if (isCanonical) canonicalPeerRecords.add(record);
+    bySession.set(peer.session, { record, isCanonical });
   }
-  return peers;
+  return bySession
+    .values()
+    .map((item) => item.record)
+    .toArray();
 }
 
 function isRunPeer(peer) {
@@ -312,23 +347,297 @@ export function chiefPath(root = mailboxRoot()) {
   return path.join(root, "chief.json");
 }
 
-function chiefLiveness(binding, peers, now) {
-  if (binding.machine && binding.machine !== hostname())
-    return { live: false, reason: "bound on another machine" };
-  const peer = peers.find((candidate) => candidate.session === binding.session);
-  if (peer?.live) return { live: true, peer };
-  const alive = pidAlive(binding.pid);
-  if (alive === false) return { live: false, reason: `process ${binding.pid} exited` };
-  if (alive) {
-    const currentBirth = binding.pidBirth ? processStarted(binding.pid) : null;
-    if (binding.pidBirth && currentBirth && currentBirth !== binding.pidBirth)
-      return { live: false, reason: `process ${binding.pid} was recycled` };
-    if (!peer) return { live: true, peer: null };
+function isTopLevelReplacementPeer(candidate, binding, now, host) {
+  if (
+    !candidate ||
+    candidate.session === binding.session ||
+    (candidate.machine && candidate.machine !== host) ||
+    candidate.pid !== binding.pid
+  ) {
+    return false;
   }
-  if (peer && !peer.live) return { live: false, reason: "mailbox peer is no longer live" };
+  if (candidate.pidBirth && binding.pidBirth && candidate.pidBirth !== binding.pidBirth) {
+    return false;
+  }
+  const live =
+    candidate.lastSeenAt || candidate.startedAt || typeof candidate.live !== "boolean"
+      ? isPeerLive(candidate, now)
+      : candidate.live;
+  return Boolean(
+    live &&
+    !isRunPeer(candidate) &&
+    !candidate.isSubagent &&
+    !candidate.agySubagentPending &&
+    !candidate.delegatedRun &&
+    !candidate.parentSession,
+  );
+}
+
+function isChiefPeerLive(peer, now, getProcessStarted = processStarted) {
+  if (getProcessStarted !== processStarted && peer?.pid && peer?.pidBirth) {
+    const alive = pidAlive(peer.pid);
+    if (alive === false) return false;
+    if (alive) {
+      const birth = getProcessStarted(peer.pid) || null;
+      if (birth && birth !== peer.pidBirth) return false;
+    }
+    return isPeerLive({ ...peer, pidBirth: undefined }, now);
+  }
+  return isPeerLive(peer, now);
+}
+
+function chiefLiveness(binding, peers, now, { getProcessStarted = processStarted } = {}) {
+  if (
+    !isPlainObject(binding) ||
+    binding.schema !== CHIEF_SCHEMA ||
+    typeof binding.session !== "string" ||
+    !binding.session
+  ) {
+    return { live: false, reason: "missing or invalid binding" };
+  }
+  const host = hostname();
+  if (typeof binding.machine === "string" && binding.machine.trim() && binding.machine !== host) {
+    return { live: false, reason: "bound on another machine" };
+  }
+  const alive = pidAlive(binding.pid);
+  if (alive === false) {
+    return { live: false, reason: `process ${binding.pid} exited` };
+  }
+  let currentBirth = null;
+  if (alive && binding.pidBirth) {
+    currentBirth = getProcessStarted(binding.pid) || null;
+    if (currentBirth && currentBirth !== binding.pidBirth) {
+      return { live: false, reason: `process ${binding.pid} was recycled` };
+    }
+  }
+  const isVerifiedLivePid = Boolean(
+    alive && (!binding.pidBirth || (currentBirth && currentBirth === binding.pidBirth)),
+  );
   const ageMs = now - stampMs(binding.boundAt);
-  if (Number.isFinite(ageMs) && ageMs <= UNVERIFIED_BINDING_GRACE_MS) return { live: true, peer };
+  const isInGrace = Number.isFinite(ageMs) && ageMs >= 0 && ageMs <= UNVERIFIED_BINDING_GRACE_MS;
+  if (binding.pid && !isVerifiedLivePid && !isInGrace) {
+    return { live: false, reason: `process ${binding.pid} birth could not be verified` };
+  }
+  const peer = findPeerForSession(
+    peers,
+    binding.session,
+    (candidate) => !isRunPeer(candidate) && (!candidate.machine || candidate.machine === host),
+  );
+  if (peer) {
+    if (binding.pid && peer.pid && peer.pid !== binding.pid) {
+      return {
+        live: false,
+        reason: `mailbox peer pid ${peer.pid} contradicts chief pid ${binding.pid}`,
+      };
+    }
+    if (binding.pidBirth && peer.pidBirth && peer.pidBirth !== binding.pidBirth) {
+      return {
+        live: false,
+        reason: "mailbox peer pidBirth contradicts chief pidBirth",
+      };
+    }
+    const peerLive =
+      peer.lastSeenAt || peer.startedAt || typeof peer.live !== "boolean"
+        ? isChiefPeerLive(peer, now, getProcessStarted)
+        : peer.live;
+    return peerLive
+      ? { live: true, peer }
+      : { live: false, reason: "mailbox peer is no longer live" };
+  }
+  if (isVerifiedLivePid) {
+    if (!isInGrace) {
+      const replacement = (Array.isArray(peers) ? peers : []).find((candidate) =>
+        isTopLevelReplacementPeer(candidate, binding, now, host),
+      );
+      if (replacement) {
+        return { live: false, reason: "chief session was cleared or replaced" };
+      }
+    }
+    return { live: true, peer: null };
+  }
+  if (isInGrace) {
+    return { live: true, peer: null };
+  }
   return { live: false, reason: "no live process or mailbox peer" };
+}
+
+const CHIEF_CAS_PY = [
+  "import fcntl, json, os, sys",
+  "req = json.loads(sys.stdin.readline())",
+  'chief_path = req["chief_path"]',
+  'lock_path = req["lock_path"]',
+  'op = req["op"]',
+  'expected_session = req.get("expected_session")',
+  'expected_revision = req.get("expected_revision")',
+  'expected_generation = req.get("expected_generation")',
+  'hold_lock = bool(req.get("hold_lock"))',
+  'force = bool(req.get("force"))',
+  "def binding_revision(obj):",
+  '    if obj is None or obj.get("__invalid__"):',
+  "        return None",
+  '    rev = obj.get("revision")',
+  "    return rev if isinstance(rev, int) and not isinstance(rev, bool) else 0",
+  "def binding_generation(obj):",
+  '    if obj is None or obj.get("__invalid__"):',
+  "        return None",
+  '    gen = obj.get("generation")',
+  "    return gen if isinstance(gen, str) and gen else None",
+  "def generation_mismatch(expected_gen, actual_gen, expected_session_id):",
+  "    if expected_gen is not None:",
+  "        return actual_gen != expected_gen",
+  "    if expected_session_id is not None:",
+  "        return actual_gen is not None",
+  "    return False",
+  "def emit(payload):",
+  "    sys.stdout.write(json.dumps(payload) + " + String.raw`"\n")`,
+  "    sys.stdout.flush()",
+  "os.makedirs(os.path.dirname(lock_path), mode=0o700, exist_ok=True)",
+  "fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)",
+  "try:",
+  "    fcntl.flock(fd, fcntl.LOCK_EX)",
+  "    current = None",
+  "    if os.path.exists(chief_path):",
+  "        try:",
+  '            with open(chief_path, "r", encoding="utf-8") as fh:',
+  "                parsed = json.load(fh)",
+  '            if isinstance(parsed, dict) and parsed.get("schema") == "ork.chief.v1" and isinstance(parsed.get("session"), str):',
+  "                current = parsed",
+  "            else:",
+  '                current = {"__invalid__": True}',
+  "        except (OSError, ValueError):",
+  '            current = {"__invalid__": True}',
+  "    actual_rev = binding_revision(current)",
+  "    actual_gen = binding_generation(current)",
+  '    if op == "clear":',
+  "        if current is None:",
+  '            emit({"status": "missing"})',
+  '        elif current.get("__invalid__"):',
+  "            if force or expected_session is None:",
+  "                try:",
+  "                    os.unlink(chief_path)",
+  "                except FileNotFoundError:",
+  "                    pass",
+  '                emit({"status": "cleared"})',
+  "                if hold_lock:",
+  "                    sys.stdin.readline()",
+  "            else:",
+  '                emit({"status": "conflict"})',
+  '        elif not force and ((expected_session is not None and current.get("session") != expected_session) or (expected_revision is not None and actual_rev != expected_revision) or generation_mismatch(expected_generation, actual_gen, expected_session)):',
+  '            emit({"status": "conflict", "actualSession": current.get("session"), "actualRevision": actual_rev, "actualGeneration": actual_gen})',
+  "        else:",
+  "            try:",
+  "                os.unlink(chief_path)",
+  "            except FileNotFoundError:",
+  "                pass",
+  '            emit({"status": "cleared"})',
+  "            if hold_lock:",
+  "                sys.stdin.readline()",
+  '    elif op == "write":',
+  '        actual_session = None if current is None else (None if current.get("__invalid__") else current.get("session"))',
+  "        rev_mismatch = (expected_revision is None and actual_rev is not None) or (expected_revision is not None and actual_rev != expected_revision)",
+  "        if not force and (actual_session != expected_session or rev_mismatch or generation_mismatch(expected_generation, actual_gen, expected_session)):",
+  '            emit({"status": "conflict", "actualSession": actual_session, "actualRevision": actual_rev, "actualGeneration": actual_gen})',
+  "        else:",
+  "            parent_dir = os.path.dirname(chief_path)",
+  "            os.makedirs(parent_dir, mode=0o700, exist_ok=True)",
+  '            tmp_path = f"{chief_path}.{os.getpid()}.{os.urandom(4).hex()}.tmp"',
+  '            with open(tmp_path, "w", encoding="utf-8") as fh:',
+  '                fh.write(json.dumps(req["binding"], indent=2) + ' + String.raw`"\n")`,
+  "            os.chmod(tmp_path, 0o600)",
+  "            os.replace(tmp_path, chief_path)",
+  '            emit({"status": "written"})',
+  "            if hold_lock:",
+  "                sys.stdin.readline()",
+  "    else:",
+  '        raise ValueError(f"unknown op: {op}")',
+  "finally:",
+  "    os.close(fd)",
+].join("\n");
+
+function runChiefCas(payload, env = process.env, onHeld = null) {
+  return new Promise((resolve, reject) => {
+    const child = spawn("python3", ["-c", CHIEF_CAS_PY], {
+      env,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    let parsedResult = null;
+    let isSettled = false;
+    let heldPromise = null;
+    let heldError = null;
+    const runHeld = async (result) => {
+      try {
+        await onHeld(result);
+      } catch (error) {
+        heldError = error;
+      } finally {
+        child.stdin.end("release\n");
+      }
+    };
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+      if (parsedResult !== null) return;
+      const nl = stdout.indexOf("\n");
+      if (nl === -1) return;
+      const line = stdout.slice(0, nl).trim();
+      try {
+        parsedResult = JSON.parse(line);
+      } catch (error) {
+        isSettled = true;
+        child.stdin.end();
+        reject(new Error(`Invalid chief lock helper output: ${error.message}`, { cause: error }));
+        return;
+      }
+      if (onHeld && (parsedResult.status === "written" || parsedResult.status === "cleared")) {
+        heldPromise = runHeld(parsedResult);
+      } else {
+        child.stdin.end();
+      }
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    child.on("error", (error) => {
+      if (isSettled) return;
+      isSettled = true;
+      reject(error);
+    });
+    child.on("close", async (code) => {
+      if (heldPromise) {
+        await heldPromise;
+      }
+      if (isSettled) return;
+      isSettled = true;
+      if (heldError) {
+        reject(heldError);
+        return;
+      }
+      if (code !== 0) {
+        reject(new Error(stderr.trim() || `chief lock helper exited with ${code}`));
+        return;
+      }
+      if (parsedResult !== null) {
+        resolve(parsedResult);
+        return;
+      }
+      try {
+        resolve(JSON.parse(stdout.trim()));
+      } catch (error) {
+        reject(new Error(`Invalid chief lock helper output: ${error.message}`, { cause: error }));
+      }
+    });
+    child.stdin.write(`${JSON.stringify({ ...payload, hold_lock: Boolean(onHeld) })}\n`);
+    if (!onHeld) {
+      child.stdin.end();
+    }
+  });
+}
+
+function bindingRevision(binding) {
+  return Number.isSafeInteger(binding?.revision) ? binding.revision : 0;
 }
 
 /** The live Chief binding, or null. `includeStale` returns stale bindings flagged instead. */
@@ -337,6 +646,7 @@ export function readChiefBinding({
   now = Date.now(),
   includeStale = false,
   peers,
+  getProcessStarted = processStarted,
 } = {}) {
   const binding = readJson(chiefPath(root));
   if (
@@ -345,11 +655,15 @@ export function readChiefBinding({
     typeof binding.session !== "string"
   )
     return null;
-  const liveness = chiefLiveness(binding, peers || readPeers(root, { now }), now);
+  const revision = bindingRevision(binding);
+  const liveness = chiefLiveness(binding, peers || readPeers(root, { now }), now, {
+    getProcessStarted,
+  });
   if (liveness.live) {
     const peer = liveness.peer;
     return {
       ...binding,
+      revision,
       ...(peer && {
         name: peer.name || binding.name,
         model: peer.model || binding.model || null,
@@ -365,7 +679,7 @@ export function readChiefBinding({
     };
   }
   return includeStale
-    ? { ...binding, live: false, stale: true, staleReason: liveness.reason }
+    ? { ...binding, revision, live: false, stale: true, staleReason: liveness.reason }
     : null;
 }
 
@@ -392,30 +706,64 @@ export async function bindChief({
   runMailbox = defaultRunMailbox,
 } = {}) {
   const self = session || sessionFromEnv(env);
-  const current = readChiefBinding({ root, now, includeStale: true });
   const file = chiefPath(root);
+  const lockFile = path.join(root, "chief.lock");
+
   if (clear) {
+    const current = readChiefBinding({ root, now, includeStale: true });
     if (!current) return { action: "none", binding: null, previous: null };
     if (!force && !current.stale && current.session !== self)
       throw new Error(
         `The Chief desk is held by live session ${current.name || current.session}; pass --force to clear it`,
       );
-    rmSync(file, { force: true });
-    clearChiefFocus(current.session, { root, env, runMailbox });
-    const peers = readPeers(root, { now });
-    for (const candidate of peers) {
-      if (candidate.session !== current.session && candidate.focus === CHIEF_FOCUS_TEXT) {
-        clearChiefFocus(candidate.session, { root, env, runMailbox });
-      }
+    const cas = await runChiefCas(
+      {
+        op: "clear",
+        chief_path: file,
+        lock_path: lockFile,
+        expected_session: current.session,
+        expected_revision: bindingRevision(current),
+        expected_generation: current.generation ?? null,
+        force: Boolean(force),
+      },
+      env,
+      () => {
+        // Focus reconciliation runs under chief.lock so a displaced Chief cannot clear a newer winner's focus.
+        const latestAfterClear = readJson(file);
+        const activeWinnerSession =
+          isPlainObject(latestAfterClear) &&
+          latestAfterClear.schema === CHIEF_SCHEMA &&
+          typeof latestAfterClear.session === "string"
+            ? latestAfterClear.session
+            : null;
+        if (activeWinnerSession !== current.session) {
+          clearChiefFocus(current.session, { root, env, runMailbox });
+        }
+        if (activeWinnerSession) return;
+        const peers = readPeers(root, { now });
+        for (const candidate of peers) {
+          if (candidate.session !== current.session && candidate.focus === CHIEF_FOCUS_TEXT) {
+            clearChiefFocus(candidate.session, { root, env, runMailbox });
+          }
+        }
+      },
+    );
+    if (cas.status === "missing") return { action: "none", binding: null, previous: null };
+    if (cas.status !== "cleared") {
+      throw new Error("Concurrent Chief desk update conflict while clearing; retry");
     }
     return { action: "cleared", binding: null, previous: current };
   }
+
   if (!self || !SESSION_ID_RE.test(self))
     throw new Error(
       "Pass --session <id> (or run inside an agent session with AGENT_MAILBOX_SESSION)",
     );
+
+  const MAX_CAS_ATTEMPTS = 16;
+
   const peers = readPeers(root, { now });
-  const peer = peers.find((candidate) => candidate.session === self) || null;
+  const peer = findPeerForSession(peers, self);
   const panes = paneFields(peer, {
     herdrPaneId: env.HERDR_PANE_ID,
     orcaEnvironment: env.ORCA_ENVIRONMENT,
@@ -425,49 +773,101 @@ export async function bindChief({
     orcaWorkspaceId: env.ORCA_WORKSPACE_ID || env.ORCA_WORKTREE_ID,
     paneId: env.TMUX_PANE,
   });
-  const isSame = current?.session === self;
-  const binding = {
-    schema: CHIEF_SCHEMA,
-    session: self,
-    name: peer?.name || self,
-    engine: engineOf(peer?.harness),
-    model: peer?.model || null,
-    cwd: peer?.checkout || peer?.cwd || process.cwd(),
-    machine: hostname(),
-    pid: Number.isSafeInteger(peer?.pid) ? peer.pid : null,
-    pidBirth: peer?.pidBirth || null,
-    ...panes,
-    boundAt: isSame ? current.boundAt : iso(now),
-    previous:
-      current && !isSame
-        ? {
-            session: current.session,
-            name: current.name || current.session,
-            boundAt: current.boundAt || null,
-            releasedAt: iso(now),
+
+  let current = null;
+  let isSame = false;
+  let binding = null;
+  let isWritten = false;
+  let isFocused = false;
+  let isStillWinner = false;
+
+  for (let attempt = 0; attempt < MAX_CAS_ATTEMPTS; attempt++) {
+    current = readChiefBinding({ root, now, includeStale: true });
+    isSame = current?.session === self;
+    const expectedRevision = current ? bindingRevision(current) : null;
+    const nextRevision = (expectedRevision ?? 0) + 1;
+    binding = {
+      schema: CHIEF_SCHEMA,
+      revision: nextRevision,
+      generation: randomUUID(),
+      session: self,
+      name: peer?.name || self,
+      engine: engineOf(peer?.harness),
+      model: peer?.model || null,
+      cwd: peer?.checkout || peer?.cwd || process.cwd(),
+      machine: hostname(),
+      pid: Number.isSafeInteger(peer?.pid) ? peer.pid : null,
+      pidBirth: peer?.pidBirth || null,
+      ...panes,
+      boundAt: isSame ? current.boundAt : iso(now),
+      previous:
+        current && !isSame
+          ? {
+              session: current.session,
+              name: current.name || current.session,
+              boundAt: current.boundAt || null,
+              releasedAt: iso(now),
+            }
+          : current?.previous || null,
+    };
+    const cas = await runChiefCas(
+      {
+        op: "write",
+        chief_path: file,
+        lock_path: lockFile,
+        expected_session: current?.session ?? null,
+        expected_revision: expectedRevision,
+        expected_generation: current?.generation ?? null,
+        force: Boolean(force && attempt === MAX_CAS_ATTEMPTS - 1),
+        binding,
+      },
+      env,
+      () => {
+        // Reconcile focus atomically while chief.lock is held so no newer Chief can overlap.
+        const latestAfterWrite = readJson(file);
+        const latestRev =
+          isPlainObject(latestAfterWrite) && latestAfterWrite.schema === CHIEF_SCHEMA
+            ? bindingRevision(latestAfterWrite)
+            : null;
+        isStillWinner =
+          isPlainObject(latestAfterWrite) &&
+          latestAfterWrite.schema === CHIEF_SCHEMA &&
+          latestAfterWrite.session === self &&
+          latestRev === binding.revision &&
+          latestAfterWrite.generation === binding.generation;
+        if (!isStillWinner) return;
+        const focus = runMailbox(["focus", "--session", self, "--text", CHIEF_FOCUS_TEXT], { env });
+        isFocused = focus.status === 0;
+        const clearedSessions = new Set();
+        if (current && !isSame && current.session) {
+          clearChiefFocus(current.session, { root, env, runMailbox });
+          clearedSessions.add(current.session);
+        }
+        const latestPeers = readPeers(root, { now });
+        for (const candidate of latestPeers) {
+          if (
+            candidate.session === self ||
+            clearedSessions.has(candidate.session) ||
+            candidate.focus !== CHIEF_FOCUS_TEXT
+          ) {
+            continue;
           }
-        : current?.previous || null,
-  };
-  writeJsonAtomic(file, binding);
-  const focus = runMailbox(["focus", "--session", self, "--text", CHIEF_FOCUS_TEXT], { env });
-  const clearedSessions = new Set();
-  if (current && !isSame && current.session) {
-    clearChiefFocus(current.session, { root, env, runMailbox });
-    clearedSessions.add(current.session);
-  }
-  for (const candidate of peers) {
-    if (
-      candidate.session === self ||
-      clearedSessions.has(candidate.session) ||
-      candidate.focus !== CHIEF_FOCUS_TEXT
-    ) {
-      continue;
+          clearChiefFocus(candidate.session, { root, env, runMailbox });
+          clearedSessions.add(candidate.session);
+        }
+      },
+    );
+    if (cas.status === "written") {
+      isWritten = true;
+      break;
     }
-    clearChiefFocus(candidate.session, { root, env, runMailbox });
-    clearedSessions.add(candidate.session);
   }
+  if (!isWritten) {
+    throw new Error("Concurrent Chief desk binding conflict; retry");
+  }
+
   let isNotified = false;
-  if (current && !isSame && !current.stale) {
+  if (isStillWinner && current && !isSame && !current.stale) {
     const notice = runMailbox(
       [
         "send",
@@ -494,7 +894,7 @@ export async function bindChief({
     action,
     binding,
     previous: current && !isSame ? current : null,
-    focus: focus.status === 0,
+    focus: isFocused,
     notified: isNotified,
     desk: listDesk(root).length,
   };
@@ -1265,6 +1665,270 @@ function parseLaunchOutput(stdout) {
   };
 }
 
+function loadConfiguredRoutes(env = process.env) {
+  let routes = {};
+  try {
+    const defaults = JSON.parse(readFileSync(ROUTES_DEFAULTS_PATH, "utf8"));
+    if (isPlainObject(defaults?.routes)) {
+      routes = { ...defaults.routes };
+    }
+  } catch (error) {
+    throw new Error(`Cannot load default routes: ${error.message}`, { cause: error });
+  }
+  const cfgPath = resolvePolicyConfigPath({ env });
+  if (cfgPath && existsSync(cfgPath)) {
+    let userCfg;
+    try {
+      userCfg = JSON.parse(readFileSync(cfgPath, "utf8"));
+    } catch (error) {
+      throw new Error(`Cannot load routes from ${cfgPath}: ${error.message}`, { cause: error });
+    }
+    if (isPlainObject(userCfg?.routes)) {
+      for (const [role, entry] of Object.entries(userCfg.routes)) {
+        const hasEngine = typeof entry?.engine === "string" && entry.engine.trim();
+        const hasAccount = typeof entry?.account === "string" && entry.account.trim();
+        if (!isPlainObject(entry) || (!hasEngine && !hasAccount)) {
+          throw new Error(`${cfgPath}: route ${JSON.stringify(role)} needs at least an engine`);
+        }
+        routes[role] = { ...entry };
+      }
+    }
+  }
+  return routes;
+}
+
+function defaultIsEngineInstalled(engine, env = process.env) {
+  const binary = engine === "antigravity" || engine === "gemini" ? "agy" : engine;
+  if (!binary) return false;
+  const pathEnv = String(env?.PATH || "");
+  if (!pathEnv) return false;
+  for (const dir of pathEnv.split(path.delimiter)) {
+    if (!dir) continue;
+    const full = path.join(dir, binary);
+    try {
+      accessSync(full, fsConstants.X_OK);
+      if (!statSync(full).isDirectory()) return true;
+    } catch {
+      // Keep scanning PATH directories.
+    }
+  }
+  return false;
+}
+
+function normalizeRouteCandidate(
+  routeName,
+  entry,
+  { isAlternate = false, env = process.env } = {},
+) {
+  const hasEngine = typeof entry?.engine === "string" && entry.engine.trim();
+  const hasAccount = typeof entry?.account === "string" && entry.account.trim();
+  if (!isPlainObject(entry) || (!hasEngine && !hasAccount)) {
+    throw new Error(`Route ${JSON.stringify(routeName)} needs an engine`);
+  }
+  let routeEngine = null;
+  let accountFromEngine = null;
+  if (hasEngine) {
+    const rawEngine = entry.engine.trim().toLowerCase();
+    const normalized = engineOf(rawEngine);
+    if (normalized && COORDINATOR_ENGINES.has(normalized)) {
+      routeEngine = normalized;
+    } else {
+      const matchedAcct = resolveConfiguredAccount(rawEngine, { env });
+      if (matchedAcct) {
+        routeEngine = engineOf(
+          String(matchedAcct.provider || "")
+            .trim()
+            .toLowerCase(),
+        );
+        accountFromEngine = matchedAcct.id || rawEngine;
+      }
+    }
+    if (!routeEngine || !COORDINATOR_ENGINES.has(routeEngine)) {
+      throw new Error(`Route ${JSON.stringify(routeName)} has unsupported engine ${entry.engine}`);
+    }
+  }
+  const explicitRouteAccount = hasAccount ? entry.account.trim() : accountFromEngine;
+  if (!routeEngine && explicitRouteAccount) {
+    const matchedAcct = resolveConfiguredAccount(explicitRouteAccount, { env });
+    if (matchedAcct) {
+      routeEngine = engineOf(
+        String(matchedAcct.provider || "")
+          .trim()
+          .toLowerCase(),
+      );
+    }
+    if (!routeEngine || !COORDINATOR_ENGINES.has(routeEngine)) {
+      throw new Error(
+        `Route ${JSON.stringify(routeName)} references unknown account ${explicitRouteAccount}`,
+      );
+    }
+  }
+  const claudeConfigDir = entry.claudeConfigDir || entry.claude_config_dir || null;
+  const tags = entry.tags === undefined ? [] : normalizeAccountTags({ tags: entry.tags });
+  return {
+    engine: routeEngine,
+    routeEngine,
+    account: explicitRouteAccount || null,
+    tags,
+    model: typeof entry.model === "string" && entry.model.trim() ? entry.model.trim() : null,
+    effort: typeof entry.effort === "string" && entry.effort.trim() ? entry.effort.trim() : null,
+    variant:
+      typeof entry.variant === "string" && entry.variant.trim() ? entry.variant.trim() : null,
+    claudeConfigDir: claudeConfigDir ? String(claudeConfigDir) : null,
+    isAlternate,
+  };
+}
+
+function evaluateRouteCandidatePolicy(
+  repoRoot,
+  candidate,
+  { env, account = null, claudeConfigDir = null } = {},
+) {
+  const effectiveAccount = account || candidate.account || null;
+  const effectiveClaudeDir = claudeConfigDir || candidate.claudeConfigDir || null;
+  const baseOpts = {
+    env,
+    ...(effectiveClaudeDir && { claudeConfigDir: effectiveClaudeDir }),
+  };
+
+  if (effectiveAccount) {
+    const policy = checkRepoPolicyForSide(repoRoot, candidate.routeEngine, {
+      ...baseOpts,
+      account: effectiveAccount,
+    });
+    if (policy.ok && candidate.tags.some((tag) => !(policy.tags || []).includes(tag))) {
+      return {
+        ok: false,
+        status: "tag_mismatch",
+        engine: candidate.routeEngine,
+        deny: policy.deny || [],
+        error: `Account '${effectiveAccount}' does not match route tags [${candidate.tags.join(", ")}].`,
+      };
+    }
+    return policy;
+  }
+
+  if (candidate.tags.length > 0) {
+    const configured = loadConfiguredAccounts({ env }).filter((acct) => {
+      const acctEngine = engineOf(
+        String(acct.provider || "")
+          .trim()
+          .toLowerCase(),
+      );
+      if (acctEngine !== candidate.routeEngine) return false;
+      const acctTags = normalizeAccountTags(acct);
+      return candidate.tags.every((tag) => acctTags.includes(tag));
+    });
+    if (configured.length === 0) {
+      return {
+        ok: false,
+        status: "policy_denied",
+        engine: candidate.routeEngine,
+        deny: [],
+        error: `No configured ${candidate.routeEngine} account matches route tags [${candidate.tags.join(", ")}]`,
+      };
+    }
+    let firstDenied = null;
+    for (const acct of configured) {
+      const policy = checkRepoPolicyForSide(repoRoot, candidate.routeEngine, {
+        ...baseOpts,
+        account: acct.id,
+      });
+      if (policy.ok) return policy;
+      firstDenied ??= policy;
+    }
+    return firstDenied;
+  }
+
+  return checkRepoPolicyForSide(repoRoot, candidate.routeEngine, baseOpts);
+}
+
+function resolveRouteForChiefSpawn(
+  routeName,
+  explicitEngine,
+  env = process.env,
+  { repoRoot, account = null, claudeConfigDir = null, isInstalled = defaultIsEngineInstalled } = {},
+) {
+  const routes = loadConfiguredRoutes(env);
+  if (!Object.hasOwn(routes, routeName)) {
+    throw new Error(
+      `Unknown --route ${JSON.stringify(routeName)}; configured: ${Object.keys(routes)
+        .toSorted((a, b) => a.localeCompare(b))
+        .join(", ")}`,
+    );
+  }
+  const entry = routes[routeName];
+  const primary = normalizeRouteCandidate(routeName, entry, { isAlternate: false, env });
+  if (explicitEngine) {
+    if (explicitEngine !== primary.routeEngine && explicitEngine !== primary.engine) {
+      return null;
+    }
+    const policy = evaluateRouteCandidatePolicy(repoRoot, primary, {
+      env,
+      account,
+      claudeConfigDir,
+    });
+    if (policy.ok) {
+      const execEngine = policy.engine || primary.routeEngine;
+      if (!isInstalled(execEngine, env)) {
+        throw new Error(
+          `Route ${JSON.stringify(routeName)} executable '${execEngine}' is not installed on PATH`,
+        );
+      }
+    }
+    return { candidate: primary, policy, primary };
+  }
+
+  const rawAlternates = Array.isArray(entry.alternates) ? entry.alternates : [];
+  const candidates = [
+    primary,
+    ...rawAlternates.map((alt) =>
+      normalizeRouteCandidate(routeName, alt, { isAlternate: true, env }),
+    ),
+  ];
+
+  const unavailableEngines = [];
+  let firstPolicyError = null;
+  for (const candidate of candidates) {
+    const policy = evaluateRouteCandidatePolicy(repoRoot, candidate, {
+      env,
+      account,
+      claudeConfigDir,
+    });
+    if (!policy.ok) {
+      firstPolicyError ??= policy.error;
+      continue;
+    }
+    const execEngine = policy.engine || candidate.routeEngine;
+    if (isInstalled(execEngine, env)) {
+      return { candidate, policy, primary };
+    }
+    unavailableEngines.push(execEngine);
+  }
+
+  if (unavailableEngines.length > 0) {
+    throw new Error(
+      `Route ${JSON.stringify(routeName)} has no installed executable (checked: ${unavailableEngines.join(", ")})`,
+    );
+  }
+  throw new Error(
+    firstPolicyError ||
+      `All candidates for route ${JSON.stringify(routeName)} are denied by policy`,
+  );
+}
+
+function appendClaudeConfigDirOnce(args, claudeConfigDir) {
+  const next = Array.isArray(args) ? [...args] : [];
+  if (!claudeConfigDir) return next;
+  const hasFlag = next.some(
+    (token) => token === "--claude-config-dir" || String(token).startsWith("--claude-config-dir="),
+  );
+  if (!hasFlag) {
+    next.push("--claude-config-dir", claudeConfigDir);
+  }
+  return next;
+}
+
 export async function chiefSpawn({
   cwd,
   worktree,
@@ -1273,6 +1937,8 @@ export async function chiefSpawn({
   goalFile,
   title,
   engine,
+  account,
+  claudeConfigDir,
   model,
   effort,
   route,
@@ -1284,6 +1950,7 @@ export async function chiefSpawn({
   exec,
   launch = defaultLaunch,
   provision = provisionWorktree,
+  isEngineInstalled = defaultIsEngineInstalled,
 } = {}) {
   if (!cwd) throw new Error("Pass --cwd <repository>");
   let goalText = typeof goal === "string" ? goal.trim() : "";
@@ -1294,9 +1961,31 @@ export async function chiefSpawn({
   if (!goalText) throw new Error("Pass --goal <text> or --goal-file <path>");
   if (goalText.length > MAX_GOAL_CHARS)
     throw new Error(`Goal must be at most ${MAX_GOAL_CHARS} characters`);
-  if (engine === "gemini") engine = "agy";
-  if (engine && !COORDINATOR_ENGINES.has(engine))
-    throw new Error(`Unsupported engine ${engine}; choose ${[...COORDINATOR_ENGINES].join(", ")}`);
+  let requestedAccount = typeof account === "string" && account.trim() ? account.trim() : null;
+  if (engine === "gemini" || engine === "antigravity") engine = "agy";
+  if (engine && !COORDINATOR_ENGINES.has(engine)) {
+    const matchedEngineAcct = resolveConfiguredAccount(engine, { env });
+    if (matchedEngineAcct) {
+      if (requestedAccount) {
+        const matchedExplicit = resolveConfiguredAccount(requestedAccount, { env });
+        if (matchedExplicit && matchedExplicit.id !== matchedEngineAcct.id) {
+          throw new Error(
+            `Engine/account '${engine}' contradicts explicit --account '${requestedAccount}'`,
+          );
+        }
+      }
+      requestedAccount ||= matchedEngineAcct.id || engine;
+      engine = engineOf(
+        String(matchedEngineAcct.provider || "")
+          .trim()
+          .toLowerCase(),
+      );
+    } else {
+      throw new Error(
+        `Unsupported engine ${engine}; choose ${[...COORDINATOR_ENGINES].join(", ")}`,
+      );
+    }
+  }
   const repoRoot = resolveRepositoryRoot(path.resolve(cwd), exec);
   const missionTitle = oneLine(title || goalText.split(/\r?\n/u, 1)[0], 80);
   const isExplicitWorktree = typeof worktree === "string" && Boolean(worktree);
@@ -1326,16 +2015,69 @@ export async function chiefSpawn({
   if (existingRoomIds.has(roomId)) throw new Error(`Room ${roomId} already exists`);
   const missionSession = `${roomId}-orch`;
   const plannedWorkspace = isWorktreeRequested ? path.join(repoRoot, ".worktrees", slug) : repoRoot;
-  let policy = { ok: true, engine: engine || null, extraArgs: [] };
-  if (engine) {
-    policy = checkRepoPolicyForSide(repoRoot, engine, { env });
-    if (!policy.ok)
-      throw new Error(policy.error || `Engine ${engine} is denied by repository policy`);
+
+  let resolvedRoute = null;
+  if (route) {
+    resolvedRoute = resolveRouteForChiefSpawn(route, engine || null, env, {
+      repoRoot,
+      account: requestedAccount,
+      claudeConfigDir: claudeConfigDir || null,
+      isInstalled: isEngineInstalled,
+    });
   }
-  const launchEngine = policy.engine || engine || null;
-  // A route picks its own engine; otherwise a long-lived orchestrator defaults to Claude.
-  const selectedEngine = launchEngine || (route ? null : "claude");
-  const roomEngine = selectedEngine || "claude";
+
+  let policy;
+  if (resolvedRoute) {
+    policy = resolvedRoute.policy;
+  } else if (engine || requestedAccount || claudeConfigDir) {
+    policy = checkRepoPolicyForSide(repoRoot, engine || null, {
+      env,
+      ...(requestedAccount && { account: requestedAccount }),
+      ...(claudeConfigDir && { claudeConfigDir }),
+    });
+  } else {
+    policy = checkRepoPolicyForSide(repoRoot, null, {
+      env,
+      candidates: ["claude", "codex", "agy", "opencode"],
+    });
+  }
+  if (!policy.ok) {
+    throw new Error(
+      policy.error ||
+        `Engine ${engine || resolvedRoute?.candidate?.engine || "claude"} is denied by repository policy`,
+    );
+  }
+
+  const routeCandidate = resolvedRoute?.candidate || null;
+  const routePrimary = resolvedRoute?.primary || null;
+  const selectedEngine = policy.engine || engine || routeCandidate?.engine;
+  if (!selectedEngine) {
+    throw new Error("Unable to resolve an allowed engine for mission spawn");
+  }
+  if (!isEngineInstalled(selectedEngine, env)) {
+    throw new Error(`Engine '${selectedEngine}' is not installed on PATH`);
+  }
+  const resolvedModel = model || routeCandidate?.model || null;
+  const resolvedEffort = effort || routeCandidate?.effort || null;
+  const roomEngine = selectedEngine;
+  const resolvedHomeDir = path.resolve(env.HOME || homedir());
+  const defaultWorkClaudeDir = path.join(resolvedHomeDir, ".claude");
+  const isAlternateClaudeProfileSwitch = Boolean(
+    routeCandidate?.isAlternate && selectedEngine === "claude" && !policy.claudeConfigDir,
+  );
+  const effectiveClaudeConfigDir =
+    policy.claudeConfigDir || (isAlternateClaudeProfileSwitch ? defaultWorkClaudeDir : null);
+  const extraArgs = appendClaudeConfigDirOnce(policy.extraArgs, effectiveClaudeConfigDir);
+  const hasAccountFlag = extraArgs.some(
+    (token) => token === "--account" || String(token).startsWith("--account="),
+  );
+  const explicitAccountToForward =
+    !hasAccountFlag && (requestedAccount || routeCandidate?.account)
+      ? policy.accountId || requestedAccount || routeCandidate?.account
+      : null;
+  const shouldForwardRouteFlag = Boolean(
+    route && !(routeCandidate?.isAlternate && routePrimary?.routeEngine === selectedEngine),
+  );
   const chief = readChiefBinding({ root, now });
   const parent = {
     alias: "chief",
@@ -1364,11 +2106,16 @@ export async function chiefSpawn({
     ".",
     "--timeout",
     timeout,
-    ...(route ? ["--route", route] : []),
-    ...(selectedEngine ? ["--engine", selectedEngine] : []),
-    ...(model ? ["--model", model] : []),
-    ...(effort ? ["--effort", effort] : []),
-    ...(policy.extraArgs || []),
+    ...(shouldForwardRouteFlag ? ["--route", route] : []),
+    "--engine",
+    selectedEngine,
+    ...(explicitAccountToForward ? ["--account", explicitAccountToForward] : []),
+    ...(resolvedModel ? ["--model", resolvedModel] : []),
+    ...(resolvedEffort ? ["--effort", resolvedEffort] : []),
+    ...(selectedEngine === "opencode" && routeCandidate?.variant
+      ? ["--variant", routeCandidate.variant]
+      : []),
+    ...extraArgs,
   ];
   const brief = missionBrief({
     roomId,
@@ -1398,9 +2145,15 @@ export async function chiefSpawn({
     parentChief: parent,
     missionSession,
     engine: selectedEngine,
+    accountId: policy.accountId || null,
+    accountAlias: policy.accountAlias || null,
+    tags: policy.tags || [],
+    claudeConfigDir: effectiveClaudeConfigDir || null,
+    codexHome: policy.codexHome || null,
+    agyHome: policy.agyHome || null,
     route: route || null,
-    model: model || null,
-    effort: effort || null,
+    model: resolvedModel,
+    effort: resolvedEffort,
     briefPath,
     jobDir,
     command,
@@ -1421,7 +2174,7 @@ export async function chiefSpawn({
     title: missionTitle,
     objective: goalText,
     engine: roomEngine,
-    model: model || undefined,
+    model: resolvedModel || undefined,
     group: path.basename(repoRoot),
     root,
   });
@@ -1433,7 +2186,10 @@ export async function chiefSpawn({
         ...room.conductor,
         status: "launching",
         mailboxSession: missionSession,
-        ...(effort && { effort }),
+        ...(policy.accountId && { accountId: policy.accountId }),
+        ...(policy.accountAlias && { accountAlias: policy.accountAlias }),
+        ...(policy.claudeConfigDir && { claudeConfigDir: policy.claudeConfigDir }),
+        ...(resolvedEffort && { effort: resolvedEffort }),
         ...(worktreeInfo && {
           worktree: {
             disposable: false,
@@ -1452,9 +2208,12 @@ export async function chiefSpawn({
         mission: { session: missionSession, briefPath, jobDir },
         launch: {
           engine: selectedEngine,
+          ...(policy.accountId && { accountId: policy.accountId }),
+          ...(policy.accountAlias && { accountAlias: policy.accountAlias }),
+          ...(policy.claudeConfigDir && { claudeConfigDir: policy.claudeConfigDir }),
           route: route || null,
-          model: model || null,
-          effort: effort || null,
+          model: resolvedModel || null,
+          effort: resolvedEffort || null,
         },
       };
       return room;
@@ -1464,9 +2223,20 @@ export async function chiefSpawn({
   mkdirSync(missionDir, { recursive: true, mode: 0o700 });
   writeFileSync(briefPath, brief, { mode: 0o600 });
   const finalCommand = command.map((part) => (part === plannedWorkspace ? workspace : part));
+  const launchEnv = applyLauncherAccountEnv(
+    {
+      ...env,
+      ORK_CHIEF_ROOM: roomId,
+      ORK_CHIEF_MISSION_SESSION: missionSession,
+    },
+    policy.accountEnv,
+  );
+  if (env.HOME !== undefined) {
+    launchEnv.HOME = env.HOME;
+  }
   const launched = launch(finalCommand, {
     cwd: workspace,
-    env: { ...env, ORK_CHIEF_ROOM: roomId, ORK_CHIEF_MISSION_SESSION: missionSession },
+    env: launchEnv,
   });
   const info = parseLaunchOutput(launched.stdout);
   const isOk = launched.status === 0;

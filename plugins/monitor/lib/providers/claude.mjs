@@ -1,8 +1,31 @@
+import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 
 import { childEnv, expandHome, resolveBinary, run } from "../exec.mjs";
 import { parseResetText } from "../time.mjs";
+
+function canonicalPath(target) {
+  const resolved = path.resolve(target);
+  try {
+    return realpathSync(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
+function resolvePathForHome(rawValue, homeBase) {
+  const trimmed = String(rawValue).trim();
+  let expanded;
+  if (trimmed === "~") {
+    expanded = homeBase;
+  } else if (trimmed.startsWith("~/")) {
+    expanded = path.join(homeBase, trimmed.slice(2));
+  } else {
+    expanded = expandHome(trimmed);
+  }
+  return path.isAbsolute(expanded) ? path.resolve(expanded) : path.resolve(homeBase, expanded);
+}
 
 const slug = (s) =>
   s
@@ -93,20 +116,35 @@ export function parseClaudeUsage(text, now = Date.now()) {
   return { windows, pools, notes };
 }
 
-const DEFAULT_CONFIG_DIR = path.join(homedir(), ".claude");
-
 export async function fetchClaude(account, { now = Date.now() } = {}) {
   const bin = resolveBinary("claude", account.command);
+  const rawHome =
+    typeof account.env?.HOME === "string" && account.env.HOME.trim()
+      ? path.resolve(homedir(), expandHome(account.env.HOME.trim()))
+      : null;
+  const homeBase = rawHome ?? homedir();
+  const defaultConfigDir = canonicalPath(path.join(homeBase, ".claude"));
   // Claude Code derives the keychain entry name from whether CLAUDE_CONFIG_DIR is set, so the
   // default profile must run with it unset even when the configured dir is ~/.claude.
-  const configDir = account.configDir ? path.resolve(expandHome(account.configDir)) : null;
+  const rawConfigDir = [
+    account.configDir,
+    account.claudeConfigDir,
+    account.env?.CLAUDE_CONFIG_DIR,
+  ].find((v) => typeof v === "string" && v.trim());
+  const configDir = rawConfigDir ? resolvePathForHome(rawConfigDir, homeBase) : null;
   const env = childEnv(
     {
       ...account.env,
-      CLAUDE_CONFIG_DIR: configDir && configDir !== DEFAULT_CONFIG_DIR ? configDir : null,
+      CLAUDE_CONFIG_DIR:
+        configDir && canonicalPath(configDir) !== defaultConfigDir ? configDir : null,
     },
     { strip: [/^ANTHROPIC_/, /^CLAUDE_CODE_/, "CLAUDECODE", "CLAUDE_CONFIG_DIR"] },
   );
+  const claudeConfigDir =
+    typeof env.CLAUDE_CONFIG_DIR === "string" && env.CLAUDE_CONFIG_DIR.trim()
+      ? resolvePathForHome(env.CLAUDE_CONFIG_DIR, homeBase)
+      : null;
+  const shouldUnsetClaudeConfigDir = claudeConfigDir === null;
   const args = [
     "-p",
     "/usage",
@@ -138,6 +176,8 @@ export async function fetchClaude(account, { now = Date.now() } = {}) {
     throw new Error(`claude /usage failed: ${String(result?.result ?? stderr).slice(0, 200)}`);
   return {
     plan: /subscription/i.test(result.result) ? "subscription" : undefined,
+    claudeConfigDir,
+    unsetClaudeConfigDir: shouldUnsetClaudeConfigDir,
     ...parseClaudeUsage(result.result, now),
   };
 }

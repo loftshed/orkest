@@ -6,6 +6,9 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -38,7 +41,8 @@ import {
 } from "../../../plugins/orchestrate/lib/smelter.mjs";
 
 function fixture() {
-  const root = mkdtempSync(path.join(tmpdir(), "orkest-state-"));
+  const rawRoot = mkdtempSync(path.join(tmpdir(), "orkest-state-"));
+  const root = realpathSync(rawRoot);
   const file = resolveFoundryStatePath(root);
   mkdirSync(path.dirname(file), { recursive: true });
   return { root, file };
@@ -53,7 +57,8 @@ function git(cwd, ...args) {
 }
 
 function worktreeFixture() {
-  const root = mkdtempSync(path.join(tmpdir(), "orkest-state-git-"));
+  const rawRoot = mkdtempSync(path.join(tmpdir(), "orkest-state-git-"));
+  const root = realpathSync(rawRoot);
   const repo = path.join(root, "repo");
   const worktree = path.join(root, "worktree");
   mkdirSync(repo);
@@ -426,4 +431,70 @@ read();
       expect(git(f.repo, "branch", "--list", "candidate")).toContain("candidate");
     },
   );
+
+  it("default writeFoundryState and loadFoundryState refuse symlinked orkest, symlinked .git, and broken gitdir backlink (#1)", () => {
+    const f = worktreeFixture();
+    const outside = path.join(f.root, "outside");
+    mkdirSync(outside, { recursive: true });
+    const orkestDir = path.dirname(f.file);
+    rmSync(orkestDir, { recursive: true, force: true });
+    symlinkSync(outside, orkestDir);
+
+    expect(() => writeFoundryState(f.worktree, { status: "verified" })).toThrow(
+      /invalid or a symlink/,
+    );
+    expect(existsSync(path.join(outside, "foundry-state.json"))).toBe(false);
+    expect(loadFoundryState(f.worktree)).toMatchObject({
+      kind: "corrupt",
+      state: null,
+    });
+
+    // Replace symlink with real orkest dir, then break the adminDir gitdir backlink.
+    rmSync(orkestDir, { recursive: true, force: true });
+    mkdirSync(orkestDir, { recursive: true });
+    const adminDir = path.dirname(orkestDir);
+    const backlinkPath = path.join(adminDir, "gitdir");
+    const realBacklink = readFileSync(backlinkPath, "utf8");
+    const decoyDotGit = path.join(f.root, "decoy-dot-git");
+    writeFileSync(decoyDotGit, "gitdir: /tmp/elsewhere\n");
+    writeFileSync(backlinkPath, `${decoyDotGit}\n`);
+    expect(() => writeFoundryState(f.worktree, { status: "verified" })).toThrow(/backlink/);
+    writeFileSync(backlinkPath, realBacklink);
+
+    // Symlinked .git entry in worktree is refused.
+    const symlinkWt = path.join(f.root, "symlink-wt");
+    mkdirSync(symlinkWt, { recursive: true });
+    symlinkSync(adminDir, path.join(symlinkWt, ".git"));
+    expect(() => writeFoundryState(symlinkWt, { status: "verified" })).toThrow(/symlink/);
+  });
+
+  it("default writeFoundryState refuses .git file pointing to unverified external directory (#3)", () => {
+    const f = worktreeFixture();
+    const emptyExternal = path.join(f.root, "empty-external-admin");
+    mkdirSync(emptyExternal, { recursive: true });
+    const rogueWt = path.join(f.root, "rogue-empty-wt");
+    mkdirSync(rogueWt, { recursive: true });
+    writeFileSync(path.join(rogueWt, ".git"), `gitdir: ${emptyExternal}\n`);
+
+    expect(() => writeFoundryState(rogueWt, { status: "verified" })).toThrow(
+      /git rev-parse --git-dir failed/,
+    );
+    expect(existsSync(path.join(emptyExternal, "orkest", "foundry-state.json"))).toBe(false);
+
+    // Even with forged HEAD + commondir + gitdir backlink, an unregistered worktree is refused.
+    const fakeAdmin = path.join(f.root, "forged-external-admin");
+    mkdirSync(fakeAdmin, { recursive: true });
+    const forgedWt = path.join(f.root, "forged-wt");
+    mkdirSync(forgedWt, { recursive: true });
+    const forgedDotGit = path.join(forgedWt, ".git");
+    writeFileSync(forgedDotGit, `gitdir: ${fakeAdmin}\n`);
+    writeFileSync(path.join(fakeAdmin, "HEAD"), "ref: refs/heads/main\n");
+    writeFileSync(path.join(fakeAdmin, "commondir"), `${path.join(f.repo, ".git")}\n`);
+    writeFileSync(path.join(fakeAdmin, "gitdir"), `${forgedDotGit}\n`);
+
+    expect(() => writeFoundryState(forgedWt, { status: "verified" })).toThrow(
+      /not a registered Git worktree/,
+    );
+    expect(existsSync(path.join(fakeAdmin, "orkest", "foundry-state.json"))).toBe(false);
+  });
 });

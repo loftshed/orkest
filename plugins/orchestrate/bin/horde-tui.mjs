@@ -1,7 +1,9 @@
 import { execFile } from "node:child_process";
-import { readFile, stat } from "node:fs/promises";
+import { readFile, realpath, stat } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { promisify } from "node:util";
 
 import { shouldUseColor } from "../../monitor/lib/render.mjs";
 import { CACHE_DIR, CONFIG_PATH } from "../../monitor/lib/store.mjs";
@@ -38,7 +40,13 @@ import {
   markOrcaViewClosed,
   resolveOrcaCli,
 } from "../lib/orca-context.mjs";
-import { configHome } from "../lib/runtime-paths.mjs";
+import {
+  isHarnessAllowed,
+  normalizeAccountTags,
+  normalizeDenyToken,
+  resolvePolicyConfigPath,
+  resolveRepoPolicy,
+} from "../lib/policy.mjs";
 import {
   ALT_SCROLL_DISABLE,
   createTerminalInput,
@@ -58,10 +66,17 @@ import {
   runOrkestUpdate,
 } from "../lib/update.mjs";
 
+export const REPO_POLICY_CACHE_TTL_MS = 15_000;
 export const UPDATE_SUCCESS_TTL_MS = 15_000;
 
+const execFileAsync = promisify(execFile);
 const PANE_ID_RE = /^[A-Za-z0-9_.:%][A-Za-z0-9_.:%-]{0,63}$/u;
 const ORKEST_TMUX_SERVER = /^orkest-label-[0-9a-f]{12}$/u;
+const repoPolicyCache = new Map();
+
+export function resetRepoPolicyCache() {
+  repoPolicyCache.clear();
+}
 
 const quotaCache = {
   snapshotPath: "",
@@ -469,102 +484,194 @@ async function mtimeOrNull(filePath) {
   }
 }
 
-async function readRepoDeniedList(cwd, options = {}) {
-  if (!cwd || typeof cwd !== "string") return [];
-  const resolvedCwd = path.resolve(cwd);
-  const deny = new Set();
-  const collectDeny = (items) => {
-    if (!Array.isArray(items)) return;
-    for (const item of items) {
-      if (typeof item === "string" && item.trim()) deny.add(item.trim().toLowerCase());
-    }
-  };
+async function existingDirectoryAncestorAsync(rawPath, homeDir) {
+  let target = String(rawPath || "").trim();
+  if (target === "~") target = homeDir;
+  else if (target.startsWith("~/")) target = path.join(homeDir, target.slice(2));
+  let current;
   try {
-    const repoPolicyPath = path.join(resolvedCwd, ".orkest", "policy.json");
-    const repoPolicy = JSON.parse(await readFile(repoPolicyPath, "utf8"));
-    collectDeny(repoPolicy?.deny || repoPolicy?.denied);
-  } catch (error) {
-    if (error.code !== "ENOENT") {
-      // Ignore malformed optional policy files in TUI read path.
+    current = await realpath(target || process.cwd());
+  } catch {
+    current = path.resolve(target || process.cwd());
+  }
+  for (;;) {
+    try {
+      const info = await stat(current);
+      if (info.isDirectory()) return await realpath(current);
+    } catch {
+      // Walk upward if stat fails.
     }
+    const parent = path.dirname(current);
+    if (parent === current) return current;
+    current = parent;
+  }
+}
+
+function isAsyncNonGitRepoError(error) {
+  if (!error || error.killed || error.signal) return false;
+  return (
+    error.code === 128 &&
+    String(error.stderr || "")
+      .toLowerCase()
+      .includes("not a git repository")
+  );
+}
+
+function isAsyncMissingGitConfigKey(error) {
+  if (!error || error.killed || error.signal) return false;
+  return error.code === 1 && String(error.stderr || "").trim() === "";
+}
+
+async function resolveGitContextAsync(cwd, options = {}) {
+  const homeDir = options.homeDir || options.env?.HOME || os.homedir();
+  const targetDir = await existingDirectoryAncestorAsync(cwd, homeDir);
+  const runAsync =
+    typeof options.execAsync === "function"
+      ? options.execAsync
+      : (cmd, args, opts) => execFileAsync(cmd, args, opts);
+  let repoRoot = targetDir;
+  let remoteUrl = "";
+  try {
+    const topRes = await runAsync("git", ["-C", targetDir, "rev-parse", "--show-toplevel"], {
+      encoding: "utf8",
+      timeout: 3000,
+    });
+    const out = String(topRes?.stdout ?? "").trim();
+    if (out) repoRoot = out;
+  } catch (error) {
+    if (isAsyncNonGitRepoError(error)) {
+      return { repoRoot, remoteUrl };
+    }
+    throw new Error(
+      `Failed to resolve git repository root for ${targetDir}: ${error?.stderr?.trim() || error?.message || error}`,
+      { cause: error },
+    );
   }
   try {
-    const cfgPath = options.configPath || path.join(configHome(options.env), "config.json");
-    const cfg = JSON.parse(await readFile(cfgPath, "utf8"));
-    const policies = cfg?.repo_policies || cfg?.repoPolicies;
-    if (policies && typeof policies === "object" && !Array.isArray(policies)) {
-      for (const [pattern, rule] of Object.entries(policies)) {
-        if (!rule || typeof rule !== "object") continue;
-        const resolvedPattern = path.resolve(pattern);
-        if (
-          resolvedCwd === resolvedPattern ||
-          resolvedCwd.startsWith(`${resolvedPattern}${path.sep}`) ||
-          path.basename(resolvedCwd) === pattern
-        ) {
-          collectDeny(rule.deny || rule.denied);
-        }
+    const remRes = await runAsync("git", ["-C", repoRoot, "config", "--get", "remote.origin.url"], {
+      encoding: "utf8",
+      timeout: 3000,
+    });
+    remoteUrl = String(remRes?.stdout ?? "").trim();
+  } catch (error) {
+    if (isAsyncMissingGitConfigKey(error) || isAsyncNonGitRepoError(error)) {
+      remoteUrl = "";
+    } else {
+      throw new Error(
+        `Failed to resolve git remote for ${repoRoot}: ${error?.stderr?.trim() || error?.message || error}`,
+        { cause: error },
+      );
+    }
+  }
+  return { repoRoot, remoteUrl };
+}
+
+export async function readRepoDeniedList(cwd, options = {}) {
+  if (!cwd || typeof cwd !== "string") return { available: true, deny: [] };
+  const canUseCache =
+    !options.config && options.remote === undefined && !options.forcePolicyRefresh;
+  const cfgPath = resolvePolicyConfigPath(options);
+  const cacheKey = `${cwd}\0${cfgPath}\0${options.homeDir || ""}`;
+  const now = options.now ?? Date.now();
+  const ttlMs = options.policyTtlMs ?? REPO_POLICY_CACHE_TTL_MS;
+
+  if (canUseCache) {
+    const cached = repoPolicyCache.get(cacheKey);
+    if (cached && now - cached.resolvedAt < ttlMs) {
+      const [cfgMtime, localMtime] = await Promise.all([
+        mtimeOrNull(cfgPath),
+        mtimeOrNull(cached.localPolicyPath),
+      ]);
+      if (cfgMtime === cached.configMtimeMs && localMtime === cached.localPolicyMtimeMs) {
+        return { available: true, deny: cached.deny };
       }
     }
-  } catch (error) {
-    if (error.code !== "ENOENT") {
-      // Ignore missing/unreadable global config in TUI read path.
-    }
   }
-  return [...deny];
+
+  try {
+    let policy;
+    if (typeof options.policyResolver === "function") {
+      policy = await options.policyResolver(cwd, options);
+    } else {
+      const { repoRoot, remoteUrl } = await resolveGitContextAsync(cwd, options);
+      policy = resolveRepoPolicy(cwd, {
+        ...options,
+        repoRoot,
+        remote: options.remote === undefined ? remoteUrl : options.remote,
+        strict: true,
+      });
+    }
+    const deny = Array.isArray(policy?.deny) ? policy.deny : [];
+    const resolvedRepo = policy?.repo || cwd;
+    if (canUseCache) {
+      const localPolicyPath = path.join(resolvedRepo, ".orkest", "policy.json");
+      const [configMtimeMs, localPolicyMtimeMs] = await Promise.all([
+        mtimeOrNull(cfgPath),
+        mtimeOrNull(localPolicyPath),
+      ]);
+      if (repoPolicyCache.size >= 64) {
+        const oldestKey = repoPolicyCache.keys().next().value;
+        repoPolicyCache.delete(oldestKey);
+      }
+      repoPolicyCache.set(cacheKey, {
+        deny,
+        repoRoot: resolvedRepo,
+        localPolicyPath,
+        configMtimeMs,
+        localPolicyMtimeMs,
+        resolvedAt: now,
+      });
+    }
+    return { available: true, deny };
+  } catch (error) {
+    return {
+      available: false,
+      error: error?.message || "Repository policy evaluation failed",
+    };
+  }
 }
 
 export function filterAccountsByRepoPolicy(accounts, denyList = []) {
   if (!Array.isArray(accounts) || accounts.length === 0) return [];
-  const deny = new Set(
-    (Array.isArray(denyList) ? denyList : []).map((item) => String(item).trim().toLowerCase()),
-  );
-  if (deny.size === 0) return accounts.map((account) => ({ ...account }));
+  let rawDeny = denyList;
+  if (denyList && !Array.isArray(denyList)) {
+    if (denyList.available === false) return [];
+    rawDeny = denyList.deny;
+  }
+  const normalizedDeny = (Array.isArray(rawDeny) ? rawDeny : [])
+    .map((item) => normalizeDenyToken(String(item ?? "")))
+    .filter(Boolean);
+  if (normalizedDeny.length === 0) return accounts.map((account) => ({ ...account }));
+  const policy = { deny: normalizedDeny };
   return accounts
     .filter((account) => {
-      const id = String(account?.id || "").toLowerCase();
-      const provider = String(account?.provider || id).toLowerCase();
-      const label = String(account?.label || "").toLowerCase();
-      const isPersonalClaude =
-        id === "plaude" ||
-        id === "claude-personal" ||
-        label.includes("personal") ||
-        label.includes("plaude");
-      const isWorkClaude = (provider === "claude" || id.startsWith("claude")) && !isPersonalClaude;
-      if (
-        isWorkClaude &&
-        (deny.has("claude-work") || (deny.has("claude") && !deny.has("plaude")))
-      ) {
-        return false;
-      }
-      if (isPersonalClaude && (deny.has("plaude") || deny.has("claude-personal"))) {
-        return false;
-      }
-      if ((provider === "codex" || id === "codex") && deny.has("codex")) {
-        return false;
-      }
-      if (
-        (provider === "antigravity" || id === "antigravity" || id === "agy") &&
-        (deny.has("agy") || deny.has("antigravity"))
-      ) {
-        return false;
-      }
-      return !deny.has(id);
+      const tags = normalizeAccountTags(account);
+      return isHarnessAllowed(
+        null,
+        {
+          ...account,
+          ...(tags.length > 0 && { tags }),
+        },
+        { policy },
+      );
     })
     .map((account) => ({ ...account }));
 }
 
 /** Follow monitor's shared snapshot without starting provider CLIs from a display. */
 export async function cachedQuota(cwd, options = {}) {
-  const snapshotPath = path.join(CACHE_DIR, "snapshot.json");
+  const cacheDir = options.cacheDir || CACHE_DIR;
+  const monitorConfigPath = options.monitorConfigPath || CONFIG_PATH;
+  const snapshotPath = path.join(cacheDir, "snapshot.json");
   const snapshotMtimeMs = await mtimeOrNull(snapshotPath);
   if (snapshotMtimeMs === null) return [];
-  const configMtimeMs = await mtimeOrNull(CONFIG_PATH);
+  const configMtimeMs = await mtimeOrNull(monitorConfigPath);
   let baseAccounts;
   if (
     quotaCache.accounts &&
     quotaCache.snapshotPath === snapshotPath &&
     quotaCache.snapshotMtimeMs === snapshotMtimeMs &&
-    quotaCache.configPath === CONFIG_PATH &&
+    quotaCache.configPath === monitorConfigPath &&
     quotaCache.configMtimeMs === configMtimeMs
   ) {
     baseAccounts = quotaCache.accounts.map((account) => ({ ...account }));
@@ -578,7 +685,7 @@ export async function cachedQuota(cwd, options = {}) {
     }
     let config;
     try {
-      config = JSON.parse(await readFile(CONFIG_PATH, "utf8"));
+      config = JSON.parse(await readFile(monitorConfigPath, "utf8"));
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
     }
@@ -588,26 +695,32 @@ export async function cachedQuota(cwd, options = {}) {
       Object.entries(entries).map(([id, entry]) => ({ ...entry, id: entry?.id || id }));
     const accounts = configured.map((account) => {
       const id = String(account?.id || "account");
-      return {
+      const merged = {
         ...entries[id],
         ...account,
         id,
         label: account?.label || id,
         short: account?.short || id.slice(0, 2).toUpperCase(),
       };
+      const tags = normalizeAccountTags(merged);
+      if (tags.length > 0) merged.tags = tags;
+      return merged;
     });
     Object.assign(quotaCache, {
       snapshotPath,
       snapshotMtimeMs,
-      configPath: CONFIG_PATH,
+      configPath: monitorConfigPath,
       configMtimeMs,
       accounts,
     });
     baseAccounts = accounts.map((account) => ({ ...account }));
   }
   if (!cwd) return baseAccounts;
-  const deny = await readRepoDeniedList(cwd, options);
-  return filterAccountsByRepoPolicy(baseAccounts, deny);
+  const policyState = await readRepoDeniedList(cwd, options);
+  if (!policyState.available) {
+    throw new Error(`Repository policy unavailable: ${policyState.error}`);
+  }
+  return filterAccountsByRepoPolicy(baseAccounts, policyState);
 }
 
 export const readQuotaAccounts = cachedQuota;
@@ -803,7 +916,8 @@ async function probeRoomDiscovery(
   for (const listener of listeners) {
     const psInfo = listenerPsRows.get(listener.pid);
     const comm = psInfo?.comm || "";
-    if (isInternalOrHarnessProcess(listener.command, comm, psInfo?.args, listener.port)) continue;
+    if (isInternalOrHarnessProcess(listener.command, comm, psInfo?.args, listener.port, { env }))
+      continue;
     const cwd = cwdMap.get(listener.pid) || "";
     const pidOwner =
       ownerByPid.get(listener.pid) || (psInfo?.ppid ? ownerByPid.get(psInfo.ppid) : undefined);
@@ -900,6 +1014,7 @@ async function probeRoomDiscovery(
     ],
     cwdByPid: cwdMap,
     ignore: ignored,
+    env,
   });
   const agentProcesses = Object.fromEntries(
     [...processMap].map(([id, value]) => [
@@ -1340,8 +1455,11 @@ export async function runHordeTui(
       if (quota) {
         try {
           const accounts = await cachedQuota(room?.cwd, { env });
+          delete room.quotaError;
           if (accounts.length > 0) room.accounts = accounts;
+          else delete room.accounts;
         } catch (error) {
+          delete room.accounts;
           room.quotaError = error.message;
         }
       }

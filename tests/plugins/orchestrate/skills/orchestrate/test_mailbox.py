@@ -721,6 +721,64 @@ class MailboxTests(unittest.TestCase):
         self.peer("conversation-done", "gemini", str(self.repository), pid=pid)  # its next turn
         self.assertIn("conversation-done", [peer["session"] for peer in MAILBOX.peers(self.base)])
 
+    def test_shared_process_subagent_expires_at_300s_with_or_without_pid(self):
+        import mailbox_store
+
+        now = MAILBOX.now().replace(microsecond=0)
+        pid = self.own_process()
+        birth = mailbox_store.process_started(pid)
+        for state in ("busy", "idle", "waiting"):
+            for peer_pid, label in ((pid, "live-pid"), (None, "unknown-pid")):
+                peer_300 = {
+                    "schema": MAILBOX.PEER_SCHEMA,
+                    "session": f"sub-300-{state}-{label}",
+                    "name": "sub",
+                    "harness": "gemini",
+                    "cwd": str(self.repository),
+                    "state": state,
+                    "sharedProcess": True,
+                    "isSubagent": True,
+                    "startedAt": MAILBOX.stamp(now - dt.timedelta(seconds=300)),
+                    "lastSeenAt": MAILBOX.stamp(now - dt.timedelta(seconds=300)),
+                }
+                if peer_pid is not None:
+                    peer_300["pid"] = peer_pid
+                    if birth:
+                        peer_300["pidBirth"] = birth
+                peer_301 = {
+                    **peer_300,
+                    "session": f"sub-301-{state}-{label}",
+                    "startedAt": MAILBOX.stamp(now - dt.timedelta(seconds=301)),
+                    "lastSeenAt": MAILBOX.stamp(now - dt.timedelta(seconds=301)),
+                }
+                self.assertTrue(mailbox_store.is_live(peer_300, now), f"{state} {label} @300s")
+                self.assertFalse(mailbox_store.is_live(peer_301, now), f"{state} {label} @301s")
+
+        # Dead PID or recycled pidBirth must still return False immediately.
+        dead_proc = subprocess.Popen(["true"])
+        dead_proc.wait()
+        dead_sub = {
+            "schema": MAILBOX.PEER_SCHEMA,
+            "session": "sub-dead",
+            "name": "sub",
+            "harness": "gemini",
+            "cwd": str(self.repository),
+            "state": "busy",
+            "sharedProcess": True,
+            "isSubagent": True,
+            "pid": dead_proc.pid,
+            "startedAt": MAILBOX.stamp(now),
+            "lastSeenAt": MAILBOX.stamp(now),
+        }
+        self.assertFalse(mailbox_store.is_live(dead_sub, now))
+        recycled_sub = {
+            **dead_sub,
+            "session": "sub-recycled",
+            "pid": pid,
+            "pidBirth": "Thu Jan  1 00:00:00 1970",
+        }
+        self.assertFalse(mailbox_store.is_live(recycled_sub, now))
+
     def test_a_session_left_alone_on_its_process_is_present_with_it_again(self):
         pid = self.own_process()
         self.peer("thread-left", "codex", str(self.repository), pid=pid)

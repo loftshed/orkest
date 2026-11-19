@@ -8,7 +8,8 @@
       "label": "Claude · work",
       "short": "CW",
       "route": "claude",
-      "billing": "work"
+      "billing": "work",
+      "tags": ["work"]
     },
     {
       "id": "claude-personal",
@@ -16,8 +17,9 @@
       "label": "Claude · personal",
       "short": "CP",
       "configDir": "~/.claude-personal",
-      "route": "plaude",
-      "billing": "personal"
+      "route": "CLAUDE_CONFIG_DIR=~/.claude-personal claude",
+      "billing": "personal",
+      "tags": ["personal"]
     },
     {
       "id": "codex",

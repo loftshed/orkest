@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import shlex
 import shutil
 import subprocess
+import tempfile
 from collections.abc import Mapping, MutableMapping
 from pathlib import Path
 
@@ -347,30 +349,39 @@ def _is_sensitive_env_name(name: str) -> bool:
     return bool(ROOT_ENV_FILE_RE.fullmatch(name) and not ENV_TEMPLATE_FILE_RE.fullmatch(name))
 
 
-def bootstrap_worktree_env(cwd: Path | str, *, overwrite: bool = False) -> list[str]:
-    """Materialize untracked main-checkout .env* and .worktreeinclude files into a linked worktree."""
+def bootstrap_worktree_env_checked(cwd: Path | str, *, overwrite: bool = False) -> tuple[list[str], list[str]]:
+    """Materialize untracked main-checkout .env* and .worktreeinclude entries, returning (copied, failed)."""
     roots = resolve_worktree_roots(cwd)
     if roots is None:
-        return []
+        return [], []
     worktree_root, main_root = roots
     if worktree_root == main_root:
-        return []
+        return [], []
 
     real_main = main_root.resolve()
     real_worktree = worktree_root.resolve()
-    tracked = _tracked_files(main_root)
+    tracked_out = _git_output(main_root, "ls-files")
+    if tracked_out is None:
+        return [], [".git/index"]
+    tracked = {norm for line in tracked_out.splitlines() if (norm := _normalize_rel_pattern(line))}
     includes, excludes = _parse_worktreeinclude(main_root / ".worktreeinclude")
 
     candidates: set[str] = set()
+    failed: list[str] = []
     try:
         for entry in os.scandir(main_root):
             if not _is_sensitive_env_name(entry.name) or entry.name in tracked:
                 continue
-            real_target = Path(entry.path).resolve(strict=True)
+            try:
+                real_target = Path(entry.path).resolve(strict=True)
+            except OSError:
+                if not entry.is_symlink():
+                    failed.append(entry.name)
+                continue
             if _is_within(real_main, real_target) and real_target.is_file():
                 candidates.add(entry.name)
     except OSError:
-        pass
+        failed.append(".")
 
     all_files: list[str] | None = None
     for pattern in includes:
@@ -396,6 +407,7 @@ def bootstrap_worktree_env(cwd: Path | str, *, overwrite: bool = False) -> list[
             elif real_target.is_file() and pattern not in tracked:
                 candidates.add(pattern)
         except OSError:
+            failed.append(pattern)
             continue
 
     copied: list[str] = []
@@ -409,21 +421,47 @@ def bootstrap_worktree_env(cwd: Path | str, *, overwrite: bool = False) -> list[
             if not _is_within(real_main, real_src) or not real_src.is_file():
                 continue
         except OSError:
+            failed.append(rel)
             continue
         if not overwrite and (dest.exists() or dest.is_symlink()):
             continue
         if dest.is_symlink():
             continue
+        tmp_path: Path | None = None
         try:
             dest.parent.mkdir(parents=True, exist_ok=True)
             if not _is_within(real_worktree, dest.parent.resolve()):
                 continue
-            shutil.copyfile(real_src, dest)
-            if _is_sensitive_env_name(dest.name):
-                dest.chmod(0o600)
+            fd, tmp_name = tempfile.mkstemp(prefix=f".{dest.name}.", suffix=".tmp", dir=dest.parent)
+            tmp_path = Path(tmp_name)
+            with os.fdopen(fd, "wb") as dst_fh:
+                with open(real_src, "rb") as src_fh:
+                    shutil.copyfileobj(src_fh, dst_fh)
+                dst_fh.flush()
+                os.fsync(dst_fh.fileno())
+            os.chmod(tmp_path, 0o600)
+            if overwrite:
+                os.replace(tmp_path, dest)
+                tmp_path = None
+            else:
+                try:
+                    os.link(tmp_path, dest)
+                except FileExistsError:
+                    continue
             copied.append(rel)
         except OSError:
+            failed.append(rel)
             continue
+        finally:
+            if tmp_path is not None:
+                with contextlib.suppress(OSError):
+                    tmp_path.unlink(missing_ok=True)
+    return copied, failed
+
+
+def bootstrap_worktree_env(cwd: Path | str, *, overwrite: bool = False) -> list[str]:
+    """Materialize untracked main-checkout .env* and .worktreeinclude files into a linked worktree."""
+    copied, _ = bootstrap_worktree_env_checked(cwd, overwrite=overwrite)
     return copied
 
 

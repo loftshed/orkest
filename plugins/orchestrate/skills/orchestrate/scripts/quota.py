@@ -80,13 +80,97 @@ def route_for(engine: str, model: str) -> tuple[str, str | None] | None:
     return None
 
 
+def _normalize_tags(*values: Any) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        items = value if isinstance(value, (list, tuple, set)) else [value]
+        for item in items:
+            if not isinstance(item, str):
+                continue
+            cleaned = item.strip().lower()
+            if cleaned and cleaned not in seen:
+                seen.add(cleaned)
+                result.append(cleaned)
+    return result
+
+
+def _canonical_path(target: str | Path) -> Path:
+    raw = str(target).strip()
+    expanded = Path(os.path.expanduser(raw))
+    if not expanded.is_absolute():
+        expanded = Path.home() / expanded
+    try:
+        return expanded.resolve()
+    except OSError:
+        return Path(os.path.abspath(str(expanded)))
+
+
+def _agy_home_from_path(target: str | Path) -> Path:
+    path = _canonical_path(target)
+    return path.parent if path.name.startswith("antigravity") else path
+
+
+def _load_monitor_accounts_by_id() -> dict[str, dict[str, Any]]:
+    raw_override = os.environ.get("MONITOR_CONFIG")
+    cfg_path = (
+        Path(raw_override).expanduser()
+        if isinstance(raw_override, str) and raw_override.strip()
+        else Path.home() / ".config" / "monitor" / "config.json"
+    )
+    try:
+        loaded = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(loaded, dict) or not isinstance(loaded.get("accounts"), list):
+        return {}
+    return {
+        acct["id"]: acct
+        for acct in loaded["accounts"]
+        if isinstance(acct, dict) and isinstance(acct.get("id"), str) and acct["id"]
+    }
+
+
+def _resolved_configured_home(account: dict[str, Any], provider: str) -> Path | None:
+    env = account.get("env") if isinstance(account.get("env"), dict) else {}
+    if provider == "claude":
+        raw_cfg = account.get("claudeConfigDir") or account.get("configDir") or env.get("CLAUDE_CONFIG_DIR")
+        if isinstance(raw_cfg, str) and raw_cfg.strip():
+            return _canonical_path(raw_cfg)
+        raw_home = env.get("HOME")
+        if isinstance(raw_home, str) and raw_home.strip():
+            return _canonical_path(Path(os.path.expanduser(raw_home)) / ".claude")
+        return None
+    if provider == "codex":
+        raw_codex = account.get("codexHome") or env.get("CODEX_HOME")
+        if isinstance(raw_codex, str) and raw_codex.strip():
+            return _canonical_path(raw_codex)
+        raw_home = env.get("HOME")
+        if isinstance(raw_home, str) and raw_home.strip():
+            return _canonical_path(Path(os.path.expanduser(raw_home)) / ".codex")
+        return None
+    if provider == "antigravity":
+        raw_gemini = env.get("GEMINI_CLI_HOME")
+        if isinstance(raw_gemini, str) and raw_gemini.strip():
+            return _canonical_path(raw_gemini)
+        raw_app = env.get("ANTIGRAVITY_APP_DATA_DIR")
+        if isinstance(raw_app, str) and raw_app.strip():
+            return _agy_home_from_path(raw_app)
+        raw_home = env.get("HOME")
+        if isinstance(raw_home, str) and raw_home.strip():
+            return _canonical_path(Path(os.path.expanduser(raw_home)) / ".gemini")
+        return None
+    return None
+
+
 def pool_lanes(engine: str, model: str, view: dict[str, Any]) -> list[dict[str, Any]]:
     """Every account's lane for this route, best first (monitor ranks lanes)."""
     route = route_for(engine, model)
     if route is None:
         return []
     provider, pool = route
-    accounts = {account["id"]: account for account in view.get("accounts", [])}
+    configured_accounts = _load_monitor_accounts_by_id()
+    accounts = {account["id"]: account for account in view.get("accounts", []) if isinstance(account, dict)}
     # An "error" lane means monitor has no data for that account at all: unknown, not empty.
     lanes = [
         lane
@@ -105,17 +189,54 @@ def pool_lanes(engine: str, model: str, view: dict[str, Any]) -> list[dict[str, 
             match = match or [lane for lane in own if lane.get("poolId") in ("codex", "all")] or own
         if match:
             account = accounts.get(account_id, {})
+            cfg_account = configured_accounts.get(account_id, {})
             config_dir = (
-                account.get("configDir")
+                account.get("claudeConfigDir")
+                or account.get("configDir")
                 or account.get("config_dir")
+                or cfg_account.get("claudeConfigDir")
+                or cfg_account.get("configDir")
                 or match[0].get("configDir")
                 or match[0].get("config_dir")
             )
+            account_home = (
+                account.get("accountHome")
+                or account.get("account_home")
+                or cfg_account.get("accountHome")
+                or match[0].get("accountHome")
+            )
+            if account_home is None:
+                resolved_cfg_home = _resolved_configured_home(cfg_account, provider)
+                if resolved_cfg_home is not None:
+                    account_home = str(resolved_cfg_home)
+            tags = _normalize_tags(
+                account.get("tags"),
+                account.get("category"),
+                cfg_account.get("tags"),
+                cfg_account.get("category"),
+            )
+            category = account.get("category") or cfg_account.get("category")
+            billing = account.get("billing") or cfg_account.get("billing")
+            alias = account.get("alias") or cfg_account.get("alias")
+            aliases = [
+                item.strip()
+                for src in (account.get("aliases"), cfg_account.get("aliases"))
+                if isinstance(src, (list, tuple))
+                for item in src
+                if isinstance(item, str) and item.strip()
+            ]
+            unset_claude_dir = account.get("unsetClaudeConfigDir")
             chosen.append(
                 {
                     **match[0],
-                    "billing": account.get("billing"),
+                    "billing": billing,
+                    **({"category": category} if category is not None else {}),
+                    **({"tags": tags} if tags else {}),
+                    **({"alias": alias} if alias is not None else {}),
+                    **({"aliases": aliases} if aliases else {}),
                     **({"configDir": config_dir} if config_dir is not None else {}),
+                    **({"accountHome": account_home} if account_home is not None else {}),
+                    **({"unsetClaudeConfigDir": bool(unset_claude_dir)} if unset_claude_dir is not None else {}),
                 }
             )
     return chosen
@@ -136,10 +257,6 @@ def assess(lane: dict[str, Any]) -> str:
     return "available"
 
 
-def _lane_haystack(lane: dict[str, Any]) -> str:
-    return " ".join(str(lane.get(k) or "") for k in ("accountId", "label", "billing", "name")).lower()
-
-
 def _prefer_claude_pool(candidates: list[dict[str, Any]], model: str | None) -> dict[str, Any]:
     lowered = model.lower() if model else ""
     target_pool = "fable" if ("fable" in lowered or "mythos" in lowered) else "all"
@@ -149,59 +266,165 @@ def _prefer_claude_pool(candidates: list[dict[str, Any]], model: str | None) -> 
     return candidates[0]
 
 
+def _prefer_pool(candidates: list[dict[str, Any]], engine: str, model: str | None) -> dict[str, Any]:
+    if engine == "claude":
+        return _prefer_claude_pool(candidates, model)
+    return candidates[0]
+
+
+def _lane_paths(lane: dict[str, Any]) -> set[Path]:
+    paths: set[Path] = set()
+    for key in ("configDir", "config_dir", "claudeConfigDir", "accountHome", "account_home"):
+        raw = lane.get(key)
+        if isinstance(raw, str) and raw.strip():
+            paths.add(_canonical_path(raw))
+    return paths
+
+
+def _lane_tags(lane: dict[str, Any]) -> set[str]:
+    return set(_normalize_tags(lane.get("tags"), lane.get("category"), lane.get("billing")))
+
+
+_STATUS_RANK = {"available": 0, "low": 1, "unknown": 2, "credits": 3, "blocked": 4}
+
+
+def _lane_rank(lane: dict[str, Any]) -> tuple[int, bool, float, float]:
+    status = assess(lane)
+    surplus = lane.get("surplusPts")
+    usable = lane.get("availableNowPct")
+    surplus_val = float(surplus) if isinstance(surplus, int | float) and not isinstance(surplus, bool) else -1e9
+    usable_val = float(usable) if isinstance(usable, int | float) and not isinstance(usable, bool) else -1.0
+    return (_STATUS_RANK.get(status, 5), bool(lane.get("stale")), -surplus_val, -usable_val)
+
+
+def _best_account_lane(candidates: list[dict[str, Any]], *, engine: str, model: str | None) -> dict[str, Any]:
+    by_account: dict[str, list[dict[str, Any]]] = {}
+    for lane in candidates:
+        acct_id = str(lane.get("accountId") or "")
+        by_account.setdefault(acct_id, []).append(lane)
+    per_account = [_prefer_pool(group, engine, model) for group in by_account.values()]
+    return min(per_account, key=_lane_rank)
+
+
+def route_account_lane(
+    lanes: list[dict[str, Any]],
+    *,
+    engine: str,
+    model: str | None = None,
+    account_id: str | None = None,
+    account_alias: str | None = None,
+    claude_config_dir: str | Path | None = None,
+    codex_home: str | Path | None = None,
+    agy_home: str | Path | None = None,
+    tags: list[str] | tuple[str, ...] | None = None,
+    category: str | None = None,
+    billing: str | None = None,
+    allowed_account_ids: set[str] | frozenset[str] | None = None,
+) -> dict[str, Any] | None:
+    """Select the matching lane across N accounts per provider:
+    accountId/alias -> canonical configDir/accountHome -> explicit tags/category -> highest-surplus allowed account.
+    """
+    candidates = [lane for lane in lanes if allowed_account_ids is None or lane.get("accountId") in allowed_account_ids]
+    if not candidates:
+        return None
+
+    if account_id is not None and account_id.strip():
+        target_id = account_id.strip().lower()
+        exact_id = [lane for lane in candidates if str(lane.get("accountId") or "").strip().lower() == target_id]
+        return _best_account_lane(exact_id, engine=engine, model=model) if exact_id else None
+
+    if account_alias is not None and account_alias.strip():
+        target_alias = account_alias.strip().lower()
+
+        def _matches_alias(lane: dict[str, Any]) -> bool:
+            if str(lane.get("alias") or "").strip().lower() == target_alias:
+                return True
+            if str(lane.get("accountId") or "").strip().lower() == target_alias:
+                return True
+            raw_aliases = lane.get("aliases")
+            if isinstance(raw_aliases, (list, tuple, set)):
+                return any(isinstance(item, str) and item.strip().lower() == target_alias for item in raw_aliases)
+            return False
+
+        exact_alias = [lane for lane in candidates if _matches_alias(lane)]
+        return _best_account_lane(exact_alias, engine=engine, model=model) if exact_alias else None
+
+    target_home: Path | None = None
+    explicit_home_requested = False
+    if engine == "claude":
+        if claude_config_dir is not None and str(claude_config_dir).strip():
+            target_home = _canonical_path(claude_config_dir)
+            explicit_home_requested = True
+        elif os.environ.get("ORKEST_CLAUDE_ACCOUNT_HOME", "").strip():
+            target_home = _canonical_path(Path(os.environ["ORKEST_CLAUDE_ACCOUNT_HOME"]).expanduser() / ".claude")
+            explicit_home_requested = True
+        else:
+            target_home = _canonical_path(Path.home() / ".claude")
+    elif engine == "codex":
+        raw_codex = codex_home or os.environ.get("ORKEST_CODEX_ACCOUNT_HOME") or os.environ.get("CODEX_HOME")
+        if raw_codex is not None and str(raw_codex).strip():
+            target_home = _canonical_path(raw_codex)
+            explicit_home_requested = True
+    elif engine == "agy":
+        if agy_home is not None and str(agy_home).strip():
+            target_home = _agy_home_from_path(agy_home)
+            explicit_home_requested = True
+        elif os.environ.get("ORKEST_AGY_ACCOUNT_HOME", "").strip():
+            target_home = _agy_home_from_path(os.environ["ORKEST_AGY_ACCOUNT_HOME"])
+            explicit_home_requested = True
+        elif os.environ.get("GEMINI_CLI_HOME", "").strip():
+            target_home = _canonical_path(os.environ["GEMINI_CLI_HOME"])
+            explicit_home_requested = True
+        elif os.environ.get("ANTIGRAVITY_APP_DATA_DIR", "").strip():
+            target_home = _agy_home_from_path(os.environ["ANTIGRAVITY_APP_DATA_DIR"])
+            explicit_home_requested = True
+
+    if target_home is not None:
+        exact_home = [lane for lane in candidates if target_home in _lane_paths(lane)]
+        if not exact_home and engine == "claude" and target_home == _canonical_path(Path.home() / ".claude"):
+            exact_home = [
+                lane
+                for lane in candidates
+                if lane.get("unsetClaudeConfigDir") is True
+                and (not _lane_paths(lane) or target_home in _lane_paths(lane))
+            ]
+        if exact_home:
+            return _best_account_lane(exact_home, engine=engine, model=model)
+
+    requested_tags = set(_normalize_tags(tags, category, billing))
+    if not requested_tags and explicit_home_requested and target_home is not None:
+        dir_name = target_home.name.lower().lstrip(".")
+        suffix = dir_name.removeprefix("claude-").removeprefix("codex-").removeprefix("gemini-")
+        if suffix and suffix not in ("claude", "codex", "gemini"):
+            requested_tags = {suffix}
+
+    if requested_tags:
+        all_match = [lane for lane in candidates if requested_tags.issubset(_lane_tags(lane))]
+        if all_match:
+            return _best_account_lane(all_match, engine=engine, model=model)
+        any_match = [lane for lane in candidates if _lane_tags(lane) & requested_tags]
+        if any_match:
+            return _best_account_lane(any_match, engine=engine, model=model)
+        alias_id_match = [
+            lane
+            for lane in candidates
+            if str(lane.get("accountId") or "").strip().lower() in requested_tags
+            or str(lane.get("alias") or "").strip().lower() in requested_tags
+        ]
+        if alias_id_match:
+            return _best_account_lane(alias_id_match, engine=engine, model=model)
+
+    return _best_account_lane(candidates, engine=engine, model=model)
+
+
 def _match_claude_lane(
     lanes: list[dict[str, Any]],
     claude_config_dir: str | Path | None = None,
     *,
     model: str | None = None,
 ) -> dict[str, Any]:
-    # executor_environment("claude") strips inherited CLAUDE_CONFIG_DIR unless --claude-config-dir is passed.
-    effective = str(claude_config_dir) if claude_config_dir else None
-    if len(lanes) > 1:
-        if effective:
-            name = Path(effective).name.lower()
-            exact = [
-                lane
-                for lane in lanes
-                if (lane.get("config_dir") or lane.get("configDir"))
-                and Path(str(lane.get("config_dir") or lane.get("configDir"))).expanduser()
-                == Path(effective).expanduser()
-            ]
-            if exact:
-                return _prefer_claude_pool(exact, model)
-            is_personal = "personal" in name or "plaude" in name
-            is_work = "work" in name or name == ".claude"
-            profile_name = name.lstrip(".")
-            short_profile = profile_name.removeprefix("claude-")
-            matched: list[dict[str, Any]] = []
-            for lane in lanes:
-                haystack = _lane_haystack(lane)
-                if (
-                    (is_personal and ("personal" in haystack or "plaude" in haystack))
-                    or (is_work and not is_personal and ("work" in haystack or "personal" not in haystack))
-                    or (
-                        profile_name
-                        and profile_name != "claude"
-                        and (profile_name in haystack or (short_profile and short_profile in haystack))
-                    )
-                ):
-                    matched.append(lane)
-            if matched:
-                first_account = matched[0].get("accountId")
-                same_account = [lane for lane in matched if lane.get("accountId") == first_account]
-                return _prefer_claude_pool(same_account or matched, model)
-        else:
-            # Unset CLAUDE_CONFIG_DIR runs against Claude Code's default profile (~/.claude), not personal.
-            non_personal = [
-                lane
-                for lane in lanes
-                if "personal" not in _lane_haystack(lane) and "plaude" not in _lane_haystack(lane)
-            ]
-            if non_personal:
-                first_account = non_personal[0].get("accountId")
-                same_account = [lane for lane in non_personal if lane.get("accountId") == first_account]
-                return _prefer_claude_pool(same_account or non_personal, model)
-    return _prefer_claude_pool(lanes, model)
+    matched = route_account_lane(lanes, engine="claude", model=model, claude_config_dir=claude_config_dir)
+    return matched if matched is not None else _prefer_claude_pool(lanes, model)
 
 
 def check(
@@ -210,6 +433,13 @@ def check(
     view: dict[str, Any] | None,
     *,
     claude_config_dir: str | Path | None = None,
+    account_id: str | None = None,
+    account_alias: str | None = None,
+    codex_home: str | Path | None = None,
+    agy_home: str | Path | None = None,
+    tags: list[str] | tuple[str, ...] | None = None,
+    category: str | None = None,
+    allowed_account_ids: set[str] | frozenset[str] | None = None,
 ) -> dict[str, Any]:
     """Whether a run on engine/model can start now: available, low, credits, blocked, unknown or not_applicable."""
     if route_for(engine, model) is None:
@@ -227,7 +457,21 @@ def check(
         ]
         detail = failed[0].get("advice") if failed else f"monitor has no pool for {engine} {model}"
         return {"status": "unknown", "detail": detail}
-    lane = _match_claude_lane(lanes, claude_config_dir, model=model) if engine == "claude" else lanes[0]
+    lane = route_account_lane(
+        lanes,
+        engine=engine,
+        model=model,
+        account_id=account_id,
+        account_alias=account_alias,
+        claude_config_dir=claude_config_dir,
+        codex_home=codex_home,
+        agy_home=agy_home,
+        tags=tags,
+        category=category,
+        allowed_account_ids=allowed_account_ids,
+    )
+    if lane is None:
+        return {"status": "unknown", "detail": f"monitor has no allowed pool for {engine} {model}"}
     return {"status": assess(lane), **summary(lane)}
 
 
@@ -240,6 +484,9 @@ def summary(lane: dict[str, Any]) -> dict[str, Any]:
         "accountId",
         "poolId",
         "billing",
+        "category",
+        "tags",
+        "alias",
         "credits",
         "availableNowPct",
         "weeklyRemainingPct",
@@ -505,9 +752,11 @@ def access_records(
                 )
                 continue
             for lane in lanes:
-                billing = lane.get("billing")
+                billing = str(lane.get("billing") or "").strip().lower()
+                category = str(lane.get("category") or "").strip().lower()
+                lane_tags = set(_normalize_tags(lane.get("tags")))
                 status = assess(lane)
-                if billing == "personal":
+                if billing == "personal" or category == "personal" or "personal" in lane_tags:
                     billing_mode = "personal_subscription"
                 elif status == "credits":
                     billing_mode = "credits"

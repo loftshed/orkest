@@ -1,7 +1,8 @@
 import { spawn } from "node:child_process";
 import { homedir } from "node:os";
+import path from "node:path";
 
-import { childEnv, resolveBinary } from "../exec.mjs";
+import { childEnv, expandHome, resolveBinary } from "../exec.mjs";
 import { VERSION } from "../version.mjs";
 
 function windowKind(mins) {
@@ -179,9 +180,38 @@ function rpcRateLimits(bin, env, timeoutMs) {
   });
 }
 
+function resolveChildEnvPath(value, baseDir = homedir()) {
+  const trimmed = String(value).trim();
+  let expanded;
+  if (trimmed === "~") {
+    expanded = baseDir;
+  } else if (trimmed.startsWith("~/")) {
+    expanded = path.join(baseDir, trimmed.slice(2));
+  } else {
+    expanded = expandHome(trimmed);
+  }
+  return path.isAbsolute(expanded) ? path.resolve(expanded) : path.resolve(baseDir, expanded);
+}
+
 export async function fetchCodex(account) {
   const bin = resolveBinary("codex", account.command);
-  const env = childEnv(account.env ?? {});
+  const rawEnv = account.env ?? {};
+  const hasAccountHome = typeof rawEnv.HOME === "string" && rawEnv.HOME.trim().length > 0;
+  const baseHome = hasAccountHome ? resolveChildEnvPath(rawEnv.HOME) : homedir();
+  const extraEnv = { ...rawEnv };
+  if (hasAccountHome) {
+    extraEnv.HOME = baseHome;
+  }
+  if (typeof rawEnv.CODEX_HOME === "string" && rawEnv.CODEX_HOME.trim()) {
+    extraEnv.CODEX_HOME = resolveChildEnvPath(rawEnv.CODEX_HOME, baseHome);
+  }
+  const env = childEnv(extraEnv);
+  if (typeof env.HOME === "string" && env.HOME.trim()) {
+    env.HOME = resolveChildEnvPath(env.HOME);
+  }
+  if (typeof env.CODEX_HOME === "string" && env.CODEX_HOME.trim()) {
+    env.CODEX_HOME = resolveChildEnvPath(env.CODEX_HOME);
+  }
   const result = await rpcRateLimits(bin, env, account.timeoutMs ?? 30_000);
   return parseCodexRateLimits(result);
 }

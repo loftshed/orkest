@@ -444,6 +444,7 @@ def takeover(
     standing: bool = False,
     successor_account: str | None = None,
     successor_repository: str | None = None,
+    view: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The lead is presumed gone: fence it now; the successor's generation stays pending until it accepts.
 
@@ -468,8 +469,9 @@ def takeover(
             # One Codex or Antigravity login serves every repository: only the team's own may succeed it.
             raise AuthorityError("a standing takeover is only for a session in the team's repository")
         # Only the monitor read happens outside the lock; the rest is re-read under it below.
+        resolved_view = view if view is not None else succession.fresh_view()
         reasons, lead_status = succession.monitor_evidence(
-            snapshot, view=succession.fresh_view(), config=succession.monitor_config(), moment=succession.now()
+            snapshot, view=resolved_view, config=succession.monitor_config(), moment=succession.now()
         )
         if reasons:
             raise AuthorityError("no standing takeover: " + "; ".join(reasons))
@@ -741,8 +743,14 @@ def main(argv: list[str] | None = None) -> int:
             )
         elif args.action == "takeover":
             facts = session_facts(args.session, args.harness, None, None)
-            account = module("succession").account_of(
-                facts["harness"], facts["accountHome"], module("succession").monitor_config()
+            succession_mod = module("succession")
+            view = (
+                succession_mod.fresh_view()
+                if (args.standing and not args.user_approved)
+                else succession_mod.cached_view()
+            )
+            account = succession_mod.account_of(
+                facts["harness"], facts["accountHome"], succession_mod.monitor_config(), view=view
             )[0]
             output = takeover(
                 args.team,
@@ -752,6 +760,7 @@ def main(argv: list[str] | None = None) -> int:
                 standing=args.standing,
                 successor_account=account,
                 successor_repository=facts["repo"],
+                view=view,
             )
         elif args.action == "accept":
             output = accept(args.team, member(args.session, args.harness), args.expect_generation, args.digest)

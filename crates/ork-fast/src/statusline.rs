@@ -24,11 +24,7 @@ const NERD_TASK_GLYPH: &str = "󰓾";
 const CHIEF_FOCUS_TEXT: &str = "Ork Chief — machine-wide master orchestrator";
 
 fn is_live_chief_session(base: &Path, session: &str) -> bool {
-    let Some(parsed) = paths::read_json_file(&base.join("chief.json")) else {
-        return false;
-    };
-    parsed.get("schema").and_then(Value::as_str) == Some("ork.chief.v1")
-        && parsed.get("session").and_then(Value::as_str) == Some(session)
+    identity::is_live_chief_binding(base, Some(session), None, None)
 }
 
 fn palette_color(c: u32) -> u32 {
@@ -577,7 +573,11 @@ fn identity_item(
             .and_then(Value::as_str)
             .map(clean_text)
             .unwrap_or_default();
-        if focus == CHIEF_FOCUS_TEXT && !is_live_chief_session(base, session) {
+        let canonical_session = peer
+            .get("session")
+            .and_then(Value::as_str)
+            .unwrap_or(session);
+        if focus == CHIEF_FOCUS_TEXT && !is_live_chief_session(base, canonical_session) {
             focus.clear();
         }
         let note_stage =
@@ -1141,31 +1141,101 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = env::temp_dir().join(format!("ork-fast-statusline-test-{nanos}"));
-        fs::create_dir_all(&dir).unwrap();
+        let raw_dir = env::temp_dir().join(format!("ork-fast-statusline-test-{nanos}"));
+        fs::create_dir_all(raw_dir.join("peers")).unwrap();
+        let dir = fs::canonicalize(&raw_dir).unwrap_or(raw_dir);
 
         assert!(!is_live_chief_session(&dir, "session-1"));
 
+        let now = paths::utc_now_secs();
+        let fresh_bound = paths::format_utc_iso_z(now - 30);
+        let stale_bound = paths::format_utc_iso_z(now - 900);
+
         fs::write(
             dir.join("chief.json"),
-            r#"{"schema":"ork.chief.v1","session":"other"}"#,
+            format!(r#"{{"schema":"ork.chief.v1","session":"other","boundAt":"{fresh_bound}"}}"#),
         )
         .unwrap();
         assert!(!is_live_chief_session(&dir, "session-1"));
 
         fs::write(
             dir.join("chief.json"),
-            r#"{"schema":"wrong.v1","session":"session-1"}"#,
+            format!(r#"{{"schema":"wrong.v1","session":"session-1","boundAt":"{fresh_bound}"}}"#),
         )
         .unwrap();
         assert!(!is_live_chief_session(&dir, "session-1"));
+
+        // Schema + session alone without peer, live PID, or boundAt grace is NOT live.
+        fs::write(
+            dir.join("chief.json"),
+            r#"{"schema":"ork.chief.v1","session":"session-1"}"#,
+        )
+        .unwrap();
+        assert!(!is_live_chief_session(&dir, "session-1"));
+
+        // Wrong machine or expired boundAt is NOT live.
+        fs::write(
+            dir.join("chief.json"),
+            format!(
+                r#"{{"schema":"ork.chief.v1","session":"session-1","boundAt":"{stale_bound}"}}"#
+            ),
+        )
+        .unwrap();
+        assert!(!is_live_chief_session(&dir, "session-1"));
+
+        fs::write(
+            dir.join("chief.json"),
+            format!(
+                r#"{{"schema":"ork.chief.v1","session":"session-1","machine":"other-host","boundAt":"{fresh_bound}"}}"#
+            ),
+        )
+        .unwrap();
+        assert!(!is_live_chief_session(&dir, "session-1"));
+
+        // Valid boundAt within grace is live.
+        fs::write(
+            dir.join("chief.json"),
+            format!(
+                r#"{{"schema":"ork.chief.v1","session":"session-1","boundAt":"{fresh_bound}"}}"#
+            ),
+        )
+        .unwrap();
+        assert!(is_live_chief_session(&dir, "session-1"));
+
+        // Rendered statusline focus caption: live peer + matching chief.json renders CHIEF_FOCUS_TEXT,
+        // stale/wrong chief.json falls back to "not set".
+        let peer_path = paths::peer_path(&dir, "session-1").unwrap();
+        let peer = json!({
+            "schema": identity::PEER_SCHEMA,
+            "session": "session-1",
+            "name": "chief-test",
+            "harness": "claude",
+            "cwd": dir.to_string_lossy(),
+            "checkout": dir.to_string_lossy(),
+            "repo": dir.to_string_lossy(),
+            "state": "busy",
+            "pid": i64::from(std::process::id()),
+            "focus": CHIEF_FOCUS_TEXT,
+            "startedAt": fresh_bound,
+            "lastSeenAt": fresh_bound,
+        });
+        paths::write_json_atomic(&peer_path, &peer).unwrap();
 
         fs::write(
             dir.join("chief.json"),
             r#"{"schema":"ork.chief.v1","session":"session-1"}"#,
         )
         .unwrap();
-        assert!(is_live_chief_session(&dir, "session-1"));
+        let live_item = identity_item(&dir, "session-1", Some("claude"), &json!({})).unwrap();
+        assert_eq!(live_item["task"], CHIEF_FOCUS_TEXT);
+
+        fs::write(
+            dir.join("chief.json"),
+            r#"{"schema":"ork.chief.v1","session":"other-session"}"#,
+        )
+        .unwrap();
+        let fallback_item = identity_item(&dir, "session-1", Some("claude"), &json!({})).unwrap();
+        assert_eq!(fallback_item["task"], "not set");
 
         let _ = fs::remove_dir_all(&dir);
     }
