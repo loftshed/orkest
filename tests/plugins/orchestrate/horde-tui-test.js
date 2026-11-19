@@ -3032,13 +3032,14 @@ describe("terminal lifecycle", () => {
     );
     await writeFile(pendingFile, "pending\n");
 
+    const realSetTimeout = setTimeout;
     const waitRealIo = async (check) => {
-      const deadline = process.hrtime.bigint() + 2_000_000_000n;
-      while (!check()) {
+      const deadline = process.hrtime.bigint() + 5_000_000_000n;
+      while (!(await check())) {
         if (process.hrtime.bigint() > deadline) {
           throw new Error("Timed out waiting for companion dismiss I/O");
         }
-        await new Promise((resolve) => setImmediate(resolve));
+        await new Promise((resolve) => realSetTimeout(resolve, 5));
       }
     };
 
@@ -3120,7 +3121,18 @@ describe("terminal lifecycle", () => {
 
     try {
       await vi.advanceTimersByTimeAsync(0);
-      await waitRealIo(() => plain(outputText).includes("Coordinator"));
+      await waitRealIo(async () => {
+        if (!plain(outputText).includes("Coordinator")) {
+          return false;
+        }
+        try {
+          const persisted = JSON.parse(await readFile(stateFile, "utf8"));
+          return persisted.label === "Swarm · Companion auto-dismiss";
+        } catch {
+          return false;
+        }
+      });
+      await new Promise((resolve) => realSetTimeout(resolve, 15));
       expect(isExited).toBe(false);
 
       // Conductor exits while worker is active -> shows hold notice without closing.
@@ -3205,13 +3217,14 @@ describe("terminal lifecycle", () => {
     await writeFile(fakeCli, "#!/bin/sh\nexit 0\n");
     chmodSync(fakeCli, 0o755);
 
+    const realSetTimeout = setTimeout;
     const waitRealIo = async (check) => {
-      const deadline = process.hrtime.bigint() + 2_000_000_000n;
-      while (!check()) {
+      const deadline = process.hrtime.bigint() + 5_000_000_000n;
+      while (!(await check())) {
         if (process.hrtime.bigint() > deadline) {
           throw new Error("Timed out waiting for companion dismiss I/O");
         }
-        await new Promise((resolve) => setImmediate(resolve));
+        await new Promise((resolve) => realSetTimeout(resolve, 5));
       }
     };
 

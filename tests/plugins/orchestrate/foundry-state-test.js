@@ -6,6 +6,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -40,7 +41,8 @@ import {
 } from "../../../plugins/orchestrate/lib/smelter.mjs";
 
 function fixture() {
-  const root = mkdtempSync(path.join(tmpdir(), "orkest-state-"));
+  const rawRoot = mkdtempSync(path.join(tmpdir(), "orkest-state-"));
+  const root = realpathSync(rawRoot);
   const file = resolveFoundryStatePath(root);
   mkdirSync(path.dirname(file), { recursive: true });
   return { root, file };
@@ -55,7 +57,8 @@ function git(cwd, ...args) {
 }
 
 function worktreeFixture() {
-  const root = mkdtempSync(path.join(tmpdir(), "orkest-state-git-"));
+  const rawRoot = mkdtempSync(path.join(tmpdir(), "orkest-state-git-"));
+  const root = realpathSync(rawRoot);
   const repo = path.join(root, "repo");
   const worktree = path.join(root, "worktree");
   mkdirSync(repo);

@@ -5660,7 +5660,7 @@ class ProcessAndResumeRegressionTests(unittest.TestCase):
                     allow_path=None,
                 )
             self.assertEqual((code_codex, result_codex["status"]), (0, "completed"))
-            self.assertEqual(capture_codex.get("codex_home"), str(personal_codex))
+            self.assertEqual(capture_codex.get("codex_home"), str(personal_codex.resolve()))
         finally:
             RUNNER.shutil.rmtree(policy_dir, ignore_errors=True)
 
@@ -5708,10 +5708,10 @@ class ProcessAndResumeRegressionTests(unittest.TestCase):
                     allow_path=None,
                 )
             self.assertEqual((code_team_single, res_team_single["status"]), (0, "completed"))
-            self.assertEqual(seen_team_envs[-1].get("GEMINI_CLI_HOME"), str(team_gemini))
+            self.assertEqual(seen_team_envs[-1].get("GEMINI_CLI_HOME"), str(team_gemini.resolve()))
             self.assertEqual(
                 seen_team_envs[-1].get("ANTIGRAVITY_APP_DATA_DIR"),
-                str(team_gemini / "antigravity-cli"),
+                str(team_gemini.resolve() / "antigravity-cli"),
             )
 
         # 5. Single team account + live GEMINI_CLI_HOME + ANTIGRAVITY_APP_DATA_DIR=/alternate/live preserves live pair.

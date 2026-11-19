@@ -65,7 +65,7 @@ def room(room_id="r1", session=LEAD, agents=None, authority=None):
 class HandoffTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name).resolve()
         self.homes = {name: self.root / name for name in ("claude-a", "claude-b", "claude-c", "claude-w")}
         for home in self.homes.values():
             home.mkdir()

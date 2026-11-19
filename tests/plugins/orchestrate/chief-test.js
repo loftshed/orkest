@@ -111,8 +111,15 @@ describe("ork chief", () => {
     tmp = fs.realpathSync(scratch);
     root = path.join(tmp, "mailbox");
     fs.mkdirSync(root, { recursive: true });
+    const binDir = path.join(tmp, "bin");
+    fs.mkdirSync(binDir, { recursive: true });
+    for (const binName of ["claude", "codex", "agy", "opencode"]) {
+      const binPath = path.join(binDir, binName);
+      fs.writeFileSync(binPath, "#!/bin/sh\nexit 0\n");
+      fs.chmodSync(binPath, 0o755);
+    }
     env = {
-      PATH: process.env.PATH,
+      PATH: `${binDir}${path.delimiter}${process.env.PATH || ""}`,
       HOME: tmp,
       ORCHESTRATE_HOME: path.join(tmp, "cache"),
       ORCHESTRATE_CONFIG: path.join(tmp, "config", "config.json"),
