@@ -901,12 +901,7 @@ async function runDeliveryWorker() {
 }
 
 try {
-  if (
-    process.argv[1] &&
-    process.argv[2] === "--deliver" &&
-    realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))
-  )
-    await runDeliveryWorker();
+  if (import.meta.main && process.argv[2] === "--deliver") await runDeliveryWorker();
 } catch {
   process.exit(1);
 }

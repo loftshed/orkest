@@ -3,7 +3,7 @@
 // setup argv. The parent has already validated the config and verified trust; this process only
 // does the asynchronous work. Input is JSON on stdin, output one JSON object on stdout.
 import { execFileSync, spawn } from "node:child_process";
-import { readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
+import { readFileSync, renameSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -190,8 +190,7 @@ async function main() {
   process.exit(0);
 }
 
-const entry = process.argv[1];
-if (entry && realpathSync(entry) === realpathSync(fileURLToPath(import.meta.url))) {
+if (import.meta.main) {
   await main();
 }
 
