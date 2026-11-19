@@ -1127,6 +1127,9 @@ pub fn session_peer_candidates(
     let mut matches = Vec::new();
     if let Ok(entries) = fs::read_dir(base.join("peers")) {
         for entry in entries.flatten() {
+            if crate::sqlite::deadline_expired() {
+                return Vec::new();
+            }
             let p = entry.path();
             if p.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;

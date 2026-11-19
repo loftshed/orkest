@@ -1,12 +1,13 @@
 //! Read-only SQLite helpers via bundled rusqlite (rooms.db, Codex state_*.sqlite, Antigravity summaries).
 
+use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
@@ -15,6 +16,45 @@ use crate::paths;
 
 pub const ROOMS_APPLICATION_ID: i64 = 1_330_793_298;
 pub const ROOMS_SCHEMA_VERSION: i64 = 2;
+
+thread_local! {
+    static OPERATION_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+/// Restores the previous per-thread operation deadline when dropped.
+pub struct DeadlineGuard(Option<Instant>);
+
+impl Drop for DeadlineGuard {
+    fn drop(&mut self) {
+        OPERATION_DEADLINE.with(|d| d.set(self.0));
+    }
+}
+
+/// Bound every room read on this thread: no busy wait past `deadline`, no Node bridge child.
+#[must_use]
+pub fn set_operation_deadline(deadline: Instant) -> DeadlineGuard {
+    DeadlineGuard(OPERATION_DEADLINE.with(|d| d.replace(Some(deadline))))
+}
+
+fn deadline_active() -> bool {
+    OPERATION_DEADLINE.with(|d| d.get().is_some())
+}
+
+#[must_use]
+pub fn deadline_expired() -> bool {
+    OPERATION_DEADLINE.with(|d| d.get().is_some_and(|at| Instant::now() >= at))
+}
+
+/// Busy-wait budget: `default_ms`, capped by whatever remains of the operation deadline.
+fn busy_budget_ms(default_ms: u64) -> u64 {
+    OPERATION_DEADLINE.with(|d| match d.get() {
+        None => default_ms,
+        Some(at) => {
+            let left = at.saturating_duration_since(Instant::now()).as_millis();
+            default_ms.min(u64::try_from(left).unwrap_or(default_ms))
+        }
+    })
+}
 
 /// Reject symlinks on the database or its WAL/SHM sidecar files (matching `orkest-sqlite.mjs`).
 #[must_use]
@@ -186,7 +226,10 @@ fn query_rooms_db(base: &Path, room_id: Option<&str>) -> Option<Vec<Value>> {
         Ok(meta) if meta.file_type().is_symlink() => return None,
         Ok(_) => {}
     }
-    let conn = open_readonly(&db, 5000)?;
+    if deadline_expired() {
+        return None;
+    }
+    let conn = open_readonly(&db, busy_budget_ms(5000))?;
     let app_id: i64 = conn
         .query_row("PRAGMA application_id", [], |r| r.get(0))
         .ok()?;
@@ -201,6 +244,9 @@ fn query_rooms_db(base: &Path, room_id: Option<&str>) -> Option<Vec<Value>> {
         let mut stmt = conn.prepare("SELECT data FROM rooms WHERE id = ?1").ok()?;
         let mut rows = stmt.query([id]).ok()?;
         loop {
+            if deadline_expired() {
+                return None;
+            }
             match rows.next() {
                 Ok(Some(row)) => {
                     let text: String = row.get(0).ok()?;
@@ -217,6 +263,9 @@ fn query_rooms_db(base: &Path, room_id: Option<&str>) -> Option<Vec<Value>> {
             .ok()?;
         let mut rows = stmt.query([]).ok()?;
         loop {
+            if deadline_expired() {
+                return None;
+            }
             match rows.next() {
                 Ok(Some(row)) => {
                     let text: String = row.get(0).ok()?;
@@ -297,6 +346,10 @@ pub fn list_rooms_checked(base: &Path) -> (Vec<Value>, bool) {
     if let Some(rooms) = query_rooms_db(base, None) {
         return (rooms, true);
     }
+    if deadline_active() {
+        // A bounded caller never spawns the Node bridge: report an incomplete read instead.
+        return (Vec::new(), false);
+    }
     if let Some(Value::Array(arr)) = invoke_room_store_bridge(base, "list", None, None) {
         return (arr, true);
     }
@@ -354,6 +407,9 @@ pub fn read_room(base: &Path, room_id: &str) -> Option<Value> {
     }
     if let Some(mut rooms) = query_rooms_db(base, Some(room_id)) {
         return rooms.drain(..).next();
+    }
+    if deadline_active() {
+        return None;
     }
     if let Some(val) = invoke_room_store_bridge(base, "get", Some(room_id), None) {
         return if val.is_object() { Some(val) } else { None };

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { execFile, spawn } from "node:child_process";
-import { readFile, realpath } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { access, lstat, readFile, realpath } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -31,7 +32,7 @@ import {
   wrapText,
 } from "../lib/horde-view.mjs";
 import { coordinatorBrief, newRoom, observeRoom, writeCoordinatorBrief } from "../lib/rooms.mjs";
-import { configPath } from "../lib/runtime-paths.mjs";
+import { cacheHome, configPath, orkFastBin } from "../lib/runtime-paths.mjs";
 import { cachedQuota, loadChiefModule, readLiveChief, runHordeTui } from "./horde-tui.mjs";
 import { roomsCommand } from "./rooms.mjs";
 
@@ -402,6 +403,83 @@ async function optionalModuleCommand(moduleRelPath, exportName, argv, context, f
   return fallback(argv, context);
 }
 
+/**
+ * The native accelerator, when it is safe to run: an executable `ork-fast*` regular file that the current
+ * user owns and nobody else can write; the file itself may not be a symlink. The default location must also
+ * resolve to itself (no symlinked cache or bin directory) and its bin directory must be private to the user.
+ * An explicit ORK_FAST_BIN is the supported trusted override: only the file is checked, not its parents.
+ */
+export async function trustedOrkFast(env = process.env, { home = os.homedir() } = {}) {
+  try {
+    const candidate = path.resolve(orkFastBin(env, { home }));
+    if (!path.basename(candidate).startsWith("ork-fast")) return null;
+    const info = await lstat(candidate);
+    if (info.isSymbolicLink() || !info.isFile()) return null;
+    if (
+      info.mode & 0o022 ||
+      (typeof process.getuid === "function" && info.uid !== process.getuid())
+    ) {
+      return null;
+    }
+    await access(candidate, fsConstants.X_OK);
+    if (!env.ORK_FAST_BIN) {
+      const expected = path.join(await realpath(cacheHome(env, { home })), "bin", "ork-fast");
+      if ((await realpath(candidate)) !== expected) return null;
+      const dir = await lstat(path.dirname(candidate));
+      if (
+        dir.mode & 0o022 ||
+        (typeof process.getuid === "function" && dir.uid !== process.getuid())
+      ) {
+        return null;
+      }
+    }
+    return candidate;
+  } catch {
+    return null;
+  }
+}
+
+const FAST_OUTPUT_LIMIT = 64 * 1024;
+const FAST_TIMEOUT_MS = 2000;
+
+/** Runs the native `herdr-status`; null means "use Python" (spawn failure, timeout, old binary, odd output). */
+async function fastHerdrStatus(argv, env = process.env) {
+  const binary = await trustedOrkFast(env);
+  if (!binary) return null;
+  const child = spawn(
+    binary,
+    ["herdr-status", "--fallback-script", path.join(scripts, "herdr_status.py"), ...argv],
+    { stdio: ["ignore", "pipe", "ignore"] },
+  );
+  const chunks = [];
+  let size = 0;
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => child.kill("SIGKILL"), FAST_TIMEOUT_MS);
+    child.stdout.on("data", (chunk) => {
+      size += chunk.length;
+      if (size > FAST_OUTPUT_LIMIT) child.kill("SIGKILL");
+      else chunks.push(chunk);
+    });
+    child.on("error", () => {
+      clearTimeout(timer);
+      resolve(null);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      const text = Buffer.concat(chunks).toString("utf8");
+      // Older binaries print usage and exit 1; a valid answer is exactly one line, success.
+      resolve(
+        code === 0 &&
+          size <= FAST_OUTPUT_LIMIT &&
+          text.length > 0 &&
+          text.indexOf("\n") === text.length - 1
+          ? text
+          : null,
+      );
+    });
+  });
+}
+
 /** Runs a terminal command, passing signals on and returning its exit code. */
 function terminalCommand(script, argv) {
   const child = spawn("python3", [path.join(scripts, script), ...argv], { stdio: "inherit" });
@@ -468,7 +546,7 @@ export function resumeArguments(engine, args) {
 
 export async function main(
   argv = process.argv.slice(2),
-  { stdout = process.stdout, runTerminal = terminalCommand } = {},
+  { stdout = process.stdout, runTerminal = terminalCommand, runFast = fastHerdrStatus } = {},
 ) {
   const engineShortcut = COORDINATORS.has(argv[0]) ? argv[0] : undefined;
   const resume = engineShortcut && resumeArguments(engineShortcut, argv.slice(1));
@@ -482,6 +560,13 @@ export async function main(
     return;
   }
   if (argv[0] === "herdr-status") {
+    // Extra arguments go straight to the Python entry: it then runs once, with its own output and exit code.
+    const line = argv.length > 1 ? null : await runFast([]);
+    if (line !== null) {
+      stdout.write(line);
+      process.exitCode = 0;
+      return;
+    }
     process.exitCode = await runTerminal("herdr_status.py", argv.slice(1));
     return;
   }

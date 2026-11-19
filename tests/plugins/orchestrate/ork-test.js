@@ -1,12 +1,27 @@
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { HALL_HELP, hallCommand } from "../../../plugins/orchestrate/bin/hall.mjs";
-import { coordinatorArguments, resumeArguments } from "../../../plugins/orchestrate/bin/ork.mjs";
+import {
+  coordinatorArguments,
+  main as orkMain,
+  resumeArguments,
+  trustedOrkFast,
+} from "../../../plugins/orchestrate/bin/ork.mjs";
 import {
   extractIssueArchetype,
   extractTaskSpec,
@@ -910,4 +925,168 @@ describe("hall, rooms, and unified subcommands", () => {
     const radarHelp = await app.run(["radar", "--help"]);
     expect(radarHelp.stdout).toContain("ork radar");
   });
+});
+
+describe("ork herdr-status", () => {
+  async function sandbox() {
+    const prefix = path.join(tmpdir(), "ork-herdr-status-");
+    const root = await realpath(await mkdtemp(prefix));
+    temporary.push(root);
+    const home = path.join(root, "orchestrate");
+    await mkdir(path.join(home, "bin"), { recursive: true });
+    const env = {
+      PATH: process.env.PATH,
+      HOME: root,
+      ORCHESTRATE_HOME: home,
+      XDG_CACHE_HOME: path.join(root, ".cache"),
+    };
+    return { root, home, env };
+  }
+
+  async function fakeBinary(file, body, mode = 0o755) {
+    await writeFile(file, `#!/bin/sh\n${body}\n`);
+    await chmod(file, mode);
+    return file;
+  }
+
+  async function run(env, ...args) {
+    const result = await exec(process.execPath, [cli, "herdr-status", ...args], { env });
+    return result.stdout;
+  }
+
+  it("uses a trusted native binary, handing it the Python fallback script", async () => {
+    const { root, env } = await sandbox();
+    const log = path.join(root, "args.log");
+    const bin = await fakeBinary(
+      path.join(root, "ork-fast"),
+      `echo "$@" > '${log}'\necho '[A] native · working'`,
+    );
+    expect(await run({ ...env, ORK_FAST_BIN: bin })).toBe("[A] native · working\n");
+    const args = (await readFile(log, "utf8")).trim();
+    expect(args).toMatch(/^herdr-status --fallback-script .*herdr_status\.py$/);
+  });
+
+  it("finds the default binary in the cache and refuses a redirected cache directory", async () => {
+    const { root, home, env } = await sandbox();
+    await fakeBinary(path.join(home, "bin", "ork-fast"), "echo DEFAULT");
+    expect(await run(env)).toBe("DEFAULT\n");
+    expect(await trustedOrkFast(env)).toBe(path.join(home, "bin", "ork-fast"));
+
+    const elsewhere = path.join(root, "elsewhere");
+    await mkdir(elsewhere);
+    await fakeBinary(path.join(elsewhere, "ork-fast"), "echo REDIRECTED");
+    await rm(path.join(home, "bin"), { recursive: true });
+    await symlink(elsewhere, path.join(home, "bin"));
+    expect(await trustedOrkFast(env)).toBeNull();
+    expect(await run(env)).toBe("\n");
+  });
+
+  it("falls back to Python for a missing, stale or malformed native binary", async () => {
+    const { root, env } = await sandbox();
+    expect(await run({ ...env, ORK_FAST_BIN: path.join(root, "missing", "ork-fast") })).toBe("\n");
+    const cases = {
+      // Binaries from before this subcommand print usage and exit 1.
+      stale:
+        "echo 'ork-fast 0.1.0 USAGE'; echo \"error: unrecognized subcommand 'herdr-status'\" >&2; exit 1",
+      "two lines": "echo one; echo two",
+      "no newline": "printf nothing",
+      empty: "exit 0",
+      failing: "echo '[A] never'; exit 3",
+      crashing: "kill -9 $$",
+    };
+    for (const [label, body] of Object.entries(cases)) {
+      const bin = await fakeBinary(
+        path.join(root, `ork-fast-${label.replaceAll(/\W/g, "")}`),
+        body,
+      );
+      expect(await run({ ...env, ORK_FAST_BIN: bin }), label).toBe("\n");
+    }
+  });
+
+  it("never executes an untrusted native binary", async () => {
+    const { root, env } = await sandbox();
+    const marker = path.join(root, "ran");
+    const body = `touch '${marker}'\necho UNTRUSTED`;
+    const writable = await fakeBinary(path.join(root, "ork-fast"), body, 0o777);
+    await chmod(writable, 0o777);
+    const real = await fakeBinary(path.join(root, "ork-fast-real"), body);
+    const link = path.join(root, "ork-fast-link");
+    await symlink(real, link);
+    const misnamed = await fakeBinary(path.join(root, "other-tool"), body);
+    const plain = await fakeBinary(path.join(root, "ork-fast-plain"), body, 0o644);
+    for (const bin of [writable, link, misnamed, plain, root]) {
+      expect(await trustedOrkFast({ ...env, ORK_FAST_BIN: bin }), bin).toBeNull();
+      expect(await run({ ...env, ORK_FAST_BIN: bin }), bin).toBe("\n");
+    }
+    expect(existsSync(marker)).toBe(false);
+    expect(await trustedOrkFast({ ...env, ORK_FAST_BIN: real })).toBe(real);
+  });
+
+  it("answers from Python when native output is replaced by an ordinary miss only once", async () => {
+    const calls = [];
+    const out = [];
+    const stdout = {
+      write: (text) => {
+        out.push(text);
+      },
+    };
+    await orkMain(["herdr-status"], {
+      stdout,
+      runFast: async () => "[A] fast\n",
+      runTerminal: async (script) => {
+        calls.push(script);
+      },
+    });
+    expect(out).toEqual(["[A] fast\n"]);
+    expect(calls).toEqual([]);
+    await orkMain(["herdr-status", "--x"], {
+      stdout,
+      runFast: async () => {
+        throw new Error("native must not run for extra arguments");
+      },
+      runTerminal: async (script, args) => {
+        calls.push([script, args]);
+        return 0;
+      },
+    });
+    expect(calls).toEqual([["herdr_status.py", ["--x"]]]);
+    expect(out).toHaveLength(1);
+  });
+
+  it("sends extra arguments straight to Python, keeping its exit code and never running the binary", async () => {
+    const { root, env } = await sandbox();
+    const marker = path.join(root, "native-ran");
+    const bin = await fakeBinary(path.join(root, "ork-fast"), `touch '${marker}'\necho NATIVE`);
+    const previous = process.exitCode;
+    const result = [];
+    await orkMain(["herdr-status", "--help", "x"], {
+      stdout: { write: () => {} },
+      runFast: async () => {
+        throw new Error("native must not run for extra arguments");
+      },
+      runTerminal: async (script, args) => {
+        result.push([script, args]);
+        return 7;
+      },
+    });
+    expect(result).toEqual([["herdr_status.py", ["--help", "x"]]]);
+    expect(process.exitCode).toBe(7);
+    process.exitCode = previous;
+    expect(existsSync(marker)).toBe(false);
+    // The real entry point: unknown options reach Python once, byte for byte.
+    expect(await run({ ...env, ORK_FAST_BIN: bin }, "--help")).toBe("\n");
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  const built = path.resolve("crates/ork-fast/target/release/ork-fast");
+  it.skipIf(!existsSync(built))(
+    "runs the optimized binary end to end, with unknown flags on Python",
+    async () => {
+      const { env } = await sandbox();
+      const withBinary = { ...env, ORK_FAST_BIN: built };
+      expect(await trustedOrkFast(withBinary)).toBe(built);
+      expect(await run(withBinary)).toBe("\n");
+      expect(await run(withBinary, "--unknown")).toBe("\n");
+    },
+  );
 });
