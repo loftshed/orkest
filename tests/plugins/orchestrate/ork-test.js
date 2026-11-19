@@ -1133,7 +1133,7 @@ describe("ork setup --trust-worktree", () => {
     const approve = vi.fn(async () => ({
       repo: "/canonical/repo",
       argv: ["pnpm", "install"],
-      hash: "abc123",
+      configSha256: "abc123",
     }));
     const env = { HOME: "/nowhere" };
     await trustWorktreeCommand(["--trust-worktree", "--cwd", "../repo"], {
@@ -1150,7 +1150,7 @@ describe("ork setup --trust-worktree", () => {
 
   it("prints the approval as JSON and propagates a refusal", async () => {
     const out = capture();
-    const result = { repo: "/r", argv: ["x"], hash: "h" };
+    const result = { repo: "/r", argv: ["x"], configSha256: "h" };
     await trustWorktreeCommand(["--trust-worktree", "--json"], {
       stdout: out,
       cwd: "/r",

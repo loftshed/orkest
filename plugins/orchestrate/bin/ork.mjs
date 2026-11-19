@@ -590,29 +590,16 @@ export async function trustWorktreeCommand(
   if (values.cwd !== undefined && values.cwd.trim() === "")
     throw usageError("ork setup --trust-worktree: --cwd needs a repository path");
   const repoRoot = path.resolve(cwd, values.cwd ?? ".");
-  let approveSetup = approve;
-  if (!approveSetup) {
-    let mod = null;
-    try {
-      mod = await import("../lib/worktree-trust.mjs");
-    } catch (error) {
-      if (error.code !== "ERR_MODULE_NOT_FOUND") throw error;
-    }
-    approveSetup = mod?.approveWorktreeSetup;
-  }
-  if (typeof approveSetup !== "function")
-    throw new Error("Worktree setup trust is unavailable in this Orkest version");
+  const approveSetup = approve ?? (await import("../lib/worktree-trust.mjs")).approveWorktreeSetup;
   const result = await approveSetup(repoRoot, { env });
   if (values.json) {
     stdout.write(`${JSON.stringify(result ?? {}, null, 2)}\n`);
     return result;
   }
-  const field = (...names) => names.map((name) => result?.[name]).find((value) => value != null);
-  const argv = field("argv", "setupCommand", "command");
   const lines = [
-    `Approved worktree setup for ${field("repo", "repoRoot", "repository") ?? repoRoot}`,
-    `  argv: ${Array.isArray(argv) ? JSON.stringify(argv) : (argv ?? "(none)")}`,
-    `  hash: ${field("hash", "sha256", "configHash") ?? "(unavailable)"}`,
+    `Approved worktree setup for ${result.repo}`,
+    `  argv: ${JSON.stringify(result.argv)}`,
+    `  hash: ${result.configSha256}`,
   ];
   stdout.write(`${lines.join("\n")}\n`);
   return result;

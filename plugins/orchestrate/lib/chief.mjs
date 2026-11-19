@@ -30,6 +30,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { emitChiefEvents } from "./chief-bridge.mjs";
+import { readFoundryState } from "./foundry.mjs";
 import { herdrEndpoint } from "./herdr-context.mjs";
 import {
   CHIEF_FOCUS_TEXT,
@@ -54,6 +55,7 @@ import { belongsToRoom, isPeerLive, newRoom, roomOwnerSessions } from "./rooms.m
 import { cacheHome } from "./runtime-paths.mjs";
 import { applyLauncherAccountEnv, checkRepoPolicyForSide } from "./side.mjs";
 import { worktreePortEnv } from "./worktree-env.mjs";
+import { listWorktreePorts } from "./worktree-ports.mjs";
 import {
   provisionWorktree,
   resolveRepositoryRoot,
@@ -1426,29 +1428,15 @@ function projectPr(pr) {
 }
 
 /**
- * Reads the saved worktree facts once per path for a whole snapshot: ports from the 4A allocation
+ * Reads the saved worktree facts once per path for a whole snapshot: ports from the allocation
  * database and the pull request from the saved Foundry state. Both are local reads; rendering and
  * status never call GitHub. A missing or unreadable source maps to `[]` / `null`.
  */
-async function createWorktreeProjector({ env, readPorts, readPr }) {
-  let ports = readPorts;
-  let pr = readPr;
-  if (!ports) {
-    try {
-      const module_ = await import("./worktree-ports.mjs");
-      if (typeof module_.listWorktreePorts === "function") ports = module_.listWorktreePorts;
-    } catch {
-      // 4A not available: no port badges.
-    }
-  }
-  if (!pr) {
-    try {
-      const module_ = await import("./foundry.mjs");
-      pr = (worktreePath) => module_.readFoundryState(worktreePath)?.pr;
-    } catch {
-      // Foundry unavailable: no PR badges.
-    }
-  }
+function createWorktreeProjector({
+  env,
+  readPorts = listWorktreePorts,
+  readPr = (worktreePath) => readFoundryState(worktreePath)?.pr,
+}) {
   const seen = new Map();
   return (worktree, repoPath) => {
     const key = worktree?.path ? path.resolve(worktree.path) : null;
@@ -1458,13 +1446,13 @@ async function createWorktreeProjector({ env, readPorts, readPr }) {
       if (existsSync(key)) {
         try {
           projected.ports = projectPorts(
-            ports?.({ repoRoot: repoPath || key, worktreePath: key, env }),
+            readPorts({ repoRoot: repoPath || key, worktreePath: key, env }),
           );
         } catch {
           projected.ports = [];
         }
         try {
-          projected.pr = projectPr(pr?.(key));
+          projected.pr = projectPr(readPr(key));
         } catch {
           projected.pr = null;
         }
@@ -1638,7 +1626,7 @@ export async function chiefStatus({
 } = {}) {
   const peers = providedPeers || readPeers(root, { now });
   const chief = readChiefBinding({ root, now, includeStale: true, peers });
-  const projectWorktree = await createWorktreeProjector({ env, readPorts, readPr });
+  const projectWorktree = createWorktreeProjector({ env, readPorts, readPr });
   const host = hostname();
   let rawRooms = [];
   let roomsError;

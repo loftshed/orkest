@@ -22,7 +22,6 @@ import {
   writeFileSync,
 } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { createRequire } from "node:module";
 import { homedir, hostname, tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -31,6 +30,7 @@ import { parseArgs, promisify } from "node:util";
 import { buildLanes } from "../../monitor/lib/analyze.mjs";
 import { shouldUseColor } from "../../monitor/lib/render.mjs";
 import { getAccounts } from "../../monitor/lib/store.mjs";
+import { emitChiefEvents } from "./chief-bridge.mjs";
 import { resolveWorktreeMarkerPath } from "./horde-room.mjs";
 import { glyphSet, glyphTier, renderPanel, renderTable, wrapText } from "./horde-view.mjs";
 import {
@@ -1542,15 +1542,6 @@ function prTransitionKey(event, pr) {
     .digest("hex");
 }
 
-/** 4C's shared dispatch path; absent module means no optional bridge in this checkout. */
-function loadEmitChiefEvents() {
-  try {
-    return createRequire(import.meta.url)("./chief-bridge.mjs").emitChiefEvents;
-  } catch {
-    return null;
-  }
-}
-
 /** Single emission site for PR events: runs after the pinned write committed, never throws. */
 function emitPrTransitions(oldPr, newPr, { owningRoomId, bridge, env, emitEvents }) {
   try {
@@ -1562,7 +1553,7 @@ function emitPrTransitions(oldPr, newPr, { owningRoomId, bridge, env, emitEvents
       prNumber: newPr.number,
     }));
     if (events.length === 0) return;
-    const emit = emitEvents ?? loadEmitChiefEvents();
+    const emit = emitEvents ?? emitChiefEvents;
     if (typeof emit !== "function") return;
     // Shared delivery owns bounding, hand-off and error swallowing; nothing here is awaited or locked.
     void (async () => {
