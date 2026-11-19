@@ -158,7 +158,7 @@ describe("ork side (side missions)", () => {
           calls.push({ cmd, args, env: opts.env });
           return {
             status: 0,
-            stdout: JSON.stringify({ id: "work-side-park01", status: "open" }),
+            stdout: JSON.stringify({ item: { id: "work-side-park01", state: "open" } }),
             stderr: "",
           };
         },
@@ -175,6 +175,26 @@ describe("ork side (side missions)", () => {
       expect(calls[0].env.CLAUDE_SESSION_ID).toBeUndefined();
       expect(calls[0].env.ANTIGRAVITY_CONVERSATION_ID).toBeUndefined();
       expect(calls[0].env.AGENT_MAILBOX_SESSION).toBe("side-coord-park01");
+    });
+
+    it("creates an open workboard card with the requested scope", async () => {
+      expect(spawnSync("git", ["init", repoDir]).status).toBe(0);
+      const cli = path.resolve(import.meta.dirname, "../../../plugins/orchestrate/bin/ork.mjs");
+      const run = spawnSync(
+        process.execPath,
+        [cli, "side", "--later", "--json", "Review retry behavior"],
+        {
+          cwd: repoDir,
+          env: { ...process.env, HOME: tmpDir, ORCHESTRATE_MAILBOX_DIR: mailboxDir },
+          encoding: "utf8",
+        },
+      );
+      expect(run.stderr).toBe("");
+      expect(run.status).toBe(0);
+      const parked = JSON.parse(run.stdout);
+      expect(parked.workItem.scope).toBe("Review retry behavior");
+      expect(parked.workItem.state).toBe("open");
+      expect(parked.workId).toBe(parked.workItem.id);
     });
 
     it("files a GitHub issue with agent:raw label in issue mode", async () => {

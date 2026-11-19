@@ -35,6 +35,7 @@ import {
   newRoom,
   observeRoom,
   recoverRoom,
+  reserveLead,
   SESSION_OBSERVATION_GRACE_MS,
   SHARED_PROCESS_BUSY_TTL_MS,
   SHARED_PROCESS_SUBAGENT_TTL_MS,
@@ -3204,6 +3205,31 @@ describe("bounded room continuations", () => {
     });
     expect(codexRoom.conductor.model).toBeUndefined();
     expect(coordinatorBrief(codexRoom)).not.toContain("Antigravity Plan/Execute phases:");
+  });
+
+  it("gives root coordinators and subswarm leads the same command-boundary guidance", async () => {
+    const root = await directory();
+    const cwd = await directory();
+    const room = await newRoom(parseTeam("codex:luna"), {
+      id: "room-boundary",
+      cwd,
+      root,
+      engine: "codex",
+      objective: "Coordinate",
+    });
+    const lead = await reserveLead(room.id, "luna-1", "Verify migration", { root });
+    expect(lead.status).toBe("native_handoff");
+    for (const brief of [coordinatorBrief(room), lead.brief]) {
+      expect(brief).toContain("Command boundaries:");
+      expect(brief).toContain("its own standalone command");
+      expect(brief).toContain("exact absolute path of the installed orchestrate skill");
+      expect(brief).toContain("skills/orchestrate/scripts/coordinator.py capture");
+      expect(brief).toContain("verify-evidence, review");
+      expect(brief).toContain("Codex judges each segment");
+      expect(brief).toContain("head or tail pipes");
+      expect(brief).toContain("Do not request broader trust for");
+      expect(brief).toContain("Preserve this rule in every delegated brief");
+    }
   });
 });
 

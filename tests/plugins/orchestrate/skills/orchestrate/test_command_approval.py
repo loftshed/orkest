@@ -188,6 +188,9 @@ class CommandApprovalTests(unittest.TestCase):
         allowed = [
             "ork chief status",
             "ork rooms dispatch --room r",
+            "ork rooms add --room r --team t",
+            "ork rooms init-task --task-spec s.json --task-dir d --host codex",
+            "ork hall worktree --room r --member m",
             "ork hall list",
             "ork horde --view --attach-room r",
             "ork horde --view --chief",
@@ -202,6 +205,11 @@ class CommandApprovalTests(unittest.TestCase):
             f"python3 {hub}/run_agent.py mailbox inbox --session s",
             f"python3 {hub}/run_agent.py --cwd /repo --task-spec s.json",
             f"python3 {hub}/coordinator.py dispatch --task-dir t",
+            f"python3 {hub}/coordinator.py capture --task-dir t",
+            f"python3 {hub}/coordinator.py capture-checks --task-dir t",
+            f"python3 {hub}/coordinator.py verify-evidence --task-dir t",
+            f"python3 {hub}/coordinator.py review --task-dir t",
+            f"python3 {hub}/coordinator.py dispatch --task-dir t --kind correction --request-id r",
             f"python3 {self.source}/coordinator.py dispatch --task-dir t",
             f"python3 {hub}/context_handoff.py capabilities",
             f"python3 {hub}/continuation_requests.py list",
@@ -228,6 +236,11 @@ class CommandApprovalTests(unittest.TestCase):
             "ork gate -- rm -rf /",
             "ork gate --heavy -- make",
             "ork label -- claude --dangerously-skip-permissions",
+            "jq . result.json",
+            "head -n 20 result.json",
+            "python3 coordinator.py capture --task-dir t",
+            "python3 skills/orchestrate/scripts/coordinator.py review --task-dir t",
+            f"python3 {self.root}/elsewhere/coordinator.py capture --task-dir t",
             "ork codex",
             "ork claude --harness-arg=--dangerously-skip-permissions",
             "orkx rooms list",
@@ -297,6 +310,53 @@ class CommandApprovalTests(unittest.TestCase):
             self.assertEqual(decision(command), "allow", command)
         for command in denied:
             self.assertIsNone(decision(command), command)
+
+    def test_codex_judges_each_segment_so_only_standalone_orkest_commands_pass(self):
+        """Real `codex execpolicy check` against the generated rules in a disposable profile."""
+        codex = shutil.which("codex")
+        if not codex:
+            self.skipTest("codex is not installed")
+        self.run_approval(opt_in=True, harnesses={"codex"})
+        rules = self.codex / "rules" / approval.CODEX_RULES_NAME
+        hub = self.hub / "scripts"
+
+        def decision(*argv: str) -> str | None:
+            result = subprocess.run(
+                [codex, "execpolicy", "check", "--rules", str(rules), *argv],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            return json.loads(result.stdout).get("decision")
+
+        for argv in (
+            ("ork", "rooms", "add", "--room", "r", "--team", "t"),
+            ("ork", "hall", "worktree", "--room", "r", "--member", "m"),
+            ("ork", "progress", "--session", "s", "--stage", "working"),
+            ("python3", f"{hub}/coordinator.py", "capture", "--task-dir", "t"),
+            ("python3", f"{hub}/coordinator.py", "verify-evidence", "--task-dir", "t"),
+            ("python3", f"{hub}/coordinator.py", "review", "--task-dir", "t"),
+        ):
+            self.assertEqual(decision(*argv), "allow", argv)
+        # The unapproved segments of a compound line stay undecided, so Codex would prompt for them.
+        for argv in (
+            ("jq", ".", "a.json"),
+            ("head", "-n", "5"),
+            ("python3", "-c", "print(1)"),
+            ("python3", "coordinator.py", "capture", "--task-dir", "t"),
+            ("python3", f"{self.root}/elsewhere/coordinator.py", "capture"),
+            ("bash", "-c", "ork rooms list"),
+        ):
+            self.assertIsNone(decision(*argv), argv)
+
+    def test_claude_and_opencode_rules_are_exact_prefixes_with_no_generic_interpreters(self):
+        self.run_approval(opt_in=True)
+        claude = self.claude_rules()
+        for broad in ("Bash(jq:*)", "Bash(head:*)", "Bash(python3:*)", "Bash(bash:*)", "Bash(ork:*)"):
+            self.assertNotIn(broad, claude)
+        # Shell-operator handling is each host's own; this checks only the rules this module writes.
+        self.assertFalse(claude_allows(claude, "jq . a.json"))
+        self.assertFalse(opencode_allows(self.opencode_rules(), "jq . a.json"))
 
     def test_symlinked_settings_keep_the_link_and_edit_its_target(self):
         dotfiles = self.root / "dotfiles/claude-settings.json"
