@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.96.0
+
+- feat: provision worktrees and reconcile their pull requests (#249)
+
 ## 0.95.0
 
 - feat: add workspace-aware Orca panels and Herdr actions (#248)
