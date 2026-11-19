@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node
 import { hostname, tmpdir } from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 
 import { runHordeTui } from "../../../plugins/orchestrate/bin/horde-tui.mjs";
 import {
@@ -369,6 +369,29 @@ it("keeps the old live stream when the replacement handshake fails, then retries
   expect(sockets[2].watched()).toEqual(["w1:p2"]);
   expect(sockets[0].destroyed).toBe(true);
   subscriber.stop();
+});
+
+it("recovers from a silent subscription, including after losing the previous socket", () => {
+  vi.useFakeTimers();
+  const { sockets, subscriber } = lifecycle({ handshakeTimeoutMs: 50 });
+  try {
+    subscriber.start();
+    vi.advanceTimersByTime(55);
+    expect(sockets[0].destroyed).toBe(true);
+    sockets[1].acknowledge();
+    subscriber.setPaneIds(["w1:p2"]);
+    sockets[2].emit("connect");
+    sockets[1].emit("end");
+    vi.advanceTimersByTime(55);
+    expect(sockets[2].destroyed).toBe(true);
+    sockets[3].acknowledge();
+    vi.advanceTimersByTime(500);
+    expect(subscriber.isSubscribed).toBe(true);
+    expect(sockets).toHaveLength(4);
+  } finally {
+    subscriber.stop();
+    vi.useRealTimers();
+  }
 });
 
 it("reconnects with the latest desired set after the live stream is lost", async () => {

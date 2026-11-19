@@ -1078,6 +1078,21 @@ describe("orca panel, host fallbacks and races", () => {
       ...overrides,
     });
 
+    it("keeps the newer workspace when a delayed request arrives after a change event", async () => {
+      const pending = Promise.withResolvers();
+      let push;
+      const page = await mountPanel(null, {
+        request: () => pending.promise,
+        on: (_event, handler) => {
+          push = handler;
+        },
+      });
+      push(goodStatus({ workspaceId: "B", workspaceName: "second" }));
+      pending.resolve(goodStatus({ workspaceId: "A", workspaceName: "first" }));
+      await pending.promise;
+      expect(page.byId.get("workspace").textContent).toBe("second");
+    });
+
     it("drives the real worker through a bridge shaped like Orca's frame facade", async () => {
       // Orca's frame shell (plugin-panel-shell-facades.ts) resolves `plugin.request` with the
       // handler's JSON output, rejects with the handler's error code, and delivers `panels.post`
@@ -1352,7 +1367,9 @@ describe("orca panel, host fallbacks and races", () => {
         },
       });
       await instance.start();
-      const pending = host.request("swarm.status");
+      const pending = expect(host.request("swarm.status")).rejects.toMatchObject({
+        code: "workspace_changed",
+      });
       await vi.waitFor(() => expect(held).toHaveLength(1));
       host.state.workspaceId = "ws2";
       await host.emit("workspace.changed", {
@@ -1362,9 +1379,8 @@ describe("orca panel, host fallbacks and races", () => {
       // The stale answer is dropped and a second read is made for the new generation.
       await vi.waitFor(() => expect(held).toHaveLength(2));
       held[1]();
-      const status = await pending;
+      await pending;
       expect(reads).toBe(2);
-      expect(status.rooms.map(({ id }) => id)).toEqual(["room-a"]);
       await instance.stop();
     });
 
@@ -1424,7 +1440,11 @@ describe("orca panel, host fallbacks and races", () => {
       expect(new Set(joined.map(({ text }) => text)).size).toBe(1);
 
       const failed = host.state.status.at(-1);
-      expect(failed.text).toBe("CW 31% · CP 57% · stale");
+      expect(failed.text).toBe("CW 31%! · CP 57%! · stale");
+      expect((await host.request("swarm.status")).quota).toEqual({
+        text: failed.text,
+        tone: "warning",
+      });
       expect(failed.tone).toBe("warning");
       expect(failed.tooltip).toContain("monitor json failed: boom");
       expect(failed.tooltip).toContain("Claude Personal (claude)");
@@ -1433,6 +1453,22 @@ describe("orca panel, host fallbacks and races", () => {
       // The failed promise is gone: the next refresh runs again and recovers.
       expect((await instance.refreshQuota()).text).toBe("CW 31% · CP 57%");
       expect(runs).toHaveLength(3);
+      await instance.stop();
+    });
+
+    it("publishes stale zero to both panel paths after a refresh fails", async () => {
+      const host = mockOrca();
+      const account = { ...CLAUDE_ACCOUNTS[0], windows: [{ label: "weekly", remainingPct: 0 }] };
+      const { exec } = monitorExec([SNAPSHOT([account]), new Error("offline")]);
+      const instance = worker(host, { node: "/usr/bin/node", exec });
+      await instance.start();
+      await expect.poll(() => host.state.status.length).toBe(1);
+      expect(host.state.status[0].text).toContain("☠");
+      await instance.refreshQuota();
+      const expected = { text: "CP 0%! · stale", tone: "warning" };
+      expect((await host.request("swarm.status")).quota).toEqual(expected);
+      timeouts.at(-1).callback();
+      await expect.poll(() => host.state.posts.at(-1)?.payload.quota).toEqual(expected);
       await instance.stop();
     });
 

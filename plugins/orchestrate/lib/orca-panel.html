@@ -142,6 +142,7 @@
 
       let status = null;
       let busy = false;
+      let refreshSequence = 0;
 
       function row(list, left, right, className) {
         const item = document.createElement("li");
@@ -204,14 +205,18 @@
           show("Ignored a malformed status from the Orkest worker.");
           return;
         }
+        refreshSequence += 1;
         status = next;
         render();
       }
 
       async function refresh() {
+        const sequence = ++refreshSequence;
         try {
-          accept(await orca.plugin.request("swarm.status", {}, { timeoutMs: 20000 }));
+          const next = await orca.plugin.request("swarm.status", {}, { timeoutMs: 20000 });
+          if (sequence === refreshSequence) accept(next);
         } catch (error) {
+          if (sequence !== refreshSequence) return;
           show(`Orkest worker unavailable: ${error?.code ?? "error"}`);
         }
       }

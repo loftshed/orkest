@@ -393,7 +393,7 @@ function quotaTooltipLine(entry, now) {
  * account with no numbers shows "?", and a fresh zero is a real, exhausted limit (☠).
  * Accounts sharing a provider tag are told apart by label.
  */
-export function summarizeQuota(snapshot, { now, maxShown = 4 } = {}) {
+export function summarizeQuota(snapshot, { now, maxShown = 4, stale = false } = {}) {
   const accounts = Array.isArray(snapshot?.accounts) ? snapshot.accounts : [];
   const lanes = Array.isArray(snapshot?.lanes) ? snapshot.lanes : [];
   const generated = Date.parse(snapshot?.generatedAt ?? "");
@@ -407,6 +407,7 @@ export function summarizeQuota(snapshot, { now, maxShown = 4 } = {}) {
       at,
     ),
   );
+  if (stale) for (const entry of entries) entry.stale = true;
   const tagCount = new Map();
   for (const entry of entries) tagCount.set(entry.short, (tagCount.get(entry.short) ?? 0) + 1);
   const nameOf = (entry) =>
@@ -441,9 +442,9 @@ export function summarizeQuota(snapshot, { now, maxShown = 4 } = {}) {
     }
     return `${name} ${Math.floor(pct)}%${entry.stale ? "!" : ""}`;
   });
+  for (const entry of unknown) cells.push(`${nameOf(entry)} ?`);
   const shown = cells.slice(0, maxShown);
   if (cells.length > maxShown) shown.push(`+${cells.length - maxShown}`);
-  for (const entry of unknown) shown.push(`${nameOf(entry)} ?`);
 
   const fresh = known.filter(({ entry }) => !entry.stale);
   const lowest = fresh.length > 0 ? Math.min(...fresh.map(({ pct }) => pct)) : null;

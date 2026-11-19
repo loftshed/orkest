@@ -423,15 +423,18 @@ export async function trustedOrkFast(env = process.env, { home = os.homedir() } 
     }
     await access(candidate, fsConstants.X_OK);
     if (!env.ORK_FAST_BIN) {
-      const expected = path.join(await realpath(cacheHome(env, { home })), "bin", "ork-fast");
-      if ((await realpath(candidate)) !== expected) return null;
-      const dir = await lstat(path.dirname(candidate));
-      if (
-        dir.mode & 0o022 ||
-        (typeof process.getuid === "function" && dir.uid !== process.getuid())
-      ) {
-        return null;
+      const managedRoot = path.resolve(cacheHome(env, { home }));
+      for (const dir of [managedRoot, path.dirname(candidate)]) {
+        const info = await lstat(dir);
+        if (
+          !info.isDirectory() ||
+          info.mode & 0o022 ||
+          (typeof process.getuid === "function" && info.uid !== process.getuid())
+        )
+          return null;
       }
+      const expected = path.join(await realpath(managedRoot), "bin", "ork-fast");
+      if ((await realpath(candidate)) !== expected) return null;
     }
     return candidate;
   } catch {
@@ -449,15 +452,27 @@ async function fastHerdrStatus(argv, env = process.env) {
   const child = spawn(
     binary,
     ["herdr-status", "--fallback-script", path.join(scripts, "herdr_status.py"), ...argv],
-    { stdio: ["ignore", "pipe", "ignore"] },
+    { detached: true, env, stdio: ["ignore", "pipe", "ignore"] },
   );
   const chunks = [];
   let size = 0;
   return new Promise((resolve) => {
-    const timer = setTimeout(() => child.kill("SIGKILL"), FAST_TIMEOUT_MS);
+    const abort = () => {
+      clearTimeout(timer);
+      if (child.pid) {
+        try {
+          process.kill(-child.pid, "SIGKILL");
+        } catch {
+          // The group may already have exited.
+        }
+      }
+      child.stdout.destroy();
+      resolve(null);
+    };
+    const timer = setTimeout(abort, FAST_TIMEOUT_MS);
     child.stdout.on("data", (chunk) => {
       size += chunk.length;
-      if (size > FAST_OUTPUT_LIMIT) child.kill("SIGKILL");
+      if (size > FAST_OUTPUT_LIMIT) abort();
       else chunks.push(chunk);
     });
     child.on("error", () => {

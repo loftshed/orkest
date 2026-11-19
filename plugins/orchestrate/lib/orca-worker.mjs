@@ -205,6 +205,7 @@ export function createOrcaWorker(
   let quotaTimer = null;
   let quotaPending = null;
   let lastQuota = null;
+  let displayedQuota = null;
   let lifecycle = 0;
   // Bumped when the workspace or a view's lifecycle changes: in-flight rooms reads then count as stale.
   let generation = 0;
@@ -213,6 +214,7 @@ export function createOrcaWorker(
   let closeEpoch = 0;
   let panelTimer = null;
   let lastPanelPost = "";
+  let panelPostSequence = 0;
   let isSplitUnsupported = false;
   let registry = { schema: ORCA_TERMINALS_SCHEMA, terminals: {} };
 
@@ -254,7 +256,9 @@ export function createOrcaWorker(
 
   async function readContext() {
     try {
-      setContext((await call("workspace.readContext", {})) ?? null);
+      const before = generation;
+      const next = await call("workspace.readContext", {});
+      if (generation === before) setContext(next ?? null);
     } catch (error) {
       log(`orkest: workspace.readContext failed: ${error.message}`);
     }
@@ -849,10 +853,12 @@ export function createOrcaWorker(
   async function updateQuota(epoch) {
     if (!node) throw new Error("node is not on PATH for the Orca plugin worker");
     const stdout = await run(exec, node, [MONITOR, "json"], { env: spawnEnv, timeout: 45_000 });
-    const summary = summarizeQuota(JSON.parse(stdout));
+    const snapshot = JSON.parse(stdout);
+    const summary = summarizeQuota(snapshot);
     // A worker that stopped or restarted meanwhile owns the status bar item now.
     if (isStopped || epoch !== lifecycle) return summary;
-    lastQuota = { summary, at: now() };
+    lastQuota = { snapshot, at: now() };
+    displayedQuota = summary;
     await setQuotaItem(summary);
     schedulePanelPost();
     return summary;
@@ -862,7 +868,8 @@ export function createOrcaWorker(
   function staleQuota(error) {
     const reason = `monitor json failed: ${String(error.stderr || error.message).slice(0, 200)}`;
     if (!lastQuota) return { text: "Quota ?", tone: "warning", tooltip: reason };
-    const { summary, at } = lastQuota;
+    const { snapshot, at } = lastQuota;
+    const summary = summarizeQuota(snapshot, { now: at, stale: true });
     return {
       text: `${summary.text} · stale`,
       tone: "warning",
@@ -878,6 +885,8 @@ export function createOrcaWorker(
       log(`orkest: quota refresh failed: ${error.message}`);
       const failed = staleQuota(error);
       if (!isStopped && epoch === lifecycle) {
+        displayedQuota = failed;
+        schedulePanelPost();
         try {
           await setQuotaItem(failed);
         } catch {
@@ -913,7 +922,7 @@ export function createOrcaWorker(
       rooms: [],
       workers: [],
       view: { open: false, chief: false, room: "" },
-      quota: lastQuota ? { text: lastQuota.summary.text, tone: lastQuota.summary.tone } : null,
+      quota: displayedQuota ? { text: displayedQuota.text, tone: displayedQuota.tone } : null,
     };
     if (!workspaceId) return base;
     let eligible = [];
@@ -956,7 +965,10 @@ export function createOrcaWorker(
     panelTimer = null;
     if (isStopped || typeof orca.panels?.post !== "function") return;
     try {
+      const snapshotGeneration = generation;
+      const sequence = ++panelPostSequence;
       const payload = await panelStatus(context);
+      if (generation !== snapshotGeneration || sequence !== panelPostSequence) return;
       const serialized = JSON.stringify(payload);
       if (serialized === lastPanelPost || isStopped) return;
       lastPanelPost = serialized;
@@ -983,7 +995,15 @@ export function createOrcaWorker(
       ) {
         throw panelError("invalid_params", "swarm.status takes no input");
       }
-      return panelStatus(await readContext());
+      const focused = await readContext();
+      const payload = await panelStatus(focused);
+      if (focused?.workspaceId !== context?.workspaceId) {
+        throw panelError(
+          "workspace_changed",
+          "The focused workspace changed while reading status.",
+        );
+      }
+      return payload;
     });
     orca.panels.handle("swarm.action", async (input) => {
       const request = parsePanelAction(input);

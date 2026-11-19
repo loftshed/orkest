@@ -981,6 +981,29 @@ describe("ork herdr-status", () => {
     expect(await run(env)).toBe("\n");
   });
 
+  it("rejects redirection of the managed cache root itself", async () => {
+    const { root, home, env } = await sandbox();
+    await fakeBinary(path.join(home, "bin", "ork-fast"), "echo REDIRECTED");
+    const link = path.join(root, "linked-cache");
+    await symlink(home, link);
+    expect(await trustedOrkFast({ ...env, ORCHESTRATE_HOME: link })).toBeNull();
+  });
+
+  it("times out and stops a helper that holds stdout after the accelerator exits", async () => {
+    const { root, env } = await sandbox();
+    const marker = path.join(root, "helper-pid");
+    const bin = await fakeBinary(
+      path.join(root, "ork-fast"),
+      `sleep 30 &\necho $! > '${marker}'\necho unfinished`,
+    );
+    const started = Date.now();
+    expect(await run({ ...env, ORK_FAST_BIN: bin })).toBe("\n");
+    expect(Date.now() - started).toBeLessThan(5000);
+    const pid = (await readFile(marker, "utf8")).trim();
+    const state = await exec("ps", ["-o", "stat=", "-p", pid]).catch(() => ({ stdout: "" }));
+    expect(state.stdout.trim()).toMatch(/^(?:Z.*)?$/u);
+  });
+
   it("falls back to Python for a missing, stale or malformed native binary", async () => {
     const { root, env } = await sandbox();
     expect(await run({ ...env, ORK_FAST_BIN: path.join(root, "missing", "ork-fast") })).toBe("\n");

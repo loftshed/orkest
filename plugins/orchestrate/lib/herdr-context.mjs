@@ -136,6 +136,7 @@ export function createHerdrLifecycleSubscriber({
   onInvalidate,
   onReconcile,
   paneIds = [],
+  handshakeTimeoutMs = 5000,
   reconnectDelayMs = 500,
   maxReconnectDelayMs = 5000,
 } = {}) {
@@ -181,6 +182,7 @@ export function createHerdrLifecycleSubscriber({
   const retire = (stream) => {
     if (!stream || stream.isDead) return;
     stream.isDead = true;
+    clearTimeout(stream.handshakeTimer);
     try {
       stream.socket?.destroy?.();
     } catch {
@@ -238,6 +240,7 @@ export function createHerdrLifecycleSubscriber({
   };
 
   const promote = (stream) => {
+    clearTimeout(stream.handshakeTimer);
     const previous = live;
     live = stream;
     candidate = null;
@@ -298,6 +301,8 @@ export function createHerdrLifecycleSubscriber({
       pending: "",
     };
     candidate = stream;
+    stream.handshakeTimer = setTimeout(() => fail(stream, "handshake_timeout"), handshakeTimeoutMs);
+    stream.handshakeTimer.unref?.();
     socket.on?.("connect", () => {
       if (stream.isDead || isStopped) return;
       const payload = JSON.stringify({

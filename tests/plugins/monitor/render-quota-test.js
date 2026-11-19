@@ -176,6 +176,13 @@ describe("summarizeQuota", () => {
     expect(summarize(accounts, NOW, { maxShown: 2 }).text).toBe("A1 10% · A4 20% · +4");
   });
 
+  test("counts unavailable accounts within the same limit and retains details in the tooltip", () => {
+    const unavailable = Array.from({ length: 16 }, (_, i) => ({ id: `missing-${i}`, ok: false }));
+    const summary = summarize([weekly("ok", 40), ...unavailable]);
+    expect(summary.text).toBe("OK 40% · missing-0 ? · missing-1 ? · missing-2 ? · +13");
+    expect(summary.tooltip).toContain("missing-15");
+  });
+
   test("tone follows the lowest fresh figure", () => {
     expect(summarize([weekly("a", 24)]).tone).toBe("warning");
     expect(summarize([weekly("a", 9)]).tone).toBe("danger");

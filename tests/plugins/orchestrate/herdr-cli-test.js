@@ -435,10 +435,11 @@ describe("herdr structured CLI operations", () => {
       const run = spawnSync("herdr", args, {
         encoding: "utf8",
         timeout: 5000,
+        cwd: root,
         env: {
           PATH: process.env.PATH,
           HOME: root,
-          HERDR_SOCKET_PATH: path.join(root, "absent.sock"),
+          HERDR_SOCKET_PATH: "./absent.sock",
         },
       });
       return { status: run.status, stdout: `${run.stdout}${run.stderr}` };
