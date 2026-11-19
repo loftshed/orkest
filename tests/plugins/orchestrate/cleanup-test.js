@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -679,5 +679,135 @@ describe("ork cleanup (Slice 1D)", () => {
     expect(
       resolveRepoPolicy(repoDir, { configPath: cfgPath, homeDir: fakeHome }).allowedHarnesses,
     ).toEqual(["codex", "agy", "claude", "opencode"]);
+  });
+});
+
+describe("ork cleanup --merged", () => {
+  const ork = path.resolve("plugins/orchestrate/bin/ork.mjs");
+  let root;
+  let env;
+
+  function fixture() {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), "ork-cleanup-merged-"));
+    const repo = path.join(root, "repo");
+    initGitRepo(repo);
+    fs.writeFileSync(path.join(repo, ".gitignore"), ".worktrees/\n");
+    execFileSync("git", ["add", ".gitignore"], { cwd: repo });
+    execFileSync("git", ["commit", "-qm", "ignore"], { cwd: repo });
+    const worktree = path.join(repo, ".worktrees", "wt-merged");
+    execFileSync("git", ["worktree", "add", "-q", "-b", "feat/merged", worktree, "main"], {
+      cwd: repo,
+    });
+    const gitDir = execFileSync("git", ["rev-parse", "--absolute-git-dir"], {
+      cwd: worktree,
+      encoding: "utf8",
+    }).trim();
+    fs.writeFileSync(
+      path.join(gitDir, "orkest.json"),
+      JSON.stringify({ branch: "feat/merged", disposable: true, parentCwd: repo }),
+    );
+    env = {
+      ...process.env,
+      HOME: path.join(root, "home"),
+      ORCHESTRATE_HOME: path.join(root, "cache"),
+    };
+    fs.mkdirSync(env.HOME, { recursive: true });
+    return { repo, worktree };
+  }
+
+  afterEach(() => {
+    process.exitCode = 0;
+  });
+
+  it("parses --merged and refuses combinations that could run destructive cleanup", () => {
+    expect(parseCleanupArgs(["status", "--merged", "--target", "main"])).toMatchObject({
+      dryRun: true,
+      merged: true,
+      target: "main",
+    });
+    for (const argv of [
+      ["--merged", "--migrate-legacy"],
+      ["--target", "main"],
+      ["--merged", "--target"],
+    ]) {
+      expect(() => parseCleanupArgs(argv)).toThrow(expect.objectContaining({ exitCode: 2 }));
+    }
+  });
+
+  it("through the real CLI: status is read-only, run quarantines, and legacy pruning never runs", () => {
+    const { repo, worktree } = fixture();
+    // A stale legacy worktree directory that the destructive path would prune must survive.
+    const legacy = path.join(root, "cache", "worktrees", "old");
+    fs.mkdirSync(legacy, { recursive: true });
+    setOldMtime(legacy, 86_400);
+    const run = (...args) =>
+      spawnSync(
+        "node",
+        [ork, "cleanup", ...args, "--merged", "--target", "main", "--json", "--cwd", repo],
+        {
+          cwd: repo,
+          encoding: "utf8",
+          env,
+        },
+      );
+    const status = run("status");
+    expect(status.status).toBe(0);
+    const statusReport = JSON.parse(status.stdout);
+    expect(statusReport).toMatchObject({
+      schema: CLEANUP_SCHEMA,
+      dryRun: true,
+      totalBytesReclaimed: 0,
+    });
+    expect(statusReport.eligible).toHaveLength(1);
+    expect(fs.existsSync(worktree)).toBe(true);
+    expect(fs.existsSync(path.join(root, "cache", "cleanup.lock"))).toBe(false);
+
+    const real = run("run");
+    expect(real.status).toBe(0);
+    const report = JSON.parse(real.stdout);
+    expect(report.quarantined).toHaveLength(1);
+    expect(fs.existsSync(worktree)).toBe(false);
+    expect(fs.existsSync(report.quarantined[0].destination)).toBe(true);
+    expect(fs.existsSync(legacy)).toBe(true);
+    const branches = execFileSync("git", ["branch", "--list", "feat/merged"], {
+      cwd: repo,
+      encoding: "utf8",
+    });
+    expect(branches).toContain("feat/merged");
+    expect(report.totalBytesReclaimed).toBe(0);
+
+    const human = spawnSync("node", [ork, "cleanup", "status", "--merged", "--cwd", repo], {
+      cwd: repo,
+      encoding: "utf8",
+      env,
+    });
+    expect(human.stdout).toContain("Bytes reclaimed: 0");
+  });
+
+  it("exits 2 for an invalid combination before touching anything", () => {
+    const { repo } = fixture();
+    const result = spawnSync(
+      "node",
+      [ork, "cleanup", "run", "--merged", "--migrate-legacy", "--cwd", repo],
+      {
+        cwd: repo,
+        encoding: "utf8",
+        env,
+      },
+    );
+    expect(result.status).toBe(2);
+    expect(fs.existsSync(path.join(root, "cache"))).toBe(false);
+  });
+
+  it("legacy cleanup without --merged is unchanged", () => {
+    const { repo } = fixture();
+    const report = cleanupCommand(["status", "--json"], {
+      cwd: repo,
+      env,
+      homeDir: env.HOME,
+      silent: true,
+    });
+    expect(report.schema).toBe(CLEANUP_SCHEMA);
+    expect(report.worktrees).toBeDefined();
   });
 });

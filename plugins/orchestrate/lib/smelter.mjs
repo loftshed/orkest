@@ -21,6 +21,7 @@ import { shouldUseColor } from "../../monitor/lib/render.mjs";
 import { loadFoundryState, resolveFoundryStatePath, writeFoundryState } from "./foundry.mjs";
 import { mailboxRoot, readRawRoom, resolveWorktreeMarkerPath } from "./horde-room.mjs";
 import { glyphSet, glyphTier, renderPanel, renderTable } from "./horde-view.mjs";
+import { ensurePullRequest, parseStrategy, pruneMergedWorktree } from "./merged-worktree.mjs";
 import {
   isHarnessAllowed,
   loadConfiguredAccounts,
@@ -406,7 +407,7 @@ function readJsonIfExists(filePath) {
   }
 }
 
-function verifyRoomIntegrationRecord(marker, foundryState, options = {}) {
+export function verifyRoomIntegrationRecord(marker, foundryState, options = {}) {
   const isRoomIntegrated = Boolean(
     marker?.roomId ||
     marker?.memberId ||
@@ -987,10 +988,7 @@ async function smeltLeasedWorktree(worktree, options, ownership) {
       };
     }
   }
-  const strategy = options.strategy || "local";
-  if (!["local", "pr"].includes(strategy)) {
-    throw new Error(`Unsupported smelter strategy: ${strategy}`);
-  }
+  const strategy = parseStrategy(options.strategy) ?? "local";
   const isDryRun = Boolean(options.dryRun || options["dry-run"]);
   const shouldSkipReview = Boolean(options.skipReview || options["skip-review"]);
   const suppliedApproval = options.approveHighBlast || options["approve-high-blast"];
@@ -1008,22 +1006,31 @@ async function smeltLeasedWorktree(worktree, options, ownership) {
         existsSync(worktreePath),
       ));
   let evidence = null;
+  const owningRoomId =
+    roomCheck.isRoomIntegrated && roomCheck.ok && typeof marker.roomId === "string"
+      ? marker.roomId
+      : undefined;
   const recordState = async (patch) => {
     await ownership.mutate();
     ownership.assertHeld();
     if (!canPersistState) return null;
     try {
-      return writeFoundryState(worktreePath, {
-        issue: worktreeObj.issue ?? marker.issue ?? taskSpec?.issue ?? null,
-        targetBranch,
-        ...(evidence && {
-          candidate: evidence.candidate,
-          evidence: { ...evidence, outcome: patch.status },
-        }),
-        infrastructureRetry: null,
-        findings: null,
-        ...patch,
-      });
+      return writeFoundryState(
+        worktreePath,
+        {
+          issue: worktreeObj.issue ?? marker.issue ?? taskSpec?.issue ?? null,
+          targetBranch,
+          ...(evidence && {
+            candidate: evidence.candidate,
+            evidence: { ...evidence, outcome: patch.status },
+          }),
+          infrastructureRetry: null,
+          findings: null,
+          ...patch,
+        },
+        // A verified PR is attributed to the room whose integration record was verified, never another.
+        patch.pr && owningRoomId ? { owningRoomId, env: options.env } : undefined,
+      );
     } catch (error_) {
       const error = new SmelterLeaseError("state_write_failed", worktreePath);
       error.cause = error_;
@@ -1753,6 +1760,7 @@ async function smeltLeasedWorktree(worktree, options, ownership) {
   let stage4;
   if (strategy === "local") {
     let isPruned = false;
+    let quarantine = null;
     const entries = parsePorcelainWorktrees(
       String(runCmd("git", ["worktree", "list", "--porcelain"])),
     );
@@ -1846,20 +1854,19 @@ async function smeltLeasedWorktree(worktree, options, ownership) {
         resolveGitSha(worktreePath, target.ref, execFileSyncFn) === candidate.commit &&
         resolveGitSha(worktreePath, "HEAD", execFileSyncFn) === candidate.commit
       ) {
-        runCmd("git", ["worktree", "remove", worktreePath], repoRoot);
-        try {
-          runCmd("git", ["branch", "-d", candidate.branch], repoRoot);
-        } catch (error) {
-          // `git branch -d` refuses branches merged into a non-HEAD target ref (e.g. release/v1 while repoRoot is on main).
-          const mergedTarget = resolveGitSha(repoRoot, target.ref, execFileSyncFn);
-          if (mergedTarget !== candidate.commit) throw error;
-          runCmd(
-            "git",
-            ["update-ref", "-d", `refs/heads/${candidate.branch}`, candidate.commit],
-            repoRoot,
-          );
-        }
-        isPruned = true;
+        // Recoverable: the common helper quarantines a proven-merged, positively owned worktree and
+        // otherwise retains it. No worktree removal, branch deletion or force exists on this path.
+        const prune = await (options.pruneMergedWorktreeFn ?? pruneMergedWorktree)({
+          repoRoot: entries[0]?.worktree ?? repoRoot,
+          worktreePath,
+          targetBranch,
+          env: options.env ?? process.env,
+          execFileSyncFn,
+          assertHeld: () => ownership.assertHeld(),
+          allowRoomId: owningRoomId,
+        });
+        isPruned = prune.pruned;
+        quarantine = prune;
       }
     }
     stage4 = {
@@ -1867,31 +1874,55 @@ async function smeltLeasedWorktree(worktree, options, ownership) {
       disposable: isDisposable,
       operations: plannedOps,
       pruned: isPruned,
+      ...(quarantine && { quarantine }),
       status: isDryRun ? "dry-run" : "passed",
       strategy: "local",
       targetBranch,
     };
   } else {
-    const prArgs = ["pr", "create", "--base", targetBranch, "--head", candidate.branch, "--fill"];
-    const plannedOps = [
-      ["git", "push", "origin", `${candidate.commit}:refs/heads/${candidate.branch}`],
-      ["gh", ...prArgs],
-    ];
-    let prOutput = null;
-    if (!isDryRun) {
-      runCmd(
-        "git",
-        ["push", "origin", `${candidate.commit}:refs/heads/${candidate.branch}`],
+    const pr = await ensurePullRequest({
+      runCmd,
+      runGit: (cmd, args) => runCmd(cmd, args, worktreePath),
+      candidate,
+      baseBranch: targetBranch,
+      priorState: loadedMeta.foundryState,
+      dryRun: isDryRun,
+      record: (patch) => recordState(patch),
+    });
+    if (!isDryRun && !["opened", "existing", "merged"].includes(pr.status)) {
+      const failed = pr.status;
+      return {
+        ok: false,
+        status: failed,
+        candidate,
+        evidence: { ...evidence, outcome: failed },
+        strategy,
+        stages: {
+          coldReview: stage3,
+          heavyGate: stage2,
+          rebaseAndScope: stage1,
+          smeltAndPrune: {
+            branch,
+            disposable: isDisposable,
+            operations: pr.operations,
+            pruned: false,
+            skipped: true,
+            status: failed,
+            strategy,
+            targetBranch,
+          },
+        },
+        targetBranch,
+        ...(pr.code && { reason: pr.code }),
         worktreePath,
-      );
-      prOutput = runCmd("gh", prArgs, worktreePath);
-      await recordState({ status: "pr_opened" });
+      };
     }
     stage4 = {
       branch,
       disposable: isDisposable,
-      operations: plannedOps,
-      output: prOutput,
+      operations: pr.operations,
+      output: pr.output ?? null,
+      pr: pr.pr ?? null,
       pruned: false,
       status: isDryRun ? "dry-run" : "passed",
       strategy: "pr",
@@ -1899,7 +1930,8 @@ async function smeltLeasedWorktree(worktree, options, ownership) {
     };
   }
 
-  const finalSmeltStatus = strategy === "local" ? "merged" : "pr_opened";
+  const finalSmeltStatus =
+    strategy === "local" || stage4.pr?.state === "MERGED" ? "merged" : "pr_opened";
   return {
     evidence: { ...evidence, outcome: isDryRun ? "dry-run" : finalSmeltStatus },
     candidate,
@@ -2002,6 +2034,7 @@ export async function smelterCli(
     throw new Error(`Unknown smelter subcommand: ${action}`);
   }
 
+  const strategy = parseStrategy(values.strategy) ?? "local";
   const targetBranch = values.target || "main";
   const width = Number(values.width || stdout.columns || 120);
   if (!Number.isSafeInteger(width) || width < 40 || width > 1000) {
@@ -2084,7 +2117,7 @@ export async function smelterCli(
       gateRunner,
       reviewRunner,
       skipReview: Boolean(values["skip-review"]),
-      strategy: values.strategy || "local",
+      strategy,
       targetBranch,
     });
     results.push(res);
