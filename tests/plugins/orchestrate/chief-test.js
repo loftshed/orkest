@@ -2869,6 +2869,28 @@ describe("ork chief", () => {
         });
       });
 
+      it("prints an already-completed mission report in human and JSON mode", async () => {
+        await writeRooms([missionRoom("reported-room", { chiefState: "done" })]);
+        const args = [
+          "send",
+          "--from",
+          "reported-room-orch",
+          "--to",
+          "chief",
+          "--kind",
+          "done",
+          "done",
+        ];
+        const human = capture();
+        const json = capture();
+        const result = await chiefCommand(args, { root, env, stdout: human, runMailbox });
+        expect(result.status).toBe("already-reported");
+        expect(human.text()).toContain("already reported completion");
+        await chiefCommand([...args, "--json"], { root, env, stdout: json, runMailbox });
+        expect(JSON.parse(json.text())).toEqual(result);
+        expect(deskPuts()).toBe(0);
+      });
+
       it("keeps a racing child done and reconcile to one completion report", async () => {
         await writeRooms([missionRoom("race-done", { launch: { pid: process.pid } })]);
         writeArtifacts("race-done", {
