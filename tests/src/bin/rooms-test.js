@@ -1,0 +1,3527 @@
+import { execFile } from "node:child_process";
+import { mkdir, mkdtemp, readFile, realpath, rm, utimes, writeFile } from "node:fs/promises";
+import { hostname, tmpdir } from "node:os";
+import path from "node:path";
+import { promisify } from "node:util";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import { roomsCommand } from "../../../src/bin/rooms.mjs";
+import {
+  clearRoomListCache,
+  createRoom,
+  deleteRoom,
+  listRawRooms,
+  listRawRoomsCached,
+  parseTeam,
+  readRawRoom,
+  readRoom,
+  ROOMS_INDEX_SCHEMA,
+  roomsDbPath,
+  roomsIndexPath,
+  updateRawRoom,
+  updateRoom,
+  withRoomLock,
+} from "../../../src/lib/horde-room.mjs";
+import { openOrkestSqlite } from "../../../src/lib/orkest-sqlite.mjs";
+import {
+  belongsToRoom,
+  bindSession,
+  coordinatorBrief,
+  dispatchMember,
+  growRoom,
+  isAwaitingObservation,
+  isPeerLive,
+  listRooms,
+  newRoom,
+  observeRoom,
+  recoverRoom,
+  reserveLead,
+  SESSION_OBSERVATION_GRACE_MS,
+  SHARED_PROCESS_BUSY_TTL_MS,
+  SHARED_PROCESS_SUBAGENT_TTL_MS,
+  SHARED_PROCESS_WAITING_TTL_MS,
+} from "../../../src/lib/rooms.mjs";
+import { retainFixtures } from "../../helpers/retain-fixtures.js";
+
+const directories = [];
+async function directory() {
+  const dir = await mkdtemp(path.join(tmpdir(), "ork-rooms-"));
+  directories.push(dir);
+  return dir;
+}
+afterEach(async () => {
+  await retainFixtures(directories.splice(0));
+});
+
+async function fixture() {
+  const root = await directory();
+  const cwd = await directory();
+  const taskDir = await directory();
+  const room = await newRoom(parseTeam("claude:haiku,codex:luna:max"), {
+    id: "room-a",
+    cwd,
+    root,
+    group: "Research",
+    title: "Investigate cache",
+  });
+  const task = {
+    schema: "agent-executor.task.v1",
+    task_id: "task-a",
+    repository: room.cwd,
+    runs: [],
+    decisions: [],
+    updated_at: "2026-10-20T15:00:00Z",
+  };
+  const run = async (args) => {
+    if (args[0] === "show") return structuredClone(task);
+    if (args[0] !== "dispatch") throw new Error(`Unexpected command ${args[0]}`);
+    const request = args[args.indexOf("--request-id") + 1];
+    let existing = task.runs.find((entry) => entry.request_id === request);
+    if (!existing) {
+      existing = {
+        run_id: `run-${task.runs.length + 1}`,
+        request_id: request,
+        kind: args[args.indexOf("--kind") + 1],
+        status: "active",
+        transport: args[args.indexOf("--transport") + 1],
+        engine: args[args.indexOf("--engine") + 1],
+        result_path: path.join(taskDir, "result.json"),
+      };
+      task.runs.push(existing);
+    }
+    return structuredClone(existing);
+  };
+  return { root, cwd: room.cwd, taskDir, room, task, run };
+}
+
+describe("room execution", () => {
+  it("projects consultations under their supervisor with independent model and lifecycle", async () => {
+    const { root, room } = await fixture();
+    room.conductor.session = { id: "supervisor-a", machine: hostname() };
+    room.conductor.model = "supervisor-model";
+    const dir = path.join(root, "consultations", "supervisor-a");
+    await mkdir(dir, { recursive: true });
+    const resultPath = path.join(root, "consult-result.json");
+    const record = {
+      schema: "orchestrate.consultation-observation.v1",
+      id: "consult-a",
+      parent_session: "supervisor-a",
+      room_id: room.id,
+      machine: hostname(),
+      pid: process.pid,
+      runner_pid: process.pid,
+      deadline_ms: Date.now() + 60_000,
+      engine: "claude",
+      model: "requested-worker-model",
+      effort: "high",
+      task: "Inspect the lifecycle",
+      started_at: new Date().toISOString(),
+      result_path: resultPath,
+    };
+    await writeFile(path.join(dir, "consult-a.json"), JSON.stringify(record));
+    const options = { root, progress: async () => new Map(), discoverNativePeers: false };
+    const observed = await observeRoom(room, options);
+    expect(observed.conductor.model).toBe("supervisor-model");
+    expect(observed.agents.at(-1)).toMatchObject({
+      id: "consult-a",
+      parent: "conductor",
+      consultation: true,
+      model: "requested-worker-model",
+      modelSource: "requested",
+      runtimeState: "running",
+    });
+    await writeFile(
+      path.join(dir, "consult-a.json"),
+      JSON.stringify({ ...record, deadline_ms: 1 }),
+    );
+    expect((await observeRoom(room, options)).agents.at(-1)).toMatchObject({
+      status: "session unavailable",
+      runtimeState: "unknown",
+    });
+    await writeFile(
+      resultPath,
+      JSON.stringify({
+        schema: "agent-executor.consultation.v1",
+        status: "answered",
+        model_observed: ["actual-worker-model"],
+        session_id: "worker-session",
+      }),
+    );
+    room.agents.push({
+      id: "hook-discovered-worker",
+      native: true,
+      nativeSession: "worker-session",
+      status: "idle",
+    });
+    const finished = await observeRoom(room, options);
+    expect(finished.agents.filter((agent) => agent.id === "consult-a")).toHaveLength(1);
+    expect(finished.agents.some((agent) => agent.id === "hook-discovered-worker")).toBe(false);
+    expect(finished.agents.at(-1)).toMatchObject({
+      model: "actual-worker-model",
+      modelSource: "observed",
+      requestedModel: "requested-worker-model",
+      status: "reported complete",
+      completion: "answered",
+      runtimeState: "stopped",
+      nativeSession: "worker-session",
+    });
+    const anotherSwarm = structuredClone(room);
+    anotherSwarm.id = "another-room";
+    expect((await observeRoom(anotherSwarm, options)).agents.some((a) => a.consultation)).toBe(
+      false,
+    );
+    const unrelated = structuredClone(room);
+    unrelated.conductor.session.id = "another-supervisor";
+    expect((await observeRoom(unrelated, options)).agents.some((a) => a.consultation)).toBe(false);
+  });
+
+  it("creates and lists grouped rooms without dispatching, then preserves members when adding", async () => {
+    const { root, room } = await fixture();
+    await growRoom(room.id, parseTeam("agy:flash"), root);
+    const result = await listRooms(root);
+    expect(
+      result.rooms.map((entry) => [
+        entry.group,
+        entry.title,
+        entry.agents.map((member) => member.status),
+      ]),
+    ).toEqual([["Research", "Investigate cache", ["queued", "queued", "queued"]]]);
+  });
+
+  it("persists intent before launch and reuses it after a lost dispatch response", async () => {
+    const { root, room, taskDir, task, run } = await fixture();
+    let isLoseReply = true;
+    const unreliable = async (args) => {
+      const result = await run(args);
+      if (args[0] === "dispatch") {
+        const saved = await readRoom(room.id, root);
+        expect(saved.agents[0].dispatch.requestId).toBe(result.request_id);
+        if (isLoseReply) {
+          isLoseReply = false;
+          throw new Error("lost reply");
+        }
+      }
+      return result;
+    };
+    await expect(
+      dispatchMember(room.id, "haiku-1", { root, taskDir, run: unreliable }),
+    ).rejects.toThrow("lost reply");
+    const result = await dispatchMember(room.id, "haiku-1", { root, taskDir, run: unreliable });
+    expect(result.room.agents[0].status).toBe("running");
+    expect(result.dispatch.run_id).toBe("run-1");
+    expect(task.runs.map((entry) => entry.run_id)).toEqual(["run-1"]);
+  });
+
+  it("shows finished work as awaiting review until the coordinator records a verdict", async () => {
+    const { root, room, taskDir, task, run } = await fixture();
+    await dispatchMember(room.id, "haiku-1", { root, taskDir, run });
+    task.runs[0].status = "finished";
+    task.runs[0].runner_status = "completed";
+    expect((await observeRoom(room.id, { root, run })).agents[0]).toMatchObject({
+      status: "review",
+      runtimeState: "stopped",
+    });
+    task.decisions.push({ run_id: "run-1", decision: "supported" });
+    expect((await observeRoom(room.id, { root, run })).agents[0].status).toBe("supported");
+    task.decisions.length = 0;
+    task.runs[0].runner_status = "failed";
+    expect((await observeRoom(room.id, { root, run })).agents[0].status).toBe("failed");
+    task.decisions.push({ run_id: "run-1", decision: "reject" });
+    expect((await observeRoom(room.id, { root, run })).agents[0].status).toBe("rejected");
+    task.decisions.push({ run_id: "run-1", decision: "takeover" });
+    expect((await observeRoom(room.id, { root, run })).agents[0].status).toBe("blocked");
+    task.task_id = "replacement";
+    expect((await observeRoom(room.id, { root, run })).agents[0]).toMatchObject({
+      status: "unknown",
+      runtimeState: "unknown",
+    });
+  });
+
+  it("reserves native work without inventing an interactive session", async () => {
+    const { root, room, taskDir, task, run } = await fixture();
+    const result = await dispatchMember(room.id, "luna-1", {
+      root,
+      taskDir,
+      run,
+      transport: "native",
+    });
+    expect(result.dispatch.transport).toBe("native");
+    task.runs[0].status = "reserved";
+    expect((await observeRoom(room.id, { root, run })).agents[1].status).toBe("reserved");
+  });
+
+  it("rejects a changed task or request instead of dispatching another worker", async () => {
+    const { root, room, taskDir, task, run } = await fixture();
+    await dispatchMember(room.id, "haiku-1", { root, taskDir, run, requestId: "one" });
+    await expect(
+      dispatchMember(room.id, "haiku-1", { root, taskDir, run, requestId: "two" }),
+    ).rejects.toThrow("already has a dispatch");
+    await expect(
+      dispatchMember(room.id, "luna-1", { root, taskDir, run, requestId: "one" }),
+    ).rejects.toThrow("another dispatch");
+    expect(task.runs.map((entry) => entry.request_id)).toEqual(["one"]);
+  });
+
+  it("clears the intent after a refusal that launched nothing, so the member can dispatch again", async () => {
+    const { root, room, taskDir, task, run } = await fixture();
+    const refuse = async (args) => {
+      if (args[0] === "dispatch") throw new Error("implementation already dispatched");
+      return run(args);
+    };
+    await expect(
+      dispatchMember(room.id, "haiku-1", { root, taskDir, run: refuse, kind: "implementation" }),
+    ).rejects.toThrow("already dispatched");
+    const refused = (await readRoom(room.id, root)).agents.find((agent) => agent.id === "haiku-1");
+    expect(refused.dispatch).toBeUndefined();
+    expect(refused.status).toBe("queued");
+    expect(refused.dispatchError).toBe("implementation already dispatched");
+    // A different kind is no longer blocked by the stale intent.
+    await dispatchMember(room.id, "haiku-1", { root, taskDir, run, kind: "investigation" });
+    expect(task.runs).toHaveLength(1);
+  });
+
+  it("keeps the intent when the outcome of a failed dispatch is unknown", async () => {
+    const { root, room, taskDir, run } = await fixture();
+    const lost = async (args) => {
+      if (args[0] === "dispatch") {
+        await run(args);
+        throw new Error("response lost");
+      }
+      return run(args);
+    };
+    await expect(dispatchMember(room.id, "haiku-1", { root, taskDir, run: lost })).rejects.toThrow(
+      "response lost",
+    );
+    const kept = (await readRoom(room.id, root)).agents.find((agent) => agent.id === "haiku-1");
+    expect(kept.dispatch.requestId).toBeTruthy();
+  });
+
+  it("reports corrupt rooms alongside valid rooms", async () => {
+    const { root } = await fixture();
+    await mkdir(path.join(root, "rooms"), { recursive: true });
+    await writeFile(path.join(root, "rooms", "broken.json"), "{", "utf8");
+    const result = await listRooms(root);
+    expect(result.rooms.map((room) => room.id)).toEqual(["room-a"]);
+    expect(result.errors[0].file).toBe("broken.json");
+  });
+
+  it("reads the real coordinator task snapshot without launching a model", async () => {
+    const { root, room, taskDir, task, run } = await fixture();
+    await dispatchMember(room.id, "haiku-1", { root, taskDir, run });
+    task.runs[0].status = "finished";
+    task.runs[0].runner_status = "completed";
+    await writeFile(path.join(taskDir, "task.json"), JSON.stringify(task));
+    const observed = await observeRoom(room.id, { root });
+    expect(observed.agents[0].runId).toBe("run-1");
+    expect(observed.agents[0].status).toBe("review");
+  });
+
+  it("refreshes each task and keeps other members visible when a task is unreadable", async () => {
+    const { root, room, taskDir, task, run } = await fixture();
+    await dispatchMember(room.id, "haiku-1", { root, taskDir, run, requestId: "first" });
+    task.runs[0].status = "finished";
+    task.runs[0].runner_status = "completed";
+    const secondDir = await directory();
+    const secondTask = {
+      ...task,
+      task_id: "task-b",
+      runs: [
+        "engine",
+        {
+          request_id: "second",
+          run_id: "run-b",
+          engine: "codex",
+          transport: "executor",
+          status: "active",
+        },
+      ],
+      decisions: ["unrelated malformed decision"],
+    };
+    await updateRoom(
+      room.id,
+      (current) => {
+        current.agents[1].dispatch = {
+          taskDir: secondDir,
+          taskId: "task-b",
+          requestId: "second",
+          runId: "run-b",
+          transport: "executor",
+        };
+        return current;
+      },
+      { root },
+    );
+    await writeFile(path.join(taskDir, "task.json"), JSON.stringify(task));
+    await writeFile(path.join(secondDir, "task.json"), JSON.stringify(secondTask));
+    expect((await observeRoom(room.id, { root })).agents.map((member) => member.status)).toEqual([
+      "review",
+      "running",
+    ]);
+
+    secondTask.runs.shift();
+    task.decisions.push({ run_id: "run-1", decision: "supported" });
+    await writeFile(path.join(taskDir, "task.json"), JSON.stringify(task));
+    await writeFile(
+      path.join(secondDir, "task.json"),
+      '{"nested":'.repeat(1100) + "0" + "}".repeat(1100),
+    );
+    expect((await observeRoom(room.id, { root })).agents.map((member) => member.status)).toEqual([
+      "supported",
+      "unknown",
+    ]);
+    await writeFile(path.join(secondDir, "task.json"), "{");
+    expect((await observeRoom(room.id, { root })).agents.map((member) => member.status)).toEqual([
+      "supported",
+      "unknown",
+    ]);
+
+    secondTask.runs[0].status = "finished";
+    secondTask.runs[0].runner_status = "completed";
+    await writeFile(path.join(secondDir, "task.json"), JSON.stringify(secondTask));
+    expect((await observeRoom(room.id, { root })).agents.map((member) => member.status)).toEqual([
+      "supported",
+      "review",
+    ]);
+  });
+
+  it("shows different runs of the same task across rooms", async () => {
+    const { root, room, taskDir, task, run } = await fixture();
+    await dispatchMember(room.id, "haiku-1", { root, taskDir, run, requestId: "first" });
+    task.runs[0].status = "finished";
+    task.runs[0].runner_status = "completed";
+    task.runs.push({
+      request_id: "second",
+      run_id: "run-2",
+      engine: "codex",
+      transport: "executor",
+      status: "active",
+    });
+    await writeFile(path.join(taskDir, "task.json"), JSON.stringify(task));
+    const other = await newRoom(parseTeam("codex:luna:max"), {
+      id: "room-b",
+      cwd: room.cwd,
+      root,
+    });
+    await updateRoom(
+      other.id,
+      (current) => {
+        current.agents[0].dispatch = {
+          taskDir,
+          taskId: task.task_id,
+          requestId: "second",
+          runId: "run-2",
+          transport: "executor",
+        };
+        return current;
+      },
+      { root },
+    );
+    let output = "";
+    await roomsCommand(["list", "--json"], {
+      root,
+      stdout: {
+        write: (value) => {
+          output += value;
+        },
+      },
+    });
+    expect(JSON.parse(output).rooms.map((entry) => [entry.id, entry.agents[0].status])).toEqual([
+      ["room-a", "review"],
+      ["room-b", "running"],
+    ]);
+  });
+
+  it("collects results only while the bound task identity still matches", async () => {
+    const { root, room, taskDir, task, run } = await fixture();
+    await dispatchMember(room.id, "haiku-1", { root, taskDir, run });
+    const collect = async (args) => {
+      if (args[0] === "recover") {
+        task.runs[0].status = "finished";
+        task.runs[0].runner_status = "completed";
+        return task;
+      }
+      return run(args);
+    };
+    expect((await recoverRoom(room.id, { root, run: collect })).agents[0].status).toBe("review");
+    task.task_id = "another-task";
+    await expect(recoverRoom(room.id, { root, run: collect })).rejects.toThrow(
+      "Task identity changed",
+    );
+  });
+});
+
+describe("rooms under a team", () => {
+  it("run only the team's tasks, pass the lead's generation and show the lead", async () => {
+    const root = await directory();
+    const cwd = await directory();
+    const taskDir = await directory();
+    const room = await newRoom(parseTeam("claude:haiku"), {
+      id: "team-room",
+      cwd,
+      root,
+      authority: "team",
+    });
+    const task = {
+      schema: "agent-executor.task.v1",
+      task_id: "t",
+      repository: room.cwd,
+      runs: [],
+      decisions: [],
+    };
+    const calls = [];
+    const run = async (args) => {
+      calls.push(args);
+      if (args[0] === "show") return structuredClone(task);
+      const request = args[args.indexOf("--request-id") + 1];
+      task.runs.push({
+        run_id: "r1",
+        request_id: request,
+        status: "active",
+        engine: "claude",
+        transport: "executor",
+      });
+      return { run_id: "r1" };
+    };
+    await expect(dispatchMember(room.id, "haiku-1", { root, taskDir, run })).rejects.toThrow(
+      "not under the room's team team",
+    );
+    task.authority = { team: "team" };
+    const lead = async (team) => ({
+      team,
+      generation: 3,
+      status: "active",
+      lead: { session: "s" },
+    });
+    await dispatchMember(room.id, "haiku-1", {
+      root,
+      taskDir,
+      run,
+      leadSession: "s",
+      leadGeneration: 3,
+      authority: lead,
+    });
+    const dispatch = calls.find((args) => args[0] === "dispatch");
+    expect(dispatch.slice(dispatch.indexOf("--lead-session"))).toEqual([
+      "--lead-session",
+      "s",
+      "--lead-generation",
+      "3",
+    ]);
+    expect((await observeRoom(room.id, { root, run, authority: lead })).lead.generation).toBe(3);
+  });
+
+  it("passes an optional runner timeout to the coordinator and keeps it with the intent", async () => {
+    const { root, room, taskDir, run } = await fixture();
+    const calls = [];
+    const record = async (args) => {
+      calls.push(args);
+      return run(args);
+    };
+    await dispatchMember(room.id, "haiku-1", { root, taskDir, run: record });
+    expect(calls.find((args) => args[0] === "dispatch")).not.toContain("--timeout");
+    expect((await readRoom(room.id, root)).agents[0].dispatch).not.toHaveProperty("timeout");
+    await dispatchMember(room.id, "luna-1", { root, taskDir, run: record, timeout: "25m" });
+    const timed = calls.findLast((args) => args[0] === "dispatch");
+    expect(timed.slice(timed.indexOf("--timeout"), timed.indexOf("--timeout") + 2)).toEqual([
+      "--timeout",
+      "25m",
+    ]);
+    expect((await readRoom(room.id, root)).agents[1].dispatch.timeout).toBe("25m");
+    await expect(
+      dispatchMember(room.id, "luna-1", { root, taskDir, run: record, timeout: "30m" }),
+    ).rejects.toThrow("Existing dispatch differs: timeout");
+    await expect(
+      dispatchMember(room.id, "haiku-1", { root, taskDir, run: record, timeout: 1500 }),
+    ).rejects.toThrow("--timeout needs a duration");
+  });
+
+  it("passes verify gates and auto-correct rounds to the coordinator and keeps them with the intent", async () => {
+    const { root, room, taskDir, run } = await fixture();
+    const calls = [];
+    const record = async (args) => {
+      calls.push(args);
+      return run(args);
+    };
+    await dispatchMember(room.id, "haiku-1", { root, taskDir, run: record });
+    const plain = calls.find((args) => args[0] === "dispatch");
+    expect(plain).not.toContain("--verify-command");
+    expect(plain).not.toContain("--auto-correct");
+    expect((await readRoom(room.id, root)).agents[0].dispatch).not.toHaveProperty("autoCorrect");
+    const gates = { verifyCommands: ["pnpm check", "pnpm test"], autoCorrect: 1 };
+    await dispatchMember(room.id, "luna-1", {
+      root,
+      taskDir,
+      run: record,
+      kind: "implementation",
+      ...gates,
+    });
+    const gated = calls.findLast((args) => args[0] === "dispatch");
+    expect(gated.slice(gated.indexOf("--verify-command"))).toEqual([
+      "--verify-command",
+      "pnpm check",
+      "--verify-command",
+      "pnpm test",
+      "--auto-correct",
+      "1",
+    ]);
+    expect((await readRoom(room.id, root)).agents[1].dispatch).toMatchObject({
+      verifyCommands: ["pnpm check", "pnpm test"],
+      autoCorrect: "1",
+    });
+    expect((await readRoom(room.id, root)).agents[1].dispatch).not.toHaveProperty("protectPaths");
+    const again = { root, taskDir, run: record, kind: "implementation" };
+    await expect(
+      dispatchMember(room.id, "luna-1", { ...again, ...gates, autoCorrect: 2 }),
+    ).rejects.toThrow("Existing dispatch differs: autoCorrect");
+    await expect(
+      dispatchMember(room.id, "luna-1", { ...again, ...gates, verifyCommands: ["pnpm check"] }),
+    ).rejects.toThrow("Existing dispatch differs: verifyCommands");
+    await dispatchMember(room.id, "luna-1", { ...again, ...gates, autoCorrect: "1" });
+    // The same request, however the number is written.
+    await dispatchMember(room.id, "luna-1", { ...again, ...gates, autoCorrect: "01" });
+    for (const [option, message] of [
+      [{ autoCorrect: "one" }, "--auto-correct needs a number"],
+      [{ autoCorrect: -1 }, "--auto-correct needs a number"],
+      [{ verifyCommands: [" "] }, "--verify-command needs a non-empty command"],
+      [{ protectPaths: [""] }, "--protect-path needs a repository-relative path"],
+      [{ protectPaths: "tests" }, "--protect-path needs a repository-relative path"],
+    ])
+      await expect(
+        dispatchMember(room.id, "haiku-1", { root, taskDir, run: record, ...option }),
+      ).rejects.toThrow(message);
+  });
+});
+
+describe("protected paths", () => {
+  it("passes protect paths to the coordinator and keeps them with the intent", async () => {
+    const { root, room, taskDir, run } = await fixture();
+    const calls = [];
+    const record = async (args) => {
+      calls.push(args);
+      return run(args);
+    };
+    const gated = {
+      root,
+      taskDir,
+      run: record,
+      kind: "implementation",
+      verifyCommands: ["pytest tests/test_x.py"],
+      autoCorrect: 1,
+      protectPaths: ["tests/test_x.py", "tests/fixtures"],
+    };
+    await dispatchMember(room.id, "luna-1", gated);
+    const sent = calls.find((args) => args[0] === "dispatch");
+    expect(sent.slice(sent.indexOf("--verify-command"))).toEqual([
+      "--verify-command",
+      "pytest tests/test_x.py",
+      "--protect-path",
+      "tests/test_x.py",
+      "--protect-path",
+      "tests/fixtures",
+      "--auto-correct",
+      "1",
+    ]);
+    const stored = (await readRoom(room.id, root)).agents[1].dispatch;
+    expect(stored.protectPaths).toEqual(["tests/test_x.py", "tests/fixtures"]);
+    expect(stored).not.toHaveProperty("restore");
+    await dispatchMember(room.id, "luna-1", gated);
+    await expect(
+      dispatchMember(room.id, "luna-1", { ...gated, protectPaths: ["tests/test_x.py"] }),
+    ).rejects.toThrow("Existing dispatch differs: protectPaths");
+  });
+});
+
+describe("refused dispatch", () => {
+  it("undoes a refused dispatch's member edits so the next dispatch starts clean", async () => {
+    const { root, room, taskDir, run } = await fixture();
+    const refusing = async (args) => {
+      if (args[0] === "dispatch") throw new Error("coordinator: refused before launch");
+      return run(args);
+    };
+    const before = (await readRoom(room.id, root)).agents[0];
+    await expect(
+      dispatchMember(room.id, "haiku-1", { root, taskDir, run: refusing, workforceRole: "scout" }),
+    ).rejects.toThrow("refused before launch");
+    const after = (await readRoom(room.id, root)).agents[0];
+    expect(after).not.toHaveProperty("dispatch");
+    expect(after.workforceRole).toBe(before.workforceRole);
+    expect(after.cwd).toBe(before.cwd);
+  });
+
+  it("still undoes the edits when the retry of an unknown outcome is refused", async () => {
+    const { root, room, taskDir, run } = await fixture();
+    let shows = 0;
+    const flaky = async (args) => {
+      if (args[0] === "dispatch") throw new Error("coordinator: refused before launch");
+      // The check after the first refusal fails, so that attempt's outcome is unknown.
+      if (args[0] === "show" && ++shows === 2) throw new Error("coordinator: task lock busy");
+      return run(args);
+    };
+    const before = (await readRoom(room.id, root)).agents[0];
+    const attempt = { root, taskDir, run: flaky, requestId: "flaky-1", workforceRole: "scout" };
+    await expect(dispatchMember(room.id, "haiku-1", attempt)).rejects.toThrow(
+      "refused before launch",
+    );
+    const kept = (await readRoom(room.id, root)).agents[0];
+    expect(kept.dispatch.requestId).toBe("flaky-1");
+    expect(kept.workforceRole).toBe("scout");
+    await expect(dispatchMember(room.id, "haiku-1", attempt)).rejects.toThrow(
+      "refused before launch",
+    );
+    const after = (await readRoom(room.id, root)).agents[0];
+    expect(after).not.toHaveProperty("dispatch");
+    expect(after.workforceRole).toBe(before.workforceRole);
+    expect(after.cwd).toBe(before.cwd);
+  });
+
+  it("refuses a retry that would change the member it runs as, leaving the member alone", async () => {
+    const { root, room, taskDir, run } = await fixture();
+    const first = { root, taskDir, run, requestId: "role-1", kind: "implementation" };
+    await dispatchMember(room.id, "haiku-1", { ...first, workforceRole: "builder" });
+    const dispatched = (await readRoom(room.id, root)).agents[0];
+    await expect(
+      dispatchMember(room.id, "haiku-1", { ...first, workforceRole: "scout" }),
+    ).rejects.toThrow("Existing dispatch differs: workforceRole");
+    await expect(
+      dispatchMember(room.id, "haiku-1", { ...first, workforceRole: "nonsense" }),
+    ).rejects.toThrow("Invalid workforce role");
+    const after = (await readRoom(room.id, root)).agents[0];
+    expect(after.workforceRole).toBe(dispatched.workforceRole);
+    expect(after.dispatch).toEqual(dispatched.dispatch);
+    // The same request, member and folder: an idempotent retry.
+    await dispatchMember(room.id, "haiku-1", { ...first, workforceRole: "builder", cwd: room.cwd });
+  });
+});
+
+describe("room CLI", () => {
+  it("passes --time-budget to init-task and --timeout to dispatch and launch", async () => {
+    const { root, room, taskDir, run } = await fixture();
+    const calls = [];
+    const record = async (args) => {
+      calls.push(args);
+      return args[0] === "init" ? { task_id: "task-a" } : run(args);
+    };
+    const stdout = { write: () => {} };
+    const init = [
+      "init-task",
+      "--task-spec",
+      path.join(taskDir, "spec.json"),
+      "--task-dir",
+      taskDir,
+    ];
+    await roomsCommand([...init, "--host", "claude"], { stdout, root, run: record });
+    await roomsCommand([...init, "--host", "claude", "--time-budget", "2h"], {
+      stdout,
+      root,
+      run: record,
+    });
+    const [plain, budgeted] = calls.filter((args) => args[0] === "init");
+    expect(plain).not.toContain("--time-budget");
+    expect(budgeted.slice(-2)).toEqual(["--time-budget", "2h"]);
+    await roomsCommand(
+      [
+        "dispatch",
+        "--room",
+        room.id,
+        "--member",
+        "haiku-1",
+        "--task-dir",
+        taskDir,
+        "--timeout",
+        "25m",
+      ],
+      { stdout, root, run: record },
+    );
+    const plan = path.join(taskDir, "plan.json");
+    await writeFile(plan, JSON.stringify({ members: [{ id: "luna-1", taskDir, timeout: "40m" }] }));
+    await roomsCommand(["launch", "--room", room.id, "--plan", plan], {
+      stdout,
+      root,
+      run: record,
+    });
+    const timeouts = calls
+      .filter((args) => args[0] === "dispatch")
+      .map((args) => args[args.indexOf("--timeout") + 1]);
+    expect(timeouts).toEqual(["25m", "40m"]);
+  });
+
+  it("passes repeated --verify-command, --protect-path and --auto-correct to dispatch and launch", async () => {
+    const { root, room, taskDir, run } = await fixture();
+    const calls = [];
+    const record = async (args) => {
+      calls.push(args);
+      return run(args);
+    };
+    const stdout = { write: () => {} };
+    await roomsCommand(
+      [
+        "dispatch",
+        "--room",
+        room.id,
+        "--member",
+        "haiku-1",
+        "--task-dir",
+        taskDir,
+        "--kind",
+        "implementation",
+        "--verify-command",
+        "pnpm check",
+        "--verify-command",
+        "pnpm test",
+        "--protect-path",
+        "tests/a.py",
+        "--protect-path",
+        "tests/b.py",
+        "--auto-correct",
+        "2",
+      ],
+      { stdout, root, run: record },
+    );
+    const plan = path.join(taskDir, "plan.json");
+    await writeFile(
+      plan,
+      JSON.stringify({
+        members: [
+          {
+            id: "luna-1",
+            taskDir,
+            kind: "implementation",
+            verifyCommands: ["gen.py apply --dry-run"],
+            autoCorrect: 1,
+            protectPaths: ["tests/test_gen.py"],
+          },
+        ],
+      }),
+    );
+    await roomsCommand(["launch", "--room", room.id, "--plan", plan], {
+      stdout,
+      root,
+      run: record,
+    });
+    const [cli, launched] = calls
+      .filter((args) => args[0] === "dispatch")
+      .map((args) => args.slice(args.indexOf("--verify-command")));
+    expect(cli).toEqual([
+      "--verify-command",
+      "pnpm check",
+      "--verify-command",
+      "pnpm test",
+      "--protect-path",
+      "tests/a.py",
+      "--protect-path",
+      "tests/b.py",
+      "--auto-correct",
+      "2",
+    ]);
+    expect(launched).toEqual([
+      "--verify-command",
+      "gen.py apply --dry-run",
+      "--protect-path",
+      "tests/test_gen.py",
+      "--auto-correct",
+      "1",
+    ]);
+  });
+
+  it("forwards explicit --allow-credits and launch allowCredits without inheriting across continue", async () => {
+    const { root, room, taskDir, task, run } = await fixture();
+    const calls = [];
+    const record = async (args) => {
+      calls.push(args);
+      return run(args);
+    };
+    const lastDispatch = () => calls.findLast((args) => args[0] === "dispatch");
+    const stdout = { write: () => {} };
+
+    // Default dispatch and explicit false omit --allow-credits and stored allowCredits.
+    await dispatchMember(room.id, "haiku-1", { root, taskDir, run: record, requestId: "plain" });
+    expect(lastDispatch()).not.toContain("--allow-credits");
+    expect((await readRoom(room.id, root)).agents[0].dispatch).not.toHaveProperty("allowCredits");
+    await dispatchMember(room.id, "haiku-1", {
+      root,
+      taskDir,
+      run: record,
+      requestId: "plain",
+      allowCredits: false,
+    });
+
+    // CLI dispatch --allow-credits forwards to coordinator and checks retry idempotency.
+    await roomsCommand(
+      [
+        "dispatch",
+        "--room",
+        room.id,
+        "--member",
+        "luna-1",
+        "--task-dir",
+        taskDir,
+        "--request-id",
+        "luna-credits",
+        "--allow-credits",
+      ],
+      { stdout, root, run: record },
+    );
+    expect(lastDispatch()).toContain("--allow-credits");
+    expect((await readRoom(room.id, root)).agents[1].dispatch.allowCredits).toBe(true);
+    await roomsCommand(
+      [
+        "dispatch",
+        "--room",
+        room.id,
+        "--member",
+        "luna-1",
+        "--task-dir",
+        taskDir,
+        "--request-id",
+        "luna-credits",
+        "--allow-credits",
+      ],
+      { stdout, root, run: record },
+    );
+    await expect(
+      dispatchMember(room.id, "luna-1", {
+        root,
+        taskDir,
+        run: record,
+        requestId: "luna-credits",
+      }),
+    ).rejects.toThrow("Existing dispatch differs: allowCredits");
+    await expect(
+      dispatchMember(room.id, "haiku-1", {
+        root,
+        taskDir,
+        run: record,
+        requestId: "plain",
+        allowCredits: true,
+      }),
+    ).rejects.toThrow("Existing dispatch differs: allowCredits");
+
+    // Validation & transport guards reject non-booleans, native transport, and launch CLI flag.
+    for (const bad of ["true", "false", 1, null]) {
+      await expect(
+        dispatchMember(room.id, "haiku-1", { root, taskDir, run: record, allowCredits: bad }),
+      ).rejects.toThrow("must be a boolean");
+    }
+    await expect(
+      dispatchMember(room.id, "haiku-1", {
+        root,
+        taskDir,
+        run: record,
+        transport: "native",
+        allowCredits: true,
+      }),
+    ).rejects.toThrow("--allow-credits applies to executor runs");
+    await expect(
+      roomsCommand(["show", "--room", room.id, "--allow-credits"], { stdout, root, run: record }),
+    ).rejects.toThrow("--allow-credits is only valid on dispatch or launch");
+    const plan = path.join(taskDir, "credits-plan.json");
+    await writeFile(plan, JSON.stringify({ members: [{ id: "luna-1", taskDir }] }));
+    await expect(
+      roomsCommand(["launch", "--room", room.id, "--plan", plan, "--allow-credits"], {
+        stdout,
+        root,
+        run: record,
+      }),
+    ).rejects.toThrow(
+      "--allow-credits on launch requires a member in the launch plan with allowCredits: true",
+    );
+
+    // Launch plan rejects non-boolean strings, requires --allow-credits when allowCredits: true, and forwards it.
+    await roomsCommand(["add", "--room", room.id, "--team", "codex:sol"], { stdout, root });
+    await writeFile(
+      plan,
+      JSON.stringify({ members: [{ id: "sol-1", taskDir, allowCredits: "true" }] }),
+    );
+    await expect(
+      roomsCommand(["launch", "--room", room.id, "--plan", plan], { stdout, root, run: record }),
+    ).rejects.toThrow("must be a boolean");
+    await writeFile(
+      plan,
+      JSON.stringify({ members: [{ id: "sol-1", taskDir, allowCredits: true }] }),
+    );
+    await expect(
+      roomsCommand(["launch", "--room", room.id, "--plan", plan], { stdout, root, run: record }),
+    ).rejects.toThrow("pass --allow-credits");
+    await roomsCommand(["launch", "--room", room.id, "--plan", plan, "--allow-credits"], {
+      stdout,
+      root,
+      run: record,
+    });
+    expect(lastDispatch()).toContain("--allow-credits");
+    expect((await readRoom(room.id, root)).agents[2].dispatch.allowCredits).toBe(true);
+
+    // Continuing without --allow-credits drops the allowance; refusal before launch restores it.
+    task.runs[1].status = "finished";
+    task.decisions.push({ run_id: "run-2", decision: "accept" });
+    const nextSpec = path.join(taskDir, "next-spec.json");
+    await writeFile(nextSpec, JSON.stringify({ objective: "Follow up" }));
+    const failingContinue = async (args) => {
+      if (args[0] === "dispatch") throw new Error("refused before launch");
+      return record(args);
+    };
+    await expect(
+      dispatchMember(room.id, "luna-1", {
+        root,
+        taskDir,
+        taskSpec: nextSpec,
+        kind: "continue",
+        requestId: "luna-continue-refused",
+        run: failingContinue,
+      }),
+    ).rejects.toThrow("refused before launch");
+    expect((await readRoom(room.id, root)).agents[1].dispatch.allowCredits).toBe(true);
+
+    await dispatchMember(room.id, "luna-1", {
+      root,
+      taskDir,
+      taskSpec: nextSpec,
+      kind: "continue",
+      requestId: "luna-continue",
+      run: record,
+    });
+    expect(lastDispatch()).not.toContain("--allow-credits");
+    expect((await readRoom(room.id, root)).agents[1].dispatch).not.toHaveProperty("allowCredits");
+
+    task.runs[3].status = "finished";
+    task.decisions.push({ run_id: "run-4", decision: "accept" });
+    await dispatchMember(room.id, "luna-1", {
+      root,
+      taskDir,
+      taskSpec: nextSpec,
+      kind: "continue",
+      requestId: "luna-continue-credits",
+      allowCredits: true,
+      run: record,
+    });
+    expect(lastDispatch()).toContain("--allow-credits");
+    expect((await readRoom(room.id, root)).agents[1].dispatch.allowCredits).toBe(true);
+  });
+
+  it("creates and lists rooms", async () => {
+    const root = await directory();
+    const cwd = await directory();
+    let output = "";
+    const stdout = {
+      write: (text) => {
+        output += text;
+      },
+    };
+    await roomsCommand(
+      ["create", "--id", "new", "--cwd", cwd, "--team", "claude:haiku", "--group", "Fixes"],
+      { stdout, root },
+    );
+    expect(JSON.parse(output).group).toBe("Fixes");
+    output = "";
+    await roomsCommand(["list", "--json"], { stdout, root });
+    expect(JSON.parse(output).rooms.map((room) => room.id)).toEqual(["new"]);
+  });
+
+  it("propagates herdrPaneId and paneId onto observed agents and ignores legacy progress-v1 paths", async () => {
+    const rawRoot = await directory();
+    const root = await realpath(rawRoot);
+    const rawCwd = await directory();
+    const cwd = await realpath(rawCwd);
+    const room = await newRoom(parseTeam("claude:haiku"), {
+      id: "room-herdr",
+      cwd,
+      root,
+    });
+    const sessionKey = "worker-session-1";
+    await mkdir(path.join(root, "peers"), { recursive: true });
+    await mkdir(path.join(path.dirname(root), "progress-v1"), { recursive: true });
+    const nowIso = new Date().toISOString();
+    await writeFile(
+      path.join(root, "peers", `${sessionKey}.json`),
+      JSON.stringify({
+        schema: "agent-executor.peer.v1",
+        session: sessionKey,
+        name: "gribble-claude-haiku-orkest-11",
+        harness: "claude",
+        cwd,
+        pid: process.pid,
+        herdrPaneId: "herdr-pane-42",
+        herdrEndpoint: "/tmp/observed-herdr.sock",
+        paneId: "%42",
+        startedAt: nowIso,
+        lastSeenAt: nowIso,
+      }),
+    );
+    await writeFile(
+      path.join(path.dirname(root), "progress-v1", `${sessionKey}.json`),
+      JSON.stringify({
+        schema: "orchestrate.progress.v1",
+        session: sessionKey,
+        harness: "claude",
+        machine: hostname(),
+        checkout: cwd,
+        goal: "Legacy goal",
+        task: "Legacy task should be ignored",
+        stage: "blocked",
+        updatedAt: nowIso,
+      }),
+    );
+    await updateRoom(
+      room.id,
+      (current) => {
+        current.agents[0].session = {
+          id: sessionKey,
+          engine: "claude",
+          machine: hostname(),
+          cwd,
+        };
+        return current;
+      },
+      { root },
+    );
+
+    const observed = await observeRoom(room.id, { root });
+    expect(observed.agents[0].herdrPaneId).toBe("herdr-pane-42");
+    expect(observed.agents[0].herdrEndpoint).toBe("/tmp/observed-herdr.sock");
+    expect(observed.agents[0].paneId).toBe("%42");
+    expect(observed.agents[0].progress.task).not.toBe("Legacy task should be ignored");
+  });
+
+  it("keeps an idle session separate from its saved review phase", async () => {
+    const { root, room, cwd } = await fixture();
+    const session = "idle-reviewer";
+    const now = new Date().toISOString();
+    await mkdir(path.join(root, "peers"), { recursive: true });
+    await mkdir(path.join(root, "progress"), { recursive: true });
+    await writeFile(
+      path.join(root, "peers", `${session}.json`),
+      JSON.stringify({
+        schema: "agent-executor.peer.v1",
+        session,
+        name: "reviewer",
+        harness: "claude",
+        state: "idle",
+        accountHome: path.join(root, "claude-home"),
+        cwd,
+        pid: process.pid,
+        startedAt: now,
+        lastSeenAt: now,
+      }),
+    );
+    await writeFile(
+      path.join(root, "progress", `${session}.json`),
+      JSON.stringify({
+        schema: "orchestrate.progress.v1",
+        session,
+        harness: "claude",
+        machine: hostname(),
+        accountHome: path.join(root, "claude-home"),
+        checkout: cwd,
+        goal: "Inspect cache",
+        task: "Review result",
+        stage: "review",
+        updatedAt: now,
+      }),
+    );
+    await updateRoom(
+      room.id,
+      (current) => {
+        current.agents[0].session = { id: session, engine: "claude", machine: hostname(), cwd };
+        return current;
+      },
+      { root },
+    );
+    const observed = await observeRoom(room.id, { root });
+    expect(observed.agents[0]).toMatchObject({
+      status: "review",
+      runtimeState: "idle",
+      progress: { stage: "review" },
+      activitySource: {
+        engine: "claude",
+        session,
+        accountHome: path.join(root, "claude-home"),
+      },
+    });
+  });
+
+  it("auto-discovers live unbound native peers in the room checkout without mutating persisted room json", async () => {
+    const rawRoot = await directory();
+    const root = await realpath(rawRoot);
+    const rawCwd = await directory();
+    const cwd = await realpath(rawCwd);
+    const room = await newRoom(parseTeam("claude:haiku"), {
+      id: "room-native-auto",
+      cwd,
+      root,
+      title: "Upgrade Swarm View",
+    });
+    const otherRoom = await newRoom(parseTeam("codex:luna"), {
+      id: "room-other",
+      cwd,
+      root,
+    });
+    await updateRoom(
+      room.id,
+      (current) => {
+        current.herdrEndpoint = "/tmp/room-herdr.sock";
+        current.conductor.herdrWorkspaceId = "w1";
+        return current;
+      },
+      { root },
+    );
+    await mkdir(path.join(root, "peers"), { recursive: true });
+    await mkdir(path.join(root, "progress"), { recursive: true });
+    const nowIso = new Date().toISOString();
+
+    // Bind another room's agent to ensure observeRoom skips sessions claimed by other rooms:
+    await updateRoom(
+      otherRoom.id,
+      (current) => {
+        current.agents[0].session = {
+          id: "claimed-by-other-room",
+          engine: "codex",
+          machine: hostname(),
+          cwd,
+        };
+        return current;
+      },
+      { root },
+    );
+
+    // Unbound native peer 1: started after room creation with an active progress record
+    await writeFile(
+      path.join(root, "peers", "native-sub-1.json"),
+      JSON.stringify({
+        schema: "agent-executor.peer.v1",
+        session: "native-sub-1",
+        name: "gribble-gemini-3-flash-orkest-ab",
+        shortName: "gribble",
+        harness: "gemini",
+        accountHome: path.join(root, "gemini-home"),
+        model: "gemini-3.8-flash-high",
+        effort: "high",
+        state: "busy",
+        cwd,
+        pid: process.pid,
+        branch: "feat/swarm-view",
+        herdrPaneId: "herdr-pane-77",
+        herdrWorkspaceId: "w1",
+        herdrEndpoint: "/tmp/room-herdr.sock",
+        startedAt: nowIso,
+        lastSeenAt: nowIso,
+      }),
+    );
+    await writeFile(
+      path.join(root, "progress", "native-sub-1.json"),
+      JSON.stringify({
+        schema: "orchestrate.progress.v1",
+        session: "native-sub-1",
+        harness: "gemini",
+        machine: hostname(),
+        accountHome: path.join(root, "gemini-home"),
+        checkout: cwd,
+        role: "scout",
+        goal: "Upgrade Swarm View",
+        task: "Auditing native subagent discovery",
+        stage: "working",
+        updatedAt: nowIso,
+      }),
+    );
+
+    await writeFile(
+      path.join(root, "peers", "other-server.json"),
+      JSON.stringify({
+        schema: "agent-executor.peer.v1",
+        session: "other-server",
+        name: "other-codex-orkest-dd",
+        harness: "codex",
+        state: "busy",
+        cwd,
+        pid: process.pid,
+        herdrPaneId: "herdr-pane-77",
+        herdrWorkspaceId: "w1",
+        herdrEndpoint: "/tmp/another-herdr.sock",
+        startedAt: nowIso,
+        lastSeenAt: nowIso,
+      }),
+    );
+
+    // Unbound native peer 2: claimed by other room (must be excluded)
+    await writeFile(
+      path.join(root, "peers", "claimed-by-other-room.json"),
+      JSON.stringify({
+        schema: "agent-executor.peer.v1",
+        session: "claimed-by-other-room",
+        name: "other-codex-orkest-cc",
+        harness: "codex",
+        state: "busy",
+        cwd,
+        pid: process.pid,
+        startedAt: nowIso,
+        lastSeenAt: nowIso,
+      }),
+    );
+
+    const observed = await observeRoom(room.id, { root });
+    const nativeAgent = observed.agents.find((agent) => agent.native === true);
+    expect(nativeAgent).toBeDefined();
+    expect(nativeAgent.id).toBe("gribble");
+    expect(nativeAgent.engine).toBe("agy");
+    expect(nativeAgent.workforceRole).toBe("scout");
+    expect(nativeAgent.status).toBe("running");
+    expect(nativeAgent.branch).toBe("feat/swarm-view");
+    expect(nativeAgent.herdrPaneId).toBe("herdr-pane-77");
+    expect(nativeAgent.herdrEndpoint).toBe("/tmp/room-herdr.sock");
+    expect(observed.agents.some((agent) => agent.nativeSession === "other-server")).toBe(false);
+    expect(nativeAgent.progress.task).toBe("Auditing native subagent discovery");
+    expect(nativeAgent.activitySource).toEqual({
+      engine: "agy",
+      session: "native-sub-1",
+      accountHome: path.join(root, "gemini-home"),
+      parentSession: undefined,
+      cwd,
+      startedAt: nowIso,
+    });
+    expect(observed.agents.some((agent) => agent.nativeSession === "claimed-by-other-room")).toBe(
+      false,
+    );
+
+    // Persisted room on disk remains untouched (only 1 declared agent):
+    const onDisk = await readRoom(room.id, root);
+    expect(onDisk.agents).toHaveLength(1);
+  });
+
+  it("matches exact checkouts, conductor subagents, and recorded member worktrees only", async () => {
+    const root = await realpath(await directory());
+    const mainCheckout = await directory();
+    const rawRoomCwd = path.join(mainCheckout, ".worktrees", "room");
+    const rawSiblingCheckout = path.join(mainCheckout, ".worktrees", "sibling");
+    await Promise.all([
+      mkdir(rawRoomCwd, { recursive: true }),
+      mkdir(rawSiblingCheckout, { recursive: true }),
+    ]);
+    const roomCwd = await realpath(rawRoomCwd);
+    const siblingCheckout = await realpath(rawSiblingCheckout);
+    const rawNestedCheckout = path.join(roomCwd, ".claude", "worktrees", "untracked");
+    await mkdir(rawNestedCheckout, { recursive: true });
+    const nestedCheckout = await realpath(rawNestedCheckout);
+    const rawRecordedWorktreeInside = path.join(roomCwd, ".worktrees", "recorded");
+    await mkdir(rawRecordedWorktreeInside, { recursive: true });
+    const recordedWorktreeInside = await realpath(rawRecordedWorktreeInside);
+    const externalWorktree = await realpath(await directory());
+    const externalSideCwd = await realpath(await directory());
+    const externalSubagentCwd = await realpath(await directory());
+    const room = await newRoom(parseTeam("codex:luna*3"), {
+      id: "room-native-membership",
+      cwd: roomCwd,
+      root,
+      title: "Room membership",
+    });
+    room.conductor.session = { id: "room-conductor-session" };
+    room.conductor.pid = process.pid;
+    room.conductor.herdrWorkspaceId = "room-workspace";
+    room.conductor.herdrEndpoint = "/tmp/room-endpoint.sock";
+    room.herdrEndpoint = "/tmp/room-endpoint.sock";
+    room.agents[0].worktree = { path: externalWorktree, disposable: false };
+    room.agents[1].sideId = "side-member-1";
+    room.agents[1].cwd = externalSideCwd;
+    room.agents[2].worktree = { path: recordedWorktreeInside, disposable: false };
+
+    await mkdir(path.join(root, "peers"), { recursive: true });
+    await mkdir(path.join(root, "progress"), { recursive: true });
+    const now = new Date();
+    const nowIso = now.toISOString();
+    const staleStartedAt = new Date(now.getTime() - 10 * 60_000).toISOString();
+    const writePeer = async (session, cwd, startedAt, extra = {}) => {
+      await writeFile(
+        path.join(root, "peers", `${session}.json`),
+        JSON.stringify({
+          schema: "agent-executor.peer.v1",
+          session,
+          name: `${session}-repo-168`,
+          harness: "codex",
+          state: "busy",
+          cwd,
+          pid: process.pid,
+          startedAt,
+          lastSeenAt: nowIso,
+          ...extra,
+        }),
+      );
+    };
+
+    await Promise.all([
+      writePeer("nested-unrelated", nestedCheckout, nowIso, {
+        parentSession: "another-conductor-session",
+      }),
+      writePeer("recorded-worktree", externalWorktree, staleStartedAt),
+      writePeer("recorded-worktree-inside", recordedWorktreeInside, staleStartedAt),
+      writePeer("recorded-side-cwd", externalSideCwd, staleStartedAt),
+      writePeer("conductor-subagent", externalSubagentCwd, staleStartedAt, {
+        parentSession: "room-conductor-session",
+      }),
+      writePeer("room-checkout-started", roomCwd, nowIso),
+      writePeer("room-checkout-old", roomCwd, staleStartedAt),
+      // A script's delegated run that was already working when the room was opened.
+      writePeer("room-checkout-delegated", roomCwd, staleStartedAt, {
+        delegatedRun: "runner-already-working",
+      }),
+      writePeer("room-checkout-shared", roomCwd, staleStartedAt, { sharedProcess: true }),
+      writePeer("room-checkout-workspace", roomCwd, staleStartedAt, {
+        herdrWorkspaceId: "room-workspace",
+        herdrEndpoint: "/tmp/room-endpoint.sock",
+      }),
+      writePeer("main-checkout", mainCheckout, nowIso),
+      writePeer("sibling-checkout", siblingCheckout, nowIso),
+    ]);
+
+    const observed = await observeRoom(room, { root });
+    const nativeSessions = new Set(
+      observed.agents.map((agent) => agent.nativeSession).filter(Boolean),
+    );
+    expect([...nativeSessions].sort((left, right) => left.localeCompare(right))).toEqual([
+      "conductor-subagent",
+      "recorded-side-cwd",
+      "recorded-worktree",
+      "recorded-worktree-inside",
+      "room-checkout-delegated",
+      "room-checkout-shared",
+      "room-checkout-started",
+      "room-checkout-workspace",
+    ]);
+  });
+
+  it("shows what a delegated run worker is doing from its run's output", async () => {
+    const root = await realpath(await directory());
+    const cwd = await realpath(await directory());
+    const outDir = await realpath(await directory());
+    const room = await newRoom(parseTeam("codex:luna"), { id: "room-delegated-tail", cwd, root });
+    await mkdir(path.join(root, "peers"), { recursive: true });
+    const now = new Date().toISOString();
+    const earlier = new Date(Date.now() - 600_000).toISOString();
+    await writeFile(
+      path.join(root, "peers", "delegated-worker.json"),
+      JSON.stringify({
+        schema: "agent-executor.peer.v1",
+        session: "delegated-worker",
+        name: "delegated-worker-repo",
+        harness: "codex",
+        state: "busy",
+        cwd,
+        pid: process.pid,
+        startedAt: earlier,
+        lastSeenAt: now,
+        delegatedRun: "run-tail",
+      }),
+    );
+    await writeFile(
+      path.join(root, "peers", "run-run-tail-worker.json"),
+      JSON.stringify({ resultPath: path.join(outDir, "result.json") }),
+    );
+    await writeFile(
+      path.join(outDir, "stdout.txt"),
+      `${JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "Checking the cohort" } })}\n`,
+    );
+    const observed = await observeRoom(room, { root });
+    const worker = observed.agents.find((agent) => agent.nativeSession === "delegated-worker");
+    expect(worker.output).toContain("Checking the cohort");
+  });
+
+  it("nests discovered peers under their owning peer, falls back to conductor, and breaks parent cycles", async () => {
+    const root = await realpath(await directory());
+    const cwd = await realpath(await directory());
+    const room = await newRoom(parseTeam("codex:luna"), {
+      id: "room-discovered-parents",
+      cwd,
+      root,
+    });
+    room.conductor.session = { id: "root-session", engine: "codex", machine: hostname(), cwd };
+    room.conductor.nativeSession = "root-session";
+    await mkdir(path.join(root, "peers"), { recursive: true });
+    const startedAt = new Date().toISOString();
+    const writePeer = async (session, person, parentSession) => {
+      await writeFile(
+        path.join(root, "peers", `${session}.json`),
+        JSON.stringify({
+          schema: "agent-executor.peer.v1",
+          session,
+          name: `${person}-codex-luna-orkest-188`,
+          person,
+          shortName: person,
+          harness: "codex",
+          state: "busy",
+          cwd,
+          checkout: cwd,
+          pid: process.pid,
+          machine: hostname(),
+          parentSession,
+          startedAt,
+          lastSeenAt: startedAt,
+        }),
+      );
+    };
+    // The child sorts before its owner, so the relationship requires a second pass.
+    await writePeer("a-child-session", "child-worker", "z-owner-session");
+    await writePeer("z-owner-session", "owner-worker", "root-session");
+    await writePeer("orphan-session", "orphan-worker", "unowned-session");
+    await writePeer("cycle-a-session", "cycle-a", "cycle-b-session");
+    await writePeer("cycle-b-session", "cycle-b", "cycle-a-session");
+
+    const observed = await observeRoom(room, { root });
+    const bySession = new Map(observed.agents.map((agent) => [agent.nativeSession, agent]));
+    expect(bySession.get("z-owner-session").parent).toBe("conductor");
+    expect(bySession.get("a-child-session").parent).toBe(bySession.get("z-owner-session").id);
+    expect(bySession.get("orphan-session").parent).toBe("conductor");
+    expect(bySession.get("cycle-a-session").parent).toBe("conductor");
+    expect(bySession.get("cycle-b-session").parent).toBe("conductor");
+  });
+
+  it("nests transcript-discovered Claude subagents under their owning worker session", async () => {
+    const root = await realpath(await directory());
+    const cwd = await realpath(await directory());
+    const accountHome = await directory();
+    const parentSession = "worker-parent-session";
+    const slug = cwd.replaceAll(/[^A-Za-z0-9-]/gu, "-");
+    const subagentsDir = path.join(accountHome, "projects", slug, parentSession, "subagents");
+    await mkdir(subagentsDir, { recursive: true });
+    await mkdir(path.join(root, "peers"), { recursive: true });
+    const room = await newRoom(parseTeam("codex:luna"), {
+      id: "room-transcript-parent",
+      cwd,
+      root,
+    });
+    const startedAt = new Date().toISOString();
+    room.conductor.session = { id: "root-session", engine: "codex", machine: hostname(), cwd };
+    await writeFile(
+      path.join(root, "peers", `${parentSession}.json`),
+      JSON.stringify({
+        schema: "agent-executor.peer.v1",
+        session: parentSession,
+        name: "worker-parent-claude-sonnet-orkest-188",
+        person: "worker-parent",
+        shortName: "worker-parent",
+        harness: "claude",
+        model: "claude-sonnet-5-5",
+        state: "busy",
+        cwd,
+        checkout: cwd,
+        accountHome,
+        pid: process.pid,
+        machine: hostname(),
+        parentSession: "root-session",
+        startedAt,
+        lastSeenAt: startedAt,
+      }),
+    );
+    await writeFile(
+      path.join(subagentsDir, "agent-childtranscript.meta.json"),
+      JSON.stringify({
+        agentType: "Explore",
+        model: "claude-sonnet-5-5",
+        description: "Inspect the worker tree",
+      }),
+    );
+    await writeFile(
+      path.join(subagentsDir, "agent-childtranscript.jsonl"),
+      `${JSON.stringify({ message: { model: "claude-sonnet-5-5" } })}\n`,
+    );
+
+    const observed = await observeRoom(room, { root });
+    const worker = observed.agents.find((agent) => agent.nativeSession === parentSession);
+    const transcriptChild = observed.agents.find(
+      (agent) => agent.nativeSession === "subagent-childtranscript",
+    );
+    expect(worker).toBeDefined();
+    expect(transcriptChild).toMatchObject({ parent: worker.id, native: true });
+    expect(transcriptChild.activitySource.parentSession).toBe(parentSession);
+  });
+
+  it("exposes the room membership predicate for direct boundary checks", () => {
+    const room = { conductor: { session: { id: "conductor-session" } } };
+    const memberPaths = new Set(["/other/worktree"]);
+    const isMember = (peerCwd, peer) =>
+      belongsToRoom({ peerCwd, roomCwd: "/repo/.worktrees/room", peer, room, memberPaths });
+
+    expect(isMember("/repo/.worktrees/room", {})).toBe(true);
+    expect(isMember("/other/worktree", {})).toBe(true);
+    expect(isMember("/external/subagent", { parentSession: "conductor-session" })).toBe(true);
+    expect(
+      isMember("/repo/.worktrees/room/.claude/worktrees/unrelated", {
+        parentSession: "another-session",
+      }),
+    ).toBe(false);
+    expect(isMember("/repo", {})).toBe(false);
+  });
+
+  it("enriches active Claude Code background subagents from .meta.json/.jsonl and retains completed subagents", async () => {
+    const rawRoot = await directory();
+    const root = await realpath(rawRoot);
+    const rawCwd = await directory();
+    const cwd = await realpath(rawCwd);
+    const accountHome = await directory();
+    const parentSession = "aefa8a6b-23c2-42d9-b932-5205dcf251d2";
+    const slug = cwd.replaceAll(/[^A-Za-z0-9-]/gu, "-");
+    const subagentsDir = path.join(accountHome, "projects", slug, parentSession, "subagents");
+    await mkdir(subagentsDir, { recursive: true });
+    await mkdir(path.join(root, "peers"), { recursive: true });
+    await mkdir(path.join(root, "progress"), { recursive: true });
+
+    const room = await newRoom([], {
+      id: "room-claude-subagents",
+      cwd,
+      root,
+      title: "Swarm Dashboard Polish",
+    });
+    await updateRoom(
+      room.id,
+      (current) => {
+        current.conductor.name = "floomp";
+        current.conductor.person = "floomp";
+        current.conductor.engine = "claude";
+        current.conductor.model = "claude-opus-5-5";
+        current.conductor.session = {
+          id: parentSession,
+          engine: "claude",
+          machine: hostname(),
+          cwd,
+        };
+        return current;
+      },
+      { root },
+    );
+
+    const staleIso = new Date(Date.now() - 4 * 60_000).toISOString();
+    // Active subagent peer written by old SubagentStart (wrong parent model & focus, stale lastSeenAt)
+    await writeFile(
+      path.join(root, "peers", "subagent-a22a04ba7fa8ef95e.json"),
+      JSON.stringify({
+        schema: "agent-executor.peer.v1",
+        session: "subagent-a22a04ba7fa8ef95e",
+        name: "ploomix-claude-opus-5-5-orkest-da",
+        person: "ploomix",
+        shortName: "ploomix",
+        harness: "claude",
+        model: "claude-opus-5-5",
+        state: "busy",
+        cwd,
+        checkout: cwd,
+        accountHome,
+        pid: process.pid,
+        sharedProcess: true,
+        isSubagent: true,
+        parentSession,
+        focus: "native general-purpose",
+        startedAt: staleIso,
+        lastSeenAt: staleIso,
+      }),
+    );
+    await writeFile(
+      path.join(subagentsDir, "agent-a22a04ba7fa8ef95e.meta.json"),
+      JSON.stringify({
+        agentType: "general-purpose",
+        model: "claude-fable-5-1",
+        description: "Fable writes layout spec",
+      }),
+    );
+    await writeFile(
+      path.join(subagentsDir, "agent-a22a04ba7fa8ef95e.jsonl"),
+      `${JSON.stringify({ message: { model: "claude-fable-5-1" } })}\n`,
+    );
+
+    // Completed subagent whose peer file was deleted by SubagentStop
+    await writeFile(
+      path.join(subagentsDir, "agent-a24fc1a93a67c7e27.meta.json"),
+      JSON.stringify({
+        agentType: "general-purpose",
+        model: "sonnet",
+        description: "Sonnet implements layout Phase 1",
+        finished: true,
+      }),
+    );
+    await writeFile(
+      path.join(subagentsDir, "agent-a24fc1a93a67c7e27.jsonl"),
+      `${JSON.stringify({ message: { model: "claude-sonnet-5-5" } })}\n`,
+    );
+
+    // Stopped subagents: no stop hook ran, so the metadata lacks `finished` and a peer record, where
+    // one exists, still says busy. Only the transcript's last entry shows the interruption.
+    const interruption = JSON.stringify({
+      type: "user",
+      message: { content: [{ type: "text", text: "[Request interrupted by user]" }] },
+    });
+    for (const agentId of ["a31stoppedwithpeer", "a32stoppednopeer"]) {
+      await writeFile(
+        path.join(subagentsDir, `agent-${agentId}.meta.json`),
+        JSON.stringify({ agentType: "general-purpose", description: `Stopped ${agentId}` }),
+      );
+      await writeFile(
+        path.join(subagentsDir, `agent-${agentId}.jsonl`),
+        `${JSON.stringify({ message: { model: "claude-fable-5-2" } })}\n${interruption}\n`,
+      );
+    }
+    await writeFile(
+      path.join(root, "peers", "subagent-a31stoppedwithpeer.json"),
+      JSON.stringify({
+        schema: "agent-executor.peer.v1",
+        session: "subagent-a31stoppedwithpeer",
+        name: "stitax-orkest-ae",
+        harness: "claude",
+        state: "busy",
+        cwd,
+        checkout: cwd,
+        accountHome,
+        pid: process.pid,
+        sharedProcess: true,
+        isSubagent: true,
+        parentSession,
+        focus: "native general-purpose",
+        startedAt: new Date().toISOString(),
+        lastSeenAt: new Date().toISOString(),
+      }),
+    );
+
+    const prevConfigDir = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = accountHome;
+    try {
+      const observed = await observeRoom(room.id, { root });
+      for (const session of ["subagent-a31stoppedwithpeer", "subagent-a32stoppednopeer"]) {
+        const stopped = observed.agents.find((a) => a.nativeSession === session);
+        expect(stopped, session).toBeDefined();
+        expect(stopped.status, session).toBe("cancelled");
+        expect(stopped.runtimeState, session).not.toBe("running");
+        expect(stopped.completion, session).toBeUndefined();
+      }
+      const activeSub = observed.agents.find((a) => a.id === "ploomix");
+      expect(activeSub).toBeDefined();
+      expect(activeSub.model).toBe("claude-fable-5-1");
+      expect(activeSub.status).toBe("running");
+      expect(activeSub.progress.task).toBe("Fable writes layout spec");
+      // Timestamp refreshed from .jsonl mtime (much newer than 4m ago):
+      expect(Date.parse(activeSub.observedAt)).toBeGreaterThan(Date.parse(staleIso));
+
+      const completedSub = observed.agents.find(
+        (a) => a.nativeSession === "subagent-a24fc1a93a67c7e27",
+      );
+      expect(completedSub).toBeDefined();
+      expect(completedSub.model).toBe("claude-sonnet-5-5");
+      expect(completedSub.status).toBe("reported complete");
+      expect(completedSub.completion).toBe("untracked");
+      expect(completedSub.progress.task).toBe("Sonnet implements layout Phase 1");
+      expect(completedSub.id).not.toMatch(/^subagent-/u);
+    } finally {
+      if (prevConfigDir === undefined) {
+        delete process.env.CLAUDE_CONFIG_DIR;
+      } else {
+        process.env.CLAUDE_CONFIG_DIR = prevConfigDir;
+      }
+    }
+  });
+
+  it("fills reserved slots with the Claude subagents whose launch prompt names their brief", async () => {
+    const root = await realpath(await directory());
+    const cwd = await realpath(await directory());
+    const accountHome = await directory();
+    const parentSession = "b7a1c2d3-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+    const slug = cwd.replaceAll(/[^A-Za-z0-9-]/gu, "-");
+    const subagentsDir = path.join(accountHome, "projects", slug, parentSession, "subagents");
+    await mkdir(subagentsDir, { recursive: true });
+    await mkdir(path.join(root, "peers"), { recursive: true });
+    await mkdir(path.join(root, "progress"), { recursive: true });
+
+    const room = await newRoom(
+      parseTeam("claude:opus@researcher,claude:opus@builder,claude:opus@reviewer,codex:sol"),
+      { id: "room-reserved-slots", cwd, root, title: "Reserved slots" },
+    );
+    const [researcher, builder, reviewer, codexSlot] = room.agents.map((agent) => agent.id);
+    await updateRoom(
+      room.id,
+      (current) => {
+        current.conductor.engine = "claude";
+        current.conductor.session = {
+          id: parentSession,
+          engine: "claude",
+          machine: hostname(),
+          cwd,
+        };
+        for (const agent of current.agents) agent.status = "reserved";
+        current.agents[1].model = "claude-opus-5-5";
+        current.agents[2].session = { id: "a7", engine: "claude", machine: hostname(), cwd };
+        current.agents[0].role = "lead";
+        current.agents[0].objective = "Map Herdr capabilities";
+        return current;
+      },
+      { root },
+    );
+    const briefs = path.join(root, "swarm-briefs", room.id);
+    const prompt = (text) =>
+      `${JSON.stringify({ type: "user", message: { role: "user", content: text } })}\n`;
+    const subagent = async (agentId, text, meta = {}) => {
+      await writeFile(
+        path.join(subagentsDir, `agent-${agentId}.meta.json`),
+        JSON.stringify({ agentType: "general-purpose", description: `Task ${agentId}`, ...meta }),
+      );
+      await writeFile(path.join(subagentsDir, `agent-${agentId}.jsonl`), prompt(text));
+    };
+    // Live peer that names the researcher's brief.
+    await subagent(
+      "a1",
+      `You are ${researcher}. Your brief is at ${path.join(briefs, `${researcher}.md`)}.`,
+    );
+    const nowIso = new Date().toISOString();
+    await writeFile(
+      path.join(root, "peers", "subagent-a1.json"),
+      JSON.stringify({
+        schema: "agent-executor.peer.v1",
+        session: "subagent-a1",
+        name: "gribnox-claude-opus-5-5-orkest-a1",
+        person: "gribnox",
+        harness: "claude",
+        state: "busy",
+        cwd,
+        checkout: cwd,
+        accountHome,
+        pid: process.pid,
+        sharedProcess: true,
+        isSubagent: true,
+        parentSession,
+        startedAt: nowIso,
+        lastSeenAt: nowIso,
+      }),
+    );
+    // Finished transcript-only subagent for the builder's slot.
+    await subagent("a2", `Brief: ${path.join(briefs, `${builder}.md`)}`, { finished: true });
+    // Bound by its bare agent ID: must not be listed a second time.
+    await subagent("a7", "Reviewer task");
+    // A second claim on the builder's slot, a claim on the Codex slot, a brief from another
+    // room, and a brief read only after launch: none of them may fill a slot.
+    await subagent("a3", `Brief: ${path.join(briefs, `${builder}.md`)}`);
+    await subagent("a4", `Brief: ${path.join(briefs, `${codexSlot}.md`)}`);
+    await subagent(
+      "a5",
+      `Brief: ${path.join(root, "swarm-briefs", "other-room", `${reviewer}.md`)}`,
+    );
+    await writeFile(
+      path.join(subagentsDir, "agent-a6.jsonl"),
+      `${prompt("Plain task")}${prompt(`Read ${path.join(briefs, `${reviewer}.md`)}`)}`,
+    );
+    await writeFile(
+      path.join(subagentsDir, "agent-a6.meta.json"),
+      JSON.stringify({ agentType: "general-purpose", description: "Task a6" }),
+    );
+
+    const previous = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = accountHome;
+    try {
+      const observed = await observeRoom(room.id, { root });
+      const byId = new Map(observed.agents.map((agent) => [agent.id, agent]));
+
+      const lead = byId.get(researcher);
+      expect(lead).toMatchObject({
+        nativeSession: "subagent-a1",
+        native: true,
+        role: "lead",
+        workforceRole: "researcher",
+        objective: "Map Herdr capabilities",
+        status: "running",
+      });
+      expect(lead.progress.role).toBe("researcher");
+      expect(byId.get(builder)).toMatchObject({
+        nativeSession: "subagent-a2",
+        workforceRole: "builder",
+        status: "reported complete",
+        model: "claude-opus-5-5",
+        cwd,
+      });
+      // A reserved slot keeps its workboard review obligations.
+      expect(byId.get(builder).completion).toBeUndefined();
+      expect(byId.get(reviewer)).toMatchObject({
+        nativeSession: "subagent-a7",
+        workforceRole: "reviewer",
+        status: "running",
+      });
+      expect(byId.get(codexSlot).nativeSession).toBeUndefined();
+
+      const sessions = observed.agents.map((agent) => agent.nativeSession).filter(Boolean);
+      expect(new Set(sessions).size).toBe(sessions.length);
+      for (const extra of ["subagent-a3", "subagent-a4", "subagent-a5", "subagent-a6"]) {
+        const agent = observed.agents.find((candidate) => candidate.nativeSession === extra);
+        expect(agent, extra).toBeDefined();
+        expect([researcher, builder, reviewer, codexSlot]).not.toContain(agent.id);
+      }
+      expect(observed.agents).toHaveLength(8);
+    } finally {
+      if (previous === undefined) {
+        delete process.env.CLAUDE_CONFIG_DIR;
+      } else {
+        process.env.CLAUDE_CONFIG_DIR = previous;
+      }
+    }
+  });
+
+  it.each(["subagent-tx1", "tx1"])(
+    "shows a slot bound as %s as working while live and keeps its reserved role",
+    async (boundSession) => {
+      const root = await realpath(await directory());
+      const cwd = await realpath(await directory());
+      const accountHome = await directory();
+      const parentSession = "c1a1c2d3-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+      const slug = cwd.replaceAll(/[^A-Za-z0-9-]/gu, "-");
+      const subagentsDir = path.join(accountHome, "projects", slug, parentSession, "subagents");
+      await mkdir(subagentsDir, { recursive: true });
+      await mkdir(path.join(root, "peers"), { recursive: true });
+      await mkdir(path.join(root, "progress"), { recursive: true });
+      const room = await newRoom(parseTeam("claude:opus@reviewer"), {
+        id: "room-bound",
+        cwd,
+        root,
+      });
+      await updateRoom(
+        room.id,
+        (current) => {
+          current.conductor.engine = "claude";
+          current.conductor.session = {
+            id: parentSession,
+            engine: "claude",
+            machine: hostname(),
+            cwd,
+          };
+          return current;
+        },
+        { root },
+      );
+      await bindSession(room.id, room.agents[0].id, {
+        session: boundSession,
+        engine: "claude",
+        root,
+      });
+      const nowIso = new Date().toISOString();
+      await writeFile(
+        path.join(subagentsDir, "agent-tx1.meta.json"),
+        JSON.stringify({ agentType: "Explore", description: "Live work", model: "sonnet" }),
+      );
+      await writeFile(path.join(subagentsDir, "agent-tx1.jsonl"), "{}\n");
+      await writeFile(
+        path.join(root, "peers", "subagent-tx1.json"),
+        JSON.stringify({
+          schema: "agent-executor.peer.v1",
+          session: "subagent-tx1",
+          name: "gribnox-claude-opus-5-5-orkest-tx",
+          person: "gribnox",
+          harness: "claude",
+          state: "busy",
+          cwd,
+          checkout: cwd,
+          accountHome,
+          pid: process.pid,
+          sharedProcess: true,
+          isSubagent: true,
+          parentSession,
+          startedAt: nowIso,
+          lastSeenAt: nowIso,
+        }),
+      );
+      await writeFile(
+        path.join(root, "progress", "subagent-tx1.json"),
+        JSON.stringify({
+          schema: "orchestrate.progress.v1",
+          session: "subagent-tx1",
+          harness: "claude",
+          machine: hostname(),
+          accountHome,
+          checkout: cwd,
+          role: "scout",
+          stage: "working",
+          goal: "Native Explore",
+          task: "Live work",
+          updatedAt: nowIso,
+        }),
+      );
+      const previous = process.env.CLAUDE_CONFIG_DIR;
+      process.env.CLAUDE_CONFIG_DIR = accountHome;
+      try {
+        const observed = await observeRoom(room.id, { root });
+        expect(observed.agents).toHaveLength(1);
+        expect(observed.agents[0]).toMatchObject({ status: "working", workforceRole: "reviewer" });
+      } finally {
+        if (previous === undefined) {
+          delete process.env.CLAUDE_CONFIG_DIR;
+        } else {
+          process.env.CLAUDE_CONFIG_DIR = previous;
+        }
+      }
+    },
+  );
+
+  it("keeps live peers authoritative and does not hydrate remote or other-engine bindings", async () => {
+    const root = await realpath(await directory());
+    const cwd = await realpath(await directory());
+    const accountHome = await directory();
+    const parentSession = "parent-bound-guards";
+    const slug = cwd.replaceAll(/[^A-Za-z0-9-]/gu, "-");
+    const subagentsDir = path.join(accountHome, "projects", slug, parentSession, "subagents");
+    await mkdir(subagentsDir, { recursive: true });
+    await mkdir(path.join(root, "peers"), { recursive: true });
+    await mkdir(path.join(root, "progress"), { recursive: true });
+    const room = await newRoom(parseTeam("claude:opus*3,codex:sol"), {
+      id: "room-bound-guards",
+      cwd,
+      root,
+    });
+    const ids = ["live", "remote", "missing", "codex"];
+    await updateRoom(
+      room.id,
+      (current) => {
+        current.conductor.engine = "claude";
+        current.conductor.session = {
+          id: parentSession,
+          engine: "claude",
+          machine: hostname(),
+          cwd,
+        };
+        for (const [index, member] of current.agents.entries()) {
+          member.session = {
+            id: `subagent-${ids[index]}`,
+            engine: member.engine,
+            machine: index === 1 ? "another-machine" : hostname(),
+            cwd,
+          };
+        }
+        return current;
+      },
+      { root },
+    );
+    for (const id of ["live", "remote", "codex"]) {
+      await writeFile(
+        path.join(subagentsDir, `agent-${id}.meta.json`),
+        JSON.stringify({
+          finished: true,
+          agentType: "Explore",
+          model: "sonnet",
+          description: "Old transcript task",
+        }),
+      );
+    }
+    const now = new Date().toISOString();
+    await writeFile(
+      path.join(root, "peers", "subagent-live.json"),
+      JSON.stringify({
+        schema: "agent-executor.peer.v1",
+        session: "subagent-live",
+        harness: "claude",
+        name: "live-agent",
+        state: "busy",
+        cwd,
+        checkout: cwd,
+        accountHome,
+        parentSession,
+        pid: process.pid,
+        sharedProcess: true,
+        isSubagent: true,
+        startedAt: now,
+        lastSeenAt: now,
+      }),
+    );
+    await writeFile(
+      path.join(root, "progress", "subagent-live.json"),
+      JSON.stringify({
+        schema: "orchestrate.progress.v1",
+        session: "subagent-live",
+        harness: "claude",
+        machine: hostname(),
+        accountHome,
+        checkout: cwd,
+        role: "reviewer",
+        goal: "Current goal",
+        task: "Current peer task",
+        stage: "blocked",
+        updatedAt: now,
+      }),
+    );
+    // Transcript-only discovery without metadata remains limited to explicit bindings.
+    await writeFile(path.join(subagentsDir, "agent-unbound.jsonl"), "{}\n");
+    vi.stubEnv("CLAUDE_CONFIG_DIR", accountHome);
+    try {
+      const observed = await observeRoom(room.id, { root });
+      expect(observed.agents).toHaveLength(4);
+      expect(observed.agents[0]).toMatchObject({
+        status: "blocked",
+        runtimeState: "running",
+        workforceRole: "reviewer",
+        progress: { task: "Current peer task", role: "reviewer" },
+      });
+      for (const member of observed.agents.slice(1)) {
+        expect(member.status).toBe("session unavailable");
+        expect(member.nativeSession).toBeUndefined();
+      }
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it.each([
+    ["subagent-tx1", true, "both"],
+    ["tx1", false, "both"],
+    ["tx1", true, "both"],
+    ["subagent-tx1", false, "both"],
+    ["subagent-tx1", false, "transcript"],
+    ["subagent-tx1", true, "meta"],
+  ])(
+    "hydrates bound %s (finished=%s, files=%s) without a peer",
+    async (session, finished, files) => {
+      const root = await realpath(await directory());
+      const cwd = await realpath(await directory());
+      const accountHome = await directory();
+      const parentSession = "parent-transcript";
+      const slug = cwd.replaceAll(/[^A-Za-z0-9-]/gu, "-");
+      const subagentsDir = path.join(accountHome, "projects", slug, parentSession, "subagents");
+      await mkdir(subagentsDir, { recursive: true });
+      const room = await newRoom(parseTeam("claude:opus@reviewer"), {
+        id: "room-bound-transcript",
+        cwd,
+        root,
+        swarm: { maxAgents: 1, maxDepth: 1 },
+      });
+      const memberId = room.agents[0].id;
+      await updateRoom(
+        room.id,
+        (current) => {
+          current.conductor.engine = "claude";
+          current.conductor.session = {
+            id: parentSession,
+            engine: "claude",
+            machine: hostname(),
+            cwd,
+          };
+          current.agents[0].role = "lead";
+          current.agents[0].objective = "Review the assigned change";
+          return current;
+        },
+        { root },
+      );
+      // Probe 13b: explicitly bind a slot, then observe only its local transcript/meta.
+      await bindSession(room.id, memberId, { session, engine: "claude", root });
+      if (files !== "transcript") {
+        await writeFile(
+          path.join(subagentsDir, "agent-tx1.meta.json"),
+          JSON.stringify({
+            agentType: "Explore",
+            description: "Reviewing slot status",
+            model: "sonnet",
+            finished,
+          }),
+        );
+      }
+      if (files !== "meta") {
+        const transcript = path.join(subagentsDir, "agent-tx1.jsonl");
+        await writeFile(
+          transcript,
+          `${JSON.stringify({ message: { model: "claude-sonnet-5-5" } })}\n`,
+        );
+        // Explicit bindings remain meaningful even when the work predates the room.
+        await utimes(transcript, new Date("2026-01-01"), new Date("2026-01-01"));
+      }
+      const stored = await readRawRoom(room.id, root);
+      // An unfinished child whose transcript has been quiet past the busy window is not running:
+      // a live (or unknown) parent process proves nothing about it.
+      const isQuiet = !finished && files !== "meta";
+      let expectedStatus = finished ? "reported complete" : "running";
+      let expectedRuntime = finished ? "stopped" : "running";
+      if (isQuiet) {
+        expectedStatus = "unknown";
+        expectedRuntime = "unknown";
+      }
+      vi.stubEnv("CLAUDE_CONFIG_DIR", accountHome);
+      try {
+        const observed = await observeRoom(room.id, { root });
+        expect(observed.agents).toHaveLength(1);
+        expect(observed.agents[0]).toMatchObject({
+          id: memberId,
+          session: { id: session },
+          nativeSession: "subagent-tx1",
+          role: "lead",
+          workforceRole: "reviewer",
+          objective: "Review the assigned change",
+          model: files === "meta" ? "sonnet" : "claude-sonnet-5-5",
+          status: expectedStatus,
+          runtimeState: expectedRuntime,
+          progress: {
+            role: "reviewer",
+            stage: finished ? "complete" : "working",
+            task: files === "transcript" ? "Running subagent (tx1)" : "Reviewing slot status",
+          },
+        });
+        expect(Number.isFinite(Date.parse(observed.agents[0].observedAt))).toBe(true);
+        expect(Number.isFinite(Date.parse(observed.agents[0].progress.startedAt))).toBe(true);
+        expect(await readRawRoom(room.id, root)).toEqual(stored);
+        expect((await observeRoom(observed, { root })).agents).toHaveLength(1);
+      } finally {
+        vi.unstubAllEnvs();
+      }
+    },
+  );
+
+  it.each([
+    ["Explore", undefined, "scout"],
+    ["Plan", undefined, "planner"],
+    ["general-purpose", undefined, "native"],
+    ["custom-agent", undefined, "native"],
+    ["Explore", "reviewer", "reviewer"],
+    ["Plan", "builder", "builder"],
+  ])(
+    "projects unmatched %s subagents with saved role %s as %s",
+    async (agentType, savedRole, expectedRole) => {
+      const root = await realpath(await directory());
+      const cwd = await realpath(await directory());
+      const accountHome = await directory();
+      const parentSession = "parent-role";
+      const slug = cwd.replaceAll(/[^A-Za-z0-9-]/gu, "-");
+      const subagentsDir = path.join(accountHome, "projects", slug, parentSession, "subagents");
+      await mkdir(subagentsDir, { recursive: true });
+      await mkdir(path.join(root, "peers"), { recursive: true });
+      await mkdir(path.join(root, "progress"), { recursive: true });
+      const room = await newRoom([], { id: "room-unmatched", cwd, root });
+      await updateRoom(
+        room.id,
+        (current) => {
+          current.conductor.engine = "claude";
+          current.conductor.session = {
+            id: parentSession,
+            engine: "claude",
+            machine: hostname(),
+            cwd,
+          };
+          return current;
+        },
+        { root },
+      );
+      for (const [agentId, live] of [
+        ["live", true],
+        ["finished", false],
+      ]) {
+        await writeFile(
+          path.join(subagentsDir, `agent-${agentId}.meta.json`),
+          JSON.stringify({
+            agentType,
+            description: "Unmatched task",
+            finished: !live,
+          }),
+        );
+        await writeFile(path.join(subagentsDir, `agent-${agentId}.jsonl`), "{}\n");
+        if (live) {
+          // Legacy peers have only focus, not agentType or isSubagent.
+          await writeFile(
+            path.join(root, "peers", `subagent-${agentId}.json`),
+            JSON.stringify({
+              schema: "agent-executor.peer.v1",
+              session: `subagent-${agentId}`,
+              harness: "claude",
+              name: "legacy",
+              state: "busy",
+              cwd,
+              checkout: cwd,
+              accountHome,
+              parentSession,
+              pid: process.pid,
+              sharedProcess: true,
+              focus: `native ${agentType}`,
+              startedAt: new Date().toISOString(),
+              lastSeenAt: new Date().toISOString(),
+            }),
+          );
+          // Exercise the legacy peer fallback without metadata.
+          await writeFile(path.join(subagentsDir, `agent-${agentId}.meta.json`), "{}");
+        }
+        if (savedRole) {
+          await writeFile(
+            path.join(root, "progress", `subagent-${agentId}.json`),
+            JSON.stringify({
+              schema: "orchestrate.progress.v1",
+              session: `subagent-${agentId}`,
+              harness: "claude",
+              machine: hostname(),
+              accountHome,
+              checkout: cwd,
+              role: savedRole,
+              stage: live ? "working" : "complete",
+              goal: "Investigate roles",
+              task: "Unmatched task",
+              updatedAt: new Date().toISOString(),
+            }),
+          );
+        }
+      }
+      vi.stubEnv("CLAUDE_CONFIG_DIR", accountHome);
+      try {
+        const observed = await observeRoom(room.id, { root });
+        expect(observed.agents).toHaveLength(2);
+        for (const agent of observed.agents) {
+          expect(agent.workforceRole).toBe(expectedRole);
+          expect(agent.progress.role || agent.workforceRole).toBe(expectedRole);
+        }
+      } finally {
+        vi.unstubAllEnvs();
+      }
+    },
+  );
+
+  it("gives a plain script a row whose status follows its reported stage", async () => {
+    const root = await realpath(await directory());
+    const cwd = await realpath(await directory());
+    await mkdir(path.join(root, "peers"), { recursive: true });
+    await mkdir(path.join(root, "progress"), { recursive: true });
+    const room = await newRoom([], { id: "room-script-row", cwd, root, title: "Wave 12" });
+    const startedAt = new Date().toISOString();
+    const report = async (session, harness, stage, extra = {}) => {
+      await writeFile(
+        path.join(root, "peers", `${session}.json`),
+        JSON.stringify({
+          schema: "agent-executor.peer.v1",
+          session,
+          name: `${session}-repo-12`,
+          harness,
+          state: "idle",
+          cwd,
+          checkout: cwd,
+          pid: process.pid,
+          startedAt,
+          lastSeenAt: startedAt,
+        }),
+      );
+      await writeFile(
+        path.join(root, "progress", `${session}.json`),
+        JSON.stringify({
+          schema: "orchestrate.progress.v1",
+          session,
+          harness,
+          machine: hostname(),
+          checkout: cwd,
+          stage,
+          goal: "Wave 12",
+          task: "Verifier B phase 2",
+          updatedAt: new Date().toISOString(),
+          ...extra,
+        }),
+      );
+    };
+    const agentOf = async (session) =>
+      (await observeRoom(room.id, { root })).agents.find(
+        (agent) => agent.nativeSession === session,
+      );
+    const statusOf = async (session) => (await agentOf(session))?.status;
+    for (const [stage, status] of [
+      ["working", "running"],
+      ["testing", "running"],
+      ["blocked", "blocked"],
+      ["complete", "reported complete"],
+    ]) {
+      await report("wave-driver", "unknown", stage);
+      expect(await statusOf("wave-driver"), stage).toBe(status);
+    }
+    // A discovered peer without a dispatch has nothing to review.
+    expect((await agentOf("wave-driver")).completion).toBe("untracked");
+    // A peer whose last report names claimed, blocked or review workboard items may still owe a
+    // review, so it stays "reported complete" rather than "finished".
+    await report("board-holder", "unknown", "complete", { workContext: "0".repeat(64) });
+    expect((await agentOf("board-holder")).completion).toBeUndefined();
+    expect((await agentOf("board-holder")).status).toBe("reported complete");
+    // A harness still reports busy or idle through its hooks, so its stage doesn't override them.
+    await report("resting-agent", "claude", "working");
+    expect(await statusOf("resting-agent")).toBe("idle");
+  });
+
+  it("projects consultation answers and attaches agent mailbox messages during observeRoom", async () => {
+    const rawRoot = await directory();
+    const root = await realpath(rawRoot);
+    const rawCwd = await directory();
+    const cwd = await realpath(rawCwd);
+    await mkdir(path.join(root, "consultations", "conductor-sess"), { recursive: true });
+    await mkdir(path.join(root, "inbox", "conductor-sess"), { recursive: true });
+
+    const room = await newRoom([{ label: "worker", engine: "codex", model: "gpt-6-astra" }], {
+      id: "room-consult-messages",
+      cwd,
+      root,
+      title: "Consult & Messages",
+    });
+    const workerId = room.agents[0].id;
+    const nowIso = new Date().toISOString();
+    await updateRoom(
+      room.id,
+      (current) => {
+        current.conductor.name = "floomp";
+        current.conductor.person = "floomp";
+        current.conductor.session = {
+          id: "conductor-sess",
+          engine: "claude",
+          machine: hostname(),
+          cwd,
+        };
+        current.agents[0].mailboxSession = "worker-sess-1";
+        return current;
+      },
+      { root },
+    );
+
+    const consultResultPath = path.join(root, "consult-result.json");
+    await writeFile(
+      consultResultPath,
+      JSON.stringify({
+        schema: "agent-executor.consultation.v1",
+        status: "succeeded",
+        engine: "claude",
+        model: "claude-opus-5-5",
+        question: "Is the migration backward-compatible?",
+        answer: "Yes, legacy names remain valid.\nNew names decompose cleanly.",
+        uncertainty: "Low",
+      }),
+    );
+    await writeFile(
+      path.join(root, "consultations", "conductor-sess", "consult-1.json"),
+      JSON.stringify({
+        schema: "orchestrate.consultation-observation.v1",
+        id: "consult-1",
+        parent_session: "conductor-sess",
+        room_id: room.id,
+        machine: hostname(),
+        pid: process.pid,
+        runner_pid: process.pid,
+        deadline_ms: Date.now() + 60_000,
+        status: "succeeded",
+        engine: "claude",
+        model: "claude-opus-5-5",
+        task: "Is the migration backward-compatible?",
+        started_at: nowIso,
+        finished_at: nowIso,
+        result_path: consultResultPath,
+      }),
+    );
+
+    await writeFile(
+      path.join(root, "inbox", "conductor-sess", "msg-1.json"),
+      JSON.stringify({
+        id: "msg-1",
+        from: workerId,
+        fromSession: "worker-sess-1",
+        to: "floomp",
+        toSession: "conductor-sess",
+        text: "Schema audit completed with zero breaking changes.",
+        sentAt: nowIso,
+      }),
+    );
+
+    const observed = await observeRoom(room.id, { root });
+    const consultAgent = observed.agents.find((a) => a.consultation === true);
+    expect(consultAgent).toBeDefined();
+    expect(consultAgent.answer).toBe(
+      "Yes, legacy names remain valid.\nNew names decompose cleanly.",
+    );
+    expect(consultAgent.uncertainty).toBe("Low");
+    expect(consultAgent.output).toEqual([
+      "Yes, legacy names remain valid.",
+      "New names decompose cleanly.",
+      "Uncertainty: Low",
+    ]);
+
+    const worker = observed.agents.find((a) => a.id === workerId);
+    expect(worker.messages).toHaveLength(1);
+    expect(worker.messages[0]).toMatchObject({
+      from: workerId,
+      to: "floomp",
+      text: "Schema audit completed with zero breaking changes.",
+    });
+    expect(observed.messages).toHaveLength(1);
+  });
+});
+
+describe("room lock ownership", () => {
+  it.each(["legacy", "json"])("does not steal an aged live %s owner", async (format) => {
+    const root = await directory();
+    const file = path.join(root, "room.json");
+    const lock = `${file}.lock`;
+    await mkdir(lock);
+    const owner =
+      format === "legacy"
+        ? `${process.pid}\n`
+        : JSON.stringify({ pid: process.pid, token: "python-holder" });
+    await writeFile(path.join(lock, "owner"), owner);
+    const now = Date.now();
+    await utimes(lock, (now - 60_000) / 1000, (now - 60_000) / 1000);
+    const clock = vi
+      .spyOn(Date, "now")
+      .mockReturnValueOnce(now)
+      .mockReturnValue(now + 4000);
+    try {
+      await expect(withRoomLock(file, () => "stolen")).rejects.toThrow("Room is locked:");
+    } finally {
+      clock.mockRestore();
+    }
+    expect(await readFile(path.join(lock, "owner"), "utf8")).toBe(owner);
+  });
+
+  it.each(["dead", "missing", "invalid", "reused", "retired"])(
+    "recovers a %s owner",
+    async (format) => {
+      const root = await directory();
+      const file = path.join(root, "room.json");
+      const lock = `${file}.lock`;
+      await mkdir(lock);
+      if (format !== "missing") {
+        const owner =
+          format === "invalid"
+            ? "partial{"
+            : JSON.stringify({
+                pid: ["dead", "retired"].includes(format) ? 2_147_483_647 : process.pid,
+                token: "ended-acquisition",
+                ...(format === "reused" && { pidBirth: "previous-process" }),
+              });
+        await writeFile(
+          path.join(lock, format === "retired" ? "owner.2147483647.abcd.retired" : "owner"),
+          owner,
+        );
+      }
+      await utimes(lock, 1, 1);
+      expect(await withRoomLock(file, () => "recovered")).toBe("recovered");
+      await expect(readFile(lock)).rejects.toMatchObject({ code: "ENOENT" });
+    },
+  );
+
+  it("gives a missing owner an acquisition grace period", async () => {
+    const root = await directory();
+    const file = path.join(root, "room.json");
+    await mkdir(`${file}.lock`);
+    const now = Date.now();
+    const clock = vi
+      .spyOn(Date, "now")
+      .mockReturnValueOnce(now)
+      .mockReturnValue(now + 4000);
+    try {
+      await expect(withRoomLock(file, () => "stolen")).rejects.toThrow("Room is locked:");
+    } finally {
+      clock.mockRestore();
+    }
+    await writeFile(path.join(`${file}.lock`, "owner"), `${process.pid}\n`);
+    expect(await readFile(path.join(`${file}.lock`, "owner"), "utf8")).toBe(`${process.pid}\n`);
+  });
+
+  it("does not release a replacement acquisition, even with the same PID", async () => {
+    const root = await directory();
+    const file = path.join(root, "room.json");
+    const ownerFile = path.join(`${file}.lock`, "owner");
+    await expect(
+      withRoomLock(file, async () => {
+        const first = JSON.parse(await readFile(ownerFile, "utf8"));
+        expect(first.pid).toBe(process.pid);
+        expect(typeof first.token).toBe("string");
+        await rm(`${file}.lock`, { recursive: true });
+        await mkdir(`${file}.lock`);
+        await writeFile(ownerFile, JSON.stringify({ pid: process.pid, token: "replacement" }));
+        throw new Error("update failed");
+      }),
+    ).rejects.toThrow("update failed");
+    expect(JSON.parse(await readFile(ownerFile, "utf8"))).toEqual({
+      pid: process.pid,
+      token: "replacement",
+    });
+  });
+});
+
+describe("SQLite room persistence", () => {
+  const execute = promisify(execFile);
+  const moduleUrl = new URL("../../../src/lib/horde-room.mjs", import.meta.url)
+    .href;
+
+  it("imports legacy rooms once, archives them, and keeps corrupt files visible", async () => {
+    const root = await directory();
+    await mkdir(path.join(root, "rooms"));
+    const legacy = createRoom([], { id: "legacy", cwd: root });
+    await writeFile(path.join(root, "rooms/legacy.json"), JSON.stringify(legacy));
+    await writeFile(
+      path.join(root, "rooms/minimal.json"),
+      JSON.stringify({ cwd: root, agents: [] }),
+    );
+    await writeFile(path.join(root, "rooms/broken.json"), "{");
+    await writeFile(
+      path.join(root, "rooms/mismatch.json"),
+      JSON.stringify({ id: "wrong", agents: [] }),
+    );
+    const listed = await listRooms(root);
+    expect(listed.rooms.map((room) => room.id)).toEqual(["legacy"]);
+    expect(listed.errors.map((error) => error.file).sort((a, b) => a.localeCompare(b))).toEqual([
+      "broken.json",
+      "minimal.json",
+      "mismatch.json",
+    ]);
+    const archived = JSON.parse(
+      await readFile(path.join(root, "rooms.v1-backup/legacy.json"), "utf8"),
+    );
+    expect(archived).toEqual(legacy);
+    expect(readRawRoom("minimal", root)).toMatchObject({ id: "minimal", cwd: root, agents: [] });
+    await updateRoom(
+      "legacy",
+      async (room) => {
+        await new Promise((resolve) => setImmediate(resolve));
+        room.title = "Updated through SQLite";
+        return room;
+      },
+      { root },
+    );
+    expect((await readRoom("legacy", root)).title).toBe("Updated through SQLite");
+    await expect(readFile(path.join(root, "rooms/legacy.json"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    expect(await readFile(path.join(root, "rooms/broken.json"), "utf8")).toBe("{");
+    expect(deleteRoom("minimal", root)).toBe(true);
+    expect(listRawRooms(root).map((room) => room.id)).toEqual(["legacy"]);
+    using db = openOrkestSqlite(roomsDbPath(root));
+    expect(db.tagStore.get`PRAGMA journal_mode`.journal_mode).toBe("wal");
+    expect(db.tagStore.get`PRAGMA synchronous`.synchronous).toBe(2);
+    expect(db.tagStore.get`PRAGMA application_id`.application_id).toBe(1_330_793_298);
+  });
+
+  it("recovers an import interrupted after commit before archive without losing the room", async () => {
+    const root = await directory();
+    await mkdir(path.join(root, "rooms"));
+    await writeFile(
+      path.join(root, "rooms/recovery.json"),
+      JSON.stringify({ id: "recovery", counter: 0 }),
+    );
+    const child = `
+      import fs from "node:fs";
+      import { syncBuiltinESMExports } from "node:module";
+      fs.renameSync = () => process.exit(73);
+      syncBuiltinESMExports();
+      const { listRawRooms } = await import(${JSON.stringify(moduleUrl)});
+      listRawRooms(process.argv[1]);
+    `;
+    await expect(
+      execute(process.execPath, ["--input-type=module", "-e", child, root]),
+    ).rejects.toMatchObject({ code: 73 });
+    {
+      using db = openOrkestSqlite(roomsDbPath(root));
+      db.tagStore
+        .run`UPDATE rooms SET data = '{"id":"recovery","counter":1}', revision = revision + 1 WHERE id = 'recovery'`;
+    }
+    expect(readRawRoom("recovery", root)).toEqual({ id: "recovery", counter: 1 });
+    await expect(readFile(path.join(root, "rooms/recovery.json"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    const archived = JSON.parse(
+      await readFile(path.join(root, "rooms.v1-backup/recovery.json"), "utf8"),
+    );
+    expect(archived).toEqual({ id: "recovery", counter: 0 });
+  });
+
+  it("retries async callbacks across processes without losing updates", async () => {
+    const root = await directory();
+    await updateRoom(
+      "concurrent",
+      () => ({ ...createRoom([], { id: "concurrent", cwd: root }), counter: 0 }),
+      { root, create: true },
+    );
+    const child = `
+      import { updateRoom } from ${JSON.stringify(moduleUrl)};
+      const root = process.argv[1];
+      for (let i = 0; i < 6; i++) {
+        await updateRoom("concurrent", async (room) => {
+          await new Promise((resolve) => setTimeout(resolve, 3));
+          room.counter++;
+          return room;
+        }, { root });
+      }
+    `;
+    await Promise.all(
+      Array.from({ length: 4 }, () =>
+        execute(process.execPath, ["--input-type=module", "-e", child, root]),
+      ),
+    );
+    expect((await readRoom("concurrent", root)).counter).toBe(24);
+  });
+
+  it("preserves identity and missing/create contracts and protects conditional deletion", async () => {
+    const root = await directory();
+    await expect(updateRoom("absent", (room) => room, { root })).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await updateRawRoom("raw", () => ({ id: "raw", agents: [] }), { root, create: true });
+    await expect(updateRawRoom("raw", () => [], { root })).rejects.toThrow(
+      "expected a plain object",
+    );
+    const date = Object.assign(new Date(), { id: "raw" });
+    await expect(updateRawRoom("raw", () => date, { root })).rejects.toThrow(
+      "expected a plain object",
+    );
+    const before = readRawRoom("raw", root);
+    await expect(updateRawRoom("raw", () => ({}), { root, create: true })).rejects.toThrow(
+      "Room already exists: raw",
+    );
+    await expect(
+      updateRawRoom("raw", (room) => ({ ...room, id: "other" }), { root }),
+    ).rejects.toThrow("Cannot change room identity");
+    await updateRawRoom("raw", (room) => ({ ...room, title: "Fresh" }), { root });
+    expect(deleteRoom("raw", root, before)).toBe(false);
+    expect(readRawRoom("raw", root).title).toBe("Fresh");
+    expect(deleteRoom("raw", root)).toBe(true);
+  });
+
+  it("allows concurrent WAL room reads during an active write and bounds optimistic CAS retries", async () => {
+    const root = await directory();
+    await mkdir(path.join(root, "rooms"), { recursive: true });
+    await writeFile(path.join(root, "rooms", "broken.json"), "{");
+    await updateRoom(
+      "active-room",
+      () => ({ ...createRoom([], { id: "active-room", cwd: root }), title: "Committed", count: 0 }),
+      { root, create: true },
+    );
+
+    using writer = openOrkestSqlite(roomsDbPath(root), { timeout: 50 });
+    writer.exec(
+      "BEGIN IMMEDIATE; UPDATE rooms SET data = json_set(data, '$.title', 'In-flight') WHERE id = 'active-room';",
+    );
+    try {
+      expect(readRawRoom("active-room", root).title).toBe("Committed");
+      expect(listRawRooms(root).map((room) => room.title)).toEqual(["Committed"]);
+    } finally {
+      writer.exec("ROLLBACK");
+    }
+
+    await expect(
+      updateRoom(
+        "active-room",
+        async (room) => {
+          using contender = openOrkestSqlite(roomsDbPath(root));
+          contender.exec("UPDATE rooms SET revision = revision + 1 WHERE id = 'active-room'");
+          room.count++;
+          return room;
+        },
+        { root, maxAttempts: 2 },
+      ),
+    ).rejects.toThrow("exceeded 2 concurrent retries: active-room");
+  });
+
+  it("clears stale member herdrPaneId when peer explicitly nulls Herdr bindings", async () => {
+    const { root, room } = await fixture();
+    room.conductor.session = { id: "coord-null-herdr", machine: hostname() };
+    room.conductor.herdrPaneId = "w1:p1";
+    room.conductor.herdrWorkspaceId = "w1";
+    room.conductor.herdrEndpoint = "/tmp/old-herdr.sock";
+    await mkdir(path.join(root, "peers"), { recursive: true });
+    await writeFile(
+      path.join(root, "peers", "coord-null-herdr.json"),
+      JSON.stringify({
+        schema: "agent-executor.peer.v1",
+        session: "coord-null-herdr",
+        name: "coordinator",
+        harness: room.conductor.engine,
+        cwd: room.cwd,
+        pid: process.pid,
+        startedAt: new Date().toISOString(),
+        lastSeenAt: new Date().toISOString(),
+        herdrPaneId: null,
+        herdrWorkspaceId: null,
+        herdrEndpoint: null,
+      }),
+    );
+    const observed = await observeRoom(room, {
+      root,
+      progress: async () => ({}),
+      discoverNativePeers: false,
+    });
+    expect(observed.conductor.herdrPaneId).toBeUndefined();
+    expect(observed.conductor.herdrWorkspaceId).toBeUndefined();
+    expect(observed.conductor.herdrEndpoint).toBeUndefined();
+  });
+});
+
+describe("bounded room continuations", () => {
+  it("projects the latest request while retaining the first request and old records", async () => {
+    const { root, room, taskDir, task, run } = await fixture();
+    await dispatchMember(room.id, "haiku-1", { root, taskDir, run, requestId: "first" });
+    task.runs[0].status = "finished";
+    task.runs[0].runner_status = "completed";
+    task.decisions.push({ run_id: "run-1", decision: "accept" });
+    task.runs.push({
+      ...task.runs[0],
+      run_id: "run-2",
+      request_id: "second",
+      kind: "continue",
+      resume_result: task.runs[0].result_path,
+      result_path: path.join(taskDir, "second-result.json"),
+      status: "active",
+      task_spec: { objective: "Second bounded task" },
+    });
+    await writeFile(path.join(taskDir, "task.json"), JSON.stringify(task));
+    const observed = await observeRoom(room.id, { root, discoverNativePeers: false });
+    expect(observed.agents[0]).toMatchObject({
+      runId: "run-2",
+      status: "running",
+      verdict: "pending",
+      objective: "Second bounded task",
+    });
+    expect(observed.agents[0].runHistory.map((entry) => entry.request_id)).toEqual([
+      "first",
+      "second",
+    ]);
+    expect((await readRoom(room.id, root)).agents[0].dispatch.requestId).toBe("first");
+    task.runs[1].status = "finished";
+    task.decisions.push({ run_id: "run-2", decision: "accept" });
+    await writeFile(path.join(taskDir, "task.json"), JSON.stringify(task));
+    expect((await observeRoom(room.id, { root })).agents[0].status).toBe("accepted");
+  });
+
+  it("dispatches continue in the same task, inherits transport and retries a lost response", async () => {
+    const { root, room, taskDir, task, run } = await fixture();
+    await dispatchMember(room.id, "haiku-1", {
+      root,
+      taskDir,
+      run,
+      requestId: "first",
+      transport: "native",
+    });
+    task.runs[0].status = "finished";
+    task.decisions.push({ run_id: "run-1", decision: "accept" });
+    const taskSpec = path.join(taskDir, "followup.json");
+    await writeFile(taskSpec, JSON.stringify({ objective: "Follow up" }));
+    let shouldLoseResponse = true;
+    const calls = [];
+    const resume = async (args) => {
+      calls.push(args);
+      const result = await run(args);
+      if (args[0] === "dispatch") {
+        const stored = task.runs.find((entry) => entry.request_id === "second");
+        stored.engine = "claude";
+        result.engine = "claude";
+        if (shouldLoseResponse) {
+          shouldLoseResponse = false;
+          throw new Error("lost continue response");
+        }
+      }
+      return result;
+    };
+    const options = { root, taskDir, taskSpec, run: resume, kind: "continue", requestId: "second" };
+    await expect(dispatchMember(room.id, "haiku-1", options)).rejects.toThrow(
+      "lost continue response",
+    );
+    expect((await readRoom(room.id, root)).agents[0].dispatch.requestId).toBe("second");
+    const continued = await dispatchMember(room.id, "haiku-1", options);
+    expect(continued.dispatch).toMatchObject({
+      run_id: "run-2",
+      request_id: "second",
+      transport: "native",
+    });
+    expect(task.runs.map((entry) => entry.request_id)).toEqual(["first", "second"]);
+    const sent = calls.find((args) => args[0] === "dispatch");
+    // The task spec is passed canonically (macOS temp folders sit behind /var -> /private/var).
+    expect(sent.slice(sent.indexOf("--task-spec"))).toEqual([
+      "--task-spec",
+      await realpath(taskSpec),
+    ]);
+    expect(sent).not.toContain("--engine");
+    expect(sent).not.toContain("--model");
+    expect(sent).not.toContain("--effort");
+    const observed = await observeRoom(room.id, { root, run: resume, discoverNativePeers: false });
+    expect(observed.agents[0]).toMatchObject({ runId: "run-2", status: "running" });
+  });
+
+  it.each([
+    ["active", false],
+    ["finished", false],
+    ["finished", true],
+  ])("treats an implicit continue after %s as new work (new path: %s)", async (status, newPath) => {
+    const { root, room, taskDir, task, run } = await fixture();
+    await dispatchMember(room.id, "haiku-1", { root, taskDir, run, requestId: "first" });
+    task.runs[0].status = "finished";
+    task.decisions.push({ run_id: "run-1", decision: "reject" });
+    const taskSpec = path.join(taskDir, "followup.json");
+    await writeFile(taskSpec, "{}");
+    const resume = async (args) => {
+      if (
+        args[0] === "dispatch" &&
+        task.runs.every((entry) => entry.request_id !== args[args.indexOf("--request-id") + 1])
+      ) {
+        const previous = task.runs.at(-1);
+        if (
+          previous.status !== "finished" ||
+          task.decisions.every((entry) => entry.run_id !== previous.run_id)
+        )
+          throw new Error("continue requires the previous run to be finished and reviewed");
+      }
+      const result = await run(args);
+      if (args[0] === "dispatch") {
+        task.runs.at(-1).engine = "claude";
+        result.engine = "claude";
+      }
+      return result;
+    };
+    await dispatchMember(room.id, "haiku-1", {
+      root,
+      taskDir,
+      taskSpec,
+      run: resume,
+      kind: "continue",
+    });
+    task.runs[1].status = status;
+    const nextSpec = newPath ? path.join(taskDir, "next.json") : taskSpec;
+    await writeFile(nextSpec, JSON.stringify({ objective: "Next bounded task" }));
+    await expect(
+      dispatchMember(room.id, "haiku-1", {
+        root,
+        taskDir,
+        taskSpec: nextSpec,
+        run: resume,
+        kind: "continue",
+      }),
+    ).rejects.toThrow("continue requires the previous run to be finished and reviewed");
+    expect(task.runs.map((entry) => entry.run_id)).toEqual(["run-1", "run-2"]);
+  });
+
+  it.each(["verification", "correction"])(
+    "continues after a reviewed %s descendant and keeps the member's chain",
+    async (kind) => {
+      const { root, room, taskDir, task, run } = await fixture();
+      await dispatchMember(room.id, "haiku-1", { root, taskDir, run, requestId: "first" });
+      task.runs[0].status = "finished";
+      task.decisions.push({ run_id: "run-1", decision: "reject" });
+      const taskSpec = path.join(taskDir, "followup.json");
+      await writeFile(taskSpec, "{}");
+      const resume = async (args) => {
+        const previous = task.runs.at(-1);
+        const result = await run(args);
+        if (args[0] === "dispatch") {
+          Object.assign(task.runs.at(-1), {
+            engine: "claude",
+            resume_result: previous.result_path,
+            result_path: path.join(taskDir, `${result.run_id}.json`),
+          });
+          Object.assign(result, task.runs.at(-1));
+        }
+        return result;
+      };
+      await dispatchMember(room.id, "haiku-1", {
+        root,
+        taskDir,
+        taskSpec,
+        run: resume,
+        kind: "continue",
+      });
+      task.runs[1].status = "finished";
+      task.runs.push({
+        ...task.runs[1],
+        run_id: "reviewed-descendant",
+        request_id: "descendant",
+        kind,
+        transport: kind === "verification" ? "host_checks" : "executor",
+        verification_of: kind === "verification" ? "run-2" : undefined,
+        resume_result: kind === "correction" ? task.runs[1].result_path : undefined,
+        result_path: path.join(taskDir, "descendant.json"),
+      });
+      task.decisions.push({ run_id: "reviewed-descendant", decision: "reject" });
+      await writeFile(taskSpec, JSON.stringify({ objective: "Next task" }));
+      const continued = await dispatchMember(room.id, "haiku-1", {
+        root,
+        taskDir,
+        taskSpec,
+        run: resume,
+        kind: "continue",
+      });
+      expect(continued.dispatch.run_id).toBe("run-4");
+      await writeFile(path.join(taskDir, "task.json"), JSON.stringify(task));
+      const observed = await observeRoom(room.id, { root, discoverNativePeers: false });
+      expect(observed.agents[0].runHistory.map((entry) => entry.run_id)).toEqual([
+        "run-1",
+        "run-2",
+        "reviewed-descendant",
+        "run-4",
+      ]);
+    },
+  );
+
+  it("keeps a same-engine consultation and another member out of the bound run chain", async () => {
+    const { root, room, taskDir, task, run } = await fixture();
+    await dispatchMember(room.id, "haiku-1", { root, taskDir, run, requestId: "first" });
+    Object.assign(task.runs[0], {
+      status: "finished",
+      task_spec: { objective: "Member objective" },
+    });
+    task.decisions.push({ run_id: "run-1", decision: "accept" });
+    for (const kind of ["consultation", "implementation"]) {
+      task.runs.push({
+        ...task.runs[0],
+        run_id: kind,
+        request_id: kind,
+        kind,
+        resume_result: task.runs[0].result_path,
+        result_path: path.join(taskDir, `${kind}.json`),
+        task_spec: { objective: "Other objective" },
+      });
+      task.decisions.push({ run_id: kind, decision: "reject" });
+    }
+    await writeFile(path.join(taskDir, "task.json"), JSON.stringify(task));
+    const observed = await observeRoom(room.id, { root, discoverNativePeers: false });
+    expect(observed.agents[0]).toMatchObject({
+      runId: "run-1",
+      status: "accepted",
+      verdict: "accept",
+      objective: "Member objective",
+    });
+    expect(observed.agents[0].runHistory.map((entry) => entry.run_id)).toEqual(["run-1"]);
+  });
+
+  it.each(["-1", "7", "1.5", "unlimited"])(
+    "rejects init-task cap %s before calling the coordinator",
+    async (value) => {
+      const root = await directory();
+      const calls = [];
+      for (const option of [["--max-continues", value], [`--max-continues=${value}`]]) {
+        await expect(
+          roomsCommand(
+            [
+              "init-task",
+              "--task-spec",
+              "spec.json",
+              "--task-dir",
+              "task",
+              "--host",
+              "claude",
+              ...option,
+            ],
+            {
+              root,
+              run: async (args) => {
+                calls.push(args);
+                return { status: "active" };
+              },
+            },
+          ),
+        ).rejects.toThrow("--max-continues must be an integer from 0 to 6 (hard ceiling 6)");
+      }
+      expect(calls).toEqual([]);
+    },
+  );
+
+  it("refuses a second continue while the first is still launching and keeps its binding", async () => {
+    const { root, room, taskDir, task, run } = await fixture();
+    await dispatchMember(room.id, "haiku-1", { root, taskDir, run, requestId: "first" });
+    task.runs[0].status = "finished";
+    task.decisions.push({ run_id: "run-1", decision: "accept" });
+    const taskSpec = path.join(taskDir, "followup.json");
+    await writeFile(taskSpec, JSON.stringify({ objective: "Follow up" }));
+    const { promise: launched, resolve: release } = Promise.withResolvers();
+    const slow = async (args) => {
+      if (args[0] === "dispatch") await launched;
+      return run(args);
+    };
+    const options = { root, taskDir, taskSpec, kind: "continue" };
+    const first = dispatchMember(room.id, "haiku-1", { ...options, run: slow });
+    await vi.waitFor(async () => {
+      expect((await readRoom(room.id, root)).agents[0].dispatch.restore).toBeDefined();
+    });
+    const inFlight = (await readRoom(room.id, root)).agents[0].dispatch.requestId;
+    await expect(dispatchMember(room.id, "haiku-1", { ...options, run })).rejects.toThrow(
+      `retry it with --request-id ${inFlight}`,
+    );
+    release();
+    const continued = await first;
+    const member = (await readRoom(room.id, root)).agents[0];
+    expect(member.dispatch).toMatchObject({
+      requestId: inFlight,
+      runId: continued.dispatch.run_id,
+    });
+    expect(member.dispatch.restore).toBeUndefined();
+    expect(member.status).not.toBe("queued");
+  });
+
+  it("does not lock a member out after a continue launched but its response was lost", async () => {
+    const { root, room, taskDir, task, run } = await fixture();
+    await dispatchMember(room.id, "haiku-1", { root, taskDir, run, requestId: "first" });
+    task.runs[0].status = "finished";
+    task.decisions.push({ run_id: "run-1", decision: "accept" });
+    const taskSpec = path.join(taskDir, "followup.json");
+    await writeFile(taskSpec, JSON.stringify({ objective: "Follow up" }));
+    let isLost = true;
+    const lossy = async (args) => {
+      const result = await run(args);
+      if (args[0] === "dispatch" && isLost) {
+        isLost = false;
+        throw new Error("lost continue response");
+      }
+      return result;
+    };
+    const options = { root, taskDir, taskSpec, kind: "continue" };
+    await expect(dispatchMember(room.id, "haiku-1", { ...options, run: lossy })).rejects.toThrow(
+      "lost continue response",
+    );
+    expect((await readRoom(room.id, root)).agents[0].dispatch.restore).toBeUndefined();
+
+    // A record left by a crash clears once that run has ended.
+    await updateRoom(
+      room.id,
+      (current) => {
+        current.agents[0].dispatch.restore = { cwd: null, workforceRole: null };
+        return current;
+      },
+      { root },
+    );
+    const launched = task.runs.at(-1);
+    launched.status = "finished";
+    task.decisions.push({ run_id: launched.run_id, decision: "accept" });
+    const next = await dispatchMember(room.id, "haiku-1", { ...options, run });
+    expect(next.dispatch.run_id).not.toBe(launched.run_id);
+  });
+
+  it("keeps a newer dispatch when an older launch reports late", async () => {
+    const { root, room, taskDir, task, run } = await fixture();
+    await dispatchMember(room.id, "haiku-1", { root, taskDir, run, requestId: "first" });
+    task.runs[0].status = "finished";
+    task.decisions.push({ run_id: "run-1", decision: "accept" });
+    const taskSpec = path.join(taskDir, "followup.json");
+    await writeFile(taskSpec, JSON.stringify({ objective: "Follow up" }));
+    const { promise: answered, resolve: answer } = Promise.withResolvers();
+    const delayed = async (args) => {
+      const result = await run(args);
+      if (args[0] === "dispatch") await answered;
+      return result;
+    };
+    const options = { root, taskDir, taskSpec, kind: "continue" };
+    const late = dispatchMember(room.id, "haiku-1", { ...options, run: delayed, requestId: "one" });
+    await vi.waitFor(() => {
+      expect(task.runs.some((entry) => entry.request_id === "one")).toBe(true);
+    });
+    const older = task.runs.find((entry) => entry.request_id === "one");
+    older.status = "finished";
+    task.decisions.push({ run_id: older.run_id, decision: "accept" });
+    const newer = await dispatchMember(room.id, "haiku-1", { ...options, run, requestId: "two" });
+    answer();
+    await late;
+    expect((await readRoom(room.id, root)).agents[0].dispatch).toMatchObject({
+      requestId: "two",
+      runId: newer.dispatch.run_id,
+    });
+  });
+
+  it("restores the previous dispatch when continue is refused before launch", async () => {
+    const { root, room, taskDir, task, run } = await fixture();
+    await dispatchMember(room.id, "haiku-1", { root, taskDir, run, requestId: "first" });
+    const taskSpec = path.join(taskDir, "followup.json");
+    await writeFile(taskSpec, "{}");
+    const refusing = async (args) => {
+      if (args[0] === "dispatch") throw new Error("previous run is unreviewed");
+      return run(args);
+    };
+    await expect(
+      dispatchMember(room.id, "haiku-1", {
+        root,
+        taskDir,
+        taskSpec,
+        run: refusing,
+        kind: "continue",
+        requestId: "second",
+      }),
+    ).rejects.toThrow("previous run is unreviewed");
+    const saved = (await readRoom(room.id, root)).agents[0];
+    expect(saved.dispatch).toMatchObject({ requestId: "first", runId: "run-1" });
+    expect(task.runs.map((entry) => entry.request_id)).toEqual(["first"]);
+    expect((await observeRoom(room.id, { root, run })).agents[0].status).toBe("running");
+  });
+
+  it("forwards per-member caps from both CLI entry points and rejects values above six", async () => {
+    const { root, room, taskDir, run } = await fixture();
+    const calls = [];
+    const record = async (args) => {
+      calls.push(args);
+      if (args[0] === "init") return { status: "active" };
+      return run(args);
+    };
+    const stdout = { write() {} };
+    await roomsCommand(
+      [
+        "init-task",
+        "--task-dir",
+        taskDir,
+        "--task-spec",
+        path.join(taskDir, "spec.json"),
+        "--host",
+        "claude",
+        "--max-continues",
+        "6",
+        "--invocation-allowance",
+        "8",
+      ],
+      { root, run: record, stdout },
+    );
+    expect(calls[0].slice(-4)).toEqual(["--max-continues", "6", "--invocation-allowance", "8"]);
+    await roomsCommand(
+      [
+        "dispatch",
+        "--room",
+        room.id,
+        "--member",
+        "haiku-1",
+        "--task-dir",
+        taskDir,
+        "--max-continues",
+        "5",
+      ],
+      { root, run: record, stdout },
+    );
+    expect((await readRoom(room.id, root)).agents[0].dispatch.maxContinues).toBe(5);
+    expect(calls.find((args) => args[0] === "dispatch").slice(-2)).toEqual([
+      "--max-continues",
+      "5",
+    ]);
+    for (const maxContinues of [7, -1, "unlimited", 1.5]) {
+      await expect(
+        dispatchMember(room.id, "luna-1", { root, taskDir, run, maxContinues }),
+      ).rejects.toThrow("hard ceiling 6");
+    }
+  });
+
+  it("includes Antigravity Plan/Execute coordinator guidance for agy or orchestrator conductors and omits it otherwise", async () => {
+    const root = await directory();
+    const cwd = await directory();
+    const agyRoom = await newRoom([], {
+      id: "room-agy-orch",
+      cwd,
+      root,
+      engine: "agy",
+      model: "gemini-pro-orchestrator",
+      objective: "Coordinate changes",
+    });
+    expect(agyRoom.conductor.model).toBe("gemini-pro-orchestrator");
+    expect((await readRoom(agyRoom.id, root)).conductor.model).toBe("gemini-pro-orchestrator");
+
+    const agyBrief = coordinatorBrief(agyRoom);
+    expect(agyBrief).toContain("Antigravity Plan/Execute phases:");
+    expect(agyBrief).toContain("exit_plan_mode");
+    expect(agyBrief).toContain("enter_plan_mode");
+    expect(agyBrief).toContain("ork rooms show");
+    expect(agyBrief).toContain("ork hall worktree");
+    expect(agyBrief).toContain("allow_paths");
+    expect(agyBrief).toContain("--verify-command");
+    expect(agyBrief).toContain("gemini:fast");
+    expect(agyBrief).toContain("gemini:hydrogen-high");
+    expect(agyBrief).toContain("gemini:pro");
+    expect(agyBrief).toContain("not `gemini:orchestrator`");
+
+    const codexRoom = await newRoom([], {
+      id: "room-codex",
+      cwd,
+      root,
+      engine: "codex",
+      objective: "Coordinate changes",
+    });
+    expect(codexRoom.conductor.model).toBeUndefined();
+    expect(coordinatorBrief(codexRoom)).not.toContain("Antigravity Plan/Execute phases:");
+  });
+
+  it("gives root coordinators and subswarm leads the same command-boundary guidance", async () => {
+    const root = await directory();
+    const cwd = await directory();
+    const room = await newRoom(parseTeam("codex:luna"), {
+      id: "room-boundary",
+      cwd,
+      root,
+      engine: "codex",
+      objective: "Coordinate",
+    });
+    const lead = await reserveLead(room.id, "luna-1", "Verify migration", { root });
+    expect(lead.status).toBe("native_handoff");
+    for (const brief of [coordinatorBrief(room), lead.brief]) {
+      expect(brief).toContain("Command boundaries:");
+      expect(brief).toContain("its own standalone command");
+      expect(brief).toContain("exact absolute path of the installed orchestrate skill");
+      expect(brief).toContain("skills/orchestrate/scripts/coordinator.py capture");
+      expect(brief).toContain("verify-evidence, review");
+      expect(brief).toContain("Codex judges each segment");
+      expect(brief).toContain("head or tail pipes");
+      expect(brief).toContain("Do not request broader trust for");
+      expect(brief).toContain("Preserve this rule in every delegated brief");
+    }
+  });
+});
+
+describe("coordination reliability", () => {
+  async function readIndex(root) {
+    return JSON.parse(await readFile(roomsIndexPath(root), "utf8"));
+  }
+
+  it("republishes the rooms index after every create, mutation, close and delete", async () => {
+    const root = await directory();
+    const cwd = await directory();
+    await newRoom(parseTeam("codex:luna"), { id: "index-a", cwd, root });
+    let index = await readIndex(root);
+    expect(index.schema).toBe(ROOMS_INDEX_SCHEMA);
+    expect(index.rooms).toMatchObject([{ id: "index-a", closed: false, sessions: [] }]);
+    const memberId = (await readRoom("index-a", root)).agents[0].id;
+    await bindSession("index-a", memberId, { session: "native-index", engine: "codex", root });
+    index = await readIndex(root);
+    expect(index.rooms[0].sessions).toEqual(["native-index"]);
+    await updateRawRoom("index-a", (room) => ({ ...room, closedAt: new Date().toISOString() }), {
+      root,
+    });
+    expect((await readIndex(root)).rooms[0].closed).toBe(true);
+    expect(deleteRoom("index-a", root)).toBe(true);
+    expect((await readIndex(root)).rooms).toEqual([]);
+  });
+
+  it("serves display lists from cache until another connection commits", async () => {
+    const root = await directory();
+    const cwd = await directory();
+    await newRoom(parseTeam("codex:luna"), { id: "cache-a", cwd, root });
+    clearRoomListCache();
+    try {
+      const first = listRawRoomsCached(root);
+      expect(first.map((room) => room.id)).toEqual(["cache-a"]);
+      // Callers own their copy.
+      first[0].title = "mutated by a caller";
+      expect(listRawRoomsCached(root)[0].title).not.toBe("mutated by a caller");
+      await newRoom(parseTeam("codex:luna"), { id: "cache-b", cwd, root });
+      expect(
+        listRawRoomsCached(root)
+          .map((room) => room.id)
+          .sort((a, b) => a.localeCompare(b)),
+      ).toEqual(["cache-a", "cache-b"]);
+      await updateRawRoom("cache-a", (room) => ({ ...room, title: "Renamed" }), { root });
+      expect(listRawRoomsCached(root).find((room) => room.id === "cache-a").title).toBe("Renamed");
+      expect(listRawRoomsCached(root)).toEqual(listRawRooms(root));
+    } finally {
+      clearRoomListCache();
+    }
+  });
+
+  it("expires shared-process sessions by state, including waiting", () => {
+    const now = Date.now();
+    const peer = (state, ageMs) => ({
+      pid: process.pid,
+      sharedProcess: true,
+      state,
+      startedAt: new Date(now - ageMs).toISOString(),
+      lastSeenAt: new Date(now - ageMs).toISOString(),
+    });
+    expect(isPeerLive(peer("waiting", SHARED_PROCESS_WAITING_TTL_MS - 1000), now)).toBe(true);
+    expect(isPeerLive(peer("waiting", SHARED_PROCESS_WAITING_TTL_MS + 1000), now)).toBe(false);
+    expect(isPeerLive(peer("busy", SHARED_PROCESS_BUSY_TTL_MS + 1000), now)).toBe(false);
+    expect(isPeerLive(peer(undefined, SHARED_PROCESS_WAITING_TTL_MS + 1000), now)).toBe(false);
+  });
+
+  it("caps shared-process subagent peers at 300s even with unknown PID while rejecting dead PIDs", () => {
+    const now = Date.now();
+    const subPeer = (state, ageMs, pidValue = process.pid) => ({
+      ...(pidValue !== null && { pid: pidValue }),
+      sharedProcess: true,
+      isSubagent: true,
+      state,
+      startedAt: new Date(now - ageMs).toISOString(),
+      lastSeenAt: new Date(now - ageMs).toISOString(),
+    });
+    for (const state of ["busy", "idle", "waiting"]) {
+      expect(isPeerLive(subPeer(state, SHARED_PROCESS_SUBAGENT_TTL_MS, process.pid), now)).toBe(
+        true,
+      );
+      expect(
+        isPeerLive(subPeer(state, SHARED_PROCESS_SUBAGENT_TTL_MS + 1000, process.pid), now),
+      ).toBe(false);
+      expect(isPeerLive(subPeer(state, SHARED_PROCESS_SUBAGENT_TTL_MS, null), now)).toBe(true);
+      expect(isPeerLive(subPeer(state, SHARED_PROCESS_SUBAGENT_TTL_MS + 1000, null), now)).toBe(
+        false,
+      );
+    }
+    expect(
+      isPeerLive(
+        {
+          ...subPeer("busy", 0, process.pid),
+          pidBirth: "Thu Jan  1 00:00:00 1970",
+        },
+        now,
+      ),
+    ).toBe(false);
+  });
+
+  it("renders a fresh binding without presence as awaiting observation, not unavailable", async () => {
+    const root = await directory();
+    const cwd = await directory();
+    const room = await newRoom(parseTeam("codex:luna"), {
+      id: "awaiting",
+      cwd,
+      root,
+      swarm: { maxAgents: 2, maxDepth: 2 },
+    });
+    const memberId = room.agents[0].id;
+    await bindSession("awaiting", memberId, { session: "never-seen", engine: "codex", root });
+    let observed = await observeRoom("awaiting", { root, discoverNativePeers: false });
+    expect(observed.agents[0]).toMatchObject({
+      status: "awaiting observation",
+      runtimeState: "unknown",
+    });
+    const stale = new Date(Date.now() - SESSION_OBSERVATION_GRACE_MS - 1000).toISOString();
+    await updateRoom(
+      "awaiting",
+      (current) => {
+        current.agents[0].session.boundAt = stale;
+        return current;
+      },
+      { root },
+    );
+    observed = await observeRoom("awaiting", { root, discoverNativePeers: false });
+    expect(observed.agents[0].status).toBe("session unavailable");
+    // A live recorded process keeps the binding pending; a dead one does not.
+    expect(isAwaitingObservation({ pid: process.pid, session: { boundAt: stale } })).toBe(true);
+    expect(isAwaitingObservation({ pid: 2 ** 22 + 7, session: { boundAt: stale } })).toBe(false);
+    expect(
+      isAwaitingObservation({
+        pid: process.pid,
+        pidBirth: "Thu Jan  1 00:00:00 1970",
+        session: { boundAt: new Date().toISOString() },
+      }),
+    ).toBe(false);
+  });
+
+  it("records the conductor's account home so its subagents are found there", async () => {
+    const root = await directory();
+    const cwd = await realpath(await directory());
+    const accountHome = await directory();
+    const room = await newRoom(parseTeam("claude:opus"), {
+      id: "conductor-source",
+      cwd,
+      root,
+      engine: "claude",
+      swarm: { maxAgents: 2, maxDepth: 2 },
+    });
+    const stamp = new Date().toISOString();
+    await mkdir(path.join(root, "peers"), { recursive: true });
+    await writeFile(
+      path.join(root, "peers", "conductor-native.json"),
+      JSON.stringify({
+        schema: "agent-executor.peer.v1",
+        session: "conductor-native",
+        name: "conductor-peer",
+        harness: "claude",
+        cwd,
+        checkout: cwd,
+        accountHome,
+        pid: process.pid,
+        state: "idle",
+        startedAt: stamp,
+        lastSeenAt: stamp,
+      }),
+    );
+    await updateRoom(
+      room.id,
+      (current) => {
+        current.conductor.session = {
+          id: "conductor-native",
+          engine: "claude",
+          machine: hostname(),
+          cwd,
+        };
+        current.conductor.activitySource = { note: "kept" };
+        return current;
+      },
+      { root },
+    );
+    const observed = await observeRoom(room.id, { root, discoverNativePeers: false });
+    expect(observed.conductor.activitySource).toMatchObject({
+      note: "kept",
+      engine: "claude",
+      session: "conductor-native",
+      accountHome,
+    });
+  });
+
+  it("stamps conductor sessionLive from snapshot or peer, including when status is completed", async () => {
+    const root = await directory();
+    const cwd = await realpath(await directory());
+    const room = await newRoom(parseTeam("claude:haiku"), {
+      id: "conductor-liveness",
+      cwd,
+      root,
+      engine: "claude",
+      swarm: { maxAgents: 2, maxDepth: 2 },
+    });
+
+    // Unbound conductor leaves sessionLive undefined.
+    const unbound = await observeRoom(room.id, { root, discoverNativePeers: false });
+    expect(unbound.conductor.sessionLive).toBeUndefined();
+
+    // Live peer stamps sessionLive = true.
+    const stamp = new Date().toISOString();
+    await mkdir(path.join(root, "peers"), { recursive: true });
+    const peerPath = path.join(root, "peers", "conductor-live.json");
+    await writeFile(
+      peerPath,
+      JSON.stringify({
+        schema: "agent-executor.peer.v1",
+        session: "conductor-live",
+        name: "conductor-peer",
+        harness: "claude",
+        cwd,
+        checkout: cwd,
+        pid: process.pid,
+        state: "idle",
+        startedAt: stamp,
+        lastSeenAt: stamp,
+      }),
+    );
+    await updateRoom(
+      room.id,
+      (current) => {
+        current.conductor.engine = "claude";
+        current.conductor.session = {
+          id: "conductor-live",
+          engine: "claude",
+          machine: hostname(),
+          cwd,
+        };
+        return current;
+      },
+      { root },
+    );
+    const live = await observeRoom(room.id, { root, discoverNativePeers: false });
+    expect(live.conductor.sessionLive).toBe(true);
+
+    // Dead peer stamps sessionLive = false even when status is "reported complete" or "completed",
+    // and clears stale runtimeState = "running" on reused room objects.
+    await rm(peerPath);
+    for (const status of ["reported complete", "completed"]) {
+      const reused = structuredClone(live);
+      reused.conductor.status = status;
+      reused.conductor.runtimeState = "running";
+      const dead = await observeRoom(reused, {
+        root,
+        discoverNativePeers: false,
+        progress: async () => ({}),
+      });
+      expect(dead.conductor.sessionLive).toBe(false);
+      expect(dead.conductor.status).toBe(status);
+      expect(dead.conductor.runtimeState).not.toBe("running");
+    }
+
+    // Mailbox-only conductor bindings also stamp sessionLive from snapshot or peer.
+    const mailboxRoom = await observeRoom(
+      {
+        id: "mailbox-room",
+        cwd,
+        swarm: { maxAgents: 2 },
+        conductor: { engine: "claude", mailboxSession: "mb-1", status: "completed" },
+        agents: [],
+      },
+      {
+        root,
+        discoverNativePeers: false,
+        progress: async () => ({
+          conductor: { name: "lead", stage: "complete", runtimeState: "idle" },
+        }),
+      },
+    );
+    expect(mailboxRoom.conductor.sessionLive).toBe(true);
+
+    const deadMailboxRoom = await observeRoom(
+      {
+        id: "mailbox-room",
+        cwd,
+        swarm: { maxAgents: 2 },
+        conductor: { engine: "claude", mailboxSession: "mb-1", status: "completed" },
+        agents: [],
+      },
+      {
+        root,
+        discoverNativePeers: false,
+        progress: async () => ({}),
+      },
+    );
+    expect(deadMailboxRoom.conductor.sessionLive).toBe(false);
+  });
+});
