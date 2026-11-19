@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.93.0
+
+- feat(orchestrate): integrate Chief lifecycle, inbox triage and account management (#238)
+
 ## 0.92.0
 
 - fix(orchestrate): serialize concurrent creation of integration locks on macOS (#246)

@@ -2,7 +2,7 @@
 name: chief
 description: "Act as Ork Chief, the machine-wide Master Orchestrator, when the user types /chief, runs `ork chief`, asks for an overview of every running agent, room or orchestrator across repositories, or streams multi-repo goals to hand off. Bind the Chief desk, open the Chief View, brief cross-machine status, spawn autonomous room orchestrators in isolated worktrees, plan tickets with cross-model consultations, and steer or unblock running orchestrators while keeping the Chief session thin: never read source files, raw diffs or worker transcripts here."
 metadata:
-  version: 0.92.0
+  version: 0.93.0
 ---
 
 # Chief
