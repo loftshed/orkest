@@ -101,6 +101,13 @@ of goals into autonomous orchestrators, each in its own worktree, that report ba
 finish or get stuck. The Chief never reads code itself, so it stays responsive overnight.
 Details: [`ork chief`](plugins/orchestrate/README.md#machine-wide-chief-ork-chief-chief).
 
+### Add as many accounts as you have
+
+`ork account add <claude|codex|agy|opencode> --profile <slug>` creates an isolated profile, records it in
+Monitor's `accounts[]`, optionally installs a launcher alias, and federates the mailbox into that
+profile so agents on different accounts can message each other. No account count limit.
+Details: [`ork account`](plugins/orchestrate/README.md#universal-accounts-ork-account-account).
+
 ### Ask another model
 
 `consult` runs a different vendor's model in its no-write mode, for a review or a root-cause
@@ -177,6 +184,7 @@ ork foundry [status|run|groom] [--dry-run] [--json]
 ork smelter [status|run] [--dry-run] [--json]
 ork side [run|status] [--prompt <text>] [--issue <n>] [--dry-run] [--json]
 ork chief [status|bind|send|spawn|desk|view] [--json]   (machine-wide Chief desk; ork chief --help)
+ork account [add|list|tag|remove|sync] [--json]   (universal accounts and profile federation; ork account --help)
 ork cleanup [status|run] [--dry-run] [--json]
 ork policy [show|allow|deny|reset] [--json]
 ork update [run|check|status|enable|disable] [--check|--apply] [--auto] [--force] [--quiet] [--json] [-h|--help]
@@ -201,6 +209,7 @@ Slash commands, in any harness that loads the plugin:
 
 <!-- generated:slash-commands -->
 
+- `/account [add <provider> --profile <slug>|list|tag|remove|sync] [--json]`: Add, list, tag, remove and sync Claude, Codex, Antigravity and OpenCode accounts
 - `/chief [status|<goal>]`: Take the machine-wide Chief desk, brief every running orchestrator, and route multi-repo work
 - `/cleanup [status|run] [--dry-run] [--migrate-legacy]`: Audit, prune, and migrate legacy Orkest / agent-executor state, worktrees, and backups
 - `/horde [toggle|open|close|<goal>]`: Toggle the Orkest Swarm View split pane or launch a swarm for a goal
@@ -216,7 +225,7 @@ The repository ships two plugins. Their READMEs cover every flag, routing table 
 
 | Plugin                                         | Version | What it does                                                       |
 | ---------------------------------------------- | ------- | ------------------------------------------------------------------ |
-| [`orchestrate`](plugins/orchestrate/README.md) | 0.91.1  | Coordinator conversations, swarms, delegation and shared work.     |
+| [`orchestrate`](plugins/orchestrate/README.md) | 0.92.0  | Coordinator conversations, swarms, delegation and shared work.     |
 | [`monitor`](plugins/monitor/README.md)         | 0.19.4  | Account quota, reset times, credit balances and spending guidance. |
 
 More: [architecture and module map](docs/ARCHITECTURE.md), [Herdr integration](docs/herdr.md),

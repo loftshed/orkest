@@ -2,7 +2,7 @@
 name: chief
 description: "Act as Ork Chief, the machine-wide Master Orchestrator, when the user types /chief, runs `ork chief`, asks for an overview of every running agent, room or orchestrator across repositories, or streams multi-repo goals to hand off. Bind the Chief desk, open the Chief View, brief cross-machine status, spawn autonomous room orchestrators in isolated worktrees, plan tickets with cross-model consultations, and steer or unblock running orchestrators while keeping the Chief session thin: never read source files, raw diffs or worker transcripts here."
 metadata:
-  version: 0.91.1
+  version: 0.92.0
 ---
 
 # Chief
@@ -17,7 +17,8 @@ implement, verify and open pull requests. If `ork` is not on `PATH`, use
 ```sh
 ork chief status               # compact cross-machine table; add --json only when you must parse it
 ork chief bind                 # claim the machine-wide Chief desk for this session
-ork chief desk                 # reports queued while no Chief was live; `--ack` once relayed
+ork chief inbox                # open items grouped by room; `--ack` clears the groups it shows
+ork chief desk                 # reports queued while no Chief was live (desk only)
 ork horde open --chief         # open the Chief View split pane beside this conversation
 ```
 
@@ -65,6 +66,10 @@ The user talks in a stream: ideas, bugs and goals for several repositories at on
    ork chief spawn --cwd <repo> --branch fix/token-refresh --goal-file /tmp/goal.md --dry-run
    ```
 
+   `--interactive` opens the orchestrator in a pane of the user's Herdr, Orca or tmux session so
+   they can watch it. It has no runner timeout, so use it only when they want to watch.
+   Claude and Codex only; without one of those sessions the command fails before creating anything.
+
    Put long specifications in a `--goal-file`, so they never pass through this conversation twice.
    Add `--engine`, `--model`, `--effort` or `--route` only when the mission needs them. Always pass
    `--worktree` (or `--branch`) unless the user asks otherwise: a mission without one works in the
@@ -82,7 +87,8 @@ The user talks in a stream: ideas, bugs and goals for several repositories at on
    ```
 
    If the target is ambiguous, `send` exits 2 and lists the candidates: pick one, never guess.
-   `send` wakes the target only when it is live; otherwise the message waits in its inbox.
+   Updates do not wake the target; add `--wake` to interrupt an idle one. Questions, escalations and
+   done reports wake a live target. Otherwise the message waits in its inbox.
 
 5. **Record** what you started in one line to the user: repo, branch, goal, how to watch it.
 
@@ -90,8 +96,12 @@ Child orchestrators report to the desk with `ork chief send --to chief --kind do
 which always reaches whoever holds the desk now. Reports sent while no Chief is live wait on the
 desk (`ork chief desk`), so nothing is lost across a rebind or a restart. When one arrives, relay
 it in one or two lines and either answer it with `send`, ask the user, or note it as done.
+`ork chief inbox --ack` clears what you relayed. `ork chief close <room>` stops tracking a finished
+mission and clears its attention; it refuses a live room, so pass `--force` only when the user asks.
 A `stale-coordinator` item means a mission's orchestrator stopped without reporting (crash,
-timeout or quota). Tell the user, and respawn it with the same goal only if they agree.
+timeout or quota). Tell the user, and respawn it with the same goal only if they agree. A mission
+whose runner exited shows its real outcome (`failed` with a reason such as
+`runner_exited_without_result`); `ork chief reconcile <roomId>` records that outcome once.
 
 ## 3. Stay thin
 

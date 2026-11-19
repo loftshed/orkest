@@ -458,6 +458,184 @@ export function notifyHerdrTransitions(
   return isTriggered;
 }
 
+const CHIEF_KIND_TITLES = {
+  blocked: "Worker blocked",
+  escalation: "Escalation",
+  failed: "Mission failed",
+  question: "Question",
+};
+
+/** One display line: controls and runs of whitespace collapse, then the result is bounded. */
+function singleLine(value, max) {
+  const text = normalizeLine(value);
+  return text.length > max ? `${text.slice(0, Math.max(0, max - 1))}…` : text;
+}
+
+function normalizeLine(value) {
+  if (typeof value !== "string") return "";
+  return value
+    .replaceAll(/\p{Cc}+/gu, " ")
+    .replaceAll(/\s+/gu, " ")
+    .trim();
+}
+
+function normalizeChiefKind(kind) {
+  if (kind === "question" || kind === "awaiting-input") return "question";
+  if (["escalation", "blocked", "failed"].includes(kind)) return kind;
+  return null;
+}
+
+function listOf(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+function unattributedBucket(from) {
+  const sender = typeof from === "string" ? from : from?.session || from?.name || "unknown";
+  return `unattributed:${normalizeLine(sender) || "unknown"}`;
+}
+
+function chiefRoomLabel(room) {
+  return singleLine(room.title || room.repo?.name || room.branch || room.id, 60);
+}
+
+/**
+ * The drawer identities the displayed status carried, copied so later polls cannot change them.
+ * A legacy status without identities yields empty lists, so nothing unidentified is acknowledged.
+ */
+function captureDrawerSnapshot(status) {
+  const idList = (values) =>
+    Array.isArray(values) ? values.filter((id) => typeof id === "string" && id) : [];
+  const declared = status?.drawerSnapshot;
+  if (declared && typeof declared === "object") {
+    return {
+      session: declared.session ?? null,
+      revision: declared.revision ?? null,
+      deskIds: idList(declared.deskIds),
+      inboxIds: idList(declared.inboxIds),
+    };
+  }
+  return { session: status?.chief?.session ?? null, revision: null, deskIds: [], inboxIds: [] };
+}
+
+/**
+ * Every notifiable Chief item in a snapshot. Rooms and attributable desk records use their room
+ * ID as the bucket; loose mail uses a stable unattributed bucket that includes its sender.
+ */
+function chiefTransitionCandidates(status) {
+  const rooms = listOf(status.rooms).filter(
+    (room) => room && typeof room === "object" && typeof room.id === "string" && room.id,
+  );
+  const labels = new Map(rooms.map((room) => [room.id, chiefRoomLabel(room)]));
+  const failures = new Map();
+  const raw = [];
+  for (const room of rooms) {
+    const label = labels.get(room.id);
+    if (room.mission?.state === "failed") {
+      const reason = normalizeLine(room.mission.reason) || "Mission failed";
+      failures.set(room.id, reason);
+      raw.push({ bucket: room.id, label, kind: "failed", text: reason });
+    }
+    for (const item of listOf(room.attention)) {
+      raw.push({ bucket: room.id, label, kind: item?.kind, text: item?.text });
+    }
+  }
+  for (const item of listOf(status.desk)) {
+    if (!item || typeof item !== "object") continue;
+    const roomId = typeof item.roomId === "string" && item.roomId ? item.roomId : null;
+    raw.push(
+      roomId
+        ? { bucket: roomId, label: labels.get(roomId) || roomId, kind: item.kind, text: item.text }
+        : {
+            bucket: unattributedBucket(item.from),
+            label: "Chief inbox",
+            kind: item.kind,
+            text: item.text,
+          },
+    );
+  }
+  for (const item of listOf(status.inbox)) {
+    if (!item || typeof item !== "object") continue;
+    raw.push({
+      bucket: unattributedBucket(item.from),
+      label: "Chief inbox",
+      kind: item.kind,
+      text: item.text,
+    });
+  }
+
+  const candidates = [];
+  const seenKeys = new Set();
+  for (const entry of raw) {
+    const kind = normalizeChiefKind(entry.kind);
+    const text = normalizeLine(entry.text);
+    if (!kind || !text) continue;
+    const failure = failures.get(entry.bucket);
+    // A failed mission's synthetic escalation repeats its reason; the failure already notified.
+    if (
+      kind === "escalation" &&
+      failure &&
+      (text === failure || text.includes(failure) || failure.includes(text))
+    )
+      continue;
+    const key = JSON.stringify([entry.bucket, kind, text]);
+    if (seenKeys.has(key)) continue;
+    seenKeys.add(key);
+    candidates.push({ key, kind, label: entry.label, text });
+  }
+  return candidates;
+}
+
+function notifyChief(candidate, { env, exec, exists, platform }) {
+  const title = singleLine(`Chief: ${CHIEF_KIND_TITLES[candidate.kind]}`, 80);
+  const body = singleLine(`${candidate.label}: ${candidate.text}`, 240);
+  if (env?.HERDR_ENV === "1") {
+    void runExec(
+      exec,
+      env.HERDR_BIN_PATH || "herdr",
+      ["notification", "show", title, "--body", body, "--sound", "request"],
+      env,
+    );
+    return true;
+  }
+  if (platform !== "darwin" || !resolveMacosHudBinary(env, { exists })) return false;
+  return sendMacosHudToast(
+    {
+      body,
+      sound: "request",
+      status: candidate.kind === "failed" ? "failed" : "blocked",
+      title,
+    },
+    { env, exec, exists, platform },
+  );
+}
+
+/**
+ * Notify once per new Chief attention item. The first snapshot (no prevStatus) only seeds the
+ * set. Items are keyed by bucket, normalized kind, and text, so timestamps, order, and repeats
+ * never notify again.
+ */
+export function notifyChiefTransitions(
+  prevStatus,
+  nextStatus,
+  notifiedSet,
+  { env = process.env, exec = execFile, exists, platform = process.platform } = {},
+) {
+  if (!nextStatus || typeof nextStatus !== "object") return false;
+  const seen = notifiedSet instanceof Set ? notifiedSet : new Set();
+  const candidates = chiefTransitionCandidates(nextStatus);
+  if (!prevStatus || typeof prevStatus !== "object") {
+    for (const candidate of candidates) seen.add(candidate.key);
+    return false;
+  }
+  let isTriggered = false;
+  for (const candidate of candidates) {
+    if (seen.has(candidate.key)) continue;
+    seen.add(candidate.key);
+    if (notifyChief(candidate, { env, exec, exists, platform })) isTriggered = true;
+  }
+  return isTriggered;
+}
+
 function toNotificationAgents(room) {
   return (room?.agents || []).map((agent) => ({
     ...agent,
@@ -1219,6 +1397,12 @@ export async function runHordeTui(
   const initialRoom = await loadRoom();
   const currentRoomId = () => view.room?.id || initialRoom.id;
   const notifiedSet = new Set();
+  const chiefNotifiedSet = new Set();
+  let isStopped = false;
+  let chiefSnapshot = null;
+  let chiefGeneration = 0;
+  let chiefAppliedGeneration = 0;
+  let isChiefActionPending = false;
   let prevAgents = toNotificationAgents(initialRoom);
   notifyHerdrTransitions(null, prevAgents, notifiedSet, {
     env,
@@ -1346,9 +1530,24 @@ export async function runHordeTui(
         lastRoomId: homeRoomId,
       })
     : null;
+  // Refreshes apply in start order: an older poll that resolves late cannot overwrite a newer frame.
   const refreshChief = async () => {
+    const generation = ++chiefGeneration;
     try {
       const status = await chiefOptions.loadStatus();
+      if (isStopped || generation < chiefAppliedGeneration) return;
+      try {
+        notifyChiefTransitions(chiefSnapshot, status, chiefNotifiedSet, {
+          env,
+          exec,
+          ...(exists && { exists }),
+          ...(platform && { platform }),
+        });
+      } catch {
+        // A notification backend must never block the Chief view from updating.
+      }
+      chiefSnapshot = status;
+      chiefAppliedGeneration = generation;
       chiefView.setStatus(status);
       liveChief =
         status?.chief &&
@@ -1358,6 +1557,7 @@ export async function runHordeTui(
           ? status.chief
           : null;
     } catch (error) {
+      if (isStopped || generation < chiefAppliedGeneration) return;
       chiefView.notice = `Could not read Chief status: ${error.message}`;
     }
     chiefRefreshedAt = Date.now();
@@ -1413,7 +1613,6 @@ export async function runHordeTui(
   }
   let isBusy = false;
   let errorText = "";
-  let isStopped = false;
   let isRawModeChanged = false;
   let isInputResumed = false;
   let isAlternateScreen = false;
@@ -1692,10 +1891,102 @@ export async function runHordeTui(
       : "Could not focus that pane. Its terminal may have closed.";
     paint();
   };
+  // Production resolves the library at action time; tests may inject `chief.send|desk|close`.
+  const chiefOperation = async (injected, exportName) => {
+    if (typeof injected === "function") return injected;
+    const chief = await loadChiefModule();
+    if (typeof chief?.[exportName] !== "function")
+      throw new Error(`${exportName} is unavailable in this Orkest version`);
+    return chief[exportName];
+  };
+  const chiefContext = () => ({ root: mailboxRoot(env), env });
+  const chiefLabel = (roomId) => {
+    const room = chiefView.status?.rooms?.find((item) => item?.id === roomId);
+    return singleLine(room ? chiefRoomLabel(room) : roomId, 60);
+  };
+  const runChiefAction = ({ verb, pending, task }) => {
+    if (isChiefActionPending) {
+      chiefView.notice = "Still finishing the last Chief action";
+      paint();
+      return;
+    }
+    isChiefActionPending = true;
+    chiefView.notice = pending;
+    paint();
+    void (async () => {
+      try {
+        chiefView.notice = singleLine(await task(), 160);
+      } catch (error) {
+        chiefView.notice = singleLine(`Could not ${verb}: ${error?.message || error}`, 160);
+      } finally {
+        isChiefActionPending = false;
+      }
+      await refreshChief();
+      if (!isStopped) paint();
+    })();
+  };
+  const replyToChief = (action) => {
+    const label = singleLine(action.targetLabel || action.target, 60);
+    runChiefAction({
+      verb: `send to ${label}`,
+      pending: `Sending to ${label}...`,
+      task: async () => {
+        const send = await chiefOperation(chiefOptions.send, "chiefSend");
+        const result = await send({
+          to: action.target,
+          kind: "update",
+          message: action.text,
+          ...chiefContext(),
+        });
+        return result?.status === "queued"
+          ? `Queued for ${label}; Chief will deliver it`
+          : `Sent to ${label}`;
+      },
+    });
+  };
+  const acknowledgeDesk = () => {
+    // Captured now, from the frame on screen, so mail arriving during the call is never consumed.
+    const snapshot = captureDrawerSnapshot(chiefView.status);
+    runChiefAction({
+      verb: "acknowledge the desk",
+      pending: "Acknowledging the desk...",
+      task: async () => {
+        const desk = await chiefOperation(chiefOptions.desk, "chiefDesk");
+        await desk({ ack: true, snapshot, ...chiefContext() });
+        return "Acknowledged the desk and unattributed inbox";
+      },
+    });
+  };
+  const closeChiefRoom = (roomId) => {
+    const label = chiefLabel(roomId);
+    runChiefAction({
+      verb: `close ${label}`,
+      pending: `Closing ${label}...`,
+      task: async () => {
+        const close = await chiefOperation(chiefOptions.close, "chiefClose");
+        const result = await close({ roomId, force: false, ...chiefContext() });
+        return result?.status === "already-closed"
+          ? `${label} was already closed`
+          : `Closed ${label}`;
+      },
+    });
+  };
   const handleAction = (action) => {
     if (chiefView && action && typeof action === "object") {
       if (action.type === "chief-drill") {
         void openRoom(action.roomId);
+        return;
+      }
+      if (action.type === "chief-reply") {
+        replyToChief(action);
+        return;
+      }
+      if (action.type === "chief-ack-desk") {
+        acknowledgeDesk();
+        return;
+      }
+      if (action.type === "chief-close-room") {
+        closeChiefRoom(action.roomId);
         return;
       }
       if (action.type === "chief-mode") {
@@ -1759,7 +2050,8 @@ export async function runHordeTui(
       const value = key?.sequence || text || "";
       let action;
       if (key?.ctrl && key.name === "c") action = { type: "close-view" };
-      else if (text === "q") action = view.requestClose();
+      // In Chief mode the literal q goes through the view so an active compose line consumes it.
+      else if (text === "q" && mode !== "chief") action = view.requestClose();
       else action = view.handleInput(value);
       handleAction(action);
     },

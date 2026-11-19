@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.92.0
+
+- fix(orchestrate): serialize concurrent creation of integration locks on macOS (#246)
+- Test orphan-lock recovery under inode reuse (#242)
+- feat(orchestrate): inventory and migrate legacy harness paths safely (#237)
+- Fix JSON output from the ork side entry point (#243)
+- fix(orchestrate): park side missions using the workboard create contract (#239)
+- fix(orchestrate): guide workers through existing command approvals (#236)
+
 ## 0.91.1
 
 - fix(orchestrate,monitor): native HTTP daemon fast-path, subagent filter, clean-commit integrate, and N-account policy (#234)

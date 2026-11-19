@@ -8,6 +8,7 @@ import os
 import plistlib
 import pty
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -30,6 +31,8 @@ import install_mailbox as installer  # noqa: E402 -- exercise the shipped instal
 import mailbox_daemon  # noqa: E402 -- exercise daemon transport mode
 import mailbox_mcp  # noqa: E402 -- the server defines the installed tool catalog
 import peer_mailbox as mailbox  # noqa: E402 -- inspect peer state on disk
+
+ZSH = shutil.which("zsh")
 
 
 class InstallMailboxTests(unittest.TestCase):
@@ -464,9 +467,14 @@ class InstallMailboxTests(unittest.TestCase):
         wrapper = self.base / ".config/orchestrate/orkest.sh"
         self.assertTrue(wrapper.is_file())
         self.assertFalse(legacy_skill.exists())
-        self.assertIn('command ork label -- agy --dangerously-skip-permissions "$@"', wrapper.read_text())
-        self.assertIn('command ork agy --dangerously-skip-permissions "$@"', wrapper.read_text())
-        self.assertNotIn("--remote-control", wrapper.read_text())
+        canonical = self.base / ".config/orkest/shell.zsh"
+        self.assertIn('command ork label -- agy --dangerously-skip-permissions "$@"', canonical.read_text())
+        self.assertIn('command ork agy --dangerously-skip-permissions "$@"', canonical.read_text())
+        self.assertNotIn("--remote-control", canonical.read_text())
+        # The installer-owned orkest.sh only sources the canonical file; .zshrc keeps one inclusion.
+        self.assertIn(str(canonical), wrapper.read_text())
+        self.assertNotIn("command ork label", wrapper.read_text())
+        self.assertEqual(zshrc.read_text().count(installer.MANAGED_ZSHRC_START), 1)
         self.assertEqual((self.base / ".local/bin/ork").resolve(), ork_cli.resolve())
         self.assertTrue((self.base / ".claude/commands/swarm.md").is_file())
         self.assertTrue((self.base / ".claude/commands/cleanup.md").is_file())
@@ -1356,6 +1364,407 @@ class InstallMailboxTests(unittest.TestCase):
         }
         aliases = installer._custom_wrapper_aliases(self.base, monitor_config=monitor_config)
         self.assertEqual(aliases, [("claude-alt", "claude")])
+
+
+class AccountFederationTests(unittest.TestCase):
+    """Per-profile federation: account_profile_targets, sync_account_profiles and the narrow CLI modes."""
+
+    URL = "http://127.0.0.1:49152/mcp"
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.base = Path(self.temporary.name).resolve()
+        self.config_path = self.base / "monitor.json"
+        environment = {"HOME": str(self.base), "MONITOR_CONFIG": str(self.config_path), "HERDR_ENV": "0"}
+        patcher = mock.patch.dict(installer.os.environ, environment)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for name in (
+            "CODEX_HOME",
+            "XDG_CONFIG_HOME",
+            "CLAUDE_CONFIG_DIR",
+            "ORKEST_DELEGATED_RUN",
+            "AGENT_EXECUTOR_RUN_ID",
+        ):
+            self.enterContext(mock.patch.dict(installer.os.environ)).pop(name, None)
+        self.enterContext(mock.patch.object(Path, "home", return_value=self.base))
+        self.enterContext(mock.patch.object(installer.shutil, "which", side_effect=lambda name: f"/usr/bin/{name}"))
+        self.enterContext(mock.patch.object(installer.mailbox, "root", return_value=self.base / "mailbox"))
+        self.ensure = self.enterContext(
+            mock.patch.object(installer.mailbox_daemon, "ensure_running", return_value={"url": self.URL})
+        )
+        self.enterContext(mock.patch.object(installer.mailbox_daemon, "read_token", return_value="tok-secret"))
+        self.fast_bin = ORK_FAST.find_ork_fast_bin()
+
+    def accounts(self):
+        home = self.base
+        shared = home / ".antigravity-shared"
+        return [
+            {"id": "claude-a", "provider": "claude", "configDir": str(home / ".claude-a")},
+            {"id": "claude-b", "provider": "claude", "configDir": "~/.claude-b"},
+            {"id": "claude-odd", "provider": "claude", "configDir": str(home / "odd dir" / ".claude")},
+            {"id": "claude-empty", "provider": "claude", "configDir": str(home / "elsewhere" / "empty")},
+            {"id": "claude-dup", "provider": "claude", "configDir": str(home / ".claude-a")},
+            {"id": "codex-a", "provider": "codex", "env": {"CODEX_HOME": str(home / ".codex-a")}},
+            {"id": "codex-b", "provider": "codex", "env": {"CODEX_HOME": "~/.codex-b"}},
+            {"id": "codex-c", "provider": "codex", "env": {"CODEX_HOME": str(home / "x y" / "codex")}},
+            {
+                "id": "agy-a",
+                "provider": "antigravity",
+                "env": {"ANTIGRAVITY_APP_DATA_DIR": str(shared), "GEMINI_CLI_HOME": str(shared)},
+            },
+            {
+                "id": "agy-b",
+                "provider": "antigravity",
+                "env": {"ANTIGRAVITY_APP_DATA_DIR": str(shared), "GEMINI_CLI_HOME": str(shared)},
+            },
+            {
+                "id": "agy-c",
+                "provider": "antigravity",
+                "env": {
+                    "ANTIGRAVITY_APP_DATA_DIR": str(home / ".antigravity-c"),
+                    "GEMINI_CLI_HOME": str(home / ".antigravity-c"),
+                },
+            },
+            *(
+                {
+                    "id": f"oc-{name}",
+                    "provider": "opencode",
+                    "env": {"XDG_CONFIG_HOME": str(home / f".opencode-{name}" / "config")},
+                }
+                for name in "abc"
+            ),
+        ]
+
+    def seed(self, accounts=None):
+        accounts = self.accounts() if accounts is None else accounts
+        self.config_path.write_text(json.dumps({"accounts": accounts, "policy": {"keep": True}}))
+        (self.base / ".claude").mkdir()
+        (self.base / ".claude-b").mkdir()
+        (self.base / ".claude-b/settings.json").write_text('{"theme": "dark"}\n')
+        (self.base / ".codex-a").mkdir()
+        (self.base / ".codex-a/config.toml").write_text('# keep me\n[mcp_servers.other]\ncommand = "x"\n')
+        oc = self.base / ".opencode-a/config/opencode"
+        oc.mkdir(parents=True)
+        (oc / "opencode.jsonc").write_text('{\n  // keep\n  "mcp": {"other": {"type": "local", "command": ["x"]}}\n}\n')
+        return accounts
+
+    def snapshot(self):
+        state = {}
+        for root, dirs, files in os.walk(self.base):
+            for name in [*dirs, *files]:
+                path = Path(root) / name
+                stat = path.lstat()
+                state[str(path)] = (stat.st_mode, stat.st_mtime_ns, path.read_bytes() if path.is_file() else None)
+        return state
+
+    def sync(self, **kwargs):
+        with redirect_stdout(io.StringIO()), mock.patch.object(sys, "stderr", io.StringIO()):
+            return installer.sync_account_profiles(
+                self.base, json.loads(self.config_path.read_text()), fast_bin=self.fast_bin, **kwargs
+            )
+
+    def test_targets_union_legacy_and_accounts_and_deduplicate_canonical_paths(self):
+        self.seed()
+        targets = installer.account_profile_targets(self.base, json.loads(self.config_path.read_text()))
+        by_main = {str(t["main"]): t for t in targets if "main" in t}
+        self.assertEqual(by_main[str(self.base / ".claude.json")]["ids"], [])
+        self.assertEqual(by_main[str(self.base / ".claude-a/.claude.json")]["ids"], ["claude-a", "claude-dup"])
+        # A custom directory whose basename is .claude is not the default profile.
+        self.assertIn(str(self.base / "odd dir/.claude/.claude.json"), by_main)
+        self.assertIn(str(self.base / "elsewhere/empty/.claude.json"), by_main)
+        self.assertEqual(
+            by_main[str(self.base / ".antigravity-shared/.gemini/config/mcp_config.json")]["ids"], ["agy-a", "agy-b"]
+        )
+        self.assertIn(str(self.base / ".codex/config.toml"), by_main)
+        self.assertIn(str(self.base / "x y/codex/config.toml"), by_main)
+        self.assertIn(str(self.base / ".opencode-a/config/opencode/opencode.jsonc"), by_main)
+        self.assertIn(str(self.base / ".opencode-b/config/opencode/opencode.json"), by_main)
+
+    def test_invalid_configured_profiles_error_per_account_without_dropping_others(self):
+        (self.base / "real").mkdir()
+        (self.base / "link").symlink_to(self.base / "real")
+        accounts = [
+            {"id": "rel", "provider": "claude", "configDir": "relative/dir"},
+            {"id": "home", "provider": "codex", "env": {"CODEX_HOME": "~"}},
+            {"id": "sym", "provider": "claude", "configDir": str(self.base / "link/inner")},
+            {"id": "ok", "provider": "claude", "configDir": str(self.base / ".claude-ok")},
+        ]
+        self.config_path.write_text(json.dumps({"accounts": accounts}))
+        result = self.sync()
+        self.assertEqual({e["id"] for e in result["errors"]}, {"rel", "home", "sym"})
+        self.assertTrue(any(p["id"] == "ok" and p["status"] == "changed" for p in result["profiles"]))
+        self.assertTrue((self.base / ".claude-ok/.claude.json").is_file())
+        self.assertFalse((self.base / "real/inner").exists())
+
+    def test_federation_registers_both_services_per_profile_on_one_endpoint_and_is_idempotent(self):
+        self.seed()
+        launcher = self.base / ".local/bin/monitor"
+        launcher.parent.mkdir(parents=True)
+        launcher.write_text("#!/bin/sh\n")
+        launcher.chmod(0o755)
+        (self.base / ".claude-b/settings.json").write_text(
+            '{"theme": "dark", "enabledPlugins": {"monitor@orkest": true}}\n'
+        )
+        first = self.sync()
+        self.assertEqual(first["errors"], [])
+        for profile in (".claude-a", ".claude-b", "odd dir/.claude", "elsewhere/empty"):
+            config = json.loads((self.base / profile / ".claude.json").read_text())
+            self.assertEqual(config["mcpServers"]["peer-mailbox"]["url"], self.URL, profile)
+            self.assertEqual(("monitor" in config["mcpServers"]), profile != ".claude-b", profile)
+            settings = json.loads((self.base / profile / "settings.json").read_text())
+            self.assertIn("Stop", settings["hooks"])
+        self.assertEqual(json.loads((self.base / ".claude-b/settings.json").read_text())["theme"], "dark")
+        for home in (".codex-a", ".codex-b", "x y/codex"):
+            parsed = tomllib.loads((self.base / home / "config.toml").read_text())
+            self.assertEqual(parsed["mcp_servers"]["peer-mailbox"]["url"], self.URL)
+            self.assertIn("monitor", parsed["mcp_servers"])
+            self.assertTrue((self.base / home / "hooks.json").is_file())
+            self.assertTrue((self.base / home / "rules/orkest.rules").is_file())
+        text = (self.base / ".codex-a/config.toml").read_text()
+        self.assertIn("# keep me", text)
+        self.assertEqual(tomllib.loads(text)["mcp_servers"]["other"], {"command": "x"})
+        for root in (".antigravity-shared", ".antigravity-c"):
+            cfg = self.base / root / ".gemini/config"
+            self.assertEqual(
+                json.loads((cfg / "mcp_config.json").read_text())["mcpServers"]["peer-mailbox"]["serverUrl"], self.URL
+            )
+            self.assertIn("peer-mailbox", json.loads((cfg / "hooks.json").read_text()))
+        for name in "abc":
+            directory = self.base / f".opencode-{name}/config/opencode"
+            # Backups share the prefix and glob order is filesystem-dependent; read the live config only.
+            found = next(path for path in (directory / "opencode.jsonc", directory / "opencode.json") if path.is_file())
+            self.assertIn(self.URL, found.read_text())
+            self.assertIn('"monitor"', found.read_text())
+        self.assertIn("// keep", (self.base / ".opencode-a/config/opencode/opencode.jsonc").read_text())
+        # Shared AGY root: exactly one profile target, listed for both accounts.
+        agy = [p for p in first["profiles"] if p["provider"] == "antigravity" and p["id"] in {"agy-a", "agy-b"}]
+        self.assertEqual({p["home"] for p in agy}, {str(self.base / ".antigravity-shared")})
+        before = self.snapshot()
+        second = self.sync()
+        self.assertEqual(second["errors"], [])
+        self.assertEqual(self.snapshot(), before)
+        self.assertTrue(all(p["status"] in {"current", "unavailable"} for p in second["profiles"]))
+
+    def test_gate_hook_is_mirrored_only_where_the_user_already_opted_in(self):
+        import gate
+
+        self.seed()
+        self.sync()
+        for profile in (".claude-a", ".claude-b"):
+            self.assertNotIn("PreToolUse", json.loads((self.base / profile / "settings.json").read_text())["hooks"])
+        default = self.base / ".claude/settings.json"
+        default.write_text(
+            json.dumps(gate.updated({}, "claude", Path(gate.__file__).resolve(), fast_bin=self.fast_bin))
+        )
+        self.sync()
+        for profile in (".claude-a", ".claude-b", "odd dir/.claude"):
+            settings = json.loads((self.base / profile / "settings.json").read_text())
+            commands = [h["command"] for g in settings["hooks"]["PreToolUse"] for h in g["hooks"]]
+            self.assertEqual(len([c for c in commands if "gate-hook" in c]), 1, profile)
+        self.assertEqual(json.loads((self.base / ".claude-b/settings.json").read_text())["theme"], "dark")
+        before = self.snapshot()
+        self.sync()
+        self.assertEqual(self.snapshot(), before)
+
+    def test_delegated_runs_cannot_self_trust_through_federation(self):
+        self.seed()
+        before = self.snapshot()
+        with mock.patch.dict(installer.os.environ, {"ORKEST_DELEGATED_RUN": "1"}):
+            with self.assertRaisesRegex(ValueError, "cannot self-trust"):
+                installer.sync_account_profiles(self.base, {}, trust_codex_hooks=True, dry_run=True)
+            with self.assertRaisesRegex(ValueError, "cannot self-trust"):
+                installer.apply_profile_target(
+                    {"harness": "codex", "home": self.base / ".codex", "main": self.base / ".codex/config.toml"},
+                    self.base, self.base, fast_bin=self.fast_bin, dry_run=True, stdio=True,
+                    daemon_url="", daemon_token="", trust_codex_hooks=True,
+                )  # fmt: skip
+            # Without the trust request a delegated run still federates, and never trusts.
+            self.assertEqual(self.sync()["errors"], [])
+        self.assertNotEqual(self.snapshot(), before)
+        for home in (".codex-a", ".codex-b"):
+            self.assertNotIn("trusted_hash", (self.base / home / "config.toml").read_text())
+
+    def test_ordinary_install_uses_the_same_targets_monitor_semantics_and_isolation(self):
+        self.seed()
+        launcher = self.base / ".local/bin/monitor"
+        launcher.parent.mkdir(parents=True)
+        launcher.write_text("#!/bin/sh\n")
+        launcher.chmod(0o755)
+        (self.base / ".claude-b/settings.json").write_text(
+            '{"theme": "dark", "enabledPlugins": {"monitor@orkest": true}}\n'
+        )
+        (self.base / ".claude-a").mkdir()
+        (self.base / ".claude-a/.credentials.json").write_text("secret-a")
+        for name in (
+            "ensure_hub", "ensure_macos_hud", "approve_orkest_commands", "install_shell_wrappers",
+            "sync_installed_runtimes_and_caches", "install_login_startup", "prune_daemon_runtimes",
+        ):  # fmt: skip
+            self.enterContext(mock.patch.object(installer, name))
+        self.enterContext(mock.patch.object(installer, "ensure_ork_fast", return_value=self.fast_bin))
+        self.enterContext(mock.patch.object(installer.mailbox_daemon, "set_mode"))
+        self.enterContext(mock.patch.object(installer.mailbox_daemon, "runtime_revision", return_value="r"))
+        self.ensure.return_value = {"url": self.URL, "runtimeRevision": "r"}
+        with redirect_stdout(io.StringIO()), mock.patch.object(sys, "stderr", io.StringIO()):
+            installer.install(verify=False, fast_bin=self.fast_bin)
+        urls = set()
+        for profile in (".claude-a", ".claude-b", "odd dir/.claude", "elsewhere/empty"):
+            servers = json.loads((self.base / profile / ".claude.json").read_text())["mcpServers"]
+            urls.add(servers["peer-mailbox"]["url"])
+            self.assertEqual("monitor" in servers, profile != ".claude-b", profile)
+        for home in (".codex-a", ".codex-b", "x y/codex"):
+            urls.add(
+                tomllib.loads((self.base / home / "config.toml").read_text())["mcp_servers"]["peer-mailbox"]["url"]
+            )
+        self.assertEqual(urls, {self.URL})
+        # Credentials stay with their own profile; no other profile receives them.
+        self.assertEqual(sorted(p.parent.name for p in self.base.rglob(".credentials.json")), [".claude-a"])
+        self.assertNotIn("secret-a", "".join(p.read_text() for p in self.base.rglob(".claude.json")))
+
+    def test_dry_run_changes_nothing_and_never_touches_the_daemon(self):
+        self.seed()
+        before = self.snapshot()
+        self.ensure.side_effect = AssertionError("daemon must not start in a dry run")
+        with mock.patch.object(installer.subprocess, "run", side_effect=AssertionError("no subprocess")):
+            result = self.sync(dry_run=True)
+        self.assertEqual(self.snapshot(), before)
+        self.assertIn("would-change", {p["status"] for p in result["profiles"]})
+        self.assertNotIn("tok-secret", json.dumps(result))
+
+    def test_absent_binary_and_malformed_config_do_not_hide_other_profiles(self):
+        self.seed()
+        (self.base / ".claude-a").mkdir()
+        (self.base / ".claude-a/.claude.json").write_text("{not json")
+        real_which = installer.shutil.which
+        with mock.patch.object(
+            installer.shutil, "which", side_effect=lambda n: None if n == "opencode" else real_which(n)
+        ):
+            result = self.sync()
+        statuses = {(p["id"]): p["status"] for p in result["profiles"]}
+        self.assertEqual(statuses["oc-a"], "unavailable")
+        self.assertEqual(statuses["claude-a"], "error")
+        self.assertEqual((self.base / ".claude-a/.claude.json").read_text(), "{not json")
+        self.assertEqual(statuses["codex-b"], "changed")
+        self.assertTrue(any(e["id"] == "claude-a" for e in result["errors"]))
+
+    def test_cli_modes_emit_one_json_object_and_reject_trust_changes(self):
+        self.seed()
+        out = io.StringIO()
+        with redirect_stdout(out), mock.patch.object(sys, "stderr", io.StringIO()):
+            code = installer.main(["--account-sync", "--json", "--dry-run", "--fast-bin", str(self.fast_bin)])
+        payload = json.loads(out.getvalue())
+        self.assertEqual((code, payload["schema"], payload["dryRun"]), (0, "ork.account.sync.v1", True))
+        self.assertEqual(payload["shell"]["status"], "would-change")
+        with mock.patch.object(sys, "stderr", io.StringIO()), self.assertRaises(SystemExit):
+            installer.main(["--account-sync", "--trust-codex-hooks"])
+        # --shell-sync touches only wrapper artifacts.
+        with redirect_stdout(io.StringIO()), mock.patch.object(sys, "stderr", io.StringIO()):
+            installer.main(["--shell-sync", "--json"])
+        self.assertTrue((self.base / ".config/orkest/shell.zsh").is_file())
+        self.assertFalse((self.base / ".codex-a/hooks.json").exists())
+        self.assertFalse((self.base / ".agents").exists())
+
+    def test_shell_artifacts_refuse_foreign_files(self):
+        canonical = self.base / ".config/orkest/shell.zsh"
+        canonical.parent.mkdir(parents=True)
+        canonical.write_text("# mine\n")
+        with redirect_stdout(io.StringIO()), self.assertRaisesRegex(ValueError, "does not own"):
+            installer.sync_shell_artifacts(self.base)
+        self.assertEqual(canonical.read_text(), "# mine\n")
+
+    @unittest.skipUnless(ZSH, "zsh is required")
+    def test_zsh_functions_follow_accounts_and_removal_only_drops_that_function(self):
+        bin_dir = self.base / "fakebin"
+        bin_dir.mkdir()
+        for name in ("claude", "codex"):
+            (bin_dir / name).write_text(f'#!/bin/sh\necho "RAN {name} $*"\n')
+            (bin_dir / name).chmod(0o755)
+        (bin_dir / "ork").write_text('#!/bin/sh\necho FOOTER\nshift 2\nexec "$@"\n')
+        (bin_dir / "ork").chmod(0o755)
+        accounts = [
+            {"id": "claude-w", "provider": "claude", "alias": "claude-w", "route": "claude-w"},
+            {"id": "codex-w", "provider": "codex", "alias": "codex-w", "route": "codex-w"},
+        ]
+        config = {"accounts": accounts}
+        with redirect_stdout(io.StringIO()):
+            installer.sync_shell_artifacts(self.base, monitor_config=config)
+        for name in ("claude-w", "codex-w"):
+            (bin_dir / name).write_text(f'#!/bin/sh\necho "RAN {name} $*"\n')
+            (bin_dir / name).chmod(0o755)
+        shell = self.base / ".config/orkest/shell.zsh"
+
+        def run(command, tty):
+            env = {"PATH": f"{bin_dir}:/usr/bin:/bin", "HOME": str(self.base)}
+            if not tty:
+                return subprocess.run(
+                    [ZSH, "-f", "-c", f"source {shlex.quote(str(shell))}; {command}"],
+                    capture_output=True, text=True, env=env, timeout=20,
+                ).stdout  # fmt: skip
+            master, slave = pty.openpty()
+            process = subprocess.Popen(
+                [ZSH, "-f", "-c", f"source {shlex.quote(str(shell))}; {command}"],
+                stdin=slave, stdout=slave, stderr=slave, env=env,
+            )  # fmt: skip
+            os.close(slave)
+            chunks = b""
+            while True:
+                try:
+                    data = os.read(master, 4096)
+                except OSError:
+                    break
+                if not data:
+                    break
+                chunks += data
+            process.wait(timeout=20)
+            os.close(master)
+            return chunks.decode()
+
+        interactive = run("claude-w hello", tty=True)
+        self.assertEqual(interactive.count("FOOTER"), 1, interactive)
+        self.assertIn("RAN claude-w", interactive)
+        self.assertNotIn("FOOTER", run("claude-w mcp list", tty=True))
+        self.assertNotIn("FOOTER", run("claude-w hello", tty=False))
+        self.assertIn("RAN claude-w mcp list", run("claude-w mcp list", tty=False))
+        with redirect_stdout(io.StringIO()):
+            installer.sync_shell_artifacts(self.base, monitor_config={"accounts": accounts[1:]})
+        self.assertIn("function", run("whence -w codex-w", tty=False))
+        self.assertNotIn("function", run("whence -w claude-w", tty=False))
+
+    def test_profiles_with_different_homes_exchange_and_acknowledge_messages(self):
+        mailbox_root = self.base / "mb-integration"
+        alpha, beta = self.base / ".claude-alpha", self.base / ".codex-beta"
+        peers = {}
+        sleepers = [subprocess.Popen(["sleep", "60"]) for _ in range(2)]
+        for sleeper in sleepers:
+            self.addCleanup(sleeper.wait)
+            self.addCleanup(sleeper.kill)
+        for session, harness, account, pid in (
+            ("alpha", "claude", alpha, sleepers[0].pid),
+            ("beta", "codex", beta, sleepers[1].pid),
+        ):
+            peers[session] = mailbox.register(
+                mailbox_root,
+                session=session,
+                harness=harness,
+                cwd=str(self.base),
+                pid=pid,
+                account=str(account),
+            )
+        sent = mailbox.send(
+            mailbox_root, sender=mailbox.sender_address(peers["alpha"]), to=peers["beta"]["name"], text="ping", kind="update", wake=False, scope="cross-project"
+        )  # fmt: skip
+        inbox = mailbox.messages(mailbox_root, "beta")
+        self.assertEqual([m["text"] for m in inbox], ["ping"])
+        self.assertEqual(mailbox.mark_read(mailbox_root, "beta", [inbox[0]["id"]]), [inbox[0]["id"]])
+        mailbox.send(
+            mailbox_root, sender=mailbox.sender_address(peers["beta"]), to=peers["alpha"]["name"], text="pong", kind="update", wake=False, scope="cross-project"
+        )  # fmt: skip
+        back = mailbox.messages(mailbox_root, "alpha")
+        self.assertEqual([m["text"] for m in back], ["pong"])
+        self.assertEqual(mailbox.mark_read(mailbox_root, "alpha", [back[0]["id"]]), [back[0]["id"]])
+        self.assertEqual(mailbox.messages(mailbox_root, "alpha"), [])
+        self.assertTrue(sent)
 
 
 if __name__ == "__main__":

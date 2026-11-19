@@ -5,24 +5,52 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
 import { renderLine } from "../../monitor/lib/render.mjs";
-import { ackDesk, bindChief, chiefSend, chiefSpawn, chiefStatus, listDesk } from "../lib/chief.mjs";
+import {
+  bindChief,
+  chiefClose,
+  chiefDesk,
+  chiefInbox,
+  chiefReconcile,
+  chiefSend,
+  chiefSpawn,
+  chiefStatus,
+  displayedDigestGroups,
+  listDesk,
+} from "../lib/chief.mjs";
 import { mailboxRoot } from "../lib/horde-room.mjs";
+import { truncateDisplay } from "../lib/tui-box.mjs";
 
 export const CHIEF_HELP = `ork chief [status] [--json] [--room <id>] [--all] [--no-quota]   (machine-wide Chief overview)
 ork chief bind [--session <id>] [--clear] [--force] [--json]   (claim or release the Chief desk)
-ork chief send --to <target> [--from <session>] [--kind update|question|escalation|done] [--no-wake] <message>
+ork chief send --to <target> [--from <session>] [--kind update|question|escalation|done] [--wake | --no-wake] <message>
 ork chief spawn --cwd <repo> [--worktree [slug] | --branch <branch>] (--goal <text> | --goal-file <path>)
-    [--title <t>] [--engine claude|agy|opencode|codex] [--model <m>] [--effort <e>] [--route <r>] [--dry-run] [--json]
+    [--title <t>] [--engine claude|agy|opencode|codex] [--model <m>] [--effort <e>] [--route <r>]
+    [--timeout <t> | --interactive] [--dry-run] [--json]
+ork chief inbox [--ack] [--json]   (open Chief items, grouped by room; --ack clears the groups shown)
+ork chief close <room-or-branch-or-session> [--force] [--json]   (stop tracking a finished mission)
+ork chief reconcile <roomId> [--event <absolute-path>] [--json]   (record a mission's exit once)
 ork chief desk [--ack] [--json]   (reports queued while no Chief was live)
 ork chief view [--print|--json] [--width N]   (Chief View; same as ork horde --view --chief)
 
 Targets resolve in order: exact session ID, "chief" (the bound Chief), room ID, agent name,
 branch or worktree slug, repository name. An ambiguous target lists its candidates.
 spawn launches a detached room orchestrator in its own room (and worktree when asked) that
-reports back to the Chief; it never passes --allow-credits or --ignore-quota.
+reports back to the Chief; it never passes --allow-credits or --ignore-quota. --interactive
+opens the harness in a pane of the current Herdr, Orca or tmux session instead.
+close stops tracking a mission and clears its attention; it never kills a process or deletes files.
 `;
 
-const SUBCOMMANDS = new Set(["bind", "desk", "send", "spawn", "status", "view"]);
+const SUBCOMMANDS = new Set([
+  "bind",
+  "close",
+  "desk",
+  "inbox",
+  "reconcile",
+  "send",
+  "spawn",
+  "status",
+  "view",
+]);
 
 function ago(stamp, now = Date.now()) {
   const ms = now - Date.parse(stamp);
@@ -181,6 +209,40 @@ function splitWorktree(argv) {
   return { rest, worktree };
 }
 
+function renderDigest(payload, width) {
+  if (payload.groups.length === 0) return ["No open Chief items."];
+  const shown = displayedDigestGroups(payload.groups);
+  const lines = [];
+  for (const group of shown) {
+    const head = group.roomId ?? "unattributed";
+    const latest = group.latest ? ago(group.latest) || "just now" : "unknown";
+    lines.push(truncateDisplay(`${head}  ${group.state}  latest ${latest}`, width));
+    const [first, second] = group.asks;
+    lines.push(
+      truncateDisplay(
+        first ? `  ${first.kind} ${first.from}: ${first.text}` : "  no open items",
+        width,
+      ),
+    );
+    if (second) {
+      const more = group.asks.length - 2;
+      lines.push(
+        truncateDisplay(
+          `  next: ${second.kind} ${second.from}: ${second.text}${more > 0 ? ` (+${more} more)` : ""}`,
+          width,
+        ),
+      );
+    } else lines.push("  one open item");
+  }
+  if (payload.groups.length > shown.length)
+    lines.push(`… ${payload.groups.length - shown.length} more rooms (ork chief inbox --json)`);
+  return lines;
+}
+
+function requireNoPositionals(positionals, verb) {
+  if (positionals.length > 0) throw new Error(`${verb} takes no positional arguments`);
+}
+
 export async function chiefCommand(argv = [], context = {}) {
   const {
     stdout = process.stdout,
@@ -190,22 +252,28 @@ export async function chiefCommand(argv = [], context = {}) {
     ...overrides
   } = context;
   const args = [...argv];
-  const action = SUBCOMMANDS.has(args[0]) ? args.shift() : "status";
   if (args.includes("--help") || args.includes("-h") || argv[0] === "help") {
     stdout.write(CHIEF_HELP);
     return;
+  }
+  let action = "status";
+  if (args[0] !== undefined && !String(args[0]).startsWith("-")) {
+    if (!SUBCOMMANDS.has(args[0]))
+      throw new Error(`Unknown chief command "${args[0]}"; run ork chief --help`);
+    action = args.shift();
   }
   if (action === "view") {
     if (typeof main !== "function") throw new Error("ork chief view must run through ork");
     return main(["horde", "--view", "--chief", ...args], { stdout });
   }
   if (action === "status") {
-    const { values } = parse(args, {
+    const { positionals, values } = parse(args, {
       all: { type: "boolean" },
       "no-quota": { type: "boolean" },
       room: { type: "string" },
       width: { type: "string" },
     });
+    requireNoPositionals(positionals, "status");
     const status = await chiefStatus({
       root,
       env,
@@ -222,11 +290,12 @@ export async function chiefCommand(argv = [], context = {}) {
     return write(stdout, status, values.json, renderChiefStatus(status, { width }).join("\n"));
   }
   if (action === "bind") {
-    const { values } = parse(args, {
+    const { positionals, values } = parse(args, {
       clear: { type: "boolean" },
       force: { type: "boolean" },
       session: { type: "string" },
     });
+    requireNoPositionals(positionals, "bind");
     const result = await bindChief({
       root,
       env,
@@ -253,7 +322,9 @@ export async function chiefCommand(argv = [], context = {}) {
       kind: { type: "string" },
       "no-wake": { type: "boolean" },
       to: { type: "string" },
+      wake: { type: "boolean" },
     });
+    if (values.wake && values["no-wake"]) throw new Error("Pass --wake or --no-wake, not both");
     const result = await chiefSend({
       root,
       env,
@@ -261,7 +332,8 @@ export async function chiefCommand(argv = [], context = {}) {
       message: positionals.join(" "),
       from: values.from,
       kind: values.kind,
-      noWake: values["no-wake"],
+      // Absent switches keep the library default: updates stay quiet, everything else wakes.
+      noWake: values["no-wake"] ? true : !values.wake && undefined,
       ...overrides,
     });
     const text =
@@ -271,17 +343,91 @@ export async function chiefCommand(argv = [], context = {}) {
     return write(stdout, result, values.json, text);
   }
   if (action === "desk") {
-    const { values } = parse(args, { ack: { type: "boolean" } });
+    const { positionals, values } = parse(args, { ack: { type: "boolean" } });
+    requireNoPositionals(positionals, "desk");
     const items = listDesk(root).map((item) =>
       Object.fromEntries(Object.entries(item).filter(([key]) => key !== "file")),
     );
-    const acknowledged = values.ack ? ackDesk(root) : 0;
+    let acknowledged = 0;
+    if (values.ack && items.length > 0) {
+      // A desk-only snapshot: it cannot touch mailbox items and never impersonates a session.
+      const result = await chiefDesk({
+        root,
+        env,
+        ack: true,
+        snapshot: {
+          session: null,
+          revision: null,
+          deskIds: items.map((item) => item.id),
+          inboxIds: [],
+        },
+        ...overrides,
+      });
+      acknowledged = result.acknowledged.desk;
+    }
     const payload = { schema: "ork.chief.desk.v1", items, acknowledged };
     const text =
       items.length === 0
         ? "The Chief desk is empty."
         : items.map((item) => `${item.at}  ${item.kind}  ${item.from}: ${item.text}`).join("\n");
     return write(stdout, payload, values.json, text);
+  }
+  if (action === "inbox") {
+    const { positionals, values } = parse(args, { ack: { type: "boolean" } });
+    requireNoPositionals(positionals, "inbox");
+    const payload = await chiefInbox({
+      root,
+      env,
+      ack: values.ack,
+      // Text mode acknowledges only the groups it displays; JSON carries and clears every group.
+      ackScope: values.json ? "all" : "displayed",
+      ...overrides,
+    });
+    const width = Number(stdout.columns || 100);
+    return write(stdout, payload, values.json, renderDigest(payload, width).join("\n"));
+  }
+  if (action === "close") {
+    const { positionals, values } = parse(args, { force: { type: "boolean" } });
+    if (positionals.length !== 1)
+      throw new Error("Pass one room, branch or session: ork chief close <target>");
+    const result = await chiefClose({
+      roomId: positionals[0],
+      target: positionals[0],
+      force: values.force,
+      root,
+      env,
+      ...overrides,
+    });
+    const text =
+      result.status === "closed"
+        ? `Closed ${result.roomId}; its attention is cleared.`
+        : `${result.roomId} was already closed.`;
+    return write(stdout, result, values.json, text);
+  }
+  if (action === "reconcile") {
+    const { positionals, values } = parse(args, {
+      event: { type: "string" },
+      hook: { type: "boolean" },
+      "mailbox-root": { type: "string" },
+    });
+    if (positionals.length !== 1) throw new Error("Pass one room ID: ork chief reconcile <roomId>");
+    if (values.event && !path.isAbsolute(values.event))
+      throw new Error("--event needs an absolute path");
+    if (values["mailbox-root"] && !path.isAbsolute(values["mailbox-root"]))
+      throw new Error("--mailbox-root needs an absolute path");
+    const result = await chiefReconcile({
+      roomId: positionals[0],
+      event: values.event ?? null,
+      hook: Boolean(values.hook),
+      root: values["mailbox-root"] ?? root,
+      env,
+      ...overrides,
+    });
+    // A completion hook that found no artifacts yet reports a retryable exit (EX_TEMPFAIL).
+    if (result.status === "retry") process.exitCode = 75;
+    const detail = result.reason ? `, ${result.reason}` : "";
+    const text = `${result.roomId}: ${result.status}${result.state ? ` (${result.state}${detail})` : ""}`;
+    return write(stdout, result, values.json, text);
   }
   const { rest, worktree } = splitWorktree(args);
   const { positionals, values } = parse(rest, {
@@ -292,6 +438,7 @@ export async function chiefCommand(argv = [], context = {}) {
     engine: { type: "string" },
     goal: { type: "string" },
     "goal-file": { type: "string" },
+    interactive: { type: "boolean" },
     model: { type: "string" },
     route: { type: "string" },
     timeout: { type: "string" },
@@ -310,6 +457,7 @@ export async function chiefCommand(argv = [], context = {}) {
     effort: values.effort,
     route: values.route,
     timeout: values.timeout,
+    interactive: Boolean(values.interactive),
     dryRun: values["dry-run"],
     root,
     env,
@@ -320,7 +468,11 @@ export async function chiefCommand(argv = [], context = {}) {
     : result.workspace;
   let text;
   if (result.dryRun)
-    text = `Would spawn room ${result.roomId} in ${where}:\n  ${result.command.join(" ")}`;
+    text = result.backend
+      ? `Would open room ${result.roomId} in a ${result.backend} pane in ${where}:\n  ${result.command.join(" ")}`
+      : `Would spawn room ${result.roomId} in ${where}:\n  ${result.command.join(" ")}`;
+  else if (result.status === "launched" && result.launch?.backend)
+    text = `Opened room ${result.roomId} in ${where} in a ${result.launch.backend} pane. It reports to the Chief.`;
   else if (result.status === "launched")
     text = `Spawned room ${result.roomId} in ${where} (pid ${result.launch.pid ?? "?"}). It reports to the Chief.`;
   else
