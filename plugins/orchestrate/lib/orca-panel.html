@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Orkest</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+      }
+      body {
+        margin: 0;
+        padding: 10px;
+        font: 12px/1.4 var(--orca-font-sans, system-ui, sans-serif);
+        background: var(--orca-background);
+        color: var(--orca-foreground);
+      }
+      h2 {
+        margin: 12px 0 4px;
+        font-size: 11px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        color: var(--orca-muted-foreground);
+      }
+      .actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+      }
+      button,
+      select {
+        font: inherit;
+        padding: 3px 8px;
+        border: 1px solid var(--orca-border);
+        border-radius: 4px;
+        background: var(--orca-secondary);
+        color: var(--orca-secondary-foreground);
+      }
+      button.primary {
+        background: var(--orca-primary);
+        color: var(--orca-primary-foreground);
+      }
+      button:disabled {
+        opacity: 0.5;
+      }
+      ul {
+        margin: 0;
+        padding: 0;
+        list-style: none;
+      }
+      li {
+        display: flex;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 3px 0;
+        border-bottom: 1px solid var(--orca-border);
+      }
+      .muted {
+        color: var(--orca-muted-foreground);
+      }
+      .state-working {
+        color: var(--orca-primary);
+      }
+      .state-blocked {
+        color: var(--orca-destructive);
+      }
+      #message {
+        min-height: 1.4em;
+        margin-top: 8px;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="workspace" class="muted">Loading…</div>
+    <div class="actions" style="margin-top: 8px">
+      <button id="open" class="primary" data-action="open" disabled>Open Swarm View</button>
+      <button id="toggle" data-action="toggle" disabled>Toggle</button>
+      <button id="close" data-action="close" disabled>Close</button>
+      <button id="chief" data-action="chief" disabled>Open Chief</button>
+    </div>
+    <div id="message" role="status" class="muted"></div>
+    <h2>Rooms</h2>
+    <label class="muted" for="room">Room</label>
+    <select id="room" disabled></select>
+    <ul id="rooms"></ul>
+    <h2>Workers</h2>
+    <ul id="workers"></ul>
+    <h2>Quota</h2>
+    <div id="quota" class="muted">—</div>
+
+    <script>
+      // Every label below reaches the page through textContent, never as markup. Requests carry only
+      // an enumerated action and a room id taken from the last validated status.
+      const ACTIONS = ["toggle", "open", "close", "chief"];
+      const STATES = ["working", "blocked", "waiting", "done", "unknown"];
+      const TONES = ["neutral", "warning", "danger"];
+      const SCHEMA = "orkest.orca-panel-status.v1";
+
+      const $ = (id) => document.getElementById(id);
+      const isObject = (value) =>
+        value !== null && typeof value === "object" && !Array.isArray(value);
+      const isText = (value, max = 256) => typeof value === "string" && value.length <= max;
+
+      /** The status when it has exactly the expected shape, otherwise null. */
+      function validateStatus(payload) {
+        if (!isObject(payload) || payload.schema !== SCHEMA) return null;
+        if (!isText(payload.workspaceId) || !isText(payload.workspaceName)) return null;
+        if (!Array.isArray(payload.rooms) || !Array.isArray(payload.workers)) return null;
+        const rooms = payload.rooms.filter(
+          (room) =>
+            isObject(room) &&
+            isText(room.id) &&
+            room.id !== "" &&
+            isText(room.label) &&
+            isText(room.status, 32) &&
+            typeof room.selected === "boolean" &&
+            typeof room.open === "boolean",
+        );
+        const workers = payload.workers.filter(
+          (worker) =>
+            isObject(worker) &&
+            isText(worker.terminalId) &&
+            isText(worker.title) &&
+            isText(worker.agent, 32) &&
+            STATES.includes(worker.state),
+        );
+        if (rooms.length !== payload.rooms.length || workers.length !== payload.workers.length) {
+          return null;
+        }
+        const view = payload.view;
+        if (!isObject(view) || typeof view.open !== "boolean" || !isText(view.room)) return null;
+        const quota = payload.quota;
+        if (
+          quota !== null &&
+          !(isObject(quota) && isText(quota.text) && TONES.includes(quota.tone))
+        ) {
+          return null;
+        }
+        return { ...payload, rooms, workers };
+      }
+
+      let status = null;
+      let busy = false;
+
+      function row(list, left, right, className) {
+        const item = document.createElement("li");
+        const a = document.createElement("span");
+        a.textContent = left;
+        const b = document.createElement("span");
+        b.textContent = right;
+        b.className = className ?? "muted";
+        item.append(a, b);
+        list.append(item);
+      }
+
+      function render() {
+        const hasWorkspace = Boolean(status?.workspaceId);
+        $("workspace").textContent = hasWorkspace
+          ? `${status.workspaceName || status.workspaceId}${status.view.open ? " · Swarm View open" : ""}`
+          : "Focus an Orca workspace to see its swarm.";
+        for (const button of document.querySelectorAll("button[data-action]")) {
+          button.disabled = busy || !hasWorkspace;
+        }
+        const roomList = $("rooms");
+        const workerList = $("workers");
+        const select = $("room");
+        roomList.replaceChildren();
+        workerList.replaceChildren();
+        const previous = select.value;
+        select.replaceChildren();
+        for (const room of status?.rooms ?? []) {
+          row(roomList, room.label, room.open ? `${room.status} · open` : room.status);
+          const option = document.createElement("option");
+          option.value = room.id;
+          option.textContent = room.label;
+          select.append(option);
+        }
+        const rooms = status?.rooms ?? [];
+        select.value = rooms.some((room) => room.id === previous)
+          ? previous
+          : (rooms.find((room) => room.selected)?.id ?? "");
+        select.disabled = busy || rooms.length < 2;
+        if (rooms.length === 0) row(roomList, hasWorkspace ? "No swarm bound here" : "—", "");
+        for (const worker of status?.workers ?? []) {
+          row(
+            workerList,
+            worker.agent ? `${worker.title} (${worker.agent})` : worker.title,
+            worker.state,
+            `state-${worker.state}`,
+          );
+        }
+        if ((status?.workers ?? []).length === 0) row(workerList, "No agents recorded", "");
+        $("quota").textContent = status?.quota?.text ?? "—";
+      }
+
+      function show(message) {
+        $("message").textContent = message;
+      }
+
+      function accept(payload) {
+        const next = validateStatus(payload);
+        if (!next) {
+          show("Ignored a malformed status from the Orkest worker.");
+          return;
+        }
+        status = next;
+        render();
+      }
+
+      async function refresh() {
+        try {
+          accept(await orca.plugin.request("swarm.status", {}, { timeoutMs: 20000 }));
+        } catch (error) {
+          show(`Orkest worker unavailable: ${error?.code ?? "error"}`);
+        }
+      }
+
+      async function act(action) {
+        if (!ACTIONS.includes(action) || busy) return;
+        busy = true;
+        render();
+        try {
+          const input = { action };
+          const room = $("room").value;
+          // Chief is not tied to a room; the others follow the room picked in this workspace.
+          if (action !== "chief" && room) input.room = room;
+          const result = await orca.plugin.request("swarm.action", input, { timeoutMs: 60000 });
+          show(isObject(result) && isText(result.message, 300) ? result.message : "Done.");
+        } catch (error) {
+          show(`Request failed: ${error?.code ?? "error"}`);
+        } finally {
+          busy = false;
+          await refresh();
+        }
+      }
+
+      for (const button of document.querySelectorAll("button[data-action]")) {
+        button.addEventListener("click", () => act(button.dataset.action));
+      }
+
+      if (typeof orca === "undefined" || !orca.plugin) {
+        show("Open this panel inside Orca.");
+      } else {
+        orca.plugin.on("status.changed", accept);
+        // The worker posts status.changed after every workspace and agent event it sees.
+        void refresh();
+      }
+    </script>
+  </body>
+</html>

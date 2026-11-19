@@ -5,7 +5,7 @@
   "id": "orkest",
   "name": "Orkest",
   "version": "0.1.0",
-  "description": "Toggle the Orkest Swarm View beside the coordinator, preview and focus agent terminals, and show quota in the status bar.",
+  "description": "Toggle the Orkest Swarm View beside the coordinator, open Chief, watch rooms and workers in a sidebar panel, preview and focus agent terminals, and show quota in the status bar.",
   "author": { "name": "loftshed", "url": "https://github.com/loftshed" },
   "repository": "https://github.com/loftshed/orkest",
   "license": "MIT",
@@ -20,10 +20,20 @@
     { "kind": "storage:own" }
   ],
   "contributes": {
+    "panels": [
+      {
+        "id": "orkest-swarm",
+        "title": "Orkest",
+        "icon": "agent",
+        "ui": "html",
+        "entry": "plugins/orchestrate/lib/orca-panel.html"
+      }
+    ],
     "commands": [
       { "id": "orkest.swarm.toggle", "title": "Orkest: Toggle Swarm View", "when": "workspace" },
       { "id": "orkest.swarm.open", "title": "Orkest: Open Swarm View", "when": "workspace" },
       { "id": "orkest.swarm.close", "title": "Orkest: Close Swarm View", "when": "workspace" },
+      { "id": "orkest.chief.open", "title": "Orkest: Open Chief View", "when": "workspace" },
       { "id": "orkest.quota.refresh", "title": "Orkest: Refresh Quota" }
     ],
     "keybindings": [
