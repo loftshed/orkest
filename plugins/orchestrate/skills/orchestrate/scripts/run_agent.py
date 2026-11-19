@@ -2352,6 +2352,7 @@ def doctor_main(argv: list[str] | None = None) -> int:
         "skill_installs": installs,
         "stale_copies": [loc for loc, info in installs.items() if not info["same_as_this"]],
         "peer_messaging": bundled_module("install_mailbox").configuration_status(),
+        "path_migration": bundled_module("path_migration").summary(),
     }
     if messaging_check is not None:
         report["messaging_check"] = messaging_check
@@ -2375,6 +2376,11 @@ def doctor_main(argv: list[str] | None = None) -> int:
     for harness, state in report["peer_messaging"].items():
         summary = "configured" if state["configured"] else "; ".join(state["issues"])
         print(f"  mailbox {harness}: {summary}")
+    migration = report["path_migration"]
+    if migration["total"]:
+        print(bundled_module("path_migration").render(migration, destinations=5))
+        if migration["ready"]:
+            print("  Apply with: ork update (backs up first; restore with path_migration.py --restore DIR).")
     if any(not row["configured"] for row in report["peer_messaging"].values()):
         print("Repair messaging with: doctor --repair-messaging (add --trust-codex-hooks only after review).")
     return 0
