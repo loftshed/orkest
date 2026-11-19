@@ -2,6 +2,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   statSync,
@@ -11,8 +12,9 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
-import { expandHome } from "./exec.mjs";
+import { childEnv, expandHome } from "./exec.mjs";
 import { detectConfig } from "./init.mjs";
+import { normalizeAccountTags } from "./policy.mjs";
 import { fetchAntigravity } from "./providers/antigravity.mjs";
 import { fetchClaude } from "./providers/claude.mjs";
 import { fetchCodex } from "./providers/codex.mjs";
@@ -152,45 +154,214 @@ export const _lockInternals = { lockIsStale, tryLock, unlock, LOCK_DIR };
 // Antigravity usage only moves while agy is in use. Override per account with minRefreshSeconds.
 const MIN_REFRESH_SECONDS = { antigravity: 600 };
 
+function hasAntigravityProbeMismatch(entry, probe) {
+  if (!entry) return false;
+  const expectedAppData = probe.appDataDir ?? null;
+  const expectedGeminiHome = probe.geminiCliHome ?? null;
+  if (entry.appDataDir === undefined || entry.geminiCliHome === undefined) {
+    return expectedAppData !== null || expectedGeminiHome !== null;
+  }
+  return entry.appDataDir !== expectedAppData || entry.geminiCliHome !== expectedGeminiHome;
+}
+
+function isMatchingCachedProbe(entry, provider, probe) {
+  return (
+    Boolean(entry) &&
+    entry.provider === provider &&
+    typeof entry.accountHome === "string" &&
+    probe.accountHome != null &&
+    entry.accountHome === probe.accountHome &&
+    (provider !== "antigravity" || !hasAntigravityProbeMismatch(entry, probe))
+  );
+}
+
 function staleIds(config, snapshot, maxAgeMs, now) {
   return config.accounts
     .filter((a) => {
       const entry = snapshot.accounts[a.id];
+      const probe = resolveAccountProbe(a, config);
+      const expectedHome = probe.accountHome;
+      const hasHomeChanged =
+        (entry?.accountHome != null && entry.accountHome !== expectedHome) ||
+        (a.provider === "antigravity" && hasAntigravityProbeMismatch(entry, probe));
       const lastAttempt = Math.max(entry?.fetchedAt ?? 0, entry?.errorAt ?? 0);
       const floor = (a.minRefreshSeconds ?? MIN_REFRESH_SECONDS[a.provider] ?? 0) * 1000;
       const limit = maxAgeMs < 0 ? maxAgeMs : Math.max(maxAgeMs, floor);
-      return !entry || entry.provider !== a.provider || now - lastAttempt > limit;
+      return !entry || entry.provider !== a.provider || hasHomeChanged || now - lastAttempt > limit;
     })
     .map((a) => a.id);
 }
 
+function canonicalPath(target) {
+  const resolved = path.resolve(target);
+  try {
+    return realpathSync(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
+function resolveChildEnvPath(value, baseDir = homedir()) {
+  const trimmed = String(value).trim();
+  let expanded;
+  if (trimmed === "~") {
+    expanded = baseDir;
+  } else if (trimmed.startsWith("~/")) {
+    expanded = path.join(baseDir, trimmed.slice(2));
+  } else {
+    expanded = expandHome(trimmed);
+  }
+  return path.isAbsolute(expanded) ? path.resolve(expanded) : path.resolve(baseDir, expanded);
+}
+
+function normalizeProviderEnv(env, keys) {
+  const normalized = {};
+  for (const key of keys) {
+    if (typeof env[key] === "string" && env[key].trim()) {
+      normalized[key] = resolveChildEnvPath(env[key]);
+    }
+  }
+  return normalized;
+}
+
+/**
+ * Resolves the canonical home directory and normalized child env overrides that Monitor's provider
+ * fetcher actually probes for an account (resolving relative paths against the child's cwd, `homedir()`).
+ */
+function resolveAccountProbe(account, config = {}) {
+  const mergedConfigEnv = { ...config.env, ...account.env };
+  if (account.provider === "claude") {
+    const rawHome =
+      typeof mergedConfigEnv.HOME === "string" && mergedConfigEnv.HOME.trim()
+        ? resolveChildEnvPath(mergedConfigEnv.HOME)
+        : null;
+    const envHomeBase = rawHome ?? homedir();
+    const defaultConfigDir = canonicalPath(path.join(envHomeBase, ".claude"));
+    const rawConfigDir = [
+      account.configDir,
+      account.claudeConfigDir,
+      mergedConfigEnv.CLAUDE_CONFIG_DIR,
+    ].find((v) => typeof v === "string" && v.trim());
+    const configDir = rawConfigDir ? resolveChildEnvPath(rawConfigDir, envHomeBase) : null;
+    const env = childEnv(
+      {
+        ...mergedConfigEnv,
+        CLAUDE_CONFIG_DIR:
+          configDir && canonicalPath(configDir) !== defaultConfigDir ? configDir : null,
+      },
+      { strip: [/^ANTHROPIC_/, /^CLAUDE_CODE_/, "CLAUDECODE", "CLAUDE_CONFIG_DIR"] },
+    );
+    const envOverrides = normalizeProviderEnv(env, ["HOME", "CLAUDE_CONFIG_DIR"]);
+    const homeBase = envOverrides.HOME ?? homedir();
+    const callerHome = canonicalPath(homedir());
+    const probedHome = envOverrides.HOME ? canonicalPath(envOverrides.HOME) : null;
+    const accountEnv = probedHome && probedHome !== callerHome ? { HOME: probedHome } : null;
+    const claudeConfigDir = envOverrides.CLAUDE_CONFIG_DIR ?? null;
+    const shouldUnsetClaudeConfigDir = claudeConfigDir === null;
+    const claudeDir = claudeConfigDir ?? path.join(homeBase, ".claude");
+    return {
+      accountHome: canonicalPath(claudeDir),
+      envOverrides,
+      accountEnv,
+      claudeConfigDir,
+      unsetClaudeConfigDir: shouldUnsetClaudeConfigDir,
+    };
+  }
+  const rawHome =
+    typeof mergedConfigEnv.HOME === "string" && mergedConfigEnv.HOME.trim()
+      ? resolveChildEnvPath(mergedConfigEnv.HOME)
+      : null;
+  const envHomeBase = rawHome ?? homedir();
+  const preResolvedEnv = { ...mergedConfigEnv };
+  if (rawHome !== null) {
+    preResolvedEnv.HOME = rawHome;
+  }
+  for (const key of ["CODEX_HOME", "GEMINI_CLI_HOME", "ANTIGRAVITY_APP_DATA_DIR"]) {
+    if (typeof preResolvedEnv[key] === "string" && preResolvedEnv[key].trim()) {
+      preResolvedEnv[key] = resolveChildEnvPath(preResolvedEnv[key], envHomeBase);
+    }
+  }
+  const env = childEnv(preResolvedEnv);
+  const envOverrides = normalizeProviderEnv(env, [
+    "HOME",
+    "CODEX_HOME",
+    "GEMINI_CLI_HOME",
+    "ANTIGRAVITY_APP_DATA_DIR",
+  ]);
+  const homeBase = envOverrides.HOME ?? homedir();
+  if (account.provider === "codex") {
+    const codexHome = canonicalPath(envOverrides.CODEX_HOME ?? path.join(homeBase, ".codex"));
+    return { accountHome: codexHome, codexHome, envOverrides };
+  }
+  if (account.provider === "antigravity") {
+    const appDataDir = envOverrides.ANTIGRAVITY_APP_DATA_DIR
+      ? canonicalPath(envOverrides.ANTIGRAVITY_APP_DATA_DIR)
+      : null;
+    const geminiCliHome = envOverrides.GEMINI_CLI_HOME
+      ? canonicalPath(envOverrides.GEMINI_CLI_HOME)
+      : null;
+    const accountHome =
+      appDataDir ?? geminiCliHome ?? canonicalPath(path.join(homeBase, ".gemini"));
+    const agyHome = geminiCliHome ?? appDataDir ?? canonicalPath(path.join(homeBase, ".gemini"));
+    return { accountHome, agyHome, appDataDir, geminiCliHome, envOverrides };
+  }
+  return { accountHome: null, envOverrides: {} };
+}
+
+export function resolveAccountHome(account, config = {}) {
+  return resolveAccountProbe(account, config).accountHome;
+}
+
 async function fetchAccount(account, config, previous) {
   const started = Date.now();
+  const probe = resolveAccountProbe(account, config);
+  const {
+    accountHome,
+    appDataDir,
+    geminiCliHome,
+    envOverrides,
+    accountEnv,
+    claudeConfigDir,
+    unsetClaudeConfigDir,
+  } = probe;
+  const isSameHome = isMatchingCachedProbe(previous, account.provider, probe);
   try {
     const data = await FETCHERS[account.provider](
-      { ...account, env: { ...config.env, ...account.env } },
+      { ...account, env: { ...config.env, ...account.env, ...envOverrides } },
       { now: started },
     );
     return {
       id: account.id,
       provider: account.provider,
+      accountHome,
+      ...(account.provider === "claude" && {
+        claudeConfigDir: data.claudeConfigDir ?? claudeConfigDir ?? null,
+        unsetClaudeConfigDir: data.unsetClaudeConfigDir ?? unsetClaudeConfigDir ?? false,
+        ...(accountEnv && { accountEnv }),
+      }),
+      ...(account.provider === "antigravity" && {
+        appDataDir: appDataDir ?? null,
+        geminiCliHome: geminiCliHome ?? null,
+      }),
       ok: true,
       fetchedAt: Date.now(),
       durationMs: Date.now() - started,
       ...data,
-      resetHistory: observeResets(
-        data,
-        previous?.provider === account.provider ? previous : null,
-        started,
-      ),
+      resetHistory: observeResets(data, isSameHome ? previous : null, started),
     };
   } catch (error) {
-    // Keep the last good reading so an outage shows stale numbers rather than nothing.
-    const keep = previous?.provider === account.provider ? previous : {};
+    // Keep the last good reading ONLY when it belongs to the same verified probed home.
+    const canKeepLegacy = isSameHome;
+    const keep = canKeepLegacy ? previous : {};
     return {
       ...keep,
       id: account.id,
       provider: account.provider,
+      accountHome: accountHome ?? (canKeepLegacy ? (previous.accountHome ?? null) : null),
+      ...(account.provider === "antigravity" && {
+        appDataDir: appDataDir ?? null,
+        geminiCliHome: geminiCliHome ?? null,
+      }),
       ok: false,
       error: error.message,
       errorAt: Date.now(),
@@ -234,19 +405,51 @@ export async function getAccounts({ maxAgeSeconds, force = false, config = loadC
     // A forced refresh is satisfied by a refresh that completed, not by one that was abandoned.
     if (force && snapshot.updatedAt !== seen) break;
   }
-  return config.accounts.map((account) => ({
-    ...(snapshot.accounts[account.id] ?? {
-      id: account.id,
-      provider: account.provider,
-      ok: false,
-      error: "not fetched yet",
-    }),
-    label: account.label ?? account.id,
-    short: account.short ?? account.id.slice(0, 2).toUpperCase(),
-    route: account.route,
-    routes: account.routes ?? {},
-    billing: account.billing ?? null,
-    configDir: account.configDir ?? null,
-    resetAnnouncements: account.resetAnnouncements ?? [],
-  }));
+  return config.accounts.map((account) => {
+    const probe = resolveAccountProbe(account, config);
+    const cached = snapshot.accounts[account.id];
+    const isValidCached = isMatchingCachedProbe(cached, account.provider, probe);
+    const entry = isValidCached
+      ? cached
+      : {
+          id: account.id,
+          provider: account.provider,
+          accountHome: null,
+          ok: false,
+          error: "not fetched yet",
+        };
+    return {
+      ...entry,
+      label: account.label ?? account.id,
+      short: account.short ?? account.id.slice(0, 2).toUpperCase(),
+      alias:
+        typeof account.alias === "string" && account.alias.trim() ? account.alias.trim() : null,
+      aliases: Array.isArray(account.aliases) ? account.aliases : [],
+      category: account.category ?? null,
+      tags: normalizeAccountTags(account),
+      route: account.route,
+      routes: account.routes ?? {},
+      billing: account.billing ?? null,
+      configDir: account.configDir ?? null,
+      ...(account.provider === "claude" && {
+        claudeConfigDir: isValidCached
+          ? (entry.claudeConfigDir ?? probe.claudeConfigDir ?? null)
+          : (probe.claudeConfigDir ?? null),
+        unsetClaudeConfigDir: isValidCached
+          ? (entry.unsetClaudeConfigDir ?? probe.unsetClaudeConfigDir ?? false)
+          : (probe.unsetClaudeConfigDir ?? false),
+        ...((isValidCached ? (entry.accountEnv ?? probe.accountEnv) : probe.accountEnv) && {
+          accountEnv: isValidCached ? (entry.accountEnv ?? probe.accountEnv) : probe.accountEnv,
+        }),
+      }),
+      ...(account.provider === "codex" && { codexHome: probe.codexHome ?? null }),
+      ...(account.provider === "antigravity" && {
+        agyHome: probe.agyHome ?? null,
+        appDataDir: probe.appDataDir ?? null,
+        geminiCliHome: probe.geminiCliHome ?? null,
+      }),
+      accountHome: entry.accountHome ?? null,
+      resetAnnouncements: account.resetAnnouncements ?? [],
+    };
+  });
 }

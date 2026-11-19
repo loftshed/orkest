@@ -26,6 +26,7 @@ import fcntl
 import functools
 import hashlib
 import importlib.util
+import inspect
 import json
 import os
 import re
@@ -63,9 +64,16 @@ LEASE_POLL_SECONDS = 5
 LAUNCH_RETRY_SECONDS = (10, 30)
 LEASE_BUSY_EXIT = 27
 STATUS_LINES = 200
-HARNESS_ENGINE = {"claude": "claude", "codex": "codex", "gemini": "agy"}
-FINAL = {"handed-over", "refused", "ignored", "failed", "not-exhausted"}
+HARNESS_ENGINE = {"claude": "claude", "codex": "codex", "gemini": "agy", "opencode": "opencode"}
+FINAL = {"handed-over", "brief-ready", "refused", "ignored", "failed", "not-exhausted"}
 WOKEN = {"scheduled", "sent"}
+CHIEF_SCHEMA = "ork.chief.v1"
+CHIEF_UNVERIFIED_GRACE_SECONDS = 600
+MAX_PEER_AGE_SECONDS = 7 * 86_400
+UNKNOWN_PID_TTL_SECONDS = 2 * 3600
+SHARED_PROCESS_IDLE_TTL_SECONDS = 3 * 3600
+SHARED_PROCESS_BUSY_TTL_SECONDS = 30 * 60
+SHARED_PROCESS_SUBAGENT_TTL_SECONDS = 300
 
 
 @functools.cache
@@ -387,11 +395,11 @@ def poll(base: Path, me: dict[str, Any], *, spawn: Callable | None = None) -> No
         return
     mailbox().annotate(base, me["session"], handoffCheckedAt=stamp(now()))
     config = s.monitor_config()
-    account, _ = s.account_of(acting["harness"], acting.get("accountHome"), config)
-    if account is None:
-        return
     view = s.cached_view()
     if view is None:
+        return
+    account, _ = s.account_of(acting["harness"], acting.get("accountHome"), config, view=view)
+    if account is None:
         return
     pool = s.pool_for(acting["harness"], session_model(acting), account, view, config)
     if pool.get("status") == "blocked":
@@ -468,7 +476,267 @@ def room_tasks(room: dict[str, Any]) -> list[dict[str, Any]]:
     return tasks
 
 
-def build_note(event: dict[str, Any], *, base: Path, rooms: list[dict[str, Any]], team: dict[str, Any] | None) -> str:
+def _is_local_peer(peer: dict[str, Any], host: str) -> bool:
+    machine = peer.get("machine")
+    return not (isinstance(machine, str) and machine.strip()) or machine == host
+
+
+def _shared_process_ttl_seconds(state: Any, is_subagent: bool = False) -> int:
+    if is_subagent:
+        return SHARED_PROCESS_SUBAGENT_TTL_SECONDS
+    if state == "busy":
+        return SHARED_PROCESS_BUSY_TTL_SECONDS
+    return SHARED_PROCESS_IDLE_TTL_SECONDS
+
+
+def _is_chief_peer_live(
+    peer: dict[str, Any],
+    moment: dt.datetime,
+    fresh_birth_fn: Callable[[int], str | None],
+) -> bool:
+    """Chief peer liveness aligned with chief.mjs (isPeerLive) & identity.rs: enforces 7-day heartbeat TTL."""
+    m = mailbox()
+    seen = parse_time(peer.get("lastSeenAt") or peer.get("startedAt"))
+    if seen is None:
+        return False
+    pid = peer.get("pid")
+    valid_pid = isinstance(pid, int) and not isinstance(pid, bool) and pid > 0
+    alive = m.pid_alive(pid) if valid_pid else None
+    if alive is False:
+        return False
+    peer_birth = peer.get("pidBirth")
+    if alive and isinstance(peer_birth, str) and peer_birth.strip() and valid_pid:
+        current = fresh_birth_fn(pid)
+        if current is not None and current != peer_birth.strip():
+            return False
+    age = (moment - seen).total_seconds()
+    if age > MAX_PEER_AGE_SECONDS:
+        return False
+    shared = peer.get("sharedProcess") is True
+    is_subagent = peer.get("isSubagent") is True
+    if shared and is_subagent:
+        return age <= SHARED_PROCESS_SUBAGENT_TTL_SECONDS
+    if alive and shared:
+        return age <= _shared_process_ttl_seconds(peer.get("state"))
+    return True if alive else age <= UNKNOWN_PID_TTL_SECONDS
+
+
+def _is_top_level_replacement_peer(
+    candidate: dict[str, Any],
+    chief_session: str,
+    pid: int,
+    pid_birth: str | None,
+    host: str,
+    moment: dt.datetime,
+    fresh_birth_fn: Callable[[int], str | None],
+) -> bool:
+    m = mailbox()
+    if (
+        not isinstance(candidate, dict)
+        or candidate.get("session") == chief_session
+        or not _is_local_peer(candidate, host)
+        or candidate.get("pid") != pid
+    ):
+        return False
+    candidate_birth = candidate.get("pidBirth")
+    if (
+        isinstance(candidate_birth, str)
+        and candidate_birth
+        and isinstance(pid_birth, str)
+        and pid_birth
+        and candidate_birth != pid_birth
+    ):
+        return False
+    if (
+        m.is_run_peer(candidate)
+        or str(candidate.get("session") or "").startswith("run-")
+        or candidate.get("isSubagent")
+        or candidate.get("agySubagentPending")
+        or candidate.get("delegatedRun")
+        or candidate.get("parentSession")
+    ):
+        return False
+    return (
+        candidate["live"]
+        if isinstance(candidate.get("live"), bool)
+        else _is_chief_peer_live(candidate, moment, fresh_birth_fn)
+    )
+
+
+def live_chief_binding(
+    base: Path,
+    session: str,
+    *,
+    event: dict[str, Any] | None = None,
+    peers: list[dict[str, Any]] | None = None,
+    moment: dt.datetime | None = None,
+) -> dict[str, Any] | None:
+    """Return the local Chief binding in `<base>/chief.json` if `session` holds it live, else None."""
+    binding = load_json(base / "chief.json")
+    if not isinstance(binding, dict) or binding.get("schema") != CHIEF_SCHEMA:
+        return None
+    chief_session = binding.get("session")
+    if not isinstance(chief_session, str) or not chief_session.strip():
+        return None
+    chief_session = chief_session.strip()
+    my_sessions = {session}
+    if event and isinstance(event.get("peerSession"), str) and event["peerSession"].strip():
+        my_sessions.add(event["peerSession"].strip())
+    if chief_session not in my_sessions:
+        return None
+    host = socket.gethostname()
+    machine = binding.get("machine")
+    if machine is not None and (not isinstance(machine, str) or (machine.strip() and machine != host)):
+        return None
+    m = mailbox()
+    pid = binding.get("pid")
+    valid_pid = isinstance(pid, int) and not isinstance(pid, bool) and pid > 0
+    alive = m.pid_alive(pid) if valid_pid else None
+    if alive is False:
+        return None
+    raw_birth = binding.get("pidBirth")
+    pid_birth = raw_birth.strip() if isinstance(raw_birth, str) and raw_birth.strip() else None
+
+    fresh_birth_cache: dict[int, str | None] = {}
+
+    def fresh_birth(target_pid: int) -> str | None:
+        if target_pid in fresh_birth_cache:
+            return fresh_birth_cache[target_pid]
+        with contextlib.suppress(AttributeError):
+            m._PID_BIRTH_CACHE.pop(target_pid, None)
+        val = m.process_started(target_pid)
+        fresh_birth_cache[target_pid] = val
+        return val
+
+    verified_live_pid = False
+    if valid_pid and alive:
+        if pid_birth:
+            current_birth = fresh_birth(pid)
+            if current_birth and current_birth != pid_birth:
+                return None
+            verified_live_pid = bool(current_birth)
+        else:
+            verified_live_pid = True
+    current_moment = moment or now()
+    bound_at = parse_time(binding.get("boundAt"))
+    age = (current_moment - bound_at).total_seconds() if bound_at is not None else None
+    is_in_grace = age is not None and 0 <= age <= CHIEF_UNVERIFIED_GRACE_SECONDS
+    if valid_pid and not verified_live_pid and not is_in_grace:
+        return None
+    if peers is not None:
+        peer = next(
+            (
+                p
+                for p in peers
+                if isinstance(p, dict)
+                and p.get("session") == chief_session
+                and not m.is_run_peer(p)
+                and not str(p.get("session") or "").startswith("run-")
+                and _is_local_peer(p, host)
+            ),
+            None,
+        )
+    else:
+        loaded = m.load(m.peer_path(base, chief_session))
+        peer = (
+            loaded
+            if isinstance(loaded, dict)
+            and loaded.get("session") == chief_session
+            and not m.is_run_peer(loaded)
+            and not str(loaded.get("session") or "").startswith("run-")
+            and _is_local_peer(loaded, host)
+            else None
+        )
+    if peer is not None:
+        peer_pid = peer.get("pid")
+        valid_peer_pid = isinstance(peer_pid, int) and not isinstance(peer_pid, bool) and peer_pid > 0
+        raw_peer_birth = peer.get("pidBirth")
+        peer_birth = raw_peer_birth.strip() if isinstance(raw_peer_birth, str) and raw_peer_birth.strip() else None
+        if valid_pid and valid_peer_pid and pid != peer_pid:
+            return None
+        if pid_birth and peer_birth and pid_birth != peer_birth:
+            return None
+        peer_live = (
+            peer["live"]
+            if isinstance(peer.get("live"), bool)
+            else _is_chief_peer_live(peer, current_moment, fresh_birth)
+        )
+        return binding if peer_live else None
+    if verified_live_pid:
+        if not is_in_grace:
+            candidate_peers = peers if peers is not None else m.peers(base, prune_dead=False)
+            if any(
+                _is_top_level_replacement_peer(
+                    candidate, chief_session, pid, pid_birth, host, current_moment, fresh_birth
+                )
+                for candidate in candidate_peers
+            ):
+                return None
+        return binding
+    if is_in_grace:
+        return binding
+    return None
+
+
+def _chief_token(binding: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(binding, dict):
+        return None
+    rev = binding.get("revision")
+    gen = binding.get("generation")
+    return {
+        "session": binding.get("session"),
+        "revision": rev if isinstance(rev, int) and not isinstance(rev, bool) else None,
+        "generation": gen.strip() if isinstance(gen, str) and gen.strip() else None,
+    }
+
+
+def _chief_token_matches(current_binding: dict[str, Any] | None, expected: dict[str, Any] | None) -> bool:
+    if not isinstance(current_binding, dict) or not isinstance(expected, dict):
+        return False
+    if current_binding.get("session") != expected.get("session"):
+        return False
+    exp_rev = expected.get("revision")
+    cur_rev = current_binding.get("revision")
+    if exp_rev is None:
+        if cur_rev is not None:
+            return False
+    elif cur_rev != exp_rev:
+        return False
+    exp_gen = expected.get("generation")
+    cur_gen = current_binding.get("generation")
+    cur_gen_str = cur_gen.strip() if isinstance(cur_gen, str) and cur_gen.strip() else None
+    if exp_gen is None:
+        return cur_gen_str is None
+    return cur_gen_str == exp_gen
+
+
+def chief_summary(binding: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "session": binding.get("session"),
+        "name": binding.get("name"),
+        "machine": binding.get("machine"),
+        "boundAt": binding.get("boundAt"),
+        "cwd": binding.get("cwd"),
+    }
+
+
+def chief_desk_lines(chief: dict[str, Any]) -> list[str]:
+    return [
+        f"- Chief session: {chief.get('session') or 'unknown'} ({chief.get('name') or 'unnamed'})",
+        f"- Machine: {chief.get('machine') or socket.gethostname()}",
+        f"- Bound at: {chief.get('boundAt') or 'unknown'}",
+        f"- Chief cwd: {chief.get('cwd') or 'unknown'}",
+    ]
+
+
+def build_note(
+    event: dict[str, Any],
+    *,
+    base: Path,
+    rooms: list[dict[str, Any]],
+    team: dict[str, Any] | None,
+    chief: dict[str, Any] | None = None,
+) -> str:
     """What the successor needs, as recorded facts only: nothing here is written by a model."""
     peer_session = event.get("peerSession") or event["session"]
     progress = mailbox().load(base / "progress" / f"{mailbox().session_key(peer_session)}.json") or {}
@@ -553,6 +821,8 @@ def build_note(event: dict[str, Any], *, base: Path, rooms: list[dict[str, Any]]
             ),
             f"- Registered tasks: {len(team.get('tasks') or [])}",
         ]
+    if chief:
+        lines += ["", "## Chief desk", "", *chief_desk_lines(chief)]
     return "\n".join(lines) + "\n"
 
 
@@ -586,6 +856,155 @@ def launch_models(harness: str, lead: dict[str, Any], routes: dict[str, Any]) ->
     return sorted(found, key=lambda model: (found[model], model))
 
 
+def _call_allowed(
+    allowed: Callable[..., bool],
+    engine: str,
+    config_dir: str | None,
+    *,
+    account_id: str,
+    provider: str | None,
+    billing_mode: str | None,
+    tags: list[str] | tuple[str, ...] | None = None,
+    account_alias: str | None = None,
+    codex_home: str | None = None,
+    agy_home: str | None = None,
+) -> bool:
+    sig = inspect.signature(allowed)
+    accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+    if accepts_kwargs or "strict" in sig.parameters:
+        optional = {
+            "account_id": account_id,
+            "provider": provider,
+            "billing_mode": billing_mode,
+            "tags": list(tags) if tags is not None else None,
+            "account_alias": account_alias,
+            "codex_home": codex_home,
+            "agy_home": agy_home,
+            "strict": True,
+        }
+        kwargs = optional if accepts_kwargs else {k: v for k, v in optional.items() if k in sig.parameters}
+        return bool(allowed(engine, config_dir, **kwargs))
+    return bool(allowed(engine, config_dir))
+
+
+def _claude_account_home_override(
+    s: Any,
+    entry: dict[str, Any],
+    config: dict[str, Any],
+    view_account: dict[str, Any] | None,
+    account_home: str,
+    *,
+    is_default_profile: bool,
+) -> str | None:
+    if isinstance(view_account, dict):
+        acct_env = view_account.get("accountEnv")
+        if isinstance(acct_env, dict):
+            raw_home = acct_env.get("HOME")
+            if isinstance(raw_home, str) and raw_home.strip():
+                return str(s._resolve_child_path(raw_home))
+    if s._has_configured_home_override(entry, config):
+        merged = s._merged_account_env(
+            entry,
+            config,
+            strip_exact=("CLAUDECODE", "CLAUDE_CONFIG_DIR"),
+            strip_prefixes=("ANTHROPIC_", "CLAUDE_CODE_"),
+        )
+        return str(s._env_base_home(merged))
+    if is_default_profile:
+        resolved_acct = Path(account_home).resolve()
+        if resolved_acct.name == ".claude" and resolved_acct != (Path.home() / ".claude").resolve():
+            return str(resolved_acct.parent)
+    return None
+
+
+def _claude_launch_binding(
+    s: Any,
+    entry: dict[str, Any],
+    config: dict[str, Any],
+    view_account: dict[str, Any] | None,
+) -> tuple[bool, str | None, str | None, dict[str, str | None]]:
+    """Resolve Monitor-verified Claude launch binding: (launchable, account_home, config_dir, launch_env)."""
+    if s._view_account_unverified(view_account):
+        return False, None, None, {}
+    account_home = str(s._configured_claude_home(entry, config, view_account=view_account))
+
+    def _build_env(cfg_dir: str | None, *, is_default_profile: bool) -> dict[str, str | None]:
+        env: dict[str, str | None] = {
+            "CLAUDE_CONFIG_DIR": cfg_dir,
+            "ORKEST_PINNED_CLAUDE_ACCOUNT": "1",
+        }
+        home_override = _claude_account_home_override(
+            s,
+            entry,
+            config,
+            view_account,
+            account_home,
+            is_default_profile=is_default_profile,
+        )
+        if home_override:
+            env["ORKEST_CLAUDE_ACCOUNT_HOME"] = home_override
+        return env
+
+    if isinstance(view_account, dict):
+        if view_account.get("unsetClaudeConfigDir") is True:
+            return True, account_home, None, _build_env(None, is_default_profile=True)
+        raw_view_cfg = view_account.get("claudeConfigDir")
+        if isinstance(raw_view_cfg, str) and raw_view_cfg.strip():
+            cfg_str = str(s._resolve_child_path(raw_view_cfg))
+            return True, account_home, cfg_str, _build_env(cfg_str, is_default_profile=False)
+    if entry.get("unsetClaudeConfigDir") is True:
+        return True, account_home, None, _build_env(None, is_default_profile=True)
+    raw_dir = entry.get("claudeConfigDir") or entry.get("configDir")
+    if not isinstance(raw_dir, str) or not raw_dir.strip():
+        if s._has_configured_home_override(entry, config):
+            return True, account_home, None, _build_env(None, is_default_profile=True)
+        return False, None, None, {}
+    resolved_cfg = s._resolve_child_path(raw_dir)
+    default_cfg = (Path.home() / ".claude").resolve()
+    if resolved_cfg == default_cfg:
+        return True, account_home, None, _build_env(None, is_default_profile=True)
+    cfg_str = str(resolved_cfg)
+    return True, account_home, cfg_str, _build_env(cfg_str, is_default_profile=False)
+
+
+def _non_claude_launch_binding(
+    s: Any,
+    harness: str,
+    entry: dict[str, Any],
+    config: dict[str, Any],
+    view_account: dict[str, Any] | None,
+) -> tuple[str | None, dict[str, str | None]]:
+    """Resolve and verify (account_home, launch_env) for a non-Claude fresh launch, or (None, {}) if unverified."""
+    if view_account is not None and "accountHome" in view_account and s._view_account_home(view_account) is None:
+        return None, {}
+    snapshot_home = s._view_account_home(view_account)
+    explicit_home, effective_home = s._configured_provider_home(
+        entry["provider"], entry, config, view_account=view_account
+    )
+    account_home = str(snapshot_home or explicit_home or effective_home)
+    if not account_home:
+        return None, {}
+    if harness == "codex":
+        return account_home, {"CODEX_HOME": account_home, "ORKEST_CODEX_ACCOUNT_HOME": account_home}
+    merged_env = s._merged_account_env(entry, config)
+    raw_app = merged_env.get("ANTIGRAVITY_APP_DATA_DIR")
+    raw_gemini = merged_env.get("GEMINI_CLI_HOME")
+    if isinstance(raw_app, str) and raw_app.strip() and not (isinstance(raw_gemini, str) and raw_gemini.strip()):
+        app_data = s._resolve_child_path(raw_app)
+        configured = app_data.parent if app_data.name.startswith("antigravity") else app_data
+        if str(configured.resolve()) == account_home:
+            return account_home, {
+                "ANTIGRAVITY_APP_DATA_DIR": str(app_data),
+                "GEMINI_CLI_HOME": account_home,
+                "ORKEST_AGY_ACCOUNT_HOME": str(app_data),
+            }
+    return account_home, {
+        "GEMINI_CLI_HOME": account_home,
+        "ANTIGRAVITY_APP_DATA_DIR": None,
+        "ORKEST_AGY_ACCOUNT_HOME": account_home,
+    }
+
+
 def choose_successor(
     lead: dict[str, Any],
     *,
@@ -595,13 +1014,13 @@ def choose_successor(
     options: dict[str, Any],
     routes: dict[str, Any] | None = None,
     deputy: dict[str, Any] | None = None,
-    allowed: Callable[[str, str | None], bool] | None = None,
+    allowed: Callable[..., bool] | None = None,
 ) -> dict[str, Any]:
     """The lead's account, pool and context, and one successor: a live idle peer, else a launch; or refusals.
 
     A successor draws on another account than the lead, in the same billing context, on a pool monitor reports
     `available` with fresh data. `deputy` (an existing team's) narrows it to that account, harness, session and
-    pool. `allowed(engine, configDir)` is the repository's harness policy for a launch."""
+    pool. `allowed(engine, configDir, ...)` is the repository's harness policy for a launch."""
     s = succession()
     result: dict[str, Any] = {"refusals": [], "successor": None}
     refuse = result["refusals"].append
@@ -616,7 +1035,7 @@ def choose_successor(
     if malformed or not isinstance(config.get("accounts", []), list):
         refuse(f"monitor's config {s.monitor_config_path()} has an account without an id: fix it first")
         return result
-    account, why = s.account_of(lead["harness"], lead.get("accountHome"), config)
+    account, why = s.account_of(lead["harness"], lead.get("accountHome"), config, view=view)
     if account is None:
         refuse(why)
         return result
@@ -628,7 +1047,7 @@ def choose_successor(
     context = pool["billing"]
     result["context"] = context
     if context is None:
-        refuse(f"the billing context of account '{account}' is unknown: set billing (work or personal) in monitor")
+        refuse(f"the billing context of account '{account}' is unknown: set billing or tags in monitor")
         return result
     excluded = set(options.get("excludeAccounts") or [])
     deputy = deputy or {}
@@ -660,12 +1079,27 @@ def choose_successor(
             or (not deputy.get("session") and not peer_tier_ok(lead.get("model"), session_model(peer)))
         ):
             continue
-        peer_account = s.account_of(harness, peer.get("accountHome"), config)[0]
+        peer_account = s.account_of(harness, peer.get("accountHome"), config, view=view)[0]
         if peer_account is None:
             continue
         candidate = s.pool_for(harness, session_model(peer), peer_account, view, config)
-        if fits(candidate, peer_account, harness):
-            choices.append((s.rank(candidate), peer["session"], peer, candidate, peer_account))
+        if not fits(candidate, peer_account, harness):
+            continue
+        peer_config_dir = peer.get("accountHome") if harness == "claude" else None
+        if allowed is not None and not _call_allowed(
+            allowed,
+            HARNESS_ENGINE[harness],
+            peer_config_dir,
+            account_id=peer_account,
+            provider=candidate.get("provider") or s.HARNESS_PROVIDER.get(harness),
+            billing_mode=candidate.get("billing") or context,
+            tags=candidate.get("tags"),
+            account_alias=candidate.get("alias"),
+            codex_home=peer.get("accountHome") if harness == "codex" else None,
+            agy_home=peer.get("accountHome") if harness == "gemini" else None,
+        ):
+            continue
+        choices.append((s.rank(candidate), peer["session"], peer, candidate, peer_account))
     if choices:
         _, _, peer, candidate, peer_account = min(choices, key=lambda item: item[:2])
         result["successor"] = {
@@ -686,26 +1120,71 @@ def choose_successor(
         return result
     routes = routes if routes is not None else module("routes").load_routes()
     quota = s.module("quota")
+    view_accounts = {
+        item["id"]: item
+        for item in view.get("accounts", [])
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
     launches = []
     for entry in config.get("accounts", []):
         if entry.get("provider") not in s.HARNESS_PROVIDER.values():
             continue
         harness = next(h for h, p in s.HARNESS_PROVIDER.items() if p == entry["provider"])
         engine = HARNESS_ENGINE[harness]
-        if harness != "claude" and s.account_of(harness, None, config)[0] != entry["id"]:
-            continue  # the runner cannot pick one of several Codex or Antigravity logins
-        # The runner picks a Claude account by its config directory: an account without one is not launchable.
-        config_dir = str(Path(entry["configDir"]).expanduser()) if entry.get("configDir") else None
-        if harness == "claude" and not config_dir:
+        account_home = None
+        launch_env: dict[str, str | None] = {}
+        config_dir = None
+        if harness == "claude":
+            launchable, account_home, config_dir, launch_env = _claude_launch_binding(
+                s, entry, config, view_accounts.get(entry["id"])
+            )
+            if not launchable:
+                continue
+        else:
+            account_home, launch_env = _non_claude_launch_binding(
+                s, harness, entry, config, view_accounts.get(entry["id"])
+            )
+            if not account_home or s.account_of(harness, account_home, config, view=view)[0] != entry["id"]:
+                continue
+        view_acct = view_accounts.get(entry["id"]) or {}
+        entry_tags = s._normalize_tags(
+            entry.get("tags"),
+            entry.get("category"),
+            view_acct.get("tags"),
+            view_acct.get("category"),
+        )
+        entry_alias = entry.get("alias") or view_acct.get("alias")
+        if allowed is not None and not _call_allowed(
+            allowed,
+            engine,
+            config_dir,
+            account_id=entry["id"],
+            provider=entry.get("provider"),
+            billing_mode=entry.get("billing") or context,
+            tags=entry_tags,
+            account_alias=entry_alias,
+            codex_home=account_home if harness == "codex" else None,
+            agy_home=account_home if harness == "gemini" else None,
+        ):
             continue
-        if allowed is not None and not allowed(engine, config_dir):
-            continue
+        quota_sig = inspect.signature(quota.check).parameters
+        quota_accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in quota_sig.values())
         for model in launch_models(harness, lead, routes):
             candidate = s.pool_for(harness, model, entry["id"], view, config)
             # The runner's own quota check must land on the same account, or the launch would fail or misroute.
-            routed = quota.check(engine, model, view, claude_config_dir=config_dir)
+            quota_opts = {
+                "claude_config_dir": config_dir,
+                "account_id": entry["id"],
+                "codex_home": account_home if harness == "codex" else None,
+                "agy_home": account_home if harness == "gemini" else None,
+            }
+            if not quota_accepts_kwargs:
+                quota_opts = {k: v for k, v in quota_opts.items() if k in quota_sig}
+            routed = quota.check(engine, model, view, **quota_opts)
             if fits(candidate, entry["id"], harness) and routed.get("accountId") == entry["id"]:
-                launches.append((s.rank(candidate), entry["id"], harness, model, candidate, config_dir))
+                launches.append(
+                    (s.rank(candidate), entry["id"], harness, model, candidate, config_dir, account_home, launch_env)
+                )
                 break
     if not launches:
         refuse(
@@ -713,7 +1192,9 @@ def choose_successor(
             "(low, blocked and credits pools never take a handoff)"
         )
         return result
-    _, account_id, harness, model, candidate, config_dir = min(launches, key=lambda item: item[:2])
+    _, account_id, harness, model, candidate, config_dir, account_home, launch_env = min(
+        launches, key=lambda item: item[:2]
+    )
     result["successor"] = {
         "kind": "launch",
         "harness": harness,
@@ -721,7 +1202,16 @@ def choose_successor(
         "model": model,
         "account": account_id,
         "pool": candidate["pool"],
-        **({"configDir": config_dir} if harness == "claude" else {}),
+        **(
+            {
+                **({"configDir": config_dir} if config_dir else {}),
+                "accountHome": account_home,
+                "launchEnv": launch_env,
+                "unsetClaudeConfigDir": config_dir is None,
+            }
+            if harness == "claude"
+            else {"accountHome": account_home, "launchEnv": launch_env}
+        ),
     }
     return result
 
@@ -877,8 +1367,24 @@ def chain_of(session: str) -> dict[str, Any]:
     return {"origin": session, "count": 0}
 
 
-def brief(event: dict[str, Any], note: str, team: str, generation: int, successor: dict[str, Any]) -> str:
+def brief(
+    event: dict[str, Any],
+    note: str,
+    team: str,
+    generation: int,
+    successor: dict[str, Any],
+    *,
+    chief: dict[str, Any] | None = None,
+) -> str:
     harness = successor["harness"]
+    chief_section = ""
+    if chief:
+        chief_section = (
+            "\n## Chief desk\n\n"
+            + "\n".join(chief_desk_lines(chief))
+            + "\n\nTeam takeover does NOT transfer `chief.json`. After accepting team leadership, run "
+            "`ork chief bind` in this session if it should also hold the machine-wide Chief desk.\n"
+        )
     return (
         "# Continue as the lead after an automatic handoff\n\n"
         f"Session {event['session']} ran out of usage ({event['reason']}). Orkest fenced it and made you its "
@@ -888,8 +1394,69 @@ def brief(event: dict[str, Any], note: str, team: str, generation: int, successo
         f"2. `python3 {script('authority.py')} accept --team {team} --session {successor['session']} "
         f"--harness {harness} --expect-generation {generation} --digest DIGEST`, with the digest show printed.\n\n"
         "If accept refuses, stop and report why: never work around the fence. Once accepted, continue the work "
-        "the note below records, in its checkout.\n\n" + note
+        "the note below records, in its checkout.\n" + chief_section + "\n" + note
     )
+
+
+def chief_brief(
+    event: dict[str, Any],
+    chief: dict[str, Any],
+    note: str,
+    *,
+    base: Path,
+    choice: dict[str, Any],
+) -> str:
+    """Private handoff brief when the machine-wide Chief runs out of usage without a team."""
+    peer_session = event.get("peerSession") or event["session"]
+    progress = mailbox().load(base / "progress" / f"{mailbox().session_key(peer_session)}.json") or {}
+    successor = choice.get("successor") or {}
+    lines = [
+        "# Ork Chief handoff brief (no team takeover)",
+        "",
+        "The machine-wide Chief session ran out of usage. `chief.json` was NOT modified automatically and no team was created.",
+        "",
+        "## Chief event & binding",
+        "",
+        f"- Event ID: {event['id']}",
+        f"- Recorded at: {event['recordedAt']}",
+        f"- Reason: {event['reason']} (from {event['source']})",
+        f"- Old Chief session: {chief.get('session') or event['session']} ({chief.get('name') or event.get('name') or 'unnamed'})",
+        f"- Machine: {chief.get('machine') or socket.gethostname()}",
+        f"- Bound at: {chief.get('boundAt') or 'unknown'}",
+        f"- Working directory: {event.get('cwd') or chief.get('cwd') or 'unknown'}",
+        f"- Checkout: {event.get('checkout') or event.get('cwd') or chief.get('cwd') or 'unknown'}",
+        f"- Model: {event.get('model') or chief.get('model') or 'unknown'}",
+        f"- Account: {choice.get('account') or 'unknown'}",
+        f"- Pool: {choice.get('pool') or 'unknown'}",
+        f"- Observed quota status: {choice.get('status') or 'unknown'}",
+        "",
+        "## Progress",
+        "",
+    ]
+    if progress:
+        for key in ("goal", "task", "stage", "role", "updatedAt"):
+            if progress.get(key):
+                val = progress[key] if isinstance(progress[key], str) else json.dumps(progress[key])
+                lines.append(f"- {key}: {val}")
+    else:
+        lines.append("- none recorded")
+    lines += [
+        "",
+        "## Recovery steps (`ork chief bind`)",
+        "",
+        "1. Open or switch to a session on another account with available quota"
+        + (
+            f" (suggested candidate: {successor.get('session') or successor.get('account')}, "
+            f"pool {successor.get('pool')}, harness {successor.get('harness')})."
+            if successor
+            else "."
+        ),
+        "2. Run `ork chief bind` (or `ork chief bind --session <SESSION_ID>`) to claim `<mailboxRoot>/chief.json`.",
+        "3. Run `ork chief status` and `ork chief desk` to inspect active rooms, standalone sessions, and unread desk reports.",
+        "",
+        note.rstrip(),
+    ]
+    return "\n".join(lines) + "\n"
 
 
 def deliver_peer(base: Path, event: dict[str, Any], successor: dict[str, Any], text: str) -> dict[str, Any]:
@@ -943,6 +1510,8 @@ def launch_command(event: dict[str, Any], successor: dict[str, Any], brief_path:
         LAUNCH_TIMEOUT,
         "--detach",
     ]
+    if successor.get("account"):
+        command += ["--account", str(successor["account"])]
     if successor.get("configDir"):
         command += ["--claude-config-dir", successor["configDir"]]
     return command  # never --allow-credits or --ignore-quota: a successor runs on free quota only
@@ -995,6 +1564,13 @@ def notice_for(event: dict[str, Any]) -> str:
     status, successor, team = event["status"], event.get("successor") or {}, event.get("team")
     reasons = "; ".join(event.get("reasons") or []) or "unknown"
     name = successor.get("name") or successor.get("session")
+    if status == "brief-ready":
+        brief_hint = f" Brief: {event['brief']}." if event.get("brief") else ""
+        return (
+            f"Orkest Chief handoff: {who} ran out of usage ({event['reason']}) while holding the Chief desk. "
+            f"A private Chief brief is ready (chief.json was not modified).{brief_hint} "
+            f"Run `ork chief bind` in a session on another account to take over the Chief desk. Details: {show}"
+        )
     if status == "handed-over":
         delivery = event.get("delivery") or {}
         if successor.get("kind") != "peer":
@@ -1007,9 +1583,14 @@ def notice_for(event: dict[str, Any]) -> str:
                 f"{delivery.get('wakeReason') or 'no reason given'}); it acts on its next turn, so wake it or tell "
                 "the user"
             )
+        chief_note = (
+            " The previous lead also held the Chief desk (chief.json untouched); run `ork chief bind` to claim it separately."
+            if event.get("chief")
+            else ""
+        )
         return (
             f"Orkest handoff: {who} ran out of usage ({event['reason']}). Team {team} is pending on {name} on "
-            f"account {successor.get('account')}, {how}; the old lead is fenced until the user re-appoints it. "
+            f"account {successor.get('account')}, {how}; the old lead is fenced until the user re-appoints it.{chief_note} "
             f"Details: {show}"
         )
     if event.get("takenOver"):
@@ -1023,6 +1604,20 @@ def notice_for(event: dict[str, Any]) -> str:
         f"the user. To continue by hand: {show}, then give that note to a session on another account"
         f"{reappoint_hint(event)}."
     )
+
+
+@contextlib.contextmanager
+def chief_lock(base: Path) -> Iterator[None]:
+    """Exclusive flock on `<base>/chief.lock`, matching chief.mjs (never unlinked on release)."""
+    lock_path = base / "chief.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(fd)
 
 
 def run(
@@ -1072,19 +1667,51 @@ def run(
         )
     except Exception as error:  # noqa: BLE001 -- a background handoff must always end with a reason the user sees
         outcome = {"status": "failed", "reasons": [f"{type(error).__name__}: {error}"]}
-    with locked(directory):
-        current = load_json(directory / "event.json") or {}
-        finished = {**event, **current, **outcome} if current.get("id") == event_id else {**event, **outcome}
-        if finished["status"] in {"handed-over", "refused", "failed"}:
-            finished["notice"] = notice_for(finished)
-            finished["noticeAt"] = stamp(now())
-        if current.get("id") == event_id:
-            save_event(directory, finished)
-        else:
-            # A newer event replaced this one meanwhile: keep this outcome in the history, never over it.
-            with contextlib.suppress(OSError), (directory / "history.jsonl").open("a", encoding="utf-8") as history:
-                history.write(json.dumps(finished, sort_keys=True) + "\n")
-    return finished
+    expected_chief = outcome.pop("_expected_chief", None) if isinstance(outcome, dict) else None
+    chief_strip_files = outcome.pop("_chief_strip_files", None) if isinstance(outcome, dict) else None
+
+    def finalize_event() -> dict[str, Any]:
+        with locked(directory):
+            current = load_json(directory / "event.json") or {}
+            finished = {**event, **current, **outcome} if current.get("id") == event_id else {**event, **outcome}
+            if finished["status"] in {"handed-over", "brief-ready", "refused", "failed"}:
+                finished["notice"] = notice_for(finished)
+                finished["noticeAt"] = stamp(now())
+            if current.get("id") == event_id:
+                save_event(directory, finished)
+            else:
+                # A newer event replaced this one meanwhile: keep this outcome in the history, never over it.
+                with contextlib.suppress(OSError), (directory / "history.jsonl").open("a", encoding="utf-8") as history:
+                    history.write(json.dumps(finished, sort_keys=True) + "\n")
+        return finished
+
+    if outcome.get("status") == "brief-ready":
+        with chief_lock(base):
+            current_binding = load_json(base / "chief.json")
+            live_now = live_chief_binding(base, session, event=event, peers=peers, moment=moment)
+            still_same = bool(live_now) and _chief_token_matches(current_binding, expected_chief)
+            if not still_same:
+                brief_file = outcome.get("brief")
+                if isinstance(brief_file, str) and brief_file:
+                    with contextlib.suppress(OSError):
+                        Path(brief_file).unlink()
+                outcome = {
+                    "team": outcome.get("team"),
+                    "status": "ignored",
+                    "reasons": ["session was superseded as Chief before publication"],
+                }
+            return finalize_event()
+    if outcome.get("chief"):
+        with chief_lock(base):
+            current_binding = load_json(base / "chief.json")
+            live_now = live_chief_binding(base, session, event=event, peers=peers, moment=moment)
+            if not (bool(live_now) and _chief_token_matches(current_binding, expected_chief)):
+                outcome.pop("chief", None)
+                for file_path, clean_text in chief_strip_files or ():
+                    with contextlib.suppress(OSError):
+                        write_private(Path(file_path), clean_text)
+            return finalize_event()
+    return finalize_event()
 
 
 def refreshed_view() -> dict[str, Any] | None:
@@ -1132,10 +1759,41 @@ def standing_wait(record: dict[str, Any], moment: dt.datetime, *, peer_session: 
     return left + 1 if 0 < left <= MAX_STANDING_WAIT else 0
 
 
-def allowed_here(policy: Any, checkout: str | None, engine: str, config_dir: str | None) -> bool:
+def allowed_here(
+    policy: Any,
+    checkout: str | None,
+    engine: str,
+    config_dir: str | None,
+    *,
+    account_id: str | None = None,
+    provider: str | None = None,
+    billing_mode: str | None = None,
+    tags: list[str] | tuple[str, ...] | None = None,
+    account_alias: str | None = None,
+    codex_home: str | None = None,
+    agy_home: str | None = None,
+    strict: bool = False,
+) -> bool:
     """The repository's harness policy for a launch; unknown is not allowed."""
     try:
-        return bool(checkout) and policy.check_execution_allowed(checkout, engine, config_dir)[0]
+        if not checkout:
+            return False
+        params = inspect.signature(policy.check_execution_allowed).parameters
+        accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        if "strict" in params or accepts_kwargs:
+            optional = {
+                "account_id": account_id,
+                "provider": provider,
+                "billing_mode": billing_mode,
+                "tags": list(tags) if tags is not None else None,
+                "account_alias": account_alias,
+                "codex_home": codex_home,
+                "agy_home": agy_home,
+                "strict": strict,
+            }
+            kwargs = optional if accepts_kwargs else {k: v for k, v in optional.items() if k in params}
+            return bool(policy.check_execution_allowed(checkout, engine, config_dir, **kwargs)[0])
+        return bool(policy.check_execution_allowed(checkout, engine, config_dir)[0])
     except Exception:  # noqa: BLE001 -- a policy that cannot be read allows nothing
         return False
 
@@ -1159,29 +1817,42 @@ def handoff(
     session = event["session"]
     conducted = (rooms or conducted_rooms)(base, session)
     found = find_team(session, conducted)
+    chief = live_chief_binding(base, session, event=event, peers=peers)
+    captured_chief_token = _chief_token(chief)
+    chief_only = bool(chief) and bool(found.get("why")) and not found.get("tell")
     outcome: dict[str, Any] = {"team": found.get("team")}
 
     def refuse(*reasons: str) -> dict[str, Any]:
         return {**outcome, "status": "refused", "reasons": list(reasons)}
 
-    if found.get("why") and not found.get("tell"):
+    if found.get("why") and not found.get("tell") and not chief:
         return {**outcome, "status": "ignored", "reasons": [found["why"]]}
     record = found.get("record")
-    note = build_note(event, base=base, rooms=conducted, team=record)
+    note = build_note(event, base=base, rooms=conducted, team=record, chief=chief)
     write_private(session_dir(session) / "note.md", note)
     outcome["note"] = str(session_dir(session) / "note.md")
-    if found.get("why"):
+    if not chief_only and found.get("why"):
         return refuse(found["why"])
-    team = found["team"]
-    chain = chain_of(session)
-    outcome["chain"] = {**chain, "count": chain["count"] + 1}
-    if chain["count"] >= CHAIN_LIMIT:
-        return refuse(f"handed over {chain['count']} times already from session {chain['origin']}; stopping there")
-    reappoint = bool(record) and not record.get("standing") and handed_by_us(record, session)
-    if record:
-        outcome["generation"] = record["generation"]
-        if not record.get("standing") and not reappoint:
-            return refuse(f"team {team} has no standing takeover rule, so only the user can approve a takeover")
+    team = found.get("team")
+    chain: dict[str, Any] = {"origin": session, "count": 0}
+    reappoint = False
+    appointing = False
+    fenced_rooms: list[dict[str, Any]] = []
+    fenced_tasks: list[str] = []
+    if not chief_only:
+        assert isinstance(team, str)
+        chain = chain_of(session)
+        outcome["chain"] = {**chain, "count": chain["count"] + 1}
+        if chain["count"] >= CHAIN_LIMIT:
+            return refuse(f"handed over {chain['count']} times already from session {chain['origin']}; stopping there")
+        reappoint = bool(record) and not record.get("standing") and handed_by_us(record, session)
+        if record:
+            outcome["generation"] = record["generation"]
+            if not record.get("standing") and not reappoint:
+                return refuse(f"team {team} has no standing takeover rule, so only the user can approve a takeover")
+        appointing = record is None or reappoint
+        # What this handoff fences: the conducted rooms under no team or this one, and their tasks.
+        fenced_rooms, fenced_tasks = fence_plan(team, conducted)
     config = s.monitor_config()
     lead = {
         "session": session,
@@ -1192,9 +1863,6 @@ def handoff(
     }
     policy = module("repo_policy")
     checkout = event.get("checkout")
-    appointing = record is None or reappoint
-    # What this handoff fences: the conducted rooms under no team or this one, and their tasks.
-    fenced_rooms, fenced_tasks = fence_plan(team, conducted)
 
     def choose(view: dict[str, Any] | None) -> dict[str, Any]:
         # Peers are read with each view: a session goes busy or idle while monitor is re-read.
@@ -1205,7 +1873,9 @@ def handoff(
             peers=peers if peers is not None else mailbox().peers(base),
             options=options,
             deputy=None if reappoint else (record or {}).get("deputy"),
-            allowed=lambda engine, config_dir: allowed_here(policy, checkout, engine, config_dir),
+            allowed=lambda engine, config_dir, **policy_ctx: allowed_here(
+                policy, checkout, engine, config_dir, **policy_ctx
+            ),
         )
 
     def judge(choice: dict[str, Any]) -> dict[str, Any] | None:
@@ -1261,6 +1931,29 @@ def handoff(
         choice = choose(view)
         if not choice.get("status") or (choice["status"] in s.EXHAUSTED and not choice.get("stale")):
             break
+    if chief_only:
+        if final := judge(choice):
+            return final
+        brief_path = session_dir(session) / "brief.md"
+        with chief_lock(base):
+            # Verify against the original captured generation so a clear/rebind during quota retries is never adopted.
+            current_binding = load_json(base / "chief.json")
+            current_chief = live_chief_binding(base, session, event=event, peers=peers)
+            if not current_chief or not _chief_token_matches(current_binding, captured_chief_token):
+                return {**outcome, "status": "ignored", "reasons": ["session is no longer the live local Chief"]}
+            write_private(brief_path, chief_brief(event, current_chief, note, base=base, choice=choice))
+        return {
+            **outcome,
+            "status": "brief-ready",
+            "reasons": [],
+            "brief": str(brief_path),
+            "account": choice.get("account"),
+            "pool": choice.get("pool"),
+            "context": choice.get("context"),
+            "quotaStatus": choice.get("status"),
+            "chief": chief_summary(current_chief),
+            "_expected_chief": captured_chief_token,
+        }
     # Checked before anything changes, with the same evidence functions the takeover runs, so a takeover
     # that would refuse never leaves a team behind. The takeover re-checks under its own lock.
     waited = False
@@ -1285,6 +1978,11 @@ def handoff(
     if reasons:
         return refuse("no standing takeover: " + "; ".join(reasons))
     if successor["kind"] == "launch":
+        if successor["harness"] != "claude" and not successor.get("accountHome"):
+            return refuse(
+                f"cannot launch {successor['harness']} successor for account '{successor.get('account')}': "
+                "verified account home is unknown"
+            )
         # A launched predecessor's own run holds the checkout until it ends: a successor waits for it.
         wait = LEASE_WAIT_SECONDS if successor_record(session) else 0
         if problem := launch_problem(checkout, wait=wait, sleep=sleep):
@@ -1357,13 +2055,38 @@ def handoff(
                 "team": team,
                 "harness": successor["harness"],
                 "model": successor.get("model"),
-                "accountHome": successor.get("configDir"),
+                "accountHome": successor.get("configDir") or successor.get("accountHome"),
             }
         )
         + "\n",
     )
+    note_path = session_dir(session) / "note.md"
     brief_path = session_dir(session) / "brief.md"
-    write_private(brief_path, brief(event, note, team, taken["generation"], successor))
+    note_without_chief = build_note(event, base=base, rooms=conducted, team=record, chief=None)
+    brief_without_chief = brief(event, note_without_chief, team, taken["generation"], successor, chief=None)
+    current_chief = chief
+    expected_chief = captured_chief_token
+    if current_chief:
+        with chief_lock(base):
+            current_binding = load_json(base / "chief.json")
+            live_now = live_chief_binding(base, session, event=event, peers=peers)
+            if not (bool(live_now) and _chief_token_matches(current_binding, expected_chief)):
+                current_chief = None
+                expected_chief = None
+                note = note_without_chief
+                write_private(note_path, note)
+                write_private(brief_path, brief_without_chief)
+            else:
+                current_chief = live_now
+                write_private(brief_path, brief(event, note, team, taken["generation"], successor, chief=current_chief))
+                outcome["chief"] = chief_summary(current_chief)
+                outcome["_expected_chief"] = expected_chief
+                outcome["_chief_strip_files"] = [
+                    (str(note_path), note_without_chief),
+                    (str(brief_path), brief_without_chief),
+                ]
+    else:
+        write_private(brief_path, brief_without_chief)
     try:
         if successor["kind"] == "peer":
             message = (
@@ -1373,8 +2096,66 @@ def handoff(
             )
             outcome["delivery"] = (deliver or deliver_peer)(base, event, successor, message)
         else:
-            env = {key: value for key, value in os.environ.items() if key != "ORKEST_HANDOFF_SUCCESSOR"}
+            env = {
+                key: value
+                for key, value in os.environ.items()
+                if key
+                not in {
+                    "ORKEST_HANDOFF_SUCCESSOR",
+                    "ORKEST_CLAUDE_ACCOUNT_HOME",
+                    "ORKEST_CODEX_ACCOUNT_HOME",
+                    "ORKEST_AGY_ACCOUNT_HOME",
+                }
+            }
             env["ORKEST_HANDOFF_LAUNCH"] = successor["session"]  # run_agent hands it to this run alone
+            launch_env = successor.get("launchEnv")
+            if successor["harness"] == "claude":
+                if isinstance(launch_env, dict):
+                    for key, value in launch_env.items():
+                        if key == "HOME":
+                            if value is not None:
+                                env["ORKEST_CLAUDE_ACCOUNT_HOME"] = value
+                            continue
+                        if value is None:
+                            env.pop(key, None)
+                        else:
+                            env[key] = value
+                    env.setdefault("ORKEST_PINNED_CLAUDE_ACCOUNT", "1")
+                elif successor.get("unsetClaudeConfigDir"):
+                    env.pop("CLAUDE_CONFIG_DIR", None)
+                    env["ORKEST_PINNED_CLAUDE_ACCOUNT"] = "1"
+                    raw_acct_home = successor.get("accountHome")
+                    if isinstance(raw_acct_home, str) and raw_acct_home.strip():
+                        acct_path = Path(raw_acct_home).resolve()
+                        if acct_path.name == ".claude" and acct_path != (Path.home() / ".claude").resolve():
+                            env["ORKEST_CLAUDE_ACCOUNT_HOME"] = str(acct_path.parent)
+                elif successor.get("configDir"):
+                    env["CLAUDE_CONFIG_DIR"] = successor["configDir"]
+                    env["ORKEST_PINNED_CLAUDE_ACCOUNT"] = "1"
+            else:
+                if not launch_env and successor.get("accountHome"):
+                    if successor["harness"] == "codex":
+                        launch_env = {
+                            "CODEX_HOME": successor["accountHome"],
+                            "ORKEST_CODEX_ACCOUNT_HOME": successor["accountHome"],
+                        }
+                    elif successor["harness"] == "gemini":
+                        launch_env = {
+                            "GEMINI_CLI_HOME": successor["accountHome"],
+                            "ANTIGRAVITY_APP_DATA_DIR": None,
+                            "ORKEST_AGY_ACCOUNT_HOME": successor["accountHome"],
+                        }
+                if not launch_env:
+                    return {
+                        **outcome,
+                        "status": "failed",
+                        "reasons": [f"cannot launch {successor['harness']} successor without verified account home"],
+                    }
+                for key, value in launch_env.items():
+                    if value is None:
+                        env.pop(key, None)
+                    else:
+                        env[key] = value
             command = launch_command(event, successor, brief_path)
             # A short reader can take the lease between launch_problem() and the launch: try again then.
             for attempt, delay in enumerate((0, *LAUNCH_RETRY_SECONDS), start=1):

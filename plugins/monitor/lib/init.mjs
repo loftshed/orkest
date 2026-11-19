@@ -16,22 +16,39 @@ const has = (name) => {
 const titleCase = (s) =>
   s.replaceAll(/(^|[-_ ])(\w)/g, (_, sep, c) => (sep ? " " : "") + c.toUpperCase());
 
+const CLAUDE_MARKERS = [".claude.json", "projects"];
+const CODEX_MARKERS = ["auth.json", "config.toml", "sessions", "history.jsonl"];
+const AGY_MARKERS = [
+  "antigravity-oauth-token",
+  "antigravity",
+  "antigravity-cli",
+  "settings.json",
+  "User",
+  path.join("antigravity-cli", "antigravity-oauth-token"),
+];
+
+function discoverProfileNames(home, prefix, markers) {
+  if (!existsSync(home)) {
+    return [];
+  }
+  const pattern = new RegExp(String.raw`^\.${prefix}-([\w-]+)$`);
+  return readdirSync(home, { withFileTypes: true })
+    .filter((d) => d.isDirectory())
+    .map((d) => ({ dir: d.name, match: pattern.exec(d.name) }))
+    .filter(({ dir, match }) => match && markers.some((m) => existsSync(path.join(home, dir, m))))
+    .map(({ match }) => match[1])
+    .toSorted((a, b) => a.localeCompare(b));
+}
+
 /**
- * Builds a starter config from what is installed on this machine: the default Claude profile, any extra
- * `~/.claude-<name>` profiles (the CLAUDE_CONFIG_DIR convention), Codex, and Antigravity's agy.
- * Only checks that files exist; never reads credentials.
+ * Builds a starter config from what is installed on this machine: default profiles and any extra
+ * `~/.claude-<name>`, `~/.codex-<name>`, and `~/.antigravity-<name>` multi-account directories.
+ * Only checks that files exist; never reads credentials or guesses account categories.
  */
 export function detectConfig({ home = homedir(), binaries = has, env = process.env } = {}) {
   const accounts = [];
   if (binaries("claude")) {
-    const extra = readdirSync(home, { withFileTypes: true })
-      .filter((d) => d.isDirectory() && /^\.claude-[\w-]+$/.test(d.name))
-      .filter(
-        (d) =>
-          existsSync(path.join(home, d.name, ".claude.json")) ||
-          existsSync(path.join(home, d.name, "projects")),
-      )
-      .map((d) => d.name.slice(".claude-".length));
+    const extra = discoverProfileNames(home, "claude", CLAUDE_MARKERS);
     const isMulti = extra.length > 0;
     if (existsSync(path.join(home, ".claude")) || existsSync(path.join(home, ".claude.json"))) {
       accounts.push({
@@ -53,19 +70,32 @@ export function detectConfig({ home = homedir(), binaries = has, env = process.e
       });
     }
   }
-  if (binaries("codex"))
+  if (binaries("codex")) {
+    const extraCodex = discoverProfileNames(home, "codex", CODEX_MARKERS);
     accounts.push({
       id: "codex",
       provider: "codex",
-      label: "Codex · ChatGPT",
+      label: extraCodex.length > 0 ? "Codex · default" : "Codex · ChatGPT",
       short: "CX",
       route: "codex",
     });
+    for (const name of extraCodex) {
+      accounts.push({
+        id: `codex-${name}`,
+        provider: "codex",
+        label: `Codex · ${titleCase(name).toLowerCase()}`,
+        short: `X${name[0].toUpperCase()}`,
+        env: { CODEX_HOME: `~/.codex-${name}` },
+        route: `CODEX_HOME=~/.codex-${name} codex`,
+      });
+    }
+  }
   if (binaries("agy")) {
+    const extraAgy = discoverProfileNames(home, "antigravity", AGY_MARKERS);
     accounts.push({
       id: "antigravity",
       provider: "antigravity",
-      label: "Antigravity",
+      label: extraAgy.length > 0 ? "Antigravity · default" : "Antigravity",
       short: "AG",
       route: "agy",
       routes: {
@@ -73,6 +103,21 @@ export function detectConfig({ home = homedir(), binaries = has, env = process.e
         "claude-gpt": "agy --model <claude or gpt-oss model>",
       },
     });
+    for (const name of extraAgy) {
+      const appDataDir = `~/.antigravity-${name}`;
+      accounts.push({
+        id: `antigravity-${name}`,
+        provider: "antigravity",
+        label: `Antigravity · ${titleCase(name).toLowerCase()}`,
+        short: `A${name[0].toUpperCase()}`,
+        env: { ANTIGRAVITY_APP_DATA_DIR: appDataDir },
+        route: `ANTIGRAVITY_APP_DATA_DIR=${appDataDir} agy`,
+        routes: {
+          gemini: `ANTIGRAVITY_APP_DATA_DIR=${appDataDir} agy --model <gemini model>`,
+          "claude-gpt": `ANTIGRAVITY_APP_DATA_DIR=${appDataDir} agy --model <claude or gpt-oss model>`,
+        },
+      });
+    }
   }
   // Corporate TLS inspection: carry an extra CA bundle through to the child CLIs.
   const configEnv = env.NODE_EXTRA_CA_CERTS

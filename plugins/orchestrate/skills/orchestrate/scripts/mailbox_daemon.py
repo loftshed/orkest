@@ -45,6 +45,12 @@ MAX_LEGACY = 128
 DRAIN_TIMEOUT = 12
 
 
+REVISION_CACHE_SCHEMA = "ork.mailbox-revision.v1"
+REVISION_FOLDERS = ("scripts", "references", "templates", "bin", "lib")
+MAX_REVISION_CACHE_BYTES = 2 * 1024 * 1024
+REVISION_HEX_RE = re.compile(r"^[0-9a-f]{16}$")
+
+
 def daemon_base(base: Path) -> Path:
     suffix = "v1" if base.name == "mailbox-v1" else hashlib.sha256(str(base.resolve()).encode()).hexdigest()[:12]
     return base.parent / ("mailbox-daemon-" + suffix)
@@ -75,21 +81,192 @@ def runtime_sources() -> dict[str, Path]:
     }
 
 
+def _is_within_root(root_dir: Path, candidate: Path) -> bool:
+    try:
+        candidate.relative_to(root_dir)
+        return True
+    except ValueError:
+        return False
+
+
+def _collect_runtime_manifest() -> tuple[
+    list[dict[str, str | None]],
+    list[dict[str, str]],
+    list[tuple[str, Path]],
+    bool,
+    Path,
+]:
+    sources = runtime_sources()
+    scripts_dir = sources["scripts"]
+    scripts_canon = scripts_dir.resolve() if scripts_dir.exists() else scripts_dir
+    roots: list[dict[str, str | None]] = []
+    files_meta: list[dict[str, str]] = []
+    file_paths: list[tuple[str, Path]] = []
+    cacheable = True
+    for folder in REVISION_FOLDERS:
+        directory = sources[folder]
+        if not directory.is_dir():
+            roots.append({"name": folder, "path": None})
+            continue
+        canon_dir = directory.resolve()
+        roots.append({"name": folder, "path": str(canon_dir)})
+        for path in sorted(directory.rglob("*")):
+            if "__pycache__" in path.parts or path.suffix == ".pyc":
+                continue
+            if path.is_symlink():
+                try:
+                    resolved = path.resolve(strict=True)
+                except OSError:
+                    cacheable = False
+                    continue
+                if not _is_within_root(canon_dir, resolved):
+                    cacheable = False
+            if path.is_file():
+                try:
+                    st = path.stat()
+                except OSError:
+                    cacheable = False
+                    continue
+                rel = str(Path(folder) / path.relative_to(directory))
+                files_meta.append(
+                    {
+                        "path": rel,
+                        "st_dev": str(st.st_dev),
+                        "st_ino": str(st.st_ino),
+                        "st_size": str(st.st_size),
+                        "st_mtime_ns": str(st.st_mtime_ns),
+                        "st_ctime_ns": str(st.st_ctime_ns),
+                    }
+                )
+                file_paths.append((rel, path))
+    return roots, files_meta, file_paths, cacheable, scripts_canon
+
+
+def _revision_cache_path(base: Path, scripts_canon: Path) -> Path:
+    scripts_hash = hashlib.sha256(str(scripts_canon).encode("utf-8")).hexdigest()
+    return daemon_base(base) / f"revision-{scripts_hash}.json"
+
+
+def _read_revision_cache(
+    cache_path: Path,
+    roots: list[dict[str, str | None]],
+    files_meta: list[dict[str, str]],
+) -> str | None:
+    import stat as stat_mod
+
+    descriptor = -1
+    try:
+        parent_stat = cache_path.parent.lstat()
+        if (
+            cache_path.parent.is_symlink()
+            or not stat_mod.S_ISDIR(parent_stat.st_mode)
+            or parent_stat.st_uid != os.getuid()
+            or (parent_stat.st_mode & 0o077) != 0
+        ):
+            return None
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+        descriptor = os.open(cache_path, flags)
+        st = os.fstat(descriptor)
+        if (
+            not stat_mod.S_ISREG(st.st_mode)
+            or st.st_uid != os.getuid()
+            or (st.st_mode & 0o077) != 0
+            or st.st_size > MAX_REVISION_CACHE_BYTES
+        ):
+            return None
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = -1
+            raw = handle.read(MAX_REVISION_CACHE_BYTES + 1)
+        if len(raw) > MAX_REVISION_CACHE_BYTES:
+            return None
+        data = json.loads(raw.decode("utf-8"))
+    except (OSError, ValueError, RecursionError):
+        return None
+    finally:
+        if descriptor != -1:
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+    if not isinstance(data, dict) or data.get("schema") != REVISION_CACHE_SCHEMA:
+        return None
+    revision = data.get("revision")
+    if not isinstance(revision, str) or not REVISION_HEX_RE.fullmatch(revision):
+        return None
+    if data.get("roots") != roots or data.get("files") != files_meta:
+        return None
+    return revision
+
+
+def _write_revision_cache(
+    cache_path: Path,
+    roots: list[dict[str, str | None]],
+    files_meta: list[dict[str, str]],
+    revision: str,
+) -> None:
+    payload = {
+        "schema": REVISION_CACHE_SCHEMA,
+        "roots": roots,
+        "files": files_meta,
+        "revision": revision,
+    }
+    temporary: str | None = None
+    try:
+        private_directory(cache_path.parent)
+        descriptor, temporary = tempfile.mkstemp(prefix=".revision-", dir=cache_path.parent)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, separators=(",", ":"), ensure_ascii=True)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, cache_path)
+        temporary = None
+    except (OSError, mailbox.MailboxError):
+        return
+    finally:
+        if temporary is not None:
+            Path(temporary).unlink(missing_ok=True)
+
+
+def runtime_revision_for(base: Path | None = None) -> str:
+    """Compute the 16-hex runtime revision, using the private stat-validated cache under daemon_base."""
+    target_base = (base or mailbox.root()).expanduser().resolve()
+    pre_roots, pre_files, file_paths, pre_cacheable, scripts_canon = _collect_runtime_manifest()
+    cache_path = _revision_cache_path(target_base, scripts_canon)
+    if pre_cacheable:
+        cached = _read_revision_cache(cache_path, pre_roots, pre_files)
+        if cached is not None:
+            return cached
+    digest = hashlib.sha256()
+    for rel, path in file_paths:
+        digest.update(rel.encode())
+        digest.update(path.read_bytes())
+    revision = digest.hexdigest()[:16]
+    post_roots, post_files, _, post_cacheable, post_scripts = _collect_runtime_manifest()
+    if (
+        pre_cacheable
+        and post_cacheable
+        and pre_roots == post_roots
+        and pre_files == post_files
+        and scripts_canon == post_scripts
+    ):
+        _write_revision_cache(cache_path, post_roots, post_files, revision)
+    return revision
+
+
 @functools.cache
 def runtime_revision() -> str:
-    digest = hashlib.sha256()
-    for folder, directory in runtime_sources().items():
-        if not directory.is_dir():
-            continue
-        for path in sorted(directory.rglob("*")):
-            if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc":
-                digest.update(str(Path(folder) / path.relative_to(directory)).encode())
-                digest.update(path.read_bytes())
-    return digest.hexdigest()[:16]
+    return runtime_revision_for()
+
+
+def runtime_revision_if_available(base: Path | None = None) -> str | None:
+    """Return runtime_revision_for(base), or None if local source/cache verification raises."""
+    try:
+        return runtime_revision_for(base)
+    except (OSError, RecursionError):
+        return None
 
 
 def runtime_bundle(base: Path) -> Path:
-    revision = runtime_revision()
+    revision = runtime_revision_for(base)
     directory = daemon_base(base) / "runtimes"
     private_directory(directory)
     destination = directory / revision
@@ -253,13 +430,14 @@ class HTTPDaemon(socketserver.ThreadingMixIn, http.server.HTTPServer):
         self.mutations: set[object] = set()
         self.drained = threading.Condition(self.guard)
         self.waits: Counter[str] = Counter()
+        self.active_waits = 0
         self.legacy: dict[str, tuple[protocol.Server, float]] = {}
         self.info = {
             "url": f"http://127.0.0.1:{self.server_address[1]}/mcp",
             "pid": os.getpid(),
             "instance": secrets.token_urlsafe(24),
             "version": DAEMON_VERSION,
-            "runtimeRevision": runtime_revision(),
+            "runtimeRevision": runtime_revision_for(base),
             "protocolVersions": list(HTTP_PROTOCOLS),
             "storeId": store_id(base),
         }
@@ -389,7 +567,9 @@ class DaemonHandler(http.server.BaseHTTPRequestHandler):
         if not self.authorize():
             return
         if self.path == "/health":
-            self.reply(200, self.server.info)
+            with self.server.guard:
+                info = {**self.server.info, "activeWaits": self.server.active_waits}
+            self.reply(200, info)
         elif self.path == "/mcp":
             self.reply(405, headers={"Allow": "POST"})
         else:
@@ -398,7 +578,19 @@ class DaemonHandler(http.server.BaseHTTPRequestHandler):
     def do_DELETE(self) -> None:
         if not self.authorize():
             return
-        if self.path == "/health":
+        parsed = urllib.parse.urlsplit(self.path)
+        if parsed.path == "/health":
+            query = urllib.parse.parse_qs(parsed.query)
+            expected_instance = (query.get("instance") or [None])[0]
+            if_idle = (query.get("ifIdle") or ["0"])[0] == "1"
+            with self.server.guard:
+                if expected_instance is not None and self.server.info.get("instance") != expected_instance:
+                    self.reply(409, {"status": "conflict", "instance": self.server.info.get("instance")})
+                    return
+                if if_idle and self.server.active_waits > 0:
+                    self.reply(409, {"status": "busy", "activeWaits": self.server.active_waits})
+                    return
+                self.server.stopping.set()
             self.reply(200, {"status": "shutting_down", "instance": self.server.info["instance"]})
             threading.Thread(target=self.server.stop, daemon=True).start()
         elif self.path == "/mcp" and self.headers.get("Mcp-Session-Id"):
@@ -457,6 +649,7 @@ class DaemonHandler(http.server.BaseHTTPRequestHandler):
                 return
             self.server.waits["legacy-batch-" + self.headers["Mcp-Session-Id"]] += 1
             if timeout_budget:
+                self.server.active_waits += 1
                 self.server.events.add(cancelled)
             self.server.mutations.add(mutation)
 
@@ -501,6 +694,8 @@ class DaemonHandler(http.server.BaseHTTPRequestHandler):
             with self.server.drained:
                 self.server.events.discard(cancelled)
                 self.server.mutations.discard(mutation)
+                if timeout_budget:
+                    self.server.active_waits -= 1
                 key = "legacy-batch-" + self.headers["Mcp-Session-Id"]
                 self.server.waits[key] -= 1
                 if not self.server.waits[key]:
@@ -635,10 +830,14 @@ class DaemonHandler(http.server.BaseHTTPRequestHandler):
         finished = threading.Event()
         if is_wait:
             with self.server.guard:
+                if self.server.stopping.is_set():
+                    self.reply(503, headers={"Retry-After": "1"})
+                    return
                 if sum(self.server.waits.values()) >= MAX_WAITS or self.server.waits[caller] >= CALLER_WAITS:
                     self.reply(503, headers={"Retry-After": "1"})
                     return
                 self.server.waits[caller] += 1
+                self.server.active_waits += 1
                 self.server.events.add(cancelled)
         monitor = None
         if is_wait:
@@ -688,6 +887,7 @@ class DaemonHandler(http.server.BaseHTTPRequestHandler):
             if is_wait:
                 with self.server.guard:
                     self.server.events.discard(cancelled)
+                    self.server.active_waits -= 1
                     self.server.waits[caller] -= 1
                     if not self.server.waits[caller]:
                         del self.server.waits[caller]
@@ -711,20 +911,40 @@ def check_daemon(url: str, token: str, *, timeout: float = 1) -> dict[str, Any] 
     return None
 
 
-def stop_daemon(url: str, token: str) -> bool:
+def _stop_daemon_status(
+    url: str,
+    token: str,
+    *,
+    expected_instance: str | None = None,
+    if_idle: bool = False,
+) -> str:
     connection = None
     try:
         parsed = endpoint(url)
+        params: dict[str, str] = {}
+        if if_idle:
+            params["ifIdle"] = "1"
+        if expected_instance is not None:
+            params["instance"] = expected_instance
+        path = "/health" + ("?" + urllib.parse.urlencode(params) if params else "")
         connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=1)
-        connection.request("DELETE", "/health", headers={"Authorization": "Bearer " + token})
+        connection.request("DELETE", path, headers={"Authorization": "Bearer " + token})
         response = connection.getresponse()
         response.read(MAX_BODY)
-        return response.status == 200
+        if response.status == 200:
+            return "stopped"
+        if response.status == 409 and (if_idle or expected_instance is not None):
+            return "declined"
+        return "failed"
     except (OSError, ValueError, http.client.HTTPException, mailbox.MailboxError):
-        return False
+        return "failed"
     finally:
         if connection:
             connection.close()
+
+
+def stop_daemon(url: str, token: str) -> bool:
+    return _stop_daemon_status(url, token) == "stopped"
 
 
 def owned_state(base: Path, *, timeout: float = 1) -> dict[str, Any] | None:
@@ -786,6 +1006,7 @@ def ensure_running(base: Path, port: int = 0, *, startup_timeout: float = 15) ->
     if type(port) is not int or not 0 <= port <= 65535 or port in RESERVED_PORTS:
         raise mailbox.MailboxError("choose an available, unreserved port or zero for first startup")
     until = time.monotonic() + startup_timeout
+    live: dict[str, Any] | None = None
     with locked_file(daemon_base(base) / "startup.lock", timeout=startup_timeout):
         live = owned_state(base, timeout=max(0.01, min(1, (until - time.monotonic()) / 2)))
         if live:
@@ -793,30 +1014,46 @@ def ensure_running(base: Path, port: int = 0, *, startup_timeout: float = 15) ->
                 raise mailbox.MailboxError(
                     "daemon already owns a different endpoint; stop it explicitly before changing port"
                 )
-            return live
-        state = load_state(base)
-        if state:
-            existing_port = endpoint(state["url"]).port
-            if port and port != existing_port:
-                raise mailbox.MailboxError("configured endpoint must remain stable; use the persisted port")
-            port = existing_port
-        start_daemon_process(base, port)
-        while time.monotonic() < until:
-            live = owned_state(base, timeout=max(0.01, min(1, (until - time.monotonic()) / 2)))
-            if live:
-                return live
-            time.sleep(0.05)
-        raise mailbox.MailboxError(
-            "daemon startup failed; check its private log or endpoint conflict; no unrelated process was stopped"
-        )
+        else:
+            state = load_state(base)
+            if state:
+                existing_port = endpoint(state["url"]).port
+                if port and port != existing_port:
+                    raise mailbox.MailboxError("configured endpoint must remain stable; use the persisted port")
+                port = existing_port
+            start_daemon_process(base, port)
+            while time.monotonic() < until:
+                live = owned_state(base, timeout=max(0.01, min(1, (until - time.monotonic()) / 2)))
+                if live:
+                    break
+                time.sleep(0.05)
+            if not live:
+                raise mailbox.MailboxError(
+                    "daemon startup failed; check its private log or endpoint conflict; no unrelated process was stopped"
+                )
+    with contextlib.suppress(OSError, RecursionError):
+        runtime_revision_for(base)
+    return live
 
 
-def stop_service(base: Path) -> bool:
+def stop_service(base: Path, *, if_idle: bool = False, expected_instance: str | None = None) -> bool:
     with locked_file(daemon_base(base) / "startup.lock"):
         state = owned_state(base)
         if not state:
             return False
-        if not stop_daemon(state["url"], read_token(base)):
+        if expected_instance is not None and state.get("instance") != expected_instance:
+            return False
+        if if_idle and (type(state.get("activeWaits")) is not int or state.get("activeWaits") != 0):
+            return False
+        outcome = _stop_daemon_status(
+            state["url"],
+            read_token(base),
+            expected_instance=expected_instance,
+            if_idle=if_idle,
+        )
+        if outcome == "declined":
+            return False
+        if outcome != "stopped":
             raise mailbox.MailboxError("owned daemon did not accept shutdown")
         until = time.monotonic() + DRAIN_TIMEOUT + 3
         while time.monotonic() < until:
@@ -903,11 +1140,15 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "status":
             state = owned_state(base)
-            data = (
-                {**state, "status": "running", "staleImplementation": state["runtimeRevision"] != runtime_revision()}
-                if state
-                else {"status": "stopped"}
-            )
+            if state:
+                rev = runtime_revision_if_available(base)
+                data = {
+                    **state,
+                    "status": "running",
+                    "staleImplementation": rev is not None and state["runtimeRevision"] != rev,
+                }
+            else:
+                data = {"status": "stopped"}
         elif args.command == "stop":
             data = {"status": "stopped" if stop_service(base) else "already_stopped"}
         else:

@@ -1312,9 +1312,71 @@ def toggle_swarm_view(
     return {"status": "opened", "room": current_room, "socket": resolved_socket}
 
 
+_BUILTIN_LABEL_HARNESSES = {
+    "codex": "codex",
+    "claude": "claude",
+    "agy": "gemini",
+    "gemini": "gemini",
+    "opencode": "opencode",
+}
+_PROVIDER_TO_LABEL_HARNESS = {
+    "codex": "codex",
+    "claude": "claude",
+    "antigravity": "gemini",
+    "agy": "gemini",
+    "gemini": "gemini",
+    "opencode": "opencode",
+}
+_PROVIDER_HEADER_RE = re.compile(r"^\s*#\s*orkest-account-provider:\s*([A-Za-z0-9_-]+)\b", re.IGNORECASE)
+
+
+def _resolve_label_harness(cmd: str) -> str | None:
+    name = Path(cmd).name
+    if name in _BUILTIN_LABEL_HARNESSES:
+        return _BUILTIN_LABEL_HARNESSES[name]
+    raw_override = os.environ.get("MONITOR_CONFIG")
+    cfg_path = (
+        Path(raw_override).expanduser()
+        if isinstance(raw_override, str) and raw_override.strip()
+        else Path.home() / ".config" / "monitor" / "config.json"
+    )
+    try:
+        config = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        config = {}
+    if isinstance(config, dict) and isinstance(config.get("accounts"), list):
+        for account in config["accounts"]:
+            if not isinstance(account, dict):
+                continue
+            alias = account.get("alias")
+            route = account.get("route")
+            route_token = (
+                route.strip() if isinstance(route, str) and not any(ch.isspace() for ch in route.strip()) else None
+            )
+            if name in {alias.strip() if isinstance(alias, str) else None, route_token}:
+                mapped = _PROVIDER_TO_LABEL_HARNESS.get(str(account.get("provider") or "").strip().lower())
+                if mapped:
+                    return mapped
+    resolved_bin = shutil.which(cmd)
+    if resolved_bin:
+        try:
+            with open(resolved_bin, "rb") as handle:
+                head = handle.read(4096)
+        except OSError:
+            head = b""
+        if b"\x00" not in head:
+            for line in head.decode("utf-8", errors="replace").splitlines()[:20]:
+                match = _PROVIDER_HEADER_RE.match(line)
+                if match:
+                    mapped = _PROVIDER_TO_LABEL_HARNESS.get(match.group(1).strip().lower())
+                    if mapped:
+                        return mapped
+    return None
+
+
 def main(arguments: list[str]) -> int:
     if not arguments or arguments == ["--help"]:
-        print("Usage: ork label -- codex|claude|plaude|agy|opencode [arguments]")
+        print("Usage: ork label -- codex|claude|agy|gemini|opencode|<account-alias> [arguments]")
         return 0 if arguments else 2
     if arguments[:1] == ["--toggle-swarm"]:
         parser = argparse.ArgumentParser(description="Open, close, or toggle the Orkest Swarm View split pane")
@@ -1408,17 +1470,14 @@ def main(arguments: list[str]) -> int:
     if not attach:
         command = arguments[1:] if arguments[:1] == ["--"] else arguments
         if not command or command == ["--help"]:
-            print("Usage: ork label -- codex|claude|plaude|agy|opencode [arguments]")
+            print("Usage: ork label -- codex|claude|agy|gemini|opencode|<account-alias> [arguments]")
             return 0 if command else 2
-        harness = {
-            "codex": "codex",
-            "claude": "claude",
-            "plaude": "claude",
-            "agy": "gemini",
-            "opencode": "opencode",
-        }.get(Path(command[0]).name)
+        harness = _resolve_label_harness(command[0])
         if not harness:
-            print("ork label supports codex, claude, plaude, agy and opencode", file=sys.stderr)
+            print(
+                "ork label supports codex, claude, agy, gemini, opencode, or configured account aliases",
+                file=sys.stderr,
+            )
             return 2
         if not shutil.which(command[0]):
             print(f"{command[0]} is not installed on PATH", file=sys.stderr)
@@ -1460,7 +1519,7 @@ def main(arguments: list[str]) -> int:
                 # exact resume target is unavailable while its owner is live.
                 if member and not mailbox.room_session_peers(base_dir, matched, member):
                     room = matched["id"]
-        if Path(command[0]).name == "codex":
+        if harness == "codex":
             titles = '["thread-title","session-id"]' if herdr_active else '["session-id"]'
             command = [command[0], "-c", f"tui.terminal_title={titles}", *command[1:]]
         if resume_swarm and room:

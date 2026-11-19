@@ -113,6 +113,7 @@ export const SHARED_PROCESS_IDLE_TTL_MS = 3 * 60 * 60 * 1000;
 // A shared-process session waiting on input is no more evidenced than an idle one.
 export const SHARED_PROCESS_WAITING_TTL_MS = SHARED_PROCESS_IDLE_TTL_MS;
 export const SHARED_PROCESS_BUSY_TTL_MS = 30 * 60 * 1000;
+export const SHARED_PROCESS_SUBAGENT_TTL_MS = 300 * 1000;
 // A bound session without presence or a live recorded process awaits its first hook this long.
 export const SESSION_OBSERVATION_GRACE_MS = 10 * 60 * 1000;
 const PROGRESS_STALE_AFTER_MS = 30 * 60 * 1000;
@@ -2928,12 +2929,15 @@ export function isPeerLive(peer, nowMs = Date.now()) {
   }
   const ageMs = nowMs - seenMs;
   if (ageMs > MAX_PEER_AGE_MS) return false;
+  if (peer.sharedProcess && peer.isSubagent === true)
+    return ageMs <= SHARED_PROCESS_SUBAGENT_TTL_MS;
   // A process hosting several sessions says nothing about any one of them.
   if (alive && peer.sharedProcess) return ageMs <= sharedProcessTtlMs(peer.state);
   return alive ?? ageMs <= UNKNOWN_PID_TTL_MS;
 }
 
-export function sharedProcessTtlMs(state) {
+export function sharedProcessTtlMs(state, isSubagent = false) {
+  if (isSubagent === true) return SHARED_PROCESS_SUBAGENT_TTL_MS;
   if (state === "busy") return SHARED_PROCESS_BUSY_TTL_MS;
   if (state === "waiting") return SHARED_PROCESS_WAITING_TTL_MS;
   return SHARED_PROCESS_IDLE_TTL_MS;

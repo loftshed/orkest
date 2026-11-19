@@ -1,9 +1,6 @@
-import { spawnSync } from "node:child_process";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import { createInterface } from "node:readline";
 
+import { isHarnessAllowed, POLICY_SCHEMA, resolveRepoPolicy } from "./policy.mjs";
 import { jsonView } from "./render.mjs";
 import { getAccounts } from "./store.mjs";
 import { VERSION } from "./version.mjs";
@@ -155,118 +152,102 @@ export function summarizeLanes(lanes) {
     .join("\n");
 }
 
-const DENY_ALIASES = {
-  claude: "claude-work",
-  "claude-work": "claude-work",
-  claude_work: "claude-work",
-  "work-claude": "claude-work",
-  plaude: "plaude",
-  "claude-personal": "plaude",
-  claude_personal: "plaude",
-  "personal-claude": "plaude",
-  "claude-all": "claude-all",
-  claude_all: "claude-all",
-  "all-claude": "claude-all",
-  codex: "codex",
-  openai: "codex",
-  agy: "agy",
-  gemini: "agy",
-  antigravity: "agy",
-  opencode: "opencode",
-  openrouter: "opencode",
-};
+function isValidPolicyPayload(parsed) {
+  return Boolean(
+    parsed &&
+    typeof parsed === "object" &&
+    !Array.isArray(parsed) &&
+    parsed.schema === POLICY_SCHEMA &&
+    Array.isArray(parsed.allowed_harnesses) &&
+    Array.isArray(parsed.deny),
+  );
+}
 
-function readRepoDeniedHarnesses(cwd) {
-  const targetDir = path.resolve(cwd || process.cwd());
-  let repoRoot = targetDir;
-  const gitTop = spawnSync("git", ["-C", targetDir, "rev-parse", "--show-toplevel"], {
-    encoding: "utf8",
-    timeout: 2000,
-  });
-  if (gitTop.status === 0 && gitTop.stdout?.trim()) {
-    try {
-      repoRoot = fs.realpathSync(gitTop.stdout.trim());
-    } catch {
-      repoRoot = path.resolve(gitTop.stdout.trim());
+export async function evaluateRepoPolicy(cwd, options = {}) {
+  const targetCwd = cwd || process.cwd();
+  if (options.policy !== undefined) {
+    if (!isValidPolicyPayload(options.policy)) {
+      throw new Error("Repository policy evaluation unavailable: invalid policy schema");
     }
+    return {
+      policy: options.policy,
+      isAllowed: (target) =>
+        isHarnessAllowed(targetCwd, target, { ...options, policy: options.policy }),
+    };
   }
-  const denied = new Set();
-  const addTokens = (list) => {
-    if (!Array.isArray(list)) return;
-    for (const raw of list) {
-      const key = String(raw ?? "")
-        .trim()
-        .toLowerCase();
-      if (key) denied.add(DENY_ALIASES[key] || key);
-    }
+
+  let policy;
+  try {
+    policy = resolveRepoPolicy(targetCwd, { ...options, strict: true });
+  } catch (error) {
+    throw new Error(`Repository policy evaluation unavailable: ${error.message}`, {
+      cause: error,
+    });
+  }
+  if (!isValidPolicyPayload(policy)) {
+    throw new Error("Repository policy evaluation unavailable: invalid policy schema");
+  }
+  return {
+    policy,
+    isAllowed: (target) => isHarnessAllowed(targetCwd, target, { ...options, policy }),
   };
-  const localPolicyPath = path.join(repoRoot, ".orkest", "policy.json");
-  if (fs.existsSync(localPolicyPath)) {
-    try {
-      const parsed = JSON.parse(fs.readFileSync(localPolicyPath, "utf8"));
-      addTokens(parsed?.deniedHarnesses ?? parsed?.deny);
-    } catch {
-      // Ignore malformed local policy
-    }
-  }
-  const home = process.env.HOME || os.homedir();
-  const xdgConfig = process.env.XDG_CONFIG_HOME || path.join(home, ".config");
-  for (const rel of ["orchestrate/config.json", "agent-executor/config.json"]) {
-    const cfgPath = path.join(xdgConfig, rel);
-    if (!fs.existsSync(cfgPath)) continue;
-    try {
-      const cfg = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
-      const map = cfg?.repoPolicies || cfg?.repo_policies;
-      if (map && typeof map === "object") {
-        for (const [pattern, rule] of Object.entries(map)) {
-          if (pattern === repoRoot || pattern === path.basename(repoRoot)) {
-            addTokens(rule?.deniedHarnesses ?? rule?.deny);
-          }
-        }
-      }
-      break;
-    } catch {
-      // Ignore malformed config
-    }
-  }
-  return denied;
 }
 
-function isLaneAllowedByPolicy(lane, accountsById, denied) {
-  if (!denied || denied.size === 0) return true;
-  const acct = accountsById[lane.accountId];
-  const provider = acct?.provider || "";
-  if (provider === "codex" && denied.has("codex")) return false;
-  if (provider === "antigravity" && denied.has("agy")) return false;
-  if (provider === "claude") {
-    if (denied.has("claude-all")) return false;
-    const billing = acct?.billing || "";
-    const isPersonal =
-      billing === "personal" ||
-      lane.accountId === "plaude" ||
-      lane.accountId.includes("personal") ||
-      (lane.route && lane.route.includes("plaude"));
-    if (isPersonal && denied.has("plaude")) return false;
-    if (!isPersonal && denied.has("claude-work")) return false;
+export function isLaneAllowedByPolicy(lane, accountsById, policyEval) {
+  const acct = accountsById[lane.accountId] || {};
+  const target = {
+    id: lane.accountId,
+    accountId: lane.accountId,
+    ...((acct.alias ?? lane.alias) !== undefined && { alias: acct.alias ?? lane.alias }),
+    ...(Array.isArray(acct.aliases)
+      ? { aliases: acct.aliases }
+      : Array.isArray(lane.aliases) && { aliases: lane.aliases }),
+    provider: acct.provider || "",
+    billing: acct.billing ?? lane.billing ?? "",
+    ...((acct.category ?? lane.category) !== undefined && {
+      category: acct.category ?? lane.category,
+    }),
+    ...((acct.tags ?? lane.tags) !== undefined && { tags: acct.tags ?? lane.tags }),
+    label: acct.label || lane.label || "",
+    route: acct.route || lane.route || "",
+    configDir: acct.configDir || acct.claudeConfigDir || "",
+    ...(acct.env && typeof acct.env === "object" && { env: acct.env }),
+    ...(acct.accountHome !== undefined && { accountHome: acct.accountHome }),
+    ...(acct.codexHome !== undefined && { codexHome: acct.codexHome }),
+    ...(acct.agyHome !== undefined && { agyHome: acct.agyHome }),
+  };
+  if (typeof policyEval?.isAllowed === "function") {
+    return policyEval.isAllowed(target);
   }
-  return true;
+  const rawDeny =
+    policyEval instanceof Set
+      ? [...policyEval]
+      : policyEval?.policy?.deny || policyEval?.deny || [];
+  return isHarnessAllowed(null, target, { policy: { deny: rawDeny } });
 }
 
-async function callTool(name, rawArgs) {
+export async function callTool(name, rawArgs, options = {}) {
   const args = rawArgs && typeof rawArgs === "object" ? rawArgs : {};
-  const accounts = await getAccounts({ force: args.refresh === true });
+  const accountsLoader = options.getAccounts || getAccounts;
+  const accounts = await accountsLoader({ force: args.refresh === true });
   const view = jsonView(accounts);
   if (name === "get_usage") {
     return `${expiringSummary(view.lanes)}${summarizeUsage(view)}\n\n${JSON.stringify(compactView(view))}`;
   }
   if (name === "recommend") {
     const family = args.family && args.family !== "any" ? args.family : null;
-    const denied = readRepoDeniedHarnesses(args.cwd);
-    const accountsById = Object.fromEntries(view.accounts.map((a) => [a.id, a]));
+    const policyEval = await evaluateRepoPolicy(args.cwd, options.policyOptions || options);
+    const rawAccountsById = Object.fromEntries(accounts.map((a) => [a.id, a]));
+    const accountsById = Object.fromEntries(
+      view.accounts.map((a) => [a.id, { ...rawAccountsById[a.id], ...a }]),
+    );
     const familyLanes = family ? view.lanes.filter((l) => l.families.includes(family)) : view.lanes;
-    const lanes = familyLanes.filter((l) => isLaneAllowedByPolicy(l, accountsById, denied));
-    if (lanes.length === 0)
-      return `No configured account serves the ${family ?? "requested"} family.`;
+    const lanes = familyLanes.filter((l) => isLaneAllowedByPolicy(l, accountsById, policyEval));
+    if (lanes.length === 0) {
+      return familyLanes.length > 0
+        ? `No configured account for the ${family ?? "requested"} family is allowed by repository policy.`
+        : `No configured account serves the ${family ?? "requested"} family.`;
+    }
     const best = lanes.find((l) => l.status === "available" || l.status === "credits");
     const head = best
       ? `Best right now: ${best.label}${best.route ? ` (use: ${best.route})` : ""}. ${best.advice}.`
@@ -280,7 +261,7 @@ async function callTool(name, rawArgs) {
 const response = (id, body) => ({ jsonrpc: "2.0", id, ...body });
 
 /** One JSON-RPC message in, one response out (null for notifications). */
-async function handle(msg) {
+export async function handle(msg, options = {}) {
   if (!msg || typeof msg !== "object" || Array.isArray(msg))
     return response(null, { error: { code: -32_600, message: "Invalid Request" } });
   const { id, method, params } = msg;
@@ -302,7 +283,7 @@ async function handle(msg) {
       if (TOOLS.every((t) => t.name !== params?.name))
         return response(id, { error: { code: -32_602, message: `Unknown tool: ${params?.name}` } });
       try {
-        const text = await callTool(params.name, params.arguments);
+        const text = await callTool(params.name, params.arguments, options);
         return response(id, { result: { content: [{ type: "text", text }] } });
       } catch (error) {
         return response(id, {

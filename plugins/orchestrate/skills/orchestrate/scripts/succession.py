@@ -1,6 +1,6 @@
 """Who should succeed a team's lead, decided from facts only and never guessed.
 
-The facts are monitor's quota pools with their account context (`billing`: work or personal), the route
+The facts are monitor's quota pools with their account context (`billing` / `category` / `tags`), the route
 table, and the live mailbox sessions. A pool is `accountId:poolId`. A deputy must draw on another account
 (two pools of one login fail together) in the same context, with room now; worker pools stay off the lead's
 and deputy's pools whenever another eligible pool exists, so the successor is not drained before it is
@@ -25,7 +25,7 @@ from typing import Any
 DEFAULT_MAX_AGE_SECONDS = 180
 # A lead's or deputy's turn hook looks at quota at most this often.
 HOOK_CHECK_SECONDS = 300
-HARNESS_ENGINE = {"claude": "claude", "codex": "codex", "gemini": "agy"}
+HARNESS_ENGINE = {"claude": "claude", "codex": "codex", "gemini": "agy", "opencode": "opencode"}
 HARNESS_PROVIDER = {"claude": "claude", "codex": "codex", "gemini": "antigravity"}
 USABLE = ("available", "low")
 EXHAUSTED = ("blocked", "credits")
@@ -97,6 +97,21 @@ def cached_view() -> dict[str, Any] | None:
     return view if isinstance(view, dict) and str(view.get("schema", "")).startswith("monitor.snapshot.") else None
 
 
+def _normalize_tags(*values: Any) -> list[str]:
+    tags: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        items = value if isinstance(value, (list, tuple, set)) else [value]
+        for item in items:
+            if not isinstance(item, str):
+                continue
+            cleaned = item.strip().lower()
+            if cleaned and cleaned not in seen:
+                seen.add(cleaned)
+                tags.append(cleaned)
+    return tags
+
+
 def pools(view: dict[str, Any] | None, config: dict[str, Any]) -> list[dict[str, Any]]:
     """Every pool monitor reports, with its account's provider and context and an assessed status."""
     if not view:
@@ -109,14 +124,36 @@ def pools(view: dict[str, Any] | None, config: dict[str, Any]) -> list[dict[str,
         account_id = lane.get("accountId")
         if lane.get("status") == "error" or account_id not in accounts:
             continue
-        billing = accounts[account_id].get("billing") or (configured.get(account_id) or {}).get("billing")
+        view_acct = accounts[account_id]
+        cfg_acct = configured.get(account_id) or {}
+        raw_billing = view_acct.get("billing") or cfg_acct.get("billing")
+        raw_category = view_acct.get("category") or cfg_acct.get("category")
+        tags = _normalize_tags(
+            view_acct.get("tags"),
+            cfg_acct.get("tags"),
+            raw_category,
+            raw_billing,
+        )
+        billing = (
+            raw_billing.strip()
+            if isinstance(raw_billing, str) and raw_billing.strip()
+            else (
+                raw_category.strip()
+                if isinstance(raw_category, str) and raw_category.strip()
+                else (tags[0] if tags else None)
+            )
+        )
+        alias = view_acct.get("alias") or cfg_acct.get("alias")
         found.append(
             {
                 "pool": f"{account_id}:{lane.get('poolId')}",
                 "accountId": account_id,
                 "poolId": lane.get("poolId"),
-                "provider": accounts[account_id].get("provider"),
-                "billing": billing if billing in ("work", "personal") else None,
+                "provider": view_acct.get("provider"),
+                "billing": billing,
+                "category": raw_category.strip() if isinstance(raw_category, str) and raw_category.strip() else None,
+                "tags": tags,
+                "alias": alias.strip() if isinstance(alias, str) and alias.strip() else None,
                 "status": quota.assess(lane),
                 "availableNowPct": lane.get("availableNowPct"),
                 "surplusPts": lane.get("surplusPts"),
@@ -129,26 +166,201 @@ def pools(view: dict[str, Any] | None, config: dict[str, Any]) -> list[dict[str,
     return found
 
 
-def account_of(harness: str, account_home: str | None, config: dict[str, Any]) -> tuple[str | None, str]:
+def _resolve_child_path(raw: str) -> Path:
+    """Resolve a path against the provider child's cwd (`Path.home()`), matching Monitor."""
+    expanded = Path(os.path.expanduser(raw.strip()))
+    if not expanded.is_absolute():
+        expanded = Path.home() / expanded
+    return expanded.resolve()
+
+
+def _merged_account_env(
+    account: dict[str, Any],
+    config: dict[str, Any],
+    *,
+    strip_exact: tuple[str, ...] = (),
+    strip_prefixes: tuple[str, ...] = (),
+) -> dict[str, str]:
+    """Mirror Monitor's childEnv merging: process env (minus stripped) + config.env + account.env, with None removals."""
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in strip_exact and not any(key.startswith(prefix) for prefix in strip_prefixes)
+    }
+    for mapping in (config.get("env"), account.get("env")):
+        if not isinstance(mapping, dict):
+            continue
+        for key, value in mapping.items():
+            if value is None:
+                env.pop(key, None)
+            else:
+                env[key] = os.path.expanduser(str(value))
+    return env
+
+
+def _env_base_home(env: dict[str, str]) -> Path:
+    raw_home = env.get("HOME")
+    if isinstance(raw_home, str) and raw_home.strip():
+        return _resolve_child_path(raw_home)
+    return Path.home()
+
+
+def _view_account_home(view_account: dict[str, Any] | None) -> Path | None:
+    if isinstance(view_account, dict):
+        raw = view_account.get("accountHome")
+        if isinstance(raw, str) and raw.strip():
+            return _resolve_child_path(raw)
+    return None
+
+
+def _view_account_unverified(view_account: dict[str, Any] | None) -> bool:
+    """True when monitor's snapshot explicitly reported accountHome: None (unverified home)."""
+    return isinstance(view_account, dict) and "accountHome" in view_account and _view_account_home(view_account) is None
+
+
+def _has_configured_home_override(account: dict[str, Any], config: dict[str, Any]) -> bool:
+    return any(
+        isinstance(mapping, dict) and mapping.get("HOME") is not None
+        for mapping in (config.get("env"), account.get("env"))
+    )
+
+
+def _configured_claude_home(
+    account: dict[str, Any],
+    config: dict[str, Any],
+    *,
+    view_account: dict[str, Any] | None = None,
+) -> Path:
+    snapshot_home = _view_account_home(view_account)
+    if snapshot_home is not None:
+        return snapshot_home
+    env = _merged_account_env(
+        account,
+        config,
+        strip_exact=("CLAUDECODE", "CLAUDE_CONFIG_DIR"),
+        strip_prefixes=("ANTHROPIC_", "CLAUDE_CODE_"),
+    )
+    default_config_dir = (Path.home() / ".claude").resolve()
+    raw_dir = account.get("configDir")
+    if isinstance(raw_dir, str) and raw_dir.strip():
+        resolved_cfg = _resolve_child_path(raw_dir)
+        if resolved_cfg != default_config_dir:
+            return resolved_cfg
+    # Match Monitor's Claude probe (providers/claude.mjs & store.mjs): ignore inherited CLAUDE_CONFIG_DIR
+    # for the default Claude account so it resolves to <HOME>/.claude.
+    return (_env_base_home(env) / ".claude").resolve()
+
+
+def _configured_provider_home(
+    provider: str,
+    account: dict[str, Any],
+    config: dict[str, Any],
+    *,
+    view_account: dict[str, Any] | None = None,
+) -> tuple[Path | None, Path]:
+    """Return (explicit_home, effective_home), both resolved canonically, for codex or antigravity."""
+    snapshot_home = _view_account_home(view_account)
+    if snapshot_home is not None:
+        return snapshot_home, snapshot_home
+    env = _merged_account_env(account, config)
+    base_home = _env_base_home(env)
+    home_overridden = _has_configured_home_override(account, config)
+    if provider == "codex":
+        raw = env.get("CODEX_HOME")
+        if isinstance(raw, str) and raw.strip():
+            resolved = _resolve_child_path(raw)
+            return resolved, resolved
+        default_home = (base_home / ".codex").resolve()
+        return (default_home if home_overridden else None), default_home
+    raw_gemini = env.get("GEMINI_CLI_HOME")
+    if isinstance(raw_gemini, str) and raw_gemini.strip():
+        resolved = _resolve_child_path(raw_gemini)
+        return resolved, resolved
+    raw_app = env.get("ANTIGRAVITY_APP_DATA_DIR")
+    if isinstance(raw_app, str) and raw_app.strip():
+        app_data = _resolve_child_path(raw_app)
+        configured = app_data.parent if app_data.name.startswith("antigravity") else app_data
+        resolved = configured.resolve()
+        return resolved, resolved
+    default_home = (base_home / ".gemini").resolve()
+    return (default_home if home_overridden else None), default_home
+
+
+def account_of(
+    harness: str,
+    account_home: str | None,
+    config: dict[str, Any],
+    *,
+    view: dict[str, Any] | None = None,
+) -> tuple[str | None, str]:
     """The monitor account a session of this harness draws on, or None and why."""
     provider = HARNESS_PROVIDER.get(harness)
     if provider is None:
         return None, f"{harness} sessions have no monitored subscription pool"
     accounts = [a for a in config.get("accounts", []) if isinstance(a, dict) and a.get("provider") == provider]
+    view_accounts = {
+        entry["id"]: entry
+        for entry in (view or {}).get("accounts", [])
+        if isinstance(entry, dict) and isinstance(entry.get("id"), str)
+    }
     if provider != "claude":
+        if not accounts:
+            return None, f"monitor has 0 {provider} accounts; cannot tell which one this session uses"
         if len(accounts) == 1:
-            return accounts[0]["id"], ""
-        return None, f"monitor has {len(accounts)} {provider} accounts; cannot tell which one this session uses"
+            account_id = accounts[0]["id"]
+            view_account = view_accounts.get(account_id)
+            if _view_account_unverified(view_account):
+                return (
+                    None,
+                    f"monitor {provider} account '{account_id}' has an unverified accountHome; refresh monitor first",
+                )
+            explicit_home, _ = _configured_provider_home(provider, accounts[0], config, view_account=view_account)
+            if isinstance(account_home, str) and account_home.strip():
+                session_home = Path(account_home).expanduser().resolve()
+                if explicit_home is not None and explicit_home != session_home:
+                    return (
+                        None,
+                        f"session account home {session_home} does not match monitor {provider} account "
+                        f"'{account_id}' ({explicit_home})",
+                    )
+            return account_id, ""
+        if not isinstance(account_home, str) or not account_home.strip():
+            return (
+                None,
+                f"this {harness} session's account home is unknown and monitor has {len(accounts)} {provider} accounts",
+            )
+        home = Path(account_home).expanduser().resolve()
+        verified_accounts = [
+            account for account in accounts if not _view_account_unverified(view_accounts.get(account.get("id")))
+        ]
+        matches = [
+            account["id"]
+            for account in verified_accounts
+            if _configured_provider_home(provider, account, config, view_account=view_accounts.get(account.get("id")))[
+                1
+            ]
+            == home
+        ]
+        if len(matches) == 1:
+            return matches[0], ""
+        if not matches and len(verified_accounts) < len(accounts):
+            return None, f"monitor {provider} account homes are unverified; refresh monitor first"
+        return None, f"{len(matches)} monitor {provider} accounts use {home}; configure a distinct home for each"
     if not account_home:
         return None, "this Claude session's config home (account) is unknown"
     home = Path(account_home).expanduser().resolve()
+    verified_claude = [
+        account for account in accounts if not _view_account_unverified(view_accounts.get(account.get("id")))
+    ]
     matches = [
         account["id"]
-        for account in accounts
-        if Path(account.get("configDir") or "~/.claude").expanduser().resolve() == home
+        for account in verified_claude
+        if _configured_claude_home(account, config, view_account=view_accounts.get(account.get("id"))) == home
     ]
     if len(matches) == 1:
         return matches[0], ""
+    if not matches and len(verified_claude) < len(accounts):
+        return None, "monitor Claude account homes are unverified; refresh monitor first"
     return None, f"{len(matches)} monitor Claude accounts use {home}; set configDir on exactly one"
 
 
@@ -168,7 +380,13 @@ def rank(pool: dict[str, Any]) -> tuple:
 
 
 def sessions_on(
-    account_id: str, provider: str | None, peers: list[dict[str, Any]], config: dict[str, Any], repository: str | None
+    account_id: str,
+    provider: str | None,
+    peers: list[dict[str, Any]],
+    config: dict[str, Any],
+    repository: str | None,
+    *,
+    view: dict[str, Any] | None = None,
 ) -> list:
     """Live interactive sessions in the team's repository that draw on this account."""
     found = []
@@ -182,7 +400,7 @@ def sessions_on(
             continue
         if not same_repository(peer.get("repo"), repository):
             continue
-        if account_of(peer["harness"], peer.get("accountHome"), config)[0] == account_id:
+        if account_of(peer["harness"], peer.get("accountHome"), config, view=view)[0] == account_id:
             found.append({"session": peer["session"], "name": peer.get("name"), "harness": peer["harness"]})
     return found
 
@@ -202,7 +420,7 @@ def propose(
         refusals.append("monitor is not installed or did not answer: quota is unknown")
         return result
     available = pools(view, config)
-    account_id, why = account_of(lead["harness"], lead.get("accountHome"), config)
+    account_id, why = account_of(lead["harness"], lead.get("accountHome"), config, view=view)
     if account_id is None:
         refusals.append(why)
         return result
@@ -214,7 +432,7 @@ def propose(
     context = lead_pool["billing"]
     result["context"] = context
     if context is None:
-        refusals.append(f"set billing (work or personal) on monitor account '{account_id}' in {monitor_config_path()}")
+        refusals.append(f"set billing or tags on monitor account '{account_id}' in {monitor_config_path()}")
         return result
     untagged = sorted({pool["accountId"] for pool in available if pool["billing"] is None})
     if untagged:
@@ -240,7 +458,7 @@ def propose(
     result["deputy"] = {
         **deputy,
         "harness": next(harness for harness, provider in HARNESS_PROVIDER.items() if provider == deputy["provider"]),
-        "sessions": sessions_on(deputy["accountId"], deputy["provider"], peers, config, lead.get("repo")),
+        "sessions": sessions_on(deputy["accountId"], deputy["provider"], peers, config, lead.get("repo"), view=view),
     }
     if not result["deputy"]["sessions"]:
         result["deputy"]["note"] = "no live session draws on this pool: start one before you need it"
@@ -369,7 +587,7 @@ def same_repository(left: str | None, right: str | None) -> bool:
 
 
 def context_changes(record: dict[str, Any], by_key: dict[str, dict[str, Any]]) -> list[str]:
-    """Accounts whose work/personal context differs from what the appointment recorded."""
+    """Accounts whose context tag differs from what the appointment recorded."""
     changed = []
     for account_id, billing in (record.get("contexts") or {}).items():
         now_billing = next((pool["billing"] for pool in by_key.values() if pool["accountId"] == account_id), None)
@@ -380,19 +598,20 @@ def context_changes(record: dict[str, Any], by_key: dict[str, dict[str, Any]]) -
 
 def set_billing(account_id: str, billing: str) -> None:
     """Record an account's context in monitor's config, as the user answered; the only field touched."""
-    if billing not in ("work", "personal"):
-        raise ValueError("billing must be work or personal")
+    cleaned = billing.strip() if isinstance(billing, str) else ""
+    if not cleaned:
+        raise ValueError("billing must be a non-empty tag")
     path = monitor_config_path()
     config = json.loads(path.read_text(encoding="utf-8"))
     account = next((a for a in config.get("accounts", []) if a.get("id") == account_id), None)
     if account is None:
         raise ValueError(f"monitor has no account '{account_id}'")
-    if account.get("billing") == billing:
+    if account.get("billing") == cleaned:
         return
     if account.get("billing"):
-        # Moving an account between work and personal is the user's own edit, never an agent's call.
+        # Moving an account between contexts is the user's own edit, never an agent's call.
         raise ValueError(f"account '{account_id}' is already {account['billing']}; change it by hand if it is wrong")
-    account["billing"] = billing
+    account["billing"] = cleaned
     temporary = path.with_name(path.name + f".{os.getpid()}.tmp")
     temporary.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
     os.replace(temporary, path)

@@ -607,21 +607,21 @@ describe("ork cleanup (Slice 1D)", () => {
     });
     expect(updated.schema).toBe(POLICY_SCHEMA);
     expect(updated.deny).toEqual(["claude-work"]);
-    expect(updated.allowedHarnesses).toEqual(["codex", "agy", "opencode", "plaude"]);
+    expect(updated.allowedHarnesses).toEqual(["codex", "agy", "claude", "opencode"]);
 
     // Existing routes key in config.json is preserved
     const savedCfg = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
     expect(savedCfg.routes).toEqual({ implementation: { engine: "codex" } });
 
     expect(isHarnessAllowed(repoDir, "claude", { configPath: cfgPath, homeDir: fakeHome })).toBe(
-      false,
+      true,
     );
     expect(
       isHarnessAllowed(repoDir, "claude-work", { configPath: cfgPath, homeDir: fakeHome }),
     ).toBe(false);
-    expect(isHarnessAllowed(repoDir, "plaude", { configPath: cfgPath, homeDir: fakeHome })).toBe(
-      true,
-    );
+    expect(
+      isHarnessAllowed(repoDir, "claude-alt", { configPath: cfgPath, homeDir: fakeHome }),
+    ).toBe(true);
     expect(
       isHarnessAllowed(repoDir, "claude-personal", { configPath: cfgPath, homeDir: fakeHome }),
     ).toBe(true);
@@ -632,14 +632,21 @@ describe("ork cleanup (Slice 1D)", () => {
     expect(
       isHarnessAllowed(
         repoDir,
-        { provider: "claude", id: "claude-work", billing: "subscription" },
+        { provider: "claude", id: "c-work", tags: ["work"], billing: "subscription" },
         { configPath: cfgPath, homeDir: fakeHome },
       ),
     ).toBe(false);
     expect(
       isHarnessAllowed(
         repoDir,
-        { provider: "claude", id: "plaude", billing: "personal" },
+        { provider: "claude", id: "claude-untagged", billing: "subscription" },
+        { configPath: cfgPath, homeDir: fakeHome },
+      ),
+    ).toBe(true);
+    expect(
+      isHarnessAllowed(
+        repoDir,
+        { provider: "claude", id: "claude-alt", billing: "personal" },
         { configPath: cfgPath, homeDir: fakeHome },
       ),
     ).toBe(true);
@@ -671,6 +678,6 @@ describe("ork cleanup (Slice 1D)", () => {
     expect(cliReset.deny).toEqual([]);
     expect(
       resolveRepoPolicy(repoDir, { configPath: cfgPath, homeDir: fakeHome }).allowedHarnesses,
-    ).toEqual(["codex", "agy", "opencode", "claude-work", "plaude"]);
+    ).toEqual(["codex", "agy", "claude", "opencode"]);
   });
 });

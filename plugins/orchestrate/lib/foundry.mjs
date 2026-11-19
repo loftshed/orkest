@@ -8,19 +8,19 @@
  * bounded worker runs.
  */
 import { execFile, execFileSync } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import {
   closeSync,
   existsSync,
-  fsyncSync,
-  mkdirSync,
+  constants as fsConstants,
+  fstatSync,
+  lstatSync,
   openSync,
   readFileSync,
-  renameSync,
-  writeFileSync,
+  realpathSync,
 } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { hostname } from "node:os";
+import { homedir, hostname } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs, promisify } from "node:util";
@@ -30,6 +30,12 @@ import { shouldUseColor } from "../../monitor/lib/render.mjs";
 import { getAccounts } from "../../monitor/lib/store.mjs";
 import { resolveWorktreeMarkerPath } from "./horde-room.mjs";
 import { glyphSet, glyphTier, renderPanel, renderTable, wrapText } from "./horde-view.mjs";
+import {
+  isHarnessAllowed,
+  normalizeAccountTags,
+  normalizeDenyToken,
+  resolveRepoPolicy,
+} from "./policy.mjs";
 import { cacheHome, configPath, envFirst } from "./runtime-paths.mjs";
 import { acquireWorkspaceLease, assertWorkspaceLease } from "./workspace-lease.mjs";
 import { bootstrapWorktreeInclude as bootstrapWorktreeIncludeShared } from "./worktree-env.mjs";
@@ -247,9 +253,15 @@ export function hasDisjointPaths(candidateAllowPaths, activeAllowPathsList = [])
 }
 
 function isPersonalLane(lane) {
-  if (lane.billing === "personal" || lane.personal === true) return true;
-  const haystack = `${lane.accountId ?? ""} ${lane.label ?? ""} ${lane.route ?? ""}`;
-  return /\b(?:personal|plaude)\b/iu.test(haystack);
+  if (
+    lane.billing === "personal" ||
+    lane.personal === true ||
+    normalizeAccountTags(lane).includes("personal")
+  ) {
+    return true;
+  }
+  const haystack = `${lane.accountId ?? ""} ${lane.accountLabel ?? ""} ${lane.label ?? ""} ${lane.route ?? ""}`;
+  return /\bpersonal\b/iu.test(haystack);
 }
 
 function matchesAllowedPools(lane, allowedPools) {
@@ -263,64 +275,39 @@ function matchesAllowedPools(lane, allowedPools) {
   );
 }
 
-function doesDenyTokenMatchLane(token, { accountId, engine, isPersonal, poolId }) {
-  switch (token) {
-    case "opencode": {
-      return engine === "opencode";
-    }
-    case "codex": {
-      return engine === "codex";
-    }
-    case "agy":
-    case "gemini":
-    case "antigravity": {
-      return engine === "agy";
-    }
-    case "claude-all": {
-      return engine === "claude";
-    }
-    case "claude-work":
-    case "claude": {
-      return engine === "claude" && !isPersonal;
-    }
-    case "plaude":
-    case "claude-personal": {
-      return engine === "claude" && isPersonal;
-    }
-    default: {
-      return (
-        Boolean(accountId && token === accountId) ||
-        Boolean(poolId && token === poolId) ||
-        Boolean(accountId && poolId && token === `${accountId}:${poolId}`)
-      );
-    }
-  }
-}
-
 export function isLaneDeniedByPolicy(lane, denyList = []) {
   if (!lane || typeof lane !== "object" || !Array.isArray(denyList) || denyList.length === 0) {
     return false;
   }
-  const tokens = denyList
-    .map((item) =>
-      String(item ?? "")
-        .trim()
-        .toLowerCase(),
-    )
+  const normalizedDeny = denyList
+    .map((item) => normalizeDenyToken(String(item ?? "")))
     .filter(Boolean);
-  if (tokens.length === 0) return false;
-  const info = {
-    accountId: String(lane.accountId ?? "")
-      .trim()
-      .toLowerCase(),
-    engine: laneEngine(lane),
-    isPersonal: isPersonalLane(lane),
-    poolId: String(lane.poolId ?? "")
-      .trim()
-      .toLowerCase(),
+  if (normalizedDeny.length === 0) return false;
+  const engine = laneEngine(lane);
+  const target = {
+    ...lane,
+    id: lane.accountId || lane.id || "",
+    accountId: lane.accountId || lane.id || "",
+    alias: lane.alias || lane.accountAlias || "",
+    provider: lane.provider || "",
+    engine,
+    tags: normalizeAccountTags(lane),
   };
-  const uniqueTokens = [...new Set(tokens)];
-  return uniqueTokens.some((token) => doesDenyTokenMatchLane(token, info));
+  if (!isHarnessAllowed(null, target, { policy: { deny: normalizedDeny } })) {
+    return true;
+  }
+  const accountId = String(lane.accountId ?? "")
+    .trim()
+    .toLowerCase();
+  const poolId = String(lane.poolId ?? "")
+    .trim()
+    .toLowerCase();
+  if (!poolId) return false;
+  const denySet = new Set(normalizedDeny);
+  return (
+    (Boolean(accountId) && denySet.has(`${accountId}:${poolId}`)) ||
+    (poolId !== engine && denySet.has(poolId))
+  );
 }
 
 function laneSurplusPts(lane) {
@@ -342,7 +329,7 @@ export function laneEngine(lane) {
   if (typeof lane.route === "string") {
     const match = /--engine\s+([a-z0-9_-]+)/iu.exec(lane.route);
     if (match) return match[1].toLowerCase() === "antigravity" ? "agy" : match[1].toLowerCase();
-    if (/\b(?:plaude|claude)\b/iu.test(lane.route)) return "claude";
+    if (/\bclaude\b/iu.test(lane.route)) return "claude";
     if (/\b(?:agy|gemini)\b/iu.test(lane.route)) return "agy";
     if (/\b(?:codex)\b/iu.test(lane.route)) return "codex";
     if (/\b(?:opencode)\b/iu.test(lane.route)) return "opencode";
@@ -402,6 +389,7 @@ export function selectSparePools(lanes, policy = {}) {
   const eligible = [];
 
   for (const lane of lanes) {
+    const laneTags = normalizeAccountTags(lane || {});
     if (
       !lane ||
       typeof lane !== "object" ||
@@ -414,7 +402,11 @@ export function selectSparePools(lanes, policy = {}) {
       lane.billing === "unauthorized" ||
       lane.unauthorized === true ||
       (Array.isArray(policy.allowedBilling) &&
-        !policy.allowedBilling.includes(lane.billing ?? "work")) ||
+        !policy.allowedBilling.includes(
+          lane.billing ?? (isPersonalLane(lane) ? "personal" : "work"),
+        )) ||
+      (Array.isArray(policy.allowedTags) &&
+        policy.allowedTags.every((tag) => !laneTags.includes(String(tag).trim().toLowerCase()))) ||
       (policy.allowPersonal === false && isPersonalLane(lane)) ||
       (Array.isArray(policy.allowedPools) && !matchesAllowedPools(lane, policy.allowedPools)) ||
       (Array.isArray(policy.deny) &&
@@ -500,23 +492,46 @@ export function extractIssueArchetype(issue, taskSpec = null) {
   return null;
 }
 
+function normalizeRouteCandidate(entry) {
+  return {
+    account: entry.account ?? entry.alias ?? null,
+    claudeConfigDir: entry.claudeConfigDir ?? entry.claude_config_dir ?? null,
+    effort: entry.effort ?? entry.variant ?? null,
+    engine: entry.engine,
+    model: entry.model,
+    tags: Array.isArray(entry.tags) ? entry.tags : [],
+  };
+}
+
 function routeCandidatesForRole(role, routesConfig = loadDefaultRoutes()) {
   const effectiveRoutes = { ...loadDefaultRoutes(), ...routesConfig };
   const route = effectiveRoutes[role];
   if (!route || typeof route !== "object") return [];
-  const primary = {
-    effort: route.effort ?? route.variant ?? null,
-    engine: route.engine,
-    model: route.model,
-  };
+  const primary = normalizeRouteCandidate(route);
   const alternates = Array.isArray(route.alternates)
-    ? route.alternates.map((alt) => ({
-        effort: alt.effort ?? alt.variant ?? null,
-        engine: alt.engine,
-        model: alt.model,
-      }))
+    ? route.alternates.map((alt) => normalizeRouteCandidate(alt))
     : [];
   return [primary, ...alternates];
+}
+
+function expandHomeDir(rawPath, homeDir = homedir()) {
+  const text = String(rawPath ?? "").trim();
+  if (!text) return "";
+  if (text === "~") return homeDir;
+  if (text === "~/") return homeDir === "/" ? "/" : `${homeDir.replace(/\/+$/u, "")}/`;
+  if (text.startsWith("~/")) return `${homeDir.replace(/\/+$/u, "")}/${text.slice(2)}`;
+  return text;
+}
+
+function normalizeConfigDirPath(rawPath, homeDir = homedir()) {
+  const expanded = expandHomeDir(rawPath, homeDir);
+  if (!expanded) return "";
+  const resolved = path.resolve(homeDir, expanded);
+  try {
+    return realpathSync(resolved);
+  } catch {
+    return resolved;
+  }
 }
 
 function candidateFamily(modelSelector) {
@@ -525,9 +540,59 @@ function candidateFamily(modelSelector) {
   return cleaned.split(":", 1)[0].toLowerCase();
 }
 
-function poolSupportsCandidate(pool, candidate) {
+function hasCandidateRouteConstraints(candidate) {
+  return Boolean(
+    candidate?.account ||
+    (Array.isArray(candidate?.tags) && candidate.tags.length > 0) ||
+    candidate?.claudeConfigDir,
+  );
+}
+
+export function poolSupportsCandidate(pool, candidate) {
   const poolEng = laneEngine(pool);
   if (poolEng !== candidate.engine) return false;
+  if (candidate.account) {
+    const target = String(candidate.account).trim().toLowerCase();
+    const poolAliases = Array.isArray(pool.aliases) ? pool.aliases : [];
+    const poolIdentities = [pool.accountId, pool.alias, ...poolAliases]
+      .filter((item) => typeof item === "string" && item.trim())
+      .map((item) => item.trim().toLowerCase());
+    if (!poolIdentities.includes(target)) return false;
+  }
+  if (Array.isArray(candidate.tags) && candidate.tags.length > 0) {
+    const poolTags = new Set(normalizeAccountTags(pool));
+    const requiredTags = candidate.tags
+      .map((tag) =>
+        String(tag ?? "")
+          .trim()
+          .toLowerCase(),
+      )
+      .filter(Boolean);
+    if (requiredTags.some((tag) => !poolTags.has(tag))) return false;
+  }
+  if (candidate.claudeConfigDir) {
+    const rawPoolHome = pool.accountEnv?.HOME || pool.env?.HOME;
+    const poolHomeDir = rawPoolHome
+      ? path.resolve(homedir(), expandHomeDir(rawPoolHome))
+      : homedir();
+    const expandedRawConfigDir = pool.configDir
+      ? path.resolve(poolHomeDir, expandHomeDir(pool.configDir, poolHomeDir))
+      : null;
+    const poolConfigDir =
+      pool.claudeConfigDir ||
+      (poolEng === "claude" ? pool.accountHome : null) ||
+      expandedRawConfigDir ||
+      null;
+    const effectivePoolConfigDir =
+      poolConfigDir || (poolEng === "claude" ? path.join(poolHomeDir, ".claude") : "");
+    if (
+      !effectivePoolConfigDir ||
+      normalizeConfigDirPath(effectivePoolConfigDir, poolHomeDir) !==
+        normalizeConfigDirPath(candidate.claudeConfigDir)
+    ) {
+      return false;
+    }
+  }
   const family = candidateFamily(candidate.model);
   const supported = laneFamilies(pool);
   return !family || supported.length === 0 || supported.includes(family);
@@ -536,23 +601,26 @@ function poolSupportsCandidate(pool, candidate) {
 function buildPoolRouteOptions(pool, archetype, routesConfig) {
   const options = [];
   const seenModels = new Set();
+  const poolEng = laneEngine(pool);
+  const archetypeCandidates = archetype ? routeCandidatesForRole(archetype, routesConfig) : [];
 
-  if (archetype) {
-    const archetypeCandidates = routeCandidatesForRole(archetype, routesConfig);
-    for (const [rank, candidate] of archetypeCandidates.entries()) {
-      if (!poolSupportsCandidate(pool, candidate) || seenModels.has(candidate.model)) continue;
-      seenModels.add(candidate.model);
-      options.push({
-        archetypeRank: rank,
-        effort: candidate.effort ?? null,
-        engine: candidate.engine,
-        isArchetypeMatch: true,
-        model: candidate.model,
-      });
-    }
+  for (const [rank, candidate] of archetypeCandidates.entries()) {
+    if (!poolSupportsCandidate(pool, candidate) || seenModels.has(candidate.model)) continue;
+    seenModels.add(candidate.model);
+    options.push({
+      archetypeRank: rank,
+      effort: candidate.effort ?? null,
+      engine: candidate.engine,
+      isArchetypeMatch: true,
+      model: candidate.model,
+    });
   }
 
-  const fallbackRole = ENGINE_FALLBACK_ROLES[laneEngine(pool)] || "implementation";
+  if (options.length === 0 && archetypeCandidates.some(hasCandidateRouteConstraints)) {
+    return [];
+  }
+
+  const fallbackRole = ENGINE_FALLBACK_ROLES[poolEng] || "implementation";
   const engineDefaults = routeCandidatesForRole(fallbackRole, routesConfig);
   for (const [index, candidate] of engineDefaults.entries()) {
     if (!poolSupportsCandidate(pool, candidate) || seenModels.has(candidate.model)) continue;
@@ -566,8 +634,18 @@ function buildPoolRouteOptions(pool, archetype, routesConfig) {
     });
   }
 
+  const rawRoleCandidates = [...archetypeCandidates, ...engineDefaults];
+  if (
+    options.length === 0 &&
+    rawRoleCandidates.some(
+      (candidate) => candidate.engine === poolEng && hasCandidateRouteConstraints(candidate),
+    )
+  ) {
+    return [];
+  }
+
   if (options.length === 0) {
-    const engine = laneEngine(pool);
+    const engine = poolEng;
     const defaultModel = Array.isArray(pool.models) && pool.models[0] ? pool.models[0] : engine;
     options.push({
       archetypeRank: archetype ? 20 : 0,
@@ -700,6 +778,7 @@ export function matchIssuesToPools(issues, lanes, activeAllowPaths = [], policy 
       archetype || ENGINE_FALLBACK_ROLES[option.engine] || "implementation";
     const selectedRoute = {
       ...(archetype && { archetype }),
+      ...(pool.accountId && { accountId: pool.accountId }),
       effort: option.effort,
       engine: option.engine,
       model: option.model,
@@ -769,12 +848,557 @@ export class FoundryStateError extends Error {
   }
 }
 
-export function loadFoundryState(worktreePath) {
-  const statePath = resolveFoundryStatePath(worktreePath);
+function lstatIfExists(targetPath) {
+  try {
+    return lstatSync(targetPath);
+  } catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+function assertNonSymlinkDirectory(dirPath, label) {
+  const info = lstatSync(dirPath);
+  if (info.isSymbolicLink() || !info.isDirectory()) {
+    throw new Error(`${label} is invalid or a symlink: ${dirPath}`);
+  }
+  return realpathSync(dirPath);
+}
+
+function readRegularFileNoFollow(filePath, label) {
+  const fd = openSync(filePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  try {
+    const info = fstatSync(fd);
+    if (!info.isFile()) {
+      throw new Error(`${label} is not a regular file: ${filePath}`);
+    }
+    return readFileSync(fd, "utf8");
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function canonicalizePathPreservingMissing(targetPath) {
+  const resolved = path.resolve(targetPath);
+  const missing = [];
+  let cursor = resolved;
+  while (true) {
+    const info = lstatIfExists(cursor);
+    if (info) {
+      const canonicalAncestor = realpathSync(cursor);
+      return missing.length > 0 ? path.join(canonicalAncestor, ...missing) : canonicalAncestor;
+    }
+    const parent = path.dirname(cursor);
+    if (parent === cursor) return resolved;
+    missing.unshift(path.basename(cursor));
+    cursor = parent;
+  }
+}
+
+function resolveValidatedWorktreeAdminDir(worktreePath) {
+  const resolvedWorktree = path.resolve(worktreePath);
+  const wtStat = lstatIfExists(resolvedWorktree);
+  if (wtStat && (wtStat.isSymbolicLink() || !wtStat.isDirectory())) {
+    throw new Error(`Foundry worktree path is invalid or a symlink: ${resolvedWorktree}`);
+  }
+  const dotGitPath = path.join(resolvedWorktree, ".git");
+  const dotGitStat = lstatIfExists(dotGitPath);
+  if (!dotGitStat) {
+    if (wtStat) {
+      const canonicalWorktree = realpathSync(resolvedWorktree);
+      return {
+        adminDir: null,
+        pinnedTarget: { baseDir: canonicalWorktree, relParts: [".git", "orkest"] },
+        statePath: path.join(canonicalWorktree, ".git", "orkest", "foundry-state.json"),
+      };
+    }
+    return {
+      adminDir: null,
+      pinnedTarget: null,
+      statePath: path.join(resolvedWorktree, ".git", "orkest", "foundry-state.json"),
+    };
+  }
+  if (dotGitStat.isSymbolicLink()) {
+    throw new Error(`Foundry worktree .git is a symlink: ${dotGitPath}`);
+  }
+
+  let canonicalAdminDir;
+  const runRevParseGitDir = () => {
+    try {
+      const out = String(
+        execFileSync("git", ["rev-parse", "--git-dir"], {
+          cwd: resolvedWorktree,
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+        }) ?? "",
+      ).trim();
+      return out || null;
+    } catch {
+      return null;
+    }
+  };
+
+  if (dotGitStat.isFile()) {
+    const dotGitText = readRegularFileNoFollow(dotGitPath, "Foundry worktree .git");
+    const match = /^gitdir:\s*(.+)$/mu.exec(dotGitText);
+    if (!match) {
+      throw new Error(
+        `Foundry worktree .git file does not point to a Git directory: ${dotGitPath}`,
+      );
+    }
+    const rawAdminDir = path.resolve(resolvedWorktree, match[1].trim());
+    canonicalAdminDir = assertNonSymlinkDirectory(
+      rawAdminDir,
+      "Foundry worktree Git admin directory",
+    );
+    const revParseGitDir = runRevParseGitDir();
+    if (!revParseGitDir) {
+      throw new Error(`Foundry worktree git rev-parse --git-dir failed for ${resolvedWorktree}`);
+    }
+    const canonicalRevParse = realpathSync(path.resolve(resolvedWorktree, revParseGitDir));
+    if (canonicalRevParse !== canonicalAdminDir) {
+      throw new Error(
+        `Foundry worktree .git link disagrees with git rev-parse --git-dir: ${dotGitPath}`,
+      );
+    }
+    const backlinkPath = path.join(canonicalAdminDir, "gitdir");
+    const backlinkStat = lstatIfExists(backlinkPath);
+    if (!backlinkStat || backlinkStat.isSymbolicLink() || !backlinkStat.isFile()) {
+      throw new Error(
+        `Foundry worktree Git backlink is missing, invalid, or a symlink: ${backlinkPath}`,
+      );
+    }
+    const backlinkTarget = readRegularFileNoFollow(
+      backlinkPath,
+      "Foundry worktree Git backlink",
+    ).trim();
+    if (!backlinkTarget) {
+      throw new Error(`Foundry worktree Git backlink is empty: ${backlinkPath}`);
+    }
+    const resolvedBacklink = realpathSync(path.resolve(canonicalAdminDir, backlinkTarget));
+    const dotGitCanonical = realpathSync(dotGitPath);
+    if (resolvedBacklink !== dotGitCanonical) {
+      throw new Error(
+        `Foundry worktree Git backlink does not point back to worktree .git: ${backlinkPath}`,
+      );
+    }
+    const canonicalWorktree = realpathSync(resolvedWorktree);
+    let worktreeListOut;
+    try {
+      worktreeListOut = String(
+        execFileSync("git", ["worktree", "list", "--porcelain"], {
+          cwd: resolvedWorktree,
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+        }) ?? "",
+      );
+    } catch {
+      throw new Error(`Foundry worktree registration check failed for ${resolvedWorktree}`);
+    }
+    const registeredWorktrees = worktreeListOut
+      .split(/\r?\n/u)
+      .filter((line) => line.startsWith("worktree "))
+      .map((line) => {
+        try {
+          return realpathSync(line.slice("worktree ".length).trim());
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean);
+    if (!registeredWorktrees.includes(canonicalWorktree)) {
+      throw new Error(`Foundry worktree is not a registered Git worktree: ${resolvedWorktree}`);
+    }
+  } else if (dotGitStat.isDirectory()) {
+    canonicalAdminDir = assertNonSymlinkDirectory(
+      dotGitPath,
+      "Foundry worktree Git admin directory",
+    );
+    const revParseGitDir = runRevParseGitDir();
+    if (revParseGitDir) {
+      const canonicalRevParse = realpathSync(path.resolve(resolvedWorktree, revParseGitDir));
+      if (canonicalRevParse !== canonicalAdminDir) {
+        throw new Error(
+          `Foundry worktree .git directory disagrees with git rev-parse --git-dir: ${dotGitPath}`,
+        );
+      }
+    }
+  } else {
+    throw new Error(`Foundry worktree .git is invalid: ${dotGitPath}`);
+  }
+
+  const orkestDir = path.join(canonicalAdminDir, "orkest");
+  if (lstatIfExists(orkestDir)) {
+    const canonicalOrkest = assertNonSymlinkDirectory(orkestDir, "Foundry orkest directory");
+    if (canonicalOrkest !== orkestDir) {
+      throw new Error(`Foundry orkest directory escapes adminDir: ${orkestDir}`);
+    }
+  }
+
+  return {
+    adminDir: canonicalAdminDir,
+    pinnedTarget: { baseDir: canonicalAdminDir, relParts: ["orkest"] },
+    statePath: path.join(canonicalAdminDir, "orkest", "foundry-state.json"),
+  };
+}
+
+function resolveValidatedFoundryTarget(worktreePath, options = {}) {
+  const { adminDir, statePath: explicitStatePath } = options;
+  let canonicalAdminDir = null;
+  if (adminDir !== undefined && adminDir !== null) {
+    if (typeof adminDir !== "string" || !adminDir.trim()) {
+      throw new Error("adminDir must be a non-empty path");
+    }
+    canonicalAdminDir = assertNonSymlinkDirectory(path.resolve(adminDir), "Foundry adminDir");
+    const orkestDir = path.join(canonicalAdminDir, "orkest");
+    if (lstatIfExists(orkestDir)) {
+      const canonicalOrkest = assertNonSymlinkDirectory(orkestDir, "Foundry orkest directory");
+      if (canonicalOrkest !== orkestDir) {
+        throw new Error(`Foundry orkest directory escapes adminDir: ${orkestDir}`);
+      }
+    }
+  }
+  let targetPath;
+  let pinnedTarget = null;
+  if (explicitStatePath !== undefined && explicitStatePath !== null) {
+    if (typeof explicitStatePath !== "string" || !explicitStatePath.trim()) {
+      throw new Error("statePath must be a non-empty path");
+    }
+    const rawTarget = path.resolve(explicitStatePath);
+    const targetStat = lstatIfExists(rawTarget);
+    if (targetStat && (targetStat.isSymbolicLink() || !targetStat.isFile())) {
+      throw new Error(`Foundry state path is invalid or a symlink: ${rawTarget}`);
+    }
+    const parentDir = path.dirname(rawTarget);
+    if (lstatIfExists(parentDir)) {
+      assertNonSymlinkDirectory(parentDir, "Foundry state directory");
+    }
+    targetPath = canonicalizePathPreservingMissing(rawTarget);
+    if (canonicalAdminDir) {
+      const expectedPath = path.join(canonicalAdminDir, "orkest", "foundry-state.json");
+      if (
+        path.dirname(targetPath) !== path.dirname(expectedPath) ||
+        path.basename(targetPath) !== "foundry-state.json"
+      ) {
+        throw new Error(
+          `Foundry statePath ${targetPath} escapes validated adminDir ${canonicalAdminDir}`,
+        );
+      }
+      pinnedTarget = { baseDir: canonicalAdminDir, relParts: ["orkest"] };
+    }
+  } else if (canonicalAdminDir) {
+    targetPath = path.join(canonicalAdminDir, "orkest", "foundry-state.json");
+    pinnedTarget = { baseDir: canonicalAdminDir, relParts: ["orkest"] };
+  } else {
+    const resolved = resolveValidatedWorktreeAdminDir(worktreePath);
+    targetPath = resolved.statePath;
+    pinnedTarget = resolved.pinnedTarget;
+  }
+  const finalStat = lstatIfExists(targetPath);
+  if (finalStat && (finalStat.isSymbolicLink() || !finalStat.isFile())) {
+    throw new Error(`Foundry state path is invalid or a symlink: ${targetPath}`);
+  }
+  return { statePath: targetPath, pinnedTarget };
+}
+
+const FOUNDRY_DIRFD_PY = String.raw`
+import base64, errno, hashlib, json, os, stat, sys, uuid
+
+DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+NOFOLLOW_RDONLY = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+NOFOLLOW_EXCL_WR = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+
+def fsync_dir(fd):
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+
+def write_all_fd(fd, raw_bytes):
+    view = memoryview(raw_bytes)
+    offset = 0
+    while offset < len(view):
+        offset += os.write(fd, view[offset:])
+
+def read_all_fd(fd):
+    chunks = []
+    while True:
+        chunk = os.read(fd, 1024 * 1024)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+def open_pinned_dir(base_dir, expected_dev, expected_ino, rel_parts=None, create=False):
+    cur_fd = os.open(base_dir, DIR_FLAGS)
+    opened = [cur_fd]
+    try:
+        st = os.fstat(cur_fd)
+        if (st.st_dev, st.st_ino) != (expected_dev, expected_ino):
+            raise RuntimeError(f"Foundry state ancestor directory identity changed: {base_dir}")
+        for part in (rel_parts or []):
+            if not part or part == ".":
+                continue
+            if part == ".." or "/" in part or "\\" in part or "\0" in part:
+                raise RuntimeError(f"Invalid foundry state path component: {part!r}")
+            try:
+                info = os.lstat(part, dir_fd=cur_fd)
+                if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                    raise RuntimeError(f"Foundry state directory is invalid or a symlink: {part}")
+            except FileNotFoundError:
+                if not create:
+                    raise
+                try:
+                    os.mkdir(part, 0o700, dir_fd=cur_fd)
+                    fsync_dir(cur_fd)
+                except FileExistsError:
+                    pass
+            nxt_fd = os.open(part, DIR_FLAGS, dir_fd=cur_fd)
+            opened.append(nxt_fd)
+            cur_fd = nxt_fd
+        return cur_fd, opened
+    except Exception:
+        for fd in reversed(opened):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        raise
+
+req = json.loads(sys.stdin.read())
+op = req["op"]
+base_dir = req["base_dir"]
+expected_dev = int(req["expected_dev"])
+expected_ino = int(req["expected_ino"])
+rel_parts = req.get("rel_parts") or []
+filename = req["filename"]
+
+try:
+    dir_fd, opened = open_pinned_dir(
+        base_dir, expected_dev, expected_ino, rel_parts=rel_parts, create=(op == "write_state")
+    )
+except FileNotFoundError as exc:
+    if op == "read_state":
+        sys.stdout.write(json.dumps({"ok": True, "missing": True}) + "\n")
+        sys.exit(0)
+    sys.stderr.write(str(exc) + "\n")
+    sys.exit(1)
+except Exception as exc:
+    sys.stderr.write(str(exc) + "\n")
+    sys.exit(1)
+
+try:
+    if op == "read_state":
+        try:
+            fd = os.open(filename, NOFOLLOW_RDONLY, dir_fd=dir_fd)
+        except FileNotFoundError:
+            sys.stdout.write(json.dumps({"ok": True, "missing": True}) + "\n")
+            sys.exit(0)
+        try:
+            st_file = os.fstat(fd)
+            if not stat.S_ISREG(st_file.st_mode):
+                raise RuntimeError(f"Foundry state path is not a regular file: {filename}")
+            raw = read_all_fd(fd)
+        finally:
+            os.close(fd)
+        sys.stdout.write(json.dumps({"ok": True, "missing": False, "b64": base64.b64encode(raw).decode("ascii")}) + "\n")
+    elif op == "write_state":
+        payload = base64.b64decode(req["b64"])
+        exclusive = bool(req.get("exclusive"))
+        tmp_name = f".{filename}.tmp-{uuid.uuid4().hex}"
+        tmp_fd = os.open(tmp_name, NOFOLLOW_EXCL_WR, 0o600, dir_fd=dir_fd)
+        try:
+            write_all_fd(tmp_fd, payload)
+            os.fsync(tmp_fd)
+        finally:
+            os.close(tmp_fd)
+        try:
+            if exclusive:
+                os.link(tmp_name, filename, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+                os.unlink(tmp_name, dir_fd=dir_fd)
+            else:
+                try:
+                    info = os.lstat(filename, dir_fd=dir_fd)
+                    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                        raise RuntimeError(f"Foundry state path is invalid or a symlink: {filename}")
+                except FileNotFoundError:
+                    pass
+                os.replace(tmp_name, filename, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            fsync_dir(dir_fd)
+        except Exception:
+            try:
+                os.unlink(tmp_name, dir_fd=dir_fd)
+            except OSError:
+                pass
+            raise
+        sys.stdout.write(json.dumps({"ok": True}) + "\n")
+    elif op == "preserve_problem":
+        kind = req["kind"]
+        fd = os.open(filename, NOFOLLOW_RDONLY, dir_fd=dir_fd)
+        try:
+            raw = read_all_fd(fd)
+        finally:
+            os.close(fd)
+        digest = hashlib.sha256(raw).hexdigest()[:16]
+        preserved_name = f"{filename}.{kind}-{digest}"
+        try:
+            pfd = os.open(preserved_name, NOFOLLOW_EXCL_WR, 0o600, dir_fd=dir_fd)
+        except FileExistsError:
+            efd = os.open(preserved_name, NOFOLLOW_RDONLY, dir_fd=dir_fd)
+            try:
+                existing = read_all_fd(efd)
+            finally:
+                os.close(efd)
+            if existing != raw:
+                raise
+        else:
+            try:
+                write_all_fd(pfd, raw)
+                os.fsync(pfd)
+            finally:
+                os.close(pfd)
+            fsync_dir(dir_fd)
+        sys.stdout.write(json.dumps({"ok": True, "preservedName": preserved_name}) + "\n")
+    else:
+        raise RuntimeError(f"Unknown foundry dir_fd op: {op}")
+except OSError as exc:
+    sys.stderr.write(f"ERRNO:{exc.errno}:{exc.strerror}\n")
+    sys.exit(2)
+except Exception as exc:
+    sys.stderr.write(str(exc) + "\n")
+    sys.exit(1)
+finally:
+    for fd in reversed(opened):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+`;
+
+function pinDirHandle(baseDir, relParts = []) {
+  const canonicalBase = assertNonSymlinkDirectory(baseDir, "Foundry state ancestor directory");
+  const fd = openSync(
+    canonicalBase,
+    fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
+  );
+  try {
+    const dirStat = fstatSync(fd, { bigint: true });
+    return {
+      baseDir: canonicalBase,
+      relParts,
+      expectedDev: String(dirStat.dev),
+      expectedIno: String(dirStat.ino),
+    };
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function pinExistingAncestorDir(targetDir, pinnedTarget = null) {
+  if (pinnedTarget?.baseDir) {
+    return pinDirHandle(pinnedTarget.baseDir, pinnedTarget.relParts || []);
+  }
+  let cursor = path.resolve(targetDir);
+  const relParts = [];
+  while (!lstatIfExists(cursor)) {
+    const parent = path.dirname(cursor);
+    if (parent === cursor) break;
+    relParts.unshift(path.basename(cursor));
+    cursor = parent;
+  }
+  return pinDirHandle(cursor, relParts);
+}
+
+function runFoundryDirFdOp(targetDir, payload, pinnedTarget = null) {
+  const pinned = pinExistingAncestorDir(targetDir, pinnedTarget);
+  try {
+    const out = execFileSync("python3", ["-B", "-c", FOUNDRY_DIRFD_PY], {
+      input: JSON.stringify({
+        ...payload,
+        base_dir: pinned.baseDir,
+        expected_dev: pinned.expectedDev,
+        expected_ino: pinned.expectedIno,
+        rel_parts: pinned.relParts,
+      }),
+      encoding: "utf8",
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    return JSON.parse(out);
+  } catch (error) {
+    const stderr = String(error.stderr || error.message || "").trim();
+    const errnoMatch = /^ERRNO:(\d+):(.*)$/mu.exec(stderr);
+    if (errnoMatch) {
+      const errNo = Number(errnoMatch[1]);
+      const msg = errnoMatch[2] || stderr;
+      const fsErr = new Error(msg);
+      switch (errNo) {
+        case fsConstants.EEXIST: {
+          fsErr.code = "EEXIST";
+          break;
+        }
+        case fsConstants.ENOENT: {
+          fsErr.code = "ENOENT";
+          break;
+        }
+        case fsConstants.ELOOP: {
+          fsErr.code = "ELOOP";
+          break;
+        }
+        default: {
+          break;
+        }
+      }
+      throw fsErr;
+    }
+    throw new Error(stderr || "Foundry dir_fd operation failed", { cause: error });
+  }
+}
+
+export function buildFoundryState(worktreePath, statePatch = {}, existing = null) {
+  const resolvedWorktree = path.resolve(worktreePath);
+  const prior = existing || {};
+  const nowIso = new Date().toISOString();
+  return {
+    ...prior,
+    ...statePatch,
+    attemptCount: Math.max(statePatch.attemptCount ?? 1, prior.attemptCount ?? 1),
+    maxAttempts: statePatch.maxAttempts ?? prior.maxAttempts ?? 2,
+    schema: FOUNDRY_STATE_SCHEMA,
+    targetBranch: statePatch.targetBranch ?? prior.targetBranch ?? "main",
+    updatedAt: statePatch.updatedAt || nowIso,
+    worktreePath: resolvedWorktree,
+    worktreeSlug: statePatch.worktreeSlug ?? prior.worktreeSlug ?? path.basename(resolvedWorktree),
+  };
+}
+
+export function loadFoundryState(worktreePath, options = {}) {
+  let target;
+  try {
+    target = resolveValidatedFoundryTarget(worktreePath, options);
+  } catch (error) {
+    return {
+      kind: "corrupt",
+      state: null,
+      path: options.statePath || resolveFoundryStatePath(worktreePath),
+      error: error.message,
+    };
+  }
+  const statePath = target.statePath;
   const result = { kind: "missing", state: null, path: statePath, error: null };
+  const stateDir = path.dirname(statePath);
+  if (!lstatIfExists(stateDir)) return result;
   let bytes;
   try {
-    bytes = readFileSync(statePath);
+    const readRes = runFoundryDirFdOp(
+      stateDir,
+      {
+        op: "read_state",
+        filename: path.basename(statePath),
+      },
+      target.pinnedTarget,
+    );
+    if (readRes.missing) return result;
+    bytes = Buffer.from(readRes.b64, "base64");
   } catch (error) {
     if (error.code === "ENOENT") return result;
     return { ...result, kind: "corrupt", error: error.message };
@@ -808,67 +1432,40 @@ export function readFoundryState(worktreePath) {
   return loaded.state;
 }
 
-function syncDirectory(directory) {
-  const descriptor = openSync(directory, "r");
-  try {
-    fsyncSync(descriptor);
-  } finally {
-    closeSync(descriptor);
-  }
-}
-
-function preserveFoundryProblem(problem) {
+function preserveFoundryProblem(problem, pinnedTarget = null) {
   // The canonical bytes stay in place: later reads must remain closed too.
-  const bytes = readFileSync(problem.path);
-  const digest = createHash("sha256").update(bytes).digest("hex").slice(0, 16);
-  const preservedPath = `${problem.path}.${problem.kind}-${digest}`;
-  let descriptor;
-  try {
-    descriptor = openSync(preservedPath, "wx", 0o600);
-  } catch (error) {
-    if (error.code !== "EEXIST" || !readFileSync(preservedPath).equals(bytes)) throw error;
-    throw new FoundryStateError(problem, preservedPath);
-  }
-  try {
-    writeFileSync(descriptor, bytes);
-    fsyncSync(descriptor);
-  } finally {
-    closeSync(descriptor);
-  }
-  syncDirectory(path.dirname(problem.path));
-  throw new FoundryStateError(problem, preservedPath);
+  const stateDir = path.dirname(problem.path);
+  const res = runFoundryDirFdOp(
+    stateDir,
+    {
+      op: "preserve_problem",
+      filename: path.basename(problem.path),
+      kind: problem.kind,
+    },
+    pinnedTarget,
+  );
+  throw new FoundryStateError(problem, path.join(stateDir, res.preservedName));
 }
 
-export function writeFoundryState(worktreePath, statePatch = {}) {
+export function writeFoundryState(worktreePath, statePatch = {}, options = {}) {
   const resolvedWorktree = path.resolve(worktreePath);
-  const statePath = resolveFoundryStatePath(resolvedWorktree);
-  const loaded = loadFoundryState(resolvedWorktree);
-  if (!["missing", "ok"].includes(loaded.kind)) preserveFoundryProblem(loaded);
-  const existing = loaded.state || {};
-  const nowIso = new Date().toISOString();
-  const merged = {
-    ...existing,
-    ...statePatch,
-    attemptCount: Math.max(statePatch.attemptCount ?? 1, existing.attemptCount ?? 1),
-    maxAttempts: statePatch.maxAttempts ?? existing.maxAttempts ?? 2,
-    schema: FOUNDRY_STATE_SCHEMA,
-    targetBranch: statePatch.targetBranch ?? existing.targetBranch ?? "main",
-    updatedAt: statePatch.updatedAt || nowIso,
-    worktreePath: resolvedWorktree,
-    worktreeSlug:
-      statePatch.worktreeSlug ?? existing.worktreeSlug ?? path.basename(resolvedWorktree),
-  };
-  mkdirSync(path.dirname(statePath), { recursive: true });
-  const temporaryPath = `${statePath}.tmp-${randomUUID()}`;
-  const descriptor = openSync(temporaryPath, "wx", 0o600);
-  try {
-    writeFileSync(descriptor, `${JSON.stringify(merged, null, 2)}\n`);
-    fsyncSync(descriptor);
-  } finally {
-    closeSync(descriptor);
-  }
-  renameSync(temporaryPath, statePath);
-  syncDirectory(path.dirname(statePath));
+  const target = resolveValidatedFoundryTarget(resolvedWorktree, options);
+  const statePath = target.statePath;
+  const loaded = loadFoundryState(resolvedWorktree, options);
+  if (!["missing", "ok"].includes(loaded.kind)) preserveFoundryProblem(loaded, target.pinnedTarget);
+  const merged = buildFoundryState(resolvedWorktree, statePatch, loaded.state);
+  const stateDir = path.dirname(statePath);
+  const payload = Buffer.from(`${JSON.stringify(merged, null, 2)}\n`, "utf8");
+  runFoundryDirFdOp(
+    stateDir,
+    {
+      op: "write_state",
+      filename: path.basename(statePath),
+      b64: payload.toString("base64"),
+      exclusive: Boolean(options.exclusive),
+    },
+    target.pinnedTarget,
+  );
   return merged;
 }
 
@@ -1336,7 +1933,8 @@ export async function loadFactoryPolicy(repoRoot = process.cwd()) {
     if (error.code !== "ENOENT") throw error;
   }
   if (repoRoot) {
-    const repoPolicyPath = path.join(path.resolve(repoRoot), ".orkest", "policy.json");
+    const resolvedRepo = path.resolve(repoRoot);
+    const repoPolicyPath = path.join(resolvedRepo, ".orkest", "policy.json");
     try {
       const repoPolicy = JSON.parse(await readFile(repoPolicyPath, "utf8"));
       if (Array.isArray(repoPolicy?.deny) && repoPolicy.deny.length > 0) {
@@ -1351,6 +1949,22 @@ export async function loadFactoryPolicy(repoRoot = process.cwd()) {
       }
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
+    }
+    try {
+      const resolved = resolveRepoPolicy(resolvedRepo, { strict: false });
+      if (Array.isArray(resolved?.deny) && resolved.deny.length > 0) {
+        basePolicy = {
+          ...basePolicy,
+          deny: [
+            ...new Set([
+              ...(Array.isArray(basePolicy.deny) ? basePolicy.deny : []),
+              ...resolved.deny,
+            ]),
+          ],
+        };
+      }
+    } catch {
+      // Keep factory/local policy if canonical repo policy cannot be resolved.
     }
   }
   return basePolicy;
@@ -1616,7 +2230,29 @@ export async function foundryCommand(
   const openIssues = await fetchOpenIssues(execGhFn, values.repo, cwd);
   const policy = { ...filePolicy, openIssues, ...policyOverride };
   const accounts = await getAccountsFn();
-  const lanes = buildLanes(accounts);
+  const accountsById = new Map(
+    (Array.isArray(accounts) ? accounts : []).map((acct) => [acct?.id, acct]),
+  );
+  const lanes = buildLanes(accounts).map((lane) => {
+    const acct = accountsById.get(lane.accountId);
+    if (!acct) return lane;
+    const tags = normalizeAccountTags({ ...acct, ...lane });
+    const accountEnv =
+      lane.accountEnv ?? acct.accountEnv ?? (acct.env?.HOME ? { HOME: acct.env.HOME } : null);
+    return {
+      ...lane,
+      ...(acct.alias && !lane.alias && { alias: acct.alias }),
+      ...(Array.isArray(acct.aliases) && !lane.aliases && { aliases: acct.aliases }),
+      ...(acct.accountHome && !lane.accountHome && { accountHome: acct.accountHome }),
+      ...(accountEnv && !lane.accountEnv && { accountEnv }),
+      ...(acct.configDir && !lane.configDir && { configDir: acct.configDir }),
+      ...(acct.claudeConfigDir &&
+        !lane.claudeConfigDir && { claudeConfigDir: acct.claudeConfigDir }),
+      ...(acct.category && !lane.category && { category: acct.category }),
+      ...(acct.billing && !lane.billing && { billing: acct.billing }),
+      ...(tags.length > 0 && { tags }),
+    };
+  });
   const sparePools = selectSparePools(lanes, policy);
 
   if (action === "status") {
@@ -1818,6 +2454,7 @@ export async function foundryCommand(
     await initialLease.release();
   }
   const routeArchetype = match.classification?.archetype || match.archetype;
+  const accountId = match.pool?.accountId || match.selectedRoute?.accountId || null;
   const agentArgs = [
     "--cwd",
     worktreePath,
@@ -1826,6 +2463,7 @@ export async function foundryCommand(
     ...(routeArchetype ? ["--route", routeArchetype] : []),
     "--engine",
     match.selectedRoute.engine,
+    ...(accountId ? ["--account", accountId] : []),
     "--model",
     match.selectedRoute.model,
     "--verify-command",

@@ -24,10 +24,12 @@ function level(pct) {
  * Pace compares what is left with what would be left if the window were used evenly until it resets.
  * surplus > 0 means the account is under-used: that capacity is lost at reset unless it is spent.
  */
-function pace(w, now) {
+function pace(w, now, measuredAt = now) {
   if (!w.resetsAt || !w.windowMins) return null;
+  const ref = Number.isFinite(measuredAt) ? Math.min(now, measuredAt) : now;
   const hoursLeft = Math.max(0, (w.resetsAt - now) / HOUR);
-  const evenLeft = clamp((100 * hoursLeft) / (w.windowMins / 60), 0, 100);
+  const measuredHoursLeft = Math.max(0, (w.resetsAt - ref) / HOUR);
+  const evenLeft = clamp((100 * measuredHoursLeft) / (w.windowMins / 60), 0, 100);
   return {
     windowId: w.id,
     hoursLeft,
@@ -152,13 +154,16 @@ export function buildLanes(accounts, now = Date.now()) {
         exhausted.length > 0 ? Math.max(...exhausted.map((w) => w.resetsAt ?? 0)) || null : null;
       const long = ws.filter((w) => (w.windowMins ?? 0) >= 1440);
       const paces = long
-        .map((w) => pace(w, now))
+        .map((w) => pace(w, now, account.fetchedAt ?? now))
         .filter(Boolean)
         .sort((a, b) => a.surplus - b.surplus);
       const binding = paces[0] ?? null;
       const weeklyRemainingPct =
         long.length > 0 ? Math.min(...long.map((w) => w.remainingPct)) : availableNowPct;
       const shortWindow = ws.find((w) => (w.windowMins ?? Infinity) < 1440) ?? null;
+      const unverified =
+        ws.some((w) => w.resetAwaitingRefresh) ||
+        (account.ok === false && Boolean(account.fetchedAt) && now - account.fetchedAt > HOUR);
       const stale =
         account.ok === false ||
         ws.some((w) => w.resetAwaitingRefresh) ||
@@ -169,7 +174,7 @@ export function buildLanes(accounts, now = Date.now()) {
       else if (exhausted.length > 0) status = "blocked";
       const surplus = binding?.surplus ?? 0;
       const expiringWindow =
-        status === "available"
+        status === "available" && !unverified
           ? (long.filter((w) => isExpiring(w, now)).sort((a, b) => a.resetsAt - b.resetsAt)[0] ??
             null)
           : null;
@@ -182,6 +187,7 @@ export function buildLanes(accounts, now = Date.now()) {
       if (status === "blocked") score = -1000 - (blockedUntil ? (blockedUntil - now) / HOUR : 999);
       else if (status === "credits") score = CREDITS_SCORE;
       else if (isLowRoom) score = -500 + Math.min(surplus, availableNowPct);
+      else if (unverified) score = -150 + clamp(Math.min(surplus, availableNowPct), -90, 100) * 0.4;
       else if (expiringWindow) score = 1000 + burnPctPerHour;
       else score = Math.min(surplus, availableNowPct);
       const lane = {

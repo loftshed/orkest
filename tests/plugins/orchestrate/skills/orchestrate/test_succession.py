@@ -201,9 +201,7 @@ class SuccessionTests(unittest.TestCase):
     def test_unknown_facts_refuse_with_a_way_to_fix_them(self) -> None:
         self.config["accounts"][0]["billing"] = None
         self.write()
-        self.assertIn(
-            "set billing (work or personal) on monitor account 'claude-personal'", self.propose()["refusals"][0]
-        )
+        self.assertIn("set billing or tags on monitor account 'claude-personal'", self.propose()["refusals"][0])
         self.config["accounts"][0]["billing"] = "personal"
         self.set_lane("codex", "codex", stale=True)
         refusal = self.propose()["refusals"][0]
@@ -237,6 +235,52 @@ class SuccessionTests(unittest.TestCase):
         self.authority("set-billing", "--account", "antigravity", "--billing", "personal")
         saved = json.loads((self.root / "monitor-config.json").read_text())
         self.assertEqual(saved["accounts"][3]["billing"], "personal")
+
+    def test_non_binary_custom_tags_and_n_accounts_per_provider(self) -> None:
+        cx1 = self.root / "cx-client-1"
+        cx2 = self.root / "cx-client-2"
+        cx1.mkdir()
+        cx2.mkdir()
+        self.config["accounts"] = [
+            {
+                "id": "claude-client",
+                "provider": "claude",
+                "tags": ["client-acme"],
+                "configDir": str(self.claude_home),
+            },
+            {
+                "id": "codex-client-low",
+                "provider": "codex",
+                "tags": ["client-acme"],
+                "env": {"CODEX_HOME": str(cx1)},
+            },
+            {
+                "id": "codex-client-high",
+                "provider": "codex",
+                "tags": ["client-acme"],
+                "env": {"CODEX_HOME": str(cx2)},
+            },
+            {
+                "id": "claude-other",
+                "provider": "claude",
+                "tags": ["personal"],
+                "configDir": str(self.root / "other-c"),
+            },
+        ]
+        self.lanes = [
+            lane("claude-client", "all"),
+            lane("codex-client-low", "codex", usable=50, surplus=10),
+            lane("codex-client-high", "codex", usable=90, surplus=50),
+            lane("claude-other", "all", usable=99, surplus=80),
+        ]
+        self.write()
+        proposal = self.propose()
+        self.assertEqual(proposal["refusals"], [])
+        self.assertEqual(proposal["context"], "client-acme")
+        self.assertEqual(proposal["deputy"]["pool"], "codex-client-high:codex")
+        SUCCESSION.set_billing("codex-client-low", "client-beta")
+        saved = json.loads((self.root / "monitor-config.json").read_text())
+        self.assertEqual(saved["accounts"][1]["billing"], "client-beta")
 
     # Appointment and standing takeover
 
@@ -527,6 +571,247 @@ class SuccessionTests(unittest.TestCase):
         }
         reasons = SUCCESSION.local_evidence(record, lead_status="credits", moment=SUCCESSION.now())
         self.assertIn("still running", reasons[0])
+
+    # Multi-account disambiguation & OpenCode parity
+
+    def _clean_env(self, **overrides: str) -> dict[str, str]:
+        env = dict(os.environ)
+        for key in ("CODEX_HOME", "GEMINI_CLI_HOME", "ANTIGRAVITY_APP_DATA_DIR", "CLAUDE_CONFIG_DIR"):
+            env.pop(key, None)
+        env.update(overrides)
+        return env
+
+    def test_two_codex_accounts_disambiguate_by_canonical_home_and_env_precedence(self) -> None:
+        fake_home = self.root / "fake-home"
+        fake_home.mkdir()
+        codex_work = self.root / "codex-work"
+        codex_work.mkdir()
+        codex_alias = self.root / "codex-work-link"
+        codex_alias.symlink_to(codex_work)
+        default_codex = fake_home / ".codex"
+        default_codex.mkdir()
+
+        config = {
+            "env": {"CODEX_HOME": str(codex_work)},
+            "accounts": [
+                {"id": "codex-work", "provider": "codex", "billing": "work"},
+                # Account env null clears inherited global CODEX_HOME back to ~/.codex.
+                {"id": "codex-personal", "provider": "codex", "billing": "personal", "env": {"CODEX_HOME": None}},
+            ],
+        }
+        with mock.patch.dict(os.environ, self._clean_env(HOME=str(fake_home), CODEX_HOME=str(codex_work)), clear=True):
+            self.assertEqual(SUCCESSION.account_of("codex", str(codex_work), config), ("codex-work", ""))
+            self.assertEqual(SUCCESSION.account_of("codex", str(codex_alias), config), ("codex-work", ""))
+            self.assertEqual(SUCCESSION.account_of("codex", str(default_codex), config), ("codex-personal", ""))
+            # Missing accountHome refuses even when os.environ["CODEX_HOME"] is set.
+            account, why = SUCCESSION.account_of("codex", None, config)
+            self.assertIsNone(account)
+            self.assertIn("unknown", why)
+            # Unknown path refuses.
+            unknown_dir = self.root / "codex-other"
+            unknown_dir.mkdir()
+            account2, why2 = SUCCESSION.account_of("codex", str(unknown_dir), config)
+            self.assertIsNone(account2)
+            self.assertIn("0 monitor codex accounts", why2)
+
+    def test_two_gemini_accounts_disambiguate_via_gemini_home_and_app_data_dir(self) -> None:
+        fake_home = self.root / "fake-home-gemini"
+        fake_home.mkdir()
+        gem_a = self.root / "gem-a"
+        gem_b = self.root / "gem-b"
+        gem_a.mkdir()
+        (gem_b / "antigravity-work").mkdir(parents=True)
+        gem_b_alias = self.root / "gem-b-link"
+        gem_b_alias.symlink_to(gem_b)
+        default_gemini = fake_home / ".gemini"
+        default_gemini.mkdir()
+
+        config = {
+            "env": {"GEMINI_CLI_HOME": str(gem_a)},
+            "accounts": [
+                {"id": "agy-a", "provider": "antigravity", "billing": "personal"},
+                {
+                    "id": "agy-b",
+                    "provider": "antigravity",
+                    "billing": "work",
+                    "env": {
+                        "GEMINI_CLI_HOME": None,
+                        "ANTIGRAVITY_APP_DATA_DIR": str(gem_b / "antigravity-work"),
+                    },
+                },
+                {
+                    "id": "agy-default",
+                    "provider": "antigravity",
+                    "billing": "personal",
+                    "env": {"GEMINI_CLI_HOME": None},
+                },
+            ],
+        }
+        with mock.patch.dict(os.environ, self._clean_env(HOME=str(fake_home)), clear=True):
+            self.assertEqual(SUCCESSION.account_of("gemini", str(gem_a), config), ("agy-a", ""))
+            self.assertEqual(SUCCESSION.account_of("gemini", str(gem_b), config), ("agy-b", ""))
+            self.assertEqual(SUCCESSION.account_of("gemini", str(gem_b_alias), config), ("agy-b", ""))
+            self.assertEqual(SUCCESSION.account_of("gemini", str(default_gemini), config), ("agy-default", ""))
+
+        # Non-antigravity basename in ANTIGRAVITY_APP_DATA_DIR resolves directly to that dir.
+        gem_custom = self.root / "gem-custom"
+        gem_custom.mkdir()
+        config_direct = {
+            "accounts": [
+                {"id": "agy-1", "provider": "antigravity", "env": {"ANTIGRAVITY_APP_DATA_DIR": str(gem_custom)}},
+                {"id": "agy-2", "provider": "antigravity", "env": {"GEMINI_CLI_HOME": str(gem_a)}},
+            ]
+        }
+        with mock.patch.dict(os.environ, self._clean_env(HOME=str(fake_home)), clear=True):
+            self.assertEqual(SUCCESSION.account_of("gemini", str(gem_custom), config_direct), ("agy-1", ""))
+
+    def test_duplicate_canonical_homes_and_conflicting_single_explicit_home_refuse(self) -> None:
+        real_dir = self.root / "shared-codex"
+        real_dir.mkdir()
+        alias_dir = self.root / "shared-codex-link"
+        alias_dir.symlink_to(real_dir)
+        other_dir = self.root / "other-codex"
+        other_dir.mkdir()
+
+        dup_config = {
+            "accounts": [
+                {"id": "codex-1", "provider": "codex", "env": {"CODEX_HOME": str(real_dir)}},
+                {"id": "codex-2", "provider": "codex", "env": {"CODEX_HOME": str(alias_dir)}},
+            ]
+        }
+        with mock.patch.dict(os.environ, self._clean_env(), clear=True):
+            account, why = SUCCESSION.account_of("codex", str(real_dir), dup_config)
+            self.assertIsNone(account)
+            self.assertIn("2 monitor codex accounts", why)
+
+            single_explicit = {
+                "accounts": [
+                    {"id": "codex-only", "provider": "codex", "env": {"CODEX_HOME": str(real_dir)}},
+                ]
+            }
+            self.assertEqual(SUCCESSION.account_of("codex", str(alias_dir), single_explicit), ("codex-only", ""))
+            self.assertEqual(SUCCESSION.account_of("codex", None, single_explicit), ("codex-only", ""))
+            conflict_acc, conflict_why = SUCCESSION.account_of("codex", str(other_dir), single_explicit)
+            self.assertIsNone(conflict_acc)
+            self.assertIn("does not match", conflict_why)
+
+            # Unconfigured single account preserves legacy fallback.
+            single_legacy = {"accounts": [{"id": "codex-legacy", "provider": "codex"}]}
+            self.assertEqual(SUCCESSION.account_of("codex", "/x", single_legacy), ("codex-legacy", ""))
+
+    def test_snapshot_account_home_and_env_home_override_resolve_canonically(self) -> None:
+        alt_home_a = self.root / "alt-home-a"
+        alt_home_b = self.root / "alt-home-b"
+        (alt_home_a / ".codex").mkdir(parents=True)
+        (alt_home_b / ".codex").mkdir(parents=True)
+        config = {
+            "accounts": [
+                {"id": "cx-a", "provider": "codex", "env": {"HOME": str(alt_home_a)}},
+                {"id": "cx-b", "provider": "codex", "env": {"HOME": str(alt_home_b)}},
+            ]
+        }
+        with mock.patch.dict(os.environ, self._clean_env(), clear=True):
+            self.assertEqual(SUCCESSION.account_of("codex", str(alt_home_a / ".codex"), config), ("cx-a", ""))
+            self.assertEqual(SUCCESSION.account_of("codex", str(alt_home_b / ".codex"), config), ("cx-b", ""))
+
+        # Snapshot accountHome overrides config fallback and flags ambiguous mappings.
+        probed_a = self.root / "probed-a"
+        probed_b = self.root / "probed-b"
+        probed_a.mkdir()
+        probed_b.mkdir()
+        view = {
+            "schema": "monitor.snapshot.v1",
+            "accounts": [
+                {"id": "cx-a", "provider": "codex", "accountHome": str(probed_a)},
+                {"id": "cx-b", "provider": "codex", "accountHome": str(probed_b)},
+            ],
+        }
+        self.assertEqual(SUCCESSION.account_of("codex", str(probed_a), config, view=view), ("cx-a", ""))
+        ambiguous_view = {
+            "schema": "monitor.snapshot.v1",
+            "accounts": [
+                {"id": "cx-a", "provider": "codex", "accountHome": str(probed_a)},
+                {"id": "cx-b", "provider": "codex", "accountHome": str(probed_a)},
+            ],
+        }
+        acc, why = SUCCESSION.account_of("codex", str(probed_a), config, view=ambiguous_view)
+        self.assertIsNone(acc)
+        self.assertIn("2 monitor codex accounts", why)
+
+    def test_claude_unchanged_and_opencode_explicitly_unmonitored(self) -> None:
+        self.assertEqual(SUCCESSION.account_of("claude", str(self.claude_home), self.config), ("claude-personal", ""))
+        self.assertEqual(SUCCESSION.HARNESS_ENGINE.get("opencode"), "opencode")
+        self.assertNotIn("opencode", SUCCESSION.HARNESS_PROVIDER)
+        acc, why = SUCCESSION.account_of("opencode", "/tmp/opencode", self.config)
+        self.assertIsNone(acc)
+        self.assertIn("no monitored subscription pool", why)
+
+    def test_claude_default_ignores_inherited_config_dir_and_codex_relative_uses_home(self) -> None:
+        fake_home = self.root / "fake-home"
+        default_claude = fake_home / ".claude"
+        inherited_claude = self.root / "inherited-claude"
+        work_claude = self.root / "work-claude"
+        rel_codex = fake_home / "rel-codex"
+        alt_cwd = self.root / "alt-cwd"
+        for d in (default_claude, inherited_claude, work_claude, rel_codex, alt_cwd):
+            d.mkdir(parents=True)
+        cfg = {
+            "accounts": [
+                {"id": "claude-default", "provider": "claude"},
+                {"id": "claude-work", "provider": "claude", "configDir": str(work_claude)},
+                {"id": "codex-rel", "provider": "codex", "env": {"CODEX_HOME": "rel-codex"}},
+                {"id": "codex-other", "provider": "codex", "env": {"CODEX_HOME": str(self.root / "cx-other")}},
+            ]
+        }
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(alt_cwd)
+            with mock.patch.dict(
+                os.environ,
+                self._clean_env(HOME=str(fake_home), CLAUDE_CONFIG_DIR=str(inherited_claude)),
+                clear=True,
+            ):
+                self.assertEqual(
+                    SUCCESSION.account_of("claude", str(default_claude), cfg),
+                    ("claude-default", ""),
+                )
+                self.assertEqual(
+                    SUCCESSION.account_of("codex", str(rel_codex), cfg),
+                    ("codex-rel", ""),
+                )
+        finally:
+            os.chdir(old_cwd)
+
+    def test_explicit_null_account_home_in_view_is_treated_as_unverified(self) -> None:
+        codex_dir = self.root / "codex-work"
+        codex_dir.mkdir()
+        single_cfg = {
+            "accounts": [
+                {"id": "work", "provider": "codex", "env": {"CODEX_HOME": str(codex_dir)}},
+            ]
+        }
+        null_view = {"schema": "monitor.snapshot.v1", "accounts": [{"id": "work", "accountHome": None}]}
+        acc, why = SUCCESSION.account_of("codex", str(codex_dir), single_cfg, view=null_view)
+        self.assertIsNone(acc)
+        self.assertIn("unverified", why)
+
+        multi_cfg = {
+            "accounts": [
+                {"id": "work", "provider": "codex", "env": {"CODEX_HOME": str(codex_dir)}},
+                {"id": "personal", "provider": "codex", "env": {"CODEX_HOME": str(self.root / "codex-personal")}},
+            ]
+        }
+        acc_m, why_m = SUCCESSION.account_of("codex", str(codex_dir), multi_cfg, view=null_view)
+        self.assertIsNone(acc_m)
+        self.assertIn("unverified", why_m)
+
+        claude_null_view = {
+            "schema": "monitor.snapshot.v1",
+            "accounts": [{"id": "claude-personal", "provider": "claude", "accountHome": None}],
+        }
+        acc_c, why_c = SUCCESSION.account_of("claude", str(self.claude_home), self.config, view=claude_null_view)
+        self.assertIsNone(acc_c)
+        self.assertIn("unverified", why_c)
 
 
 if __name__ == "__main__":

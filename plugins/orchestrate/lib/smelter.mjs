@@ -19,8 +19,14 @@ import { parseArgs } from "node:util";
 
 import { shouldUseColor } from "../../monitor/lib/render.mjs";
 import { loadFoundryState, resolveFoundryStatePath, writeFoundryState } from "./foundry.mjs";
-import { resolveWorktreeMarkerPath } from "./horde-room.mjs";
+import { mailboxRoot, readRawRoom, resolveWorktreeMarkerPath } from "./horde-room.mjs";
 import { glyphSet, glyphTier, renderPanel, renderTable } from "./horde-view.mjs";
+import {
+  isHarnessAllowed,
+  loadConfiguredAccounts,
+  resolveConfiguredAccount,
+  resolveRepoPolicy,
+} from "./policy.mjs";
 import { acquireWorkspaceLease, assertWorkspaceLease } from "./workspace-lease.mjs";
 
 const scriptsDir = fileURLToPath(new URL("../skills/orchestrate/scripts/", import.meta.url));
@@ -234,17 +240,79 @@ export function isEngineInstalled(engine, env = process.env) {
   return pathDirs.some((dir) => existsSync(path.join(dir, engine)));
 }
 
+function normalizeReviewerEngineToken(rawEngine, options = {}) {
+  const cleaned = String(rawEngine ?? "")
+    .trim()
+    .toLowerCase();
+  if (!cleaned) return "";
+  if (cleaned === "antigravity" || cleaned === "gemini") return "agy";
+  if (cleaned === "openai") return "codex";
+  if (cleaned === "openrouter") return "opencode";
+  if (Object.hasOwn(REVIEWER_PREFERENCE, cleaned)) return cleaned;
+  const acct = resolveConfiguredAccount(cleaned, options);
+  if (acct?.provider) {
+    const prov = String(acct.provider).trim().toLowerCase();
+    return prov === "antigravity" || prov === "gemini" ? "agy" : prov;
+  }
+  return cleaned;
+}
+
+function isReviewerEngineAllowedByPolicy(engine, configuredAccounts, policy, options = {}) {
+  if (!policy || !Array.isArray(policy.deny) || policy.deny.length === 0) return true;
+  const evalOpts = {
+    policy,
+    ...(options.env && { env: options.env }),
+    ...(options.homeDir && { homeDir: options.homeDir }),
+    ...(options.monitorConfigPath && { monitorConfigPath: options.monitorConfigPath }),
+    accounts: configuredAccounts,
+  };
+  const matchingAccounts = configuredAccounts.filter((acct) => {
+    const prov = String(acct?.provider || acct?.engine || "")
+      .trim()
+      .toLowerCase();
+    const norm = prov === "antigravity" || prov === "gemini" ? "agy" : prov;
+    return norm === engine;
+  });
+  if (matchingAccounts.length > 0) {
+    return matchingAccounts.some((acct) => isHarnessAllowed(options.cwd || null, acct, evalOpts));
+  }
+  return isHarnessAllowed(options.cwd || null, { provider: engine, engine }, evalOpts);
+}
+
 /**
  * Selects a cross-vendor engine for independent cold review, preferring an
  * installed cross-vendor harness and falling back to available harnesses when
  * a machine only has a subset installed.
  */
 export function selectColdReviewerEngine(workerEngine, options = {}) {
-  const raw = String(workerEngine ?? "")
-    .trim()
-    .toLowerCase();
-  const normalized = raw === "antigravity" ? "agy" : raw;
-  const candidates = REVIEWER_PREFERENCE[normalized] || REVIEWER_PREFERENCE.codex;
+  const normalized = normalizeReviewerEngineToken(workerEngine, options);
+  const baseCandidates = REVIEWER_PREFERENCE[normalized] || REVIEWER_PREFERENCE.codex;
+  let policy = options.policy || null;
+  if (!policy && options.cwd) {
+    try {
+      policy = resolveRepoPolicy(options.cwd, {
+        ...(options.env && { env: options.env }),
+        ...(options.homeDir && { homeDir: options.homeDir }),
+        strict: false,
+      });
+    } catch {
+      policy = null;
+    }
+  }
+  let candidates = baseCandidates;
+  if (policy && Array.isArray(policy.deny) && policy.deny.length > 0) {
+    const configuredAccounts = Array.isArray(options.accounts)
+      ? options.accounts
+      : loadConfiguredAccounts({
+          ...(options.env && { env: options.env }),
+          ...(options.homeDir && { homeDir: options.homeDir }),
+          ...(options.monitorConfigPath && { monitorConfigPath: options.monitorConfigPath }),
+        });
+    const allowed = baseCandidates.filter((engine) =>
+      isReviewerEngineAllowedByPolicy(engine, configuredAccounts, policy, options),
+    );
+    if (allowed.length > 0) candidates = allowed;
+  }
   if (Array.isArray(options?.availableEngines)) {
     const available = new Set(options.availableEngines.map((item) => String(item).toLowerCase()));
     return candidates.find((engine) => available.has(engine)) || candidates[0];
@@ -338,6 +406,117 @@ function readJsonIfExists(filePath) {
   }
 }
 
+function verifyRoomIntegrationRecord(marker, foundryState, options = {}) {
+  const isRoomIntegrated = Boolean(
+    marker?.roomId ||
+    marker?.memberId ||
+    marker?.integrationId ||
+    foundryState?.roomId ||
+    foundryState?.memberId ||
+    foundryState?.integrationId,
+  );
+  if (!isRoomIntegrated) {
+    return { ok: true, isRoomIntegrated: false };
+  }
+  if (!marker || typeof marker !== "object") {
+    return { ok: false, isRoomIntegrated: true, reason: "room_marker_missing" };
+  }
+  const roomId = marker.roomId;
+  const memberId = marker.memberId;
+  const integrationId = marker.integrationId;
+  if (
+    typeof roomId !== "string" ||
+    !roomId ||
+    typeof memberId !== "string" ||
+    !memberId ||
+    typeof integrationId !== "string" ||
+    !integrationId ||
+    typeof marker.commit !== "string" ||
+    !marker.commit
+  ) {
+    return { ok: false, isRoomIntegrated: true, reason: "room_integration_incomplete" };
+  }
+  if (
+    (foundryState?.roomId && foundryState.roomId !== roomId) ||
+    (foundryState?.memberId && foundryState.memberId !== memberId) ||
+    (foundryState?.integrationId && foundryState.integrationId !== integrationId)
+  ) {
+    return { ok: false, isRoomIntegrated: true, reason: "room_integration_state_mismatch" };
+  }
+  const root =
+    options.mailboxRoot || marker.mailboxRoot || foundryState?.mailboxRoot || mailboxRoot();
+  let room;
+  try {
+    room = readRawRoom(roomId, root);
+  } catch {
+    return { ok: false, isRoomIntegrated: true, reason: "room_missing_or_unreadable" };
+  }
+  if (!room || !Array.isArray(room.agents)) {
+    return { ok: false, isRoomIntegrated: true, reason: "room_missing_or_unreadable" };
+  }
+  const member = room.agents.find((agent) => agent && agent.id === memberId);
+  const integration = member?.integration;
+  if (!integration || typeof integration !== "object") {
+    return { ok: false, isRoomIntegrated: true, reason: "room_integration_not_committed" };
+  }
+  if (integration.integrationId !== integrationId) {
+    return { ok: false, isRoomIntegrated: true, reason: "room_integration_id_mismatch" };
+  }
+  if (integration.commit !== marker.commit) {
+    return { ok: false, isRoomIntegrated: true, reason: "room_integration_commit_mismatch" };
+  }
+  if (foundryState?.acceptedCommit && foundryState.acceptedCommit !== integration.commit) {
+    return {
+      ok: false,
+      isRoomIntegrated: true,
+      reason: "room_integration_accepted_commit_mismatch",
+    };
+  }
+  if (
+    typeof integration.targetBranch === "string" &&
+    integration.targetBranch &&
+    typeof foundryState?.targetBranch === "string" &&
+    foundryState.targetBranch &&
+    integration.targetBranch !== foundryState.targetBranch
+  ) {
+    return {
+      ok: false,
+      isRoomIntegrated: true,
+      reason: "room_target_branch_mismatch",
+    };
+  }
+  const recordedWorktree = member?.worktree;
+  if (!recordedWorktree || typeof recordedWorktree.path !== "string" || !recordedWorktree.path) {
+    return { ok: false, isRoomIntegrated: true, reason: "room_worktree_mismatch" };
+  }
+  if (recordedWorktree.disposable === false) {
+    return { ok: false, isRoomIntegrated: true, reason: "room_worktree_not_disposable" };
+  }
+  if (options.worktreePath) {
+    let canonicalRecordedWorktree;
+    let canonicalLiveWorktree;
+    try {
+      canonicalRecordedWorktree = realpathSync(path.resolve(recordedWorktree.path));
+      canonicalLiveWorktree = realpathSync(path.resolve(options.worktreePath));
+    } catch {
+      return { ok: false, isRoomIntegrated: true, reason: "room_worktree_mismatch" };
+    }
+    if (canonicalLiveWorktree !== canonicalRecordedWorktree) {
+      return { ok: false, isRoomIntegrated: true, reason: "room_worktree_mismatch" };
+    }
+  }
+  if (
+    typeof recordedWorktree.branch === "string" &&
+    recordedWorktree.branch &&
+    typeof marker.branch === "string" &&
+    marker.branch &&
+    recordedWorktree.branch !== marker.branch
+  ) {
+    return { ok: false, isRoomIntegrated: true, reason: "room_branch_mismatch" };
+  }
+  return { ok: true, isRoomIntegrated: true, integration, room, member };
+}
+
 function loadWorktreeMetadata(worktreePath, explicitMarkerPath = null) {
   const markerPath = explicitMarkerPath || resolveWorktreeMarkerPath(worktreePath) || null;
   const gitDir = markerPath
@@ -411,6 +590,7 @@ export function discoverSmeltableWorktrees(
     execFileSyncFn = execFileSync,
     includeAllStates = false,
     includeKeep = false,
+    mailboxRoot: overrideMailboxRoot,
     targetBranch = "main",
   } = {},
 ) {
@@ -443,13 +623,29 @@ export function discoverSmeltableWorktrees(
     if (!includeKeep && marker.disposable === false) continue;
 
     if (!includeAllStates && !foundryState && !stateProblem) continue;
+    const roomCheck = verifyRoomIntegrationRecord(marker, foundryState, {
+      mailboxRoot: overrideMailboxRoot,
+      worktreePath,
+    });
+    if (!roomCheck.ok) {
+      continue;
+    }
+    if (
+      roomCheck.isRoomIntegrated &&
+      typeof roomCheck.member?.worktree?.branch === "string" &&
+      roomCheck.member.worktree.branch &&
+      entry.branch &&
+      entry.branch !== roomCheck.member.worktree.branch
+    ) {
+      continue;
+    }
     // A worktree records the branch its result belongs on; one queued for another branch is left
     // for a run that targets that branch, never rebased onto this one.
-    if (
-      !includeAllStates &&
-      typeof foundryState?.targetBranch === "string" &&
-      foundryState.targetBranch !== targetBranch
-    )
+    const recordedTargetBranch =
+      (roomCheck.isRoomIntegrated ? roomCheck.integration?.targetBranch : null) ||
+      foundryState?.targetBranch ||
+      null;
+    if (!includeAllStates && recordedTargetBranch && recordedTargetBranch !== targetBranch)
       continue;
     if (!includeAllStates && foundryState && typeof foundryState.status === "string") {
       if (SKIPPED_SMELTER_STATES.has(foundryState.status)) {
@@ -573,20 +769,41 @@ export async function smeltWorktree(worktree, options = {}) {
   let candidate = null;
   let evidence = null;
   let targetLease;
+  const targetBranch = options.targetBranch || options.target || "main";
   const execGit = options.execFileSync || options.execFileSyncFn || execFileSync;
   const stopped = (status) => new SmelterLeaseError(status, worktreePath);
   const checkState = () => {
     assertWorkspaceLease(lease);
     const loaded = loadFoundryState(worktreePath);
+    const meta = loadWorktreeMetadata(
+      worktreePath,
+      typeof worktree === "object" ? worktree.markerPath : null,
+    );
+    const effectiveMarker = meta.marker;
     if (loaded.kind === "missing") {
-      if (
-        loadWorktreeMetadata(worktreePath).marker ||
-        (typeof worktree === "object" && worktree.marker)
-      )
+      if (effectiveMarker || (typeof worktree === "object" && worktree.marker)) {
         throw stopped("unmanaged");
+      }
       return;
     }
     if (loaded.kind !== "ok") throw stopped("state_unreadable");
+    const roomCheck = verifyRoomIntegrationRecord(effectiveMarker, loaded.state, {
+      ...options,
+      worktreePath,
+    });
+    if (!roomCheck.ok) {
+      if (roomCheck.reason === "room_worktree_mismatch") throw stopped("room_worktree_mismatch");
+      if (roomCheck.reason === "room_branch_mismatch") throw stopped("room_branch_mismatch");
+      if (roomCheck.reason === "room_target_branch_mismatch")
+        throw stopped("target_branch_mismatch");
+      throw stopped("room_integration_unverified");
+    }
+    if (roomCheck.isRoomIntegrated) {
+      const recordedTarget = roomCheck.integration?.targetBranch || loaded.state?.targetBranch;
+      if (recordedTarget && recordedTarget !== targetBranch) {
+        throw stopped("target_branch_mismatch");
+      }
+    }
     if (["launching", "running", "launch_uncertain"].includes(loaded.state.status))
       throw stopped(loaded.state.status);
   };
@@ -655,6 +872,67 @@ export async function smeltWorktree(worktree, options = {}) {
   }
 }
 
+function deleteTempRebaseRef(refName, runCmd) {
+  if (typeof refName !== "string" || !refName.startsWith("refs/orkest/rebase-tmp/")) {
+    return;
+  }
+  try {
+    runCmd("git", ["update-ref", "-d", refName]);
+  } catch {
+    /* Best-effort cleanup of temporary rebase ref. */
+  }
+}
+
+function isRebasedHeadConsistentWithPending(
+  worktreePath,
+  headSha,
+  branch,
+  targetBranch,
+  acceptedCommit,
+  foundryState,
+  pendingRebase,
+  execFileSyncFn,
+) {
+  if (
+    !pendingRebase ||
+    typeof pendingRebase !== "object" ||
+    pendingRebase.acceptedCommit !== acceptedCommit ||
+    pendingRebase.rebaseBranch !== branch ||
+    pendingRebase.targetBranch !== targetBranch
+  ) {
+    return false;
+  }
+  const hasValidFrom =
+    pendingRebase.fromCommit === acceptedCommit ||
+    (foundryState?.acceptedCommit === acceptedCommit &&
+      Boolean(foundryState?.rebasedCommit) &&
+      pendingRebase.fromCommit === foundryState.rebasedCommit);
+  if (
+    !hasValidFrom ||
+    typeof pendingRebase.targetOid !== "string" ||
+    !pendingRebase.targetOid ||
+    typeof pendingRebase.rebasedOid !== "string" ||
+    !pendingRebase.rebasedOid ||
+    headSha !== pendingRebase.rebasedOid
+  ) {
+    return false;
+  }
+  if (typeof pendingRebase.rebasedTree === "string" && pendingRebase.rebasedTree) {
+    const headTree = resolveGitSha(worktreePath, `${headSha}^\u{7B}tree}`, execFileSyncFn);
+    if (headTree !== pendingRebase.rebasedTree) return false;
+  }
+  try {
+    execFileSyncFn("git", ["merge-base", "--is-ancestor", pendingRebase.targetOid, headSha], {
+      cwd: worktreePath,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function smeltLeasedWorktree(worktree, options, ownership) {
   const worktreeObj =
     typeof worktree === "string"
@@ -670,11 +948,45 @@ async function smeltLeasedWorktree(worktree, options, ownership) {
       worktreePath,
     };
   }
-  const hasMarker = Boolean(worktreeObj.marker || loadedMeta.marker);
-  const marker = worktreeObj.marker ?? loadedMeta.marker ?? {};
+  const loadedMarker = loadedMeta.marker;
+  const roomCheck = verifyRoomIntegrationRecord(loadedMarker, loadedMeta.foundryState, {
+    ...options,
+    worktreePath,
+  });
+  if (!roomCheck.ok) {
+    let mappedStatus = "room_integration_unverified";
+    if (
+      roomCheck.reason === "room_worktree_mismatch" ||
+      roomCheck.reason === "room_branch_mismatch"
+    ) {
+      mappedStatus = roomCheck.reason;
+    } else if (roomCheck.reason === "room_target_branch_mismatch") {
+      mappedStatus = "target_branch_mismatch";
+    }
+    return {
+      ok: false,
+      status: mappedStatus,
+      reason: roomCheck.reason,
+      worktreePath,
+    };
+  }
+  const hasMarker = Boolean(loadedMarker || (!roomCheck.isRoomIntegrated && worktreeObj.marker));
+  const marker = loadedMarker ?? (roomCheck.isRoomIntegrated ? null : worktreeObj.marker) ?? {};
   const taskSpec = worktreeObj.taskSpec ?? loadedMeta.taskSpec ?? null;
 
   const targetBranch = options.targetBranch || options.target || "main";
+  if (roomCheck.isRoomIntegrated) {
+    const recordedTargetBranch =
+      roomCheck.integration?.targetBranch || loadedMeta.foundryState?.targetBranch || null;
+    if (recordedTargetBranch && recordedTargetBranch !== targetBranch) {
+      return {
+        ok: false,
+        status: "target_branch_mismatch",
+        reason: `Worktree was integrated for target branch ${recordedTargetBranch}, not ${targetBranch}`,
+        worktreePath,
+      };
+    }
+  }
   const strategy = options.strategy || "local";
   if (!["local", "pr"].includes(strategy)) {
     throw new Error(`Unsupported smelter strategy: ${strategy}`);
@@ -773,6 +1085,37 @@ async function smeltLeasedWorktree(worktree, options, ownership) {
   const target = { ref: `refs/heads/${targetBranch}`, sha: null };
   target.sha = resolveGitSha(worktreePath, target.ref, execFileSyncFn);
   if (!target.sha) return { ok: false, status: "target_missing", target, worktreePath };
+  if (
+    typeof loadedMeta.foundryState?.targetBranch === "string" &&
+    loadedMeta.foundryState.targetBranch &&
+    loadedMeta.foundryState.targetBranch !== targetBranch
+  ) {
+    return {
+      ok: false,
+      status: "target_branch_mismatch",
+      reason: `Worktree target branch ${loadedMeta.foundryState.targetBranch} does not match requested ${targetBranch}`,
+      worktreePath,
+    };
+  }
+  if (!isDryRun && loadedMeta.foundryState?.pendingRebase) {
+    try {
+      const hasInProgressRebase = ["rebase-merge", "rebase-apply", "REBASE_HEAD"].some((item) => {
+        const p = String(
+          execFileSyncFn("git", ["rev-parse", "--git-path", item], {
+            cwd: worktreePath,
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "pipe"],
+          }) ?? "",
+        ).trim();
+        return Boolean(p) && existsSync(path.resolve(worktreePath, p));
+      });
+      if (hasInProgressRebase) {
+        runCmd("git", ["rebase", "--abort"]);
+      }
+    } catch {
+      /* Best-effort cleanup of interrupted rebase state before status check. */
+    }
+  }
   const porcelainStatus = String(
     runCmd("git", ["status", "--porcelain"], worktreePath) ?? "",
   ).trim();
@@ -780,25 +1123,256 @@ async function smeltLeasedWorktree(worktree, options, ownership) {
     throw new Error(`Worktree ${worktreePath} has uncommitted changes:\n${porcelainStatus}`);
   }
 
-  if (!isDryRun) {
+  let expectedRoomBranch = null;
+  let preRebaseBranch = null;
+  let preRebaseHead = null;
+  let shouldSkipRoomRebase = false;
+  if (roomCheck.isRoomIntegrated) {
+    const memberWorktree = roomCheck.member?.worktree;
+    if (!memberWorktree?.path) {
+      return {
+        ok: false,
+        status: "room_worktree_mismatch",
+        reason: "Room member has no recorded worktree path",
+        worktreePath,
+      };
+    }
+    if (realpathSync(path.resolve(memberWorktree.path)) !== realpathSync(worktreePath)) {
+      return {
+        ok: false,
+        status: "room_worktree_mismatch",
+        reason: `Worktree path ${worktreePath} does not match durable member.worktree.path ${memberWorktree.path}`,
+        worktreePath,
+      };
+    }
     try {
-      runCmd("git", ["rebase", target.sha]);
-    } catch (error) {
-      try {
-        runCmd("git", ["rebase", "--abort"]);
-      } catch {
-        /* A rebase that never started has nothing to abort. */
+      const topLevel = String(runCmd("git", ["rev-parse", "--show-toplevel"])).trim();
+      if (topLevel && realpathSync(path.resolve(topLevel)) !== realpathSync(worktreePath)) {
+        return {
+          ok: false,
+          status: "room_worktree_mismatch",
+          reason: `Worktree root ${topLevel} does not match leased checkout ${worktreePath}`,
+          worktreePath,
+        };
       }
-      await recordState({
-        rebase: {
-          conflictOn: {
-            targetHeadSha: target.sha,
-            worktreeHeadSha: resolveGitSha(worktreePath, "HEAD", execFileSyncFn),
+    } catch {
+      // Mocked execFileSyncFn in unit tests may return empty string for rev-parse.
+    }
+    expectedRoomBranch =
+      memberWorktree.branch || loadedMarker.branch || loadedMeta.foundryState?.branch || null;
+    try {
+      preRebaseBranch = String(runCmd("git", ["symbolic-ref", "--short", "-q", "HEAD"])).trim();
+    } catch {
+      preRebaseBranch = "";
+    }
+    const acceptedCommit = roomCheck.integration.commit;
+    if (!isDryRun && !preRebaseBranch && loadedMeta.foundryState?.pendingRebase) {
+      const pending = loadedMeta.foundryState.pendingRebase;
+      const isValidPendingBranch =
+        typeof pending?.rebaseBranch === "string" &&
+        Boolean(pending.rebaseBranch) &&
+        (!expectedRoomBranch || pending.rebaseBranch === expectedRoomBranch) &&
+        (!memberWorktree.branch || pending.rebaseBranch === memberWorktree.branch);
+      const isValidPendingFrom =
+        pending?.fromCommit === acceptedCommit ||
+        (loadedMeta.foundryState?.acceptedCommit === acceptedCommit &&
+          Boolean(loadedMeta.foundryState?.rebasedCommit) &&
+          pending?.fromCommit === loadedMeta.foundryState.rebasedCommit);
+      if (
+        isValidPendingBranch &&
+        isValidPendingFrom &&
+        pending.acceptedCommit === acceptedCommit &&
+        pending.targetBranch === targetBranch
+      ) {
+        const branchSha = resolveGitSha(
+          worktreePath,
+          `refs/heads/${pending.rebaseBranch}`,
+          execFileSyncFn,
+        );
+        const hasRebasedBranch =
+          typeof pending.rebasedOid === "string" &&
+          Boolean(pending.rebasedOid) &&
+          branchSha === pending.rebasedOid;
+        const hasFromBranch = branchSha === pending.fromCommit;
+        if (hasRebasedBranch || hasFromBranch) {
+          runCmd("git", ["checkout", pending.rebaseBranch]);
+          if (hasFromBranch) {
+            deleteTempRebaseRef(pending.tempRef, runCmd);
+            await recordState({
+              acceptedCommit,
+              pendingRebase: null,
+              status: loadedMeta.foundryState?.status || "verified",
+            });
+          }
+          try {
+            preRebaseBranch = String(
+              runCmd("git", ["symbolic-ref", "--short", "-q", "HEAD"]),
+            ).trim();
+          } catch {
+            preRebaseBranch = "";
+          }
+        }
+      }
+    }
+    if (
+      !preRebaseBranch ||
+      (expectedRoomBranch && preRebaseBranch !== expectedRoomBranch) ||
+      (memberWorktree.branch && preRebaseBranch !== memberWorktree.branch)
+    ) {
+      return {
+        ok: false,
+        status: "room_branch_mismatch",
+        reason: `Worktree branch ${preRebaseBranch || "(detached)"} does not match accepted room branch ${expectedRoomBranch}`,
+        worktreePath,
+      };
+    }
+    preRebaseHead = String(runCmd("git", ["rev-parse", "HEAD"])).trim();
+    const isAcceptedMatch = preRebaseHead === acceptedCommit;
+    const isRecordedRebaseMatch =
+      loadedMeta.foundryState?.acceptedCommit === acceptedCommit &&
+      Boolean(loadedMeta.foundryState?.rebasedCommit) &&
+      preRebaseHead === loadedMeta.foundryState.rebasedCommit;
+    if (isAcceptedMatch || isRecordedRebaseMatch) {
+      if (isRecordedRebaseMatch && loadedMeta.foundryState?.rebasedOnto === target.sha) {
+        shouldSkipRoomRebase = true;
+      }
+      if (!isDryRun && loadedMeta.foundryState?.pendingRebase) {
+        deleteTempRebaseRef(loadedMeta.foundryState.pendingRebase.tempRef, runCmd);
+        await recordState({
+          acceptedCommit,
+          pendingRebase: null,
+          status: loadedMeta.foundryState?.status || "verified",
+        });
+      }
+    } else {
+      const pendingRebase = loadedMeta.foundryState?.pendingRebase || null;
+      const isPendingReconciled = isRebasedHeadConsistentWithPending(
+        worktreePath,
+        preRebaseHead,
+        preRebaseBranch,
+        targetBranch,
+        acceptedCommit,
+        loadedMeta.foundryState,
+        pendingRebase,
+        execFileSyncFn,
+      );
+      if (!isPendingReconciled) {
+        return {
+          ok: false,
+          status: "room_commit_mismatch",
+          reason: `Worktree HEAD ${preRebaseHead} does not match durable room accepted commit ${acceptedCommit}`,
+          worktreePath,
+        };
+      }
+      if (pendingRebase.targetOid === target.sha) {
+        shouldSkipRoomRebase = true;
+      }
+      if (!isDryRun) {
+        await recordState({
+          acceptedCommit,
+          rebasedCommit: preRebaseHead,
+          rebasedOnto: pendingRebase.targetOid,
+          pendingRebase: null,
+          status: loadedMeta.foundryState?.status || "verified",
+        });
+        deleteTempRebaseRef(pendingRebase.tempRef, runCmd);
+      }
+    }
+  }
+
+  if (!isDryRun) {
+    if (roomCheck.isRoomIntegrated) {
+      if (!shouldSkipRoomRebase) {
+        const txId = randomUUID();
+        const tempRef = `refs/orkest/rebase-tmp/${txId}`;
+        const basePending = {
+          acceptedCommit: roomCheck.integration.commit,
+          fromCommit: preRebaseHead,
+          rebaseBranch: preRebaseBranch,
+          targetBranch,
+          targetOid: target.sha,
+          tempRef,
+          rebasedOid: null,
+          startedAt: new Date().toISOString(),
+        };
+        await recordState({
+          acceptedCommit: roomCheck.integration.commit,
+          pendingRebase: basePending,
+          status: loadedMeta.foundryState?.status || "verified",
+        });
+        let rebasedOid;
+        let rebasedTree;
+        try {
+          runCmd("git", ["checkout", "--detach", preRebaseHead]);
+          runCmd("git", ["rebase", target.sha]);
+          rebasedOid = String(runCmd("git", ["rev-parse", "HEAD"])).trim();
+          rebasedTree = String(runCmd("git", ["rev-parse", "HEAD^{tree}"])).trim();
+          runCmd("git", ["update-ref", tempRef, rebasedOid]);
+        } catch (error) {
+          try {
+            runCmd("git", ["rebase", "--abort"]);
+          } catch {
+            /* A rebase that never started has nothing to abort. */
+          }
+          try {
+            runCmd("git", ["checkout", preRebaseBranch]);
+          } catch {
+            /* Best-effort return to preRebaseBranch. */
+          }
+          deleteTempRebaseRef(tempRef, runCmd);
+          await recordState({
+            pendingRebase: null,
+            rebase: {
+              conflictOn: {
+                targetHeadSha: target.sha,
+                worktreeHeadSha: resolveGitSha(worktreePath, "HEAD", execFileSyncFn),
+              },
+            },
+            status: "rebase_conflict",
+          });
+          throw error;
+        }
+        await recordState({
+          acceptedCommit: roomCheck.integration.commit,
+          pendingRebase: {
+            ...basePending,
+            rebasedOid,
+            rebasedTree,
           },
-        },
-        status: "rebase_conflict",
-      });
-      throw error;
+          status: loadedMeta.foundryState?.status || "verified",
+        });
+        runCmd("git", ["update-ref", `refs/heads/${preRebaseBranch}`, rebasedOid, preRebaseHead]);
+        runCmd("git", ["checkout", preRebaseBranch]);
+        await recordState({
+          acceptedCommit: roomCheck.integration.commit,
+          rebasedCommit: rebasedOid,
+          rebasedOnto: target.sha,
+          pendingRebase: null,
+          status: loadedMeta.foundryState?.status || "verified",
+        });
+        deleteTempRebaseRef(tempRef, runCmd);
+      }
+    } else {
+      try {
+        runCmd("git", ["rebase", target.sha]);
+      } catch (error) {
+        try {
+          runCmd("git", ["rebase", "--abort"]);
+        } catch {
+          /* A rebase that never started has nothing to abort. */
+        }
+        await recordState({
+          pendingRebase: null,
+          rebase: {
+            conflictOn: {
+              targetHeadSha: target.sha,
+              worktreeHeadSha: resolveGitSha(worktreePath, "HEAD", execFileSyncFn),
+            },
+          },
+          status: "rebase_conflict",
+        });
+        throw error;
+      }
     }
   }
   const candidate = {
@@ -806,6 +1380,14 @@ async function smeltLeasedWorktree(worktree, options, ownership) {
     tree: String(runCmd("git", ["rev-parse", "HEAD^{tree}"])).trim(),
     branch: String(runCmd("git", ["symbolic-ref", "--short", "HEAD"])).trim(),
   };
+  if (roomCheck.isRoomIntegrated && expectedRoomBranch && candidate.branch !== expectedRoomBranch) {
+    return {
+      ok: false,
+      status: "room_branch_mismatch",
+      reason: `Worktree branch ${candidate.branch} does not match accepted room branch ${expectedRoomBranch}`,
+      worktreePath,
+    };
+  }
   const branch = candidate.branch;
   const changedPaths = String(
     runCmd("git", ["diff", "--name-only", "--no-renames", "-z", target.sha, candidate.commit]),
@@ -995,7 +1577,10 @@ async function smeltLeasedWorktree(worktree, options, ownership) {
   ownership.checkStable();
 
   // Stage 3: Cross-Vendor Cold Review
-  const reviewerEngine = selectColdReviewerEngine(workerEngine);
+  const reviewerEngine = selectColdReviewerEngine(workerEngine, {
+    cwd: repoRoot,
+    env: options.env,
+  });
   evidence.review.engine = reviewerEngine;
   const consultArgs = [
     "consult",
@@ -1262,7 +1847,18 @@ async function smeltLeasedWorktree(worktree, options, ownership) {
         resolveGitSha(worktreePath, "HEAD", execFileSyncFn) === candidate.commit
       ) {
         runCmd("git", ["worktree", "remove", worktreePath], repoRoot);
-        runCmd("git", ["branch", "-d", candidate.branch], repoRoot);
+        try {
+          runCmd("git", ["branch", "-d", candidate.branch], repoRoot);
+        } catch (error) {
+          // `git branch -d` refuses branches merged into a non-HEAD target ref (e.g. release/v1 while repoRoot is on main).
+          const mergedTarget = resolveGitSha(repoRoot, target.ref, execFileSyncFn);
+          if (mergedTarget !== candidate.commit) throw error;
+          runCmd(
+            "git",
+            ["update-ref", "-d", `refs/heads/${candidate.branch}`, candidate.commit],
+            repoRoot,
+          );
+        }
         isPruned = true;
       }
     }

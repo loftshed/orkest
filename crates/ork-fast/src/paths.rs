@@ -5,7 +5,6 @@ use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::os::unix::io::IntoRawFd;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -604,6 +603,7 @@ impl Drop for FileLockGuard {
 
 const LOCK_ACQUIRE_ATTEMPTS: usize = 64;
 
+#[cfg(test)]
 pub(crate) fn fd_identity(fd: libc::c_int) -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::io::FromRawFd;
@@ -612,36 +612,113 @@ pub(crate) fn fd_identity(fd: libc::c_int) -> Option<(u64, u64)> {
     Some((meta.dev(), meta.ino()))
 }
 
-fn same_inode(fd: libc::c_int, lock_path: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    let Ok(current) = fs::metadata(lock_path) else {
-        return false;
+// cspell:ignore dirfd fstatat mkfifo
+fn open_parent_dirfd(parent: &Path) -> io::Result<std::os::unix::io::OwnedFd> {
+    use std::ffi::CString;
+    use std::os::unix::io::FromRawFd;
+
+    let c_parent = CString::new(parent.as_os_str().as_encoded_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid lock parent path"))?;
+    let fd = unsafe {
+        libc::open(
+            c_parent.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
     };
-    fd_identity(fd) == Some((current.dev(), current.ino()))
+    if fd >= 0 {
+        return Ok(unsafe { std::os::unix::io::OwnedFd::from_raw_fd(fd) });
+    }
+    let err = io::Error::last_os_error();
+    if err.kind() != io::ErrorKind::NotFound {
+        return Err(err);
+    }
+    fs::create_dir_all(parent)?;
+    let fd2 = unsafe {
+        libc::open(
+            c_parent.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd2 < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { std::os::unix::io::OwnedFd::from_raw_fd(fd2) })
+}
+
+fn is_regular_fd(fd: libc::c_int) -> io::Result<bool> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((st.st_mode as libc::mode_t & libc::S_IFMT) == libc::S_IFREG)
+}
+
+fn same_regular_inode_in_dirfd(
+    fd: libc::c_int,
+    parent_fd: libc::c_int,
+    c_name: &std::ffi::CStr,
+) -> bool {
+    let mut fd_st: libc::stat = unsafe { std::mem::zeroed() };
+    let mut path_st: libc::stat = unsafe { std::mem::zeroed() };
+    (unsafe { libc::fstat(fd, &mut fd_st) } == 0)
+        && (unsafe {
+            libc::fstatat(
+                parent_fd,
+                c_name.as_ptr(),
+                &mut path_st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } == 0)
+        && (fd_st.st_mode as libc::mode_t & libc::S_IFMT) == libc::S_IFREG
+        && (path_st.st_mode as libc::mode_t & libc::S_IFMT) == libc::S_IFREG
+        && fd_st.st_dev == path_st.st_dev
+        && fd_st.st_ino == path_st.st_ino
 }
 
 pub fn lock_path_exclusive(lock_path: &Path) -> io::Result<FileLockGuard> {
+    use std::ffi::CString;
+    use std::os::unix::io::AsRawFd;
+
+    let file_name = lock_path
+        .file_name()
+        .filter(|n| !n.is_empty())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "lock path has no filename"))?;
+    let c_name = CString::new(file_name.as_encoded_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid lock filename"))?;
+    let parent = lock_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+
     for _ in 0..LOCK_ACQUIRE_ATTEMPTS {
-        let file = match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_CLOEXEC)
-            .open(lock_path)
-        {
-            Ok(file) => file,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                if let Some(parent) = lock_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
+        let parent_fd = open_parent_dirfd(parent)?;
+        let fd = unsafe {
+            libc::openat(
+                parent_fd.as_raw_fd(),
+                c_name.as_ptr(),
+                libc::O_RDWR
+                    | libc::O_CREAT
+                    | libc::O_NOFOLLOW
+                    | libc::O_NONBLOCK
+                    | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::NotFound {
+                fs::create_dir_all(parent)?;
                 continue;
             }
-            Err(err) => return Err(err),
-        };
-        let fd = file.into_raw_fd();
+            return Err(err);
+        }
         let guard = FileLockGuard { fd };
+        if !is_regular_fd(fd)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "lock target is not a regular file",
+            ));
+        }
         loop {
             if unsafe { libc::flock(fd, libc::LOCK_EX) } == 0 {
                 break;
@@ -651,7 +728,7 @@ pub fn lock_path_exclusive(lock_path: &Path) -> io::Result<FileLockGuard> {
                 return Err(err);
             }
         }
-        if same_inode(fd, lock_path) {
+        if same_regular_inode_in_dirfd(fd, parent_fd.as_raw_fd(), &c_name) {
             unsafe {
                 libc::futimens(fd, std::ptr::null());
             }
@@ -669,6 +746,112 @@ pub fn lock_for(target_path: &Path) -> io::Result<FileLockGuard> {
         fs::create_dir_all(parent)?;
     }
     lock_path_exclusive(&target_path.with_extension("lock"))
+}
+
+/// Maximum size (256 KiB) accepted when reading `chief.json`.
+pub const CHIEF_JSON_MAX_BYTES: usize = 256 * 1024;
+
+/// Read and parse `chief.json` inside an already-pinned directory descriptor without
+/// following symlinks or blocking on FIFOs, verifying regular-file type, matching UID,
+/// and a 256 KiB read cap.
+pub fn read_chief_json_in_dir_fd(
+    dir_fd: std::os::unix::io::BorrowedFd<'_>,
+) -> io::Result<Option<serde_json::Value>> {
+    use std::ffi::CString;
+    use std::io::Read;
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+
+    let c_name = CString::new("chief.json").expect("static name has no NUL");
+    let fd = unsafe {
+        libc::openat(
+            dir_fd.as_raw_fd(),
+            c_name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(err);
+    }
+    let file = unsafe { fs::File::from_raw_fd(fd) };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(file.as_raw_fd(), &mut st) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let fmt = st.st_mode as libc::mode_t & libc::S_IFMT;
+    if fmt == libc::S_IFDIR {
+        return Err(io::Error::from_raw_os_error(libc::EISDIR));
+    }
+    if fmt != libc::S_IFREG {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "chief.json is not a regular file",
+        ));
+    }
+    let uid = unsafe { libc::getuid() };
+    if st.st_uid != uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "chief.json owner mismatch",
+        ));
+    }
+    if st.st_size < 0 || st.st_size as u64 > CHIEF_JSON_MAX_BYTES as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "chief.json exceeds size cap",
+        ));
+    }
+    let mut buf = Vec::with_capacity((st.st_size as usize).min(CHIEF_JSON_MAX_BYTES));
+    file.take((CHIEF_JSON_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut buf)?;
+    if buf.len() > CHIEF_JSON_MAX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "chief.json exceeds size cap",
+        ));
+    }
+    let val = serde_json::from_slice::<serde_json::Value>(&buf)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    Ok(Some(val))
+}
+
+/// Pin `base` via `O_RDONLY | O_DIRECTORY | O_CLOEXEC`, open `chief.json` via
+/// `openat(..., O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)`, verify regular file
+/// and matching UID, read capped at 256 KiB, and parse JSON.
+pub fn read_chief_json_bounded(base: &Path) -> io::Result<Option<serde_json::Value>> {
+    use std::ffi::CString;
+    use std::os::unix::io::{AsFd, FromRawFd, OwnedFd};
+
+    let c_base = CString::new(base.as_os_str().as_encoded_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid base path"))?;
+    let base_fd = unsafe {
+        libc::open(
+            c_base.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if base_fd < 0 {
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(err);
+    }
+    let owned_base = unsafe { OwnedFd::from_raw_fd(base_fd) };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(base_fd, &mut st) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if (st.st_mode as libc::mode_t & libc::S_IFMT) != libc::S_IFDIR {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "base is not a directory",
+        ));
+    }
+    read_chief_json_in_dir_fd(owned_base.as_fd())
 }
 
 /// Read JSON from `path`, returning `None` on I/O or parse failure.
@@ -863,6 +1046,9 @@ fn days_in_month(y: i64, m: u32) -> u32 {
 /// Parse an ISO-8601 timestamp (`YYYY-MM-DDTHH:MM:SS[.frac][Z|+HH:MM|-HH:MM]`) into UTC epoch seconds.
 #[must_use]
 pub fn parse_iso8601_utc_secs(s: &str) -> Option<i64> {
+    if !s.is_ascii() {
+        return None;
+    }
     let b = s.as_bytes();
     if b.len() < 19
         || b[4] != b'-'
@@ -1012,25 +1198,42 @@ fn index_has_active_session(base: &Path, session: &str) -> Option<bool> {
 }
 
 /// Legacy `<base>/rooms/*.json` records not yet imported into `rooms.db`.
+/// Returns `true` if a legacy open room may reference `session` or if legacy room status is unreadable/unknown.
 fn legacy_room_references_session(base: &Path, session: &str) -> bool {
     let rooms_dir = base.join("rooms");
+    match fs::symlink_metadata(&rooms_dir) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => return true,
+        Ok(_) => {}
+    }
     let Ok(entries) = fs::read_dir(&rooms_dir) else {
-        return false;
+        return true;
     };
-    for entry in entries.flatten() {
+    for entry_res in entries {
+        let Ok(entry) = entry_res else {
+            return true;
+        };
         let p = entry.path();
         if p.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        let Ok(content) = fs::read_to_string(&p) else {
-            continue;
+        let Ok(meta) = fs::symlink_metadata(&p) else {
+            return true;
         };
-        if !content.contains(session) {
-            continue;
+        if meta.file_type().is_symlink() || !meta.is_file() {
+            return true;
         }
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content)
-            && !room_is_closed(&val)
-        {
+        let Ok(content) = fs::read_to_string(&p) else {
+            return true;
+        };
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) else {
+            return true;
+        };
+        if !val.is_object() {
+            return true;
+        }
+        if !room_is_closed(&val) && content.contains(session) {
             return true;
         }
     }
@@ -1113,7 +1316,10 @@ pub fn has_active_room_for_session(base: &Path, session: &str) -> bool {
     }
     match index_has_active_session(base, session) {
         Some(found) => found,
-        None => base.join("rooms.db").exists(),
+        None => !matches!(
+            fs::symlink_metadata(base.join("rooms.db")),
+            Err(ref e) if e.kind() == io::ErrorKind::NotFound
+        ),
     }
 }
 
@@ -1361,6 +1567,80 @@ mod tests {
         assert!(!has_active_room_for_session(&dir, "session-closed"));
         assert!(!has_active_room_for_session(&dir, "session-legacy-arch"));
         assert!(!has_active_room_for_session(&dir, "session-legacy-canc"));
+        // Corrupt legacy JSON is treated conservatively as active/unknown.
+        fs::write(dir.join("rooms/corrupt.json"), "{not-json").unwrap();
+        assert!(has_active_room_for_session(&dir, "session-closed"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_parse_iso8601_utf8_malformed_timezone_no_panic() {
+        assert_eq!(parse_iso8601_utc_secs("2026-01-01T00:00:00+aé:0"), None);
+        assert_eq!(parse_iso8601_utc_secs("2026-01-01T00:00:00+aé0"), None);
+        assert_eq!(parse_iso8601_utc_secs("2026-01-01T00:00:00+é"), None);
+        assert_eq!(parse_iso8601_utc_secs("2026-01-01T00:00:00.éZ"), None);
+        assert!(parse_iso8601_utc_secs("2026-01-01T00:00:00+02:30").is_some());
+    }
+
+    #[test]
+    fn test_lock_path_exclusive_rejects_symlink_and_fifo() {
+        use std::ffi::CString;
+        use std::os::unix::fs::symlink;
+
+        let dir = scratch("lock-safety");
+        let target = dir.join("target.txt");
+        fs::write(&target, "keep").unwrap();
+        let sym_lock = dir.join("sym.lock");
+        symlink(&target, &sym_lock).unwrap();
+        assert!(lock_path_exclusive(&sym_lock).is_err());
+
+        let fifo_lock = dir.join("fifo.lock");
+        let c_fifo = CString::new(fifo_lock.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+        assert!(lock_path_exclusive(&fifo_lock).is_err());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_read_chief_json_bounded_handles_missing_valid_symlink_fifo_size_and_json() {
+        use std::ffi::CString;
+        use std::os::unix::fs::symlink;
+
+        let dir = scratch("chief-bounded");
+        assert_eq!(read_chief_json_bounded(&dir).unwrap(), None);
+        assert_eq!(
+            read_chief_json_bounded(&dir.join("missing-dir")).unwrap(),
+            None
+        );
+
+        let chief_path = dir.join("chief.json");
+        write_json_atomic(&chief_path, &serde_json::json!({"session": "c1"})).unwrap();
+        let loaded = read_chief_json_bounded(&dir).unwrap().unwrap();
+        assert_eq!(loaded["session"], "c1");
+
+        // Oversized (> 256 KiB) -> Err
+        let big = format!(r#"{{"pad":"{}"}}"#, "x".repeat(CHIEF_JSON_MAX_BYTES + 16));
+        fs::write(&chief_path, big).unwrap();
+        assert!(read_chief_json_bounded(&dir).is_err());
+
+        // Invalid JSON -> Err
+        fs::write(&chief_path, "{corrupt").unwrap();
+        assert!(read_chief_json_bounded(&dir).is_err());
+
+        // Symlink -> Err
+        let outside = dir.join("outside.json");
+        fs::write(&outside, r#"{"session":"outside"}"#).unwrap();
+        fs::remove_file(&chief_path).unwrap();
+        symlink(&outside, &chief_path).unwrap();
+        assert!(read_chief_json_bounded(&dir).is_err());
+
+        // FIFO -> Err without blocking
+        fs::remove_file(&chief_path).unwrap();
+        let c_fifo = CString::new(chief_path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+        assert!(read_chief_json_bounded(&dir).is_err());
+
         let _ = fs::remove_dir_all(&dir);
     }
 }

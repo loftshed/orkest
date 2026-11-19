@@ -42,6 +42,7 @@ SHARED_PROCESS_IDLE_TTL = dt.timedelta(hours=3)
 # Waiting on input is no more evidence of a shared-process session than idling. rooms.mjs uses the same windows.
 SHARED_PROCESS_WAITING_TTL = SHARED_PROCESS_IDLE_TTL
 SHARED_PROCESS_BUSY_TTL = dt.timedelta(minutes=30)
+SHARED_PROCESS_SUBAGENT_TTL = dt.timedelta(seconds=300)
 # Lock acquisition retries when a pruner unlinked the lock path between open and flock.
 LOCK_ACQUIRE_ATTEMPTS = 64
 HARNESSES = ("claude", "codex", "opencode", "gemini", "unknown")
@@ -54,7 +55,7 @@ SCOPES = ("project", "cross-project")
 # have native messaging are listed here so the mailbox refuses same-harness, same-account traffic for them.
 NATIVE_MESSAGING = {"claude": "SendMessage (find the session with ListAgents)"}
 # A harness's account is the config home it runs under: (environment override, default directory name in ~).
-# Profiles sit beside the default as ~/<default>-<label>, e.g. ~/.claude-personal.
+# Profiles sit beside the default as ~/<default>-<label>, e.g. ~/.claude-alt.
 # GEMINI_CLI_HOME is read by gemini-cli; Antigravity (agy) uses ANTIGRAVITY_APP_DATA_DIR under ~/.gemini.
 ACCOUNT_HOMES = {
     "claude": ("CLAUDE_CONFIG_DIR", ".claude"),
@@ -794,7 +795,9 @@ def harness_pid(harness: str, start: int | None = None) -> int | None:
     return start or os.getppid()
 
 
-def shared_process_ttl(state: Any) -> dt.timedelta:
+def shared_process_ttl(state: Any, is_subagent: bool = False) -> dt.timedelta:
+    if is_subagent:
+        return SHARED_PROCESS_SUBAGENT_TTL
     if state == "busy":
         return SHARED_PROCESS_BUSY_TTL
     if state == "waiting":
@@ -811,6 +814,8 @@ def is_live(peer: dict[str, Any], moment: dt.datetime | None = None) -> bool:
     except (AttributeError, TypeError, ValueError):
         return False
     alive = _MB.pid_alive(peer.get("pid"))
+    if alive is False:
+        return False
     if alive and peer.get("pidBirth"):
         current = _MB.process_started(peer["pid"])
         if current is not None and current != peer["pidBirth"]:
@@ -819,6 +824,8 @@ def is_live(peer: dict[str, Any], moment: dt.datetime | None = None) -> bool:
             return True  # the session's own process is still running: present however long it has been idle
     if moment - seen > MAX_AGE:
         return False
+    if peer.get("sharedProcess") and peer.get("isSubagent") is True:
+        return moment - seen <= SHARED_PROCESS_SUBAGENT_TTL
     if alive and peer.get("sharedProcess"):
         return moment - seen <= shared_process_ttl(peer.get("state"))
     return alive if alive is not None else moment - seen <= UNKNOWN_PID_TTL

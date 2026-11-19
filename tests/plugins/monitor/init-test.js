@@ -33,3 +33,52 @@ test("detectConfig leaves out CLIs that are not installed", () => {
   expect(config.accounts.map((a) => a.id)).toStrictEqual(["codex"]);
   expect(config.env).toStrictEqual({});
 });
+
+test("detectConfig discovers multi-account claude, codex, and antigravity dirs without guessing categories", () => {
+  const multiHome = mkdtempSync(path.join(tmpdir(), "monitor-multi-home-"));
+  try {
+    mkdirSync(path.join(multiHome, ".claude"));
+    mkdirSync(path.join(multiHome, ".claude-acme", "projects"), { recursive: true });
+    mkdirSync(path.join(multiHome, ".claude-personal"));
+    writeFileSync(path.join(multiHome, ".claude-personal", ".claude.json"), "{}");
+
+    mkdirSync(path.join(multiHome, ".codex-work"));
+    writeFileSync(path.join(multiHome, ".codex-work", "auth.json"), "{}");
+    mkdirSync(path.join(multiHome, ".codex-acme"));
+    writeFileSync(path.join(multiHome, ".codex-acme", "config.toml"), "");
+    mkdirSync(path.join(multiHome, ".codex-unrelated"));
+
+    mkdirSync(path.join(multiHome, ".antigravity-work"));
+    writeFileSync(path.join(multiHome, ".antigravity-work", "antigravity-oauth-token"), "tok");
+    mkdirSync(path.join(multiHome, ".antigravity-client"));
+    writeFileSync(path.join(multiHome, ".antigravity-client", "settings.json"), "{}");
+    mkdirSync(path.join(multiHome, ".antigravity-empty"));
+
+    const config = detectConfig({ home: multiHome, binaries: () => true, env: {} });
+    expect(config.accounts.map((a) => a.id)).toStrictEqual([
+      "claude",
+      "claude-acme",
+      "claude-personal",
+      "codex",
+      "codex-acme",
+      "codex-work",
+      "antigravity",
+      "antigravity-client",
+      "antigravity-work",
+    ]);
+    for (const acct of config.accounts) {
+      expect(acct.billing).toBeUndefined();
+      expect(acct.category).toBeUndefined();
+      expect(acct.tags).toBeUndefined();
+    }
+    const codexWork = config.accounts.find((a) => a.id === "codex-work");
+    expect(codexWork?.env).toStrictEqual({ CODEX_HOME: "~/.codex-work" });
+    expect(codexWork?.route).toBe("CODEX_HOME=~/.codex-work codex");
+
+    const agyWork = config.accounts.find((a) => a.id === "antigravity-work");
+    expect(agyWork?.env).toStrictEqual({ ANTIGRAVITY_APP_DATA_DIR: "~/.antigravity-work" });
+    expect(agyWork?.route).toBe("ANTIGRAVITY_APP_DATA_DIR=~/.antigravity-work agy");
+  } finally {
+    rmSync(multiHome, { recursive: true, force: true });
+  }
+});

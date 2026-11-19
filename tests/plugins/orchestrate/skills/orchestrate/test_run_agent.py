@@ -1304,7 +1304,7 @@ else:
     prompt = sys.stdin.read()
     output_index = sys.argv.index("--output-last-message") + 1
     pathlib.Path(sys.argv[output_index]).write_text(report(), encoding="utf-8")
-    capture({"stdin": prompt, "lease_held": lease_held()})
+    capture({"stdin": prompt, "lease_held": lease_held(), "codex_home": os.environ.get("CODEX_HOME")})
     print(json.dumps({"type": "thread.started", "thread_id": "codex-thread-1"}))
     for usage in json.loads(os.environ.get("FAKE_CODEX_USAGE", "[]")):
         print(json.dumps({"type": "turn.completed", "usage": usage}))
@@ -4463,6 +4463,33 @@ class ProcessAndResumeRegressionTests(unittest.TestCase):
 
     def test_repo_policy_denylist_blocks_disallowed_harnesses_and_profiles(self) -> None:
         repo_policy = RUNNER.bundled_module("repo_policy")
+        work_claude_dir = self.external_path / ".claude"
+        alt_claude_dir = self.external_path / ".claude-alt"
+        work_claude_dir.mkdir(parents=True, exist_ok=True)
+        alt_claude_dir.mkdir(parents=True, exist_ok=True)
+        monitor_cfg = self.external_path / "monitor-policy.json"
+        monitor_cfg.write_text(
+            json.dumps(
+                {
+                    "accounts": [
+                        {
+                            "id": "claude-work",
+                            "provider": "claude",
+                            "tags": ["work"],
+                            "configDir": str(work_claude_dir),
+                        },
+                        {
+                            "id": "claude-alt",
+                            "provider": "claude",
+                            "alias": "claude-alt",
+                            "tags": ["personal", "client-acme"],
+                            "configDir": str(alt_claude_dir),
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
         policy_cfg = {
             "repo_policies": [
                 {
@@ -4473,30 +4500,47 @@ class ProcessAndResumeRegressionTests(unittest.TestCase):
         }
         resolved = repo_policy.resolve_repo_policy(self.repository.path, config=policy_cfg)
         self.assertEqual(resolved["deny"], ["claude-work", "opencode"])
-        self.assertEqual(resolved["allowed_harnesses"], ["codex", "agy", "plaude"])
+        self.assertEqual(resolved["allowed_harnesses"], ["codex", "agy", "claude"])
 
-        # Default/work claude is blocked
+        # Default/work claude account is blocked
         allowed_default, reason_default, _ = repo_policy.check_execution_allowed(
-            self.repository.path, "claude", None, config=policy_cfg
+            self.repository.path,
+            "claude",
+            None,
+            config=policy_cfg,
+            home=self.external_path,
+            monitor_config_path=monitor_cfg,
+            strict=True,
         )
         self.assertFalse(allowed_default)
         self.assertIn("claude-work", reason_default or "")
-        self.assertIn("plaude", reason_default or "")
 
         # Explicit ~/.claude work profile is blocked
         allowed_work, reason_work, _ = repo_policy.check_execution_allowed(
-            self.repository.path, "claude", "~/.claude", config=policy_cfg
+            self.repository.path,
+            "claude",
+            work_claude_dir,
+            config=policy_cfg,
+            home=self.external_path,
+            monitor_config_path=monitor_cfg,
+            strict=True,
         )
         self.assertFalse(allowed_work)
         self.assertIn("claude-work", reason_work or "")
 
-        # Personal ~/.claude-personal (plaude) profile is allowed!
-        allowed_plaude, reason_plaude, auto_dir = repo_policy.check_execution_allowed(
-            self.repository.path, "claude", "~/.claude-personal", config=policy_cfg
+        # Custom ~/.claude-alt profile is allowed!
+        allowed_alt, reason_alt, auto_dir = repo_policy.check_execution_allowed(
+            self.repository.path,
+            "claude",
+            alt_claude_dir,
+            config=policy_cfg,
+            home=self.external_path,
+            monitor_config_path=monitor_cfg,
+            strict=True,
         )
-        self.assertTrue(allowed_plaude)
-        self.assertIsNone(reason_plaude)
-        self.assertEqual(auto_dir, Path("~/.claude-personal").expanduser())
+        self.assertTrue(allowed_alt)
+        self.assertIsNone(reason_alt)
+        self.assertEqual(auto_dir, alt_claude_dir)
 
         # agy and codex are allowed; opencode is blocked
         self.assertTrue(repo_policy.check_execution_allowed(self.repository.path, "agy", config=policy_cfg)[0])
@@ -4507,34 +4551,40 @@ class ProcessAndResumeRegressionTests(unittest.TestCase):
         self.assertFalse(allowed_oc)
         self.assertIn("opencode", reason_oc or "")
 
-        # End-to-end enforcement in run_agent.py via .orkest/policy.json
+        # End-to-end enforcement in run_agent.py via .orkest/policy.json and --account claude-alt
         policy_file = self.repository.path / ".orkest" / "policy.json"
         policy_file.parent.mkdir(parents=True, exist_ok=True)
         policy_file.write_text(json.dumps({"deny": ["claude-work", "opencode"]}), encoding="utf-8")
         try:
-            with self.assertRaisesRegex(RUNNER.RunnerError, "claude-work"):
-                self.run_main(engine="claude", model="sonnet", no_change=True, expect_changes=False, allow_path=None)
+            with mock.patch.dict(
+                os.environ,
+                {"HOME": str(self.external_path), "MONITOR_CONFIG": str(monitor_cfg)},
+            ):
+                with self.assertRaisesRegex(RUNNER.RunnerError, "claude-work"):
+                    self.run_main(
+                        engine="claude", model="sonnet", no_change=True, expect_changes=False, allow_path=None
+                    )
 
-            with self.assertRaisesRegex(RUNNER.RunnerError, "opencode"):
-                self.run_main(
-                    engine="opencode",
-                    model="openrouter/z-ai/glm-5.3-flash",
+                with self.assertRaisesRegex(RUNNER.RunnerError, "opencode"):
+                    self.run_main(
+                        engine="opencode",
+                        model="openrouter/z-ai/glm-5.3-flash",
+                        no_change=True,
+                        expect_changes=False,
+                        allow_path=None,
+                    )
+
+                # Passing --account claude-alt succeeds!
+                code_ok, result_ok, _, _, _ = self.run_main(
+                    engine="claude",
+                    model="sonnet",
                     no_change=True,
                     expect_changes=False,
                     allow_path=None,
+                    extra_args=["--account", "claude-alt"],
                 )
-
-            # Passing --claude-config-dir ~/.claude-personal succeeds!
-            code_ok, result_ok, _, _, _ = self.run_main(
-                engine="claude",
-                model="sonnet",
-                no_change=True,
-                expect_changes=False,
-                allow_path=None,
-                extra_args=["--claude-config-dir", str(self.external_path / ".claude-personal")],
-            )
-            self.assertEqual(code_ok, 0)
-            self.assertEqual(result_ok["status"], "completed")
+                self.assertEqual(code_ok, 0)
+                self.assertEqual(result_ok["status"], "completed")
         finally:
             RUNNER.shutil.rmtree(policy_file.parent, ignore_errors=True)
 
@@ -4694,3 +4744,1005 @@ class ProcessAndResumeRegressionTests(unittest.TestCase):
         self.assertIn("gpt:luna", unresolved_selectors)
         self.assertIn("gpt:sol", strict_out.getvalue())
         self.assertIn("gpt-7-mystery", strict_out.getvalue())
+
+    def test_git_state_v2_tree_oid_writes_no_repo_objects_and_supports_legacy_reverify(self) -> None:
+        audit = RUNNER.bundled_module("workspace_audit")
+        repo = self.repository.path
+        objects_dir = Path(self.repository.git("rev-parse", "--path-format=absolute", "--git-path", "objects"))
+        before_objects = sorted(p.relative_to(objects_dir).as_posix() for p in objects_dir.rglob("*") if p.is_file())
+
+        untracked_file = repo / "allowed" / "untracked-audit-test.txt"
+        untracked_file.parent.mkdir(parents=True, exist_ok=True)
+        untracked_file.write_text("ephemeral untracked content\n", encoding="utf-8")
+
+        state = RUNNER.git_state(repo, ["allowed/untracked-audit-test.txt"])
+        self.assertEqual(state["fingerprint_version"], 2)
+        self.assertTrue(state["tree_oid"])
+
+        # #11: Real .git/objects must not retain any blobs from untracked files during git_state/git_tree_oid.
+        after_objects = sorted(p.relative_to(objects_dir).as_posix() for p in objects_dir.rglob("*") if p.is_file())
+        self.assertEqual(after_objects, before_objects)
+
+        # #10: v1 pre-tree receipt matches by fingerprint and reverify_legacy_git_state upgrades it; v2 enforces tree_oid.
+        legacy_v1 = {
+            "fingerprint": state["fingerprint"],
+            "status": state["status"],
+            "path_fingerprints": state["path_fingerprints"],
+            "tracked_path_fingerprints": state["tracked_path_fingerprints"],
+        }
+        self.assertTrue(audit.is_legacy_pre_tree_state(legacy_v1))
+        self.assertTrue(audit.git_state_matches(state, legacy_v1))
+        upgraded = audit.reverify_legacy_git_state(repo, legacy_v1, ["allowed/untracked-audit-test.txt"])
+        self.assertEqual(upgraded["fingerprint_version"], 2)
+        self.assertEqual(upgraded["tree_oid"], state["tree_oid"])
+
+        v2_mismatch = {**state, "tree_oid": "0" * 40}
+        self.assertFalse(audit.git_state_matches(state, v2_mismatch))
+        self.assertFalse(audit.git_state_matches(state, legacy_v1, require_tree=True))
+
+    def test_implicit_default_codex_and_agy_accounts_resolve_tags_and_obey_policy(self) -> None:
+        repo_policy = RUNNER.bundled_module("repo_policy")
+        default_codex = self.external_path / ".codex"
+        alt_codex = self.external_path / ".codex-alt"
+        default_gemini = self.external_path / ".gemini"
+        work_agy_app = default_gemini / "antigravity-work"
+        default_codex.mkdir(parents=True, exist_ok=True)
+        alt_codex.mkdir(parents=True, exist_ok=True)
+        work_agy_app.mkdir(parents=True, exist_ok=True)
+        monitor_cfg = self.external_path / "monitor-implicit-policy.json"
+        monitor_cfg.write_text(
+            json.dumps(
+                {
+                    "accounts": [
+                        {
+                            "id": "codex-work",
+                            "provider": "codex",
+                            "tags": ["work"],
+                            "codexHome": str(default_codex),
+                        },
+                        {
+                            "id": "codex-personal",
+                            "provider": "codex",
+                            "tags": ["personal"],
+                            "codexHome": str(alt_codex),
+                        },
+                        {
+                            "id": "agy-work",
+                            "provider": "antigravity",
+                            "tags": ["work"],
+                            "env": {"ANTIGRAVITY_APP_DATA_DIR": str(work_agy_app)},
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        policy_file = self.repository.path / ".orkest" / "policy.json"
+        policy_file.parent.mkdir(parents=True, exist_ok=True)
+        policy_file.write_text(json.dumps({"deny": ["tag:work"]}), encoding="utf-8")
+        try:
+            # Implicit default ~/.codex resolves tags=["work"] and is denied.
+            ok_codex, reason_codex, _ = repo_policy.check_execution_allowed(
+                self.repository.path,
+                "codex",
+                home=self.external_path,
+                monitor_config_path=monitor_cfg,
+                env={"HOME": str(self.external_path), "MONITOR_CONFIG": str(monitor_cfg)},
+                strict=True,
+            )
+            self.assertFalse(ok_codex)
+            self.assertIn("tag:work", reason_codex or "")
+
+            # Implicit default ~/.gemini / ANTIGRAVITY_APP_DATA_DIR resolves tags=["work"] and is denied.
+            ok_agy, reason_agy, _ = repo_policy.check_execution_allowed(
+                self.repository.path,
+                "agy",
+                home=self.external_path,
+                monitor_config_path=monitor_cfg,
+                env={
+                    "HOME": str(self.external_path),
+                    "MONITOR_CONFIG": str(monitor_cfg),
+                    "ANTIGRAVITY_APP_DATA_DIR": str(work_agy_app),
+                },
+                strict=True,
+            )
+            self.assertFalse(ok_agy)
+            self.assertIn("tag:work", reason_agy or "")
+
+            # Account-scoped deny also blocks implicit default codex account.
+            ok_acct_deny, _, _ = repo_policy.check_execution_allowed(
+                self.repository.path,
+                "codex",
+                config={"repo_policies": [{"path": str(self.repository.path), "deny": ["account:codex-work"]}]},
+                home=self.external_path,
+                monitor_config_path=monitor_cfg,
+                env={"HOME": str(self.external_path), "MONITOR_CONFIG": str(monitor_cfg)},
+                strict=True,
+            )
+            self.assertFalse(ok_acct_deny)
+
+            # End-to-end run_agent.py blocks implicit codex and agy when HOME/.codex or ANTIGRAVITY_APP_DATA_DIR has tag:work.
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "HOME": str(self.external_path),
+                    "MONITOR_CONFIG": str(monitor_cfg),
+                    "CODEX_HOME": "",
+                    "ORKEST_CODEX_ACCOUNT_HOME": "",
+                    "ANTIGRAVITY_APP_DATA_DIR": str(work_agy_app),
+                    "GEMINI_CLI_HOME": "",
+                    "ORKEST_AGY_ACCOUNT_HOME": "",
+                },
+            ):
+                with self.assertRaisesRegex(RUNNER.RunnerError, "tag:work"):
+                    self.run_main(
+                        engine="codex",
+                        model="gpt-5.6-luna",
+                        no_change=True,
+                        expect_changes=False,
+                        allow_path=None,
+                    )
+                with self.assertRaisesRegex(RUNNER.RunnerError, "tag:work"):
+                    self.run_main(
+                        engine="agy",
+                        model="gemini-3.8-flash-medium",
+                        no_change=True,
+                        expect_changes=False,
+                        allow_path=None,
+                    )
+        finally:
+            RUNNER.shutil.rmtree(policy_file.parent, ignore_errors=True)
+
+    def test_executor_environment_and_detached_launch_strip_inherited_homes(self) -> None:
+        inherited = {
+            "CODEX_HOME": "/tmp/inherited-codex",
+            "GEMINI_CLI_HOME": "/tmp/inherited-gemini",
+            "ANTIGRAVITY_APP_DATA_DIR": "/tmp/inherited-gemini/antigravity-old",
+        }
+        with mock.patch.dict(os.environ, inherited):
+            codex_default = RUNNER.executor_environment("codex", pinned_account=True)
+            self.assertNotIn("CODEX_HOME", codex_default)
+
+            agy_default = RUNNER.executor_environment("agy", pinned_account=True)
+            self.assertNotIn("GEMINI_CLI_HOME", agy_default)
+            self.assertNotIn("ANTIGRAVITY_APP_DATA_DIR", agy_default)
+
+            agy_app_only = RUNNER.executor_environment(
+                "agy", agy_app_data_dir="/tmp/custom-agy/antigravity-work", pinned_account=True
+            )
+            self.assertEqual(
+                agy_app_only["ANTIGRAVITY_APP_DATA_DIR"], str(Path("/tmp/custom-agy/antigravity-work").expanduser())
+            )
+            self.assertEqual(agy_app_only["GEMINI_CLI_HOME"], str(Path("/tmp/custom-agy").expanduser()))
+
+        with mock.patch.dict(os.environ, {**inherited, "ORKEST_PINNED_CODEX_ACCOUNT": "1"}):
+            self.assertNotIn("CODEX_HOME", RUNNER.executor_environment("codex"))
+        with mock.patch.dict(os.environ, {**inherited, "ORKEST_PINNED_AGY_ACCOUNT": "1"}):
+            agy_env = RUNNER.executor_environment("agy")
+            self.assertNotIn("GEMINI_CLI_HOME", agy_env)
+            self.assertNotIn("ANTIGRAVITY_APP_DATA_DIR", agy_env)
+
+        # launch_detached propagates ORKEST_PINNED_*_ACCOUNT when explicit_account=True.
+        seen_env: dict[str, str | None] = {}
+
+        def fake_launch(launch_args):
+            seen_env["codex"] = os.environ.get("ORKEST_PINNED_CODEX_ACCOUNT")
+            seen_env["agy"] = os.environ.get("ORKEST_PINNED_AGY_ACCOUNT")
+            seen_env["claude"] = os.environ.get("ORKEST_PINNED_CLAUDE_ACCOUNT")
+            return 0
+
+        with mock.patch.object(RUNNER._JOB_STEERING_MOD, "launch_detached", side_effect=fake_launch):
+            for eng in ("codex", "agy", "claude"):
+                seen_env.clear()
+                self.assertEqual(RUNNER.launch_detached(argparse.Namespace(engine=eng, explicit_account=True)), 0)
+                self.assertEqual(seen_env[eng], "1")
+
+        # End-to-end --account codex-default strips inherited CODEX_HOME from the spawned executor environment.
+        monitor_cfg = self.external_path / "monitor-default-codex.json"
+        monitor_cfg.write_text(
+            json.dumps({"accounts": [{"id": "codex-default", "provider": "codex"}]}),
+            encoding="utf-8",
+        )
+        alt_codex = self.external_path / "inherited-codex"
+        alt_codex.mkdir(parents=True, exist_ok=True)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "HOME": str(self.external_path),
+                "MONITOR_CONFIG": str(monitor_cfg),
+                "CODEX_HOME": str(alt_codex),
+            },
+        ):
+            code, _, _, _, capture = self.run_main(
+                engine="codex",
+                model="gpt-5.6-luna",
+                no_change=True,
+                expect_changes=False,
+                allow_path=None,
+                extra_args=["--account", "codex-default"],
+            )
+        self.assertEqual(code, 0)
+        self.assertIsNone(capture["codex_home"])
+
+    def test_strict_policy_fails_closed_on_malformed_monitor_json(self) -> None:
+        repo_policy = RUNNER.bundled_module("repo_policy")
+        bad_monitor_cfg = self.external_path / "bad-monitor.json"
+        bad_monitor_cfg.write_text("{not-valid-json", encoding="utf-8")
+
+        self.assertEqual(repo_policy.load_configured_accounts(monitor_config_path=bad_monitor_cfg, strict=False), [])
+        with self.assertRaises(repo_policy.PolicyConfigError):
+            repo_policy.load_configured_accounts(monitor_config_path=bad_monitor_cfg, strict=True)
+        with self.assertRaises(repo_policy.PolicyConfigError):
+            repo_policy.resolve_configured_account("codex-work", monitor_config_path=bad_monitor_cfg, strict=True)
+        with self.assertRaises(repo_policy.PolicyConfigError):
+            repo_policy.check_execution_allowed(
+                self.repository.path,
+                "codex",
+                monitor_config_path=bad_monitor_cfg,
+                strict=True,
+            )
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "HOME": str(self.external_path),
+                "MONITOR_CONFIG": str(bad_monitor_cfg),
+                "ORCHESTRATE_AUTO_ACCOUNT": "1",
+            },
+        ):
+            with self.assertRaises(RUNNER.RunnerError) as raised:
+                self.run_main(
+                    engine="codex",
+                    model="gpt-5.6-luna",
+                    no_change=True,
+                    expect_changes=False,
+                    allow_path=None,
+                )
+            self.assertEqual(raised.exception.exit_code, 2)
+
+        # Non-array accounts in monitor/config.json (and in-memory config) also fail closed when strict.
+        non_array_cfg = self.external_path / "non-array-accounts.json"
+        non_array_cfg.write_text(json.dumps({"accounts": {"id": "codex-work"}}), encoding="utf-8")
+        self.assertEqual(repo_policy.load_configured_accounts(monitor_config_path=non_array_cfg, strict=False), [])
+        with self.assertRaises(repo_policy.PolicyConfigError):
+            repo_policy.load_configured_accounts(monitor_config_path=non_array_cfg, strict=True)
+        with self.assertRaises(repo_policy.PolicyConfigError):
+            repo_policy.load_configured_accounts(config={"accounts": "not-an-array"}, strict=True)
+        with self.assertRaises(repo_policy.PolicyConfigError):
+            repo_policy.check_execution_allowed(
+                self.repository.path,
+                "codex",
+                monitor_config_path=non_array_cfg,
+                strict=True,
+            )
+        with mock.patch.dict(os.environ, {"MONITOR_CONFIG": str(non_array_cfg)}):
+            self.assertEqual(RUNNER._MODEL_ROUTING_MOD.load_monitor_accounts(strict=False), [])
+            with self.assertRaises(ValueError):
+                RUNNER._MODEL_ROUTING_MOD.load_monitor_accounts(strict=True)
+            with self.assertRaises(ValueError):
+                RUNNER._MODEL_ROUTING_MOD.resolve_configured_account("codex-work", strict=True)
+            with self.assertRaises(RUNNER.RunnerError) as non_array_err:
+                self.run_main(
+                    engine="codex",
+                    model="gpt-5.6-luna",
+                    no_change=True,
+                    expect_changes=False,
+                    allow_path=None,
+                )
+            self.assertEqual(non_array_err.exception.exit_code, 2)
+
+    def test_pinned_account_beats_inherited_orkest_account_home_env_vars(self) -> None:
+        inherited = {
+            "ORKEST_CLAUDE_ACCOUNT_HOME": "/red-claude",
+            "ORKEST_CODEX_ACCOUNT_HOME": "/red-codex",
+            "ORKEST_AGY_ACCOUNT_HOME": "/red-agy",
+            "CLAUDE_CONFIG_DIR": "/blue-claude",
+            "CODEX_HOME": "/blue-codex",
+            "GEMINI_CLI_HOME": "/blue-agy",
+            "ANTIGRAVITY_APP_DATA_DIR": "/blue-agy/antigravity-old",
+        }
+        with mock.patch.dict(os.environ, inherited):
+            codex_env = RUNNER.executor_environment("codex", codex_home=None, pinned_account=True)
+            self.assertNotIn("CODEX_HOME", codex_env)
+            self.assertNotIn("ORKEST_CODEX_ACCOUNT_HOME", codex_env)
+
+            claude_env = RUNNER.executor_environment("claude", claude_config_dir=None, pinned_account=True)
+            self.assertNotIn("CLAUDE_CONFIG_DIR", claude_env)
+            self.assertNotEqual(claude_env.get("HOME"), "/red-claude")
+
+            claude_explicit_cfg = RUNNER.executor_environment("claude", claude_config_dir="/custom-claude")
+            self.assertEqual(claude_explicit_cfg.get("CLAUDE_CONFIG_DIR"), "/custom-claude")
+            self.assertNotEqual(claude_explicit_cfg.get("HOME"), "/red-claude")
+
+            agy_env = RUNNER.executor_environment("agy", agy_home=None, pinned_account=True)
+            self.assertNotIn("GEMINI_CLI_HOME", agy_env)
+            self.assertNotIn("ANTIGRAVITY_APP_DATA_DIR", agy_env)
+
+            agy_explicit_app = RUNNER.executor_environment("agy", agy_app_data_dir="/custom-agy/antigravity-work")
+            self.assertEqual(agy_explicit_app.get("ANTIGRAVITY_APP_DATA_DIR"), "/custom-agy/antigravity-work")
+            self.assertEqual(agy_explicit_app.get("GEMINI_CLI_HOME"), "/custom-agy")
+
+    def test_repo_policy_denies_account_by_single_word_route_alias(self) -> None:
+        repo_policy = RUNNER.bundled_module("repo_policy")
+        agy_alt_home = self.external_path / ".gemini-route-alt"
+        agy_alt_home.mkdir(parents=True, exist_ok=True)
+        monitor_cfg = self.external_path / "monitor-route-alias.json"
+        monitor_cfg.write_text(
+            json.dumps(
+                {
+                    "accounts": [
+                        {
+                            "id": "agy-alt-id",
+                            "provider": "antigravity",
+                            "route": "agy-alt",
+                            "env": {"GEMINI_CLI_HOME": str(agy_alt_home)},
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        cfg = {"repo_policies": [{"path": str(self.repository.path), "deny": ["agy-alt"]}]}
+        ok_by_home, reason_by_home, _ = repo_policy.check_execution_allowed(
+            self.repository.path,
+            "agy",
+            config=cfg,
+            home=self.external_path,
+            monitor_config_path=monitor_cfg,
+            agy_home=agy_alt_home,
+            strict=True,
+        )
+        self.assertFalse(ok_by_home)
+        self.assertIn("agy-alt", reason_by_home or "")
+
+        ok_by_selector, reason_by_selector, _ = repo_policy.check_execution_allowed(
+            self.repository.path,
+            "agy-alt",
+            config=cfg,
+            home=self.external_path,
+            monitor_config_path=monitor_cfg,
+            strict=True,
+        )
+        self.assertFalse(ok_by_selector)
+        self.assertIn("agy-alt", reason_by_selector or "")
+
+    def test_handoff_env_fallback_detached_unset_and_strict_null_accounts(self) -> None:
+        repo_policy = RUNNER.bundled_module("repo_policy")
+        second_home = self.external_path / "handoff-claude-home"
+        second_home.mkdir(parents=True, exist_ok=True)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "ORKEST_PINNED_CLAUDE_ACCOUNT": "1",
+                "ORKEST_CLAUDE_ACCOUNT_HOME": str(second_home),
+            },
+        ):
+            handoff_env = RUNNER.executor_environment("claude", self.repository.path, pinned_account=False)
+            self.assertEqual(handoff_env.get("HOME"), str(second_home))
+            pinned_default_env = RUNNER.executor_environment("claude", self.repository.path, pinned_account=True)
+            self.assertNotEqual(pinned_default_env.get("HOME"), str(second_home))
+
+        # launch_detached pops stale ORKEST_*_ACCOUNT_HOME when explicit_account=True selects default home,
+        # and restores those variables in finally.
+        seen_detached: dict[str, str | None] = {}
+
+        def capture_detached(_launch_args):
+            seen_detached["claude"] = os.environ.get("ORKEST_CLAUDE_ACCOUNT_HOME")
+            seen_detached["codex"] = os.environ.get("ORKEST_CODEX_ACCOUNT_HOME")
+            seen_detached["agy"] = os.environ.get("ORKEST_AGY_ACCOUNT_HOME")
+            seen_detached["pin_codex"] = os.environ.get("ORKEST_PINNED_CODEX_ACCOUNT")
+            return 0
+
+        stale_env = {
+            "ORKEST_CLAUDE_ACCOUNT_HOME": "/stale-claude",
+            "ORKEST_CODEX_ACCOUNT_HOME": "/stale-codex",
+            "ORKEST_AGY_ACCOUNT_HOME": "/stale-agy",
+        }
+        with (
+            mock.patch.dict(os.environ, stale_env),
+            mock.patch.object(RUNNER._JOB_STEERING_MOD, "launch_detached", side_effect=capture_detached),
+        ):
+            self.assertEqual(RUNNER.launch_detached(argparse.Namespace(engine="codex", explicit_account=True)), 0)
+            self.assertIsNone(seen_detached["claude"])
+            self.assertIsNone(seen_detached["codex"])
+            self.assertIsNone(seen_detached["agy"])
+            self.assertEqual(seen_detached["pin_codex"], "1")
+            self.assertEqual(os.environ.get("ORKEST_CODEX_ACCOUNT_HOME"), "/stale-codex")
+            self.assertEqual(os.environ.get("ORKEST_AGY_ACCOUNT_HOME"), "/stale-agy")
+
+        # Strict mode rejects `"accounts": null` in both repo_policy and model_routing.
+        null_cfg = self.external_path / "null-accounts.json"
+        null_cfg.write_text(json.dumps({"accounts": None}), encoding="utf-8")
+        self.assertEqual(repo_policy.load_configured_accounts(monitor_config_path=null_cfg, strict=False), [])
+        with self.assertRaises(repo_policy.PolicyConfigError):
+            repo_policy.load_configured_accounts(monitor_config_path=null_cfg, strict=True)
+        with self.assertRaises(repo_policy.PolicyConfigError):
+            repo_policy.load_configured_accounts(config={"accounts": None}, strict=True)
+        with mock.patch.dict(os.environ, {"MONITOR_CONFIG": str(null_cfg)}):
+            self.assertEqual(RUNNER._MODEL_ROUTING_MOD.load_monitor_accounts(strict=False), [])
+            with self.assertRaises(ValueError):
+                RUNNER._MODEL_ROUTING_MOD.load_monitor_accounts(strict=True)
+
+    def test_native_agy_policy_prefers_antigravity_app_data_dir_over_gemini_cli_home(self) -> None:
+        gemini_home = self.external_path / ".gemini"
+        work_app = gemini_home / "antigravity-work"
+        work_app.mkdir(parents=True, exist_ok=True)
+        monitor_cfg = self.external_path / "monitor-agy-native.json"
+        monitor_cfg.write_text(
+            json.dumps(
+                {
+                    "accounts": [
+                        {"id": "agy-default", "provider": "antigravity"},
+                        {
+                            "id": "agy-work",
+                            "provider": "antigravity",
+                            "tags": ["work"],
+                            "env": {
+                                "GEMINI_CLI_HOME": str(gemini_home),
+                                "ANTIGRAVITY_APP_DATA_DIR": str(work_app),
+                            },
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        policy_dir = self.repository.path / ".orkest"
+        policy_dir.mkdir(exist_ok=True)
+        (policy_dir / "policy.json").write_text(json.dumps({"deny": ["tag:work"]}), encoding="utf-8")
+        try:
+            host_clear = {key: "" for keys in RUNNER.HOST_MARKERS.values() for key in keys}
+            with (
+                mock.patch.object(Path, "home", return_value=self.external_path),
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        **host_clear,
+                        "HOME": str(self.external_path),
+                        "MONITOR_CONFIG": str(monitor_cfg),
+                        "ANTIGRAVITY_CONVERSATION_ID": "agy-conv-1",
+                        "GEMINI_CLI_HOME": str(gemini_home),
+                        "ANTIGRAVITY_APP_DATA_DIR": str(work_app),
+                        "ORKEST_AGY_ACCOUNT_HOME": "",
+                    },
+                ),
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "run_agent.py",
+                        "--cwd",
+                        str(self.repository.path),
+                        "--brief",
+                        "Check",
+                        "--engine",
+                        "agy",
+                        "--model",
+                        "gemini-3.8-flash-medium",
+                    ],
+                ),
+            ):
+                with self.assertRaises(RUNNER.RunnerError) as raised:
+                    RUNNER.main()
+                self.assertEqual(raised.exception.exit_code, 2)
+                self.assertIn("work", str(raised.exception))
+        finally:
+            RUNNER.shutil.rmtree(policy_dir, ignore_errors=True)
+
+    def test_child_agy_marker_forces_executor_and_native_policy_ignores_child_marker(self) -> None:
+        gemini_home = self.external_path / ".gemini"
+        work_app = gemini_home / "antigravity-work"
+        personal_app = gemini_home / "antigravity-personal"
+        work_app.mkdir(parents=True, exist_ok=True)
+        personal_app.mkdir(parents=True, exist_ok=True)
+        monitor_cfg = self.external_path / "monitor-agy-child-marker.json"
+        monitor_cfg.write_text(
+            json.dumps(
+                {
+                    "accounts": [
+                        {
+                            "id": "agy-work",
+                            "provider": "antigravity",
+                            "tags": ["work"],
+                            "env": {"GEMINI_CLI_HOME": str(gemini_home), "ANTIGRAVITY_APP_DATA_DIR": str(work_app)},
+                        },
+                        {
+                            "id": "agy-personal",
+                            "provider": "antigravity",
+                            "tags": ["personal"],
+                            "env": {
+                                "GEMINI_CLI_HOME": str(gemini_home),
+                                "ANTIGRAVITY_APP_DATA_DIR": str(personal_app),
+                            },
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        policy_dir = self.repository.path / ".orkest"
+        policy_dir.mkdir(exist_ok=True)
+        (policy_dir / "policy.json").write_text(json.dumps({"deny": ["tag:work"]}), encoding="utf-8")
+        try:
+            host_clear = {key: "" for keys in RUNNER.HOST_MARKERS.values() for key in keys}
+            env = {
+                **host_clear,
+                "HOME": str(self.external_path),
+                "MONITOR_CONFIG": str(monitor_cfg),
+                "ANTIGRAVITY_CONVERSATION_ID": "agy-host-1",
+                "GEMINI_CLI_HOME": str(gemini_home),
+                "ANTIGRAVITY_APP_DATA_DIR": str(work_app),
+                "ORKEST_AGY_ACCOUNT_HOME": str(personal_app),
+            }
+            with mock.patch.object(Path, "home", return_value=self.external_path), mock.patch.dict(os.environ, env):
+                # 1. Explicit --transport native refuses child marker profile switch.
+                with self.assertRaises(RUNNER.RunnerError) as raised:
+                    self.run_main(
+                        engine="agy",
+                        model="gemini-3.8-flash-medium",
+                        no_change=True,
+                        expect_changes=False,
+                        allow_path=None,
+                        extra_args=["--transport", "native"],
+                    )
+                self.assertEqual(raised.exception.exit_code, 4)
+
+                # 2. --transport auto routes to executor (not native_handoff) and applies ORKEST_AGY_ACCOUNT_HOME.
+                seen_exec_envs: list[dict[str, str]] = []
+                orig_exec_env = RUNNER.executor_environment
+
+                def spy_exec_env(*args, **kwargs):
+                    out = orig_exec_env(*args, **kwargs)
+                    seen_exec_envs.append(out)
+                    return out
+
+                with mock.patch.object(RUNNER, "executor_environment", side_effect=spy_exec_env):
+                    code, result, _out, _summary, _capture = self.run_main(
+                        engine="agy",
+                        model="gemini-3.8-flash-medium",
+                        no_change=True,
+                        expect_changes=False,
+                        allow_path=None,
+                    )
+                self.assertEqual((code, result["status"]), (0, "completed"))
+                self.assertEqual(seen_exec_envs[-1].get("ANTIGRAVITY_APP_DATA_DIR"), str(personal_app.resolve()))
+
+                # 3. Any remaining native check evaluates against host ANTIGRAVITY_APP_DATA_DIR, never child marker.
+                args_native = RUNNER.parse_args(
+                    [
+                        "--cwd",
+                        str(self.repository.path),
+                        "--brief",
+                        "Inspect.",
+                        "--engine",
+                        "agy",
+                        "--model",
+                        "gemini-3.8-flash-medium",
+                        "--transport",
+                        "native",
+                    ]
+                )
+                with (
+                    mock.patch.object(
+                        RUNNER._MODEL_ROUTING_MOD, "_child_marker_switches_host_profile", return_value=False
+                    ),
+                    self.assertRaises(RUNNER.RunnerError) as native_err,
+                ):
+                    RUNNER.native_handoff(args_native, "agy")
+                self.assertEqual(native_err.exception.exit_code, 2)
+                self.assertIn("work", str(native_err.exception))
+        finally:
+            RUNNER.shutil.rmtree(policy_dir, ignore_errors=True)
+
+    def test_implicit_antigravity_app_data_dir_survives_executor_env_and_allows_auto_account(self) -> None:
+        gemini_home = self.external_path / ".gemini"
+        work_app = gemini_home / "antigravity-work"
+        personal_app = gemini_home / "antigravity-personal"
+        work_app.mkdir(parents=True, exist_ok=True)
+        personal_app.mkdir(parents=True, exist_ok=True)
+        monitor_cfg = self.external_path / "monitor-agy-implicit.json"
+        monitor_cfg.write_text(
+            json.dumps(
+                {
+                    "accounts": [
+                        {
+                            "id": "agy-work",
+                            "provider": "antigravity",
+                            "tags": ["work"],
+                            "env": {"GEMINI_CLI_HOME": str(gemini_home), "ANTIGRAVITY_APP_DATA_DIR": str(work_app)},
+                        },
+                        {
+                            "id": "agy-personal",
+                            "provider": "antigravity",
+                            "tags": ["personal"],
+                            "env": {
+                                "GEMINI_CLI_HOME": str(gemini_home),
+                                "ANTIGRAVITY_APP_DATA_DIR": str(personal_app),
+                            },
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        fake_view = {
+            "schema": "monitor.snapshot.v1",
+            "accounts": [
+                {"id": "agy-work", "provider": "antigravity"},
+                {"id": "agy-personal", "provider": "antigravity"},
+            ],
+            "lanes": [
+                {
+                    "accountId": "agy-personal",
+                    "poolId": "all",
+                    "label": "Agy personal",
+                    "status": "available",
+                    "availableNowPct": 85,
+                    "surplusPts": 20,
+                    "stale": False,
+                }
+            ],
+        }
+        fake_monitor = self.external_path / "fake-monitor-agy"
+        fake_monitor.write_text(f"#!/bin/sh\ncat <<'EOF'\n{json.dumps(fake_view)}\nEOF\n", encoding="utf-8")
+        fake_monitor.chmod(0o755)
+        host_clear = {key: "" for keys in RUNNER.HOST_MARKERS.values() for key in keys}
+
+        # 1. Implicit ANTIGRAVITY_APP_DATA_DIR survives HOST_SESSION_ENV into executor_environment without --account.
+        with (
+            mock.patch.object(Path, "home", return_value=self.external_path),
+            mock.patch.dict(
+                os.environ,
+                {
+                    **host_clear,
+                    "HOME": str(self.external_path),
+                    "MONITOR_CONFIG": str(monitor_cfg),
+                    "GEMINI_CLI_HOME": str(gemini_home),
+                    "ANTIGRAVITY_APP_DATA_DIR": str(personal_app),
+                    "ORKEST_AGY_ACCOUNT_HOME": "",
+                },
+            ),
+        ):
+            direct_env = RUNNER.executor_environment("agy", self.repository.path)
+            self.assertEqual(direct_env.get("ANTIGRAVITY_APP_DATA_DIR"), str(personal_app))
+            self.assertEqual(direct_env.get("GEMINI_CLI_HOME"), str(gemini_home))
+
+            seen_envs: list[dict[str, str]] = []
+            orig_exec_env = RUNNER.executor_environment
+
+            def spy_exec_env(*args, **kwargs):
+                out = orig_exec_env(*args, **kwargs)
+                seen_envs.append(out)
+                return out
+
+            with mock.patch.object(RUNNER, "executor_environment", side_effect=spy_exec_env):
+                code, result, _out, _summary, _capture = self.run_main(
+                    engine="agy",
+                    model="gemini-3.8-flash-medium",
+                    no_change=True,
+                    expect_changes=False,
+                    allow_path=None,
+                )
+            self.assertEqual((code, result["status"]), (0, "completed"))
+            self.assertEqual(seen_envs[-1].get("ANTIGRAVITY_APP_DATA_DIR"), str(personal_app.resolve()))
+
+        # 2. When implicit ANTIGRAVITY_APP_DATA_DIR is denied, ORCHESTRATE_AUTO_ACCOUNT=1 still switches to agy-personal.
+        policy_dir = self.repository.path / ".orkest"
+        policy_dir.mkdir(exist_ok=True)
+        (policy_dir / "policy.json").write_text(json.dumps({"deny": ["tag:work"]}), encoding="utf-8")
+        try:
+            with (
+                mock.patch.object(Path, "home", return_value=self.external_path),
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        **host_clear,
+                        "HOME": str(self.external_path),
+                        "MONITOR_CONFIG": str(monitor_cfg),
+                        "MONITOR_BIN": str(fake_monitor),
+                        "ORCHESTRATE_AUTO_ACCOUNT": "1",
+                        "GEMINI_CLI_HOME": str(gemini_home),
+                        "ANTIGRAVITY_APP_DATA_DIR": str(work_app),
+                        "ORKEST_AGY_ACCOUNT_HOME": "",
+                    },
+                ),
+            ):
+                seen_auto_envs: list[dict[str, str]] = []
+                orig_exec_env = RUNNER.executor_environment
+
+                def spy_auto_env(*args, **kwargs):
+                    out = orig_exec_env(*args, **kwargs)
+                    seen_auto_envs.append(out)
+                    return out
+
+                with mock.patch.object(RUNNER, "executor_environment", side_effect=spy_auto_env):
+                    code_auto, result_auto, _out, _summary, _capture = self.run_main(
+                        engine="agy",
+                        model="gemini-3.8-flash-medium",
+                        no_change=True,
+                        expect_changes=False,
+                        allow_path=None,
+                    )
+                self.assertEqual((code_auto, result_auto["status"]), (0, "completed"))
+                self.assertEqual(seen_auto_envs[-1].get("ANTIGRAVITY_APP_DATA_DIR"), str(personal_app.resolve()))
+        finally:
+            RUNNER.shutil.rmtree(policy_dir, ignore_errors=True)
+
+    def test_detached_claude_handoff_cannot_pass_policy_as_base_and_execute_as_red(self) -> None:
+        base_home = self.external_path / "claude-base-home"
+        red_home = self.external_path / "claude-red-home"
+        (base_home / ".claude").mkdir(parents=True, exist_ok=True)
+        (red_home / ".claude").mkdir(parents=True, exist_ok=True)
+        monitor_cfg = self.external_path / "monitor-claude-handoff-policy.json"
+        monitor_cfg.write_text(
+            json.dumps(
+                {
+                    "accounts": [
+                        {"id": "claude-base", "provider": "claude", "tags": ["personal"]},
+                        {
+                            "id": "claude-red",
+                            "provider": "claude",
+                            "tags": ["work"],
+                            "configDir": "~/.claude",
+                            "env": {"HOME": str(red_home)},
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        policy_dir = self.repository.path / ".orkest"
+        policy_dir.mkdir(exist_ok=True)
+        (policy_dir / "policy.json").write_text(json.dumps({"deny": ["tag:work"]}), encoding="utf-8")
+        try:
+            repo_policy = RUNNER.bundled_module("repo_policy")
+            handoff_env = {
+                "HOME": str(base_home),
+                "MONITOR_CONFIG": str(monitor_cfg),
+                "CLAUDE_CONFIG_DIR": str(base_home / ".claude"),
+                "ORKEST_PINNED_CLAUDE_ACCOUNT": "1",
+                "ORKEST_CLAUDE_ACCOUNT_HOME": str(red_home),
+                "ORCHESTRATE_AUTO_ACCOUNT": "1",
+            }
+            with mock.patch.object(Path, "home", return_value=base_home):
+                ok, reason, _ = repo_policy.check_execution_allowed(
+                    self.repository.path,
+                    "claude",
+                    home=base_home,
+                    monitor_config_path=monitor_cfg,
+                    env=handoff_env,
+                    strict=True,
+                )
+                self.assertFalse(ok)
+                self.assertIn("tag:work", reason or "")
+
+                with mock.patch.dict(os.environ, handoff_env):
+                    with self.assertRaises(RUNNER.RunnerError) as raised:
+                        self.run_main(
+                            engine="claude",
+                            model="opus",
+                            no_change=True,
+                            expect_changes=False,
+                            allow_path=None,
+                        )
+                    self.assertEqual(raised.exception.exit_code, 2)
+                    self.assertIn("tag:work", str(raised.exception))
+        finally:
+            RUNNER.shutil.rmtree(policy_dir, ignore_errors=True)
+
+    def test_agy_shared_marker_verbatim_gemini_cli_home_and_engine_scoped_explicit_pin(self) -> None:
+        host_dir = self.external_path / "host"
+        shared_dir = self.external_path / "shared"
+        team_gemini = self.external_path / "profiles" / "antigravity-team"
+        green_app = self.external_path / "apps" / "green"
+        work_codex = self.external_path / ".codex-work"
+        personal_codex = self.external_path / ".codex-personal"
+        for directory in (host_dir, shared_dir, team_gemini, green_app, work_codex, personal_codex):
+            directory.mkdir(parents=True, exist_ok=True)
+
+        # 1. Host ANTIGRAVITY_APP_DATA_DIR=/shared + GEMINI_CLI_HOME=/host vs ORKEST_AGY_ACCOUNT_HOME=/shared.
+        host_clear = {key: "" for keys in RUNNER.HOST_MARKERS.values() for key in keys}
+        shared_env = {
+            **host_clear,
+            "HOME": str(self.external_path),
+            "ANTIGRAVITY_CONVERSATION_ID": "agy-host-1",
+            "GEMINI_CLI_HOME": str(host_dir),
+            "ANTIGRAVITY_APP_DATA_DIR": str(shared_dir),
+            "ORKEST_AGY_ACCOUNT_HOME": str(shared_dir),
+        }
+        with mock.patch.dict(os.environ, shared_env):
+            with self.assertRaises(RUNNER.RunnerError) as raised:
+                self.run_main(
+                    engine="agy",
+                    model="gemini-3.8-flash-medium",
+                    no_change=True,
+                    expect_changes=False,
+                    allow_path=None,
+                    extra_args=["--transport", "native"],
+                )
+            self.assertEqual(raised.exception.exit_code, 4)
+
+            seen_exec_envs: list[dict[str, str]] = []
+            orig_exec_env = RUNNER.executor_environment
+
+            def spy_exec_env(*args, **kwargs):
+                out = orig_exec_env(*args, **kwargs)
+                seen_exec_envs.append(out)
+                return out
+
+            with mock.patch.object(RUNNER, "executor_environment", side_effect=spy_exec_env):
+                code, result, _out, _summary, _capture = self.run_main(
+                    engine="agy",
+                    model="gemini-3.8-flash-medium",
+                    no_change=True,
+                    expect_changes=False,
+                    allow_path=None,
+                )
+            self.assertEqual((code, result["status"]), (0, "completed"))
+            self.assertEqual(seen_exec_envs[-1].get("GEMINI_CLI_HOME"), str(shared_dir))
+            self.assertEqual(
+                seen_exec_envs[-1].get("ANTIGRAVITY_APP_DATA_DIR"),
+                str(shared_dir / "antigravity-cli"),
+            )
+
+        # 2. Verbatim GEMINI_CLI_HOME=/profiles/antigravity-team + ANTIGRAVITY_APP_DATA_DIR=/apps/green.
+        team_env = RUNNER.executor_environment(
+            "agy",
+            self.repository.path,
+            agy_home=team_gemini,
+            agy_app_data_dir=green_app,
+            pinned_account=True,
+        )
+        self.assertEqual(team_env.get("GEMINI_CLI_HOME"), str(team_gemini))
+        self.assertEqual(team_env.get("ANTIGRAVITY_APP_DATA_DIR"), str(green_app))
+
+        # 3. Implicit Codex ORCHESTRATE_AUTO_ACCOUNT=1 fallback succeeds when ORKEST_CLAUDE_ACCOUNT_HOME is set.
+        monitor_cfg = self.external_path / "monitor-codex-pin-scope.json"
+        monitor_cfg.write_text(
+            json.dumps(
+                {
+                    "accounts": [
+                        {"id": "codex-work", "provider": "codex", "tags": ["work"], "codexHome": str(work_codex)},
+                        {
+                            "id": "codex-personal",
+                            "provider": "codex",
+                            "tags": ["personal"],
+                            "codexHome": str(personal_codex),
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        fake_view = {
+            "schema": "monitor.snapshot.v1",
+            "accounts": [
+                {"id": "codex-work", "provider": "codex"},
+                {"id": "codex-personal", "provider": "codex"},
+            ],
+            "lanes": [
+                {
+                    "accountId": "codex-personal",
+                    "poolId": "all",
+                    "label": "Codex personal",
+                    "status": "available",
+                    "availableNowPct": 85,
+                    "surplusPts": 20,
+                    "stale": False,
+                }
+            ],
+        }
+        fake_monitor = self.external_path / "fake-monitor-codex-scope"
+        fake_monitor.write_text(f"#!/bin/sh\ncat <<'EOF'\n{json.dumps(fake_view)}\nEOF\n", encoding="utf-8")
+        fake_monitor.chmod(0o755)
+        policy_dir = self.repository.path / ".orkest"
+        policy_dir.mkdir(exist_ok=True)
+        (policy_dir / "policy.json").write_text(json.dumps({"deny": ["tag:work"]}), encoding="utf-8")
+        try:
+            with mock.patch.dict(
+                os.environ,
+                {
+                    **host_clear,
+                    "HOME": str(self.external_path),
+                    "MONITOR_CONFIG": str(monitor_cfg),
+                    "MONITOR_BIN": str(fake_monitor),
+                    "ORCHESTRATE_AUTO_ACCOUNT": "1",
+                    "CODEX_HOME": str(work_codex),
+                    "ORKEST_PINNED_CLAUDE_ACCOUNT": "1",
+                    "ORKEST_CLAUDE_ACCOUNT_HOME": str(self.external_path / "unrelated-claude"),
+                },
+            ):
+                code_codex, result_codex, _out, _summary, capture_codex = self.run_main(
+                    engine="codex",
+                    model="gpt-5.6-luna",
+                    no_change=True,
+                    expect_changes=False,
+                    allow_path=None,
+                )
+            self.assertEqual((code_codex, result_codex["status"]), (0, "completed"))
+            self.assertEqual(capture_codex.get("codex_home"), str(personal_codex))
+        finally:
+            RUNNER.shutil.rmtree(policy_dir, ignore_errors=True)
+
+        # 4. Single typed GEMINI_CLI_HOME=/profiles/antigravity-team preserves verbatim GEMINI_CLI_HOME in executor.
+        cfg_single_team = self.external_path / "monitor-single-team-agy.json"
+        cfg_single_team.write_text(
+            json.dumps(
+                {
+                    "accounts": [
+                        {
+                            "id": "agy-team-single",
+                            "provider": "antigravity",
+                            "env": {"GEMINI_CLI_HOME": str(team_gemini)},
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        with mock.patch.dict(
+            os.environ,
+            {
+                **host_clear,
+                "HOME": str(self.external_path),
+                "MONITOR_CONFIG": str(cfg_single_team),
+                "GEMINI_CLI_HOME": str(team_gemini),
+                "ANTIGRAVITY_APP_DATA_DIR": "",
+                "ORKEST_AGY_ACCOUNT_HOME": "",
+            },
+        ):
+            seen_team_envs: list[dict[str, str]] = []
+            orig_exec_env = RUNNER.executor_environment
+
+            def spy_team_env(*args, **kwargs):
+                out = orig_exec_env(*args, **kwargs)
+                seen_team_envs.append(out)
+                return out
+
+            with mock.patch.object(RUNNER, "executor_environment", side_effect=spy_team_env):
+                code_team_single, res_team_single, _out, _summary, _capture = self.run_main(
+                    engine="agy",
+                    model="gemini-3.8-flash-medium",
+                    no_change=True,
+                    expect_changes=False,
+                    allow_path=None,
+                )
+            self.assertEqual((code_team_single, res_team_single["status"]), (0, "completed"))
+            self.assertEqual(seen_team_envs[-1].get("GEMINI_CLI_HOME"), str(team_gemini))
+            self.assertEqual(
+                seen_team_envs[-1].get("ANTIGRAVITY_APP_DATA_DIR"),
+                str(team_gemini / "antigravity-cli"),
+            )
+
+        # 5. Single team account + live GEMINI_CLI_HOME + ANTIGRAVITY_APP_DATA_DIR=/alternate/live preserves live pair.
+        alt_live_app = self.external_path / "alternate" / "live"
+        alt_live_app.mkdir(parents=True, exist_ok=True)
+        with mock.patch.dict(
+            os.environ,
+            {
+                **host_clear,
+                "HOME": str(self.external_path),
+                "MONITOR_CONFIG": str(cfg_single_team),
+                "GEMINI_CLI_HOME": str(team_gemini),
+                "ANTIGRAVITY_APP_DATA_DIR": str(alt_live_app),
+            },
+        ):
+            seen_alt_live_envs: list[dict[str, str]] = []
+            orig_exec_env = RUNNER.executor_environment
+
+            def spy_alt_live_env(*args, **kwargs):
+                out = orig_exec_env(*args, **kwargs)
+                seen_alt_live_envs.append(out)
+                return out
+
+            with mock.patch.object(RUNNER, "executor_environment", side_effect=spy_alt_live_env):
+                code_alt_live, res_alt_live, _out, _summary, _capture = self.run_main(
+                    engine="agy",
+                    model="gemini-3.8-flash-medium",
+                    no_change=True,
+                    expect_changes=False,
+                    allow_path=None,
+                )
+            self.assertEqual((code_alt_live, res_alt_live["status"]), (0, "completed"))
+            self.assertEqual(seen_alt_live_envs[-1].get("GEMINI_CLI_HOME"), str(team_gemini))
+            self.assertEqual(seen_alt_live_envs[-1].get("ANTIGRAVITY_APP_DATA_DIR"), str(alt_live_app))

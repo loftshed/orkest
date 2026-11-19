@@ -47,7 +47,6 @@ ork
 orkest
 osascript
 osworld
-plaude
 plasmoid
 pousr
 PRIO

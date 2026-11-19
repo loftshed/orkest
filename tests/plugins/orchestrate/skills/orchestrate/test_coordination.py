@@ -674,6 +674,68 @@ class CoordinatorTests(unittest.TestCase):
         )
         self.assertEqual((code, checked["runner_status"]), (0, "verification_mutation"))
 
+    def test_reverify_upgrades_accepted_pre_tree_legacy_receipt_and_enforces_task_lock(self):
+        _, work = self.start("legacy-work", "implementation", "--verify-command", "test -f allowed/output.txt")
+        result_path = Path(work["result_path"])
+        legacy_result = COORDINATOR.read(result_path)
+        legacy_result["git_after"].pop("tree_oid", None)
+        legacy_result["git_after"].pop("fingerprint_version", None)
+        result_path.write_text(json.dumps(legacy_result), encoding="utf-8")
+        state = COORDINATOR.load(self.directory)
+        state["runs"][0]["result_sha256"] = COORDINATOR.digest(result_path)
+        state["status"] = "accepted"
+        COORDINATOR.save(self.directory, state)
+
+        # #10: Direct review --decision accept on a pre-tree legacy receipt requires reverify first.
+        state_active = COORDINATOR.load(self.directory)
+        state_active["status"] = "active"
+        COORDINATOR.save(self.directory, state_active)
+        proof = self.reviewed_evidence()
+        code_refuse, err_refuse = self.call(
+            "review", "--run-id", work["run_id"], "--decision", "accept", "--review-id", proof
+        )
+        self.assertEqual(code_refuse, 2)
+        self.assertIn("reverify", err_refuse)
+
+        # Restore accepted state and verify explicit reverify upgrades legacy receipt to v2 tree_oid.
+        state_acc = COORDINATOR.load(self.directory)
+        state_acc["status"] = "accepted"
+        COORDINATOR.save(self.directory, state_acc)
+        code, checked = self.call(
+            "reverify",
+            "--run-id",
+            work["run_id"],
+            "--request-id",
+            "upgrade-legacy-tree",
+            "--reason",
+            "Upgrade pre-tree legacy receipt",
+        )
+        self.assertEqual((code, checked["runner_status"]), (0, "completed"), checked)
+        upgraded = COORDINATOR.read(Path(checked["result_path"]))
+        self.assertEqual(upgraded["git_after"]["fingerprint_version"], 2)
+        self.assertTrue(upgraded["git_after"]["tree_oid"])
+
+        # #8: Coordinator task_json_lock creates and holds advisory task.json.lock.
+        lock_file = self.directory / "task.json.lock"
+        with COORDINATOR.task_json_lock(self.directory):
+            self.assertTrue(lock_file.is_file())
+            with lock_file.open("r+b"):
+                # Another process cannot take LOCK_EX | LOCK_NB while held (check via subprocess).
+                probe = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        (
+                            "import fcntl, sys; fd = open(sys.argv[1], 'r+b'); "
+                            "fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)"
+                        ),
+                        str(lock_file),
+                    ],
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertNotEqual(probe.returncode, 0)
+
     def test_investigation_can_start_without_a_hypothesis_and_is_audited_read_only(self):
         with mock.patch.dict(os.environ, {"FAKE_NO_CHANGE": "1"}):
             code, run = self.start("explore", "investigation")
@@ -2065,6 +2127,120 @@ class CoordinatorTests(unittest.TestCase):
                     cwd=self.fixture.repository.path,
                 )
                 self.assertEqual(progress.read(base, peer)["role"], "reviewer")
+
+    def test_dispatch_forwards_and_inherits_account_and_claude_config_dir(self):
+        COORDINATOR.RUNNER.shutil.rmtree(self.directory, ignore_errors=True)
+        self.assertEqual(self.call("init", "--task-spec", str(self.spec_path), "--host", "codex")[0], 0)
+        claude_dir = self.fixture.external_path / ".claude-team"
+        claude_dir.mkdir(parents=True, exist_ok=True)
+        monitor_cfg = self.fixture.external_path / "monitor-coord.json"
+        monitor_cfg.write_text(
+            json.dumps(
+                {
+                    "accounts": [
+                        {
+                            "id": "claude-team-id",
+                            "provider": "claude",
+                            "alias": "claude-team",
+                            "configDir": str(claude_dir),
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        with mock.patch.dict(os.environ, {"MONITOR_CONFIG": str(monitor_cfg)}):
+            code, first = self.call(
+                "dispatch",
+                "--kind",
+                "implementation",
+                "--request-id",
+                "impl-acct",
+                "--engine",
+                "claude",
+                "--model",
+                "claude-sonnet-4-6",
+                "--account",
+                "claude-team",
+                "--claude-config-dir",
+                str(claude_dir),
+            )
+            self.assertEqual(code, 0, first)
+            self.assertEqual(first["account"], "claude-team")
+            self.assertEqual(first["claude_config_dir"], str(claude_dir))
+            self.assertEqual(first["command"][first["command"].index("--account") + 1], "claude-team")
+            self.assertEqual(first["command"][first["command"].index("--claude-config-dir") + 1], str(claude_dir))
+
+            # Correction inherits account and claude_config_dir and rejects overrides.
+            corr_proof = self.reviewed_evidence()
+            bad_corr_code, bad_corr = self.call(
+                "dispatch",
+                "--kind",
+                "correction",
+                "--request-id",
+                "corr-override",
+                "--review-id",
+                corr_proof,
+                "--account",
+                "other-acct",
+            )
+            self.assertEqual(bad_corr_code, 2)
+            self.assertIn("omit overrides", bad_corr)
+
+            corr_code, corrected = self.call(
+                "dispatch",
+                "--kind",
+                "correction",
+                "--request-id",
+                "corr-inherit",
+                "--review-id",
+                corr_proof,
+            )
+            self.assertEqual(corr_code, 0, corrected)
+            self.assertEqual(corrected["account"], "claude-team")
+            self.assertEqual(corrected["claude_config_dir"], str(claude_dir))
+            self.assertEqual(corrected["command"][corrected["command"].index("--account") + 1], "claude-team")
+            self.assertEqual(
+                corrected["command"][corrected["command"].index("--claude-config-dir") + 1], str(claude_dir)
+            )
+
+            proof = self.reviewed_evidence()
+            self.assertEqual(
+                self.call("review", "--run-id", corrected["run_id"], "--decision", "accept", "--review-id", proof)[0],
+                0,
+            )
+
+            # Continue inherits account and claude_config_dir and rejects overrides.
+            bad_cont_code, bad_cont = self.call(
+                "dispatch",
+                "--kind",
+                "continue",
+                "--request-id",
+                "cont-override",
+                "--task-spec",
+                str(self.spec_path),
+                "--claude-config-dir",
+                str(claude_dir),
+            )
+            self.assertEqual(bad_cont_code, 2)
+            self.assertIn("omit overrides", bad_cont)
+
+            cont_code, continued = self.call(
+                "dispatch",
+                "--kind",
+                "continue",
+                "--request-id",
+                "cont-inherit",
+                "--task-spec",
+                str(self.spec_path),
+            )
+            self.assertEqual(cont_code, 0, continued)
+            self.assertEqual(continued["account"], "claude-team")
+            self.assertEqual(continued["claude_config_dir"], str(claude_dir))
+            self.assertEqual(continued["command"][continued["command"].index("--account") + 1], "claude-team")
+            self.assertEqual(
+                continued["command"][continued["command"].index("--claude-config-dir") + 1], str(claude_dir)
+            )
 
 
 class CompletionEventConcurrencyTests(unittest.TestCase):

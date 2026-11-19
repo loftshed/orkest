@@ -412,6 +412,41 @@ class AuthorityTests(unittest.TestCase):
             os.environ.pop("ORCHESTRATE_HOME", None)
             self.assertEqual(AUTHORITY.cache_dir(), legacy_home)
 
+    def test_standing_takeover_cli_passes_verified_view_to_account_of(self) -> None:
+        import io
+
+        succession_mod = AUTHORITY.module("succession")
+        fake_view = {"schema": "monitor.snapshot.v1", "accounts": [], "lanes": []}
+        with (
+            mock.patch.object(succession_mod, "fresh_view", return_value=fake_view),
+            mock.patch.object(succession_mod, "monitor_config", return_value={"accounts": []}),
+            mock.patch.object(succession_mod, "account_of", return_value=("deputy-acct", "")) as acct_mock,
+            mock.patch.object(AUTHORITY, "takeover", return_value={"status": "pending"}) as tk_mock,
+            mock.patch.object(
+                AUTHORITY,
+                "session_facts",
+                return_value={"session": DEPUTY, "harness": "codex", "model": None, "accountHome": "/x", "repo": "/r"},
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            code = AUTHORITY.main(
+                [
+                    "takeover",
+                    "--team",
+                    "team",
+                    "--session",
+                    DEPUTY,
+                    "--harness",
+                    "codex",
+                    "--expect-generation",
+                    "1",
+                    "--standing",
+                ]
+            )
+        self.assertEqual(code, 0)
+        self.assertIs(acct_mock.call_args.kwargs.get("view"), fake_view)
+        self.assertIs(tk_mock.call_args.kwargs.get("view"), fake_view)
+
 
 if __name__ == "__main__":
     unittest.main()

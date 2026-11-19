@@ -64,14 +64,21 @@ def view() -> dict:
         "schema": "monitor.snapshot.v1",
         "generatedAt": "2026-09-25T17:00:00.000Z",
         "accounts": [
-            {"id": "claude-work", "provider": "claude", "billing": "work"},
-            {"id": "claude-personal", "provider": "claude", "billing": "personal"},
+            {"id": "claude-work", "provider": "claude", "billing": "work", "configDir": "~/.claude", "tags": ["work"]},
+            {
+                "id": "claude-alt",
+                "provider": "claude",
+                "billing": "personal",
+                "alias": "claude-alt",
+                "configDir": "~/.claude-alt",
+                "tags": ["personal"],
+            },
             {"id": "codex", "provider": "codex", "billing": None},
             {"id": "antigravity", "provider": "antigravity", "billing": None},
         ],
         "lanes": [
-            lane("claude-personal", "all", "Claude · personal · all models", surplus=44),
-            lane("claude-personal", "fable", "Claude · personal · Fable", surplus=44),
+            lane("claude-alt", "all", "Claude · alt · all models", surplus=44),
+            lane("claude-alt", "fable", "Claude · alt · Fable", surplus=44),
             lane("antigravity", "claude-gpt", "Antigravity · Claude & GPT", usable=27, surplus=9),
             lane("antigravity", "gemini", "Antigravity · Gemini", usable=6, surplus=2),
             lane("codex", "codex", "Codex · ChatGPT", usable=51, surplus=-19),
@@ -109,7 +116,7 @@ class RouteMappingTests(unittest.TestCase):
         lanes = QUOTA.pool_lanes("claude", "claude-fable-5-1", view())
         self.assertEqual(
             [(entry["accountId"], entry["poolId"]) for entry in lanes],
-            [("claude-personal", "fable"), ("claude-work", "fable")],
+            [("claude-alt", "fable"), ("claude-work", "fable")],
         )
         self.assertEqual(lanes[0]["billing"], "personal")
 
@@ -183,18 +190,18 @@ class CheckTests(unittest.TestCase):
 
     def test_claude_config_dir_selects_matching_account_pool(self) -> None:
         current = view()
-        # Default ~/.claude (work) is blocked even though claude-personal is first in the lane list.
+        # Default ~/.claude (work) is blocked even though claude-alt is first in the lane list.
         work_result = QUOTA.check("claude", "opus", current, claude_config_dir=Path("~/.claude"))
         self.assertEqual((work_result["accountId"], work_result["status"]), ("claude-work", "blocked"))
-        personal_result = QUOTA.check("claude", "opus", current, claude_config_dir=Path("~/.claude-personal"))
-        self.assertEqual((personal_result["accountId"], personal_result["status"]), ("claude-personal", "available"))
+        alt_result = QUOTA.check("claude", "opus", current, claude_config_dir=Path("~/.claude-alt"))
+        self.assertEqual((alt_result["accountId"], alt_result["status"]), ("claude-alt", "available"))
         # check_quota alias is also available.
         self.assertEqual(
             QUOTA.check_quota("claude", "opus", current, claude_config_dir="~/.claude")["accountId"], "claude-work"
         )
         # Inherited CLAUDE_CONFIG_DIR does not redirect a default check (claude_config_dir=None),
         # because executor_environment("claude") strips CLAUDE_CONFIG_DIR unless --claude-config-dir is passed.
-        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "/Users/example/.claude-personal"}):
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "/Users/example/.claude-alt"}):
             default_result = QUOTA.check("claude", "opus", current, claude_config_dir=None)
         self.assertEqual((default_result["accountId"], default_result["status"]), ("claude-work", "blocked"))
         # Parent path segments containing "personal" or "work" do not shadow the profile directory basename.
@@ -205,14 +212,121 @@ class CheckTests(unittest.TestCase):
         missing_pct["lanes"][3]["availableNowPct"] = None
         self.assertEqual(QUOTA.check("agy", "gemini-3.8-flash-medium", missing_pct)["status"], "unknown")
         self.assertIn("quota is exhausted", QUOTA.blocked_message("claude", "opus", work_result, missing_pct))
-        # Exact configDir on monitor accounts is preserved by pool_lanes and matched by _match_claude_lane.
+        # Exact configDir on monitor accounts is preserved by pool_lanes and matched by route_account_lane.
         with_config_dirs = view()
         with_config_dirs["accounts"][0]["configDir"] = "~/.claude-work-custom"
-        with_config_dirs["accounts"][1]["configDir"] = "~/.claude-personal-custom"
+        with_config_dirs["accounts"][1]["configDir"] = "~/.claude-alt-custom"
         custom_work = QUOTA.check("claude", "opus", with_config_dirs, claude_config_dir="~/.claude-work-custom")
         self.assertEqual((custom_work["accountId"], custom_work["status"]), ("claude-work", "blocked"))
-        custom_personal = QUOTA.check("claude", "opus", with_config_dirs, claude_config_dir="~/.claude-personal-custom")
-        self.assertEqual((custom_personal["accountId"], custom_personal["status"]), ("claude-personal", "available"))
+        custom_alt = QUOTA.check("claude", "opus", with_config_dirs, claude_config_dir="~/.claude-alt-custom")
+        self.assertEqual((custom_alt["accountId"], custom_alt["status"]), ("claude-alt", "available"))
+
+    def test_route_account_lane_ranks_n_accounts_per_provider_and_matches_tags(self) -> None:
+        multi_view = {
+            "schema": "monitor.snapshot.v1",
+            "accounts": [
+                {
+                    "id": "claude-p1",
+                    "provider": "claude",
+                    "tags": ["personal"],
+                    "configDir": "~/.claude-p1",
+                },
+                {
+                    "id": "claude-p2",
+                    "provider": "claude",
+                    "tags": ["personal"],
+                    "configDir": "~/.claude-p2",
+                },
+                {
+                    "id": "claude-client",
+                    "provider": "claude",
+                    "category": "client-acme",
+                    "configDir": "~/.claude-acme",
+                },
+                {
+                    "id": "codex-w1",
+                    "provider": "codex",
+                    "tags": ["work"],
+                    "accountHome": "/tmp/codex-w1",
+                },
+                {
+                    "id": "codex-w2",
+                    "provider": "codex",
+                    "tags": ["work"],
+                    "accountHome": "/tmp/codex-w2",
+                },
+                {
+                    "id": "codex-untagged",
+                    "provider": "codex",
+                    "accountHome": "/tmp/codex-untagged",
+                },
+            ],
+            "lanes": [
+                lane("claude-p1", "all", "Claude · p1", usable=50, surplus=12),
+                lane("claude-p2", "all", "Claude · p2", usable=80, surplus=48),
+                lane("claude-client", "all", "Claude · acme", usable=90, surplus=65),
+                lane("codex-w1", "codex", "Codex · w1", usable=40, surplus=5),
+                lane("codex-w2", "codex", "Codex · w2", usable=85, surplus=35),
+                lane("codex-untagged", "codex", "Codex · untagged", usable=95, surplus=70),
+            ],
+        }
+        # Exact accountId wins over higher-surplus accounts.
+        by_id = QUOTA.check("claude", "opus", multi_view, account_id="claude-p1")
+        self.assertEqual(by_id["accountId"], "claude-p1")
+        # Exact canonical codex_home matches codex-w1 directly.
+        by_home = QUOTA.check("codex", "gpt-5.6-luna", multi_view, codex_home="/tmp/codex-w1")
+        self.assertEqual(by_home["accountId"], "codex-w1")
+        # Explicit tag filter across N accounts picks highest-surplus matching account.
+        by_tag_claude = QUOTA.check("claude", "opus", multi_view, tags=["personal"])
+        self.assertEqual(by_tag_claude["accountId"], "claude-p2")
+        by_tag_codex = QUOTA.check("codex", "gpt-5.6-luna", multi_view, tags=["work"])
+        self.assertEqual(by_tag_codex["accountId"], "codex-w2")
+        # Category tag selects client-tagged account.
+        by_cat = QUOTA.check("claude", "opus", multi_view, category="client-acme")
+        self.assertEqual(by_cat["accountId"], "claude-client")
+        # Untargeted check picks highest-surplus allowed account (including untagged).
+        highest_codex = QUOTA.check("codex", "gpt-5.6-luna", multi_view)
+        self.assertEqual(highest_codex["accountId"], "codex-untagged")
+        # allowed_account_ids restricts candidates before ranking.
+        restricted = QUOTA.check("codex", "gpt-5.6-luna", multi_view, allowed_account_ids={"codex-w1", "codex-w2"})
+        self.assertEqual(restricted["accountId"], "codex-w2")
+
+    def test_route_account_lane_never_falls_back_on_missed_account_pin(self) -> None:
+        lanes = [
+            {
+                **lane("codex-a", "codex", "Codex · A", usable=90, surplus=50),
+                "alias": "work-codex",
+                "aliases": ["team-codex"],
+            },
+            {**lane("codex-b", "codex", "Codex · B", usable=95, surplus=70), "alias": "personal-codex"},
+        ]
+        # Exact account_id and account_alias (including aliases list) match strictly.
+        self.assertEqual(QUOTA.route_account_lane(lanes, engine="codex", account_id="codex-a")["accountId"], "codex-a")
+        self.assertEqual(
+            QUOTA.route_account_lane(lanes, engine="codex", account_alias="team-codex")["accountId"],
+            "codex-a",
+        )
+        # Missing account_id or account_alias pins must return None instead of falling back to codex-b.
+        self.assertIsNone(QUOTA.route_account_lane(lanes, engine="codex", account_id="codex-missing"))
+        self.assertIsNone(QUOTA.route_account_lane(lanes, engine="codex", account_alias="missing-alias"))
+        # check() surfaces missing pinned account as unknown rather than checking another account.
+        view_with_aliases = {
+            "schema": "monitor.snapshot.v1",
+            "accounts": [
+                {"id": "codex-a", "provider": "codex", "alias": "work-codex", "aliases": ["team-codex"]},
+                {"id": "codex-b", "provider": "codex", "alias": "personal-codex"},
+            ],
+            "lanes": lanes,
+        }
+        self.assertEqual(
+            QUOTA.check("codex", "gpt-5.6-luna", view_with_aliases, account_alias="team-codex")["accountId"], "codex-a"
+        )
+        self.assertEqual(
+            QUOTA.check("codex", "gpt-5.6-luna", view_with_aliases, account_id="codex-missing")["status"], "unknown"
+        )
+        self.assertEqual(
+            QUOTA.check("codex", "gpt-5.6-luna", view_with_aliases, account_alias="missing-alias")["status"], "unknown"
+        )
 
 
 class RecommendTests(unittest.TestCase):
@@ -262,9 +376,7 @@ class RecommendTests(unittest.TestCase):
         )
 
     def test_personal_quota_joins_when_authorized_and_ranks_by_unused_capacity(self) -> None:
-        self.assertEqual(
-            self.recommend(personal_quota_authorized=True)[0], ("claude-sonnet-5", "monitor:claude-personal")
-        )
+        self.assertEqual(self.recommend(personal_quota_authorized=True)[0], ("claude-sonnet-5", "monitor:claude-alt"))
 
     def test_without_monitor_access_is_unknown_not_zero(self) -> None:
         records = QUOTA.access_records(None, self.registry)

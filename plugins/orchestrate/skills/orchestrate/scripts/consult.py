@@ -207,6 +207,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Claude account profile for --engine claude; choosing a profile chooses its billing",
     )
     parser.add_argument(
+        "--account",
+        help="Configured Monitor account ID or alias to run the consultation under",
+    )
+    parser.add_argument(
         "--billing-mode",
         choices=("unknown", "subscription", "personal_subscription", "api"),
         default="unknown",
@@ -476,8 +480,9 @@ def load_follow_up(path: Path) -> dict[str, Any]:
 
 
 def resolve_route(args: argparse.Namespace, previous: dict[str, Any] | None) -> dict[str, Any]:
-    """Engine, model, effort and variant: pinned by a follow-up, else explicit, else inferred, else the route."""
+    """Engine, model, effort, variant and account: pinned by a follow-up, else explicit, else inferred, else the route."""
     runner = _runner()
+    routing = runner._MODEL_ROUTING_MOD
     if previous is not None:
         if args.engine and args.engine != previous["engine"]:
             raise _error(f"a follow-up stays on {previous['engine']}; ask a fresh question to change the engine")
@@ -495,6 +500,19 @@ def resolve_route(args: argparse.Namespace, previous: dict[str, Any] | None) -> 
         config_dir = previous.get("claude_config_dir")
         if args.claude_config_dir and str(args.claude_config_dir.expanduser()) != (config_dir or ""):
             raise _error("a follow-up stays on the profile that answered; it cannot change the billing account")
+        requested_account = getattr(args, "account", None)
+        if requested_account:
+            prev_acct = previous.get("account_id")
+            prev_alias = previous.get("account_alias")
+            try:
+                resolved_req = routing.resolve_configured_account(requested_account, strict=True)
+            except ValueError as exc:
+                raise _error(str(exc), 2) from exc
+            req_id = resolved_req.get("account_id") if resolved_req else requested_account
+            if prev_acct and req_id != prev_acct and requested_account not in (prev_acct, prev_alias):
+                raise _error("a follow-up stays on the account that answered; it cannot change the billing account")
+            if not prev_acct and resolved_req is not None:
+                raise _error("a follow-up stays on the account that answered; it cannot change the billing account")
         return {
             "engine": previous["engine"],
             "model": previous["model"],
@@ -502,6 +520,32 @@ def resolve_route(args: argparse.Namespace, previous: dict[str, Any] | None) -> 
             "variant": previous.get("variant"),
             "route": None,
             "claude_config_dir": config_dir,
+            "claude_account_home": previous.get("claude_account_home"),
+            "codex_home": previous.get("codex_home"),
+            "agy_home": previous.get("agy_home"),
+            "agy_app_data_dir": previous.get("agy_app_data_dir"),
+            "effective_claude_config_dir": config_dir or previous.get("effective_claude_config_dir"),
+            "effective_claude_account_home": (
+                previous.get("claude_account_home") or previous.get("effective_claude_account_home")
+            ),
+            "effective_codex_home": previous.get("codex_home") or previous.get("effective_codex_home"),
+            "effective_agy_home": previous.get("agy_home") or previous.get("effective_agy_home"),
+            "effective_agy_app_data_dir": (
+                previous.get("agy_app_data_dir") or previous.get("effective_agy_app_data_dir")
+            ),
+            "account_id": previous.get("account_id"),
+            "account_alias": previous.get("account_alias"),
+            "account_provider": previous.get("account_provider"),
+            "account_tags": previous.get("account_tags") or [],
+            "account_billing": previous.get("account_billing"),
+            "explicit_account": bool(
+                previous.get("explicit_account")
+                or config_dir
+                or previous.get("claude_account_home")
+                or previous.get("codex_home")
+                or previous.get("agy_home")
+                or previous.get("agy_app_data_dir")
+            ),
         }
     routes = runner.routes_module().load_routes()
     route_name = args.route
@@ -510,6 +554,18 @@ def resolve_route(args: argparse.Namespace, previous: dict[str, Any] | None) -> 
     if route_name is not None and route_name not in routes:
         raise _error(f"unknown --route {route_name!r}; configured: {', '.join(sorted(routes))}")
     engine = args.engine
+    requested_account = getattr(args, "account", None)
+    if requested_account and not engine:
+        try:
+            acct = routing.resolve_configured_account(requested_account, strict=True)
+        except ValueError as exc:
+            raise _error(str(exc), 2) from exc
+        if acct is None:
+            raise _error(
+                f"unknown --account {requested_account!r}: not found in Monitor config {routing.monitor_config_path()}",
+                4,
+            )
+        engine = acct["engine"]
     if args.model and not engine:
         base_model, _ = runner.split_opencode_model(None, args.model)
         assert base_model is not None
@@ -519,40 +575,140 @@ def resolve_route(args: argparse.Namespace, previous: dict[str, Any] | None) -> 
         if engine is None:
             raise _error(f"cannot tell which engine runs {args.model!r}; pass --engine")
     namespace = argparse.Namespace(
-        route=route_name, engine=engine, model=args.model, effort=args.effort, variant=args.variant
+        route=route_name,
+        engine=engine,
+        model=args.model,
+        effort=args.effort,
+        variant=args.variant,
+        claude_config_dir=args.claude_config_dir,
+        account=requested_account,
     )
     if engine and route_name:
-        # An explicit model or engine that the role does not cover still gets that engine's own defaults.
-        namespace.route = route_name if routes[route_name]["engine"] == engine else None
+        # An explicit model, account, or engine that the role does not cover still gets that engine's own defaults.
+        normalize_route_engine = getattr(routing, "_normalize_route_engine", lambda val: val)
+        namespace.route = route_name if normalize_route_engine(routes[route_name].get("engine")) == engine else None
     resolved = runner.resolve_route(namespace)
     if resolved.engine != "opencode" and resolved.variant:
         raise _error("--variant is only valid with --engine opencode")
+    effective_claude_dir = args.claude_config_dir or getattr(resolved, "claude_config_dir", None)
+    claude_account_home = getattr(resolved, "claude_account_home", None)
+    codex_home = getattr(resolved, "codex_home", None)
+    agy_home = getattr(resolved, "agy_home", None)
+    agy_app_data_dir = getattr(resolved, "agy_app_data_dir", None)
+
+    def _opt_path_str(val: Any) -> str | None:
+        return str(Path(val).expanduser()) if val else None
+
     return {
         "engine": resolved.engine,
         "model": resolved.model or runner.preferred_model(resolved.engine),
         "effort": resolved.effort,
         "variant": resolved.variant,
         "route": resolved.resolved_route,
-        "claude_config_dir": str(args.claude_config_dir.expanduser()) if args.claude_config_dir else None,
+        "claude_config_dir": _opt_path_str(effective_claude_dir),
+        "claude_account_home": _opt_path_str(claude_account_home),
+        "codex_home": _opt_path_str(codex_home),
+        "agy_home": _opt_path_str(agy_home),
+        "agy_app_data_dir": _opt_path_str(agy_app_data_dir),
+        "effective_claude_config_dir": _opt_path_str(
+            effective_claude_dir or getattr(resolved, "effective_claude_config_dir", None)
+        ),
+        "effective_claude_account_home": _opt_path_str(
+            claude_account_home or getattr(resolved, "effective_claude_account_home", None)
+        ),
+        "effective_codex_home": _opt_path_str(codex_home or getattr(resolved, "effective_codex_home", None)),
+        "effective_agy_home": _opt_path_str(agy_home or getattr(resolved, "effective_agy_home", None)),
+        "effective_agy_app_data_dir": _opt_path_str(
+            agy_app_data_dir or getattr(resolved, "effective_agy_app_data_dir", None)
+        ),
+        "account_id": getattr(resolved, "account_id", None),
+        "account_alias": getattr(resolved, "account_alias", None),
+        "account_provider": getattr(resolved, "account_provider", None),
+        "account_tags": list(getattr(resolved, "account_tags", None) or []),
+        "account_billing": getattr(resolved, "account_billing", None),
+        "explicit_account": routing._has_explicit_account_pin(
+            resolved.engine,
+            explicit_account=bool(requested_account or getattr(resolved, "explicit_account", False)),
+            claude_config_dir=args.claude_config_dir,
+            include_child_markers=False,
+        ),
     }
 
 
-def decide_transport(args: argparse.Namespace, engine: str, host: str | None, previous: dict[str, Any] | None) -> str:
+def _effective_claude_profile_dir(value: str | Path | None) -> Path:
+    if not value:
+        return (Path.home() / ".claude").resolve()
+    return Path(value).expanduser().resolve()
+
+
+def _claude_profile_dirs_match(first: str | Path | None, second: str | Path | None) -> bool:
+    return _effective_claude_profile_dir(first) == _effective_claude_profile_dir(second)
+
+
+def _agy_paths_match(route: dict[str, Any]) -> bool:
+    return _runner()._MODEL_ROUTING_MOD._agy_paths_match(
+        route.get("agy_home") or route.get("effective_agy_home"),
+        route.get("agy_app_data_dir") or route.get("effective_agy_app_data_dir"),
+    )
+
+
+def _route_switches_host_profile(route: dict[str, Any]) -> bool:
+    engine = route.get("engine")
+    if engine and _runner()._MODEL_ROUTING_MOD._child_marker_switches_host_profile(engine):
+        return True
+    if engine == "claude":
+        host_claude_dir = os.environ.get("CLAUDE_CONFIG_DIR") or None
+        target_dir = route.get("claude_config_dir")
+        if target_dir is None and route.get("claude_account_home"):
+            target_dir = str(Path(route["claude_account_home"]).expanduser() / ".claude")
+        if target_dir or route.get("claude_account_home") or route.get("explicit_account"):
+            return not _claude_profile_dirs_match(target_dir, host_claude_dir)
+        return False
+    if engine == "codex":
+        if route.get("codex_home") or route.get("explicit_account"):
+            host_codex = os.environ.get("CODEX_HOME") or str(Path.home() / ".codex")
+            route_codex = (
+                Path(route["codex_home"]).expanduser().resolve()
+                if route.get("codex_home")
+                else (Path.home() / ".codex").resolve()
+            )
+            return route_codex != Path(host_codex).expanduser().resolve()
+        return False
+    if engine == "agy":
+        if route.get("agy_home") or route.get("agy_app_data_dir") or route.get("explicit_account"):
+            return not _agy_paths_match(route)
+        return False
+    return False
+
+
+def decide_transport(
+    args: argparse.Namespace,
+    engine: str,
+    host: str | None,
+    previous: dict[str, Any] | None,
+    route: dict[str, Any] | None = None,
+) -> str:
     if previous is not None:
         if args.transport == "native":
             raise _error("a follow-up continues the executor session that answered; it cannot move to native tools")
         return "executor"
+    switches_profile = _route_switches_host_profile(route or {})
+    if not switches_profile and engine == "claude" and args.claude_config_dir:
+        host_claude_dir = os.environ.get("CLAUDE_CONFIG_DIR") or None
+        switches_profile = not _claude_profile_dirs_match(args.claude_config_dir, host_claude_dir)
     if args.transport == "native":
         if host != engine:
             raise _error(
                 f"--transport native needs the calling harness to run {engine} models itself (host: {host or 'unknown'})"
             )
+        if switches_profile:
+            raise _error("--transport native cannot switch to a different account/profile; use --transport executor")
         return "native"
     if args.transport == "executor":
         return "executor"
     # auto: a model the caller's own harness runs goes to its native tools, unless the caller chose
-    # another billing boundary (a Claude profile) that native tools cannot switch to.
-    if host == engine and not (engine == "claude" and args.claude_config_dir):
+    # another billing/account boundary that native tools cannot switch to.
+    if host == engine and not switches_profile:
         return "native"
     return "executor"
 
@@ -600,6 +756,13 @@ def build_request(args: argparse.Namespace, *, shared_inputs: dict[str, Any] | N
         raise _error("--question is required")
     previous = load_follow_up(args.follow_up) if args.follow_up else None
     intent, repository = resolve_reading(args, previous)
+    policy_cwd = repository
+    if policy_cwd is None:
+        repo_policy = runner.bundled_module("repo_policy")
+        try:
+            policy_cwd = str(repo_policy.resolve_repo_root(Path.cwd(), strict=True))
+        except repo_policy.PolicyConfigError as exc:
+            raise _error(str(exc), 2) from exc
     panel_inputs = shared_inputs
     question = (
         panel_inputs["question"] if panel_inputs is not None else read_text_argument(args.question, option="--question")
@@ -624,7 +787,7 @@ def build_request(args: argparse.Namespace, *, shared_inputs: dict[str, Any] | N
     )
     route = resolve_route(args, previous)
     host = args.host or detect_host()
-    transport = decide_transport(args, route["engine"], host, previous)
+    transport = decide_transport(args, route["engine"], host, previous, route=route)
     if transport == "native" and args.detach:
         raise _error("--detach runs the executor; a native consultation is asynchronous through the host's own tools")
     timeout = args.timeout or DEFAULT_TIMEOUTS[intent]
@@ -634,6 +797,7 @@ def build_request(args: argparse.Namespace, *, shared_inputs: dict[str, Any] | N
         "created_at": runner.utc_now(),
         "intent": intent,
         "read": repository,
+        "policy_cwd": policy_cwd,
         "web": bool(
             getattr(args, "web", False)
             or getattr(args, "route", None) == "web-research"
@@ -659,6 +823,8 @@ def build_request(args: argparse.Namespace, *, shared_inputs: dict[str, Any] | N
                 "session_id": previous["session_id"],
                 "workspace": previous.get("workspace"),
                 "usage_cumulative": (previous.get("usage") or {}).get("cumulative"),
+                "account_id": previous.get("account_id"),
+                "account_alias": previous.get("account_alias"),
             }
             if previous
             else None
@@ -743,11 +909,15 @@ def record_consultation(
     return record
 
 
-def codex_mcp_server_names(workspace: Path) -> list[str]:
+def codex_mcp_server_names(workspace: Path, *, codex_home: str | Path | None = None) -> list[str]:
     """Configured Codex MCP server names across user and repository config files."""
     import tomllib
 
-    home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
+    home = Path(
+        codex_home
+        or os.environ.get("ORKEST_CODEX_ACCOUNT_HOME")
+        or os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))
+    ).expanduser()
     paths = [home / "config.toml"]
     with contextlib.suppress(OSError):
         resolved = workspace.resolve()
@@ -787,6 +957,7 @@ def consult_command(
     agy_stdin: bool,
     new_session_id: str | None,
     executor_version: str | None,
+    codex_home: str | Path | None = None,
 ) -> list[str]:
     runner = _runner()
     if engine == "codex":
@@ -805,7 +976,7 @@ def consult_command(
         ]
         if web:
             command.append("--search")
-        mcp_names = codex_mcp_server_names(workspace)
+        mcp_names = codex_mcp_server_names(workspace, codex_home=codex_home)
         if mcp_names:
             entries = ",".join(f"{json.dumps(name)}={{enabled=false}}" for name in mcp_names)
             command += ["-c", f"mcp_servers={{{entries}}}"]
@@ -899,6 +1070,11 @@ def consult_environment(
     *,
     reading: bool,
     web: bool = False,
+    claude_account_home: str | Path | None = None,
+    codex_home: str | Path | None = None,
+    agy_home: str | Path | None = None,
+    agy_app_data_dir: str | Path | None = None,
+    pinned_account: bool = False,
 ) -> dict[str, str]:
     environment = _runner().executor_environment(
         engine,
@@ -906,6 +1082,11 @@ def consult_environment(
         claude_config_dir,
         session_id=session_id,
         read_only=True,
+        claude_account_home=claude_account_home,
+        codex_home=codex_home,
+        agy_home=agy_home,
+        agy_app_data_dir=agy_app_data_dir,
+        pinned_account=pinned_account,
     )
     # A standalone consultant must not inherit the supervising actor's mailbox identity.
     for key in ("AGENT_MAILBOX_SESSION", "AGENT_MAILBOX_LISTENER_SESSION", "AGENT_MAILBOX_PEER"):
@@ -1040,6 +1221,16 @@ def base_result(request: dict[str, Any], *, started_at: str) -> dict[str, Any]:
         "variant": request.get("variant"),
         "billing_mode": request["billing_mode"],
         "claude_config_dir": request.get("claude_config_dir"),
+        "claude_account_home": request.get("claude_account_home"),
+        "codex_home": request.get("codex_home"),
+        "agy_home": request.get("agy_home"),
+        "agy_app_data_dir": request.get("agy_app_data_dir"),
+        "account_id": request.get("account_id"),
+        "account_alias": request.get("account_alias"),
+        "account_provider": request.get("account_provider"),
+        "account_tags": request.get("account_tags") or [],
+        "account_billing": request.get("account_billing"),
+        "explicit_account": bool(request.get("explicit_account")),
         "timeout": request["timeout"],
         "question": request["question"],
         "context_chars": len(request.get("context") or ""),
@@ -1123,6 +1314,8 @@ def perform(
     output_format: str,
     dry_run: bool,
     emit_output: bool = True,
+    recheck_policy: bool = False,
+    transport_mode: str | None = None,
 ) -> int:
     runner = _runner()
     started_at = runner.utc_now()
@@ -1130,6 +1323,8 @@ def perform(
     directory = prepare_consult_dir(out_dir, request.get("read"))
     result_path = directory / "result.json"
     try:
+        if recheck_policy:
+            enforce_policy(request, transport_mode=transport_mode)
         return _perform(
             request,
             directory=directory,
@@ -1189,13 +1384,23 @@ def _perform(
     engine = request["engine"]
     intent = request["intent"]
     executable, version, model, selection, catalog, effort, variant = preflight(request)
+    eff_claude_dir = request.get("claude_config_dir") or request.get("effective_claude_config_dir")
+    eff_claude_home = request.get("claude_account_home") or request.get("effective_claude_account_home")
+    eff_codex_home = request.get("codex_home") or request.get("effective_codex_home")
+    eff_agy_home = request.get("agy_home") or request.get("effective_agy_home")
+    eff_agy_app_data_dir = request.get("agy_app_data_dir") or request.get("effective_agy_app_data_dir")
     if not dry_run:
         runner.quota_gate(
             engine,
             model,
             ignore=request.get("ignore_quota", False),
-            claude_config_dir=request.get("claude_config_dir"),
+            claude_config_dir=eff_claude_dir,
             allow_credits=request.get("allow_credits", False),
+            account_id=request.get("account_id"),
+            account_alias=request.get("account_alias"),
+            codex_home=eff_codex_home,
+            agy_home=eff_agy_home,
+            tags=request.get("account_tags"),
         )
     previous = request.get("previous") or {}
     session_id = previous.get("session_id")
@@ -1240,6 +1445,7 @@ def _perform(
         agy_stdin=agy_stdin,
         new_session_id=new_session_id,
         executor_version=version,
+        codex_home=eff_codex_home,
     )
     result = {
         **base_result(request, started_at=started_at),
@@ -1289,10 +1495,15 @@ def _perform(
     environment = consult_environment(
         engine,
         workspace,
-        request.get("claude_config_dir"),
+        eff_claude_dir,
         session_id or new_session_id,
         reading=reading,
         web=bool(request.get("web") or request.get("route") == "web-research"),
+        claude_account_home=eff_claude_home,
+        codex_home=eff_codex_home,
+        agy_home=eff_agy_home,
+        agy_app_data_dir=eff_agy_app_data_dir,
+        pinned_account=bool(request.get("explicit_account")),
     )
     stdin_path: Path | None = prompt_path if engine in ("codex", "claude") else None
     if agy_stdin:
@@ -1459,8 +1670,13 @@ def launch_detached(request: dict[str, Any], args: argparse.Namespace) -> int:
         request["engine"],
         model,
         ignore=request.get("ignore_quota", False),
-        claude_config_dir=request.get("claude_config_dir"),
+        claude_config_dir=request.get("claude_config_dir") or request.get("effective_claude_config_dir"),
         allow_credits=request.get("allow_credits", False),
+        account_id=request.get("account_id"),
+        account_alias=request.get("account_alias"),
+        codex_home=request.get("codex_home") or request.get("effective_codex_home"),
+        agy_home=request.get("agy_home") or request.get("effective_agy_home"),
+        tags=request.get("account_tags"),
     )
     request = {**request, "model": model, "effort": effort["requested"], "variant": variant}
     job_dir = prepare_consult_dir(None, request.get("read"))
@@ -1484,6 +1700,29 @@ def launch_detached(request: dict[str, Any], args: argparse.Namespace) -> int:
         "--format",
         args.format,
     ]
+    child_env = dict(os.environ)
+    if request.get("explicit_account"):
+        engine = request.get("engine")
+        if engine == "claude":
+            child_env["ORKEST_PINNED_CLAUDE_ACCOUNT"] = "1"
+        elif engine == "codex":
+            child_env["ORKEST_PINNED_CODEX_ACCOUNT"] = "1"
+        elif engine == "agy":
+            child_env["ORKEST_PINNED_AGY_ACCOUNT"] = "1"
+        if not request.get("claude_account_home"):
+            child_env.pop("ORKEST_CLAUDE_ACCOUNT_HOME", None)
+        if not request.get("codex_home"):
+            child_env.pop("ORKEST_CODEX_ACCOUNT_HOME", None)
+        if not request.get("agy_app_data_dir") and not request.get("agy_home"):
+            child_env.pop("ORKEST_AGY_ACCOUNT_HOME", None)
+    if request.get("claude_account_home"):
+        child_env["ORKEST_CLAUDE_ACCOUNT_HOME"] = str(request["claude_account_home"])
+    if request.get("codex_home"):
+        child_env["ORKEST_CODEX_ACCOUNT_HOME"] = str(request["codex_home"])
+    if request.get("agy_app_data_dir"):
+        child_env["ORKEST_AGY_ACCOUNT_HOME"] = str(request["agy_app_data_dir"])
+    elif request.get("agy_home"):
+        child_env["ORKEST_AGY_ACCOUNT_HOME"] = str(request["agy_home"])
     stdout_path = job_dir / "runner.stdout"
     stderr_path = job_dir / "runner.stderr"
     with (
@@ -1493,7 +1732,7 @@ def launch_detached(request: dict[str, Any], args: argparse.Namespace) -> int:
         process = subprocess.Popen(
             command,
             cwd=job_dir,
-            env=dict(os.environ),
+            env=child_env,
             stdin=subprocess.DEVNULL,
             stdout=stdout_handle,
             stderr=stderr_handle,
@@ -1529,10 +1768,247 @@ def launch_detached(request: dict[str, Any], args: argparse.Namespace) -> int:
     return 0
 
 
-def enforce_policy(request: dict[str, Any]) -> None:
-    """Refuse a consultant whose engine the repository's policy denies (`ork policy`)."""
-    target = Path(request["read"]) if request.get("read") else Path.cwd()
-    _runner().enforce_repo_policy(target, request["engine"], request.get("claude_config_dir"))
+def _call_enforce_repo_policy(
+    runner: Any,
+    target: Path,
+    engine: str,
+    claude_config_dir: str | Path | None,
+    *,
+    account_id: str | None = None,
+    provider: str | None = None,
+    billing_mode: str | None = None,
+    tags: list[str] | tuple[str, ...] | None = None,
+    account_alias: str | None = None,
+    codex_home: str | Path | None = None,
+    agy_home: str | Path | None = None,
+    agy_app_data_dir: str | Path | None = None,
+) -> Path | None:
+    import inspect
+
+    fn = runner.enforce_repo_policy
+    target_fn = fn.side_effect if callable(getattr(fn, "side_effect", None)) else fn
+    params = inspect.signature(target_fn).parameters
+    accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    optional = {
+        "account_id": account_id,
+        "provider": provider,
+        "billing_mode": billing_mode,
+        "tags": list(tags) if tags is not None else None,
+        "account_alias": account_alias,
+        "codex_home": codex_home,
+        "agy_home": agy_home,
+        "agy_app_data_dir": agy_app_data_dir,
+    }
+    kwargs = optional if accepts_kwargs else {k: v for k, v in optional.items() if k in params}
+    return fn(target, engine, claude_config_dir, **kwargs)
+
+
+def enforce_policy(request: dict[str, Any], *, transport_mode: str | None = None) -> None:
+    """Refuse a consultant whose engine or account the repository's policy denies (`ork policy`)."""
+    runner = _runner()
+    routing = runner._MODEL_ROUTING_MOD
+    policy_cwd = request.get("policy_cwd")
+    target = Path(request["read"]) if request.get("read") else (Path(policy_cwd) if policy_cwd else Path.cwd())
+    is_follow_up = bool(request.get("follow_up_of") or request.get("previous"))
+    engine = request["engine"]
+    is_native = request.get("transport") == "native"
+    host_claude_dir = os.environ.get("CLAUDE_CONFIG_DIR") or None
+
+    if is_native and _route_switches_host_profile(request):
+        if transport_mode == "native":
+            raise _error("--transport native cannot switch to a different account/profile; use --transport executor")
+        request["transport"] = "executor"
+        is_native = False
+
+    if is_native:
+        policy_claude_dir = (host_claude_dir or str(Path.home() / ".claude")) if engine == "claude" else None
+        policy_codex_home = (os.environ.get("CODEX_HOME") or str(Path.home() / ".codex")) if engine == "codex" else None
+        policy_agy_home = (
+            (
+                (os.environ.get("ANTIGRAVITY_APP_DATA_DIR") or "").strip()
+                or (os.environ.get("GEMINI_CLI_HOME") or "").strip()
+                or str(Path.home() / ".gemini")
+            )
+            if engine == "agy"
+            else None
+        )
+    else:
+        policy_claude_dir = (
+            (request.get("claude_config_dir") or request.get("effective_claude_config_dir"))
+            if engine == "claude"
+            else None
+        )
+        policy_codex_home = (
+            (request.get("codex_home") or request.get("effective_codex_home")) if engine == "codex" else None
+        )
+        policy_agy_home = (
+            (
+                request.get("agy_app_data_dir")
+                or request.get("effective_agy_app_data_dir")
+                or request.get("agy_home")
+                or request.get("effective_agy_home")
+            )
+            if engine == "agy"
+            else None
+        )
+    explicit_pin = routing._has_explicit_account_pin(
+        engine,
+        explicit_account=request.get("explicit_account"),
+        claude_config_dir=request.get("claude_config_dir"),
+        claude_account_home=request.get("claude_account_home"),
+        codex_home=request.get("codex_home"),
+        agy_home=request.get("agy_home"),
+        agy_app_data_dir=request.get("agy_app_data_dir"),
+        include_child_markers=not is_native,
+    )
+
+    matched_account: dict[str, Any] | None = None
+    native_agy_gemini = ((os.environ.get("GEMINI_CLI_HOME") or "").strip() or None) if is_native else None
+    native_agy_app = ((os.environ.get("ANTIGRAVITY_APP_DATA_DIR") or "").strip() or None) if is_native else None
+    try:
+        if is_native and not explicit_pin:
+            matched_account = routing.resolve_account_by_home(
+                engine,
+                claude_config_dir=policy_claude_dir,
+                codex_home=policy_codex_home,
+                agy_home=native_agy_gemini if engine == "agy" else policy_agy_home,
+                agy_app_data_dir=native_agy_app if engine == "agy" else None,
+                include_child_markers=False,
+                strict=True,
+            )
+            account_id = (matched_account or {}).get("account_id")
+            account_alias = (matched_account or {}).get("account_alias")
+            provider = (matched_account or {}).get("provider")
+            billing_mode = (matched_account or {}).get("billing_mode")
+            tags = (matched_account or {}).get("tags")
+        else:
+            if not request.get("account_id"):
+                matched_account = routing.resolve_account_by_home(
+                    engine,
+                    claude_config_dir=policy_claude_dir,
+                    claude_account_home=request.get("claude_account_home"),
+                    codex_home=policy_codex_home,
+                    agy_home=native_agy_gemini if (is_native and engine == "agy") else policy_agy_home,
+                    agy_app_data_dir=(
+                        native_agy_app
+                        if (is_native and engine == "agy")
+                        else (request.get("agy_app_data_dir") or request.get("effective_agy_app_data_dir"))
+                    ),
+                    include_child_markers=not is_native,
+                    strict=True,
+                )
+            account_id = request.get("account_id") or (matched_account or {}).get("account_id")
+            account_alias = request.get("account_alias") or (matched_account or {}).get("account_alias")
+            provider = request.get("account_provider") or (matched_account or {}).get("provider")
+            billing_mode = request.get("account_billing") or (matched_account or {}).get("billing_mode")
+            tags = request.get("account_tags") or (matched_account or {}).get("tags")
+    except ValueError as exc:
+        raise runner.RunnerError(str(exc), 2) from exc
+
+    try:
+        auto_claude_dir = _call_enforce_repo_policy(
+            runner,
+            target,
+            engine,
+            policy_claude_dir,
+            account_id=account_id,
+            provider=provider,
+            billing_mode=billing_mode,
+            tags=tags,
+            account_alias=account_alias,
+            codex_home=policy_codex_home,
+            agy_home=(native_agy_gemini if (is_native and engine == "agy") else policy_agy_home),
+            agy_app_data_dir=(
+                native_agy_app
+                if (is_native and engine == "agy")
+                else (
+                    (request.get("agy_app_data_dir") or request.get("effective_agy_app_data_dir"))
+                    if engine == "agy"
+                    else None
+                )
+            ),
+        )
+    except runner.RunnerError as exc:
+        if (
+            exc.exit_code != 2
+            or explicit_pin
+            or os.environ.get("ORCHESTRATE_AUTO_ACCOUNT") != "1"
+            or isinstance(exc.__cause__, runner.bundled_module("repo_policy").PolicyConfigError)
+        ):
+            raise
+        if is_follow_up:
+            raise runner.RunnerError(
+                "the original consultation's profile is now denied by repository policy; "
+                "start a fresh consultation to switch profiles",
+                2,
+            ) from exc
+        try:
+            auto_acct = routing.select_auto_account(target, engine, model=request.get("model"), strict=True)
+        except ValueError as cfg_exc:
+            raise runner.RunnerError(str(cfg_exc), 2) from cfg_exc
+        if auto_acct is None:
+            raise
+        acct_route = {
+            "engine": engine,
+            "explicit_account": True,
+            "claude_config_dir": str(auto_acct["claude_config_dir"]) if auto_acct.get("claude_config_dir") else None,
+            "claude_account_home": str(auto_acct["claude_account_home"])
+            if auto_acct.get("claude_account_home")
+            else None,
+            "codex_home": str(auto_acct["codex_home"]) if auto_acct.get("codex_home") else None,
+            "agy_home": str(auto_acct["agy_home"]) if auto_acct.get("agy_home") else None,
+            "agy_app_data_dir": str(auto_acct["agy_app_data_dir"]) if auto_acct.get("agy_app_data_dir") else None,
+            "effective_agy_app_data_dir": (
+                str(auto_acct["agy_app_data_dir"])
+                if auto_acct.get("agy_app_data_dir")
+                else (
+                    str(auto_acct["agy_home"] / "antigravity-cli")
+                    if auto_acct.get("agy_typed_gemini_home") and auto_acct.get("agy_home") is not None
+                    else None
+                )
+            ),
+        }
+        switched_native = is_native and _route_switches_host_profile(acct_route)
+        if switched_native:
+            if transport_mode == "native":
+                raise _error(
+                    "--transport native cannot switch to a different account/profile; use --transport executor"
+                ) from exc
+            request["transport"] = "executor"
+        request["explicit_account"] = True
+        request["account_id"] = auto_acct.get("account_id")
+        request["account_alias"] = auto_acct.get("account_alias")
+        request["account_provider"] = auto_acct.get("provider")
+        request["account_tags"] = list(auto_acct.get("tags") or [])
+        request["account_billing"] = auto_acct.get("billing_mode")
+        request["claude_config_dir"] = acct_route["claude_config_dir"]
+        request["claude_account_home"] = acct_route["claude_account_home"]
+        request["codex_home"] = acct_route["codex_home"]
+        request["agy_home"] = acct_route["agy_home"]
+        request["agy_app_data_dir"] = acct_route["agy_app_data_dir"]
+        request["effective_claude_config_dir"] = acct_route["claude_config_dir"]
+        request["effective_claude_account_home"] = acct_route["claude_account_home"]
+        request["effective_codex_home"] = acct_route["codex_home"]
+        request["effective_agy_home"] = acct_route["agy_home"]
+        request["effective_agy_app_data_dir"] = acct_route["effective_agy_app_data_dir"]
+        return
+
+    if auto_claude_dir is not None and not _claude_profile_dirs_match(auto_claude_dir, None):
+        if is_follow_up and not request.get("claude_config_dir"):
+            raise runner.RunnerError(
+                "the original consultation's profile is now denied by repository policy; "
+                "start a fresh consultation to switch profiles",
+                2,
+            )
+        is_native_claude = is_native and engine == "claude"
+        switched_native_profile = is_native_claude and not _claude_profile_dirs_match(auto_claude_dir, host_claude_dir)
+        if switched_native_profile:
+            if transport_mode == "native":
+                raise _error("--transport native cannot switch to a different Claude profile; use --transport executor")
+            request["transport"] = "executor"
+        if not request.get("claude_config_dir") and (not is_native_claude or switched_native_profile):
+            request["claude_config_dir"] = str(auto_claude_dir)
+            request["effective_claude_config_dir"] = str(auto_claude_dir)
 
 
 def run_panel_member(
@@ -1543,10 +2019,11 @@ def run_panel_member(
 ) -> tuple[int, dict[str, Any]]:
     """Run one isolated consultant and turn any preflight refusal into its own result file."""
     runner = _runner()
+    member_request = dict(request)
     try:
-        enforce_policy(request)
+        enforce_policy(member_request)
         exit_code = perform(
-            request,
+            member_request,
             out_dir=out_dir,
             completion_event=None,
             notification_mode="none",
@@ -1560,7 +2037,7 @@ def run_panel_member(
         exit_code = getattr(exc, "exit_code", EXIT_FAILED)
         status = "refused" if isinstance(exc, runner.RunnerError) and exit_code != EXIT_FAILED else "failed"
         result = {
-            **base_result(request, started_at=runner.utc_now()),
+            **base_result(member_request, started_at=runner.utc_now()),
             "status": status,
             "task_outcome": "failed",
             "exit_code": exit_code,
@@ -1695,9 +2172,12 @@ def main(argv: list[str] | None = None) -> int:
         return perform_panel(requests, args)
 
     request = build_request(args)
-    if not args.request:
-        # A detached child (--request) was already checked by the parent that wrote its request.
-        enforce_policy(request)
+    completion_event = runner.normalize_completion_event_path(args.completion_event) if args.completion_event else None
+    defer_policy_to_perform = bool(
+        args.request and not args.detach and request.get("transport") != "native" and completion_event is not None
+    )
+    if not defer_policy_to_perform:
+        enforce_policy(request, transport_mode=args.transport)
     if "parent_session" not in request:
         request["parent_session"] = next(
             (
@@ -1726,7 +2206,6 @@ def main(argv: list[str] | None = None) -> int:
         return launch_detached(request, args)
     if request["transport"] == "native":
         return native_handoff(request, out_dir=args.out_dir, output_format=args.format)
-    completion_event = runner.normalize_completion_event_path(args.completion_event) if args.completion_event else None
     return perform(
         request,
         out_dir=args.out_dir,
@@ -1734,6 +2213,7 @@ def main(argv: list[str] | None = None) -> int:
         notification_mode=args.notify or "none",
         output_format=args.format,
         dry_run=args.dry_run,
+        **({"recheck_policy": True, "transport_mode": args.transport} if defer_policy_to_perform else {}),
     )
 
 

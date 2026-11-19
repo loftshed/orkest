@@ -19,7 +19,7 @@
 
  [1mWhere to spend next[0m  [2m(pts = weekly % left minus what even use would leave)[0m
   1  Antigravity · Gemini               [38;5;71m +46 pts[0m   under-used, spend freely                     [36magy --model gemini:best[0m
-  2  Claude · personal                  [38;5;71m +43 pts[0m   under-used, spend freely                     [36mplaude[0m
+  2  Claude · personal                  [38;5;71m +43 pts[0m   under-used, spend freely                     [36mCLAUDE_CONFIG_DIR=~/.claude-personal claude[0m
   3  Claude · work                      [2m  +1 pts[0m   on pace                                      [36mclaude[0m
   4  Codex · ChatGPT                    [38;5;179m −21 pts[0m   ahead of pace, conserve                      [36mcodex[0m
  [31m ✗[0m  Antigravity · Claude & GPT         [2m        [0m   out until Wed 2:36 AM (in 9h 36m)            [36magy --model claude:best[0m

@@ -14,10 +14,13 @@ use crate::sha1;
 use crate::sha256;
 
 pub const PEER_SCHEMA: &str = "agent-executor.peer.v1";
+pub const CHIEF_SCHEMA: &str = "ork.chief.v1";
 pub const MAX_AGE_SECS: i64 = 7 * 86_400;
 pub const UNKNOWN_PID_TTL_SECS: i64 = 2 * 3600;
 pub const SHARED_PROCESS_IDLE_TTL_SECS: i64 = 3 * 3600;
 pub const SHARED_PROCESS_BUSY_TTL_SECS: i64 = 30 * 60;
+pub const SHARED_PROCESS_SUBAGENT_TTL_SECS: i64 = 300;
+pub const CHIEF_UNVERIFIED_GRACE_SECS: i64 = 600;
 
 // cspell:disable
 const LEGACY_MARTIAN_NAMES: &[&str] = &[
@@ -132,6 +135,22 @@ pub fn pid_alive_opt(peer: &Value) -> Option<bool> {
     Some(is_pid_live(pid))
 }
 
+/// Query `ps` for the process start timestamp without using `PID_BIRTH_CACHE`.
+#[must_use]
+pub fn process_started_fresh(pid: i64) -> Option<String> {
+    if pid <= 0 || pid > i64::from(i32::MAX) {
+        return None;
+    }
+    let output = Command::new("ps")
+        .args(["-o", "lstart=", "-p", &pid.to_string()])
+        .env("TZ", "UTC")
+        .env("LC_ALL", "C")
+        .output()
+        .ok()?;
+    let started = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!started.is_empty()).then_some(started)
+}
+
 #[must_use]
 pub fn process_started(pid: i64) -> Option<String> {
     if pid <= 0 || pid > i64::from(i32::MAX) {
@@ -144,16 +163,7 @@ pub fn process_started(pid: i64) -> Option<String> {
     {
         return Some(cached.clone());
     }
-    let output = Command::new("ps")
-        .args(["-o", "lstart=", "-p", &pid.to_string()])
-        .env("TZ", "UTC")
-        .env("LC_ALL", "C")
-        .output()
-        .ok()?;
-    let started = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if started.is_empty() {
-        return None;
-    }
+    let started = process_started_fresh(pid)?;
     if let Ok(mut map) = cache.lock() {
         if map.len() >= 256 {
             map.clear();
@@ -257,8 +267,15 @@ pub fn harness_pid(harness: &str) -> Option<i64> {
     Some(start)
 }
 
-#[must_use]
-pub fn is_live_peer(peer: &Value, now_secs: Option<i64>) -> bool {
+fn is_live_peer_with_options<F>(
+    peer: &Value,
+    now_secs: Option<i64>,
+    enforce_max_age_for_non_shared: bool,
+    mut birth_fn: F,
+) -> bool
+where
+    F: FnMut(i64) -> Option<String>,
+{
     let now = now_secs.unwrap_or_else(paths::utc_now_secs);
     let seen_str = peer
         .get("lastSeenAt")
@@ -268,22 +285,29 @@ pub fn is_live_peer(peer: &Value, now_secs: Option<i64>) -> bool {
         return false;
     };
     let alive = pid_alive_opt(peer);
+    if alive == Some(false) {
+        return false;
+    }
     let shared = peer.get("sharedProcess").and_then(Value::as_bool) == Some(true);
+    let is_subagent = peer.get("isSubagent").and_then(Value::as_bool) == Some(true);
     if alive == Some(true)
         && let Some(birth) = peer.get("pidBirth").and_then(Value::as_str)
         && !birth.is_empty()
         && let Some(pid) = peer.get("pid").and_then(Value::as_i64)
-        && let Some(current) = process_started(pid)
+        && let Some(current) = birth_fn(pid)
     {
         if current != birth {
             return false;
         }
-        if !shared {
+        if !shared && !enforce_max_age_for_non_shared {
             return true;
         }
     }
     if now - seen > MAX_AGE_SECS {
         return false;
+    }
+    if shared && is_subagent {
+        return now - seen <= SHARED_PROCESS_SUBAGENT_TTL_SECS;
     }
     if alive == Some(true) && shared {
         let ttl = match peer.get("state").and_then(Value::as_str) {
@@ -297,6 +321,25 @@ pub fn is_live_peer(peer: &Value, now_secs: Option<i64>) -> bool {
         Some(b) => b,
         None => now - seen <= UNKNOWN_PID_TTL_SECS,
     }
+}
+
+fn is_live_peer_with<F>(peer: &Value, now_secs: Option<i64>, birth_fn: F) -> bool
+where
+    F: FnMut(i64) -> Option<String>,
+{
+    is_live_peer_with_options(peer, now_secs, false, birth_fn)
+}
+
+fn is_chief_peer_live_with<F>(peer: &Value, now_secs: Option<i64>, birth_fn: F) -> bool
+where
+    F: FnMut(i64) -> Option<String>,
+{
+    is_live_peer_with_options(peer, now_secs, true, birth_fn)
+}
+
+#[must_use]
+pub fn is_live_peer(peer: &Value, now_secs: Option<i64>) -> bool {
+    is_live_peer_with(peer, now_secs, process_started)
 }
 
 fn percent_decode(raw: &str) -> String {
@@ -1998,10 +2041,8 @@ pub fn mark_delegated(base: &Path, me: Value) -> Value {
     me
 }
 
-#[must_use]
-pub fn peers_live(base: &Path, include_runs: bool) -> Vec<Value> {
+fn peers_live_at(base: &Path, include_runs: bool, now: i64) -> Vec<Value> {
     let mut found = Vec::new();
-    let now = paths::utc_now_secs();
     let Ok(entries) = fs::read_dir(base.join("peers")) else {
         return found;
     };
@@ -2049,13 +2090,293 @@ pub fn peers_live(base: &Path, include_runs: bool) -> Vec<Value> {
 }
 
 #[must_use]
+pub fn peers_live(base: &Path, include_runs: bool) -> Vec<Value> {
+    peers_live_at(base, include_runs, paths::utc_now_secs())
+}
+
+fn positive_pid(val: &Value) -> Option<i64> {
+    let p = val.get("pid")?;
+    if p.is_boolean() {
+        return None;
+    }
+    let pid = p.as_i64()?;
+    (pid > 0 && pid <= i64::from(i32::MAX)).then_some(pid)
+}
+
+fn within_bound_grace(binding: &Value, now: i64) -> bool {
+    let Some(bound_at) = binding
+        .get("boundAt")
+        .and_then(Value::as_str)
+        .and_then(paths::parse_iso8601_utc_secs)
+    else {
+        return false;
+    };
+    let age = now - bound_at;
+    (0..=CHIEF_UNVERIFIED_GRACE_SECS).contains(&age)
+}
+
+fn is_top_level_replacement_peer<F>(
+    p: &Value,
+    chief_session: &str,
+    chief_pid: i64,
+    chief_birth: Option<&str>,
+    now: i64,
+    is_local_peer: &dyn Fn(&Value) -> bool,
+    fresh_birth_fn: &mut F,
+) -> bool
+where
+    F: FnMut(i64) -> Option<String>,
+{
+    if !paths::valid_peer(p)
+        || is_run_peer(Some(p))
+        || p.get("session").and_then(Value::as_str) == Some(chief_session)
+        || !is_local_peer(p)
+        || positive_pid(p) != Some(chief_pid)
+        || p.get("isSubagent").is_some_and(paths::is_truthy_json)
+        || p.get("agySubagentPending")
+            .is_some_and(paths::is_truthy_json)
+        || p.get("delegatedRun").is_some_and(paths::is_truthy_json)
+        || p.get("parentSession").is_some_and(paths::is_truthy_json)
+    {
+        return false;
+    }
+    if let Some(bb) = chief_birth
+        && let Some(pb) = p
+            .get("pidBirth")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        && bb != pb
+    {
+        return false;
+    }
+    is_chief_peer_live_with(p, Some(now), fresh_birth_fn)
+}
+
+fn is_live_chief_binding_with<F>(
+    base: &Path,
+    expected_session: Option<&str>,
+    peers: Option<&[Value]>,
+    now_secs: Option<i64>,
+    mut fresh_birth_fn: F,
+) -> bool
+where
+    F: FnMut(i64) -> Option<String>,
+{
+    let now = now_secs.unwrap_or_else(paths::utc_now_secs);
+    let Ok(Some(binding)) = paths::read_chief_json_bounded(base) else {
+        return false;
+    };
+    if binding.get("schema").and_then(Value::as_str) != Some(CHIEF_SCHEMA) {
+        return false;
+    }
+    let Some(session) = binding
+        .get("session")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    else {
+        return false;
+    };
+    if let Some(exp) = expected_session
+        && session != exp
+    {
+        return false;
+    }
+    let host = paths::current_hostname();
+    if let Some(machine) = binding
+        .get("machine")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        && host.as_deref() != Some(machine)
+    {
+        return false;
+    }
+
+    let binding_pid = positive_pid(&binding);
+    let binding_birth = binding
+        .get("pidBirth")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let mut cached_fresh_birth: Option<(i64, Option<String>)> = None;
+    let mut lookup_fresh_birth = |pid: i64| -> Option<String> {
+        if let Some((cached_pid, ref val)) = cached_fresh_birth
+            && cached_pid == pid
+        {
+            return val.clone();
+        }
+        let val = fresh_birth_fn(pid);
+        cached_fresh_birth = Some((pid, val.clone()));
+        val
+    };
+
+    let mut verified_live_pid = false;
+    if let Some(pid) = binding_pid {
+        if !is_pid_live(pid) {
+            return false;
+        }
+        if let Some(birth) = binding_birth {
+            match lookup_fresh_birth(pid) {
+                Some(current) if current != birth => return false,
+                Some(_) => verified_live_pid = true,
+                None => verified_live_pid = false,
+            }
+        } else {
+            verified_live_pid = true;
+        }
+    }
+
+    let is_in_grace = within_bound_grace(&binding, now);
+    if binding_pid.is_some() && !verified_live_pid && !is_in_grace {
+        return false;
+    }
+
+    let is_local_peer = |p: &Value| -> bool {
+        match p
+            .get("machine")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            Some(pm) => host.as_deref() == Some(pm),
+            None => true,
+        }
+    };
+
+    let exact_peer: Option<Value> = if let Some(slice) = peers {
+        slice
+            .iter()
+            .find(|p| {
+                paths::valid_peer(p)
+                    && !is_run_peer(Some(p))
+                    && p.get("session").and_then(Value::as_str) == Some(session)
+                    && is_local_peer(p)
+            })
+            .cloned()
+    } else {
+        paths::peer_path(base, session)
+            .ok()
+            .and_then(|p| paths::read_json_file(&p))
+            .filter(|p| {
+                paths::valid_peer(p)
+                    && !is_run_peer(Some(p))
+                    && p.get("session").and_then(Value::as_str) == Some(session)
+                    && is_local_peer(p)
+            })
+    };
+
+    if let Some(peer) = exact_peer {
+        let peer_pid = positive_pid(&peer);
+        let peer_birth = peer
+            .get("pidBirth")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let (Some(bp), Some(pp)) = (binding_pid, peer_pid)
+            && bp != pp
+        {
+            return false;
+        }
+        if let (Some(bb), Some(pb)) = (binding_birth, peer_birth)
+            && bb != pb
+        {
+            return false;
+        }
+        return is_chief_peer_live_with(&peer, Some(now), &mut lookup_fresh_birth);
+    }
+
+    if verified_live_pid {
+        if is_in_grace {
+            return true;
+        }
+        let pid = binding_pid.unwrap_or_default();
+        let has_replacement = if let Some(slice) = peers {
+            slice.iter().any(|p| {
+                is_top_level_replacement_peer(
+                    p,
+                    session,
+                    pid,
+                    binding_birth,
+                    now,
+                    &is_local_peer,
+                    &mut lookup_fresh_birth,
+                )
+            })
+        } else if let Ok(entries) = fs::read_dir(base.join("peers")) {
+            let mut paths_list: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+            paths_list.sort();
+            let mut found = false;
+            for path in paths_list {
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                let Some(peer) = paths::read_json_file(&path) else {
+                    continue;
+                };
+                let Some(sid) = peer.get("session").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Ok(canon) = paths::peer_path(base, sid) else {
+                    continue;
+                };
+                if canon != path && canon.exists() {
+                    continue;
+                }
+                if is_top_level_replacement_peer(
+                    &peer,
+                    session,
+                    pid,
+                    binding_birth,
+                    now,
+                    &is_local_peer,
+                    &mut lookup_fresh_birth,
+                ) {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        } else {
+            false
+        };
+        return !has_replacement;
+    }
+
+    is_in_grace
+}
+
+/// Validate whether `<base>/chief.json` currently represents a live local Chief binding.
+#[must_use]
+pub fn is_live_chief_binding(
+    base: &Path,
+    expected_session: Option<&str>,
+    peers: Option<&[Value]>,
+    now_secs: Option<i64>,
+) -> bool {
+    is_live_chief_binding_with(
+        base,
+        expected_session,
+        peers,
+        now_secs,
+        process_started_fresh,
+    )
+}
+
+#[must_use]
 pub fn colleagues(base: &Path, me: &Value) -> Vec<Value> {
     let my_sid = me.get("session").and_then(Value::as_str);
+    let my_nonempty_sid = my_sid.filter(|s| !s.is_empty());
     peers_live(base, false)
         .into_iter()
         .filter(|peer| {
             let sid = peer.get("session").and_then(Value::as_str);
-            sid != my_sid && (sid == my_sid || same_project(me, peer))
+            let parent_matches_me = my_nonempty_sid
+                .is_some_and(|ms| peer.get("parentSession").and_then(Value::as_str) == Some(ms));
+            sid != my_sid
+                && same_project(me, peer)
+                && peer.get("isSubagent").and_then(Value::as_bool) != Some(true)
+                && peer.get("agySubagentPending").and_then(Value::as_bool) != Some(true)
+                && !parent_matches_me
         })
         .collect()
 }
@@ -2123,6 +2444,778 @@ mod tests {
         assert!(verified.contains(&"native-abc".to_string()));
         let found = session_peer(&base, "native-abc", Some("claude"), Some("/tmp"), false);
         assert_eq!(found.unwrap()["session"], "session-1");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn test_temp_dir(label: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let raw = env::temp_dir().join(format!("ork-fast-{label}-{}-{nanos}", std::process::id()));
+        let _ = fs::remove_dir_all(&raw);
+        fs::create_dir_all(&raw).unwrap();
+        fs::canonicalize(&raw).unwrap_or(raw)
+    }
+
+    fn make_peer_doc(session: &str, name: &str, repo: &str, seen_secs: i64, pid: i64) -> Value {
+        json!({
+            "schema": PEER_SCHEMA,
+            "session": session,
+            "name": name,
+            "harness": "gemini",
+            "machine": paths::current_hostname().unwrap_or_default(),
+            "cwd": repo,
+            "checkout": repo,
+            "repo": repo,
+            "remotes": [],
+            "state": "busy",
+            "pid": pid,
+            "startedAt": paths::format_utc_iso_z(seen_secs),
+            "lastSeenAt": paths::format_utc_iso_z(seen_secs),
+        })
+    }
+
+    #[test]
+    fn test_colleagues_excludes_children_pending_and_unrelated_projects() {
+        let dir = test_temp_dir("colleagues");
+        let base = dir.join("mailbox-v1");
+        fs::create_dir_all(base.join("peers")).unwrap();
+        let now = paths::utc_now_secs();
+        let pid = i64::from(std::process::id());
+        let repo_a = dir.join("repo-a");
+        let repo_b = dir.join("repo-b");
+        fs::create_dir_all(&repo_a).unwrap();
+        fs::create_dir_all(&repo_b).unwrap();
+        let repo_a_str = repo_a.to_string_lossy().into_owned();
+        let repo_b_str = repo_b.to_string_lossy().into_owned();
+
+        let me = make_peer_doc("parent-1", "alpha", &repo_a_str, now, pid);
+        let main_colleague = json!({
+            "schema": PEER_SCHEMA,
+            "session": "colleague-main",
+            "name": "bravo",
+            "harness": "gemini",
+            "machine": paths::current_hostname().unwrap_or_default(),
+            "cwd": repo_a_str,
+            "checkout": repo_a_str,
+            "repo": repo_a_str,
+            "remotes": [],
+            "state": "idle",
+            "sharedProcess": true,
+            "pid": pid,
+            "startedAt": paths::format_utc_iso_z(now),
+            "lastSeenAt": paths::format_utc_iso_z(now),
+        });
+        let confirmed_child = json!({
+            "schema": PEER_SCHEMA,
+            "session": "child-confirmed",
+            "name": "charlie",
+            "harness": "gemini",
+            "machine": paths::current_hostname().unwrap_or_default(),
+            "cwd": repo_a_str,
+            "checkout": repo_a_str,
+            "repo": repo_a_str,
+            "remotes": [],
+            "state": "busy",
+            "isSubagent": true,
+            "parentSession": "parent-1",
+            "pid": pid,
+            "startedAt": paths::format_utc_iso_z(now),
+            "lastSeenAt": paths::format_utc_iso_z(now),
+        });
+        let pending_child = json!({
+            "schema": PEER_SCHEMA,
+            "session": "child-pending",
+            "name": "delta",
+            "harness": "gemini",
+            "machine": paths::current_hostname().unwrap_or_default(),
+            "cwd": repo_a_str,
+            "checkout": repo_a_str,
+            "repo": repo_a_str,
+            "remotes": [],
+            "state": "busy",
+            "agySubagentPending": true,
+            "pid": pid,
+            "startedAt": paths::format_utc_iso_z(now),
+            "lastSeenAt": paths::format_utc_iso_z(now),
+        });
+        let parent_matched_child = json!({
+            "schema": PEER_SCHEMA,
+            "session": "child-parent-match",
+            "name": "echo",
+            "harness": "gemini",
+            "machine": paths::current_hostname().unwrap_or_default(),
+            "cwd": repo_a_str,
+            "checkout": repo_a_str,
+            "repo": repo_a_str,
+            "remotes": [],
+            "state": "busy",
+            "parentSession": "parent-1",
+            "pid": pid,
+            "startedAt": paths::format_utc_iso_z(now),
+            "lastSeenAt": paths::format_utc_iso_z(now),
+        });
+        let other_project = make_peer_doc("other-proj", "foxtrot", &repo_b_str, now, pid);
+
+        for doc in [
+            &me,
+            &main_colleague,
+            &confirmed_child,
+            &pending_child,
+            &parent_matched_child,
+            &other_project,
+        ] {
+            let sid = doc["session"].as_str().unwrap();
+            let p = paths::peer_path(&base, sid).unwrap();
+            paths::write_json_atomic(&p, doc).unwrap();
+        }
+
+        let found = colleagues(&base, &me);
+        let found_sids: Vec<&str> = found
+            .iter()
+            .filter_map(|p| p.get("session").and_then(Value::as_str))
+            .collect();
+        assert_eq!(found_sids, vec!["colleague-main"]);
+
+        // Missing self session must not match missing parentSession on a colleague.
+        let mut me_missing_sid = me.clone();
+        me_missing_sid.as_object_mut().unwrap().remove("session");
+        let found_without_self = colleagues(&base, &me_missing_sid);
+        let found_without_self_sids: Vec<&str> = found_without_self
+            .iter()
+            .filter_map(|p| p.get("session").and_then(Value::as_str))
+            .collect();
+        assert!(found_without_self_sids.contains(&"colleague-main"));
+        assert!(!found_without_self_sids.contains(&"child-confirmed"));
+        assert!(!found_without_self_sids.contains(&"child-pending"));
+        assert!(!found_without_self_sids.contains(&"other-proj"));
+
+        // Direct addressing and peers_live still see the child.
+        assert_eq!(
+            session_peer(&base, "child-confirmed", Some("gemini"), None, false).unwrap()["session"],
+            "child-confirmed"
+        );
+        assert!(
+            peers_live(&base, false)
+                .iter()
+                .any(|p| p["session"] == "child-confirmed")
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_is_live_peer_shared_subagent_and_normal_ttl_boundaries() {
+        let now = 1_800_000_000_i64;
+        let pid = i64::from(std::process::id());
+        let birth = process_started_fresh(pid).unwrap();
+
+        let shared_sub = |age: i64, state: &str| {
+            json!({
+                "schema": PEER_SCHEMA,
+                "session": "sub-1",
+                "name": "sub",
+                "harness": "gemini",
+                "cwd": "/tmp",
+                "state": state,
+                "sharedProcess": true,
+                "isSubagent": true,
+                "pid": pid,
+                "pidBirth": birth,
+                "startedAt": paths::format_utc_iso_z(now - age),
+                "lastSeenAt": paths::format_utc_iso_z(now - age),
+            })
+        };
+        assert!(is_live_peer(&shared_sub(300, "busy"), Some(now)));
+        assert!(!is_live_peer(&shared_sub(301, "busy"), Some(now)));
+        assert!(is_live_peer(&shared_sub(300, "idle"), Some(now)));
+        assert!(!is_live_peer(&shared_sub(301, "idle"), Some(now)));
+        assert!(is_live_peer(&shared_sub(300, "waiting"), Some(now)));
+        assert!(!is_live_peer(&shared_sub(301, "waiting"), Some(now)));
+
+        // Unknown/invalid PID shared subagent must also expire at 300s (never 2h UNKNOWN_PID_TTL_SECS).
+        for (state, bad_pid) in [
+            ("busy", Value::Null),
+            ("idle", json!("not-a-pid")),
+            ("waiting", json!(false)),
+        ] {
+            let make_unknown_sub = |age: i64| {
+                let mut doc = json!({
+                    "schema": PEER_SCHEMA,
+                    "session": "sub-unknown-pid",
+                    "name": "sub",
+                    "harness": "gemini",
+                    "cwd": "/tmp",
+                    "state": state,
+                    "sharedProcess": true,
+                    "isSubagent": true,
+                    "startedAt": paths::format_utc_iso_z(now - age),
+                    "lastSeenAt": paths::format_utc_iso_z(now - age),
+                });
+                if !bad_pid.is_null() {
+                    doc["pid"] = bad_pid.clone();
+                }
+                doc
+            };
+            assert!(
+                is_live_peer(&make_unknown_sub(300), Some(now)),
+                "state={state}"
+            );
+            assert!(
+                !is_live_peer(&make_unknown_sub(301), Some(now)),
+                "state={state}"
+            );
+        }
+
+        let shared_main = |age: i64, state: &str| {
+            json!({
+                "schema": PEER_SCHEMA,
+                "session": "main-1",
+                "name": "main",
+                "harness": "gemini",
+                "cwd": "/tmp",
+                "state": state,
+                "sharedProcess": true,
+                "pid": pid,
+                "pidBirth": birth,
+                "startedAt": paths::format_utc_iso_z(now - age),
+                "lastSeenAt": paths::format_utc_iso_z(now - age),
+            })
+        };
+        assert!(is_live_peer(&shared_main(1800, "busy"), Some(now)));
+        assert!(!is_live_peer(&shared_main(1801, "busy"), Some(now)));
+        assert!(is_live_peer(&shared_main(10_800, "idle"), Some(now)));
+        assert!(!is_live_peer(&shared_main(10_801, "idle"), Some(now)));
+        assert!(is_live_peer(&shared_main(10_800, "waiting"), Some(now)));
+        assert!(!is_live_peer(&shared_main(10_801, "waiting"), Some(now)));
+
+        // Dead PID and recycled PID (mismatched pidBirth) must return false.
+        let mut child = Command::new("true").spawn().unwrap();
+        let dead_pid = i64::from(child.id());
+        let _ = child.wait();
+        let dead_peer = make_peer_doc("dead-1", "dead", "/tmp", now, dead_pid);
+        assert!(!is_live_peer(&dead_peer, Some(now)));
+        let mut dead_shared_sub = shared_sub(0, "busy");
+        dead_shared_sub["pid"] = json!(dead_pid);
+        dead_shared_sub.as_object_mut().unwrap().remove("pidBirth");
+        assert!(!is_live_peer(&dead_shared_sub, Some(now)));
+
+        let recycled_peer = json!({
+            "schema": PEER_SCHEMA,
+            "session": "recycled-1",
+            "name": "recycled",
+            "harness": "gemini",
+            "cwd": "/tmp",
+            "state": "busy",
+            "pid": pid,
+            "pidBirth": "Thu Jan  1 00:00:00 1970",
+            "startedAt": paths::format_utc_iso_z(now),
+            "lastSeenAt": paths::format_utc_iso_z(now),
+        });
+        assert!(!is_live_peer(&recycled_peer, Some(now)));
+        let mut recycled_shared_sub = shared_sub(0, "busy");
+        recycled_shared_sub["pidBirth"] = json!("Thu Jan  1 00:00:00 1970");
+        assert!(!is_live_peer(&recycled_shared_sub, Some(now)));
+    }
+
+    #[test]
+    fn test_is_live_chief_binding_cases() {
+        let dir = test_temp_dir("chief-liveness");
+        let base = dir.join("mailbox-v1");
+        fs::create_dir_all(base.join("peers")).unwrap();
+        let now = 1_800_000_000_i64;
+        let pid = i64::from(std::process::id());
+        let birth = process_started_fresh(pid).unwrap();
+        let host = paths::current_hostname().unwrap_or_default();
+
+        let mut dead_child = Command::new("true").spawn().unwrap();
+        let dead_pid = i64::from(dead_child.id());
+        let _ = dead_child.wait();
+
+        let write_chief = |doc: &Value| {
+            paths::write_json_atomic(&base.join("chief.json"), doc).unwrap();
+        };
+
+        // 1. Missing chief.json -> false
+        assert!(!is_live_chief_binding(&base, None, Some(&[]), Some(now)));
+
+        // 2. boundAt grace boundaries: 599, 600 -> true; 601, missing, future -> false
+        for (age, expected) in [(599, true), (600, true), (601, false), (-1, false)] {
+            write_chief(&json!({
+                "schema": CHIEF_SCHEMA,
+                "session": "chief-1",
+                "boundAt": paths::format_utc_iso_z(now - age),
+            }));
+            assert_eq!(
+                is_live_chief_binding(&base, Some("chief-1"), Some(&[]), Some(now)),
+                expected,
+                "age={age}"
+            );
+        }
+        write_chief(&json!({
+            "schema": CHIEF_SCHEMA,
+            "session": "chief-1",
+        }));
+        assert!(!is_live_chief_binding(
+            &base,
+            Some("chief-1"),
+            Some(&[]),
+            Some(now)
+        ));
+
+        // 3. Wrong machine -> false
+        write_chief(&json!({
+            "schema": CHIEF_SCHEMA,
+            "session": "chief-1",
+            "machine": "wrong-remote-host",
+            "pid": pid,
+            "boundAt": paths::format_utc_iso_z(now),
+        }));
+        assert!(!is_live_chief_binding(
+            &base,
+            Some("chief-1"),
+            Some(&[]),
+            Some(now)
+        ));
+
+        // 4. Dead or recycled PID -> false even if stale peer record looks live
+        let stale_live_peer = json!({
+            "schema": PEER_SCHEMA,
+            "session": "chief-1",
+            "name": "chief",
+            "harness": "claude",
+            "machine": host,
+            "cwd": "/tmp",
+            "state": "busy",
+            "startedAt": paths::format_utc_iso_z(now),
+            "lastSeenAt": paths::format_utc_iso_z(now),
+        });
+        write_chief(&json!({
+            "schema": CHIEF_SCHEMA,
+            "session": "chief-1",
+            "machine": host,
+            "pid": dead_pid,
+            "boundAt": paths::format_utc_iso_z(now),
+        }));
+        assert!(!is_live_chief_binding(
+            &base,
+            Some("chief-1"),
+            Some(std::slice::from_ref(&stale_live_peer)),
+            Some(now)
+        ));
+
+        write_chief(&json!({
+            "schema": CHIEF_SCHEMA,
+            "session": "chief-1",
+            "machine": host,
+            "pid": pid,
+            "pidBirth": "Thu Jan  1 00:00:00 1970",
+            "boundAt": paths::format_utc_iso_z(now),
+        }));
+        assert!(!is_live_chief_binding(
+            &base,
+            Some("chief-1"),
+            Some(std::slice::from_ref(&stale_live_peer)),
+            Some(now)
+        ));
+
+        // 5. Same-PID top-level replacement: allowed within 600s grace, rejected after 600s
+        let replacement_peer = json!({
+            "schema": PEER_SCHEMA,
+            "session": "other-top-level",
+            "name": "other",
+            "harness": "claude",
+            "machine": host,
+            "cwd": "/tmp",
+            "state": "busy",
+            "pid": pid,
+            "pidBirth": birth,
+            "startedAt": paths::format_utc_iso_z(now),
+            "lastSeenAt": paths::format_utc_iso_z(now),
+        });
+        write_chief(&json!({
+            "schema": CHIEF_SCHEMA,
+            "session": "chief-1",
+            "machine": host,
+            "pid": pid,
+            "pidBirth": birth,
+            "boundAt": paths::format_utc_iso_z(now - 600),
+        }));
+        assert!(is_live_chief_binding(
+            &base,
+            Some("chief-1"),
+            Some(std::slice::from_ref(&replacement_peer)),
+            Some(now)
+        ));
+        write_chief(&json!({
+            "schema": CHIEF_SCHEMA,
+            "session": "chief-1",
+            "machine": host,
+            "pid": pid,
+            "pidBirth": birth,
+            "boundAt": paths::format_utc_iso_z(now - 601),
+        }));
+        assert!(!is_live_chief_binding(
+            &base,
+            Some("chief-1"),
+            Some(std::slice::from_ref(&replacement_peer)),
+            Some(now)
+        ));
+
+        // 6. Children, delegatedRun, and run peers do NOT count as replacement evidence,
+        //    whereas a top-level sharedProcess peer DOES invalidate Chief past 600s grace.
+        let shared_child_peer = json!({
+            "schema": PEER_SCHEMA,
+            "session": "child-on-same-pid",
+            "name": "child",
+            "harness": "gemini",
+            "machine": host,
+            "cwd": "/tmp",
+            "state": "busy",
+            "sharedProcess": true,
+            "isSubagent": true,
+            "pid": pid,
+            "pidBirth": birth,
+            "startedAt": paths::format_utc_iso_z(now),
+            "lastSeenAt": paths::format_utc_iso_z(now),
+        });
+        let pending_child_peer = json!({
+            "schema": PEER_SCHEMA,
+            "session": "pending-child-same-pid",
+            "name": "pending",
+            "harness": "gemini",
+            "machine": host,
+            "cwd": "/tmp",
+            "state": "busy",
+            "sharedProcess": true,
+            "agySubagentPending": true,
+            "pid": pid,
+            "pidBirth": birth,
+            "startedAt": paths::format_utc_iso_z(now),
+            "lastSeenAt": paths::format_utc_iso_z(now),
+        });
+        let parent_session_only_peer = json!({
+            "schema": PEER_SCHEMA,
+            "session": "child-parent-only",
+            "name": "child-parent",
+            "harness": "gemini",
+            "machine": host,
+            "cwd": "/tmp",
+            "state": "busy",
+            "parentSession": "chief-1",
+            "pid": pid,
+            "pidBirth": birth,
+            "startedAt": paths::format_utc_iso_z(now),
+            "lastSeenAt": paths::format_utc_iso_z(now),
+        });
+        let delegated_run_peer = json!({
+            "schema": PEER_SCHEMA,
+            "session": "delegated-same-pid",
+            "name": "delegated",
+            "harness": "claude",
+            "machine": host,
+            "cwd": "/tmp",
+            "state": "busy",
+            "delegatedRun": "run-r1",
+            "pid": pid,
+            "pidBirth": birth,
+            "startedAt": paths::format_utc_iso_z(now),
+            "lastSeenAt": paths::format_utc_iso_z(now),
+        });
+        let run_peer = json!({
+            "schema": PEER_SCHEMA,
+            "session": "run-r1-worker",
+            "run": "r1",
+            "role": "worker",
+            "name": "worker",
+            "harness": "claude",
+            "machine": host,
+            "cwd": "/tmp",
+            "state": "busy",
+            "pid": pid,
+            "pidBirth": birth,
+            "startedAt": paths::format_utc_iso_z(now),
+            "lastSeenAt": paths::format_utc_iso_z(now),
+        });
+        assert!(is_live_chief_binding(
+            &base,
+            Some("chief-1"),
+            Some(&[
+                shared_child_peer,
+                pending_child_peer,
+                parent_session_only_peer,
+                delegated_run_peer,
+                run_peer,
+            ]),
+            Some(now)
+        ));
+
+        let shared_top_level_replacement = json!({
+            "schema": PEER_SCHEMA,
+            "session": "chief-cleared-new",
+            "name": "new-top-level",
+            "harness": "gemini",
+            "machine": host,
+            "cwd": "/tmp",
+            "state": "busy",
+            "sharedProcess": true,
+            "pid": pid,
+            "pidBirth": birth,
+            "startedAt": paths::format_utc_iso_z(now),
+            "lastSeenAt": paths::format_utc_iso_z(now),
+        });
+        assert!(!is_live_chief_binding(
+            &base,
+            Some("chief-1"),
+            Some(&[shared_top_level_replacement]),
+            Some(now)
+        ));
+
+        // 7. Contradictory exact peer PID vs binding PID -> false
+        let conflicting_peer = json!({
+            "schema": PEER_SCHEMA,
+            "session": "chief-1",
+            "name": "chief",
+            "harness": "claude",
+            "machine": host,
+            "cwd": "/tmp",
+            "state": "busy",
+            "pid": pid + 999,
+            "startedAt": paths::format_utc_iso_z(now),
+            "lastSeenAt": paths::format_utc_iso_z(now),
+        });
+        assert!(!is_live_chief_binding(
+            &base,
+            Some("chief-1"),
+            Some(&[conflicting_peer]),
+            Some(now)
+        ));
+
+        // 8. When binding has pidBirth and fresh ps lookup is unavailable (None), do NOT treat as
+        //    perpetually verified: bounded 600s grace applies. Legacy no-pidBirth stays verified.
+        write_chief(&json!({
+            "schema": CHIEF_SCHEMA,
+            "session": "chief-1",
+            "machine": host,
+            "pid": pid,
+            "pidBirth": birth,
+            "boundAt": paths::format_utc_iso_z(now - 600),
+        }));
+        assert!(is_live_chief_binding_with(
+            &base,
+            Some("chief-1"),
+            Some(&[]),
+            Some(now),
+            |_| None
+        ));
+        write_chief(&json!({
+            "schema": CHIEF_SCHEMA,
+            "session": "chief-1",
+            "machine": host,
+            "pid": pid,
+            "pidBirth": birth,
+            "boundAt": paths::format_utc_iso_z(now - 601),
+        }));
+        assert!(!is_live_chief_binding_with(
+            &base,
+            Some("chief-1"),
+            Some(&[]),
+            Some(now),
+            |_| None
+        ));
+        write_chief(&json!({
+            "schema": CHIEF_SCHEMA,
+            "session": "chief-1",
+            "machine": host,
+            "pid": pid,
+            "boundAt": paths::format_utc_iso_z(now - 601),
+        }));
+        assert!(is_live_chief_binding_with(
+            &base,
+            Some("chief-1"),
+            Some(&[]),
+            Some(now),
+            |_| None
+        ));
+
+        // 8b. Exact peer (lastSeen 1 day old) must NOT bypass expired grace when fresh birth lookup returns None.
+        let one_day_ago = paths::format_utc_iso_z(now - 86_400);
+        let old_exact_peer = json!({
+            "schema": PEER_SCHEMA,
+            "session": "chief-1",
+            "name": "chief",
+            "harness": "claude",
+            "machine": host,
+            "cwd": "/tmp",
+            "state": "idle",
+            "pid": pid,
+            "pidBirth": birth,
+            "startedAt": one_day_ago,
+            "lastSeenAt": one_day_ago,
+        });
+        write_chief(&json!({
+            "schema": CHIEF_SCHEMA,
+            "session": "chief-1",
+            "machine": host,
+            "pid": pid,
+            "pidBirth": birth,
+            "boundAt": paths::format_utc_iso_z(now - 601),
+        }));
+        assert!(!is_live_chief_binding_with(
+            &base,
+            Some("chief-1"),
+            Some(std::slice::from_ref(&old_exact_peer)),
+            Some(now),
+            |_| None
+        ));
+        write_chief(&json!({
+            "schema": CHIEF_SCHEMA,
+            "session": "chief-1",
+            "machine": host,
+            "pid": pid,
+            "pidBirth": birth,
+            "generation": "gen-1",
+            "boundAt": paths::format_utc_iso_z(now - 600),
+        }));
+        assert!(is_live_chief_binding_with(
+            &base,
+            Some("chief-1"),
+            Some(&[old_exact_peer]),
+            Some(now),
+            |_| None
+        ));
+
+        // 9. Poisoned PID_BIRTH_CACHE must never overturn fresh birth checks on exact peer or replacement.
+        let mut sleeper = Command::new("sleep").arg("30").spawn().unwrap();
+        let sleeper_pid = i64::from(sleeper.id());
+        let sleeper_birth = process_started_fresh(sleeper_pid).unwrap();
+        {
+            let cache = PID_BIRTH_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+            let mut map = cache.lock().unwrap();
+            map.insert(sleeper_pid, "Thu Jan  1 00:00:00 1970".to_string());
+        }
+        write_chief(&json!({
+            "schema": CHIEF_SCHEMA,
+            "session": "chief-1",
+            "machine": host,
+            "pid": sleeper_pid,
+            "pidBirth": sleeper_birth,
+            "boundAt": paths::format_utc_iso_z(now - 601),
+        }));
+        let exact_sleeper_peer = json!({
+            "schema": PEER_SCHEMA,
+            "session": "chief-1",
+            "name": "chief",
+            "harness": "claude",
+            "machine": host,
+            "cwd": "/tmp",
+            "state": "busy",
+            "pid": sleeper_pid,
+            "pidBirth": sleeper_birth,
+            "startedAt": paths::format_utc_iso_z(now),
+            "lastSeenAt": paths::format_utc_iso_z(now),
+        });
+        assert!(is_live_chief_binding(
+            &base,
+            Some("chief-1"),
+            Some(&[exact_sleeper_peer]),
+            Some(now)
+        ));
+        let replacement_sleeper_peer = json!({
+            "schema": PEER_SCHEMA,
+            "session": "new-top-sleeper",
+            "name": "other",
+            "harness": "claude",
+            "machine": host,
+            "cwd": "/tmp",
+            "state": "busy",
+            "sharedProcess": true,
+            "pid": sleeper_pid,
+            "pidBirth": sleeper_birth,
+            "startedAt": paths::format_utc_iso_z(now),
+            "lastSeenAt": paths::format_utc_iso_z(now),
+        });
+        assert!(!is_live_chief_binding(
+            &base,
+            Some("chief-1"),
+            Some(&[replacement_sleeper_peer]),
+            Some(now)
+        ));
+        if let Some(cache) = PID_BIRTH_CACHE.get()
+            && let Ok(mut map) = cache.lock()
+        {
+            map.remove(&sleeper_pid);
+        }
+        let _ = sleeper.kill();
+        let _ = sleeper.wait();
+
+        // 10. Non-shared exact peer with verified live PID + matching pidBirth MUST still enforce
+        //     7-day (604_800s) Chief heartbeat max-age (parity with chief.mjs & handoff.py),
+        //     while is_live_peer keeps non-shared mail reachability past 7 days.
+        write_chief(&json!({
+            "schema": CHIEF_SCHEMA,
+            "session": "chief-1",
+            "machine": host,
+            "pid": pid,
+            "pidBirth": birth,
+            "boundAt": paths::format_utc_iso_z(now - 8 * 86_400),
+        }));
+        let make_non_shared_exact_peer = |age: i64| {
+            json!({
+                "schema": PEER_SCHEMA,
+                "session": "chief-1",
+                "name": "chief",
+                "harness": "claude",
+                "machine": host,
+                "cwd": "/tmp",
+                "state": "idle",
+                "sharedProcess": false,
+                "pid": pid,
+                "pidBirth": birth,
+                "startedAt": paths::format_utc_iso_z(now - age),
+                "lastSeenAt": paths::format_utc_iso_z(now - age),
+            })
+        };
+        let aged_8d_peer = make_non_shared_exact_peer(8 * 86_400);
+        assert!(is_live_peer(&aged_8d_peer, Some(now)));
+        assert!(!is_live_chief_binding(
+            &base,
+            Some("chief-1"),
+            Some(std::slice::from_ref(&aged_8d_peer)),
+            Some(now)
+        ));
+        assert!(is_live_chief_binding(
+            &base,
+            Some("chief-1"),
+            Some(&[make_non_shared_exact_peer(MAX_AGE_SECS)]),
+            Some(now)
+        ));
+        assert!(!is_live_chief_binding(
+            &base,
+            Some("chief-1"),
+            Some(&[make_non_shared_exact_peer(MAX_AGE_SECS + 1)]),
+            Some(now)
+        ));
+
+        // Fresh exact peer must also NOT bypass unverified-PID expired grace.
+        let fresh_exact_peer = make_non_shared_exact_peer(0);
+        write_chief(&json!({
+            "schema": CHIEF_SCHEMA,
+            "session": "chief-1",
+            "machine": host,
+            "pid": pid,
+            "pidBirth": birth,
+            "boundAt": paths::format_utc_iso_z(now - 601),
+        }));
+        assert!(!is_live_chief_binding_with(
+            &base,
+            Some("chief-1"),
+            Some(&[fresh_exact_peer]),
+            Some(now),
+            |_| None
+        ));
+
         let _ = fs::remove_dir_all(&dir);
     }
 }

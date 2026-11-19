@@ -37,6 +37,7 @@ import {
   recoverRoom,
   SESSION_OBSERVATION_GRACE_MS,
   SHARED_PROCESS_BUSY_TTL_MS,
+  SHARED_PROCESS_SUBAGENT_TTL_MS,
   SHARED_PROCESS_WAITING_TTL_MS,
 } from "../../../plugins/orchestrate/lib/rooms.mjs";
 import { retainFixtures } from "../../helpers/retain-fixtures.js";
@@ -1582,7 +1583,7 @@ describe("room CLI", () => {
       { root },
     );
 
-    const staleIso = new Date(Date.now() - 14 * 60_000).toISOString();
+    const staleIso = new Date(Date.now() - 4 * 60_000).toISOString();
     // Active subagent peer written by old SubagentStart (wrong parent model & focus, stale lastSeenAt)
     await writeFile(
       path.join(root, "peers", "subagent-a22a04ba7fa8ef95e.json"),
@@ -1688,7 +1689,7 @@ describe("room CLI", () => {
       expect(activeSub.model).toBe("claude-fable-5-1");
       expect(activeSub.status).toBe("running");
       expect(activeSub.progress.task).toBe("Fable writes layout spec");
-      // Timestamp refreshed from .jsonl mtime (much newer than 14m ago):
+      // Timestamp refreshed from .jsonl mtime (much newer than 4m ago):
       expect(Date.parse(activeSub.observedAt)).toBeGreaterThan(Date.parse(staleIso));
 
       const completedSub = observed.agents.find(
@@ -3268,6 +3269,39 @@ describe("coordination reliability", () => {
     expect(isPeerLive(peer("waiting", SHARED_PROCESS_WAITING_TTL_MS + 1000), now)).toBe(false);
     expect(isPeerLive(peer("busy", SHARED_PROCESS_BUSY_TTL_MS + 1000), now)).toBe(false);
     expect(isPeerLive(peer(undefined, SHARED_PROCESS_WAITING_TTL_MS + 1000), now)).toBe(false);
+  });
+
+  it("caps shared-process subagent peers at 300s even with unknown PID while rejecting dead PIDs", () => {
+    const now = Date.now();
+    const subPeer = (state, ageMs, pidValue = process.pid) => ({
+      ...(pidValue !== null && { pid: pidValue }),
+      sharedProcess: true,
+      isSubagent: true,
+      state,
+      startedAt: new Date(now - ageMs).toISOString(),
+      lastSeenAt: new Date(now - ageMs).toISOString(),
+    });
+    for (const state of ["busy", "idle", "waiting"]) {
+      expect(isPeerLive(subPeer(state, SHARED_PROCESS_SUBAGENT_TTL_MS, process.pid), now)).toBe(
+        true,
+      );
+      expect(
+        isPeerLive(subPeer(state, SHARED_PROCESS_SUBAGENT_TTL_MS + 1000, process.pid), now),
+      ).toBe(false);
+      expect(isPeerLive(subPeer(state, SHARED_PROCESS_SUBAGENT_TTL_MS, null), now)).toBe(true);
+      expect(isPeerLive(subPeer(state, SHARED_PROCESS_SUBAGENT_TTL_MS + 1000, null), now)).toBe(
+        false,
+      );
+    }
+    expect(
+      isPeerLive(
+        {
+          ...subPeer("busy", 0, process.pid),
+          pidBirth: "Thu Jan  1 00:00:00 1970",
+        },
+        now,
+      ),
+    ).toBe(false);
   });
 
   it("renders a fresh binding without presence as awaiting observation, not unavailable", async () => {

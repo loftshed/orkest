@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { chmodSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, realpath, writeFile } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import path from "node:path";
@@ -1728,21 +1728,123 @@ describe("terminal lifecycle", () => {
     expect(view.handleKey("u")).toBe(true);
     expect(view.quotaMode).toBe("expanded");
 
-    // Verify repo-denied account filtering in horde-tui:
+    // Verify repo-denied account filtering in horde-tui (multi-account tags, aliases, and IDs):
     const sampleAccounts = [
-      { id: "claude", provider: "claude", label: "Claude Work", short: "K" },
-      { id: "plaude", provider: "claude", label: "Claude Personal", short: "P" },
+      { id: "claude-w1", provider: "claude", label: "Claude Work 1", short: "W1", tags: ["work"] },
+      { id: "claude-w2", provider: "claude", label: "Claude Work 2", short: "W2", tags: ["work"] },
+      {
+        id: "claude-p1",
+        alias: "claude-alt",
+        provider: "claude",
+        label: "Claude Personal 1",
+        short: "P1",
+        tags: ["personal"],
+      },
+      {
+        id: "claude-p2",
+        provider: "claude",
+        label: "Claude Personal 2",
+        short: "P2",
+        tags: ["personal"],
+      },
+      {
+        id: "claude-acme",
+        provider: "claude",
+        label: "Claude Acme",
+        short: "CA",
+        tags: ["client-acme"],
+      },
       { id: "codex", provider: "codex", label: "Codex", short: "C" },
       { id: "antigravity", provider: "antigravity", label: "Gemini", short: "G" },
     ];
     expect(
-      hordeTuiModule.filterAccountsByRepoPolicy(sampleAccounts, ["claude-work"]).map((a) => a.id),
-    ).toEqual(["plaude", "codex", "antigravity"]);
+      hordeTuiModule.filterAccountsByRepoPolicy(sampleAccounts, ["work"]).map((a) => a.id),
+    ).toEqual(["claude-p1", "claude-p2", "claude-acme", "codex", "antigravity"]);
     expect(
       hordeTuiModule
-        .filterAccountsByRepoPolicy(sampleAccounts, ["plaude", "codex"])
+        .filterAccountsByRepoPolicy(sampleAccounts, ["personal", "client-acme", "codex"])
         .map((a) => a.id),
-    ).toEqual(["claude", "antigravity"]);
+    ).toEqual(["claude-w1", "claude-w2", "antigravity"]);
+    expect(
+      hordeTuiModule
+        .filterAccountsByRepoPolicy(sampleAccounts, ["claude-alt", "claude-w2"])
+        .map((a) => a.id),
+    ).toEqual(["claude-w1", "claude-p2", "claude-acme", "codex", "antigravity"]);
+
+    // Verify cachedQuota caches repo policy per (cwd, mtime, TTL) without re-running git on every 1s refresh:
+    const policyCacheTmp = await mkdtemp(path.join(tmpdir(), "ork-tui-policy-cache-"));
+    try {
+      const qCacheDir = path.join(policyCacheTmp, "cache");
+      const qConfigDir = path.join(policyCacheTmp, "cfg");
+      const qRepo = path.join(policyCacheTmp, "repo-cached");
+      mkdirSync(qCacheDir, { recursive: true });
+      mkdirSync(qConfigDir, { recursive: true });
+      mkdirSync(path.join(qRepo, ".orkest"), { recursive: true });
+      const monCfgPath = path.join(qConfigDir, "monitor.json");
+      const polCfgPath = path.join(qConfigDir, "orchestrate.json");
+      writeFileSync(
+        path.join(qCacheDir, "snapshot.json"),
+        JSON.stringify({
+          accounts: {
+            claude: { id: "claude", provider: "claude", billing: "work" },
+            codex: { id: "codex", provider: "codex" },
+          },
+        }),
+      );
+      writeFileSync(
+        monCfgPath,
+        JSON.stringify({
+          accounts: [
+            { id: "claude", provider: "claude", billing: "work" },
+            { id: "codex", provider: "codex" },
+          ],
+        }),
+      );
+      writeFileSync(polCfgPath, JSON.stringify({}));
+      writeFileSync(
+        path.join(qRepo, ".orkest", "policy.json"),
+        JSON.stringify({ deny: ["codex"] }),
+      );
+
+      hordeTuiModule.resetRepoPolicyCache();
+      let gitCalls = 0;
+      const countingExecAsync = async () => {
+        gitCalls += 1;
+        return { stdout: "", stderr: "" };
+      };
+      const baseOpts = {
+        cacheDir: qCacheDir,
+        monitorConfigPath: monCfgPath,
+        configPath: polCfgPath,
+        homeDir: policyCacheTmp,
+        env: { HOME: policyCacheTmp },
+        execAsync: countingExecAsync,
+        policyTtlMs: 15_000,
+      };
+      const r1 = await hordeTuiModule.cachedQuota(qRepo, { ...baseOpts, now: 1000 });
+      expect(r1.map((a) => a.id)).toEqual(["claude"]);
+      expect(gitCalls).toBe(2);
+
+      // Subsequent 1s tick hits cache: 0 git spawns
+      const r2 = await hordeTuiModule.cachedQuota(qRepo, { ...baseOpts, now: 2000 });
+      expect(r2.map((a) => a.id)).toEqual(["claude"]);
+      expect(gitCalls).toBe(2);
+
+      // Modifying .orkest/policy.json invalidates immediately even within TTL
+      const localPolicyFile = path.join(qRepo, ".orkest", "policy.json");
+      writeFileSync(localPolicyFile, JSON.stringify({ deny: ["claude-work"] }));
+      utimesSync(localPolicyFile, new Date(Date.now() + 2000), new Date(Date.now() + 2000));
+      const r3 = await hordeTuiModule.cachedQuota(qRepo, { ...baseOpts, now: 3000 });
+      expect(r3.map((a) => a.id)).toEqual(["codex"]);
+      expect(gitCalls).toBe(4);
+
+      // TTL expiry re-evaluates
+      const r4 = await hordeTuiModule.cachedQuota(qRepo, { ...baseOpts, now: 20_000 });
+      expect(r4.map((a) => a.id)).toEqual(["codex"]);
+      expect(gitCalls).toBe(6);
+    } finally {
+      rmSync(policyCacheTmp, { recursive: true, force: true });
+    }
 
     // Test probeRoomServices & cachedServices with mocked lsof, ps, and docker ps output
     // (including internal agy / codex IPC ephemeral ports that must be filtered out):
@@ -3336,6 +3438,81 @@ describe("terminal lifecycle", () => {
       chiefInput.emit("data", "q");
       await chiefRunning;
       vi.useRealTimers();
+    }
+  });
+
+  it("fails closed in strict mode and surfaces unavailable state when policy or git lookup fails", async () => {
+    const tmpDir = await mkdtemp(path.join(tmpdir(), "ork-tui-strict-policy-"));
+    try {
+      const qCacheDir = path.join(tmpDir, "cache");
+      const qConfigDir = path.join(tmpDir, "cfg");
+      const qRepo = path.join(tmpDir, "repo-strict");
+      mkdirSync(qCacheDir, { recursive: true });
+      mkdirSync(qConfigDir, { recursive: true });
+      mkdirSync(path.join(qRepo, ".orkest"), { recursive: true });
+      const monCfgPath = path.join(qConfigDir, "monitor.json");
+      const polCfgPath = path.join(qConfigDir, "orchestrate.json");
+      writeFileSync(
+        path.join(qCacheDir, "snapshot.json"),
+        JSON.stringify({
+          accounts: {
+            claude: { id: "claude", provider: "claude", billing: "work" },
+            codex: { id: "codex", provider: "codex" },
+          },
+        }),
+      );
+      writeFileSync(
+        monCfgPath,
+        JSON.stringify({
+          accounts: [
+            { id: "claude", provider: "claude", billing: "work" },
+            { id: "codex", provider: "codex" },
+          ],
+        }),
+      );
+      writeFileSync(polCfgPath, JSON.stringify({}));
+      writeFileSync(path.join(qRepo, ".orkest", "policy.json"), JSON.stringify({ deny: "all" }));
+
+      hordeTuiModule.resetRepoPolicyCache();
+      const baseOpts = {
+        cacheDir: qCacheDir,
+        monitorConfigPath: monCfgPath,
+        configPath: polCfgPath,
+        homeDir: tmpDir,
+        env: { HOME: tmpDir },
+        execAsync: async () => ({ stdout: "", stderr: "" }),
+      };
+
+      const badState = await hordeTuiModule.readRepoDeniedList(qRepo, baseOpts);
+      expect(badState.available).toBe(false);
+      expect(badState.error).toContain("expected array");
+      expect(
+        hordeTuiModule.filterAccountsByRepoPolicy([{ id: "codex", provider: "codex" }], badState),
+      ).toEqual([]);
+      await expect(hordeTuiModule.cachedQuota(qRepo, baseOpts)).rejects.toThrow(
+        /Repository policy unavailable/u,
+      );
+
+      // Git lookup ENOENT error also fails closed instead of exposing unrestricted accounts
+      writeFileSync(
+        path.join(qRepo, ".orkest", "policy.json"),
+        JSON.stringify({ deny: ["codex"] }),
+      );
+      hordeTuiModule.resetRepoPolicyCache();
+      const gitFailOpts = {
+        ...baseOpts,
+        execAsync: async () => {
+          throw Object.assign(new Error("spawn git ENOENT"), { code: "ENOENT" });
+        },
+      };
+      const gitErrState = await hordeTuiModule.readRepoDeniedList(qRepo, gitFailOpts);
+      expect(gitErrState.available).toBe(false);
+      expect(gitErrState.error).toContain("Failed to resolve git repository root");
+      await expect(hordeTuiModule.cachedQuota(qRepo, gitFailOpts)).rejects.toThrow(
+        /Repository policy unavailable/u,
+      );
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
     }
   });
 });

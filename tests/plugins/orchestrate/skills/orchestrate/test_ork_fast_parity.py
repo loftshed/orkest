@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import hashlib
 import http.server
@@ -7,6 +8,7 @@ import json
 import os
 import socket
 import socketserver
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -26,7 +28,10 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import _ork_fast_test_helpers as ORK_FAST  # noqa: E402
+import handoff  # noqa: E402 -- exercise shipped Chief liveness parity
 import install_mailbox  # noqa: E402 -- exercise the shipped installer
+import mailbox_store  # noqa: E402 -- exercise shipped process birth helper
+import mailbox_wake  # noqa: E402 -- exercise exact wake notice formatting
 import peer_mailbox  # noqa: E402 -- exercise shipped peer storage helpers
 import room_store  # noqa: E402 -- rooms written through the shipped Node store
 import runtime_paths  # noqa: E402 -- exercise shipped path helpers
@@ -352,6 +357,11 @@ class TestOrkFastIntegration(unittest.TestCase):
             ("missing_chief_json", None, "not set"),
             ("other_chief_session", {"schema": "ork.chief.v1", "session": "other-session"}, "not set"),
             ("matching_chief_session", {"schema": "ork.chief.v1", "session": session_id}, chief_focus),
+            (
+                "matching_chief_session_with_generation",
+                {"schema": "ork.chief.v1", "session": session_id, "generation": "gen-1"},
+                chief_focus,
+            ),
         )
         for label_case, chief_doc, expected_task in scenarios:
             with self.subTest(case=label_case):
@@ -365,6 +375,83 @@ class TestOrkFastIntegration(unittest.TestCase):
                 )
                 self.assertEqual(rust_json["task"], expected_task)
 
+    def test_chief_liveness_aged_non_shared_exact_peer_parity(self):
+        """Test 8-day-old non-shared Chief exact peer with verified live PID fails closed in Python & Rust."""
+        mailbox_root = runtime_paths.cache_home(env=self.env, home=self.home) / "mailbox-v1"
+        (mailbox_root / "peers").mkdir(parents=True)
+        checkout_dir = self.home / "repo"
+        checkout_dir.mkdir(parents=True)
+        resolved_checkout = str(checkout_dir.resolve())
+        session_id = "sess-chief-aged-parity"
+        s_key = peer_mailbox.session_key(session_id)
+        pid = os.getpid()
+        pid_birth = mailbox_store.process_started(pid)
+        self.assertTrue(pid_birth)
+        host = socket.gethostname()
+        now = dt.datetime.now(dt.UTC)
+        aged_stamp = (now - dt.timedelta(days=8)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        fresh_stamp = (now - dt.timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        chief_focus = "Ork Chief — machine-wide master orchestrator"
+        stdin_payload = {"session_id": session_id, "terminal_width": 120}
+
+        peer_record = {
+            "schema": "agent-executor.peer.v1",
+            "session": session_id,
+            "name": "iron-aurora-ab",
+            "harness": "claude",
+            "machine": host,
+            "cwd": resolved_checkout,
+            "checkout": resolved_checkout,
+            "repo": str(self.home / "repos" / "orkest"),
+            "sessionModel": "claude-sonnet-4-6",
+            "effort": "high",
+            "state": "idle",
+            "sharedProcess": False,
+            "pid": pid,
+            "pidBirth": pid_birth,
+            "focus": chief_focus,
+            "startedAt": aged_stamp,
+            "lastSeenAt": aged_stamp,
+        }
+        peer_file = mailbox_root / "peers" / f"{s_key}.json"
+        peer_file.write_text(json.dumps(peer_record), encoding="utf-8")
+
+        chief_doc = {
+            "schema": "ork.chief.v1",
+            "session": session_id,
+            "machine": host,
+            "pid": pid,
+            "pidBirth": pid_birth,
+            "boundAt": aged_stamp,
+        }
+        chief_file = mailbox_root / "chief.json"
+        chief_file.write_text(json.dumps(chief_doc), encoding="utf-8")
+
+        self.assertIsNone(handoff.live_chief_binding(mailbox_root, session_id))
+        aged_rust = ORK_FAST.statusline_identity(
+            session_id, "claude", payload=stdin_payload, base=mailbox_root, env=self.env
+        )
+        self.assertEqual(aged_rust["task"], "not set")
+
+        # Control: 1-day-old heartbeat with the same verified live PID is live in both.
+        peer_record["lastSeenAt"] = fresh_stamp
+        peer_file.write_text(json.dumps(peer_record), encoding="utf-8")
+        self.assertIsNotNone(handoff.live_chief_binding(mailbox_root, session_id))
+        fresh_rust = ORK_FAST.statusline_identity(
+            session_id, "claude", payload=stdin_payload, base=mailbox_root, env=self.env
+        )
+        self.assertEqual(fresh_rust["task"], chief_focus)
+
+        # Symlinked chief.json must fail closed in Rust without following the symlink.
+        target_chief = self.home / "outside-chief.json"
+        target_chief.write_text(json.dumps(chief_doc), encoding="utf-8")
+        chief_file.unlink()
+        chief_file.symlink_to(target_chief)
+        symlink_rust = ORK_FAST.statusline_identity(
+            session_id, "claude", payload=stdin_payload, base=mailbox_root, env=self.env
+        )
+        self.assertEqual(symlink_rust["task"], "not set")
+
     def test_mailbox_hook_stop_preinvocation_and_unread_delivery(self):
         """Test Stop state->idle + gemini lastStopReason, PreInvocation mid-turn + agy pending classification, and unread inbox delivery."""
         mailbox_root = runtime_paths.cache_home(env=self.env, home=self.home) / "mailbox-v1"
@@ -375,15 +462,18 @@ class TestOrkFastIntegration(unittest.TestCase):
         old_stamp = (dt.datetime.now(dt.UTC) - dt.timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
         checkout_dir = self.home / "repo"
         checkout_dir.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(checkout_dir)], check=True, capture_output=True)
+        expected_repo = str((checkout_dir / ".git").resolve())
 
         peer_record = {
             "schema": "agent-executor.peer.v1",
             "session": session_id,
             "name": "cobalt-nova-cd",
+            "announcedName": "cobalt-nova-cd",
             "harness": "gemini",
             "cwd": str(checkout_dir.resolve()),
             "checkout": str(checkout_dir.resolve()),
-            "repo": str(checkout_dir.resolve()),
+            "repo": expected_repo,
             "remotes": [],
             "model": "gemini-3.8-flash-high",
             "state": "busy",
@@ -393,9 +483,31 @@ class TestOrkFastIntegration(unittest.TestCase):
         }
         peer_file.write_text(json.dumps(peer_record), encoding="utf-8")
 
-        # 1. PreInvocation mid-turn fast-path updates lastSeenAt cleanly
+        # Seed deterministic registered name and announcedName before asserting steady-state {}.
+        ORK_FAST.run_mailbox_hook(
+            {
+                "session_id": session_id,
+                "cwd": str(checkout_dir.resolve()),
+                "workspacePaths": [str(checkout_dir.resolve())],
+                "prompt": "warm up",
+            },
+            harness="gemini",
+            event="PreInvocation",
+            base=mailbox_root,
+            env=self.env,
+        )
+        warm = json.loads(peer_file.read_text(encoding="utf-8"))
+        warm["lastSeenAt"] = old_stamp
+        peer_file.write_text(json.dumps(warm), encoding="utf-8")
+
+        # 1. PreInvocation steady state updates lastSeenAt cleanly with empty {}.
         pre_out = ORK_FAST.run_mailbox_hook(
-            {"session_id": session_id, "prompt": "continue work"},
+            {
+                "session_id": session_id,
+                "cwd": str(checkout_dir.resolve()),
+                "workspacePaths": [str(checkout_dir.resolve())],
+                "prompt": "continue work",
+            },
             harness="gemini",
             event="PreInvocation",
             base=mailbox_root,
@@ -406,27 +518,52 @@ class TestOrkFastIntegration(unittest.TestCase):
         self.assertEqual(after_pre["state"], "busy")
         self.assertNotEqual(after_pre["lastSeenAt"], old_stamp)
 
-        # 1b. Gemini peer with agySubagentPending=True resolves natively from subagent transcript
+        # 1b. Delayed Gemini subagent classification: missing evidence -> agySubagentPending -> transcript/SQLite resolves
+        gemini_home = self.home / ".gemini"
+        brain_dir = gemini_home / "antigravity-cli" / "brain"
+        brain_dir.mkdir(parents=True, exist_ok=True)
+        sub_env = {**self.env, "GEMINI_CLI_HOME": str(gemini_home)}
+
         pending_sid = "sess-mailbox-pending-1"
         pending_key = peer_mailbox.session_key(pending_sid)
         pending_file = mailbox_root / "peers" / f"{pending_key}.json"
-        pending_record = {**peer_record, "session": pending_sid, "agySubagentPending": True}
-        pending_file.write_text(json.dumps(pending_record), encoding="utf-8")
         sub_transcript = self.home / "sub-transcript.jsonl"
         sub_transcript.write_text(
-            json.dumps(
-                {
-                    "step_index": 1,
-                    "type": "SYSTEM_MESSAGE",
-                    "content": (
-                        "<SYSTEM_MESSAGE>\n"
-                        f"[Message] timestamp=2026-11-15T00:00:00Z sender={session_id} priority=HIGH content=work"
-                    ),
-                }
-            )
-            + "\n",
+            json.dumps({"step_index": 0, "type": "EPHEMERAL_MESSAGE", "content": "warming up"}) + "\n",
             encoding="utf-8",
         )
+        # First hook with missing parent evidence marks agySubagentPending=True without mis-tagging isSubagent
+        ORK_FAST.run_mailbox_hook(
+            {
+                "conversationId": pending_sid,
+                "invocationNum": 1,
+                "transcriptPath": str(sub_transcript),
+                "workspacePaths": [str(checkout_dir.resolve())],
+            },
+            harness="gemini",
+            event="PreInvocation",
+            base=mailbox_root,
+            env=sub_env,
+        )
+        pending_initial = json.loads(pending_file.read_text(encoding="utf-8"))
+        self.assertTrue(pending_initial.get("agySubagentPending"))
+        self.assertFalse(pending_initial.get("isSubagent"))
+
+        # Second hook adds structured opening SYSTEM_MESSAGE -> resolves isSubagent, parentSession, clears pending
+        with sub_transcript.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "step_index": 1,
+                        "type": "SYSTEM_MESSAGE",
+                        "content": (
+                            "<SYSTEM_MESSAGE>\n"
+                            f"[Message] timestamp=2026-11-15T00:00:00Z sender={session_id} priority=HIGH content=work"
+                        ),
+                    }
+                )
+                + "\n"
+            )
         ORK_FAST.run_mailbox_hook(
             {
                 "conversationId": pending_sid,
@@ -437,12 +574,182 @@ class TestOrkFastIntegration(unittest.TestCase):
             harness="gemini",
             event="PreInvocation",
             base=mailbox_root,
-            env=self.env,
+            env=sub_env,
         )
         classified_pending = json.loads(pending_file.read_text(encoding="utf-8"))
         self.assertTrue(classified_pending.get("isSubagent"))
         self.assertEqual(classified_pending.get("parentSession"), session_id)
         self.assertIsNone(classified_pending.get("agySubagentPending"))
+
+        # SQLite conversation_parents fixture resolves delayed child without needing SYSTEM_MESSAGE
+        db_path = gemini_home / "antigravity-cli" / "conversation_summaries.db"
+        sqlite_child_sid = "sess-mailbox-sqlite-child-1"
+        with contextlib.closing(sqlite3.connect(db_path)) as con, con:
+            con.execute(
+                "CREATE TABLE conversation_summaries ("
+                "conversation_id TEXT PRIMARY KEY, parent_conversation_id TEXT, nesting_depth INTEGER, agent_name TEXT)"
+            )
+            con.execute("CREATE TABLE conversation_parents (conversation_id TEXT PRIMARY KEY, parent_id TEXT)")
+            con.execute("INSERT INTO conversation_parents VALUES (?, ?)", (sqlite_child_sid, session_id))
+        ORK_FAST.run_mailbox_hook(
+            {
+                "conversationId": sqlite_child_sid,
+                "workspacePaths": [str(checkout_dir.resolve())],
+            },
+            harness="gemini",
+            event="SessionStart",
+            base=mailbox_root,
+            env=sub_env,
+        )
+        sqlite_child = json.loads(
+            (mailbox_root / "peers" / f"{peer_mailbox.session_key(sqlite_child_sid)}.json").read_text(encoding="utf-8")
+        )
+        self.assertTrue(sqlite_child.get("isSubagent"))
+        self.assertEqual(sqlite_child.get("parentSession"), session_id)
+        self.assertIsNone(sqlite_child.get("agySubagentPending"))
+
+        # Parent hook banner must list non-subagent colleague while hiding confirmed and still-pending children
+        still_pending_sid = "sess-mailbox-still-pending-1"
+        still_pending_file = mailbox_root / "peers" / f"{peer_mailbox.session_key(still_pending_sid)}.json"
+        still_pending_transcript = self.home / "still-pending-transcript.jsonl"
+        still_pending_transcript.write_text(
+            json.dumps({"step_index": 0, "type": "EPHEMERAL_MESSAGE", "content": "warming up"}) + "\n",
+            encoding="utf-8",
+        )
+        ORK_FAST.run_mailbox_hook(
+            {
+                "conversationId": still_pending_sid,
+                "invocationNum": 1,
+                "transcriptPath": str(still_pending_transcript),
+                "workspacePaths": [str(checkout_dir.resolve())],
+            },
+            harness="gemini",
+            event="PreInvocation",
+            base=mailbox_root,
+            env=sub_env,
+        )
+        still_pending = json.loads(still_pending_file.read_text(encoding="utf-8"))
+        self.assertTrue(still_pending.get("agySubagentPending"))
+        self.assertFalse(still_pending.get("isSubagent"))
+
+        colleague_sid = "sess-mailbox-colleague-1"
+        colleague_file = mailbox_root / "peers" / f"{peer_mailbox.session_key(colleague_sid)}.json"
+        colleague_record = {
+            **peer_record,
+            "session": colleague_sid,
+            "name": "emerald-lyra-xy",
+            "state": "idle",
+            "repo": expected_repo,
+            "checkout": str(checkout_dir.resolve()),
+        }
+        colleague_file.write_text(json.dumps(colleague_record), encoding="utf-8")
+        for peer_doc in (after_pre, classified_pending, sqlite_child, still_pending, colleague_record):
+            self.assertEqual(peer_doc.get("repo"), expected_repo)
+
+        parent_banner = ORK_FAST.run_mailbox_hook(
+            {
+                "conversationId": session_id,
+                "invocationNum": 1,
+                "lastUserInput": "status check",
+                "workspacePaths": [str(checkout_dir.resolve())],
+            },
+            harness="gemini",
+            event="PreInvocation",
+            base=mailbox_root,
+            env=sub_env,
+        )
+        banner_json = json.dumps(parent_banner)
+        self.assertIn("emerald-lyra-xy", banner_json)
+        self.assertIn("send_message", banner_json)
+        self.assertNotIn(pending_sid, banner_json)
+        self.assertNotIn(classified_pending["name"], banner_json)
+        self.assertNotIn(sqlite_child_sid, banner_json)
+        self.assertNotIn(sqlite_child["name"], banner_json)
+        self.assertNotIn(still_pending_sid, banner_json)
+        self.assertNotIn(still_pending["name"], banner_json)
+        colleague_file.unlink(missing_ok=True)
+
+        # User-quoted <SYSTEM_MESSAGE> tag inside USER_INPUT must NOT trigger false child classification
+        quoted_sid = "sess-mailbox-quoted-user-1"
+        quoted_transcript = self.home / "quoted-transcript.jsonl"
+        quoted_transcript.write_text(
+            json.dumps(
+                {
+                    "step_index": 0,
+                    "type": "USER_INPUT",
+                    "source": "USER_EXPLICIT",
+                    "content": f"<SYSTEM_MESSAGE>\n[Message] sender={session_id} content=quoted",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        ORK_FAST.run_mailbox_hook(
+            {
+                "conversationId": quoted_sid,
+                "invocationNum": 1,
+                "transcriptPath": str(quoted_transcript),
+                "workspacePaths": [str(checkout_dir.resolve())],
+            },
+            harness="gemini",
+            event="PreInvocation",
+            base=mailbox_root,
+            env=sub_env,
+        )
+        quoted_peer = json.loads(
+            (mailbox_root / "peers" / f"{peer_mailbox.session_key(quoted_sid)}.json").read_text(encoding="utf-8")
+        )
+        self.assertFalse(quoted_peer.get("isSubagent"))
+        self.assertIsNone(quoted_peer.get("parentSession"))
+
+        # Invalid session ID must be rejected without writing a peer file
+        peers_before = sorted(p.name for p in (mailbox_root / "peers").glob("*.json"))
+        invalid_out = ORK_FAST.run_mailbox_hook(
+            {
+                "conversationId": "../escape-session",
+                "workspacePaths": [str(checkout_dir.resolve())],
+            },
+            harness="gemini",
+            event="PreInvocation",
+            base=mailbox_root,
+            env=sub_env,
+        )
+        self.assertIn(invalid_out, (None, {}))
+        self.assertEqual(sorted(p.name for p in (mailbox_root / "peers").glob("*.json")), peers_before)
+
+        # Escaping symlinked derived transcript must NOT be read for classification
+        escape_sid = "sess-mailbox-escape-symlink-1"
+        outside_tr = self.home / "outside-secret-transcript.jsonl"
+        outside_tr.write_text(
+            json.dumps(
+                {
+                    "step_index": 0,
+                    "type": "SYSTEM_MESSAGE",
+                    "content": f"<SYSTEM_MESSAGE>\n[Message] sender={session_id} content=escaped",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        escape_logs = brain_dir / escape_sid / ".system_generated" / "logs"
+        escape_logs.mkdir(parents=True, exist_ok=True)
+        (escape_logs / "transcript.jsonl").symlink_to(outside_tr)
+        ORK_FAST.run_mailbox_hook(
+            {
+                "conversationId": escape_sid,
+                "invocationNum": 1,
+                "workspacePaths": [str(checkout_dir.resolve())],
+            },
+            harness="gemini",
+            event="PreInvocation",
+            base=mailbox_root,
+            env=sub_env,
+        )
+        escape_peer = json.loads(
+            (mailbox_root / "peers" / f"{peer_mailbox.session_key(escape_sid)}.json").read_text(encoding="utf-8")
+        )
+        self.assertFalse(escape_peer.get("isSubagent"))
+        self.assertIsNone(escape_peer.get("parentSession"))
 
         # 2. Stop transitions busy -> idle and sets gemini lastStopReason
         stop_out = ORK_FAST.run_mailbox_hook(
@@ -516,6 +823,7 @@ class TestOrkFastIntegration(unittest.TestCase):
                     "schema": "agent-executor.peer.v1",
                     "session": session_id,
                     "name": "cobalt-nova-cd",
+                    "announcedName": "cobalt-nova-cd",
                     "harness": "gemini",
                     "cwd": str(checkout_dir.resolve()),
                     "checkout": str(checkout_dir.resolve()),
@@ -550,6 +858,9 @@ class TestOrkFastIntegration(unittest.TestCase):
                 env=self.env,
             )
 
+        # Warm up so solo self-name announcement settles before testing room index fast path.
+        warm_out = invoke_pre()
+        self.assertIn("Your agent name is", json.dumps(warm_out))
         self.assertEqual(invoke_pre(), {}, "no rooms: stay on fast path with empty JSON")
         room_store.put_room(
             mailbox_root,
@@ -622,6 +933,151 @@ class TestOrkFastIntegration(unittest.TestCase):
         self.assertIsNotNone(peer)
         self.assertEqual(peer["harness"], "claude")
         self.assertEqual(Path(peer["cwd"]).resolve(), repo.resolve())
+
+    def test_mailbox_hook_solo_self_name_announcement(self):
+        """Solo sessions announce their name once, re-announce on rename, suppress run/delegated/subagent, and stay quiet on Stop."""
+        mailbox_root = runtime_paths.cache_home(env=self.env, home=self.home) / "mailbox-v1"
+        session = "sess-solo-announce-1"
+        repo_dir = (self.home / "repo").resolve()
+        peer_file = self._fast_peer(mailbox_root, session)
+
+        # 1st UserPromptSubmit announces registered self-name and records announcedName.
+        first = ORK_FAST.run_mailbox_hook(
+            {"hook_event_name": "UserPromptSubmit", "session_id": session, "cwd": str(repo_dir), "prompt": "hi"},
+            harness="claude",
+            base=mailbox_root,
+            env=self.env,
+        )
+        registered_doc = json.loads(peer_file.read_text(encoding="utf-8"))
+        assigned = registered_doc["name"]
+        first_ctx = (first or {}).get("hookSpecificOutput", {}).get("additionalContext", "")
+        self.assertIn(f"Your agent name is {assigned}", first_ctx)
+        self.assertEqual(registered_doc.get("announcedName"), assigned)
+
+        # 2nd UserPromptSubmit is quiet.
+        second = ORK_FAST.run_mailbox_hook(
+            {"hook_event_name": "UserPromptSubmit", "session_id": session, "cwd": str(repo_dir), "prompt": "next"},
+            harness="claude",
+            base=mailbox_root,
+            env=self.env,
+        )
+        self.assertIsNone(second)
+
+        # Model change triggers deterministic rename, announces once, then quiet again.
+        third = ORK_FAST.run_mailbox_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "cwd": str(repo_dir),
+                "model": "claude-sonnet-5-5",
+                "prompt": "after rename",
+            },
+            harness="claude",
+            base=mailbox_root,
+            env=self.env,
+        )
+        renamed = json.loads(peer_file.read_text(encoding="utf-8"))["name"]
+        self.assertNotEqual(renamed, assigned)
+        third_ctx = (third or {}).get("hookSpecificOutput", {}).get("additionalContext", "")
+        self.assertIn(f"Your agent name is {renamed}", third_ctx)
+        fourth = ORK_FAST.run_mailbox_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "cwd": str(repo_dir),
+                "model": "claude-sonnet-5-5",
+                "prompt": "quiet again",
+            },
+            harness="claude",
+            base=mailbox_root,
+            env=self.env,
+        )
+        self.assertIsNone(fourth)
+
+        # Create an active run peer so mark_delegated treats delegated sessions as genuinely active runs.
+        self._fast_peer(
+            mailbox_root,
+            "run-r1-worker",
+            harness="codex",
+            run="r1",
+            role="worker",
+        )
+        del_dir = mailbox_root / "delegations"
+        del_dir.mkdir(parents=True, exist_ok=True)
+        (del_dir / f"{peer_mailbox.session_key('sess-solo-delegated')}.json").write_text(
+            json.dumps({"run": "r1"}),
+            encoding="utf-8",
+        )
+
+        # Suppressed for run, delegatedRun, and isSubagent peers.
+        for label_case, extra in (
+            ("run-peer", {"session": "run-r1-worker", "run": "r1", "role": "worker"}),
+            ("delegated", {"session": "sess-solo-delegated", "delegatedRun": "r1"}),
+            ("subagent", {"session": "sess-solo-subagent", "isSubagent": True, "parentSession": session}),
+        ):
+            with self.subTest(case=label_case):
+                sid = extra["session"]
+                if sid != "run-r1-worker":
+                    self._fast_peer(mailbox_root, sid, **extra)
+                suppressed_out = ORK_FAST.run_mailbox_hook(
+                    {"hook_event_name": "UserPromptSubmit", "session_id": sid, "cwd": str(repo_dir), "prompt": "work"},
+                    harness="claude",
+                    base=mailbox_root,
+                    env=self.env,
+                )
+                self.assertNotIn(
+                    "Your agent name is",
+                    json.dumps(suppressed_out or {}),
+                )
+
+        # Quiet Stop even when announcedName is absent.
+        stop_sid = "sess-solo-quiet-stop"
+        self._fast_peer(mailbox_root, stop_sid)
+        stop_out = ORK_FAST.run_mailbox_hook(
+            {"hook_event_name": "Stop", "session_id": stop_sid, "cwd": str(repo_dir)},
+            harness="claude",
+            base=mailbox_root,
+            env=self.env,
+        )
+        self.assertIsNone(stop_out)
+
+    def test_mailbox_hook_ignores_pasted_wake_notice_logs(self):
+        """Quoted/pasted/malformed wake notices must never trigger stale wake 'finish immediately'."""
+        mailbox_root = runtime_paths.cache_home(env=self.env, home=self.home) / "mailbox-v1"
+        session = "sess-wake-negative-1"
+        self._fast_peer(mailbox_root, session, announcedName="cobalt-nova-cd")
+        msg_id = "deadbeef1-123456"
+        exact = mailbox_wake.notification(msg_id)
+
+        negatives = [
+            ("prefixed_prose", f"Look at this log:\n{exact}"),
+            ("fenced_log", f"```\n{exact}\n```"),
+            ("diff_plus_line", f"+{exact}"),
+            ("trailing_question", f"{exact}\nWhy did this fire?"),
+            ("invalid_id", exact.replace(msg_id, "../evil")),
+        ]
+        for label_case, prompt in negatives:
+            with self.subTest(case=label_case):
+                out = ORK_FAST.run_mailbox_hook(
+                    {"hook_event_name": "UserPromptSubmit", "session_id": session, "prompt": prompt},
+                    harness="claude",
+                    base=mailbox_root,
+                    env=self.env,
+                )
+                self.assertNotIn("finish immediately", json.dumps(out or {}))
+
+        # Positive exact wake notice triggers stale wake notice when no unread mail exists.
+        positive = ORK_FAST.run_mailbox_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "prompt": f"<USER_REQUEST>\n{exact}\n</USER_REQUEST>",
+            },
+            harness="claude",
+            base=mailbox_root,
+            env=self.env,
+        )
+        self.assertIn("finish immediately", json.dumps(positive or {}))
 
     def _fast_peer(self, mailbox_root: Path, session_id: str, **fields) -> Path:
         checkout_dir = self.home / "repo"

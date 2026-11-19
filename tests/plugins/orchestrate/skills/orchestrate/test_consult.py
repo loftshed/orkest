@@ -60,7 +60,7 @@ import pathlib
 import sys
 
 def capture(extra=None):
-    payload = {"argv": sys.argv[1:], "cwd": os.getcwd(), "env": {k: v for k, v in os.environ.items() if k.startswith(("OPENCODE", "CLAUDE", "TERM", "NO_COLOR"))}}
+    payload = {"argv": sys.argv[1:], "cwd": os.getcwd(), "env": {k: v for k, v in os.environ.items() if k.startswith(("OPENCODE", "CLAUDE", "TERM", "NO_COLOR", "ANTIGRAVITY", "GEMINI"))}}
     if extra:
         payload.update(extra)
     pathlib.Path(os.environ["FAKE_CAPTURE"]).write_text(json.dumps(payload), encoding="utf-8")
@@ -675,6 +675,268 @@ class ConsultTests(unittest.TestCase):
         policy.assert_called_once()
         perform.assert_not_called()
 
+    def test_enforce_policy_propagates_returned_claude_config_dir_and_preserves_explicit_profile(self) -> None:
+        auto_dir = self.root / "auto-alt"
+        auto_dir.mkdir()
+        env = self.environment(CLAUDE_CODE_SESSION_ID="host-claude")
+
+        with mock.patch.object(RUNNER, "enforce_repo_policy", return_value=auto_dir) as policy:
+            code, result, _ = self.consult("--question", "Why?", "--model", "opus", "--format", "text", env=env)
+
+        self.assertEqual(code, 0, result)
+        policy.assert_called_once()
+        self.assertEqual(result["status"], "answered")
+        self.assertEqual(result["transport"], "executor")
+        self.assertEqual(result["claude_config_dir"], str(auto_dir))
+        capture = json.loads(self.capture_path.read_text(encoding="utf-8"))
+        self.assertEqual(capture["env"].get("CLAUDE_CONFIG_DIR"), str(auto_dir))
+
+        explicit_dir = self.root / "explicit-alt"
+        explicit_dir.mkdir()
+        with mock.patch.object(RUNNER, "enforce_repo_policy", return_value=None):
+            code2, result2, _ = self.consult(
+                "--question",
+                "Why?",
+                "--model",
+                "opus",
+                "--claude-config-dir",
+                str(explicit_dir),
+                "--format",
+                "text",
+                env=env,
+            )
+
+        self.assertEqual(code2, 0, result2)
+        self.assertEqual(result2["claude_config_dir"], str(explicit_dir))
+        capture2 = json.loads(self.capture_path.read_text(encoding="utf-8"))
+        self.assertEqual(capture2["env"].get("CLAUDE_CONFIG_DIR"), str(explicit_dir))
+
+    def test_native_transport_verifies_effective_host_profile_and_rejects_profile_switch(self) -> None:
+        work_dir = self.root / ".claude"
+        work_dir.mkdir(exist_ok=True)
+        alt_dir = self.root / ".claude-alt"
+        alt_dir.mkdir(exist_ok=True)
+        monitor_cfg = self.root / "monitor-consult-native.json"
+        monitor_cfg.write_text(
+            json.dumps(
+                {
+                    "accounts": [
+                        {"id": "claude-work", "provider": "claude", "tags": ["work"], "configDir": str(work_dir)},
+                        {
+                            "id": "claude-alt",
+                            "provider": "claude",
+                            "alias": "claude-alt",
+                            "tags": ["personal"],
+                            "configDir": str(alt_dir),
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        work_env = self.environment(CLAUDECODE="1", HOME=str(self.root), MONITOR_CONFIG=str(monitor_cfg))
+        work_env.pop("CLAUDE_CONFIG_DIR", None)
+
+        # 1. Explicit --transport native with explicit alt dir on a work host is refused
+        code, result, _ = self.consult(
+            "--question",
+            "Why?",
+            "--model",
+            "opus",
+            "--transport",
+            "native",
+            "--claude-config-dir",
+            str(alt_dir),
+            env=work_env,
+        )
+        self.assertEqual(code, 4)
+        self.assertIn("--transport native", result["error"])
+
+        # 2. Explicit --transport native on a work host whose work profile is denied fails even if ORCHESTRATE_AUTO_ACCOUNT=1
+        policy_dir = self.repository / ".orkest"
+        policy_dir.mkdir(exist_ok=True)
+        (policy_dir / "policy.json").write_text(json.dumps({"deny": ["claude-work"]}), encoding="utf-8")
+        try:
+            auto_work_env = {**work_env, "ORCHESTRATE_AUTO_ACCOUNT": "1"}
+            code_native, res_native, _ = self.consult(
+                "--question",
+                "Why?",
+                "--model",
+                "opus",
+                "--read",
+                str(self.repository),
+                "--transport",
+                "native",
+                env=auto_work_env,
+            )
+            self.assertEqual(code_native, 4)
+            self.assertIn("--transport native", res_native["error"])
+
+            # 3. auto transport on the same denied work host reroutes to executor with allowed alt account
+            code_auto, res_auto, _ = self.consult(
+                "--question",
+                "Why?",
+                "--model",
+                "opus",
+                "--read",
+                str(self.repository),
+                env=auto_work_env,
+            )
+            self.assertEqual(code_auto, 0, res_auto)
+            self.assertEqual(res_auto["transport"], "executor")
+            self.assertEqual(res_auto["claude_config_dir"], str(alt_dir))
+            self.assertEqual(res_auto["account_id"], "claude-alt")
+
+            # 4. Host actually running on alt CLAUDE_CONFIG_DIR is allowed for native transport
+            alt_host_env = {**work_env, "CLAUDE_CONFIG_DIR": str(alt_dir)}
+            code_alt, res_alt, _ = self.consult(
+                "--question",
+                "Why?",
+                "--model",
+                "opus",
+                "--read",
+                str(self.repository),
+                "--transport",
+                "native",
+                env=alt_host_env,
+            )
+            self.assertEqual(code_alt, 0, res_alt)
+            self.assertEqual(res_alt["status"], "native_handoff")
+        finally:
+            (policy_dir / "policy.json").unlink(missing_ok=True)
+
+    def test_follow_up_refuses_denied_original_profile_instead_of_swapping_accounts(self) -> None:
+        work_dir = self.root / ".claude"
+        work_dir.mkdir(exist_ok=True)
+        alt_dir = self.root / ".claude-alt"
+        alt_dir.mkdir(exist_ok=True)
+        monitor_cfg = self.root / "monitor-consult-followup.json"
+        monitor_cfg.write_text(
+            json.dumps(
+                {
+                    "accounts": [
+                        {"id": "claude-work", "provider": "claude", "tags": ["work"], "configDir": str(work_dir)},
+                        {
+                            "id": "claude-alt",
+                            "provider": "claude",
+                            "alias": "claude-alt",
+                            "tags": ["personal"],
+                            "configDir": str(alt_dir),
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        env = self.environment(HOME=str(self.root), MONITOR_CONFIG=str(monitor_cfg))
+        env.pop("CLAUDE_CONFIG_DIR", None)
+
+        code, first, _ = self.consult(
+            "--question",
+            "Which lock?",
+            "--model",
+            "opus",
+            "--read",
+            str(self.repository),
+            env=env,
+        )
+        self.assertEqual(code, 0, first)
+        self.assertIsNone(first["claude_config_dir"])
+
+        policy_dir = self.repository / ".orkest"
+        policy_dir.mkdir(exist_ok=True)
+        (policy_dir / "policy.json").write_text(json.dumps({"deny": ["claude-work"]}), encoding="utf-8")
+        try:
+            auto_env = {**env, "ORCHESTRATE_AUTO_ACCOUNT": "1"}
+            code2, refused, _ = self.consult(
+                "--question",
+                "Follow up?",
+                "--follow-up",
+                first["result_path"],
+                env=auto_env,
+            )
+            self.assertEqual(code2, 2)
+            self.assertIn("fresh consultation", refused["error"])
+        finally:
+            (policy_dir / "policy.json").unlink(missing_ok=True)
+
+    def test_repo_policy_enforces_account_and_tag_denials_and_cli_rejects_contradictory_account(self) -> None:
+        repo_policy = RUNNER.bundled_module("repo_policy")
+        work_dir = self.root / ".claude"
+        alt_dir = self.root / ".claude-alt"
+        monitor_cfg = self.root / "monitor-policy-tags.json"
+        monitor_cfg.write_text(
+            json.dumps(
+                {
+                    "accounts": [
+                        {"id": "claude-work", "provider": "claude", "tags": ["work"], "configDir": str(work_dir)},
+                        {
+                            "id": "claude-alt",
+                            "provider": "claude",
+                            "alias": "claude-alt",
+                            "tags": ["personal", "client-a"],
+                            "configDir": str(alt_dir),
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        cfg = {"repo_policies": [{"path": str(self.repository), "deny": ["claude-work", "tag:client-a"]}]}
+        ok1, msg1, _ = repo_policy.check_execution_allowed(
+            self.repository,
+            "claude",
+            alt_dir,
+            config=cfg,
+            home=self.root,
+            monitor_config_path=monitor_cfg,
+            strict=True,
+        )
+        self.assertFalse(ok1)
+        self.assertIn("client-a", msg1 or "")
+
+        ok2, msg2, _ = repo_policy.check_execution_allowed(
+            self.repository,
+            "claude",
+            work_dir,
+            config=cfg,
+            home=self.root,
+            monitor_config_path=monitor_cfg,
+            strict=True,
+        )
+        self.assertFalse(ok2)
+        self.assertIn("claude-work", msg2 or "")
+
+        # CLI --account contradicting --claude-config-dir fails closed.
+        code_bad, res_bad, _ = self.consult(
+            "--question",
+            "Why?",
+            "--account",
+            "claude-alt",
+            "--claude-config-dir",
+            str(work_dir),
+            env=self.environment(HOME=str(self.root), MONITOR_CONFIG=str(monitor_cfg)),
+        )
+        self.assertEqual(code_bad, 4)
+        self.assertIn("contradicts", res_bad["error"])
+
+    def test_enforce_policy_isolates_returned_claude_config_dir_per_panel_member(self) -> None:
+        auto_dir = self.root / "panel-auto-alt"
+        auto_dir.mkdir()
+
+        def policy_for_member(_cwd, engine, claude_config_dir=None, **_kwargs):
+            if engine == "claude":
+                return auto_dir
+            return None
+
+        with mock.patch.object(RUNNER, "enforce_repo_policy", side_effect=policy_for_member):
+            code, panel, _ = self.consult("--question", "Why?", "--model", "opus,gpt-5.6-luna", "--format", "json")
+
+        self.assertEqual(code, 0, panel)
+        by_engine = {member["engine"]: member for member in panel["consultants"]}
+        self.assertEqual(by_engine["claude"]["claude_config_dir"], str(auto_dir))
+        self.assertIsNone(by_engine["codex"]["claude_config_dir"])
+
     def test_all_failed_panel_uses_the_first_consultants_exit_code(self) -> None:
         def refuse_both(_engine, model, **_kwargs):
             code = 15 if model == "gpt-5.6-sol" else 18
@@ -1067,6 +1329,1281 @@ class ConsultTests(unittest.TestCase):
         self.assertTrue(result["web"])
         self.assertIn("--search", self.capture()["argv"])
         self.assertIn("cite URLs for external facts", self.capture()["stdin"])
+
+    def test_saved_request_rechecks_repo_policy_before_dispatch(self) -> None:
+        request_path = self.root / "saved-request.json"
+        request_payload = {
+            "schema": CONSULT.REQUEST_SCHEMA,
+            "intent": "investigate",
+            "question": "Check lock safety",
+            "context": None,
+            "attachments": [],
+            "change": None,
+            "read": str(self.repository),
+            "engine": "codex",
+            "model": "gpt-5.6-sol",
+            "requested_model": "gpt:sol",
+            "effort": "high",
+            "variant": None,
+            "route": "consultation",
+            "transport": "executor",
+            "host": None,
+            "billing_mode": "unknown",
+            "timeout": "1m",
+            "allow_credits": False,
+            "ignore_quota": False,
+            "web": False,
+            "claude_config_dir": None,
+        }
+        request_path.write_text(json.dumps(request_payload), encoding="utf-8")
+        policy_dir = self.repository / ".orkest"
+        policy_dir.mkdir(exist_ok=True)
+        (policy_dir / "policy.json").write_text(json.dumps({"deny": ["codex"]}), encoding="utf-8")
+        try:
+            env = self.environment()
+            with mock.patch.dict(os.environ, env):
+                event_path = RUNNER.prepare_completion_event_path()
+                with (
+                    mock.patch.object(CONSULT, "_perform") as perform_inner,
+                    self.assertRaises(RUNNER.RunnerError) as raised,
+                ):
+                    CONSULT.main(
+                        [
+                            "--request",
+                            str(request_path),
+                            "--out-dir",
+                            str(self.root / "child-run"),
+                            "--completion-event",
+                            str(event_path),
+                        ]
+                    )
+            self.assertEqual(raised.exception.exit_code, 2)
+            self.assertIn("denied", str(raised.exception))
+            perform_inner.assert_not_called()
+            self.assertTrue((self.root / "child-run" / "result.json").is_file())
+            self.assertTrue(event_path.is_file())
+        finally:
+            (policy_dir / "policy.json").unlink(missing_ok=True)
+
+    def test_native_transport_accepts_explicit_default_work_profile_and_rejects_personal_symlink_to_work(self) -> None:
+        work_dir = self.root / ".claude"
+        work_dir.mkdir(exist_ok=True)
+        alt_link = self.root / ".claude-alt-symlink"
+        alt_link.symlink_to(work_dir)
+        monitor_cfg = self.root / "monitor-consult-symlink.json"
+        monitor_cfg.write_text(
+            json.dumps(
+                {
+                    "accounts": [
+                        {"id": "claude-work", "provider": "claude", "tags": ["work"], "configDir": str(work_dir)},
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        # 1. With CLAUDE_CONFIG_DIR unset, explicit --claude-config-dir ~/.claude matches host default for --transport native
+        work_env = self.environment(CLAUDECODE="1", HOME=str(self.root), MONITOR_CONFIG=str(monitor_cfg))
+        work_env.pop("CLAUDE_CONFIG_DIR", None)
+        self.assertTrue(CONSULT._claude_profile_dirs_match("~/.claude", None))
+        with mock.patch.dict(os.environ, work_env, clear=True):
+            self.assertTrue(CONSULT._claude_profile_dirs_match(work_dir, None))
+            code, res, _ = self.consult(
+                "--question",
+                "Why?",
+                "--model",
+                "opus",
+                "--transport",
+                "native",
+                "--claude-config-dir",
+                str(work_dir),
+                env=work_env,
+            )
+        self.assertEqual(code, 0, res)
+        self.assertEqual(res["status"], "native_handoff")
+
+        # 2. A custom-named symlink pointing to ~/.claude cannot bypass claude-work denial
+        repo_policy = RUNNER.bundled_module("repo_policy")
+        cfg = {"repo_policies": [{"path": str(self.repository), "deny": ["claude-work"]}]}
+        allowed, reason, _ = repo_policy.check_execution_allowed(
+            self.repository,
+            "claude",
+            alt_link,
+            config=cfg,
+            home=self.root,
+            monitor_config_path=monitor_cfg,
+            strict=True,
+        )
+        self.assertFalse(allowed)
+        self.assertIn("claude-work", reason or "")
+
+    def test_detached_without_read_rechecks_originating_repo_policy_in_child(self) -> None:
+        orig_cwd = Path.cwd()
+        policy_dir = self.repository / ".orkest"
+        env = self.environment()
+        captured_popen: dict[str, object] = {}
+
+        class _FakeProc:
+            pid = 42424
+
+            @staticmethod
+            def wait() -> int:
+                return 0
+
+        real_popen = subprocess.Popen
+
+        def fake_popen(cmd, **kwargs):
+            if isinstance(cmd, (list, tuple)) and any("run_agent.py" in str(part) for part in cmd):
+                captured_popen["cmd"] = cmd
+                captured_popen["cwd"] = kwargs.get("cwd")
+                return _FakeProc()
+            return real_popen(cmd, **kwargs)
+
+        try:
+            os.chdir(self.repository)
+            with (
+                mock.patch.dict(os.environ, env),
+                mock.patch.object(CONSULT.subprocess, "Popen", side_effect=fake_popen),
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        str(SCRIPT),
+                        "consult",
+                        "--question",
+                        "Why?",
+                        "--model",
+                        "gpt:luna",
+                        "--detach",
+                        "--notify",
+                        "none",
+                    ],
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                code = RUNNER.main()
+            self.assertEqual(code, 0)
+
+            job_dir = Path(str(captured_popen["cwd"]))
+            self.assertNotEqual(job_dir.resolve(), self.repository.resolve())
+            request_path = job_dir / "request.json"
+            saved_request = json.loads(request_path.read_text(encoding="utf-8"))
+            self.assertIsNone(saved_request["read"])
+            self.assertEqual(saved_request["policy_cwd"], str(self.repository.resolve()))
+
+            # Originating repo adds a deny rule AFTER detached submission; child starts in job_dir outside the repo.
+            policy_dir.mkdir(exist_ok=True)
+            (policy_dir / "policy.json").write_text(json.dumps({"deny": ["codex"]}), encoding="utf-8")
+
+            os.chdir(job_dir)
+            cmd_args = list(captured_popen["cmd"])  # [python, run_agent.py, consult, ...]
+            consult_argv = cmd_args[cmd_args.index("consult") + 1 :]
+            with (
+                mock.patch.dict(os.environ, env),
+                mock.patch.object(CONSULT, "_perform") as perform_inner,
+                self.assertRaises(RUNNER.RunnerError) as raised,
+            ):
+                CONSULT.main(consult_argv)
+            self.assertEqual(raised.exception.exit_code, 2)
+            self.assertIn("denied", str(raised.exception))
+            perform_inner.assert_not_called()
+            result = json.loads((job_dir / "run" / "result.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["status"], "failed")
+            self.assertIn("denied", result["error"])
+            event_path = Path(consult_argv[consult_argv.index("--completion-event") + 1])
+            self.assertTrue(event_path.is_file())
+        finally:
+            os.chdir(orig_cwd)
+            (policy_dir / "policy.json").unlink(missing_ok=True)
+
+    def test_repo_policy_strict_fails_closed_on_unreadable_local_policy_even_when_exists_returns_false(self) -> None:
+        repo_policy = RUNNER.bundled_module("repo_policy")
+        policy_dir = self.repository / ".orkest"
+        policy_dir.mkdir(exist_ok=True)
+        policy_file = policy_dir / "policy.json"
+        policy_file.write_text(json.dumps({"deny": ["codex"]}), encoding="utf-8")
+
+        # Simulate Python 3.15 EACCES where Path.exists()/is_symlink() return False while read_text raises EACCES
+        orig_read_text = Path.read_text
+
+        def fake_read_text(path_self: Path, *args, **kwargs):
+            if path_self == policy_file:
+                raise PermissionError(13, "Permission denied", str(path_self))
+            return orig_read_text(path_self, *args, **kwargs)
+
+        with (
+            mock.patch.object(Path, "exists", return_value=False),
+            mock.patch.object(Path, "is_symlink", return_value=False),
+            mock.patch.object(Path, "read_text", fake_read_text),
+            self.assertRaises(repo_policy.PolicyConfigError),
+        ):
+            repo_policy.check_execution_allowed(
+                self.repository,
+                "codex",
+                home=self.root,
+                strict=True,
+            )
+
+        # Also fail closed if FileNotFoundError occurs while os.lstat on .orkest raises PermissionError
+        orig_lstat = os.lstat
+
+        def fake_file_not_found(path_self: Path, *args, **kwargs):
+            if path_self == policy_file:
+                raise FileNotFoundError(2, "No such file", str(path_self))
+            return orig_read_text(path_self, *args, **kwargs)
+
+        def fake_lstat(target, *args, **kwargs):
+            if Path(target) == policy_dir:
+                raise PermissionError(13, "Permission denied", str(target))
+            return orig_lstat(target, *args, **kwargs)
+
+        with (
+            mock.patch.object(Path, "read_text", fake_file_not_found),
+            mock.patch.object(os, "lstat", fake_lstat),
+            self.assertRaises(repo_policy.PolicyConfigError),
+        ):
+            repo_policy.check_execution_allowed(
+                self.repository,
+                "codex",
+                home=self.root,
+                strict=True,
+            )
+
+        # Real filesystem chmod 0o000 on .orkest and non-directory .orkest also fail closed when non-root
+        if os.geteuid() != 0:
+            policy_dir.chmod(0o000)
+            try:
+                with self.assertRaises(repo_policy.PolicyConfigError):
+                    repo_policy.check_execution_allowed(
+                        self.repository,
+                        "codex",
+                        home=self.root,
+                        strict=True,
+                    )
+            finally:
+                policy_dir.chmod(0o755)
+
+        policy_file.unlink()
+        policy_dir.rmdir()
+        policy_dir.write_text("not-a-directory", encoding="utf-8")
+        try:
+            with self.assertRaises(repo_policy.PolicyConfigError):
+                repo_policy.check_execution_allowed(
+                    self.repository,
+                    "codex",
+                    home=self.root,
+                    strict=True,
+                )
+        finally:
+            policy_dir.unlink()
+
+    def test_explicit_default_account_pin_switches_host_profile_and_strips_inherited_env(self) -> None:
+        alt_codex = self.root / ".codex-alt"
+        alt_claude = self.root / ".claude-alt"
+        work_agy = self.root / ".gemini" / "antigravity-work"
+        personal_agy = self.root / ".gemini" / "antigravity-personal"
+        for directory in (alt_codex, alt_claude, work_agy, personal_agy):
+            directory.mkdir(parents=True, exist_ok=True)
+        monitor_cfg = self.root / "monitor-pin.json"
+        monitor_cfg.write_text(
+            json.dumps(
+                {
+                    "accounts": [
+                        {"id": "codex-default", "provider": "codex"},
+                        {"id": "codex-alt", "provider": "codex", "codexHome": str(alt_codex)},
+                        {"id": "claude-default", "provider": "claude"},
+                        {"id": "claude-alt", "provider": "claude", "configDir": str(alt_claude)},
+                        {"id": "agy-default", "provider": "antigravity"},
+                        {
+                            "id": "agy-work",
+                            "provider": "antigravity",
+                            "env": {"ANTIGRAVITY_APP_DATA_DIR": str(work_agy)},
+                        },
+                        {
+                            "id": "agy-personal",
+                            "provider": "antigravity",
+                            "env": {"ANTIGRAVITY_APP_DATA_DIR": str(personal_agy)},
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        # 1. Host on alt CODEX_HOME + --account codex-default switches profile -> native rejected, auto uses executor,
+        #    and consult_environment receives pinned_account=True so ORKEST_CODEX_ACCOUNT_HOME=/red is not applied.
+        codex_env = self.environment(
+            HOME=str(self.root),
+            MONITOR_CONFIG=str(monitor_cfg),
+            CODEX_THREAD_ID="codex-host-thread",
+            CODEX_HOME=str(alt_codex),
+            ORKEST_CODEX_ACCOUNT_HOME=str(alt_codex),
+        )
+        with mock.patch.dict(os.environ, codex_env, clear=True):
+            self.assertTrue(
+                CONSULT._route_switches_host_profile({"engine": "codex", "codex_home": None, "explicit_account": True})
+            )
+            code_native, res_native, _ = self.consult(
+                "--question",
+                "Why?",
+                "--account",
+                "codex-default",
+                "--model",
+                "gpt:luna",
+                "--transport",
+                "native",
+                env=codex_env,
+            )
+        self.assertEqual(code_native, 4)
+        self.assertIn("--transport executor", res_native["error"])
+
+        seen_envs: list[dict[str, str]] = []
+        orig_consult_env = CONSULT.consult_environment
+
+        def spy_consult_env(*args, **kwargs):
+            env_out = orig_consult_env(*args, **kwargs)
+            seen_envs.append({"pinned": str(kwargs.get("pinned_account")), "codex_home": env_out.get("CODEX_HOME", "")})
+            return env_out
+
+        with (
+            mock.patch.dict(os.environ, codex_env, clear=True),
+            mock.patch.object(CONSULT, "consult_environment", side_effect=spy_consult_env),
+        ):
+            code_auto, res_auto, _ = self.consult(
+                "--question",
+                "Why?",
+                "--account",
+                "codex-default",
+                "--model",
+                "gpt:luna",
+                env=codex_env,
+            )
+        self.assertEqual(code_auto, 0, res_auto)
+        self.assertEqual(res_auto["transport"], "executor")
+        self.assertTrue(res_auto["explicit_account"])
+        self.assertEqual(seen_envs, [{"pinned": "True", "codex_home": ""}])
+
+        # 2. Host on alt CLAUDE_CONFIG_DIR + --account claude-default switches profile -> native rejected.
+        claude_env = self.environment(
+            HOME=str(self.root),
+            MONITOR_CONFIG=str(monitor_cfg),
+            CLAUDECODE="1",
+            CLAUDE_CONFIG_DIR=str(alt_claude),
+        )
+        with mock.patch.dict(os.environ, claude_env, clear=True):
+            self.assertTrue(
+                CONSULT._route_switches_host_profile(
+                    {"engine": "claude", "claude_config_dir": None, "explicit_account": True}
+                )
+            )
+            code_claude, res_claude, _ = self.consult(
+                "--question",
+                "Why?",
+                "--account",
+                "claude-default",
+                "--model",
+                "opus",
+                "--transport",
+                "native",
+                env=claude_env,
+            )
+        self.assertEqual(code_claude, 4)
+        self.assertIn("--transport executor", res_claude["error"])
+
+        # 3. Agy host on antigravity-work: explicit default, agy-personal switch profile, agy-work matches host.
+        agy_env = self.environment(
+            HOME=str(self.root),
+            MONITOR_CONFIG=str(monitor_cfg),
+            ANTIGRAVITY_CONVERSATION_ID="agy-host-conv",
+            GEMINI_CLI_HOME=str(self.root / ".gemini"),
+            ANTIGRAVITY_APP_DATA_DIR=str(work_agy),
+        )
+        with mock.patch.dict(os.environ, agy_env, clear=True):
+            self.assertTrue(
+                CONSULT._route_switches_host_profile(
+                    {"engine": "agy", "agy_home": None, "agy_app_data_dir": None, "explicit_account": True}
+                )
+            )
+            self.assertTrue(
+                CONSULT._route_switches_host_profile(
+                    {
+                        "engine": "agy",
+                        "agy_home": str(self.root / ".gemini"),
+                        "agy_app_data_dir": str(personal_agy),
+                        "explicit_account": True,
+                    }
+                )
+            )
+            self.assertFalse(
+                CONSULT._route_switches_host_profile(
+                    {
+                        "engine": "agy",
+                        "agy_home": str(self.root / ".gemini"),
+                        "agy_app_data_dir": str(work_agy),
+                        "explicit_account": True,
+                    }
+                )
+            )
+            code_agy_native, res_agy_native, _ = self.consult(
+                "--question",
+                "Why?",
+                "--account",
+                "agy-default",
+                "--model",
+                "gemini-3.8-flash-medium",
+                "--transport",
+                "native",
+                env=agy_env,
+            )
+            self.assertEqual(code_agy_native, 4)
+            self.assertIn("--transport executor", res_agy_native["error"])
+
+            code_agy_same, res_agy_same, _ = self.consult(
+                "--question",
+                "Why?",
+                "--account",
+                "agy-work",
+                "--model",
+                "gemini-3.8-flash-medium",
+                "--transport",
+                "native",
+                env=agy_env,
+            )
+            self.assertEqual(code_agy_same, 0, res_agy_same)
+            self.assertEqual(res_agy_same["status"], "native_handoff")
+
+    def test_auto_account_fallback_pins_request_switches_transport_and_detached_env(self) -> None:
+        alt_codex = self.root / ".codex-work"
+        alt_codex.mkdir(parents=True, exist_ok=True)
+        monitor_cfg = self.root / "monitor-auto-pin.json"
+        monitor_cfg.write_text(
+            json.dumps(
+                {
+                    "accounts": [
+                        {"id": "codex-default", "provider": "codex"},
+                        {
+                            "id": "codex-work",
+                            "provider": "codex",
+                            "tags": ["work"],
+                            "codexHome": str(alt_codex),
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        policy_dir = self.repository / ".orkest"
+        policy_dir.mkdir(exist_ok=True)
+        (policy_dir / "policy.json").write_text(json.dumps({"deny": ["tag:work"]}), encoding="utf-8")
+        host_env = self.environment(
+            HOME=str(self.root),
+            MONITOR_CONFIG=str(monitor_cfg),
+            ORCHESTRATE_AUTO_ACCOUNT="1",
+            CODEX_THREAD_ID="codex-host-1",
+            CODEX_HOME=str(alt_codex),
+        )
+        try:
+            with mock.patch.dict(os.environ, host_env, clear=True):
+                code_native, res_native, _ = self.consult(
+                    "--read",
+                    str(self.repository),
+                    "--question",
+                    "Why?",
+                    "--model",
+                    "gpt:luna",
+                    "--transport",
+                    "native",
+                    env=host_env,
+                )
+            self.assertEqual(code_native, 4)
+            self.assertIn("--transport executor", res_native["error"])
+
+            seen_envs: list[dict[str, str]] = []
+            orig_consult_env = CONSULT.consult_environment
+
+            def spy_consult_env(*args, **kwargs):
+                env_out = orig_consult_env(*args, **kwargs)
+                seen_envs.append(
+                    {"pinned": str(kwargs.get("pinned_account")), "codex_home": env_out.get("CODEX_HOME", "")}
+                )
+                return env_out
+
+            with (
+                mock.patch.dict(os.environ, host_env, clear=True),
+                mock.patch.object(CONSULT, "consult_environment", side_effect=spy_consult_env),
+            ):
+                code_auto, res_auto, _ = self.consult(
+                    "--read",
+                    str(self.repository),
+                    "--question",
+                    "Why?",
+                    "--model",
+                    "gpt:luna",
+                    env=host_env,
+                )
+            self.assertEqual(code_auto, 0, res_auto)
+            self.assertEqual(res_auto["transport"], "executor")
+            self.assertTrue(res_auto["explicit_account"])
+            self.assertEqual(res_auto["account_id"], "codex-default")
+            self.assertEqual(seen_envs, [{"pinned": "True", "codex_home": ""}])
+
+            # Detached launch propagates ORKEST_PINNED_CODEX_ACCOUNT=1 and strips stale ORKEST_CODEX_ACCOUNT_HOME.
+            captured_popen_env: dict[str, str] = {}
+
+            class _FakeProc:
+                pid = 43434
+
+                @staticmethod
+                def wait() -> int:
+                    return 0
+
+            real_popen = subprocess.Popen
+
+            def fake_popen(cmd, *popen_args, **kwargs):
+                if isinstance(cmd, (list, tuple)) and any("run_agent.py" in str(part) for part in cmd):
+                    captured_popen_env.update(kwargs.get("env") or {})
+                    return _FakeProc()
+                return real_popen(cmd, *popen_args, **kwargs)
+
+            detach_env = {**host_env, "ORKEST_CODEX_ACCOUNT_HOME": str(alt_codex)}
+            with (
+                mock.patch.dict(os.environ, detach_env, clear=True),
+                mock.patch.object(CONSULT.subprocess, "Popen", side_effect=fake_popen),
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        str(SCRIPT),
+                        "consult",
+                        "--read",
+                        str(self.repository),
+                        "--question",
+                        "Why?",
+                        "--account",
+                        "codex-default",
+                        "--model",
+                        "gpt:luna",
+                        "--detach",
+                        "--notify",
+                        "none",
+                    ],
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(RUNNER.main(), 0)
+            self.assertEqual(captured_popen_env.get("ORKEST_PINNED_CODEX_ACCOUNT"), "1")
+            self.assertNotIn("ORKEST_CODEX_ACCOUNT_HOME", captured_popen_env)
+        finally:
+            shutil.rmtree(policy_dir, ignore_errors=True)
+
+    def test_native_agy_policy_prefers_app_data_dir_and_auto_fallback_clears_stale_homes(self) -> None:
+        gemini_home = self.root / ".gemini"
+        work_app = gemini_home / "antigravity-work"
+        work_app.mkdir(parents=True, exist_ok=True)
+        monitor_cfg = self.root / "monitor-agy-consult.json"
+        monitor_cfg.write_text(
+            json.dumps(
+                {
+                    "accounts": [
+                        {"id": "agy-default", "provider": "antigravity"},
+                        {
+                            "id": "agy-work",
+                            "provider": "antigravity",
+                            "tags": ["work"],
+                            "env": {
+                                "GEMINI_CLI_HOME": str(gemini_home),
+                                "ANTIGRAVITY_APP_DATA_DIR": str(work_app),
+                            },
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        policy_dir = self.repository / ".orkest"
+        policy_dir.mkdir(exist_ok=True)
+        (policy_dir / "policy.json").write_text(json.dumps({"deny": ["tag:work"]}), encoding="utf-8")
+        agy_env = self.environment(
+            HOME=str(self.root),
+            MONITOR_CONFIG=str(monitor_cfg),
+            ANTIGRAVITY_CONVERSATION_ID="agy-host-1",
+            GEMINI_CLI_HOME=str(gemini_home),
+            ANTIGRAVITY_APP_DATA_DIR=str(work_app),
+        )
+        try:
+            with mock.patch.dict(os.environ, agy_env, clear=True):
+                code_denied, res_denied, _ = self.consult(
+                    "--read",
+                    str(self.repository),
+                    "--question",
+                    "Why?",
+                    "--model",
+                    "gemini-3.8-flash-medium",
+                    env=agy_env,
+                )
+            self.assertEqual(code_denied, 2)
+            self.assertIn("work", res_denied["error"])
+
+            auto_env = {**agy_env, "ORCHESTRATE_AUTO_ACCOUNT": "1"}
+            with mock.patch.dict(os.environ, auto_env, clear=True):
+                code_auto, res_auto, _ = self.consult(
+                    "--read",
+                    str(self.repository),
+                    "--question",
+                    "Why?",
+                    "--model",
+                    "gemini-3.8-flash-medium",
+                    env=auto_env,
+                )
+            self.assertEqual(code_auto, 0, res_auto)
+            self.assertEqual(res_auto["transport"], "executor")
+            self.assertTrue(res_auto["explicit_account"])
+            self.assertEqual(res_auto["account_id"], "agy-default")
+        finally:
+            shutil.rmtree(policy_dir, ignore_errors=True)
+
+    def test_child_agy_marker_forces_executor_and_native_policy_uses_host_app_data_dir(self) -> None:
+        gemini_home = self.root / ".gemini"
+        work_app = gemini_home / "antigravity-work"
+        personal_app = gemini_home / "antigravity-personal"
+        work_app.mkdir(parents=True, exist_ok=True)
+        personal_app.mkdir(parents=True, exist_ok=True)
+        monitor_cfg = self.root / "monitor-agy-child-marker.json"
+        monitor_cfg.write_text(
+            json.dumps(
+                {
+                    "accounts": [
+                        {
+                            "id": "agy-work",
+                            "provider": "antigravity",
+                            "tags": ["work"],
+                            "env": {"GEMINI_CLI_HOME": str(gemini_home), "ANTIGRAVITY_APP_DATA_DIR": str(work_app)},
+                        },
+                        {
+                            "id": "agy-personal",
+                            "provider": "antigravity",
+                            "tags": ["personal"],
+                            "env": {
+                                "GEMINI_CLI_HOME": str(gemini_home),
+                                "ANTIGRAVITY_APP_DATA_DIR": str(personal_app),
+                            },
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        policy_dir = self.repository / ".orkest"
+        policy_dir.mkdir(exist_ok=True)
+        (policy_dir / "policy.json").write_text(json.dumps({"deny": ["tag:work"]}), encoding="utf-8")
+        env = self.environment(
+            HOME=str(self.root),
+            MONITOR_CONFIG=str(monitor_cfg),
+            ANTIGRAVITY_CONVERSATION_ID="agy-host-1",
+            GEMINI_CLI_HOME=str(gemini_home),
+            ANTIGRAVITY_APP_DATA_DIR=str(work_app),
+            ORKEST_AGY_ACCOUNT_HOME=str(personal_app),
+        )
+        try:
+            with mock.patch.object(Path, "home", return_value=self.root):
+                # 1. --transport native refuses switching away from host ANTIGRAVITY_APP_DATA_DIR.
+                code_native, res_native, _ = self.consult(
+                    "--read",
+                    str(self.repository),
+                    "--question",
+                    "Why?",
+                    "--model",
+                    "gemini-3.8-flash-medium",
+                    "--transport",
+                    "native",
+                    env=env,
+                )
+                self.assertEqual(code_native, 4)
+                self.assertIn("--transport executor", res_native["error"])
+
+                # 2. --transport auto switches to executor and applies ORKEST_AGY_ACCOUNT_HOME.
+                code_auto, res_auto, _ = self.consult(
+                    "--read",
+                    str(self.repository),
+                    "--question",
+                    "Why?",
+                    "--model",
+                    "gemini-3.8-flash-medium",
+                    env=env,
+                )
+                self.assertEqual(code_auto, 0, res_auto)
+                self.assertEqual(res_auto["transport"], "executor")
+                self.assertEqual(self.capture()["env"].get("ANTIGRAVITY_APP_DATA_DIR"), str(personal_app))
+
+                # 3. Remaining native policy check evaluates host ANTIGRAVITY_APP_DATA_DIR, never ORKEST_AGY_ACCOUNT_HOME.
+                with (
+                    mock.patch.dict(os.environ, env, clear=True),
+                    mock.patch.object(
+                        RUNNER._MODEL_ROUTING_MOD, "_child_marker_switches_host_profile", return_value=False
+                    ),
+                    self.assertRaises(RUNNER.RunnerError) as raised,
+                ):
+                    CONSULT.enforce_policy(
+                        {
+                            "engine": "agy",
+                            "model": "gemini-3.8-flash-medium",
+                            "transport": "native",
+                            "read": str(self.repository),
+                        },
+                        transport_mode="native",
+                    )
+                self.assertEqual(raised.exception.exit_code, 2)
+                self.assertIn("work", str(raised.exception))
+        finally:
+            shutil.rmtree(policy_dir, ignore_errors=True)
+
+    def test_implicit_antigravity_app_data_dir_survives_consult_env_and_allows_auto_account(self) -> None:
+        gemini_home = self.root / ".gemini"
+        work_app = gemini_home / "antigravity-work"
+        personal_app = gemini_home / "antigravity-personal"
+        work_app.mkdir(parents=True, exist_ok=True)
+        personal_app.mkdir(parents=True, exist_ok=True)
+        monitor_cfg = self.root / "monitor-agy-implicit-consult.json"
+        monitor_cfg.write_text(
+            json.dumps(
+                {
+                    "accounts": [
+                        {
+                            "id": "agy-work",
+                            "provider": "antigravity",
+                            "tags": ["work"],
+                            "env": {"GEMINI_CLI_HOME": str(gemini_home), "ANTIGRAVITY_APP_DATA_DIR": str(work_app)},
+                        },
+                        {
+                            "id": "agy-personal",
+                            "provider": "antigravity",
+                            "tags": ["personal"],
+                            "env": {
+                                "GEMINI_CLI_HOME": str(gemini_home),
+                                "ANTIGRAVITY_APP_DATA_DIR": str(personal_app),
+                            },
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        fake_view = {
+            "schema": "monitor.snapshot.v1",
+            "accounts": [
+                {"id": "agy-work", "provider": "antigravity"},
+                {"id": "agy-personal", "provider": "antigravity"},
+            ],
+            "lanes": [
+                {
+                    "accountId": "agy-personal",
+                    "poolId": "all",
+                    "label": "Agy personal",
+                    "status": "available",
+                    "availableNowPct": 80,
+                    "surplusPts": 25,
+                    "stale": False,
+                }
+            ],
+        }
+        fake_monitor = self.root / "fake-monitor-agy-consult"
+        fake_monitor.write_text(f"#!/bin/sh\ncat <<'EOF'\n{json.dumps(fake_view)}\nEOF\n", encoding="utf-8")
+        fake_monitor.chmod(0o755)
+
+        # 1. Without --account, ANTIGRAVITY_APP_DATA_DIR survives HOST_SESSION_ENV into consult_environment.
+        ok_env = self.environment(
+            HOME=str(self.root),
+            MONITOR_CONFIG=str(monitor_cfg),
+            GEMINI_CLI_HOME=str(gemini_home),
+            ANTIGRAVITY_APP_DATA_DIR=str(personal_app),
+        )
+        with mock.patch.object(Path, "home", return_value=self.root):
+            code, res, _ = self.consult(
+                "--question",
+                "Why?",
+                "--model",
+                "gemini-3.8-flash-medium",
+                env=ok_env,
+            )
+            self.assertEqual(code, 0, res)
+            self.assertFalse(res["explicit_account"])
+            self.assertEqual(self.capture()["env"].get("ANTIGRAVITY_APP_DATA_DIR"), str(personal_app))
+
+        # 2. When implicit ANTIGRAVITY_APP_DATA_DIR is denied, ORCHESTRATE_AUTO_ACCOUNT=1 still switches to agy-personal.
+        policy_dir = self.repository / ".orkest"
+        policy_dir.mkdir(exist_ok=True)
+        (policy_dir / "policy.json").write_text(json.dumps({"deny": ["tag:work"]}), encoding="utf-8")
+        auto_env = self.environment(
+            HOME=str(self.root),
+            MONITOR_CONFIG=str(monitor_cfg),
+            MONITOR_BIN=str(fake_monitor),
+            ORCHESTRATE_AUTO_ACCOUNT="1",
+            GEMINI_CLI_HOME=str(gemini_home),
+            ANTIGRAVITY_APP_DATA_DIR=str(work_app),
+        )
+        try:
+            with mock.patch.object(Path, "home", return_value=self.root):
+                code_auto, res_auto, _ = self.consult(
+                    "--read",
+                    str(self.repository),
+                    "--question",
+                    "Why?",
+                    "--model",
+                    "gemini-3.8-flash-medium",
+                    env=auto_env,
+                )
+            self.assertEqual(code_auto, 0, res_auto)
+            self.assertTrue(res_auto["explicit_account"])
+            self.assertEqual(res_auto["account_id"], "agy-personal")
+            self.assertEqual(self.capture()["env"].get("ANTIGRAVITY_APP_DATA_DIR"), str(personal_app))
+        finally:
+            shutil.rmtree(policy_dir, ignore_errors=True)
+
+    def test_detached_claude_handoff_markers_enforce_successor_policy_over_stale_claude_config_dir(self) -> None:
+        base_home = self.root / "claude-base"
+        red_home = self.root / "claude-red"
+        (base_home / ".claude").mkdir(parents=True, exist_ok=True)
+        (red_home / ".claude").mkdir(parents=True, exist_ok=True)
+        monitor_cfg = self.root / "monitor-claude-handoff-consult.json"
+        monitor_cfg.write_text(
+            json.dumps(
+                {
+                    "accounts": [
+                        {"id": "claude-base", "provider": "claude", "tags": ["personal"]},
+                        {
+                            "id": "claude-red",
+                            "provider": "claude",
+                            "tags": ["work"],
+                            "configDir": "~/.claude",
+                            "env": {"HOME": str(red_home)},
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        policy_dir = self.repository / ".orkest"
+        policy_dir.mkdir(exist_ok=True)
+        (policy_dir / "policy.json").write_text(json.dumps({"deny": ["tag:work"]}), encoding="utf-8")
+        env = self.environment(
+            HOME=str(base_home),
+            MONITOR_CONFIG=str(monitor_cfg),
+            CLAUDE_CONFIG_DIR=str(base_home / ".claude"),
+            ORKEST_PINNED_CLAUDE_ACCOUNT="1",
+            ORKEST_CLAUDE_ACCOUNT_HOME=str(red_home),
+            ORCHESTRATE_AUTO_ACCOUNT="1",
+        )
+        try:
+            with mock.patch.object(Path, "home", return_value=base_home):
+                code, res, _ = self.consult(
+                    "--read",
+                    str(self.repository),
+                    "--question",
+                    "Why?",
+                    "--model",
+                    "opus",
+                    env=env,
+                )
+            self.assertEqual(code, 2)
+            self.assertIn("tag:work", res["error"])
+            self.assertFalse(self.capture_path.exists())
+        finally:
+            shutil.rmtree(policy_dir, ignore_errors=True)
+
+    def test_agy_shared_dir_marker_switches_and_unrelated_claude_marker_allows_codex_auto_account(self) -> None:
+        host_dir = self.root / "host"
+        shared_dir = self.root / "shared"
+        team_gemini = self.root / "profiles" / "antigravity-team"
+        green_app = self.root / "apps" / "green"
+        work_codex = self.root / ".codex-work"
+        personal_codex = self.root / ".codex-personal"
+        for directory in (host_dir, shared_dir, team_gemini, green_app, work_codex, personal_codex):
+            directory.mkdir(parents=True, exist_ok=True)
+
+        # 1. Host ANTIGRAVITY_APP_DATA_DIR=/shared + GEMINI_CLI_HOME=/host vs ORKEST_AGY_ACCOUNT_HOME=/shared.
+        shared_env = self.environment(
+            HOME=str(self.root),
+            ANTIGRAVITY_CONVERSATION_ID="agy-host-1",
+            GEMINI_CLI_HOME=str(host_dir),
+            ANTIGRAVITY_APP_DATA_DIR=str(shared_dir),
+            ORKEST_AGY_ACCOUNT_HOME=str(shared_dir),
+        )
+        code_native, res_native, _ = self.consult(
+            "--question",
+            "Why?",
+            "--model",
+            "gemini-3.8-flash-medium",
+            "--transport",
+            "native",
+            env=shared_env,
+        )
+        self.assertEqual(code_native, 4)
+        self.assertIn("--transport executor", res_native["error"])
+
+        code_auto, res_auto, _ = self.consult(
+            "--question",
+            "Why?",
+            "--model",
+            "gemini-3.8-flash-medium",
+            env=shared_env,
+        )
+        self.assertEqual(code_auto, 0, res_auto)
+        self.assertEqual(res_auto["transport"], "executor")
+        self.assertEqual(self.capture()["env"].get("GEMINI_CLI_HOME"), str(shared_dir))
+        self.assertEqual(self.capture()["env"].get("ANTIGRAVITY_APP_DATA_DIR"), str(shared_dir / "antigravity-cli"))
+
+        # 2. Explicit account with GEMINI_CLI_HOME=/profiles/antigravity-team and ANTIGRAVITY_APP_DATA_DIR=/apps/green.
+        monitor_cfg = self.root / "monitor-consult-followup4.json"
+        monitor_cfg.write_text(
+            json.dumps(
+                {
+                    "accounts": [
+                        {
+                            "id": "agy-team",
+                            "provider": "antigravity",
+                            "env": {
+                                "GEMINI_CLI_HOME": str(team_gemini),
+                                "ANTIGRAVITY_APP_DATA_DIR": str(green_app),
+                            },
+                        },
+                        {
+                            "id": "codex-work",
+                            "provider": "codex",
+                            "tags": ["work"],
+                            "codexHome": str(work_codex),
+                        },
+                        {
+                            "id": "codex-personal",
+                            "provider": "codex",
+                            "tags": ["personal"],
+                            "codexHome": str(personal_codex),
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        team_env = self.environment(HOME=str(self.root), MONITOR_CONFIG=str(monitor_cfg))
+        code_team, res_team, _ = self.consult(
+            "--question",
+            "Why?",
+            "--account",
+            "agy-team",
+            "--model",
+            "gemini-3.8-flash-medium",
+            env=team_env,
+        )
+        self.assertEqual(code_team, 0, res_team)
+        self.assertEqual(self.capture()["env"].get("GEMINI_CLI_HOME"), str(team_gemini))
+        self.assertEqual(self.capture()["env"].get("ANTIGRAVITY_APP_DATA_DIR"), str(green_app))
+
+        # 3. Unrelated ORKEST_CLAUDE_ACCOUNT_HOME does not block codex ORCHESTRATE_AUTO_ACCOUNT=1 fallback.
+        fake_view = {
+            "schema": "monitor.snapshot.v1",
+            "accounts": [
+                {"id": "codex-work", "provider": "codex"},
+                {"id": "codex-personal", "provider": "codex"},
+            ],
+            "lanes": [
+                {
+                    "accountId": "codex-personal",
+                    "poolId": "all",
+                    "label": "Codex personal",
+                    "status": "available",
+                    "availableNowPct": 90,
+                    "surplusPts": 40,
+                    "stale": False,
+                }
+            ],
+        }
+        fake_monitor = self.root / "fake-monitor-codex-pin-scope"
+        fake_monitor.write_text(f"#!/bin/sh\ncat <<'EOF'\n{json.dumps(fake_view)}\nEOF\n", encoding="utf-8")
+        fake_monitor.chmod(0o755)
+        policy_dir = self.repository / ".orkest"
+        policy_dir.mkdir(exist_ok=True)
+        (policy_dir / "policy.json").write_text(json.dumps({"deny": ["tag:work"]}), encoding="utf-8")
+        codex_env = self.environment(
+            HOME=str(self.root),
+            MONITOR_CONFIG=str(monitor_cfg),
+            MONITOR_BIN=str(fake_monitor),
+            ORCHESTRATE_AUTO_ACCOUNT="1",
+            CODEX_HOME=str(work_codex),
+            ORKEST_PINNED_CLAUDE_ACCOUNT="1",
+            ORKEST_CLAUDE_ACCOUNT_HOME=str(self.root / "unrelated-claude"),
+        )
+        try:
+            code_codex, res_codex, _ = self.consult(
+                "--read",
+                str(self.repository),
+                "--question",
+                "Why?",
+                "--model",
+                "gpt:luna",
+                env=codex_env,
+            )
+            self.assertEqual(code_codex, 0, res_codex)
+            self.assertEqual(res_codex["account_id"], "codex-personal")
+
+            # 4. Passing --claude-config-dir /other on Codex still allows ORCHESTRATE_AUTO_ACCOUNT=1 fallback.
+            codex_claude_flag_env = self.environment(
+                HOME=str(self.root),
+                MONITOR_CONFIG=str(monitor_cfg),
+                MONITOR_BIN=str(fake_monitor),
+                ORCHESTRATE_AUTO_ACCOUNT="1",
+                CODEX_HOME=str(work_codex),
+            )
+            code_codex_flag, res_codex_flag, _ = self.consult(
+                "--read",
+                str(self.repository),
+                "--question",
+                "Why?",
+                "--model",
+                "gpt:luna",
+                "--claude-config-dir",
+                str(self.root / "other-claude"),
+                env=codex_claude_flag_env,
+            )
+            self.assertEqual(code_codex_flag, 0, res_codex_flag)
+            self.assertEqual(res_codex_flag["account_id"], "codex-personal")
+        finally:
+            shutil.rmtree(policy_dir, ignore_errors=True)
+
+        # 5. Host GEMINI_CLI_HOME=/profiles/antigravity-team vs ORKEST_AGY_ACCOUNT_HOME=/profiles/antigravity-team.
+        team_host_env = self.environment(
+            HOME=str(self.root),
+            ANTIGRAVITY_CONVERSATION_ID="agy-host-team",
+            GEMINI_CLI_HOME=str(team_gemini),
+            ANTIGRAVITY_APP_DATA_DIR="",
+            ORKEST_AGY_ACCOUNT_HOME=str(team_gemini),
+        )
+        code_team_native, res_team_native, _ = self.consult(
+            "--question",
+            "Why?",
+            "--model",
+            "gemini-3.8-flash-medium",
+            "--transport",
+            "native",
+            env=team_host_env,
+        )
+        self.assertEqual(code_team_native, 4)
+        self.assertIn("--transport executor", res_team_native["error"])
+
+        code_team_auto, res_team_auto, _ = self.consult(
+            "--question",
+            "Why?",
+            "--model",
+            "gemini-3.8-flash-medium",
+            env=team_host_env,
+        )
+        self.assertEqual(code_team_auto, 0, res_team_auto)
+        self.assertEqual(res_team_auto["transport"], "executor")
+        self.assertEqual(self.capture()["env"].get("GEMINI_CLI_HOME"), str(team_gemini.parent))
+        self.assertEqual(self.capture()["env"].get("ANTIGRAVITY_APP_DATA_DIR"), str(team_gemini))
+
+        # 6. Shared GEMINI_CLI_HOME [green(work), default(personal)] allows native default;
+        #    [parent(personal), team(work, /profiles/antigravity-team)] denies native on team.
+        caller_home = self.root / "caller-home-consult"
+        default_gemini = caller_home / ".gemini"
+        green_app2 = default_gemini / "antigravity-green"
+        default_gemini.mkdir(parents=True, exist_ok=True)
+        green_app2.mkdir(parents=True, exist_ok=True)
+        cfg_shared_consult = self.root / "monitor-consult-shared-green-default.json"
+        cfg_shared_consult.write_text(
+            json.dumps(
+                {
+                    "accounts": [
+                        {
+                            "id": "agy-green",
+                            "provider": "antigravity",
+                            "tags": ["work"],
+                            "env": {
+                                "GEMINI_CLI_HOME": str(default_gemini),
+                                "ANTIGRAVITY_APP_DATA_DIR": str(green_app2),
+                            },
+                        },
+                        {"id": "agy-default", "provider": "antigravity", "tags": ["personal"]},
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        policy_dir = self.repository / ".orkest"
+        policy_dir.mkdir(exist_ok=True)
+        (policy_dir / "policy.json").write_text(json.dumps({"deny": ["tag:work"]}), encoding="utf-8")
+        try:
+            with mock.patch.object(Path, "home", return_value=caller_home):
+                env_def = self.environment(
+                    HOME=str(caller_home),
+                    MONITOR_CONFIG=str(cfg_shared_consult),
+                    ANTIGRAVITY_CONVERSATION_ID="agy-host-def",
+                )
+                code_def, res_def, _ = self.consult(
+                    "--read",
+                    str(self.repository),
+                    "--question",
+                    "Why?",
+                    "--model",
+                    "gemini-3.8-flash-medium",
+                    "--transport",
+                    "native",
+                    env=env_def,
+                )
+                self.assertEqual(code_def, 0, res_def)
+                self.assertEqual(res_def["status"], "native_handoff")
+
+            cfg_team_consult = self.root / "monitor-consult-team-parent.json"
+            cfg_team_consult.write_text(
+                json.dumps(
+                    {
+                        "accounts": [
+                            {
+                                "id": "agy-parent",
+                                "provider": "antigravity",
+                                "tags": ["personal"],
+                                "env": {"GEMINI_CLI_HOME": str(team_gemini.parent)},
+                            },
+                            {
+                                "id": "agy-team",
+                                "provider": "antigravity",
+                                "tags": ["work"],
+                                "env": {"GEMINI_CLI_HOME": str(team_gemini)},
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            env_team_denied = self.environment(
+                HOME=str(caller_home),
+                MONITOR_CONFIG=str(cfg_team_consult),
+                ANTIGRAVITY_CONVERSATION_ID="agy-host-team",
+                GEMINI_CLI_HOME=str(team_gemini),
+                ANTIGRAVITY_APP_DATA_DIR="",
+                ORKEST_AGY_ACCOUNT_HOME="",
+            )
+            code_denied, res_denied, _ = self.consult(
+                "--read",
+                str(self.repository),
+                "--question",
+                "Why?",
+                "--model",
+                "gemini-3.8-flash-medium",
+                "--transport",
+                "native",
+                env=env_team_denied,
+            )
+            self.assertEqual(code_denied, 2)
+            self.assertIn("tag:work", res_denied["error"])
+        finally:
+            shutil.rmtree(policy_dir, ignore_errors=True)
+
+        # 7. Single typed GEMINI_CLI_HOME=/profiles/antigravity-team preserves verbatim GEMINI_CLI_HOME in executor.
+        cfg_single_team = self.root / "monitor-consult-single-team.json"
+        cfg_single_team.write_text(
+            json.dumps(
+                {
+                    "accounts": [
+                        {
+                            "id": "agy-team-single",
+                            "provider": "antigravity",
+                            "env": {"GEMINI_CLI_HOME": str(team_gemini)},
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        env_single_team = self.environment(
+            HOME=str(caller_home),
+            MONITOR_CONFIG=str(cfg_single_team),
+            GEMINI_CLI_HOME=str(team_gemini),
+            ANTIGRAVITY_APP_DATA_DIR="",
+            ORKEST_AGY_ACCOUNT_HOME="",
+        )
+        code_single, res_single, _ = self.consult(
+            "--question",
+            "Why?",
+            "--model",
+            "gemini-3.8-flash-medium",
+            env=env_single_team,
+        )
+        self.assertEqual(code_single, 0, res_single)
+        self.assertEqual(res_single["account_id"], "agy-team-single")
+        self.assertEqual(self.capture()["env"].get("GEMINI_CLI_HOME"), str(team_gemini))
+        self.assertEqual(self.capture()["env"].get("ANTIGRAVITY_APP_DATA_DIR"), str(team_gemini / "antigravity-cli"))
+
+        # 8. Single team account + live GEMINI_CLI_HOME + ANTIGRAVITY_APP_DATA_DIR=/alternate/live preserves live pair.
+        alt_live_app = self.root / "alternate" / "live"
+        alt_live_app.mkdir(parents=True, exist_ok=True)
+        env_alt_live = self.environment(
+            HOME=str(caller_home),
+            MONITOR_CONFIG=str(cfg_single_team),
+            GEMINI_CLI_HOME=str(team_gemini),
+            ANTIGRAVITY_APP_DATA_DIR=str(alt_live_app),
+        )
+        code_alt_live, res_alt_live, _ = self.consult(
+            "--question",
+            "Why?",
+            "--model",
+            "gemini-3.8-flash-medium",
+            env=env_alt_live,
+        )
+        self.assertEqual(code_alt_live, 0, res_alt_live)
+        self.assertIsNone(res_alt_live["account_id"])
+        self.assertEqual(self.capture()["env"].get("GEMINI_CLI_HOME"), str(team_gemini))
+        self.assertEqual(self.capture()["env"].get("ANTIGRAVITY_APP_DATA_DIR"), str(alt_live_app))
+
+    def test_claude_config_dir_precedence_over_env_claude_config_dir_in_policy_and_consult(self) -> None:
+        caller_home = self.root / "claude-precedence-home"
+        default_claude = caller_home / ".claude"
+        denied_dir = caller_home / ".claude-denied"
+        default_claude.mkdir(parents=True, exist_ok=True)
+        denied_dir.mkdir(parents=True, exist_ok=True)
+        monitor_cfg = self.root / "monitor-consult-claude-precedence.json"
+        monitor_cfg.write_text(
+            json.dumps(
+                {
+                    "accounts": [
+                        {
+                            "id": "team",
+                            "provider": "claude",
+                            "claude_config_dir": str(default_claude),
+                            "env": {"CLAUDE_CONFIG_DIR": str(denied_dir)},
+                        },
+                        {
+                            "id": "blocked",
+                            "provider": "claude",
+                            "claudeConfigDir": str(denied_dir),
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        policy_dir = self.repository / ".orkest"
+        policy_dir.mkdir(exist_ok=True)
+        (policy_dir / "policy.json").write_text(json.dumps({"deny": ["account:blocked"]}), encoding="utf-8")
+        try:
+            env = self.environment(HOME=str(caller_home), MONITOR_CONFIG=str(monitor_cfg))
+            env.pop("CLAUDE_CONFIG_DIR", None)
+            code, res, _ = self.consult(
+                "--read",
+                str(self.repository),
+                "--question",
+                "Why?",
+                "--model",
+                "opus",
+                env=env,
+            )
+            self.assertEqual(code, 0, res)
+            self.assertEqual(res["status"], "answered")
+            self.assertIn(res["claude_config_dir"], (None, str(default_claude)))
+            self.assertNotEqual(res["claude_config_dir"], str(denied_dir))
+            captured_env = self.capture()["env"]
+            self.assertIn(captured_env.get("CLAUDE_CONFIG_DIR"), (None, str(default_claude)))
+            self.assertNotEqual(captured_env.get("CLAUDE_CONFIG_DIR"), str(denied_dir))
+        finally:
+            shutil.rmtree(policy_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -15,6 +15,7 @@ import {
   listDesk,
   missionBrief,
   readChiefBinding,
+  readPeers,
   resolveChiefTarget,
   sessionKey,
 } from "../../../plugins/orchestrate/lib/chief.mjs";
@@ -1080,5 +1081,1135 @@ describe("ork chief", () => {
     });
     expect(brief).toContain("--kind question");
     expect(brief).toMatch(/without making extra edits or\s+expanding scope/u);
+  });
+
+  describe("pre-provision policy & route gate", () => {
+    it("refuses denied explicit engine, denied implicit candidate, and denied/unknown named routes before any side effects", async () => {
+      const repo = makeRepo(tmp, "gated-repo");
+      fs.mkdirSync(path.join(repo, ".orkest"), { recursive: true });
+      fs.writeFileSync(
+        path.join(repo, ".orkest", "policy.json"),
+        JSON.stringify({ deny: ["agy", "codex"] }),
+        "utf8",
+      );
+
+      const provision = vi.fn();
+      const launch = vi.fn();
+
+      // 1. Denied explicit engine
+      await expect(
+        chiefSpawn({
+          cwd: repo,
+          worktree: "wt-denied-eng",
+          goal: "Should not run",
+          engine: "codex",
+          root,
+          env,
+          provision,
+          launch,
+        }),
+      ).rejects.toThrow(/denied/u);
+
+      // 2. Denied named route (gemini -> agy) including on dryRun
+      await expect(
+        chiefSpawn({
+          cwd: repo,
+          worktree: "wt-denied-route",
+          goal: "Should not run",
+          route: "gemini",
+          dryRun: true,
+          root,
+          env,
+          provision,
+          launch,
+        }),
+      ).rejects.toThrow(/denied/u);
+
+      // 3. Unknown named route
+      await expect(
+        chiefSpawn({
+          cwd: repo,
+          worktree: "wt-unknown-route",
+          goal: "Should not run",
+          route: "nonexistent-route",
+          root,
+          env,
+          provision,
+          launch,
+        }),
+      ).rejects.toThrow(/Unknown --route/u);
+
+      // 4. Denied implicit candidate when all harnesses are denied
+      fs.writeFileSync(
+        path.join(repo, ".orkest", "policy.json"),
+        JSON.stringify({ deny: ["all"] }),
+        "utf8",
+      );
+      await expect(
+        chiefSpawn({
+          cwd: repo,
+          worktree: "wt-all-denied",
+          goal: "Should not run",
+          root,
+          env,
+          provision,
+          launch,
+        }),
+      ).rejects.toThrow(/denied/u);
+
+      expect(provision).not.toHaveBeenCalled();
+      expect(launch).not.toHaveBeenCalled();
+      expect(fs.existsSync(path.join(repo, ".worktrees"))).toBe(false);
+      expect(listRawRooms(root)).toEqual([]);
+      expect(fs.existsSync(path.join(root, "chief", "missions"))).toBe(false);
+    });
+
+    it("preserves permitted Claude default, resolves agy named route without codex fallback, and propagates N-account reroutes cleanly", async () => {
+      const repo = makeRepo(tmp, "allowed-repo");
+      const launch = vi.fn(() => ({
+        status: 0,
+        stdout: "AGENT_JOB_STATUS=started\nAGENT_JOB_PID=4321\n",
+        stderr: "",
+      }));
+
+      // 1. Named route "gemini" selects engine "agy", never "--engine codex"
+      const agyPlan = await chiefSpawn({
+        cwd: repo,
+        goal: "Research design",
+        route: "gemini",
+        dryRun: true,
+        root,
+        env,
+        launch,
+      });
+      expect(agyPlan.engine).toBe("agy");
+      expect(agyPlan.command).toEqual(
+        expect.arrayContaining(["--route", "gemini", "--engine", "agy"]),
+      );
+      expect(agyPlan.command).not.toContain("codex");
+
+      // 2. Multi-account Monitor config: when work Claude is denied, auto-selection picks allowed personal Claude account (claude-p1 / claude-alt)
+      const monitorCfgPath = path.join(tmp, "chief-monitor.json");
+      const personalDir = path.join(tmp, ".claude-p1");
+      const personalDir2 = path.join(tmp, ".claude-p2");
+      const acmeDir = path.join(tmp, ".claude-acme");
+      const codexPersHome = path.join(tmp, ".codex-personal");
+      fs.writeFileSync(
+        monitorCfgPath,
+        JSON.stringify({
+          accounts: [
+            { id: "claude-work-1", provider: "claude", tags: ["work"] },
+            {
+              id: "claude-p1",
+              alias: "claude-alt",
+              provider: "claude",
+              configDir: personalDir,
+              tags: ["personal"],
+            },
+            {
+              id: "claude-p2",
+              provider: "claude",
+              configDir: personalDir2,
+              tags: ["personal"],
+            },
+            {
+              id: "claude-acme",
+              provider: "claude",
+              configDir: acmeDir,
+              tags: ["client-acme"],
+            },
+            { id: "codex-work", provider: "codex", tags: ["work"] },
+            {
+              id: "codex-p1",
+              alias: "codex-pers",
+              provider: "codex",
+              codexHome: codexPersHome,
+              tags: ["personal"],
+            },
+          ],
+        }),
+        "utf8",
+      );
+      const multiEnv = { ...env, MONITOR_CONFIG: monitorCfgPath };
+
+      fs.mkdirSync(path.join(repo, ".orkest"), { recursive: true });
+      fs.writeFileSync(
+        path.join(repo, ".orkest", "policy.json"),
+        JSON.stringify({ deny: ["work"] }),
+        "utf8",
+      );
+      const autoPersonalPlan = await chiefSpawn({
+        cwd: repo,
+        goal: "Default auto personal",
+        dryRun: true,
+        root,
+        env: multiEnv,
+      });
+      expect(autoPersonalPlan.engine).toBe("claude");
+      expect(autoPersonalPlan.accountId).toBe("claude-p1");
+      expect(autoPersonalPlan.accountAlias).toBe("claude-alt");
+      expect(autoPersonalPlan.claudeConfigDir).toBe(personalDir);
+
+      // 3. Explicit --engine claude with ORCHESTRATE_AUTO_ACCOUNT=1 reroutes to claude-p2 when claude-p1 is also denied
+      fs.writeFileSync(
+        path.join(repo, ".orkest", "policy.json"),
+        JSON.stringify({ deny: ["work", "claude-p1"] }),
+        "utf8",
+      );
+      const rerouteRes = await chiefSpawn({
+        cwd: repo,
+        goal: "Run with second personal profile",
+        engine: "claude",
+        root,
+        env: { ...multiEnv, ORCHESTRATE_AUTO_ACCOUNT: "1" },
+        launch,
+        now: NOW,
+      });
+      expect(rerouteRes.engine).toBe("claude");
+      expect(rerouteRes.accountId).toBe("claude-p2");
+      expect(rerouteRes.claudeConfigDir).toBe(personalDir2);
+      expect(rerouteRes.command.filter((token) => token === "--claude-config-dir")).toHaveLength(1);
+      expect(rerouteRes.command).toEqual(
+        expect.arrayContaining(["--claude-config-dir", personalDir2, "--account", "claude-p2"]),
+      );
+      const [, launchOpts] = launch.mock.calls[0];
+      expect(launchOpts.env.CLAUDE_CONFIG_DIR).toBeUndefined();
+      const storedRoom = readRawRoom(rerouteRes.roomId, root);
+      expect(storedRoom.conductor.accountId).toBe("claude-p2");
+      expect(storedRoom.conductor.claudeConfigDir).toBe(personalDir2);
+
+      // 4. Explicit --account across Codex resolves codexHome, forwards --account, and strips raw provider env vars
+      const codexPlan = await chiefSpawn({
+        cwd: repo,
+        goal: "Codex personal run",
+        account: "codex-pers",
+        dryRun: true,
+        root,
+        env: multiEnv,
+        isEngineInstalled: (eng) => eng === "codex",
+      });
+      expect(codexPlan.engine).toBe("codex");
+      expect(codexPlan.accountId).toBe("codex-p1");
+      expect(codexPlan.codexHome).toBe(codexPersHome);
+      expect(codexPlan.command).toEqual(expect.arrayContaining(["--account", "codex-p1"]));
+
+      const codexLiveLaunch = vi.fn(() => ({
+        status: 0,
+        stdout: "AGENT_JOB_STATUS=started\nAGENT_JOB_PID=4888\n",
+        stderr: "",
+      }));
+      const codexLiveRes = await chiefSpawn({
+        cwd: repo,
+        goal: "Codex live launcher env isolation",
+        account: "codex-pers",
+        root,
+        env: {
+          ...multiEnv,
+          CODEX_HOME: "/stale/codex",
+          CLAUDE_CONFIG_DIR: "/stale/claude",
+          GEMINI_CLI_HOME: "/stale/gemini",
+          ANTIGRAVITY_APP_DATA_DIR: "/stale/agy",
+        },
+        launch: codexLiveLaunch,
+        now: NOW,
+        isEngineInstalled: (eng) => eng === "codex",
+      });
+      expect(codexLiveRes.command.filter((token) => token === "--account")).toHaveLength(1);
+      expect(codexLiveRes.command).toEqual(expect.arrayContaining(["--account", "codex-p1"]));
+      const [, codexLiveOpts] = codexLiveLaunch.mock.calls[0];
+      expect(codexLiveOpts.env.HOME).toBe(multiEnv.HOME);
+      expect(codexLiveOpts.env.ORKEST_CODEX_ACCOUNT_HOME).toBe(codexPersHome);
+      expect(codexLiveOpts.env.CODEX_HOME).toBeUndefined();
+      expect(codexLiveOpts.env.CLAUDE_CONFIG_DIR).toBeUndefined();
+      expect(codexLiveOpts.env.GEMINI_CLI_HOME).toBeUndefined();
+      expect(codexLiveOpts.env.ANTIGRAVITY_APP_DATA_DIR).toBeUndefined();
+
+      // 5. Account env.HOME preserves caller HOME on launchEnv and deduplicates --account in command
+      const customClaudeHome = path.join(tmp, "custom-chief-claude-home");
+      const customCodexHome = path.join(tmp, "custom-chief-codex-home");
+      fs.mkdirSync(customClaudeHome, { recursive: true });
+      fs.mkdirSync(customCodexHome, { recursive: true });
+      const homeMonitorCfg = path.join(tmp, "chief-home-monitor.json");
+      fs.writeFileSync(
+        homeMonitorCfg,
+        JSON.stringify({
+          accounts: [
+            {
+              id: "claude-alt-home",
+              provider: "claude",
+              env: { HOME: customClaudeHome },
+              tags: ["personal"],
+            },
+            {
+              id: "codex-alt-home",
+              provider: "codex",
+              env: { HOME: customCodexHome },
+              tags: ["personal"],
+            },
+          ],
+        }),
+        "utf8",
+      );
+      fs.writeFileSync(
+        path.join(repo, ".orkest", "policy.json"),
+        JSON.stringify({ deny: [] }),
+        "utf8",
+      );
+      const homeEnv = { ...env, MONITOR_CONFIG: homeMonitorCfg };
+      const homeLaunch = vi.fn(() => ({
+        status: 0,
+        stdout: "AGENT_JOB_STATUS=started\nAGENT_JOB_PID=4999\n",
+        stderr: "",
+      }));
+
+      const claudeHomeRes = await chiefSpawn({
+        cwd: repo,
+        goal: "Claude custom home without HOME override",
+        engine: "claude",
+        account: "claude-alt-home",
+        root,
+        env: homeEnv,
+        launch: homeLaunch,
+        now: NOW,
+        isEngineInstalled: (eng) => eng === "claude",
+      });
+      expect(claudeHomeRes.command.filter((token) => token === "--account")).toHaveLength(1);
+      expect(claudeHomeRes.command).toEqual(
+        expect.arrayContaining(["--account", "claude-alt-home"]),
+      );
+      const [, claudeHomeLaunchOpts] = homeLaunch.mock.calls[0];
+      expect(claudeHomeLaunchOpts.env.HOME).toBe(homeEnv.HOME);
+      expect(claudeHomeLaunchOpts.env.ORKEST_CLAUDE_ACCOUNT_HOME).toBe(customClaudeHome);
+
+      const codexHomeRes = await chiefSpawn({
+        cwd: repo,
+        goal: "Codex custom home without HOME override",
+        engine: "codex",
+        account: "codex-alt-home",
+        root,
+        env: homeEnv,
+        launch: homeLaunch,
+        now: NOW,
+        isEngineInstalled: (eng) => eng === "codex",
+      });
+      expect(codexHomeRes.command.filter((token) => token === "--account")).toHaveLength(1);
+      const [, codexHomeLaunchOpts] = homeLaunch.mock.calls[1];
+      expect(codexHomeLaunchOpts.env.HOME).toBe(homeEnv.HOME);
+      expect(codexHomeLaunchOpts.env.ORKEST_CODEX_ACCOUNT_HOME).toBe(
+        path.join(customCodexHome, ".codex"),
+      );
+    });
+
+    it("resolves named-route alternates against repo policy and installed harnesses", async () => {
+      const repo = makeRepo(tmp, "route-alternates-repo");
+      fs.mkdirSync(path.join(repo, ".orkest"), { recursive: true });
+      // independent-review: primary=codex, alt1=claude (claude:best/high), alt2=agy (gemini:carbon-high)
+      fs.writeFileSync(
+        path.join(repo, ".orkest", "policy.json"),
+        JSON.stringify({ deny: ["codex"] }),
+        "utf8",
+      );
+
+      // 1. Primary codex denied -> selects installed & allowed alternate 1 (claude)
+      const alt1Plan = await chiefSpawn({
+        cwd: repo,
+        goal: "Review architecture",
+        route: "independent-review",
+        dryRun: true,
+        root,
+        env,
+        isEngineInstalled: (eng) => eng === "claude" || eng === "agy",
+      });
+      expect(alt1Plan.engine).toBe("claude");
+      expect(alt1Plan.model).toBe("claude:best");
+      expect(alt1Plan.effort).toBe("high");
+      expect(alt1Plan.command).toEqual(
+        expect.arrayContaining([
+          "--route",
+          "independent-review",
+          "--engine",
+          "claude",
+          "--model",
+          "claude:best",
+          "--effort",
+          "high",
+        ]),
+      );
+
+      // 2. Primary codex allowed, but NOT installed -> selects installed alternate 1 (claude)
+      fs.writeFileSync(
+        path.join(repo, ".orkest", "policy.json"),
+        JSON.stringify({ deny: [] }),
+        "utf8",
+      );
+      const uninstalledPrimaryPlan = await chiefSpawn({
+        cwd: repo,
+        goal: "Review when codex missing",
+        route: "independent-review",
+        dryRun: true,
+        root,
+        env,
+        isEngineInstalled: (eng) => eng === "claude",
+      });
+      expect(uninstalledPrimaryPlan.engine).toBe("claude");
+      expect(uninstalledPrimaryPlan.model).toBe("claude:best");
+      expect(uninstalledPrimaryPlan.effort).toBe("high");
+
+      // 3. Both codex and claude unavailable/denied -> selects alternate 2 (agy) and records it in room.conductor
+      fs.writeFileSync(
+        path.join(repo, ".orkest", "policy.json"),
+        JSON.stringify({ deny: ["codex", "claude-work"] }),
+        "utf8",
+      );
+      const launch = vi.fn(() => ({
+        status: 0,
+        stdout: "AGENT_JOB_STATUS=started\nAGENT_JOB_PID=5151\n",
+        stderr: "",
+      }));
+      const alt2Res = await chiefSpawn({
+        cwd: repo,
+        goal: "Fallback to agy alternate",
+        route: "independent-review",
+        root,
+        env,
+        launch,
+        isEngineInstalled: (eng) => eng === "agy",
+      });
+      expect(alt2Res.engine).toBe("agy");
+      expect(alt2Res.model).toBe("gemini:carbon-high");
+      const alt2Room = readRawRoom(alt2Res.roomId, root);
+      expect(alt2Room.conductor.engine).toBe("agy");
+      expect(alt2Room.conductor.model).toBe("gemini:carbon-high");
+
+      // 4. All route candidates denied -> rejects before provisioning
+      fs.writeFileSync(
+        path.join(repo, ".orkest", "policy.json"),
+        JSON.stringify({ deny: ["codex", "claude-all", "agy"] }),
+        "utf8",
+      );
+      const provision = vi.fn();
+      await expect(
+        chiefSpawn({
+          cwd: repo,
+          worktree: "wt-should-not-exist",
+          goal: "Should fail",
+          route: "independent-review",
+          root,
+          env,
+          provision,
+          isEngineInstalled: () => true,
+        }),
+      ).rejects.toThrow(/denied/u);
+      expect(provision).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("chiefLiveness table & chief.lock CAS", () => {
+    it("enforces exact 600s grace boundaries, PID reuse, wrong host, same-PID replacement, shared child non-replacement, and read-only stability", () => {
+      const chiefFile = chiefPath(root);
+
+      // 1. 599s / 600s / 601s grace window when no PID and no exact peer
+      const boundAt = new Date(NOW).toISOString();
+      fs.writeFileSync(
+        chiefFile,
+        JSON.stringify({
+          schema: "ork.chief.v1",
+          session: "chief-grace",
+          name: "grace",
+          machine: os.hostname(),
+          pid: null,
+          boundAt,
+        }),
+      );
+      const beforeBytes = fs.readFileSync(chiefFile, "utf8");
+      expect(readChiefBinding({ root, now: NOW + 599_000, peers: [] })).toMatchObject({
+        session: "chief-grace",
+        live: true,
+      });
+      expect(readChiefBinding({ root, now: NOW + 600_000, peers: [] })).toMatchObject({
+        session: "chief-grace",
+        live: true,
+      });
+      expect(readChiefBinding({ root, now: NOW + 601_000, peers: [] })).toBeNull();
+      expect(
+        readChiefBinding({ root, now: NOW + 601_000, peers: [], includeStale: true }),
+      ).toMatchObject({
+        live: false,
+        stale: true,
+      });
+      expect(readChiefBinding({ root, now: NOW - 1000, peers: [] })).toBeNull();
+      expect(fs.readFileSync(chiefFile, "utf8")).toBe(beforeBytes);
+
+      // 2. Wrong host -> stale
+      fs.writeFileSync(
+        chiefFile,
+        JSON.stringify({
+          schema: "ork.chief.v1",
+          session: "chief-remote",
+          name: "remote",
+          machine: `${os.hostname()}-other`,
+          pid: process.pid,
+          boundAt,
+        }),
+      );
+      expect(readChiefBinding({ root, now: NOW, peers: [] })).toBeNull();
+      expect(readChiefBinding({ root, now: NOW, peers: [], includeStale: true })).toMatchObject({
+        stale: true,
+        staleReason: expect.stringContaining("another machine"),
+      });
+
+      // 3. PID reuse rejected even when a stale live-looking peer record exists
+      writePeer(root, { session: "chief-reused", name: "reused", cwd: tmp, pid: process.pid });
+      fs.writeFileSync(
+        chiefFile,
+        JSON.stringify({
+          schema: "ork.chief.v1",
+          session: "chief-reused",
+          name: "reused",
+          machine: os.hostname(),
+          pid: process.pid,
+          pidBirth: "1999-01-01T00:00:00Z",
+          boundAt,
+        }),
+      );
+      expect(readChiefBinding({ root, now: NOW })).toBeNull();
+      expect(readChiefBinding({ root, now: NOW, includeStale: true })).toMatchObject({
+        stale: true,
+        staleReason: expect.stringContaining("recycled"),
+      });
+
+      // 4. Shared child / run peer on same PID past grace does NOT replace Chief
+      fs.rmSync(path.join(root, "peers"), { recursive: true, force: true });
+      fs.writeFileSync(
+        chiefFile,
+        JSON.stringify({
+          schema: "ork.chief.v1",
+          session: "chief-parent",
+          name: "parent",
+          machine: os.hostname(),
+          pid: process.pid,
+          boundAt: new Date(NOW - 700_000).toISOString(),
+        }),
+      );
+      writePeer(root, {
+        session: "child-sub",
+        name: "sub",
+        cwd: tmp,
+        pid: process.pid,
+        isSubagent: true,
+        sharedProcess: true,
+        parentSession: "chief-parent",
+      });
+      writePeer(root, {
+        session: "run-99-worker",
+        name: "worker",
+        cwd: tmp,
+        pid: process.pid,
+        run: "99",
+      });
+      expect(readChiefBinding({ root, now: NOW })).toMatchObject({
+        session: "chief-parent",
+        live: true,
+      });
+
+      // 5. Same-PID top-level replacement past grace marks Chief cleared/replaced
+      writePeer(root, {
+        session: "chief-cleared-new",
+        name: "new-top-level",
+        cwd: tmp,
+        pid: process.pid,
+        sharedProcess: true,
+      });
+      expect(readChiefBinding({ root, now: NOW })).toBeNull();
+      expect(readChiefBinding({ root, now: NOW, includeStale: true })).toMatchObject({
+        stale: true,
+        staleReason: expect.stringContaining("cleared or replaced"),
+      });
+    });
+
+    it("serializes concurrent bindChief mutations via chief.lock flock CAS without losing history", async () => {
+      writePeer(root, { session: "race-a", name: "race-a", cwd: tmp });
+      writePeer(root, { session: "race-b", name: "race-b", cwd: tmp });
+
+      // Hold chief.lock from an external Python process briefly while bindChief waits and retries CAS
+      const lockScript = [
+        "import fcntl, json, os, sys, time",
+        "root = sys.argv[1]",
+        "lock_path = os.path.join(root, 'chief.lock')",
+        "chief_path = os.path.join(root, 'chief.json')",
+        "fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)",
+        "fcntl.flock(fd, fcntl.LOCK_EX)",
+        "print('LOCKED', flush=True)",
+        "time.sleep(0.15)",
+        "with open(chief_path, 'w') as fh:",
+        "    json.dump({'schema': 'ork.chief.v1', 'session': 'ext-holder', 'name': 'ext', 'machine': os.uname().nodename, 'pid': os.getpid(), 'boundAt': '2026-01-01T00:00:00Z'}, fh)",
+        "os.close(fd)",
+      ].join("\n");
+
+      const locker = spawn("python3", ["-c", lockScript, root], {
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      const lockerDone = new Promise((resolve) => locker.on("close", resolve));
+      await new Promise((resolve, reject) => {
+        locker.on("error", reject);
+        locker.stdout.on("data", (chunk) => {
+          if (String(chunk).includes("LOCKED")) resolve();
+        });
+      });
+
+      const [resA, resB] = await Promise.all([
+        bindChief({ root, env, session: "race-a", runMailbox: mailboxMock(), now: NOW }),
+        bindChief({ root, env, session: "race-b", runMailbox: mailboxMock(), now: NOW + 5 }),
+      ]);
+      await lockerDone;
+
+      const finalStored = JSON.parse(fs.readFileSync(chiefPath(root), "utf8"));
+      expect(["race-a", "race-b"]).toContain(finalStored.session);
+      expect(finalStored.revision).toBeGreaterThanOrEqual(1);
+      expect(finalStored.previous).toBeTruthy();
+      expect([resA.action, resB.action].every((act) => act === "taken" || act === "bound")).toBe(
+        true,
+      );
+      // chief.lock remains on disk (never unlinked on release)
+      expect(fs.existsSync(path.join(root, "chief.lock"))).toBe(true);
+    });
+
+    it("reconciles focus to the winning binding revision and rejects stale clear when same session rebinds", async () => {
+      writePeer(root, { session: "race-win", name: "race-win", cwd: tmp });
+      writePeer(root, { session: "race-lose", name: "race-lose", cwd: tmp });
+
+      let focusOwner = null;
+      const focusLog = [];
+      const trackingMailbox = (delayLoseMs = 0) =>
+        vi.fn((args) => {
+          if (args[0] === "focus") {
+            const sessIdx = args.indexOf("--session");
+            const sess = sessIdx === -1 ? null : args[sessIdx + 1];
+            const isClear = args.includes("--clear");
+            focusLog.push({ sess, isClear, delayLoseMs });
+            if (isClear) {
+              if (focusOwner === sess) focusOwner = null;
+            } else {
+              focusOwner = sess;
+            }
+          }
+          return { status: 0, stdout: '{"id":"m1","wake":{"status":"woken"}}', stderr: "" };
+        });
+
+      const [resWin, resLose] = await Promise.all([
+        bindChief({
+          root,
+          env,
+          session: "race-lose",
+          runMailbox: trackingMailbox(1),
+          now: NOW,
+        }),
+        bindChief({
+          root,
+          env,
+          session: "race-win",
+          runMailbox: trackingMailbox(2),
+          now: NOW + 10,
+        }),
+      ]);
+      const finalStored = JSON.parse(fs.readFileSync(chiefPath(root), "utf8"));
+      expect(finalStored.session).toBe(focusOwner);
+      expect(resWin.binding.revision).not.toBe(resLose.binding.revision);
+
+      // Rebinding the same session increments revision; a stale clear holding the old revision must NOT clear the live renewal
+      const liveSession = finalStored.session;
+      const stalePre = readChiefBinding({ root, now: NOW + 20, includeStale: true });
+      const renewed = await bindChief({
+        root,
+        env,
+        session: liveSession,
+        runMailbox: trackingMailbox(),
+        now: NOW + 30,
+      });
+      expect(renewed.binding.revision).toBe(stalePre.revision + 1);
+      await expect(
+        bindChief({
+          root,
+          env,
+          session: "outsider",
+          clear: true,
+          runMailbox: trackingMailbox(),
+          now: NOW + 35,
+        }),
+      ).rejects.toThrow(/--force/u);
+      expect(fs.existsSync(chiefPath(root))).toBe(true);
+    });
+
+    it("enforces liveness parity (contradictory peers, unavailable birth grace, 7-day heartbeat), generation CAS on clear, and route fidelity / missing executable rejection", async () => {
+      const chiefFile = chiefPath(root);
+
+      // 1. Liveness parity: exact peer PID / pidBirth contradiction -> stale
+      writePeer(root, {
+        session: "chief-contra",
+        name: "contra",
+        cwd: tmp,
+        pid: process.pid + 999_999,
+      });
+      fs.writeFileSync(
+        chiefFile,
+        JSON.stringify({
+          schema: "ork.chief.v1",
+          session: "chief-contra",
+          name: "contra",
+          machine: os.hostname(),
+          pid: process.pid,
+          boundAt: new Date(NOW).toISOString(),
+        }),
+      );
+      expect(readChiefBinding({ root, now: NOW })).toBeNull();
+      expect(readChiefBinding({ root, now: NOW, includeStale: true })).toMatchObject({
+        stale: true,
+        staleReason: expect.stringContaining("contradicts"),
+      });
+
+      // 2. Liveness parity: unavailable birth lookup respects 600s grace both with and without exact peer
+      fs.rmSync(path.join(root, "peers"), { recursive: true, force: true });
+      writePeer(root, {
+        session: "chief-nobirth",
+        name: "nobirth",
+        cwd: tmp,
+        pid: process.pid,
+        lastSeenAt: new Date(NOW - 86_400_000).toISOString(),
+      });
+      fs.writeFileSync(
+        chiefFile,
+        JSON.stringify({
+          schema: "ork.chief.v1",
+          session: "chief-nobirth",
+          name: "nobirth",
+          machine: os.hostname(),
+          pid: process.pid,
+          pidBirth: "2026-01-01T00:00:00Z",
+          boundAt: new Date(NOW - 700_000).toISOString(),
+        }),
+      );
+      expect(readChiefBinding({ root, now: NOW, getProcessStarted: () => {} })).toBeNull();
+      expect(
+        readChiefBinding({
+          root,
+          now: NOW - 200_000,
+          getProcessStarted: () => {},
+        }),
+      ).toMatchObject({ session: "chief-nobirth", live: true });
+
+      // 3. Liveness parity: aged 7-day heartbeat is rejected even if peer.live was pre-populated true
+      fs.writeFileSync(
+        chiefFile,
+        JSON.stringify({
+          schema: "ork.chief.v1",
+          session: "chief-aged",
+          name: "aged",
+          machine: os.hostname(),
+          pid: null,
+          boundAt: new Date(NOW - 8 * 86_400_000).toISOString(),
+        }),
+      );
+      expect(
+        readChiefBinding({
+          root,
+          now: NOW,
+          peers: [
+            {
+              session: "chief-aged",
+              name: "aged",
+              cwd: tmp,
+              pid: null,
+              lastSeenAt: new Date(NOW - 8 * 86_400_000).toISOString(),
+              live: true,
+            },
+          ],
+        }),
+      ).toBeNull();
+
+      // 3b. Liveness parity: 8-day-old non-shared exact peer with verified live PID returns null (live: false),
+      // while exact 7-day-old non-shared exact peer stays live, and fresh exact peer cannot bypass expired birth grace.
+      const birth = "2026-01-01T00:00:00Z";
+      fs.writeFileSync(
+        chiefFile,
+        JSON.stringify({
+          schema: "ork.chief.v1",
+          session: "chief-aged-live",
+          name: "aged-live",
+          machine: os.hostname(),
+          pid: process.pid,
+          pidBirth: birth,
+          boundAt: new Date(NOW - 8 * 86_400_000).toISOString(),
+        }),
+      );
+      expect(
+        readChiefBinding({
+          root,
+          now: NOW,
+          getProcessStarted: () => birth,
+          peers: [
+            {
+              session: "chief-aged-live",
+              name: "aged-live",
+              cwd: tmp,
+              pid: process.pid,
+              pidBirth: birth,
+              sharedProcess: false,
+              lastSeenAt: new Date(NOW - 8 * 86_400_000).toISOString(),
+              live: true,
+            },
+          ],
+        }),
+      ).toBeNull();
+      expect(
+        readChiefBinding({
+          root,
+          now: NOW,
+          getProcessStarted: () => birth,
+          peers: [
+            {
+              session: "chief-aged-live",
+              name: "aged-live",
+              cwd: tmp,
+              pid: process.pid,
+              pidBirth: birth,
+              sharedProcess: false,
+              lastSeenAt: new Date(NOW - 7 * 86_400_000).toISOString(),
+              live: true,
+            },
+          ],
+        }),
+      ).toMatchObject({ session: "chief-aged-live", live: true });
+
+      fs.writeFileSync(
+        chiefFile,
+        JSON.stringify({
+          schema: "ork.chief.v1",
+          session: "chief-nobirth-fresh-peer",
+          name: "nobirth-fresh",
+          machine: os.hostname(),
+          pid: process.pid,
+          pidBirth: birth,
+          boundAt: new Date(NOW - 601_000).toISOString(),
+        }),
+      );
+      expect(
+        readChiefBinding({
+          root,
+          now: NOW,
+          getProcessStarted: () => {},
+          peers: [
+            {
+              session: "chief-nobirth-fresh-peer",
+              name: "nobirth-fresh",
+              cwd: tmp,
+              pid: process.pid,
+              pidBirth: birth,
+              sharedProcess: false,
+              lastSeenAt: new Date(NOW).toISOString(),
+              live: true,
+            },
+          ],
+        }),
+      ).toBeNull();
+
+      // 4. bindChief records unique generation UUID and stale clear does NOT retry against newer revision/generation
+      fs.rmSync(chiefFile, { force: true });
+      writePeer(root, { session: "gen-chief", name: "gen-chief", cwd: tmp });
+      const firstBind = await bindChief({
+        root,
+        env,
+        session: "gen-chief",
+        runMailbox: mailboxMock(),
+        now: NOW,
+      });
+      expect(typeof firstBind.binding.generation).toBe("string");
+      expect(firstBind.binding.generation.length).toBeGreaterThan(10);
+
+      // Hold chief.lock while renewing the same session so a concurrent clear observes old (rev, gen) and fails on conflict
+      const renewFirst = await bindChief({
+        root,
+        env,
+        session: "gen-chief",
+        runMailbox: mailboxMock(),
+        now: NOW + 5,
+      });
+      expect(renewFirst.binding.generation).not.toBe(firstBind.binding.generation);
+
+      // Simulate stale clear holding firstBind's generation via a concurrent bind while clear waits on chief.lock
+      const lockScript = [
+        "import fcntl, os, sys, time",
+        'fd = os.open(os.path.join(sys.argv[1], "chief.lock"), os.O_CREAT | os.O_RDWR, 0o600)',
+        "fcntl.flock(fd, fcntl.LOCK_EX)",
+        String.raw`sys.stdout.write("LOCKED\n"); sys.stdout.flush()`,
+        "time.sleep(0.2)",
+        "os.close(fd)",
+      ].join("\n");
+      const locker = spawn("python3", ["-c", lockScript, root], {
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      await new Promise((resolve, reject) => {
+        locker.on("error", reject);
+        locker.stdout.on("data", (chunk) => {
+          if (String(chunk).includes("LOCKED")) resolve();
+        });
+      });
+      const clearPromise = bindChief({
+        root,
+        env,
+        session: "gen-chief",
+        clear: true,
+        runMailbox: mailboxMock(),
+        now: NOW + 10,
+      });
+      // Replace chief.json while lock is held (simulating renewal between read and clear CAS)
+      const renewedRecord = {
+        ...renewFirst.binding,
+        revision: renewFirst.binding.revision + 1,
+        generation: "renewed-generation-uuid",
+      };
+      fs.writeFileSync(chiefFile, JSON.stringify(renewedRecord, null, 2));
+      await new Promise((resolve) => locker.on("close", resolve));
+      await expect(clearPromise).rejects.toThrow(/conflict/u);
+      expect(JSON.parse(fs.readFileSync(chiefFile, "utf8")).generation).toBe(
+        "renewed-generation-uuid",
+      );
+
+      // 5. Route fidelity: route with tags/alias preserves --model, --effort, --claude-config-dir with --engine claude
+      const repo = makeRepo(tmp, "route-fidelity-repo");
+      const cfgDir = path.dirname(env.ORCHESTRATE_CONFIG);
+      fs.mkdirSync(cfgDir, { recursive: true });
+      const personalDir = path.join(tmp, ".claude-p1");
+      const monitorCfgPath = path.join(tmp, "route-monitor.json");
+      fs.writeFileSync(
+        monitorCfgPath,
+        JSON.stringify({
+          accounts: [
+            { id: "claude-work", provider: "claude", tags: ["work"] },
+            {
+              id: "claude-p1",
+              alias: "claude-alt",
+              provider: "claude",
+              configDir: personalDir,
+              tags: ["personal"],
+            },
+          ],
+        }),
+        "utf8",
+      );
+      const routeEnv = { ...env, MONITOR_CONFIG: monitorCfgPath };
+      fs.writeFileSync(
+        env.ORCHESTRATE_CONFIG,
+        JSON.stringify({
+          routes: {
+            "personal-fast": {
+              engine: "claude-alt",
+              tags: ["personal"],
+              model: "claude:fast",
+              effort: "low",
+            },
+          },
+        }),
+        "utf8",
+      );
+      const personalPlan = await chiefSpawn({
+        cwd: repo,
+        goal: "Fast personal review",
+        route: "personal-fast",
+        dryRun: true,
+        root,
+        env: routeEnv,
+        isEngineInstalled: (eng) => eng === "claude",
+      });
+      expect(personalPlan.engine).toBe("claude");
+      expect(personalPlan.accountId).toBe("claude-p1");
+      expect(personalPlan.accountAlias).toBe("claude-alt");
+      expect(personalPlan.model).toBe("claude:fast");
+      expect(personalPlan.effort).toBe("low");
+      expect(personalPlan.command).toEqual(
+        expect.arrayContaining([
+          "--route",
+          "personal-fast",
+          "--engine",
+          "claude",
+          "--account",
+          "claude-p1",
+          "--model",
+          "claude:fast",
+          "--effort",
+          "low",
+          "--claude-config-dir",
+          personalDir,
+        ]),
+      );
+
+      // 6. Unavailable executables fail before provisioning worktree or room
+      const provision = vi.fn();
+      await expect(
+        chiefSpawn({
+          cwd: repo,
+          worktree: "wt-missing-bin",
+          goal: "Should fail unavailable",
+          route: "independent-review",
+          root,
+          env: routeEnv,
+          provision,
+          isEngineInstalled: () => false,
+        }),
+      ).rejects.toThrow(/no installed executable/u);
+      expect(provision).not.toHaveBeenCalled();
+
+      // 7. Denied personal primary falling back to work-profile Claude alternate does not revert to ~/.claude-p1
+      const altWorkRepo = makeRepo(tmp, "personal-to-work-alt-repo");
+      fs.mkdirSync(path.join(altWorkRepo, ".orkest"), { recursive: true });
+      fs.writeFileSync(
+        path.join(altWorkRepo, ".orkest", "policy.json"),
+        JSON.stringify({ deny: ["personal"] }),
+        "utf8",
+      );
+      fs.writeFileSync(
+        env.ORCHESTRATE_CONFIG,
+        JSON.stringify({
+          routes: {
+            "personal-or-work": {
+              engine: "claude",
+              tags: ["personal"],
+              model: "claude:fast",
+              effort: "low",
+              alternates: [
+                {
+                  engine: "claude",
+                  model: "claude:balanced",
+                  effort: "medium",
+                },
+              ],
+            },
+          },
+        }),
+        "utf8",
+      );
+      const workClaudeDir = path.join(tmp, ".claude");
+      const altWorkPlan = await chiefSpawn({
+        cwd: altWorkRepo,
+        goal: "Run allowed work alternate",
+        route: "personal-or-work",
+        dryRun: true,
+        root,
+        env: routeEnv,
+        isEngineInstalled: (eng) => eng === "claude",
+      });
+      expect(altWorkPlan.engine).toBe("claude");
+      expect(altWorkPlan.accountId).toBe("claude-work");
+      expect(altWorkPlan.model).toBe("claude:balanced");
+      expect(altWorkPlan.effort).toBe("medium");
+      expect(altWorkPlan.claudeConfigDir).toBe(workClaudeDir);
+      expect(altWorkPlan.command).not.toContain("--route");
+      expect(altWorkPlan.command).toEqual(
+        expect.arrayContaining([
+          "--engine",
+          "claude",
+          "--model",
+          "claude:balanced",
+          "--effort",
+          "medium",
+          "--claude-config-dir",
+          workClaudeDir,
+        ]),
+      );
+
+      // Round-trip the spawned command's routing flags through Python run_agent.parse_args + resolve_route
+      const runAgentScript = path.resolve(
+        path.dirname(fileURLToPath(import.meta.url)),
+        "../../../plugins/orchestrate/skills/orchestrate/scripts/run_agent.py",
+      );
+      const cliFlags = altWorkPlan.command.slice(2);
+      const pyCheck = spawnSync(
+        "python3",
+        [
+          "-c",
+          [
+            "import importlib.util, json, sys",
+            `spec = importlib.util.spec_from_file_location("run_agent_mod", ${JSON.stringify(runAgentScript)})`,
+            "mod = importlib.util.module_from_spec(spec)",
+            "spec.loader.exec_module(mod)",
+            "args = mod.resolve_route(mod.parse_args(json.loads(sys.argv[1])))",
+            "print(json.dumps({'engine': args.engine, 'model': args.model, 'effort': args.effort, 'claude_config_dir': str(args.claude_config_dir) if args.claude_config_dir else None}))",
+          ].join("\n"),
+          JSON.stringify(cliFlags),
+        ],
+        {
+          env: {
+            ...process.env,
+            HOME: tmp,
+            MONITOR_CONFIG: routeEnv.MONITOR_CONFIG,
+            ORCHESTRATE_CONFIG: env.ORCHESTRATE_CONFIG,
+          },
+          encoding: "utf8",
+        },
+      );
+      expect(pyCheck.status).toBe(0);
+      expect(JSON.parse(pyCheck.stdout)).toEqual({
+        engine: "claude",
+        model: "claude:balanced",
+        effort: "medium",
+        claude_config_dir: workClaudeDir,
+      });
+
+      // 8. Canonical peer precedence: stale legacy copy sorting before <sessionKey>.json never poisons bindChief or chiefLiveness
+      fs.rmSync(chiefFile, { force: true });
+      fs.rmSync(path.join(root, "peers"), { recursive: true, force: true });
+      const canonSession = "chief:Canon";
+      writePeer(root, {
+        session: canonSession,
+        name: "live-canonical-chief",
+        cwd: tmp,
+        pid: process.pid,
+        paneId: "%42",
+      });
+      // Write a stale legacy peer file that sorts lexicographically BEFORE <sessionKey(canonSession)>.json
+      fs.writeFileSync(
+        path.join(root, "peers", "000-stale-legacy-chief.json"),
+        JSON.stringify({
+          schema: "agent-executor.peer.v1",
+          session: canonSession,
+          name: "stale-legacy-chief",
+          harness: "claude",
+          cwd: tmp,
+          machine: os.hostname(),
+          pid: deadPid(),
+          pidBirth: "2020-01-01T00:00:00Z",
+          paneId: "%999",
+          startedAt: new Date(NOW - 86_400_000).toISOString(),
+          lastSeenAt: new Date(NOW - 86_400_000).toISOString(),
+        }),
+      );
+      const resolvedPeers = readPeers(root, { now: NOW });
+      expect(resolvedPeers.filter((p) => p.session === canonSession)).toHaveLength(1);
+      expect(resolvedPeers.find((p) => p.session === canonSession)).toMatchObject({
+        name: "live-canonical-chief",
+        pid: process.pid,
+        paneId: "%42",
+        live: true,
+      });
+      const boundCanon = await bindChief({
+        root,
+        env,
+        session: canonSession,
+        runMailbox: mailboxMock(),
+        now: NOW,
+      });
+      expect(boundCanon.binding).toMatchObject({
+        session: canonSession,
+        name: "live-canonical-chief",
+        pid: process.pid,
+        paneId: "%42",
+      });
+      expect(readChiefBinding({ root, now: NOW })).toMatchObject({
+        session: canonSession,
+        name: "live-canonical-chief",
+        pid: process.pid,
+        paneId: "%42",
+        live: true,
+      });
+    });
   });
 });

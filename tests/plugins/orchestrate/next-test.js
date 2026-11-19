@@ -1,3 +1,5 @@
+import { execFileSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
 import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -45,10 +47,27 @@ async function createMockWorktree(
   } = {},
 ) {
   const wtPath = path.join(rootDir, slug);
-  const gitDir = path.join(rootDir, `gitdir-${slug}`);
-  await mkdir(wtPath, { recursive: true });
+  const runGit = (cwd, args) =>
+    execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  if (!existsSync(path.join(repoRoot, ".git"))) {
+    await mkdir(repoRoot, { recursive: true });
+    runGit(repoRoot, ["init", "-b", "main"]);
+    runGit(repoRoot, [
+      "-c",
+      "user.name=Next Test",
+      "-c",
+      "user.email=next@example.invalid",
+      "commit",
+      "--allow-empty",
+      "-m",
+      "base",
+    ]);
+  }
+  runGit(repoRoot, ["worktree", "add", "-b", branch, wtPath]);
+  const dotGitText = readFileSync(path.join(wtPath, ".git"), "utf8");
+  const gitDirMatch = /^gitdir:\s*(.+)$/mu.exec(dotGitText);
+  const gitDir = path.resolve(wtPath, gitDirMatch[1].trim());
   await mkdir(path.join(gitDir, "orkest"), { recursive: true });
-  await writeFile(path.join(wtPath, ".git"), `gitdir: ${gitDir}\n`);
   await writeFile(
     path.join(gitDir, "orkest.json"),
     JSON.stringify({

@@ -1329,6 +1329,34 @@ class InstallMailboxTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "exactly four"):
                     check_mailbox.check(require_codex_hook_trust=False)
 
+    def test_custom_wrapper_aliases_reject_zsh_hooks_and_special_namespaces(self):
+        rejected = [
+            "precmd",  # cspell:ignore precmd
+            "preexec",  # cspell:ignore preexec
+            "chpwd",  # cspell:ignore chpwd
+            "periodic",
+            "zshexit",  # cspell:ignore zshexit
+            "zshaddhistory",  # cspell:ignore zshaddhistory
+            "zsh_directory_name",
+            "PROMPT_COMMAND",
+            "command_not_found_handle",
+            "command_not_found_handler",
+            "_private_helper",
+            "TRAPINT",
+            "trap_exit",
+            "chpwd_functions",
+            "custom_FUNCTIONS",
+        ]
+        monitor_config = {
+            "accounts": [
+                {"id": f"acct-{idx}", "provider": "claude", "alias": name}
+                for idx, name in enumerate([*rejected, "claude-alt"])
+            ]
+            + [{"id": "acct-route", "provider": "codex", "route": "precmd_functions"}]
+        }
+        aliases = installer._custom_wrapper_aliases(self.base, monitor_config=monitor_config)
+        self.assertEqual(aliases, [("claude-alt", "claude")])
+
 
 if __name__ == "__main__":
     unittest.main()

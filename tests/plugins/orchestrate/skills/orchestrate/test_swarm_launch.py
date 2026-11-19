@@ -768,7 +768,7 @@ class HerdrSwarmLaunchTests(unittest.TestCase):
             sid,
         )
         self.assertEqual(
-            agent_statusline_tmux.extract_resumed_session_id(["plaude", "-r", sid]),
+            agent_statusline_tmux.extract_resumed_session_id(["claude-alt", "-r", sid]),
             sid,
         )
         self.assertEqual(
@@ -789,6 +789,91 @@ class HerdrSwarmLaunchTests(unittest.TestCase):
         )
         self.assertIsNone(agent_statusline_tmux.extract_resumed_session_id(["claude", "--resume"]))
         self.assertIsNone(agent_statusline_tmux.extract_resumed_session_id(["codex", "resume", "--last"]))
+
+    def test_shell_wrapper_script_generates_dynamic_aliases_without_hardcoded_names(self):
+        import install_mailbox
+
+        with tempfile.TemporaryDirectory(prefix="ork-wrappers-") as temporary:
+            home = Path(temporary)
+            cfg = home / ".config" / "monitor" / "config.json"
+            cfg.parent.mkdir(parents=True, exist_ok=True)
+            cfg.write_text(
+                json.dumps(
+                    {
+                        "accounts": [
+                            {"id": "claude-default", "provider": "claude", "route": "claude"},
+                            {
+                                "id": "claude-alt-id",
+                                "provider": "claude",
+                                "alias": "claude-alt",
+                                "configDir": str(home / ".claude-alt"),
+                            },
+                            {"id": "codex-alt-id", "provider": "codex", "route": "codex-alt"},
+                            {"id": "agy-alt-id", "provider": "antigravity", "alias": "agy-alt"},
+                            {"id": "bad-reserved", "provider": "claude", "alias": "git"},
+                            {"id": "bad-chars", "provider": "claude", "alias": "bad alias;rm"},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"MONITOR_CONFIG": ""}, clear=False):
+                script = install_mailbox.shell_wrapper_script(home=home)
+            self.assertIn("unalias codex claude agy claude-alt codex-alt agy-alt 2>/dev/null", script)
+            self.assertIn("claude-alt() {", script)
+            self.assertIn("command ork label -- claude-alt", script)
+            self.assertIn("codex-alt() {", script)
+            self.assertIn("command ork label -- codex-alt", script)
+            self.assertIn("agy-alt() {", script)
+            self.assertIn("command ork label -- agy-alt --dangerously-skip-permissions", script)
+            self.assertNotIn("git() {", script)
+            self.assertNotIn("bad alias", script)
+
+    def test_ork_label_resolves_builtin_configured_aliases_and_provider_headers(self):
+        import agent_statusline_tmux
+
+        with tempfile.TemporaryDirectory(prefix="ork-label-resolve-") as temporary:
+            root = Path(temporary)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            header_wrapper = bin_dir / "custom-claude-bin"
+            header_wrapper.write_text(
+                '#!/bin/sh\n# orkest-account-provider: claude\nexec claude "$@"\n',
+                encoding="utf-8",
+            )
+            header_wrapper.chmod(0o755)
+            header_agy = bin_dir / "custom-agy-bin"
+            header_agy.write_text(
+                '#!/bin/sh\n# orkest-account-provider: antigravity\nexec agy "$@"\n',
+                encoding="utf-8",
+            )
+            header_agy.chmod(0o755)
+            cfg = root / "monitor-config.json"
+            cfg.write_text(
+                json.dumps(
+                    {
+                        "accounts": [
+                            {"id": "claude-alt-id", "provider": "claude", "alias": "claude-alt"},
+                            {"id": "codex-alt-id", "provider": "codex", "route": "codex-alt"},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.dict(
+                os.environ,
+                {"MONITOR_CONFIG": str(cfg), "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}"},
+            ):
+                self.assertEqual(agent_statusline_tmux._resolve_label_harness("codex"), "codex")
+                self.assertEqual(agent_statusline_tmux._resolve_label_harness("claude"), "claude")
+                self.assertEqual(agent_statusline_tmux._resolve_label_harness("agy"), "gemini")
+                self.assertEqual(agent_statusline_tmux._resolve_label_harness("gemini"), "gemini")
+                self.assertEqual(agent_statusline_tmux._resolve_label_harness("opencode"), "opencode")
+                self.assertEqual(agent_statusline_tmux._resolve_label_harness("claude-alt"), "claude")
+                self.assertEqual(agent_statusline_tmux._resolve_label_harness("codex-alt"), "codex")
+                self.assertEqual(agent_statusline_tmux._resolve_label_harness("custom-claude-bin"), "claude")
+                self.assertEqual(agent_statusline_tmux._resolve_label_harness("custom-agy-bin"), "gemini")
+                self.assertIsNone(agent_statusline_tmux._resolve_label_harness("unknown-tool"))
 
     def test_resumed_session_reconnects_to_previous_swarm_room_and_history(self):
         import agent_statusline_tmux

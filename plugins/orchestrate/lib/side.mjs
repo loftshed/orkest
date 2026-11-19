@@ -16,7 +16,15 @@ import {
   updateRoom,
   workforceRoleInfo,
 } from "./horde-room.mjs";
-import { cacheHome, configHome } from "./runtime-paths.mjs";
+import {
+  CANONICAL_HARNESSES,
+  isHarnessAllowed,
+  loadConfiguredAccounts,
+  normalizeAccountTags,
+  resolveConfiguredAccount,
+  resolveRepoPolicy,
+} from "./policy.mjs";
+import { cacheHome } from "./runtime-paths.mjs";
 import { bootstrapWorktreeInclude } from "./worktree-env.mjs";
 import { provisionWorktree } from "./worktree-provision.mjs";
 
@@ -40,7 +48,8 @@ Modes:
   --mode <mode>         Explicit mode: auto | execute | investigate | park | issue
 
 Options:
-  --engine <engine>     Engine override (codex, claude, agy, opencode)
+  --engine <engine>     Engine or account alias override (codex, claude, agy, opencode, or account alias)
+  --account <id>        Account ID or alias override (from monitor config)
   --model <model>       Model override
   --effort <level>      Effort level override (low, medium, high, max)
   --allow-paths <csv>   Comma-separated allow_paths for execute mode (default: ".")
@@ -167,9 +176,11 @@ export function parseSideArgs(argv = []) {
     park: false,
     issue: false,
     engine: null,
+    account: null,
     model: null,
     effort: null,
     allowPaths: ["."],
+    claudeConfigDir: null,
     room: null,
     session: null,
     harness: null,
@@ -197,6 +208,10 @@ export function parseSideArgs(argv = []) {
       options.engine = String(args[++i]);
     } else if (token.startsWith("--engine=")) {
       options.engine = token.slice("--engine=".length);
+    } else if (token === "--account" && i + 1 < args.length) {
+      options.account = String(args[++i]);
+    } else if (token.startsWith("--account=")) {
+      options.account = token.slice("--account=".length);
     } else if (token === "--model" && i + 1 < args.length) {
       options.model = String(args[++i]);
     } else if (token.startsWith("--model=")) {
@@ -232,6 +247,10 @@ export function parseSideArgs(argv = []) {
       options.cwd = String(args[++i]);
     } else if (token.startsWith("--cwd=")) {
       options.cwd = token.slice("--cwd=".length);
+    } else if (token === "--claude-config-dir" && i + 1 < args.length) {
+      options.claudeConfigDir = String(args[++i]);
+    } else if (token.startsWith("--claude-config-dir=")) {
+      options.claudeConfigDir = token.slice("--claude-config-dir=".length);
     } else {
       positional.push(token);
     }
@@ -271,10 +290,18 @@ function defaultRunCommand(cmd, args, opts = {}) {
 
 function resolveGitRoot(cwd, runCmd) {
   const res = runCmd("git", ["rev-parse", "--show-toplevel"], { cwd });
-  if (res.status === 0 && res.stdout.trim()) {
+  if (res && !res.error && res.status === 0 && res.stdout.trim()) {
     return res.stdout.trim();
   }
-  return path.resolve(cwd);
+  const stderr = String(res?.stderr || "").toLowerCase();
+  if (res && !res.error && res.status === 128 && stderr.includes("not a git repository")) {
+    return path.resolve(cwd);
+  }
+  const detail =
+    res?.error?.message ||
+    res?.stderr?.trim() ||
+    `git exited with status ${res?.status ?? "unknown"}`;
+  throw new Error(`Failed to resolve git repository root for ${cwd}: ${detail}`);
 }
 
 function sameDirectory(left, right) {
@@ -370,6 +397,9 @@ async function registerSideMemberInRoom(roomRecord, sideSpec) {
           role: "worker",
           ...(workforceRoleInfo(workforceRole) && { workforceRole }),
           engine: sideSpec.engine,
+          ...(sideSpec.accountId && { accountId: sideSpec.accountId }),
+          ...(sideSpec.accountAlias && { accountAlias: sideSpec.accountAlias }),
+          ...(sideSpec.claudeConfigDir && { claudeConfigDir: sideSpec.claudeConfigDir }),
           model: sideSpec.model,
           ...(sideSpec.effort && { effort: sideSpec.effort }),
           label: `side-${sideSpec.mode}`,
@@ -449,6 +479,40 @@ function provisionSideWorktree(repoRoot, shortId, runCmd) {
   return { worktreePath, branch };
 }
 
+const RAW_PROVIDER_ENV_KEYS = [
+  "ANTIGRAVITY_APP_DATA_DIR",
+  "CLAUDE_CONFIG_DIR",
+  "CODEX_HOME",
+  "GEMINI_CLI_HOME",
+];
+
+/**
+ * Applies account environment overrides onto a coordinator/launcher environment
+ * while stripping raw provider/HOME selectors and translating custom Codex/Antigravity
+ * directories to child-only `ORKEST_*_ACCOUNT_HOME` variables.
+ */
+export function applyLauncherAccountEnv(targetEnv, accountEnv) {
+  for (const key of RAW_PROVIDER_ENV_KEYS) {
+    delete targetEnv[key];
+  }
+  if (!accountEnv || typeof accountEnv !== "object") {
+    return targetEnv;
+  }
+  const safeAccountEnv = { ...accountEnv };
+  if (safeAccountEnv.CODEX_HOME && !safeAccountEnv.ORKEST_CODEX_ACCOUNT_HOME) {
+    safeAccountEnv.ORKEST_CODEX_ACCOUNT_HOME = safeAccountEnv.CODEX_HOME;
+  }
+  const rawAgyHome = safeAccountEnv.ANTIGRAVITY_APP_DATA_DIR || safeAccountEnv.GEMINI_CLI_HOME;
+  if (rawAgyHome && !safeAccountEnv.ORKEST_AGY_ACCOUNT_HOME) {
+    safeAccountEnv.ORKEST_AGY_ACCOUNT_HOME = rawAgyHome;
+  }
+  delete safeAccountEnv.HOME;
+  for (const key of RAW_PROVIDER_ENV_KEYS) {
+    delete safeAccountEnv[key];
+  }
+  return Object.assign(targetEnv, safeAccountEnv);
+}
+
 function buildIsolatedEnv(baseEnv = process.env, isolatedCoordSession, mailboxDir = null) {
   const env = { ...baseEnv };
   // CRITICAL INVARIANT: Never allow a side mission to inherit the parent tab's
@@ -468,173 +532,687 @@ function buildIsolatedEnv(baseEnv = process.env, isolatedCoordSession, mailboxDi
   return env;
 }
 
-function resolveConfigDir(env = process.env, explicitConfigDir = null) {
-  if (explicitConfigDir) return path.resolve(explicitConfigDir);
-  return configHome(env);
+function expandClaudeDir(configDir, homeDir = os.homedir()) {
+  const text = String(configDir ?? "").trim();
+  if (!text) return "";
+  if (text === "~") return homeDir;
+  if (text === "~/") return homeDir === "/" ? "/" : `${homeDir.replace(/\/+$/u, "")}/`;
+  if (text.startsWith("~/")) return `${homeDir.replace(/\/+$/u, "")}/${text.slice(2)}`;
+  return text;
 }
 
-function collectDenyEntries(policyObj) {
-  if (!policyObj || typeof policyObj !== "object") return [];
-  const raw =
-    policyObj.deny ||
-    policyObj.denied ||
-    policyObj.denied_harnesses ||
-    policyObj.denied_engines ||
-    [];
-  return Array.isArray(raw)
-    ? raw
-        .map((x) =>
-          String(x || "")
-            .trim()
-            .toLowerCase(),
-        )
-        .filter(Boolean)
-    : [];
+function canonicalizeProfilePath(targetPath) {
+  let current = path.resolve(String(targetPath));
+  for (let depth = 0; depth < 40; depth += 1) {
+    try {
+      return fs.realpathSync(current);
+    } catch {
+      try {
+        const stat = fs.lstatSync(current);
+        if (stat.isSymbolicLink()) {
+          current = path.resolve(path.dirname(current), fs.readlinkSync(current));
+          continue;
+        }
+      } catch {
+        // Fall through to parent resolution when path does not exist yet.
+      }
+      const parent = path.dirname(current);
+      if (parent === current) return current;
+      try {
+        return path.join(fs.realpathSync(parent), path.basename(current));
+      } catch {
+        return current;
+      }
+    }
+  }
+  return current;
+}
+
+const PATH_ENV_KEYS = new Set([
+  "ANTIGRAVITY_APP_DATA_DIR",
+  "CLAUDE_CONFIG_DIR",
+  "CODEX_HOME",
+  "GEMINI_CLI_HOME",
+  "HOME",
+  "OPENCODE_CONFIG",
+  "XDG_CONFIG_HOME",
+]);
+
+function canonicalEngineName(rawEngine) {
+  const cleaned = String(rawEngine || "")
+    .trim()
+    .toLowerCase();
+  if (!cleaned) return "";
+  if (cleaned === "gemini" || cleaned === "antigravity") return "agy";
+  if (cleaned === "openai") return "codex";
+  if (cleaned === "openrouter") return "opencode";
+  if (cleaned === "anthropic") return "claude";
+  return cleaned;
+}
+
+function accountBaseHome(account, homeDir) {
+  const rawHome = account?.env?.HOME;
+  if (typeof rawHome === "string" && rawHome.trim()) {
+    return path.resolve(expandClaudeDir(rawHome.trim(), homeDir));
+  }
+  return homeDir;
+}
+
+function resolvedAccountClaudeDir(account, homeDir) {
+  const baseHome = accountBaseHome(account, homeDir);
+  const rawDir =
+    account?.configDir || account?.claudeConfigDir || account?.env?.CLAUDE_CONFIG_DIR || null;
+  if (typeof rawDir === "string" && rawDir.trim()) {
+    return path.resolve(expandClaudeDir(rawDir.trim(), baseHome));
+  }
+  return path.join(baseHome, ".claude");
+}
+
+function resolvedAccountCodexHome(account, homeDir) {
+  const baseHome = accountBaseHome(account, homeDir);
+  const rawDir = account?.codexHome || account?.codex_home || account?.env?.CODEX_HOME || null;
+  if (typeof rawDir === "string" && rawDir.trim()) {
+    return path.resolve(expandClaudeDir(rawDir.trim(), baseHome));
+  }
+  return null;
+}
+
+function resolvedAccountAgyHome(account, homeDir) {
+  const baseHome = accountBaseHome(account, homeDir);
+  const rawDir =
+    account?.agyHome ||
+    account?.agy_home ||
+    account?.geminiCliHome ||
+    account?.env?.GEMINI_CLI_HOME ||
+    account?.env?.ANTIGRAVITY_APP_DATA_DIR ||
+    null;
+  if (typeof rawDir === "string" && rawDir.trim()) {
+    return path.resolve(expandClaudeDir(rawDir.trim(), baseHome));
+  }
+  return null;
+}
+
+function resolveAccountRuntimeConfig(engine, account, homeDir, explicitClaudeConfigDir = null) {
+  const baseHome = account ? accountBaseHome(account, homeDir) : homeDir;
+  const accountEnv = {};
+  if (account?.env && typeof account.env === "object" && !Array.isArray(account.env)) {
+    for (const [key, value] of Object.entries(account.env)) {
+      if (typeof value !== "string" || !value.trim()) continue;
+      accountEnv[key] = PATH_ENV_KEYS.has(key)
+        ? path.resolve(expandClaudeDir(value.trim(), baseHome))
+        : value;
+    }
+  }
+
+  let claudeConfigDir = null;
+  let codexHome = null;
+  let agyHome = null;
+  const extraArgs = [];
+
+  if (engine === "claude") {
+    const defaultClaudeDir = canonicalizeProfilePath(path.join(homeDir, ".claude"));
+    if (explicitClaudeConfigDir) {
+      claudeConfigDir = explicitClaudeConfigDir;
+      extraArgs.push("--claude-config-dir", explicitClaudeConfigDir);
+    } else if (account) {
+      const configuredDir =
+        account.configDir || account.claudeConfigDir || account.env?.CLAUDE_CONFIG_DIR || null;
+      if (typeof configuredDir === "string" && configuredDir.trim()) {
+        const resolvedDir = path.resolve(expandClaudeDir(configuredDir.trim(), baseHome));
+        if (canonicalizeProfilePath(resolvedDir) !== defaultClaudeDir) {
+          claudeConfigDir = resolvedDir;
+          extraArgs.push("--claude-config-dir", resolvedDir);
+        }
+      }
+    }
+  } else if (engine === "codex" && account) {
+    codexHome = resolvedAccountCodexHome(account, homeDir);
+    if (!codexHome && typeof account.configDir === "string" && account.configDir.trim()) {
+      codexHome = path.resolve(expandClaudeDir(account.configDir.trim(), baseHome));
+    }
+    if (codexHome) {
+      accountEnv.CODEX_HOME = codexHome;
+    }
+  } else if (engine === "agy" && account) {
+    agyHome = resolvedAccountAgyHome(account, homeDir);
+    if (!agyHome && typeof account.configDir === "string" && account.configDir.trim()) {
+      agyHome = path.resolve(expandClaudeDir(account.configDir.trim(), baseHome));
+    }
+    if (agyHome && !accountEnv.ANTIGRAVITY_APP_DATA_DIR) {
+      accountEnv.GEMINI_CLI_HOME = agyHome;
+    }
+  }
+
+  if (account?.id && !extraArgs.includes("--account")) {
+    extraArgs.push("--account", account.id);
+  }
+
+  // Never propagate HOME into coordinator/launcher env (it splits Orkest locks/caches);
+  // translate account.env.HOME into the child-only engine override instead.
+  if (accountEnv.HOME) {
+    const customHome = accountEnv.HOME;
+    delete accountEnv.HOME;
+    if (engine === "claude" && !accountEnv.ORKEST_CLAUDE_ACCOUNT_HOME) {
+      accountEnv.ORKEST_CLAUDE_ACCOUNT_HOME = customHome;
+    } else if (engine === "codex" && !accountEnv.ORKEST_CODEX_ACCOUNT_HOME) {
+      accountEnv.ORKEST_CODEX_ACCOUNT_HOME = codexHome || path.join(customHome, ".codex");
+    } else if (engine === "agy" && !accountEnv.ORKEST_AGY_ACCOUNT_HOME) {
+      accountEnv.ORKEST_AGY_ACCOUNT_HOME = agyHome || path.join(customHome, ".gemini");
+    }
+  }
+
+  return {
+    engine,
+    accountId: account?.id || null,
+    accountAlias: account?.alias || null,
+    tags: account ? normalizeAccountTags(account) : [],
+    claudeConfigDir,
+    codexHome,
+    agyHome,
+    accountEnv: Object.keys(accountEnv).length > 0 ? accountEnv : null,
+    extraArgs,
+  };
+}
+
+function buildAccountLookupOptions(options, env, homeDir) {
+  const lookup = { env, homeDir };
+  if (options.monitorConfigPath) lookup.monitorConfigPath = String(options.monitorConfigPath);
+  if (Array.isArray(options.accounts)) lookup.accounts = options.accounts;
+  if (options.monitorConfig && typeof options.monitorConfig === "object") {
+    lookup.config = options.monitorConfig;
+  } else if (
+    options.config &&
+    typeof options.config === "object" &&
+    Array.isArray(options.config.accounts)
+  ) {
+    lookup.config = options.config;
+  }
+  return lookup;
+}
+
+function pickDefaultAccountForEngine(engine, matchingAccounts, homeDir) {
+  if (matchingAccounts.length === 0) return null;
+  if (engine === "claude") {
+    const defaultDir = canonicalizeProfilePath(path.join(homeDir, ".claude"));
+    const primary = matchingAccounts.find(
+      (acct) =>
+        canonicalizeProfilePath(resolvedAccountClaudeDir(acct, homeDir)) === defaultDir &&
+        !acct.env?.HOME,
+    );
+    return primary || matchingAccounts[0];
+  }
+  if (engine === "codex") {
+    const defaultDir = canonicalizeProfilePath(path.join(homeDir, ".codex"));
+    const primary = matchingAccounts.find((acct) => {
+      const custom = resolvedAccountCodexHome(acct, homeDir);
+      return (!custom || canonicalizeProfilePath(custom) === defaultDir) && !acct.env?.HOME;
+    });
+    return primary || matchingAccounts[0];
+  }
+  if (engine === "agy") {
+    const defaultDir = canonicalizeProfilePath(path.join(homeDir, ".gemini"));
+    const primary = matchingAccounts.find((acct) => {
+      const custom = resolvedAccountAgyHome(acct, homeDir);
+      return (!custom || canonicalizeProfilePath(custom) === defaultDir) && !acct.env?.HOME;
+    });
+    return primary || matchingAccounts[0];
+  }
+  return matchingAccounts[0];
+}
+
+function checkAccountClaudeDirContradiction(
+  account,
+  accountEngine,
+  explicitClaudeConfigDir,
+  rawExplicitClaudeDir,
+  homeDir,
+  deny,
+) {
+  if (!explicitClaudeConfigDir) return null;
+  if (accountEngine !== "claude") {
+    return {
+      ok: false,
+      status: "profile_mismatch",
+      engine: accountEngine,
+      accountId: account.id || null,
+      deny: [...deny],
+      error: `Account '${account.alias || account.id}' (provider '${accountEngine}') contradicts explicit claudeConfigDir '${rawExplicitClaudeDir}'.`,
+    };
+  }
+  const acctDir = canonicalizeProfilePath(resolvedAccountClaudeDir(account, homeDir));
+  const explicitCanonical = canonicalizeProfilePath(explicitClaudeConfigDir);
+  if (acctDir !== explicitCanonical) {
+    return {
+      ok: false,
+      status: "profile_mismatch",
+      engine: "claude",
+      accountId: account.id || null,
+      deny: [...deny],
+      error: `Account '${account.alias || account.id}' claudeConfigDir contradicts explicit claudeConfigDir '${rawExplicitClaudeDir}'.`,
+    };
+  }
+  return null;
 }
 
 /**
- * Check repository harness denylist policies from `<configHome>/config.json` (`repo_policies`)
- * and `<repoRoot>/.orkest/policy.json`.
+ * Check repository harness denylist policies using canonical evaluation (`policy.mjs`).
  */
 export function checkRepoPolicyForSide(repoRoot, engine = null, options = {}) {
-  const resolvedRepo = path.resolve(repoRoot || process.cwd());
-  const repoBase = path.basename(resolvedRepo);
   const env = options.env || process.env;
-  const configDir = resolveConfigDir(env, options.configDir);
-  const denySet = new Set();
-
-  // 1. Check <configHome>/config.json repo_policies
-  const configFile = path.join(configDir, "config.json");
-  if (fs.existsSync(configFile)) {
-    try {
-      const cfg = JSON.parse(fs.readFileSync(configFile, "utf8"));
-      const policies = cfg?.repo_policies;
-      if (Array.isArray(policies)) {
-        for (const entry of policies) {
-          if (!entry || typeof entry !== "object") continue;
-          const target = entry.repo || entry.path || entry.pattern || "";
-          if (
-            target === "*" ||
-            target === repoBase ||
-            (target && path.resolve(target) === resolvedRepo) ||
-            (target && resolvedRepo.endsWith(target))
-          ) {
-            for (const item of collectDenyEntries(entry)) denySet.add(item);
-          }
-        }
-      } else if (policies && typeof policies === "object") {
-        for (const [key, entry] of Object.entries(policies)) {
-          if (
-            key === "*" ||
-            key === repoBase ||
-            path.resolve(key) === resolvedRepo ||
-            resolvedRepo.endsWith(key)
-          ) {
-            for (const item of collectDenyEntries(entry)) denySet.add(item);
-          }
-        }
-      }
-    } catch {
-      // Ignore malformed config.json
-    }
+  const homeDir = path.resolve(options.homeDir || env.HOME || os.homedir());
+  let configPath = options.configPath ? path.resolve(String(options.configPath)) : undefined;
+  if (!configPath && options.configDir) {
+    configPath = path.join(path.resolve(String(options.configDir)), "config.json");
   }
+  const policyOptions = { env, homeDir, strict: true };
+  if (configPath) policyOptions.configPath = configPath;
+  if (options.config) policyOptions.config = options.config;
+  if (options.remote !== undefined) policyOptions.remote = options.remote;
+  if (options.spawnSync) policyOptions.spawnSync = options.spawnSync;
+  const policy = resolveRepoPolicy(repoRoot || process.cwd(), policyOptions);
+  const resolvedRepo = policy.repo;
 
-  // 2. Check <repoRoot>/.orkest/policy.json
-  const repoPolicyFile = path.join(resolvedRepo, ".orkest", "policy.json");
-  if (fs.existsSync(repoPolicyFile)) {
-    try {
-      const repoPolicy = JSON.parse(fs.readFileSync(repoPolicyFile, "utf8"));
-      for (const item of collectDenyEntries(repoPolicy)) denySet.add(item);
-    } catch {
-      // Ignore malformed .orkest/policy.json
-    }
-  }
-
-  const hasExplicitEngine = Boolean(options.engine || engine);
-  const requested = String(engine || options.engine || "codex").toLowerCase();
-  const personalClaudeConfigDir = path.join(os.homedir(), ".claude-personal");
-
-  const isClaudeAllDenied =
-    denySet.has("claude-all") ||
-    denySet.has("all") ||
-    ((denySet.has("claude") || denySet.has("claude-work")) &&
-      (denySet.has("plaude") || denySet.has("claude-personal")));
-  const isWorkClaudeDenied = denySet.has("claude-work") || denySet.has("claude");
-
-  const isDenied = (eng) => {
-    if (denySet.has("all")) return true;
-    if (eng === "claude") return isClaudeAllDenied;
-    if (eng === "plaude")
-      return isClaudeAllDenied || denySet.has("plaude") || denySet.has("claude-personal");
-    if (eng === "agy" || eng === "gemini") return denySet.has("agy") || denySet.has("gemini");
-    return denySet.has(eng);
+  const accountLookupOpts = buildAccountLookupOptions(options, env, homeDir);
+  const configuredAccounts = loadConfiguredAccounts({ ...accountLookupOpts, strict: true });
+  const evalOptions = {
+    ...policyOptions,
+    ...accountLookupOpts,
+    policy,
+    accounts: configuredAccounts,
   };
 
-  if (hasExplicitEngine) {
-    if (isDenied(requested)) {
+  const isAutoAccount = env.ORCHESTRATE_AUTO_ACCOUNT === "1";
+  const rawExplicitClaudeDir = options.claudeConfigDir || options.claude_config_dir || null;
+  const explicitClaudeConfigDir = rawExplicitClaudeDir
+    ? path.resolve(expandClaudeDir(rawExplicitClaudeDir, homeDir))
+    : null;
+
+  const requestedAccountSelector = options.account ? String(options.account).trim() : null;
+  const requestedRaw = engine || options.engine || null;
+  const hasExplicitEngine = Boolean(requestedRaw);
+
+  const allowResult = (resolvedEngine, account, fallbackFrom = null, overrideClaudeDir = null) => ({
+    ok: true,
+    status: "allowed",
+    ...resolveAccountRuntimeConfig(resolvedEngine, account, homeDir, overrideClaudeDir),
+    ...(fallbackFrom !== undefined && fallbackFrom !== null && { fallbackFrom }),
+    deny: [...policy.deny],
+  });
+
+  // 1. Explicit --account <id-or-alias>
+  if (requestedAccountSelector) {
+    const selectedAccount = resolveConfiguredAccount(requestedAccountSelector, accountLookupOpts);
+    if (!selectedAccount) {
+      return {
+        ok: false,
+        status: "unknown_account",
+        accountId: requestedAccountSelector,
+        deny: [...policy.deny],
+        error: `Unknown account '${requestedAccountSelector}': not found in monitor config.`,
+      };
+    }
+    const accountEngine = canonicalEngineName(selectedAccount.provider || selectedAccount.engine);
+    if (hasExplicitEngine) {
+      const requestedEngine = canonicalEngineName(requestedRaw);
+      const isCanonicalEngineToken = CANONICAL_HARNESSES.includes(requestedEngine);
+      if (isCanonicalEngineToken) {
+        if (requestedEngine !== accountEngine) {
+          return {
+            ok: false,
+            status: "profile_mismatch",
+            engine: requestedEngine,
+            accountId: selectedAccount.id || null,
+            deny: [...policy.deny],
+            error: `Engine '${requestedRaw}' contradicts account '${selectedAccount.alias || selectedAccount.id}' (provider '${accountEngine}').`,
+          };
+        }
+      } else {
+        const requestedAcct = resolveConfiguredAccount(String(requestedRaw), accountLookupOpts);
+        if (requestedAcct && requestedAcct.id !== selectedAccount.id) {
+          return {
+            ok: false,
+            status: "profile_mismatch",
+            engine: accountEngine,
+            accountId: selectedAccount.id || null,
+            deny: [...policy.deny],
+            error: `Engine/account '${requestedRaw}' contradicts explicit account '${requestedAccountSelector}'.`,
+          };
+        }
+        if (!requestedAcct && requestedEngine !== accountEngine) {
+          return {
+            ok: false,
+            status: "profile_mismatch",
+            engine: requestedEngine,
+            accountId: selectedAccount.id || null,
+            deny: [...policy.deny],
+            error: `Engine '${requestedRaw}' contradicts account '${selectedAccount.alias || selectedAccount.id}' (provider '${accountEngine}').`,
+          };
+        }
+      }
+    }
+    const dirMismatch = checkAccountClaudeDirContradiction(
+      selectedAccount,
+      accountEngine,
+      explicitClaudeConfigDir,
+      rawExplicitClaudeDir,
+      homeDir,
+      policy.deny,
+    );
+    if (dirMismatch) return dirMismatch;
+
+    if (!isHarnessAllowed(resolvedRepo, selectedAccount, evalOptions)) {
       return {
         ok: false,
         status: "policy_denied",
-        engine: requested,
-        deny: [...denySet],
-        error: `Engine '${requested}' is denied by repository policy for ${resolvedRepo}.`,
+        engine: accountEngine,
+        accountId: selectedAccount.id || null,
+        accountAlias: selectedAccount.alias || null,
+        tags: normalizeAccountTags(selectedAccount),
+        deny: [...policy.deny],
+        error: `Account '${selectedAccount.alias || selectedAccount.id}' (${accountEngine}) is denied by repository policy for ${resolvedRepo}.`,
       };
     }
-    if ((requested === "claude" && isWorkClaudeDenied) || requested === "plaude") {
-      return {
-        ok: true,
-        status: "allowed",
-        engine: "claude",
-        profile: "plaude",
-        claudeConfigDir: personalClaudeConfigDir,
-        extraArgs: ["--claude-config-dir", personalClaudeConfigDir],
-        deny: [...denySet],
-      };
-    }
-    return {
-      ok: true,
-      status: "allowed",
-      engine: requested === "gemini" ? "agy" : requested,
-      profile: null,
-      claudeConfigDir: null,
-      extraArgs: [],
-      deny: [...denySet],
-    };
+    return allowResult(accountEngine, selectedAccount, null, explicitClaudeConfigDir);
   }
 
-  // No explicit --engine passed; default is "codex", falling back to ["agy", "plaude", "claude", "opencode"]
-  const candidates = ["codex", "agy", "plaude", "claude", "opencode"];
-  for (const candidate of candidates) {
-    if (isDenied(candidate)) continue;
-    if (candidate === "plaude" || (candidate === "claude" && isWorkClaudeDenied)) {
+  // 2. Explicit --engine <engine-or-account-alias>
+  if (hasExplicitEngine) {
+    const trimmedRaw = String(requestedRaw).trim();
+    const canonicalRequested = canonicalEngineName(trimmedRaw);
+    const isCanonicalOrLegacyEngine =
+      CANONICAL_HARNESSES.includes(canonicalRequested) ||
+      canonicalRequested === "claude-work" ||
+      canonicalRequested === "claude-personal";
+
+    const matchedByEngineToken = isCanonicalOrLegacyEngine
+      ? null
+      : resolveConfiguredAccount(trimmedRaw, accountLookupOpts);
+
+    if (matchedByEngineToken) {
+      const accountEngine = canonicalEngineName(
+        matchedByEngineToken.provider || matchedByEngineToken.engine,
+      );
+      const dirMismatch = checkAccountClaudeDirContradiction(
+        matchedByEngineToken,
+        accountEngine,
+        explicitClaudeConfigDir,
+        rawExplicitClaudeDir,
+        homeDir,
+        policy.deny,
+      );
+      if (dirMismatch) return dirMismatch;
+      if (!isHarnessAllowed(resolvedRepo, matchedByEngineToken, evalOptions)) {
+        return {
+          ok: false,
+          status: "policy_denied",
+          engine: accountEngine,
+          accountId: matchedByEngineToken.id || null,
+          accountAlias: matchedByEngineToken.alias || null,
+          tags: normalizeAccountTags(matchedByEngineToken),
+          deny: [...policy.deny],
+          error: `Account '${matchedByEngineToken.alias || matchedByEngineToken.id}' (${accountEngine}) is denied by repository policy for ${resolvedRepo}.`,
+        };
+      }
+      return allowResult(accountEngine, matchedByEngineToken, null, explicitClaudeConfigDir);
+    }
+
+    if (canonicalRequested === "claude-work" || canonicalRequested === "claude-personal") {
+      const requiredTag = canonicalRequested === "claude-work" ? "work" : "personal";
+      const matchingAccounts = configuredAccounts.filter(
+        (acct) =>
+          canonicalEngineName(acct.provider || acct.engine) === "claude" &&
+          normalizeAccountTags(acct).includes(requiredTag),
+      );
+      if (explicitClaudeConfigDir) {
+        const dirAccount = resolveConfiguredAccount(
+          { provider: "claude", claudeConfigDir: explicitClaudeConfigDir },
+          accountLookupOpts,
+        );
+        if (dirAccount && !normalizeAccountTags(dirAccount).includes(requiredTag)) {
+          return {
+            ok: false,
+            status: "profile_mismatch",
+            engine: canonicalRequested,
+            deny: [...policy.deny],
+            error: `Engine '${requestedRaw}' contradicts explicit claudeConfigDir '${rawExplicitClaudeDir}'.`,
+          };
+        }
+        const target = dirAccount || {
+          provider: "claude",
+          engine: "claude",
+          claudeConfigDir: explicitClaudeConfigDir,
+          tags: [requiredTag],
+        };
+        if (!isHarnessAllowed(resolvedRepo, target, evalOptions)) {
+          return {
+            ok: false,
+            status: "policy_denied",
+            engine: canonicalRequested,
+            deny: [...policy.deny],
+            error: `Engine '${canonicalRequested}' is denied by repository policy for ${resolvedRepo}.`,
+          };
+        }
+        return allowResult("claude", dirAccount, null, explicitClaudeConfigDir);
+      }
+      if (matchingAccounts.length > 0) {
+        const allowed = matchingAccounts.find((acct) =>
+          isHarnessAllowed(resolvedRepo, acct, evalOptions),
+        );
+        if (!allowed) {
+          return {
+            ok: false,
+            status: "policy_denied",
+            engine: canonicalRequested,
+            deny: [...policy.deny],
+            error: `Engine '${canonicalRequested}' is denied by repository policy for ${resolvedRepo}.`,
+          };
+        }
+        return allowResult("claude", allowed);
+      }
+      if (!isHarnessAllowed(resolvedRepo, canonicalRequested, evalOptions)) {
+        return {
+          ok: false,
+          status: "policy_denied",
+          engine: canonicalRequested,
+          deny: [...policy.deny],
+          error: `Engine '${canonicalRequested}' is denied by repository policy for ${resolvedRepo}.`,
+        };
+      }
+      return allowResult("claude", null);
+    }
+
+    if (explicitClaudeConfigDir && canonicalRequested !== "claude") {
       return {
-        ok: true,
-        status: "allowed",
-        engine: "claude",
-        profile: "plaude",
-        fallbackFrom: candidate === "codex" ? null : "codex",
-        claudeConfigDir: personalClaudeConfigDir,
-        extraArgs: ["--claude-config-dir", personalClaudeConfigDir],
-        deny: [...denySet],
+        ok: false,
+        status: "profile_mismatch",
+        engine: canonicalRequested,
+        deny: [...policy.deny],
+        error: `Engine '${requestedRaw}' contradicts explicit claudeConfigDir '${rawExplicitClaudeDir}'.`,
       };
     }
-    return {
-      ok: true,
-      status: "allowed",
-      engine: candidate,
-      profile: null,
-      fallbackFrom: candidate === "codex" ? null : "codex",
-      claudeConfigDir: null,
-      extraArgs: [],
-      deny: [...denySet],
-    };
+
+    if (canonicalRequested === "claude" && explicitClaudeConfigDir) {
+      const dirAccount = resolveConfiguredAccount(
+        { provider: "claude", claudeConfigDir: explicitClaudeConfigDir },
+        accountLookupOpts,
+      );
+      const target = dirAccount || {
+        provider: "claude",
+        engine: "claude",
+        claudeConfigDir: explicitClaudeConfigDir,
+        configDir: explicitClaudeConfigDir,
+      };
+      if (!isHarnessAllowed(resolvedRepo, target, evalOptions)) {
+        return {
+          ok: false,
+          status: "policy_denied",
+          engine: "claude",
+          ...(dirAccount?.id && { accountId: dirAccount.id }),
+          deny: [...policy.deny],
+          error: `Engine 'claude' (claudeConfigDir '${rawExplicitClaudeDir}') is denied by repository policy for ${resolvedRepo}.`,
+        };
+      }
+      return allowResult("claude", dirAccount, null, explicitClaudeConfigDir);
+    }
+
+    const matchingAccounts = configuredAccounts.filter(
+      (acct) => canonicalEngineName(acct.provider || acct.engine) === canonicalRequested,
+    );
+    if (matchingAccounts.length > 0) {
+      const defaultAccount = pickDefaultAccountForEngine(
+        canonicalRequested,
+        matchingAccounts,
+        homeDir,
+      );
+      if (defaultAccount && isHarnessAllowed(resolvedRepo, defaultAccount, evalOptions)) {
+        return allowResult(canonicalRequested, defaultAccount);
+      }
+      if (isAutoAccount) {
+        const allowed = matchingAccounts.find((acct) =>
+          isHarnessAllowed(resolvedRepo, acct, evalOptions),
+        );
+        if (allowed) {
+          return allowResult(canonicalRequested, allowed);
+        }
+      }
+      return {
+        ok: false,
+        status: "policy_denied",
+        engine: canonicalRequested,
+        ...(defaultAccount?.id && { accountId: defaultAccount.id }),
+        deny: [...policy.deny],
+        error: `Engine '${canonicalRequested}' is denied by repository policy for ${resolvedRepo}.`,
+      };
+    }
+
+    if (
+      !isHarnessAllowed(
+        resolvedRepo,
+        { provider: canonicalRequested, engine: canonicalRequested },
+        evalOptions,
+      )
+    ) {
+      return {
+        ok: false,
+        status: "policy_denied",
+        engine: canonicalRequested,
+        deny: [...policy.deny],
+        error: `Engine '${canonicalRequested}' is denied by repository policy for ${resolvedRepo}.`,
+      };
+    }
+    return allowResult(canonicalRequested, null);
+  }
+
+  // 3. Auto-selection across candidates & all N configured accounts
+  const candidates =
+    Array.isArray(options.candidates) && options.candidates.length > 0
+      ? options.candidates
+      : CANONICAL_HARNESSES;
+  const defaultPrimary = canonicalEngineName(candidates[0]) || "codex";
+
+  for (const rawCandidate of candidates) {
+    const candidateStr = String(rawCandidate || "").trim();
+    if (!candidateStr) continue;
+    const canonicalCandidate = canonicalEngineName(candidateStr);
+    const isGenericHarness =
+      CANONICAL_HARNESSES.includes(canonicalCandidate) ||
+      canonicalCandidate === "claude-work" ||
+      canonicalCandidate === "claude-personal";
+    const fallbackFrom = canonicalCandidate === defaultPrimary ? null : defaultPrimary;
+
+    if (!isGenericHarness) {
+      const acctCandidate = resolveConfiguredAccount(candidateStr, accountLookupOpts);
+      if (!acctCandidate) continue;
+      const acctEngine = canonicalEngineName(acctCandidate.provider || acctCandidate.engine);
+      if (
+        checkAccountClaudeDirContradiction(
+          acctCandidate,
+          acctEngine,
+          explicitClaudeConfigDir,
+          rawExplicitClaudeDir,
+          homeDir,
+          policy.deny,
+        ) ||
+        !isHarnessAllowed(resolvedRepo, acctCandidate, evalOptions)
+      ) {
+        continue;
+      }
+      return allowResult(acctEngine, acctCandidate, fallbackFrom, explicitClaudeConfigDir);
+    }
+
+    if (canonicalCandidate === "claude-work" || canonicalCandidate === "claude-personal") {
+      const requiredTag = canonicalCandidate === "claude-work" ? "work" : "personal";
+      const matching = configuredAccounts.filter(
+        (acct) =>
+          canonicalEngineName(acct.provider || acct.engine) === "claude" &&
+          normalizeAccountTags(acct).includes(requiredTag),
+      );
+      if (explicitClaudeConfigDir) {
+        const dirAccount = resolveConfiguredAccount(
+          { provider: "claude", claudeConfigDir: explicitClaudeConfigDir },
+          accountLookupOpts,
+        );
+        if (dirAccount && !normalizeAccountTags(dirAccount).includes(requiredTag)) continue;
+        const target = dirAccount || {
+          provider: "claude",
+          engine: "claude",
+          claudeConfigDir: explicitClaudeConfigDir,
+          tags: [requiredTag],
+        };
+        if (!isHarnessAllowed(resolvedRepo, target, evalOptions)) continue;
+        return allowResult("claude", dirAccount, fallbackFrom, explicitClaudeConfigDir);
+      }
+      if (matching.length > 0) {
+        const allowed = matching.find((acct) => isHarnessAllowed(resolvedRepo, acct, evalOptions));
+        if (!allowed) continue;
+        return allowResult("claude", allowed, fallbackFrom);
+      }
+      if (!isHarnessAllowed(resolvedRepo, canonicalCandidate, evalOptions)) continue;
+      return allowResult("claude", null, fallbackFrom);
+    }
+
+    if (canonicalCandidate === "claude" && explicitClaudeConfigDir) {
+      const dirAccount = resolveConfiguredAccount(
+        { provider: "claude", claudeConfigDir: explicitClaudeConfigDir },
+        accountLookupOpts,
+      );
+      const target = dirAccount || {
+        provider: "claude",
+        engine: "claude",
+        claudeConfigDir: explicitClaudeConfigDir,
+        configDir: explicitClaudeConfigDir,
+      };
+      if (!isHarnessAllowed(resolvedRepo, target, evalOptions)) continue;
+      return allowResult("claude", dirAccount, fallbackFrom, explicitClaudeConfigDir);
+    }
+
+    const matchingAccounts = configuredAccounts.filter(
+      (acct) => canonicalEngineName(acct.provider || acct.engine) === canonicalCandidate,
+    );
+    if (matchingAccounts.length > 0) {
+      const allowed = matchingAccounts.find((acct) =>
+        isHarnessAllowed(resolvedRepo, acct, evalOptions),
+      );
+      if (!allowed) continue;
+      return allowResult(canonicalCandidate, allowed, fallbackFrom);
+    }
+
+    if (
+      isHarnessAllowed(
+        resolvedRepo,
+        { provider: canonicalCandidate, engine: canonicalCandidate },
+        evalOptions,
+      )
+    ) {
+      return allowResult(canonicalCandidate, null, fallbackFrom);
+    }
   }
 
   return {
     ok: false,
     status: "policy_denied",
-    engine: requested,
-    deny: [...denySet],
+    engine: defaultPrimary,
+    deny: [...policy.deny],
     error: `All candidate engines are denied by repository policy for ${resolvedRepo}.`,
   };
 }
@@ -810,7 +1388,12 @@ export async function sideCommand(argv = [], context = {}) {
   const repoRoot = resolveGitRoot(cwd, runCmd);
   const policyCheck = checkRepoPolicyForSide(repoRoot, options.engine, {
     ...options,
-    configDir: context.configDir,
+    account: options.account || context.account || null,
+    claudeConfigDir: options.claudeConfigDir || context.claudeConfigDir || null,
+    configDir: options.configDir || context.configDir,
+    ...(context.monitorConfigPath && { monitorConfigPath: context.monitorConfigPath }),
+    ...(context.monitorConfig && { monitorConfig: context.monitorConfig }),
+    ...(context.accounts && { accounts: context.accounts }),
     env,
   });
   if (!policyCheck.ok) {
@@ -818,8 +1401,9 @@ export async function sideCommand(argv = [], context = {}) {
       schema: "ork.side.v1",
       sideId,
       mode: classified.mode,
-      status: "policy_denied",
+      status: policyCheck.status || "policy_denied",
       engine: policyCheck.engine,
+      ...(policyCheck.accountId && { accountId: policyCheck.accountId }),
       deny: policyCheck.deny,
       error: policyCheck.error,
       isolatedInbox: true,
@@ -884,10 +1468,10 @@ export async function sideCommand(argv = [], context = {}) {
   };
   fs.writeFileSync(specPath, `${JSON.stringify(specPayload, null, 2)}\n`, "utf8");
 
-  const isolatedEnv = buildIsolatedEnv(env, isolatedCoordSession, mailboxDir);
-  if (policyCheck.claudeConfigDir) {
-    isolatedEnv.CLAUDE_CONFIG_DIR = policyCheck.claudeConfigDir;
-  }
+  const isolatedEnv = applyLauncherAccountEnv(
+    buildIsolatedEnv(env, isolatedCoordSession, mailboxDir),
+    policyCheck.accountEnv,
+  );
   const initRes = runCmd(
     "python3",
     [COORDINATOR_PY, "init", "--task-dir", taskDir, "--task-spec", specPath, "--host", "other"],
@@ -929,7 +1513,26 @@ export async function sideCommand(argv = [], context = {}) {
     dispatchArgs.push("--effort", selectedEffort);
   }
   if (Array.isArray(policyCheck.extraArgs) && policyCheck.extraArgs.length > 0) {
-    dispatchArgs.push(...policyCheck.extraArgs);
+    const hasFlag = (flag) =>
+      dispatchArgs.some((arg) => arg === flag || String(arg).startsWith(`${flag}=`));
+    for (let i = 0; i < policyCheck.extraArgs.length; i += 1) {
+      const token = policyCheck.extraArgs[i];
+      if (token === "--claude-config-dir" || token === "--account") {
+        const next = policyCheck.extraArgs[i + 1];
+        if (!hasFlag(token) && typeof next === "string") {
+          dispatchArgs.push(token, next);
+        }
+        if (i + 1 < policyCheck.extraArgs.length) i += 1;
+        continue;
+      }
+      if (
+        (String(token).startsWith("--claude-config-dir=") && hasFlag("--claude-config-dir")) ||
+        (String(token).startsWith("--account=") && hasFlag("--account"))
+      ) {
+        continue;
+      }
+      dispatchArgs.push(token);
+    }
   }
 
   const dispatchRes = runCmd("python3", dispatchArgs, {
@@ -965,7 +1568,8 @@ export async function sideCommand(argv = [], context = {}) {
     mode: classified.mode,
     sideId,
     engine: resolvedEngine,
-    profile: policyCheck.profile || null,
+    accountId: policyCheck.accountId || null,
+    accountAlias: policyCheck.accountAlias || null,
     claudeConfigDir: policyCheck.claudeConfigDir || null,
     model: resolvedModel,
     effort: dispatchInfo.effort || selectedEffort,
@@ -1002,8 +1606,12 @@ export async function sideCommand(argv = [], context = {}) {
     taskDir,
     runId,
     engine: resolvedEngine,
-    profile: policyCheck.profile || null,
+    accountId: policyCheck.accountId || null,
+    accountAlias: policyCheck.accountAlias || null,
+    tags: policyCheck.tags || [],
     claudeConfigDir: policyCheck.claudeConfigDir || null,
+    codexHome: policyCheck.codexHome || null,
+    agyHome: policyCheck.agyHome || null,
     model: resolvedModel,
     effort: options.effort || null,
     worktreePath,

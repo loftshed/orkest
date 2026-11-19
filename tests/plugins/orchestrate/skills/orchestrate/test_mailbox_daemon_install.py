@@ -435,3 +435,79 @@ class TestMailboxDaemonInstall(unittest.TestCase):
         mocked_trust.assert_called_once()
         mocked_check.assert_called_once_with(require_codex_hook_trust=True)
         self.assertNotIn("pending review", output.getvalue())
+
+    def test_install_defers_stale_daemon_upgrade_when_active_waits_remain_and_restarts_when_idle(self):
+        import http.client
+        import urllib.parse
+
+        self.install()
+        initial = daemon.owned_state(self.base)
+        self.assertIsNotNone(initial)
+        token = daemon.read_token(self.base)
+        project = Path(self.temp.name) / "wait-project"
+        project.mkdir(exist_ok=True)
+        mailbox.register(self.base, session="wait-peer", harness="codex", cwd=str(project), pid=os.getpid())
+
+        parsed = urllib.parse.urlparse(initial["url"])
+        conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=6)
+        try:
+            wait_req = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "wait",
+                    "arguments": {"session": "wait-peer", "timeoutSeconds": 3},
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientCapabilities": {},
+                        "io.modelcontextprotocol/clientInfo": {"name": "install-test", "version": "1"},
+                    },
+                },
+            }
+            conn.request(
+                "POST",
+                "/mcp",
+                json.dumps(wait_req),
+                {
+                    "Authorization": "Bearer " + token,
+                    "Content-Type": "application/json",
+                    "Accept": "application/json, text/event-stream",
+                    "MCP-Protocol-Version": "2026-07-28",
+                    "Mcp-Method": "tools/call",
+                    "Mcp-Name": "wait",
+                },
+            )
+            import time
+
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                health = daemon.check_daemon(initial["url"], token)
+                if health and health.get("activeWaits", 0) >= 1:
+                    break
+                time.sleep(0.02)
+            self.assertEqual(daemon.check_daemon(initial["url"], token)["activeWaits"], 1)
+
+            with (
+                mock.patch.object(daemon, "runtime_revision", return_value="0000000000000000"),
+                mock.patch.object(daemon, "stop_service", wraps=daemon.stop_service) as spy_stop,
+            ):
+                self.install()
+            spy_stop.assert_called_once_with(self.base, if_idle=True, expected_instance=initial["instance"])
+            still_running = daemon.owned_state(self.base)
+            self.assertEqual(still_running["instance"], initial["instance"])
+            self.assertEqual(still_running["pid"], initial["pid"])
+            resp = conn.getresponse()
+            resp.read()
+        finally:
+            conn.close()
+
+        # Once idle, stale-revision install stops the old instance and starts a fresh one.
+        with (
+            mock.patch.object(daemon, "runtime_revision", return_value="0000000000000000"),
+            mock.patch.object(daemon, "stop_service", wraps=daemon.stop_service) as spy_stop_idle,
+        ):
+            self.install()
+        spy_stop_idle.assert_called_once_with(self.base, if_idle=True, expected_instance=initial["instance"])
+        restarted = daemon.owned_state(self.base)
+        self.assertNotEqual(restarted["instance"], initial["instance"])

@@ -54,7 +54,11 @@ export function childEnv(extra = {}, { strip = [] } = {}) {
   return env;
 }
 
-export function run(cmd, args, { env, timeoutMs = 60_000, maxBytes = 4 * 1024 * 1024, cwd } = {}) {
+export function run(
+  cmd,
+  args,
+  { env, timeoutMs = 60_000, maxBytes = 4 * 1024 * 1024, cwd, abortOnOutput } = {},
+) {
   return new Promise((resolve, reject) => {
     const child = spawn(cmd, args, {
       env,
@@ -72,11 +76,23 @@ export function run(cmd, args, { env, timeoutMs = 60_000, maxBytes = 4 * 1024 * 
     let stdout = "";
     let stderr = "";
     let isKilledForSize = false;
+    let isSettled = false;
     const cleanup = () => {
       clearTimeout(timer);
       process.off("exit", onExit);
     };
+    const abortInteractive = () => {
+      if (isSettled) return;
+      isSettled = true;
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      child.kill("SIGKILL");
+      cleanup();
+      reject(new Error(`${cmd} requires interactive authentication`));
+    };
     const timer = setTimeout(() => {
+      if (isSettled) return;
+      isSettled = true;
       child.stdout?.destroy();
       child.stderr?.destroy();
       child.kill("SIGKILL");
@@ -84,8 +100,12 @@ export function run(cmd, args, { env, timeoutMs = 60_000, maxBytes = 4 * 1024 * 
       reject(new Error(`${cmd} timed out after ${Math.round(timeoutMs / 1000)}s`));
     }, timeoutMs);
     child.stdout.on("data", (d) => {
-      if (isKilledForSize) return;
+      if (isSettled || isKilledForSize) return;
       stdout += d;
+      if (abortOnOutput instanceof RegExp && abortOnOutput.test(stdout)) {
+        abortInteractive();
+        return;
+      }
       if (stdout.length <= maxBytes) return;
       isKilledForSize = true;
       child.stdout.destroy();
@@ -93,13 +113,21 @@ export function run(cmd, args, { env, timeoutMs = 60_000, maxBytes = 4 * 1024 * 
       child.kill("SIGKILL");
     });
     child.stderr.on("data", (d) => {
+      if (isSettled) return;
       if (stderr.length < 64 * 1024) stderr += d;
+      if (abortOnOutput instanceof RegExp && abortOnOutput.test(stderr)) {
+        abortInteractive();
+      }
     });
     child.on("error", (err) => {
+      if (isSettled) return;
+      isSettled = true;
       cleanup();
       reject(err);
     });
     child.on("close", (code) => {
+      if (isSettled) return;
+      isSettled = true;
       cleanup();
       resolve({ code, stdout, stderr });
     });

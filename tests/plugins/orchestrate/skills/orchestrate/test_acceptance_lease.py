@@ -94,6 +94,8 @@ class AcceptanceLeaseTests(unittest.TestCase):
             record["candidate"],
             {
                 "fingerprint": self.result["git_after"]["fingerprint"],
+                "fingerprint_version": self.result["git_after"]["fingerprint_version"],
+                "tree_oid": self.result["git_after"]["tree_oid"],
                 "git_identity": self.result["git_identity_after"],
             },
         )

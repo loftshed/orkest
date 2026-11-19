@@ -1,5 +1,7 @@
 import path from "node:path";
 
+import { loadConfiguredAccounts } from "./policy.mjs";
+
 const KNOWN_SERVICE_TOKENS = [
   "vite",
   "next",
@@ -44,7 +46,6 @@ const INTERNAL_OR_HARNESS_TOKENS = [
   "antigravity",
   "language_server",
   "claude",
-  "plaude",
   "codex",
   "opencode",
   "cclsp",
@@ -66,11 +67,41 @@ const INTERNAL_OR_HARNESS_TOKENS = [
   "crashpad",
 ];
 
+const KNOWN_SERVICE_TOKEN_SET = new Set(KNOWN_SERVICE_TOKENS);
+
 const SENSITIVE_NAME_RE = /token|secret|password|passwd|api[_-]?key|auth|bearer|credential/iu;
 const ENV_ASSIGNMENT_RE = /^[A-Za-z_][A-Za-z0-9_]*=/u;
 const MCP_INVOCATION_RE = /(?:^|\s)(?:mcp|--mcp(?:\s|=|$)|mcp-server\b|@modelcontextprotocol\/)/iu;
 const MCP_SCRIPT_RE = /(?:^|[\s/\\])[\w.-]*[-_]mcp\.(?:mjs|cjs|js|ts|py|sh)(?:\s|$)/iu;
 const MAX_PROCESSES_PER_AGENT = 20;
+
+function configuredAliasTokens(options = {}) {
+  let accounts = Array.isArray(options?.accounts) ? options.accounts : null;
+  if (!accounts) {
+    try {
+      accounts = loadConfiguredAccounts(options);
+    } catch {
+      accounts = [];
+    }
+  }
+  const aliases = [];
+  for (const account of accounts) {
+    if (!account || typeof account !== "object") continue;
+    const rawList = [account.alias, ...(Array.isArray(account.aliases) ? account.aliases : [])];
+    for (const raw of rawList) {
+      if (typeof raw !== "string") continue;
+      const cleaned = raw.trim().toLowerCase();
+      if (cleaned && !KNOWN_SERVICE_TOKEN_SET.has(cleaned)) aliases.push(cleaned);
+    }
+  }
+  return aliases;
+}
+
+export function internalOrHarnessTokens(options = {}) {
+  const aliases = configuredAliasTokens(options);
+  if (aliases.length === 0) return INTERNAL_OR_HARNESS_TOKENS;
+  return [...new Set([...INTERNAL_OR_HARNESS_TOKENS, ...aliases])];
+}
 
 function matchTokenInText(text, tokens) {
   const lower = String(text || "").toLowerCase();
@@ -86,9 +117,16 @@ export function matchKnownServiceToken(command = "", comm = "", args = "") {
 }
 
 /** Shared room-service filter for framework and agent process probes. */
-export function isInternalOrHarnessProcess(command = "", comm = "", args = "", port = 0) {
+export function isInternalOrHarnessProcess(
+  command = "",
+  comm = "",
+  args = "",
+  port = 0,
+  options = {},
+) {
   const execIdentity = `${path.basename(comm || "")} ${command} ${args}`;
-  if (matchTokenInText(execIdentity, INTERNAL_OR_HARNESS_TOKENS)) return true;
+  const tokens = Array.isArray(options?.tokens) ? options.tokens : internalOrHarnessTokens(options);
+  if (matchTokenInText(execIdentity, tokens)) return true;
   if (Number.isFinite(port) && port >= 49_152) {
     const knownToken = matchKnownServiceToken(command, comm, args);
     const hasExplicitPortFlag = /(?:^|\s)(?:--port(?:\s|=)|\b-p\s+\d+)/iu.test(args);
@@ -333,12 +371,12 @@ function ignoreSet(ignore) {
   return Number.isSafeInteger(ignore) && ignore > 0 ? new Set([ignore]) : new Set();
 }
 
-function processIsExcluded(row, ignored, internalListenersByPid) {
+function processIsExcluded(row, ignored, internalListenersByPid, tokens) {
   if (!row || ignored.has(row.pid) || isProbeProcess(row.args)) return true;
   const listenerFlags = internalListenersByPid.get(row.pid) || [];
   if (listenerFlags.length > 0 && listenerFlags.every(Boolean)) return true;
   const command = commandName(row.args);
-  return isInternalOrHarnessProcess(command, command, row.args, 0);
+  return isInternalOrHarnessProcess(command, command, row.args, 0, { tokens });
 }
 
 function treeAttribution(
@@ -349,6 +387,7 @@ function treeAttribution(
   memberPidSet,
   ignored,
   internalListenersByPid,
+  tokens,
 ) {
   const best = new Map();
   for (const member of members) {
@@ -366,7 +405,7 @@ function treeAttribution(
         const distance = current.distance + 1;
         if (
           !memberPidSet.has(childPid) &&
-          !processIsExcluded(row, ignored, internalListenersByPid)
+          !processIsExcluded(row, ignored, internalListenersByPid, tokens)
         ) {
           const existing = best.get(childPid);
           if (!existing || distance < existing.distance) {
@@ -392,6 +431,7 @@ function sharedPidAttribution(
   internalListenersByPid,
   cwdByPid,
   assigned,
+  tokens,
 ) {
   const sharedRoots = new Set();
   for (const member of members) {
@@ -405,7 +445,7 @@ function sharedPidAttribution(
       if (
         !memberPidSet.has(childPid) &&
         !assigned.has(childPid) &&
-        !processIsExcluded(row, ignored, internalListenersByPid)
+        !processIsExcluded(row, ignored, internalListenersByPid, tokens)
       ) {
         candidates.add(childPid);
       }
@@ -456,7 +496,7 @@ function descendantsOfFromChildren(children, root) {
   return descendants;
 }
 
-function listenerInfo(table, listeners) {
+function listenerInfo(table, listeners, tokens) {
   const portsByPid = new Map();
   const internalByPid = new Map();
   const listenerRows = Array.isArray(listeners) ? listeners : [];
@@ -469,7 +509,7 @@ function listenerInfo(table, listeners) {
     const command = String(listener?.command || "");
     const comm = String(listener?.comm || commandName(row?.args || ""));
     const args = String(listener?.args || row?.args || "");
-    const isInternal = isInternalOrHarnessProcess(command, comm, args, port);
+    const isInternal = isInternalOrHarnessProcess(command, comm, args, port, { tokens });
     if (!internalByPid.has(pid)) internalByPid.set(pid, []);
     internalByPid.get(pid).push(isInternal);
     if (isInternal) continue;
@@ -486,6 +526,10 @@ export function buildAgentProcesses({
   listeners = [],
   cwdByPid = new Map(),
   ignore,
+  env,
+  homeDir,
+  monitorConfigPath,
+  accounts,
 } = {}) {
   const table = processRows(inputTable);
   const validMembers = members.filter((member) => typeof member?.id === "string" && member.id);
@@ -499,8 +543,9 @@ export function buildAgentProcesses({
     memberCounts.set(pid, (memberCounts.get(pid) || 0) + 1);
   }
   const ignored = ignoreSet(ignore);
+  const tokens = internalOrHarnessTokens({ env, homeDir, monitorConfigPath, accounts });
   const children = childrenByPid(table);
-  const { portsByPid, internalByPid } = listenerInfo(table, listeners);
+  const { portsByPid, internalByPid } = listenerInfo(table, listeners, tokens);
   const tree = treeAttribution(
     table,
     children,
@@ -509,6 +554,7 @@ export function buildAgentProcesses({
     memberPidSet,
     ignored,
     internalByPid,
+    tokens,
   );
   const cwdMap =
     cwdByPid instanceof Map
@@ -524,6 +570,7 @@ export function buildAgentProcesses({
     internalByPid,
     cwdMap,
     new Set(tree.keys()),
+    tokens,
   );
   const assignments = new Map();
   for (const [pid, assignment] of tree) {
@@ -535,7 +582,7 @@ export function buildAgentProcesses({
   const byMember = new Map(validMembers.map((member) => [member.id, []]));
   for (const [, assignment] of assignments) {
     const row = assignment.row;
-    if (!row || processIsExcluded(row, ignored, internalByPid)) continue;
+    if (!row || processIsExcluded(row, ignored, internalByPid, tokens)) continue;
     const memberProcesses = byMember.get(assignment.memberId);
     if (!memberProcesses) continue;
     memberProcesses.push({
