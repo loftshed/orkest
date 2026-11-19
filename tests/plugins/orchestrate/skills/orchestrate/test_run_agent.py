@@ -2312,6 +2312,18 @@ else:
         self.assertEqual(result["status"], "preflight_failed")
         self.assertEqual(capture, {})
 
+    def wait_for_detached_exit(self, output: str) -> None:
+        # The worker writes its completion event and job status after publishing result.json.
+        pid = int(
+            next(
+                line.removeprefix("AGENT_JOB_PID=") for line in output.splitlines() if line.startswith("AGENT_JOB_PID=")
+            )
+        )
+        deadline = time.monotonic() + 20
+        while RUNNER._pid_is_alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertFalse(RUNNER._pid_is_alive(pid), f"detached worker {pid} did not exit before fixture teardown")
+
     def test_detached_mode_returns_without_polling_and_writes_result(self) -> None:
         brief = self.external_path / "detached-brief.md"
         brief.write_text("# Objective\n\nCreate the fixture output.\n", encoding="utf-8")
@@ -2352,11 +2364,8 @@ else:
         event_line = next(line for line in output.getvalue().splitlines() if line.startswith("AGENT_EVENT="))
         event_path = Path(event_line.partition("=")[2])
         event_id_line = next(line for line in output.getvalue().splitlines() if line.startswith("AGENT_EVENT_ID="))
-        for _attempt in range(100):
-            if result_path.exists() and event_path.exists():
-                break
-            time.sleep(0.05)
         self.assertEqual(exit_code, 0)
+        self.wait_for_detached_exit(output.getvalue())
         self.assertTrue(result_path.exists())
         self.assertTrue(event_path.exists())
         self.assertIn(cache_root.resolve(), job_path.parents)
@@ -2453,11 +2462,8 @@ else:
         result_path = Path(
             next(line for line in output.getvalue().splitlines() if line.startswith("AGENT_RESULT=")).partition("=")[2]
         )
-        for _attempt in range(100):
-            if result_path.exists():
-                break
-            time.sleep(0.05)
         self.assertEqual(exit_code, 0)
+        self.wait_for_detached_exit(output.getvalue())
         result = json.loads(result_path.read_text(encoding="utf-8"))
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["task_input"], "task_spec")
