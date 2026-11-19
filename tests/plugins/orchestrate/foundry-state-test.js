@@ -235,11 +235,15 @@ describe("strict Foundry state with retained fixtures", () => {
   it("a concurrent real reader observes only complete atomic states", async ({ signal }) => {
     const f = fixture();
     writeFileSync(f.file, JSON.stringify({ generation: 0, payload: "0".repeat(100_000) }));
-    const writer = fork(new URL("fixtures/foundry-state-writer.mjs", import.meta.url), [f.root], {
-      detached: true,
-      execArgv: [],
-      stdio: ["ignore", "ignore", "inherit", "ipc"],
-    });
+    const writer = fork(
+      new URL("../../helpers/foundry-state-writer.mjs", import.meta.url),
+      [f.root],
+      {
+        detached: true,
+        execArgv: [],
+        stdio: ["ignore", "ignore", "inherit", "ipc"],
+      },
+    );
     const closed = new Promise((resolve) => writer.once("close", resolve));
     let childError;
     writer.on("error", (error) => {
@@ -256,7 +260,7 @@ describe("strict Foundry state with retained fixtures", () => {
     };
     signal.addEventListener("abort", stopWriter, { once: true });
     try {
-      let isObservedIntermediate = false;
+      let hasObservedIntermediate = false;
       while (
         writer.pid &&
         writer.exitCode === null &&
@@ -266,8 +270,8 @@ describe("strict Foundry state with retained fixtures", () => {
         if (childError) throw childError;
         const state = JSON.parse(readFileSync(f.file, "utf8"));
         expect(state.payload).toBe(String(state.generation).repeat(100_000));
-        if (!isObservedIntermediate && state.generation > 0 && state.generation < 100) {
-          isObservedIntermediate = true;
+        if (!hasObservedIntermediate && state.generation > 0 && state.generation < 100) {
+          hasObservedIntermediate = true;
           writer.send("observed");
         }
         await yieldTurn();
@@ -275,7 +279,7 @@ describe("strict Foundry state with retained fixtures", () => {
       const code = await closed;
       if (childError) throw childError;
       expect(code).toBe(0);
-      expect(isObservedIntermediate).toBe(true);
+      expect(hasObservedIntermediate).toBe(true);
       expect(JSON.parse(readFileSync(f.file, "utf8"))).toMatchObject({
         generation: 100,
         payload: "100".repeat(100_000),

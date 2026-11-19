@@ -1,6 +1,6 @@
 import { once } from "node:events";
 
-import { writeFoundryState } from "../../../../plugins/orchestrate/lib/foundry.mjs";
+import { writeFoundryState } from "../../plugins/orchestrate/lib/foundry.mjs";
 
 const observed = once(process, "message");
 for (let generation = 1; generation <= 100; generation++) {
