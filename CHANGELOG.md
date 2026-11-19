@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.94.1
+
+- refactor: install commands and skills from canonical adapter files (#241)
+
 ## 0.94.0
 
 - feat: retire the Claude marketplace and release Orkest as one product (#240)
