@@ -579,7 +579,9 @@ print(json.dumps({'rooms': [r['id'] for r in rooms], 'room': room, 'notice': not
             (broken_plugin / "skills/orchestrate/scripts").mkdir(parents=True)
             (broken_checkout / "src/bin").mkdir(parents=True)
             (broken_checkout / "src/bin/ork.mjs").write_text("\n")
-            (broken_checkout / "src/bin/room-store.mjs").write_text("if (process.argv[2] === 'rebind') process.exit(1);\n")
+            (broken_checkout / "src/bin/room-store.mjs").write_text(
+                "if (process.argv[2] === 'rebind') process.exit(1);\n"
+            )
             environment = self.environment(home)
             environment["ORKEST_SWARM_ROOM"] = room["id"]
             failing_env = {
