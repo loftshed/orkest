@@ -322,11 +322,14 @@ it("upgrades an old Monitor copy, keeping custom files and the previous copy, an
   writeFileSync(path.join(old, "package.json"), '{"version":"0.0.1"}\n');
   writeFileSync(path.join(old, "notes.txt"), "mine\n");
   writeFileSync(path.join(old, "src/bin/custom.mjs"), "// mine\n");
+  mkdirSync(path.join(old, "src/lib/monitor"), { recursive: true });
+  writeFileSync(path.join(old, "src/lib/monitor/user-note"), "keep me");
 
   const first = fixture.run();
   expect(first.status, first.stderr).toBe(0);
   expect(readFileSync(path.join(old, "notes.txt"), "utf8")).toBe("mine\n");
   expect(readFileSync(path.join(old, "src/bin/custom.mjs"), "utf8")).toBe("// mine\n");
+  expect(readFileSync(path.join(old, "src/lib/monitor/user-note"), "utf8")).toBe("keep me");
   expect(readFileSync(path.join(old, "bin/monitor.mjs"), "utf8")).toBe("// old\n");
   expect(fixture.launch("--version").stdout.trim()).toBe("9.9.9");
   const backups = path.join(fixture.home, ".local/share/monitor-backups");

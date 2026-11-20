@@ -56,11 +56,14 @@ rmtree() { node -e 'require("fs").rmSync(process.argv[1], { recursive: true, for
 # ~/.local/share/monitor-backups; nothing is deleted.
 runtime="$HOME/.local/share/monitor"
 backups="$HOME/.local/share/monitor-backups"
-managed="package.json config.example.json src/bin/monitor.mjs src/bin/observe.mjs src/lib/monitor skills/monitor"
 root="$(cd "$repo/../.." && pwd -P)"
 for needed in "$root/package.json" "$root/src/bin/monitor.mjs" "$root/src/bin/observe.mjs" "$root/src/lib/monitor" "$repo/skills/monitor/SKILL.md" "$repo/config.example.json"; do
   [ -e "$needed" ] || { echo "install: missing $needed" >&2; exit 1; }
 done
+# Enumerate shipped leaves so local additions beside managed modules survive upgrades.
+managed="$(printf '%s\n' package.json config.example.json src/bin/monitor.mjs src/bin/observe.mjs
+  (cd "$root" && find src/lib/monitor -type f -print)
+  (cd "$repo" && find skills/monitor -type f -print))"
 version="$(node -p "require(process.argv[1]).version" "$root/package.json")"
 
 # A link of ours points at a known destination: a checkout's own monitor skill (where earlier installs linked it),
@@ -87,7 +90,7 @@ abandon() {
   echo "install: $1; the existing runtime was left in place (staged copy kept at $parked)" >&2
   exit 1
 }
-for item in $managed; do
+while IFS= read -r item; do
   # A link above a managed path, ours or not, is never written through.
   parent="$(dirname "$item")"
   walked=
@@ -98,6 +101,9 @@ for item in $managed; do
   if [ -L "$stage/$item" ] && ! owned_link "$stage/$item"; then
     echo "• $runtime/$item is your own link; left alone" >&2
     continue
+  fi
+  if [ -d "$stage/$item" ] && [ ! -L "$stage/$item" ]; then
+    abandon "$runtime/$item is a directory where a managed file is needed"
   fi
   if [ -e "$stage/$item" ] || [ -L "$stage/$item" ]; then
     # Only managed leaves are replaced, inside the staged copy; the live runtime is untouched until the swap.
@@ -119,10 +125,12 @@ const manifest = {
 require("fs").writeFileSync(file, JSON.stringify(manifest, null, 2) + "\n");
 ' "$version" "$stage/package.json" ;;
     config.example.json) cp "$repo/config.example.json" "$stage/$item" ;;
-    skills/monitor) cp -R "$repo/skills/monitor" "$stage/$item" ;;
-    *) cp -R "$root/$item" "$stage/$item" ;;
+    skills/monitor/*) cp -p "$repo/skills/monitor" "$stage/$item" ;;
+    *) cp -p "$root/$item" "$stage/$item" ;;
   esac
-done
+done <<EOF
+$managed
+EOF
 staged_version="$("$node_bin" "$stage/src/bin/monitor.mjs" --version)" || staged_version=
 if [ "$staged_version" != "$version" ]; then
   abandon "the staged runtime did not report version $version (got '$staged_version')"
@@ -130,9 +138,11 @@ fi
 
 same=1
 if [ -d "$runtime" ]; then
-  for item in $managed; do
+  while IFS= read -r item; do
     diff -r "$stage/$item" "$runtime/$item" >/dev/null 2>&1 || same=0
-  done
+  done <<EOF
+$managed
+EOF
 else
   same=0
 fi

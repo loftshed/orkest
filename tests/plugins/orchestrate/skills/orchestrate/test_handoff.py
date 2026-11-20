@@ -2190,7 +2190,7 @@ class HandoffTests(unittest.TestCase):
     ) -> None:
         # #2: Monitor render.mjs jsonView preserves unsetClaudeConfigDir / claudeConfigDir / accountEnv into choose_successor.
         repo_root = Path(__file__).resolve().parents[5]
-        render_mjs = repo_root / "plugins" / "monitor" / "lib" / "render.mjs"
+        render_mjs = repo_root / "src" / "lib" / "monitor" / "render.mjs"
         second_home = (self.root / "acct-second-home").resolve()
         (second_home / ".claude").mkdir(parents=True, exist_ok=True)
         caller_home = (self.root / "caller-real-home").resolve()

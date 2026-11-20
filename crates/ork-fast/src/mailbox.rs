@@ -1512,9 +1512,9 @@ mod tests {
     }
 
     fn setup_scripts_tree(dir: &Path) -> PathBuf {
-        let skill = dir.join("fake-plugin/skills/orchestrate");
+        let skill = dir.join("fake-checkout/plugins/orchestrate/skills/orchestrate");
         let scripts = skill.join("scripts");
-        let lib = dir.join("fake-plugin/lib");
+        let lib = dir.join("fake-checkout/src/lib");
         fs::create_dir_all(&scripts).unwrap();
         fs::create_dir_all(&lib).unwrap();
         fs::write(scripts.join("mailbox_daemon.py"), "# stub\n").unwrap();
