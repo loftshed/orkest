@@ -9,7 +9,9 @@
 | `<!-- generated:slash-commands -->` | Frontmatter of `adapters/claude/commands/*.md`               |
 | `<!-- generated:requirements -->`   | `engines.node` in `package.json`                             |
 | `docs/images/*.png`                 | The Swarm View and `monitor` renderers, drawn from demo data |
-| Plugin versions in the table        | The release job, see [releases](releases.md)                 |
+| Product version                     | The release job, see [releases](releases.md)                 |
+
+The install section describes the shared runtime and its harness adapters. Keep checkout paths aligned with `src/` and `adapters/`.
 
 Edit a generated block at its source, never between its markers. To add one, return it from
 `generatedBlocks` in [`scripts/lib/readme.js`](../scripts/lib/readme.js) and place its markers in

@@ -63,7 +63,7 @@ rmtree() { node -e 'require("fs").rmSync(process.argv[1], { recursive: true, for
 # ~/.local/share/monitor-backups; nothing is deleted.
 runtime="$HOME/.local/share/monitor"
 backups="$HOME/.local/share/monitor-backups"
-for needed in "$root/package.json" "$root/src/bin/monitor.mjs" "$root/src/bin/observe.mjs" "$root/src/lib/monitor" "$repo/skills/monitor/SKILL.md" "$repo/config.example.json"; do
+for needed in "$root/package.json" "$root/src/bin/monitor.mjs" "$root/src/bin/observe.mjs" "$root/src/lib/monitor" "$root/adapters/skills/monitor/SKILL.md" "$repo/config.example.json"; do
   [ -e "$needed" ] || { echo "install: missing $needed" >&2; exit 1; }
 done
 # Enumerate shipped leaves so local additions beside managed modules survive upgrades.
@@ -75,7 +75,7 @@ managed="$(printf '%s\n' package.json config.example.json src/bin/monitor.mjs sr
     references/families.json \
     references/workforce-roles.json
   (cd "$root" && find src/lib/monitor -type f -print)
-  (cd "$repo" && find skills/monitor -type f -print))"
+  (cd "$root/adapters" && find skills/monitor -type f -print))"
 version="$(node -p "require(process.argv[1]).version" "$root/package.json")"
 
 # A link of ours points at a known destination: a checkout's own monitor skill (where earlier installs linked it),
@@ -137,7 +137,7 @@ const manifest = {
 require("fs").writeFileSync(file, JSON.stringify(manifest, null, 2) + "\n");
 ' "$version" "$stage/package.json" ;;
     config.example.json) cp "$repo/config.example.json" "$stage/$item" ;;
-    skills/monitor/*) cp -p "$repo/$item" "$stage/$item" ;;
+    skills/monitor/*) cp -p "$root/adapters/$item" "$stage/$item" ;;
     *) cp -p "$root/$item" "$stage/$item" ;;
   esac
 done <<EOF
@@ -233,10 +233,10 @@ if [ "$with_app" = 1 ]; then
   app="$HOME/Applications/Monitor.app"
   # Rebuild only when the app itself changes. It is ad-hoc signed, so macOS privacy settings identify it by
   # its exact code: every rebuild made macOS forget an "Allow" and ask again.
-  build_hash="$(cat "$repo/macos/main.swift" "$repo/macos/build.sh" | shasum -a 256 | cut -c1-16):$launcher"
+  build_hash="$(cat "$root/adapters/macos/monitor/main.swift" "$root/adapters/macos/monitor/build.sh" | shasum -a 256 | cut -c1-16):$launcher"
   installed_hash="$(/usr/libexec/PlistBuddy -c 'Print :MonitorBuildHash' "$app/Contents/Info.plist" 2>/dev/null || true)"
   if [ "$build_hash" != "$installed_hash" ]; then
-    MONITOR_COMMAND="$launcher" MONITOR_BUILD_HASH="$build_hash" "$repo/macos/build.sh" "$app"
+    MONITOR_COMMAND="$launcher" MONITOR_BUILD_HASH="$build_hash" "$root/adapters/macos/monitor/build.sh" "$app"
   else
     echo "• menu bar app unchanged, not rebuilt (keeps its macOS privacy permissions)"
   fi

@@ -4,6 +4,11 @@ Orkest is a cross-harness multi-agent orchestrator and spare-token software fact
 
 It is one product with one version, not a Claude Code plugin. `install.sh` links `ork` and `monitor` onto `PATH`, links the skills into each harness's skills directory, writes the commands, and registers monitor's MCP server; every harness calls `ork`. `ork update` fast-forwards the checkout and reruns that wiring. A leftover plugin install from before the change is reported, with the commands to remove it, and never removed automatically.
 
+Orkest ships one runtime. The CLI entry points live in `src/bin/`, the Node modules in `src/lib/`,
+and the Python coordinator and mailbox in `src/py/`. Both languages read the registries in
+`references/`. Harness-facing commands, skills, OpenCode statusline, Plasma widget and macOS front ends live in
+`adapters/`. Herdr and Orca discover their manifests at the checkout root.
+
 ## 1. Command & Subsystem Glossary (Orc Stronghold Vocabulary)
 
 Every Orkest command has a plain-English engineering meaning alongside its `ork` name:

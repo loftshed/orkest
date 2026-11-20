@@ -14,7 +14,7 @@
 set -eu
 
 repo="$(cd "$(dirname "$0")" && pwd -P)"
-skill="$repo/skills/orchestrate"
+skill="$(cd "$repo/../.." && pwd -P)/adapters/skills/orchestrate"
 scripts="$repo/../../src/py"
 hub="$HOME/.agents/skills/orchestrate"
 legacy_hub="$HOME/.agents/skills/agent-executor"

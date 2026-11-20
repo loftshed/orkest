@@ -65,7 +65,7 @@ Replace the example with a verified original source and an explicit date with ti
 For passive history collection on macOS, run:
 
 ```sh
-node plugins/monitor/macos/install-observer.mjs
+node adapters/macos/monitor/install-observer.mjs
 ```
 
 This installs a separate login agent, `local.monitor.observer`, which checks the existing Monitor cache once a minute. It does not restart the menu bar app, query providers, spend tokens or redeem resets. Keep Monitor running so its cache receives fresh readings. When the computer sleeps or Monitor stops refreshing, the recorder cannot fill that gap.
@@ -138,7 +138,7 @@ The menu bar app runs the provider CLIs, and macOS charges whatever they touch t
 On KDE Plasma 6, install the panel/desktop widget after installing the CLI:
 
 ```sh
-sh plugins/monitor/linux/install.sh
+sh adapters/linux/install.sh
 ```
 
 Open **Add Widgets**, search for **Monitor**, and place it on your panel or desktop.

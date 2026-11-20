@@ -351,7 +351,7 @@ def _resolve_macos_hud_binary(
     if hud_bin.is_file() and os_mod.access(hud_bin, os.X_OK):
         return hud_bin
 
-    build_script = runtime_paths.runtime_root(__file__) / "plugins/orchestrate/macos" / "build.sh"
+    build_script = runtime_paths.runtime_root(__file__) / "adapters/macos/hud" / "build.sh"
     if not build_script.is_file() or not shutil_mod.which("xcrun"):
         return None
 

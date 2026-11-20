@@ -12,7 +12,7 @@ legacy_hub="$HOME/.agents/skills/agent-executor"
 remove_link() {
   place="$1"
   if [ -L "$place" ]; then
-    if python3 - "$place" "$repo/skills/orchestrate" <<'PY'
+    if python3 - "$place" "$repo/../../adapters/skills/orchestrate" <<'PY'
 import sys
 from pathlib import Path
 

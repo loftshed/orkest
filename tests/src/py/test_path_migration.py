@@ -87,22 +87,35 @@ class PathMigrationTests(Fixture):
             previous = str(directory / "references/model-registry.json")
             self.assertEqual(pm._map(rules, previous), (previous, str(self.root / "references/model-registry.json")))
 
-    def test_hub_compatibility_script_runs_canonical_cli(self):
+    def test_canonical_cli_runs_after_skill_shim_retirement(self):
         import subprocess
 
-        old_skill = SCRIPTS.parents[1] / "plugins/orchestrate/skills/orchestrate"
-        alias = self.home / "linked-skill"
-        alias.symlink_to(old_skill, target_is_directory=True)
+        root = SCRIPTS.parents[1]
+        skill = root / "adapters/skills/orchestrate"
+        self.assertTrue((skill / "SKILL.md").is_file())
+        self.assertFalse((skill / "scripts/run_agent.py").exists())
+        self.assertFalse((root / "plugins/orchestrate/skills/orchestrate/scripts/run_agent.py").exists())
+        result = subprocess.run(
+            [sys.executable, "-I", str(SCRIPTS / "run_agent.py"), "--help"], check=True, capture_output=True
+        )
+        self.assertIn(b"usage:", result.stdout)
+        self.assertNotIn(b"moved to", result.stderr)
 
-        def invoke(path):
-            return subprocess.run([sys.executable, "-I", str(path), "--help"], check=True, capture_output=True)
-
-        canonical = invoke(SCRIPTS / "run_agent.py")
-        for directory in (old_skill, alias):
-            legacy = invoke(directory / "scripts/run_agent.py")
-            self.assertEqual(legacy.stdout, canonical.stdout)
-            self.assertIn(str(SCRIPTS / "run_agent.py").encode(), legacy.stderr)
-            self.assertEqual(legacy.stderr.count(b"moved to"), 1)
+    def test_statusline_migration_preserves_other_opencode_plugin_links(self):
+        plugins = self.home / ".config/opencode/plugins"
+        plugins.mkdir(parents=True)
+        previous = self.root / "plugins/orchestrate/opencode/agent-statusline"
+        canonical = self.root / "adapters/opencode/agent-statusline"
+        canonical.mkdir(parents=True)
+        owned = plugins / "orkest-agent-statusline"
+        custom = plugins / "my-statusline"
+        owned.symlink_to(previous)
+        custom.symlink_to(previous)
+        report = pm.apply(self.home, roots=[self.root])
+        self.assertEqual(owned.readlink(), canonical)
+        self.assertEqual(custom.readlink(), previous)
+        pm.restore(Path(report["backup"]))
+        self.assertEqual(owned.readlink(), previous)
 
     def test_uninspectable_configs_are_reported_and_preserved(self):
         self.land_new_layout()

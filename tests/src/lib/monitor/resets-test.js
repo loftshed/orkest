@@ -240,7 +240,7 @@ test.skipIf(process.platform !== "darwin")(
       const appPath = path.join(dir, "Monitor.app");
       const fakeCli = path.join(dir, "fake-monitor.sh");
       const snapshotPath = path.join(dir, "snapshot.json");
-      const buildScript = new URL("../../../../plugins/monitor/macos/build.sh", import.meta.url)
+      const buildScript = new URL("../../../../adapters/macos/monitor/build.sh", import.meta.url)
         .pathname;
       const snapshot = {
         schema: "monitor.snapshot.v1",

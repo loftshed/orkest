@@ -298,19 +298,21 @@ export function writeRelease(plan, root = REPO_ROOT) {
     for (const plugin of plugins) {
       // The installed monitor copy writes its own package.json from the root version; this one is kept in step.
       const manifest = `plugins/${plugin}/package.json`;
-      if (fs.existsSync(path.join(root, manifest))) {
-        setJsonVersion(path.join(root, manifest), release.version);
-        written.add(manifest);
+      if (!fs.existsSync(path.join(root, manifest))) {
+        continue;
       }
-      const skillsRoot = path.join(pluginsRoot, plugin, "skills");
-      const skills = fs.existsSync(skillsRoot) ? fs.readdirSync(skillsRoot) : [];
-      for (const skill of skills) {
-        const relative = `plugins/${plugin}/skills/${skill}/SKILL.md`;
-        if (!fs.existsSync(path.join(root, relative))) continue;
-        const original = fs.readFileSync(path.join(root, relative), "utf8");
-        const updated = setFrontmatterVersion(original, release.version);
-        if (updated !== original) write(relative, updated);
-      }
+
+      setJsonVersion(path.join(root, manifest), release.version);
+      written.add(manifest);
+    }
+    const skillsRoot = path.join(root, "adapters", "skills");
+    const skills = fs.existsSync(skillsRoot) ? fs.readdirSync(skillsRoot) : [];
+    for (const skill of skills) {
+      const relative = `adapters/skills/${skill}/SKILL.md`;
+      if (!fs.existsSync(path.join(root, relative))) continue;
+      const original = fs.readFileSync(path.join(root, relative), "utf8");
+      const updated = setFrontmatterVersion(original, release.version);
+      if (updated !== original) write(relative, updated);
     }
     write(release.changelogPath, release.changelog);
   }

@@ -105,7 +105,7 @@ def _verify_codex_hook_trust(native: RpcClient, config: Path) -> None:
     hooks = native.request("hooks/list", {"cwds": [str(Path.home())]})
     expected_hooks = mailbox_hook_updates(
         hooks,
-        Path.home() / ".agents/skills/orchestrate/scripts/peer_mailbox.py",
+        Path(__file__).resolve().with_name("peer_mailbox.py"),
         config.with_name("hooks.json"),
         fast_bin=runtime_paths.ork_fast_bin(),
     )

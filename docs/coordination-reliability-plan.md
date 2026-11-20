@@ -68,7 +68,7 @@ but progress rejected the unregistered peer. Include that binding-without-presen
 Create one self-contained board issue per numbered item, with the contracts and acceptance checks
 below. Split a large item into focused PRs at its stated boundaries. One integration owner accepts
 results and owns final checks. Paths below are relative to `plugins/orchestrate/` unless stated
-otherwise; Python modules are in `skills/orchestrate/scripts/`, and `lib/` and `bin/` Node modules
+otherwise; Python modules are in `src/py/`, and `lib/` and `bin/` Node modules
 are now `src/lib/` and `src/bin/` at the repository root.
 
 ### 1. Repair concurrent writes and the side command boundary
@@ -141,7 +141,7 @@ worktree after that contract is agreed.
 
 Modules: `conductor_policy.py`, `routes.py`, `families.py`, `model_routing.py`, `coordinator.py`,
 `native_bridge.py`, `render_brief.py`, `lib/rooms.mjs`, and the native guidance in
-`skills/orchestrate/references/swarm.md`.
+`adapters/skills/orchestrate/references/swarm.md`.
 
 Extend existing decision records and routing. Evaluate portability, independently checkable
 acceptance, handoff value, task difficulty, available quota and context needs before selecting a

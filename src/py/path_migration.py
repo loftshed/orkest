@@ -55,6 +55,9 @@ MOVES: tuple[tuple[str, str], ...] = (
         )
     ),
     ("plugins/orchestrate/references/swarm-presets.json", "references/swarm-presets.json"),
+    ("plugins/orchestrate/opencode/agent-statusline", "adapters/opencode/agent-statusline"),
+    ("plugins/orchestrate/macos", "adapters/macos/hud"),
+    ("plugins/monitor/macos", "adapters/macos/monitor"),
     ("plugins/orchestrate/commands", "adapters/claude/commands"),
     ("plugins/orchestrate/skills", "adapters/skills"),
     ("plugins/monitor/skills", "adapters/skills"),
@@ -201,7 +204,12 @@ def link_dirs(home: Path) -> list[Path]:
     codex = _env_dir("CODEX_HOME", home / ".codex", home)
     xdg = _env_dir("XDG_CONFIG_HOME", home / ".config", home)
     dirs = [home / ".local/bin", home / ".agents/skills", codex / "skills", home / ".codex/skills"]
-    dirs += [home / ".gemini/config/skills", home / ".gemini/antigravity/skills", xdg / "opencode/skills"]
+    dirs += [
+        home / ".gemini/config/skills",
+        home / ".gemini/antigravity/skills",
+        xdg / "opencode/skills",
+        xdg / "opencode/plugins",
+    ]
     dirs += [profile / "skills" for profile in claude_profiles(home)]
     unique: list[Path] = []
     for directory in dirs:
@@ -224,7 +232,7 @@ def build_rules(home: Path, roots: list[Path]) -> list[Rule]:
         # Every skill link (hub, each harness) that really leads into this checkout is an alias of its scripts.
         for directory in link_dirs(home):
             alias = directory / "orchestrate"
-            if alias.is_symlink() and (alias / "scripts").is_dir() and _inside_root(alias, root):
+            if alias.is_symlink() and _links_to_skill(alias, skill, root / "adapters/skills/orchestrate"):
                 for variant in _variants(alias / "scripts"):
                     rules.setdefault(variant, str(root / SCRIPTS_NEW))
                 for old, new in MOVES:
@@ -234,10 +242,10 @@ def build_rules(home: Path, roots: list[Path]) -> list[Rule]:
     return [Rule(old, rules[old]) for old in sorted(rules, key=lambda value: (-len(value), value))]
 
 
-def _inside_root(link: Path, root: Path) -> bool:
+def _links_to_skill(link: Path, *owned: Path) -> bool:
     try:
-        return link.resolve().is_relative_to(root.resolve())
-    except OSError:
+        return link.resolve() in owned
+    except (OSError, RuntimeError):
         return False
 
 
@@ -288,7 +296,9 @@ def _symlink_changes(rules: list[Rule], directory: Path, home: Path, seen: set[s
     changes: list[Change] = []
     if not directory.is_dir():
         return changes
-    for entry in sorted(directory.iterdir()):
+    # OpenCode allows arbitrary user plugins beside Orkest's documented statusline link.
+    entries = [directory / "orkest-agent-statusline"] if directory.name == "plugins" else sorted(directory.iterdir())
+    for entry in entries:
         if not entry.is_symlink() or str(entry) in seen:
             continue
         mapped = _map(rules, _abs_target(entry, os.readlink(entry)))

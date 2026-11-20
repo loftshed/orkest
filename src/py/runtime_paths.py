@@ -20,7 +20,7 @@ def node_runtime(script: str | Path = __file__) -> Path:
 
 def skill_directory(script: str | Path = __file__) -> Path:
     root = runtime_root(script)
-    skill = root / "plugins/orchestrate/skills/orchestrate"
+    skill = root / "adapters/skills/orchestrate"
     return skill if skill.is_dir() else root
 
 

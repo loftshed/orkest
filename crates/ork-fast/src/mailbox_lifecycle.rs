@@ -4752,7 +4752,7 @@ pub(crate) fn current_runtime_revision(base: &Path) -> Option<String> {
     let (references, templates, node_runtime) = if let Some(root) = checkout {
         (
             root.join("references"),
-            root.join("plugins/orchestrate/skills/orchestrate/templates"),
+            root.join("adapters/skills/orchestrate/templates"),
             root.join("src"),
         )
     } else if skill.join("lib").is_dir() {

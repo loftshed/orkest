@@ -79,7 +79,7 @@ an agent to read its live terminal without leaving your conversation:
 | `q`       | Close the view; workers keep running                   |
 
 Reconnect from any terminal with `ork horde --attach-room <id>`; add `--view` to only observe.
-Details: [conversational swarms](plugins/orchestrate/skills/orchestrate/references/swarm.md).
+Details: [conversational swarms](adapters/skills/orchestrate/references/swarm.md).
 
 ### Fire off side missions
 
@@ -237,6 +237,10 @@ More: [architecture and module map](docs/ARCHITECTURE.md), [Herdr integration](d
 
 ## Install
 
+The installer links the skills from `adapters/skills/`, installs Claude commands from
+`adapters/claude/commands/`, and points the CLI at `src/bin/ork.mjs`. Python helpers run
+from `src/py/`. Existing installations can migrate their saved paths with `ork update`.
+
 <!-- generated:requirements -->
 
 Requires Git, Node.js 26.13+, Python 3.11+, `tmux`, and at least one installed, authenticated harness CLI (`claude`, `codex`, `agy`, or `opencode`).
@@ -272,7 +276,7 @@ Optional setup:
   [terminal footer setup](plugins/orchestrate/README.md#agent-status-in-terminal-footers).
 - **Herdr:** pane labels, the swarm pane and layout restoration are covered in
   [Herdr integration](docs/herdr.md).
-- **KDE Plasma widget:** `sh plugins/monitor/linux/install.sh`.
+- **KDE Plasma widget:** `sh adapters/linux/install.sh`.
 
 ## Development
 
