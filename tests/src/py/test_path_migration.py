@@ -101,6 +101,22 @@ class PathMigrationTests(Fixture):
         self.assertIn(b"usage:", result.stdout)
         self.assertNotIn(b"moved to", result.stderr)
 
+    def test_statusline_migration_preserves_other_opencode_plugin_links(self):
+        plugins = self.home / ".config/opencode/plugins"
+        plugins.mkdir(parents=True)
+        previous = self.root / "plugins/orchestrate/opencode/agent-statusline"
+        canonical = self.root / "adapters/opencode/agent-statusline"
+        canonical.mkdir(parents=True)
+        owned = plugins / "orkest-agent-statusline"
+        custom = plugins / "my-statusline"
+        owned.symlink_to(previous)
+        custom.symlink_to(previous)
+        report = pm.apply(self.home, roots=[self.root])
+        self.assertEqual(owned.readlink(), canonical)
+        self.assertEqual(custom.readlink(), previous)
+        pm.restore(Path(report["backup"]))
+        self.assertEqual(owned.readlink(), previous)
+
     def test_uninspectable_configs_are_reported_and_preserved(self):
         self.land_new_layout()
         binary, oversized = [profile / "settings.json" for profile in self.profiles]

@@ -296,7 +296,9 @@ def _symlink_changes(rules: list[Rule], directory: Path, home: Path, seen: set[s
     changes: list[Change] = []
     if not directory.is_dir():
         return changes
-    for entry in sorted(directory.iterdir()):
+    # OpenCode allows arbitrary user plugins beside Orkest's documented statusline link.
+    entries = [directory / "orkest-agent-statusline"] if directory.name == "plugins" else sorted(directory.iterdir())
+    for entry in entries:
         if not entry.is_symlink() or str(entry) in seen:
             continue
         mapped = _map(rules, _abs_target(entry, os.readlink(entry)))
