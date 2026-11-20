@@ -1,3 +1,4 @@
+import { breakerRetryAt } from "./adaptive-probes.mjs";
 import {
   blockedWindows,
   buildLanes,
@@ -241,6 +242,16 @@ export function jsonView(accounts, now = Date.now()) {
       credits: creditBalance(a),
       ok: a.ok !== false,
       error: a.ok === false ? a.error : null,
+      ...(a.probeHealth && {
+        probe: {
+          p95Ms: a.probeHealth.p95Ms,
+          p99Ms: a.probeHealth.p99Ms,
+          lastDurationMs: a.probeHealth.lastDurationMs,
+          lastDeadlineMs: a.probeHealth.lastDeadlineMs,
+          lastOutcome: a.probeHealth.lastOutcome,
+          retryAt: iso(breakerRetryAt(a, now)),
+        },
+      }),
       fetchedAt: iso(a.fetchedAt),
       ageMinutes: a.fetchedAt ? Math.round((now - a.fetchedAt) / 60_000) : null,
       headline: headline(a, now),

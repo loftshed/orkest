@@ -12,6 +12,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
+import { breakerRetryAt, probeDeadline, recordProbe } from "./adaptive-probes.mjs";
 import { childEnv, expandHome } from "./exec.mjs";
 import { detectConfig } from "./init.mjs";
 import { normalizeAccountTags } from "./policy.mjs";
@@ -180,12 +181,19 @@ function staleIds(config, snapshot, maxAgeMs, now) {
     .filter((a) => {
       const entry = snapshot.accounts[a.id];
       const probe = resolveAccountProbe(a, config);
+      const floor = (a.minRefreshSeconds ?? MIN_REFRESH_SECONDS[a.provider] ?? 0) * 1000;
+      if (isMatchingCachedProbe(entry, a.provider, probe)) {
+        const retryAt = breakerRetryAt(entry, now);
+        if (retryAt !== null) {
+          const age = now - entry.errorAt;
+          return now >= retryAt && (age < 0 || maxAgeMs < 0 || age >= floor);
+        }
+      }
       const expectedHome = probe.accountHome;
       const hasHomeChanged =
         (entry?.accountHome != null && entry.accountHome !== expectedHome) ||
         (a.provider === "antigravity" && hasAntigravityProbeMismatch(entry, probe));
       const lastAttempt = Math.max(entry?.fetchedAt ?? 0, entry?.errorAt ?? 0);
-      const floor = (a.minRefreshSeconds ?? MIN_REFRESH_SECONDS[a.provider] ?? 0) * 1000;
       const limit = maxAgeMs < 0 ? maxAgeMs : Math.max(maxAgeMs, floor);
       return !entry || entry.provider !== a.provider || hasHomeChanged || now - lastAttempt > limit;
     })
@@ -325,11 +333,16 @@ async function fetchAccount(account, config, previous) {
     unsetClaudeConfigDir,
   } = probe;
   const isSameHome = isMatchingCachedProbe(previous, account.provider, probe);
+  const health = isSameHome ? previous.probeHealth : null;
+  const timeoutMs = probeDeadline(account, health);
+  const startTick = performance.now();
   try {
     const data = await FETCHERS[account.provider](
-      { ...account, env: { ...config.env, ...account.env, ...envOverrides } },
+      { ...account, timeoutMs, env: { ...config.env, ...account.env, ...envOverrides } },
       { now: started },
     );
+    const now = Date.now();
+    const elapsedMs = Math.round(performance.now() - startTick);
     return {
       id: account.id,
       provider: account.provider,
@@ -344,27 +357,39 @@ async function fetchAccount(account, config, previous) {
         geminiCliHome: geminiCliHome ?? null,
       }),
       ok: true,
-      fetchedAt: Date.now(),
-      durationMs: Date.now() - started,
+      fetchedAt: now,
+      durationMs: elapsedMs,
+      probeHealth: recordProbe(health, {
+        outcome: "success",
+        elapsedMs,
+        deadlineMs: timeoutMs,
+        now,
+      }),
       ...data,
       resetHistory: observeResets(data, isSameHome ? previous : null, started),
     };
   } catch (error) {
     // Keep the last good reading ONLY when it belongs to the same verified probed home.
-    const canKeepLegacy = isSameHome;
-    const keep = canKeepLegacy ? previous : {};
+    const keep = isSameHome ? previous : {};
+    const now = Date.now();
     return {
       ...keep,
       id: account.id,
       provider: account.provider,
-      accountHome: accountHome ?? (canKeepLegacy ? (previous.accountHome ?? null) : null),
+      accountHome: accountHome ?? (isSameHome ? (previous.accountHome ?? null) : null),
       ...(account.provider === "antigravity" && {
         appDataDir: appDataDir ?? null,
         geminiCliHome: geminiCliHome ?? null,
       }),
       ok: false,
       error: error.message,
-      errorAt: Date.now(),
+      errorAt: now,
+      probeHealth: recordProbe(health, {
+        outcome: error.code === "MONITOR_PROBE_TIMEOUT" ? "timeout" : "error",
+        elapsedMs: Math.round(performance.now() - startTick),
+        deadlineMs: timeoutMs,
+        now,
+      }),
     };
   }
 }

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.97.0
+
+- feat(monitor): adapt account probe deadlines and back off repeated failures (#252)
+
+## 0.96.1
+
+- refactor: move Monitor and Orkest into a shared Node runtime (#250)
+
 ## 0.96.0
 
 - feat: provision worktrees and reconcile their pull requests (#249)

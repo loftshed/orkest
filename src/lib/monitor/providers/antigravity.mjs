@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
+import { PROBE_CEILINGS_MS } from "../adaptive-probes.mjs";
 import { childEnv, expandHome, resolveBinary, run } from "../exec.mjs";
 
 const slug = (s) =>
@@ -162,10 +163,10 @@ export function probeEnv(extra = {}, { platform = process.platform, hasLoginFile
   return { ...env, SSH_CONNECTION: LOOPBACK_SSH_CONNECTION };
 }
 
-async function runUsage(bin, account) {
+async function runUsage(bin, account, timeoutMs) {
   const { code, stdout, stderr } = await run(bin, ["-p", "/usage", "--output-format", "json"], {
     env: probeEnv(account.env ?? {}),
-    timeoutMs: account.timeoutMs ?? 60_000,
+    timeoutMs,
     maxBytes: 1024 * 1024,
     abortOnOutput: /Authentication required\.|Waiting for authentication/i,
   });
@@ -178,14 +179,17 @@ async function runUsage(bin, account) {
 
 export async function fetchAntigravity(account) {
   const bin = resolveBinary("agy", account.command);
-  let payload = await runUsage(bin, account);
+  const timeoutMs = account.timeoutMs ?? PROBE_CEILINGS_MS.antigravity;
+  const deadline = performance.now() + timeoutMs;
+  let payload = await runUsage(bin, account, timeoutMs);
   if (!payload || typeof payload !== "object") {
     throw new Error("agy /usage returned a non-object JSON payload");
   }
   // agy occasionally answers status ERROR with no detail and succeeds a moment later; retry once.
-  if (payload.status && payload.status !== "SUCCESS") {
+  if (payload.status && payload.status !== "SUCCESS" && deadline - performance.now() > 1500) {
     await sleep(1500);
-    payload = await runUsage(bin, account);
+    const remainingMs = Math.ceil(deadline - performance.now());
+    if (remainingMs > 0) payload = await runUsage(bin, account, remainingMs);
     if (!payload || typeof payload !== "object") {
       throw new Error("agy /usage returned a non-object JSON payload");
     }
