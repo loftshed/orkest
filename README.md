@@ -276,7 +276,7 @@ Optional setup:
   [terminal footer setup](plugins/orchestrate/README.md#agent-status-in-terminal-footers).
 - **Herdr:** pane labels, the swarm pane and layout restoration are covered in
   [Herdr integration](docs/herdr.md).
-- **KDE Plasma widget:** `sh plugins/monitor/linux/install.sh`.
+- **KDE Plasma widget:** `sh adapters/linux/install.sh`.
 
 ## Development
 

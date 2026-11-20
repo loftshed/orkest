@@ -29,7 +29,7 @@ By default each harness asks before an agent runs `ork` or an Orkest script. To 
 It approves these commands, and nothing else:
 
 - `ork` with one of `chief`, `cleanup`, `factory`, `foundry`, `hall`, `herdr-status`, `name`, `next`, `policy show`, `progress`, `quota`, `radar`, `rooms`, `routes`, `setup --dry-run`, `side`, `side-mission`, `smelter`, `swarm`, `telemetry`, `update`, `gate status`, or non-launching `horde` subcommands/flags (`toggle`, `open`, `close`, `spawn`, `--attach-room`, `--view`, `--chief`, `--print`, `--json`, `--fixture`); also through the `ork` link's absolute path and `node <checkout>/src/bin/ork.mjs`.
-- `python3` (or the installing interpreter) with `coordinator.py`, `agent_progress.py`, `peer_mailbox.py`, `context_handoff.py`, `continuation_requests.py`, `telemetry.py`, safe `run_agent.py` coordination/consultation subcommands and flags (excluding `probe`, `horde`, and `listen`), `authority.py show|accept|offer`, and `handoff.py status|show` at their absolute paths in `~/.agents/skills/orchestrate`, the harness's own skill link, and the checkout.
+- `python3` (or the installing interpreter) with `coordinator.py`, `agent_progress.py`, `peer_mailbox.py`, `context_handoff.py`, `continuation_requests.py`, `telemetry.py`, safe `run_agent.py` coordination/consultation subcommands and flags (excluding `probe`, `horde`, and `listen`), `authority.py show|accept|offer`, and `handoff.py status|show` at their absolute paths in the checkout's `src/py/` directory.
 
 `ork gate -- COMMAND`, `gate.py`, `ork label`, `ork policy allow|deny|reset`, `ork setup` without `--dry-run` (such as `--fast-bin` or `--trust-codex-hooks`), interactive `ork horde --engine` / `ork codex|claude|agy|opencode` launchers, `run_agent.py probe|horde|listen`, mutating `authority.py` (`appoint`, `takeover`, `withdraw`, `set-billing`), and `handoff.py enable|disable` still ask, as do generic `python3`, `node` and shell commands. Sandbox and other tool settings are untouched. `run_agent.py` still enforces `credits.allow=false` in `config.json` across all harnesses, while Claude Code (`permissions.ask`) and OpenCode (`permission.bash` trailing `"ask"` rules) also re-prompt on `--allow-credits`, `--ignore-quota`, and `--trust-codex-hooks`. Account selection, worker scopes, repository policy and deletion confirmations still apply. Dispatch does launch workers and run the verification commands it is given.
 
@@ -133,7 +133,7 @@ No adapter setup is needed for Codex; `ork label -- codex` reads the active thre
 
 ## Inspect routes, models, and health
 
-In the examples below, `<scripts>` stands for `<checkout>/src/py` (or `~/.agents/skills/orchestrate/scripts` after running `install.sh`):
+In the examples below, `<scripts>` stands for `<checkout>/src/py`:
 
 ```sh
 python3 <scripts>/run_agent.py doctor --check-messaging       # host, CLI versions, routes, skill links, and model-free MCP/hook check

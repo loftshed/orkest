@@ -6,7 +6,7 @@ It is one product with one version, not a Claude Code plugin. `install.sh` links
 
 Orkest ships one runtime. The CLI entry points live in `src/bin/`, the Node modules in `src/lib/`,
 and the Python coordinator and mailbox in `src/py/`. Both languages read the registries in
-`references/`. Harness-facing commands, skills, OpenCode statusline and macOS front ends live in
+`references/`. Harness-facing commands, skills, OpenCode statusline, Plasma widget and macOS front ends live in
 `adapters/`. Herdr and Orca discover their manifests at the checkout root.
 
 ## 1. Command & Subsystem Glossary (Orc Stronghold Vocabulary)

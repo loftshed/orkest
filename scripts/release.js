@@ -298,10 +298,12 @@ export function writeRelease(plan, root = REPO_ROOT) {
     for (const plugin of plugins) {
       // The installed monitor copy writes its own package.json from the root version; this one is kept in step.
       const manifest = `plugins/${plugin}/package.json`;
-      if (fs.existsSync(path.join(root, manifest))) {
-        setJsonVersion(path.join(root, manifest), release.version);
-        written.add(manifest);
+      if (!fs.existsSync(path.join(root, manifest))) {
+        continue;
       }
+
+      setJsonVersion(path.join(root, manifest), release.version);
+      written.add(manifest);
     }
     const skillsRoot = path.join(root, "adapters", "skills");
     const skills = fs.existsSync(skillsRoot) ? fs.readdirSync(skillsRoot) : [];

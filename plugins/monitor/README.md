@@ -138,7 +138,7 @@ The menu bar app runs the provider CLIs, and macOS charges whatever they touch t
 On KDE Plasma 6, install the panel/desktop widget after installing the CLI:
 
 ```sh
-sh plugins/monitor/linux/install.sh
+sh adapters/linux/install.sh
 ```
 
 Open **Add Widgets**, search for **Monitor**, and place it on your panel or desktop.
