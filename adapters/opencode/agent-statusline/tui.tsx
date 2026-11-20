@@ -63,11 +63,20 @@ function resolveDefaultFastBin(): string {
   return path.join(resolveCacheHome(), "bin/ork-fast");
 }
 
+function resolveScriptsDir(): string {
+  const local = path.dirname(fileURLToPath(import.meta.url));
+  const source = path.resolve(existsSync(local) ? realpathSync(local) : local, "../../../src/py");
+  if (existsSync(path.join(source, "agent_statusline_tmux.py"))) return source;
+  const skill = path.join(homedir(), ".agents/skills/orchestrate");
+  if (existsSync(skill)) {
+    const installed = path.resolve(realpathSync(skill), "../../../src/py");
+    if (existsSync(path.join(installed, "agent_statusline_tmux.py"))) return installed;
+  }
+  return source;
+}
+
 const defaultFastBin = resolveDefaultFastBin();
-const defaultScriptsDir = path.resolve(
-  path.dirname(realpathSync(fileURLToPath(import.meta.url))),
-  "../../../src/py",
-);
+const defaultScriptsDir = resolveScriptsDir();
 
 function Label(props: { sessionID?: string; plainColor: string; fastBin: string }) {
   const [item, setItem] = createSignal<Identity | null>(null);
