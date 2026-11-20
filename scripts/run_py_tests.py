@@ -7,6 +7,7 @@ import concurrent.futures
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -16,13 +17,25 @@ TESTS_DIR = Path("tests/src/py")
 def run_test_file(test_file: Path, env: dict[str, str]) -> tuple[Path, int, float, str, str]:
     print(f"[START] {test_file.name}", flush=True)
     started = time.monotonic()
-    completed = subprocess.run(
-        [sys.executable, "-B", "-m", "unittest", str(test_file)],
-        capture_output=True,
-        text=True,
-        env=env,
-        check=False,
-    )
+    with tempfile.TemporaryDirectory(prefix="ork-python-profile-") as home:
+        # Each module exercises its own fallback paths, including through real child processes.
+        profile = {
+            **env,
+            "HOME": home,
+            "XDG_CONFIG_HOME": str(Path(home, ".config")),
+            "XDG_CACHE_HOME": str(Path(home, ".cache")),
+            "XDG_STATE_HOME": str(Path(home, ".local", "state")),
+            "XDG_DATA_HOME": str(Path(home, ".local", "share")),
+        }
+        profile.pop("ORCHESTRATE_HOME", None)
+        profile.pop("AGENT_EXECUTOR_HOME", None)
+        completed = subprocess.run(
+            [sys.executable, "-B", "-m", "unittest", str(test_file)],
+            capture_output=True,
+            text=True,
+            env=profile,
+            check=False,
+        )
     elapsed = time.monotonic() - started
     return test_file, completed.returncode, elapsed, completed.stdout, completed.stderr
 

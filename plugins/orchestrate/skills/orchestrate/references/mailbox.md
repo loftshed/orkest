@@ -563,3 +563,13 @@ MCP `register` or `focus` accepts optional `model`; CLI `mailbox focus --text 'Y
 --model ACTUAL_MODEL_ID` updates it. Explicit declarations have `modelSource: declared`, hook
 observations have `modelSource: runtime`; these are metadata provenance, not provider attestation.
 Update the declaration when switching models. Missing metadata never prevents discovery or routing.
+
+## Upgrading existing peer and inbox storage
+
+A new, empty mailbox root can store peer registrations, inbox records, acknowledgements and local activity hints in the room SQLite database. Existing roots continue using their legacy records until an explicit cutover. Upgrade every harness and native hook that can access that root, then quiesce the old writers before running `run_agent.py mailbox migrate --quiesced`. A command that encounters an interrupted migration should stop. After resolving any reported conflict, repeat the migration on the same root.
+
+The migration validates record identities and retains the original directories under `mailbox-legacy-v1` on the same filesystem. The former `peers` and `inbox` paths become regular fence files. An older writer trying to create another JSON record at those paths will fail. Keep the fences in place and preserve the backup and `rooms.db` together. The backup represents the cutover instant. The database contains registrations and acknowledgements made later.
+
+Mailbox contents stay private to the mailbox root. The local changelog contains opaque entity IDs with presence or read-state changes. Shared-host replication excludes this stream.
+
+To run older mailbox clients with the current peer metadata, messages, acknowledgements and send-retry journal, stop mailbox writers and run `mailbox export --destination /absolute/new-cache/mailbox-v1`. Create the parent directory first. Export reads a single committed snapshot and requires a new destination outside the active root. After a successful export, point older clients' `ORCHESTRATE_HOME` at the new cache parent. Their writes affect their new copy. The original pre-migration records remain in `mailbox-legacy-v1`. If export reports an error, retain the incomplete destination for inspection and choose a new path before retrying.

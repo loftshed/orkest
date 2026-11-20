@@ -16,7 +16,7 @@ import path from "node:path";
 import { createInterface } from "node:readline";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import {
   collectActiveWorktreeAllowPaths,
@@ -46,6 +46,16 @@ import {
 } from "../../../src/lib/smelter.mjs";
 import { acquireWorkspaceLease } from "../../../src/lib/workspace-lease.mjs";
 import { listWorktreePorts } from "../../../src/lib/worktree-ports.mjs";
+
+// Canonical Foundry state lives in the profile's rooms database: keep every test off the real one.
+const realHome = process.env.ORCHESTRATE_HOME;
+beforeAll(() => {
+  process.env.ORCHESTRATE_HOME = mkdtempSync(path.join(tmpdir(), "orkest-state-home-"));
+});
+afterAll(() => {
+  if (realHome === undefined) delete process.env.ORCHESTRATE_HOME;
+  else process.env.ORCHESTRATE_HOME = realHome;
+});
 
 function fixture() {
   const rawRoot = mkdtempSync(path.join(tmpdir(), "orkest-state-"));
@@ -344,7 +354,7 @@ describe("strict Foundry state with retained fixtures", () => {
         if (childError) throw childError;
         if (elapsed() > budgetMs)
           throw new Error(diagnostics("concurrent reader exceeded its wall budget"));
-        const state = JSON.parse(readFileSync(f.file, "utf8"));
+        const state = readFoundryState(f.root);
         reads++;
         highestObserved = Math.max(highestObserved, state.generation);
         expect(state.payload).toBe(String(state.generation).repeat(100_000));
@@ -360,11 +370,13 @@ describe("strict Foundry state with retained fixtures", () => {
       if (code !== 0) throw new Error(diagnostics(`writer exited with code ${code}`));
       if (!hasObservedIntermediate)
         throw new Error(diagnostics("reader never saw an intermediate generation"));
-      expect(JSON.parse(readFileSync(f.file, "utf8"))).toMatchObject({
+      expect(readFoundryState(f.root)).toMatchObject({
         generation: generations,
         payload: String(generations).repeat(100_000),
       });
+      // The seeded legacy file is retained byte-for-byte and never rewritten.
       expect(readdirSync(path.dirname(f.file))).toEqual(["foundry-state.json"]);
+      expect(JSON.parse(readFileSync(f.file, "utf8")).generation).toBe(0);
     } catch (error) {
       if (signal.aborted && !/phase=/u.test(String(error?.message))) {
         error.message += `\n${diagnostics("aborted by test timeout")}`;
@@ -395,6 +407,7 @@ describe("strict Foundry state with retained fixtures", () => {
       git(f.repo, "worktree", "add", "-b", slug, worktree, "main");
       const state = writeFoundryState(worktree, { status });
       const directory = path.dirname(resolveFoundryStatePath(worktree));
+      mkdirSync(directory, { recursive: true });
       writeFileSync(
         path.join(path.dirname(directory), "orkest.json"),
         JSON.stringify({ disposable: true, slug }),
@@ -428,12 +441,16 @@ describe("strict Foundry state with retained fixtures", () => {
       "-m",
       "candidate",
     );
-    writeFoundryState(f.worktree, {
-      status: "verified",
-      attemptCount: 7,
-      allowPaths: ["tracked.txt"],
-      verification: { candidate: { commit: git(f.worktree, "rev-parse", "HEAD") } },
-    });
+    // Pre-promotion state: a legacy file is read until the first canonical write.
+    writeFileSync(
+      f.file,
+      JSON.stringify({
+        status: "verified",
+        attemptCount: 7,
+        allowPaths: ["tracked.txt"],
+        verification: { candidate: { commit: git(f.worktree, "rev-parse", "HEAD") } },
+      }),
+    );
     const beforeHead = git(f.worktree, "rev-parse", "HEAD");
     const env = { ...process.env, ORCHESTRATE_HOME: path.join(f.root, "cache") };
     const previousExitCode = process.exitCode;
@@ -633,9 +650,9 @@ describe("Foundry state pr record", () => {
   it("validates the frozen shape, keeps unknown fields and leaves old records untouched", () => {
     const f = worktreeFixture();
     const first = writeFoundryState(f.worktree, { status: "verified", custom: { keep: true } });
-    const before = readFileSync(f.file, "utf8");
     expect(first.pr).toBeUndefined();
-    expect(Object.hasOwn(JSON.parse(before), "pr")).toBe(false);
+    expect(Object.hasOwn(readFoundryState(f.worktree), "pr")).toBe(false);
+    expect(existsSync(f.file)).toBe(false); // canonical state is not duplicated into a file
 
     const withPr = writeFoundryState(f.worktree, { pr: { ...OPEN_PR, extra: "kept" } });
     expect(withPr.custom).toEqual({ keep: true });

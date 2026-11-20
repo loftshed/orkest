@@ -532,6 +532,7 @@ export function createChiefBridge({
       "content-type": "application/json",
       "content-length": String(Buffer.byteLength(body)),
       "user-agent": "ork-chief-bridge",
+      "idempotency-key": JSON.parse(body).id,
     };
     if (webhook.bearerToken) headers.authorization = `Bearer ${webhook.bearerToken}`;
     const response = await send.https({
@@ -746,6 +747,20 @@ export function getChiefBridge(env = process.env) {
   return defaults.get(key);
 }
 
+// Bind a source intent to the opted-in sink configuration. No credential enters the intent table.
+export function chiefNotificationProfile(cfg, env) {
+  return createHash("sha256")
+    .update(
+      JSON.stringify([
+        chiefBridgeConfigPath(env),
+        cfg.webhook,
+        cfg.command,
+        [...cfg.events].toSorted((a, b) => a.localeCompare(b)),
+      ]),
+    )
+    .digest("hex");
+}
+
 const HANDOFF_MS = 500;
 const WORKER_ENV_KEYS = [
   "HOME",
@@ -779,15 +794,20 @@ const LEASE_TOKEN_RE = /^[0-9a-f]{24}$/u;
  * drain lease; any other emitter just queues and returns, so concurrent CLIs never multiply workers.
  * Resolves once the events are durable and any worker has its hand-off (bounded) and never rejects.
  */
-export async function spawnChiefDelivery(events, { env = process.env, spawnFn = spawn } = {}) {
+export async function spawnChiefDelivery(
+  events,
+  { env = process.env, spawnFn = spawn, expectedProfile, onAdmitted, resumePending = false } = {},
+) {
   let store = null;
   let token = null;
   try {
     const cfg = loadChiefBridgeConfig(env);
-    if (!cfg) return false;
+    if (!cfg || (expectedProfile && chiefNotificationProfile(cfg, env) !== expectedProfile))
+      return false;
     const batch = events.map((event) => cleanEvent(event)).filter(Boolean);
     const input = JSON.stringify(batch.slice(0, BRIDGE_LIMITS.pending));
-    if (batch.length === 0 || Buffer.byteLength(input) > WORKER_INPUT_BYTES) return false;
+    if ((!resumePending && batch.length === 0) || Buffer.byteLength(input) > WORKER_INPUT_BYTES)
+      return false;
     const { openDeliveryStore, deliveryStatePath, DELIVERY_LIMITS } =
       await import("./chief-delivery.mjs");
     // The caller never waits on the optional state file beyond this one small budget.
@@ -795,15 +815,25 @@ export async function spawnChiefDelivery(events, { env = process.env, spawnFn = 
       admissionMs: DELIVERY_LIMITS.admissionMs,
     });
     const profile = store.fingerprint(cfg);
-    let isQueued = false;
+    let isQueued = resumePending && store.due(profile).length > 0;
+    const admitted = [];
     for (const event of batch.slice(0, BRIDGE_LIMITS.pending)) {
       const payload = cfg.events.has(event.event) ? buildChiefPayload(event) : null;
-      if (payload && store.enqueue(payload, profile).status === "queued") isQueued = true;
+      if (!payload) continue;
+      const { status } = store.enqueue(payload, profile);
+      if (status === "queued") isQueued = true;
+      if (status === "queued" || status === "duplicate") admitted.push(payload.id);
     }
-    if (!isQueued) return false;
+    if (!isQueued) {
+      onAdmitted?.(admitted);
+      return false;
+    }
     token = store.newToken();
     // A live holder drains what was just queued, and cannot release without seeing it.
-    if (!store.acquireLease(token, store.limits.spawnGraceMs)) return true;
+    if (!store.acquireLease(token, store.limits.spawnGraceMs)) {
+      onAdmitted?.(admitted);
+      return true;
+    }
     const workerEnv = { [LEASE_ENV]: token };
     for (const key of WORKER_ENV_KEYS) if (typeof env[key] === "string") workerEnv[key] = env[key];
     const child = spawnFn(process.execPath, [fileURLToPath(import.meta.url), "--deliver"], {
@@ -821,7 +851,8 @@ export async function spawnChiefDelivery(events, { env = process.env, spawnFn = 
     clearTimeout(timer);
     child.unref();
     child.stdin.unref?.();
-    if (!isWritten) store.abandonLease(token);
+    if (isWritten) onAdmitted?.(admitted);
+    else store.abandonLease(token);
     return isWritten;
   } catch {
     // A worker that never started must not hold the lease for its whole grace period.

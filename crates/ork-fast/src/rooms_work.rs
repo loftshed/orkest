@@ -9,6 +9,7 @@ use std::sync::OnceLock;
 use serde_json::{Map, Value, json};
 
 use crate::identity;
+use crate::mailbox_records;
 use crate::paths;
 use crate::sha256;
 use crate::sqlite;
@@ -1266,9 +1267,7 @@ fn workboard_present(
         return false;
     };
     if !presence.contains_key(session) {
-        let exact = paths::peer_path(base, session)
-            .ok()
-            .and_then(|p| paths::read_json_file(&p));
+        let exact = mailbox_records::read_peer(base, session);
         let mut alive = exact.as_ref().is_some_and(|p| {
             paths::valid_peer(p)
                 && identity::same_project(p, project)
@@ -1278,14 +1277,10 @@ fn workboard_present(
         if !alive {
             if alias_peers.is_none() {
                 let mut loaded = Vec::new();
-                if let Ok(entries) = fs::read_dir(base.join("peers")) {
-                    for entry in entries.flatten() {
-                        let p = entry.path();
-                        if p.extension().and_then(|e| e.to_str()) == Some("json")
-                            && let Some(candidate) = paths::read_json_file(&p)
-                            && paths::valid_peer(&candidate)
-                        {
-                            loaded.push(candidate);
+                if let Ok(listing) = mailbox_records::list_peers(base) {
+                    for (_, candidate) in listing.bodies() {
+                        if paths::valid_peer(candidate) {
+                            loaded.push(candidate.clone());
                         }
                     }
                 }

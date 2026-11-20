@@ -4,8 +4,9 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 
+import { foundryStateKey } from "../../../src/lib/foundry-outbox.mjs";
 import {
   createFoundryAttempt,
   foundryRun,
@@ -15,6 +16,7 @@ import {
   resolveWorktreeGitDir,
   writeFoundryState,
 } from "../../../src/lib/foundry.mjs";
+import { mailboxRoot, roomsDbPath } from "../../../src/lib/horde-room.mjs";
 import { nextCommand } from "../../../src/lib/next.mjs";
 import { smeltWorktree } from "../../../src/lib/smelter.mjs";
 import { acquireWorkspaceLease } from "../../../src/lib/workspace-lease.mjs";
@@ -32,6 +34,18 @@ function git(cwd, ...args) {
     stdio: ["ignore", "pipe", "pipe"],
   }).trim();
 }
+// Canonical Foundry state is per profile. In-process calls follow process.env while spawned `ork`
+// children follow the fixture env, so every fixture points both at its own disposable profile.
+const realHome = process.env.ORCHESTRATE_HOME;
+afterAll(() => {
+  if (realHome === undefined) delete process.env.ORCHESTRATE_HOME;
+  else process.env.ORCHESTRATE_HOME = realHome;
+});
+/** Canonical state as stable text, or null before any state exists. */
+function stateText(wt) {
+  const state = readFoundryState(wt);
+  return state ? JSON.stringify(state) : null;
+}
 function fixture() {
   const root = mkdtempSync(path.join(tmpdir(), "ork-ownership-"));
   const repo = path.join(root, "repo");
@@ -47,6 +61,7 @@ function fixture() {
     ORCHESTRATE_HOME: path.join(root, "cache"),
     AGENT_EXECUTOR_CONFIG: path.join(root, "no-config"),
   };
+  process.env.ORCHESTRATE_HOME = env.ORCHESTRATE_HOME;
   return { root, repo, env };
 }
 function worktree(f, slug, status, { commit = false, managed = true } = {}) {
@@ -68,12 +83,11 @@ function worktree(f, slug, status, { commit = false, managed = true } = {}) {
   return wt;
 }
 function snapshot(wt) {
-  const stateFile = resolveFoundryStatePath(wt);
   return {
     head: git(wt, "rev-parse", "HEAD"),
     branch: git(wt, "branch", "--show-current"),
     dirty: git(wt, "status", "--porcelain"),
-    state: existsSync(stateFile) ? readFileSync(stateFile, "utf8") : null,
+    state: stateText(wt),
   };
 }
 function start(source, args, env) {
@@ -449,7 +463,7 @@ describe("durable workspace adoption with retained real Git and process fixtures
   it("detects a changed HEAD after review and never merges or overwrites state", async () => {
     const f = fixture();
     const wt = worktree(f, "stale", "verified", { commit: true });
-    const state = readFileSync(resolveFoundryStatePath(wt), "utf8");
+    const state = stateText(wt);
     const mainHead = git(f.repo, "rev-parse", "HEAD");
     const result = await smeltWorktree(wt, {
       cwd: f.repo,
@@ -466,7 +480,7 @@ describe("durable workspace adoption with retained real Git and process fixtures
     });
     expect(result).toMatchObject({ status: "stale_candidate", ok: false });
     expect(git(f.repo, "rev-parse", "HEAD")).toBe(mainHead);
-    expect(readFileSync(resolveFoundryStatePath(wt), "utf8")).toBe(state);
+    expect(stateText(wt)).toBe(state);
   });
 
   it.each([2, 3])(
@@ -474,7 +488,7 @@ describe("durable workspace adoption with retained real Git and process fixtures
     async (handover) => {
       const f = fixture();
       const wt = worktree(f, "handover", "verified", { commit: true });
-      const state = readFileSync(resolveFoundryStatePath(wt), "utf8");
+      const state = stateText(wt);
       const mainHead = git(f.repo, "rev-parse", "HEAD");
       const writerSource = String.raw`
 import {execFileSync} from 'node:child_process';
@@ -512,7 +526,7 @@ try {
       });
       expect(result).toMatchObject({ status: "stale_candidate", ok: false });
       expect(git(f.repo, "rev-parse", "HEAD")).toBe(mainHead);
-      expect(readFileSync(resolveFoundryStatePath(wt), "utf8")).toBe(state);
+      expect(stateText(wt)).toBe(state);
       expect(git(wt, "log", "-1", "--format=%s")).toBe("handover writer");
     },
   );
@@ -662,15 +676,19 @@ function runnerStub(f, wt, scenario) {
     ...scenario,
     resultPath,
     launchSnapshot,
-    statePath: resolveFoundryStatePath(wt),
+    dbPath: roomsDbPath(mailboxRoot(f.env)),
+    stateKey: foundryStateKey(resolveFoundryStatePath(wt)),
   };
   writeFileSync(
     script,
     `
-import json, os, signal, sys
+import json, os, signal, sqlite3, sys
 from pathlib import Path
 config = json.loads(${JSON.stringify(JSON.stringify(config))})
-Path(config['launchSnapshot']).write_bytes(Path(config['statePath']).read_bytes())
+conn = sqlite3.connect(config['dbPath'])
+row = conn.execute('SELECT state FROM foundry_states WHERE key = ?', (config['stateKey'],)).fetchone()
+conn.close()
+Path(config['launchSnapshot']).write_text(row[0])
 mode = config.get('mode', 'summary')
 if mode == 'signal':
     os.kill(os.getpid(), signal.SIGTERM)
@@ -749,9 +767,7 @@ for (const flow of ["foundry", "repair"]) {
           });
           if (scenario.outcome === "busy") {
             expect(result).toMatchObject({ status: "busy" });
-            expect(readFileSync(resolveFoundryStatePath(wt))).toEqual(
-              readFileSync(stub.launchSnapshot),
-            );
+            expect(state).toEqual(launching);
             expect(process.exitCode).toBe(1);
             return;
           }

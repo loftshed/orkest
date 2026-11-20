@@ -9,8 +9,8 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use crate::{
-    identity, mailbox_lifecycle, mailbox_swarm, mailbox_transcript, paths, rooms_work, sqlite,
-    terminal,
+    identity, mailbox_lifecycle, mailbox_records, mailbox_swarm, mailbox_transcript, paths,
+    rooms_work, sqlite, terminal,
 };
 
 fn is_valid_terminal_server(s: &str) -> bool {
@@ -31,26 +31,6 @@ fn check_slash_or_side_keywords(text: &str) -> bool {
         || lower.contains("/horde")
         || lower.contains("[orkest-swarm")
         || lower.contains("/clear")
-}
-
-fn has_unread_mail(inbox_dir: &Path) -> bool {
-    if !inbox_dir.is_dir() {
-        return false;
-    }
-    let Ok(entries) = fs::read_dir(inbox_dir) else {
-        return false;
-    };
-    for entry in entries.flatten() {
-        let p = entry.path();
-        if p.extension().and_then(|ext| ext.to_str()) == Some("json")
-            && let Some(val) = paths::read_json_file(&p)
-            && paths::valid_message(&val)
-            && !val.get("readAt").is_some_and(paths::is_truthy_json)
-        {
-            return true;
-        }
-    }
-    false
 }
 
 fn extract_model_str(val: &Value) -> Option<String> {
@@ -108,26 +88,11 @@ fn payload_changes_model(payload: &Value, peer: &Value) -> bool {
     false
 }
 
-fn update_peer_locked<F>(peer_file: &Path, mutate: F) -> bool
+fn update_peer_locked<F>(base: &Path, session: &str, mutate: F) -> bool
 where
     F: FnOnce(&mut serde_json::Map<String, Value>) -> bool,
 {
-    let Ok(_guard) = paths::lock_for(peer_file) else {
-        return false;
-    };
-    let Some(mut val) = paths::read_json_file(peer_file) else {
-        return false;
-    };
-    if !paths::valid_peer(&val) {
-        return false;
-    }
-    let Some(obj) = val.as_object_mut() else {
-        return false;
-    };
-    if !mutate(obj) {
-        return false;
-    }
-    paths::write_json_atomic(peer_file, &val).is_ok()
+    mailbox_records::update_peer(base, session, mutate).is_some()
 }
 
 fn seen_colleagues_vec(peer: &Value) -> Vec<String> {
@@ -182,9 +147,7 @@ fn try_fast_path_with_probe(
             return None;
         }
     }
-    let s_key = paths::session_key(session).ok()?;
-    let peer_file = base.join("peers").join(format!("{s_key}.json"));
-    let peer = paths::read_json_file(&peer_file)?;
+    let peer = mailbox_records::read_peer(base, session)?;
     if !paths::valid_peer(&peer) || peer.get("session").and_then(Value::as_str) != Some(session) {
         return None;
     }
@@ -214,8 +177,7 @@ fn try_fast_path_with_probe(
     if daemon_mode == mailbox_lifecycle::DaemonMode::NeedsFullCheck {
         return None;
     }
-    let inbox_dir = base.join("inbox").join(&s_key);
-    if has_unread_mail(&inbox_dir) {
+    if mailbox_records::has_unread(base, session) {
         return None;
     }
     if paths::has_active_room_for_session(base, session) {
@@ -257,7 +219,7 @@ fn try_fast_path_with_probe(
         } else {
             None
         };
-        let updated = update_peer_locked(&peer_file, |obj| {
+        let updated = update_peer_locked(base, session, |obj| {
             obj.insert("state".to_string(), Value::String("idle".to_string()));
             obj.insert(
                 "lastSeenAt".to_string(),
@@ -312,7 +274,7 @@ fn try_fast_path_with_probe(
                 return None;
             }
         }
-        let updated = update_peer_locked(&peer_file, |obj| {
+        let updated = update_peer_locked(base, session, |obj| {
             if obj.get("state").and_then(Value::as_str) != Some("busy")
                 || !obj.get("lastStopReason").is_none_or(Value::is_null)
             {
@@ -373,6 +335,14 @@ pub fn run(
         _ => return Ok(()),
     };
     let base = paths::cache_home(None, None).join("mailbox-v1");
+    if mailbox_records::ensure_at_entrypoint(&base) == mailbox_records::Backend::Invalid {
+        // Never fall back to the legacy files of a root that is migrating or fenced.
+        eprintln!(
+            "orkest mailbox: the mailbox store is mid-migration or its writer fence is broken; \
+             skipping this hook until the migration finishes or the fence is repaired."
+        );
+        return Ok(());
+    }
     run_on_base(&base, harness_arg, event_arg, &payload, &mut io::stdout())
 }
 
@@ -488,9 +458,7 @@ fn run_on_base(
             {
                 return Ok(());
             }
-            let parent_to_refresh = paths::peer_path(&base, &session)
-                .ok()
-                .and_then(|p| paths::read_json_file(&p))
+            let parent_to_refresh = mailbox_records::read_peer(&base, &session)
                 .filter(|p| p.get("isSubagent").is_some_and(paths::is_truthy_json))
                 .and_then(|p| {
                     p.get("parentSession")
@@ -591,9 +559,7 @@ fn run_on_base(
         }
     }
 
-    let previous = paths::peer_path(&base, &session)
-        .ok()
-        .and_then(|p| paths::read_json_file(&p));
+    let previous = mailbox_records::read_peer(&base, &session);
     let previous_valid = previous.as_ref().is_some_and(paths::valid_peer);
     let has_transcript = transcript_file.is_some();
 
@@ -849,16 +815,16 @@ fn run_on_base(
             || me.get("parentSession").is_some()
             || me.get("subagentSource").is_some()
             || me.get("parentSessionSource").is_some())
-        && let Ok(pp) = paths::peer_path(&base, &session)
+        && paths::session_key(&session).is_ok()
     {
-        update_peer_locked(&pp, |obj| {
+        update_peer_locked(&base, &session, |obj| {
             let removed_sub = obj.remove("isSubagent").is_some();
             let removed_parent = obj.remove("parentSession").is_some();
             let removed_source = obj.remove("subagentSource").is_some();
             let removed_parent_source = obj.remove("parentSessionSource").is_some();
             removed_sub || removed_parent || removed_source || removed_parent_source
         });
-        if let Some(reloaded) = paths::read_json_file(&pp) {
+        if let Some(reloaded) = mailbox_records::read_peer(&base, &session) {
             me = reloaded;
         }
     }
@@ -1068,9 +1034,7 @@ fn run_on_base(
         && !suppress_toplevel
     {
         cleared_notice = mailbox_lifecycle::adopt_cleared(&base, &mut me);
-        if let Ok(pp) = paths::peer_path(&base, &session)
-            && let Some(reloaded) = paths::read_json_file(&pp)
-        {
+        if let Some(reloaded) = mailbox_records::read_peer(&base, &session) {
             me = reloaded;
         }
     } else if matches!(
@@ -1247,9 +1211,7 @@ fn run_on_base(
             me.get("accountHome").and_then(Value::as_str),
         )
     {
-        let existing_mail = paths::inbox_dir(&base, &session)
-            .ok()
-            .and_then(|d| paths::read_json_file(&d.join(format!("{notice_id}.json"))));
+        let existing_mail = mailbox_records::read_message(&base, &session, &notice_id);
         if let Some(read_at) = existing_mail
             .as_ref()
             .and_then(|m| m.get("readAt"))
@@ -1890,7 +1852,7 @@ mod tests {
         assert!(out_stop.is_empty());
 
         // 3. Mid-turn busy PreInvocation takes fast path when announcedName matches name.
-        update_peer_locked(&pp, |obj| {
+        update_peer_locked(&base, "solo-ann-1", |obj| {
             obj.insert("state".to_string(), json!("busy"));
             true
         });
@@ -1908,7 +1870,7 @@ mod tests {
         );
 
         // 4. If name != announcedName (e.g., stale announcedName or model rename), fast path yields and full path re-announces.
-        update_peer_locked(&pp, |obj| {
+        update_peer_locked(&base, "solo-ann-1", |obj| {
             obj.insert("announcedName".to_string(), json!("codex-stale-martian"));
             true
         });
@@ -2130,7 +2092,7 @@ mod tests {
         assert!(after_clear.get("awaitingClear").is_none_or(Value::is_null));
 
         // Fast path must refuse while pendingChiefTransfer is set so Stop/PreInvocation also retry.
-        update_peer_locked(&succ_pp, |obj| {
+        update_peer_locked(&base, "chief-succ", |obj| {
             obj.insert("state".to_string(), json!("idle"));
             true
         });

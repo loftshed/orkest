@@ -1053,5 +1053,515 @@ class AntigravityOrchestratorHookTests(unittest.TestCase):
         self.assertEqual(mailbox.load(mailbox.peer_path(self.base, "sess-b"))["focus"], other_focus)
 
 
+class MailboxRecordsCutoverTests(unittest.TestCase):
+    """Exercise peer and inbox records through a logging proxy to the actual Node bridge."""
+
+    def setUp(self) -> None:
+        import mailbox_records
+
+        self.records = mailbox_records
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.base = self.root / "mailbox-v1"
+        self.cwd = str(self.root / "project")
+        subprocess.run(["git", "init", "-q", self.cwd], check=True)
+        self.log = self.root / "bridge.log"
+        real = os.environ.get("MAILBOX_RECORDS_TEST_BRIDGE") or str(mailbox_records._bridge())
+        self.assertTrue(Path(real).is_file(), real)
+        self.env = {
+            "ORKEST_MAILBOX_RECORDS_NODE": sys.executable,
+            "ORKEST_MAILBOX_RECORDS_BRIDGE": str(TESTS / "mailbox_records_fake_bridge.py"),
+            "FAKE_BRIDGE_LOG": str(self.log),
+            "FAKE_BRIDGE_REAL": real,
+            "FAKE_BRIDGE_NODE": room_store._node_binary(),
+        }
+        environment = patch.dict(os.environ, self.env)
+        environment.start()
+        self.addCleanup(environment.stop)
+        self.sender_session = "00000000-0000-0000-0000-0000000000a1"
+        self.target_session = "00000000-0000-0000-0000-0000000000b2"
+
+    def calls(self) -> list[dict]:
+        if not self.log.exists():
+            return []
+        return [json.loads(line) for line in self.log.read_text().splitlines()]
+
+    def activate(self) -> None:
+        self.assertTrue(self.records.ensure(self.base))
+        self.assertTrue(self.records.active(self.base))
+
+    def pair(self) -> tuple[dict, dict]:
+        sender = mailbox.register(
+            self.base, session=self.sender_session, harness="codex", cwd=self.cwd, pid=os.getpid()
+        )
+        target = mailbox.register(
+            self.base, session=self.target_session, harness="opencode", cwd=self.cwd, pid=os.getpid()
+        )
+        return sender, target
+
+    def probe(self, code: str, *args: str, extra: dict | None = None) -> object:
+        """Run `code` in a fresh interpreter that shares nothing in memory with this test."""
+        prelude = (
+            "import sys, json; sys.path.insert(0, sys.argv[1]); import peer_mailbox as m; from pathlib import Path;"
+        )
+        fresh = subprocess.run(
+            [sys.executable, "-c", prelude + code, str(SCRIPTS), str(self.base), *args],
+            capture_output=True,
+            text=True,
+            env={**os.environ, **(extra or {})},
+            timeout=60,
+            check=False,
+        )
+        self.assertEqual(fresh.returncode, 0, fresh.stderr)
+        return json.loads(fresh.stdout)
+
+    def cli(self, *args: str) -> subprocess.CompletedProcess:
+        home = self.root / "home"
+        env = {
+            **{key: value for key, value in os.environ.items() if key in {"PATH", "LANG", "TMPDIR"}},
+            **self.env,
+            "HOME": str(home),
+            "ORCHESTRATE_HOME": str(home / "cache"),
+            "XDG_CACHE_HOME": str(home / ".cache"),
+            "XDG_CONFIG_HOME": str(home / ".config"),
+        }
+        return subprocess.run(
+            [sys.executable, str(SCRIPTS / "peer_mailbox.py"), *args],
+            capture_output=True,
+            text=True,
+            cwd=self.cwd,
+            env=env,
+            timeout=60,
+            check=False,
+        )
+
+    def test_legacy_root_keeps_files_and_never_starts_the_bridge(self) -> None:
+        sender, target = self.pair()
+        self.assertFalse(self.records.ensure(self.base))
+        mailbox.send(self.base, sender=sender, to=target["session"], text="legacy hello")
+        self.assertEqual(self.records.state(self.base), "legacy")
+        self.assertEqual(len(list(self.base.glob("inbox/*/*.json"))), 1)
+        self.assertTrue((self.base / "peers").is_dir())
+        self.assertEqual(self.calls(), [])
+        self.assertIsNone(self.records.fingerprint(self.base))
+
+    def test_nonempty_root_without_records_is_not_claimed(self) -> None:
+        self.base.mkdir()
+        (self.base / "locks").mkdir()
+        self.assertFalse(self.records.ensure(self.base))
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(self.records.state(self.base), "legacy")
+
+    def test_ensure_commits_an_empty_root_and_records_replace_files(self) -> None:
+        self.activate()
+        self.assertEqual([call["operation"] for call in self.calls()], ["ensure"])
+        for name in ("peers", "inbox", self.records.MARKER):
+            self.assertEqual((self.base / name).read_bytes(), self.records.FENCE)
+        sender, target = self.pair()
+        before = self.records.fingerprint(self.base)
+        sent = mailbox.send(self.base, sender=sender, to=target["session"], text="hello records")
+        self.assertNotEqual(self.records.fingerprint(self.base), before)
+        self.assertTrue((self.base / "peers").is_file() and (self.base / "inbox").is_file())
+        owner = mailbox.session_key(self.target_session)
+        self.assertEqual(self.records.get(self.base, "inbox", owner, sent["id"])["text"], "hello records")
+        self.assertEqual(
+            {peer["session"] for peer in mailbox.peers(self.base)}, {self.sender_session, self.target_session}
+        )
+        locks = {lock.relative_to(self.base).as_posix() for lock, _ in self.records.lock_files(self.base)}
+        self.assertIn(f"mailbox-locks/peer/{mailbox.session_key(self.sender_session)}.lock", locks)
+        puts = [call["request"] for call in self.calls() if call["operation"] == "put"]
+        self.assertTrue(puts and all(not request["key"].endswith(".json") for request in puts))
+        self.assertIn(
+            ("peer", "", mailbox.session_key(self.sender_session)),
+            {(request["collection"], request["owner"], request["key"]) for request in puts},
+        )
+
+    def test_python_and_native_hook_lock_the_same_peer_inode(self) -> None:
+        self.activate()
+        session = self.target_session
+        run_mailbox_hook(
+            {"hook_event_name": "SessionStart", "session_id": session, "cwd": self.cwd},
+            harness="claude",
+            base=self.base,
+            env={"PATH": os.environ["PATH"], "HOME": str(self.root)},
+        )
+        peer_path = mailbox.peer_path(self.base, session)
+        lock_path = self.records.lock_path(self.records.locate(peer_path))
+        before = lock_path.stat()
+        with mailbox.locked(peer_path):
+            self.assertTrue(os.path.samestat(before, lock_path.stat()))
+            self.assertEqual(mailbox.load(peer_path)["session"], session)
+
+    def test_native_delivery_ack_is_private_atomic_and_consumed_once_across_restarts(self) -> None:
+        import hashlib
+        import sqlite3
+        from concurrent.futures import ThreadPoolExecutor
+
+        self.activate()
+        session = self.target_session
+        env = {
+            "HOME": str(self.root),
+            "PATH": os.environ["PATH"],
+            "ORKEST_PRESENCE_SCOPE": "room:presence",
+            "ORKEST_NODE_BIN": str(self.root / "absent-node"),
+        }
+
+        def hook(event):
+            return run_mailbox_hook(
+                {"session_id": session, "hook_event_name": event, "cwd": self.cwd, "prompt": "task"},
+                harness="claude",
+                base=self.base,
+                cwd=self.cwd,
+                env=env,
+            )
+
+        # The activated store permits native first registration and metadata updates without Node.
+        hook("SessionStart")
+        sender = mailbox.register(
+            self.base, session=self.sender_session, harness="codex", cwd=self.cwd, pid=os.getpid()
+        )
+        sent = mailbox.send(self.base, sender=sender, to=session, text="private race receipt")
+        other = mailbox.send(self.base, sender=sender, to=session, text="other private note")
+        mid = sent["id"]
+        entity = hashlib.sha256(json.dumps(["inbox", session, mid], separators=(",", ":")).encode()).hexdigest()
+        with contextlib.closing(sqlite3.connect(self.base / "rooms.db", isolation_level=None)) as db:
+
+            def events():
+                return db.execute(
+                    "SELECT scope,kind,seq,id,body FROM outbox_events WHERE entity=? ORDER BY cursor", (entity,)
+                ).fetchall()
+
+            before = events()
+            self.assertEqual(len(before), 1)
+            db.execute("CREATE TABLE reject_test_entity(entity TEXT)")
+            db.execute("INSERT INTO reject_test_entity VALUES (?)", (entity,))
+            db.execute(
+                "CREATE TRIGGER reject_ack BEFORE UPDATE ON outbox_views WHEN NEW.entity IN (SELECT entity FROM reject_test_entity) BEGIN SELECT RAISE(ABORT,'test_failure'); END"
+            )
+            notice = json.dumps(hook("UserPromptSubmit"))
+            self.assertNotIn("private race receipt", notice)
+            self.assertIn("other private note", notice)
+            self.assertTrue(self.records.get(self.base, "inbox", session, other["id"])["readAt"])
+            self.assertFalse(self.records.get(self.base, "inbox", session, mid)["readAt"])
+            self.assertEqual(events(), before)
+            db.execute("DROP TRIGGER reject_ack")
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                notes = list(pool.map(hook, ["UserPromptSubmit"] * 3))
+            self.assertEqual(sum("private race receipt" in json.dumps(note) for note in notes), 1)
+            self.assertNotIn("private race receipt", json.dumps(hook("UserPromptSubmit")))
+            rows = events()
+            self.assertEqual(
+                [(s, k, json.loads(b)) for s, k, _, _, b in rows],
+                [
+                    ("mailbox-local", "mailbox.inbox", {"state": "unread"}),
+                    ("mailbox-local", "mailbox.inbox", {"state": "read"}),
+                ],
+            )
+            self.assertEqual(len({r[3] for r in rows}), 2)
+            self.assertGreater(rows[1][2], rows[0][2])
+            self.assertEqual(
+                db.execute("SELECT seq,body FROM outbox_views WHERE entity=?", (entity,)).fetchone(),
+                (rows[1][2], rows[1][4]),
+            )
+            self.assertTrue(self.records.get(self.base, "inbox", session, mid)["readAt"])
+
+    def test_native_heartbeat_projects_at_one_cursor_and_rolls_back_on_projection_failure(self) -> None:
+        import hashlib
+        import sqlite3
+
+        self.activate()
+        session = self.target_session
+        env = {"HOME": str(self.root), "PATH": os.environ["PATH"], "ORKEST_PRESENCE_SCOPE": "room:heartbeat"}
+        prompt = {"hook_event_name": "UserPromptSubmit", "session_id": session, "cwd": self.cwd, "prompt": "hello"}
+
+        def invoke():
+            run_mailbox_hook(prompt, harness="claude", base=self.base, cwd=self.cwd, env=env)
+
+        invoke()
+        invoke()
+        # Later calls must update a real heartbeat without a usable Node bridge.
+        env["ORKEST_NODE_BIN"] = str(self.root / "absent-node")
+        entity = hashlib.sha256(json.dumps(["peer", "", session], separators=(",", ":")).encode()).hexdigest()
+        with contextlib.closing(sqlite3.connect(self.base / "rooms.db", isolation_level=None)) as db:
+            db.create_function("orkest_digest", 1, lambda value: hashlib.sha256(value.encode()).hexdigest())
+
+            def age():
+                db.execute(
+                    "UPDATE mailbox_records SET body=json_set(body,'$.lastSeenAt','2000-01-01T00:00:00Z') WHERE key=?",
+                    (session,),
+                )
+
+            def cursor():
+                return db.execute("SELECT MAX(cursor) FROM outbox_events").fetchone()[0]
+
+            age()
+            start = cursor()
+            invoke()
+            rows = db.execute(
+                "SELECT scope,kind,entity,seq,body FROM outbox_events WHERE cursor>? ORDER BY cursor", (start,)
+            ).fetchall()
+            self.assertEqual(
+                [(s, k, e) for s, k, e, _, _ in rows],
+                [("mailbox-local", "mailbox.peer", entity), ("room:heartbeat", "peer.presence", entity)],
+            )
+            for scope, kind, _, seq, body in rows:
+                self.assertEqual(
+                    db.execute(
+                        "SELECT seq,body FROM outbox_views WHERE scope=? AND kind=? AND entity=?", (scope, kind, entity)
+                    ).fetchone(),
+                    (seq, body),
+                )
+            self.assertGreater(json.loads(rows[-1][-1])["observedAt"], 946684800000)
+            age()
+            before = db.execute("SELECT body,updated_ms FROM mailbox_records WHERE key=?", (session,)).fetchone()
+            last = cursor()
+            db.execute(
+                "CREATE TRIGGER reject_sample BEFORE UPDATE ON outbox_views WHEN NEW.kind='peer.presence' BEGIN SELECT RAISE(ABORT,'test_failure'); END"
+            )
+            invoke()
+            self.assertEqual(cursor(), last)
+            self.assertEqual(
+                db.execute("SELECT body,updated_ms FROM mailbox_records WHERE key=?", (session,)).fetchone(), before
+            )
+
+    def test_public_focus_send_inbox_and_ack_on_a_fresh_root(self) -> None:
+        self.activate()
+        sender, target = self.pair()
+        focused = mailbox.set_focus(self.base, self.sender_session, "records demo")
+        self.assertEqual(focused["focus"], "records demo")
+        sent = mailbox.send(self.base, sender=sender, to=target["session"], text="please ack")
+        page, more = mailbox.message_page(self.base, self.target_session)
+        self.assertEqual(([message["id"] for message in page], more), ([sent["id"]], False))
+        self.assertEqual(mailbox.mark_read(self.base, self.target_session, [sent["id"]]), [sent["id"]])
+        self.assertEqual(mailbox.incoming(self.base, self.target_session), [])
+
+    def test_acknowledgement_is_durable_for_a_fresh_process(self) -> None:
+        self.activate()
+        sender, target = self.pair()
+        sent = mailbox.send(self.base, sender=sender, to=target["session"], text="ack me")
+        taken = mailbox.take(self.base, self.target_session)
+        self.assertEqual([message["id"] for message in taken], [sent["id"]])
+        stored = self.records.get(self.base, "inbox", mailbox.session_key(self.target_session), sent["id"])
+        self.assertTrue(stored["readAt"])
+        # A replayed original send never makes the acknowledged message unread again.
+        mailbox.write(
+            mailbox.inbox_dir(self.base, self.target_session) / f"{sent['id']}.json", {**stored, "readAt": None}
+        )
+        code = "print(json.dumps([x['id'] for x in m.messages(Path(sys.argv[2]), sys.argv[3])]))"
+        for forced in ("0", "1"):
+            unread = self.probe(code, self.target_session, extra={"ORKEST_ROOM_STORE_BRIDGE": forced})
+            self.assertEqual(unread, [])
+
+    def test_one_shot_hint_flags_persist_across_processes(self) -> None:
+        self.activate()
+        _, target = self.pair()
+        mailbox.annotate(self.base, target["session"], feedbackRequested=True, joinHintShown=True)
+        code = (
+            "p = m.load(m.peer_path(Path(sys.argv[2]), sys.argv[3]));"
+            "print(json.dumps([p.get('feedbackRequested'), p.get('joinHintShown')]))"
+        )
+        self.assertEqual(self.probe(code, self.target_session), [True, True])
+        self.assertEqual(mailbox.feedback_request(self.base, target), "")
+
+    def test_active_root_fails_closed_instead_of_using_legacy_files(self) -> None:
+        self.activate()
+        _, target = self.pair()
+        path = mailbox.peer_path(self.base, target["session"])
+        with (
+            patch.dict(os.environ, {"FAKE_BRIDGE_FAIL": "all", "ORKEST_ROOM_STORE_BRIDGE": "1"}),
+            self.assertRaises(self.records.RecordsUnavailable),
+        ):
+            mailbox.load(path)
+        with (
+            patch.dict(os.environ, {"FAKE_BRIDGE_FAIL": "put"}),
+            self.assertRaises(self.records.RecordsUnavailable),
+        ):
+            mailbox.annotate(self.base, target["session"], focus="x")
+        # A legacy writer that recreates its directory breaks the fence: surfaced, never read.
+        (self.base / "peers").unlink()
+        (self.base / "peers").mkdir()
+        (self.base / "peers" / path.name).write_text(json.dumps(target))
+        self.assertEqual(self.records.state(self.base), "broken")
+        self.assertFalse(self.records.ensure(self.base))
+        with self.assertRaisesRegex(self.records.RecordsUnavailable, "fence is broken"):
+            mailbox.load(path)
+        with self.assertRaises(self.records.RecordsUnavailable):
+            mailbox.peers(self.base)
+
+    def test_pending_migration_fails_closed(self) -> None:
+        self.base.mkdir()
+        (self.base / self.records.PENDING).write_bytes(self.records.FENCE)
+        self.assertEqual(self.records.state(self.base), "pending")
+        path = mailbox.peer_path(self.base, self.sender_session)
+        with self.assertRaisesRegex(self.records.RecordsUnavailable, "pending"):
+            mailbox.load(path)
+        with self.assertRaisesRegex(self.records.RecordsUnavailable, "pending"):
+            mailbox.register(self.base, session=self.sender_session, harness="codex", cwd=self.cwd)
+        self.assertFalse((self.base / "peers").exists())
+        self.assertFalse(self.records.ensure(self.base))
+
+    def test_direct_and_bridge_reads_agree(self) -> None:
+        self.activate()
+        sender, target = self.pair()
+        first = mailbox.send(self.base, sender=sender, to=target["session"], text="one")
+        second = mailbox.send(self.base, sender=sender, to=target["session"], text="two")
+        direct = mailbox.messages(self.base, self.target_session)
+        everywhere = mailbox.all_message_entries(self.base)
+        self.log.unlink()
+        with patch.dict(os.environ, {"ORKEST_ROOM_STORE_BRIDGE": "1"}):
+            bridged = mailbox.messages(self.base, self.target_session)
+            peers = mailbox.peers(self.base, prune_dead=False)
+            bridged_everywhere = mailbox.all_message_entries(self.base)
+        self.assertEqual(direct, bridged)
+        self.assertEqual(everywhere, bridged_everywhere)
+        self.assertEqual([message["id"] for message in direct], [first["id"], second["id"]])
+        self.assertEqual(len(peers), 2)
+        self.assertTrue({"list", "owners"} <= {call["operation"] for call in self.calls()})
+
+    def test_wait_read_cache_skips_acknowledged_rows_and_sees_new_mail(self) -> None:
+        self.activate()
+        sender, target = self.pair()
+        old = mailbox.send(self.base, sender=sender, to=target["session"], text="old")
+        mailbox.mark_read(self.base, self.target_session, [old["id"]])
+        cache: dict = {}
+        self.assertEqual(list(mailbox.iter_messages(self.base, self.target_session, read_cache=cache)), [])
+        self.assertEqual(len(cache), 1)
+        new = mailbox.send(self.base, sender=sender, to=target["session"], text="new")
+        found = list(mailbox.iter_messages(self.base, self.target_session, read_cache=cache))
+        self.assertEqual([message["id"] for message in found], [new["id"]])
+        result = mailbox.wait(self.base, self.target_session, timeout=1, poll=0.05)
+        self.assertEqual([message["id"] for message in result["messages"]], [new["id"]])
+
+    def test_idle_wait_skips_rereads_while_the_store_is_unchanged(self) -> None:
+        self.activate()
+        sender, target = self.pair()
+        reads = []
+        original = mailbox.iter_incoming
+
+        def counting(*args, **kwargs):
+            reads.append(1)
+            return original(*args, **kwargs)
+
+        with (
+            patch.object(mailbox, "iter_incoming", counting),
+            patch.object(self.records, "racy", return_value=False),
+        ):
+            result = mailbox.wait(self.base, self.target_session, timeout=0.3, poll=0.02)
+        self.assertEqual(result["status"], "timed_out")
+        self.assertEqual(len(reads), 1)
+        sent = mailbox.send(self.base, sender=sender, to=target["session"], text="wake up")
+        ticks = iter([False, False, True])
+        with patch.object(self.records, "racy", side_effect=lambda token: next(ticks, False)):
+            found = mailbox.wait(self.base, self.target_session, timeout=2, poll=0.02)
+        self.assertEqual([message["id"] for message in found["messages"]], [sent["id"]])
+
+    def test_reply_lookup_and_receipts_span_every_inbox(self) -> None:
+        self.activate()
+        sender, target = self.pair()
+        question = mailbox.send(self.base, sender=sender, to=target["session"], text="question?")
+        status = mailbox.reply_target_status(self.base, self.sender_session, question["id"])
+        self.assertEqual(status["session"], self.target_session)
+        self.assertFalse(status["messageRead"])
+        mailbox.send(self.base, sender=target, to=sender["session"], text="answer", reply_to=question["id"])
+        self.assertEqual(mailbox.replied_to(self.base, self.target_session), {question["id"]})
+        mailbox.take(self.base, self.target_session)
+        self.assertTrue(mailbox.reply_target_status(self.base, self.sender_session, question["id"])["messageRead"])
+
+    def test_prune_and_unregister_delete_rows(self) -> None:
+        self.activate()
+        sender, target = self.pair()
+        sent = mailbox.send(self.base, sender=sender, to=target["session"], text="expiring")
+        owner = mailbox.session_key(self.target_session)
+        old = self.records.get(self.base, "inbox", owner, sent["id"])
+        old["sentAt"] = mailbox.stamp(mailbox.now() - mailbox.MAX_AGE - mailbox.dt.timedelta(hours=1))
+        self.assertTrue(self.records.delete(self.base, "inbox", owner, sent["id"]))
+        self.records.put(self.base, "inbox", owner, sent["id"], old)
+        removed = mailbox.prune(self.base)
+        self.assertEqual(removed["messages"], 1)
+        self.assertIsNone(self.records.get(self.base, "inbox", owner, sent["id"]))
+        mailbox.unregister(self.base, self.sender_session)
+        self.assertIsNone(self.records.get(self.base, "peer", "", mailbox.session_key(self.sender_session)))
+        self.assertFalse(mailbox.record_exists(mailbox.peer_path(self.base, self.sender_session)))
+        self.assertEqual((self.base / "peers").read_bytes(), self.records.FENCE)
+
+    def test_status_snapshot_lists_record_peers(self) -> None:
+        import mailbox_status
+
+        self.activate()
+        sender, _ = self.pair()
+        snapshot = mailbox_status.snapshot(self.base, sender)
+        self.assertEqual({row["session"] for row in snapshot["agents"]}, {self.sender_session, self.target_session})
+
+    def test_migrate_requires_quiesced_and_sends_the_bridge_signature(self) -> None:
+        sender, target = self.pair()
+        mailbox.send(self.base, sender=sender, to=target["session"], text="carry me")
+        with (
+            patch.object(mailbox, "root", return_value=self.base),
+            patch("sys.stdout", new_callable=io.StringIO) as out,
+            patch("sys.stderr", new_callable=io.StringIO) as err,
+        ):
+            self.assertEqual(mailbox.main(["migrate"]), 2)
+            self.assertIn("--quiesced", err.getvalue())
+            self.assertEqual(self.calls(), [])
+            with patch("mailbox_daemon.owned_state", return_value={"pid": 1}):
+                self.assertEqual(mailbox.main(["migrate", "--quiesced"]), 4)
+            self.assertEqual(self.calls(), [])
+            with patch("mailbox_daemon.owned_state", return_value=None):
+                self.assertEqual(mailbox.main(["migrate", "--quiesced", "--format", "json"]), 0)
+        self.assertEqual(self.calls(), [{"operation": "migrate", "request": {"quiesced": True}}])
+        report = json.loads(out.getvalue())
+        self.assertIs(report["active"], True)
+        self.assertTrue(Path(report["backup"]).joinpath("inbox").is_dir())
+        self.assertEqual(self.records.state(self.base), "active")
+        texts = [message["text"] for message in mailbox.messages(self.base, self.target_session)]
+        self.assertEqual(texts, ["carry me"])
+        self.assertEqual(
+            {peer["session"] for peer in mailbox.peers(self.base)}, {self.sender_session, self.target_session}
+        )
+
+    def test_export_is_read_only_and_never_ensures(self) -> None:
+        self.activate()
+        sender, target = self.pair()
+        request = {
+            "sender": sender,
+            "to": target["session"],
+            "text": "durable",
+            "wake": False,
+            "idempotency_key": "key",
+        }
+        delivered = mailbox.send(self.base, **request)
+        before_calls = len(self.calls())
+        destination = self.root / "new-root"
+        with (
+            patch.object(mailbox, "root", return_value=self.base),
+            patch("sys.stdout", new_callable=io.StringIO) as out,
+            patch("sys.stderr", new_callable=io.StringIO) as err,
+        ):
+            self.assertEqual(mailbox.main(["export", "--destination", "relative/root"]), 2)
+            self.assertIn("absolute", err.getvalue())
+            self.assertEqual(mailbox.main(["export", "--destination", str(destination), "--format", "json"]), 0)
+        self.assertEqual(
+            self.calls()[before_calls:], [{"operation": "export", "request": {"destination": str(destination)}}]
+        )
+        self.assertEqual(json.loads(out.getvalue())["peers"], 2)
+        self.assertTrue((destination / "peers" / (mailbox.session_key(self.target_session) + ".json")).is_file())
+        self.assertEqual(self.records.state(self.base), "active")
+        replay = mailbox.send(destination, **request)
+        self.assertEqual(replay["id"], delivered["id"])
+        self.assertEqual(len(mailbox.messages(destination, target["session"], unread_only=False)), 1)
+
+    def test_cli_entry_ensures_new_roots_only(self) -> None:
+        result = self.cli("peers", "--session", self.sender_session, "--harness", "codex", "--format", "json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        base = self.root / "home" / "cache" / "mailbox-v1"
+        self.assertEqual(self.records.state(base), "active")
+        self.assertEqual(self.calls()[0]["operation"], "ensure")
+        self.assertTrue((base / "peers").is_file())
+        sent = self.cli("focus", "--session", self.sender_session, "--harness", "codex", "--text", "demo")
+        self.assertEqual(sent.returncode, 0, sent.stderr)
+        self.assertEqual(self.records.get(base, "peer", "", mailbox.session_key(self.sender_session))["focus"], "demo")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -31,6 +31,7 @@ if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
 import mailbox_cli  # noqa: E402
+import mailbox_records  # noqa: E402
 import room_store  # noqa: E402
 from mailbox_cli import (  # noqa: E402, F401
     build_parser,
@@ -80,6 +81,7 @@ from mailbox_store import (  # noqa: E402, F401
     account_label,
     account_route,
     acquire_lock,
+    all_message_entries,
     base_dir,
     check_deadline,
     check_scope,
@@ -99,6 +101,7 @@ from mailbox_store import (  # noqa: E402, F401
     legacy_session_keys,
     load,
     locked,
+    message_entries,
     message_id,
     migrate_legacy_session,
     model_fields,
@@ -109,15 +112,22 @@ from mailbox_store import (  # noqa: E402, F401
     other_account,
     owns,
     parse_stamp,
+    peer_entries,
+    peer_files,
     peer_name,
     peer_path,
+    peers_present,
     pick_martian,
     pid_alive,
     process_started,
     project,
     readable_name,
+    record_exists,
+    record_mtime,
+    record_state,
     register_facade,
     remote_identity,
+    remove_record,
     repository_name,
     root,
     run_deadline,
@@ -294,10 +304,9 @@ def run_closed_at(base: Path, run: str) -> dt.datetime | None:
     deadline = run_deadline(peer)
     if deadline is None:
         # Retention runs from the last write, not from a made-up deadline in the past.
-        stamps = []
-        for item in found.values():
-            with contextlib.suppress(OSError):
-                stamps.append(peer_path(base, item["session"]).stat().st_mtime)
+        stamps = [
+            stamp_ for item in found.values() if (stamp_ := record_mtime(peer_path(base, item["session"]))) is not None
+        ]
         return dt.datetime.fromtimestamp(max(stamps), dt.UTC) if stamps else now()
     return deadline if now() >= deadline else None
 
@@ -726,8 +735,8 @@ def co_hosted(base: Path, peer: dict[str, Any]) -> list[dict[str, Any]]:
         return []
     return [
         other
-        for path in (base / "peers").glob("*.json")
-        if valid_peer(other := load(path))
+        for path, other in peer_entries(base)
+        if valid_peer(other)
         and other["session"] != peer["session"]
         and not is_run_peer(other)
         and other.get("pid") == pid
@@ -814,7 +823,7 @@ def drop_if_dead(path: Path, moment: dt.datetime) -> bool:
             return False
         if valid_peer(peer):
             mailbox_presence.record(path.parent.parent, peer)
-        path.unlink(missing_ok=True)
+        remove_record(path)
     mailbox_presence.deliver(path.parent.parent)
     return True
 
@@ -826,24 +835,23 @@ def unregister(base: Path, session: str, *, lock_held: bool = False) -> None:
     """
     path = peer_path(base, session)
     if lock_held:
-        path.unlink(missing_ok=True)
+        remove_record(path)
         return
     with locked(path):
-        path.unlink(missing_ok=True)
+        remove_record(path)
 
 
 def peers(base: Path, *, prune_dead: bool = True, include_runs: bool = False) -> list[dict[str, Any]]:
     found = []
     moment = now()
-    for path in sorted((base / "peers").glob("*.json")):
-        peer = load(path)
+    for path, peer in peer_entries(base):
         if not peer or peer.get("schema") != PEER_SCHEMA:
             continue
         try:
             canonical = peer_path(base, str(peer.get("session")))
         except MailboxError:
             continue
-        if canonical != path and canonical.exists():
+        if canonical != path and record_exists(canonical):
             continue  # a pre-%3A record of a session that has registered again
         if is_run_peer(peer):
             if include_runs and is_run_record(peer):
@@ -868,8 +876,8 @@ def taken_persons(base: Path, session: str) -> set[str]:
     moment = now()
     return {
         peer["person"]
-        for path in (base / "peers").glob("*.json")
-        if valid_peer(peer := load(path))
+        for _, peer in peer_entries(base)
+        if valid_peer(peer)
         and peer["session"] != session
         and isinstance(peer.get("person"), str)
         and is_live(peer, moment)
@@ -897,8 +905,8 @@ def resolve(base: Path, address: str, *, sender: dict[str, Any], scope: str = "p
     moment = now()
     ended = [
         peer
-        for path in (base / "peers").glob("*.json")
-        if valid_peer(peer := load(path))
+        for _, peer in peer_entries(base)
+        if valid_peer(peer)
         and not is_run_peer(peer)
         and not is_live(peer, moment)
         and (scope == "cross-project" or peer["session"] == sender.get("session") or same_project(sender, peer))
@@ -1252,7 +1260,7 @@ def send(
             write(operation, entry)
         path = inbox_dir(base, target["session"]) / f"{message['id']}.json"
         stored = load(path)
-        if path.exists():
+        if stored is not None or record_exists(path):
             if not valid_message(stored) or any(
                 stored.get(key) != value for key, value in message.items() if key != "readAt"
             ):
@@ -1399,12 +1407,8 @@ def remember_wake(base: Path, target: dict[str, Any], identifier: str, result: d
         wake_recovery.record_intent(base, target, identifier, result)
 
 
-def _message_file_state(path: Path) -> tuple[int, int, int, int, int] | None:
-    try:
-        info = path.stat()
-        return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
-    except OSError:
-        return None
+def _message_file_state(path: Path) -> tuple[Any, ...] | None:
+    return record_state(path)
 
 
 def iter_messages(
@@ -1412,8 +1416,21 @@ def iter_messages(
     session: str,
     *,
     unread_only: bool = True,
-    read_cache: dict[Path, tuple[int, int, int, int, int]] | None = None,
+    read_cache: dict[Path, tuple[Any, ...]] | None = None,
 ) -> Iterator[dict[str, Any]]:
+    if mailbox_records.active(base):
+        # One read returns every row with its change token, so the cache only skips re-validation.
+        for path, message, state in message_entries(base, session, with_state=True):
+            if read_cache is not None and unread_only and read_cache.get(path) == state:
+                continue
+            if not valid_message(message) or message["id"] != path.stem:
+                continue
+            if unread_only and message.get("readAt"):
+                if read_cache is not None and len(read_cache) < 8192:
+                    read_cache[path] = state
+            else:
+                yield message
+        return
     for path in sorted(inbox_dir(base, session).glob("*.json")):
         state = None
         if read_cache is not None and unread_only:
@@ -1459,7 +1476,7 @@ def iter_incoming(
     unread_only: bool = True,
     scope: str = "project",
     operation: str = "inbox",
-    read_cache: dict[Path, tuple[int, int, int, int, int]] | None = None,
+    read_cache: dict[Path, tuple[Any, ...]] | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Include explicitly addressed cross-project mail without widening peer discovery."""
     check_scope(scope)
@@ -1577,8 +1594,7 @@ def thread_id(base: Path, session: str, reply_to: str | None) -> str | None:
     wait(replyTo=postId) and channel history agree with it."""
     if reply_to is None or not re.fullmatch(MESSAGE_ID, reply_to):
         return reply_to
-    for path in sorted((base / "inbox").glob(f"*/{reply_to}.json")):
-        message = load(path)
+    for _, message in all_message_entries(base, reply_to):
         if not valid_message(message) or not isinstance(message.get("postId"), str):
             continue
         if session in {message["from"].get("session"), message["to"].get("session")}:
@@ -1603,8 +1619,7 @@ def reply_target_status(base: Path, session: str, reply_to: str) -> dict[str, An
         }
     if not re.fullmatch(MESSAGE_ID, reply_to):
         return None
-    for path in sorted((base / "inbox").glob(f"*/{reply_to}.json")):
-        message = load(path)
+    for _, message in all_message_entries(base, reply_to):
         if not valid_message(message) or message["from"].get("session") != session:
             continue
         target_session = str(message["to"].get("session") or "")
@@ -1649,12 +1664,23 @@ def wait(
         if not question:
             raise MailboxError("wait requires a question sent by this recipient")
         question_ids = {question["id"], question.get("clientId")} - {None}
-    read_cache: dict[Path, tuple[int, int, int, int, int]] = {}
+    read_cache: dict[Path, tuple[Any, ...]] = {}
+    quiet_token: tuple[Any, ...] | None = None
     while True:
-        # A run reply stays replayable after acknowledgement.
-        rows = iter_incoming(
-            base, session, unread_only=not (run_peer and reply_to), scope=scope, operation="wait", read_cache=read_cache
-        )
+        # Nothing committed to the record store since the last empty pass: skip the re-read, not the run check.
+        token = mailbox_records.fingerprint(base)
+        if token is not None and token == quiet_token and not mailbox_records.racy(token):
+            rows: Iterator[dict[str, Any]] = iter(())
+        else:
+            # A run reply stays replayable after acknowledgement.
+            rows = iter_incoming(
+                base,
+                session,
+                unread_only=not (run_peer and reply_to),
+                scope=scope,
+                operation="wait",
+                read_cache=read_cache,
+            )
         if run_peer:
             rows = (message for message in rows if message.get("run") == run_peer["run"])
         if reply_to:
@@ -1664,6 +1690,7 @@ def wait(
                 if message.get("replyTo") in question_ids and (not run_peer or message.get("kind") == "reply")
             )
         unread, more = bounded_messages(rows, limit=limit, max_bytes=max_bytes)
+        quiet_token = None if unread else token
         if unread:
             if mark and not run_peer:
                 unread = claim(base, session, unread, scope=scope)
@@ -1797,9 +1824,7 @@ def _session_peer_candidates(
     if eligible(direct) and direct["session"] == session:
         return [direct]
     matches = [
-        peer
-        for file in (base / "peers").glob("*.json")
-        if eligible(peer := load(file), True) and session in native_session_ids(peer, base)
+        peer for _, peer in peer_entries(base) if eligible(peer, True) and session in native_session_ids(peer, base)
     ]
     return matches
 
@@ -1916,8 +1941,7 @@ def _prune_rooms_and_briefs(base: Path, cutoff: dt.datetime) -> None:
                     shutil.rmtree(brief_dir, ignore_errors=True)
     for progress_path in (base / "progress").glob("*.json"):
         with contextlib.suppress(OSError):
-            peer_file = base / "peers" / progress_path.name
-            peer = load(peer_file)
+            peer = load(base / "peers" / progress_path.name)
             if valid_peer(peer) and is_live(peer):
                 continue
             progress = load(progress_path)
@@ -1959,8 +1983,7 @@ def prune(base: Path) -> dict[str, int]:
     removed = {"peers": 0, "messages": 0}
     moment = now()
     run_sessions: set[str] = set()
-    for path in (base / "peers").glob("*.json"):
-        peer = load(path)
+    for _, peer in peer_entries(base):
         if not is_run_record(peer):
             continue
         run = peer["run"]
@@ -1976,12 +1999,12 @@ def prune(base: Path) -> dict[str, int]:
             for session in expired:
                 expired_path = peer_path(base, session)
                 with locked(expired_path):
-                    expired_path.unlink(missing_ok=True)
+                    remove_record(expired_path)
+                for message_path, _, _ in message_entries(base, session):
+                    remove_record(message_path)
+                    removed["messages"] += 1
                 inbox = inbox_dir(base, session)
-                if inbox.exists():
-                    for message_path in inbox.glob("*.json"):
-                        message_path.unlink(missing_ok=True)
-                        removed["messages"] += 1
+                if inbox.exists() and not mailbox_records.active(base):
                     with contextlib.suppress(OSError):
                         inbox.rmdir()
                 removed["peers"] += 1
@@ -1994,29 +2017,34 @@ def prune(base: Path) -> dict[str, int]:
         with contextlib.suppress(OSError):
             if time.time() - path.stat().st_mtime > MAX_AGE.total_seconds():
                 path.unlink()
-    for path in (base / "peers").glob("*.json"):
+    for path in peer_files(base):
         if drop_if_dead(path, now()):
             removed["peers"] += 1
     cutoff = now() - MAX_AGE
-    for path in (base / "inbox").glob("*/*.json"):
-        if path.parent.name in {session_key(session) for session in run_sessions}:
+    run_keys = {session_key(session) for session in run_sessions}
+    for path, message in all_message_entries(base):
+        if path.parent.name in run_keys:
             continue
-        message = load(path)
         try:
             expired = not message or parse_stamp(str(message.get("sentAt"))) < cutoff
         except ValueError:
             expired = True
         if expired:
-            path.unlink(missing_ok=True)
-            _unlink_stale_lock(path.with_suffix(".lock"))
+            remove_record(path)
+            location = mailbox_records.locate(path)
+            _unlink_stale_lock(mailbox_records.lock_path(location) if location else path.with_suffix(".lock"))
             removed["messages"] += 1
+    if mailbox_records.active(base):
+        for lock_file, record in mailbox_records.lock_files(base):
+            if not record_exists(record):
+                _unlink_stale_lock(lock_file)
     for lock_file in [*(base / "peers").glob("*.lock"), *(base / "inbox").glob("*/*.lock")]:
-        if not lock_file.with_suffix(".json").exists():
+        if not record_exists(lock_file.with_suffix(".json")):
             _unlink_stale_lock(lock_file)
     for inbox_sub in (base / "inbox").glob("*"):
         if (
             inbox_sub.is_dir()
-            and not (base / "peers" / f"{inbox_sub.name}.json").exists()
+            and not record_exists(base / "peers" / f"{inbox_sub.name}.json")
             and not any(inbox_sub.glob("*.json"))
         ):
             for lock_file in inbox_sub.glob("*.lock"):
@@ -2028,7 +2056,7 @@ def prune(base: Path) -> dict[str, int]:
         with contextlib.suppress(OSError):
             if (
                 wake_sub.is_dir()
-                and not (base / "peers" / f"{wake_sub.name}.json").exists()
+                and not record_exists(base / "peers" / f"{wake_sub.name}.json")
                 and time.time() - wake_sub.stat().st_mtime > MAX_AGE.total_seconds()
             ):
                 for item in wake_sub.glob("*"):
@@ -2119,7 +2147,7 @@ def notify(
     if deliver and base is not None:
         destination = inbox_dir(base, to["session"]) / f"{msg['id']}.json"
         with locked(destination):
-            if not destination.exists():
+            if not record_exists(destination):
                 write(destination, msg)
     return msg
 
@@ -2141,10 +2169,8 @@ def replied_to(base: Path, session: str) -> set[str]:
     """IDs of the messages `session` replied to, from one pass over the retained mail."""
     return {
         message["replyTo"]
-        for path in (base / "inbox").glob("*/*.json")
-        if (message := load(path))
-        and isinstance(message.get("replyTo"), str)
-        and (message.get("from") or {}).get("session") == session
+        for _, message in all_message_entries(base)
+        if message and isinstance(message.get("replyTo"), str) and (message.get("from") or {}).get("session") == session
     }
 
 

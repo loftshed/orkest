@@ -29,7 +29,7 @@ _ROOM_ID_RE = re.compile(r"[\w-]{1,80}", flags=re.ASCII)
 _SYSTEM_NODE_DIRS = frozenset({"/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"})
 # Must match ROOMS_APPLICATION_ID and ROOMS_MIGRATIONS.length in horde-room.mjs.
 ROOMS_APPLICATION_ID = 1_330_793_298
-ROOMS_SCHEMA_VERSION = 2
+ROOMS_SCHEMA_VERSION = 12
 
 
 def sqlite_qualified(version: tuple[int, int, int] = sqlite3.sqlite_version_info) -> bool:
@@ -49,10 +49,9 @@ def _direct_rows(base: Path, room_id: str | None = None) -> list[dict[str, Any]]
     except (OSError, sqlite3.Error):
         return None
     try:
-        if (
-            connection.execute("PRAGMA application_id").fetchone()[0] != ROOMS_APPLICATION_ID
-            or connection.execute("PRAGMA user_version").fetchone()[0] != ROOMS_SCHEMA_VERSION
-        ):
+        if connection.execute("PRAGMA application_id").fetchone()[0] != ROOMS_APPLICATION_ID or connection.execute(
+            "PRAGMA user_version"
+        ).fetchone()[0] not in range(2, ROOMS_SCHEMA_VERSION + 1):
             return None
         if room_id is None:
             rows = connection.execute("SELECT data FROM rooms ORDER BY updated_at DESC, id ASC").fetchall()
@@ -97,11 +96,11 @@ def _discover_node_binary() -> str:
     return found or "node"
 
 
-def _bridge() -> Path:
-    candidate = runtime_paths.node_runtime(__file__) / "bin/room-store.mjs"
+def _bridge(name: str = "room-store.mjs") -> Path:
+    candidate = runtime_paths.node_runtime(__file__) / "bin" / name
     if candidate.is_file():
         return candidate
-    raise OSError("Node room-store bridge is missing from this runtime")
+    raise OSError(f"Node bridge {name} is missing from this runtime")
 
 
 def _header_tokens(path: Path, size: int) -> tuple[bytes, ...]:

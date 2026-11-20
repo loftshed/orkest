@@ -1,10 +1,3 @@
-/**
- * Ork Chief: the machine-wide Master Orchestrator desk.
- *
- * One session per machine may hold the Chief desk (`<mailboxRoot>/chief.json`). The Chief
- * observes every room and standalone session on the machine, routes messages to them, and
- * spawns autonomous room orchestrators that report back to it. Reads never mutate state.
- */
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import {
@@ -19,7 +12,6 @@ import {
   readdirSync,
   readFileSync,
   realpathSync,
-  renameSync,
   statSync,
   unlinkSync,
   writeFileSync,
@@ -30,6 +22,16 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { emitChiefEvents } from "./chief-bridge.mjs";
+import { reconcileChiefIntents, recordChiefIntents } from "./chief-notification-intents.mjs";
+import {
+  commitAckTx,
+  committedInboxIds,
+  completeAckTx,
+  linkDeskItem,
+  pendingAckTxs,
+  putDeskItem,
+  readDesk,
+} from "./chief-outbox.mjs";
 import { readFoundryState } from "./foundry.mjs";
 import { herdrEndpoint } from "./herdr-context.mjs";
 import {
@@ -42,6 +44,15 @@ import {
   readRawRoom,
   updateRawRoom,
 } from "./horde-room.mjs";
+/**
+ * Ork Chief: the machine-wide Master Orchestrator desk.
+ *
+ * One session per machine may hold the Chief desk (`<mailboxRoot>/chief.json`). The Chief
+ * observes every room and standalone session on the machine, routes messages to them, and
+ * spawns autonomous room orchestrators that report back to it. Reads never mutate state.
+ */
+import { mailboxFileMap } from "./mailbox-projection.mjs";
+import { recordSessionKey } from "./mailbox-records.mjs";
 import { isTerminalDisplayState, memberDisplayState } from "./member-state.mjs";
 import { orcaPaneContext, orcaTerminalHandle, resolveOrcaCli } from "./orca-context.mjs";
 import {
@@ -51,6 +62,7 @@ import {
   resolveConfiguredAccount,
   resolvePolicyConfigPath,
 } from "./policy.mjs";
+import { remoteObservations } from "./remote-observations.mjs";
 import { belongsToRoom, isPeerLive, newRoom, roomOwnerSessions } from "./rooms.mjs";
 import { cacheHome, runtimeReference } from "./runtime-paths.mjs";
 import { applyLauncherAccountEnv, checkRepoPolicyForSide } from "./side.mjs";
@@ -138,13 +150,6 @@ function readJson(file, maxBytes = 256 * 1024) {
   }
 }
 
-function writeJsonAtomic(file, value) {
-  mkdirSync(path.dirname(file), { recursive: true });
-  const temporary = `${file}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
-  writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
-  renameSync(temporary, file);
-}
-
 function pidAlive(pid) {
   if (!Number.isSafeInteger(pid) || pid <= 0) return null;
   try {
@@ -157,11 +162,7 @@ function pidAlive(pid) {
 
 /** Mirrors the mailbox's file naming for a session ID. */
 export function sessionKey(session) {
-  if (typeof session !== "string" || !SESSION_ID_RE.test(session)) return null;
-  const key = session.replaceAll(":", "%3A");
-  if (session === session.toLowerCase() && key.length <= 128) return key;
-  const digest = createHash("sha1").update(session).digest("hex").slice(0, 10);
-  return `${key.slice(0, 128)}~${digest}`;
+  return recordSessionKey(session);
 }
 
 export function sessionFromEnv(env = process.env) {
@@ -292,9 +293,10 @@ function findPeerForSession(peers, session, predicate = null) {
 }
 
 export function readPeers(root = mailboxRoot(), { now = Date.now() } = {}) {
+  const stored = mailboxFileMap(root, "peer");
   let entries;
   try {
-    entries = readdirSync(path.join(root, "peers"));
+    entries = stored ? stored.keys().toArray() : readdirSync(path.join(root, "peers"));
   } catch {
     return [];
   }
@@ -303,7 +305,7 @@ export function readPeers(root = mailboxRoot(), { now = Date.now() } = {}) {
   const sorted = entries.toSorted((left, right) => left.localeCompare(right));
   for (const entry of sorted) {
     if (!entry.endsWith(".json")) continue;
-    const peer = readJson(path.join(root, "peers", entry), 64 * 1024);
+    const peer = stored ? stored.get(entry) : readJson(path.join(root, "peers", entry), 64 * 1024);
     if (
       !isPlainObject(peer) ||
       peer.schema !== "agent-executor.peer.v1" ||
@@ -915,13 +917,6 @@ export async function bindChief({
 // ---------------------------------------------------------------------------
 // Chief desk: durable reports addressed to a Chief that is not currently live
 
-function deskDir(root) {
-  return path.join(root, "chief", "desk");
-}
-
-const DESK_JOURNAL_VERSION = 1;
-const LEGACY_DESK_PREFIX = "legacy:";
-
 // ---------------------------------------------------------------------------
 // Guarded filesystem helpers: trusted roots, private directories, bounded reads
 
@@ -1044,109 +1039,13 @@ async function withExclusiveLock(lockFile, fn, { timeoutMs = 15_000 } = {}) {
   }
 }
 
-function deskJournalPath(root) {
-  return path.join(root, "chief", "desk.jsonl");
-}
-
-function deskLockPath(root) {
-  return path.join(root, "chief", "desk.lock");
-}
-
 function missionLockPath(root, roomId) {
   return path.join(root, "chief", "locks", `${roomId}.lock`);
 }
 
-/** Journal records are versioned: put adds an immutable item, ack tombstones IDs. */
-function readDeskJournal(root) {
-  const puts = new Map();
-  const acked = new Set();
-  const links = new Map();
-  let text;
-  try {
-    text = readFileSync(deskJournalPath(root), "utf8");
-  } catch {
-    return { puts, acked };
-  }
-  for (const line of text.split("\n")) {
-    if (!line.trim()) continue;
-    let record;
-    try {
-      record = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    if (!isPlainObject(record) || record.v !== DESK_JOURNAL_VERSION) continue;
-    if (
-      record.op === "put" &&
-      typeof record.id === "string" &&
-      isPlainObject(record.item) &&
-      !puts.has(record.id)
-    ) {
-      puts.set(record.id, { ...record.item, id: record.id });
-    } else if (record.op === "ack" && Array.isArray(record.ids)) {
-      for (const id of record.ids) if (typeof id === "string") acked.add(id);
-    } else if (record.op === "link" && isStringId(record.id) && isStringId(record.messageId)) {
-      links.set(record.id, record.messageId);
-    }
-  }
-  return { puts, acked, links };
-}
-
-function appendDeskJournal(root, record) {
-  mkdirSync(path.dirname(deskJournalPath(root)), { recursive: true, mode: 0o700 });
-  writeFileSync(
-    deskJournalPath(root),
-    `${JSON.stringify({ v: DESK_JOURNAL_VERSION, ...record })}\n`,
-    {
-      flag: "a",
-      mode: 0o600,
-    },
-  );
-}
-
-/** Legacy `chief/desk/*.json` items: identity comes from the enumerated filename, never JSON. */
-function readLegacyDesk(root) {
-  let entries;
-  try {
-    entries = readdirSync(deskDir(root));
-  } catch {
-    return [];
-  }
-  return entries
-    .filter((entry) => entry.endsWith(".json"))
-    .sort((left, right) => left.localeCompare(right))
-    .map((entry) => {
-      const file = path.join(deskDir(root), entry);
-      const json = readJson(file);
-      if (!isPlainObject(json) || typeof json.text !== "string") return null;
-      return {
-        ...json,
-        id: `${LEGACY_DESK_PREFIX}${entry.slice(0, -".json".length)}`,
-        file,
-        roomId: null,
-      };
-    })
-    .filter(Boolean);
-}
-
-/** Active desk items: journal puts minus acknowledged IDs, plus unacknowledged legacy files. */
+/** Active desk items from the canonical store: puts minus acknowledged IDs. */
 export function listDesk(root = mailboxRoot()) {
-  const { puts, acked: journalAcked, links } = readDeskJournal(root);
-  const acked = new Set([...journalAcked, ...committedAcknowledgements(root).deskIds]);
-  const items = puts
-    .values()
-    .filter((record) => !acked.has(record.id))
-    .map((item) => ({
-      ...item,
-      roomId: validRoomIdOrNull(item.roomId),
-      mailboxId: links.get(item.id) ?? null,
-    }))
-    .toArray();
-  for (const legacy of readLegacyDesk(root)) if (!acked.has(legacy.id)) items.push(legacy);
-  return items.sort(
-    (left, right) =>
-      String(left.at).localeCompare(String(right.at)) || left.id.localeCompare(right.id),
-  );
+  return readDesk(root);
 }
 
 function validRoomIdOrNull(value) {
@@ -1162,51 +1061,13 @@ export async function ackDesk(root = mailboxRoot()) {
 
 const ACK_TRANSACTION_SCHEMA = "ork.chief.ack.v1";
 
-function ackTransactionFile(root, id) {
-  return path.join(root, "chief", "ack-transactions", `${id}.json`);
-}
-
-function listAckTransactions(root) {
-  const directory = path.join(root, "chief", "ack-transactions");
-  let entries;
-  try {
-    entries = readdirSync(directory);
-  } catch {
-    return [];
-  }
-  return entries
-    .filter((entry) => /^[0-9a-f]{32}\.json$/u.test(entry))
-    .sort((left, right) => left.localeCompare(right))
-    .map((entry) => readJson(path.join(directory, entry)))
-    .filter((record) => isPlainObject(record) && record.schema === ACK_TRANSACTION_SCHEMA);
-}
-
-/** IDs in committed transactions are hidden from readers now, even before their backing writes finish. */
-function committedAcknowledgements(root) {
-  const deskIds = [];
-  const inboxIds = [];
-  for (const record of listAckTransactions(root)) {
-    if (record.state !== "committed") continue;
-    if (Array.isArray(record.deskIds)) deskIds.push(...record.deskIds.filter(isStringId));
-    if (Array.isArray(record.inboxIds)) inboxIds.push(...record.inboxIds.filter(isStringId));
-  }
-  return { deskIds, inboxIds };
-}
-
 function isStringId(value) {
   return typeof value === "string" && value.length > 0 && value.length <= 200;
 }
 
-/** Applies the backing writes of a committed transaction. Safe to repeat: every step is idempotent. */
+/** Applies the mailbox half of a committed transaction. Safe to repeat: every step is idempotent. */
 async function finishAcknowledgement(root, record, { runMailbox, env }) {
-  const { deskIds = [], inboxIds = [], session = null } = record;
-  if (deskIds.length > 0) {
-    await withExclusiveLock(deskLockPath(root), async () => {
-      const { acked } = readDeskJournal(root);
-      const missing = deskIds.filter((id) => !acked.has(id));
-      if (missing.length > 0) appendDeskJournal(root, { op: "ack", ids: missing, tx: record.id });
-    });
-  }
+  const { inboxIds = [], session = null } = record;
   if (inboxIds.length > 0) {
     if (!session || typeof runMailbox !== "function") {
       const error = new Error("Mailbox acknowledgment needs the Chief session");
@@ -1228,12 +1089,13 @@ async function finishAcknowledgement(root, record, { runMailbox, env }) {
       throw error;
     }
   }
-  writeJsonAtomic(ackTransactionFile(root, record.id), { ...record, state: "complete" });
+  completeAckTx(root, record.id);
 }
 
 /**
- * Durably commits one acknowledged-ID set under the desk lock, then applies it. Callers pass
- * explicit IDs only, so mail or desk items that arrive after the snapshot survive.
+ * Durably commits one acknowledged-ID set (desk rows and redacted events in one transaction), then
+ * applies the mailbox half. Callers pass explicit IDs only, so mail or desk items that arrive
+ * after the snapshot survive.
  */
 export async function commitAcknowledgement({
   root = mailboxRoot(),
@@ -1256,9 +1118,7 @@ export async function commitAcknowledgement({
     inboxIds: inbox,
     at: iso(now),
   };
-  await withExclusiveLock(deskLockPath(root), async () => {
-    writeJsonAtomic(ackTransactionFile(root, record.id), record);
-  });
+  commitAckTx(root, record);
   await finishAcknowledgement(root, record, { runMailbox, env });
   return { desk: desk.length, inbox: inbox.length };
 }
@@ -1269,8 +1129,7 @@ export async function resumeAcknowledgements(
   { runMailbox = null, env } = {},
 ) {
   let resumed = 0;
-  for (const record of listAckTransactions(root)) {
-    if (record.state !== "committed") continue;
+  for (const record of pendingAckTxs(root)) {
     await finishAcknowledgement(root, record, { runMailbox, env });
     resumed++;
   }
@@ -1285,7 +1144,7 @@ function recordDesk(root, item, now, { id } = {}) {
     ...item,
     at: iso(now),
   };
-  appendDeskJournal(root, { op: "put", id: record.id, item: record });
+  putDeskItem(root, record);
   return record;
 }
 
@@ -1322,16 +1181,19 @@ function readUnreadInbox(root, session) {
   const key = sessionKey(session);
   if (!key) return [];
   const directory = path.join(root, "inbox", key);
+  const stored = mailboxFileMap(root, "inbox", key);
   let entries;
   try {
-    entries = readdirSync(directory).filter((entry) => entry.endsWith(".json"));
+    entries = stored
+      ? stored.keys().toArray()
+      : readdirSync(directory).filter((entry) => entry.endsWith(".json"));
   } catch {
     return [];
   }
-  const hidden = new Set(committedAcknowledgements(root).inboxIds);
+  const hidden = new Set(committedInboxIds(root));
   return entries
     .sort((left, right) => left.localeCompare(right))
-    .map((entry) => readJson(path.join(directory, entry), 64 * 1024))
+    .map((entry) => (stored ? stored.get(entry) : readJson(path.join(directory, entry), 64 * 1024)))
     .filter(
       (message) =>
         isPlainObject(message) &&
@@ -1739,6 +1601,12 @@ export async function chiefStatus({
     },
     accounts: [],
   };
+  try {
+    const remotes = remoteObservations(root);
+    if (remotes.length > 0) status.remoteObservations = remotes;
+  } catch (error) {
+    status.remoteObservationsError = error.message;
+  }
   if (roomsError) status.roomsError = roomsError;
   if (quota) {
     try {
@@ -1931,6 +1799,10 @@ async function recordMissionReport({
   const nextState = MISSION_STATES[kind || "update"];
   let effectiveState = nextState;
   let isTransition = false;
+  const notification = () =>
+    isTransition && sourceId && REPORT_EVENTS.has(kind)
+      ? [{ event: kind, roomId: room.id, key: `report:${sourceId}` }]
+      : [];
   const record = () =>
     updateRawRoom(
       room.id,
@@ -1952,13 +1824,17 @@ async function recordMissionReport({
         }
         return current;
       },
-      { root },
+      {
+        root,
+        onCommit: (db) => {
+          if (!events) recordChiefIntents(db, notification(), env);
+        },
+      },
     );
   if (locked) await record();
   else await withExclusiveLock(missionLockPath(root, room.id), record);
   // The write committed: queue the event for delivery by the caller once its locks are released.
-  if (events && isTransition && sourceId && REPORT_EVENTS.has(kind))
-    events.push({ event: kind, roomId: room.id, key: `report:${sourceId}` });
+  events?.push(...notification());
   return { roomId: room.id, state: effectiveState };
 }
 
@@ -2212,7 +2088,7 @@ function missionBodyOf(roomId, outcome) {
 }
 
 /** Writes a pending mission outcome once; a repeat or a conflicting late exit never reopens it. */
-async function recordMissionOutcome(root, roomId, outcome, { now = Date.now() } = {}) {
+async function recordMissionOutcome(root, roomId, outcome, { now = Date.now(), env, bridge } = {}) {
   let decision = { status: "unchanged" };
   await updateRawRoom(
     roomId,
@@ -2256,7 +2132,23 @@ async function recordMissionOutcome(root, roomId, outcome, { now = Date.now() } 
       if (room.conductor) room.conductor.status = outcome.state === "done" ? "completed" : "failed";
       return room;
     },
-    { root },
+    {
+      root,
+      onCommit: (db) => {
+        if (!bridge && decision.status === "recorded")
+          recordChiefIntents(
+            db,
+            [
+              {
+                event: decision.state === "done" ? "done" : "failed",
+                roomId,
+                key: `outcome:${decision.reportId}`,
+              },
+            ],
+            env,
+          );
+      },
+    },
   );
   return decision;
 }
@@ -2265,22 +2157,14 @@ async function recordMissionOutcome(root, roomId, outcome, { now = Date.now() } 
 async function deliverMissionReport(room, { root, env, now, runMailbox }) {
   const report = room.chief?.report;
   if (!report || !isStringId(report.id)) return { status: "none" };
-  await withExclusiveLock(deskLockPath(root), async () => {
-    const { puts } = readDeskJournal(root);
-    if (!puts.has(report.id))
-      appendDeskJournal(root, {
-        op: "put",
-        id: report.id,
-        item: {
-          schema: "ork.chief.desk.v1",
-          id: report.id,
-          roomId: room.id,
-          from: room.chief?.mission?.session ?? null,
-          kind: report.kind === "done" ? "done" : "escalation",
-          text: report.body,
-          at: report.at ?? iso(now),
-        },
-      });
+  putDeskItem(root, {
+    schema: "ork.chief.desk.v1",
+    id: report.id,
+    roomId: room.id,
+    from: room.chief?.mission?.session ?? null,
+    kind: report.kind === "done" ? "done" : "escalation",
+    text: report.body,
+    at: report.at ?? iso(now),
   });
   if (report.status === "delivered") return { status: "delivered", id: report.id };
   const chief = readChiefBinding({ root, now });
@@ -2316,11 +2200,8 @@ async function deliverMissionReport(room, { root, env, now, runMailbox }) {
   } catch {
     messageId = null;
   }
-  if (messageId)
-    await withExclusiveLock(deskLockPath(root), async () => {
-      if (!readDeskJournal(root).links.has(report.id))
-        appendDeskJournal(root, { op: "link", id: report.id, messageId });
-    });
+  if (!messageId) return { status: "queued", id: report.id, error: "delivery receipt missing" };
+  linkDeskItem(root, report.id, messageId);
   await updateRawRoom(
     room.id,
     (current) => {
@@ -2383,7 +2264,8 @@ export async function chiefReconcile({
           evidence: exit.evidence,
         };
       let decision = { status: "none" };
-      if (exit.state) decision = await recordMissionOutcome(root, roomId, exit, { now });
+      if (exit.state)
+        decision = await recordMissionOutcome(root, roomId, exit, { now, env, bridge });
       // Only the recorded terminal outcome is an event; its durable report ID is the identity.
       if (decision.status === "recorded")
         events.push({
@@ -2410,7 +2292,8 @@ export async function chiefReconcile({
     });
   } finally {
     // The terminal outcome is already committed, even if slow delivery above failed.
-    await emitChiefEvents(events, { env, bridge });
+    if (bridge) await emitChiefEvents(events, { env, bridge });
+    else await reconcileChiefIntents(root, env);
   }
   return result;
 }
@@ -2432,17 +2315,19 @@ export async function chiefSend(options = {}) {
       owner = null;
     }
     if (owner) {
-      const events = [];
+      const events = options.bridge ? [] : null;
       const result = await withExclusiveLock(missionLockPath(root, owner.id), () =>
         chiefSendBody({ ...options, lockedMission: owner.id, events }),
       );
-      await emitChiefEvents(events, { env, bridge: options.bridge });
+      if (options.bridge) await emitChiefEvents(events, { env, bridge: options.bridge });
+      else await reconcileChiefIntents(root, env);
       return result;
     }
   }
-  const events = [];
+  const events = options.bridge ? [] : null;
   const result = await chiefSendBody({ ...options, events });
-  await emitChiefEvents(events, { env, bridge: options.bridge });
+  if (options.bridge) await emitChiefEvents(events, { env, bridge: options.bridge });
+  else await reconcileChiefIntents(root, env);
   return result;
 }
 

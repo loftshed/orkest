@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
+import mailbox_records
+
 PEER_SCHEMA = "agent-executor.peer.v1"
 MAIL_SCHEMA = "agent-executor.mail.v1"
 MAX_BYTES = 32 * 1024
@@ -303,6 +305,9 @@ def run_deadline(peer: dict[str, Any]) -> dt.datetime | None:
 
 
 def write(path: Path, value: dict[str, Any]) -> None:
+    if location := mailbox_records.locate(path):
+        mailbox_records.put(*location, value)
+        return
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix=".mail-")
     try:
@@ -316,6 +321,9 @@ def write(path: Path, value: dict[str, Any]) -> None:
 
 
 def load(path: Path) -> dict[str, Any] | None:
+    if location := mailbox_records.locate(path):
+        # An unavailable store raises: an active root never reads the legacy file instead.
+        return mailbox_records.get(*location)
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -359,8 +367,10 @@ def acquire_lock(lock_path: Path) -> int:
 
 @contextlib.contextmanager
 def locked(path: Path):
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    descriptor = acquire_lock(path.with_suffix(".lock"))
+    location = mailbox_records.locate(path)
+    lock = mailbox_records.lock_path(location) if location else path.with_suffix(".lock")
+    lock.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor = acquire_lock(lock)
     try:
         yield
     finally:
@@ -394,6 +404,97 @@ def inbox_dir(base: Path, session: str) -> Path:
     return base / "inbox" / session_key(session)
 
 
+def remove_record(path: Path) -> bool:
+    """Delete a peer or message: its row under an active root, otherwise its file."""
+    if location := mailbox_records.locate(path):
+        return mailbox_records.delete(*location)
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def record_exists(path: Path) -> bool:
+    if location := mailbox_records.locate(path):
+        return mailbox_records.get(*location) is not None
+    return path.exists()
+
+
+def record_mtime(path: Path) -> float | None:
+    """Seconds since the epoch of the last write, or None when absent."""
+    if location := mailbox_records.locate(path):
+        row = mailbox_records.get_row(*location)
+        return row["updated_ms"] / 1000 if row else None
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
+
+
+def record_state(path: Path) -> tuple[Any, ...] | None:
+    """A change token for read caches: file identity and times, or the row's update time and checksum."""
+    if location := mailbox_records.locate(path):
+        row = mailbox_records.get_row(*location)
+        return mailbox_records.row_state(row) if row else None
+    try:
+        info = path.stat()
+    except OSError:
+        return None
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+
+def peer_entries(base: Path) -> list[tuple[Path, dict[str, Any] | None]]:
+    """Every peer record with its legacy-shaped path, in file-name order, read once."""
+    if mailbox_records.active(base):
+        return [
+            (mailbox_records.record_path(base, "peer", "", row["key"]), row["body"])
+            for row in mailbox_records.list_rows(base, "peer", "")
+        ]
+    return [(path, _MB.load(path)) for path in sorted((base / "peers").glob("*.json"))]
+
+
+def peers_present(base: Path) -> bool:
+    """Whether this root can hold peer records at all: an active record store or a peers directory."""
+    return mailbox_records.active(base) or (base / "peers").is_dir()
+
+
+def peer_files(base: Path) -> list[Path]:
+    return [path for path, _ in peer_entries(base)]
+
+
+def message_entries(
+    base: Path, session: str, *, with_state: bool = False
+) -> list[tuple[Path, dict[str, Any] | None, tuple[Any, ...] | None]]:
+    """One inbox in delivery order: path, message and (on request) its change token."""
+    if mailbox_records.active(base):
+        owner = session_key(session)
+        return [
+            (
+                mailbox_records.record_path(base, "inbox", owner, row["key"]),
+                row["body"],
+                mailbox_records.row_state(row) if with_state else None,
+            )
+            for row in mailbox_records.list_rows(base, "inbox", owner)
+        ]
+    found = []
+    for path in sorted(inbox_dir(base, session).glob("*.json")):
+        state = record_state(path) if with_state else None
+        found.append((path, _MB.load(path), state))
+    return found
+
+
+def all_message_entries(base: Path, identifier: str | None = None) -> list[tuple[Path, dict[str, Any] | None]]:
+    """Every inbox's messages (or those with one id), ordered by inbox then id."""
+    if mailbox_records.active(base):
+        return [
+            (mailbox_records.record_path(base, "inbox", row["owner"], row["key"]), row["body"])
+            for row in mailbox_records.list_collection(base, "inbox", identifier)
+        ]
+    pattern = f"*/{identifier}.json" if identifier is not None else "*/*.json"
+    return [(path, _MB.load(path)) for path in sorted((base / "inbox").glob(pattern))]
+
+
 def owns(base: Path, path: Path, peer: dict[str, Any]) -> bool:
     """Whether the record sits at its own session's file, not a copy or a stray."""
     try:
@@ -404,6 +505,8 @@ def owns(base: Path, path: Path, peer: dict[str, Any]) -> bool:
 
 def migrate_legacy_session(base: Path, session: str) -> None:
     """Move a session's peer and inbox from file names earlier versions used, keeping only what is its own."""
+    if mailbox_records.active(base):
+        return  # the cutover already stored every record under its canonical key
     for legacy in legacy_session_keys(session):
         legacy_peer = base / "peers" / f"{legacy}.json"
         old = _MB.load(legacy_peer)

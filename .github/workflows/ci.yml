@@ -60,7 +60,9 @@ jobs:
           CI: true
       - name: Run Python tests
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
-        run: ./scripts/test.sh python
+        run: |
+          ./scripts/test.sh python
+          cat "$GITHUB_STEP_SUMMARY"
       - name: Type-check Monitor menu bar app
         run: swiftc -typecheck -swift-version 5 -framework AppKit plugins/monitor/macos/main.swift
       - name: Type-check OrkestHUD toast app

@@ -15,7 +15,7 @@ use serde_json::Value;
 use crate::paths;
 
 pub const ROOMS_APPLICATION_ID: i64 = 1_330_793_298;
-pub const ROOMS_SCHEMA_VERSION: i64 = 2;
+pub const ROOMS_SCHEMA_VERSION: i64 = 12;
 
 thread_local! {
     static OPERATION_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
@@ -36,7 +36,7 @@ pub fn set_operation_deadline(deadline: Instant) -> DeadlineGuard {
     DeadlineGuard(OPERATION_DEADLINE.with(|d| d.replace(Some(deadline))))
 }
 
-fn deadline_active() -> bool {
+pub(crate) fn deadline_active() -> bool {
     OPERATION_DEADLINE.with(|d| d.get().is_some())
 }
 
@@ -46,7 +46,7 @@ pub fn deadline_expired() -> bool {
 }
 
 /// Busy-wait budget: `default_ms`, capped by whatever remains of the operation deadline.
-fn busy_budget_ms(default_ms: u64) -> u64 {
+pub(crate) fn busy_budget_ms(default_ms: u64) -> u64 {
     OPERATION_DEADLINE.with(|d| match d.get() {
         None => default_ms,
         Some(at) => {
@@ -72,7 +72,15 @@ pub fn db_has_symlink(db_path: &Path) -> bool {
     false
 }
 
-fn open_readonly(db_path: &Path, timeout_ms: u64) -> Option<Connection> {
+pub(crate) fn open_readonly(db_path: &Path, timeout_ms: u64) -> Option<Connection> {
+    open_existing(db_path, timeout_ms, OpenFlags::SQLITE_OPEN_READ_ONLY)
+}
+
+pub(crate) fn open_existing(
+    db_path: &Path,
+    timeout_ms: u64,
+    access: OpenFlags,
+) -> Option<Connection> {
     if db_has_symlink(db_path) {
         return None;
     }
@@ -81,7 +89,7 @@ fn open_readonly(db_path: &Path, timeout_ms: u64) -> Option<Connection> {
     if !meta.is_file() || meta.file_type().is_symlink() {
         return None;
     }
-    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let flags = access | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_NOFOLLOW;
     let conn = Connection::open_with_flags(&canon, flags).ok()?;
     let _ = conn.busy_timeout(Duration::from_millis(timeout_ms));
     Some(conn)
@@ -212,6 +220,33 @@ fn has_legacy_room_files(base: &Path) -> bool {
     false
 }
 
+/// Consult the transactionally maintained room/session index. An unreadable store must take
+/// the full hook path; pre-outbox schemas continue using their published JSON index.
+pub fn room_hook_hint(base: &Path, session: &str) -> Option<bool> {
+    let file = base.join("rooms.db");
+    match fs::symlink_metadata(&file) {
+        Err(error) if error.kind() == ErrorKind::NotFound => return None,
+        Ok(meta) if meta.is_file() => {}
+        _ => return Some(true),
+    }
+    let Some(conn) = open_readonly(&file, busy_budget_ms(40)) else {
+        return Some(true);
+    };
+    let schema = conn.query_row("SELECT (SELECT application_id FROM pragma_application_id), (SELECT user_version FROM pragma_user_version)", [], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)));
+    match schema {
+        Ok((ROOMS_APPLICATION_ID, 1..=4)) => None,
+        Ok((ROOMS_APPLICATION_ID, 5..=ROOMS_SCHEMA_VERSION)) => Some(
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM outbox_room_hints WHERE session=?1)",
+                [session],
+                |row| row.get(0),
+            )
+            .unwrap_or(true),
+        ),
+        _ => Some(true),
+    }
+}
+
 fn query_rooms_db(base: &Path, room_id: Option<&str>) -> Option<Vec<Value>> {
     if env::var("ORKEST_ROOM_STORE_BRIDGE").as_deref() == Ok("1") {
         return None;
@@ -236,7 +271,7 @@ fn query_rooms_db(base: &Path, room_id: Option<&str>) -> Option<Vec<Value>> {
     let user_ver: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .ok()?;
-    if app_id != ROOMS_APPLICATION_ID || user_ver != ROOMS_SCHEMA_VERSION {
+    if app_id != ROOMS_APPLICATION_ID || !(2..=ROOMS_SCHEMA_VERSION).contains(&user_ver) {
         return None;
     }
     let mut rooms = Vec::new();
@@ -280,18 +315,23 @@ fn query_rooms_db(base: &Path, room_id: Option<&str>) -> Option<Vec<Value>> {
     Some(rooms)
 }
 
-fn room_store_bridge_path() -> Option<PathBuf> {
+/// Locate `bin/<name>` in the orchestrate plugin next to the resolved scripts root.
+pub(crate) fn plugin_bin_path(name: &str) -> Option<PathBuf> {
+    let rel = Path::new("bin").join(name);
     if let Some(scripts) = paths::scripts_root() {
         let resolved = fs::canonicalize(&scripts).unwrap_or(scripts);
-        // An installed runtime copy keeps `bin/` beside `scripts/`'s parent; a checkout keeps it in `src/bin`.
-        if let Some(candidate) = resolved.parent().map(|p| p.join("bin/room-store.mjs"))
+        if let Some(candidate) = resolved.parent().map(|p| p.join(&rel))
             && candidate.is_file()
         {
             return Some(candidate);
         }
     }
-    let candidate = paths::runtime_root()?.join("src/bin/room-store.mjs");
+    let candidate = paths::runtime_root()?.join("src").join(&rel);
     candidate.is_file().then_some(candidate)
+}
+
+fn room_store_bridge_path() -> Option<PathBuf> {
+    plugin_bin_path("room-store.mjs")
 }
 
 /// Invoke `node <checkout>/src/bin/room-store.mjs <command> --root <base> [room_id]`.

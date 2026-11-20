@@ -1,25 +1,18 @@
 import { execFileSync } from "node:child_process";
-import {
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  realpathSync,
-  renameSync,
-  writeFileSync,
-} from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 
 import {
   foundryRun,
   readFoundryState,
-  resolveFoundryStatePath,
   resolveTaskSpecPath,
   resolveWorktreeGitDir,
   verifyBuilderWorktree,
   writeFoundryState,
 } from "../../../src/lib/foundry.mjs";
+import { mailboxRoot, openRooms } from "../../../src/lib/horde-room.mjs";
 import { nextCommand } from "../../../src/lib/next.mjs";
 import { smeltWorktree } from "../../../src/lib/smelter.mjs";
 
@@ -31,7 +24,14 @@ function git(cwd, ...args) {
     stdio: ["ignore", "pipe", "pipe"],
   }).trim();
 }
-function fixture({ high = false, allowPaths = ["change.txt"] } = {}) {
+// Canonical Foundry state is per profile: each fixture gets its own disposable profile, and the
+// test process follows it so in-process writes and spawned/injected callers share one database.
+const realHome = process.env.ORCHESTRATE_HOME;
+afterAll(() => {
+  if (realHome === undefined) delete process.env.ORCHESTRATE_HOME;
+  else process.env.ORCHESTRATE_HOME = realHome;
+});
+function fixture({ high = false, allowPaths = ["change.txt"], state = true } = {}) {
   // Git reports real paths; macOS temp directories sit behind a symlink.
   const created = mkdtempSync(path.join(tmpdir(), "ork-candidate-retained-"));
   const root = realpathSync(created);
@@ -67,7 +67,8 @@ function fixture({ high = false, allowPaths = ["change.txt"] } = {}) {
       parentCwd: "/incorrect-marker-root",
     }),
   );
-  writeFoundryState(wt, { status: "verified", attemptCount: 1 });
+  process.env.ORCHESTRATE_HOME = path.join(root, "cache");
+  if (state) writeFoundryState(wt, { status: "verified", attemptCount: 1 });
   return {
     repo,
     wt,
@@ -284,12 +285,17 @@ describe("one pinned candidate with retained real Git", () => {
     const result = await smelt(f, {
       execFileSyncFn: (cmd, args, options) => {
         const output = execFileSync(cmd, args, options);
-        if (cmd === "git" && args[0] === "merge")
-          writeFileSync(resolveFoundryStatePath(f.wt), "corrupt state bytes");
+        if (cmd === "git" && args[0] === "merge") {
+          // Make the canonical state write fail after the merge; the transaction rolls back.
+          using db = openRooms(mailboxRoot(f.env));
+          db.exec(`CREATE TRIGGER fail_state BEFORE UPDATE ON foundry_states
+            BEGIN SELECT RAISE(ABORT, 'injected state write failure'); END`);
+        }
         return output;
       },
     });
     expect(result).toMatchObject({ ok: false, status: "merged_state_unrecorded" });
+    expect(readFoundryState(f.wt)).toMatchObject({ status: "verified", attemptCount: 1 });
     expect(git(f.repo, "rev-parse", "HEAD")).toBe(result.candidate.commit);
   });
 
@@ -348,8 +354,7 @@ describe("one pinned candidate with retained real Git", () => {
   });
 
   it("Foundry uses the real verifier even with an injected builder", async () => {
-    const f = fixture();
-    renameSync(resolveFoundryStatePath(f.wt), path.join(f.root, "previous-state.json"));
+    const f = fixture({ state: false });
     const now = Date.now();
     const task = {
       schema: "agent-executor.task-spec.v1",

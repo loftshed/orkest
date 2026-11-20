@@ -401,6 +401,7 @@ async function fetchAccount(account, config, previous) {
 export async function getAccounts({ maxAgeSeconds, force = false, config = loadConfig() } = {}) {
   const maxAgeMs = force ? -1 : (maxAgeSeconds ?? config.maxAgeSeconds ?? 180) * 1000;
   let snapshot = readSnapshot();
+  let didPublishQuota = false;
   const deadline = Date.now() + 90_000;
   while (staleIds(config, snapshot, maxAgeMs, Date.now()).length > 0) {
     if (tryLock()) {
@@ -416,6 +417,11 @@ export async function getAccounts({ maxAgeSeconds, force = false, config = loadC
         for (const id of Object.keys(snapshot.accounts))
           if (config.accounts.every((a) => a.id !== id)) delete snapshot.accounts[id];
         snapshot.updatedAt = Date.now();
+        if (config.replicationScope) {
+          const { publishQuota } = await import("./publish-quota.mjs");
+          publishQuota(Object.values(snapshot.accounts), config.replicationScope);
+          didPublishQuota = true;
+        }
         writeSnapshot(snapshot);
       } finally {
         unlock();
@@ -429,6 +435,13 @@ export async function getAccounts({ maxAgeSeconds, force = false, config = loadC
     if (Date.now() > deadline) break;
     // A forced refresh is satisfied by a refresh that completed, not by one that was abandoned.
     if (force && snapshot.updatedAt !== seen) break;
+  }
+  if (config.replicationScope && !didPublishQuota) {
+    const { publishQuota } = await import("./publish-quota.mjs");
+    publishQuota(
+      config.accounts.map(({ id }) => snapshot.accounts[id]).filter(Boolean),
+      config.replicationScope,
+    );
   }
   return config.accounts.map((account) => {
     const probe = resolveAccountProbe(account, config);

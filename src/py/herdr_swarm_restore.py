@@ -20,6 +20,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+import mailbox_records
 import room_store
 import runtime_paths
 from herdr_context import canonical_endpoint, endpoint
@@ -455,11 +456,13 @@ def inventory(
     mailbox_dir = base / "mailbox-v1"
     peers_by_session: dict[str, dict[str, Any]] = {}
     peers_dir = mailbox_dir / "peers"
-    if peers_dir.is_dir():
-        for peer_file in sorted(peers_dir.glob("*.json")):
-            peer_doc = load(peer_file)
-            if isinstance(peer_doc, dict) and isinstance(peer_doc.get("session"), str):
-                peers_by_session[peer_doc["session"]] = peer_doc
+    if mailbox_records.active(mailbox_dir):
+        peer_docs = [row["body"] for row in mailbox_records.list_rows(mailbox_dir, "peer", "")]
+    else:
+        peer_docs = [load(peer_file) for peer_file in sorted(peers_dir.glob("*.json"))] if peers_dir.is_dir() else []
+    for peer_doc in peer_docs:
+        if isinstance(peer_doc, dict) and isinstance(peer_doc.get("session"), str):
+            peers_by_session[peer_doc["session"]] = peer_doc
 
     directory = state_directory(base, env)
     view_records: dict[str, tuple[Path, dict[str, Any]]] = {}

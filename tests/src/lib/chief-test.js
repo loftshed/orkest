@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
-import fs, { readdirSync } from "node:fs";
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -26,7 +26,13 @@ import {
   resolveChiefTarget,
   sessionKey,
 } from "../../../src/lib/chief.mjs";
-import { listRawRooms, readRawRoom, updateRawRoom } from "../../../src/lib/horde-room.mjs";
+import {
+  listRawRooms,
+  readRawRoom,
+  roomsDbPath,
+  updateRawRoom,
+} from "../../../src/lib/horde-room.mjs";
+import { openOrkestSqlite } from "../../../src/lib/orkest-sqlite.mjs";
 import { displayWidth } from "../../../src/lib/tui-box.mjs";
 
 const NOW = Date.now();
@@ -2461,13 +2467,22 @@ describe("ork chief", () => {
       return { jobDir, resultPath, eventPath };
     }
 
-    function deskPuts() {
-      const file = path.join(root, "chief", "desk.jsonl");
+    /** One value from the canonical desk tables, or 0 before the first desk write. */
+    function deskRows(sql) {
+      const file = roomsDbPath(root);
       if (!fs.existsSync(file)) return 0;
-      return fs
-        .readFileSync(file, "utf8")
-        .split("\n")
-        .filter((line) => line.includes('"op":"put"')).length;
+      const db = openOrkestSqlite(file, { readOnly: true });
+      try {
+        if (!db.prepare("SELECT 1 FROM sqlite_master WHERE name='chief_desk_items'").get())
+          return 0;
+        return db.prepare(sql).get().n;
+      } finally {
+        db.close();
+      }
+    }
+
+    function deskPuts() {
+      return deskRows("SELECT count(*) AS n FROM chief_desk_items");
     }
 
     function bindLiveChief() {
@@ -3700,11 +3715,11 @@ describe("ork chief", () => {
           peers: [],
         });
         expect(retried.groups).toEqual([]);
-        const transactions = readdirSync(path.join(root, "chief", "ack-transactions")).map((file) =>
-          JSON.parse(fs.readFileSync(path.join(root, "chief", "ack-transactions", file), "utf8")),
+        expect(deskRows("SELECT count(*) AS n FROM chief_ack_txs")).toBeGreaterThan(0);
+        expect(deskRows("SELECT count(*) AS n FROM chief_ack_txs WHERE state != 'complete'")).toBe(
+          0,
         );
-        expect(transactions.length).toBeGreaterThan(0);
-        expect(transactions.every((record) => record.state === "complete")).toBe(true);
+        expect(fs.existsSync(path.join(root, "chief", "ack-transactions"))).toBe(false);
       });
 
       it("closes by ID and repeats safely, rejects live and standalone targets, and leaves other rooms visible", async () => {

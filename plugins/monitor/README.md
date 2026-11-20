@@ -125,7 +125,7 @@ No config is needed: without `~/.config/monitor/config.json`, monitor monitors w
 
 `./uninstall.sh` removes the launcher, app, login agent, MCP registrations and cache (`--purge` also removes the config).
 
-`install.sh` installs a self-contained copy to `~/.local/share/monitor` (`package.json`, `src/bin/monitor.mjs`, `src/bin/observe.mjs`, `src/lib/monitor` and the skill, laid out like the checkout) and points the launcher there, so the menu bar app and MCP servers never read the checkout. The copy is staged and checked before it replaces the old one; the previous copy moves to `~/.local/share/monitor-backups`, and files or links of your own inside the runtime are kept. macOS privacy protection makes background access to `~/Documents` wait on a permission prompt, which returns with every rebuild of the ad-hoc-signed app. Re-run `./install.sh` after pulling changes, moving the checkout, or changing Node versions.
+`install.sh` installs a self-contained copy to `~/.local/share/monitor` (`package.json`, `src/bin/monitor.mjs`, `src/bin/observe.mjs`, `src/lib/monitor`, the shared SQLite modules and room definitions for publishing quota, and the skill, laid out like the checkout) and points the launcher there, so the menu bar app and MCP servers never read the checkout. The copy is staged and checked before it replaces the old one; the previous copy moves to `~/.local/share/monitor-backups`, and files or links of your own inside the runtime are kept. macOS privacy protection makes background access to `~/Documents` wait on a permission prompt, which returns with every rebuild of the ad-hoc-signed app. Re-run `./install.sh` after pulling changes, moving the checkout, or changing Node versions.
 
 ## macOS permission prompts
 

@@ -932,17 +932,22 @@ describe("ork next --strategy", () => {
       encoding: "utf8",
     }).trim();
     const url = "https://github.com/acme/widgets/pull/73";
-    writeFoundryState(wt.path, {
-      status: "pr_unverified",
-      prReconcile: {
-        repository: "acme/widgets",
-        baseBranch: "main",
-        headBranch: "feat/issue-301",
-        headOid: head,
-        phase: "created_unverified",
-        url,
+    // The spawned `ork` follows env, so the in-process writer and reader must use the same profile.
+    writeFoundryState(
+      wt.path,
+      {
+        status: "pr_unverified",
+        prReconcile: {
+          repository: "acme/widgets",
+          baseBranch: "main",
+          headBranch: "feat/issue-301",
+          headOid: head,
+          phase: "created_unverified",
+          url,
+        },
       },
-    });
+      { env },
+    );
     await writeNextLedger(
       repoRoot,
       {
@@ -996,7 +1001,7 @@ describe("ork next --strategy", () => {
     expect(payload.executedAction.kind).toBe("reconcile_pr");
     expect(payload.status).toBe("pr_opened");
     expect(payload.execution.pr).toMatchObject({ number: 73, state: "OPEN", headOid: head });
-    expect(readFoundryState(wt.path).pr).toMatchObject({ number: 73, url });
+    expect(readFoundryState(wt.path, { env }).pr).toMatchObject({ number: 73, url });
     const calls = readFileSync(callLog, "utf8");
     expect(calls).not.toMatch(/pr create/u);
     // The settled PR is not re-reconciled by yet another fresh process.

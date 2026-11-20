@@ -50,7 +50,7 @@ rmtree() { node -e 'require("fs").rmSync(process.argv[1], { recursive: true, for
 #
 # The copy mirrors the checkout's layout, so the relative imports and the version lookup resolve exactly as
 # they do there: package.json, src/bin/{monitor,observe}.mjs, src/lib/monitor and skills/monitor. Only
-# those paths are managed. The new copy is staged beside the live one, starting from everything already
+# those paths and the shared quota publisher dependencies are managed. The new copy starts from everything already
 # installed (custom files, a pre-`src/` bin/ and lib/, links you made), has its managed paths replaced, and
 # is swapped in only once it reports the right version. The previous copy moves to
 # ~/.local/share/monitor-backups; nothing is deleted.
@@ -62,6 +62,12 @@ for needed in "$root/package.json" "$root/src/bin/monitor.mjs" "$root/src/bin/ob
 done
 # Enumerate shipped leaves so local additions beside managed modules survive upgrades.
 managed="$(printf '%s\n' package.json config.example.json src/bin/monitor.mjs src/bin/observe.mjs
+  # Scoped quota publication uses the same store, migrations and room definitions as ork.
+  printf '%s\n' src/lib/families-schema.mjs src/lib/horde-room.mjs src/lib/orkest-sqlite.mjs \
+    src/lib/outbox.mjs src/lib/outbox-checkpoint.mjs src/lib/outbox-migration.mjs \
+    src/lib/outbox-policy.mjs src/lib/room-commands.mjs src/lib/room-project.mjs src/lib/runtime-paths.mjs src/lib/coordination-private-schema.mjs src/lib/projection-history.mjs \
+    references/families.json \
+    references/workforce-roles.json
   (cd "$root" && find src/lib/monitor -type f -print)
   (cd "$repo" && find skills/monitor -type f -print))"
 version="$(node -p "require(process.argv[1]).version" "$root/package.json")"

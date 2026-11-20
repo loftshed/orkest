@@ -1335,6 +1335,9 @@ pub fn has_active_room_for_session(base: &Path, session: &str) -> bool {
     if legacy_room_references_session(base, session) {
         return true;
     }
+    if let Some(active) = crate::sqlite::room_hook_hint(base, session) {
+        return active;
+    }
     match index_has_active_session(base, session) {
         Some(found) => found,
         None => !matches!(
@@ -1513,7 +1516,11 @@ mod tests {
     #[test]
     fn test_rooms_index_answers_for_sqlite_store() {
         let dir = scratch("index");
-        fs::write(dir.join("rooms.db"), b"").unwrap();
+        let db = rusqlite::Connection::open(dir.join("rooms.db")).unwrap();
+        db.pragma_update(None, "application_id", crate::sqlite::ROOMS_APPLICATION_ID)
+            .unwrap();
+        db.pragma_update(None, "user_version", 2).unwrap();
+        drop(db);
         fs::write(
             dir.join("rooms-index.json"),
             r#"{"schema":"orkest.rooms-index.v1","rooms":[
@@ -1532,6 +1539,20 @@ mod tests {
         assert!(!has_active_room_for_session(&dir, "session-other"));
         assert!(!has_active_room_for_session(&dir, "session"));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_outbox_room_hint_uses_the_committed_projection() {
+        let dir = scratch("transactional-hint");
+        let db = rusqlite::Connection::open(dir.join("rooms.db")).unwrap();
+        db.pragma_update(None, "application_id", crate::sqlite::ROOMS_APPLICATION_ID)
+            .unwrap();
+        db.pragma_update(None, "user_version", crate::sqlite::ROOMS_SCHEMA_VERSION)
+            .unwrap();
+        db.execute_batch("CREATE TABLE outbox_room_hints(room TEXT,session TEXT); INSERT INTO outbox_room_hints VALUES('room','current');").unwrap();
+        fs::write(dir.join("rooms-index.json"), r#"{"schema":"orkest.rooms-index.v1","rooms":[{"id":"old","closed":false,"sessions":["obsolete"]}]}"#).unwrap();
+        assert!(has_active_room_for_session(&dir, "current"));
+        assert!(!has_active_room_for_session(&dir, "obsolete"));
     }
 
     #[test]

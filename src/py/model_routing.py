@@ -757,13 +757,19 @@ def _observed_claude_resolved_ids(aliases: tuple[str, ...]) -> dict[str, list[st
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         pass
 
-    peers_dir = _agent_cache_dir() / "mailbox-v1" / "peers"
-    if peers_dir.is_dir():
-        for peer_file in peers_dir.glob("*.json"):
-            try:
-                peer = json.loads(peer_file.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                continue
+    mailbox_dir = _agent_cache_dir() / "mailbox-v1"
+    peer_docs: list[Any] = []
+    if (mailbox_dir / "mailbox-sqlite-v1").is_file():
+        # Best effort: an unreadable record store only hides observed model ids.
+        with contextlib.suppress(Exception):
+            records = _bundled_module("mailbox_records")
+            peer_docs = [row["body"] for row in records.list_rows(mailbox_dir, "peer", "")]
+    elif (mailbox_dir / "peers").is_dir():
+        for peer_file in (mailbox_dir / "peers").glob("*.json"):
+            with contextlib.suppress(json.JSONDecodeError, OSError):
+                peer_docs.append(json.loads(peer_file.read_text(encoding="utf-8")))
+    if peer_docs:
+        for peer in peer_docs:
             if not isinstance(peer, dict):
                 continue
             for key in ("sessionModel", "stepModel", "model", "executionModel"):

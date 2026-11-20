@@ -1289,8 +1289,7 @@ def detect_conductor_model(repo: Path) -> str | None:
     with contextlib.suppress(Exception):
         mailbox = bundled_module("peer_mailbox")
         base = mailbox.root()
-        peers_dir = base / "peers"
-        if not peers_dir.is_dir():
+        if not mailbox.peers_present(base):
             return None
         target_ws = mailbox.workspace(str(repo))
         if not target_ws:

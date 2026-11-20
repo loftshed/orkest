@@ -13,6 +13,7 @@ use std::path::{Component, Path, PathBuf};
 use serde_json::Value;
 
 use crate::identity;
+use crate::mailbox_records;
 use crate::paths;
 
 pub const TRANSCRIPT_TAIL_BYTES: usize = 256 * 1024;
@@ -614,7 +615,7 @@ pub fn agy_cohosted_active_parent(
     let Some(pid_val) = pid.filter(|&p| p > 0) else {
         return (None, false);
     };
-    let Ok(entries) = fs::read_dir(base.join("peers")) else {
+    let Ok(listing) = mailbox_records::list_peers(base) else {
         return (None, false);
     };
     let explicit_account = account.map(str::trim).filter(|s| !s.is_empty()).map(|s| {
@@ -626,26 +627,16 @@ pub fn agy_cohosted_active_parent(
         .unwrap_or_else(|| paths::expand_home("~/.gemini", None));
 
     let now_secs = paths::utc_now_secs();
-    let mut paths_list: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
-    paths_list.sort();
     let mut by_session: HashMap<String, (Value, PathBuf)> = HashMap::new();
-    for p in paths_list {
-        if p.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-        let Some(other) = paths::read_json_file(&p) else {
-            continue;
-        };
+    for (key, other) in listing.bodies() {
+        let other = other.clone();
         if !paths::valid_peer(&other) {
             continue;
         }
         let Some(other_sid) = other.get("session").and_then(Value::as_str) else {
             continue;
         };
-        let Ok(canon) = paths::peer_path(base, other_sid) else {
-            continue;
-        };
-        if canon != p && canon.exists() {
+        if !listing.is_canonical(key, other_sid) {
             continue;
         }
         if other_sid == session

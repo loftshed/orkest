@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { chmodSync, lstatSync, mkdirSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { backup, Database } from "node:sqlite";
@@ -163,6 +164,9 @@ export function openOrkestSqlite(
   });
 
   try {
+    db.function("orkest_digest", { deterministic: true }, (text) =>
+      createHash("sha256").update(text).digest("hex"),
+    );
     if (!readOnly) {
       const journalMode = enableWalMode(db, timeout);
       if (journalMode !== "wal") {

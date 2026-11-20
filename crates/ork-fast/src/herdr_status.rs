@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use crate::identity;
+use crate::mailbox_records;
 use crate::paths;
 use crate::rooms_work;
 use crate::sqlite;
@@ -248,18 +249,42 @@ fn lookup(base: &Path, request: &Request, budget: &Budget, raw: &[u8]) -> Option
     let _bound = sqlite::set_operation_deadline(budget_deadline(budget));
     let mut peers: Vec<Value> = Vec::new();
     let mut codex_sessions: HashSet<String> = HashSet::new();
-    let entries = fs::read_dir(base.join("peers")).ok()?;
-    for (seen, entry) in entries.flatten().enumerate() {
-        if budget.expired() || seen >= MAX_PEER_FILES {
+    let mut loaded: Vec<Value> = Vec::new();
+    match mailbox_records::backend(base) {
+        mailbox_records::Backend::Legacy => {
+            let entries = fs::read_dir(base.join("peers")).ok()?;
+            for (seen, entry) in entries.flatten().enumerate() {
+                if budget.expired() || seen >= MAX_PEER_FILES {
+                    return None;
+                }
+                let name = entry.file_name();
+                if !is_peer_file(&name.to_string_lossy()) {
+                    continue;
+                }
+                if let Some(peer) = load_object(&entry.path()) {
+                    loaded.push(peer);
+                }
+            }
+        }
+        mailbox_records::Backend::Sqlite => {
+            let listing = mailbox_records::list_peers(base).ok()?;
+            if listing.records.len() >= MAX_PEER_FILES {
+                return None;
+            }
+            loaded.extend(
+                listing
+                    .records
+                    .into_iter()
+                    .filter_map(|r| r.body)
+                    .filter(Value::is_object),
+            );
+        }
+        mailbox_records::Backend::Invalid => return None,
+    }
+    for peer in loaded {
+        if budget.expired() {
             return None;
         }
-        let name = entry.file_name();
-        if !is_peer_file(&name.to_string_lossy()) {
-            continue;
-        }
-        let Some(peer) = load_object(&entry.path()) else {
-            continue;
-        };
         let valid = paths::valid_peer(&peer);
         if valid && field(&peer, "harness").as_str() == Some("codex") {
             codex_sessions.extend(identity::native_session_ids(Some(&peer), Some(base)));

@@ -1,9 +1,9 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, realpathSync } from "node:fs";
+import { existsSync, mkdtempSync, realpathSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
   bootstrapWorktreeInclude,
@@ -26,11 +26,13 @@ import {
   foundryStatus,
   isLaneDeniedByPolicy,
   loadFactoryPolicy,
+  loadFoundryState,
   poolSupportsCandidate,
   readFoundryState,
   selectSparePools,
   writeFoundryState,
 } from "../../../src/lib/foundry.mjs";
+import { mailboxRoot, openRooms } from "../../../src/lib/horde-room.mjs";
 import {
   alignCanonicalPath,
   buildColdReviewQuestion,
@@ -44,6 +46,27 @@ import {
   smeltWorktree,
 } from "../../../src/lib/smelter.mjs";
 import { retainFixtures } from "../../helpers/retain-fixtures.js";
+
+// Canonical Foundry state is per profile: every test gets its own disposable profile so state never
+// leaks between tests or reaches the real rooms database.
+const realHome = process.env.ORCHESTRATE_HOME;
+beforeEach(() => {
+  process.env.ORCHESTRATE_HOME = mkdtempSync(path.join(tmpdir(), "orkest-smelter-home-"));
+});
+afterAll(() => {
+  if (realHome === undefined) delete process.env.ORCHESTRATE_HOME;
+  else process.env.ORCHESTRATE_HOME = realHome;
+});
+/** Make every later canonical state write fail (and roll back) until the returned restore runs. */
+function failStateWrites() {
+  using db = openRooms(mailboxRoot(process.env));
+  db.exec(`CREATE TRIGGER IF NOT EXISTS fail_state BEFORE UPDATE ON foundry_states
+    BEGIN SELECT RAISE(ABORT, 'injected state write failure'); END`);
+  return () => {
+    using again = openRooms(mailboxRoot(process.env));
+    again.exec("DROP TRIGGER IF EXISTS fail_state");
+  };
+}
 
 // Foundry tests model Git explicitly too; no fallback can reach the host Git binary.
 function foundryRun(args, options) {
@@ -1034,7 +1057,8 @@ describe("foundry re-exports and factory fixes", () => {
       status: "failed",
     });
 
-    const savedState = JSON.parse(await readFile(resolveFoundryStatePath(worktreePath), "utf8"));
+    const savedState = readFoundryState(worktreePath);
+    expect(existsSync(resolveFoundryStatePath(worktreePath))).toBe(false);
     expect(savedState).toMatchObject({
       acceptanceCriteria: ["Scoped Vitest check passes with maxWorkers=2"],
       attemptCount: 1,
@@ -2016,7 +2040,11 @@ describe("ork smelter", () => {
       { adminDir, statePath, exclusive: true },
     );
     expect(saved.status).toBe("verified");
-    expect(JSON.parse(await readFile(statePath, "utf8")).status).toBe("verified");
+    expect(loadFoundryState(wt, { adminDir, statePath })).toMatchObject({
+      kind: "ok",
+      state: { status: "verified" },
+    });
+    expect(existsSync(statePath)).toBe(false);
     expect(() =>
       writeFoundryState(wt, { status: "verified" }, { adminDir, statePath: outside }),
     ).toThrow(/escapes validated adminDir/);
@@ -2172,9 +2200,7 @@ describe("ork smelter", () => {
     });
     expect(failedGateRes.ok).toBe(false);
     expect(failedGateRes.status).toBe("gate_failed");
-    const stateAfterRebase = JSON.parse(
-      await readFile(path.join(wtGitDir, "orkest", "foundry-state.json"), "utf8"),
-    );
+    const stateAfterRebase = readFoundryState(wtPath);
     expect(stateAfterRebase.acceptedCommit).toBe(acceptedCommit);
     expect(stateAfterRebase.rebasedCommit).toBeTruthy();
     expect(stateAfterRebase.rebasedCommit).not.toBe(acceptedCommit);
@@ -2359,7 +2385,7 @@ describe("ork smelter", () => {
       cwd: realRepo,
       stdio: "ignore",
     });
-    const orkestDir = path.join(crashWt.wtGitDir, "orkest");
+    let restoreWrites;
     let didBreakAfterUpdateRef = false;
     try {
       const crashRes = await smeltWorktree(crashWt.wtPath, {
@@ -2374,7 +2400,7 @@ describe("ork smelter", () => {
             !didBreakAfterUpdateRef
           ) {
             didBreakAfterUpdateRef = true;
-            chmodSync(orkestDir, 0o555);
+            restoreWrites = failStateWrites();
           }
           return out;
         },
@@ -2384,16 +2410,14 @@ describe("ork smelter", () => {
       expect(crashRes.ok).toBe(false);
       expect(crashRes.status).toBe("state_write_failed");
     } finally {
-      chmodSync(orkestDir, 0o755);
+      restoreWrites?.();
     }
     const postCrashHead = execFileSync("git", ["rev-parse", "HEAD"], {
       cwd: crashWt.wtPath,
       encoding: "utf8",
     }).trim();
     expect(postCrashHead).not.toBe(crashWt.acceptedCommit);
-    const persistedCrashState = JSON.parse(
-      await readFile(path.join(orkestDir, "foundry-state.json"), "utf8"),
-    );
+    const persistedCrashState = readFoundryState(crashWt.wtPath);
     expect(persistedCrashState.pendingRebase).toMatchObject({
       acceptedCommit: crashWt.acceptedCommit,
       targetBranch: "main",
@@ -2517,6 +2541,7 @@ describe("ork smelter", () => {
       stdio: "ignore",
     });
 
+    let restoreCtxWrites;
     let didBreakCtx = false;
     try {
       const ctxCrash = await smeltWorktree(ctxPath, {
@@ -2531,7 +2556,7 @@ describe("ork smelter", () => {
             !didBreakCtx
           ) {
             didBreakCtx = true;
-            chmodSync(ctxOrkestDir, 0o555);
+            restoreCtxWrites = failStateWrites();
           }
           return out;
         },
@@ -2541,15 +2566,13 @@ describe("ork smelter", () => {
       expect(ctxCrash.ok).toBe(false);
       expect(ctxCrash.status).toBe("state_write_failed");
     } finally {
-      chmodSync(ctxOrkestDir, 0o755);
+      restoreCtxWrites?.();
     }
     const ctxRebasedHead = execFileSync("git", ["rev-parse", "HEAD"], {
       cwd: ctxPath,
       encoding: "utf8",
     }).trim();
-    const ctxStateBeforeRetry = JSON.parse(
-      await readFile(path.join(ctxOrkestDir, "foundry-state.json"), "utf8"),
-    );
+    const ctxStateBeforeRetry = readFoundryState(ctxPath);
     expect(ctxStateBeforeRetry.pendingRebase.rebasedOid).toBe(ctxRebasedHead);
 
     // If a strayed/partial commit replaces HEAD on the branch, recovery refuses with room_commit_mismatch (#6).
@@ -2631,6 +2654,26 @@ describe("smelter pull request strategy", () => {
     expect(log).toEqual([]);
   });
 
+  it("uses the requested profile for state checks and all transitions", async () => {
+    const root = await makeTempDir("ork-smelter-profile-worktree-");
+    const ambient = await makeTempDir("ork-smelter-ambient-");
+    const selected = await makeTempDir("ork-smelter-selected-");
+    const original = process.env.ORCHESTRATE_HOME;
+    process.env.ORCHESTRATE_HOME = ambient;
+    try {
+      writeFoundryState(root, { status: "running" });
+      const env = { ...process.env, ORCHESTRATE_HOME: selected };
+      const fakeGh = makeFakeGh({ head: "builder", oid: "fixture-head" });
+      const result = await run(root, fakeGh, [], { env });
+      expect(result.status).toBe("pr_opened");
+      expect(loadFoundryState(root, { env }).state?.pr?.state).toBe("OPEN");
+      expect(readFoundryState(root)?.status).toBe("running");
+    } finally {
+      if (original === undefined) delete process.env.ORCHESTRATE_HOME;
+      else process.env.ORCHESTRATE_HOME = original;
+    }
+  });
+
   it("dry run plans the operations and never pushes or calls gh", async () => {
     const root = await makeTempDir("ork-smelter-pr-dry-");
     const log = [];
@@ -2691,6 +2734,9 @@ describe("smelter pull request strategy", () => {
     });
     expect(fakeGh.prs).toHaveLength(1);
 
+    fakeGh.run = (args) => (args[1] === "list" ? "[]" : realRun(args));
+    expect(await run(root, fakeGh, [])).toMatchObject({ status: "pr_unverified" });
+    expect(fakeGh.calls.filter((call) => call[1] === "create")).toHaveLength(1);
     fakeGh.run = realRun;
     const retried = await run(root, fakeGh, []);
     expect(retried.status).toBe("pr_opened");

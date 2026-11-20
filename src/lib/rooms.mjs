@@ -29,6 +29,7 @@ import {
   WORKFORCE_ROLES,
   workforceRoleInfo,
 } from "./horde-room.mjs";
+import { mailboxFileMap, mailboxProjection } from "./mailbox-projection.mjs";
 import { hasTerminalDecision, memberDisplayState } from "./member-state.mjs";
 import { verifiedNativeIds } from "./native-identity.mjs";
 import { readDelegatedRunTail } from "./run-activity.mjs";
@@ -1918,7 +1919,7 @@ async function appendConsultations(room, root) {
 async function appendRoomMessages(room, root) {
   let inboxDirs;
   try {
-    inboxDirs = await readdir(path.join(root, "inbox"));
+    inboxDirs = mailboxProjection(root, "owners") ?? (await readdir(path.join(root, "inbox")));
   } catch {
     return;
   }
@@ -1956,16 +1957,19 @@ async function appendRoomMessages(room, root) {
   inboxDirs.sort((a, b) => a.localeCompare(b));
   for (const dirName of inboxDirs) {
     const inboxPath = path.join(root, "inbox", dirName);
+    const stored = mailboxFileMap(root, "inbox", dirName);
     let files;
     try {
-      files = await readdir(inboxPath);
+      files = stored ? stored.keys().toArray() : await readdir(inboxPath);
     } catch {
       continue;
     }
     files.sort((a, b) => a.localeCompare(b));
     for (const file of files) {
       if (!file.endsWith(".json")) continue;
-      const msg = await readOptionalJson(path.join(inboxPath, file), 64 * 1024);
+      const msg = stored
+        ? stored.get(file)
+        : await readOptionalJson(path.join(inboxPath, file), 64 * 1024);
       if (
         (msg?.schema && msg.schema !== "agent-executor.mail.v1") ||
         typeof msg?.text !== "string" ||
@@ -2118,9 +2122,10 @@ async function appendNativePeers(room, snapshots, root) {
       if (resolvedPath && resolvedPath !== roomCwd) memberPaths.add(resolvedPath);
     }
   }
+  const stored = mailboxFileMap(root, "peer");
   let rawPeerEntries;
   try {
-    rawPeerEntries = await readdir(path.join(root, "peers"));
+    rawPeerEntries = stored ? stored.keys().toArray() : await readdir(path.join(root, "peers"));
   } catch {
     rawPeerEntries = [];
   }
@@ -2130,7 +2135,9 @@ async function appendNativePeers(room, snapshots, root) {
   const maxAgents = room.swarm?.maxAgents || 64;
   const liveChiefSession = readLiveChiefSession(root);
   for (const entry of peerFiles) {
-    const peer = await readOptionalJson(path.join(root, "peers", entry), 64 * 1024);
+    const peer = stored
+      ? stored.get(entry)
+      : await readOptionalJson(path.join(root, "peers", entry), 64 * 1024);
     if (
       !isValidPeer(peer) ||
       !isPeerLive(peer) ||
@@ -3007,11 +3014,14 @@ async function sessionPeerCandidates(
     (!isAlias ||
       !(peer.isSubagent || peer.delegatedRun || peer.run || peer.session.startsWith("run-"))) &&
     (!expectedCwd || (await resolveCwd(peer.checkout || peer.cwd)) === expectedCwd);
-  const direct = await readOptionalJson(path.join(root, "peers", `${key}.json`), 64 * 1024);
+  const stored = mailboxFileMap(root, "peer");
+  const direct = stored
+    ? stored.get(`${key}.json`)
+    : await readOptionalJson(path.join(root, "peers", `${key}.json`), 64 * 1024);
   if (direct?.session === session && (await eligible(direct))) return [direct];
   let files;
   try {
-    files = await readdir(path.join(root, "peers"));
+    files = stored ? stored.keys().toArray() : await readdir(path.join(root, "peers"));
   } catch (error) {
     if (error.code === "ENOENT") return [];
     throw error;
@@ -3019,7 +3029,9 @@ async function sessionPeerCandidates(
   const matches = [];
   for (const file of files) {
     if (!file.endsWith(".json")) continue;
-    const peer = await readOptionalJson(path.join(root, "peers", file), 64 * 1024);
+    const peer = stored
+      ? stored.get(file)
+      : await readOptionalJson(path.join(root, "peers", file), 64 * 1024);
     if (sessionIdentities(peer, root).includes(session) && (await eligible(peer, true)))
       matches.push(peer);
   }

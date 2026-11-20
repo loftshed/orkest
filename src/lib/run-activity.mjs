@@ -1,6 +1,8 @@
 import { lstat, open, readFile } from "node:fs/promises";
 import path from "node:path";
 
+import { mailboxProjection } from "./mailbox-projection.mjs";
+
 const TAIL_BYTES = 192 * 1024;
 const MAX_LINES = 12;
 const MAX_LINE = 160;
@@ -73,9 +75,17 @@ export function summarizeRunOutput(text) {
 export async function readDelegatedRunTail(mailboxRoot, runId) {
   if (typeof runId !== "string" || !/^[\w.-]{1,120}$/u.test(runId)) return [];
   try {
-    const record = JSON.parse(
-      await readFile(path.join(mailboxRoot, "peers", `run-${runId}-worker.json`), "utf8"),
-    );
+    const stored = mailboxProjection(mailboxRoot, "get", {
+      collection: "peer",
+      owner: "",
+      key: `run-${runId}-worker`,
+    });
+    const record =
+      stored === undefined
+        ? JSON.parse(
+            await readFile(path.join(mailboxRoot, "peers", `run-${runId}-worker.json`), "utf8"),
+          )
+        : stored;
     const resultPath = record?.resultPath;
     if (typeof resultPath !== "string" || !path.isAbsolute(resultPath)) return [];
     const file = path.join(path.dirname(resultPath), "stdout.txt");

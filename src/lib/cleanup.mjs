@@ -6,6 +6,9 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { loadFoundryState, writeFoundryState } from "./foundry.mjs";
+import { openRooms as openMailboxDatabase } from "./horde-room.mjs";
+import { mailboxFileMap, mailboxProjection } from "./mailbox-projection.mjs";
+import { changeRecord } from "./mailbox-records.mjs";
 import { formatMergedCleanupReport, mergedCleanup, prRecordsEqual } from "./merged-worktree.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -934,13 +937,17 @@ function collectActiveRunIds(cacheHome) {
     }
   }
   const peersDir = path.join(cacheHome, "mailbox-v1", "peers");
-  if (fs.existsSync(peersDir)) {
+  const stored = mailboxFileMap(path.dirname(peersDir), "peer");
+  if (stored || fs.existsSync(peersDir)) {
     try {
-      for (const file of fs.readdirSync(peersDir)) {
+      const files = stored ? stored.keys() : fs.readdirSync(peersDir);
+      for (const file of files) {
         if (!file.endsWith(".json")) {
           continue;
         }
-        const peer = JSON.parse(fs.readFileSync(path.join(peersDir, file), "utf8"));
+        const peer = stored
+          ? stored.get(file)
+          : JSON.parse(fs.readFileSync(path.join(peersDir, file), "utf8"));
         if (!(peer?.pid && isPidAlive(peer.pid))) {
           continue;
         }
@@ -1640,18 +1647,21 @@ export function pruneStaleMailboxPeers(
   { dryRun = false, graceMs = 900_000, nowMs = Date.now() } = {},
 ) {
   const peersDir = path.join(cacheHome, "mailbox-v1", "peers");
+  const root = path.dirname(peersDir);
+  const rows = mailboxProjection(root, "list", { collection: "peer", owner: "" });
+  const stored = rows && new Map(rows.map((row) => [row.key + ".json", row]));
   const pruned = [];
   const kept = [];
   let bytesReclaimed = 0;
 
-  if (!fs.existsSync(peersDir)) {
+  if (!stored && !fs.existsSync(peersDir)) {
     return { pruned, kept, bytesReclaimed };
   }
 
   const activeRunIds = collectActiveRunIds(cacheHome);
   let files;
   try {
-    files = fs.readdirSync(peersDir);
+    files = stored ? stored.keys().toArray() : fs.readdirSync(peersDir);
   } catch {
     return { pruned, kept, bytesReclaimed };
   }
@@ -1661,7 +1671,8 @@ export function pruneStaleMailboxPeers(
       continue;
     }
     const peerPath = path.join(peersDir, file);
-    const st = statSafe(peerPath);
+    const row = stored?.get(file);
+    const st = row ? { mtimeMs: row.updated_ms, size: 0 } : statSafe(peerPath);
     if (!st) {
       continue;
     }
@@ -1672,7 +1683,7 @@ export function pruneStaleMailboxPeers(
     }
     let peer = null;
     try {
-      peer = JSON.parse(fs.readFileSync(peerPath, "utf8"));
+      peer = row ? row.body : JSON.parse(fs.readFileSync(peerPath, "utf8"));
     } catch {
       // Ignore unreadable peer JSON
     }
@@ -1690,10 +1701,24 @@ export function pruneStaleMailboxPeers(
       continue;
     }
 
+    if (row && !dryRun) {
+      using db = openMailboxDatabase(root);
+      if (
+        !changeRecord(db, "delete", {
+          collection: "peer",
+          owner: "",
+          key: row.key,
+          expected: row.body,
+        })
+      ) {
+        kept.push(peerPath);
+        continue;
+      }
+    }
     const size = st.size || 0;
     bytesReclaimed += size;
     pruned.push(peerPath);
-    if (!dryRun) {
+    if (!dryRun && !row) {
       try {
         fs.unlinkSync(peerPath);
       } catch {

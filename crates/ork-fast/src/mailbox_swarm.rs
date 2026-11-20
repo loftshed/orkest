@@ -10,6 +10,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::identity;
+use crate::mailbox_records;
 use crate::mailbox_transcript;
 use crate::paths;
 use crate::rooms_work;
@@ -452,24 +453,6 @@ pub fn swarm_command_context(
     }
 }
 
-fn count_unread_inbox(inbox_dir: &Path) -> usize {
-    let Ok(entries) = fs::read_dir(inbox_dir) else {
-        return 0;
-    };
-    let mut n = 0;
-    for entry in entries.flatten() {
-        let p = entry.path();
-        if p.extension().and_then(|e| e.to_str()) == Some("json")
-            && let Some(msg) = paths::read_json_file(&p)
-            && msg.is_object()
-            && !msg.get("readAt").is_some_and(paths::is_truthy_json)
-        {
-            n += 1;
-        }
-    }
-    n
-}
-
 fn auto_recover_task_cli(task_dir: &Path) -> Option<Value> {
     let script = paths::scripts_root()?.join("coordinator.py");
     if !script.is_file() {
@@ -617,9 +600,9 @@ fn swarm_next_advisor(
                     .and_then(|m| m.get("conductor"))
                     .and_then(Value::as_str)
                     .filter(|s| !s.is_empty())
-                    && let Ok(c_inbox) = paths::inbox_dir(base, c_peer)
+                    && paths::session_key(c_peer).is_ok()
                 {
-                    let unread = count_unread_inbox(&c_inbox);
+                    let unread = mailbox_records::count_unread(base, c_peer, false, false);
                     if unread > 0 {
                         respond_items.push(format!("respond:{agent_id}:{run_id}:{unread}"));
                         advisor_lines.push(format!(

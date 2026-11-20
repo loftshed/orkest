@@ -2,6 +2,7 @@ import { defineConfig } from "vitest/config";
 
 export default defineConfig({
   test: {
+    setupFiles: ["tests/helpers/isolated-profile.js"],
     include: ["tests/**/*-test.js"],
     // CI keeps a JUnit report as a build artifact.
     outputFile: { junit: "junit.xml" },

@@ -229,14 +229,9 @@ def _present(
         alive = bool(mailbox.valid_peer(peer) and mailbox.same_project(peer, project) and mailbox.is_live(peer))
         if not alive:
             if alias_peers is None:
-                peers_dir = base / "peers"
                 alias_peers = (
-                    [
-                        candidate
-                        for candidate_path in peers_dir.glob("*.json")
-                        if mailbox.valid_peer(candidate := mailbox.load(candidate_path))
-                    ]
-                    if peers_dir.is_dir()
+                    [candidate for _, candidate in mailbox.peer_entries(base) if mailbox.valid_peer(candidate)]
+                    if mailbox.peers_present(base)
                     else []
                 )
             for candidate in alias_peers:
@@ -306,14 +301,9 @@ def snapshot(base: Path, me: dict[str, Any], *, item: str | None = None) -> list
         )
     states = _states(board)
     presence: dict[str, tuple[dict[str, Any] | None, bool]] = {}
-    peers_dir = base / "peers"
     alias_peers = (
-        [
-            candidate
-            for candidate_path in peers_dir.glob("*.json")
-            if mailbox.valid_peer(candidate := mailbox.load(candidate_path))
-        ]
-        if peers_dir.is_dir() and selected
+        [candidate for _, candidate in mailbox.peer_entries(base) if mailbox.valid_peer(candidate)]
+        if selected and mailbox.peers_present(base)
         else []
     )
     records = [_view(base, states, record, presence, alias_peers) for record in selected]
