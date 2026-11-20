@@ -198,7 +198,7 @@ describe("agent process table", () => {
     const table = parseProcessTable(
       [
         " 600 1 10:00 /usr/bin/agent root",
-        " 601 600 00:30 /usr/bin/node /home/dev/.local/share/monitor/bin/monitor.mjs mcp",
+        " 601 600 00:30 /usr/bin/node /home/dev/.local/share/monitor/src/bin/monitor.mjs mcp",
         " 602 600 00:25 /usr/bin/python3 ./tools/gen_mcp.py",
         " 603 600 00:20 /usr/bin/npx @modelcontextprotocol/server-filesystem /tmp/repo",
         " 604 600 00:15 /usr/bin/python3 ./tools/generate_report.py",
