@@ -3,16 +3,9 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 
-import {
-  WORKFORCE_ROLES,
-  workforceRoleInfo,
-} from "../../../src/lib/horde-room.mjs";
-import {
-  diffCatalogAgainstSeen,
-  loadBenchmarkPriors,
-  radarCli,
-} from "../../../src/lib/radar.mjs";
 import { updateModelRadar } from "../../../scripts/update-model-radar.mjs";
+import { WORKFORCE_ROLES, workforceRoleInfo } from "../../../src/lib/horde-room.mjs";
+import { diffCatalogAgainstSeen, loadBenchmarkPriors, radarCli } from "../../../src/lib/radar.mjs";
 
 describe("ork radar and benchmark priors", () => {
   it("loads structured benchmark priors for all supported model families", async () => {

@@ -3,10 +3,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-import {
-  readDelegatedRunTail,
-  summarizeRunOutput,
-} from "../../../src/lib/run-activity.mjs";
+import { readDelegatedRunTail, summarizeRunOutput } from "../../../src/lib/run-activity.mjs";
 
 const directories = [];
 afterEach(async () => {

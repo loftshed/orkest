@@ -812,8 +812,7 @@ describe("Foundry disposable worktree preparation", () => {
         order.push("prepare");
         leaseBusyDuringPrepare = !(await acquireWorkspaceLease(worktreePath, { env: f.env }))
           .acquired;
-        const { prepareWorktree } =
-          await import("../../../src/lib/worktree-provision.mjs");
+        const { prepareWorktree } = await import("../../../src/lib/worktree-provision.mjs");
         return prepareWorktree(repoRoot, worktreePath, options);
       },
       execAgentFn: async (_args, options) => {

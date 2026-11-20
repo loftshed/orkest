@@ -255,8 +255,7 @@ describe("one pinned candidate with retained real Git", () => {
     const before = targetSnapshot(f);
     const result = await smelt(f, {
       acquireWorkspaceLeaseFn: async (workspace, options) => {
-        const { acquireWorkspaceLease } =
-          await import("../../../src/lib/workspace-lease.mjs");
+        const { acquireWorkspaceLease } = await import("../../../src/lib/workspace-lease.mjs");
         if (workspace === f.repo) git(f.repo, "update-ref", "--no-deref", "HEAD", f.target);
         return acquireWorkspaceLease(workspace, options);
       },

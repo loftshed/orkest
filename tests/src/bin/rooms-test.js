@@ -2521,8 +2521,7 @@ describe("room lock ownership", () => {
 
 describe("SQLite room persistence", () => {
   const execute = promisify(execFile);
-  const moduleUrl = new URL("../../../src/lib/horde-room.mjs", import.meta.url)
-    .href;
+  const moduleUrl = new URL("../../../src/lib/horde-room.mjs", import.meta.url).href;
 
   it("imports legacy rooms once, archives them, and keeps corrupt files visible", async () => {
     const root = await directory();

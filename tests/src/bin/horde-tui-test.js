@@ -18,10 +18,7 @@ import {
 import * as hordeTuiModule from "../../../src/bin/horde-tui.mjs";
 import * as factoryModule from "../../../src/lib/factory.mjs";
 import * as foundryModule from "../../../src/lib/foundry.mjs";
-import {
-  createHerdrLifecycleSubscriber,
-  herdrEndpoint,
-} from "../../../src/lib/herdr-context.mjs";
+import { createHerdrLifecycleSubscriber, herdrEndpoint } from "../../../src/lib/herdr-context.mjs";
 import {
   addMembers,
   createRoom,

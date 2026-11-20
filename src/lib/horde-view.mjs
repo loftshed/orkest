@@ -10,11 +10,11 @@ import { existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { renderLine, timeLeft } from "./monitor/render.mjs";
 import { redactCommand } from "./agent-processes.mjs";
 import { mapDiffLines, markText } from "./diff-marks.mjs";
 import { coalesceMessages, resolveMemberWorktree } from "./horde-room.mjs";
 import { memberDisplayState, MEMBER_OUTCOMES as OUTCOMES } from "./member-state.mjs";
+import { renderLine, timeLeft } from "./monitor/render.mjs";
 import {
   displayWidth,
   fit,

@@ -5,15 +5,12 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { cachedQuota, filterAccountsByRepoPolicy } from "../../../src/bin/horde-tui.mjs";
 import {
   evaluateRepoPolicy as evaluateMonitorPolicy,
   callTool as monitorCallTool,
   handle as monitorHandle,
 } from "../../../src/lib/monitor/mcp.mjs";
-import {
-  cachedQuota,
-  filterAccountsByRepoPolicy,
-} from "../../../src/bin/horde-tui.mjs";
 import {
   isAccountAllowed,
   isHarnessAllowed,
@@ -1205,8 +1202,7 @@ describe("canonical repo policy parity & monitor adapter", () => {
       "claude-personal",
       "custom-box",
     ];
-    const policyModuleUrl = new URL("../../../src/lib/monitor/policy.mjs", import.meta.url)
-      .href;
+    const policyModuleUrl = new URL("../../../src/lib/monitor/policy.mjs", import.meta.url).href;
     const workerScript = [
       `import { setRepoPolicyDeny } from ${JSON.stringify(policyModuleUrl)};`,
       "const [repo, cfg, home, target] = process.argv.slice(1);",
@@ -1377,8 +1373,7 @@ describe("canonical repo policy parity & monitor adapter", () => {
       "utf8",
     );
 
-    const policyModuleUrl = new URL("../../../src/lib/monitor/policy.mjs", import.meta.url)
-      .href;
+    const policyModuleUrl = new URL("../../../src/lib/monitor/policy.mjs", import.meta.url).href;
     const workerScript = [
       `import { setRepoPolicyDeny } from ${JSON.stringify(policyModuleUrl)};`,
       "const [targetRepo, targetCfg, targetHome, targetDeny] = process.argv.slice(1);",

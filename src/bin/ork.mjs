@@ -7,8 +7,6 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs, promisify } from "node:util";
 
-import { jsonView, renderLine, renderReport, shouldUseColor } from "../lib/monitor/render.mjs";
-import { getAccounts } from "../lib/monitor/store.mjs";
 import { ChiefView } from "../lib/chief-view.mjs";
 import { foundryCommand } from "../lib/foundry.mjs";
 import {
@@ -31,6 +29,8 @@ import {
   renderTable,
   wrapText,
 } from "../lib/horde-view.mjs";
+import { jsonView, renderLine, renderReport, shouldUseColor } from "../lib/monitor/render.mjs";
+import { getAccounts } from "../lib/monitor/store.mjs";
 import { coordinatorBrief, newRoom, observeRoom, writeCoordinatorBrief } from "../lib/rooms.mjs";
 import { cacheHome, configPath, orkFastBin } from "../lib/runtime-paths.mjs";
 import { cachedQuota, loadChiefModule, readLiveChief, runHordeTui } from "./horde-tui.mjs";
@@ -83,7 +83,9 @@ Use --cwd to choose the room's repository. Closing the view leaves workers runni
 `;
 
 const execute = promisify(execFile);
-const scripts = fileURLToPath(new URL("../../plugins/orchestrate/skills/orchestrate/scripts/", import.meta.url));
+const scripts = fileURLToPath(
+  new URL("../../plugins/orchestrate/skills/orchestrate/scripts/", import.meta.url),
+);
 const defaultRoutesUrl = new URL(
   "../../plugins/orchestrate/skills/orchestrate/references/routes.default.json",
   import.meta.url,
@@ -809,7 +811,10 @@ export async function main(
   if (argv[0] === "name") {
     // A readable session name for the current checkout: claude --name "$(ork name --model opus-5.5)".
     const script = fileURLToPath(
-      new URL("../../plugins/orchestrate/skills/orchestrate/scripts/peer_mailbox.py", import.meta.url),
+      new URL(
+        "../../plugins/orchestrate/skills/orchestrate/scripts/peer_mailbox.py",
+        import.meta.url,
+      ),
     );
     const { stdout: name } = await execute("python3", [script, "name", ...argv.slice(1)], {
       timeout: 30_000,

@@ -38,10 +38,7 @@ vi.mock("node:fs/promises", async (importOriginal) => {
   };
 });
 
-import {
-  readAgentActivity,
-  resetActivityCursorCache,
-} from "../../../src/lib/agent-activity.mjs";
+import { readAgentActivity, resetActivityCursorCache } from "../../../src/lib/agent-activity.mjs";
 
 const context = { root: "" };
 

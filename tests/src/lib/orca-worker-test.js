@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import vm from "node:vm";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { checkOrcaManifest } from "../../../scripts/validate.js";
 import { summarizeQuota as monitorSummarizeQuota } from "../../../src/lib/monitor/render.mjs";
 import {
   closeOrcaCompanionPane,
@@ -31,7 +32,6 @@ import activate, {
   summarizeQuota,
   swarmViewCommand,
 } from "../../../src/lib/orca-worker.mjs";
-import { checkOrcaManifest } from "../../../scripts/validate.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
 const SCREEN_READER = "/usr/bin/orca";
@@ -997,10 +997,7 @@ describe("orca panel, host fallbacks and races", () => {
 
   describe("panel page", () => {
     async function mountPanel(statusPayload, bridge) {
-      const html = await readFile(
-        path.join(ROOT, "src/lib/orca-panel.html"),
-        "utf8",
-      );
+      const html = await readFile(path.join(ROOT, "src/lib/orca-panel.html"), "utf8");
       const script = /<script>([\s\S]*)<\/script>/u.exec(html)[1];
       class Element {
         constructor(tag) {
@@ -1176,10 +1173,7 @@ describe("orca panel, host fallbacks and races", () => {
     });
 
     it("renders labels as text and never builds markup", async () => {
-      const html = await readFile(
-        path.join(ROOT, "src/lib/orca-panel.html"),
-        "utf8",
-      );
+      const html = await readFile(path.join(ROOT, "src/lib/orca-panel.html"), "utf8");
       expect(html).not.toMatch(/innerHTML|outerHTML|insertAdjacentHTML|document\.write|eval\(/u);
       const page = await mountPanel(goodStatus());
       expect(page.byId.get("rooms").firstElementChild.firstElementChild.textContent).toBe(

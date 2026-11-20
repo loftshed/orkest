@@ -68,9 +68,14 @@ export const CHIEF_SPAWN_SCHEMA = "ork.chief.spawn.v1";
 export const CHIEF_SEND_SCHEMA = "ork.chief.send.v1";
 export { CHIEF_FOCUS_TEXT } from "./horde-room.mjs";
 
-const SCRIPTS_DIR = fileURLToPath(new URL("../../plugins/orchestrate/skills/orchestrate/scripts/", import.meta.url));
+const SCRIPTS_DIR = fileURLToPath(
+  new URL("../../plugins/orchestrate/skills/orchestrate/scripts/", import.meta.url),
+);
 const ROUTES_DEFAULTS_PATH = fileURLToPath(
-  new URL("../../plugins/orchestrate/skills/orchestrate/references/routes.default.json", import.meta.url),
+  new URL(
+    "../../plugins/orchestrate/skills/orchestrate/references/routes.default.json",
+    import.meta.url,
+  ),
 );
 const PEER_MAILBOX_PY = path.join(SCRIPTS_DIR, "peer_mailbox.py");
 const RUN_AGENT_PY = path.join(SCRIPTS_DIR, "run_agent.py");
@@ -3457,7 +3462,10 @@ function interactiveLauncher({
     ...(model && engine === "codex" ? ["-m", model] : []),
   ];
   const statusline = fileURLToPath(
-    new URL("../../plugins/orchestrate/skills/orchestrate/scripts/agent_statusline_tmux.py", import.meta.url),
+    new URL(
+      "../../plugins/orchestrate/skills/orchestrate/scripts/agent_statusline_tmux.py",
+      import.meta.url,
+    ),
   );
   return [
     "#!/bin/sh",

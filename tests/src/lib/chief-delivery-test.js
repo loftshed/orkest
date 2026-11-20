@@ -6,19 +6,12 @@ import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import {
-  createChiefBridge,
-  emitChiefEvents,
-} from "../../../src/lib/chief-bridge.mjs";
-import {
-  deliveryStatePath,
-  openDeliveryStore,
-} from "../../../src/lib/chief-delivery.mjs";
+import { createChiefBridge, emitChiefEvents } from "../../../src/lib/chief-bridge.mjs";
+import { deliveryStatePath, openDeliveryStore } from "../../../src/lib/chief-delivery.mjs";
 import { openOrkestSqlite } from "../../../src/lib/orkest-sqlite.mjs";
 import { moveFixtureAside, retainFixtures } from "../../helpers/retain-fixtures.js";
 
-const BRIDGE_URL = new URL("../../../src/lib/chief-bridge.mjs", import.meta.url)
-  .href;
+const BRIDGE_URL = new URL("../../../src/lib/chief-bridge.mjs", import.meta.url).href;
 const ctx = { tmp: "", configFile: "", hooks: "", recorded: "", log: "", flag: "" };
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));

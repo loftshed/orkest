@@ -43,11 +43,7 @@ import {
   updateRoom,
 } from "../../../src/lib/horde-room.mjs";
 import * as roomsModule from "../../../src/lib/rooms.mjs";
-import {
-  cacheHome,
-  configPath,
-  envFirst,
-} from "../../../src/lib/runtime-paths.mjs";
+import { cacheHome, configPath, envFirst } from "../../../src/lib/runtime-paths.mjs";
 import * as swarmModule from "../../../src/lib/swarm.mjs";
 
 const exec = promisify(execFile);

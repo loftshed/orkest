@@ -32,7 +32,10 @@ const ALIAS_RE = /^[a-z][a-z0-9_-]*$/;
 const MARKER_VERSION = "# orkest-managed-alias: v1";
 const PROFILE_MARKER = ".orkest-account.json";
 const SCRIPT = fileURLToPath(
-  new URL("../../plugins/orchestrate/skills/orchestrate/scripts/install_mailbox.py", import.meta.url),
+  new URL(
+    "../../plugins/orchestrate/skills/orchestrate/scripts/install_mailbox.py",
+    import.meta.url,
+  ),
 );
 
 const PROVIDERS = {

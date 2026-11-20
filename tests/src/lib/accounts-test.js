@@ -5,17 +5,10 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import {
-  addAccount,
-  listAccounts,
-  removeAccount,
-  tagAccount,
-} from "../../../src/lib/accounts.mjs";
+import { addAccount, listAccounts, removeAccount, tagAccount } from "../../../src/lib/accounts.mjs";
 
 const ORK = fileURLToPath(new URL("../../../src/bin/ork.mjs", import.meta.url));
-const ACCOUNTS = fileURLToPath(
-  new URL("../../../src/lib/accounts.mjs", import.meta.url),
-);
+const ACCOUNTS = fileURLToPath(new URL("../../../src/lib/accounts.mjs", import.meta.url));
 const POLICY = fileURLToPath(new URL("../../../src/lib/monitor/policy.mjs", import.meta.url));
 const PYTHON_DIR = path.dirname(
   spawnSync("sh", ["-c", "command -v python3"], { encoding: "utf8" }).stdout.trim() || "/usr/bin/x",

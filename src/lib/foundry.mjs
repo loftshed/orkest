@@ -27,12 +27,12 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs, promisify } from "node:util";
 
-import { buildLanes } from "./monitor/analyze.mjs";
-import { shouldUseColor } from "./monitor/render.mjs";
-import { getAccounts } from "./monitor/store.mjs";
 import { emitChiefEvents } from "./chief-bridge.mjs";
 import { resolveWorktreeMarkerPath } from "./horde-room.mjs";
 import { glyphSet, glyphTier, renderPanel, renderTable, wrapText } from "./horde-view.mjs";
+import { buildLanes } from "./monitor/analyze.mjs";
+import { shouldUseColor } from "./monitor/render.mjs";
+import { getAccounts } from "./monitor/store.mjs";
 import {
   isHarnessAllowed,
   normalizeAccountTags,
@@ -48,7 +48,9 @@ import {
 import { prepareWorktree } from "./worktree-provision.mjs";
 
 const execute = promisify(execFile);
-const scriptsDir = fileURLToPath(new URL("../../plugins/orchestrate/skills/orchestrate/scripts/", import.meta.url));
+const scriptsDir = fileURLToPath(
+  new URL("../../plugins/orchestrate/skills/orchestrate/scripts/", import.meta.url),
+);
 const defaultRoutesUrl = new URL(
   "../../plugins/orchestrate/skills/orchestrate/references/routes.default.json",
   import.meta.url,

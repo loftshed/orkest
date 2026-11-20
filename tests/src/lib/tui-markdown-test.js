@@ -1,10 +1,7 @@
 import { stripVTControlCharacters } from "node:util";
 import { describe, expect, it } from "vitest";
 
-import {
-  extractAgentFocusMarkdown,
-  HordeView,
-} from "../../../src/lib/horde-view.mjs";
+import { extractAgentFocusMarkdown, HordeView } from "../../../src/lib/horde-view.mjs";
 import { displayWidth } from "../../../src/lib/tui-box.mjs";
 import {
   parseInlineSpans,

@@ -7,10 +7,7 @@ import { notifyHerdrTransitions } from "../../../src/bin/horde-tui.mjs";
 import { roomsCommand } from "../../../src/bin/rooms.mjs";
 import { createRoom, parseTeam, updateRoom } from "../../../src/lib/horde-room.mjs";
 import { HordeView } from "../../../src/lib/horde-view.mjs";
-import {
-  isTerminalDisplayState,
-  memberDisplayState,
-} from "../../../src/lib/member-state.mjs";
+import { isTerminalDisplayState, memberDisplayState } from "../../../src/lib/member-state.mjs";
 import { newRoom, observeRoom } from "../../../src/lib/rooms.mjs";
 import { plain } from "../../../src/lib/tui-box.mjs";
 

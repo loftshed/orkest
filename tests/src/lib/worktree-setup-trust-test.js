@@ -14,20 +14,14 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-import {
-  listWorktreePorts,
-  worktreePortsDbPath,
-} from "../../../src/lib/worktree-ports.mjs";
+import { listWorktreePorts, worktreePortsDbPath } from "../../../src/lib/worktree-ports.mjs";
 import {
   prepareWorktree,
   provisionWorktree,
   recoverInterruptedSetup,
 } from "../../../src/lib/worktree-provision.mjs";
 import { processStartIdentity } from "../../../src/lib/worktree-setup-worker.mjs";
-import {
-  approveWorktreeSetup,
-  describeWorktreeSetup,
-} from "../../../src/lib/worktree-trust.mjs";
+import { approveWorktreeSetup, describeWorktreeSetup } from "../../../src/lib/worktree-trust.mjs";
 import { retainFixtures } from "../../helpers/retain-fixtures.js";
 
 const directories = [];

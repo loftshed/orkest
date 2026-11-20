@@ -12,7 +12,9 @@ import { coordinator, memberOf, observeRoom } from "./rooms.mjs";
 import { isPathAllowed } from "./smelter.mjs";
 import { currentBranch, resolveRepositoryRoot } from "./worktree-provision.mjs";
 
-const scriptsDir = fileURLToPath(new URL("../../plugins/orchestrate/skills/orchestrate/scripts", import.meta.url));
+const scriptsDir = fileURLToPath(
+  new URL("../../plugins/orchestrate/skills/orchestrate/scripts", import.meta.url),
+);
 const INTEGRATION_LOCK_TIMEOUT_MS = 30_000;
 const INTEGRATION_LOCK_POLL_MS = 25;
 

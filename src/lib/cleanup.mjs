@@ -9,7 +9,16 @@ import { loadFoundryState, writeFoundryState } from "./foundry.mjs";
 import { formatMergedCleanupReport, mergedCleanup, prRecordsEqual } from "./merged-worktree.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const SCRIPTS_DIR = path.resolve(__dirname, "..", "..", "plugins", "orchestrate", "skills", "orchestrate", "scripts");
+const SCRIPTS_DIR = path.resolve(
+  __dirname,
+  "..",
+  "..",
+  "plugins",
+  "orchestrate",
+  "skills",
+  "orchestrate",
+  "scripts",
+);
 const RUN_AGENT_SCRIPT = path.join(SCRIPTS_DIR, "run_agent.py");
 
 export const CLEANUP_SCHEMA = "ork.cleanup.v1";

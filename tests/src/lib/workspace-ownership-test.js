@@ -21,8 +21,7 @@ import { acquireWorkspaceLease } from "../../../src/lib/workspace-lease.mjs";
 
 const foundryUrl = new URL("../../../src/lib/foundry.mjs", import.meta.url).href;
 const nextUrl = new URL("../../../src/lib/next.mjs", import.meta.url).href;
-const leaseUrl = new URL("../../../src/lib/workspace-lease.mjs", import.meta.url)
-  .href;
+const leaseUrl = new URL("../../../src/lib/workspace-lease.mjs", import.meta.url).href;
 const sink = { write() {} };
 
 // Real Git is restricted to retained throwaway repositories. No test reaches pruning.

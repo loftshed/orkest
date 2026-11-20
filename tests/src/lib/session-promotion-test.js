@@ -16,12 +16,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { roomsCommand } from "../../../src/bin/rooms.mjs";
 import { herdrEndpoint } from "../../../src/lib/herdr-context.mjs";
-import {
-  listRawRooms,
-  parseTeam,
-  readRoom,
-  updateRoom,
-} from "../../../src/lib/horde-room.mjs";
+import { listRawRooms, parseTeam, readRoom, updateRoom } from "../../../src/lib/horde-room.mjs";
 import { openOrkestSqlite } from "../../../src/lib/orkest-sqlite.mjs";
 import { resumeRoomStatus } from "../../../src/lib/room-resume.mjs";
 import {

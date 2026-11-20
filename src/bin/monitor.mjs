@@ -7,7 +7,13 @@ import { detectConfig } from "../lib/monitor/init.mjs";
 import { serveMcp, summarizeLanes } from "../lib/monitor/mcp.mjs";
 import { registerMcp } from "../lib/monitor/register.mjs";
 import { jsonView, renderLine, renderReport, shouldUseColor } from "../lib/monitor/render.mjs";
-import { CACHE_DIR, CONFIG_PATH, getAccounts, loadConfig, writeConfig } from "../lib/monitor/store.mjs";
+import {
+  CACHE_DIR,
+  CONFIG_PATH,
+  getAccounts,
+  loadConfig,
+  writeConfig,
+} from "../lib/monitor/store.mjs";
 import { VERSION } from "../lib/monitor/version.mjs";
 
 const HELP = `monitor: remaining quota across your Claude, Codex and Antigravity accounts

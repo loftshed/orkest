@@ -26,9 +26,6 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs, promisify } from "node:util";
 
-import { buildLanes } from "./monitor/analyze.mjs";
-import { shouldUseColor } from "./monitor/render.mjs";
-import { getAccounts } from "./monitor/store.mjs";
 import {
   collectActiveWorktreeAllowPaths,
   countCommitsAhead,
@@ -61,6 +58,9 @@ import {
   RECONCILABLE_PR_STATUSES,
   reconcilePullRequest,
 } from "./merged-worktree.mjs";
+import { buildLanes } from "./monitor/analyze.mjs";
+import { shouldUseColor } from "./monitor/render.mjs";
+import { getAccounts } from "./monitor/store.mjs";
 import { observeRoom, recoverRoom } from "./rooms.mjs";
 import { cacheHome } from "./runtime-paths.mjs";
 import {
@@ -73,7 +73,9 @@ import {
 import { acquireWorkspaceLease, assertWorkspaceLease } from "./workspace-lease.mjs";
 
 const executeAsync = promisify(execFile);
-const scriptsDir = fileURLToPath(new URL("../../plugins/orchestrate/skills/orchestrate/scripts/", import.meta.url));
+const scriptsDir = fileURLToPath(
+  new URL("../../plugins/orchestrate/skills/orchestrate/scripts/", import.meta.url),
+);
 
 export const NEXT_SCHEMA = "ork.next.v1";
 export const NEXT_LEDGER_SCHEMA = "ork.next.ledger.v1";

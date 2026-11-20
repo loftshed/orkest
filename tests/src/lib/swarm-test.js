@@ -9,11 +9,7 @@ import { afterEach, expect, it } from "vitest";
 import { main as orkMain } from "../../../src/bin/ork.mjs";
 import { roomsCommand } from "../../../src/bin/rooms.mjs";
 import { parseTeam, readRoom, updateRoom } from "../../../src/lib/horde-room.mjs";
-import {
-  agentFolder,
-  HordeView,
-  worktreeBadge,
-} from "../../../src/lib/horde-view.mjs";
+import { agentFolder, HordeView, worktreeBadge } from "../../../src/lib/horde-view.mjs";
 import {
   bindSession,
   dispatchMember,

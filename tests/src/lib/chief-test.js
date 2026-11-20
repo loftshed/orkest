@@ -26,11 +26,7 @@ import {
   resolveChiefTarget,
   sessionKey,
 } from "../../../src/lib/chief.mjs";
-import {
-  listRawRooms,
-  readRawRoom,
-  updateRawRoom,
-} from "../../../src/lib/horde-room.mjs";
+import { listRawRooms, readRawRoom, updateRawRoom } from "../../../src/lib/horde-room.mjs";
 import { displayWidth } from "../../../src/lib/tui-box.mjs";
 
 const NOW = Date.now();
@@ -2371,12 +2367,8 @@ describe("ork chief", () => {
   describe("mission lifecycle, digest, close and interactive launch", () => {
     const HEX = "a".repeat(32);
     const OTHER_HEX = "b".repeat(32);
-    const ORK_BIN = fileURLToPath(
-      new URL("../../../src/bin/ork.mjs", import.meta.url),
-    );
-    const CHIEF_BIN = fileURLToPath(
-      new URL("../../../src/bin/chief.mjs", import.meta.url),
-    );
+    const ORK_BIN = fileURLToPath(new URL("../../../src/bin/ork.mjs", import.meta.url));
+    const CHIEF_BIN = fileURLToPath(new URL("../../../src/bin/chief.mjs", import.meta.url));
     let cache;
     let repo;
     let runMailbox;

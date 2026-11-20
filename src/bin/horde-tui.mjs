@@ -5,8 +5,6 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
-import { shouldUseColor } from "../lib/monitor/render.mjs";
-import { CACHE_DIR, CONFIG_PATH } from "../lib/monitor/store.mjs";
 import { readAgentDiff } from "../lib/agent-diff.mjs";
 import { createAgentPreview } from "../lib/agent-preview.mjs";
 import {
@@ -35,6 +33,8 @@ import {
   MEMBER_OUTCOMES,
   memberDisplayState,
 } from "../lib/member-state.mjs";
+import { shouldUseColor } from "../lib/monitor/render.mjs";
+import { CACHE_DIR, CONFIG_PATH } from "../lib/monitor/store.mjs";
 import {
   agentOrcaTerminal,
   isCurrentOrcaAgent,

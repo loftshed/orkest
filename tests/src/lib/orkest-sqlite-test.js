@@ -19,9 +19,7 @@ import {
 
 const execFileAsync = promisify(execFile);
 const nodeExecutable = process.execPath;
-const sqliteModuleUrl = pathToFileURL(
-  path.resolve("src/lib/orkest-sqlite.mjs"),
-).href;
+const sqliteModuleUrl = pathToFileURL(path.resolve("src/lib/orkest-sqlite.mjs")).href;
 
 const temporaryDirectory = { path: "" };
 

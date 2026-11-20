@@ -17,11 +17,11 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
-import { shouldUseColor } from "./monitor/render.mjs";
 import { loadFoundryState, resolveFoundryStatePath, writeFoundryState } from "./foundry.mjs";
 import { mailboxRoot, readRawRoom, resolveWorktreeMarkerPath } from "./horde-room.mjs";
 import { glyphSet, glyphTier, renderPanel, renderTable } from "./horde-view.mjs";
 import { ensurePullRequest, parseStrategy, pruneMergedWorktree } from "./merged-worktree.mjs";
+import { shouldUseColor } from "./monitor/render.mjs";
 import {
   isHarnessAllowed,
   loadConfiguredAccounts,
@@ -30,7 +30,9 @@ import {
 } from "./policy.mjs";
 import { acquireWorkspaceLease, assertWorkspaceLease } from "./workspace-lease.mjs";
 
-const scriptsDir = fileURLToPath(new URL("../../plugins/orchestrate/skills/orchestrate/scripts/", import.meta.url));
+const scriptsDir = fileURLToPath(
+  new URL("../../plugins/orchestrate/skills/orchestrate/scripts/", import.meta.url),
+);
 
 export const COLD_REVIEW_QUESTION =
   "Review the changes and report ONLY concrete correctness bugs, security vulnerabilities, concurrency/race conditions, or scope violations under FINDINGS. Do not report stylistic preferences or speculative refactors; write 'none' under FINDINGS if no concrete defects exist.";

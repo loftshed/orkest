@@ -260,7 +260,10 @@ export function roomPath(id, root = mailboxRoot()) {
 
 export async function loadPresets() {
   return JSON.parse(
-    await readFile(new URL("../../plugins/orchestrate/references/swarm-presets.json", import.meta.url), "utf8"),
+    await readFile(
+      new URL("../../plugins/orchestrate/references/swarm-presets.json", import.meta.url),
+      "utf8",
+    ),
   );
 }
 

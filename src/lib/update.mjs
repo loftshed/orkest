@@ -508,7 +508,10 @@ export async function runUpdateCli(argv = [], io = {}) {
 
   if (subcommand === "run" && !options.auto && (!isQuiet || result.updated)) {
     const scanner = fileURLToPath(
-      new URL("../../plugins/orchestrate/skills/orchestrate/scripts/legacy_plugin.py", import.meta.url),
+      new URL(
+        "../../plugins/orchestrate/skills/orchestrate/scripts/legacy_plugin.py",
+        import.meta.url,
+      ),
     );
     let notice;
     try {

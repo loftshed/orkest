@@ -16,10 +16,7 @@ import {
   updateRoom,
   validateRoom,
 } from "../../../src/lib/horde-room.mjs";
-import {
-  HordeView,
-  settingsProvenanceLabel,
-} from "../../../src/lib/horde-view.mjs";
+import { HordeView, settingsProvenanceLabel } from "../../../src/lib/horde-view.mjs";
 import { evaluateNextCandidates } from "../../../src/lib/next.mjs";
 import {
   archiveRoom,

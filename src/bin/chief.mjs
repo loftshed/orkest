@@ -4,7 +4,6 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
-import { renderLine } from "../lib/monitor/render.mjs";
 import {
   bindChief,
   chiefClose,
@@ -18,6 +17,7 @@ import {
   listDesk,
 } from "../lib/chief.mjs";
 import { mailboxRoot } from "../lib/horde-room.mjs";
+import { renderLine } from "../lib/monitor/render.mjs";
 import { truncateDisplay } from "../lib/tui-box.mjs";
 
 export const CHIEF_HELP = `ork chief [status] [--json] [--room <id>] [--all] [--no-quota]   (machine-wide Chief overview)

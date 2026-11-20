@@ -1,8 +1,8 @@
 import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { ANSI as MONITOR_ANSI } from "../../../src/lib/monitor/render.mjs";
 import { HordeView } from "../../../src/lib/horde-view.mjs";
+import { ANSI as MONITOR_ANSI } from "../../../src/lib/monitor/render.mjs";
 import {
   displayWidth,
   frame,

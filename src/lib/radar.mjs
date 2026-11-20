@@ -12,7 +12,6 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { parseArgs, promisify } from "node:util";
 
-import { shouldUseColor } from "./monitor/render.mjs";
 import {
   auditCatalogDrift,
   knownEngines,
@@ -20,6 +19,7 @@ import {
   modelMatchesFamilySelector,
   nativeEngineForModel,
 } from "./families-schema.mjs";
+import { shouldUseColor } from "./monitor/render.mjs";
 import { cacheHome } from "./runtime-paths.mjs";
 import { glyphSet, glyphTier, renderPanel, renderTable, tone, wrapText } from "./tui-box.mjs";
 

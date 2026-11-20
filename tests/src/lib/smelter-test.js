@@ -2071,8 +2071,7 @@ describe("ork smelter", () => {
       encoding: "utf8",
     }).trim();
 
-    const { parseTeam, updateRoom } =
-      await import("../../../src/lib/horde-room.mjs");
+    const { parseTeam, updateRoom } = await import("../../../src/lib/horde-room.mjs");
     const { newRoom } = await import("../../../src/lib/rooms.mjs");
     const room = await newRoom(parseTeam("codex:luna:max"), {
       id: "room-smelt-check",
@@ -2208,8 +2207,7 @@ describe("ork smelter", () => {
     execFileSync("git", ["commit", "-m", "init"], { cwd: realRepo, stdio: "ignore" });
     execFileSync("git", ["branch", "release/v1", "main"], { cwd: realRepo });
 
-    const { parseTeam, updateRoom } =
-      await import("../../../src/lib/horde-room.mjs");
+    const { parseTeam, updateRoom } = await import("../../../src/lib/horde-room.mjs");
     const { newRoom } = await import("../../../src/lib/rooms.mjs");
 
     // Helper to create an integrated worktree for a target branch.
