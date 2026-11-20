@@ -7,10 +7,7 @@ const SOURCE_FAMILIES_URL = new URL(
   "../../plugins/orchestrate/skills/orchestrate/references/families.json",
   import.meta.url,
 );
-const BUNDLED_FAMILIES_URL = new URL(
-  "../references/families.json",
-  import.meta.url,
-);
+const BUNDLED_FAMILIES_URL = new URL("../references/families.json", import.meta.url);
 const DEFAULT_FAMILIES_URL = existsSync(SOURCE_FAMILIES_URL)
   ? SOURCE_FAMILIES_URL
   : BUNDLED_FAMILIES_URL;
