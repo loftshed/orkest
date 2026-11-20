@@ -25,10 +25,9 @@ async function fixture({ mutate = false } = {}) {
   const directory = await mkdtemp(path.join(tmpdir(), "visual-test-"));
   directories.push(directory);
   const repo = path.join(directory, "repo");
-  await mkdir(path.join(repo, "plugins/orchestrate/lib"), { recursive: true });
-  await mkdir(path.join(repo, "plugins/monitor/lib"), { recursive: true });
-  await writeFile(path.join(repo, "plugins/monitor/lib/fixture.mjs"), "export {};\n");
-  const renderer = path.join(repo, "plugins/orchestrate/lib/horde-view.mjs");
+  await mkdir(path.join(repo, "src/lib/monitor"), { recursive: true });
+  await writeFile(path.join(repo, "src/lib/monitor/fixture.mjs"), "export {};\n");
+  const renderer = path.join(repo, "src/lib/horde-view.mjs");
   const source = (text) =>
     String.raw`import {appendFileSync} from 'node:fs'; export class HordeView { constructor(){} handleInput(){} render(){${mutate ? String.raw`appendFileSync(new URL(import.meta.url),'// changed during capture\n');` : ""}return ['\u001b[36m${text}\u001b[0m'];} }`.replaceAll(
       String.raw`\u001b`,

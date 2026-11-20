@@ -7,7 +7,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify, stripVTControlCharacters } from "node:util";
 
-import { displayWidth } from "../../plugins/orchestrate/lib/tui-box.mjs";
+import { displayWidth } from "../../src/lib/tui-box.mjs";
 import { ansiToWindowSvg } from "./readme.js";
 
 const execute = promisify(execFile);
@@ -305,9 +305,20 @@ export function syntheticRoom() {
   };
 }
 
+/** The Node library roots of a checkout: `src/lib` now, the plugin directories in revisions before the move. */
+async function libraryRoots(repo) {
+  try {
+    await readdir(path.join(repo, "src/lib"));
+    return ["src/lib"];
+  } catch {
+    return ["plugins/orchestrate/lib", "plugins/monitor/lib"];
+  }
+}
+
 export async function renderFixture(repo, spec) {
+  const [library] = await libraryRoots(repo);
   const { HordeView } = await import(
-    pathToFileURL(path.join(repo, "plugins/orchestrate/lib/horde-view.mjs")).href
+    pathToFileURL(path.join(repo, library, "horde-view.mjs")).href
   );
   const room = syntheticRoom();
   switch (spec.scenario) {
@@ -1342,7 +1353,8 @@ async function sourceInfo(repo, ref = "working-tree") {
 
 async function rendererFingerprint(repo) {
   const hash = createHash("sha256");
-  for (const directory of ["plugins/orchestrate/lib", "plugins/monitor/lib"]) {
+  const roots = await libraryRoots(repo);
+  for (const directory of roots) {
     const files = (await readdir(path.join(repo, directory), { recursive: true }))
       .filter((file) => file.endsWith(".mjs"))
       .sort((left, right) => left.localeCompare(right, "en"));

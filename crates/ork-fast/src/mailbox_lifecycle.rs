@@ -3825,10 +3825,10 @@ pub fn maybe_trigger_auto_update(base: &Path, me: &Value, event: &str) {
             }
         }
     }
-    let Some(plugin) = paths::plugin_root() else {
+    let Some(runtime) = paths::runtime_root() else {
         return;
     };
-    let cli = plugin.join("bin/ork.mjs");
+    let cli = runtime.join("src/bin/ork.mjs");
     let mut cmd = Command::new(paths::node_binary());
     cmd.arg(cli)
         .args(["update", "run", "--auto", "--quiet"])
@@ -4780,10 +4780,17 @@ pub(crate) fn current_runtime_revision(base: &Path) -> Option<String> {
     let scripts_dir = paths::scripts_root()?;
     let scripts_canon = fs::canonicalize(&scripts_dir).unwrap_or(scripts_dir);
     let skill = scripts_canon.parent()?;
-    let plugin = if skill.join("lib").is_dir() {
-        skill
+    // An installed runtime copy keeps `bin/` and `lib/` beside the skill folders; a checkout keeps the
+    // shared Node runtime in `<checkout>/src/{bin,lib}`, four levels above the skill.
+    let node_runtime = if skill.join("lib").is_dir() {
+        skill.to_path_buf()
     } else {
-        skill.parent().and_then(Path::parent)?
+        skill
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .and_then(Path::parent)?
+            .join("src")
     };
 
     let mut roots_json = Vec::with_capacity(REVISION_FOLDERS.len());
@@ -4794,7 +4801,7 @@ pub(crate) fn current_runtime_revision(base: &Path) -> Option<String> {
     for &folder in REVISION_FOLDERS {
         let dir = match folder {
             "scripts" | "references" | "templates" => skill.join(folder),
-            _ => plugin.join(folder),
+            _ => node_runtime.join(folder),
         };
         if !dir.is_dir() {
             roots_json.push(json!({"name": folder, "path": Value::Null}));
@@ -5497,9 +5504,9 @@ pub(crate) mod tests {
     }
 
     fn setup_minimal_scripts_dir(dir: &Path) -> PathBuf {
-        let skill = dir.join("fake-plugin/skills/orchestrate");
+        let skill = dir.join("fake-checkout/plugins/orchestrate/skills/orchestrate");
         let scripts = skill.join("scripts");
-        let lib = dir.join("fake-plugin/lib");
+        let lib = dir.join("fake-checkout/src/lib");
         fs::create_dir_all(&scripts).unwrap();
         fs::create_dir_all(&lib).unwrap();
         fs::write(scripts.join("mailbox_daemon.py"), "# stub\n").unwrap();
@@ -5582,7 +5589,16 @@ pub(crate) mod tests {
         let scripts_canon = fs::canonicalize(&scripts).unwrap();
         let scripts_hash = sha256::sha256_hex(scripts_canon.to_string_lossy().as_bytes());
         let skill_dir = scripts_canon.parent().unwrap();
-        let lib_dir = skill_dir.parent().unwrap().parent().unwrap().join("lib");
+        let lib_dir = skill_dir
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("src/lib");
         let mut files_rows = Vec::new();
         for (folder, root_dir, rel) in [
             ("scripts", &scripts_canon, "scripts/mailbox_daemon.py"),

@@ -509,7 +509,7 @@ class RoomLockTests(unittest.TestCase):
         self.assertEqual(json.loads((self.lock / "owner").read_text()), {"pid": os.getpid(), "token": "replacement"})
 
     def test_python_and_node_holders_exclude_each_other_when_aged(self):
-        module = SCRIPTS.parents[2] / "lib/horde-room.mjs"
+        module = SCRIPTS.parents[4] / "src/lib/horde-room.mjs"
         script = f"""
             import {{ withRoomLock }} from {json.dumps(module.as_uri())};
             await withRoomLock(process.argv[1], async () => {{
@@ -604,7 +604,7 @@ class RoomStoreTests(unittest.TestCase):
             )
             self.assertIsNone(tmux.rebind_session_swarm_room(base, "room", "absent", "new"))
             room_store.list_rooms(base)
-            sqlite_module = (SCRIPTS.parents[2] / "lib/orkest-sqlite.mjs").as_uri()
+            sqlite_module = (SCRIPTS.parents[4] / "src/lib/orkest-sqlite.mjs").as_uri()
             script = f"""
               import {{ openOrkestSqlite }} from {json.dumps(sqlite_module)};
               const db = openOrkestSqlite(process.argv[1] + '/rooms.db');
@@ -655,7 +655,7 @@ class RoomStoreTests(unittest.TestCase):
 
             db_path = base / "rooms.db"
             before = db_path.stat()
-            sqlite_module = (SCRIPTS.parents[2] / "lib/orkest-sqlite.mjs").as_uri()
+            sqlite_module = (SCRIPTS.parents[4] / "src/lib/orkest-sqlite.mjs").as_uri()
             subprocess.run(
                 [
                     "node",

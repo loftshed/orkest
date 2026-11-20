@@ -22,7 +22,7 @@ import peer_mailbox as mailbox  # noqa: E402
 import room_store  # noqa: E402
 import swarm_status  # noqa: E402
 
-CLI = SCRIPTS.parents[2] / "bin/ork.mjs"
+CLI = SCRIPTS.parents[4] / "src/bin/ork.mjs"
 
 
 class ResumeRoomTests(unittest.TestCase):
@@ -43,7 +43,7 @@ class ResumeRoomTests(unittest.TestCase):
             PYTHONPATH=str(SCRIPTS),
             ORKEST_NODE_BIN=room_store._node_binary(),
             ORKEST_SCRIPTS_DIR=str(SCRIPTS),
-            ORKEST_PLUGIN_ROOT=str(CLI.parents[1]),
+            ORKEST_PLUGIN_ROOT=str(SCRIPTS.parents[2]),
             ORK_FAST_BIN=str(ORK_FAST.find_ork_fast_bin()),
         )
         return environment
@@ -123,8 +123,8 @@ else:
 peer = mailbox.load(mailbox.peer_path(base, 'new-native'))
 rooms = room_store.list_rooms(base)
 room = room_store.read_room(base, os.environ['TEST_ROOM'])
-node_code = '''import { observeRoom } from './plugins/orchestrate/lib/rooms.mjs';
-import { HordeView } from './plugins/orchestrate/lib/horde-view.mjs';
+node_code = '''import { observeRoom } from './src/lib/rooms.mjs';
+import { HordeView } from './src/lib/horde-view.mjs';
 const room = await observeRoom(process.env.TEST_ROOM, {root: process.env.AGENT_EXECUTOR_HOME + '/mailbox-v1', discoverNativePeers: false});
 process.stdout.write(JSON.stringify({progress: room.conductor.progress, header: new HordeView(room, {color: false}).render(160).join(String.fromCharCode(10))}));'''
 view = subprocess.run([room_store._node_binary(), '--input-type=module', '-e', node_code],
@@ -574,10 +574,14 @@ print(json.dumps({'rooms': [r['id'] for r in rooms], 'room': room, 'notice': not
                 }
             ]
             room = room_store.put_room(base, room)
-            broken_plugin = home / "broken-plugin"
+            broken_checkout = home / "broken-checkout"
+            broken_plugin = broken_checkout / "plugins/orchestrate"
             (broken_plugin / "skills/orchestrate/scripts").mkdir(parents=True)
-            (broken_plugin / "bin").mkdir(parents=True)
-            (broken_plugin / "bin/room-store.mjs").write_text("if (process.argv[2] === 'rebind') process.exit(1);\n")
+            (broken_checkout / "src/bin").mkdir(parents=True)
+            (broken_checkout / "src/bin/ork.mjs").write_text("\n")
+            (broken_checkout / "src/bin/room-store.mjs").write_text(
+                "if (process.argv[2] === 'rebind') process.exit(1);\n"
+            )
             environment = self.environment(home)
             environment["ORKEST_SWARM_ROOM"] = room["id"]
             failing_env = {

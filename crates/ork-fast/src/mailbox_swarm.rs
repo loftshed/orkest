@@ -224,10 +224,10 @@ pub fn side_command_context(
                 Let the user know in one short line and do not call any tools."
             .to_string();
     }
-    let Some(plugin) = paths::plugin_root() else {
+    let Some(runtime) = paths::runtime_root() else {
         return String::new();
     };
-    let side_script = plugin.join("lib/side.mjs");
+    let side_script = runtime.join("src/lib/side.mjs");
     if !side_script.is_file() {
         return String::new();
     }
@@ -983,7 +983,7 @@ fn record_native_swarm_identity(base: &Path, me: &mut Value) {
 }
 
 fn promote_resumed_coordinator(base: &Path, session: &str, cwd: &str) -> Option<Value> {
-    let cli = paths::plugin_root()?.join("bin/ork.mjs");
+    let cli = paths::runtime_root()?.join("src/bin/ork.mjs");
     if !cli.is_file() {
         return None;
     }

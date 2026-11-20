@@ -1,0 +1,4322 @@
+import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
+import { EventEmitter } from "node:events";
+import { chmodSync, mkdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdir, mkdtemp, readFile, realpath, writeFile } from "node:fs/promises";
+import { hostname, tmpdir } from "node:os";
+import path from "node:path";
+import { promisify } from "node:util";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import {
+  focusAgentPane,
+  notifyChiefTransitions,
+  notifyHerdrTransitions,
+  runHordeTui,
+  runTui,
+} from "../../../src/bin/horde-tui.mjs";
+import * as hordeTuiModule from "../../../src/bin/horde-tui.mjs";
+import * as factoryModule from "../../../src/lib/factory.mjs";
+import * as foundryModule from "../../../src/lib/foundry.mjs";
+import { createHerdrLifecycleSubscriber, herdrEndpoint } from "../../../src/lib/herdr-context.mjs";
+import {
+  addMembers,
+  createRoom,
+  parseTeam,
+  readRoom,
+  roomPath,
+  updateRoom,
+  validateRoom,
+} from "../../../src/lib/horde-room.mjs";
+import {
+  CLOSE_CONFIRM_MS,
+  extractAgentFocusMarkdown,
+  HordeView,
+  normalizeAgent,
+  normalizeModelAndEffort,
+  shortAgentName,
+} from "../../../src/lib/horde-view.mjs";
+import { ORCA_VIEW_SCHEMA, readJsonState } from "../../../src/lib/orca-context.mjs";
+import {
+  ANSI,
+  cellWidth,
+  displayWidth,
+  fit,
+  fitStyled,
+  frame,
+  GLYPHS,
+  glyphTier,
+  plain,
+  progressBar,
+  renderPanel,
+  renderTable,
+  tone,
+  wrapText,
+} from "../../../src/lib/tui-box.mjs";
+import { retainFixtures } from "../../helpers/retain-fixtures.js";
+
+const exec = promisify(execFile);
+const cli = path.resolve("src/bin/ork.mjs");
+const temporary = [];
+async function directory() {
+  const dir = await mkdtemp(path.join(tmpdir(), "horde-test-"));
+  temporary.push(dir);
+  return dir;
+}
+beforeEach(() => vi.stubEnv("NO_COLOR", ""));
+afterEach(async () => {
+  vi.unstubAllEnvs();
+  await retainFixtures(temporary.splice(0));
+});
+
+function fixture(team = "claude:haiku,agy:flash,codex:luna:max") {
+  const room = createRoom(parseTeam(team), { id: "sample-room", now: 1000 });
+  room.conductor.status = "running";
+  room.agents[0].status = "running";
+  room.agents[0].output = ["Inspecting source", "Found two candidates"];
+  room.agents[1].status = "blocked";
+  room.agents[1].question = "Which branch should I review?";
+  room.agents[1].output = ["Waiting for branch"];
+  room.messages = [
+    { from: "haiku-1", text: "Source inspected" },
+    { from: "haiku-1", text: "Source inspected" },
+  ];
+  return room;
+}
+
+describe("swarm rooms", () => {
+  it("expands mixed-provider teams with effort and distinct member identities", () => {
+    const room = createRoom(parseTeam("claude:haiku*2,agy:flash*2,codex:luna:max"));
+    expect(
+      room.agents.map(({ id, model, effort, status }) => ({ id, model, effort, status })),
+    ).toEqual([
+      { id: "haiku-1", model: "haiku", effort: undefined, status: "queued" },
+      { id: "haiku-2", model: "haiku", effort: undefined, status: "queued" },
+      { id: "flash-1", model: "gemini:fast", effort: undefined, status: "queued" },
+      { id: "flash-2", model: "gemini:fast", effort: undefined, status: "queued" },
+      { id: "luna-1", model: "gpt:luna", effort: "max", status: "queued" },
+    ]);
+  });
+
+  it("parses AGY Carbon, Hydrogen, and Orchestrator team shorthands", () => {
+    expect(
+      parseTeam(
+        "agy:carbon,agy:carbon-low,agy:carbon-medium,agy:carbon-high,agy:hydrogen,agy:hydrogen-low,agy:hydrogen-medium,agy:hydrogen-high,agy:hydrogen-xhigh,agy:orchestrator,agy:orchestrator-carbon,agy:orchestrator-argon,agy:carbon:high,agy:hydrogen:xhigh",
+      ),
+    ).toEqual([
+      { engine: "agy", model: "gemini:carbon", label: "carbon" },
+      { engine: "agy", model: "gemini:carbon-low", label: "carbon-low" },
+      { engine: "agy", model: "gemini:carbon", label: "carbon-medium" },
+      { engine: "agy", model: "gemini:carbon-high", label: "carbon-high" },
+      { engine: "agy", model: "gemini:hydrogen", label: "hydrogen" },
+      { engine: "agy", model: "gemini:hydrogen-low", label: "hydrogen-low" },
+      { engine: "agy", model: "gemini:hydrogen", label: "hydrogen-medium" },
+      { engine: "agy", model: "gemini:hydrogen-high", label: "hydrogen-high" },
+      { engine: "agy", model: "gemini:hydrogen-xhigh", label: "hydrogen-xhigh" },
+      { engine: "agy", model: "gemini:orchestrator", label: "orchestrator" },
+      { engine: "agy", model: "gemini:orchestrator", label: "orchestrator-carbon" },
+      { engine: "agy", model: "gemini:orchestrator-argon", label: "orchestrator-argon" },
+      { engine: "agy", model: "gemini:carbon-high", effort: "high", label: "carbon" },
+      { engine: "agy", model: "gemini:hydrogen-xhigh", effort: "xhigh", label: "hydrogen" },
+    ]);
+  });
+
+  it.each([
+    "",
+    "claude:haiku*0",
+    "claude:haiku*65",
+    "codex",
+    "unknown:luna",
+    "codex::",
+    "agy:flash,",
+  ])("rejects invalid team %s", (team) => {
+    expect(() => parseTeam(team)).toThrow();
+  });
+
+  it("preserves concurrent additions and existing conductor output", async () => {
+    const root = await directory();
+    await updateRoom("sample-room", () => fixture(), { root, create: true });
+    await Promise.all([
+      updateRoom("sample-room", (room) => addMembers(room, parseTeam("claude:haiku")), { root }),
+      updateRoom("sample-room", (room) => addMembers(room, parseTeam("claude:haiku")), { root }),
+    ]);
+    const room = await readRoom("sample-room", root);
+    expect(room.agents.map((agent) => agent.id)).toEqual([
+      "haiku-1",
+      "flash-1",
+      "luna-1",
+      "haiku-2",
+      "haiku-3",
+    ]);
+    expect(room.agents[0].output).toEqual(["Inspecting source", "Found two candidates"]);
+    expect(room.conductor.status).toBe("running");
+  });
+
+  it("rejects path escapes and malformed members", () => {
+    expect(roomPath("safe", "/cache")).toBe("/cache/rooms/safe.json");
+    expect(() => roomPath("../escape", "/cache")).toThrow("Room ID");
+    const room = fixture();
+    room.agents[0].id = undefined;
+    expect(() => validateRoom(room)).toThrow("Invalid or duplicate");
+    const invalidWorktree = fixture();
+    invalidWorktree.agents[0].worktree = { disposable: "yes" };
+    expect(() => validateRoom(invalidWorktree)).toThrow("Invalid member worktree metadata");
+  });
+
+  it("rejects a stored room whose identity differs from its filename", async () => {
+    const root = await directory();
+    await mkdir(path.join(root, "rooms"));
+    await writeFile(
+      roomPath("sample-room", root),
+      JSON.stringify({ ...fixture(), id: "other-room" }),
+    );
+    await expect(readRoom("sample-room", root)).rejects.toMatchObject({ code: "ENOENT" });
+    const invalidRoom = JSON.parse(await readFile(roomPath("sample-room", root), "utf8"));
+    expect(invalidRoom.id).toBe("other-room");
+  });
+
+  it("leaves the old room intact when an update fails", async () => {
+    const root = await directory();
+    await updateRoom("sample-room", () => fixture(), { root, create: true });
+    await expect(
+      updateRoom("sample-room", (room) => ({ ...room, id: "other" }), { root }),
+    ).rejects.toThrow("identity");
+    expect((await readRoom("sample-room", root)).id).toBe("sample-room");
+    await updateRoom("sample-room", (room) => addMembers(room, parseTeam("claude:haiku")), {
+      root,
+    });
+    expect((await readRoom("sample-room", root)).agents.at(-1).id).toBe("haiku-2");
+  });
+});
+
+describe("tui-box primitives and HordeView unification", () => {
+  it("exports reusable box, width, and table primitives from tui-box and HordeView", () => {
+    expect(typeof HordeView).toBe("function");
+    expect(ANSI.cyan).toBe("36");
+    expect(GLYPHS.unicode.topLeft).toBe("┌");
+    expect(cellWidth("a")).toBe(1);
+    expect(cellWidth("界")).toBe(2);
+    expect(plain("\u{1B}[31mhi\u{1B}[0m")).toBe("hi");
+    expect(fit("hello", 3)).toBe("hel");
+    const styled = fitStyled(tone("hello", "cyan", true), 8);
+    expect(displayWidth(styled)).toBe(8);
+    expect(frame("box", ["row"], 10)).toHaveLength(3);
+    expect(renderPanel("panel", ["body"], 16)).toHaveLength(3);
+    expect(renderTable(["A", "B"], [["1", "2"]], 12)).toHaveLength(3);
+  });
+
+  it("labels a consultation model as requested until the provider confirms it", () => {
+    const room = fixture();
+    room.conductor.model = "supervisor-model";
+    room.agents = [
+      {
+        id: "consult-a",
+        engine: "claude",
+        model: "worker-model",
+        effort: "high",
+        consultation: true,
+        modelSource: "requested",
+        workforceRole: "consultant",
+        status: "running",
+        runtimeState: "running",
+        parent: "conductor",
+      },
+    ];
+    let rendered = plain(new HordeView(room).render(120).join("\n"));
+    expect(rendered).toContain("supervisor-model");
+    expect(rendered).toContain("[consultant]");
+    expect(rendered).toContain("\u{EC82}  worker-model (requested) / high");
+    room.agents[0].model = "confirmed-worker";
+    room.agents[0].modelSource = "observed";
+    rendered = plain(new HordeView(room).render(120).join("\n"));
+    expect(rendered).toContain("[consultant]");
+    expect(rendered).toContain("\u{EC82}  confirmed-worker / high");
+    expect(rendered).not.toContain("(requested)");
+  });
+
+  it("uses two card columns on a wide terminal and stacked cards when narrow", () => {
+    const view = new HordeView(fixture(), { now: () => 2000 });
+    const wide = view.render(120);
+    expect(wide.some((line) => line.includes("1 flash-1") && line.includes("2 luna-1"))).toBe(true);
+    expect(wide.some((line) => line.includes("? Shortcuts"))).toBe(true);
+    const narrow = view.render(70);
+    expect(narrow.some((line) => line.includes("1 flash-1") && line.includes("2 luna-1"))).toBe(
+      false,
+    );
+    expect(narrow.join("\n")).toContain("1 flash-1");
+    expect(narrow.join("\n")).toContain("2 luna-1");
+    expect(narrow.join("\n")).toContain("3 haiku-1");
+    expect(narrow.join("\n")).not.toContain("3/64 slots · page 1/1");
+  });
+
+  it("focuses and pins detail while new output arrives", () => {
+    const room = fixture("claude:haiku*2,agy:flash*2");
+    const view = new HordeView(room, { now: () => 2000 });
+    view.handleInput("3");
+    view.handleInput("p");
+    view.handleInput("1");
+    expect(view.render(90).join("\n")).toContain("PIN ");
+    const changed = structuredClone(room);
+    changed.agents[2].output.push("Branch selected");
+    view.setRoom(changed);
+    expect(view.render(90).join("\n")).toContain("Branch selected");
+    view.handleInput("3");
+    view.handleInput("p");
+    const unpinned = view.render(90).join("\n");
+    expect(unpinned).not.toContain("PIN ");
+    expect(unpinned).toContain("▸ ");
+  });
+
+  it("supports more than nine members with page-local number keys", () => {
+    const view = new HordeView(fixture("claude:haiku*12"), { height: 18 });
+    view.render(80);
+    view.handleInput("n");
+    view.handleInput("n");
+    view.handleInput("2");
+    const rendered = view.render(80).join("\n");
+    expect(view.focusId).toBe("haiku-1");
+    expect(rendered).toContain("2 haiku-1");
+    expect(rendered).toContain("page 3/3");
+  });
+
+  it("keeps focus, detail and navigation visible on a short terminal", () => {
+    const room = fixture("claude:haiku*9");
+    room.agents[0].output = ["First agent result"];
+    const view = new HordeView(room, { height: 18 });
+    view.render(80);
+    for (let index = 0; index < 8; index++) view.handleInput("\u{1B}[B");
+    const lines = view.render(80);
+    expect(lines.length).toBeLessThanOrEqual(18);
+    expect(lines.join("\n")).toContain("haiku-1");
+    expect(lines.join("\n")).toContain("▸ ");
+    expect(lines.join("\n")).toContain("First agent result");
+    expect(lines.join("\n")).not.toContain(" Close view ");
+  });
+
+  it("fits Unicode and strips injected terminal controls", () => {
+    const room = fixture();
+    room.agents[2].output = ["\u{1B}[2J界界 👩‍💻 safe\u{7}"];
+    const view = new HordeView(room);
+    view.handleKey("2");
+    const lines = view.render(32);
+    expect(lines.every((line) => displayWidth(line) <= 32)).toBe(true);
+    expect(lines.join("\n")).toContain("safe");
+    expect(lines.join("\n")).not.toContain("\u{1B}");
+  });
+
+  it("frames responsive layouts within terminal width and uses tone-colored ANSI safely", () => {
+    const room = fixture();
+    room.agents[2].status = "running";
+    room.agents[2].output = ["\u{1B}[31munsafe\u{1B}[0m 👩‍💻 界\nnext line"];
+    const view = new HordeView(room, { now: () => 2000, height: 28, color: true });
+    view.handleKey("2");
+    for (const width of [40, 47, 48, 63, 64, 79, 80, 120]) {
+      const lines = view.render(width);
+      expect(lines.every((line) => displayWidth(line) <= width)).toBe(true);
+      expect(lines.join("\n")).not.toContain("\u{1B}[31munsafe");
+    }
+    expect(view.render(80).join("\n")).toContain("\u{1B}[36m");
+    expect(view.render(80).join("\n")).toContain("\u{1B}[36;1m");
+    expect(view.render(80).join("\n")).toContain("next line");
+  });
+
+  it("offers explicit glyph tiers, locale-safe fallback, and eighth-step bars", () => {
+    expect(glyphTier({ ORK_GLYPHS: "nerd", LANG: "C" })).toBe("nerd");
+    expect(glyphTier({ TERM: "dumb", LANG: "en_US.UTF-8" })).toBe("ascii");
+    expect(glyphTier({ TERM: "xterm-256color" })).toBe("ascii");
+    expect(progressBar(0.125, 4, "unicode")).toBe("▌░░░");
+    expect(displayWidth("\u{F0000}")).toBe(1);
+    expect(displayWidth("\u{E0A0}")).toBe(1);
+    expect(displayWidth("󰚩")).toBe(1);
+    expect(wrapText("界", 1)).toEqual(["?"]);
+    const ascii = new HordeView(fixture(), { height: 24, tier: "ascii" }).render(40);
+    expect(ascii.join("\n")).toContain("+ Swarm · sample-room");
+    expect(ascii.every((line) => displayWidth(line) <= 40)).toBe(true);
+    const nerd = new HordeView(fixture(), { height: 24, tier: "nerd" }).render(80);
+    expect(nerd.join("\n")).toContain("╭ Swarm · sample-room");
+    expect(nerd.join("\n")).toContain("󰔛");
+    expect(nerd.join("\n")).toContain("󰀪");
+    expect(nerd.every((line) => displayWidth(line) <= 80)).toBe(true);
+  });
+
+  it("displays short Martian names and deduplicates model effort suffixes in HordeView", () => {
+    expect(shortAgentName({ id: "haiku-1" })).toBe("haiku-1");
+    expect(shortAgentName({ id: "builder-67-statusline-nerdfont" })).toBe(
+      "builder-67-statusline-nerdfont",
+    );
+    expect(shortAgentName({ name: "builder-67-statusline-nerdfont" })).toBe(
+      "builder-67-statusline-nerdfont",
+    );
+    expect(shortAgentName({ name: "gribble-gemini-4-argon-medium-orkest-1f" })).toBe("gribble");
+    expect(shortAgentName({ id: "flash-1", name: "gribble-gemini-4-argon-medium-orkest-1f" })).toBe(
+      "gribble",
+    );
+    expect(normalizeModelAndEffort("Gemini 4 Argon (Medium)", "medium")).toEqual({
+      model: "Gemini 4 Argon",
+      effort: "medium",
+    });
+    expect(normalizeModelAndEffort("gemini-4-argon-medium", "—")).toEqual({
+      model: "gemini-4-argon",
+      effort: "medium",
+    });
+    expect(normalizeModelAndEffort("gpt-oss-120b-medium", "")).toEqual({
+      model: "gpt-oss-120b",
+      effort: "medium",
+    });
+
+    const room = fixture("claude:haiku,agy:flash");
+    room.conductor.name = "gribble-gemini-4-argon-medium-orkest-1f";
+    room.conductor.resolvedModel = "Gemini 4 Argon (Medium)";
+    room.conductor.resolvedEffort = "medium";
+    room.agents[0].status = "completed";
+    room.agents[0].name = "snorfle-opus-high-orkest-23";
+    room.agents[1].status = "running";
+    room.agents[1].name = "snoobix-gemini-4-argon-medium-orkest-56";
+    room.agents[1].resolvedModel = "gemini-4-argon-medium";
+    room.agents[1].resolvedEffort = "—";
+    const rendered = new HordeView(room, { height: 28, tier: "nerd" }).render(90).join("\n");
+    expect(rendered).toContain("\u{F06A9} gribble");
+    expect(rendered).not.toContain("ork: ");
+    expect(rendered).not.toContain("gribble-gemini-4-argon-medium-orkest-1f");
+    expect(rendered).toContain("Gemini 4 Argon / medium");
+    expect(rendered).not.toContain("(Medium) / medium");
+    expect(rendered).toContain("1 snoobix");
+    expect(rendered).toContain("gemini-4-argon / medium");
+    expect(rendered).toContain("󰋗 2 snorfle");
+  });
+
+  it("renders an empty room, key help and a coalesced log overlay", () => {
+    const room = fixture();
+    room.agents = [];
+    const view = new HordeView(room, { height: 24, color: true });
+    const emptyLines = view.render(80);
+    const emptyRowIndex = emptyLines.findIndex((line) =>
+      plain(line).includes("The coordinator will add agents as work is assigned."),
+    );
+    expect(emptyRowIndex).toBeGreaterThan(7);
+    expect(emptyRowIndex).toBeLessThan(18);
+    expect(emptyLines[emptyRowIndex]).toContain(
+      "\u{1B}[2mThe coordinator will add agents as work is assigned.\u{1B}[0m",
+    );
+    expect(plain(emptyLines[emptyRowIndex])).toMatch(
+      /^ {10,}The coordinator will add agents as work is assigned\. {10,}$/u,
+    );
+    view.handleInput("?");
+    expect(view.render(80).join("\n")).toContain("Keyboard shortcuts");
+    view.handleInput("\u{1B}");
+    view.handleInput("g");
+    const logFrame = view.render(80).join("\n");
+    expect(plain(logFrame)).toContain("haiku-1: Source inspected (×2)");
+    expect(logFrame).toContain("\u{1B}[36;1mhaiku-1:\u{1B}[0m Source inspected");
+    expect(plain(logFrame)).toContain("Room log");
+  });
+
+  it.each([
+    [{ kind: "5h" }, { kind: "weekly" }],
+    [{ windowMins: 300 }, { windowMins: 10_080 }],
+    [{ label: "session" }, { id: "7-day" }],
+  ])("selects measured quota periods with honest fallback and exhaustion", (short, weekly) => {
+    const room = fixture();
+    room.accounts = [
+      {
+        short: "CL",
+        windows: [
+          { ...short, remainingPct: 92 },
+          { ...weekly, remainingPct: 21 },
+        ],
+      },
+      { short: "CX", windows: [{ ...weekly, remainingPct: 63 }] },
+      { short: "OLD", windows: [{ remainingPct: 45 }] },
+      {
+        short: "ZERO",
+        windows: [
+          { ...short, remainingPct: 100 },
+          { ...weekly, remainingPct: 0 },
+        ],
+      },
+    ];
+    const view = new HordeView(room, { tier: "ascii", quotaWindow: "weekly" });
+    expect(view.quotaSummaryLines(140).map(plain).join("\n")).toMatch(
+      /CL .*21%.*CX .*63%.*OLD .*45%.*ZERO .*0%/u,
+    );
+    view.handleInput("w");
+    expect(view.quotaSummaryLines(140).map(plain).join("\n")).toMatch(
+      /CL .*92%.*CX .*63%.*OLD .*45%.*ZERO .*0%/u,
+    );
+  });
+
+  it.each([
+    [31, 203],
+    [32, 114],
+    [33, 221],
+    [34, 111],
+    [35, 176],
+    [36, 80],
+  ])(
+    "styles coordinator identity %i and semantic segments without changing text",
+    (identity, palette) => {
+      const room = fixture();
+      room.agents = [];
+      room.conductor = {
+        name: "gribble",
+        cwd: "/workspace/orkest",
+        branch: "main",
+        engine: "agy",
+        paneId: "w1:p1",
+        model: "gemini-test",
+        effort: "high",
+        status: "blocked",
+        progress: { color: identity, role: "lead" },
+      };
+      const view = new HordeView(room, { color: true, tier: "nerd", now: () => 1000 });
+      const colored = view.render(160).join("\n");
+      expect(colored).toContain(`\u{1B}[38;5;${palette};1m\u{F06A9} gribble\u{1B}[0m`);
+      expect(plain(colored)).toContain("\u{F06A9} gribble");
+      expect(plain(colored)).not.toContain("ork: ");
+      expect(plain(colored)).toContain("agy");
+      expect(plain(colored)).not.toContain("harness: ");
+      expect(colored).toContain("\u{1B}[38;5;80magy\u{1B}[0m");
+      expect(plain(colored)).not.toContain("w1:p1");
+      expect(colored).toContain("\u{1B}[38;5;117;1mgemini-test");
+      expect(colored).toContain("\u{1B}[38;5;180;1mhigh");
+      expect(colored).toContain("\u{1B}[38;5;245m | ");
+      expect(colored).toContain("\u{1B}[38;5;245m / ");
+      expect(colored).toContain("\u{1B}[1morkest");
+      expect(colored).toContain("\u{1B}[38;5;176m (main)");
+      expect(colored).toContain("\u{1B}[38;5;221;1mblocked");
+      const uncolored = new HordeView(room, { color: false, tier: "nerd", now: () => 1000 })
+        .render(160)
+        .join("\n");
+      expect(colored.split("\n").map(plain).join("\n")).toBe(uncolored);
+      for (const tier of ["nerd", "unicode", "ascii"]) {
+        const narrow = new HordeView(room, { color: true, tier }).render(40);
+        expect(narrow.every((line) => displayWidth(line) <= 40)).toBe(true);
+        expect(narrow.map(plain).join("\n")).toContain(
+          tier === "nerd" ? "\u{F06A9} gribble" : "gribble",
+        );
+        expect(narrow.map(plain).join("\n")).not.toContain("ork: ");
+      }
+    },
+  );
+
+  it.each([
+    ["failed", 203],
+    ["reported (awaiting review)", 221],
+    ["planning", 180],
+    ["testing", 80],
+    ["running", 117],
+  ])("colors the %s coordinator stage", (status, code) => {
+    const room = fixture();
+    room.conductor.status = status === "reported (awaiting review)" ? "completed" : status;
+    const text = new HordeView(room, { color: true }).render(140).join("\n");
+    expect(text).toContain(`\u{1B}[38;5;${code};1m${status}`);
+  });
+
+  it("uses explicit identity color and marks fresh progress as live", () => {
+    const room = fixture();
+    room.conductor = {
+      name: "gribble",
+      status: "running",
+      color: 35,
+      progress: { color: 31, reportedAt: "2026-11-06T12:00:00Z" },
+    };
+    const options = { color: true, tier: "nerd", now: () => Date.parse("2026-11-06T12:00:10Z") };
+    const live = new HordeView(room, options).render(140).join("\n");
+    expect(live).toContain("\u{1B}[38;5;176;1m\u{F06A9} gribble");
+    expect(live).toContain("\u{1B}[38;5;114;1mlive");
+    room.conductor.paused = true;
+    const paused = new HordeView(room, options).render(140).join("\n");
+    expect(paused).toContain("\u{1B}[38;5;221;1mnew launches paused");
+  });
+
+  it("honors NO_COLOR for coordinator styling", () => {
+    vi.stubEnv("NO_COLOR", "1");
+    try {
+      const text = new HordeView(fixture(), { color: true }).render(100).join("\n");
+      expect(text).toContain("Coordinator");
+      expect(text).toBe(text.split("\n").map(plain).join("\n"));
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("starts quota collapsed with each account's lowest remaining percentage on one row", () => {
+    const room = fixture();
+    room.accounts = [
+      { id: "codex", short: "C", windows: [{ remainingPct: 92 }, { remainingPct: 81 }] },
+      { id: "claude", short: "K", windows: [{ remainingPct: 64 }] },
+    ];
+    const view = new HordeView(room, { tier: "unicode" });
+    const lines = view.render(100);
+    expect(view.quotaMode).toBe("collapsed");
+    expect(lines.filter((line) => line.includes("Quota"))).toHaveLength(0);
+    const summary = lines.find((line) => line.includes("C ━━━─ 81%"));
+    expect(summary).toContain("C ━━━─ 81%  K ━━━─ 64%");
+    expect(summary).toContain("▸");
+    expect(view.handleKey("u")).toBe(true);
+    expect(view.render(100).join("\n")).toContain("▾ Quota");
+  });
+
+  it("keeps Antigravity quota pools separate in the compact meter summary", () => {
+    const room = fixture();
+    room.accounts = [
+      {
+        id: "antigravity",
+        short: "AG",
+        provider: "antigravity",
+        windows: [
+          { pool: "gemini", remainingPct: 77 },
+          { pool: "gemini", remainingPct: 86 },
+          { pool: "claude-gpt", remainingPct: 10 },
+          { pool: "claude-gpt", remainingPct: 100 },
+        ],
+      },
+    ];
+    const lines = new HordeView(room, { tier: "unicode" }).render(100);
+    const summary = lines.find((line) => line.includes("AG Gemini"));
+    expect(summary).toContain("AG Gemini ━━━─ 77%");
+    expect(summary).toContain("AG Claude/GPT ━─── 10%");
+    expect(summary).toContain("▸");
+    expect(lines.filter((line) => line.includes("Quota"))).toHaveLength(0);
+  });
+
+  it("renders quota pills from monitor account data in the bottom telemetry stack", () => {
+    const room = fixture();
+    room.accounts = [
+      {
+        id: "test",
+        short: "CX",
+        provider: "codex",
+        pools: [{ id: "default", label: "Codex", windowIds: ["week"] }],
+        windows: [
+          {
+            id: "week",
+            label: "Weekly",
+            windowMins: 10_080,
+            usedPct: 20,
+            remainingPct: 80,
+            resetsAt: 1000 + 86_400_000,
+          },
+        ],
+      },
+    ];
+    const rendered = new HordeView(room, { now: () => 1000, quotaMode: "expanded" })
+      .render(100)
+      .join("\n");
+    expect(rendered).toContain("Quota");
+    expect(rendered).toContain("\u{EC81}  Weekly");
+    expect(rendered).toContain("80% left");
+  });
+
+  it("renders all configured quota accounts and splits Antigravity pools onto separate lines", () => {
+    const room = fixture();
+    room.accounts = [
+      {
+        id: "claude-work",
+        short: "CW",
+        provider: "claude",
+        windows: [
+          { id: "5h", label: "5-hour", remainingPct: 89, resetsAt: 1_793_766_600_000 },
+          {
+            id: "week",
+            label: "weekly",
+            kind: "weekly",
+            remainingPct: 48,
+            resetsAt: 1_794_013_200_000,
+          },
+          {
+            id: "week-fable",
+            label: "Fable weekly",
+            kind: "weekly",
+            remainingPct: 97,
+            resetsAt: 1_794_013_200_000,
+            scope: "Fable",
+          },
+        ],
+      },
+      {
+        id: "claude-personal",
+        short: "CP",
+        provider: "claude",
+        windows: [
+          { id: "5h", label: "5-hour", remainingPct: 100 },
+          { id: "week", label: "weekly", remainingPct: 86 },
+        ],
+      },
+      {
+        id: "codex",
+        short: "CX",
+        provider: "codex",
+        credits: { hasCredits: true, unlimited: false, balance: 45_916 },
+        windows: [
+          {
+            id: "weekly",
+            label: "weekly",
+            kind: "weekly",
+            remainingPct: 0,
+            resetsAt: 1_794_013_200_000,
+          },
+        ],
+      },
+      {
+        id: "antigravity",
+        short: "AG",
+        provider: "antigravity",
+        windows: [
+          {
+            id: "gemini-weekly",
+            label: "Gemini weekly",
+            kind: "weekly",
+            remainingPct: 77,
+            resetsAt: 1_794_013_200_000,
+            pool: "gemini",
+          },
+          { id: "gemini-5h", label: "Gemini 5-hour", remainingPct: 86, pool: "gemini" },
+          {
+            id: "claude-gpt-weekly",
+            label: "Claude & GPT weekly",
+            remainingPct: 10,
+            pool: "claude-gpt",
+          },
+          {
+            id: "claude-gpt-5h",
+            label: "Claude & GPT 5-hour",
+            remainingPct: 100,
+            pool: "claude-gpt",
+          },
+        ],
+      },
+    ];
+    const nowMs = 1_793_754_000_000;
+    const resetDay = new Date(1_794_013_200_000).toLocaleDateString("en-US", { weekday: "short" });
+    const rendered = new HordeView(room, { now: () => nowMs, height: 32, quotaMode: "expanded" })
+      .render(90)
+      .join("\n");
+    expect(rendered).toContain("CW ");
+    expect(rendered).toContain(`5h 89% · wk 48% · Fable wk 97% · resets in 3d (${resetDay})`);
+    expect(rendered).toContain("CP ");
+    expect(rendered).toContain("5h 100% · wk 86%");
+    expect(rendered).toContain(`weekly 0% left · 45,916 cr · resets in 3d (${resetDay})`);
+    expect(rendered).toContain(`Gemini · wk 77% · 5h 86% · resets in 3d (${resetDay})`);
+    expect(rendered).toContain("Claude/GPT · wk 10% · 5h 100%");
+  });
+
+  it("collapses unfocused completed agents to 1-line rows and cycles hide/expand with c", () => {
+    const room = fixture("claude:haiku*3");
+    room.agents[0].status = "completed";
+    room.agents[0].objective = "First task done";
+    room.agents[1].status = "completed";
+    room.agents[1].objective = "Second task done";
+    room.agents[2].status = "running";
+    room.agents[2].objective = "Third task working";
+    room.agents[2].observedAt = new Date(980_000).toISOString();
+
+    const view = new HordeView(room, { now: () => 1_000_000, height: 28, tier: "unicode" });
+    const collapsed = view.render(90).join("\n");
+    // Most recent running agent (haiku-3) is #1 and focused; older completed agents (haiku-2, haiku-1) collapse below it
+    expect(collapsed).toContain("├─▸");
+    expect(collapsed).toContain("1 haiku-3");
+    expect(collapsed).toContain("haiku · running · live");
+    expect(collapsed).not.toContain("step 2/4");
+    expect(collapsed).toContain("├─  ○ 2 haiku-2");
+    expect(collapsed).toContain("└─  ○ 3 haiku-1");
+
+    // Press c -> hidden mode
+    view.handleInput("c");
+    const hidden = view.render(90).join("\n");
+    expect(hidden).not.toContain("2 haiku-2");
+    expect(hidden).not.toContain("3 haiku-1");
+    expect(hidden).toContain("2 inactive hidden (press c to expand)");
+
+    // Press c -> expanded mode
+    view.handleInput("c");
+    const expanded = view.render(90).join("\n");
+    expect(expanded).toContain("2 haiku-2");
+    expect(expanded).toContain("Second task done");
+    expect(expanded).toContain("3 haiku-1");
+    expect(expanded).toContain("First task done");
+  });
+
+  it("orders agents from most recent to least recent so new agents push old ones off the bottom", () => {
+    const room = fixture("claude:haiku*2");
+    room.agents[0].status = "completed";
+    room.agents[0].observedAt = "2026-11-04T02:00:00Z";
+    room.agents[1].status = "completed";
+    room.agents[1].observedAt = "2026-11-04T03:00:00Z";
+    const view = new HordeView(room, { height: 24, tier: "unicode" });
+    expect(view.room.agents.map((agent) => agent.id)).toEqual(["haiku-2", "haiku-1"]);
+    expect(view.focusId).toBe("haiku-2");
+
+    const updated = structuredClone(room);
+    addMembers(updated, parseTeam("agy:pro"));
+    view.setRoom(updated);
+    expect(view.room.agents.map((agent) => agent.id)).toEqual(["pro-1", "haiku-2", "haiku-1"]);
+    expect(view.focusId).toBe("pro-1");
+  });
+
+  it("counts execution separately from phase and collapses automatically selected idle history", () => {
+    const room = fixture("claude:haiku*3");
+    room.conductor.status = "completed";
+    Object.assign(room.agents[0], {
+      status: "review",
+      runtimeState: "stopped",
+      dispatch: { taskDir: "/tasks/finished" },
+      objective: "Finished extraction",
+      observedAt: "2026-11-04T12:00:00Z",
+    });
+    Object.assign(room.agents[1], {
+      status: "working",
+      runtimeState: "idle",
+      objective: "Old progress report",
+      observedAt: "2026-11-04T14:00:00Z",
+    });
+    Object.assign(room.agents[2], {
+      status: "review",
+      runtimeState: "running",
+      objective: "Inspect current result",
+      observedAt: "2026-11-04T13:00:00Z",
+    });
+    const view = new HordeView(room, { height: 36, tier: "unicode" });
+    const rendered = view.render(100).join("\n");
+    expect(rendered).toContain("1 active");
+    expect(rendered).toContain("awaiting review");
+    expect(rendered).toContain("idle · last reported working");
+    expect(rendered).not.toContain("┌ ▸ 1 haiku-2");
+    expect(rendered).toMatch(/haiku[^\n]*· idle|idle[^\n]*· haiku/u);
+    expect(view.needsAnimation).toBe(true);
+    view.handleInput("2");
+    expect(view.render(100).join("\n")).toContain("├─▸ · 2 haiku-2");
+    room.agents[2].runtimeState = "stopped";
+    view.setRoom(room);
+    expect(view.needsAnimation).toBe(false);
+    room.agents[2].status = "blocked";
+    room.agents[2].runtimeState = "idle";
+    view.setRoom(room);
+    const blocked = view.render(100).join("\n");
+    expect(blocked).toContain("1 blocked");
+    expect(blocked).toContain("1 haiku-3");
+  });
+
+  it("shows an idle native reviewer without implying an unaccepted executor result", () => {
+    const room = fixture();
+    room.agents = [room.agents[0]];
+    Object.assign(room.agents[0], { status: "review", runtimeState: "idle" });
+    const view = new HordeView(room, { height: 32, completedMode: "expanded" });
+    expect(view.render(100).join("\n")).toContain("idle · last reported review");
+    expect(view.needsAnimation).toBe(false);
+  });
+
+  it("shows the neutral native label for a subagent without a workforce preset", () => {
+    const room = fixture();
+    room.agents = [room.agents[0]];
+    Object.assign(room.agents[0], {
+      native: true,
+      workforceRole: "native",
+      status: "running",
+      runtimeState: "running",
+      progress: { task: "General subagent task", stage: "working" },
+    });
+    const view = new HordeView(room, { height: 32, color: false });
+    expect(plain(view.render(100).join("\n"))).toContain("[native]");
+  });
+
+  it("joins the coordinator, cards, quota and services cleanly with bottom telemetry ordering", () => {
+    const room = fixture("claude:haiku,agy:flash");
+    room.quotaError = "Quota unavailable";
+    room.services = [{ kind: "port", port: 5017, name: "preview" }];
+    const lines = new HordeView(room, {
+      height: 40,
+      tier: "unicode",
+      quotaMode: "expanded",
+    }).render(90);
+    const quotaIndex = lines.findIndex((line) => line.includes("Quota"));
+    const serviceIndex = lines.findIndex((line) => line.includes("Services"));
+    const firstAgentLine = lines.findIndex((line) => line.includes("flash-1"));
+    const lastAgentLine = lines.findLastIndex((line) => line.includes("haiku-1"));
+    expect(lines[0][1]).toBe("┌");
+    expect(lines.slice(1, firstAgentLine).every((line) => "│├".includes(line[1]))).toBe(true);
+    expect(quotaIndex).toBeGreaterThan(lastAgentLine);
+    expect(serviceIndex).toBeGreaterThan(quotaIndex);
+    expect(lines.join("\n")).toContain("Awaiting assignment");
+    expect(lines.every((line) => displayWidth(line) <= 90)).toBe(true);
+  });
+
+  it("keeps the tree connected across worktree headings and collapsed children", () => {
+    const room = fixture("codex:luna,claude:haiku,claude:haiku");
+    room.cwd = "/workspace/project";
+    room.quotaError = "Quota unavailable";
+    room.services = [{ kind: "port", port: 5017, name: "preview" }];
+    const [parent, active, finished] = room.agents;
+    parent.name = "supervisor";
+    parent.cwd = room.cwd;
+    active.parent = parent.id;
+    active.cwd = "/worktrees/" + "long-audit-worktree-name-".repeat(4);
+    active.status = "running";
+    finished.parent = parent.id;
+    finished.cwd = "/worktrees/previous-audit";
+    finished.status = "reported complete";
+    for (const width of [70, 120]) {
+      const lines = new HordeView(room, { height: 60, tier: "unicode", color: false }).render(
+        width,
+      );
+      const start = lines.findIndex((line) => line.includes("project · 1 agent"));
+      const end = lines.findIndex((line) => line.includes("haiku-2"));
+      const serviceIndex = lines.findIndex((line) => line.includes("Services"));
+      expect(lines.slice(start, end).every((line) => "│├".includes(line[1]))).toBe(true);
+      expect(serviceIndex).toBeGreaterThan(end);
+      expect(lines.find((line) => line.includes("long-audit"))).toContain(" · 1 agent");
+      expect(lines.every((line) => displayWidth(line) <= width)).toBe(true);
+      expect(lines.find((line) => line.includes("haiku-2"))).toContain("↳ supervisor");
+    }
+  });
+
+  it("shows repository context once across active and completed agent rows", () => {
+    const room = fixture("codex:luna,claude:haiku,agy:flash");
+    room.cwd = "/workspace/sample-project";
+    for (const [index, agent] of room.agents.entries()) {
+      agent.cwd = room.cwd;
+      agent.name = index === 0 ? "codex:sample-project" : "sample-project";
+      agent.status = index === 2 ? "completed" : "working";
+    }
+    const rendered = new HordeView(room, { height: 32, tier: "unicode" }).render(90).join("\n");
+    expect(rendered).toContain("sample-project");
+    expect(rendered).not.toContain("── sample-project · 3 agents ──");
+    expect(rendered.match(/sample-project/gu)).toHaveLength(1);
+    expect(rendered).toContain("▸ ");
+    expect(rendered).toContain("codex");
+    expect(rendered).toContain("claude");
+  });
+
+  it("renders outer tree rails, contrasting headers, and wt:<slug> badges for disposable worktrees in swarm view", () => {
+    const room = fixture("agy:pro@ui-designer,claude:haiku@reviewer");
+    room.title = "Worktree grouping";
+    room.cwd = "/workspace/orkest";
+    room.conductor = { engine: "agy", role: "lead", status: "working" };
+    room.swarm = { maxAgents: 6, maxDepth: 3 };
+    room.agents[0].cwd = "/workspace/orkest";
+    room.agents[1].cwd = "/cache/worktrees/orkest/wt-50";
+    room.agents[1].worktree = {
+      path: "/cache/worktrees/orkest/wt-50",
+      branch: "feat/wt-50",
+      disposable: true,
+      parentCwd: "/workspace/orkest",
+      slug: "wt-50",
+    };
+
+    const unicodeLines = new HordeView(room, { height: 28, tier: "unicode", color: true }).render(
+      90,
+    );
+    expect(unicodeLines.every((line) => displayWidth(line) <= 90)).toBe(true);
+    const unicodeText = unicodeLines.join("\n");
+    expect(plain(unicodeText)).toContain("orkest · 2 agents");
+    expect(unicodeText).toContain("wt:50");
+    expect(unicodeText).not.toContain("wt:wt-50");
+    expect(unicodeText).not.toContain("\u{1B}[44;97;1m");
+    expect(unicodeText).toContain("\u{1B}[48;5;237;97;1m");
+
+    const asciiText = new HordeView(room, { height: 28, tier: "ascii" }).render(85).join("\n");
+    expect(asciiText).toContain("orkest · 2 agents");
+    expect(asciiText).toContain("+-> ! 1 haiku-1");
+    expect(asciiText).toContain("Awaiting assignment");
+    expect(asciiText).toContain("`-  > 2 pro-1");
+    expect(asciiText).toContain("wt:50");
+    expect(asciiText).not.toContain("wt:wt-50");
+  });
+});
+
+describe("ork CLI", () => {
+  it("prints offline fixtures and JSON without creating a room", async () => {
+    const dir = await directory();
+    const file = path.join(dir, "fixture.json");
+    await writeFile(file, JSON.stringify(fixture()));
+    const env = {
+      ...process.env,
+      AGENT_EXECUTOR_HOME: dir,
+      LANG: "en_US.UTF-8",
+      NO_COLOR: "1",
+      TERM: "xterm-256color",
+    };
+    const printed = await exec(
+      process.execPath,
+      [cli, "horde", "--fixture", file, "--print", "--width", "70"],
+      { env },
+    );
+    expect(printed.stdout).toContain("┌ Swarm · sample-room");
+    expect(printed.stdout).toContain("3/64 slots");
+    expect(printed.stdout).toContain(" Shortcuts");
+    expect(printed.stdout).not.toContain("\u{1B}");
+    const json = await exec(process.execPath, [cli, "horde", "--fixture", file, "--json"], {
+      env,
+    });
+    expect(JSON.parse(json.stdout).agents[0].output).toEqual([
+      "Inspecting source",
+      "Found two candidates",
+    ]);
+    await expect(
+      readFile(path.join(dir, "mailbox-v1/rooms/sample-room.json")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(path.join(dir, "mailbox-v1/rooms.db"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
+  it.each([
+    ["--width", "0"],
+    ["--width", "Infinity"],
+    ["--unknown"],
+    ["--team", "claude:haiku", "--preset", "scout-swarm"],
+    ["--print", "--json"],
+    ["spawn", "--team", "claude:haiku"],
+    ["--preset", "missing"],
+  ])("rejects invalid options %j before creating rooms", async (...args) => {
+    const dir = await directory();
+    await expect(
+      exec(process.execPath, [cli, "horde", ...args], {
+        env: { ...process.env, AGENT_EXECUTOR_HOME: dir },
+      }),
+    ).rejects.toMatchObject({ code: 1, stderr: expect.stringContaining("ork:") });
+    await expect(readFile(path.join(dir, "mailbox-v1/rooms"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
+  it.each([
+    "not json",
+    "{}",
+    JSON.stringify({ schema: "agent-executor.room.v1", id: "../escape", agents: [] }),
+  ])("rejects invalid fixture %s without creating a room", async (contents) => {
+    const dir = await directory();
+    const file = path.join(dir, "fixture.json");
+    await writeFile(file, contents);
+    await expect(
+      exec(process.execPath, [cli, "horde", "--fixture", file, "--print"], {
+        env: { ...process.env, AGENT_EXECUTOR_HOME: dir },
+      }),
+    ).rejects.toMatchObject({ code: 1, stderr: expect.stringContaining("ork:") });
+  });
+
+  it("creates a preset room and appends queued agents to the same durable room", async () => {
+    const dir = await directory();
+    const env = { ...process.env, AGENT_EXECUTOR_HOME: dir };
+    const created = await exec(
+      process.execPath,
+      [cli, "horde", "--preset", "scout-swarm", "--json"],
+      { env },
+    );
+    const room = JSON.parse(created.stdout);
+    expect(room.agents.map((agent) => agent.id)).toEqual([
+      "haiku-1",
+      "haiku-2",
+      "flash-1",
+      "flash-2",
+      "luna-1",
+    ]);
+    const spawned = await exec(
+      process.execPath,
+      [cli, "horde", "spawn", "--attach-room", room.id, "--team", "claude:haiku", "--json"],
+      { env },
+    );
+    expect(JSON.parse(spawned.stdout).agents.at(-1)).toMatchObject({
+      id: "haiku-3",
+      status: "queued",
+    });
+    expect((await readRoom(room.id, path.join(dir, "mailbox-v1"))).agents).toHaveLength(6);
+  });
+});
+
+describe("terminal lifecycle", () => {
+  it("loads a worker diff and ignores it after focus moves to another agent", async () => {
+    const root = await directory();
+    const resultPath = path.join(root, "result.json");
+    await writeFile(
+      resultPath,
+      JSON.stringify({
+        repository: path.join(root, "repository"),
+        run_delta: { changed_paths: ["changed.txt"] },
+        git_after: { status: [" M changed.txt"], fingerprint: "result-fingerprint" },
+      }),
+    );
+    const room = fixture();
+    for (const agent of room.agents) agent.resultPath = resultPath;
+    // eslint-disable-next-line unicorn/prefer-event-target -- The TUI consumes Node terminal stream events.
+    const input = Object.assign(new EventEmitter(), {
+      isTTY: true,
+      isRaw: false,
+      setRawMode: vi.fn((raw) => {
+        input.isRaw = raw;
+      }),
+      resume() {},
+      pause() {},
+    });
+    const output = { isTTY: true, rows: 32, columns: 120 };
+    let outputText = "";
+    output.write = (chunk) => {
+      outputText += chunk;
+    };
+    let statusCallback;
+    let diffCallback;
+    const exec = (command, args, _options, callback) => {
+      if (args[1] === "status") {
+        statusCallback = callback;
+        return;
+      }
+      if (args[1] === "diff") {
+        diffCallback = callback;
+        return;
+      }
+      callback(null, "{}");
+    };
+    const running = runHordeTui(async () => room, {
+      input,
+      output,
+      exec,
+      env: {},
+      quota: false,
+      services: false,
+      update: false,
+    });
+    try {
+      await vi.waitFor(() => expect(outputText).toContain("View chat"));
+      input.emit("data", "d");
+      await vi.waitFor(() => expect(outputText).toContain("Changes · read only"));
+      expect(outputText).toContain("Loading...");
+      await vi.waitFor(() => expect(statusCallback).toBeTypeOf("function"));
+
+      input.emit("data", "2");
+      await vi.waitFor(() => expect(outputText).toContain("Waiting for branch"));
+      statusCallback(null, " M changed.txt\0");
+      await vi.waitFor(() => expect(diffCallback).toBeTypeOf("function"));
+      diffCallback(null, "diff --git a/changed.txt b/changed.txt\n+OUTDATED DIFF\n");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(outputText).not.toContain("OUTDATED DIFF");
+      expect(plain(outputText)).toContain("Recorded activity");
+    } finally {
+      input.emit("data", "q");
+      await running;
+    }
+  });
+
+  it.each([false, true])("restores terminal state after q when raw mode was %s", async (wasRaw) => {
+    vi.useFakeTimers();
+    // eslint-disable-next-line unicorn/prefer-event-target -- Node readline requires a stream EventEmitter API.
+    const input = new EventEmitter();
+    input.isTTY = true;
+    input.isRaw = wasRaw;
+    input.setRawMode = vi.fn((raw) => {
+      input.isRaw = raw;
+    });
+    input.resume = vi.fn();
+    input.pause = vi.fn();
+    const output = { isTTY: true, rows: 24, columns: 80, write: vi.fn() };
+    const signals = { SIGINT: process.listeners("SIGINT"), SIGTERM: process.listeners("SIGTERM") };
+    const load = vi.fn(async () => fixture());
+    let running;
+    try {
+      running = runTui(load, { input, output, quota: false });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(input.isRaw).toBe(true);
+      expect(output.write.mock.calls.flat().join("")).toContain("\u{1B}[?1049h\u{1B}[?25l");
+      input.emit("data", "q");
+      await running;
+      expect(input.isRaw).toBe(wasRaw);
+      expect(input.pause).toHaveBeenCalledOnce();
+      expect(input.listenerCount("keypress")).toBe(0);
+      expect(input.listenerCount("end")).toBe(0);
+      expect(process.listeners("SIGINT")).toEqual(signals.SIGINT);
+      expect(process.listeners("SIGTERM")).toEqual(signals.SIGTERM);
+      expect(output.write.mock.calls.flat().join("")).toContain("\u{1B}[?25h\u{1B}[?1049l");
+      expect(vi.getTimerCount()).toBe(0);
+      const frames = output.write.mock.calls.length;
+      const loads = load.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(output.write).toHaveBeenCalledTimes(frames);
+      expect(load).toHaveBeenCalledTimes(loads);
+    } finally {
+      input.emit("data", "q");
+      await running;
+      vi.useRealTimers();
+    }
+  });
+
+  it("asks for a second q before closing an embedded Herdr view pane", async () => {
+    const view = new HordeView(fixture(), { confirmClose: true });
+    expect(view.requestClose(1000)).toBe(true);
+    expect(view.notice).toContain("Press q again");
+    expect(view.requestClose(1000 + CLOSE_CONFIRM_MS + 1)).toBe(true);
+    expect(view.requestClose(1000 + CLOSE_CONFIRM_MS + 2)).toEqual({ type: "close-view" });
+    view.requestClose(5000);
+    view.handleKey("c");
+    expect(view.closeArmedAt).toBeUndefined();
+    view.overlay = "help";
+    expect(plain(view.render(100).join("\n"))).toContain("Close this pane (q twice)");
+    expect(new HordeView(fixture()).requestClose()).toEqual({ type: "close-view" });
+
+    vi.useFakeTimers();
+    // eslint-disable-next-line unicorn/prefer-event-target -- Node readline requires a stream EventEmitter API.
+    const input = new EventEmitter();
+    Object.assign(input, {
+      isTTY: true,
+      isRaw: false,
+      setRawMode: vi.fn(),
+      resume: vi.fn(),
+      pause: vi.fn(),
+    });
+    const output = { isTTY: true, rows: 24, columns: 80, write: vi.fn() };
+    let isClosed = false;
+    const run = async () => {
+      await runTui(async () => fixture(), {
+        input,
+        output,
+        quota: false,
+        env: { ORKEST_HERDR_VIEW_STATE: path.join(tmpdir(), "absent-view-state.json") },
+      });
+      isClosed = true;
+    };
+    const running = run();
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      input.emit("data", "q");
+      await vi.advanceTimersByTimeAsync(10);
+      expect(isClosed).toBe(false);
+      expect(plain(output.write.mock.calls.flat().join(""))).toContain("Press q again");
+      input.emit("data", "q");
+      await running;
+      expect(isClosed).toBe(true);
+    } finally {
+      input.emit("data", "\u{3}");
+      await running;
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not write the same frame on every timer tick and redraws on resize", async () => {
+    vi.useFakeTimers();
+    // eslint-disable-next-line unicorn/prefer-event-target -- Readline keypress and terminal resize use Node stream events.
+    const input = new EventEmitter();
+    input.isTTY = true;
+    input.isRaw = false;
+    input.setRawMode = vi.fn();
+    input.resume = vi.fn();
+    input.pause = vi.fn();
+    // eslint-disable-next-line unicorn/prefer-event-target -- Readline keypress and terminal resize use Node stream events.
+    const output = new EventEmitter();
+    output.isTTY = true;
+    output.rows = 24;
+    output.columns = 80;
+    output.write = vi.fn();
+    const running = runTui(
+      async () => {
+        const room = fixture();
+        for (const agent of room.agents) agent.status = "completed";
+        return room;
+      },
+      { input, output, quota: false },
+    );
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      const initialWrites = output.write.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(600);
+      expect(output.write).toHaveBeenCalledTimes(initialWrites);
+      output.columns = 90;
+      output.emit("resize");
+      expect(output.write).toHaveBeenCalledTimes(initialWrites + 1);
+      input.emit("data", "q");
+      await running;
+      expect(input.setRawMode).toHaveBeenLastCalledWith(false);
+      expect(output.listenerCount("resize")).toBe(0);
+    } finally {
+      input.emit("data", "q");
+      await running;
+      vi.useRealTimers();
+    }
+  });
+
+  it("restores terminal state when painting fails after entering the alternate screen", async () => {
+    vi.useFakeTimers();
+    // eslint-disable-next-line unicorn/prefer-event-target -- Readline keypress uses the Node stream EventEmitter API.
+    const input = new EventEmitter();
+    input.isTTY = true;
+    input.isRaw = false;
+    input.setRawMode = vi.fn((raw) => {
+      input.isRaw = raw;
+    });
+    input.resume = vi.fn();
+    input.pause = vi.fn();
+    const output = { isTTY: true, rows: 24, columns: 80, write: vi.fn() };
+    output.write
+      .mockImplementationOnce(() => {})
+      .mockImplementationOnce(() => {
+        throw new Error("terminal write failed");
+      });
+    try {
+      await expect(runTui(async () => fixture(), { input, output, quota: false })).rejects.toThrow(
+        "terminal write failed",
+      );
+      expect(input.isRaw).toBe(false);
+      expect(input.pause).toHaveBeenCalledOnce();
+      expect(output.write.mock.calls.at(-1)[0]).toContain("\u{1B}[?1049l");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reopens an existing worktree when an agent's Herdr pane is gone, and reports failure cleanly", async () => {
+    const root = await realpath(await directory());
+    const parent = path.join(root, "my repo");
+    const worktree = path.join(parent, ".worktrees", "wt one");
+    mkdirSync(worktree, { recursive: true });
+    writeFileSync(path.join(worktree, ".git"), "gitdir: elsewhere\n");
+    const env = { HERDR_ENV: "1", HERDR_SOCKET_PATH: path.join(root, "herdr.sock") };
+    const endpoint = herdrEndpoint(env);
+    const agent = {
+      id: "a1",
+      herdrPaneId: "w4:p2",
+      herdrEndpoint: endpoint,
+      session: { id: "native-1" },
+      worktree: { path: worktree, parentCwd: parent, disposable: true, slug: "wt one" },
+    };
+    const calls = [];
+    const exec = (binary, args, options, callback) => {
+      calls.push({ binary, args, options });
+      if (args[0] === "workspace") {
+        callback(
+          null,
+          JSON.stringify({
+            result: {
+              type: "workspace_info",
+              workspace: {
+                workspace_id: "w4",
+                worktree: {
+                  repo_root: parent,
+                  checkout_path: parent,
+                  is_linked_worktree: false,
+                },
+              },
+            },
+          }),
+        );
+      } else if (args[0] === "worktree") {
+        callback(
+          null,
+          JSON.stringify({
+            result: {
+              type: "worktree_opened",
+              workspace: { workspace_id: "w4" },
+              tab: { tab_id: "w4:t1" },
+              root_pane: { pane_id: "w4:p9" },
+              worktree: { path: worktree },
+              already_open: false,
+            },
+          }),
+        );
+      } else {
+        // agent get / pane current: the terminal no longer exists.
+        callback(new Error("pane not found"));
+      }
+    };
+
+    expect(await focusAgentPane(agent, { exec, env, root: parent })).toBe(true);
+    const opened = calls.filter((call) => call.args[0] === "worktree");
+    expect(opened).toHaveLength(1);
+    expect(opened[0].args).toEqual([
+      "worktree",
+      "open",
+      "--workspace",
+      "w4",
+      "--path",
+      await realpath(worktree),
+      "--focus",
+    ]);
+    expect(opened[0].options.cwd).toBe(await realpath(parent));
+    expect(calls.some((call) => call.args.includes("create"))).toBe(false);
+    expect(calls.findIndex((call) => call.args[0] === "workspace")).toBeLessThan(
+      calls.findIndex((call) => call.args[0] === "worktree"),
+    );
+
+    // A failed workspace lookup drops the hint and uses the explicit root instead.
+    calls.length = 0;
+    const noWorkspace = (binary, args, options, callback) =>
+      args[0] === "workspace" ? callback(new Error("gone")) : exec(binary, args, options, callback);
+    expect(await focusAgentPane(agent, { exec: noWorkspace, env, root: parent })).toBe(true);
+    const fallbackArgs = calls.find((call) => call.args[0] === "worktree").args;
+    expect(fallbackArgs).not.toContain("--workspace");
+    expect(fallbackArgs.slice(2, 4)).toEqual(["--cwd", await realpath(parent)]);
+
+    // Another endpoint, an untrusted path or a rejecting Herdr all report failure; nothing opens.
+    calls.length = 0;
+    expect(
+      await focusAgentPane(
+        { ...agent, herdrEndpoint: path.join(root, "other.sock") },
+        { exec, env, root: parent },
+      ),
+    ).toBe(false);
+    expect(
+      await focusAgentPane(
+        { ...agent, worktree: { ...agent.worktree, path: root } },
+        { exec, env, root: parent },
+      ),
+    ).toBe(false);
+    expect(await focusAgentPane(agent, { exec, env, root: path.join(root, "unrelated") })).toBe(
+      false,
+    );
+    expect(calls.filter((call) => call.args[0] === "worktree")).toHaveLength(0);
+    const rejecting = (binary, args, options, callback) =>
+      args[0] === "worktree"
+        ? callback(new Error("rejected"))
+        : exec(binary, args, options, callback);
+    expect(await focusAgentPane(agent, { exec: rejecting, env, root: parent })).toBe(false);
+    // Without a worktree the original behaviour is unchanged.
+    expect(await focusAgentPane({ ...agent, worktree: undefined }, { exec, env })).toBe(false);
+  });
+
+  it("sends one Herdr notification per event and falls back to the macOS HUD only when Herdr rejects", async () => {
+    const root = await realpath(await directory());
+    const hudBin = path.join(root, "OrkestHUD");
+    await writeFile(hudBin, "#!/bin/sh\nexit 0\n");
+    chmodSync(hudBin, 0o755);
+    const calls = [];
+    const makeExec = (isHerdrRejecting) => (binary, args, options, callback) => {
+      calls.push({ binary, args });
+      const cb = typeof options === "function" ? options : callback;
+      cb?.(binary === "herdr" && isHerdrRejecting ? new Error("rejected") : null, "", "");
+    };
+    const prev = [{ id: "a1", person: "gribble", stage: "working", summary: "Writing" }];
+    const next = [{ id: "a1", person: "gribble", stage: "blocked", summary: "-- Need input" }];
+    const env = { HERDR_ENV: "1", ORKEST_HUD_BIN: hudBin };
+
+    notifyHerdrTransitions(prev, next, new Set(), {
+      env,
+      exec: makeExec(false),
+      platform: "darwin",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(calls.map((call) => call.binary)).toEqual(["herdr"]);
+    expect(calls[0].args).toEqual([
+      "notification",
+      "show",
+      "Orkest: gribble blocked",
+      "--body",
+      "-- Need input",
+      "--sound",
+      "request",
+    ]);
+
+    calls.length = 0;
+    notifyHerdrTransitions(prev, next, new Set(), {
+      env,
+      exec: makeExec(true),
+      platform: "darwin",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(calls.map((call) => call.binary)).toEqual(["herdr", hudBin]);
+
+    calls.length = 0;
+    notifyHerdrTransitions(prev, next, new Set(), {
+      env,
+      exec: makeExec(true),
+      platform: "linux",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(calls.map((call) => call.binary)).toEqual(["herdr"]);
+  });
+
+  it("supports o-key pane focus, focusAgentPane, notifyHerdrTransitions, and primary module exports", async () => {
+    expect(runTui).toBe(runHordeTui);
+    expect(factoryModule.foundryCommand).toBe(foundryModule.foundryCommand);
+    expect(factoryModule.runSmelterPass).toBe(foundryModule.runSmelterPass);
+    expect(foundryModule.runFoundryPass).toBe(foundryModule.runSmelterPass);
+    expect(typeof foundryModule.resolveWorktreeGitDir).toBe("function");
+
+    const normalized = normalizeAgent(
+      { id: "a1", progress: { herdrPaneId: "herdr-pane-9", paneId: "%9" } },
+      { cwd: "/workspace" },
+    );
+    expect(normalized.herdrPaneId).toBe("herdr-pane-9");
+    expect(normalized.paneId).toBe("%9");
+
+    const room = fixture("claude:haiku,agy:flash");
+    room.agents[0].herdrPaneId = "pane-haiku-1";
+    room.agents[1].paneId = "%42";
+    const focusedCalls = [];
+    const view = new HordeView(room, {
+      height: 24,
+      tier: "unicode",
+      onFocusPane: (agent) => {
+        focusedCalls.push(agent);
+      },
+    });
+    expect(view.render(80).join("\n")).toContain(" Open terminal ");
+    expect(view.handleKey("o")).toBe(true);
+    expect(view.lastFocusedAgentId).toBe(view.focusId);
+    expect(focusedCalls).toHaveLength(1);
+    expect(focusedCalls[0].paneId).toBe("%42");
+
+    view.handleKey("\u{1B}[B");
+    expect(view.handleKey("o")).toBe(true);
+    expect(focusedCalls).toHaveLength(2);
+    expect(focusedCalls[1].herdrPaneId).toBe("pane-haiku-1");
+
+    const execCalls = [];
+    const herdrEnv = {
+      HERDR_ENV: "1",
+      HERDR_SOCKET_PATH: path.join(tmpdir(), "horde-tui-herdr.sock"),
+    };
+    const endpoint = herdrEndpoint(herdrEnv);
+    const mockExec = (cmd, args, callback) => {
+      execCalls.push([cmd, args]);
+      if (args[0] === "agent" && args[1] === "get")
+        callback(
+          null,
+          JSON.stringify({
+            result: {
+              type: "agent_info",
+              agent: { agent_session: { kind: "id", value: "native-1" } },
+            },
+          }),
+        );
+      else callback(null, "");
+    };
+    await focusAgentPane(
+      { id: "a1", herdrPaneId: "hp-1", herdrEndpoint: endpoint, session: { id: "native-1" } },
+      { exec: mockExec, env: herdrEnv },
+    );
+    await focusAgentPane(
+      { id: "a2", paneId: "%2", terminalServer: "orkest-label-0123456789ab" },
+      { exec: mockExec },
+    );
+    expect(
+      await focusAgentPane({ id: "a-bad-1", herdrPaneId: "-malicious-flag" }, { exec: mockExec }),
+    ).toBe(false);
+    expect(await focusAgentPane({ id: "a-bad-2", paneId: "bad\npane" }, { exec: mockExec })).toBe(
+      false,
+    );
+    expect(
+      await focusAgentPane(
+        { id: "a3", herdrPaneId: "hp-err", herdrEndpoint: endpoint, session: { id: "native-1" } },
+        {
+          env: herdrEnv,
+          exec: () => {
+            throw new Error("herdr unavailable");
+          },
+        },
+      ),
+    ).toBe(false);
+    expect(
+      await focusAgentPane(
+        {
+          id: "a4",
+          herdrPaneId: "hp-cb-err",
+          herdrEndpoint: endpoint,
+          session: { id: "native-1" },
+        },
+        {
+          env: herdrEnv,
+          exec: (_cmd, _args, cb) => {
+            cb(new Error("command failed"));
+          },
+        },
+      ),
+    ).toBe(false);
+    expect(execCalls).toEqual([
+      ["herdr", ["agent", "get", "hp-1"]],
+      ["herdr", ["agent", "focus", "hp-1"]],
+      ["tmux", ["-L", "orkest-label-0123456789ab", "select-pane", "-t", "%2"]],
+    ]);
+    expect(
+      await focusAgentPane(
+        {
+          herdrPaneId: "hp-1",
+          herdrEndpoint: "/tmp/other-herdr.sock",
+          session: { id: "native-1" },
+        },
+        { exec: mockExec, env: herdrEnv },
+      ),
+    ).toBe(false);
+    expect(execCalls).toHaveLength(3);
+    expect(
+      await focusAgentPane(
+        { herdrPaneId: "hp-1", herdrEndpoint: endpoint, session: { id: "another-session" } },
+        { exec: mockExec, env: herdrEnv },
+      ),
+    ).toBe(false);
+    expect(execCalls.at(-1)).toEqual(["herdr", ["agent", "get", "hp-1"]]);
+    expect(
+      await focusAgentPane(
+        { herdrPaneId: "hp-1", paneId: "%3", terminalServer: "orkest-label-0123456789ab" },
+        { exec: mockExec, env: {} },
+      ),
+    ).toBe(false);
+    expect(execCalls.at(-1)).toEqual(["herdr", ["agent", "get", "hp-1"]]);
+
+    const notificationCalls = [];
+    const notificationExec = (cmd, args) => {
+      notificationCalls.push([cmd, args]);
+    };
+
+    // Initial startup seed (prevAgents = null) records existing blocked/reported states without notifying:
+    const seededSet = new Set();
+    expect(
+      notifyHerdrTransitions(
+        null,
+        [{ id: "a1", person: "gribble", stage: "blocked", summary: "Already blocked" }],
+        seededSet,
+        { env: { HERDR_ENV: "1", HERDR_PANE_ID: "hp-1" }, exec: notificationExec },
+      ),
+    ).toBe(false);
+    expect(seededSet.has("a1:blocked:Already blocked")).toBe(true);
+    expect(notificationCalls).toHaveLength(0);
+
+    const seededCompleteSet = new Set();
+    expect(
+      notifyHerdrTransitions(
+        null,
+        [{ id: "a1", person: "gribble", stage: "completed", summary: "Already done" }],
+        seededCompleteSet,
+        { env: { HERDR_ENV: "1", HERDR_PANE_ID: "hp-1" }, exec: notificationExec },
+      ),
+    ).toBe(false);
+    expect(seededCompleteSet.has('room:outcomes:[["reported",1]]')).toBe(true);
+    expect(notificationCalls).toHaveLength(0);
+
+    // Empty/missing previous stage does not trigger an outcome notification:
+    const emptyStageSet = new Set();
+    expect(
+      notifyHerdrTransitions(
+        [{ id: "a1", person: "gribble", stage: "", summary: "" }],
+        [{ id: "a1", person: "gribble", stage: "completed", summary: "Done" }],
+        emptyStageSet,
+        { env: { HERDR_ENV: "1", HERDR_PANE_ID: "hp-1" }, exec: notificationExec },
+      ),
+    ).toBe(false);
+    expect(notificationCalls).toHaveLength(0);
+
+    const notifiedSet = new Set();
+    const prev = [
+      { id: "a1", person: "gribble", stage: "working", summary: "Writing tests" },
+      { id: "a2", person: "snoobix", stage: "working", summary: "Refactoring" },
+    ];
+    const nextBlocked = [
+      { id: "a1", person: "gribble", stage: "blocked", summary: "Need confirmation" },
+      { id: "a2", person: "snoobix", stage: "working", summary: "Refactoring" },
+    ];
+    // No-op when Herdr env vars are absent:
+    notifyHerdrTransitions(prev, nextBlocked, notifiedSet, { env: {}, exec: notificationExec });
+    expect(notificationCalls).toHaveLength(0);
+
+    // Fires edge-triggered blocked notification when HERDR_PANE_ID is present:
+    notifyHerdrTransitions(prev, nextBlocked, notifiedSet, {
+      env: { HERDR_ENV: "1", HERDR_PANE_ID: "hp-1" },
+      exec: notificationExec,
+    });
+    expect(notificationCalls).toEqual([
+      [
+        "herdr",
+        [
+          "notification",
+          "show",
+          "Orkest: gribble blocked",
+          "--body",
+          "Need confirmation",
+          "--sound",
+          "request",
+        ],
+      ],
+    ]);
+    expect(notifiedSet.has("a1:blocked:Need confirmation")).toBe(true);
+
+    // Deduplicated on repeated poll with same state:
+    notifyHerdrTransitions(prev, nextBlocked, notifiedSet, {
+      env: { HERDR_ENV: "1", HERDR_PANE_ID: "hp-1" },
+      exec: notificationExec,
+    });
+    expect(notificationCalls).toHaveLength(1);
+
+    // Announces reported outcomes when all agents finish after at least one was active:
+    const nextDone = [
+      { id: "a1", person: "gribble", stage: "completed", summary: "Done" },
+      { id: "a2", person: "snoobix", stage: "completed", summary: "Done" },
+    ];
+    notifyHerdrTransitions(nextBlocked, nextDone, notifiedSet, {
+      env: { HERDR_ENV: "1", HERDR_SOCKET_PATH: "/tmp/herdr.sock" },
+      exec: notificationExec,
+    });
+    expect(notificationCalls).toHaveLength(2);
+    expect(notificationCalls[1]).toEqual([
+      "herdr",
+      [
+        "notification",
+        "show",
+        "Orkest: Swarm reported (awaiting review)",
+        "--body",
+        "All 2 agents reported (awaiting review).",
+        "--sound",
+        "request",
+      ],
+    ]);
+    expect(notifiedSet.has('room:outcomes:[["reported",2]]')).toBe(true);
+  });
+
+  it("shows observed processes on cards and Focus/Pinned panels in monochrome", () => {
+    const room = fixture("claude:haiku,agy:flash");
+    const member = room.agents[0];
+    member.status = "working";
+    member.progress = { ...member.progress, task: "Run the focused suite" };
+    room.agentProcesses = {
+      [member.id]: {
+        processes: [
+          {
+            pid: 9101,
+            ppid: 9100,
+            ageSeconds: 42,
+            command: "python3 -m pytest tests/test_app.py",
+            via: "tree",
+            ports: [],
+          },
+          {
+            pid: 9102,
+            ppid: 9100,
+            ageSeconds: 420,
+            command: "node node_modules/.bin/vite --port",
+            via: "cwd",
+            ports: [5173],
+          },
+        ],
+        more: 1,
+      },
+    };
+
+    const view = new HordeView(room, { height: 40, color: false, tier: "unicode", now: () => 0 });
+    view.focusId = member.id;
+    view.hasExplicitFocus = true;
+    const focusText = plain(view.render(100).join("\n"));
+
+    expect(focusText).toContain("3 procs · :5173");
+    expect(focusText).toContain("Running");
+    expect(focusText).toContain("9101  42s  python3 -m pytest tests/test_app.py");
+    expect(focusText).toContain(
+      "9102  7m  node node_modules/.bin/vite --port :5173 (by directory)",
+    );
+    expect(focusText).toContain("…and 1 more");
+
+    view.pinnedId = member.id;
+    const pinnedText = plain(view.render(100).join("\n"));
+    expect(pinnedText).toContain("Pinned · haiku-1");
+    expect(pinnedText).toContain("Running");
+
+    member.status = "reported complete";
+    member.completion = "untracked";
+    room.agentProcesses[member.id].more = 0;
+    const finishedText = plain(
+      new HordeView(room, { height: 40, color: false, now: () => 0 }).render(100).join("\n"),
+    );
+    expect(finishedText).toContain("2 procs left");
+  });
+
+  it("drops the process count before narrowing the card's model or status text", () => {
+    const room = fixture("claude:haiku,agy:flash");
+    const member = room.agents[0];
+    member.status = "working";
+    room.agentProcesses = {
+      [member.id]: {
+        processes: [
+          {
+            pid: 9101,
+            ppid: 9100,
+            ageSeconds: 5,
+            command: "python test.py",
+            via: "tree",
+            ports: [],
+          },
+        ],
+        more: 0,
+      },
+    };
+    const narrowLines = new HordeView(room, {
+      height: 28,
+      color: false,
+      tier: "ascii",
+      now: () => 0,
+    })
+      .render(24)
+      .map(plain);
+    const agentLine = narrowLines.find((line) => line.includes("haiku-1")) || "";
+    expect(agentLine).toContain("2 haiku-1");
+    expect(narrowLines.join("\n")).not.toContain("proc");
+    expect(displayWidth(agentLine)).toBeLessThanOrEqual(24);
+
+    const widerLines = new HordeView(room, {
+      height: 28,
+      color: false,
+      tier: "ascii",
+      now: () => 0,
+    })
+      .render(35)
+      .map(plain);
+    const widerAgentLine = widerLines.find((line) => line.includes("haiku-1")) || "";
+    expect(widerAgentLine).toContain("2 haiku-1");
+    expect(widerAgentLine).toContain("haiku · working");
+  });
+
+  it("renders redesigned orchestrator card, collapsible inline quota, and running services footer", async () => {
+    const room = fixture("claude:haiku,agy:flash");
+    room.title = "Swarm View Upgrade";
+    room.conductor = {
+      ...room.conductor,
+      name: "gribble-gemini-4-argon-medium-orkest-1f",
+      engine: "agy",
+      branch: "feat/swarm-view",
+      herdrPaneId: "pane-lead-1",
+      status: "running",
+      progress: {
+        name: "gribble-gemini-4-argon-medium-orkest-1f",
+        model: "Gemini 4 Argon (Medium)",
+        effort: "—",
+        goal: "Ship Swarm View v2",
+        task: "Coordinating slice 2A",
+        reportedAt: new Date(10_000).toISOString(),
+      },
+    };
+    room.accounts = [
+      {
+        id: "codex",
+        short: "C",
+        windows: [
+          { id: "five_hour", label: "5h", remainingPct: 92 },
+          { id: "weekly", label: "wk", remainingPct: 81 },
+        ],
+      },
+      {
+        id: "claude",
+        short: "K",
+        windows: [{ id: "weekly", label: "wk", remainingPct: 64 }],
+      },
+    ];
+    room.services = [
+      {
+        kind: "port",
+        port: 3004,
+        pid: 4242,
+        name: "vite",
+        worktree: "wt:slice-2a",
+        owner: "haiku-1",
+        uptime: "04:12",
+      },
+      {
+        kind: "docker",
+        port: 5432,
+        name: "orkest-postgres-1",
+        image: "postgres:16",
+        worktree: "orkest",
+        uptime: "12 minutes",
+      },
+    ];
+    expect(() => validateRoom(structuredClone(room))).not.toThrow();
+
+    const view = new HordeView(room, {
+      height: 34,
+      tier: "unicode",
+      quotaMode: "expanded",
+      servicesMode: "expanded",
+      now: () => 20_000,
+    });
+    const expandedText = view.render(100).join("\n");
+    expect(expandedText).toContain("gribble");
+    expect(expandedText).toContain("(feat/swarm-view)");
+    expect(expandedText).toContain("agy");
+    expect(expandedText).not.toContain("ork: ");
+    expect(expandedText).not.toContain("harness: ");
+    expect(expandedText).not.toContain("pane-lead-1");
+    expect(expandedText).toContain("Ship Swarm View v2 — Coordinating slice 2A");
+    expect(expandedText).toContain("▾ Quota");
+    expect(expandedText).toContain("▾ Services");
+    expect(expandedText).toContain("2 running · localhost :3004 :5432");
+    expect(expandedText).toMatch(
+      /:3004 {2}vite \(pid 4242\) · wt:slice-2a · by haiku-1 +up 04:12/u,
+    );
+    expect(expandedText).toMatch(/:5432 {2}docker postgres:16 · orkest +up 12 minutes/u);
+    expect(expandedText).toContain("g Log");
+    expect(expandedText).toContain("? Shortcuts");
+
+    // Toggle quota to collapsed 1-line inline bar with 'u':
+    expect(view.handleKey("u")).toBe(true);
+    expect(view.quotaMode).toBe("collapsed");
+    const collapsedText = view.render(100).join("\n");
+    expect(collapsedText).toContain("C ━━━─ 92%");
+    expect(collapsedText).toContain("K ━━━─ 64%");
+    expect(collapsedText.split("\n").filter((line) => line.includes("Quota"))).toHaveLength(0);
+
+    // Toggle back to expanded with 'u':
+    expect(view.handleKey("u")).toBe(true);
+    expect(view.quotaMode).toBe("expanded");
+
+    // Toggle services to collapsed 1-line inline bar with 'v':
+    expect(view.handleKey("v")).toEqual({
+      type: "services-toggle",
+      servicesMode: "collapsed",
+    });
+    expect(view.servicesMode).toBe("collapsed");
+    const collapsedServicesText = view.render(100).join("\n");
+    expect(collapsedServicesText).toContain("▸ Services");
+    expect(collapsedServicesText).toContain(
+      "2 running · localhost :3004 vite (wt:slice-2a) · :5432 docker postgres:16 (orkest)",
+    );
+    expect(collapsedServicesText).not.toContain("pid 4242");
+
+    // Toggle services back to expanded with 'v':
+    expect(view.handleKey("v")).toEqual({
+      type: "services-toggle",
+      servicesMode: "expanded",
+    });
+    expect(view.servicesMode).toBe("expanded");
+
+    // Render the clickable update bubble at the bottom and retain the Shift+U shortcut:
+    view.setRoom({
+      ...room,
+      update: { available: true, commitsBehind: 3, remoteSha: "a1b2c3d4" },
+    });
+    const updateAvailableLines = view.render(100);
+    const updateAvailableText = updateAvailableLines.join("\n");
+    expect(updateAvailableText).toContain("Update");
+    expect(updateAvailableText).toContain("↑ 3 new commits on origin/main · click to update");
+    expect(updateAvailableLines.find((line) => line.includes("View chat"))).not.toContain("Update");
+    expect(view.handleKey("U")).toEqual({ type: "pull-update" });
+    // Lowercase 'u' still toggles quotaMode:
+    expect(view.handleKey("u")).toBe(true);
+    expect(view.quotaMode).toBe("collapsed");
+    expect(view.handleKey("u")).toBe(true);
+    expect(view.quotaMode).toBe("expanded");
+
+    // Verify repo-denied account filtering in horde-tui (multi-account tags, aliases, and IDs):
+    const sampleAccounts = [
+      { id: "claude-w1", provider: "claude", label: "Claude Work 1", short: "W1", tags: ["work"] },
+      { id: "claude-w2", provider: "claude", label: "Claude Work 2", short: "W2", tags: ["work"] },
+      {
+        id: "claude-p1",
+        alias: "claude-alt",
+        provider: "claude",
+        label: "Claude Personal 1",
+        short: "P1",
+        tags: ["personal"],
+      },
+      {
+        id: "claude-p2",
+        provider: "claude",
+        label: "Claude Personal 2",
+        short: "P2",
+        tags: ["personal"],
+      },
+      {
+        id: "claude-acme",
+        provider: "claude",
+        label: "Claude Acme",
+        short: "CA",
+        tags: ["client-acme"],
+      },
+      { id: "codex", provider: "codex", label: "Codex", short: "C" },
+      { id: "antigravity", provider: "antigravity", label: "Gemini", short: "G" },
+    ];
+    expect(
+      hordeTuiModule.filterAccountsByRepoPolicy(sampleAccounts, ["work"]).map((a) => a.id),
+    ).toEqual(["claude-p1", "claude-p2", "claude-acme", "codex", "antigravity"]);
+    expect(
+      hordeTuiModule
+        .filterAccountsByRepoPolicy(sampleAccounts, ["personal", "client-acme", "codex"])
+        .map((a) => a.id),
+    ).toEqual(["claude-w1", "claude-w2", "antigravity"]);
+    expect(
+      hordeTuiModule
+        .filterAccountsByRepoPolicy(sampleAccounts, ["claude-alt", "claude-w2"])
+        .map((a) => a.id),
+    ).toEqual(["claude-w1", "claude-p2", "claude-acme", "codex", "antigravity"]);
+
+    // Verify cachedQuota caches repo policy per (cwd, mtime, TTL) without re-running git on every 1s refresh:
+    const policyCacheTmp = await mkdtemp(path.join(tmpdir(), "ork-tui-policy-cache-"));
+    try {
+      const qCacheDir = path.join(policyCacheTmp, "cache");
+      const qConfigDir = path.join(policyCacheTmp, "cfg");
+      const qRepo = path.join(policyCacheTmp, "repo-cached");
+      mkdirSync(qCacheDir, { recursive: true });
+      mkdirSync(qConfigDir, { recursive: true });
+      mkdirSync(path.join(qRepo, ".orkest"), { recursive: true });
+      const monCfgPath = path.join(qConfigDir, "monitor.json");
+      const polCfgPath = path.join(qConfigDir, "orchestrate.json");
+      writeFileSync(
+        path.join(qCacheDir, "snapshot.json"),
+        JSON.stringify({
+          accounts: {
+            claude: { id: "claude", provider: "claude", billing: "work" },
+            codex: { id: "codex", provider: "codex" },
+          },
+        }),
+      );
+      writeFileSync(
+        monCfgPath,
+        JSON.stringify({
+          accounts: [
+            { id: "claude", provider: "claude", billing: "work" },
+            { id: "codex", provider: "codex" },
+          ],
+        }),
+      );
+      writeFileSync(polCfgPath, JSON.stringify({}));
+      writeFileSync(
+        path.join(qRepo, ".orkest", "policy.json"),
+        JSON.stringify({ deny: ["codex"] }),
+      );
+
+      hordeTuiModule.resetRepoPolicyCache();
+      let gitCalls = 0;
+      const countingExecAsync = async () => {
+        gitCalls += 1;
+        return { stdout: "", stderr: "" };
+      };
+      const baseOpts = {
+        cacheDir: qCacheDir,
+        monitorConfigPath: monCfgPath,
+        configPath: polCfgPath,
+        homeDir: policyCacheTmp,
+        env: { HOME: policyCacheTmp },
+        execAsync: countingExecAsync,
+        policyTtlMs: 15_000,
+      };
+      const r1 = await hordeTuiModule.cachedQuota(qRepo, { ...baseOpts, now: 1000 });
+      expect(r1.map((a) => a.id)).toEqual(["claude"]);
+      expect(gitCalls).toBe(2);
+
+      // Subsequent 1s tick hits cache: 0 git spawns
+      const r2 = await hordeTuiModule.cachedQuota(qRepo, { ...baseOpts, now: 2000 });
+      expect(r2.map((a) => a.id)).toEqual(["claude"]);
+      expect(gitCalls).toBe(2);
+
+      // Modifying .orkest/policy.json invalidates immediately even within TTL
+      const localPolicyFile = path.join(qRepo, ".orkest", "policy.json");
+      writeFileSync(localPolicyFile, JSON.stringify({ deny: ["claude-work"] }));
+      utimesSync(localPolicyFile, new Date(Date.now() + 2000), new Date(Date.now() + 2000));
+      const r3 = await hordeTuiModule.cachedQuota(qRepo, { ...baseOpts, now: 3000 });
+      expect(r3.map((a) => a.id)).toEqual(["codex"]);
+      expect(gitCalls).toBe(4);
+
+      // TTL expiry re-evaluates
+      const r4 = await hordeTuiModule.cachedQuota(qRepo, { ...baseOpts, now: 20_000 });
+      expect(r4.map((a) => a.id)).toEqual(["codex"]);
+      expect(gitCalls).toBe(6);
+    } finally {
+      rmSync(policyCacheTmp, { recursive: true, force: true });
+    }
+
+    // Test probeRoomServices & cachedServices with mocked lsof, ps, and docker ps output
+    // (including internal agy / codex IPC ephemeral ports that must be filtered out):
+    const probeRoom = {
+      id: "room-svc-probe",
+      cwd: "/Users/dev/orkest",
+      conductor: { id: "conductor", name: "gribble", pid: 9000 },
+      agents: [
+        {
+          id: "worker-1",
+          name: "snoobix",
+          pid: 9100,
+          worktree: {
+            disposable: true,
+            path: "/Users/dev/orkest/.worktrees/wt-ui",
+            slug: "wt-ui",
+          },
+        },
+      ],
+    };
+    const psCalls = [];
+    const mockExec = (cmd, args, cb) => {
+      if (cmd === "lsof" && args.includes("-sTCP:LISTEN")) {
+        cb(
+          null,
+          [
+            "p9105",
+            "c node",
+            "n127.0.0.1:4173",
+            "p9000",
+            "c agy",
+            "n127.0.0.1:58406",
+            "p9100",
+            "c codex",
+            "n127.0.0.1:60693",
+            "p9999",
+            "c python",
+            "n*:8000",
+            "",
+          ].join("\n"),
+        );
+        return;
+      }
+      if (cmd === "ps") psCalls.push(args);
+      if (cmd === "ps" && args.includes("-axo")) {
+        cb(
+          null,
+          [
+            " 9105  9100 02:15 node /Users/dev/orkest/node_modules/.bin/vite --port 4173",
+            " 9000     1 15:00 agy --workspace /Users/dev/orkest",
+            " 9100  9000 12:00 codex --full-auto",
+            " 9999     1 10:00 python -m http.server",
+            "",
+          ].join("\n"),
+        );
+        return;
+      }
+      if (cmd === "ps" && args.includes("-p")) {
+        cb(
+          null,
+          [
+            " 9105  9100 02:15 node /Users/dev/orkest/node_modules/.bin/vite --port 4173",
+            " 9000     1 15:00 agy --workspace /Users/dev/orkest",
+            " 9100  9000 12:00 codex --full-auto",
+            " 9999     1 10:00 python -m http.server",
+            "",
+          ].join("\n"),
+        );
+        return;
+      }
+      if (cmd === "lsof" && args.includes("cwd")) {
+        cb(
+          null,
+          [
+            "p9105",
+            "n/Users/dev/orkest/.worktrees/wt-ui",
+            "p9000",
+            "n/Users/dev/orkest",
+            "p9100",
+            "n/Users/dev/orkest/.worktrees/wt-ui",
+            "p9999",
+            "n/tmp/unrelated",
+            "",
+          ].join("\n"),
+        );
+        return;
+      }
+      if (cmd === "docker") {
+        cb(
+          null,
+          `${JSON.stringify({
+            Names: "orkest-redis-1",
+            Image: "redis:7-alpine",
+            Ports: "0.0.0.0:6379->6379/tcp",
+            Labels:
+              "com.docker.compose.project=orkest,com.docker.compose.project.working_dir=/Users/dev/orkest",
+            RunningFor: "5 minutes ago",
+          })}\n`,
+        );
+        return;
+      }
+      cb(null, "");
+    };
+    const discovery = await hordeTuiModule.cachedRoomDiscovery(probeRoom, {
+      exec: mockExec,
+      now: () => 1000,
+      force: true,
+    });
+    expect(psCalls.filter((args) => args.includes("-axo"))).toHaveLength(1);
+    expect(psCalls.filter((args) => args.includes("-p"))).toHaveLength(1);
+    const services = discovery.services;
+    expect(services).toEqual([
+      {
+        kind: "port",
+        port: 4173,
+        pid: 9105,
+        name: "vite",
+        cwd: "/Users/dev/orkest/.worktrees/wt-ui",
+        worktree: "wt:ui",
+        owner: "snoobix",
+        uptime: "02:15",
+      },
+      {
+        kind: "docker",
+        name: "orkest-redis-1",
+        image: "redis:7-alpine",
+        port: 6379,
+        ports: "0.0.0.0:6379->6379/tcp",
+        cwd: "/Users/dev/orkest",
+        worktree: "orkest",
+        uptime: "5 minutes",
+      },
+    ]);
+    expect(discovery.agentProcesses["worker-1"].processes).toContainEqual(
+      expect.objectContaining({ pid: 9105, via: "tree", ports: [4173] }),
+    );
+    expect(discovery.agentProcesses["worker-1"].more).toBe(0);
+    const cached = await hordeTuiModule.cachedServices(probeRoom, {
+      exec: () => {
+        throw new Error("should use cache");
+      },
+      now: () => 2000,
+      ttlMs: 60_000,
+    });
+    expect(cached).toHaveLength(2);
+  });
+
+  it("skips spawning docker ps when Docker.app is half-copied and backs off after docker failures", async () => {
+    hordeTuiModule.resetDockerProbeGuard();
+    let root = null;
+    try {
+      root = await mkdtemp(path.join(tmpdir(), "ork-horde-docker-"));
+      const binDir = path.join(root, "bin");
+      mkdirSync(binDir, { recursive: true });
+      const appPath = path.join(root, "Applications", "Docker.app", "Contents");
+      mkdirSync(path.join(appPath, "MacOS"), { recursive: true });
+      mkdirSync(path.join(appPath, "_CodeSignature"), { recursive: true });
+      mkdirSync(path.join(appPath, "Resources", "bin"), { recursive: true });
+      writeFileSync(path.join(appPath, "Info.plist"), "<plist></plist>\n", "utf8");
+      writeFileSync(
+        path.join(appPath, "_CodeSignature", "CodeResources"),
+        "<plist></plist>\n",
+        "utf8",
+      );
+      const desktopExe = path.join(appPath, "MacOS", "Docker Desktop");
+      writeFileSync(desktopExe, "#!/bin/sh\nexit 0\n", "utf8");
+      chmodSync(desktopExe, 0o755);
+      const dockerCli = path.join(appPath, "Resources", "bin", "docker");
+      writeFileSync(dockerCli, "#!/bin/sh\necho '[]'\n", "utf8");
+      chmodSync(dockerCli, 0o755);
+      symlinkSync(dockerCli, path.join(binDir, "docker"));
+
+      const probeRoom = {
+        id: "room-docker-guard",
+        cwd: "/Users/dev/orkest",
+        conductor: { id: "conductor", name: "gribble", pid: 9000 },
+        agents: [{ id: "worker-1", name: "snoobix", pid: 9100 }],
+      };
+      const calls = [];
+      let shouldFailDocker = true;
+      const mockExec = (cmd, args, cb) => {
+        calls.push(cmd);
+        if (cmd === "lsof" && args.includes("-sTCP:LISTEN")) {
+          cb(null, "p9105\nc node\nn127.0.0.1:4173\n");
+          return;
+        }
+        if (cmd === "ps" && args.includes("-axo")) {
+          cb(
+            null,
+            " 9105  9100 02:15 node vite --port 4173\n 9000 1 15:00 agy\n 9100 9000 12:00 codex\n",
+          );
+          return;
+        }
+        if (cmd === "ps" && args.includes("-p")) {
+          cb(null, " 9105  9100 02:15 node vite --port 4173\n");
+          return;
+        }
+        if (cmd === "lsof" && args.includes("cwd")) {
+          cb(null, "p9105\nn/Users/dev/orkest\n");
+          return;
+        }
+        if (cmd === "docker") {
+          if (shouldFailDocker) {
+            cb(Object.assign(new Error("killed"), { signal: "SIGKILL" }), "");
+            return;
+          }
+          cb(null, "");
+          return;
+        }
+        cb(null, "");
+      };
+
+      const damagedEnv = { PATH: binDir, HOME: root, DOCKER_HOST: "tcp://127.0.0.1:2375" };
+      const damagedDiscovery = await hordeTuiModule.cachedRoomDiscovery(probeRoom, {
+        exec: mockExec,
+        env: damagedEnv,
+        now: () => 1000,
+        force: true,
+        checkDocker: true,
+      });
+      expect(calls).not.toContain("docker");
+      expect(damagedDiscovery.services).toHaveLength(1);
+      expect(damagedDiscovery.services[0].kind).toBe("port");
+
+      // Repair Docker.app by restoring Contents/Resources/cli-plugins, then fail once with SIGKILL -> backoff skips next poll.
+      mkdirSync(path.join(appPath, "Resources", "cli-plugins"), { recursive: true });
+      const composePlugin = path.join(appPath, "Resources", "cli-plugins", "docker-compose");
+      writeFileSync(composePlugin, "#!/bin/sh\nexit 0\n", "utf8");
+      chmodSync(composePlugin, 0o755);
+
+      calls.length = 0;
+      await hordeTuiModule.cachedRoomDiscovery(probeRoom, {
+        exec: mockExec,
+        env: damagedEnv,
+        now: () => 2000,
+        force: true,
+        checkDocker: true,
+      });
+      expect(calls.filter((cmd) => cmd === "docker")).toHaveLength(1);
+
+      calls.length = 0;
+      shouldFailDocker = false;
+      await hordeTuiModule.cachedRoomDiscovery(probeRoom, {
+        exec: mockExec,
+        env: damagedEnv,
+        now: () => 5000,
+        force: true,
+        checkDocker: true,
+      });
+      expect(calls).not.toContain("docker");
+    } finally {
+      hordeTuiModule.resetDockerProbeGuard();
+      if (root) rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("subscribes to Herdr lifecycle events, invalidates on pane updates, and reconciles on events_lost", async () => {
+    const sockets = [];
+    function createFakeSocket() {
+      const listeners = new Map();
+      const sock = {
+        written: [],
+        destroyed: false,
+        on(event, fn) {
+          const list = listeners.get(event) || [];
+          list.push(fn);
+          listeners.set(event, list);
+        },
+        emit(event, ...args) {
+          const handlers = listeners.get(event) || [];
+          for (const fn of handlers) fn(...args);
+        },
+        write(chunk) {
+          sock.written.push(String(chunk));
+        },
+        destroy() {
+          sock.destroyed = true;
+        },
+      };
+      return sock;
+    }
+    const invalidations = [];
+    const reconciles = [];
+    const sub = createHerdrLifecycleSubscriber({
+      env: { HERDR_ENV: "1", HERDR_SOCKET_PATH: "/tmp/fake-herdr.sock" },
+      connect: () => {
+        const sock = createFakeSocket();
+        sockets.push(sock);
+        return sock;
+      },
+      onInvalidate: (evt) => {
+        invalidations.push(evt);
+      },
+      onReconcile: (evt) => {
+        reconciles.push(evt);
+      },
+      paneIds: ["w1:p1"],
+      reconnectDelayMs: 5,
+      maxReconnectDelayMs: 20,
+    });
+    sub.start();
+    expect(sockets).toHaveLength(1);
+    sockets[0].emit("connect");
+    expect(sockets[0].written).toHaveLength(1);
+    const req = JSON.parse(sockets[0].written[0]);
+    expect(req.method).toBe("events.subscribe");
+    expect(req.params.subscriptions).toContainEqual({ type: "pane.updated" });
+    expect(req.params.subscriptions).toContainEqual({
+      type: "pane.agent_status_changed",
+      pane_id: "w1:p1",
+    });
+
+    sockets[0].emit(
+      "data",
+      `${JSON.stringify({ id: req.id, result: { type: "subscription_started" } })}\n`,
+    );
+    expect(sub.isSubscribed).toBe(true);
+    expect(reconciles).toHaveLength(1);
+    expect(invalidations.at(-1)?.reason).toBe("subscription_started");
+
+    sockets[0].emit(
+      "data",
+      `${JSON.stringify({ event: "pane_updated", data: { type: "pane_updated" } })}\n`,
+    );
+    expect(invalidations.at(-1)?.reason).toBe("pane_updated");
+
+    // Simulate events_lost -> should destroy socket, schedule reconnect, and re-subscribe
+    sockets[0].emit("data", `${JSON.stringify({ error: { code: "events_lost" } })}\n`);
+    expect(sockets[0].destroyed).toBe(true);
+    expect(sub.isSubscribed).toBe(false);
+    expect(invalidations.at(-1)?.reason).toBe("events_lost");
+
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    expect(sockets).toHaveLength(2);
+    sockets[1].emit("connect");
+    const req2 = JSON.parse(sockets[1].written[0]);
+    sockets[1].emit(
+      "data",
+      `${JSON.stringify({ id: req2.id, result: { type: "subscription_started" } })}\n`,
+    );
+    expect(sub.isSubscribed).toBe(true);
+    expect(sub.generation).toBe(2);
+    expect(reconciles).toHaveLength(2);
+    sub.stop();
+    expect(sockets[1].destroyed).toBe(true);
+  });
+
+  it("preserves ArchScout name, omits duplicate QUESTION_GLYPH on reported rows, avoids wt:wt- doubling, and truncates overflow with ellipsis", () => {
+    const room = fixture("codex:gpt-sol,agy:gemini-fast,claude:claude-best");
+    room.title = "demo";
+    room.cwd = "/workspace/demo";
+    room.update = { available: true, commitsBehind: 3, remoteSha: "b4d9c8e", status: "available" };
+    room.services = [{ name: "Dev server", port: 5173, status: "running", uptime: "5m" }];
+    room.agents = [
+      {
+        id: "search-coord",
+        name: "SearchCoord",
+        parent: "conductor",
+        engine: "codex",
+        model: "gpt:sol",
+        status: "working",
+        progress: { task: "Coordinating index and query workers", stage: "working" },
+      },
+      {
+        id: "arch-scout",
+        name: "ArchScout",
+        parent: "search-coord",
+        engine: "agy",
+        model: "gemini:fast",
+        status: "completed",
+        outcome: "completed",
+        objective: "Explore existing search patterns",
+        output: ["Found reusable index abstractions"],
+      },
+      {
+        id: "query-worker",
+        name: "QueryWorker",
+        parent: "search-coord",
+        engine: "claude",
+        model: "claude:best",
+        status: "blocked",
+        question: "Should missing schema fields default to null across all queries?",
+        objective: "Refactor query syntax",
+      },
+    ];
+    room.agentProcesses = {
+      "arch-scout": {
+        processes: [
+          {
+            pid: 9012,
+            ppid: 9000,
+            ageSeconds: 240,
+            command: "python3 -m unittest test_indexer",
+            via: "cwd",
+            ports: [3000],
+          },
+        ],
+        more: 0,
+      },
+    };
+
+    const view = new HordeView(room, { height: 28, tier: "nerd", color: false, now: () => 0 });
+    view.focusId = "arch-scout";
+    view.hasExplicitFocus = true;
+    const lines56 = view.render(56).map(plain);
+
+    const archRow = lines56.find((line) => line.includes("ArchScout")) || "";
+    expect(archRow).toContain("3 ArchScout");
+    expect(archRow).toContain("gemini:fast · review");
+    expect(archRow).not.toContain("reported (awaiting review)");
+    expect(archRow.match(/\u{F02D7}/gu)).toHaveLength(1);
+
+    const archSubtitle = lines56.find((line) => line.includes("1 proc left")) || "";
+    expect(archSubtitle).toContain("1 proc left · :3000");
+    expect(archSubtitle).not.toMatch(/·\s*$/u);
+
+    const questionLine = lines56.find((line) => line.includes("Question:")) || "";
+    expect(questionLine).toContain("…");
+
+    const focusProcLine = lines56.find((line) => line.includes("9012  4m")) || "";
+    expect(focusProcLine).toContain("…");
+
+    const updateLine = lines56.find((line) => line.includes("Update")) || "";
+    expect(updateLine).not.toContain("click to up ");
+
+    // Collapsed completed reported row at wide width uses `<model> · reported (awaiting review)` and single glyph,
+    // and disposable worktree `wt-indexer` renders as `wt:indexer` (never `wt:wt-`):
+    room.agentProcesses = {};
+    room.agents[1].worktree = {
+      disposable: true,
+      slug: "wt-indexer",
+      path: "/workspace/demo/.worktrees/wt-indexer",
+      parentCwd: "/workspace/demo",
+    };
+    const wideView = new HordeView(room, { height: 28, tier: "nerd", color: false, now: () => 0 });
+    const wideLines = wideView.render(100).map(plain);
+    const wideArchRow = wideLines.find((line) => line.includes("ArchScout")) || "";
+    expect(wideArchRow).toContain("gemini:fast · reported (awaiting review)");
+    expect(wideArchRow.match(/\u{F02D7}/gu)).toHaveLength(1);
+    expect(wideLines.join("\n")).toContain("wt:indexer");
+    expect(wideLines.join("\n")).not.toContain("wt:wt-");
+  });
+
+  it("folds multi-wave accepted scratch history, deduplicates slot names and errors, and stays single-page", () => {
+    const room = fixture();
+    room.cwd = "/workspace/project";
+    room.swarm = { maxAgents: 24, maxDepth: 4 };
+    const acceptedWave = Array.from({ length: 18 }, (_, index) => {
+      if (index === 16) {
+        return {
+          id: "gemini-4-hydrogen-xhigh-2",
+          name: "gemini-4-hydrogen-xhigh-2",
+          engine: "agy",
+          model: "gemini-4-hydrogen-xhigh",
+          status: "completed",
+          verdict: "accept",
+          cwd: "/tmp/waves/wave-1/shadow",
+          dispatch: { taskDir: "/tmp/waves/wave-1" },
+          objective: "Shadow pass",
+          observedAt: "2026-11-10T00:18:00Z",
+        };
+      }
+      if (index === 17) {
+        return {
+          id: "gemini-4-argon-high-3",
+          name: "gemini-4-argon-high-3",
+          engine: "agy",
+          model: "Gemini 4 Argon",
+          status: "completed",
+          verdict: "accept",
+          cwd: "/tmp/waves/wave-1/gemini-4-argon",
+          dispatch: { taskDir: "/tmp/waves/wave-1" },
+          objective: "Argon pass",
+          observedAt: "2026-11-10T00:19:00Z",
+        };
+      }
+      return {
+        id: `wave-slot-${index}`,
+        name: `wave-slot-${index}`,
+        engine: "claude",
+        model: "claude-haiku-4-5",
+        status: "completed",
+        verdict: "accept",
+        cwd: `/tmp/waves/wave-1/slot-${index}`,
+        dispatch: { taskDir: "/tmp/waves/wave-1" },
+        objective: `Accepted wave item ${index}`,
+        observedAt: `2026-11-10T00:${String(index).padStart(2, "0")}:00Z`,
+      };
+    });
+    room.agents = [
+      ...acceptedWave,
+      {
+        id: "gpt-6-1-terra-3",
+        name: "gpt-6-1-terra-3",
+        engine: "codex",
+        model: "gpt-6-1-terra",
+        status: "failed",
+        error: "Failed",
+        cwd: "/tmp/waves/wave-2/tiebreak",
+        dispatch: { taskDir: "/tmp/waves/wave-2" },
+        objective: "Tiebreak verification pass",
+        observedAt: "2026-11-10T01:00:00Z",
+      },
+      {
+        id: "sonnet-4",
+        name: "sonnet-4",
+        engine: "claude",
+        model: "claude-sonnet-4-6",
+        status: "working",
+        cwd: "/workspace/project/packages/ui",
+        progress: { task: "Implement sidebar layout", stage: "working" },
+        observedAt: "2026-11-10T02:00:00Z",
+      },
+    ];
+
+    const view = new HordeView(room, { height: 28, tier: "unicode", color: false, now: () => 0 });
+    expect(view.pageCount()).toBe(1);
+    const collapsedLines = view.render(110).map(plain);
+    const collapsedText = collapsedLines.join("\n");
+    expect(collapsedLines.every((line) => displayWidth(line) <= 110)).toBe(true);
+    expect(collapsedText).toContain("1 terra-3 [tiebreak]");
+    expect(collapsedText).not.toContain("1 gpt-6-1-terra-3");
+    expect(collapsedText).toContain("Tiebreak verification pass");
+    expect(collapsedText).not.toContain("Error: Failed");
+    expect(collapsedText).toContain("2 sonnet-4 [ui]");
+    expect(collapsedText).toContain("18 inactive hidden (press c to expand)");
+    expect(collapsedText).toContain("20/24 slots · page 1/1");
+    expect(extractAgentFocusMarkdown(room.agents[18])).toBe("");
+
+    // Pressing c in collapsed skips hidden when 0 non-resolved collapsible agents exist
+    expect(view.handleKey("c")).toBe(true);
+    expect(view.completedMode).toBe("expanded");
+    const expandedText = view.render(140).map(plain).join("\n");
+    expect(expandedText).toContain("hydrogen-2 [shadow]");
+    expect(expandedText).toContain("argon-3");
+    expect(expandedText).not.toContain("argon-3 [gemini-4-argon]");
+
+    // Clicking inactive-hidden expands directly from collapsed too
+    view.completedMode = "collapsed";
+    const hiddenLines = view.render(110).map(plain);
+    const hiddenIdx = hiddenLines.findIndex((line) => line.includes("18 inactive hidden"));
+    expect(hiddenIdx).toBeGreaterThanOrEqual(0);
+    expect(view.handleMouse({ x: 5, y: hiddenIdx + 1, action: "press", button: 0 })).toBe(true);
+    expect(view.completedMode).toBe("expanded");
+  });
+
+  it("renders connected parent-child vertical stems on row 2 and sub-lead child badges", () => {
+    const room = fixture("codex:luna,claude:haiku,agy:flash,claude:sonnet");
+    room.cwd = "/workspace/project";
+    const [leadAgent, subLead, grandChild, sibling] = room.agents;
+    leadAgent.name = "wave-lead";
+    leadAgent.status = "working";
+    leadAgent.progress = { task: "Coordinating child tasks", stage: "working" };
+
+    subLead.name = "sub-coord";
+    subLead.parent = leadAgent.id;
+    subLead.role = "coordinator";
+    subLead.status = "working";
+    subLead.progress = { task: "Managing leaf task", stage: "working" };
+
+    grandChild.name = "leaf-worker";
+    grandChild.parent = subLead.id;
+    grandChild.status = "working";
+    grandChild.progress = { task: "Running leaf build", stage: "working" };
+
+    sibling.name = "peer-worker";
+    sibling.parent = leadAgent.id;
+    sibling.status = "working";
+    sibling.progress = { task: "Checking sibling lint", stage: "working" };
+
+    const lines = new HordeView(room, { height: 32, tier: "unicode", color: false, now: () => 0 })
+      .render(96)
+      .map(plain);
+    expect(lines.every((line) => displayWidth(line) <= 96)).toBe(true);
+    const joined = lines.join("\n");
+    expect(joined).toContain("1 wave-lead [lead · 2]");
+    expect(joined).toContain("[coordinator · 1 sub]");
+
+    const leadRow2Index = lines.findIndex((line) => line.includes("Coordinating child tasks"));
+    const childRow1Index = leadRow2Index + 1;
+    expect(leadRow2Index).toBeGreaterThan(0);
+    // Parent row 2 stem aligns vertically with child row 1 branch
+    expect(lines[leadRow2Index][4]).toBe("│");
+    expect("├└").toContain(lines[childRow1Index][4]);
+  });
+
+  it("suppresses automatic Focus popup for running agents with active processes", () => {
+    const room = fixture("claude:haiku,agy:flash");
+    const running = room.agents[0];
+    running.status = "working";
+    running.progress = { task: "Running dev server", stage: "working" };
+    room.agents = [running];
+    room.agentProcesses = {
+      [running.id]: {
+        processes: [
+          {
+            pid: 9102,
+            ppid: 9100,
+            ageSeconds: 42,
+            command: "node vite --port 5173",
+            via: "tree",
+            ports: [5173],
+          },
+        ],
+        more: 0,
+      },
+    };
+
+    const view = new HordeView(room, { height: 32, tier: "unicode", color: false, now: () => 0 });
+    const runningText = view.render(100).map(plain).join("\n");
+    expect(runningText).toContain("1 proc · :5173");
+    expect(runningText).not.toContain("Focus · haiku-1");
+
+    // Leftover processes, blocked, and failed states do not auto-open Focus without explicit focus/pin
+    running.status = "reported complete";
+    view.setRoom(room);
+    const leftoverText = view.render(100).map(plain).join("\n");
+    expect(leftoverText).not.toContain("Focus · haiku-1");
+    expect(leftoverText).toContain("1 proc left");
+
+    const urgentRoom = fixture("codex:gpt,claude:haiku");
+    urgentRoom.agents[0].id = "gpt-6-1-terra-3";
+    urgentRoom.agents[0].name = "gpt-6-1-terra-3";
+    urgentRoom.agents[0].model = "gpt-6-1-terra";
+    urgentRoom.agents[0].status = "failed";
+    urgentRoom.agents[0].error = "Check failed";
+    urgentRoom.agents[1].status = "blocked";
+    urgentRoom.agents[1].question = "Proceed with fallback?";
+    const urgentView = new HordeView(urgentRoom, {
+      height: 32,
+      tier: "unicode",
+      color: false,
+      now: () => 0,
+    });
+    const autoUrgent = urgentView.render(100).map(plain).join("\n");
+    expect(autoUrgent).not.toContain("Focus ·");
+    expect(autoUrgent).not.toContain("Pinned ·");
+
+    urgentView.focusId = "gpt-6-1-terra-3";
+    urgentView.hasExplicitFocus = true;
+    const explicitFocus = urgentView.render(100).map(plain).join("\n");
+    expect(explicitFocus).toContain("Focus · terra-3");
+    expect(explicitFocus).not.toContain("Focus · gpt-6-1-terra-3");
+
+    urgentView.hasExplicitFocus = false;
+    urgentView.handleInput("p");
+    const pinnedFocus = urgentView.render(100).map(plain).join("\n");
+    expect(pinnedFocus).toContain("Pinned · terra-3");
+  });
+
+  it("groups non-/tmp consultation wave workers under room.cwd and emits one inactive-hidden row across folders", () => {
+    const room = fixture();
+    room.cwd = "/workspace/chronicle";
+    room.swarm = { maxAgents: 24, maxDepth: 4 };
+    const waveConsults = Array.from({ length: 4 }, (_, index) => ({
+      id: `consult-${index}`,
+      name: `consult-${index}`,
+      engine: "claude",
+      model: "claude-haiku-4-5",
+      status: "completed",
+      verdict: "accept",
+      consultation: true,
+      cwd: `/Users/dev/.cache/orchestrate/consults-v1/wave-${index}/shadow_${index}`,
+      resultPath: `/Users/dev/.cache/orchestrate/consults-v1/wave-${index}/shadow_${index}/result.json`,
+      objective: `Consult pass ${index}`,
+      observedAt: `2026-11-10T00:0${index}:00Z`,
+    }));
+    room.agents = [
+      ...waveConsults,
+      {
+        id: "active-main",
+        name: "active-main",
+        engine: "claude",
+        model: "claude-sonnet-4-6",
+        status: "working",
+        cwd: "/workspace/chronicle",
+        progress: { task: "Synthesizing wave results", stage: "working" },
+        observedAt: "2026-11-10T01:00:00Z",
+      },
+    ];
+    const consultView = new HordeView(room, {
+      height: 28,
+      tier: "nerd",
+      color: false,
+      now: () => 0,
+    });
+    const consultText = consultView.render(100).map(plain).join("\n");
+    expect(consultText).not.toContain("shadow_0");
+    expect(consultText).toContain("4 inactive hidden (press c to expand)");
+    expect(consultView.targets.filter((t) => t.id.startsWith("inactive-hidden:"))).toHaveLength(1);
+    expect(consultView.targets.some((t) => t.id === "inactive-hidden:all")).toBe(true);
+
+    // Distinct non-disposable repos with folded agents across them still emit only ONE summary row
+    const multiRepoRoom = fixture();
+    multiRepoRoom.cwd = "/workspace/repo-a";
+    multiRepoRoom.agents = [
+      {
+        id: "a-active",
+        name: "a-active",
+        status: "working",
+        cwd: "/workspace/repo-a",
+        progress: { task: "Active in A", stage: "working" },
+        observedAt: "2026-11-10T02:00:00Z",
+      },
+      {
+        id: "b-active",
+        name: "b-active",
+        status: "working",
+        cwd: "/workspace/repo-b",
+        worktree: { disposable: false, path: "/workspace/repo-b" },
+        progress: { task: "Active in B", stage: "working" },
+        observedAt: "2026-11-10T01:50:00Z",
+      },
+      {
+        id: "b-done-1",
+        name: "b-done-1",
+        status: "completed",
+        verdict: "accept",
+        cwd: "/workspace/repo-b",
+        worktree: { disposable: false, path: "/workspace/repo-b" },
+        observedAt: "2026-11-10T00:10:00Z",
+      },
+      {
+        id: "c-done-only",
+        name: "c-done-only",
+        status: "completed",
+        verdict: "accept",
+        cwd: "/workspace/repo-c",
+        worktree: { disposable: false, path: "/workspace/repo-c" },
+        observedAt: "2026-11-10T00:05:00Z",
+      },
+    ];
+    const multiView = new HordeView(multiRepoRoom, {
+      height: 30,
+      tier: "unicode",
+      color: false,
+      now: () => 0,
+    });
+    const multiLines = multiView.render(100).map(plain);
+    const multiText = multiLines.join("\n");
+    expect(multiText).not.toContain("repo-c");
+    expect(multiLines.filter((line) => line.includes("inactive hidden"))).toHaveLength(1);
+    expect(multiText).toContain("└─ 2 inactive hidden (press c to expand)");
+    expect(multiView.targets.filter((t) => t.id.startsWith("inactive-hidden:"))).toHaveLength(1);
+
+    // 5 unscoped quota pools compact cleanly to 1 row inside the telemetry box at width 76
+    const compactQuotaRoom = fixture();
+    compactQuotaRoom.accounts = [
+      {
+        id: "claude",
+        provider: "claude",
+        short: "CL",
+        windows: [
+          { pool: "all", remainingPct: 68 },
+          { pool: "fable", remainingPct: 44 },
+        ],
+      },
+      { id: "codex", provider: "codex", short: "CX", windows: [{ remainingPct: 82 }] },
+      {
+        id: "agy",
+        provider: "antigravity",
+        short: "AG",
+        windows: [
+          { pool: "claude-gpt", remainingPct: 33 },
+          { pool: "gemini", remainingPct: 79 },
+        ],
+      },
+    ];
+    const compactQuotaView = new HordeView(compactQuotaRoom, {
+      height: 28,
+      tier: "nerd",
+      color: false,
+      now: () => 0,
+    });
+    const rendered76 = compactQuotaView.render(76).map(plain);
+    const quotaBoxRows = rendered76.filter((line) => line.includes("%"));
+    expect(quotaBoxRows).toHaveLength(1);
+    expect(quotaBoxRows[0]).toContain("Gem");
+    expect(quotaBoxRows[0]).toContain("5h \u{F054}");
+  });
+
+  it("frames collapsed telemetry in one rounded footer box and renders a thin rule when telemetry is absent", () => {
+    const withTelemetry = fixture();
+    withTelemetry.swarm = { maxAgents: 4, maxDepth: 2 };
+    withTelemetry.accounts = [
+      { short: "CX", provider: "codex", windows: [{ kind: "5h", remainingPct: 80 }] },
+    ];
+    withTelemetry.services = [{ name: "Dev server", port: 5179, status: "running" }];
+    withTelemetry.update = { available: true, commitsBehind: 2, remoteSha: "abc1234" };
+
+    const boxedLines = new HordeView(withTelemetry, { height: 30, tier: "nerd", now: () => 0 })
+      .render(90)
+      .map(plain);
+    const boxTopIdx = boxedLines.findIndex(
+      (line) => line.trimStart().startsWith("╭") && line.includes("3/4 slots · page 1/1"),
+    );
+    const boxBotIdx = boxedLines.findIndex(
+      (line, idx) => idx > boxTopIdx && line.trimStart().startsWith("╰"),
+    );
+    expect(boxTopIdx).toBeGreaterThan(0);
+    expect(boxBotIdx).toBe(boxTopIdx + 4);
+    expect(boxedLines[boxTopIdx + 1]).toContain("\u{EC81}");
+    expect(boxedLines[boxTopIdx + 1]).toContain("5h \u{F054}");
+    expect(boxedLines[boxTopIdx + 2]).toContain("\u{F054} \u{F233} Services");
+    expect(boxedLines[boxTopIdx + 3]).toContain("Update");
+    expect(boxedLines[boxBotIdx + 1]).toContain("Enter View chat");
+    expect(boxedLines[boxBotIdx + 1]).not.toMatch(/^\s*─+\s*$/u);
+
+    const noTelemetry = fixture();
+    noTelemetry.swarm = { maxAgents: 4, maxDepth: 2 };
+    const ruleLines = new HordeView(noTelemetry, { height: 24, tier: "nerd", now: () => 0 })
+      .render(90)
+      .map(plain);
+    const hintIdx = ruleLines.findIndex((line) => line.includes("Enter View chat"));
+    expect(hintIdx).toBeGreaterThan(0);
+    expect(ruleLines[hintIdx - 1].trim()).toMatch(/^─+ 3\/4 slots · page 1\/1$/u);
+  });
+
+  it("strips numeric version tokens when deduplicating slot agent names", () => {
+    const room = fixture("claude:sonnet,codex:gpt");
+    room.agents[0].name = "claude-sonnet-4-6-2";
+    room.agents[0].model = "claude-sonnet-4-6";
+    room.agents[1].name = "gpt-6-1-terra-3";
+    room.agents[1].model = "gpt-6-1-terra";
+    const text = new HordeView(room, { height: 24, tier: "unicode", color: false, now: () => 0 })
+      .render(100)
+      .map(plain)
+      .join("\n");
+    expect(text).toContain("sonnet-2");
+    expect(text).toContain("terra-3");
+    expect(text).not.toContain("6-2");
+  });
+
+  it("omits orphan parent row-2 vertical stem when a depth-5 child overflows with +1", () => {
+    const room = fixture("claude:haiku,claude:sonnet,agy:flash,codex:gpt,claude:opus,agy:pro");
+    for (let i = 0; i < room.agents.length; i++) {
+      room.agents[i].id = `depth-${i}`;
+      room.agents[i].name = `depth-${i}`;
+      room.agents[i].parent = i === 0 ? "conductor" : `depth-${i - 1}`;
+      room.agents[i].status = "working";
+      room.agents[i].progress = { task: `Task at depth ${i}`, stage: "working" };
+    }
+    const lines = new HordeView(room, { height: 40, tier: "unicode", color: false, now: () => 0 })
+      .render(96)
+      .map(plain);
+    const depth4TaskLine = lines.find((line) => line.includes("Task at depth 4"));
+    const depth5BranchLine = lines.find((line) => line.includes("+1 └─"));
+    expect(depth4TaskLine).toBeDefined();
+    expect(depth5BranchLine).toBeDefined();
+    // Depth-4 row 2 should omit the vertical child stem when depth-5 uses "+1 └─"
+    expect(depth4TaskLine).not.toContain("│");
+    expect(depth4TaskLine).toMatch(/^\s+\S\s+Task at depth 4/);
+  });
+
+  it("keeps automatic focus on a visible renderable agent when completed waves fold via c", () => {
+    const room = fixture("claude:haiku,claude:sonnet,agy:flash");
+    room.agents[0].name = "done-a";
+    room.agents[0].status = "accepted";
+    room.agents[1].name = "done-b";
+    room.agents[1].status = "accepted";
+    room.agents[2].name = "active-c";
+    room.agents[2].status = "working";
+    room.agents[2].progress = { task: "Still active", stage: "working" };
+
+    const view = new HordeView(room, { height: 32, tier: "unicode", color: false, now: () => 0 });
+    expect(view.focusId).toBe(room.agents[2].id);
+    // Simulate room update initially landing focus on a non-explicit completed agent
+    view.focusId = room.agents[0].id;
+    view.hasExplicitFocus = false;
+    view.pinnedId = undefined;
+    // Toggle c until resolved agents fold
+    view.handleKey("c");
+    expect(view.renderableAgents().some((agent) => agent.id === view.focusId)).toBe(true);
+    view.handleKey("c");
+    expect(view.renderableAgents().some((agent) => agent.id === view.focusId)).toBe(true);
+  });
+
+  it("focuses an Orca agent terminal through the Orca CLI, never the Linux screen reader", async () => {
+    const calls = [];
+    const exec = (command, args, callback) => {
+      calls.push([command, args]);
+      callback(null, "{}");
+    };
+    const orcaEnv = { ORCA_PANE_KEY: "pane-view", ORCA_TERMINAL_HANDLE: "term_view", PATH: "" };
+    const room = fixture("claude:haiku,agy:flash");
+    room.agents[0].orcaTerminalHandle = "term_haiku";
+    room.agents[1].orcaTerminalHandle = "term_flash";
+    const focused = [];
+    const view = new HordeView(room, {
+      height: 24,
+      tier: "unicode",
+      onFocusPane: (agent) => {
+        focused.push(agent);
+      },
+    });
+    expect(view.handleKey("o")).toBe(true);
+    expect(["term_haiku", "term_flash"]).toContain(focused.at(-1).orcaTerminalHandle);
+
+    expect(
+      await focusAgentPane(
+        { id: "a1", orcaTerminalHandle: "term_agent" },
+        { exec, env: orcaEnv, orcaCli: "/opt/orca/orca-ide" },
+      ),
+    ).toBe(true);
+    expect(calls).toEqual([
+      ["/opt/orca/orca-ide", ["terminal", "switch", "--terminal", "term_agent", "--json"]],
+    ]);
+    // Outside Orca, in another Orca environment, without a CLI, or with an unsafe handle: no call.
+    expect(
+      await focusAgentPane(
+        { id: "a2", orcaTerminalHandle: "term_agent" },
+        { exec, env: { PATH: "" }, orcaCli: "/opt/orca/orca-ide" },
+      ),
+    ).toBe(false);
+    expect(
+      await focusAgentPane(
+        { id: "a3", orcaTerminalHandle: "term_agent", orcaEnvironment: "ssh:box" },
+        { exec, env: orcaEnv, orcaCli: "/opt/orca/orca-ide" },
+      ),
+    ).toBe(false);
+    expect(
+      await focusAgentPane(
+        { id: "a4", orcaTerminalHandle: "term_agent" },
+        { exec, env: { ...orcaEnv, ORCA_CLI_COMMAND: "/usr/bin/orca" } },
+      ),
+    ).toBe(false);
+    expect(
+      await focusAgentPane(
+        { id: "a5", orcaTerminalHandle: "-rf" },
+        { exec, env: orcaEnv, orcaCli: "/opt/orca/orca-ide" },
+      ),
+    ).toBe(false);
+    expect(calls).toHaveLength(1);
+  });
+
+  it("disarms confirmClose across Chief and Room mode switches and non-q keys in Herdr", async () => {
+    // eslint-disable-next-line unicorn/prefer-event-target -- Readline keypress uses the Node stream EventEmitter API.
+    const input = Object.assign(new EventEmitter(), {
+      isTTY: true,
+      isRaw: false,
+      setRawMode: vi.fn((raw) => {
+        input.isRaw = raw;
+      }),
+      resume() {},
+      pause() {},
+    });
+    const frames = [];
+    const output = {
+      isTTY: true,
+      rows: 30,
+      columns: 80,
+      write: (chunk) => {
+        frames.push(chunk);
+      },
+    };
+    const room = fixture();
+    room.chief = { goal: "Mission stays intact", state: "running" };
+    const status = {
+      schema: "ork.chief.status.v1",
+      generatedAt: "2026-11-18T06:00:00.000Z",
+      machine: "kahuna",
+      chief: {
+        schema: "ork.chief.v1",
+        live: true,
+        stale: false,
+        session: "chief-1",
+        name: "Ork Chief",
+      },
+      summary: { orchestrators: 1, working: 1, blocked: 0, attention: 0, standalone: 0 },
+      rooms: [
+        {
+          id: room.id,
+          title: room.title || "Main",
+          cwd: "/repo",
+          repo: { name: "repo", path: "/repo" },
+          branch: "main",
+          counts: { working: 1, blocked: 0, done: 0, idle: 0, total: 1 },
+          attention: [],
+          coordinator: { session: "c1", name: "C1", engine: "claude", status: "running" },
+        },
+      ],
+      standalone: [],
+      inbox: [],
+      desk: [],
+    };
+    const running = runHordeTui(async () => structuredClone(room), {
+      input,
+      output,
+      env: { ORKEST_HERDR_VIEW_STATE: "/tmp/herdr-state.json" },
+      exec: (_c, _a, cb) => cb(null, ""),
+      quota: false,
+      services: false,
+      update: false,
+      chief: {
+        loadStatus: async () => structuredClone(status),
+        loadRoom: async () => structuredClone(room),
+        initialMode: "chief",
+      },
+    });
+    const text = () => frames.join("");
+    try {
+      await vi.waitFor(() => expect(text()).toContain("ORK CHIEF"));
+      frames.length = 0;
+      input.emit("data", "q");
+      await vi.waitFor(() => expect(text()).toContain("Press q again"));
+
+      // Moving in Chief mode clears the armed notice back to the confirm-close footer hint.
+      frames.length = 0;
+      input.emit("data", "j");
+      await vi.waitFor(() => expect(text()).toContain("Press q twice"));
+      frames.length = 0;
+      input.emit("data", "q");
+      await vi.waitFor(() => expect(text()).toContain("Press q again"));
+
+      // Switching to Room mode cancels armed close, preserves room.chief mission metadata,
+      // and leaves a non-Chief room unbadged.
+      frames.length = 0;
+      input.emit("data", "\r");
+      await vi.waitFor(() => expect(text()).toContain("Coordinator"));
+      expect(text()).not.toContain("★ chief");
+      frames.length = 0;
+      input.emit("data", "q");
+      await vi.waitFor(() => expect(text()).toContain("Press q again"));
+      expect(room.chief).toEqual({ goal: "Mission stays intact", state: "running" });
+    } finally {
+      input.emit("data", "q");
+      input.emit("data", "q");
+      await running;
+    }
+  });
+
+  it("dispatches macOS HUD notifications from notifyHerdrTransitions on darwin and skips on linux or missing binary", async () => {
+    const root = await realpath(await directory());
+    const hudBin = path.join(root, "OrkestHUD");
+    await writeFile(hudBin, "#!/bin/sh\nexit 0\n");
+    chmodSync(hudBin, 0o755);
+
+    const hudCalls = [];
+    const hudExec = (binary, args, options, callback) => {
+      hudCalls.push({ binary, args, options });
+      callback?.(null, "", "");
+    };
+    const darwinEnv = { ORKEST_HUD_BIN: hudBin, ORCA_TERMINAL_HANDLE: "term_9" };
+
+    const seenInactive = new Set();
+    const prev = [
+      { id: "a1", person: "gribble", stage: "working", summary: "Writing tests" },
+      { id: "a2", person: "snoobix", stage: "working", summary: "Refactoring" },
+    ];
+    const nextBlocked = [
+      { id: "a1", person: "gribble", stage: "blocked", summary: "Need confirmation" },
+      { id: "a2", person: "snoobix", stage: "working", summary: "Refactoring" },
+    ];
+
+    // On linux or missing binary with HERDR_ENV unset, returns false and invokes nothing:
+    expect(
+      notifyHerdrTransitions(prev, nextBlocked, seenInactive, {
+        env: darwinEnv,
+        exec: hudExec,
+        platform: "linux",
+      }),
+    ).toBe(false);
+    expect(
+      notifyHerdrTransitions(prev, nextBlocked, seenInactive, {
+        env: { ORKEST_HUD_BIN: path.join(root, "missing-hud") },
+        exec: hudExec,
+        platform: "darwin",
+      }),
+    ).toBe(false);
+    expect(
+      notifyHerdrTransitions(prev, nextBlocked, seenInactive, {
+        env: darwinEnv,
+        exec: hudExec,
+        exists: () => false,
+        platform: "darwin",
+      }),
+    ).toBe(false);
+    expect(hudCalls).toHaveLength(0);
+
+    // Warm-up with prevAgents = null records initial blocked state without notifying:
+    const seen = new Set();
+    expect(
+      notifyHerdrTransitions(
+        null,
+        [{ id: "a0", person: "seeded", stage: "blocked", summary: "Initial block" }],
+        seen,
+        { env: darwinEnv, exec: hudExec, platform: "darwin" },
+      ),
+    ).toBe(false);
+    expect(seen.has("a0:blocked:Initial block")).toBe(true);
+    expect(hudCalls).toHaveLength(0);
+
+    // Blocked agent transition invokes OrkestHUD --json with blocked status:
+    expect(
+      notifyHerdrTransitions(prev, nextBlocked, seen, {
+        env: darwinEnv,
+        exec: hudExec,
+        platform: "darwin",
+      }),
+    ).toBe(true);
+    expect(hudCalls).toHaveLength(1);
+    expect(hudCalls[0].binary).toBe(hudBin);
+    expect(hudCalls[0].args[0]).toBe("--json");
+    expect(JSON.parse(hudCalls[0].args[1])).toEqual({
+      agent: "gribble",
+      body: "Need confirmation",
+      sound: "request",
+      status: "blocked",
+      target: { id: "term_9", kind: "orca" },
+      title: "gribble blocked",
+    });
+
+    // Deduplicated on repeated poll:
+    expect(
+      notifyHerdrTransitions(prev, nextBlocked, seen, {
+        env: darwinEnv,
+        exec: hudExec,
+        platform: "darwin",
+      }),
+    ).toBe(false);
+    expect(hudCalls).toHaveLength(1);
+
+    // Reported (non-accepted) outcome transition invokes OrkestHUD --json with info status:
+    const nextReported = [
+      { id: "a1", person: "gribble", stage: "completed", summary: "Done" },
+      { id: "a2", person: "snoobix", stage: "completed", summary: "Done" },
+    ];
+    expect(
+      notifyHerdrTransitions(nextBlocked, nextReported, seen, {
+        env: darwinEnv,
+        exec: hudExec,
+        platform: "darwin",
+      }),
+    ).toBe(true);
+    expect(hudCalls).toHaveLength(2);
+    expect(JSON.parse(hudCalls[1].args[1])).toEqual({
+      body: "All 2 agents reported (awaiting review).",
+      sound: "request",
+      status: "info",
+      target: { id: "term_9", kind: "orca" },
+      title: "Swarm reported (awaiting review)",
+    });
+
+    // Accepted outcome transition invokes OrkestHUD --json with done status:
+    const nextAccepted = [
+      { id: "a1", person: "gribble", status: "completed", verdict: "accept" },
+      { id: "a2", person: "snoobix", status: "completed", verdict: "accept" },
+    ];
+    expect(
+      notifyHerdrTransitions(nextReported, nextAccepted, seen, {
+        env: darwinEnv,
+        exec: hudExec,
+        platform: "darwin",
+      }),
+    ).toBe(true);
+    expect(hudCalls).toHaveLength(3);
+    expect(JSON.parse(hudCalls[2].args[1])).toEqual({
+      body: "All 2 agents accepted.",
+      sound: "done",
+      status: "done",
+      target: { id: "term_9", kind: "orca" },
+      title: "Swarm accepted",
+    });
+  });
+
+  it("holds Herdr companion split open while workers run, clears notice on recovery, and auto-dismisses after grace", async () => {
+    const root = await realpath(await directory());
+    const socket = path.join(root, "herdr.sock");
+    const hash = (value) => createHash("sha256").update(value).digest("hex");
+    const stateDir = path.join(root, "herdr-views-v1", hash(socket).slice(0, 24));
+    await mkdir(stateDir, { recursive: true });
+    const stateFile = path.join(stateDir, `${hash("room-a")}.json`);
+    const pendingFile = stateFile.replace(/\.json$/u, ".pending");
+    const closedFile = stateFile.replace(/\.json$/u, ".closed");
+    await writeFile(
+      stateFile,
+      JSON.stringify({
+        schema: "orkest.herdr-view.v1",
+        room: "room-a",
+        pane: "w1:p2",
+        terminal_id: "term-view",
+        endpoint: socket,
+        host: hostname(),
+      }),
+    );
+    await writeFile(pendingFile, "pending\n");
+
+    const realSetTimeout = setTimeout;
+    const waitRealIo = async (check) => {
+      const deadline = process.hrtime.bigint() + 5_000_000_000n;
+      while (!(await check())) {
+        if (process.hrtime.bigint() > deadline) {
+          throw new Error("Timed out waiting for companion dismiss I/O");
+        }
+        await new Promise((resolve) => realSetTimeout(resolve, 5));
+      }
+    };
+
+    vi.useFakeTimers({
+      toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"],
+    });
+    // eslint-disable-next-line unicorn/prefer-event-target -- Readline keypress uses the Node stream EventEmitter API.
+    const input = Object.assign(new EventEmitter(), {
+      isTTY: true,
+      isRaw: false,
+      setRawMode: vi.fn((raw) => {
+        input.isRaw = raw;
+      }),
+      resume: vi.fn(),
+      pause: vi.fn(),
+    });
+    let outputText = "";
+    const output = {
+      isTTY: true,
+      rows: 28,
+      columns: 100,
+      write: (chunk) => {
+        outputText += chunk;
+      },
+    };
+    const execCalls = [];
+    const exec = (binary, args, options, callback) => {
+      const cb = typeof options === "function" ? options : callback;
+      execCalls.push([binary, ...args]);
+      if (args[0] === "pane" && args[1] === "current") {
+        cb(
+          null,
+          JSON.stringify({ result: { pane: { pane_id: "w1:p2", terminal_id: "term-view" } } }),
+        );
+        return;
+      }
+      cb(null, "{}");
+    };
+    const room = {
+      id: "room-a",
+      title: "Companion auto-dismiss",
+      conductor: { id: "conductor", status: "running", sessionLive: true, runtimeState: "running" },
+      agents: [{ id: "worker-1", status: "working", runtimeState: "running" }],
+      messages: [],
+    };
+    let clock = 0;
+    let isExited = false;
+    const run = async () => {
+      await runHordeTui(async () => structuredClone(room), {
+        input,
+        output,
+        exec,
+        herdrConnect: () => ({ on() {}, write() {}, destroy() {} }),
+        env: {
+          HERDR_ENV: "1",
+          HERDR_PANE_ID: "w1:p2",
+          HERDR_SOCKET_PATH: socket,
+          ORCHESTRATE_HOME: root,
+          ORKEST_HERDR_VIEW_STATE: stateFile,
+        },
+        mouse: false,
+        quota: false,
+        services: false,
+        update: false,
+        chiefHint: false,
+        companionGraceMs: 4000,
+        now: () => clock,
+        // Production room views attach chief loaders with initialMode: "room".
+        chief: {
+          loadStatus: async () => ({ rooms: [], standalone: [] }),
+          loadRoom: async () => structuredClone(room),
+          homeRoomId: "room-a",
+          initialMode: "room",
+        },
+      });
+      isExited = true;
+    };
+    const running = run();
+
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      await waitRealIo(async () => {
+        if (!plain(outputText).includes("Coordinator")) {
+          return false;
+        }
+        try {
+          const persisted = JSON.parse(await readFile(stateFile, "utf8"));
+          return persisted.label === "Swarm · Companion auto-dismiss";
+        } catch {
+          return false;
+        }
+      });
+      await new Promise((resolve) => realSetTimeout(resolve, 15));
+      expect(isExited).toBe(false);
+
+      // Conductor exits while worker is active -> shows hold notice without closing.
+      room.conductor.sessionLive = false;
+      room.conductor.runtimeState = "unknown";
+      clock = 1000;
+      outputText = "";
+      await vi.advanceTimersByTimeAsync(1000);
+      await waitRealIo(() =>
+        plain(outputText).includes(
+          "Orchestrator exited — keeping Swarm View open while workers finish",
+        ),
+      );
+      expect(isExited).toBe(false);
+      await expect(readFile(closedFile, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+
+      // Conductor returns -> clears hold notice back to default footer notice.
+      room.conductor.sessionLive = true;
+      room.conductor.runtimeState = "running";
+      clock = 2000;
+      outputText = "";
+      await vi.advanceTimersByTimeAsync(1000);
+      await waitRealIo(() => plain(outputText).includes("Mouse off — press m to re-enable mouse"));
+      expect(plain(outputText)).not.toContain(
+        "Orchestrator exited — keeping Swarm View open while workers finish",
+      );
+      expect(isExited).toBe(false);
+
+      // Conductor exits again and worker finishes -> waits graceMs before dismissing.
+      room.conductor.sessionLive = false;
+      room.conductor.runtimeState = "unknown";
+      room.agents[0] = {
+        id: "worker-1",
+        status: "completed",
+        verdict: "accept",
+        runtimeState: "stopped",
+      };
+      clock = 3000;
+      await vi.advanceTimersByTimeAsync(1000);
+      await waitRealIo(() => plain(outputText).includes("accepted"));
+      expect(isExited).toBe(false);
+
+      clock = 6999;
+      await vi.advanceTimersByTimeAsync(1000);
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(isExited).toBe(false);
+      expect(execCalls).not.toContainEqual(["herdr", "pane", "close", "w1:p2"]);
+
+      clock = 7000;
+      await vi.advanceTimersByTimeAsync(1000);
+      await waitRealIo(() => isExited);
+      await running;
+      expect(isExited).toBe(true);
+      expect(await readFile(closedFile, "utf8")).toBe("closed\n");
+      await expect(readFile(pendingFile, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+      expect(execCalls).toContainEqual(["herdr", "pane", "close", "w1:p2"]);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      input.emit("data", "qq");
+      await running;
+      vi.useRealTimers();
+    }
+  });
+
+  it("holds Orca companion split open while workers run, auto-dismisses after grace, and never dismisses Chief views", async () => {
+    const root = await realpath(await directory());
+    const orcaFile = path.join(root, "orca-views-v1", "room-a.json");
+    await mkdir(path.dirname(orcaFile), { recursive: true });
+    await writeFile(
+      orcaFile,
+      JSON.stringify({
+        schema: ORCA_VIEW_SCHEMA,
+        room: "room-a",
+        workspaceId: "ws-1",
+        terminalId: "term_view",
+        sourceTerminalId: "term_coord",
+        chief: false,
+        closed: false,
+      }),
+    );
+    const fakeCli = path.join(root, "orca-ide");
+    await writeFile(fakeCli, "#!/bin/sh\nexit 0\n");
+    chmodSync(fakeCli, 0o755);
+
+    const realSetTimeout = setTimeout;
+    const waitRealIo = async (check) => {
+      const deadline = process.hrtime.bigint() + 5_000_000_000n;
+      while (!(await check())) {
+        if (process.hrtime.bigint() > deadline) {
+          throw new Error("Timed out waiting for companion dismiss I/O");
+        }
+        await new Promise((resolve) => realSetTimeout(resolve, 5));
+      }
+    };
+
+    vi.useFakeTimers({
+      toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"],
+    });
+    // eslint-disable-next-line unicorn/prefer-event-target -- Readline keypress uses the Node stream EventEmitter API.
+    const input = Object.assign(new EventEmitter(), {
+      isTTY: true,
+      isRaw: false,
+      setRawMode: vi.fn((raw) => {
+        input.isRaw = raw;
+      }),
+      resume: vi.fn(),
+      pause: vi.fn(),
+    });
+    let outputText = "";
+    const output = {
+      isTTY: true,
+      rows: 28,
+      columns: 100,
+      write: (chunk) => {
+        outputText += chunk;
+      },
+    };
+    const execCalls = [];
+    const exec = (binary, args, options, callback) => {
+      const cb = typeof options === "function" ? options : callback;
+      execCalls.push([binary, args]);
+      cb(null, "{}");
+    };
+    const room = {
+      id: "room-a",
+      title: "Orca companion",
+      conductor: { id: "conductor", status: "running", sessionLive: true, runtimeState: "running" },
+      agents: [{ id: "worker-1", status: "working", runtimeState: "running" }],
+      messages: [],
+    };
+    let clock = 0;
+    let isExited = false;
+    const run = async () => {
+      await runHordeTui(async () => structuredClone(room), {
+        input,
+        output,
+        exec,
+        env: {
+          HOME: root,
+          ORCA_CLI_COMMAND: fakeCli,
+          ORKEST_ORCA_VIEW_STATE: orcaFile,
+          PATH: "",
+        },
+        quota: false,
+        services: false,
+        update: false,
+        chiefHint: false,
+        companionGraceMs: 2500,
+        now: () => clock,
+      });
+      isExited = true;
+    };
+    const running = run();
+
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      await waitRealIo(() => plain(outputText).includes("Orca companion"));
+      expect(isExited).toBe(false);
+
+      room.conductor.sessionLive = false;
+      room.conductor.runtimeState = "unknown";
+      clock = 1000;
+      outputText = "";
+      await vi.advanceTimersByTimeAsync(1000);
+      await waitRealIo(() =>
+        plain(outputText).includes(
+          "Orchestrator exited — keeping Swarm View open while workers finish",
+        ),
+      );
+      expect(isExited).toBe(false);
+
+      room.agents[0] = {
+        id: "worker-1",
+        status: "completed",
+        verdict: "accept",
+        runtimeState: "stopped",
+      };
+      clock = 2000;
+      await vi.advanceTimersByTimeAsync(1000);
+      await waitRealIo(() => plain(outputText).includes("accepted"));
+      expect(isExited).toBe(false);
+
+      clock = 4499;
+      await vi.advanceTimersByTimeAsync(1000);
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(isExited).toBe(false);
+      expect(execCalls).toHaveLength(0);
+
+      clock = 4500;
+      await vi.advanceTimersByTimeAsync(1000);
+      await waitRealIo(() => isExited);
+      await running;
+      expect(isExited).toBe(true);
+      expect(await readJsonState(orcaFile)).toMatchObject({
+        closed: true,
+        autoDismissed: true,
+      });
+      expect(execCalls).toEqual([
+        [fakeCli, ["terminal", "close", "--terminal", "term_view", "--json"]],
+      ]);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      input.emit("data", "q");
+      await running;
+      vi.useRealTimers();
+    }
+
+    // Chief session with initialMode: "chief" must stay open even if drilled into its home room.
+    await writeFile(
+      orcaFile,
+      JSON.stringify({
+        schema: ORCA_VIEW_SCHEMA,
+        room: "room-a",
+        workspaceId: "ws-1",
+        terminalId: "term_view",
+        sourceTerminalId: "term_coord",
+        chief: false,
+        closed: false,
+      }),
+    );
+    vi.useFakeTimers({
+      toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"],
+    });
+    // eslint-disable-next-line unicorn/prefer-event-target -- Readline keypress uses the Node stream EventEmitter API.
+    const chiefInput = Object.assign(new EventEmitter(), {
+      isTTY: true,
+      isRaw: false,
+      setRawMode: vi.fn(),
+      resume: vi.fn(),
+      pause: vi.fn(),
+    });
+    let chiefOutputText = "";
+    const chiefOutput = {
+      isTTY: true,
+      rows: 28,
+      columns: 100,
+      write: (chunk) => {
+        chiefOutputText += chunk;
+      },
+    };
+    const chiefExec = vi.fn((_b, _a, opts, cb) =>
+      (typeof opts === "function" ? opts : cb)(null, "{}"),
+    );
+    const chiefRoom = {
+      id: "room-a",
+      title: "Chief desk",
+      conductor: { id: "conductor", status: "running", sessionLive: true, runtimeState: "running" },
+      agents: [],
+      messages: [],
+    };
+    let chiefClock = 0;
+    let isChiefExited = false;
+    const chiefStatus = {
+      schema: "ork.chief.status.v1",
+      generatedAt: "2026-11-18T06:00:00.000Z",
+      machine: "kahuna",
+      chief: { live: true, stale: false, session: "chief-1", name: "Ork Chief" },
+      summary: { orchestrators: 1, working: 1, blocked: 0, attention: 0, standalone: 0 },
+      rooms: [
+        {
+          id: "room-a",
+          title: "Chief desk",
+          cwd: "/repo",
+          repo: { name: "repo", path: "/repo" },
+          branch: "main",
+          counts: { working: 0, blocked: 0, done: 0, idle: 0, total: 0 },
+          attention: [],
+          coordinator: { session: "c1", name: "C1", engine: "claude", status: "running" },
+        },
+      ],
+      standalone: [],
+      inbox: [],
+      desk: [],
+    };
+    const runChief = async () => {
+      await runHordeTui(async () => structuredClone(chiefRoom), {
+        input: chiefInput,
+        output: chiefOutput,
+        exec: chiefExec,
+        env: { HOME: root, ORCA_CLI_COMMAND: fakeCli, ORKEST_ORCA_VIEW_STATE: orcaFile, PATH: "" },
+        quota: false,
+        services: false,
+        update: false,
+        chiefHint: false,
+        companionGraceMs: 1000,
+        now: () => chiefClock,
+        chief: {
+          loadStatus: async () => structuredClone(chiefStatus),
+          loadRoom: async () => structuredClone(chiefRoom),
+          homeRoomId: "room-a",
+          initialMode: "chief",
+        },
+      });
+      isChiefExited = true;
+    };
+    const chiefRunning = runChief();
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      await waitRealIo(() => plain(chiefOutputText).includes("ORK CHIEF"));
+      // Enter drills into homeRoomId ("room-a"), leaving drilledRoomId undefined.
+      chiefInput.emit("data", "\r");
+      await waitRealIo(() => plain(chiefOutputText).includes("Chief desk"));
+      chiefRoom.conductor.sessionLive = false;
+      chiefRoom.conductor.runtimeState = "unknown";
+      chiefClock = 10_000;
+      await vi.advanceTimersByTimeAsync(2000);
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(isChiefExited).toBe(false);
+      expect(chiefExec).not.toHaveBeenCalled();
+      expect((await readJsonState(orcaFile)).closed).toBe(false);
+      chiefInput.emit("data", "q");
+      await chiefRunning;
+      expect(isChiefExited).toBe(true);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      chiefInput.emit("data", "q");
+      await chiefRunning;
+      vi.useRealTimers();
+    }
+  });
+
+  it("fails closed in strict mode and surfaces unavailable state when policy or git lookup fails", async () => {
+    const tmpDir = await mkdtemp(path.join(tmpdir(), "ork-tui-strict-policy-"));
+    try {
+      const qCacheDir = path.join(tmpDir, "cache");
+      const qConfigDir = path.join(tmpDir, "cfg");
+      const qRepo = path.join(tmpDir, "repo-strict");
+      mkdirSync(qCacheDir, { recursive: true });
+      mkdirSync(qConfigDir, { recursive: true });
+      mkdirSync(path.join(qRepo, ".orkest"), { recursive: true });
+      const monCfgPath = path.join(qConfigDir, "monitor.json");
+      const polCfgPath = path.join(qConfigDir, "orchestrate.json");
+      writeFileSync(
+        path.join(qCacheDir, "snapshot.json"),
+        JSON.stringify({
+          accounts: {
+            claude: { id: "claude", provider: "claude", billing: "work" },
+            codex: { id: "codex", provider: "codex" },
+          },
+        }),
+      );
+      writeFileSync(
+        monCfgPath,
+        JSON.stringify({
+          accounts: [
+            { id: "claude", provider: "claude", billing: "work" },
+            { id: "codex", provider: "codex" },
+          ],
+        }),
+      );
+      writeFileSync(polCfgPath, JSON.stringify({}));
+      writeFileSync(path.join(qRepo, ".orkest", "policy.json"), JSON.stringify({ deny: "all" }));
+
+      hordeTuiModule.resetRepoPolicyCache();
+      const baseOpts = {
+        cacheDir: qCacheDir,
+        monitorConfigPath: monCfgPath,
+        configPath: polCfgPath,
+        homeDir: tmpDir,
+        env: { HOME: tmpDir },
+        execAsync: async () => ({ stdout: "", stderr: "" }),
+      };
+
+      const badState = await hordeTuiModule.readRepoDeniedList(qRepo, baseOpts);
+      expect(badState.available).toBe(false);
+      expect(badState.error).toContain("expected array");
+      expect(
+        hordeTuiModule.filterAccountsByRepoPolicy([{ id: "codex", provider: "codex" }], badState),
+      ).toEqual([]);
+      await expect(hordeTuiModule.cachedQuota(qRepo, baseOpts)).rejects.toThrow(
+        /Repository policy unavailable/u,
+      );
+
+      // Git lookup ENOENT error also fails closed instead of exposing unrestricted accounts
+      writeFileSync(
+        path.join(qRepo, ".orkest", "policy.json"),
+        JSON.stringify({ deny: ["codex"] }),
+      );
+      hordeTuiModule.resetRepoPolicyCache();
+      const gitFailOpts = {
+        ...baseOpts,
+        execAsync: async () => {
+          throw Object.assign(new Error("spawn git ENOENT"), { code: "ENOENT" });
+        },
+      };
+      const gitErrState = await hordeTuiModule.readRepoDeniedList(qRepo, gitFailOpts);
+      expect(gitErrState.available).toBe(false);
+      expect(gitErrState.error).toContain("Failed to resolve git repository root");
+      await expect(hordeTuiModule.cachedQuota(qRepo, gitFailOpts)).rejects.toThrow(
+        /Repository policy unavailable/u,
+      );
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+function deferred() {
+  const { promise, resolve } = Promise.withResolvers();
+  return { promise, resolve };
+}
+
+function chiefRoom(id, patch = {}) {
+  return {
+    id,
+    agents: [],
+    cwd: "/repo",
+    repo: { name: "repo", path: "/repo" },
+    branch: "main",
+    counts: { working: 1, blocked: 0, done: 0, idle: 0, total: 1 },
+    attention: [],
+    coordinator: { session: `${id}-c`, name: "C", engine: "claude", status: "running" },
+    mission: null,
+    ...patch,
+  };
+}
+
+function chiefStatusFixture({ rooms = [], desk = [], inbox = [], drawerSnapshot } = {}) {
+  return {
+    schema: "ork.chief.status.v1",
+    generatedAt: "2026-11-18T06:00:00.000Z",
+    machine: "kahuna",
+    chief: {
+      schema: "ork.chief.v1",
+      live: true,
+      stale: false,
+      session: "chief-1",
+      name: "Ork Chief",
+    },
+    summary: { orchestrators: rooms.length, working: 0, blocked: 0, attention: 0, standalone: 0 },
+    rooms,
+    standalone: [],
+    inbox,
+    desk,
+    drawerSnapshot: drawerSnapshot ?? {
+      session: "chief-1",
+      revision: "7",
+      deskIds: desk.map((item) => item.id),
+      inboxIds: inbox.map((item) => item.id),
+    },
+  };
+}
+
+function startChiefTui({ status, room, env = {}, exec: execMock = () => {}, chief = {} }) {
+  // eslint-disable-next-line unicorn/prefer-event-target -- Readline keypress uses the Node stream EventEmitter API.
+  const input = Object.assign(new EventEmitter(), {
+    isTTY: true,
+    isRaw: false,
+    setRawMode: vi.fn(),
+    resume() {},
+    pause() {},
+  });
+  const frames = [];
+  const output = {
+    isTTY: true,
+    rows: 30,
+    columns: 100,
+    write: (chunk) => {
+      frames.push(String(chunk));
+    },
+  };
+  const loader = { current: status, delayed: null, delayedStarted: false, failNext: null };
+  const loadStatus = vi.fn(async () => {
+    if (loader.failNext) {
+      const error = loader.failNext;
+      loader.failNext = null;
+      throw error;
+    }
+    if (loader.delayed) {
+      const pending = loader.delayed;
+      loader.delayed = null;
+      loader.delayedStarted = true;
+      return pending.promise;
+    }
+    return structuredClone(loader.current);
+  });
+  let isClosed = false;
+  const running = (async () => {
+    await runHordeTui(async () => structuredClone(room), {
+      input,
+      output,
+      env,
+      exec: execMock,
+      quota: false,
+      services: false,
+      update: false,
+      chief: {
+        loadStatus,
+        loadRoom: async () => structuredClone(room),
+        initialMode: "chief",
+        ...chief,
+      },
+    });
+    isClosed = true;
+  })();
+  return {
+    loader,
+    loadStatus,
+    running,
+    isClosed: () => isClosed,
+    text: () => plain(frames.join("")),
+    frames,
+    type(keys) {
+      for (const key of keys) input.emit("data", key);
+    },
+    async stop() {
+      input.emit("data", "\u{3}");
+      await running;
+    },
+  };
+}
+
+function chiefNotifier() {
+  const calls = [];
+  const exec = vi.fn((command, args, ...rest) => {
+    calls.push({ command, args });
+    rest.at(-1)?.(null, "", "");
+  });
+  return { calls, exec };
+}
+
+describe("Chief TUI actions and notifications", () => {
+  it("sends a Chief reply from real keys and repaints from an immediate fresh status", async () => {
+    const room = chiefRoom("r1", { repo: { name: "repo", path: "/repo" } });
+    const send = vi.fn(async () => ({ status: "sent" }));
+    const tui = startChiefTui({
+      status: chiefStatusFixture({ rooms: [room] }),
+      room,
+      chief: { send },
+    });
+    try {
+      await vi.waitFor(() => expect(tui.text()).toContain("repo"));
+      const before = tui.loadStatus.mock.calls.length;
+      tui.type("r");
+      for (const key of "quota?") tui.type(key);
+      tui.type("\r");
+      await vi.waitFor(() => expect(tui.text()).toContain("Sent to C"));
+      expect(send).toHaveBeenCalledTimes(1);
+      expect(send).toHaveBeenCalledWith(
+        expect.objectContaining({
+          to: "r1",
+          kind: "update",
+          message: "quota?",
+          root: expect.any(String),
+          env: expect.any(Object),
+        }),
+      );
+      expect(tui.loadStatus.mock.calls.length).toBeGreaterThan(before);
+    } finally {
+      await tui.stop();
+    }
+  });
+
+  it("acknowledges only the drawer IDs captured on A and keeps mail that arrives during the ack", async () => {
+    const room = chiefRoom("r1", { repo: { name: "repo", path: "/repo" } });
+    const desk = [{ id: "d1", roomId: null, from: "c1", kind: "question", text: "Which branch?" }];
+    const inbox = [{ id: "i1", from: "lead", kind: "unread", text: "fyi" }];
+    const snapshot = { session: "chief-1", revision: "7", deskIds: ["d1"], inboxIds: ["i1"] };
+    const gate = deferred();
+    const ack = vi.fn(() => gate.promise);
+    const tui = startChiefTui({
+      status: chiefStatusFixture({ rooms: [room], desk, inbox, drawerSnapshot: snapshot }),
+      room,
+      chief: { desk: ack },
+    });
+    try {
+      await vi.waitFor(() => expect(tui.text()).toContain("repo"));
+      tui.type("i");
+      await vi.waitFor(() => expect(tui.text()).toContain("Which branch?"));
+      tui.type("A");
+      await vi.waitFor(() => expect(ack).toHaveBeenCalledTimes(1));
+      // A second A while the first acknowledgment is pending must not start another one.
+      tui.type("A");
+      expect(ack).toHaveBeenCalledTimes(1);
+      expect(tui.text()).toContain("Still finishing the last Chief action");
+      tui.loader.current = chiefStatusFixture({
+        rooms: [room],
+        desk: [...desk, { id: "d2", roomId: null, from: "c2", kind: "question", text: "Late?" }],
+        inbox: [...inbox, { id: "i2", from: "ops", kind: "unread", text: "arrived mid-ack" }],
+      });
+      gate.resolve({ ok: true });
+      await vi.waitFor(() =>
+        expect(tui.text()).toContain("Acknowledged the desk and unattributed inbox"),
+      );
+      expect(ack).toHaveBeenCalledWith({
+        ack: true,
+        snapshot: { session: "chief-1", revision: "7", deskIds: ["d1"], inboxIds: ["i1"] },
+        root: expect.any(String),
+        env: expect.any(Object),
+      });
+    } finally {
+      await tui.stop();
+    }
+  });
+
+  it("reports a refused room close, then keeps the TUI responsive", async () => {
+    const room = chiefRoom("r1", {
+      repo: { name: "repo", path: "/repo" },
+      counts: { working: 0, blocked: 0, done: 1, idle: 0, total: 1 },
+      coordinator: { session: "r1-c", name: "C", engine: "claude", status: "done" },
+    });
+    const close = vi.fn(async () => {
+      throw new Error("Room still has running workers");
+    });
+    const tui = startChiefTui({
+      status: chiefStatusFixture({ rooms: [room] }),
+      room,
+      chief: { close },
+    });
+    try {
+      await vi.waitFor(() => expect(tui.text()).toContain("repo"));
+      tui.type("x");
+      tui.type("x");
+      await vi.waitFor(() =>
+        expect(tui.text()).toContain("Could not close repo: Room still has running workers"),
+      );
+      expect(close).toHaveBeenCalledTimes(1);
+      expect(close).toHaveBeenCalledWith({
+        roomId: "r1",
+        force: false,
+        root: expect.any(String),
+        env: expect.any(Object),
+      });
+      tui.type("?");
+      await vi.waitFor(() => expect(tui.text()).toContain("Close this reference"));
+      expect(tui.isClosed()).toBe(false);
+    } finally {
+      await tui.stop();
+    }
+  });
+
+  it("reports a confirmed room close and an already-closed room", async () => {
+    const room = chiefRoom("r1", {
+      repo: { name: "repo", path: "/repo" },
+      counts: { working: 0, blocked: 0, done: 1, idle: 0, total: 1 },
+      coordinator: { session: "r1-c", name: "C", engine: "claude", status: "done" },
+    });
+    const close = vi
+      .fn()
+      .mockResolvedValueOnce({ status: "closed" })
+      .mockResolvedValueOnce({ status: "already-closed" });
+    const tui = startChiefTui({
+      status: chiefStatusFixture({ rooms: [room] }),
+      room,
+      chief: { close },
+    });
+    try {
+      await vi.waitFor(() => expect(tui.text()).toContain("repo"));
+      tui.type("x");
+      tui.type("x");
+      await vi.waitFor(() => expect(tui.text()).toContain("Closed repo"));
+      tui.type("x");
+      tui.type("x");
+      await vi.waitFor(() => expect(tui.text()).toContain("repo was already closed"));
+      expect(close).toHaveBeenCalledTimes(2);
+    } finally {
+      await tui.stop();
+    }
+  });
+
+  it("refuses to close a room with running workers without calling close", async () => {
+    const room = chiefRoom("r1", { repo: { name: "repo", path: "/repo" } });
+    const close = vi.fn(async () => ({ status: "closed" }));
+    const tui = startChiefTui({
+      status: chiefStatusFixture({ rooms: [room] }),
+      room,
+      chief: { close },
+    });
+    try {
+      await vi.waitFor(() => expect(tui.text()).toContain("repo"));
+      tui.type("x");
+      tui.type("x");
+      await vi.waitFor(() => expect(tui.text()).toContain("is still working"));
+      expect(close).not.toHaveBeenCalled();
+    } finally {
+      await tui.stop();
+    }
+  });
+
+  it("applies the newer frame when a poll started before a mutation resolves late", async () => {
+    const room = chiefRoom("r1", { repo: { name: "old-repo", path: "/repo" } });
+    const send = vi.fn(async () => ({ status: "sent" }));
+    const tui = startChiefTui({
+      status: chiefStatusFixture({ rooms: [room] }),
+      room,
+      chief: { send },
+    });
+    try {
+      await vi.waitFor(() => expect(tui.text()).toContain("old-repo"));
+      const stale = deferred();
+      tui.loader.delayed = stale;
+      await vi.waitFor(() => expect(tui.loader.delayedStarted).toBe(true), { timeout: 4000 });
+
+      tui.loader.current = chiefStatusFixture({
+        rooms: [{ ...room, repo: { name: "newer-repo", path: "/repo" } }],
+      });
+      tui.type("r");
+      tui.type("ok");
+      tui.type("\r");
+      await vi.waitFor(() => expect(tui.text()).toContain("newer-repo"));
+
+      tui.frames.length = 0;
+      stale.resolve(
+        chiefStatusFixture({ rooms: [{ ...room, repo: { name: "stale-repo", path: "/repo" } }] }),
+      );
+      await new Promise((done) => setTimeout(done, 50));
+      expect(tui.text()).not.toContain("stale-repo");
+    } finally {
+      await tui.stop();
+    }
+  });
+
+  it("keeps a literal q as compose text instead of closing the Chief view", async () => {
+    const room = chiefRoom("r1", { repo: { name: "repo", path: "/repo" } });
+    const send = vi.fn(async () => ({ status: "sent" }));
+    const tui = startChiefTui({
+      status: chiefStatusFixture({ rooms: [room] }),
+      room,
+      chief: { send },
+    });
+    try {
+      await vi.waitFor(() => expect(tui.text()).toContain("repo"));
+      tui.type("r");
+      tui.type("q");
+      await new Promise((done) => setTimeout(done, 20));
+      expect(tui.isClosed()).toBe(false);
+      tui.type("\r");
+      await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(1));
+      expect(send).toHaveBeenCalledWith(expect.objectContaining({ message: "q" }));
+      expect(tui.isClosed()).toBe(false);
+    } finally {
+      await tui.stop();
+    }
+  });
+
+  it("notifies a new blocked worker once after a failed load recovers", async () => {
+    const room = chiefRoom("r1", { repo: { name: "repo", path: "/repo" } });
+    const blocked = chiefRoom("r1", {
+      repo: { name: "repo", path: "/repo" },
+      attention: [
+        {
+          kind: "blocked",
+          from: "w1",
+          text: "Need confirmation",
+          at: "2026-11-18T06:01:00.000Z",
+        },
+      ],
+    });
+    const { calls, exec } = chiefNotifier();
+    const tui = startChiefTui({
+      status: chiefStatusFixture({ rooms: [room] }),
+      room,
+      env: { HERDR_ENV: "1", HERDR_BIN_PATH: "herdr-test" },
+      exec,
+    });
+    try {
+      await vi.waitFor(() => expect(tui.text()).toContain("repo"));
+      tui.loader.failNext = new Error("boom");
+      await vi.waitFor(() => expect(tui.text()).toContain("Could not read Chief status: boom"), {
+        timeout: 4000,
+      });
+      tui.loader.current = chiefStatusFixture({ rooms: [blocked] });
+      await vi.waitFor(() => expect(calls).toHaveLength(1), { timeout: 4000 });
+      expect(calls[0]).toEqual({
+        command: "herdr-test",
+        args: [
+          "notification",
+          "show",
+          "Chief: Worker blocked",
+          "--body",
+          "repo: Need confirmation",
+          "--sound",
+          "request",
+        ],
+      });
+      // Later polls return the same blocked worker and must not repeat the notification.
+      await new Promise((done) => setTimeout(done, 1200));
+      expect(calls).toHaveLength(1);
+    } finally {
+      await tui.stop();
+    }
+  });
+});
+
+describe("notifyChiefTransitions", () => {
+  const herdr = { HERDR_ENV: "1", HERDR_BIN_PATH: "herdr" };
+  const hud = { HERDR_ENV: undefined };
+  const question = (text) => ({ kind: "awaiting-input", from: "w1", text, at: "t1" });
+  const roomsOf = (...attention) => [
+    chiefRoom("r1", { title: "alpha", attention: attention[0] ?? [] }),
+    chiefRoom("r2", { title: "beta", attention: attention[1] ?? [] }),
+  ];
+  const seeded = (status) => {
+    const seen = new Set();
+    notifyChiefTransitions(null, status, seen, { env: herdr, platform: "linux" });
+    return seen;
+  };
+
+  it("seeds the first successful snapshot silently", () => {
+    const { calls, exec } = chiefNotifier();
+    const status = chiefStatusFixture({ rooms: roomsOf([question("Need quota?")]) });
+    const seen = new Set();
+    expect(
+      notifyChiefTransitions(null, status, seen, { env: herdr, exec, platform: "darwin" }),
+    ).toBe(false);
+    expect(calls).toHaveLength(0);
+    expect(seen.size).toBe(1);
+    expect(notifyChiefTransitions(status, status, seen, { env: herdr, exec })).toBe(false);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("stays silent for unchanged, reordered, and timestamp-only snapshots", () => {
+    const { calls, exec } = chiefNotifier();
+    const prev = chiefStatusFixture({
+      rooms: roomsOf([question("Need quota?")], [question("Q2")]),
+    });
+    const seen = seeded(prev);
+    const reordered = chiefStatusFixture({
+      rooms: roomsOf([question("Need quota?")], [question("Q2")]).toReversed(),
+      generatedAt: "2026-11-18T07:00:00.000Z",
+    });
+    reordered.rooms[0].attention[0].at = "t9";
+    expect(notifyChiefTransitions(prev, reordered, seen, { env: herdr, exec })).toBe(false);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("notifies the same text once in each of two rooms", () => {
+    const { calls, exec } = chiefNotifier();
+    const prev = chiefStatusFixture({ rooms: roomsOf() });
+    const seen = seeded(prev);
+    const next = chiefStatusFixture({
+      rooms: roomsOf([question("Need quota?")], [question("Need quota?")]),
+    });
+    expect(notifyChiefTransitions(prev, next, seen, { env: herdr, exec })).toBe(true);
+    expect(calls.map((call) => call.args[4])).toEqual(["alpha: Need quota?", "beta: Need quota?"]);
+  });
+
+  it("notifies a changed question but not its repeat", () => {
+    const { calls, exec } = chiefNotifier();
+    const prev = chiefStatusFixture({ rooms: roomsOf([question("Old?")]) });
+    const seen = seeded(prev);
+    const next = chiefStatusFixture({ rooms: roomsOf([question("New?")]) });
+    expect(notifyChiefTransitions(prev, next, seen, { env: herdr, exec })).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].args[4]).toBe("alpha: New?");
+    expect(notifyChiefTransitions(next, next, seen, { env: herdr, exec })).toBe(false);
+    expect(calls).toHaveLength(1);
+  });
+
+  it("notifies a new blocked worker with a sanitized single-line body", () => {
+    const { calls, exec } = chiefNotifier();
+    const prev = chiefStatusFixture({ rooms: roomsOf() });
+    const seen = seeded(prev);
+    const next = chiefStatusFixture({
+      rooms: roomsOf([{ kind: "blocked", from: "w1", text: "Need\u{1B}[31m help\nnow" }]),
+    });
+    expect(
+      notifyChiefTransitions(prev, next, seen, {
+        env: {},
+        exec,
+        exists: () => true,
+        platform: "darwin",
+      }),
+    ).toBe(true);
+    expect(calls).toHaveLength(1);
+    const payload = JSON.parse(calls[0].args[1]);
+    expect(payload).toEqual({
+      body: "alpha: Need [31m help now",
+      sound: "request",
+      status: "blocked",
+      title: "Chief: Worker blocked",
+    });
+  });
+
+  it("notifies a failed mission once, including its synthetic escalation and desk copy", () => {
+    const { calls, exec } = chiefNotifier();
+    const prev = chiefStatusFixture({ rooms: roomsOf() });
+    const seen = seeded(prev);
+    const failed = roomsOf();
+    failed[0] = chiefRoom("r1", {
+      title: "alpha",
+      mission: { state: "failed", reason: "provider_quota_exhausted" },
+      attention: [{ kind: "escalation", from: "C", text: "provider_quota_exhausted" }],
+    });
+    const next = chiefStatusFixture({
+      rooms: failed,
+      desk: [
+        {
+          id: "d1",
+          roomId: "r1",
+          from: "C",
+          kind: "escalation",
+          text: "provider_quota_exhausted",
+        },
+      ],
+    });
+    expect(
+      notifyChiefTransitions(prev, next, seen, {
+        env: {},
+        exec,
+        exists: () => true,
+        platform: "darwin",
+      }),
+    ).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(JSON.parse(calls[0].args[1])).toEqual({
+      body: "alpha: provider_quota_exhausted",
+      sound: "request",
+      status: "failed",
+      title: "Chief: Mission failed",
+    });
+  });
+
+  it("stays silent for updates, completed missions, idle rows, and generic unread mail", () => {
+    const { calls, exec } = chiefNotifier();
+    const prev = chiefStatusFixture({ rooms: roomsOf() });
+    const seen = seeded(prev);
+    const next = chiefStatusFixture({
+      rooms: [
+        chiefRoom("r1", {
+          title: "alpha",
+          mission: { state: "done", reason: null },
+          attention: [
+            { kind: "update", text: "Progress" },
+            { kind: "stale-coordinator", text: "gone" },
+          ],
+        }),
+      ],
+      inbox: [{ id: "i1", from: "lead", kind: "unread", text: "fyi" }],
+      desk: [{ id: "d1", roomId: "r1", from: "C", kind: "done", text: "Finished" }],
+    });
+    expect(notifyChiefTransitions(prev, next, seen, { env: herdr, exec })).toBe(false);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("keys loose mail by its unattributed sender, so a desk copy does not repeat an inbox message", () => {
+    const { calls, exec } = chiefNotifier();
+    const prev = chiefStatusFixture({ rooms: [] });
+    const seen = seeded(prev);
+    const next = chiefStatusFixture({
+      rooms: [],
+      inbox: [{ id: "i1", from: "lead", kind: "awaiting-input", text: "Ready?" }],
+      desk: [{ id: "d1", roomId: null, from: "lead", kind: "question", text: "Ready?" }],
+    });
+    expect(
+      notifyChiefTransitions(prev, next, seen, {
+        env: {},
+        exec,
+        exists: () => true,
+        platform: "darwin",
+      }),
+    ).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(JSON.parse(calls[0].args[1]).body).toBe("Chief inbox: Ready?");
+  });
+
+  it("uses Herdr on Darwin when HERDR_ENV is set, and never the HUD", () => {
+    const { calls, exec } = chiefNotifier();
+    const prev = chiefStatusFixture({ rooms: roomsOf() });
+    const seen = seeded(prev);
+    const next = chiefStatusFixture({ rooms: roomsOf([question("Need quota?")]) });
+    notifyChiefTransitions(prev, next, seen, {
+      env: herdr,
+      exec,
+      exists: () => true,
+      platform: "darwin",
+    });
+    expect(calls).toEqual([
+      {
+        command: "herdr",
+        args: [
+          "notification",
+          "show",
+          "Chief: Question",
+          "--body",
+          "alpha: Need quota?",
+          "--sound",
+          "request",
+        ],
+      },
+    ]);
+  });
+
+  it("uses the HUD on Darwin without Herdr", () => {
+    const { calls, exec } = chiefNotifier();
+    const prev = chiefStatusFixture({ rooms: roomsOf() });
+    const seen = seeded(prev);
+    const next = chiefStatusFixture({ rooms: roomsOf([question("Need quota?")]) });
+    notifyChiefTransitions(prev, next, seen, {
+      env: { ...hud, ORKEST_HUD_BIN: "/opt/OrkestHUD" },
+      exec,
+      exists: (candidate) => candidate === "/opt/OrkestHUD",
+      platform: "darwin",
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0].command).toBe("/opt/OrkestHUD");
+    expect(calls[0].args[0]).toBe("--json");
+    expect(JSON.parse(calls[0].args[1])).toEqual({
+      body: "alpha: Need quota?",
+      sound: "request",
+      status: "blocked",
+      title: "Chief: Question",
+    });
+  });
+
+  it("stays silent on Linux without Herdr and when the HUD is missing", () => {
+    const { calls, exec } = chiefNotifier();
+    const prev = chiefStatusFixture({ rooms: roomsOf() });
+    const seen = seeded(prev);
+    const next = chiefStatusFixture({ rooms: roomsOf([question("Need quota?")]) });
+    expect(
+      notifyChiefTransitions(prev, next, seen, {
+        env: { ORKEST_HUD_BIN: "/opt/OrkestHUD" },
+        exec,
+        exists: () => true,
+        platform: "linux",
+      }),
+    ).toBe(false);
+    expect(
+      notifyChiefTransitions(prev, next, new Set(seen), {
+        env: {},
+        exec,
+        exists: () => false,
+        platform: "darwin",
+      }),
+    ).toBe(false);
+    expect(calls).toHaveLength(0);
+  });
+});

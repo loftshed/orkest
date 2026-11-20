@@ -3,7 +3,7 @@
 import { once } from "node:events";
 import { setTimeout as sleep } from "node:timers/promises";
 
-import { writeFoundryState } from "../../plugins/orchestrate/lib/foundry.mjs";
+import { writeFoundryState } from "../../src/lib/foundry.mjs";
 
 const [worktree, countArg = "100", gateArg = "50", handshakeMsArg = "30000"] =
   process.argv.slice(2);

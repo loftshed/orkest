@@ -583,10 +583,10 @@ pub fn update_room_metadata(
 }
 
 pub fn bind_room_conductor(base: &Path, room_id: &str, engine: &str, session_id: &str) -> bool {
-    let Some(plugin) = paths::plugin_root() else {
+    let Some(runtime) = paths::runtime_root() else {
         return false;
     };
-    let cli = plugin.join("bin/ork.mjs");
+    let cli = runtime.join("src/bin/ork.mjs");
     if !cli.is_file() {
         return false;
     }

@@ -218,8 +218,8 @@ def build_scope(
     raw_source = Path(os.path.abspath(source)) if source is not None else Path(os.path.abspath(__file__)).parent
     resolved_source = raw_source.resolve()
     cli_candidates = [
-        *([raw_source.parents[2] / "bin/ork.mjs"] if len(raw_source.parents) >= 3 else []),
-        *([resolved_source.parents[2] / "bin/ork.mjs"] if len(resolved_source.parents) >= 3 else []),
+        *([raw_source.parents[4] / "src/bin/ork.mjs"] if len(raw_source.parents) >= 5 else []),
+        *([resolved_source.parents[4] / "src/bin/ork.mjs"] if len(resolved_source.parents) >= 5 else []),
     ]
     links = [Path(environ.get("ORKEST_BIN_DIR") or home / ".local/bin") / "ork", home / ".local/bin/ork"]
     found_ork = which("ork")

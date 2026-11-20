@@ -81,9 +81,7 @@ async function rasterizeToPng(tool, svgPath, imagePath) {
 
 async function drawScreenshots(repo, shots) {
   const tool = await requireRasterizer();
-  const { cellWidth } = await import(
-    pathToFileURL(path.join(repo, "plugins/orchestrate/lib/tui-box.mjs")).href
-  );
+  const { cellWidth } = await import(pathToFileURL(path.join(repo, "src/lib/tui-box.mjs")).href);
   const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "readme-screenshots-"));
   try {
     fs.mkdirSync(path.join(repo, IMAGES), { recursive: true });

@@ -97,7 +97,7 @@ def _discover_node_binary() -> str:
 
 def _bridge() -> Path:
     source = Path(__file__).resolve()
-    for parent in (source.parents[1], source.parents[3]):
+    for parent in (source.parents[1], source.parents[3], source.parents[5] / "src"):
         candidate = parent / "bin" / "room-store.mjs"
         if candidate.is_file():
             return candidate

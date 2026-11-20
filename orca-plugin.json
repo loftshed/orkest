@@ -10,7 +10,7 @@
   "repository": "https://github.com/loftshed/orkest",
   "license": "MIT",
   "engines": { "orca": ">=1.4.259" },
-  "main": "plugins/orchestrate/lib/orca-worker.mjs",
+  "main": "src/lib/orca-worker.mjs",
   "capabilities": [
     { "kind": "workspace:read" },
     { "kind": "workspace:write" },
@@ -26,7 +26,7 @@
         "title": "Orkest",
         "icon": "agent",
         "ui": "html",
-        "entry": "plugins/orchestrate/lib/orca-panel.html"
+        "entry": "src/lib/orca-panel.html"
       }
     ],
     "commands": [

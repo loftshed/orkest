@@ -39,8 +39,8 @@ MANIFEST = "manifest.json"
 MAX_TEXT_BYTES = 5_000_000
 
 # (old, new) paths relative to the checkout root, longest `old` first. Each maps a whole subtree; a
-# reference migrates only if the mapped file or directory exists. Stage 3 has not decided where monitor's
-# lib lands, so it has no rule yet.
+# reference migrates only if the mapped file or directory exists. Both Node bin directories share `src/bin`;
+# the orchestrate lib is `src/lib` and monitor's lib is `src/lib/monitor` (each has its own policy.mjs).
 MOVES: tuple[tuple[str, str], ...] = (
     ("plugins/orchestrate/skills/orchestrate/scripts", "src/py"),
     ("plugins/orchestrate/skills/orchestrate/references", "references"),
@@ -50,6 +50,7 @@ MOVES: tuple[tuple[str, str], ...] = (
     ("plugins/orchestrate/bin", "src/bin"),
     ("plugins/monitor/bin", "src/bin"),
     ("plugins/orchestrate/lib", "src/lib"),
+    ("plugins/monitor/lib", "src/lib/monitor"),
 )
 # Hooks and rules written by the installer name scripts through each skill link, which points at the hub.
 SCRIPTS_NEW = "src/py"

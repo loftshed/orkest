@@ -73,6 +73,16 @@ test("a file a command names must exist", () => {
   expect(validate(root)).toStrictEqual([]);
 });
 
+test("a shared runtime file a command names must exist", () => {
+  const root = fixtureRepo();
+  write(root, "plugins/demo/commands/go.md", "Read `src/lib/gone.mjs`, then `ork go`.\n");
+  expect(validate(root)).toStrictEqual([
+    "plugins/demo/commands/go.md: src/lib/gone.mjs does not exist",
+  ]);
+  write(root, "src/lib/gone.mjs", "");
+  expect(validate(root)).toStrictEqual([]);
+});
+
 test("the retired plugin variable is reported wherever it returns", () => {
   const root = fixtureRepo();
   write(root, "plugins/demo/commands/go.md", 'node "${CLAUDE_PLUGIN_ROOT}/bin/ork.mjs" go\n');

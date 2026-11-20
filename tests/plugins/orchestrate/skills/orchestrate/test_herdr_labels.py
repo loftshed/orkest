@@ -654,7 +654,7 @@ class StatusCommandTests(unittest.TestCase):
 
     def run_status(self, **extra):
         result = subprocess.run(
-            ["node", str(SCRIPTS.parents[2] / "bin/ork.mjs"), "herdr-status"],
+            ["node", str(SCRIPTS.parents[4] / "src/bin/ork.mjs"), "herdr-status"],
             env={**self.env, **extra},
             capture_output=True,
             text=True,

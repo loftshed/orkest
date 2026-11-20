@@ -81,7 +81,7 @@ Routine usage changes and ordinary short-window rollovers do not add records. Ea
 
 `status.json` shows the last recorder check and the age of each account's reading. Files are private to the current user. `observationId` supports deduplication if a crash repeats a row. The installed script lives outside the checkout, so switching branches does not change the recorder.
 
-On other platforms, schedule `node plugins/monitor/bin/observe.mjs` once a minute with one scheduler. It also supports `--cache-dir` and `--output-dir` for isolated analysis or testing. To stop the macOS recorder while retaining its data:
+On other platforms, schedule `node src/bin/observe.mjs` once a minute with one scheduler. It also supports `--cache-dir` and `--output-dir` for isolated analysis or testing. To stop the macOS recorder while retaining its data:
 
 ```sh
 launchctl bootout "gui/$(id -u)/local.monitor.observer"
@@ -125,7 +125,7 @@ No config is needed: without `~/.config/monitor/config.json`, monitor monitors w
 
 `./uninstall.sh` removes the launcher, app, login agent, MCP registrations and cache (`--purge` also removes the config).
 
-`install.sh` installs a copy of the CLI to `~/.local/share/monitor` and points the launcher there, so the menu bar app and MCP servers never read the checkout. macOS privacy protection makes background access to `~/Documents` wait on a permission prompt, which returns with every rebuild of the ad-hoc-signed app. Re-run `./install.sh` after pulling changes, moving the checkout, or changing Node versions.
+`install.sh` installs a self-contained copy to `~/.local/share/monitor` (`package.json`, `src/bin/monitor.mjs`, `src/bin/observe.mjs`, `src/lib/monitor` and the skill, laid out like the checkout) and points the launcher there, so the menu bar app and MCP servers never read the checkout. The copy is staged and checked before it replaces the old one; the previous copy moves to `~/.local/share/monitor-backups`, and files or links of your own inside the runtime are kept. macOS privacy protection makes background access to `~/Documents` wait on a permission prompt, which returns with every rebuild of the ad-hoc-signed app. Re-run `./install.sh` after pulling changes, moving the checkout, or changing Node versions.
 
 ## macOS permission prompts
 
@@ -196,8 +196,8 @@ The server's instructions remind agents that switching accounts can switch billi
 
 ```sh
 # from the repository root
-./node_modules/.bin/vitest run tests/plugins/monitor
+./node_modules/.bin/vitest run tests/src/lib/monitor
 macos/build.sh /tmp/Monitor.app && "/tmp/Monitor.app/Contents/MacOS/MonitorBar" --dump-menu   # add --collapse all to see collapsed sections
 ```
 
-Parsers are tested against captured real output in `tests/plugins/monitor/fixtures` at the repository root. Claude's `/usage` is human text, so its parser is the most likely thing to break on a Claude Code update; the fixtures make that visible.
+Parsers are tested against captured real output in `tests/src/lib/monitor/fixtures` at the repository root. Claude's `/usage` is human text, so its parser is the most likely thing to break on a Claude Code update; the fixtures make that visible.

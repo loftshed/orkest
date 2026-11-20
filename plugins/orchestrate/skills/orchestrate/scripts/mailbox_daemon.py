@@ -74,10 +74,10 @@ def valid_store_ids(base: Path) -> set[str]:
 
 def runtime_sources() -> dict[str, Path]:
     skill = Path(__file__).resolve().parent.parent
-    plugin = skill if (skill / "lib").is_dir() else skill.parents[1]
+    node_runtime = skill if (skill / "lib").is_dir() else skill.parents[3] / "src"
     return {
         **{folder: skill / folder for folder in ("scripts", "references", "templates")},
-        **{folder: plugin / folder for folder in ("bin", "lib")},
+        **{folder: node_runtime / folder for folder in ("bin", "lib")},
     }
 
 

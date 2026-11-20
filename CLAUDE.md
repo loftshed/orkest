@@ -34,7 +34,7 @@ Both scripts call `./node_modules/.bin` directly, so they work without pnpm on P
 - **Harness-facing text calls `ork` (or `monitor`) on `PATH`**, never `${CLAUDE_PLUGIN_ROOT}`, which the validator rejects. `${CLAUDE_SKILL_DIR}` is a skill feature and stays, quoted wherever a shell expands it; the validator fails when it, or a file a command names, points at a missing file.
 - **Regenerate the README, don't hand-edit its generated parts.** The `<!-- generated:… -->` blocks and `docs/images/` come from the code; after changing an `ork` command, a slash command or the terminal UI, run `corepack pnpm readme` and commit the result. The gate fails while they are stale. Details: [docs/readme.md](docs/readme.md).
 - **Keep documentation short.** Say what the reader needs to do or know, once. Put gotchas under a Troubleshooting heading.
-- **Follow the TUI design system.** Terminal UI changes in `plugins/orchestrate/lib/tui-*.mjs` and `horde-view.mjs` follow [docs/terminal-ui.md](docs/terminal-ui.md) and can be visually compared with [docs/tui-visual-testing.md](docs/tui-visual-testing.md).
+- **Follow the TUI design system.** Terminal UI changes in `src/lib/tui-*.mjs` and `horde-view.mjs` follow [docs/terminal-ui.md](docs/terminal-ui.md) and can be visually compared with [docs/tui-visual-testing.md](docs/tui-visual-testing.md).
 
 ## Hooks
 

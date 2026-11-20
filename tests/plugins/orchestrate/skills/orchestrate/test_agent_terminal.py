@@ -1000,7 +1000,7 @@ class TerminalTests(unittest.TestCase):
                         "node",
                         [
                             "node",
-                            str(SCRIPTS.parents[2] / "bin/ork.mjs"),
+                            str(SCRIPTS.parents[4] / "src/bin/ork.mjs"),
                             "label",
                             "--",
                             str(binary),
@@ -1200,7 +1200,7 @@ class TerminalTests(unittest.TestCase):
                 "node",
                 [
                     "node",
-                    str(SCRIPTS.parents[2] / "bin/ork.mjs"),
+                    str(SCRIPTS.parents[4] / "src/bin/ork.mjs"),
                     "label",
                     "--",
                     str(binary),
@@ -1277,7 +1277,7 @@ class TerminalTests(unittest.TestCase):
                     termios.tcsetwinsize(0, (30, 120))
                     os.execvpe(
                         "node",
-                        ["node", str(SCRIPTS.parents[2] / "bin/ork.mjs"), "label", "--", str(binary)],
+                        ["node", str(SCRIPTS.parents[4] / "src/bin/ork.mjs"), "label", "--", str(binary)],
                         environment,
                     )
                 try:

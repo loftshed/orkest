@@ -67,8 +67,8 @@ push and pull request, so a hand-edited version fails there.
 
 1. Confirms it is running in GitHub Actions for a push to the default branch, on the exact
    commit that was tested.
-2. Writes the new version into the root `package.json`, `plugins/monitor/package.json` (the
-   installed monitor copy has no root to read) and any `SKILL.md` `metadata.version`, and adds
+2. Writes the new version into the root `package.json`, `plugins/monitor/package.json` (kept
+   in step with the root; the installed monitor copy gets a `package.json` generated from the root version) and any `SKILL.md` `metadata.version`, and adds
    the changelog section.
 3. Formats those files and runs the lint gate again.
 4. Commits them as `chore(release): publish orkest`, with a `Release-Of:` trailer naming the

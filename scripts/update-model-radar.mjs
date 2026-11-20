@@ -14,7 +14,7 @@ import {
   DEFAULT_PRIORS_PATH,
   diffCatalogAgainstSeen,
   loadBenchmarkPriors,
-} from "../plugins/orchestrate/lib/radar.mjs";
+} from "../src/lib/radar.mjs";
 
 export const OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models";
 

@@ -6,7 +6,7 @@
   "license": "MIT",
   "type": "module",
   "bin": {
-    "monitor": "bin/monitor.mjs"
+    "monitor": "../../src/bin/monitor.mjs"
   },
   "engines": {
     "node": ">=22"

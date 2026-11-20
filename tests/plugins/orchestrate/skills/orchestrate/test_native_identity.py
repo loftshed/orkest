@@ -57,7 +57,7 @@ class NativeIdentityTests(unittest.TestCase):
                         room_store._node_binary(),
                         "--input-type=module",
                         "-e",
-                        "import { sessionIdentities } from './plugins/orchestrate/lib/rooms.mjs'; "
+                        "import { sessionIdentities } from './src/lib/rooms.mjs'; "
                         "console.log(JSON.stringify(sessionIdentities(JSON.parse(process.argv[1]),process.argv[2])));",
                         json.dumps(peer),
                         str(base),
@@ -143,7 +143,7 @@ class NativeIdentityLifecycleTests(unittest.TestCase):
                 room_store._node_binary(),
                 "--input-type=module",
                 "-e",
-                "import { sessionIdentities } from './plugins/orchestrate/lib/rooms.mjs'; "
+                "import { sessionIdentities } from './src/lib/rooms.mjs'; "
                 "console.log(JSON.stringify(sessionIdentities(JSON.parse(process.argv[1]),process.argv[2])));",
                 json.dumps(peer),
                 str(self.base),

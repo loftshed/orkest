@@ -283,26 +283,18 @@ fn query_rooms_db(base: &Path, room_id: Option<&str>) -> Option<Vec<Value>> {
 fn room_store_bridge_path() -> Option<PathBuf> {
     if let Some(scripts) = paths::scripts_root() {
         let resolved = fs::canonicalize(&scripts).unwrap_or(scripts);
+        // An installed runtime copy keeps `bin/` beside `scripts/`'s parent; a checkout keeps it in `src/bin`.
         if let Some(candidate) = resolved.parent().map(|p| p.join("bin/room-store.mjs"))
             && candidate.is_file()
         {
             return Some(candidate);
         }
-        if let Some(candidate) = resolved
-            .parent()
-            .and_then(|p| p.parent())
-            .and_then(|p| p.parent())
-            .map(|p| p.join("bin/room-store.mjs"))
-            && candidate.is_file()
-        {
-            return Some(candidate);
-        }
     }
-    let candidate = paths::plugin_root()?.join("bin/room-store.mjs");
+    let candidate = paths::runtime_root()?.join("src/bin/room-store.mjs");
     candidate.is_file().then_some(candidate)
 }
 
-/// Invoke `node <plugin>/bin/room-store.mjs <command> --root <base> [room_id]`.
+/// Invoke `node <checkout>/src/bin/room-store.mjs <command> --root <base> [room_id]`.
 pub fn invoke_room_store_bridge(
     base: &Path,
     command: &str,

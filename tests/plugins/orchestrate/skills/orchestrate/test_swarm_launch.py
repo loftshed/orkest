@@ -23,7 +23,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 SCRIPTS = Path(__file__).resolve().parents[5] / "plugins/orchestrate/skills/orchestrate/scripts"
-CLI = SCRIPTS.parents[2] / "bin/ork.mjs"
+CLI = SCRIPTS.parents[4] / "src/bin/ork.mjs"
 TESTS_DIR = Path(__file__).resolve().parent
 if str(TESTS_DIR) not in sys.path:
     sys.path.insert(0, str(TESTS_DIR))

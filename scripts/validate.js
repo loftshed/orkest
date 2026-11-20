@@ -106,8 +106,8 @@ function checkSkill(skillDirectory, context) {
 
 function checkPathReferences(pluginDirectory, context) {
   const skillPattern = /\$\{CLAUDE_SKILL_DIR\}\/([\w./-]+)/gu;
-  // A repo-relative path a command names in backticks, e.g. `plugins/orchestrate/lib/x.mjs`.
-  const commandPattern = /`((?:adapters|plugins|skills|crates|scripts|docs)\/[\w./-]+)`/gu;
+  // A repo-relative path a command names in backticks, e.g. `src/lib/x.mjs`.
+  const commandPattern = /`((?:adapters|plugins|skills|src|crates|scripts|docs)\/[\w./-]+)`/gu;
   const retired = /\$\{CLAUDE_PLUGIN_ROOT[}:]/u;
   for (const filePath of listFiles(pluginDirectory)) {
     if (!TEXT_EXTENSIONS.has(path.extname(filePath))) continue;
