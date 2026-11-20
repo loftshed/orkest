@@ -6,11 +6,10 @@ whether anything shipped changed and, if so, releases the next `vX.Y.Z`.
 
 ## How a version is chosen
 
-The script looks at the commits since the highest published tag that touched what a checkout
-ships: `plugins/`, `crates/ork-fast`, `install.sh`, `herdr-plugin.toml`, `orca-plugin.json` and
-`.opencode`, plus `src/`, `adapters/` and `references/` for the layout the later stages of issue 233
-move code to, so a commit that only edits a command or skill text still releases. Changelog edits, documentation, tests and repository tooling do not count, and a
-change that was later reverted releases nothing.
+The release planner examines commits since the highest published tag. Its shipped paths include
+`src/`, `adapters/`, `references/`, the installers under `plugins/`, `crates/ork-fast`, `install.sh`,
+and the Herdr and Orca manifests. A change confined to a command or skill can trigger a release.
+Documentation, tests, repository tooling, changelog edits and reverted changes do not trigger one.
 
 | Commits since the last release              | Next version                             |
 | ------------------------------------------- | ---------------------------------------- |
@@ -68,7 +67,7 @@ push and pull request, so a hand-edited version fails there.
 1. Confirms it is running in GitHub Actions for a push to the default branch, on the exact
    commit that was tested.
 2. Writes the new version into the root `package.json`, `plugins/monitor/package.json` (kept
-   in step with the root; the installed monitor copy gets a `package.json` generated from the root version) and any `SKILL.md` `metadata.version`, and adds
+   in step with the root; the installed monitor copy gets a `package.json` generated from the root version) and any `metadata.version` in `adapters/skills/*/SKILL.md`, and adds
    the changelog section.
 3. Formats those files and runs the lint gate again.
 4. Commits them as `chore(release): publish orkest`, with a `Release-Of:` trailer naming the
