@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { homedir } from "node:os";
 import path from "node:path";
 
+import { PROBE_CEILINGS_MS, probeTimeoutError } from "../adaptive-probes.mjs";
 import { childEnv, expandHome, resolveBinary } from "../exec.mjs";
 import { VERSION } from "../version.mjs";
 
@@ -130,7 +131,8 @@ function rpcRateLimits(bin, env, timeoutMs) {
       fn(value);
     };
     const timer = setTimeout(
-      () => finish(reject, new Error(`codex app-server timed out after ${timeoutMs / 1000}s`)),
+      () =>
+        finish(reject, probeTimeoutError(`codex app-server timed out after ${timeoutMs / 1000}s`)),
       timeoutMs,
     );
     // If codex dies between messages, the write fails with EPIPE; the close handler reports the failure.
@@ -212,6 +214,6 @@ export async function fetchCodex(account) {
   if (typeof env.CODEX_HOME === "string" && env.CODEX_HOME.trim()) {
     env.CODEX_HOME = resolveChildEnvPath(env.CODEX_HOME);
   }
-  const result = await rpcRateLimits(bin, env, account.timeoutMs ?? 30_000);
+  const result = await rpcRateLimits(bin, env, account.timeoutMs ?? PROBE_CEILINGS_MS.codex);
   return parseCodexRateLimits(result);
 }

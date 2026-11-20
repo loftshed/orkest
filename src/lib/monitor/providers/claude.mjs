@@ -2,6 +2,7 @@ import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 
+import { PROBE_CEILINGS_MS } from "../adaptive-probes.mjs";
 import { childEnv, expandHome, resolveBinary, run } from "../exec.mjs";
 import { parseResetText } from "../time.mjs";
 
@@ -163,7 +164,7 @@ export async function fetchClaude(account, { now = Date.now() } = {}) {
   // well over 15 s; 90 s avoids reporting a cold start as a failure.
   const { code, stdout, stderr } = await run(bin, args, {
     env,
-    timeoutMs: account.timeoutMs ?? 90_000,
+    timeoutMs: account.timeoutMs ?? PROBE_CEILINGS_MS.claude,
   });
   let parsed;
   try {

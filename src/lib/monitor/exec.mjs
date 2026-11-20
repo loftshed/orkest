@@ -3,6 +3,7 @@ import { accessSync, constants } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 
+import { probeTimeoutError } from "./adaptive-probes.mjs";
 export function expandHome(p) {
   if (typeof p !== "string") return p;
   if (p === "~") return homedir();
@@ -97,7 +98,7 @@ export function run(
       child.stderr?.destroy();
       child.kill("SIGKILL");
       cleanup();
-      reject(new Error(`${cmd} timed out after ${Math.round(timeoutMs / 1000)}s`));
+      reject(probeTimeoutError(`${cmd} timed out after ${Math.round(timeoutMs / 1000)}s`));
     }, timeoutMs);
     child.stdout.on("data", (d) => {
       if (isSettled || isKilledForSize) return;
