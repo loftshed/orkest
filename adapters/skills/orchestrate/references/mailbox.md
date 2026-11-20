@@ -179,7 +179,7 @@ It validates the closed JSON Schema subset it advertises, including types, enums
 array bounds, ids and UTF-8 message size. It never resolves remote schema references. The daemon validates local bearer credentials, HTTP Origin and mirrored method/name/version headers. Resources, prompts, subscriptions and model sampling are unused. Stdio exposes no HTTP endpoint. Hosts enforce user permissions; mailbox peer identity is local
 coordination metadata, not authentication against other programs running as the same OS user.
 
-See the [MCP audit](../../../../../docs/mailbox-mcp-audit.md) for verification and evaluation evidence.
+See the [MCP audit](../../../../docs/mailbox-mcp-audit.md) for verification and evaluation evidence.
 
 ## Wake an idle peer
 
@@ -541,7 +541,7 @@ and backups. To restore stdio through the doctor, use `doctor --repair-messaging
 HTTP send keys are scoped to the caller and full delivery intent. Full recovery entries have a seven-day replay window. Prune/startup removes expired bodies and keeps body-free tombstones for active callers; an expired pending operation cannot resurrect pruned mail. Do not reuse a key for another message. Recovery reports an unknown previous activation as `uncertain` and never retries it. A persisted or queued message does not prove another model ran
 or answered. No lifecycle/health/readiness command starts a model turn.
 
-See the [daemon qualification](../../../../../docs/mailbox-daemon-qualification.md) for measured
+See the [daemon qualification](../../../../docs/mailbox-daemon-qualification.md) for measured
 resource/context costs and the scope of native-client and synthetic evaluation evidence.
 
 ## Troubleshooting

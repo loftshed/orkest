@@ -149,10 +149,7 @@ describe("releases in a repository", () => {
     put("CHANGELOG.md", "# Changelog\n\n## History\n\n- Before the merge.\n");
     for (const name of ["one", "two"]) {
       put(`plugins/${name}/CHANGELOG.md`, "# Changelog\n\n## 0.3.0\n\n- Earlier.\n");
-      put(
-        `plugins/${name}/skills/${name}/SKILL.md`,
-        `---\nname: ${name}\ndescription: ${name}.\n---\n`,
-      );
+      put(`adapters/skills/${name}/SKILL.md`, `---\nname: ${name}\ndescription: ${name}.\n---\n`);
     }
     put("plugins/two/package.json", { name: "two", version: "0.3.0" });
     since = commit("chore: start");
@@ -164,14 +161,14 @@ describe("releases in a repository", () => {
   afterEach(() => fs.rmSync(scratch, { force: true, recursive: true }));
 
   test("a first release goes out at the version package.json declares", () => {
-    commit("feat: new skill", "plugins/one/skills/extra/SKILL.md");
+    commit("feat: new skill", "adapters/skills/extra/SKILL.md");
     expect(planned()).toEqual(["v0.3.0@0.3.0"]);
   });
 
   test("the first product release continues the earlier stream's line", () => {
     publishedBefore("0.3.0");
-    commit("fix: wording", "plugins/two/skills/two/SKILL.md");
-    commit("feat: new skill", "plugins/one/skills/extra/SKILL.md");
+    commit("fix: wording", "adapters/skills/two/SKILL.md");
+    commit("feat: new skill", "adapters/skills/extra/SKILL.md");
     const [release] = planRelease({ root }).releases;
     expect([release.tag, release.previous, release.version]).toEqual(["v0.4.0", "0.3.0", "0.4.0"]);
     expect(release.notes).toContain("feat: new skill");
@@ -182,7 +179,7 @@ describe("releases in a repository", () => {
     publishedBefore("0.3.0");
     git(["tag", "monitor--v9.9.9"]);
     git(["tag", "ancient--v0.2.0"]);
-    commit("fix: wording", "plugins/two/skills/two/SKILL.md");
+    commit("fix: wording", "adapters/skills/two/SKILL.md");
     expect(planned()).toEqual(["v0.3.1@0.3.1"]);
   });
 
@@ -192,9 +189,9 @@ describe("releases in a repository", () => {
     commit("docs: readme", "README.md");
     commit("docs: history", "CHANGELOG.md", `${read("CHANGELOG.md")}\nNote.\n`);
     commit("docs: old history", "plugins/one/CHANGELOG.md", "# Changelog\n\nNote.\n");
-    const original = read("plugins/two/skills/two/SKILL.md");
-    commit("feat: try something", "plugins/two/skills/two/SKILL.md");
-    commit("revert: try something", "plugins/two/skills/two/SKILL.md", original);
+    const original = read("adapters/skills/two/SKILL.md");
+    commit("feat: try something", "adapters/skills/two/SKILL.md");
+    commit("revert: try something", "adapters/skills/two/SKILL.md", original);
     expect(planned()).toEqual([]);
   });
 
@@ -206,7 +203,7 @@ describe("releases in a repository", () => {
     commit("fix: installer", "install.sh");
     expect(planned()).toEqual(["v0.3.2@0.3.2"]);
     publishedBefore("0.3.2", "v0.3.2");
-    git(["rm", "--quiet", "plugins/one/skills/one/SKILL.md"]);
+    git(["rm", "--quiet", "adapters/skills/one/SKILL.md"]);
     commit("remove a skill");
     expect(planned()).toEqual(["v0.3.3@0.3.3"]);
   });
@@ -248,7 +245,7 @@ describe("releases in a repository", () => {
     publishedBefore();
     commit(
       "fix: two",
-      "plugins/two/skills/two/SKILL.md",
+      "adapters/skills/two/SKILL.md",
       "---\nname: two\ndescription: 2.\nmetadata:\n  version: 0.3.0\n---\n",
     );
     const files = writeRelease(planRelease({ root }), root);
@@ -256,43 +253,43 @@ describe("releases in a repository", () => {
       "CHANGELOG.md",
       "package.json",
       "plugins/two/package.json",
-      "plugins/two/skills/two/SKILL.md",
+      "adapters/skills/two/SKILL.md",
     ]);
     expect(json("package.json").version).toBe("0.3.1");
     expect(json("plugins/two/package.json").version).toBe("0.3.1");
-    expect(read("plugins/two/skills/two/SKILL.md")).toContain("  version: 0.3.1");
+    expect(read("adapters/skills/two/SKILL.md")).toContain("  version: 0.3.1");
     expect(read("CHANGELOG.md")).toMatch(/^# Changelog\n\n## 0\.3\.1\n\n- fix: two\n\n## History/u);
     expect(validate(root)).toEqual([]);
   });
 
   test("a tag becomes the next baseline, and a tag off this history is refused", () => {
     publishedBefore();
-    const source = commit("fix: one", "plugins/one/skills/one/SKILL.md");
+    const source = commit("fix: one", "adapters/skills/one/SKILL.md");
     writeRelease(planRelease({ root }), root);
     commit(RELEASE_SUBJECT);
     git(["tag", "v0.3.1"]);
     expect(planned()).toEqual([]);
-    commit("fix: again", "plugins/one/skills/one/SKILL.md");
+    commit("fix: again", "adapters/skills/one/SKILL.md");
     expect(planned()).toEqual(["v0.3.2@0.3.2"]);
     git(["checkout", "--quiet", "--detach", source]);
     expect(planned()).toEqual([]);
     git(["checkout", "--quiet", "-b", "elsewhere", since]);
     put("release.json", { legacyTags: ["one"], since });
-    commit("fix: unrelated", "plugins/one/skills/one/SKILL.md");
+    commit("fix: unrelated", "adapters/skills/one/SKILL.md");
     expect(() => planRelease({ root })).toThrow("not in this branch's history");
   });
 
   test("release commits of either subject are not release notes", () => {
     publishedBefore();
-    commit("chore(release): publish plugins", "plugins/one/skills/one/SKILL.md");
-    commit(`${RELEASE_SUBJECT}\n\n- v0.3.1`, "plugins/two/skills/two/SKILL.md");
-    commit("fix: real change", "plugins/one/skills/one/SKILL.md");
+    commit("chore(release): publish plugins", "adapters/skills/one/SKILL.md");
+    commit(`${RELEASE_SUBJECT}\n\n- v0.3.1`, "adapters/skills/two/SKILL.md");
+    commit("fix: real change", "adapters/skills/one/SKILL.md");
     expect(planRelease({ root }).releases[0].notes).toBe("- fix: real change");
   });
 
   test("check gates the release in a scratch worktree and leaves the checkout alone", () => {
     publishedBefore();
-    commit("fix: one", "plugins/one/skills/one/SKILL.md");
+    commit("fix: one", "adapters/skills/one/SKILL.md");
     put("scratch.txt", "local work\n");
     const status = git(["status", "--porcelain"]);
     let seen;
@@ -326,7 +323,7 @@ describe("releases in a repository", () => {
 
     beforeEach(() => {
       publishedBefore();
-      const source = commit("fix: ship two", "plugins/two/skills/two/SKILL.md");
+      const source = commit("fix: ship two", "adapters/skills/two/SKILL.md");
       remote = path.join(scratch, "remote.git");
       execFileSync("git", ["init", "--quiet", "--bare", remote]);
       git(["push", "--quiet", remote, "HEAD:refs/heads/main"]);
@@ -392,7 +389,7 @@ describe("releases in a repository", () => {
     });
 
     test("a newer push wins and publishes everything since the last release once", async () => {
-      const newer = commit("feat: grow one", "plugins/one/skills/one/SKILL.md");
+      const newer = commit("feat: grow one", "adapters/skills/one/SKILL.md");
       git(["push", "--quiet", remote, "HEAD:refs/heads/main"]);
       git(["checkout", "--quiet", "--detach", env.GITHUB_SHA]);
       expect(await publish()).toContain("moved on");

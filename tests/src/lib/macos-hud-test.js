@@ -251,8 +251,7 @@ describe.runIf(process.platform === "darwin")("OrkestHUD.app Swift integration",
     const dir = mkdtempSync(path.join(tmpdir(), "orkest-hud-build-"));
     try {
       const appPath = path.join(dir, "OrkestHUD.app");
-      const buildScript = new URL("../../../plugins/orchestrate/macos/build.sh", import.meta.url)
-        .pathname;
+      const buildScript = new URL("../../../adapters/macos/hud/build.sh", import.meta.url).pathname;
       const build = spawnSync(buildScript, [appPath], {
         encoding: "utf8",
         env: { ...process.env, ORKEST_HUD_BUILD_HASH: "test-hash-1" },

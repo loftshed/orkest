@@ -66,9 +66,9 @@ jobs:
           cat "$GITHUB_STEP_SUMMARY"
           exit "$status"
       - name: Type-check Monitor menu bar app
-        run: swiftc -typecheck -swift-version 5 -framework AppKit plugins/monitor/macos/main.swift
+        run: swiftc -typecheck -swift-version 5 -framework AppKit adapters/macos/monitor/main.swift
       - name: Type-check OrkestHUD toast app
-        run: swiftc -typecheck -swift-version 5 -framework AppKit -framework QuartzCore plugins/orchestrate/macos/hud.swift
+        run: swiftc -typecheck -swift-version 5 -framework AppKit -framework QuartzCore adapters/macos/hud/hud.swift
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:

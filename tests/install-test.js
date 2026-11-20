@@ -262,7 +262,7 @@ function monitorFixture({ version = "9.9.9", failing = false } = {}) {
   const files = {
     "package.json": JSON.stringify({ name: "orkest", version }),
     "plugins/monitor/config.example.json": "{}\n",
-    "plugins/monitor/skills/monitor/SKILL.md": "---\nname: monitor\n---\n",
+    "adapters/skills/monitor/SKILL.md": "---\nname: monitor\n---\n",
     "src/bin/monitor.mjs": failing
       ? "process.exit(3);\n"
       : 'import { VERSION } from "../lib/monitor/version.mjs";\nconsole.log(VERSION);\n',

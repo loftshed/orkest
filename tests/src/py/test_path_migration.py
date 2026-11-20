@@ -87,22 +87,17 @@ class PathMigrationTests(Fixture):
             previous = str(directory / "references/model-registry.json")
             self.assertEqual(pm._map(rules, previous), (previous, str(self.root / "references/model-registry.json")))
 
-    def test_hub_compatibility_script_runs_canonical_cli(self):
+    def test_canonical_cli_runs_after_skill_shim_retirement(self):
         import subprocess
 
-        old_skill = SCRIPTS.parents[1] / "plugins/orchestrate/skills/orchestrate"
-        alias = self.home / "linked-skill"
-        alias.symlink_to(old_skill, target_is_directory=True)
-
-        def invoke(path):
-            return subprocess.run([sys.executable, "-I", str(path), "--help"], check=True, capture_output=True)
-
-        canonical = invoke(SCRIPTS / "run_agent.py")
-        for directory in (old_skill, alias):
-            legacy = invoke(directory / "scripts/run_agent.py")
-            self.assertEqual(legacy.stdout, canonical.stdout)
-            self.assertIn(str(SCRIPTS / "run_agent.py").encode(), legacy.stderr)
-            self.assertEqual(legacy.stderr.count(b"moved to"), 1)
+        root = SCRIPTS.parents[1]
+        skill = root / "adapters/skills/orchestrate"
+        self.assertTrue((skill / "SKILL.md").is_file())
+        self.assertFalse((skill / "scripts/run_agent.py").exists())
+        self.assertFalse((root / "plugins/orchestrate/skills/orchestrate/scripts/run_agent.py").exists())
+        result = subprocess.run([sys.executable, "-I", str(SCRIPTS / "run_agent.py"), "--help"], check=True, capture_output=True)
+        self.assertIn(b"usage:", result.stdout)
+        self.assertNotIn(b"moved to", result.stderr)
 
     def test_uninspectable_configs_are_reported_and_preserved(self):
         self.land_new_layout()

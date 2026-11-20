@@ -302,15 +302,15 @@ export function writeRelease(plan, root = REPO_ROOT) {
         setJsonVersion(path.join(root, manifest), release.version);
         written.add(manifest);
       }
-      const skillsRoot = path.join(pluginsRoot, plugin, "skills");
-      const skills = fs.existsSync(skillsRoot) ? fs.readdirSync(skillsRoot) : [];
-      for (const skill of skills) {
-        const relative = `plugins/${plugin}/skills/${skill}/SKILL.md`;
-        if (!fs.existsSync(path.join(root, relative))) continue;
-        const original = fs.readFileSync(path.join(root, relative), "utf8");
-        const updated = setFrontmatterVersion(original, release.version);
-        if (updated !== original) write(relative, updated);
-      }
+    }
+    const skillsRoot = path.join(root, "adapters", "skills");
+    const skills = fs.existsSync(skillsRoot) ? fs.readdirSync(skillsRoot) : [];
+    for (const skill of skills) {
+      const relative = `adapters/skills/${skill}/SKILL.md`;
+      if (!fs.existsSync(path.join(root, relative))) continue;
+      const original = fs.readFileSync(path.join(root, relative), "utf8");
+      const updated = setFrontmatterVersion(original, release.version);
+      if (updated !== original) write(relative, updated);
     }
     write(release.changelogPath, release.changelog);
   }

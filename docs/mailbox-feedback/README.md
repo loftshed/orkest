@@ -30,4 +30,4 @@ Configure `mailbox_feedback.directory` in the existing agent-executor config to 
 project. CLI calls and hooks pick up configuration on their next invocation. Restart an existing
 mailbox MCP server to load the new tool and recorder.
 
-See the [tool and configuration reference](../../plugins/orchestrate/skills/orchestrate/references/mailbox.md#communication-feedback).
+See the [tool and configuration reference](../../adapters/skills/orchestrate/references/mailbox.md#communication-feedback).

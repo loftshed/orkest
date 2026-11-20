@@ -79,7 +79,7 @@ an agent to read its live terminal without leaving your conversation:
 | `q`       | Close the view; workers keep running                   |
 
 Reconnect from any terminal with `ork horde --attach-room <id>`; add `--view` to only observe.
-Details: [conversational swarms](plugins/orchestrate/skills/orchestrate/references/swarm.md).
+Details: [conversational swarms](adapters/skills/orchestrate/references/swarm.md).
 
 ### Fire off side missions
 
@@ -236,6 +236,10 @@ More: [architecture and module map](docs/ARCHITECTURE.md), [Herdr integration](d
 [Orca integration](docs/orca.md), [all documentation](docs/README.md).
 
 ## Install
+
+The installer links the skills from `adapters/skills/`, installs Claude commands from
+`adapters/claude/commands/`, and points the CLI at `src/bin/ork.mjs`. Python helpers run
+from `src/py/`. Existing installations can migrate their saved paths with `ork update`.
 
 <!-- generated:requirements -->
 

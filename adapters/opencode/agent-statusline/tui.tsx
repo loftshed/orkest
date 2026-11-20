@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -63,14 +63,11 @@ function resolveDefaultFastBin(): string {
   return path.join(resolveCacheHome(), "bin/ork-fast");
 }
 
-function resolveScriptsDir(): string {
-  const source = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../../src/py");
-  if (existsSync(path.join(source, "agent_statusline_tmux.py"))) return source;
-  return path.join(homedir(), ".agents/skills/orchestrate/scripts");
-}
-
 const defaultFastBin = resolveDefaultFastBin();
-const defaultScriptsDir = resolveScriptsDir();
+const defaultScriptsDir = path.resolve(
+  path.dirname(realpathSync(fileURLToPath(import.meta.url))),
+  "../../../src/py",
+);
 
 function Label(props: { sessionID?: string; plainColor: string; fastBin: string }) {
   const [item, setItem] = createSignal<Identity | null>(null);

@@ -82,7 +82,7 @@ To bind an interactive coordinator or worker session to a swarm room:
 ork hall bind --room ROOM_ID --member conductor --engine codex --session SESSION_ID
 ```
 
-See [rooms](skills/orchestrate/references/rooms.md) and [workboard](skills/orchestrate/references/workboard.md)
+See [rooms](../../adapters/skills/orchestrate/references/rooms.md) and [workboard](../../adapters/skills/orchestrate/references/workboard.md)
 for creating rooms, binding sessions, and tracking shared work.
 
 ### Claude Code and Antigravity
@@ -122,7 +122,7 @@ For OpenCode v2, link the TUI plugin from the repository root and restart the TU
 
 ```sh
 mkdir -p ~/.config/opencode/plugins
-ln -s "$PWD/plugins/orchestrate/opencode/agent-statusline" ~/.config/opencode/plugins/orkest-agent-statusline
+ln -s "$PWD/adapters/opencode/agent-statusline" ~/.config/opencode/plugins/orkest-agent-statusline
 ```
 
 The label appears once the OpenCode session registers with the peer mailbox.
@@ -144,7 +144,7 @@ python3 <scripts>/run_agent.py quota                          # live quota per r
 node <checkout>/src/bin/ork.mjs --help        # hall/rooms, horde TUI, foundry, smelter, radar, routes, quota, telemetry, and session naming
 ```
 
-Routes are configured in `~/.config/orchestrate/config.json` (`run_agent.py init` writes a starter file) overlaid on [`routes.default.json`](../../references/routes.default.json). Model selectors (`family` or `family:tier` from [`families.json`](../../references/families.json)) resolve against the live catalog so model upgrades do not require config edits. For task archetypes and route tiers, see [`archetype-rationale.md`](skills/orchestrate/references/archetype-rationale.md).
+Routes are configured in `~/.config/orchestrate/config.json` (`run_agent.py init` writes a starter file) overlaid on [`routes.default.json`](../../references/routes.default.json). Model selectors (`family` or `family:tier` from [`families.json`](../../references/families.json)) resolve against the live catalog so model upgrades do not require config edits. For task archetypes and route tiers, see [`archetype-rationale.md`](../../adapters/skills/orchestrate/references/archetype-rationale.md).
 
 ## Ask one question (`consult`)
 
@@ -177,7 +177,7 @@ order and each consultant has its own preflight, quota check and `result.json`. 
 would otherwise use native handoff. Panels cannot use `--follow-up` or `--detach`; they exit 0 if any consultant
 answered, otherwise with the first consultant's exit code.
 
-Details: [`skills/orchestrate/references/consult.md`](skills/orchestrate/references/consult.md).
+Details: [`skills/orchestrate/references/consult.md`](../../adapters/skills/orchestrate/references/consult.md).
 
 ## Delegate a bounded task (`run_agent.py`, `steer`, `probe`)
 
@@ -203,7 +203,7 @@ python3 <scripts>/run_agent.py \
     -- python3 -m unittest tests.test_module
   ```
 
-Details: [`skills/orchestrate/references/runner.md`](skills/orchestrate/references/runner.md), [`skills/orchestrate/references/brief-template.md`](skills/orchestrate/references/brief-template.md), [`skills/orchestrate/references/completion.md`](skills/orchestrate/references/completion.md).
+Details: [`skills/orchestrate/references/runner.md`](../../adapters/skills/orchestrate/references/runner.md), [`skills/orchestrate/references/brief-template.md`](../../adapters/skills/orchestrate/references/brief-template.md), [`skills/orchestrate/references/completion.md`](../../adapters/skills/orchestrate/references/completion.md).
 
 ## Multi-agent coordination
 
@@ -219,7 +219,7 @@ python3 <scripts>/run_agent.py mailbox wait --reply-to <message-id> --timeout 30
 python3 <scripts>/mailbox_daemon.py status
 ```
 
-For persistent headless Claude or Antigravity workers that should wake automatically when mail arrives, run `python3 <scripts>/run_agent.py listen --engine claude|agy --prompt 'Task'`. Details: [`skills/orchestrate/references/mailbox.md`](skills/orchestrate/references/mailbox.md).
+For persistent headless Claude or Antigravity workers that should wake automatically when mail arrives, run `python3 <scripts>/run_agent.py listen --engine claude|agy --prompt 'Task'`. Details: [`skills/orchestrate/references/mailbox.md`](../../adapters/skills/orchestrate/references/mailbox.md).
 
 ### Coordinator, team authority, and deputy succession
 
@@ -227,7 +227,7 @@ For persistent headless Claude or Antigravity workers that should wake automatic
 
 `authority.py` gives a multi-agent team one accountable lead with a compare-and-swap generation fence (`appoint`, `offer`, `takeover`, `accept`, `show`) and can propose a deputy on an independent quota pool (`authority.py propose`) so leadership can hand over cleanly if the lead's account hits a quota window limit.
 
-Details: [`skills/orchestrate/references/coordinator.md`](skills/orchestrate/references/coordinator.md).
+Details: [`skills/orchestrate/references/coordinator.md`](../../adapters/skills/orchestrate/references/coordinator.md).
 
 ### Swarm rooms and Horde TUI (`ork`)
 
@@ -252,8 +252,8 @@ models and permissions. **Ctrl-b Tab** switches panes; **Ctrl-b d** detaches. `-
 harnesses. Writers in one checkout take turns; `ork hall worktree` gives a member its own checkout so
 several can implement at once.
 
-Details: [conversational swarms](skills/orchestrate/references/swarm.md),
-[room commands](skills/orchestrate/references/rooms.md) and
+Details: [conversational swarms](../../adapters/skills/orchestrate/references/swarm.md),
+[room commands](../../adapters/skills/orchestrate/references/rooms.md) and
 [agent instructions](skills/orchestrate/SKILL.md).
 
 ### Machine-wide Chief (`ork chief`, `/chief`)

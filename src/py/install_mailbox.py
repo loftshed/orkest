@@ -1523,7 +1523,7 @@ def backup(path: Path, *, keep_backups: int = DEFAULT_KEEP_BACKUPS) -> None:
 
 
 def ensure_hub(hub: Path, skill: Path, *, dry_run: bool = False) -> None:
-    if hub.exists() and hub.resolve() == skill.resolve() and (hub / "scripts/mailbox_mcp.py").is_file():
+    if hub.exists() and hub.resolve() == skill.resolve() and (hub / "SKILL.md").is_file():
         return
     if dry_run:
         print(f"would link messaging skill hub: {hub} -> {skill}")
@@ -2324,7 +2324,7 @@ def ensure_macos_hud(
 
     macos_dir = next(
         (root / "macos" for root in _candidate_plugin_roots(plugin_root) if (root / "macos" / "build.sh").is_file()),
-        runtime_paths.runtime_root(__file__) / "plugins/orchestrate/macos",
+        runtime_paths.runtime_root(__file__) / "adapters/macos/hud",
     )
     build_sh = macos_dir / "build.sh"
     hud_swift = macos_dir / "hud.swift"
@@ -2786,7 +2786,7 @@ def sync_account_profiles(
                 daemon_token = mailbox_daemon.read_token(base)
             except (OSError, ValueError, RuntimeError, KeyError, subprocess.SubprocessError) as error:
                 startup_error = f"mailbox daemon unavailable: {error}"
-    if not dry_run and not (hub / "peer_mailbox.py").exists():
+    if not dry_run and not (hub.parent / "SKILL.md").is_file():
         ensure_hub(hub.parent, runtime_paths.skill_directory(__file__))
     binaries = {"claude": "claude", "codex": "codex", "agy": "agy", "opencode": "opencode"}
     for target in targets:

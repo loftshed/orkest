@@ -39,7 +39,7 @@ to resolve a catalog gap. Record any provider-observed model separately from the
 and dispatched alias; if no resolved version is available, leave it unresolved in the final report.
 
 `--model` also takes a family selector (`gpt:sol`, `gemini:fast`, `deepseek`) from
-[families.json](../../../../../references/families.json), resolved against the live catalog to the newest matching ID; a selector
+[families.json](../../../../references/families.json), resolved against the live catalog to the newest matching ID; a selector
 alone infers its engine. The result records the resolved ID with `model_preflight:
 live_family_resolved`, `families` prints every resolution, and `AGENT_NOTE=model_advanced` on stderr
 marks a selector that now resolves to a newer model. A coordinator dispatch records the resolved ID,
@@ -68,7 +68,7 @@ cache read/creation and output tokens plus Claude Code's own cost estimate (`nat
 Unknown is never zero.
 
 `--billing-mode api|subscription|unknown` declares the billing context without inspecting credentials.
-[The dated registry](../../../../../references/model-registry.json) holds verified public API tariffs; a reference estimate is
+[The dated registry](../../../../references/model-registry.json) holds verified public API tariffs; a reference estimate is
 emitted only when usage, rate freshness (30 days, or an entry's `revalidate_on`) and tariff tier permit.
 agy slugs use their base model's tariff. It is not an invoice. See
 [verification findings](research-verification-2026-09-18.md).
@@ -290,6 +290,6 @@ most once a day.
 ## Routes and setup
 
 `routes` prints the effective role → engine/model/effort table: the bundled
-[defaults](../../../../../references/routes.default.json) overlaid by `~/.config/orchestrate/config.json`
+[defaults](../../../../references/routes.default.json) overlaid by `~/.config/orchestrate/config.json`
 (`$AGENT_EXECUTOR_CONFIG`, or under `$XDG_CONFIG_HOME`). `init` writes a starter config. `doctor`
 reports the host, installed CLI versions, skill installs, and stale copies.
