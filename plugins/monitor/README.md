@@ -201,3 +201,9 @@ macos/build.sh /tmp/Monitor.app && "/tmp/Monitor.app/Contents/MacOS/MonitorBar" 
 ```
 
 Parsers are tested against captured real output in `tests/src/lib/monitor/fixtures` at the repository root. Claude's `/usage` is human text, so its parser is the most likely thing to break on a Claude Code update; the fixtures make that visible.
+
+### Probe timeouts and recovery
+
+Monitor retains the latest 128 successful probe durations for each account in its snapshot. After five successes it uses the larger of twice p95 and 1.25 times p99 plus 250 ms, retaining headroom for the five most recent successes as the latency distribution shifts, with a 1.5-second minimum. The account's `timeoutMs` is always the ceiling. The default ceilings are 90 seconds for Claude, 30 seconds for Codex and 60 seconds for Antigravity. A retry following a timeout receives a larger budget, up to that ceiling.
+
+Two consecutive timeouts pause probes for that account for 15 seconds. Further timeouts double the pause up to five minutes. A refresh after the pause probes the account again, even if its cached quota would otherwise be fresh, subject to the provider’s minimum refresh interval. A manual refresh honors the breaker pause and can bypass the provider’s normal minimum interval. The public JSON account’s `probe` field reports the most recent outcome and budget, p95/p99, and the breaker retry timestamp. Other accounts continue refreshing, and the last good quota stays available for the same account home. Authentication and provider errors retain their normal retry cadence. Probe timing and retry state survive CLI and MCP process restarts through the shared snapshot.
