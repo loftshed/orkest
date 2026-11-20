@@ -64,8 +64,8 @@ class CommandApprovalTests(unittest.TestCase):
         self.checkout = self.root / "checkout/plugins/orchestrate"
         self.source = self.checkout / "skills/orchestrate/scripts"
         self.source.mkdir(parents=True)
-        (self.checkout / "bin").mkdir()
-        (self.checkout / "bin/ork.mjs").write_text("")
+        (self.checkout.parents[1] / "src/bin").mkdir(parents=True)
+        (self.checkout.parents[1] / "src/bin/ork.mjs").write_text("")
         self.hub = self.home / ".agents/skills/orchestrate"
         self.hub.parent.mkdir(parents=True)
         self.hub.symlink_to(self.source.parent)
@@ -184,7 +184,7 @@ class CommandApprovalTests(unittest.TestCase):
     def test_rules_cover_orkest_entry_points_and_path_variants_but_nothing_generic(self):
         self.run_approval(opt_in=True)
         hub = self.hub / "scripts"
-        cli = self.checkout / "bin/ork.mjs"
+        cli = self.checkout.parents[1] / "src/bin/ork.mjs"
         allowed = [
             "ork chief status",
             "ork rooms dispatch --room r",
@@ -479,8 +479,9 @@ class CommandApprovalTests(unittest.TestCase):
         alias_var = self.root / "var"
         alias_var.symlink_to(self.root / "private/var")
         alias_checkout = alias_var / "folders/checkout/plugins/orchestrate"
-        (alias_checkout / "bin").mkdir(parents=True)
-        (alias_checkout / "bin/ork.mjs").write_text("#!/usr/bin/env node\n")
+        alias_cli = alias_checkout.parents[1] / "src/bin/ork.mjs"
+        alias_cli.parent.mkdir(parents=True)
+        alias_cli.write_text("#!/usr/bin/env node\n")
         alias_source = alias_checkout / "skills/orchestrate/scripts"
         alias_source.mkdir(parents=True)
         for name in approval.SCRIPTS:
@@ -491,8 +492,8 @@ class CommandApprovalTests(unittest.TestCase):
         self.hub.symlink_to(alias_source.parent)
         self.run_approval(opt_in=True)
         claude = self.claude_rules()
-        self.assertTrue(claude_allows(claude, f"node {alias_checkout / 'bin/ork.mjs'} hall list"))
-        self.assertTrue(claude_allows(claude, f"node {(alias_checkout / 'bin/ork.mjs').resolve()} hall list"))
+        self.assertTrue(claude_allows(claude, f"node {alias_cli} hall list"))
+        self.assertTrue(claude_allows(claude, f"node {alias_cli.resolve()} hall list"))
         self.assertTrue(claude_allows(claude, f"python3 {alias_source / 'run_agent.py'} consult"))
         self.assertTrue(claude_allows(claude, f"python3 {(alias_source / 'run_agent.py').resolve()} consult"))
 

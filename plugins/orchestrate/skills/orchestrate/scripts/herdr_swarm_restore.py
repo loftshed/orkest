@@ -427,7 +427,7 @@ def inventory(
 ) -> dict[str, Any]:
     """Read-only reconciliation of Orkest rooms, views, and peers against passive Herdr inventory."""
     current_endpoint = endpoint(env)
-    cli_path = (cli or (Path(__file__).resolve().parents[3] / "bin" / "ork.mjs")).resolve()
+    cli_path = (cli or (Path(__file__).resolve().parents[5] / "src" / "bin" / "ork.mjs")).resolve()
     panes = api.panes()
     panes_by_id = {pane["pane_id"]: pane for pane in panes if isinstance(pane.get("pane_id"), str)}
     process_cache: dict[str, dict[str, Any] | None] = {}
@@ -735,7 +735,7 @@ def main() -> int:
         return 0
     api = Herdr(binary, env)
     base = runtime_paths.cache_home()
-    cli = Path(__file__).resolve().parents[3] / "bin" / "ork.mjs"
+    cli = Path(__file__).resolve().parents[5] / "src" / "bin" / "ork.mjs"
     if args.inventory:
         print(json.dumps(inventory(base, env, api, cli=cli, only_room=args.room)))
         return 0

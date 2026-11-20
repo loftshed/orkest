@@ -393,14 +393,14 @@ worker jobs. Native leads stay in their parent's harness; workers can use other 
 ```bash
 # Start a coordinator with a queued custom team or preset.
 python3 <skill-directory>/scripts/run_agent.py horde --team 'claude:haiku*2,agy:flash*2,codex:luna:max'
-node plugins/orchestrate/bin/ork.mjs horde --preset scout-swarm
+node src/bin/ork.mjs horde --preset scout-swarm
 
 # Observe an existing room without starting or rejoining a conversation.
-node plugins/orchestrate/bin/ork.mjs horde --attach-room ROOM_ID --view
+node src/bin/ork.mjs horde --attach-room ROOM_ID --view
 python3 <skill-directory>/scripts/run_agent.py horde spawn --attach-room ROOM_ID --team 'codex:luna:max'
 
 # Offline fixture inspection and formatting
-node plugins/orchestrate/bin/ork.mjs horde --fixture /path/to/room.json --print --width 120
+node src/bin/ork.mjs horde --fixture /path/to/room.json --print --width 120
 ```
 
 `--json` outputs room JSON, `--print` renders one frame, and `--fixture` reads saved state offline.

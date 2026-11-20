@@ -406,12 +406,31 @@ def _install_cross_harness_skill(
     return changed
 
 
+ORK_CLI_RELATIVE = Path("src/bin/ork.mjs")
+
+
+def _default_ork_cli() -> Path:
+    """`ork` in this checkout: `src/bin/ork.mjs` under the repository root."""
+    return Path(__file__).resolve().parents[5] / ORK_CLI_RELATIVE
+
+
+def _checkout_of(ork_cli: Path) -> Path:
+    """The repository root above `<root>/src/bin/ork.mjs`; the plugin directory above a pre-move `bin/ork.mjs`."""
+    return ork_cli.parent.parent.parent if ork_cli.parent.parent.name == "src" else ork_cli.parent.parent
+
+
+def _orchestrate_plugin_of(ork_cli: Path) -> Path:
+    """The `plugins/orchestrate` directory (skill, macOS HUD) that belongs to this `ork.mjs`."""
+    checkout = _checkout_of(ork_cli)
+    return checkout / "plugins/orchestrate" if (checkout / "plugins/orchestrate").is_dir() else checkout
+
+
 def _candidate_plugin_roots(plugin_root: Path | None = None, ork_cli: Path | None = None) -> list[Path]:
     roots: list[Path] = []
     if plugin_root is not None:
         roots.append(plugin_root)
     if ork_cli is not None:
-        roots.append(ork_cli.parent.parent)
+        roots.append(_orchestrate_plugin_of(ork_cli))
     roots.append(Path(__file__).resolve().parents[3])
     unique: list[Path] = []
     for root in roots:
@@ -431,7 +450,7 @@ HERDR_SHORTCUT_BLOCK = (
 
 
 def _herdr_source_root(ork_cli: Path | None) -> Path | None:
-    cli = ork_cli or (Path(__file__).resolve().parents[3] / "bin/ork.mjs")
+    cli = ork_cli or _default_ork_cli()
     return next((directory for directory in cli.resolve().parents if (directory / "herdr-plugin.toml").is_file()), None)
 
 
@@ -579,8 +598,8 @@ def install_herdr_integration(home: Path, ork_cli: Path | None = None, *, dry_ru
         print(f"✓ Herdr ctrl+alt+s shortcut: {config_file}")
     if enabled:
         _offer_herdr_ui(config_file)
-    cli = ork_cli or (Path(__file__).resolve().parents[3] / "bin/ork.mjs")
-    helper = cli.resolve().parent.parent / "skills/orchestrate/scripts/herdr_swarm_restore.py"
+    cli = ork_cli or _default_ork_cli()
+    helper = _orchestrate_plugin_of(cli.resolve()) / "skills/orchestrate/scripts/herdr_swarm_restore.py"
     if enabled and os.environ.get("HERDR_ENV") == "1" and helper.is_file():
         try:
             adopted = subprocess.run(
@@ -1133,32 +1152,37 @@ unset -f _orkest_set_footer _orkest_alias_uses_executable
 
 
 def sync_installed_runtimes(home: Path, ork_cli: Path | None = None, *, dry_run: bool = False) -> bool:
-    """Propagate checkout changes to the ~/.local/share/monitor runtime copy."""
-    changed = False
-    ork_cli = ork_cli or (Path(__file__).resolve().parents[3] / "bin/ork.mjs")
-    plugins_dir = ork_cli.resolve().parents[2]
-    if plugins_dir.name != "plugins":
-        return False
+    """Refresh an existing ~/.local/share/monitor copy from this checkout.
 
-    monitor_src = plugins_dir / "monitor"
+    The monitor installer does the work (`--runtime-only`): it stages a complete runtime, checks it, keeps the
+    previous copy under ~/.local/share/monitor-backups and rewrites the launcher.
+    """
+    ork_cli = ork_cli or _default_ork_cli()
+    checkout = _checkout_of(ork_cli.resolve())
+    installer = checkout / "plugins/monitor/install.sh"
     monitor_runtime = home / ".local/share/monitor"
-    if monitor_src.is_dir() and monitor_runtime.is_dir():
-        if dry_run:
-            print(f"would sync monitor runtime: {monitor_runtime}")
-        else:
-            for item_name in ("bin", "lib", "package.json"):
-                src_item = monitor_src / item_name
-                dst_item = monitor_runtime / item_name
-                if not src_item.exists():
-                    continue
-                if src_item.is_dir():
-                    shutil.copytree(src_item, dst_item, dirs_exist_ok=True)
-                else:
-                    shutil.copy2(src_item, dst_item)
-            print(f"✓ monitor runtime synced: {monitor_runtime}")
-        changed = True
-
-    return changed
+    if not installer.is_file() or not monitor_runtime.is_dir():
+        return False
+    if dry_run:
+        print(f"would sync monitor runtime: {monitor_runtime}")
+        return True
+    try:
+        result = subprocess.run(
+            ["sh", str(installer), "--runtime-only"],
+            env={**os.environ, "HOME": str(home)},
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        print(f"• monitor runtime not synced ({error}); the installed copy was left as it was")
+        return False
+    if result.returncode:
+        print(f"• monitor runtime not synced: {(result.stderr or result.stdout).strip()}")
+        return False
+    print(f"✓ monitor runtime synced: {monitor_runtime}")
+    return True
 
 
 def _validate_fast_bin(fast_bin: Path | str) -> Path:
@@ -1286,7 +1310,7 @@ def install_shell_wrappers(
     if fast_bin is not None:
         fast_bin = _validate_fast_bin(fast_bin)
     changed = False
-    ork_cli = ork_cli or (Path(__file__).resolve().parents[3] / "bin/ork.mjs")
+    ork_cli = ork_cli or _default_ork_cli()
     bin_link = home / ".local/bin/ork"
     if ork_cli.is_file() and not (bin_link.is_symlink() and bin_link.resolve() == ork_cli.resolve()):
         if dry_run:
@@ -1975,7 +1999,7 @@ def codex_rules(home: Path, hub: Path, ork_cli: Path | None = None) -> str:
     def script(name: str) -> list[str]:
         return _path_variants([directory / name for directory in script_dirs])
 
-    cli = ork_cli or source.parents[2] / "bin/ork.mjs"
+    cli = ork_cli or _default_ork_cli()
     nodes = ["node", *_path_variants([Path(found) for found in [shutil.which("node")] if found])]
     ork_commands = ["ork", *_path_variants([Path(found) for found in [shutil.which("ork")] if found])]
     pythons = [

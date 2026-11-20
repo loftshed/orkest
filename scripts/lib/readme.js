@@ -69,8 +69,7 @@ export function requirements(manifest) {
 
 /** Every generated text block of the README, by name. */
 export async function generatedBlocks(repo) {
-  const orchestrate = path.join(repo, "plugins/orchestrate");
-  const help = await execute(process.execPath, [path.join(orchestrate, "bin/ork.mjs"), "--help"]);
+  const help = await execute(process.execPath, [path.join(repo, "src/bin/ork.mjs"), "--help"]);
   const manifest = fs.readFileSync(path.join(repo, "package.json"), "utf8");
   return {
     commands: commandReference(help.stdout),
@@ -82,7 +81,7 @@ export async function generatedBlocks(repo) {
 const load = (repo, file) => import(pathToFileURL(path.join(repo, file)).href);
 
 async function swarmCapture(repo, { cols, rows, prepare }) {
-  const { HordeView } = await load(repo, "plugins/orchestrate/lib/horde-view.mjs");
+  const { HordeView } = await load(repo, "src/lib/horde-view.mjs");
   const view = new HordeView(demoRoom(), {
     now: () => DEMO_NOW,
     height: rows,
@@ -99,7 +98,7 @@ export async function captures(repo) {
   // change a screenshot, wherever it is made.
   process.env.TZ = "UTC";
   delete process.env.NO_COLOR;
-  const { renderReport } = await load(repo, "plugins/monitor/lib/render.mjs");
+  const { renderReport } = await load(repo, "src/lib/monitor/render.mjs");
   return [
     {
       name: "swarm-view",

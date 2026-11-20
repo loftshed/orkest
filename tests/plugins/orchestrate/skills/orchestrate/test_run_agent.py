@@ -91,7 +91,7 @@ class HordeCommandTests(unittest.TestCase):
         self.assertEqual(
             received,
             [
-                str(SCRIPT.resolve().parents[3] / "bin" / "ork.mjs"),
+                str(SCRIPT.resolve().parents[5] / "src" / "bin" / "ork.mjs"),
                 "horde",
                 "spawn",
                 "--team",

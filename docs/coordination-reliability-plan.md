@@ -68,7 +68,8 @@ but progress rejected the unregistered peer. Include that binding-without-presen
 Create one self-contained board issue per numbered item, with the contracts and acceptance checks
 below. Split a large item into focused PRs at its stated boundaries. One integration owner accepts
 results and owns final checks. Paths below are relative to `plugins/orchestrate/` unless stated
-otherwise; Python modules are in `skills/orchestrate/scripts/`.
+otherwise; Python modules are in `skills/orchestrate/scripts/`, and `lib/` and `bin/` Node modules
+are now `src/lib/` and `src/bin/` at the repository root.
 
 ### 1. Repair concurrent writes and the side command boundary
 

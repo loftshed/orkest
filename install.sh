@@ -170,7 +170,7 @@ if [ "$has_harness" -eq 0 ]; then
 fi
 
 bin_dir=${ORKEST_BIN_DIR:-$home_dir/.local/bin}
-ork_target=$repo_dir/plugins/orchestrate/bin/ork.mjs
+ork_target=$repo_dir/src/bin/ork.mjs
 ork_link=$bin_dir/ork
 orchestrate_installer=${ORKEST_INSTALL_ORCHESTRATE:-$repo_dir/plugins/orchestrate/install.sh}
 monitor_installer=${ORKEST_INSTALL_MONITOR:-$repo_dir/plugins/monitor/install.sh}

@@ -256,7 +256,23 @@ pub fn scripts_root() -> Option<PathBuf> {
     None
 }
 
-/// Resolve the `plugins/orchestrate` root containing `bin/`, `lib/`, and `skills/`.
+/// The checkout root above a `plugins/orchestrate` directory, when it holds the shared Node
+/// runtime (`src/bin/ork.mjs`).
+fn checkout_of_plugin(plugin: &Path) -> Option<PathBuf> {
+    let root = plugin.parent()?.parent()?;
+    root.join("src/bin/ork.mjs")
+        .is_file()
+        .then(|| root.to_path_buf())
+}
+
+/// Resolve the checkout root holding the shared Node runtime: `src/bin` and `src/lib`.
+#[must_use]
+pub fn runtime_root() -> Option<PathBuf> {
+    checkout_of_plugin(&plugin_root()?)
+}
+
+/// Resolve the `plugins/orchestrate` root containing `skills/`. Its checkout holds the Node runtime
+/// under `src/`; see [`runtime_root`].
 #[must_use]
 pub fn plugin_root() -> Option<PathBuf> {
     if let Ok(val) = env::var("ORKEST_PLUGIN_ROOT")
@@ -273,14 +289,14 @@ pub fn plugin_root() -> Option<PathBuf> {
             .parent()
             .and_then(|p| p.parent())
             .and_then(|p| p.parent())
-            && plugin.join("bin/ork.mjs").is_file()
+            && checkout_of_plugin(plugin).is_some()
         {
             return Some(plugin.to_path_buf());
         }
     }
     let manifest_candidate =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/orchestrate");
-    if manifest_candidate.join("bin/ork.mjs").is_file() {
+    if checkout_of_plugin(&manifest_candidate).is_some() {
         return fs::canonicalize(&manifest_candidate)
             .ok()
             .or(Some(manifest_candidate));

@@ -21,7 +21,7 @@ import orca_context
 import peer_mailbox as mailbox
 import room_store
 
-ORK = Path(__file__).resolve().parents[3] / "bin" / "ork.mjs"
+ORK = Path(__file__).resolve().parents[5] / "src" / "bin" / "ork.mjs"
 CHIEF_VIEW_KEY = "__chief__"
 
 

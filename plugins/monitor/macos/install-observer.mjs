@@ -19,7 +19,7 @@ mkdirSync(runtime, { recursive: true, mode: 0o700 });
 mkdirSync(output, { recursive: true, mode: 0o700 });
 mkdirSync(path.dirname(plist), { recursive: true });
 const script = path.join(runtime, "observe.mjs");
-copyFileSync(new URL("../bin/observe.mjs", import.meta.url), script);
+copyFileSync(new URL("../../../src/bin/observe.mjs", import.meta.url), script);
 const escape = (s) => s.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 const args = [process.execPath, script, "--cache-dir", cache, "--output-dir", output];
 writeFileSync(

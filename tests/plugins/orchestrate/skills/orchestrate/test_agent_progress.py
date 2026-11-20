@@ -39,7 +39,7 @@ class ProgressTests(unittest.TestCase):
         return subprocess.run(
             [
                 "node",
-                str(SCRIPTS.parents[2] / "bin/ork.mjs"),
+                str(SCRIPTS.parents[4] / "src/bin/ork.mjs"),
                 "progress",
                 "--session",
                 self.peer["session"],

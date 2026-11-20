@@ -44,7 +44,7 @@ yourself in the worktree, read them with the API or a helper:
 
 ```sh
 repo="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"
-node --input-type=module -e 'import { listWorktreePorts } from "<orkest>/plugins/orchestrate/lib/worktree-ports.mjs"; console.log(listWorktreePorts({ repoRoot: process.argv[1], worktreePath: process.cwd() }))' "$repo"
+node --input-type=module -e 'import { listWorktreePorts } from "<orkest>/src/lib/worktree-ports.mjs"; console.log(listWorktreePorts({ repoRoot: process.argv[1], worktreePath: process.cwd() }))' "$repo"
 ```
 
 Failures carry a code: `ORK_PORTS_EXHAUSTED` (range full), `ORK_PORTS_BUSY` (database locked or probe

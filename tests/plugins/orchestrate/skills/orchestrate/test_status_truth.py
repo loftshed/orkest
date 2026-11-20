@@ -103,7 +103,7 @@ class StatusTruthTests(unittest.TestCase):
                 self.root,
                 {"HERDR_SOCKET_PATH": str(self.root / "server.sock")},
                 api,
-                cli=SCRIPTS.parents[2] / "bin/ork.mjs",
+                cli=SCRIPTS.parents[4] / "src/bin/ork.mjs",
             )
         self.assertEqual((report["status"], report["mode"]), ("ok", "read_only"))
         self.assertEqual(len(report["resources"]), 1)

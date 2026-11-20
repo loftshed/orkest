@@ -48,7 +48,7 @@ class OwnershipTests(unittest.TestCase):
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(body)
         release = self.root / "release/plugins/orchestrate"
-        cli = release / "bin/ork.mjs"
+        cli = self.root / "release/src/bin/ork.mjs"
         cli.parent.mkdir(parents=True)
         cli.write_text("")
         for revision in ("retirement", "relocation"):

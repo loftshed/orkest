@@ -2510,8 +2510,8 @@ def main() -> int:
     if argv and argv[0] == "probe":
         return probe_main(argv[1:])
     if argv and argv[0] == "horde":
-        plugin_root = Path(__file__).resolve().parents[3]
-        command = ["node", str(plugin_root / "bin" / "ork.mjs"), "horde", *argv[1:]]
+        checkout = Path(__file__).resolve().parents[5]
+        command = ["node", str(checkout / "src" / "bin" / "ork.mjs"), "horde", *argv[1:]]
         try:
             return subprocess.run(command, check=False).returncode
         except FileNotFoundError:

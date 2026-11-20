@@ -448,7 +448,7 @@ class InstallMailboxTests(unittest.TestCase):
                 installer.mailbox_hook_updates({"data": [{"hooks": mutated}]}, self.script, self.path)
 
     def test_shell_wrappers_generate_orkest_sh_and_wire_zshrc_idempotently(self):
-        ork_cli = self.base / "bin/ork.mjs"
+        ork_cli = self.base / "src/bin/ork.mjs"
         ork_cli.parent.mkdir(parents=True)
         ork_cli.write_text("#!/usr/bin/env node\n")
         (self.base / ".claude").mkdir()
@@ -495,7 +495,7 @@ class InstallMailboxTests(unittest.TestCase):
 
     def test_side_command_and_skill_registration_when_present_in_plugin_root(self):
         plugin_root = self.base / "plugin-root"
-        ork_cli = plugin_root / "bin/ork.mjs"
+        ork_cli = plugin_root / "src/bin/ork.mjs"
         ork_cli.parent.mkdir(parents=True)
         ork_cli.write_text("#!/usr/bin/env node\n")
         (plugin_root / "adapters/claude/commands").mkdir(parents=True)
@@ -590,7 +590,7 @@ class InstallMailboxTests(unittest.TestCase):
         self.assertTrue((plugin_root / "adapters/skills/chief/SKILL.md").is_file())
         (self.base / ".claude").mkdir()
         (self.base / ".codex").mkdir()
-        ork_cli = self.base / "plugin-without-chief/bin/ork.mjs"
+        ork_cli = self.base / "plugin-without-chief/src/bin/ork.mjs"
         ork_cli.parent.mkdir(parents=True)
         ork_cli.write_text("#!/usr/bin/env node\n")
 
@@ -823,7 +823,7 @@ class InstallMailboxTests(unittest.TestCase):
 
     def herdr_source(self):
         root = self.base / "source"
-        cli = root / "plugins/renamed-plugin/bin/ork.mjs"
+        cli = root / "src/bin/ork.mjs"
         cli.parent.mkdir(parents=True, exist_ok=True)
         cli.write_text("// test CLI\n")
         (root / "herdr-plugin.toml").write_text('id = "orkest.swarms"\n')
@@ -924,7 +924,7 @@ class InstallMailboxTests(unittest.TestCase):
 
     def test_herdr_update_adopts_live_views_only_for_enabled_registration(self):
         root, cli = self.herdr_source()
-        helper = cli.parent.parent / "skills/orchestrate/scripts/herdr_swarm_restore.py"
+        helper = root / "plugins/orchestrate/skills/orchestrate/scripts/herdr_swarm_restore.py"
         helper.parent.mkdir(parents=True)
         helper.write_text("# fake helper\n")
         self.herdr_binary.return_value = "herdr-test"
@@ -1185,7 +1185,7 @@ class InstallMailboxTests(unittest.TestCase):
             self.assertEqual(run_mock.call_count, 2)
 
     def test_fast_bin_validation_in_install_and_shell_wrappers(self):
-        ork_cli = self.base / "bin/ork.mjs"
+        ork_cli = self.base / "src/bin/ork.mjs"
         ork_cli.parent.mkdir(parents=True)
         ork_cli.write_text("#!/usr/bin/env node\n")
 

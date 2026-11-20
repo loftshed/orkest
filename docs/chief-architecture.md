@@ -2,12 +2,12 @@
 
 `ork chief` / `/chief` gives one agent session (the **Chief**) a live view of every room, orchestrator and agent session on the machine, a way to steer any of them, and a way to spawn new autonomous room orchestrators in other repositories and worktrees that report back to it. This document records the v1 design that ships in this branch and the follow-up tickets.
 
-| Piece                     | Files                                                                                                                                                                                                                                | Owner role    |
-| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------- |
-| Runtime and CLI           | [`lib/chief.mjs`](../plugins/orchestrate/lib/chief.mjs), [`bin/chief.mjs`](../plugins/orchestrate/bin/chief.mjs), `ork chief` hook in [`bin/ork.mjs`](../plugins/orchestrate/bin/ork.mjs)                                            | `chief-arch`  |
-| Chief View (side window)  | [`lib/chief-view.mjs`](../plugins/orchestrate/lib/chief-view.mjs), `--chief` mode in `bin/horde-tui.mjs`, `lib/horde-view.mjs`, `lib/orca-worker.mjs`, `agent_statusline_tmux.py`, `herdr_swarm_restore.py`, `orca_swarm_restore.py` | `chief-tui`   |
-| Skill, command, installer | [`skills/chief/SKILL.md`](../adapters/skills/chief/SKILL.md), [`commands/chief.md`](../adapters/claude/commands/chief.md), `install_mailbox.py`                                                                                      | `chief-skill` |
-| Tests                     | `tests/plugins/orchestrate/chief-test.js`, `tests/plugins/orchestrate/chief-view-test.js`, `test_install_mailbox.py`                                                                                                                 | all           |
+| Piece                     | Files                                                                                                                                                                                                                | Owner role    |
+| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------- |
+| Runtime and CLI           | [`lib/chief.mjs`](../src/lib/chief.mjs), [`bin/chief.mjs`](../src/bin/chief.mjs), `ork chief` hook in [`bin/ork.mjs`](../src/bin/ork.mjs)                                                                            | `chief-arch`  |
+| Chief View (side window)  | [`lib/chief-view.mjs`](../src/lib/chief-view.mjs), `--chief` mode in `bin/horde-tui.mjs`, `lib/horde-view.mjs`, `lib/orca-worker.mjs`, `agent_statusline_tmux.py`, `herdr_swarm_restore.py`, `orca_swarm_restore.py` | `chief-tui`   |
+| Skill, command, installer | [`skills/chief/SKILL.md`](../adapters/skills/chief/SKILL.md), [`commands/chief.md`](../adapters/claude/commands/chief.md), `install_mailbox.py`                                                                      | `chief-skill` |
+| Tests                     | `tests/src/lib/chief-test.js`, `tests/src/lib/chief-view-test.js`, `test_install_mailbox.py`                                                                                                                         | all           |
 
 ## 1. Model
 
@@ -145,7 +145,7 @@ Sessions default to `$AGENT_MAILBOX_SESSION`, then the harness session variables
 
 ## 3. Verified by
 
-`tests/plugins/orchestrate/chief-test.js` runs against temporary mailbox roots and real temporary Git repositories, with the mailbox CLI and the launcher replaced by mocks, so no model is called:
+`tests/src/lib/chief-test.js` runs against temporary mailbox roots and real temporary Git repositories, with the mailbox CLI and the launcher replaced by mocks, so no model is called:
 
 - bind from a peer record, environment session, atomic write, focus call; stale expiry for a dead PID without mutating the file; last-writer-wins handover with `previous` and a `--no-wake` notice; holder-only, forced and stale clearing,
 - multi-repo status across a repository and a linked worktree: counts, attention kinds (blocked, escalation, stale coordinator), native helper attribution, standalone peers (run and dead peers excluded), unattributed inbox, quota, `--all`, the compact table (at most 40 lines), `--json` and `--room`,

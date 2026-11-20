@@ -140,6 +140,53 @@ class PathMigrationTests(Fixture):
         second = pm.apply(self.home, roots=[self.root])
         self.assertEqual((second["total"], second["applied"], second["backup"]), (0, 0, None))
 
+    def test_monitor_modules_and_both_bin_trees_follow_their_shared_runtime_locations(self):
+        monitor = {
+            "mcpServers": {
+                "monitor": {
+                    "command": "node",
+                    "args": [f"{self.root}/plugins/monitor/bin/monitor.mjs", "mcp"],
+                }
+            },
+            "hooks": {
+                "Stop": [
+                    {"command": f"node {self.root}/plugins/monitor/lib/policy.mjs"},
+                    {"command": f"node {self.root}/plugins/orchestrate/lib/policy.mjs"},
+                    {"command": f"node {self.root}/plugins/orchestrate/bin/ork.mjs quota"},
+                ]
+            },
+            "note": f"user text names {self.root}/plugins/monitor/lib/policy.mjs",
+        }
+        path = self.profiles[0] / "settings.json"
+        path.write_text(json.dumps(monitor))
+        before = path.read_bytes()
+        # Nothing moves until the destination files exist, even for rules whose neighbours already moved.
+        self.land_new_layout()
+        (self.root / "src/lib").mkdir()
+        (self.root / "src/lib/policy.mjs").write_text("//orchestrate")
+        pm.apply(self.home, roots=[self.root])
+        settings = json.loads(path.read_text())
+        self.assertEqual(settings["mcpServers"]["monitor"]["args"][0], f"{self.root}/plugins/monitor/bin/monitor.mjs")
+        self.assertEqual(settings["hooks"]["Stop"][0]["command"], f"node {self.root}/plugins/monitor/lib/policy.mjs")
+        self.assertEqual(settings["hooks"]["Stop"][1]["command"], f"node {self.root}/src/lib/policy.mjs")
+        self.assertEqual(settings["hooks"]["Stop"][2]["command"], f"node {self.root}/src/bin/ork.mjs quota")
+        # The monitor files land: the same references now resolve to monitor's own library and bin.
+        (self.root / "src/lib/monitor").mkdir()
+        (self.root / "src/lib/monitor/policy.mjs").write_text("//monitor")
+        (self.root / "src/bin/monitor.mjs").write_text("//")
+        result = pm.apply(self.home, roots=[self.root])
+        settings = json.loads(path.read_text())
+        self.assertEqual(settings["mcpServers"]["monitor"]["args"], [f"{self.root}/src/bin/monitor.mjs", "mcp"])
+        self.assertEqual(settings["hooks"]["Stop"][0]["command"], f"node {self.root}/src/lib/monitor/policy.mjs")
+        self.assertEqual(settings["hooks"]["Stop"][1]["command"], f"node {self.root}/src/lib/policy.mjs")
+        self.assertIn("plugins/monitor/lib/policy.mjs", settings["note"])
+        self.assertEqual(pm.restore(Path(result["backup"])), 1)
+        self.assertNotEqual(path.read_bytes(), before)  # the first apply's rewrite is separate history
+        restored = json.loads(path.read_text())
+        self.assertEqual(restored["mcpServers"]["monitor"]["args"][0], f"{self.root}/plugins/monitor/bin/monitor.mjs")
+        self.assertEqual(restored["hooks"]["Stop"][0]["command"], f"node {self.root}/plugins/monitor/lib/policy.mjs")
+        self.assertEqual(restored["hooks"]["Stop"][1]["command"], f"node {self.root}/src/lib/policy.mjs")
+
     def test_missing_or_dangling_destinations_are_skipped(self):
         self.land_new_layout()
         (self.root / "src/py/peer_mailbox.py").unlink()

@@ -589,7 +589,7 @@ def _previous_herdr_view(
     coordinator = next((pane for pane in panes if pane["pane_id"] == coordinator_pane), None)
     if not coordinator:
         return None
-    cli = Path(__file__).resolve().parents[3] / "bin" / "ork.mjs"
+    cli = Path(__file__).resolve().parents[5] / "src" / "bin" / "ork.mjs"
     candidates = []
     for path in sorted(restoration.state_directory(base.parent, environment).glob("*.json")):
         record = restoration.load(path)
@@ -640,7 +640,7 @@ def _open_herdr_swarm_view_unlocked(
     import herdr_swarm_restore as restoration
 
     api = restoration.Herdr(herdr, environment)
-    cli = Path(__file__).resolve().parents[3] / "bin" / "ork.mjs"
+    cli = Path(__file__).resolve().parents[5] / "src" / "bin" / "ork.mjs"
     state = restoration.state_path(base.parent, room, environment)
     try:
         previous = None
@@ -794,7 +794,7 @@ def _ensure_bound_room(
     environment: dict[str, str],
     base: Path | None = None,
 ) -> tuple[str | None, str | None]:
-    cli = Path(__file__).resolve().parents[3] / "bin" / "ork.mjs"
+    cli = Path(__file__).resolve().parents[5] / "src" / "bin" / "ork.mjs"
     node = shutil.which("node") or "node"
     engine = {"gemini": "agy", "agy": "agy", "claude": "claude", "codex": "codex", "opencode": "opencode"}.get(
         harness or "", "codex"
@@ -1024,7 +1024,7 @@ def _toggle_herdr_swarm_view_unlocked(
             recorded_view_pane = owned["pane_id"] if owned else None
             if owned:
                 info = api.processes(owned["pane_id"])
-                cli = Path(__file__).resolve().parents[3] / "bin" / "ork.mjs"
+                cli = Path(__file__).resolve().parents[5] / "src" / "bin" / "ork.mjs"
                 if not restoration.view_process(info, cli, current_room) and not restoration.idle_shell(info):
                     return {
                         "status": "error",
@@ -1062,7 +1062,7 @@ def _toggle_herdr_swarm_view_unlocked(
     elif recorded_view_pane:
         try:
             api = restoration.Herdr(herdr, environment)
-            cli = Path(__file__).resolve().parents[3] / "bin" / "ork.mjs"
+            cli = Path(__file__).resolve().parents[5] / "src" / "bin" / "ork.mjs"
             if not restoration.view_process(api.processes(recorded_view_pane), cli, current_room):
                 recorded_view_pane = None
         except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired):
@@ -1221,7 +1221,7 @@ def toggle_swarm_view(
     if view_panes and action == "open":
         return {"status": "already_open", "room": current_room, "socket": resolved_socket}
 
-    cli = Path(__file__).resolve().parents[3] / "bin" / "ork.mjs"
+    cli = Path(__file__).resolve().parents[5] / "src" / "bin" / "ork.mjs"
     environment = dict(os.environ)
     environment.pop("TMUX", None)
     environment.pop("TMUX_PANE", None)
@@ -1765,7 +1765,7 @@ def main(arguments: list[str]) -> int:
     if room:
         subprocess.run([*base, "set-option", "-t", session, "@orkest_room", room], env=environment, check=True)
         if not herdr_active:
-            cli = Path(__file__).resolve().parents[3] / "bin" / "ork.mjs"
+            cli = Path(__file__).resolve().parents[5] / "src" / "bin" / "ork.mjs"
             split = subprocess.run(
                 [
                     *base,

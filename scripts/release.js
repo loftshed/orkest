@@ -296,7 +296,7 @@ export function writeRelease(plan, root = REPO_ROOT) {
     const pluginsRoot = path.join(root, "plugins");
     const plugins = fs.existsSync(pluginsRoot) ? fs.readdirSync(pluginsRoot) : [];
     for (const plugin of plugins) {
-      // monitor's runtime copy under ~/.local/share/monitor has no root package.json to read.
+      // The installed monitor copy writes its own package.json from the root version; this one is kept in step.
       const manifest = `plugins/${plugin}/package.json`;
       if (fs.existsSync(path.join(root, manifest))) {
         setJsonVersion(path.join(root, manifest), release.version);

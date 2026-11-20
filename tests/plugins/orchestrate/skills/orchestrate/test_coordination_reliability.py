@@ -20,7 +20,7 @@ from unittest import mock
 TESTS_DIR = Path(__file__).resolve().parent
 REPO = Path(__file__).resolve().parents[5]
 SCRIPTS = REPO / "plugins/orchestrate/skills/orchestrate/scripts"
-ROOMS_MJS = REPO / "plugins/orchestrate/lib/rooms.mjs"
+ROOMS_MJS = REPO / "src/lib/rooms.mjs"
 sys.path.insert(0, str(TESTS_DIR))
 sys.path.insert(0, str(SCRIPTS))
 import _ork_fast_test_helpers as fast  # noqa: E402

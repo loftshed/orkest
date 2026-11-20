@@ -8,14 +8,16 @@ import {
   readdirSync,
   readFileSync,
   readlinkSync,
+  renameSync,
   rmSync,
   symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { expect, it } from "vitest";
+import { expect, it, onTestFinished } from "vitest";
 
 const repo = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const installer = path.join(repo, "install.sh");
@@ -171,7 +173,7 @@ it("runs installers in order, passes options, and links ork", () =>
 
     const orkLink = path.join(home, ".local/bin/ork");
     expect(lstatSync(orkLink).isSymbolicLink()).toBe(true);
-    expect(readlinkSync(orkLink)).toBe(path.join(repo, "plugins/orchestrate/bin/ork.mjs"));
+    expect(readlinkSync(orkLink)).toBe(path.join(repo, "src/bin/ork.mjs"));
   }));
 
 it("keeps dry-run changes out of HOME and previews monitor and doctor steps", () =>
@@ -241,3 +243,158 @@ it("rejects trusting and untrusting Orkest commands together", () =>
     expect(result.stderr).toContain("choose one of --trust-orkest-commands");
     expect(logLines()).toEqual([]);
   }));
+
+// ── standalone Monitor runtime ─────────────────────────────────────────────
+
+const monitorInstaller = path.join(repo, "plugins/monitor/install.sh");
+
+/** A throwaway checkout with just what plugins/monitor/install.sh copies, and an empty HOME. */
+function monitorFixture({ version = "9.9.9", failing = false } = {}) {
+  const tempRoot = mkdtempSync(path.join(os.tmpdir(), "orkest-monitor-install-test-"));
+  onTestFinished(() => rmSync(tempRoot, { recursive: true, force: true }));
+  const checkout = path.join(tempRoot, "checkout");
+  const home = path.join(tempRoot, "home");
+  const files = {
+    "package.json": JSON.stringify({ name: "orkest", version }),
+    "plugins/monitor/config.example.json": "{}\n",
+    "plugins/monitor/skills/monitor/SKILL.md": "---\nname: monitor\n---\n",
+    "src/bin/monitor.mjs": failing
+      ? "process.exit(3);\n"
+      : 'import { VERSION } from "../lib/monitor/version.mjs";\nconsole.log(VERSION);\n',
+    "src/bin/observe.mjs": "// observer\n",
+    "src/bin/ork.mjs": "// not part of the standalone copy\n",
+    "src/lib/monitor/version.mjs":
+      'import { readFileSync } from "node:fs";\nexport const VERSION = JSON.parse(readFileSync(new URL("../../../package.json", import.meta.url), "utf8")).version;\n',
+    "src/lib/chief.mjs": "// not part of the standalone copy\n",
+  };
+  for (const [relative, contents] of Object.entries(files)) {
+    mkdirSync(path.dirname(path.join(checkout, relative)), { recursive: true });
+    writeFileSync(path.join(checkout, relative), contents, "utf8");
+  }
+  mkdirSync(home, { recursive: true });
+  const script = path.join(checkout, "plugins/monitor/install.sh");
+  writeExecutable(script, readFileSync(monitorInstaller, "utf8"));
+  const run = (...args) =>
+    spawnSync("sh", [script, "--no-app", ...args], {
+      env: { ...process.env, HOME: home, MONITOR_CONFIG: path.join(home, "monitor-config.json") },
+      encoding: "utf8",
+    });
+  const runtime = path.join(home, ".local/share/monitor");
+  const launcher = path.join(home, ".local/bin/monitor");
+  const launch = (...args) =>
+    spawnSync(launcher, args, { env: { PATH: process.env.PATH, HOME: home }, encoding: "utf8" });
+  return { tempRoot, checkout, home, run, runtime, launcher, launch };
+}
+
+it("installs a standalone Monitor that runs with the checkout out of the way", () => {
+  const fixture = monitorFixture();
+  const installed = fixture.run();
+  expect(installed.status, installed.stderr).toBe(0);
+  const binaries = readdirSync(path.join(fixture.runtime, "src/bin"));
+  expect(binaries.toSorted((a, b) => a.localeCompare(b))).toEqual(["monitor.mjs", "observe.mjs"]);
+  expect(existsSync(path.join(fixture.runtime, "src/lib/monitor/version.mjs"))).toBe(true);
+  expect(existsSync(path.join(fixture.runtime, "src/lib/chief.mjs"))).toBe(false);
+  const manifest = JSON.parse(readFileSync(path.join(fixture.runtime, "package.json"), "utf8"));
+  expect(manifest).toMatchObject({
+    name: "monitor",
+    version: "9.9.9",
+  });
+  expect(readlinkSync(path.join(fixture.home, ".agents/skills/monitor"))).toBe(
+    path.join(fixture.runtime, "skills/monitor"),
+  );
+
+  const away = `${fixture.checkout}.away`;
+  renameSync(fixture.checkout, away);
+  const ran = fixture.launch("--version");
+  renameSync(away, fixture.checkout);
+  expect(ran.status, ran.stderr).toBe(0);
+  expect(ran.stdout.trim()).toBe("9.9.9");
+});
+
+it("upgrades an old Monitor copy, keeping custom files and the previous copy, and is repeatable", () => {
+  const fixture = monitorFixture();
+  const old = fixture.runtime;
+  mkdirSync(path.join(old, "bin"), { recursive: true });
+  mkdirSync(path.join(old, "lib"), { recursive: true });
+  mkdirSync(path.join(old, "src/bin"), { recursive: true });
+  writeFileSync(path.join(old, "bin/monitor.mjs"), "// old\n");
+  writeFileSync(path.join(old, "lib/old.mjs"), "// old\n");
+  writeFileSync(path.join(old, "package.json"), '{"version":"0.0.1"}\n');
+  writeFileSync(path.join(old, "notes.txt"), "mine\n");
+  writeFileSync(path.join(old, "src/bin/custom.mjs"), "// mine\n");
+
+  const first = fixture.run();
+  expect(first.status, first.stderr).toBe(0);
+  expect(readFileSync(path.join(old, "notes.txt"), "utf8")).toBe("mine\n");
+  expect(readFileSync(path.join(old, "src/bin/custom.mjs"), "utf8")).toBe("// mine\n");
+  expect(readFileSync(path.join(old, "bin/monitor.mjs"), "utf8")).toBe("// old\n");
+  expect(fixture.launch("--version").stdout.trim()).toBe("9.9.9");
+  const backups = path.join(fixture.home, ".local/share/monitor-backups");
+  const [previous] = readdirSync(backups);
+  expect(readFileSync(path.join(backups, previous, "package.json"), "utf8")).toBe(
+    '{"version":"0.0.1"}\n',
+  );
+
+  const second = fixture.run();
+  expect(second.status, second.stderr).toBe(0);
+  expect(second.stdout).toContain("runtime unchanged");
+  expect(readdirSync(backups)).toEqual([previous]);
+});
+
+it("leaves the installed Monitor runnable when the new copy fails its check", () => {
+  const fixture = monitorFixture();
+  expect(fixture.run().status).toBe(0);
+  const before = readFileSync(fixture.launcher, "utf8");
+  writeFileSync(
+    path.join(fixture.checkout, "package.json"),
+    '{"name":"orkest","version":"9.9.10"}',
+  );
+  writeFileSync(path.join(fixture.checkout, "src/bin/monitor.mjs"), "process.exit(3);\n");
+
+  const failed = fixture.run();
+  expect(failed.status).toBe(1);
+  expect(failed.stderr).toContain("existing runtime was left in place");
+  expect(readFileSync(fixture.launcher, "utf8")).toBe(before);
+  expect(fixture.launch("--version").stdout.trim()).toBe("9.9.9");
+  const backups = readdirSync(path.join(fixture.home, ".local/share/monitor-backups"));
+  expect(backups.some((name) => name.startsWith("failed-"))).toBe(true);
+});
+
+it("keeps links the user made and never writes through them", () => {
+  const fixture = monitorFixture();
+  const own = path.join(fixture.home, "my-skill");
+  mkdirSync(own, { recursive: true });
+  mkdirSync(path.join(fixture.home, ".claude/skills"), { recursive: true });
+  symlinkSync(own, path.join(fixture.home, ".claude/skills/monitor"));
+  mkdirSync(path.join(fixture.home, ".codex/skills"), { recursive: true });
+  symlinkSync("/nowhere/skills/monitor", path.join(fixture.home, ".codex/skills/monitor"));
+  const historical = path.join(fixture.home, ".agents/skills");
+  mkdirSync(historical, { recursive: true });
+  symlinkSync("/old/checkout/plugins/monitor/skills/monitor", path.join(historical, "monitor"));
+
+  const installed = fixture.run();
+  expect(installed.status, installed.stderr).toBe(0);
+  expect(readlinkSync(path.join(fixture.home, ".claude/skills/monitor"))).toBe(own);
+  expect(readlinkSync(path.join(fixture.home, ".codex/skills/monitor"))).toBe(
+    "/nowhere/skills/monitor",
+  );
+  expect(readlinkSync(path.join(historical, "monitor"))).toBe(
+    path.join(fixture.runtime, "skills/monitor"),
+  );
+
+  const target = path.join(fixture.home, "elsewhere");
+  mkdirSync(target);
+  rmSync(path.join(fixture.runtime, "src/lib"), { recursive: true });
+  // Neither the user's own link nor one that points where our installer once did is written through.
+  symlinkSync(target, path.join(fixture.runtime, "src/lib"));
+  const blocked = fixture.run();
+  expect(blocked.status).toBe(1);
+  expect(readdirSync(target)).toEqual([]);
+
+  const skill = path.join(fixture.runtime, "skills/monitor");
+  const skillBefore = readdirSync(skill);
+  unlinkSync(path.join(fixture.runtime, "src/lib"));
+  symlinkSync(skill, path.join(fixture.runtime, "src/lib"));
+  expect(fixture.run().status).toBe(1);
+  expect(readdirSync(skill)).toEqual(skillBefore);
+});

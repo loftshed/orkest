@@ -4,8 +4,8 @@ name: Terminal visuals
 on:
   pull_request:
     paths:
+      - "src/lib/**"
       - "plugins/orchestrate/**"
-      - "plugins/monitor/lib/**"
       - "scripts/test-tui-visual.js"
       - "scripts/lib/tui-visual.js"
       - "tests/scripts/tui-visual-test.js"

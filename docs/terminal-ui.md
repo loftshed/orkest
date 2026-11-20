@@ -1,15 +1,15 @@
 # Terminal UI Design System
 
-Orkest's terminal UI (`ork horde` / `ork swarm` and statuslines) is built on four focused modules in [`plugins/orchestrate/lib/`](../plugins/orchestrate/lib/):
+Orkest's terminal UI (`ork horde` / `ork swarm` and statuslines) is built on four focused modules in [`src/lib/`](../src/lib/):
 
-| Module                                                                | Responsibility                                                                                                                                                     |
-| --------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| [`tui-theme.mjs`](../plugins/orchestrate/lib/tui-theme.mjs)           | Semantic ANSI SGR token dictionary (`DEFAULT_THEME`) and per-view override validation (`resolveTheme`).                                                            |
-| [`tui-box.mjs`](../plugins/orchestrate/lib/tui-box.mjs)               | Control-character sanitization (`plain`), grapheme display width (`cellWidth`, `displayWidth`), width-safe ANSI fitting (`fitStyled`, `wrapText`), and box frames. |
-| [`tui-components.mjs`](../plugins/orchestrate/lib/tui-components.mjs) | Reusable primitives: `sectionHeading`, `disclosure`, `actionBar`, `statusRow`, `treeCard`, `shimmerText`, and `providerMark`.                                      |
-| [`tui-markdown.mjs`](../plugins/orchestrate/lib/tui-markdown.mjs)     | Theme-aware, width-safe Markdown (`renderMarkdown`), structured activity banners, and coalesced room log lines (`renderLogLine`).                                  |
-| [`member-state.mjs`](../plugins/orchestrate/lib/member-state.mjs)     | Shared display-state derivation and outcome vocabulary for projection, view and notifications.                                                                     |
-| [`horde-view.mjs`](../plugins/orchestrate/lib/horde-view.mjs)         | Stateful layout, keyboard/mouse hit targets, disclosure state, and inline preview/overlay containers for the Swarm pane.                                           |
+| Module                                                | Responsibility                                                                                                                                                     |
+| ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| [`tui-theme.mjs`](../src/lib/tui-theme.mjs)           | Semantic ANSI SGR token dictionary (`DEFAULT_THEME`) and per-view override validation (`resolveTheme`).                                                            |
+| [`tui-box.mjs`](../src/lib/tui-box.mjs)               | Control-character sanitization (`plain`), grapheme display width (`cellWidth`, `displayWidth`), width-safe ANSI fitting (`fitStyled`, `wrapText`), and box frames. |
+| [`tui-components.mjs`](../src/lib/tui-components.mjs) | Reusable primitives: `sectionHeading`, `disclosure`, `actionBar`, `statusRow`, `treeCard`, `shimmerText`, and `providerMark`.                                      |
+| [`tui-markdown.mjs`](../src/lib/tui-markdown.mjs)     | Theme-aware, width-safe Markdown (`renderMarkdown`), structured activity banners, and coalesced room log lines (`renderLogLine`).                                  |
+| [`member-state.mjs`](../src/lib/member-state.mjs)     | Shared display-state derivation and outcome vocabulary for projection, view and notifications.                                                                     |
+| [`horde-view.mjs`](../src/lib/horde-view.mjs)         | Stateful layout, keyboard/mouse hit targets, disclosure state, and inline preview/overlay containers for the Swarm pane.                                           |
 
 ---
 
@@ -42,7 +42,7 @@ new HordeView(room, {
 
 ## 2. Glyph Tiers (`ORK_GLYPHS`)
 
-Every component accepts `tier` (`"nerd"`, `"unicode"`, or `"ascii"`), resolved by `glyphTier()` in [`tui-box.mjs`](../plugins/orchestrate/lib/tui-box.mjs):
+Every component accepts `tier` (`"nerd"`, `"unicode"`, or `"ascii"`), resolved by `glyphTier()` in [`tui-box.mjs`](../src/lib/tui-box.mjs):
 
 | Element              | `nerd` (`ORK_GLYPHS=nerd`)              | `unicode` (UTF-8 default) | `ascii` (`TERM=dumb` / non-UTF-8) |
 | -------------------- | --------------------------------------- | ------------------------- | --------------------------------- |
@@ -84,7 +84,7 @@ Every component accepts `tier` (`"nerd"`, `"unicode"`, or `"ascii"`), resolved b
    - Dismissal uses a single primary **`Back`** (`Esc`) button in the footer toolbar (plus clicking the focused agent card or pressing `?`/`g` again to toggle), never both `Back` and `Return to chat` at once.
 6. **Cross-Command Framing & Palette Parity:**
    - Every tabular or report CLI subcommand (`ork routes`, `ork telemetry`, `ork foundry status`, `ork smelter status`, `ork radar status|diff|priors`) renders through `renderPanel` and `renderTable` with `glyphTier()` so all Orkest terminal output shares the same rounded/square box borders and semantic tokens.
-   - `agent_statusline.py`, `monitor/lib/render.mjs`, and `tui-theme.mjs` share identical 256-color codes for identity (`203`, `114`, `221`, `111`, `176`, `80`), model/effort/separators (`117`, `180`, `245`), and quota health (`71`, `179`, `208`, `240`), verified by unit tests.
+   - `agent_statusline.py`, `src/lib/monitor/render.mjs`, and `tui-theme.mjs` share identical 256-color codes for identity (`203`, `114`, `221`, `111`, `176`, `80`), model/effort/separators (`117`, `180`, `245`), and quota health (`71`, `179`, `208`, `240`), verified by unit tests.
 7. **Internal Pane IDs Stay Hidden:**
    - Raw Herdr or tmux pane identifiers (`wQ:p1`, `%12`) belong on click/focus targets (`herdrPaneId`, `paneId`), never in visible header titles or card labels.
    - Focusing a Herdr pane by ID uses `herdr agent focus <herdrPaneId>` (not `herdr pane focus`, which is directional).
