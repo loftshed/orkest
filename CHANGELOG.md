@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.98.1
+
+- refactor: finish harness adapters and retire transitional Python paths (#254)
+
 ## 0.98.0
 
 - feat: coordinate local state, recovery and scoped peer replication (#253)
