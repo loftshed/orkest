@@ -30,6 +30,13 @@ test("uses bounded successful nearest-rank samples, with cold-start, floor and a
   }
   expect(state.samplesMs).toHaveLength(128);
   expect(state.samplesMs[0]).toBe(1300);
+  expect(state.history).toHaveLength(128);
+  expect(state.history[0]).toEqual({
+    at: 13,
+    outcome: "success",
+    elapsedMs: 1300,
+    deadlineMs: 30_000,
+  });
   expect(state).toMatchObject({ p95Ms: 13_400, p99Ms: 13_900 });
   expect(probeDeadline(account, state)).toBe(26_800);
   expect(probeDeadline({ ...account, timeoutMs: 900 }, state)).toBe(900);
@@ -120,10 +127,12 @@ else setTimeout(()=>process.stdout.write(fs.readFileSync(USAGE)), mode==='slow-s
     windows: good.windows,
     probeHealth: { lastOutcome: "timeout", consecutiveTimeouts: 2, samplesMs: [] },
   });
+  expect(failed.probeHealth.history.map((entry) => entry.outcome)).toEqual(["timeout", "timeout"]);
   expect(failed.probeHealth.retryAt).toBeGreaterThan(Date.now());
   await refresh("--refresh");
   expect(await count("a")).toBe(3);
   expect(await count("b")).toBe(4);
+  expect((await read()).accounts.a.probeHealth.history).toEqual(failed.probeHealth.history);
   const due = await read();
   due.accounts.a.probeHealth.retryAt = Date.now() - 1;
   await writeFile(snapshot, JSON.stringify(due));
@@ -141,7 +150,12 @@ else setTimeout(()=>process.stdout.write(fs.readFileSync(USAGE)), mode==='slow-s
   });
   await writeFile(mode, "auth");
   await refresh("--refresh");
-  expect((await read()).accounts.a.probeHealth.lastOutcome).toBe("error");
+  expect((await read()).accounts.a.probeHealth.history.map((entry) => entry.outcome)).toEqual([
+    "timeout",
+    "timeout",
+    "success",
+    "error",
+  ]);
   // A different profile must not inherit an open breaker or quota windows.
   await mkdir(path.join(dir, "replacement"));
   accounts[0].env.GEMINI_CLI_HOME = path.join(dir, "replacement");

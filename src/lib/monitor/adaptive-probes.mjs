@@ -40,6 +40,8 @@ function timeoutCount(state) {
 }
 
 export function recordProbe(state, { outcome, elapsedMs, deadlineMs, now }) {
+  const history = Array.isArray(state?.history) ? state.history.slice(1 - WINDOW) : [];
+  history.push({ at: now, outcome, elapsedMs, deadlineMs });
   const values = samples(state);
   if (outcome === "success") {
     values.push(elapsedMs);
@@ -49,6 +51,7 @@ export function recordProbe(state, { outcome, elapsedMs, deadlineMs, now }) {
   const backoff = Math.min(MAX_BACKOFF_MS, 15_000 * 2 ** (consecutiveTimeouts - 2));
   return {
     samplesMs: values,
+    history,
     ...quantiles(values),
     lastDurationMs: elapsedMs,
     lastDeadlineMs: deadlineMs,
