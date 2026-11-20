@@ -797,7 +797,11 @@ class InstallMailboxTests(unittest.TestCase):
         for foreign in (False, True):
             with self.subTest(foreign=foreign):
                 home = self.base / ("foreign-home" if foreign else "owned-home")
-                target = self.base / "other-checkout/skills/orchestrate" if foreign else plugin / "skills/orchestrate"
+                target = (
+                    self.base / "other-checkout/skills/orchestrate"
+                    if foreign
+                    else self.base / "checkout/adapters/skills/orchestrate"
+                )
                 target.mkdir(parents=True, exist_ok=True)
                 hub = home / ".agents/skills/orchestrate"
                 hub.parent.mkdir(parents=True)

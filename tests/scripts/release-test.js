@@ -250,10 +250,10 @@ describe("releases in a repository", () => {
     );
     const files = writeRelease(planRelease({ root }), root);
     expect(files).toEqual([
+      "adapters/skills/two/SKILL.md",
       "CHANGELOG.md",
       "package.json",
       "plugins/two/package.json",
-      "adapters/skills/two/SKILL.md",
     ]);
     expect(json("package.json").version).toBe("0.3.1");
     expect(json("plugins/two/package.json").version).toBe("0.3.1");

@@ -95,7 +95,9 @@ class PathMigrationTests(Fixture):
         self.assertTrue((skill / "SKILL.md").is_file())
         self.assertFalse((skill / "scripts/run_agent.py").exists())
         self.assertFalse((root / "plugins/orchestrate/skills/orchestrate/scripts/run_agent.py").exists())
-        result = subprocess.run([sys.executable, "-I", str(SCRIPTS / "run_agent.py"), "--help"], check=True, capture_output=True)
+        result = subprocess.run(
+            [sys.executable, "-I", str(SCRIPTS / "run_agent.py"), "--help"], check=True, capture_output=True
+        )
         self.assertIn(b"usage:", result.stdout)
         self.assertNotIn(b"moved to", result.stderr)
 

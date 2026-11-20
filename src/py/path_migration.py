@@ -204,7 +204,12 @@ def link_dirs(home: Path) -> list[Path]:
     codex = _env_dir("CODEX_HOME", home / ".codex", home)
     xdg = _env_dir("XDG_CONFIG_HOME", home / ".config", home)
     dirs = [home / ".local/bin", home / ".agents/skills", codex / "skills", home / ".codex/skills"]
-    dirs += [home / ".gemini/config/skills", home / ".gemini/antigravity/skills", xdg / "opencode/skills", xdg / "opencode/plugins"]
+    dirs += [
+        home / ".gemini/config/skills",
+        home / ".gemini/antigravity/skills",
+        xdg / "opencode/skills",
+        xdg / "opencode/plugins",
+    ]
     dirs += [profile / "skills" for profile in claude_profiles(home)]
     unique: list[Path] = []
     for directory in dirs:
@@ -227,7 +232,7 @@ def build_rules(home: Path, roots: list[Path]) -> list[Rule]:
         # Every skill link (hub, each harness) that really leads into this checkout is an alias of its scripts.
         for directory in link_dirs(home):
             alias = directory / "orchestrate"
-            if alias.is_symlink() and alias.resolve() in (skill, root / "adapters/skills/orchestrate"):
+            if alias.is_symlink() and _links_to_skill(alias, skill, root / "adapters/skills/orchestrate"):
                 for variant in _variants(alias / "scripts"):
                     rules.setdefault(variant, str(root / SCRIPTS_NEW))
                 for old, new in MOVES:
@@ -237,10 +242,10 @@ def build_rules(home: Path, roots: list[Path]) -> list[Rule]:
     return [Rule(old, rules[old]) for old in sorted(rules, key=lambda value: (-len(value), value))]
 
 
-def _inside_root(link: Path, root: Path) -> bool:
+def _links_to_skill(link: Path, *owned: Path) -> bool:
     try:
-        return link.resolve().is_relative_to(root.resolve())
-    except OSError:
+        return link.resolve() in owned
+    except (OSError, RuntimeError):
         return False
 
 

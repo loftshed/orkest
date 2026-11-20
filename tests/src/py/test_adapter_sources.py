@@ -52,7 +52,10 @@ class AdapterSourceTests(unittest.TestCase):
             sources = [p for p in tracked if p.endswith(f"/skills/{name}/SKILL.md")]
             self.assertEqual([f"adapters/skills/{name}/SKILL.md"], sources)
         self.assertEqual(sorted(installer.ADAPTER_COMMANDS), sorted(p.stem for p in COMMANDS.glob("*.md")))
-        self.assertEqual(sorted((*installer.ADAPTER_SKILLS, "orchestrate", "monitor")), sorted(p.parent.name for p in SKILLS.glob("*/SKILL.md")))
+        self.assertEqual(
+            sorted((*installer.ADAPTER_SKILLS, "orchestrate", "monitor")),
+            sorted(p.parent.name for p in SKILLS.glob("*/SKILL.md")),
+        )
 
     def test_installer_embeds_no_command_or_skill_body(self):
         text = (REPO_ROOT / "src/py/install_mailbox.py").read_text()
