@@ -1042,7 +1042,7 @@ class ReportingAndArtifactTests(unittest.TestCase):
             self.assertEqual(delivery, {"kind": "desktop", "status": "sent", "provider": "macos-hud"})
             self.assertEqual(run.call_count, 2)
             self.assertEqual(run.call_args_list[0].args[0][0], "/bin/sh")
-            self.assertTrue(run.call_args_list[0].args[0][1].endswith("macos/build.sh"))
+            self.assertTrue(run.call_args_list[0].args[0][1].endswith("adapters/macos/hud/build.sh"))
             self.assertEqual(run.call_args_list[1].args[0][0], str(hud_bin))
 
     def test_safety_violations_override_a_successful_executor_exit(self) -> None:

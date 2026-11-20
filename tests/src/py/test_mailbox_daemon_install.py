@@ -220,7 +220,7 @@ class TestMailboxDaemonInstall(unittest.TestCase):
         profile.mkdir()
         (profile / "settings.json").write_text('{"custom":"keep"}')
         self.install()
-        self.assertEqual(hub.resolve(), SCRIPTS.parents[1] / "plugins/orchestrate/skills/orchestrate")
+        self.assertEqual(hub.resolve(), SCRIPTS.parents[1] / "adapters/skills/orchestrate")
         self.assertEqual(next(hub.parent.glob("orchestrate.mailbox-bak.*/notes.txt")).read_text(), "keep old content")
         self.assertEqual(json.loads((profile / "settings.json").read_text())["custom"], "keep")
         self.assertEqual(
