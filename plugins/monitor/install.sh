@@ -125,7 +125,7 @@ const manifest = {
 require("fs").writeFileSync(file, JSON.stringify(manifest, null, 2) + "\n");
 ' "$version" "$stage/package.json" ;;
     config.example.json) cp "$repo/config.example.json" "$stage/$item" ;;
-    skills/monitor/*) cp -p "$repo/skills/monitor" "$stage/$item" ;;
+    skills/monitor/*) cp -p "$repo/$item" "$stage/$item" ;;
     *) cp -p "$root/$item" "$stage/$item" ;;
   esac
 done <<EOF
