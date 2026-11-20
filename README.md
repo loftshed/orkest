@@ -194,6 +194,7 @@ ork radar [status|diff|priors|ack] [--refresh] [--ack] [--line|--json]
 ork gate [--heavy] [--label <text>] -- <command>   (also: ork gate status|install|uninstall)
 ork swarm [toggle|open|close] [--chief]   (alias for ork horde toggle|open|close)
 ork factory [status|run|groom] [--dry-run] [--json]   (alias for ork foundry)
+ork sync identity|pair|pull|view|serve --help   (replicate scoped project streams between paired hosts)
 ork rooms --help                (alias for ork hall)
 ork herdr-status                     (focused Herdr pane agent, plain text)
 ork setup [--dry-run] [--trust-codex-hooks] [--trust-orkest-commands|--untrust-orkest-commands]   (install mailbox, hooks and shell wrapper shortcuts)

@@ -12,6 +12,7 @@ import {
   deleteRoom,
   listRawRooms,
   listRawRoomsCached,
+  openRooms,
   parseTeam,
   readRawRoom,
   readRoom,
@@ -2590,7 +2591,9 @@ describe("SQLite room persistence", () => {
       execute(process.execPath, ["--input-type=module", "-e", child, root]),
     ).rejects.toMatchObject({ code: 73 });
     {
+      // Inject an already committed current-generation row without running the importer's archive step.
       using db = openOrkestSqlite(roomsDbPath(root));
+      db.function("orkest_outbox_writer", () => 1);
       db.tagStore
         .run`UPDATE rooms SET data = '{"id":"recovery","counter":1}', revision = revision + 1 WHERE id = 'recovery'`;
     }
@@ -2666,7 +2669,7 @@ describe("SQLite room persistence", () => {
       { root, create: true },
     );
 
-    using writer = openOrkestSqlite(roomsDbPath(root), { timeout: 50 });
+    using writer = openRooms(root);
     writer.exec(
       "BEGIN IMMEDIATE; UPDATE rooms SET data = json_set(data, '$.title', 'In-flight') WHERE id = 'active-room';",
     );
@@ -2681,7 +2684,7 @@ describe("SQLite room persistence", () => {
       updateRoom(
         "active-room",
         async (room) => {
-          using contender = openOrkestSqlite(roomsDbPath(root));
+          using contender = openRooms(root);
           contender.exec("UPDATE rooms SET revision = revision + 1 WHERE id = 'active-room'");
           room.count++;
           return room;

@@ -78,10 +78,8 @@ def aggregate_children(base: Path, parent_peer: dict[str, Any]) -> dict[str, Any
 
     active_children: list[dict[str, str]] = []
     moment = mailbox.now()
-    peers_dir = base / "peers"
-    if peers_dir.is_dir():
-        for path in sorted(peers_dir.glob("*.json")):
-            peer = mailbox.load(path)
+    if mailbox.peers_present(base):
+        for _, peer in mailbox.peer_entries(base):
             if not isinstance(peer, dict) or peer.get("schema") != mailbox.PEER_SCHEMA:
                 continue
             if not peer.get("isSubagent"):
@@ -279,8 +277,7 @@ def discovery_available() -> bool:
 def _codex_title_pane(base: Path, session: str, binary: str, env: dict[str, str]) -> dict | None:
     identities = mailbox.native_session_ids(mailbox.session_peer(base, session, harness="codex"), base)
     sessions = set(identities)
-    for path in (base / "peers").glob("*.json"):
-        peer = mailbox.load(path)
+    for _, peer in mailbox.peer_entries(base):
         if isinstance(peer, dict) and peer.get("harness") == "codex" and isinstance(peer.get("session"), str):
             sessions.update(mailbox.native_session_ids(peer, base))
     try:

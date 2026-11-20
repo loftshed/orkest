@@ -505,7 +505,8 @@ describe("adopting the running conversation", () => {
     const { cwd, root, options, peer } = await fixture();
     const first = await promoteSession({ session: peer.session, cwd }, options);
     using writer = openOrkestSqlite(path.join(root, "rooms.db"));
-    writer.exec("UPDATE rooms SET data = json_set(data, '$.title', 'Committed WAL')");
+    writer.exec("PRAGMA wal_autocheckpoint=0");
+    await updateRoom(first.room.id, (room) => ({ ...room, title: "Committed WAL" }), { root });
     const files = ["rooms.db", "rooms.db-wal", "rooms.db-shm"];
     const before = await Promise.all(files.map((file) => readFile(path.join(root, file))));
     const report = await resumeRoomStatus({ root, cwd });

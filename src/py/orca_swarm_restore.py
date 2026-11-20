@@ -62,12 +62,10 @@ def _peer_stamp(peer: Mapping[str, Any]) -> str:
 
 def _peer_for_terminal(base: Path, terminal: str, environment: str | None = None) -> dict[str, Any] | None:
     env_name = os.environ.get("ORCA_ENVIRONMENT", "").strip() if environment is None else environment.strip()
-    peers_dir = base / "peers"
-    if not peers_dir.is_dir():
+    if not mailbox.peers_present(base):
         return None
     matches = []
-    for path in sorted(peers_dir.glob("*.json")):
-        peer = mailbox.load(path)
+    for _, peer in mailbox.peer_entries(base):
         if (
             not isinstance(peer, dict)
             or not mailbox.valid_peer(peer)

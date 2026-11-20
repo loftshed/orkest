@@ -1,18 +1,21 @@
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
-  chmodSync,
+  closeSync,
   copyFileSync,
   existsSync,
+  fchmodSync,
+  constants as fsConstants,
+  fstatSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readdirSync,
   readFileSync,
   realpathSync,
   renameSync,
   rmSync,
-  statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -39,6 +42,18 @@ import {
   supportedEfforts,
 } from "./families-schema.mjs";
 import { migrateSchema, openOrkestSqlite, withImmediateTransaction } from "./orkest-sqlite.mjs";
+import { createCheckpointTables, sweepExpiredStaging } from "./outbox-checkpoint.mjs";
+import { backupLegacyRooms } from "./outbox-migration.mjs";
+import {
+  appendInTransaction,
+  assertOwner,
+  createOutbox,
+  installEventProjection,
+  localStream,
+} from "./outbox.mjs";
+import { installNotificationHistory, installProjectionHistory } from "./projection-history.mjs";
+import { completeRoomCommand, createRoomCommands, previousRoomCommand } from "./room-commands.mjs";
+import { roomProject } from "./room-project.mjs";
 import { cacheHome, runtimeReference } from "./runtime-paths.mjs";
 
 export const ROOM_SCHEMA = "agent-executor.room.v1";
@@ -613,7 +628,10 @@ function missingRoom(id) {
 
 function legacyFiles(root) {
   try {
-    return readdirSync(path.join(root, "rooms"))
+    const directory = path.join(root, "rooms");
+    if (!lstatSync(directory).isDirectory())
+      throw new Error("Legacy room directory must be a real directory");
+    return readdirSync(directory)
       .filter((file) => file.endsWith(".json"))
       .sort((a, b) => a.localeCompare(b));
   } catch (error) {
@@ -625,8 +643,18 @@ function legacyFiles(root) {
 function legacyRecord(root, file) {
   const id = file.slice(0, -5);
   const source = roomPath(id, root);
-  const raw = readFileSync(source, "utf8");
-  const info = statSync(source, { bigint: true });
+  const fd = openSync(
+    source,
+    fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
+  );
+  let raw, info;
+  try {
+    info = fstatSync(fd, { bigint: true });
+    if (!info.isFile()) throw new Error("Legacy room must be a regular file");
+    raw = readFileSync(fd, "utf8");
+  } finally {
+    closeSync(fd);
+  }
   const room = JSON.parse(raw);
   if (!room || typeof room !== "object" || Array.isArray(room))
     throw new Error("Invalid room: expected a plain object");
@@ -641,12 +669,50 @@ function legacyRecord(root, file) {
   return {
     room,
     source,
+    info,
     digest,
     updatedAt: Number.isFinite(timestamp) ? Math.trunc(timestamp) : Number(info.mtimeMs),
   };
 }
 
-const ROOMS_APPLICATION_ID = 1_330_793_298;
+function assertRoomOwner(db, id, expectedRevision) {
+  assertOwner(db, {
+    ...localStream(db, `room:${id}`),
+    kind: "room.summary",
+    entity: id,
+    expectedRevision,
+  });
+}
+
+function projectRoomHint(db, room, isRemoved) {
+  db.tagStore.run`DELETE FROM outbox_room_hints WHERE room=${room.id}`;
+  if (isRemoved || isClosedRoom(room)) return;
+  for (const session of roomIndexSessions(room)) {
+    db.tagStore.run`INSERT INTO outbox_room_hints VALUES(${room.id},${session})`;
+  }
+}
+
+function recordRoomState(db, room, isRemoved = false) {
+  const project = roomProject(db, room, isRemoved);
+  appendInTransaction(db, {
+    scope: "rooms-local",
+    entity: room.id,
+    kind: "room.record",
+    body: { removed: isRemoved, room: isRemoved ? null : room, project },
+  });
+  appendInTransaction(db, {
+    scope: `room:${room.id}`,
+    entity: room.id,
+    kind: "room.summary",
+    body: {
+      removed: isRemoved,
+      lifecycle: ["archived", "cancelled"].includes(room.lifecycle) ? room.lifecycle : "active",
+      members: Array.isArray(room.agents) ? room.agents.length : 0,
+    },
+  });
+}
+
+export const ROOMS_APPLICATION_ID = 1_330_793_298;
 const MAX_ROOM_CAS_ATTEMPTS = 32;
 const ROOMS_MIGRATIONS = [
   (connection) =>
@@ -666,7 +732,64 @@ const ROOMS_MIGRATIONS = [
       GENERATED ALWAYS AS (coalesce(json_extract(data, '$.lifecycle'), 'active')) VIRTUAL;
     CREATE INDEX rooms_lifecycle ON rooms (lifecycle, updated_at DESC);
   `),
+  (db) => {
+    backupLegacyRooms(db);
+    createOutbox(db);
+    const rows = db.tagStore.iterate`SELECT data FROM rooms ORDER BY id`;
+    for (const row of rows) {
+      recordRoomState(db, JSON.parse(row.data));
+    }
+  },
+  createCheckpointTables,
+  (db) => {
+    db.exec(
+      "CREATE TABLE outbox_room_hints(room TEXT NOT NULL,session TEXT NOT NULL,PRIMARY KEY(room,session)) STRICT; CREATE INDEX outbox_hint_sessions ON outbox_room_hints(session)",
+    );
+    const rows = db.tagStore.iterate`SELECT data FROM rooms`;
+    for (const row of rows) projectRoomHint(db, JSON.parse(row.data), false);
+  },
+  (db) =>
+    db.exec(
+      "ALTER TABLE outbox_staging ADD COLUMN touched_ms INTEGER NOT NULL DEFAULT 0; CREATE INDEX outbox_staging_age ON outbox_staging(touched_ms)",
+    ),
+  (db) => {
+    // Old handles may already have checked user_version before the cutover acquired its lock.
+    db.exec(`
+      CREATE TRIGGER outbox_guard_insert BEFORE INSERT ON rooms WHEN orkest_outbox_writer() <> 1 BEGIN SELECT RAISE(ABORT,'outbox_writer_required'); END;
+      CREATE TRIGGER outbox_guard_update BEFORE UPDATE ON rooms WHEN orkest_outbox_writer() <> 1 BEGIN SELECT RAISE(ABORT,'outbox_writer_required'); END;
+      CREATE TRIGGER outbox_guard_delete BEFORE DELETE ON rooms WHEN orkest_outbox_writer() <> 1 BEGIN SELECT RAISE(ABORT,'outbox_writer_required'); END;
+    `);
+  },
+  (db) =>
+    db.exec(`
+    CREATE TABLE outbox_receipts (origin TEXT NOT NULL,epoch TEXT NOT NULL,scope TEXT NOT NULL,kind TEXT NOT NULL,entity TEXT NOT NULL,received_ms INTEGER NOT NULL,
+      PRIMARY KEY(origin,epoch,scope,kind,entity)) STRICT;
+    CREATE TRIGGER outbox_record_receipt AFTER INSERT ON outbox_views WHEN NEW.kind IN ('peer.presence','monitor.quota') BEGIN
+      INSERT INTO outbox_receipts VALUES(NEW.origin,NEW.epoch,NEW.scope,NEW.kind,NEW.entity,CAST(unixepoch('subsec')*1000 AS INTEGER));
+    END;
+    CREATE TRIGGER outbox_refresh_receipt AFTER UPDATE ON outbox_views WHEN NEW.kind IN ('peer.presence','monitor.quota') BEGIN
+      INSERT INTO outbox_receipts VALUES(NEW.origin,NEW.epoch,NEW.scope,NEW.kind,NEW.entity,CAST(unixepoch('subsec')*1000 AS INTEGER))
+      ON CONFLICT(origin,epoch,scope,kind,entity) DO UPDATE SET received_ms=excluded.received_ms;
+    END;
+  `),
+  createRoomCommands,
+  installEventProjection,
+  installProjectionHistory,
+  installNotificationHistory,
 ];
+
+export const ROOMS_SCHEMA_VERSION = ROOMS_MIGRATIONS.length;
+
+export function auditLegacyRooms(root) {
+  const files = legacyFiles(root);
+  const valid = validLegacyRecords(root);
+  return {
+    candidates: files.length,
+    readable: valid.length,
+    unsupported: files.length - valid.length,
+    sharedFiles: valid.filter((row) => row.info.nlink > 1n).length,
+  };
+}
 
 function validLegacyRecords(root) {
   const records = [];
@@ -688,45 +811,68 @@ function syncLegacyRoomFiles(db, root) {
     return;
   }
   withImmediateTransaction(db, () => {
-    for (const { file, room, digest, updatedAt } of validLegacyRecords(root)) {
-      if (
-        db.tagStore.get`SELECT digest FROM legacy_room_imports WHERE file = ${file}`?.digest ===
-        digest
-      )
-        continue;
+    for (const { file, room, digest, updatedAt, info } of validLegacyRecords(root)) {
+      const imported = db.tagStore.get`SELECT digest FROM legacy_room_imports WHERE file=${file}`;
+      if (imported?.digest === digest || (imported && info.nlink > 1n)) continue;
       db.tagStore.run`
         INSERT INTO rooms (id, cwd, updated_at, data) VALUES (${room.id}, ${typeof room.cwd === "string" ? room.cwd : ""}, ${updatedAt}, ${JSON.stringify(room)})
         ON CONFLICT(id) DO UPDATE SET cwd = excluded.cwd, updated_at = excluded.updated_at,
           revision = rooms.revision + 1, data = excluded.data`;
+      recordRoomState(db, room);
+      projectRoomHint(db, room, false);
       db.tagStore.run`INSERT INTO legacy_room_imports (file, digest) VALUES (${file}, ${digest})
         ON CONFLICT(file) DO UPDATE SET digest = excluded.digest`;
     }
   });
   withImmediateTransaction(db, () => {
-    for (const { file, source, digest } of validLegacyRecords(root)) {
+    for (const { file, source, digest, info } of validLegacyRecords(root)) {
       if (
+        info.nlink !== 1n ||
         db.tagStore.get`SELECT digest FROM legacy_room_imports WHERE file = ${file}`?.digest !==
-        digest
+          digest
       )
         continue;
       const backup = path.join(root, "rooms.v1-backup");
       mkdirSync(backup, { recursive: true, mode: 0o700 });
+      if (!lstatSync(backup).isDirectory()) throw new Error("Room backup must be a real directory");
       const destination = path.join(backup, file);
-      const target = existsSync(destination) ? path.join(backup, `${file}.${digest}`) : destination;
-      renameSync(source, target);
-      chmodSync(target, 0o400);
+      const isOccupied = (filePath) => lstatSync(filePath, { throwIfNoEntry: false }) !== undefined;
+      let target = isOccupied(destination) ? path.join(backup, `${file}.${digest}`) : destination;
+      if (isOccupied(target)) target = path.join(mkdtempSync(path.join(backup, "retry-")), file);
+      const fd = openSync(
+        source,
+        fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
+      );
+      try {
+        const actual = fstatSync(fd, { bigint: true });
+        if (
+          actual.ino !== info.ino ||
+          actual.dev !== info.dev ||
+          actual.nlink !== 1n ||
+          actual.mtimeNs !== info.mtimeNs
+        )
+          continue;
+        renameSync(source, target);
+        const archived = lstatSync(target, { bigint: true });
+        if (archived.ino === info.ino && archived.dev === info.dev && archived.nlink === 1n)
+          fchmodSync(fd, 0o400);
+      } finally {
+        closeSync(fd);
+      }
     }
   });
   refreshRoomsIndex(db, root);
 }
 
-function openRooms(root) {
+export function openRooms(root) {
   const db = openOrkestSqlite(roomsDbPath(root), { synchronous: "FULL" });
   try {
+    db.function("orkest_outbox_writer", { deterministic: true }, () => 1);
     migrateSchema(db, {
       applicationId: ROOMS_APPLICATION_ID,
       migrations: ROOMS_MIGRATIONS,
     });
+    sweepExpiredStaging(db);
     syncLegacyRoomFiles(db, root);
     return db;
   } catch (error) {
@@ -745,7 +891,7 @@ function openRoomsForRead(root) {
       using versionQuery = db.prepare("PRAGMA user_version");
       isCurrent =
         appQuery.get().application_id === ROOMS_APPLICATION_ID &&
-        versionQuery.get().user_version === ROOMS_MIGRATIONS.length;
+        versionQuery.get().user_version === ROOMS_SCHEMA_VERSION;
     } catch (error) {
       db.close();
       throw error;
@@ -916,16 +1062,25 @@ export async function readRoom(id, root = mailboxRoot()) {
   return validateRoom(readRawRoom(id, root));
 }
 
-export function deleteRoom(id, root = mailboxRoot(), expected) {
+export function deleteRoom(id, root = mailboxRoot(), expected, expectedRevision, operation) {
   roomPath(id, root);
-  if (!existsSync(roomsDbPath(root)) && !existsSync(path.join(root, "rooms"))) return false;
+  if (!operation && !existsSync(roomsDbPath(root)) && !existsSync(path.join(root, "rooms")))
+    return false;
   using db = openRooms(root);
   const deleted = withImmediateTransaction(db, () => {
+    const previous = previousRoomCommand(db, id, operation);
+    if (previous !== undefined) return previous;
+    assertRoomOwner(db, id, expectedRevision);
     const result =
       expected === undefined
         ? db.tagStore.run`DELETE FROM rooms WHERE id = ${id}`
         : db.tagStore
             .run`DELETE FROM rooms WHERE id = ${id} AND data = ${JSON.stringify(expected)}`;
+    if (result.changes === 1) {
+      recordRoomState(db, { id }, true);
+      projectRoomHint(db, { id }, true);
+    }
+    completeRoomCommand(db, id, operation, result.changes === 1);
     return result.changes === 1;
   });
   if (deleted) refreshRoomsIndex(db, root);
@@ -1084,7 +1239,14 @@ export async function withRoomLock(file, update) {
 async function updateStoredRoom(
   id,
   update,
-  { root = mailboxRoot(), create = false, maxAttempts = MAX_ROOM_CAS_ATTEMPTS } = {},
+  {
+    root = mailboxRoot(),
+    create = false,
+    maxAttempts = MAX_ROOM_CAS_ATTEMPTS,
+    onCommit,
+    expectedRevision,
+    operation,
+  } = {},
   validate,
 ) {
   roomPath(id, root);
@@ -1095,6 +1257,9 @@ async function updateStoredRoom(
     let row;
     {
       using db = openRooms(root);
+      const prior = previousRoomCommand(db, id, operation);
+      if (prior !== undefined) return prior;
+      assertRoomOwner(db, id, expectedRevision);
       row = db.tagStore.get`SELECT data, revision FROM rooms WHERE id = ${id}`;
     }
     if (create && row) throw new Error(`Room already exists: ${id}`);
@@ -1105,6 +1270,9 @@ async function updateStoredRoom(
     room.updatedAt = Date.now();
     using db = openRooms(root);
     const committed = withImmediateTransaction(db, () => {
+      const prior = previousRoomCommand(db, id, operation);
+      if (prior !== undefined) return prior;
+      assertRoomOwner(db, id, expectedRevision);
       const data = JSON.stringify(room);
       const result = row
         ? db.tagStore
@@ -1112,11 +1280,18 @@ async function updateStoredRoom(
             data = ${data}, revision = revision + 1 WHERE id = ${id} AND revision = ${row.revision} AND data = ${row.data}`
         : db.tagStore.run`INSERT INTO rooms (id, cwd, updated_at, data)
             VALUES (${id}, ${typeof room.cwd === "string" ? room.cwd : ""}, ${room.updatedAt}, ${data}) ON CONFLICT(id) DO NOTHING`;
-      return result.changes === 1;
+      if (result.changes === 1) {
+        recordRoomState(db, room);
+        projectRoomHint(db, room, false);
+        completeRoomCommand(db, id, operation, room);
+        onCommit?.(db, room);
+        return room;
+      }
+      return null;
     });
     if (committed) {
       refreshRoomsIndex(db, root);
-      return room;
+      return committed;
     }
     const delayMs = Math.floor(Math.random() * Math.min(5 * 2 ** Math.min(attempt, 5), 100));
     if (delayMs > 0) await sleep(delayMs);

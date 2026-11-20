@@ -16,6 +16,7 @@ import {
   readRoom,
   updateRoom,
 } from "./horde-room.mjs";
+import { mailboxProjection } from "./mailbox-projection.mjs";
 import {
   coordinatorBrief,
   hasOtherLiveOwner,
@@ -55,12 +56,19 @@ async function currentPeer(root, session, cwd, env, now, expectedEngine) {
   let peer;
   try {
     const peerFile = path.join(root, "peers", `${sessionKey(session)}.json`);
-    peer =
-      (await resolveSessionPeer(session, root, {
-        now,
-        cwd: cwd || process.cwd(),
-        engine: expectedEngine || env.ORKEST_TERMINAL_HARNESS,
-      })) || JSON.parse(await readFile(peerFile, "utf8"));
+    peer = await resolveSessionPeer(session, root, {
+      now,
+      cwd: cwd || process.cwd(),
+      engine: expectedEngine || env.ORKEST_TERMINAL_HARNESS,
+    });
+    if (!peer) {
+      const stored = mailboxProjection(root, "get", {
+        collection: "peer",
+        owner: "",
+        key: sessionKey(session),
+      });
+      peer = stored === undefined ? JSON.parse(await readFile(peerFile, "utf8")) : stored;
+    }
   } catch (error) {
     if (error.code === "ENOENT")
       throw new Error(

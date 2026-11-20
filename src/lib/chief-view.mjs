@@ -962,6 +962,12 @@ export class ChiefView {
         ` ${this.style(`${mail} ${unread} unread for Chief`, "warning")}${this.style(" · ork chief status", "muted")}`,
       );
     }
+    const remoteObservations = list(this.status?.remoteObservations);
+    for (const observation of remoteObservations) {
+      const host = text(observation.origin).slice(0, 12);
+      const counts = `${observation.rooms} rooms · ${observation.presentPeers} peers · ${observation.accounts} quota accounts (${observation.staleAccounts} stale) · ${observation.chiefItems} Chief items`;
+      body.push(` ${this.style(`Remote ${host} · ${counts}`, "muted")}`);
+    }
     if (this.status?.roomsError) {
       const message = `rooms unavailable: ${text(this.status.roomsError)}`;
       body.push(` ${this.style(truncateDisplay(message, budget, this.tier), "muted")}`);

@@ -200,8 +200,25 @@ def build_parser() -> argparse.ArgumentParser:
         "tasks",
         "board",
         "work",
+        "migrate",
+        "export",
     ):
         sub = commands.add_parser(name)
+        if name == "migrate":
+            sub.description = (
+                "Move this machine's legacy peer and inbox files into the shared SQLite store, once. Stop every "
+                "mailbox session, the daemon and hooks first; pass --quiesced to confirm."
+            )
+            sub.add_argument("--quiesced", action="store_true", help="confirm no mailbox reader or writer is running")
+            sub.add_argument("--format", choices=("text", "json"), default="text")
+            continue
+        if name == "export":
+            sub.description = (
+                "Copy this machine's peer and inbox records into a new mailbox root; this root is only read."
+            )
+            sub.add_argument("--destination", required=True, help="absolute path of the new root")
+            sub.add_argument("--format", choices=("text", "json"), default="text")
+            continue
         if name == "name":
             sub.add_argument("--harness", choices=HARNESSES)
             sub.add_argument("--model", help="model the new session will run, e.g. opus-5.5 or claude-opus-5-5")
@@ -363,6 +380,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     base = _MB.root()
+    if args.action == "migrate":
+        return migrate(base, args)
+    if args.action == "export":
+        return export(base, args)
+    import mailbox_records
+
+    # A genuinely empty or new root starts on the shared store; legacy roots stay put until migrated.
+    mailbox_records.ensure(base)
 
     try:
         if args.action == "name":
@@ -692,7 +717,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.action not in {"feedback", "feedback-summary", "prune"}:
             peer = {"harness": args.harness or "unknown", "session": _MB.session_arg(args)}
             if _MB.session_arg(args):
-                with contextlib.suppress(MailboxError):
+                with contextlib.suppress(MailboxError, OSError):  # a fail-closed store must not mask the error
                     peer = _MB.load(peer_path(base, _MB.session_arg(args))) or peer
             _MB.record_failure(base, peer, args.action, getattr(args, "scope", "project"), error)
             request = _MB.feedback_request(base, peer)
@@ -700,6 +725,49 @@ def main(argv: list[str] | None = None) -> int:
                 print(request, file=sys.stderr)
         print(f"mailbox: {error}", file=sys.stderr)
         return 4
+
+
+def migrate(base: Path, args: argparse.Namespace) -> int:
+    """`mailbox migrate --quiesced`: the bridge moves a legacy root and reports what it moved."""
+    import mailbox_daemon
+    import mailbox_records
+
+    if not args.quiesced:
+        print(
+            "mailbox: migrate moves every peer and message into the shared store; stop all mailbox sessions, "
+            "the daemon and hooks first, then rerun with --quiesced",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        if mailbox_daemon.owned_state(base) is not None:
+            raise MailboxError("the mailbox daemon is still running; stop it first with: mailbox daemon stop")
+        report = mailbox_records.migrate(base)
+    except (MailboxError, OSError) as error:
+        print(f"mailbox: {error}", file=sys.stderr)
+        return 4
+    if args.format == "json":
+        print(json.dumps(report, ensure_ascii=True))
+    else:
+        print(json.dumps(report, ensure_ascii=True, indent=2))
+    return 0
+
+
+def export(base: Path, args: argparse.Namespace) -> int:
+    """`mailbox export --destination ROOT`: a read-only bridge operation that never ensures or activates."""
+    import mailbox_records
+
+    destination = Path(args.destination)
+    if not destination.is_absolute():
+        print("mailbox: --destination must be an absolute path", file=sys.stderr)
+        return 2
+    try:
+        report = mailbox_records.export(base, destination)
+    except OSError as error:
+        print(f"mailbox: {error}", file=sys.stderr)
+        return 4
+    print(json.dumps(report, ensure_ascii=True, indent=None if args.format == "json" else 2))
+    return 0
 
 
 if __name__ == "__main__":

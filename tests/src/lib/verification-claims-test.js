@@ -58,8 +58,9 @@ function fixture(taskSpec = {}, { high = false } = {}) {
     path.join(resolveWorktreeGitDir(wt), "orkest.json"),
     JSON.stringify({ disposable: false, slug: "candidate", branch: "builder" }),
   );
-  writeFoundryState(wt, { status: "verified", attemptCount: 2, maxAttempts: 2 });
-  return { root, wt, repo, env: { ...process.env, ORCHESTRATE_HOME: path.join(root, "cache") } };
+  const env = { ...process.env, ORCHESTRATE_HOME: path.join(root, "cache") };
+  writeFoundryState(wt, { status: "verified", attemptCount: 2, maxAttempts: 2 }, { env });
+  return { root, wt, repo, env };
 }
 function smelt(f, options = {}) {
   return smeltWorktree(f.wt, {
@@ -128,7 +129,7 @@ describe("verification claims follow evidence", () => {
     expect(commands).toEqual(["node test-a.mjs", "node test-b.mjs"]);
     expect(question).toBe(buildColdReviewQuestion(result.evidence));
     expect(question).toContain(`Candidate commit: ${result.candidate.commit}`);
-    expect(readFoundryState(f.wt).evidence).toEqual(result.evidence);
+    expect(readFoundryState(f.wt, { env: f.env }).evidence).toEqual(result.evidence);
   });
 
   it("falls back to development verify_command, then lint, never development_checks", async () => {
@@ -168,7 +169,7 @@ describe("verification claims follow evidence", () => {
             at: expect.any(String),
           },
         ]);
-        expect(readFoundryState(f.wt).evidence.review.result).toBe("not_reviewed");
+        expect(readFoundryState(f.wt, { env: f.env }).evidence.review.result).toBe("not_reviewed");
       }
     },
   );
@@ -212,7 +213,7 @@ describe("verification claims follow evidence", () => {
       retryable: true,
       evidence: { review: { result: "infrastructure_failure" } },
     });
-    expect(readFoundryState(f.wt)).toMatchObject({
+    expect(readFoundryState(f.wt, { env: f.env })).toMatchObject({
       status: "review_infrastructure_failure",
       attemptCount: 2,
       infrastructureRetry: { count: 1 },
@@ -233,7 +234,7 @@ describe("verification claims follow evidence", () => {
       status: "review_changes_requested",
       evidence: { review: { result: "findings" } },
     });
-    expect(readFoundryState(f.wt)).toMatchObject({
+    expect(readFoundryState(f.wt, { env: f.env })).toMatchObject({
       attemptCount: 2,
       findings: "- Race in merge",
       infrastructureRetry: null,
@@ -258,7 +259,7 @@ describe("verification claims follow evidence", () => {
         checks: [{ kind: "default-lint", result: "infrastructure_failure", exitCode: null }],
       },
     });
-    expect(readFoundryState(f.wt)).toMatchObject({
+    expect(readFoundryState(f.wt, { env: f.env })).toMatchObject({
       status: "gate_infrastructure_failure",
       attemptCount: 2,
     });
@@ -308,7 +309,7 @@ describe("verification claims follow evidence", () => {
           ],
         },
       });
-      expect(readFoundryState(f.wt).attemptCount).toBe(2);
+      expect(readFoundryState(f.wt, { env: f.env }).attemptCount).toBe(2);
     },
   );
 
@@ -328,7 +329,7 @@ describe("verification claims follow evidence", () => {
         ],
       },
     });
-    expect(readFoundryState(f.wt).attemptCount).toBe(2);
+    expect(readFoundryState(f.wt, { env: f.env }).attemptCount).toBe(2);
   });
 
   it.each(["candidate", "policy"])(

@@ -18,6 +18,7 @@ import {
   openSync,
   readFileSync,
   realpathSync,
+  statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -28,7 +29,14 @@ import { fileURLToPath } from "node:url";
 import { parseArgs, promisify } from "node:util";
 
 import { emitChiefEvents } from "./chief-bridge.mjs";
-import { resolveWorktreeMarkerPath } from "./horde-room.mjs";
+import { reconcileChiefIntents, recordChiefIntents } from "./chief-notification-intents.mjs";
+import {
+  commitFoundryState,
+  foundryRoot,
+  foundryStateKey,
+  readFoundryRow,
+} from "./foundry-outbox.mjs";
+import { readRawRoom, resolveWorktreeMarkerPath } from "./horde-room.mjs";
 import { glyphSet, glyphTier, renderPanel, renderTable, wrapText } from "./horde-view.mjs";
 import { buildLanes } from "./monitor/analyze.mjs";
 import { shouldUseColor } from "./monitor/render.mjs";
@@ -1393,18 +1401,28 @@ export function buildFoundryState(worktreePath, statePatch = {}, existing = null
   };
 }
 
-export function loadFoundryState(worktreePath, options = {}) {
-  let target;
+/** Identity of the directory that anchors a state location, so a recreated worktree starts empty. */
+function stateIdentity(target) {
+  const base = target.pinnedTarget?.baseDir;
+  if (!base) return "path";
   try {
-    target = resolveValidatedFoundryTarget(worktreePath, options);
-  } catch (error) {
-    return {
-      kind: "corrupt",
-      state: null,
-      path: options.statePath || resolveFoundryStatePath(worktreePath),
-      error: error.message,
-    };
+    const info = statSync(base, { bigint: true });
+    return `${info.ino}:${info.birthtimeNs}`;
+  } catch {
+    return "path";
   }
+}
+
+function foundryLocation(target, options) {
+  return {
+    root: foundryRoot(options),
+    key: foundryStateKey(target.statePath),
+    identity: stateIdentity(target),
+  };
+}
+
+/** Pre-promotion file state. Read only before the canonical row exists; never written. */
+function loadLegacyFoundryFile(target) {
   const statePath = target.statePath;
   const result = { kind: "missing", state: null, path: statePath, error: null };
   const stateDir = path.dirname(statePath);
@@ -1447,8 +1465,30 @@ export function loadFoundryState(worktreePath, options = {}) {
   return { ...result, kind: "ok", state };
 }
 
-export function readFoundryState(worktreePath) {
-  const loaded = loadFoundryState(worktreePath);
+export function loadFoundryState(worktreePath, options = {}) {
+  let target;
+  try {
+    target = resolveValidatedFoundryTarget(worktreePath, options);
+  } catch (error) {
+    return {
+      kind: "corrupt",
+      state: null,
+      path: options.statePath || resolveFoundryStatePath(worktreePath),
+      error: error.message,
+    };
+  }
+  try {
+    const { root, key, identity } = foundryLocation(target, options);
+    const row = readFoundryRow(root, key, identity);
+    if (row) return { kind: "ok", state: row.state, path: target.statePath, error: null };
+  } catch (error) {
+    return { kind: "corrupt", state: null, path: target.statePath, error: error.message };
+  }
+  return loadLegacyFoundryFile(target);
+}
+
+export function readFoundryState(worktreePath, options = {}) {
+  const loaded = loadFoundryState(worktreePath, options);
   if (loaded.kind === "missing") return null;
   if (loaded.kind !== "ok") throw new FoundryStateError(loaded);
   return loaded.state;
@@ -1539,62 +1579,93 @@ function prTransitionKey(event, pr) {
     .digest("hex");
 }
 
-/** Single emission site for PR events: runs after the pinned write committed, never throws. */
-function emitPrTransitions(oldPr, newPr, { owningRoomId, bridge, env, emitEvents }) {
+function prNotificationEvents(oldPr, newPr, owningRoomId) {
+  if (typeof owningRoomId !== "string" || !owningRoomId) return [];
+  return foundryPrTransitions(oldPr, newPr).map((event) => ({
+    event,
+    roomId: owningRoomId,
+    key: prTransitionKey(event, newPr),
+    prNumber: newPr.number,
+  }));
+}
+
+/**
+ * The room that durably owns this worktree: the integration marker in its Git admin directory
+ * must name a room, member and integration that the profile's room record confirms. A caller's
+ * `owningRoomId` is honoured as given; otherwise nothing is exported for unbound state.
+ */
+function durableRoomId(target, root) {
+  const directory = path.dirname(target.statePath);
+  if (path.basename(directory) !== "orkest") return;
   try {
-    if (typeof owningRoomId !== "string" || !owningRoomId) return;
-    const events = foundryPrTransitions(oldPr, newPr).map((event) => ({
-      event,
-      roomId: owningRoomId,
-      key: prTransitionKey(event, newPr),
-      prNumber: newPr.number,
-    }));
-    if (events.length === 0) return;
-    const emit = emitEvents ?? emitChiefEvents;
-    if (typeof emit !== "function") return;
-    // Shared delivery owns bounding, hand-off and error swallowing; nothing here is awaited or locked.
-    void (async () => {
-      try {
-        await emit(events, { env: env ?? process.env, bridge });
-      } catch {
-        // Optional bridge: never surfaces.
-      }
-    })();
+    const markerFile = path.join(path.dirname(directory), "orkest.json");
+    if (!lstatIfExists(markerFile)?.isFile()) return;
+    const marker = JSON.parse(readRegularFileNoFollow(markerFile, "Foundry worktree marker"));
+    const { roomId, memberId, integrationId, commit } = marker ?? {};
+    if ([roomId, memberId, integrationId, commit].some((v) => !(typeof v === "string" && v)))
+      return;
+    const room = readRawRoom(roomId, root);
+    const member = room?.agents?.find((agent) => agent?.id === memberId);
+    return member?.integration?.integrationId === integrationId &&
+      member.integration.commit === commit
+      ? roomId
+      : undefined;
   } catch {
-    // Delivery is best effort; the committed state is already the source of truth.
+    return;
   }
 }
 
+/**
+ * Commits the next state and its redacted transition event in one immediate transaction on the
+ * shared rooms database. A legacy file is imported once, at the first write, and never read again.
+ */
 export function writeFoundryState(worktreePath, statePatch = {}, options = {}) {
   const resolvedWorktree = path.resolve(worktreePath);
   const target = resolveValidatedFoundryTarget(resolvedWorktree, options);
-  const statePath = target.statePath;
-  const loaded = loadFoundryState(resolvedWorktree, options);
-  if (!["missing", "ok"].includes(loaded.kind)) preserveFoundryProblem(loaded, target.pinnedTarget);
+  const { root, key, identity } = foundryLocation(target, options);
+  let legacy = null;
+  if (!readFoundryRow(root, key, identity)) {
+    const loaded = loadLegacyFoundryFile(target);
+    if (!["missing", "ok"].includes(loaded.kind))
+      preserveFoundryProblem(loaded, target.pinnedTarget);
+    legacy = loaded.state;
+  }
   if (statePatch.pr !== undefined)
     statePatch = { ...statePatch, pr: normalizeFoundryPr(statePatch.pr) };
-  const merged = buildFoundryState(resolvedWorktree, statePatch, loaded.state);
-  const stateDir = path.dirname(statePath);
-  const payload = Buffer.from(`${JSON.stringify(merged, null, 2)}\n`, "utf8");
-  runFoundryDirFdOp(
-    stateDir,
-    {
-      op: "write_state",
-      filename: path.basename(statePath),
-      bytes: payload,
-      exclusive: Boolean(options.exclusive),
+  const owningRoomId = options.owningRoomId ?? durableRoomId(target, root);
+  const env = options.env ?? process.env;
+  let events = [];
+  const committed = commitFoundryState(root, {
+    key,
+    statePath: target.statePath,
+    identity,
+    owningRoomId,
+    exclusive: Boolean(options.exclusive),
+    legacy,
+    operationId: options.operationId,
+    expectedRevision: options.expectedRevision,
+    patch: statePatch,
+    build: (existing) => buildFoundryState(resolvedWorktree, statePatch, existing),
+    onCommit(db, previous, next) {
+      if (statePatch.pr === undefined) return;
+      events = prNotificationEvents(previous?.pr, next.pr, owningRoomId);
+      if (!options.bridge && !options.emitEvents) recordChiefIntents(db, events, env);
     },
-    target.pinnedTarget,
-  );
-  if (statePatch.pr !== undefined) {
-    emitPrTransitions(loaded.state?.pr, merged.pr, {
-      owningRoomId: options.owningRoomId,
-      bridge: options.bridge,
-      emitEvents: options.emitEvents,
-      env: options.env,
-    });
+  });
+  if (options.bridge || options.emitEvents) {
+    if (events.length > 0) {
+      void (async () => {
+        try {
+          await (options.emitEvents ?? emitChiefEvents)(events, { env, bridge: options.bridge });
+        } catch {
+          // Injected transports are optional observers.
+        }
+      })();
+    }
+  } else if (owningRoomId && statePatch.pr !== undefined) {
+    void reconcileChiefIntents(root, env);
   }
-  return merged;
+  return committed.state;
 }
 
 export function processIdentity(pid = process.pid) {

@@ -77,8 +77,12 @@ def snapshot(
     items = work.snapshot(base, me)
     agents = []
     members = set()
-    for path in sorted((base / "peers").glob("*.json")):
-        peer = cached_load(path)
+    if mailbox.mailbox_records.active(base):
+        # One committed read returns every record; the stat cache only serves the legacy files.
+        entries = mailbox.peer_entries(base)
+    else:
+        entries = [(path, cached_load(path)) for path in sorted((base / "peers").glob("*.json"))]
+    for _, peer in entries:
         if not mailbox.valid_peer(peer) or mailbox.is_run_peer(peer) or not mailbox.same_project(me, peer):
             continue
         if agent and not _matches(peer, agent):

@@ -157,6 +157,24 @@ export function originRepository(url) {
   return match ? match[1] : null;
 }
 
+function remoteEndpoint(raw) {
+  const value = raw
+    .trim()
+    .replace(/\.git\/?$/u, "")
+    .replace(/\/$/u, "");
+  if (value.includes("://")) {
+    try {
+      const url = new URL(value);
+      if (url.protocol === "file:") return url.host ? `//${url.host}${url.pathname}` : url.pathname;
+      return url.host.toLowerCase() + url.pathname;
+    } catch {
+      return null;
+    }
+  }
+  const scp = /^(?:[^/@]+@)?([^/:]+):(.+)$/u.exec(value);
+  return scp ? `${scp[1].toLowerCase()}/${scp[2]}` : value;
+}
+
 export function resolveRepositoryName({ gh }) {
   try {
     const parsed = parseJson(gh(["repo", "view", "--json", "nameWithOwner"]));
@@ -216,12 +234,22 @@ export async function ensurePullRequest({
   }
   // The PR belongs to this checkout's own origin; gh's idea of the repository is only a cross-check.
   let origin;
+  let pushOrigin;
   try {
-    origin = originRepository(String(runGit("git", ["remote", "get-url", "origin"]) ?? ""));
+    origin = String(runGit("git", ["remote", "get-url", "origin"]) ?? "").trim();
+    pushOrigin = String(
+      runGit("git", ["remote", "get-url", "--push", "--all", "origin"]) ?? "",
+    ).trim();
   } catch {
     origin = null;
   }
-  if (!origin || origin.toLowerCase() !== repo.repository.toLowerCase()) {
+  if (
+    !origin ||
+    originRepository(origin)?.toLowerCase() !== repo.repository.toLowerCase() ||
+    pushOrigin.split(/\r?\n/u).length !== 1 ||
+    !remoteEndpoint(origin) ||
+    remoteEndpoint(origin) !== remoteEndpoint(pushOrigin)
+  ) {
     return { status: "repository_unverified", operations, code: "origin_mismatch" };
   }
   const identity = { repository: repo.repository, baseBranch, headBranch, headOid };
@@ -253,8 +281,17 @@ export async function ensurePullRequest({
       ? reconcile
       : null;
 
+  if (reconcile && !pending)
+    return { status: "pr_conflict", operations, code: "pending_identity_changed" };
   let found = lookupPullRequest(identity, { gh });
-  if (found.status === "none" && pending?.url) {
+  const priorPr = priorState?.pr;
+  const recordedPr =
+    priorPr && Object.entries(identity).every(([key, value]) => priorPr[key] === value)
+      ? priorPr
+      : null;
+  if (found.status === "none" && recordedPr) {
+    found = viewPullRequest(identity, recordedPr.number, { gh });
+  } else if (found.status === "none" && pending?.url) {
     found = viewPullRequest(identity, pending.url, { gh });
     if (found.status === "error" && found.code === "pr_identity_mismatch")
       found = { status: "none" };
@@ -269,19 +306,21 @@ export async function ensurePullRequest({
     return settle(found.pr, "existing");
   }
 
-  if (reconcileOnly) {
-    // Discovery found nothing: never push or create from a reconcile-only retry.
+  if (reconcileOnly || (pending && pending.phase !== "push_pending")) {
+    // A create may already have reached GitHub. A negative list can lag the write.
+    // Older creating markers also span both push and create, so reconcile them conservatively.
     return { status: "pr_unverified", operations, reconcile: pending };
   }
   const marker = {
     ...identity,
-    phase: "creating",
+    phase: "push_pending",
     startedAt: new Date().toISOString(),
     url: null,
   };
   await record({ status: "pr_creating", prReconcile: marker });
   runGit("git", ["push", "origin", `${headOid}:refs/heads/${headBranch}`]);
   operations.push(["git", "push"]);
+  await record({ status: "pr_creating", prReconcile: { ...marker, phase: "creating" } });
   let output;
   try {
     output = String(

@@ -604,11 +604,11 @@ class RoomStoreTests(unittest.TestCase):
             )
             self.assertIsNone(tmux.rebind_session_swarm_room(base, "room", "absent", "new"))
             room_store.list_rooms(base)
-            sqlite_module = (SCRIPTS.parents[1] / "src/lib/orkest-sqlite.mjs").as_uri()
+            rooms_module = (SCRIPTS.parents[1] / "src/lib/horde-room.mjs").as_uri()
             script = f"""
-              import {{ openOrkestSqlite }} from {json.dumps(sqlite_module)};
-              const db = openOrkestSqlite(process.argv[1] + '/rooms.db');
-              db.exec(`UPDATE rooms SET data = json_set(data, '$.title', 'WAL update'), revision = revision + 1`);
+              import {{ openRooms, updateRawRoom }} from {json.dumps(rooms_module)};
+              const root = process.argv[1], db = openRooms(root);
+              await updateRawRoom('room', room => ({{...room, title:'WAL update'}}), {{root}});
               console.log('ready');
               process.stdin.once('data', () => {{ db.close(); process.exit(0); }});
             """
@@ -655,19 +655,19 @@ class RoomStoreTests(unittest.TestCase):
 
             db_path = base / "rooms.db"
             before = db_path.stat()
-            sqlite_module = (SCRIPTS.parents[1] / "src/lib/orkest-sqlite.mjs").as_uri()
+            rooms_module = (SCRIPTS.parents[1] / "src/lib/horde-room.mjs").as_uri()
             subprocess.run(
                 [
                     "node",
                     "--input-type=module",
                     "-e",
                     (
-                        f"import {{ openOrkestSqlite }} from {json.dumps(sqlite_module)};"
-                        "using db = openOrkestSqlite(process.argv[1]);"
-                        "db.exec(\"UPDATE rooms SET data = json_set(data, '$.title', 'Updated!') WHERE id = 'alpha'\");"
+                        f"import {{ openRooms, updateRawRoom }} from {json.dumps(rooms_module)};"
+                        "const root = process.argv[1]; using db = openRooms(root);"
+                        "await updateRawRoom('alpha', room => ({...room, title:'Updated!'}), { root });"
                         "db.exec('PRAGMA wal_checkpoint(TRUNCATE)');"
                     ),
-                    str(db_path),
+                    str(base),
                 ],
                 check=True,
                 timeout=10,

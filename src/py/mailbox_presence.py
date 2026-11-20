@@ -65,8 +65,7 @@ def record(base: Path, peer: dict[str, Any]) -> None:
         memberships = set(channels.memberships(peer))
         deliveries = []
         explanation = reason(peer)
-        for recipient_path in sorted((base / "peers").glob("*.json")):
-            recipient = mailbox.load(recipient_path)
+        for _, recipient in mailbox.peer_entries(base):
             if (
                 not mailbox.valid_peer(recipient)
                 or mailbox.is_run_peer(recipient)
@@ -140,7 +139,7 @@ def deliver(base: Path) -> None:
 
 
 def reconcile(base: Path) -> None:
-    for path in sorted((base / "peers").glob("*.json")):
+    for path in mailbox.peer_files(base):
         mailbox.drop_if_dead(path, mailbox.now())
     deliver(base)
 

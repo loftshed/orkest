@@ -1421,6 +1421,10 @@ def is_wait(request: Any) -> bool:
 
 def main() -> int:
     server = Server()
+    import mailbox_records
+
+    # A genuinely empty or new root starts on the shared store; legacy roots stay put until migrated.
+    mailbox_records.ensure(server.base)
     output = threading.Lock()
     pending: dict[Any, threading.Event] = {}
     workers: set[threading.Thread] = set()

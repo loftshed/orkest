@@ -25,21 +25,28 @@ done
 # Prefer a stable non-shim path over `node -p process.execPath` (which resolves Homebrew symlinks into a
 # versioned Cellar directory that breaks on `brew upgrade node`, falling back to `volta-shim` and spawning
 # two processes per invocation).
+root="$(cd "$repo/../.." && pwd -P)"
 resolve_node() {
-  for candidate in /opt/homebrew/bin/node /usr/local/bin/node; do
-    if [ -x "$candidate" ]; then
+  path_node="$(node -p process.execPath)"
+  volta_node=
+  if command -v volta >/dev/null 2>&1; then
+    volta_node="$(volta which node 2>/dev/null || true)"
+  fi
+  fallback=
+  for candidate in /opt/homebrew/bin/node /usr/local/bin/node "$volta_node" "$path_node"; do
+    [ -x "$candidate" ] || continue
+    [ -n "$fallback" ] || fallback="$candidate"
+    if "$candidate" --input-type=module -e '
+      import { pathToFileURL } from "node:url";
+      const { assertSqliteRuntime } = await import(pathToFileURL(process.argv[1]));
+      assertSqliteRuntime();
+    ' "$root/src/lib/orkest-sqlite.mjs" >/dev/null 2>&1; then
       printf '%s\n' "$candidate"
       return
     fi
   done
-  if command -v volta >/dev/null 2>&1; then
-    volta_node="$(volta which node 2>/dev/null || true)"
-    if [ -n "$volta_node" ] && [ -x "$volta_node" ]; then
-      printf '%s\n' "$volta_node"
-      return
-    fi
-  fi
-  node -p process.execPath
+  # Standalone Monitor without replication continues to support Node 22.
+  printf '%s\n' "$fallback"
 }
 node_bin="$(resolve_node)"
 rmtree() { node -e 'require("fs").rmSync(process.argv[1], { recursive: true, force: true })' "$1"; }
@@ -50,18 +57,23 @@ rmtree() { node -e 'require("fs").rmSync(process.argv[1], { recursive: true, for
 #
 # The copy mirrors the checkout's layout, so the relative imports and the version lookup resolve exactly as
 # they do there: package.json, src/bin/{monitor,observe}.mjs, src/lib/monitor and skills/monitor. Only
-# those paths are managed. The new copy is staged beside the live one, starting from everything already
+# those paths and the shared quota publisher dependencies are managed. The new copy starts from everything already
 # installed (custom files, a pre-`src/` bin/ and lib/, links you made), has its managed paths replaced, and
 # is swapped in only once it reports the right version. The previous copy moves to
 # ~/.local/share/monitor-backups; nothing is deleted.
 runtime="$HOME/.local/share/monitor"
 backups="$HOME/.local/share/monitor-backups"
-root="$(cd "$repo/../.." && pwd -P)"
 for needed in "$root/package.json" "$root/src/bin/monitor.mjs" "$root/src/bin/observe.mjs" "$root/src/lib/monitor" "$repo/skills/monitor/SKILL.md" "$repo/config.example.json"; do
   [ -e "$needed" ] || { echo "install: missing $needed" >&2; exit 1; }
 done
 # Enumerate shipped leaves so local additions beside managed modules survive upgrades.
 managed="$(printf '%s\n' package.json config.example.json src/bin/monitor.mjs src/bin/observe.mjs
+  # Scoped quota publication uses the same store, migrations and room definitions as ork.
+  printf '%s\n' src/lib/families-schema.mjs src/lib/horde-room.mjs src/lib/orkest-sqlite.mjs \
+    src/lib/outbox.mjs src/lib/outbox-checkpoint.mjs src/lib/outbox-migration.mjs \
+    src/lib/outbox-policy.mjs src/lib/room-commands.mjs src/lib/room-project.mjs src/lib/runtime-paths.mjs src/lib/coordination-private-schema.mjs src/lib/projection-history.mjs \
+    references/families.json \
+    references/workforce-roles.json
   (cd "$root" && find src/lib/monitor -type f -print)
   (cd "$repo" && find skills/monitor -type f -print))"
 version="$(node -p "require(process.argv[1]).version" "$root/package.json")"

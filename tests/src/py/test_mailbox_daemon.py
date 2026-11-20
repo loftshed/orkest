@@ -683,15 +683,11 @@ d.serve(base)
         self.body(self.send(text="private synthetic body", key="old-key"))
         operation = next((self.base / "journal").glob("*/*.json"))
         entry = mailbox.load(operation)
-        old = (dt.datetime.now(dt.UTC) - dt.timedelta(days=8)).isoformat().replace("+00:00", "Z")
-        entry["message"]["sentAt"] = old
         entry.pop("response", None)
         mailbox.write(operation, entry)
-        message_path = mailbox.inbox_dir(self.base, "receiver") / (entry["message"]["id"] + ".json")
-        message = mailbox.load(message_path)
-        message["sentAt"] = old
-        mailbox.write(message_path, message)
-        mailbox.prune(self.base)
+        # Expire the delivery without aging the still-live registered sender.
+        with mock.patch.object(mailbox, "MAX_AGE", dt.timedelta(0)):
+            mailbox.prune(self.base)
         self.assertNotIn("private synthetic body", operation.read_text())
         self.assertEqual(mailbox.load(operation)["schema"], "agent-executor.send-operation.expired.v1")
         replay = self.send(text="private synthetic body", key="old-key")[1]

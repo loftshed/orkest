@@ -31,10 +31,9 @@ def status() -> str:
     base = mailbox.root()
     peers = []
     codex_sessions = set()
-    for path in (base / "peers").glob("*.json"):
+    for _, peer in mailbox.peer_entries(base):
         if time.monotonic() >= deadline:
             return ""
-        peer = mailbox.load(path)
         if mailbox.valid_peer(peer) and peer.get("harness") == "codex":
             codex_sessions.update(mailbox.native_session_ids(peer, base))
         if (

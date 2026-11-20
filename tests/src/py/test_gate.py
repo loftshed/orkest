@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import select
 import shlex
 import signal
 import subprocess
@@ -240,6 +241,13 @@ class Probe(unittest.TestCase):
         sig = os.environ.get("PROBE_SIGNAL")
         if sig:
             os.kill(os.getpid(), int(sig))
+        release = os.environ.get("PROBE_RELEASE")
+        if release:
+            deadline = time.monotonic() + 45
+            while not Path(release).exists():
+                if time.monotonic() > deadline:
+                    self.fail("the parent did not release the probe")
+                time.sleep(0.05)
         time.sleep(float(os.environ.get("PROBE_SLEEP", "0")))
         with out.open("a") as handle:
             handle.write(f"end {time.time()}\\n")
@@ -319,20 +327,37 @@ class RunTests(unittest.TestCase):
         self.assertIn("FAILED", log.read_text())
 
     def test_a_heavy_run_waits_for_a_focused_one_and_says_who_holds_the_gate(self):
+        release = self.directory / "release-focused"
         focused = self.gate(
             "--label", "probe one", "--", sys.executable, "-m", "unittest", "probe_test",
-            env={"PROBE_SLEEP": "1.5"}, wait=False,
+            env={"PROBE_RELEASE": str(release)}, wait=False,
         )  # fmt: skip
-        self.wait_for_start()
-        status = subprocess.run(
-            [sys.executable, "-B", str(SCRIPT), "status", "--json"], env=self.env, capture_output=True, text=True
-        )
-        self.assertIn("probe one", [holder["label"] for holder in json.loads(status.stdout)["holders"]])
-        code, _, stderr = self.gate("--heavy", "--", sys.executable, "-m", "unittest", "discover", "-p", "probe_*.py")
-        focused.communicate(timeout=30)
-        self.assertEqual(code, 0, stderr)
-        self.assertIn("gate: waiting for", stderr)
-        self.assertIn("`probe one`", stderr)
+        heavy = None
+        try:
+            self.wait_for_start()
+            status = subprocess.run(
+                [sys.executable, "-B", str(SCRIPT), "status", "--json"],
+                env=self.env,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=20,
+            )
+            self.assertIn("probe one", [holder["label"] for holder in json.loads(status.stdout)["holders"]])
+            heavy = self.gate(
+                "--heavy", "--", sys.executable, "-m", "unittest", "discover", "-p", "probe_*.py", wait=False
+            )
+            self.assertTrue(select.select([heavy.stderr], [], [], 20)[0], "the heavy run never reported contention")
+            waiting = heavy.stderr.readline()
+            self.assertIn("gate: waiting for", waiting)
+            self.assertIn("`probe one`", waiting)
+        finally:
+            release.touch()
+            focused.communicate(timeout=30)
+            if heavy is not None:
+                _, stderr = heavy.communicate(timeout=30)
+        self.assertEqual(focused.returncode, 0)
+        self.assertEqual(heavy.returncode, 0, stderr)
         first_end = float(self.probe_lines()[1].split()[1])
         second_start = float(self.probe_lines()[2].split()[1])
         self.assertGreaterEqual(second_start, first_end)

@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import {
   chmodSync,
+  cpSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -16,6 +17,7 @@ import {
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { expect, it, onTestFinished } from "vitest";
 
@@ -254,6 +256,9 @@ function monitorFixture({ version = "9.9.9", failing = false } = {}) {
   onTestFinished(() => rmSync(tempRoot, { recursive: true, force: true }));
   const checkout = path.join(tempRoot, "checkout");
   const home = path.join(tempRoot, "home");
+  cpSync(path.join(repo, "src/lib"), path.join(checkout, "src/lib"), { recursive: true });
+  const references = "references";
+  cpSync(path.join(repo, references), path.join(checkout, references), { recursive: true });
   const files = {
     "package.json": JSON.stringify({ name: "orkest", version }),
     "plugins/monitor/config.example.json": "{}\n",
@@ -309,6 +314,62 @@ it("installs a standalone Monitor that runs with the checkout out of the way", (
   renameSync(away, fixture.checkout);
   expect(ran.status, ran.stderr).toBe(0);
   expect(ran.stdout.trim()).toBe("9.9.9");
+});
+
+it("publishes scoped quota from an installed Monitor after its checkout moves", () => {
+  const f = monitorFixture();
+  for (const file of ["src/bin/monitor.mjs", "src/lib/monitor/version.mjs"])
+    cpSync(path.join(repo, file), path.join(f.checkout, file));
+  const config = path.join(f.home, "monitor-config.json");
+  const usage = path.join(f.home, "usage.json");
+  cpSync(path.join(repo, "tests/src/lib/monitor/fixtures/agy-usage.json"), usage);
+  const command = path.join(f.home, "read-usage");
+  writeExecutable(command, '#!/bin/sh\ncat "$USAGE"\n');
+  writeFileSync(
+    config,
+    JSON.stringify({
+      replicationScope: "room:demo",
+      accounts: [{ id: "portable", provider: "antigravity", command, env: { USAGE: usage } }],
+    }),
+  );
+  // A version manager may prefer an executable that can run Monitor but cannot open the shared database.
+  const tools = path.join(f.home, "bin");
+  mkdirSync(tools);
+  writeExecutable(path.join(tools, "volta"), '#!/bin/sh\nprintf "%s\\n" "$HOME/bin/basic-node"\n');
+  writeExecutable(
+    path.join(tools, "basic-node"),
+    '#!/bin/sh\nexec node --no-experimental-sqlite "$@"\n',
+  );
+  const installed = spawnSync(
+    "sh",
+    [path.join(f.checkout, "plugins/monitor/install.sh"), "--no-app"],
+    {
+      env: {
+        ...process.env,
+        HOME: f.home,
+        PATH: tools + path.delimiter + process.env.PATH,
+        MONITOR_CONFIG: config,
+      },
+      encoding: "utf8",
+    },
+  );
+  expect(installed.status, installed.stderr).toBe(0);
+  renameSync(f.checkout, f.checkout + ".away");
+  const cache = path.join(f.home, "orkest-cache");
+  const result = spawnSync(f.launcher, ["json", "--refresh"], {
+    env: { HOME: f.home, PATH: process.env.PATH, MONITOR_CONFIG: config, ORCHESTRATE_HOME: cache },
+    encoding: "utf8",
+  });
+  expect(result.status, result.stderr).toBe(0);
+  using db = new DatabaseSync(path.join(cache, "mailbox-v1/rooms.db"), { readOnly: true });
+  const row = db
+    .prepare("SELECT entity, body FROM outbox_events WHERE scope=? AND kind=?")
+    .get("room:demo", "monitor.quota");
+  expect(row.entity).toBe("portable");
+  expect(JSON.parse(row.body)).toMatchObject({
+    provider: "antigravity",
+    limits: expect.any(Array),
+  });
 });
 
 it("upgrades an old Monitor copy, keeping custom files and the previous copy, and is repeatable", () => {

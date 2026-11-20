@@ -9,6 +9,7 @@ use std::sync::{Mutex, OnceLock};
 
 use serde_json::{Value, json};
 
+use crate::mailbox_records;
 use crate::paths;
 use crate::sha1;
 use crate::sha256;
@@ -96,8 +97,7 @@ pub fn is_run_record(peer: Option<&Value>) -> bool {
 
 #[must_use]
 pub fn run_status(base: &Path, run: &str) -> Option<String> {
-    let worker_file = paths::peer_path(base, &format!("run-{run}-worker")).ok()?;
-    let rec = paths::read_json_file(&worker_file)?;
+    let rec = mailbox_records::read_peer(base, &format!("run-{run}-worker"))?;
     if let Some(res_path) = rec.get("resultPath").and_then(Value::as_str)
         && let Some(res_json) = paths::read_json_file(Path::new(res_path))
         && res_json.is_object()
@@ -998,9 +998,8 @@ pub fn attest_native_sessions(base: &Path, session: &str, observed: &[&str]) -> 
     if observed.is_empty() || observed.iter().any(|s| !paths::valid_session_id(s)) {
         return None;
     }
-    let path = paths::peer_path(base, session).ok()?;
-    let _guard = paths::lock_for(&path).ok()?;
-    let mut peer = paths::read_json_file(&path)?;
+    let _guard = mailbox_records::lock_peer(base, session).ok()?;
+    let mut peer = mailbox_records::read_peer(base, session)?;
     if !paths::valid_peer(&peer) {
         return Some(peer);
     }
@@ -1035,7 +1034,7 @@ pub fn attest_native_sessions(base: &Path, session: &str, observed: &[&str]) -> 
             sig.map_or(Value::Null, Value::String),
         );
     }
-    paths::write_json_atomic(&path, &peer).ok()?;
+    mailbox_records::write_peer(base, session, &peer).ok()?;
     Some(peer)
 }
 
@@ -1114,10 +1113,10 @@ pub fn session_peer_candidates(
                     .is_some_and(|s| s.starts_with("run-"))))
     };
 
-    let Ok(direct_path) = paths::peer_path(base, session) else {
+    if paths::session_key(session).is_err() {
         return Vec::new();
-    };
-    if let Some(direct) = paths::read_json_file(&direct_path)
+    }
+    if let Some(direct) = mailbox_records::read_peer(base, session)
         && eligible(&direct, false)
         && direct.get("session").and_then(Value::as_str) == Some(session)
     {
@@ -1125,20 +1124,19 @@ pub fn session_peer_candidates(
     }
 
     let mut matches = Vec::new();
-    if let Ok(entries) = fs::read_dir(base.join("peers")) {
-        for entry in entries.flatten() {
-            if crate::sqlite::deadline_expired() {
-                return Vec::new();
-            }
-            let p = entry.path();
-            if p.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            if let Some(peer) = paths::read_json_file(&p)
-                && eligible(&peer, true)
-                && native_session_ids(Some(&peer), Some(base)).contains(session)
-            {
-                matches.push(peer);
+    match mailbox_records::list_peers(base) {
+        Err(mailbox_records::StoreError::Deadline) => return Vec::new(),
+        Err(_) => {}
+        Ok(listing) => {
+            for (_, peer) in listing.bodies() {
+                if crate::sqlite::deadline_expired() {
+                    return Vec::new();
+                }
+                if eligible(peer, true)
+                    && native_session_ids(Some(peer), Some(base)).contains(session)
+                {
+                    matches.push(peer.clone());
+                }
             }
         }
     }
@@ -1211,17 +1209,12 @@ pub fn pick_martian(seed: &str, taken: &HashSet<String>) -> String {
 pub fn taken_persons(base: &Path, exclude_session: &str) -> HashSet<String> {
     let now = paths::utc_now_secs();
     let mut taken = HashSet::new();
-    if let Ok(entries) = fs::read_dir(base.join("peers")) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            if let Some(peer) = paths::read_json_file(&p)
-                && paths::valid_peer(&peer)
+    if let Ok(listing) = mailbox_records::list_peers(base) {
+        for (_, peer) in listing.bodies() {
+            if paths::valid_peer(peer)
                 && peer.get("session").and_then(Value::as_str) != Some(exclude_session)
                 && let Some(person) = peer.get("person").and_then(Value::as_str)
-                && is_live_peer(&peer, Some(now))
+                && is_live_peer(peer, Some(now))
             {
                 taken.insert(person.to_string());
             }
@@ -1544,6 +1537,11 @@ pub fn migrate_legacy_session(base: &Path, session: &str) {
     if k2 != canonical_key {
         legacy_keys.insert(k2);
     }
+    match mailbox_records::backend(base) {
+        mailbox_records::Backend::Legacy => {}
+        // The cutover already filed every legacy key spelling under its canonical key.
+        mailbox_records::Backend::Sqlite | mailbox_records::Backend::Invalid => return,
+    }
     for legacy in legacy_keys {
         let legacy_peer = base.join("peers").join(format!("{legacy}.json"));
         if let Some(old) = paths::read_json_file(&legacy_peer)
@@ -1598,23 +1596,18 @@ fn co_hosted(base: &Path, peer: &Value) -> Vec<Value> {
     };
     let now = paths::utc_now_secs();
     let mut found = Vec::new();
-    if let Ok(entries) = fs::read_dir(base.join("peers")) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            if let Some(other) = paths::read_json_file(&p)
-                && paths::valid_peer(&other)
+    if let Ok(listing) = mailbox_records::list_peers(base) {
+        for (key, other) in listing.bodies() {
+            if paths::valid_peer(other)
                 && let Some(other_sid) = other.get("session").and_then(Value::as_str)
                 && other_sid != my_session
-                && !is_run_peer(Some(&other))
+                && !is_run_peer(Some(other))
                 && other.get("pid").and_then(Value::as_i64) == Some(pid)
                 && other.get("pidBirth").and_then(Value::as_str) == Some(birth)
-                && paths::peer_path(base, other_sid).ok().as_ref() == Some(&p)
-                && is_live_peer(&other, Some(now))
+                && paths::session_key(other_sid).ok().as_deref() == Some(key)
+                && is_live_peer(other, Some(now))
             {
-                found.push(other);
+                found.push(other.clone());
             }
         }
     }
@@ -1659,16 +1652,15 @@ fn persist_agy_control(base: &Path, session: &str, pid: Option<i64>) {
 }
 
 pub fn annotate_peer(base: &Path, session: &str, updates: &[(&str, Value)]) -> Option<Value> {
-    let path = paths::peer_path(base, session).ok()?;
-    let _guard = paths::lock_for(&path).ok()?;
-    let mut peer = paths::read_json_file(&path)?;
+    let _guard = mailbox_records::lock_peer(base, session).ok()?;
+    let mut peer = mailbox_records::read_peer(base, session)?;
     if paths::valid_peer(&peer)
         && let Some(obj) = peer.as_object_mut()
     {
         for (k, v) in updates {
             obj.insert((*k).to_string(), v.clone());
         }
-        paths::write_json_atomic(&path, &peer).ok()?;
+        mailbox_records::write_peer(base, session, &peer).ok()?;
     }
     Some(peer)
 }
@@ -1690,10 +1682,16 @@ pub struct RegisterArgs<'a> {
 }
 
 pub fn register_peer(base: &Path, args: RegisterArgs<'_>) -> Option<Value> {
-    let path = paths::peer_path(base, args.session).ok()?;
-    let _guard = paths::lock_for(&path).ok()?;
+    let _guard = mailbox_records::lock_peer(base, args.session).ok()?;
     migrate_legacy_session(base, args.session);
-    let mut peer = paths::read_json_file(&path).unwrap_or_else(|| json!({}));
+    let mut peer = match mailbox_records::read_peer_checked(base, args.session) {
+        Ok(found) => found.flatten().unwrap_or_else(|| json!({})),
+        // Never treat an unreadable active store as a first registration.
+        Err(_) if mailbox_records::backend(base) != mailbox_records::Backend::Legacy => {
+            return None;
+        }
+        Err(_) => json!({}),
+    };
     let had_verified = !verified_native_ids(base, &peer).is_empty();
     let prev_identity = had_verified.then(|| identity_message(&peer));
     let obj = peer.as_object_mut()?;
@@ -1982,7 +1980,7 @@ pub fn register_peer(base: &Path, args: RegisterArgs<'_>) -> Option<Value> {
     }
 
     let final_peer = Value::Object(obj.clone());
-    paths::write_json_atomic(&path, &final_peer).ok()?;
+    mailbox_records::write_peer(base, args.session, &final_peer).ok()?;
     if args.harness == "gemini" {
         persist_agy_control(base, args.session, eff_pid);
     }
@@ -2021,9 +2019,7 @@ pub fn mark_delegated(base: &Path, me: Value) -> Value {
             .map_or_else(String::new, |r| format!("run-{r}-worker"))
     };
     let record = if run_session.starts_with("run-") {
-        paths::peer_path(base, &run_session)
-            .ok()
-            .and_then(|p| paths::read_json_file(&p))
+        mailbox_records::read_peer(base, &run_session)
     } else {
         None
     };
@@ -2046,38 +2042,27 @@ pub fn mark_delegated(base: &Path, me: Value) -> Value {
 
 fn peers_live_at(base: &Path, include_runs: bool, now: i64) -> Vec<Value> {
     let mut found = Vec::new();
-    let Ok(entries) = fs::read_dir(base.join("peers")) else {
+    let Ok(listing) = mailbox_records::list_peers(base) else {
         return found;
     };
-    let mut paths_list: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
-    paths_list.sort();
-    for path in paths_list {
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-        let Some(peer) = paths::read_json_file(&path) else {
-            continue;
-        };
+    for (key, peer) in listing.bodies() {
         if peer.get("schema").and_then(Value::as_str) != Some(PEER_SCHEMA) {
             continue;
         }
         let Some(sid) = peer.get("session").and_then(Value::as_str) else {
             continue;
         };
-        let Ok(canon) = paths::peer_path(base, sid) else {
-            continue;
-        };
-        if canon != path && canon.exists() {
+        if !listing.is_canonical(key, sid) {
             continue;
         }
-        if is_run_peer(Some(&peer)) {
-            if include_runs && is_run_record(Some(&peer)) {
-                found.push(peer);
+        if is_run_peer(Some(peer)) {
+            if include_runs && is_run_record(Some(peer)) {
+                found.push(peer.clone());
             }
             continue;
         }
-        if paths::valid_peer(&peer) && is_live_peer(&peer, Some(now)) {
-            found.push(peer);
+        if paths::valid_peer(peer) && is_live_peer(peer, Some(now)) {
+            found.push(peer.clone());
         }
     }
     found.sort_by(|a, b| {
@@ -2257,15 +2242,12 @@ where
             })
             .cloned()
     } else {
-        paths::peer_path(base, session)
-            .ok()
-            .and_then(|p| paths::read_json_file(&p))
-            .filter(|p| {
-                paths::valid_peer(p)
-                    && !is_run_peer(Some(p))
-                    && p.get("session").and_then(Value::as_str) == Some(session)
-                    && is_local_peer(p)
-            })
+        mailbox_records::read_peer(base, session).filter(|p| {
+            paths::valid_peer(p)
+                && !is_run_peer(Some(p))
+                && p.get("session").and_then(Value::as_str) == Some(session)
+                && is_local_peer(p)
+        })
     };
 
     if let Some(peer) = exact_peer {
@@ -2305,28 +2287,17 @@ where
                     &mut lookup_fresh_birth,
                 )
             })
-        } else if let Ok(entries) = fs::read_dir(base.join("peers")) {
-            let mut paths_list: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
-            paths_list.sort();
+        } else if let Ok(listing) = mailbox_records::list_peers(base) {
             let mut found = false;
-            for path in paths_list {
-                if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                    continue;
-                }
-                let Some(peer) = paths::read_json_file(&path) else {
-                    continue;
-                };
+            for (key, peer) in listing.bodies() {
                 let Some(sid) = peer.get("session").and_then(Value::as_str) else {
                     continue;
                 };
-                let Ok(canon) = paths::peer_path(base, sid) else {
-                    continue;
-                };
-                if canon != path && canon.exists() {
+                if !listing.is_canonical(key, sid) {
                     continue;
                 }
                 if is_top_level_replacement_peer(
-                    &peer,
+                    peer,
                     session,
                     pid,
                     binding_birth,
@@ -2386,13 +2357,10 @@ pub fn colleagues(base: &Path, me: &Value) -> Vec<Value> {
 
 /// Remove a peer under its flock (`mailbox_store.unregister`).
 pub fn unregister_peer(base: &Path, session: &str) {
-    let Ok(path) = paths::peer_path(base, session) else {
+    let Ok(_guard) = mailbox_records::lock_peer(base, session) else {
         return;
     };
-    let Ok(_guard) = paths::lock_for(&path) else {
-        return;
-    };
-    let _ = fs::remove_file(path);
+    let _ = mailbox_records::delete_peer(base, session);
 }
 
 #[cfg(test)]

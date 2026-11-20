@@ -445,7 +445,10 @@ export function verifyRoomIntegrationRecord(marker, foundryState, options = {}) 
     return { ok: false, isRoomIntegrated: true, reason: "room_integration_state_mismatch" };
   }
   const root =
-    options.mailboxRoot || marker.mailboxRoot || foundryState?.mailboxRoot || mailboxRoot();
+    options.mailboxRoot ||
+    marker.mailboxRoot ||
+    foundryState?.mailboxRoot ||
+    mailboxRoot(options.env);
   let room;
   try {
     room = readRawRoom(roomId, root);
@@ -518,7 +521,7 @@ export function verifyRoomIntegrationRecord(marker, foundryState, options = {}) 
   return { ok: true, isRoomIntegrated: true, integration, room, member };
 }
 
-function loadWorktreeMetadata(worktreePath, explicitMarkerPath = null) {
+function loadWorktreeMetadata(worktreePath, explicitMarkerPath = null, env = process.env) {
   const markerPath = explicitMarkerPath || resolveWorktreeMarkerPath(worktreePath) || null;
   const gitDir = markerPath
     ? path.dirname(markerPath)
@@ -538,10 +541,11 @@ function loadWorktreeMetadata(worktreePath, explicitMarkerPath = null) {
     }
   }
   const foundryStatePath = resolveFoundryStatePath(worktreePath);
-  const loadedState = loadFoundryState(worktreePath);
+  const loadedState = loadFoundryState(worktreePath, { env });
   const foundryState = loadedState.state;
   const stateProblem = ["missing", "ok"].includes(loadedState.kind) ? null : loadedState;
   return {
+    loadedState,
     foundryState,
     foundryStatePath,
     stateProblem,
@@ -591,6 +595,7 @@ export function discoverSmeltableWorktrees(
     execFileSyncFn = execFileSync,
     includeAllStates = false,
     includeKeep = false,
+    env = process.env,
     mailboxRoot: overrideMailboxRoot,
     targetBranch = "main",
   } = {},
@@ -619,13 +624,14 @@ export function discoverSmeltableWorktrees(
       markerPath,
       taskSpec,
       taskSpecPath,
-    } = loadWorktreeMetadata(worktreePath);
+    } = loadWorktreeMetadata(worktreePath, null, env);
     if (!marker || typeof marker !== "object") continue;
     if (!includeKeep && marker.disposable === false) continue;
 
     if (!includeAllStates && !foundryState && !stateProblem) continue;
     const roomCheck = verifyRoomIntegrationRecord(marker, foundryState, {
       mailboxRoot: overrideMailboxRoot,
+      env,
       worktreePath,
     });
     if (!roomCheck.ok) {
@@ -775,11 +781,12 @@ export async function smeltWorktree(worktree, options = {}) {
   const stopped = (status) => new SmelterLeaseError(status, worktreePath);
   const checkState = () => {
     assertWorkspaceLease(lease);
-    const loaded = loadFoundryState(worktreePath);
     const meta = loadWorktreeMetadata(
       worktreePath,
       typeof worktree === "object" ? worktree.markerPath : null,
+      options.env,
     );
+    const loaded = meta.loadedState;
     const effectiveMarker = meta.marker;
     if (loaded.kind === "missing") {
       if (effectiveMarker || (typeof worktree === "object" && worktree.marker)) {
@@ -865,7 +872,9 @@ export async function smeltWorktree(worktree, options = {}) {
       candidate,
       ...(error.cause && { stateErrors: [error.cause.message] }),
       worktreePath,
-      ...(error.status === "state_unreadable" && { stateProblem: loadFoundryState(worktreePath) }),
+      ...(error.status === "state_unreadable" && {
+        stateProblem: loadFoundryState(worktreePath, { env: options.env }),
+      }),
     });
   } finally {
     await targetLease?.release();
@@ -940,7 +949,7 @@ async function smeltLeasedWorktree(worktree, options, ownership) {
       ? { path: path.resolve(worktree), worktreePath: path.resolve(worktree) }
       : { ...worktree };
   const worktreePath = path.resolve(worktreeObj.worktreePath || worktreeObj.path || process.cwd());
-  const loadedMeta = loadWorktreeMetadata(worktreePath, worktreeObj.markerPath);
+  const loadedMeta = loadWorktreeMetadata(worktreePath, worktreeObj.markerPath, options.env);
   if (loadedMeta.stateProblem || worktreeObj.stateProblem) {
     return {
       ok: false,
@@ -1029,7 +1038,7 @@ async function smeltLeasedWorktree(worktree, options, ownership) {
           ...patch,
         },
         // A verified PR is attributed to the room whose integration record was verified, never another.
-        patch.pr && owningRoomId ? { owningRoomId, env: options.env } : undefined,
+        { env: options.env, ...(patch.pr && owningRoomId && { owningRoomId }) },
       );
     } catch (error_) {
       const error = new SmelterLeaseError("state_write_failed", worktreePath);
@@ -1103,6 +1112,48 @@ async function smeltLeasedWorktree(worktree, options, ownership) {
       reason: `Worktree target branch ${loadedMeta.foundryState.targetBranch} does not match requested ${targetBranch}`,
       worktreePath,
     };
+  }
+  const mergeIntent = loadedMeta.foundryState?.mergeIntent;
+  if (!isDryRun && mergeIntent) {
+    if (
+      strategy !== "local" ||
+      mergeIntent.targetRef !== target.ref ||
+      !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u.test(mergeIntent.headOid)
+    )
+      return { ok: false, status: "merge_intent_conflict", worktreePath, target };
+    // Read the actual ref, including later fast-forwards, before starting another rebase or merge.
+    let hasLanded = target.sha === mergeIntent.headOid;
+    if (!hasLanded) {
+      try {
+        runCmd("git", ["merge-base", "--is-ancestor", mergeIntent.headOid, target.sha]);
+        hasLanded = true;
+      } catch (error) {
+        if (error.status !== 1) throw error;
+      }
+    }
+    if (hasLanded) {
+      if (loadedMeta.foundryState.evidence) {
+        evidence = { ...loadedMeta.foundryState.evidence, outcome: "merged" };
+      }
+      await recordState({ status: "merged", mergeIntent: null });
+      return {
+        schema: "ork.smelter.run.v1",
+        ok: true,
+        status: "merged",
+        strategy,
+        targetBranch,
+        candidate: loadedMeta.foundryState.candidate,
+        evidence,
+        worktreePath,
+        pruned: false,
+        reconciled: true,
+      };
+    }
+    if (
+      target.sha !== mergeIntent.previousOid ||
+      resolveGitSha(worktreePath, "HEAD", execFileSyncFn) !== mergeIntent.headOid
+    )
+      return { ok: false, status: "merge_intent_conflict", worktreePath, target };
   }
   if (!isDryRun && loadedMeta.foundryState?.pendingRebase) {
     try {
@@ -1771,6 +1822,10 @@ async function smeltLeasedWorktree(worktree, options, ownership) {
         : ["git", "update-ref", target.ref, candidate.commit, target.sha],
     ];
     if (!isDryRun) {
+      await recordState({
+        status: "verified",
+        mergeIntent: { targetRef: target.ref, previousOid: target.sha, headOid: candidate.commit },
+      });
       if (checkout) {
         await ownership.target(checkout.worktree);
         let attached = "";
@@ -1838,7 +1893,7 @@ async function smeltLeasedWorktree(worktree, options, ownership) {
           worktreePath,
         };
       try {
-        await recordState({ status: "merged" });
+        await recordState({ status: "merged", mergeIntent: null });
       } catch (error) {
         return {
           ok: false,
@@ -2002,6 +2057,7 @@ export async function smelterCli(
   argv = [],
   {
     cwd = process.cwd(),
+    env = process.env,
     execFileSyncFn = execFileSync,
     gateRunner = null,
     reviewRunner = null,
@@ -2042,6 +2098,7 @@ export async function smelterCli(
   }
 
   const discovered = discoverSmeltableWorktrees(cwd, {
+    env,
     execFileSyncFn,
     includeKeep: Boolean(values.worktree),
     targetBranch,
@@ -2110,6 +2167,7 @@ export async function smelterCli(
   const results = [];
   for (const wt of selected) {
     const res = await smeltWorktree(wt, {
+      env,
       approveHighBlast: values["approve-high-blast"],
       cwd,
       dryRun: Boolean(values["dry-run"]),

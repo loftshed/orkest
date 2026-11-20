@@ -7,25 +7,59 @@ import { rebindSession } from "../lib/rooms.mjs";
 
 const { positionals, values } = parseArgs({
   allowPositionals: true,
-  options: { root: { type: "string" } },
+  options: {
+    root: { type: "string" },
+    "expected-revision": { type: "string" },
+    "operation-id": { type: "string" },
+  },
 });
 const [command, id] = positionals;
 if (!values.root) throw new Error("--root is required");
 const root = values.root;
+const revision = values["expected-revision"];
+const expectedRevision = revision === undefined ? undefined : Number(revision);
+if (
+  revision !== undefined &&
+  (!["put", "set-meta", "delete"].includes(command) ||
+    !/^\d+$/u.test(revision) ||
+    !Number.isSafeInteger(expectedRevision))
+)
+  throw new Error("Invalid --expected-revision");
+
+function operationFor(data) {
+  const operationId = values["operation-id"];
+  if (operationId === undefined) return;
+  return {
+    id: operationId,
+    request: {
+      command,
+      expectedRevision: expectedRevision ?? null,
+      data: structuredClone(data ?? null),
+    },
+  };
+}
+if (values["operation-id"] !== undefined && !["put", "set-meta", "delete"].includes(command))
+  throw new Error("Invalid --operation-id");
 
 function payload() {
   return JSON.parse(readFileSync(0, "utf8"));
 }
 
 async function put(room) {
+  const operation = operationFor(room);
   for (let attempt = 0; attempt < 16; attempt++) {
     try {
-      return await updateRawRoom(id, () => room, { root });
+      return await updateRawRoom(id, () => room, { root, expectedRevision, operation });
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
     }
     try {
-      return await updateRawRoom(id, () => room, { root, create: true });
+      return await updateRawRoom(id, () => room, {
+        root,
+        create: true,
+        expectedRevision,
+        operation,
+      });
     } catch (error) {
       if (error.message !== `Room already exists: ${id}`) throw error;
     }
@@ -57,7 +91,7 @@ async function run() {
           }
           return room;
         },
-        { root },
+        { root, expectedRevision, operation: operationFor(fields) },
       );
     }
     case "rebind": {
@@ -68,7 +102,8 @@ async function run() {
     }
     case "delete": {
       const text = readFileSync(0, "utf8").trim();
-      return deleteRoom(id, root, text ? JSON.parse(text) : undefined);
+      const expected = text ? JSON.parse(text) : undefined;
+      return deleteRoom(id, root, expected, expectedRevision, operationFor(expected));
     }
     default: {
       throw new Error("Expected list, get, put, set-meta, rebind or delete");

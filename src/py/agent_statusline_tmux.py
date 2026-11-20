@@ -739,8 +739,7 @@ def _find_herdr_peer(
         return None
     best: dict[str, object] | None = None
     with contextlib.suppress(OSError):
-        for path in sorted((base / "peers").glob("*.json")):
-            peer = mailbox.load(path)
+        for _, peer in mailbox.peer_entries(base):
             if not isinstance(peer, dict) or not mailbox.valid_peer(peer):
                 continue
             if (

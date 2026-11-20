@@ -105,7 +105,7 @@ Pools are the independently limited groups inside an account: Antigravity's Gemi
 
 ## Install
 
-Part of [Orkest](../../README.md). Requires Node 22+ and the CLIs of the providers you use. Nothing is installed from npm.
+Part of [Orkest](../../README.md). Standalone monitoring requires Node 22+ and the CLIs of the providers you use. Publishing quota with `replicationScope` also requires the Orkest SQLite runtime (Node 26.13+ with SQLite). Nothing is installed from npm.
 
 From the repository root, `./install.sh` installs Orkest, the monitor CLI, and its MCP server. Use `--no-app` for the CLI without the macOS menu bar app or `--no-monitor` to skip monitor.
 
@@ -125,7 +125,7 @@ No config is needed: without `~/.config/monitor/config.json`, monitor monitors w
 
 `./uninstall.sh` removes the launcher, app, login agent, MCP registrations and cache (`--purge` also removes the config).
 
-`install.sh` installs a self-contained copy to `~/.local/share/monitor` (`package.json`, `src/bin/monitor.mjs`, `src/bin/observe.mjs`, `src/lib/monitor` and the skill, laid out like the checkout) and points the launcher there, so the menu bar app and MCP servers never read the checkout. The copy is staged and checked before it replaces the old one; the previous copy moves to `~/.local/share/monitor-backups`, and files or links of your own inside the runtime are kept. macOS privacy protection makes background access to `~/Documents` wait on a permission prompt, which returns with every rebuild of the ad-hoc-signed app. Re-run `./install.sh` after pulling changes, moving the checkout, or changing Node versions.
+`install.sh` installs a self-contained copy to `~/.local/share/monitor` (`package.json`, `src/bin/monitor.mjs`, `src/bin/observe.mjs`, `src/lib/monitor`, the shared SQLite modules and room definitions for publishing quota, and the skill, laid out like the checkout) and points the launcher there, so the menu bar app and MCP servers never read the checkout. The copy is staged and checked before it replaces the old one; the previous copy moves to `~/.local/share/monitor-backups`, and files or links of your own inside the runtime are kept. macOS privacy protection makes background access to `~/Documents` wait on a permission prompt, which returns with every rebuild of the ad-hoc-signed app. Re-run `./install.sh` after pulling changes, moving the checkout, or changing Node versions.
 
 ## macOS permission prompts
 

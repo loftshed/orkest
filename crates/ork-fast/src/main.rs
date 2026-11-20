@@ -6,6 +6,7 @@ mod identity;
 mod lease;
 mod mailbox;
 mod mailbox_lifecycle;
+mod mailbox_records;
 mod mailbox_swarm;
 mod mailbox_transcript;
 mod paths;

@@ -2,7 +2,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::env;
-use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -12,6 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::{Map, Value, json};
 
 use crate::identity;
+use crate::mailbox_records;
 use crate::paths;
 use crate::rooms_work::{self, ProgressRecord};
 
@@ -356,24 +356,14 @@ fn aggregate_children(base: &Path, parent_peer: &Value) -> ChildAggregate {
         return ChildAggregate::default();
     };
 
-    let peers_dir = base.join("peers");
-    let Ok(entries) = fs::read_dir(&peers_dir) else {
+    let Ok(listing) = mailbox_records::list_peers(base) else {
         return ChildAggregate::default();
     };
-    let mut paths_list: Vec<PathBuf> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("json"))
-        .collect();
-    paths_list.sort();
 
     let now_secs = paths::utc_now_secs();
     let mut children: Vec<(String, String, String, String, String)> = Vec::new();
-    for path in paths_list {
-        let Some(peer) = paths::read_json_file(&path) else {
-            continue;
-        };
-        if !paths::valid_peer(&peer) || !peer.get("isSubagent").is_some_and(paths::is_truthy_json) {
+    for (_, peer) in listing.bodies() {
+        if !paths::valid_peer(peer) || !peer.get("isSubagent").is_some_and(paths::is_truthy_json) {
             continue;
         }
         if clean_120(peer.get("parentSession")) != parent_session {
@@ -405,7 +395,7 @@ fn aggregate_children(base: &Path, parent_peer: &Value) -> ChildAggregate {
         {
             continue;
         }
-        if !identity::is_live_peer(&peer, Some(now_secs)) {
+        if !identity::is_live_peer(peer, Some(now_secs)) {
             continue;
         }
         let seen_stamp = peer
@@ -419,7 +409,7 @@ fn aggregate_children(base: &Path, parent_peer: &Value) -> ChildAggregate {
             continue;
         }
 
-        let (model_str, effort_str, source_str) = extract_model_and_effort(Some(&peer), None);
+        let (model_str, effort_str, source_str) = extract_model_and_effort(Some(peer), None);
         let provenance = if source_str == "runtime" && !model_str.is_empty() {
             "observed".to_string()
         } else if !model_str.is_empty() {
@@ -840,15 +830,12 @@ fn codex_title_pane(
     let peer = identity::session_peer(base, session, Some("codex"), None, false);
     let identities = identity::native_session_ids(peer.as_ref(), Some(base));
     let mut sessions = identities.clone();
-    if let Ok(entries) = fs::read_dir(base.join("peers")) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.extension().and_then(|e| e.to_str()) == Some("json")
-                && let Some(candidate) = paths::read_json_file(&p)
-                && candidate.get("harness").and_then(Value::as_str) == Some("codex")
+    if let Ok(listing) = mailbox_records::list_peers(base) {
+        for (_, candidate) in listing.bodies() {
+            if candidate.get("harness").and_then(Value::as_str) == Some("codex")
                 && candidate.get("session").is_some_and(Value::is_string)
             {
-                sessions.extend(identity::native_session_ids(Some(&candidate), Some(base)));
+                sessions.extend(identity::native_session_ids(Some(candidate), Some(base)));
             }
         }
     }
@@ -1475,10 +1462,7 @@ pub fn bind_terminal(
             occupant,
         );
         if !matched_room_id.is_empty() && is_exact_conductor {
-            let stored = paths::peer_path(base, &session)
-                .ok()
-                .and_then(|p| paths::read_json_file(&p))
-                .unwrap_or(Value::Null);
+            let stored = mailbox_records::read_peer(base, &session).unwrap_or(Value::Null);
             let mut fields = Map::new();
             fields.insert(
                 "herdrCoordinatorPaneId".to_string(),
@@ -1699,17 +1683,10 @@ pub fn pane_session(base: &Path, pane_pid: i64, harness: &str) -> Option<String>
         false
     };
 
-    let entries = fs::read_dir(base.join("peers")).ok()?;
+    let listing = mailbox_records::list_peers(base).ok()?;
     let mut sessions = Vec::new();
-    for entry in entries.flatten() {
-        let p = entry.path();
-        if p.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-        let Some(peer) = paths::read_json_file(&p) else {
-            continue;
-        };
-        if !paths::valid_peer(&peer) || peer.get("harness").and_then(Value::as_str) != Some(harness)
+    for (_, peer) in listing.bodies() {
+        if !paths::valid_peer(peer) || peer.get("harness").and_then(Value::as_str) != Some(harness)
         {
             continue;
         }
@@ -1720,7 +1697,7 @@ pub fn pane_session(base: &Path, pane_pid: i64, harness: &str) -> Option<String>
             continue;
         };
         if in_pane(pid)
-            && identity::is_live_peer(&peer, None)
+            && identity::is_live_peer(peer, None)
             && let Some(session_id) = peer.get("session").and_then(Value::as_str)
         {
             sessions.push(session_id.to_string());
@@ -1766,17 +1743,10 @@ pub fn codex_pane_session(base: &Path, pane: &str, server: &str, account: &str) 
         return None;
     }
     let resolved_account = paths::resolve_path(Path::new(account)).ok()?;
-    let entries = fs::read_dir(base.join("peers")).ok()?;
+    let listing = mailbox_records::list_peers(base).ok()?;
     let mut sessions = Vec::new();
-    for entry in entries.flatten() {
-        let p = entry.path();
-        if p.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-        let Some(peer) = paths::read_json_file(&p) else {
-            continue;
-        };
-        if !paths::valid_peer(&peer) || peer.get("harness").and_then(Value::as_str) != Some("codex")
+    for (_, peer) in listing.bodies() {
+        if !paths::valid_peer(peer) || peer.get("harness").and_then(Value::as_str) != Some("codex")
         {
             continue;
         }
