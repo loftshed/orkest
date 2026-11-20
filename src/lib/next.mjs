@@ -73,9 +73,7 @@ import {
 import { acquireWorkspaceLease, assertWorkspaceLease } from "./workspace-lease.mjs";
 
 const executeAsync = promisify(execFile);
-const scriptsDir = fileURLToPath(
-  new URL("../../plugins/orchestrate/skills/orchestrate/scripts/", import.meta.url),
-);
+const scriptsDir = fileURLToPath(new URL("../../src/py/", import.meta.url));
 
 export const NEXT_SCHEMA = "ork.next.v1";
 export const NEXT_LEDGER_SCHEMA = "ork.next.ledger.v1";

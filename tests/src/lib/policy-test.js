@@ -26,7 +26,7 @@ import {
 } from "../../../src/lib/policy.mjs";
 
 const REPO_ROOT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
-const SCRIPTS_DIR = path.join(REPO_ROOT_DIR, "plugins/orchestrate/skills/orchestrate/scripts");
+const SCRIPTS_DIR = path.join(REPO_ROOT_DIR, "src/py");
 
 function git(cwd, ...args) {
   const res = spawnSync("git", args, { cwd, encoding: "utf8" });

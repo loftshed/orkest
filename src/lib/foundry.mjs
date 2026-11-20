@@ -39,7 +39,7 @@ import {
   normalizeDenyToken,
   resolveRepoPolicy,
 } from "./policy.mjs";
-import { cacheHome, configPath, envFirst } from "./runtime-paths.mjs";
+import { cacheHome, configPath, envFirst, runtimeReference } from "./runtime-paths.mjs";
 import { acquireWorkspaceLease, assertWorkspaceLease } from "./workspace-lease.mjs";
 import {
   bootstrapWorktreeInclude as bootstrapWorktreeIncludeShared,
@@ -48,13 +48,8 @@ import {
 import { prepareWorktree } from "./worktree-provision.mjs";
 
 const execute = promisify(execFile);
-const scriptsDir = fileURLToPath(
-  new URL("../../plugins/orchestrate/skills/orchestrate/scripts/", import.meta.url),
-);
-const defaultRoutesUrl = new URL(
-  "../../plugins/orchestrate/skills/orchestrate/references/routes.default.json",
-  import.meta.url,
-);
+const scriptsDir = fileURLToPath(new URL("../../src/py/", import.meta.url));
+const defaultRoutesUrl = runtimeReference("routes.default.json");
 const TASK_SPEC_SCHEMA = "agent-executor.task-spec.v1";
 export const FOUNDRY_STATE_SCHEMA = "ork.foundry.state.v2";
 

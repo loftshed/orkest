@@ -292,7 +292,7 @@ describe("rooms decision projection", () => {
   it("keeps accepted snapshots after workspace changes and audits only undecided work", async () => {
     const { root, task, observe } = await fixture();
     await execute("git", ["init", "--quiet", root]);
-    const scripts = path.resolve("plugins/orchestrate/skills/orchestrate/scripts");
+    const scripts = path.resolve("src/py");
     const { stdout } = await execute("python3", [
       "-B",
       "-c",

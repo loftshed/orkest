@@ -1,0 +1,702 @@
+"""The footer displays only identity and work recorded for its own session."""
+
+from __future__ import annotations
+
+import itertools
+import json
+import os
+import re
+import select
+import socket
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from unittest import mock
+
+TESTS_DIR = Path(__file__).resolve().parent
+SCRIPTS = Path(__file__).resolve().parents[3] / "src/py"
+sys.path.insert(0, str(TESTS_DIR))
+sys.path.insert(0, str(SCRIPTS))
+import _ork_fast_test_helpers as fast  # noqa: E402
+import agent_statusline_tmux as tmux  # noqa: E402
+import mailbox_tasks  # noqa: E402
+import mailbox_work  # noqa: E402
+import peer_mailbox as mailbox  # noqa: E402
+import room_store  # noqa: E402
+
+
+class AgentStatuslineTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.home = Path(temporary.name)
+        self.base = self.home / "mailbox-v1"
+        self.environment = {**os.environ, "AGENT_EXECUTOR_HOME": str(self.home)}
+        self.environment.pop("NO_COLOR", None)
+        self.environment.pop("ORK_GLYPHS", None)
+        self.peer("claude-123", "snorfle-opus-high-project-23", "claude")
+        self.peer("gemini-456", "snoobix-gemini-low-project-56", "gemini")
+
+    def peer(self, session, name, harness, pid=None, **fields):
+        peer = {
+            "schema": mailbox.PEER_SCHEMA,
+            "session": session,
+            "name": name,
+            "harness": harness,
+            "pid": pid or os.getpid(),
+            "cwd": str(self.home),
+            "checkout": str(self.home),
+            "repo": str(self.home / ".git"),
+            "repository": "project",
+            "remotes": [],
+            "startedAt": mailbox.stamp(),
+            "lastSeenAt": mailbox.stamp(),
+            **fields,
+        }
+        mailbox.write(mailbox.peer_path(self.base, session), peer)
+        return peer
+
+    def run_status(self, *args, payload=None, environment=None):
+        return fast.run_statusline(
+            *args,
+            stdin_data=payload,
+            base=self.base,
+            env=environment or self.environment,
+            check=True,
+        ).stdout
+
+    def fields(self, session="claude-123"):
+        return json.loads(self.run_status("--session", session, "--json", "--width", "200"))
+
+    def room(self, *, title="Build a footer", session="claude-123", name="room-a", dispatch=None):
+        member = {
+            "id": "agent-1",
+            "engine": "claude",
+            "model": "opus",
+            "session": {"id": session, "engine": "claude", "machine": socket.gethostname(), "cwd": str(self.home)},
+        }
+        if dispatch:
+            member["dispatch"] = dispatch
+        mailbox.write(
+            self.base / "rooms" / f"{name}.json",
+            {
+                "schema": "agent-executor.room.v1",
+                "id": name,
+                "title": title,
+                "cwd": str(self.home),
+                "machine": socket.gethostname(),
+                "agents": [member],
+                "conductor": {},
+            },
+        )
+
+    def test_claude_and_antigravity_show_their_own_identity_and_runtime_settings(self):
+        line = self.run_status(
+            "--plain",
+            "--width",
+            "200",
+            payload={"session_id": "claude-123", "model": {"id": "opus-4"}, "effort": {"level": "high"}},
+        )
+        self.assertEqual(
+            line,
+            "snorfle | opus-4 / high | repo : project | stage : not set | goal : not set | task : not set\n",
+        )
+        line = self.run_status(
+            "--plain",
+            "--width",
+            "200",
+            payload={"conversation_id": "gemini-456", "model": {"id": "gemini-pro", "effort": "low"}},
+        )
+        self.assertEqual(
+            line,
+            "snoobix | gemini-pro / low | repo : project | stage : not set | goal : not set | task : not set\n",
+        )
+        deduped = self.run_status(
+            "--plain",
+            "--width",
+            "200",
+            payload={
+                "conversation_id": "gemini-456",
+                "model": {
+                    "id": "Gemini 4 Argon (Medium)",
+                    "display_name": "Gemini 4 Argon (Medium)",
+                    "effort": "medium",
+                },
+            },
+        )
+        self.assertEqual(
+            deduped,
+            "snoobix | Gemini 4 Argon / medium | repo : project | stage : not set | goal : not set | task : not set\n",
+        )
+        self.peer("gemini-456", "snoobix-gemini-4-argon-medium-project-56", "gemini", model="gemini-4-argon-medium")
+        fields = self.fields("gemini-456")
+        self.assertEqual(
+            (fields["name"], fields["fullName"], fields["model"], fields["effort"]),
+            ("snoobix", "snoobix-gemini-4-argon-medium-project-56", "gemini-4-argon", "medium"),
+        )
+
+    def test_color_is_stable_and_no_color_is_respected(self):
+        colored = self.run_status("--width", "200", payload={"session_id": "claude-123"})
+        self.assertRegex(
+            colored,
+            r"^\x1b\[0m\x1b\[48;5;[0-9]+;38;5;232;1m 󰚩 \x1b\[0m \x1b\[38;5;[0-9]+;1m(snorfle)\x1b\[0m",
+        )
+        self.assertEqual(
+            re.sub(r"\x1b\[[0-9;]*m", "", colored),
+            " 󰚩  snorfle | — / — | repo : project | stage : not set | goal : not set | task : not set\n",
+        )
+        self.assertNotIn("\x1b[48;5;", colored[28:])
+        unicode_colored = self.run_status(
+            "--width",
+            "200",
+            payload={"session_id": "claude-123"},
+            environment={**self.environment, "ORK_GLYPHS": "unicode"},
+        )
+        self.assertRegex(
+            unicode_colored,
+            r"^\x1b\[0m\x1b\[48;5;[0-9]+m  \x1b\[0m \x1b\[38;5;[0-9]+;1m(snorfle)\x1b\[0m",
+        )
+        tmux_colored = self.run_status("--width", "200", "--tmux", payload={"session_id": "claude-123"})
+        self.assertRegex(
+            tmux_colored,
+            r"^#\[align=left,bg=default,fg=default\]#\[bg=colour[0-9]+,fg=colour232,bold\] 󰚩 #\[bg=default,fg=default\] #\[fg=colour[0-9]+,bold\]",
+        )
+        self.assertNotIn("fill=colour", tmux_colored)
+        tmux_line2 = self.run_status("--width", "200", "--tmux", "--line", "2", payload={"session_id": "claude-123"})
+        self.assertRegex(
+            tmux_line2,
+            r"^#\[align=left,bg=default,fg=default\]#\[fg=colour[0-9]+\] 󰓾 #\[fg=default\] ",
+        )
+        self.assertNotIn("bg=colour", tmux_line2)
+        self.assertEqual(colored, self.run_status("--width", "200", payload={"session_id": "claude-123"}))
+        self.assertNotIn(
+            "\x1b",
+            self.run_status(payload={"session_id": "claude-123"}, environment={**self.environment, "NO_COLOR": "1"}),
+        )
+
+    def test_renamed_agent_and_changed_fields_are_read_on_refresh(self):
+        self.peer(
+            "claude-123", "snorfle-opus-max-project-23", "claude", model="opus", effort="max", focus="Review docs"
+        )
+        fields = self.fields()
+        self.assertEqual(
+            (fields["name"], fields["fullName"], fields["model"], fields["effort"], fields["task"], fields["stage"]),
+            ("snorfle", "snorfle-opus-max-project-23", "opus", "max", "Review docs", "not set"),
+        )
+
+    def test_codex_uses_its_own_runtime_model_and_effort_from_its_account(self):
+        account = self.home / "codex-account"
+        account.mkdir()
+        with sqlite3.connect(account / "state_5.sqlite") as database:
+            database.execute("CREATE TABLE threads (id TEXT, model TEXT, reasoning_effort TEXT)")
+            database.executemany(
+                "INSERT INTO threads VALUES (?, ?, ?)",
+                [("codex-789", "gpt-6", "max"), ("other", "gpt-other", "low")],
+            )
+        self.peer("codex-789", "blip-gpt-high-project-89", "codex", accountHome=str(account))
+        fields = self.fields("codex-789")
+        self.assertEqual((fields["model"], fields["effort"]), ("gpt-6", "max"))
+        with sqlite3.connect(account / "state_5.sqlite") as database:
+            database.execute("UPDATE threads SET reasoning_effort = 'medium' WHERE id = 'codex-789'")
+        self.assertEqual(self.fields("codex-789")["effort"], "medium")
+
+    def test_workboard_assignment_reflects_claim_block_and_review(self):
+        peer = mailbox.load(mailbox.peer_path(self.base, "claude-123"))
+        created = mailbox_work.mutate(
+            self.base,
+            peer,
+            action="create",
+            key="footer",
+            title="Render the status line",
+            scope="Terminal",
+            acceptance="Fields visible",
+        )["item"]
+        claimed = mailbox_work.mutate(
+            self.base, peer, action="claim", item=created["id"], revision=created["revision"]
+        )["item"]
+        self.room()
+        fields = self.fields()
+        self.assertEqual(
+            (fields["goal"], fields["task"], fields["stage"]), ("Build a footer", "Render the status line", "claimed")
+        )
+        blocked = mailbox_work.mutate(
+            self.base,
+            peer,
+            action="checkpoint",
+            item=claimed["id"],
+            revision=claimed["revision"],
+            blocker="Waiting for a decision",
+        )["item"]
+        self.assertEqual(self.fields()["stage"], "blocked")
+        unblocked = mailbox_work.mutate(
+            self.base, peer, action="checkpoint", item=blocked["id"], revision=blocked["revision"], blocker=""
+        )["item"]
+        mailbox_work.mutate(
+            self.base,
+            peer,
+            action="submit",
+            item=unblocked["id"],
+            revision=unblocked["revision"],
+            evidence="Change is ready",
+            verification="Focused checks pass",
+        )
+        self.assertEqual(self.fields()["stage"], "review")
+
+    def test_room_task_uses_exact_run_and_verdict(self):
+        directory = self.home / "task"
+        binding = {
+            "taskDir": str(directory),
+            "taskId": "task-a",
+            "requestId": "request-a",
+            "runId": "run-a",
+            "transport": "native",
+        }
+        self.room(dispatch=binding)
+        task = {
+            "schema": "agent-executor.task.v1",
+            "task_id": "task-a",
+            "repository": str(self.home),
+            "task_spec": {"objective": "Test the footer"},
+            "runs": [
+                {
+                    "request_id": "request-a",
+                    "run_id": "run-a",
+                    "engine": "claude",
+                    "transport": "native",
+                    "status": "finished",
+                    "runner_status": "completed",
+                }
+            ],
+            "decisions": [],
+        }
+        task["runs"].insert(0, "unrelated malformed run")
+        task["decisions"].append("unrelated malformed decision")
+        mailbox.write(directory / "task.json", task)
+        self.assertEqual((self.fields()["task"], self.fields()["stage"]), ("Test the footer", "review"))
+        task["decisions"].append({"run_id": "run-a", "decision": "accept"})
+        mailbox.write(directory / "task.json", task)
+        self.assertEqual(self.fields()["stage"], "accepted")
+        task["runs"].pop(0)
+        task["decisions"].clear()
+        task["runs"][0]["runner_status"] = "failed"
+        mailbox.write(directory / "task.json", task)
+        self.assertEqual(self.fields()["stage"], "failed")
+        task["decisions"].append({"run_id": "run-a", "decision": "reject"})
+        mailbox.write(directory / "task.json", task)
+        self.assertEqual(self.fields()["stage"], "rejected")
+        task["decisions"].append({"run_id": "run-a", "decision": "takeover"})
+        mailbox.write(directory / "task.json", task)
+        self.assertEqual(self.fields()["stage"], "blocked")
+        task["runs"][0]["run_id"] = "different"
+        mailbox.write(directory / "task.json", task)
+        self.assertEqual((self.fields()["task"], self.fields()["stage"]), ("not set", "not set"))
+
+    def test_ambiguous_rooms_and_tasks_do_not_choose_a_winner(self):
+        self.room(title="First goal")
+        self.room(title="Another goal", name="room-b")
+        fields = self.fields()
+        self.assertEqual((fields["goal"], fields["task"], fields["stage"]), ("multiple rooms", "not set", "not set"))
+
+        peer = mailbox.load(mailbox.peer_path(self.base, "claude-123"))
+        for index in range(2):
+            created = mailbox_work.mutate(
+                self.base,
+                peer,
+                action="create",
+                key=f"task-{index}",
+                title=f"Task {index}",
+                scope="Terminal",
+                acceptance="Visible",
+            )["item"]
+            mailbox_work.mutate(self.base, peer, action="claim", item=created["id"], revision=created["revision"])
+        fields = self.fields()
+        self.assertEqual((fields["task"], fields["stage"]), ("multiple tasks", "varies"))
+
+    def test_saved_note_must_match_this_sessions_focus(self):
+        peer = self.peer("claude-123", "snorfle-opus-high-project-23", "claude", focus="Review docs")
+        mailbox_tasks.save(self.base, peer, status="blocked", blocker="Waiting for review")
+        self.assertEqual((self.fields()["task"], self.fields()["stage"]), ("Review docs", "blocked"))
+        self.peer("claude-123", "snorfle-opus-high-project-23", "claude", focus="Build a footer")
+        self.assertEqual((self.fields()["task"], self.fields()["stage"]), ("Build a footer", "not set"))
+
+    def test_stale_chief_focus_is_cleared_for_non_chief_session(self):
+        chief_focus = "Ork Chief — machine-wide master orchestrator"
+        self.peer("claude-123", "snorfle-opus-high-project-23", "claude", focus=chief_focus)
+        self.assertEqual(self.fields()["task"], "not set")
+        mailbox.write(
+            self.base / "chief.json",
+            {"schema": "ork.chief.v1", "session": "other-chief"},
+        )
+        self.assertEqual(self.fields()["task"], "not set")
+        mailbox.write(
+            self.base / "chief.json",
+            {"schema": "ork.chief.v1", "session": "claude-123"},
+        )
+        self.assertEqual(self.fields()["task"], chief_focus)
+
+    def test_width_and_untrusted_terminal_text_are_safe(self):
+        self.peer(
+            "claude-123",
+            "snorfle-opus-high-project-23",
+            "claude",
+            model="a-very-long-model-version",
+            effort="medium",
+            focus="A long task with #() and \x1b[2J escape",
+        )
+        self.room(title="An overarching goal that is much longer than usual")
+        line = self.run_status("--session", "claude-123", "--width", "80", "--plain").strip()
+        self.assertLessEqual(len(line), 80)
+        self.assertIn("repo : ", line)
+        self.assertIn("stage : ", line)
+        self.assertIn("goal : ", line)
+        self.assertIn("task : ", line)
+        self.assertTrue(line.startswith("snorfle | "))
+        self.assertNotIn("\x1b", line)
+        narrow = self.run_status("--session", "claude-123", "--width", "32", "--plain").strip()
+        self.assertLessEqual(len(narrow), 32)
+        tmux = self.run_status(
+            "--session", "claude-123", "--width", "200", "--tmux", environment={**self.environment, "NO_COLOR": "1"}
+        )
+        self.assertIn("##()", tmux)
+        self.assertNotIn("\x1b", tmux)
+
+    def test_missing_invalid_or_wrong_harness_does_not_guess(self):
+        self.assertEqual(self.run_status("--plain", payload={"session_id": "other"}), "")
+        self.assertEqual(self.run_status("--plain", payload={"session_id": "../claude-123"}), "")
+        self.assertEqual(self.run_status("--harness", "gemini", payload={"session_id": "claude-123"}), "")
+        self.assertEqual(self.run_status("--plain", payload=[]), "")
+        self.peer("invalid-name", "name\x1b[2J", "claude")
+        self.assertEqual(self.run_status("--session", "invalid-name"), "")
+
+    def test_pane_matching_requires_exactly_one_live_codex_peer(self):
+        self.peer("codex-789", "blip-gpt-high-project-89", "codex", os.getpid())
+        line = self.run_status("--pane-pid", str(os.getpid()), "--harness", "codex", "--plain", "--width", "200")
+        self.assertTrue(line.startswith("blip | "))
+        self.peer("codex-999", "zog-gpt-low-project-99", "codex", os.getpid())
+        self.assertEqual(self.run_status("--pane-pid", str(os.getpid()), "--harness", "codex", "--plain"), "")
+
+    def test_visible_codex_thread_selects_its_identity_on_a_shared_daemon(self):
+        first = "01a18d2e-cd95-7043-bc95-2339f2faf78e"
+        second = "01a18d61-329d-7170-af88-c965f50e6366"
+        for session, name in ((first, "blip-gpt-high-project-8e"), (second, "zog-gpt-low-project-66")):
+            self.peer(session, name, "codex", pid=99999999, accountHome=str(self.home))
+        binary = self.home / "tmux"
+        binary.write_text('#!/bin/sh\ncat "$TEST_PANE_TITLE"\n')
+        binary.chmod(0o755)
+        title = self.home / "title"
+        environment = {
+            **self.environment,
+            "PATH": str(self.home) + os.pathsep + os.environ["PATH"],
+            "TEST_PANE_TITLE": str(title),
+        }
+        arguments = (
+            "--codex-pane",
+            "%0",
+            "--tmux-server",
+            "private",
+            "--codex-home",
+            str(self.home),
+            "--harness",
+            "codex",
+            "--json",
+            "--width",
+            "200",
+        )
+        title.write_text(first[:29] + "...")
+        first_fields = json.loads(self.run_status(*arguments, environment=environment))
+        self.assertEqual((first_fields["name"], first_fields["fullName"]), ("blip", "blip-gpt-high-project-8e"))
+        title.write_text(second)
+        second_fields = json.loads(self.run_status(*arguments, environment=environment))
+        self.assertEqual((second_fields["name"], second_fields["fullName"]), ("zog", "zog-gpt-low-project-66"))
+        title.write_text(first[:29] + "...")
+        self.peer(first[:29] + "0000000", "conflicting-peer", "codex", accountHome=str(self.home))
+        self.assertEqual(self.run_status(*arguments, environment=environment), "")
+        title.write_text("not a native thread ID")
+        self.assertEqual(self.run_status(*arguments, environment=environment), "")
+        title.write_text(second)
+        self.peer(second, "other-account", "codex", accountHome=str(self.home / "different-account"))
+        self.assertEqual(self.run_status(*arguments, environment=environment), "")
+
+    def test_multiline_status_split(self):
+        line1 = self.run_status(
+            "--plain",
+            "--width",
+            "200",
+            "--line",
+            "1",
+            payload={"session_id": "claude-123", "model": {"id": "opus-4"}, "effort": {"level": "high"}},
+        )
+        self.assertEqual(line1, "snorfle | opus-4 / high | repo : project\n")
+        line2 = self.run_status(
+            "--plain",
+            "--width",
+            "200",
+            "--line",
+            "2",
+            payload={"session_id": "claude-123"},
+        )
+        self.assertEqual(line2, "stage : not set | goal : not set | task : not set\n")
+
+
+class RoomLockTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.path = Path(temporary.name) / "room.json"
+        self.lock = Path(f"{self.path}.lock")
+
+    def age_lock(self):
+        old = time.time() - 60
+        os.utime(self.lock, (old, old))
+
+    def assert_locked(self):
+        with mock.patch.object(tmux.time, "monotonic", side_effect=itertools.count(0, 4)):
+            with self.assertRaisesRegex(OSError, "Room is locked"):
+                with tmux._node_room_lock(self.path):
+                    self.fail("entered another holder's lock")
+
+    def test_aged_live_legacy_and_json_owners_are_preserved(self):
+        self.lock.mkdir()
+        for owner in (f"{os.getpid()}\n", json.dumps({"pid": os.getpid(), "token": "legacy-upgrade"})):
+            with self.subTest(owner=owner):
+                (self.lock / "owner").write_text(owner)
+                self.age_lock()
+                self.assert_locked()
+                self.assertEqual((self.lock / "owner").read_text(), owner)
+
+    def test_dead_missing_invalid_and_reused_owners_recover(self):
+        for kind in ("dead", "missing", "invalid", "reused", "retired"):
+            with self.subTest(kind=kind):
+                self.lock.mkdir()
+                if kind != "missing":
+                    owner = (
+                        "partial{"
+                        if kind == "invalid"
+                        else json.dumps(
+                            {
+                                "pid": 2147483647 if kind in ("dead", "retired") else os.getpid(),
+                                "token": "ended-acquisition",
+                                "pidBirth": "previous-process",
+                            }
+                        )
+                    )
+                    name = "owner.2147483647.abcd.retired" if kind == "retired" else "owner"
+                    (self.lock / name).write_text(owner)
+                self.age_lock()
+                with tmux._node_room_lock(self.path):
+                    current = json.loads((self.lock / "owner").read_text())
+                    self.assertEqual(current["pid"], os.getpid())
+                    self.assertEqual(len(current["token"]), 32)
+                self.assertFalse(self.lock.exists())
+
+    def test_missing_owner_gets_an_acquisition_grace_period(self):
+        self.lock.mkdir()
+        self.assert_locked()
+        self.assertTrue(self.lock.is_dir())
+
+    def test_release_keeps_a_replacement_acquisition_with_same_pid(self):
+        with self.assertRaisesRegex(RuntimeError, "update failed"):
+            with tmux._node_room_lock(self.path):
+                (self.lock / "owner").unlink()
+                self.lock.rmdir()
+                self.lock.mkdir()
+                (self.lock / "owner").write_text(json.dumps({"pid": os.getpid(), "token": "replacement"}))
+                raise RuntimeError("update failed")
+        self.assertEqual(json.loads((self.lock / "owner").read_text()), {"pid": os.getpid(), "token": "replacement"})
+
+    def test_python_and_node_holders_exclude_each_other_when_aged(self):
+        module = SCRIPTS.parents[1] / "src/lib/horde-room.mjs"
+        script = f"""
+            import {{ withRoomLock }} from {json.dumps(module.as_uri())};
+            await withRoomLock(process.argv[1], async () => {{
+                console.log("acquired");
+                await new Promise((resolve) => process.stdin.once("data", resolve));
+            }});
+        """
+        child = subprocess.Popen(
+            ["node", "--input-type=module", "-e", script, str(self.path)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            self.assertTrue(select.select([child.stdout], [], [], 5)[0], "Node did not acquire the lock")
+            self.assertEqual(child.stdout.readline(), "acquired\n")
+            self.age_lock()
+            self.assert_locked()
+        finally:
+            try:
+                _, errors = child.communicate("release\n", timeout=5)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.communicate()
+                raise
+        self.assertEqual(child.returncode, 0, errors)
+        with tmux._node_room_lock(self.path):
+            self.age_lock()
+            script = f"""
+                import {{ withRoomLock }} from {json.dumps(module.as_uri())};
+                const now = Date.now();
+                let first = true;
+                Date.now = () => {{ if (first) {{ first = false; return now; }} return now + 4000; }};
+                try {{
+                    await withRoomLock(process.argv[1], () => console.log("stolen"));
+                }} catch (error) {{ console.log(error.message); }}
+            """
+            result = subprocess.run(
+                ["node", "--input-type=module", "-e", script, str(self.path)],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=True,
+            )
+            self.assertEqual(result.stdout, f"Room is locked: {self.path}\n")
+            self.assertEqual(json.loads((self.lock / "owner").read_text())["pid"], os.getpid())
+
+
+class RoomStoreTests(unittest.TestCase):
+    def test_empty_store_never_spawns_node_and_legacy_import_is_cached_and_invalidated(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary) / "mailbox-v1"
+            with mock.patch.object(room_store.subprocess, "run", side_effect=AssertionError("unexpected Node spawn")):
+                self.assertEqual(room_store.list_rooms(base), [])
+                self.assertIsNone(room_store.read_room(base, "missing"))
+            legacy = base / "rooms" / "legacy.json"
+            mailbox.write(legacy, {"id": "legacy", "agents": [], "title": "Before"})
+            # Legacy files need the Node import first, so Python never reads rooms.db around them.
+            with mock.patch.object(sqlite3, "connect", side_effect=AssertionError("Python must not open rooms.db")):
+                self.assertEqual(room_store.read_room(base, "legacy")["title"], "Before")
+            self.assertFalse(legacy.exists())
+            self.assertTrue((base / "rooms.v1-backup" / "legacy.json").exists())
+            # After the import, reads may use the read-only sqlite3 reader.
+            room_store.list_rooms(base)
+            with mock.patch.object(room_store.subprocess, "run", side_effect=AssertionError("cache miss")):
+                cached = room_store.read_room(base, "legacy")
+                cached["title"] = "Local mutation"
+                self.assertEqual(room_store.read_room(base, "legacy")["title"], "Before")
+            room_store._invoke(base, "set-meta", "legacy", {"title": "External change"})
+            self.assertEqual(room_store.read_room(base, "legacy")["title"], "External change")
+            self.assertEqual(
+                tmux._update_room_metadata(base, "legacy", title="Metadata", removed=None)["title"], "Metadata"
+            )
+            self.assertEqual(room_store.read_room(base, "legacy")["title"], "Metadata")
+            self.assertFalse(legacy.exists())
+
+    def test_rebind_preserves_history_and_wal_changes_invalidate_cached_rooms(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary) / "mailbox-v1"
+            mailbox.register(base, session="new", harness="claude", cwd=temporary, pid=os.getpid())
+            mailbox.attest_native_sessions(base, "new", "old")
+            room_store.put_room(
+                base, {"id": "room", "cwd": temporary, "agents": [], "conductor": {"session": {"id": "old"}}}
+            )
+            room_store.list_rooms(base)
+            rebound = tmux.rebind_session_swarm_room(base, "room", "conductor", "new")
+            self.assertEqual(rebound["conductor"], {"session": {"id": "new"}, "previousSessions": ["old"]})
+            self.assertEqual(
+                tmux.rebind_session_swarm_room(base, "room", "conductor", "new")["conductor"]["previousSessions"],
+                ["old"],
+            )
+            self.assertIsNone(tmux.rebind_session_swarm_room(base, "room", "absent", "new"))
+            room_store.list_rooms(base)
+            sqlite_module = (SCRIPTS.parents[1] / "src/lib/orkest-sqlite.mjs").as_uri()
+            script = f"""
+              import {{ openOrkestSqlite }} from {json.dumps(sqlite_module)};
+              const db = openOrkestSqlite(process.argv[1] + '/rooms.db');
+              db.exec(`UPDATE rooms SET data = json_set(data, '$.title', 'WAL update'), revision = revision + 1`);
+              console.log('ready');
+              process.stdin.once('data', () => {{ db.close(); process.exit(0); }});
+            """
+            child = subprocess.Popen(
+                ["node", "--input-type=module", "-e", script, str(base)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                self.assertEqual(child.stdout.readline().strip(), "ready")
+                self.assertTrue((base / "rooms.db-wal").exists())
+                self.assertEqual(room_store.read_room(base, "room")["title"], "WAL update")
+                with mock.patch.object(
+                    room_store.subprocess, "run", side_effect=AssertionError("single-room cache miss")
+                ):
+                    self.assertEqual(room_store.read_room(base, "room")["conductor"]["session"]["id"], "new")
+                    self.assertIsNone(room_store.read_room(base, ".DS_Store"))
+            finally:
+                _, errors = child.communicate("close", timeout=10)
+                self.assertEqual(child.returncode, 0, errors)
+
+    @mock.patch.dict(os.environ, {"ORKEST_ROOM_STORE_BRIDGE": "1"})
+    def test_single_room_lookup_uses_get_and_header_counter_invalidates_restored_mtime(self):
+        # Pins the Node bridge path; the direct sqlite3 reader shares the same signature cache.
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary) / "mailbox-v1"
+            room_store.put_room(base, {"id": "alpha", "agents": [], "title": "Initial"})
+            room_store.put_room(base, {"id": "beta", "agents": [], "title": "Other"})
+            room_store._CACHE.clear()
+
+            original_invoke = room_store._invoke
+            commands: list[tuple[str, str | None]] = []
+            with mock.patch.object(
+                room_store,
+                "_invoke",
+                side_effect=lambda b, cmd, rid=None, payload=None: (
+                    commands.append((cmd, rid)) or original_invoke(b, cmd, rid, payload)
+                ),
+            ):
+                self.assertEqual(room_store.read_room(base, "alpha")["title"], "Initial")
+                self.assertEqual(commands, [("get", "alpha")])
+
+            db_path = base / "rooms.db"
+            before = db_path.stat()
+            sqlite_module = (SCRIPTS.parents[1] / "src/lib/orkest-sqlite.mjs").as_uri()
+            subprocess.run(
+                [
+                    "node",
+                    "--input-type=module",
+                    "-e",
+                    (
+                        f"import {{ openOrkestSqlite }} from {json.dumps(sqlite_module)};"
+                        "using db = openOrkestSqlite(process.argv[1]);"
+                        "db.exec(\"UPDATE rooms SET data = json_set(data, '$.title', 'Updated!') WHERE id = 'alpha'\");"
+                        "db.exec('PRAGMA wal_checkpoint(TRUNCATE)');"
+                    ),
+                    str(db_path),
+                ],
+                check=True,
+                timeout=10,
+            )
+            os.utime(db_path, ns=(before.st_atime_ns, before.st_mtime_ns))
+            self.assertEqual(room_store.read_room(base, "alpha")["title"], "Updated!")
+
+    def test_orca_toggle_swarm_view_forwards_chief_flag(self):
+        import orca_swarm_restore
+
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary) / "mailbox-v1"
+            base.mkdir(parents=True, exist_ok=True)
+            with mock.patch.dict(
+                os.environ,
+                {"HERDR_ENV": "0", "ORCA_PANE_KEY": "pane-1", "ORCA_TERMINAL_HANDLE": "term_1"},
+                clear=True,
+            ):
+                with mock.patch.object(orca_swarm_restore, "toggle", return_value={"status": "opened"}) as mocked:
+                    result = tmux.toggle_swarm_view(
+                        "open",
+                        room=None,
+                        session_id="chief-1",
+                        base=base,
+                        chief=True,
+                    )
+            self.assertEqual(result["status"], "opened")
+            self.assertTrue(mocked.call_args.kwargs["chief"])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -657,10 +657,7 @@ process.stdout.write(JSON.stringify({ type: "result", is_error: false, result: "
     accountHome: path.join(realpathSync(autoClaudeHome), ".claude"),
   });
 
-  const scriptsDir = new URL(
-    "../../../../plugins/orchestrate/skills/orchestrate/scripts",
-    import.meta.url,
-  ).pathname;
+  const scriptsDir = new URL("../../../../src/py", import.meta.url).pathname;
   const handoffProbe = spawnSync(
     "python3",
     [

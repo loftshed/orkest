@@ -27,18 +27,12 @@ const execFileAsync = promisify(execFile);
 
 export const DEFAULT_PRIORS_PATH = path.resolve(
   import.meta.dirname,
-  "../../plugins/orchestrate/skills/orchestrate/references/benchmarks.prior.json",
+  "../../references/benchmarks.prior.json",
 );
 
-const TELEMETRY_SCRIPT_PATH = path.resolve(
-  import.meta.dirname,
-  "../../plugins/orchestrate/skills/orchestrate/scripts/telemetry.py",
-);
+const TELEMETRY_SCRIPT_PATH = path.resolve(import.meta.dirname, "../../src/py/telemetry.py");
 
-const RUN_AGENT_SCRIPT_PATH = path.resolve(
-  import.meta.dirname,
-  "../../plugins/orchestrate/skills/orchestrate/scripts/run_agent.py",
-);
+const RUN_AGENT_SCRIPT_PATH = path.resolve(import.meta.dirname, "../../src/py/run_agent.py");
 
 const MODELS_CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const SEEN_SCHEMA = "orkest.models-seen.v1";

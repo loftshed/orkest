@@ -17,6 +17,7 @@ ork chief bind                 # claim the machine-wide Chief desk for this sess
 ork chief inbox                # open items grouped by room; `--ack` clears the groups it shows
 ork chief desk                 # reports queued while no Chief was live (desk only)
 ork horde open --chief         # open the Chief View split pane beside this conversation
+
 ```
 
 - `bind` is a singleton. If `status` shows another live Chief, tell the user which session holds
@@ -48,8 +49,10 @@ The user talks in a stream: ideas, bugs and goals for several repositories at on
 2. **Plan when it is not obvious.** For a design, a risky change or a ticket breakdown, ask another
    model family before spawning, and keep only its verdict:
 
+   Set `ORKEST_CHECKOUT` to the absolute path of your Orkest checkout.
+
    ```sh
-   python3 ~/.agents/skills/orchestrate/scripts/run_agent.py consult \
+   python3 "$ORKEST_CHECKOUT/src/py/run_agent.py" consult \
      --question 'Split <goal> into independently mergeable tickets; flag risks' \
      --read <repo> --model gpt:sol
    ```

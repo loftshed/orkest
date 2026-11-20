@@ -6,7 +6,7 @@ description = "Group, inspect, and manage Orkest swarms"
 platforms = ["macos", "linux"]
 
 [[startup]]
-command = ["python3", "plugins/orchestrate/skills/orchestrate/scripts/herdr_swarm_restore.py", "--restore"]
+command = ["python3", "src/py/herdr_swarm_restore.py", "--restore"]
 
 [[actions]]
 id = "toggle"
@@ -15,7 +15,7 @@ description = "Open or close the Orkest Swarm View split pane"
 contexts = ["global", "workspace", "tab", "pane"]
 command = [
   "python3",
-  "plugins/orchestrate/skills/orchestrate/scripts/agent_statusline_tmux.py",
+  "src/py/agent_statusline_tmux.py",
   "--toggle-swarm",
   "toggle",
 ]
@@ -27,7 +27,7 @@ description = "Open the Orkest Swarm View in a right-side split pane"
 contexts = ["global", "workspace", "tab", "pane"]
 command = [
   "python3",
-  "plugins/orchestrate/skills/orchestrate/scripts/agent_statusline_tmux.py",
+  "src/py/agent_statusline_tmux.py",
   "--toggle-swarm",
   "open",
 ]
@@ -39,7 +39,7 @@ description = "Close the Orkest Swarm View split pane in the current workspace"
 contexts = ["global", "workspace", "tab", "pane"]
 command = [
   "python3",
-  "plugins/orchestrate/skills/orchestrate/scripts/agent_statusline_tmux.py",
+  "src/py/agent_statusline_tmux.py",
   "--toggle-swarm",
   "close",
 ]
@@ -48,4 +48,4 @@ command = [
 id = "room"
 title = "Orkest Swarm"
 placement = "split"
-command = ["sh", "-c", 'exec python3 "$HERDR_PLUGIN_ROOT/plugins/orchestrate/skills/orchestrate/scripts/herdr_swarm_restore.py" --view']
+command = ["sh", "-c", 'exec python3 "$HERDR_PLUGIN_ROOT/src/py/herdr_swarm_restore.py" --view']

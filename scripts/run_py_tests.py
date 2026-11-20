@@ -10,7 +10,7 @@ import sys
 import time
 from pathlib import Path
 
-TESTS_DIR = Path("tests/plugins/orchestrate/skills/orchestrate")
+TESTS_DIR = Path("tests/src/py")
 
 
 def run_test_file(test_file: Path, env: dict[str, str]) -> tuple[Path, int, float, str, str]:

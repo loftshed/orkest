@@ -5,7 +5,7 @@ set -eu
 
 repo="$(cd "$(dirname "$0")" && pwd -P)"
 command -v python3 >/dev/null || { echo "python3 is required" >&2; exit 1; }
-python3 "$repo/skills/orchestrate/scripts/install_mailbox.py" --remove-herdr
+python3 "$repo/../../src/py/install_mailbox.py" --remove-herdr
 
 hub="$HOME/.agents/skills/orchestrate"
 legacy_hub="$HOME/.agents/skills/agent-executor"

@@ -1512,8 +1512,7 @@ mod tests {
     }
 
     fn setup_scripts_tree(dir: &Path) -> PathBuf {
-        let skill = dir.join("fake-checkout/plugins/orchestrate/skills/orchestrate");
-        let scripts = skill.join("scripts");
+        let scripts = dir.join("fake-checkout/src/py");
         let lib = dir.join("fake-checkout/src/lib");
         fs::create_dir_all(&scripts).unwrap();
         fs::create_dir_all(&lib).unwrap();

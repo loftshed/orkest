@@ -18,11 +18,11 @@ tool permissions; that removes friction, it does not widen the task's authorized
 consultant (`consult`) runs in its engine's no-write mode instead.
 
 `<skill-directory>` below is this file's physical directory. Start with
-`python3 <skill-directory>/scripts/run_agent.py doctor` on an unfamiliar machine: it names the host,
+`python3 <orkest-checkout>/src/py/run_agent.py doctor` on an unfamiliar machine: it names the host,
 the installed CLIs, the routes in effect, and stale skill copies.
 
 Before using cross-harness messages on an unfamiliar install, run
-`python3 <skill-directory>/scripts/run_agent.py doctor --check-messaging`. If setup is missing or
+`python3 <orkest-checkout>/src/py/run_agent.py doctor --check-messaging`. If setup is missing or
 stale, repair it yourself with `doctor --repair-messaging`, then repeat the check. This creates the
 skill hub if needed, registers the shared local HTTP mailbox, installs turn hooks, and permits only its local
 Codex tools; it preserves unrelated settings and backs up changed files. Do not leave these routine
@@ -31,7 +31,7 @@ repairs for the user to ask another agent to perform.
 Codex requires review and trust of command hooks. After the user approves these four mailbox hooks,
 use `doctor --repair-messaging --trust-codex-hooks`; otherwise point them to Codex `/hooks` for that
 one-time review. Never trust unrelated hooks. The standalone installer
-`python3 <skill-directory>/scripts/install_mailbox.py --trust-codex-hooks` performs the same setup
+`python3 <orkest-checkout>/src/py/install_mailbox.py --trust-codex-hooks` performs the same setup
 and verification without an AI session. See [references/mailbox.md](references/mailbox.md) for
 delivery behavior and hosts without turn hooks.
 
@@ -212,7 +212,7 @@ Team authority appointment and succession remain the separate workflow above.
 When the owner lacks one fact, diagnosis or second opinion, ask instead of delegating:
 
 ```bash
-python3 <skill-directory>/scripts/run_agent.py consult \
+python3 <orkest-checkout>/src/py/run_agent.py consult \
   --question 'Is unlinking a flock file after close safe here?' \
   --context @notes.md --attach src/lock.py --model gpt:sol
 ```
@@ -239,7 +239,7 @@ and effort pinned; `--detach` answers in the background and prints an `AGENT_EVE
 An explicit user request beats every default. Otherwise use a role from `routes`:
 
 ```bash
-python3 <skill-directory>/scripts/run_agent.py routes
+python3 <orkest-checkout>/src/py/run_agent.py routes
 ```
 
 | Role                           | Default                             |
@@ -274,7 +274,7 @@ see [references/archetype-rationale.md](references/archetype-rationale.md).
 ## Check quota
 
 ```bash
-python3 <skill-directory>/scripts/run_agent.py quota
+python3 <orkest-checkout>/src/py/run_agent.py quota
 ```
 
 It reads live [monitor](https://github.com/loftshed/orkest/tree/main/plugins/monitor) data.
@@ -330,7 +330,7 @@ never blocks OpenCode.
 3. Launch:
 
    ```bash
-   python3 <skill-directory>/scripts/run_agent.py \
+   python3 <orkest-checkout>/src/py/run_agent.py \
      --cwd <absolute-repository-root> --task-spec <spec.json> --route implementation \
      --verify-command 'python3 -m unittest tests.test_jobs' --expect-changes
    ```
@@ -392,12 +392,12 @@ worker jobs. Native leads stay in their parent's harness; workers can use other 
 
 ```bash
 # Start a coordinator with a queued custom team or preset.
-python3 <skill-directory>/scripts/run_agent.py horde --team 'claude:haiku*2,agy:flash*2,codex:luna:max'
+python3 <orkest-checkout>/src/py/run_agent.py horde --team 'claude:haiku*2,agy:flash*2,codex:luna:max'
 node src/bin/ork.mjs horde --preset scout-swarm
 
 # Observe an existing room without starting or rejoining a conversation.
 node src/bin/ork.mjs horde --attach-room ROOM_ID --view
-python3 <skill-directory>/scripts/run_agent.py horde spawn --attach-room ROOM_ID --team 'codex:luna:max'
+python3 <orkest-checkout>/src/py/run_agent.py horde spawn --attach-room ROOM_ID --team 'codex:luna:max'
 
 # Offline fixture inspection and formatting
 node src/bin/ork.mjs horde --fixture /path/to/room.json --print --width 120
@@ -418,7 +418,7 @@ Use `run_agent.py probe` to run a test command against an isolated `/tmp` overla
 copy only the needed files, apply a candidate patch there, and put the test command after `--`:
 
 ```bash
-python3 <skill-directory>/scripts/run_agent.py probe \
+python3 <orkest-checkout>/src/py/run_agent.py probe \
   --copy src/module.py \
   --patch /tmp/candidate.patch \
   -- python3 -m unittest tests.test_module
@@ -439,7 +439,7 @@ When you learn something mid-run that should change a detached job's direction (
 lead, a wrong assumption), steer it instead of killing and relaunching, which loses its context:
 
 ```bash
-python3 <skill-directory>/scripts/run_agent.py steer <AGENT_EVENT_ID> --cwd <repo> --message @lead.md
+python3 <orkest-checkout>/src/py/run_agent.py steer <AGENT_EVENT_ID> --cwd <repo> --message @lead.md
 ```
 
 The job's runner interrupts the executor (SIGINT, then SIGTERM), resumes the same session in the same
@@ -478,10 +478,10 @@ sessions of your own harness and account. Details: [references/mailbox.md](refer
 ### Compact communication commands
 
 ```bash
-python3 <skill-directory>/scripts/run_agent.py mailbox focus --session MY_ID --harness codex --text 'Your actual responsibility' --model VERIFIED_MODEL_ID --harness-label Codex
-python3 <skill-directory>/scripts/run_agent.py mailbox peers --session MY_ID --format json
-python3 <skill-directory>/scripts/run_agent.py mailbox send --session MY_ID --to PEER_SESSION_ID --message 'Question with evidence'
-python3 <skill-directory>/scripts/run_agent.py mailbox wait --session MY_ID --reply-to SENT_MESSAGE_ID --timeout 300
+python3 <orkest-checkout>/src/py/run_agent.py mailbox focus --session MY_ID --harness codex --text 'Your actual responsibility' --model VERIFIED_MODEL_ID --harness-label Codex
+python3 <orkest-checkout>/src/py/run_agent.py mailbox peers --session MY_ID --format json
+python3 <orkest-checkout>/src/py/run_agent.py mailbox send --session MY_ID --to PEER_SESSION_ID --message 'Question with evidence'
+python3 <orkest-checkout>/src/py/run_agent.py mailbox wait --session MY_ID --reply-to SENT_MESSAGE_ID --timeout 300
 ```
 
 Omit model/host declarations unless verified from your current runtime. `--text`, `--message`, and
@@ -513,8 +513,8 @@ hookless MCP callers use `register` with `cwd`, `harness`, and optional `focus`,
 CLI calls register the supplied session automatically:
 
 ```bash
-python3 <skill-directory>/scripts/run_agent.py mailbox focus --session NATIVE_SESSION_ID --harness codex --text 'Your actual task'
-python3 <skill-directory>/scripts/run_agent.py mailbox peers --session NATIVE_SESSION_ID
+python3 <orkest-checkout>/src/py/run_agent.py mailbox focus --session NATIVE_SESSION_ID --harness codex --text 'Your actual task'
+python3 <orkest-checkout>/src/py/run_agent.py mailbox peers --session NATIVE_SESSION_ID
 ```
 
 Peer listings lead with this display name, stored once as `focus`. The separate `name` is a generated
@@ -578,8 +578,8 @@ Remaining risks: <none or concise list>
 
 ```bash
 # from the repository root; tests live outside the shipped skill
-python3 -m py_compile plugins/orchestrate/skills/orchestrate/scripts/*.py
-python3 -m unittest discover -s tests/plugins/orchestrate/skills/orchestrate -p 'test_*.py'
+python3 -m py_compile src/py/*.py
+python3 -m unittest discover -s tests/src/py -p 'test_*.py'
 ```
 
 Task listings show purpose, model, and harness separately. Model defaults to `model unknown`;

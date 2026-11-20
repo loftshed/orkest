@@ -29,7 +29,7 @@ Set `ORK_GLYPHS=nerd` (default), `unicode`, or `ascii` to choose icons. While ru
 server socket to invalidate cached state and reconcile on reconnect or `events_lost`.
 
 To inspect Orkest bindings against live Herdr panes without mutating state, run
-`python3 plugins/orchestrate/skills/orchestrate/scripts/herdr_swarm_restore.py --inventory`
+`python3 src/py/herdr_swarm_restore.py --inventory`
 (optionally `--room <ROOM_ID>`), which reports `pane_existence`, `available_shell`,
 `live_agent_conversation`, `executing_worker`, and `accepted_task` for each resource.
 See the [Swarm outcome rules](../plugins/orchestrate/skills/orchestrate/references/swarm.md)

@@ -255,7 +255,7 @@ if [ "$dry_run" -eq 1 ]; then
   if [ -n "$doctor_override" ]; then
     printf '  would run: %s --check-messaging\n' "$doctor_override"
   else
-    printf '  would run: python3 %s doctor --check-messaging\n' "$home_dir/.agents/skills/orchestrate/scripts/run_agent.py"
+    printf '  would run: python3 %s doctor --check-messaging\n' "$repo_dir/src/py/run_agent.py"
   fi
   exit 0
 fi
@@ -268,7 +268,7 @@ if [ -n "$doctor_override" ]; then
     doctor_status=$?
   fi
 else
-  if python3 "$home_dir/.agents/skills/orchestrate/scripts/run_agent.py" doctor --check-messaging; then
+  if python3 "$repo_dir/src/py/run_agent.py" doctor --check-messaging; then
     doctor_status=0
   else
     doctor_status=$?

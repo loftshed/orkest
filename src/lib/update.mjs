@@ -339,10 +339,7 @@ export async function runOrkestUpdate(options = {}) {
   let migrationReport;
   let migrationError;
   if (!options.skipPostInstall) {
-    const installMailboxPath = path.join(
-      repoRoot,
-      "plugins/orchestrate/skills/orchestrate/scripts/install_mailbox.py",
-    );
+    const installMailboxPath = path.join(repoRoot, "src/py/install_mailbox.py");
     await execCommand(exec, "python3", [installMailboxPath], {
       cwd: repoRoot,
       timeout: 15_000,
@@ -507,12 +504,7 @@ export async function runUpdateCli(argv = [], io = {}) {
   }
 
   if (subcommand === "run" && !options.auto && (!isQuiet || result.updated)) {
-    const scanner = fileURLToPath(
-      new URL(
-        "../../plugins/orchestrate/skills/orchestrate/scripts/legacy_plugin.py",
-        import.meta.url,
-      ),
-    );
+    const scanner = fileURLToPath(new URL("../../src/py/legacy_plugin.py", import.meta.url));
     let notice;
     try {
       const response = await execCommand(execFile, "python3", [scanner, "--only-if-present"], {

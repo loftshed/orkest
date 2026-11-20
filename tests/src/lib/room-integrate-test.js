@@ -31,9 +31,7 @@ const memberId = "luna-1";
 const message = "feat(room): integrate accepted result";
 const allowedPaths = ["allowed"];
 const verificationCommands = ["node --version", "git --version"];
-const scriptsDir = fileURLToPath(
-  new URL("../../../plugins/orchestrate/skills/orchestrate/scripts", import.meta.url),
-);
+const scriptsDir = fileURLToPath(new URL("../../../src/py", import.meta.url));
 
 function captureAcceptedSnapshot(checkout) {
   const script = [

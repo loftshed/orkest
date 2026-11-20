@@ -1,16 +1,9 @@
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import path from "node:path";
 
-import { cacheHome } from "./runtime-paths.mjs";
+import { cacheHome, runtimeReference } from "./runtime-paths.mjs";
 
-const SOURCE_FAMILIES_URL = new URL(
-  "../../plugins/orchestrate/skills/orchestrate/references/families.json",
-  import.meta.url,
-);
-const BUNDLED_FAMILIES_URL = new URL("../references/families.json", import.meta.url);
-const DEFAULT_FAMILIES_URL = existsSync(SOURCE_FAMILIES_URL)
-  ? SOURCE_FAMILIES_URL
-  : BUNDLED_FAMILIES_URL;
+const DEFAULT_FAMILIES_URL = runtimeReference("families.json");
 
 const FALLBACK_EFFORTS = Object.freeze([
   "minimal",

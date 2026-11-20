@@ -4,8 +4,10 @@ Dot can use its local executor to read Orkest's existing workboard. No separate 
 mailbox, credential or listener is needed. The status view does not send messages, register the
 observer, acknowledge mail or change ownership. Run it from the Git project you want to observe:
 
+Set `ORKEST_CHECKOUT` to the absolute path of your Orkest checkout.
+
 ```sh
-python3 ~/.agents/skills/orchestrate/scripts/run_agent.py mailbox board \
+python3 "$ORKEST_CHECKOUT/src/py/run_agent.py" mailbox board \
   --view status --format json
 ```
 
@@ -20,7 +22,7 @@ members and their associated work. This covers teams or swarms using mailbox cha
 arbitrary host grouping. Keep the working directory and filters unchanged while following updates.
 
 ```sh
-python3 ~/.agents/skills/orchestrate/scripts/run_agent.py mailbox board \
+python3 "$ORKEST_CHECKOUT/src/py/run_agent.py" mailbox board \
   --view status --channel export --format json
 ```
 
@@ -35,7 +37,7 @@ Do not broaden project scope merely because a selected agent has no matching rec
 Use the returned `cursor` to wait locally for one update:
 
 ```sh
-python3 ~/.agents/skills/orchestrate/scripts/run_agent.py mailbox board \
+python3 "$ORKEST_CHECKOUT/src/py/run_agent.py" mailbox board \
   --view status --channel export --since RETURNED_CURSOR --timeout 300 --format json
 ```
 

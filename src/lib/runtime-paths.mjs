@@ -2,6 +2,12 @@ import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 
+/** Product data in a checkout or in the daemon's self-contained runtime bundle. */
+export function runtimeReference(name) {
+  const checkout = new URL(`../../references/${name}`, import.meta.url);
+  return existsSync(checkout) ? checkout : new URL(`../references/${name}`, import.meta.url);
+}
+
 function expandHome(value, home = homedir()) {
   return value.replace(/^~(?=\/|$)/u, () => home);
 }

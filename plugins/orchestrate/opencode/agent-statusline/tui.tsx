@@ -64,13 +64,9 @@ function resolveDefaultFastBin(): string {
 }
 
 function resolveScriptsDir(): string {
-  const homeCandidate = path.join(homedir(), ".agents/skills/orchestrate/scripts");
-  if (existsSync(homeCandidate)) return homeCandidate;
-  const colocated = path.resolve(
-    path.dirname(fileURLToPath(import.meta.url)),
-    "../../skills/orchestrate/scripts",
-  );
-  return existsSync(colocated) ? colocated : homeCandidate;
+  const source = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../../src/py");
+  if (existsSync(path.join(source, "agent_statusline_tmux.py"))) return source;
+  return path.join(homedir(), ".agents/skills/orchestrate/scripts");
 }
 
 const defaultFastBin = resolveDefaultFastBin();

@@ -8,7 +8,7 @@ themselves or wake another agent.
 Review the collector from this checkout:
 
 ```bash
-python3 plugins/orchestrate/skills/orchestrate/scripts/run_agent.py mailbox feedback-summary --scope cross-project --format json
+python3 src/py/run_agent.py mailbox feedback-summary --scope cross-project --format json
 ```
 
 Agent reports answer three questions: what were you trying to achieve, what went wrong, and what

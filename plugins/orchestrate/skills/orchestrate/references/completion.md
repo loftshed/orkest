@@ -13,7 +13,7 @@ Keep waiting outside the language-model loop. Repeated status commands, sleeps, 
    matters, launch with `--detach`, keep the returned `AGENT_EVENT`, and make exactly one blocking call:
 
    ```bash
-   python3 <skill-directory>/scripts/run_agent.py events wait <AGENT_EVENT-path-or-id> --messages --timeout 30m
+   python3 <orkest-checkout>/src/py/run_agent.py events wait <AGENT_EVENT-path-or-id> --messages --timeout 30m
    ```
 
    The process does cheap filesystem checks and returns on a worker message or the atomic terminal event.
@@ -26,7 +26,7 @@ Keep waiting outside the language-model loop. Repeated status commands, sleeps, 
 3. **Several jobs.** One process supervises them all:
 
    ```bash
-   python3 <skill-directory>/scripts/run_agent.py events follow <event-1> <event-2> --messages --timeout 1h
+   python3 <orkest-checkout>/src/py/run_agent.py events follow <event-1> <event-2> --messages --timeout 1h
    ```
 
    It deduplicates references and prints one JSON line per finished job. It returns early for a
@@ -45,7 +45,7 @@ timeout longer than you would wait yourself, and end the turn. The host reports 
 the command's last output says what changed:
 
 ```bash
-python3 <skill-directory>/scripts/run_agent.py mailbox wait --session MY_ID --reply-to SENT_MESSAGE_ID --timeout 3600
+python3 <orkest-checkout>/src/py/run_agent.py mailbox wait --session MY_ID --reply-to SENT_MESSAGE_ID --timeout 3600
 start=$(git rev-parse HEAD); until [ "$(git rev-parse HEAD)" != "$start" ]; do sleep 5; done; git log --oneline -3
 until [ -f "$RESULT" ] || [ -f "$FAILED" ]; do sleep 5; done; ls -l "$RESULT" "$FAILED" 2>/dev/null
 while kill -0 "$PID" 2>/dev/null; do sleep 5; done; echo "process $PID exited"
@@ -65,8 +65,8 @@ only after review.
 Before starting another delegated run in a repository, read its inbox once:
 
 ```bash
-python3 <skill-directory>/scripts/run_agent.py events --cwd <absolute-repository-root> --format json
-python3 <skill-directory>/scripts/run_agent.py events --ack <exact-event-id>
+python3 <orkest-checkout>/src/py/run_agent.py events --cwd <absolute-repository-root> --format json
+python3 <orkest-checkout>/src/py/run_agent.py events --ack <exact-event-id>
 ```
 
 Detached runs keep private artifacts under `<cache>/jobs-v1` and atomically publish an event under

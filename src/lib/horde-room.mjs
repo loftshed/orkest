@@ -39,7 +39,7 @@ import {
   supportedEfforts,
 } from "./families-schema.mjs";
 import { migrateSchema, openOrkestSqlite, withImmediateTransaction } from "./orkest-sqlite.mjs";
-import { cacheHome } from "./runtime-paths.mjs";
+import { cacheHome, runtimeReference } from "./runtime-paths.mjs";
 
 export const ROOM_SCHEMA = "agent-executor.room.v1";
 export const CHIEF_FOCUS_TEXT = "Ork Chief — machine-wide master orchestrator";
@@ -89,13 +89,7 @@ export function requireActiveRoom(room) {
   );
 }
 
-const sourceRolesPath = new URL(
-  "../../plugins/orchestrate/skills/orchestrate/references/workforce-roles.json",
-  import.meta.url,
-);
-const rolesPath = existsSync(sourceRolesPath)
-  ? sourceRolesPath
-  : new URL("../references/workforce-roles.json", import.meta.url);
+const rolesPath = runtimeReference("workforce-roles.json");
 export const WORKFORCE_ROLES = JSON.parse(readFileSync(rolesPath, "utf8"));
 const ROLE_ALIASES = new Map(
   Object.values(WORKFORCE_ROLES).flatMap((role) => [
@@ -259,12 +253,7 @@ export function roomPath(id, root = mailboxRoot()) {
 }
 
 export async function loadPresets() {
-  return JSON.parse(
-    await readFile(
-      new URL("../../plugins/orchestrate/references/swarm-presets.json", import.meta.url),
-      "utf8",
-    ),
-  );
+  return JSON.parse(await readFile(runtimeReference("swarm-presets.json"), "utf8"));
 }
 
 /** Team shorthand is resolved by the runner's live catalog and families.json, never pinned here. */

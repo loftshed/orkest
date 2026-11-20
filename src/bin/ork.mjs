@@ -32,7 +32,7 @@ import {
 import { jsonView, renderLine, renderReport, shouldUseColor } from "../lib/monitor/render.mjs";
 import { getAccounts } from "../lib/monitor/store.mjs";
 import { coordinatorBrief, newRoom, observeRoom, writeCoordinatorBrief } from "../lib/rooms.mjs";
-import { cacheHome, configPath, orkFastBin } from "../lib/runtime-paths.mjs";
+import { cacheHome, configPath, orkFastBin, runtimeReference } from "../lib/runtime-paths.mjs";
 import { cachedQuota, loadChiefModule, readLiveChief, runHordeTui } from "./horde-tui.mjs";
 import { roomsCommand } from "./rooms.mjs";
 
@@ -83,17 +83,9 @@ Use --cwd to choose the room's repository. Closing the view leaves workers runni
 `;
 
 const execute = promisify(execFile);
-const scripts = fileURLToPath(
-  new URL("../../plugins/orchestrate/skills/orchestrate/scripts/", import.meta.url),
-);
-const defaultRoutesUrl = new URL(
-  "../../plugins/orchestrate/skills/orchestrate/references/routes.default.json",
-  import.meta.url,
-);
-const defaultFamiliesUrl = new URL(
-  "../../plugins/orchestrate/skills/orchestrate/references/families.json",
-  import.meta.url,
-);
+const scripts = fileURLToPath(new URL("../../src/py/", import.meta.url));
+const defaultRoutesUrl = runtimeReference("routes.default.json");
+const defaultFamiliesUrl = runtimeReference("families.json");
 const ARCHETYPES = [
   "debug-invariants",
   "structural-refactor",
@@ -810,12 +802,7 @@ export async function main(
   if (argv[0] === "rooms" || argv[0] === "hall") return roomsCommand(argv.slice(1), { stdout });
   if (argv[0] === "name") {
     // A readable session name for the current checkout: claude --name "$(ork name --model opus-5.5)".
-    const script = fileURLToPath(
-      new URL(
-        "../../plugins/orchestrate/skills/orchestrate/scripts/peer_mailbox.py",
-        import.meta.url,
-      ),
-    );
+    const script = fileURLToPath(new URL("../../src/py/peer_mailbox.py", import.meta.url));
     const { stdout: name } = await execute("python3", [script, "name", ...argv.slice(1)], {
       timeout: 30_000,
     });

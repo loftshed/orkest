@@ -31,12 +31,7 @@ const SLUG_RE = /^[a-z0-9][a-z0-9_-]*$/;
 const ALIAS_RE = /^[a-z][a-z0-9_-]*$/;
 const MARKER_VERSION = "# orkest-managed-alias: v1";
 const PROFILE_MARKER = ".orkest-account.json";
-const SCRIPT = fileURLToPath(
-  new URL(
-    "../../plugins/orchestrate/skills/orchestrate/scripts/install_mailbox.py",
-    import.meta.url,
-  ),
-);
+const SCRIPT = fileURLToPath(new URL("../../src/py/install_mailbox.py", import.meta.url));
 
 const PROVIDERS = {
   claude: { stored: "claude", bin: "claude", short: "CL", dir: (s) => `.claude-${s}` },

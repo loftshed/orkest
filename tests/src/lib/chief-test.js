@@ -2270,7 +2270,7 @@ describe("ork chief", () => {
       // Round-trip the spawned command's routing flags through Python run_agent.parse_args + resolve_route
       const runAgentScript = path.resolve(
         path.dirname(fileURLToPath(import.meta.url)),
-        "../../../plugins/orchestrate/skills/orchestrate/scripts/run_agent.py",
+        "../../../src/py/run_agent.py",
       );
       const cliFlags = altWorkPlan.command.slice(2);
       const pyCheck = spawnSync(

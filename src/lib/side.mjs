@@ -30,8 +30,7 @@ import { prepareWorktree, provisionWorktree } from "./worktree-provision.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const PLUGIN_ROOT = path.resolve(__dirname, "../../plugins/orchestrate");
-const SCRIPTS_DIR = path.join(PLUGIN_ROOT, "skills", "orchestrate", "scripts");
+const SCRIPTS_DIR = path.resolve(__dirname, "../py");
 const COORDINATOR_PY = path.join(SCRIPTS_DIR, "coordinator.py");
 const PEER_MAILBOX_PY = path.join(SCRIPTS_DIR, "peer_mailbox.py");
 

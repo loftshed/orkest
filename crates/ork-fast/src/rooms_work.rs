@@ -34,8 +34,7 @@ pub const PROGRESS_STAGES: &[&str] = &[
 pub const TASK_NOTE_SCHEMA: &str = "orchestrate.task-note.v1";
 pub const TASK_NOTE_RETENTION_SECS: i64 = 30 * 86_400;
 
-const EMBEDDED_WORKFORCE_ROLES: &str =
-    include_str!("../../../plugins/orchestrate/skills/orchestrate/references/workforce-roles.json");
+const EMBEDDED_WORKFORCE_ROLES: &str = include_str!("../../../references/workforce-roles.json");
 
 static KNOWN_ROLES_CACHE: OnceLock<HashSet<String>> = OnceLock::new();
 
@@ -828,8 +827,8 @@ pub fn known_roles() -> &'static HashSet<String> {
             })
             .filter(|p| p.is_file())
             .or_else(|| {
-                paths::plugin_root()
-                    .map(|p| p.join("skills/orchestrate/references/workforce-roles.json"))
+                paths::runtime_root()
+                    .map(|p| p.join("references/workforce-roles.json"))
                     .filter(|p| p.is_file())
             })
             .and_then(|p| paths::read_json_file(&p));
@@ -1100,9 +1099,7 @@ pub fn progress_reminder(base: &Path, peer: &Value, starting: bool) -> String {
     );
     let script_path = paths::scripts_root()
         .map(|s| s.join("agent_progress.py"))
-        .or_else(|| {
-            paths::plugin_root().map(|p| p.join("skills/orchestrate/scripts/agent_progress.py"))
-        })
+        .or_else(|| paths::runtime_root().map(|p| p.join("src/py/agent_progress.py")))
         .unwrap_or_else(|| PathBuf::from("agent_progress.py"));
     let script_canon = fs::canonicalize(&script_path).unwrap_or(script_path);
     let script_str = script_canon.to_string_lossy();
