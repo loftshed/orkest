@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.97.1
+
+- refactor: move Python runtime and shared registries out of the skill (#251)
+
 ## 0.97.0
 
 - feat(monitor): adapt account probe deadlines and back off repeated failures (#252)
