@@ -3719,6 +3719,17 @@ class SteerTests(unittest.TestCase):
             mock.patch.dict(os.environ, environment),
             contextlib.redirect_stdout(io.StringIO()),
         ):
+            # The completion receipt is durable before the first process exits its workspace lease.
+            support = RUNNER.bundled_module("execution_support")
+
+            def previous_lease_released() -> bool:
+                try:
+                    with support.workspace_lease(self.repository.path, RUNNER.default_agent_cache_dir()):
+                        return True
+                except support.ContractError:
+                    return False
+
+            self.assertTrue(self.wait_until(previous_lease_released), "first runner still owns its worktree")
             code = RUNNER.main()
         resumed = json.loads((out_dir / "result.json").read_text(encoding="utf-8"))
         self.assertEqual((code, resumed["status"], resumed["scope_violations"]), (0, "completed", []))

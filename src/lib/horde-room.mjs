@@ -95,7 +95,7 @@ const sourceRolesPath = new URL(
 );
 const rolesPath = existsSync(sourceRolesPath)
   ? sourceRolesPath
-  : new URL("../../plugins/orchestrate/references/workforce-roles.json", import.meta.url);
+  : new URL("../references/workforce-roles.json", import.meta.url);
 export const WORKFORCE_ROLES = JSON.parse(readFileSync(rolesPath, "utf8"));
 const ROLE_ALIASES = new Map(
   Object.values(WORKFORCE_ROLES).flatMap((role) => [
