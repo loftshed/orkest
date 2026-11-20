@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.98.0
+
+- feat: coordinate local state, recovery and scoped peer replication (#253)
+
 ## 0.97.1
 
 - refactor: move Python runtime and shared registries out of the skill (#251)
