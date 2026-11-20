@@ -48,7 +48,9 @@ export function recordProbe(state, { outcome, elapsedMs, deadlineMs, now }) {
     if (values.length > WINDOW) values.shift();
   }
   const consecutiveTimeouts = outcome === "timeout" ? Math.min(8, timeoutCount(state) + 1) : 0;
-  const backoff = Math.min(MAX_BACKOFF_MS, 15_000 * 2 ** (consecutiveTimeouts - 2));
+  const failures =
+    history.length - 1 - history.findLastIndex((entry) => entry?.outcome === "success");
+  const backoff = Math.min(MAX_BACKOFF_MS, 15_000 * 2 ** (failures - 2));
   return {
     samplesMs: values,
     history,
@@ -57,7 +59,7 @@ export function recordProbe(state, { outcome, elapsedMs, deadlineMs, now }) {
     lastDeadlineMs: deadlineMs,
     lastOutcome: outcome,
     consecutiveTimeouts,
-    retryAt: consecutiveTimeouts >= 2 ? now + backoff : null,
+    retryAt: failures >= 2 ? now + backoff : null,
   };
 }
 

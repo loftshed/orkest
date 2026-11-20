@@ -60,7 +60,7 @@ test("uses bounded successful nearest-rank samples, with cold-start, floor and a
   expect(open.retryAt).toBe(301_000);
   expect(
     recordProbe(open, { outcome: "error", elapsedMs: 1, deadlineMs: 30_000, now: 1001 }),
-  ).toMatchObject({ retryAt: null, consecutiveTimeouts: 0 });
+  ).toMatchObject({ retryAt: 301_001, consecutiveTimeouts: 0 });
 });
 
 test("fresh CLI processes share the timeout breaker, retain verified quota, and recover one probe", async () => {
@@ -156,6 +156,12 @@ else setTimeout(()=>process.stdout.write(fs.readFileSync(USAGE)), mode==='slow-s
     "success",
     "error",
   ]);
+  await refresh("--refresh");
+  const afterTwoErrors = (await read()).accounts.a;
+  expect(afterTwoErrors.probeHealth.retryAt).toBeGreaterThan(Date.now());
+  const attempts = await count("a");
+  await refresh("--refresh");
+  expect(await count("a")).toBe(attempts);
   // A different profile must not inherit an open breaker or quota windows.
   await mkdir(path.join(dir, "replacement"));
   accounts[0].env.GEMINI_CLI_HOME = path.join(dir, "replacement");
