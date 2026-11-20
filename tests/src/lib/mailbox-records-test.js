@@ -6,6 +6,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   renameSync,
   statSync,
   symlinkSync,
@@ -222,7 +223,7 @@ test("legacy export projects new peer metadata, acknowledgements and removals wi
   call(root, "delete", { ...inbox, key: removed.id });
   const destination = path.join(temp(), "mailbox-v1");
   expect(call(root, "export", { destination })).toEqual({
-    destination,
+    destination: realpathSync(destination),
     peers: 1,
     messages: 2,
     unread: 1,
@@ -297,7 +298,7 @@ test("publishes room, mailbox, Chief and Foundry rollback at one committed curso
   expect(JSON.parse(readFileSync(restoredMessage))).toEqual(msg);
   expect(readFileSync(path.join(report.root, "chief", "desk.jsonl"), "utf8")).toContain("retained");
   const manifest = JSON.parse(readFileSync(path.join(report.root, report.foundry.manifest)));
-  expect(manifest.entries[0].destination).toBe(resolveFoundryStatePath(worktree));
+  expect(manifest.entries[0].destination).toBe(resolveFoundryStatePath(realpathSync(worktree)));
   using snapshot = openOrkestSqlite(path.join(report.root, "post-cutover.sqlite"), {
     readOnly: true,
   });

@@ -68,10 +68,10 @@ function worktree() {
   return { dir, file };
 }
 
-function sql(query) {
+function sql(query, ...params) {
   const db = openOrkestSqlite(roomsDbPath(root), { readOnly: true });
   try {
-    return db.prepare(query).all();
+    return db.prepare(query).all(...params);
   } finally {
     db.close();
   }
@@ -105,7 +105,9 @@ describe("Foundry canonical state in the shared WAL store", () => {
     const legacy = JSON.stringify({ attemptCount: 3, status: "verified", note: "old" });
     writeFileSync(f.file, legacy);
     expect(readFoundryState(f.dir)).toMatchObject({ attemptCount: 3 }); // read-only projection
-    expect(sql("SELECT count(*) AS n FROM foundry_states WHERE state LIKE '%old%'")[0].n).toBe(0);
+    expect(sql("SELECT key FROM foundry_states WHERE key = ?", foundryStateKey(f.file))).toEqual(
+      [],
+    );
 
     const merged = writeFoundryState(f.dir, { status: "merged" });
     expect(merged).toMatchObject({ attemptCount: 3, note: "old", status: "merged" });

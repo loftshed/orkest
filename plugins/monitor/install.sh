@@ -25,21 +25,28 @@ done
 # Prefer a stable non-shim path over `node -p process.execPath` (which resolves Homebrew symlinks into a
 # versioned Cellar directory that breaks on `brew upgrade node`, falling back to `volta-shim` and spawning
 # two processes per invocation).
+root="$(cd "$repo/../.." && pwd -P)"
 resolve_node() {
-  for candidate in /opt/homebrew/bin/node /usr/local/bin/node; do
-    if [ -x "$candidate" ]; then
+  path_node="$(node -p process.execPath)"
+  volta_node=
+  if command -v volta >/dev/null 2>&1; then
+    volta_node="$(volta which node 2>/dev/null || true)"
+  fi
+  fallback=
+  for candidate in /opt/homebrew/bin/node /usr/local/bin/node "$volta_node" "$path_node"; do
+    [ -x "$candidate" ] || continue
+    [ -n "$fallback" ] || fallback="$candidate"
+    if "$candidate" --input-type=module -e '
+      import { pathToFileURL } from "node:url";
+      const { assertSqliteRuntime } = await import(pathToFileURL(process.argv[1]));
+      assertSqliteRuntime();
+    ' "$root/src/lib/orkest-sqlite.mjs" >/dev/null 2>&1; then
       printf '%s\n' "$candidate"
       return
     fi
   done
-  if command -v volta >/dev/null 2>&1; then
-    volta_node="$(volta which node 2>/dev/null || true)"
-    if [ -n "$volta_node" ] && [ -x "$volta_node" ]; then
-      printf '%s\n' "$volta_node"
-      return
-    fi
-  fi
-  node -p process.execPath
+  # Standalone Monitor without replication continues to support Node 22.
+  printf '%s\n' "$fallback"
 }
 node_bin="$(resolve_node)"
 rmtree() { node -e 'require("fs").rmSync(process.argv[1], { recursive: true, force: true })' "$1"; }
@@ -56,7 +63,6 @@ rmtree() { node -e 'require("fs").rmSync(process.argv[1], { recursive: true, for
 # ~/.local/share/monitor-backups; nothing is deleted.
 runtime="$HOME/.local/share/monitor"
 backups="$HOME/.local/share/monitor-backups"
-root="$(cd "$repo/../.." && pwd -P)"
 for needed in "$root/package.json" "$root/src/bin/monitor.mjs" "$root/src/bin/observe.mjs" "$root/src/lib/monitor" "$repo/skills/monitor/SKILL.md" "$repo/config.example.json"; do
   [ -e "$needed" ] || { echo "install: missing $needed" >&2; exit 1; }
 done

@@ -105,7 +105,7 @@ Pools are the independently limited groups inside an account: Antigravity's Gemi
 
 ## Install
 
-Part of [Orkest](../../README.md). Requires Node 22+ and the CLIs of the providers you use. Nothing is installed from npm.
+Part of [Orkest](../../README.md). Standalone monitoring requires Node 22+ and the CLIs of the providers you use. Publishing quota with `replicationScope` also requires the Orkest SQLite runtime (Node 26.13+ with SQLite). Nothing is installed from npm.
 
 From the repository root, `./install.sh` installs Orkest, the monitor CLI, and its MCP server. Use `--no-app` for the CLI without the macOS menu bar app or `--no-monitor` to skip monitor.
 

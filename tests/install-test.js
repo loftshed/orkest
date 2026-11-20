@@ -332,7 +332,27 @@ it("publishes scoped quota from an installed Monitor after its checkout moves", 
       accounts: [{ id: "portable", provider: "antigravity", command, env: { USAGE: usage } }],
     }),
   );
-  const installed = f.run();
+  // A version manager may prefer an executable that can run Monitor but cannot open the shared database.
+  const tools = path.join(f.home, "bin");
+  mkdirSync(tools);
+  writeExecutable(path.join(tools, "volta"), '#!/bin/sh\nprintf "%s\\n" "$HOME/bin/basic-node"\n');
+  writeExecutable(
+    path.join(tools, "basic-node"),
+    '#!/bin/sh\nexec node --no-experimental-sqlite "$@"\n',
+  );
+  const installed = spawnSync(
+    "sh",
+    [path.join(f.checkout, "plugins/monitor/install.sh"), "--no-app"],
+    {
+      env: {
+        ...process.env,
+        HOME: f.home,
+        PATH: tools + path.delimiter + process.env.PATH,
+        MONITOR_CONFIG: config,
+      },
+      encoding: "utf8",
+    },
+  );
   expect(installed.status, installed.stderr).toBe(0);
   renameSync(f.checkout, f.checkout + ".away");
   const cache = path.join(f.home, "orkest-cache");
