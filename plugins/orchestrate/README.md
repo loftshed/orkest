@@ -133,7 +133,7 @@ No adapter setup is needed for Codex; `ork label -- codex` reads the active thre
 
 ## Inspect routes, models, and health
 
-In the examples below, `<scripts>` stands for `<checkout>/plugins/orchestrate/skills/orchestrate/scripts` (or `~/.agents/skills/orchestrate/scripts` after running `install.sh`):
+In the examples below, `<scripts>` stands for `<checkout>/src/py` (or `~/.agents/skills/orchestrate/scripts` after running `install.sh`):
 
 ```sh
 python3 <scripts>/run_agent.py doctor --check-messaging       # host, CLI versions, routes, skill links, and model-free MCP/hook check
@@ -144,7 +144,7 @@ python3 <scripts>/run_agent.py quota                          # live quota per r
 node <checkout>/src/bin/ork.mjs --help        # hall/rooms, horde TUI, foundry, smelter, radar, routes, quota, telemetry, and session naming
 ```
 
-Routes are configured in `~/.config/orchestrate/config.json` (`run_agent.py init` writes a starter file) overlaid on [`routes.default.json`](skills/orchestrate/references/routes.default.json). Model selectors (`family` or `family:tier` from [`families.json`](skills/orchestrate/references/families.json)) resolve against the live catalog so model upgrades do not require config edits. For task archetypes and route tiers, see [`archetype-rationale.md`](skills/orchestrate/references/archetype-rationale.md).
+Routes are configured in `~/.config/orchestrate/config.json` (`run_agent.py init` writes a starter file) overlaid on [`routes.default.json`](../../references/routes.default.json). Model selectors (`family` or `family:tier` from [`families.json`](../../references/families.json)) resolve against the live catalog so model upgrades do not require config edits. For task archetypes and route tiers, see [`archetype-rationale.md`](skills/orchestrate/references/archetype-rationale.md).
 
 ## Ask one question (`consult`)
 

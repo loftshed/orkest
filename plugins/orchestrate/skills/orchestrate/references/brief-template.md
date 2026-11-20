@@ -7,7 +7,7 @@ only the task-specific values.
 Create a concise JSON spec outside the target repository and pass it to the runner (when the resolved engine matches the calling harness, `run_agent.py` returns `AGENT_STATUS=native_handoff` with the rendered brief so you can run it via your host's native subagent tools or `coordinator.py dispatch --transport native`; pass `--transport executor` only when crossing an account/profile boundary or resuming an executor CLI session):
 
 ```bash
-python3 <skill-directory>/scripts/run_agent.py \
+python3 <orkest-checkout>/src/py/run_agent.py \
   --cwd <absolute-repository-root> \
   --task-spec <brief-spec.json> \
   --engine agy \

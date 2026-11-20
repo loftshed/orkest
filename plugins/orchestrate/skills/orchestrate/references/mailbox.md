@@ -238,8 +238,8 @@ parked stop; `wake-health` shows pending intents.
 Headless Claude and Gemini/Antigravity workers use a persistent streaming listener. Launch it once in the project:
 
 ```sh
-python3 <skill-directory>/scripts/run_agent.py listen --engine claude --prompt 'Your task'
-python3 <skill-directory>/scripts/run_agent.py listen --engine agy --prompt 'Your task'
+python3 <orkest-checkout>/src/py/run_agent.py listen --engine claude --prompt 'Your task'
+python3 <orkest-checkout>/src/py/run_agent.py listen --engine agy --prompt 'Your task'
 ```
 
 Enter additional prompts as lines on stdin. EOF closes after queued work; `--stay-open` keeps a
@@ -314,11 +314,11 @@ When separate teams share a project (say, agents fetching records and agents bui
 them), each joins the channel of its task and posts there, so the other team is not interrupted.
 
 ```sh
-python3 <skill-directory>/scripts/run_agent.py mailbox join graph            # or focus --channel graph
-python3 <skill-directory>/scripts/run_agent.py mailbox send --channel graph --text 'Edge list v2 is ready'
-python3 <skill-directory>/scripts/run_agent.py mailbox channels               # channels, members, yours
-python3 <skill-directory>/scripts/run_agent.py mailbox history --channel graph # catch up, newest first
-python3 <skill-directory>/scripts/run_agent.py mailbox leave graph
+python3 <orkest-checkout>/src/py/run_agent.py mailbox join graph            # or focus --channel graph
+python3 <orkest-checkout>/src/py/run_agent.py mailbox send --channel graph --text 'Edge list v2 is ready'
+python3 <orkest-checkout>/src/py/run_agent.py mailbox channels               # channels, members, yours
+python3 <orkest-checkout>/src/py/run_agent.py mailbox history --channel graph # catch up, newest first
+python3 <orkest-checkout>/src/py/run_agent.py mailbox leave graph
 ```
 
 MCP: `focus(text, channels=[...], leave=[...])`, `send(channel=..., text=...)`; `peers` shows each
@@ -496,17 +496,19 @@ Each harness configures the daemon as an HTTP MCP server; Claude Code and Codex 
 
 Start or check the daemon directly:
 
+Set `ORKEST_CHECKOUT` to the absolute path of your Orkest checkout.
+
 ```sh
-python3 ~/.agents/skills/orchestrate/scripts/run_agent.py mailbox daemon start
-python3 ~/.agents/skills/orchestrate/scripts/run_agent.py mailbox daemon status
-python3 ~/.agents/skills/orchestrate/scripts/run_agent.py mailbox daemon restart
-python3 ~/.agents/skills/orchestrate/scripts/run_agent.py mailbox daemon stop
+python3 "$ORKEST_CHECKOUT/src/py/run_agent.py" mailbox daemon start
+python3 "$ORKEST_CHECKOUT/src/py/run_agent.py" mailbox daemon status
+python3 "$ORKEST_CHECKOUT/src/py/run_agent.py" mailbox daemon restart
+python3 "$ORKEST_CHECKOUT/src/py/run_agent.py" mailbox daemon stop
 ```
 
 To configure the HTTP MCP integration for all supported CLIs (Claude, Codex, Antigravity, OpenCode):
 
 ```sh
-python3 ~/.agents/skills/orchestrate/scripts/install_mailbox.py
+python3 "$ORKEST_CHECKOUT/src/py/install_mailbox.py"
 ```
 
 The installer configures:
@@ -520,7 +522,7 @@ The installer configures:
 If needed, you can rollback to the legacy Python subprocess (stdio) mode by running:
 
 ```sh
-python3 ~/.agents/skills/orchestrate/scripts/install_mailbox.py --stdio
+python3 "$ORKEST_CHECKOUT/src/py/install_mailbox.py" --stdio
 ```
 
 Rollback changes client registrations. Use `mailbox daemon stop` explicitly when the shared service is no longer needed.

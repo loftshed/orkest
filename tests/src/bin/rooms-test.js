@@ -3222,7 +3222,7 @@ describe("bounded room continuations", () => {
       expect(brief).toContain("Command boundaries:");
       expect(brief).toContain("its own standalone command");
       expect(brief).toContain("exact absolute path of the installed orchestrate skill");
-      expect(brief).toContain("skills/orchestrate/scripts/coordinator.py capture");
+      expect(brief).toContain("src/py/coordinator.py capture");
       expect(brief).toContain("verify-evidence, review");
       expect(brief).toContain("Codex judges each segment");
       expect(brief).toContain("head or tail pipes");

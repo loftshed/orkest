@@ -35,12 +35,12 @@ concrete fix, most severe first; an investigation's findings put the most likely
 its confidence. Both quote their evidence and say what they did not check.
 
 ```bash
-python3 <skill-directory>/scripts/run_agent.py consult \
+python3 <orkest-checkout>/src/py/run_agent.py consult \
   --question 'Is unlinking a flock file after close safe on macOS?' \
   --context 'We hold the lock across fork; see the attached module.' \
   --attach src/lock.py --model gpt:sol --effort high
 
-python3 <skill-directory>/scripts/run_agent.py consult --intent review \
+python3 <orkest-checkout>/src/py/run_agent.py consult --intent review \
   --read . --diff origin/main --question 'Anything unsafe in this change?' --model claude:best
 ```
 
@@ -185,7 +185,7 @@ scope, or verify evidence.
 ## Follow-up questions
 
 ```bash
-python3 <skill-directory>/scripts/run_agent.py consult \
+python3 <orkest-checkout>/src/py/run_agent.py consult \
   --question 'And if the descriptor is inherited across exec?' --follow-up <result.json>
 ```
 
@@ -199,8 +199,8 @@ result's baseline where the engine's counters allow it.
 ## Asynchronous consultations
 
 ```bash
-python3 <skill-directory>/scripts/run_agent.py consult --detach --question @q.md --attach notes.md
-python3 <skill-directory>/scripts/run_agent.py events wait <AGENT_EVENT_ID> --timeout 15m
+python3 <orkest-checkout>/src/py/run_agent.py consult --detach --question @q.md --attach notes.md
+python3 <orkest-checkout>/src/py/run_agent.py events wait <AGENT_EVENT_ID> --timeout 15m
 ```
 
 `--detach` resolves the model, effort, route rule and quota first and pins the resolved model, then

@@ -15,6 +15,7 @@ set -eu
 
 repo="$(cd "$(dirname "$0")" && pwd -P)"
 skill="$repo/skills/orchestrate"
+scripts="$repo/../../src/py"
 hub="$HOME/.agents/skills/orchestrate"
 legacy_hub="$HOME/.agents/skills/agent-executor"
 backups="${XDG_DATA_HOME:-$HOME/.local/share}/orchestrate/backups"
@@ -108,7 +109,7 @@ set --
 [ "$trust_hooks" = 0 ] || set -- --trust-codex-hooks
 [ -z "$approval" ] || set -- "$@" "$approval"
 if [ "$dry_run" = 1 ]; then
-  python3 "$skill/scripts/install_mailbox.py" --dry-run "$@"
+  python3 "$scripts/install_mailbox.py" --dry-run "$@"
   retire_legacy_skills
   exit 0
 fi
@@ -120,9 +121,9 @@ if [ -f "$config" ]; then
 elif [ -f "$legacy_config" ]; then
   echo "• route config exists: $legacy_config"
 else
-  python3 "$skill/scripts/run_agent.py" init
+  python3 "$scripts/run_agent.py" init
 fi
-python3 "$skill/scripts/install_mailbox.py" "$@"
+python3 "$scripts/install_mailbox.py" "$@"
 retire_legacy_skills
 echo
-python3 "$skill/scripts/run_agent.py" doctor
+python3 "$scripts/run_agent.py" doctor

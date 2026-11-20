@@ -4,9 +4,7 @@ import { fileURLToPath } from "node:url";
 
 import { orkFastBin } from "./runtime-paths.mjs";
 
-const holderPath = fileURLToPath(
-  new URL("../../plugins/orchestrate/skills/orchestrate/scripts/lease_holder.py", import.meta.url),
-);
+const holderPath = fileURLToPath(new URL("../../src/py/lease_holder.py", import.meta.url));
 
 /** Advisory, non-blocking lease. Only the private holder receives its stdin pipe. */
 export async function acquireWorkspaceLease(

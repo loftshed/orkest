@@ -27,7 +27,7 @@
     "project-words.txt",
     "tests/**",
     "docs/images/**",
-    "plugins/orchestrate/skills/orchestrate/scripts/mailbox_store.py",
+    "src/py/mailbox_store.py",
     "pnpm-lock.yaml"
   ],
   "ignoreRegExpList": [

@@ -16,7 +16,7 @@ coordinator's checks below; the board cannot override them.
 the owner continues. For a narrow consultation, provide `consultation: true`, `question`, and
 `decision_needed`; ownership remains with the current agent.
 
-`recommend --packet access.json` filters [profiles.json](profiles.json) using observed access
+`recommend --packet access.json` filters [profiles.json](../../../../../references/profiles.json) using observed access
 records: `model`, `engine`, `available`, `observed_at`, `source`, and `billing_mode`. The packet
 also has `host` and `role`. Use native availability first; do not run external discovery for a
 native route. Candidates are provisional, and effort suggestions still require validation by

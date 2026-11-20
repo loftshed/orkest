@@ -214,7 +214,15 @@ pub fn valid_message_id(id: &str) -> bool {
             .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// Resolve the orchestrate skill `scripts/` directory, preferring overrides, installed hub, then checkout.
+/// Find the canonical Python modules from a checkout path, including a resolved installed skill link.
+fn checkout_scripts(start: &Path) -> Option<PathBuf> {
+    start
+        .ancestors()
+        .map(|dir| dir.join("src/py"))
+        .find(|p| p.join("run_agent.py").is_file())
+}
+
+/// Prefer explicit overrides, then this binary's checkout, the installed hub, or the build checkout.
 #[must_use]
 pub fn scripts_root() -> Option<PathBuf> {
     if let Ok(val) = env::var("ORKEST_SCRIPTS_DIR")
@@ -225,35 +233,34 @@ pub fn scripts_root() -> Option<PathBuf> {
             return Some(p);
         }
     }
-    if let Ok(plugin_env) = env::var("ORKEST_PLUGIN_ROOT")
-        && !plugin_env.trim().is_empty()
+    if let Ok(val) = env::var("ORKEST_PLUGIN_ROOT")
+        && !val.trim().is_empty()
     {
-        let p = expand_home(plugin_env.trim(), None).join("skills/orchestrate/scripts");
-        if p.is_dir() {
+        let plugin = expand_home(val.trim(), None);
+        if let Some(p) = checkout_scripts(&plugin) {
             return Some(p);
         }
-    }
-    if let Ok(exe) = env::current_exe() {
-        let resolved_exe = fs::canonicalize(&exe).unwrap_or(exe);
-        for ancestor in resolved_exe.ancestors() {
-            let candidate = ancestor.join("plugins/orchestrate/skills/orchestrate/scripts");
-            if candidate.is_dir() {
-                return Some(candidate);
-            }
+        let legacy = plugin.join("skills/orchestrate/scripts");
+        if legacy.is_dir() {
+            return Some(legacy);
         }
     }
-    let hub_scripts = expand_home("~/.agents/skills/orchestrate/scripts", None);
-    if hub_scripts.is_dir() {
-        return Some(hub_scripts);
+    if let Ok(exe) = env::current_exe()
+        && let Some(p) = checkout_scripts(&fs::canonicalize(&exe).unwrap_or(exe))
+    {
+        return Some(p);
     }
-    let manifest_candidate = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../plugins/orchestrate/skills/orchestrate/scripts");
-    if manifest_candidate.is_dir() {
-        return fs::canonicalize(&manifest_candidate)
-            .ok()
-            .or(Some(manifest_candidate));
+    let hub = expand_home("~/.agents/skills/orchestrate", None);
+    if let Ok(skill) = fs::canonicalize(&hub) {
+        if let Some(p) = checkout_scripts(&skill) {
+            return Some(p);
+        }
+        let bundle = skill.join("scripts");
+        if bundle.is_dir() {
+            return Some(bundle);
+        }
     }
-    None
+    fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../src/py")).ok()
 }
 
 /// The checkout root above a `plugins/orchestrate` directory, when it holds the shared Node
@@ -285,6 +292,12 @@ pub fn plugin_root() -> Option<PathBuf> {
     }
     if let Some(scripts) = scripts_root() {
         let resolved = fs::canonicalize(&scripts).unwrap_or(scripts);
+        if let Some(root) = resolved
+            .ancestors()
+            .find(|p| p.join("src/bin/ork.mjs").is_file())
+        {
+            return Some(root.join("plugins/orchestrate"));
+        }
         if let Some(plugin) = resolved
             .parent()
             .and_then(|p| p.parent())

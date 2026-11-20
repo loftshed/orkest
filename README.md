@@ -114,8 +114,10 @@ Details: [`ork account`](plugins/orchestrate/README.md#universal-accounts-ork-ac
 investigation that doesn't hand over file ownership. Agents call it on their own when a second
 opinion adds confidence.
 
+Set `ORKEST_CHECKOUT` to the absolute path of your Orkest checkout.
+
 ```sh
-python3 ~/.agents/skills/orchestrate/scripts/run_agent.py consult --intent review \
+python3 "$ORKEST_CHECKOUT/src/py/run_agent.py" consult --intent review \
   --read . --diff origin/main \
   --question "Any race conditions or missed edge cases?" --model gpt:sol
 ```

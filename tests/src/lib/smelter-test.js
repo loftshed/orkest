@@ -1240,12 +1240,8 @@ describe("ork smelter", () => {
     ).toBe("medium");
 
     expect(classifyBlastRadius(["plugins/orchestrate/bin/ork.mjs"])).toBe("high");
-    expect(
-      classifyBlastRadius(["plugins/orchestrate/skills/orchestrate/scripts/run_agent.py"]),
-    ).toBe("high");
-    expect(classifyBlastRadius(["plugins/orchestrate/skills/orchestrate/scripts/gate.py"])).toBe(
-      "high",
-    );
+    expect(classifyBlastRadius(["src/py/run_agent.py"])).toBe("high");
+    expect(classifyBlastRadius(["src/py/gate.py"])).toBe("high");
     expect(classifyBlastRadius([".github/workflows/release.yml"])).toBe("high");
     expect(classifyBlastRadius(["plugins/orchestrate/lib/auth-policy.mjs"])).toBe("high");
   });

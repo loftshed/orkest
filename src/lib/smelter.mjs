@@ -30,9 +30,7 @@ import {
 } from "./policy.mjs";
 import { acquireWorkspaceLease, assertWorkspaceLease } from "./workspace-lease.mjs";
 
-const scriptsDir = fileURLToPath(
-  new URL("../../plugins/orchestrate/skills/orchestrate/scripts/", import.meta.url),
-);
+const scriptsDir = fileURLToPath(new URL("../../src/py/", import.meta.url));
 
 export const COLD_REVIEW_QUESTION =
   "Review the changes and report ONLY concrete correctness bugs, security vulnerabilities, concurrency/race conditions, or scope violations under FINDINGS. Do not report stylistic preferences or speculative refactors; write 'none' under FINDINGS if no concrete defects exist.";

@@ -43,12 +43,8 @@ import {
 
 const execute = promisify(execFile);
 const plugin = fileURLToPath(new URL("../../plugins/orchestrate/", import.meta.url));
-const coordinatorPath = fileURLToPath(
-  new URL("../../plugins/orchestrate/skills/orchestrate/scripts/coordinator.py", import.meta.url),
-);
-const authorityPath = fileURLToPath(
-  new URL("../../plugins/orchestrate/skills/orchestrate/scripts/authority.py", import.meta.url),
-);
+const coordinatorPath = fileURLToPath(new URL("../../src/py/coordinator.py", import.meta.url));
+const authorityPath = fileURLToPath(new URL("../../src/py/authority.py", import.meta.url));
 
 const RUN_FIELDS = [
   "kind",
@@ -236,7 +232,7 @@ publication, billing changes, or takeover of another session.
 Command boundaries: run each installed ork command (ork rooms add, ork hall worktree, ork progress,
 ork rooms dispatch) as its own standalone command. For host receipt capture, verify-evidence, review
 and correction dispatch use python3 with the exact absolute path of the installed orchestrate skill,
-standalone, for example python3 ${path.join(plugin, "skills/orchestrate/scripts/coordinator.py")} capture
+standalone, for example python3 ${coordinatorPath} capture
 --task-dir DIR. Relative script paths fail the trust policy and prompt. Inspect files with separate
 read-only commands and a tool's own output limit (--limit, -n, the Read tool's offset and limit), not
 head or tail pipes. Codex judges each segment of a compound command on its own, so one unapproved

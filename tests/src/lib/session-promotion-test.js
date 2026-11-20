@@ -45,7 +45,7 @@ function attest(root, session, ...ids) {
         "-B",
         "-c",
         "import json,sys; from pathlib import Path; sys.path.insert(0,sys.argv[1]); import peer_mailbox as m; print(json.dumps(m.attest_native_sessions(Path(sys.argv[2]),sys.argv[3],*sys.argv[4:])))",
-        path.resolve("plugins/orchestrate/skills/orchestrate/scripts"),
+        path.resolve("src/py"),
         root,
         session,
         ...ids,

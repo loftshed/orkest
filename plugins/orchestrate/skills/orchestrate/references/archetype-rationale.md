@@ -29,7 +29,7 @@ The [design checkpoint](design-completion.md) also leaves calibration pending.
 
 ## Choosing workers without outsourcing judgment
 
-Use [routes.default.json](routes.default.json) as a starting candidate list, subject to explicit user
+Use [routes.default.json](../../../../../references/routes.default.json) as a starting candidate list, subject to explicit user
 choices, observed access, and billing authorization. Its exact model order has not been validated by
 a local comparison. Do not infer that a named model leads an archetype because a benchmark proved it.
 
@@ -43,14 +43,14 @@ conductor should interpret that evidence and own a routing rationale. Delegating
 not transfer responsibility for its conclusions. The same principle applies to architecture and
 ambiguous design decisions.
 
-The `tier_strengths` strings in [families.json](families.json) are qualitative hints displayed by the
+The `tier_strengths` strings in [families.json](../../../../../references/families.json) are qualitative hints displayed by the
 route viewer. They are not measured scores and do not participate in selector resolution or telemetry
 ranking. Keep the current descriptions separate from verified capabilities of a pinned model version.
-[profiles.json](profiles.json) explicitly labels its guidance as workload hypotheses.
+[profiles.json](../../../../../references/profiles.json) explicitly labels its guidance as workload hypotheses.
 
 ## What the local evidence can establish
 
-[telemetry.py](../scripts/telemetry.py) groups recorded results by task archetype, engine, resolved
+[telemetry.py](../../../../../src/py/telemetry.py) groups recorded results by task archetype, engine, resolved
 model, and effort. It reports accepted outcomes, first-pass outcomes, duration, and the lower endpoint
 of a 95% Wilson interval for the accepted proportion.
 
@@ -75,9 +75,9 @@ not subscription invoices.
 
 ## Quota is a separate constraint
 
-[conductor_policy.py](../scripts/conductor_policy.py) requires observed access, rejects observations
+[conductor_policy.py](../../../../../src/py/conductor_policy.py) requires observed access, rejects observations
 older than 24 hours, and excludes unauthorized personal subscription access. The launch-time
-[quota check](../scripts/quota.py) checks pool availability again. Available quota does not prove that
+[quota check](../../../../../src/py/quota.py) checks pool availability again. Available quota does not prove that
 a model fits a task, and a favorable score does not authorize a billing switch.
 
 Monitor's `surplusPts` compares remaining weekly capacity with an even-use schedule. An `expiring`
@@ -94,7 +94,7 @@ gate above; it does not apply that generic quota sort. See
 
 - **Retired legacy priors:** Direct audits of `swebench.com`, LiveCodeBench's generation JSON, and
   Aider Polyglot (`2025-10-03`) confirmed zero 2026-H2 models (`gpt-6*`, `claude-5.5`/`5.2`,
-  `gemini-4-*`, `glm-5.3*`, `deepseek-v4.1*`, `kimi-k3*`) appear on those leaderboards. [benchmarks.prior.json](benchmarks.prior.json)
+  `gemini-4-*`, `glm-5.3*`, `deepseek-v4.1*`, `kimi-k3*`) appear on those leaderboards. [benchmarks.prior.json](../../../../../references/benchmarks.prior.json)
   now tracks `terminal_bench_4_1`, `deepswe_v1_1`, `osworld_2_1`, and `frontier_swe_2`, leaving
   unpublished metrics strictly `null` (_unknown is never zero_).
 - **Published cross-vendor signal:** On Terminal-Bench 4.1 (`tbench.ai`, `n = 330`), `claude-fable-5-2`
@@ -104,7 +104,7 @@ gate above; it does not apply that generic quota sort. See
   `gemini-4-hydrogen-high` (`0.5636`), `gemini-4-argon-high` (`0.5545`; `#1` DeepSWE v1.1 at `0.779`),
   and `gpt-6.1-terra` (`0.5333` vs `gpt-6-luna` `0.1515`). `claude-haiku-5-5` reaches `0.4000` TB4.1
   and `0.724` OSWorld-2.1 (up from `0.157` on Haiku 4.5).
-- **Verified tariffs and expiries:** [model-registry.json](model-registry.json) reflects `2026-11-14`
+- **Verified tariffs and expiries:** [model-registry.json](../../../../../references/model-registry.json) reflects `2026-11-14`
   standard API tariffs: `claude-opus-5-5` (`$4/$20`, `$0.20` cache read), `claude-sonnet-5-5` (`$2/$10`,
   `$0.10` cache read), `claude-fable-5-2` (`$8/$40`), `claude-haiku-5-5` (`$0.10/$0.50 <= 100K`, `5x`
   over `100K`), `gpt-6.1-terra` (`$1/$5`), `gemini-4-hydrogen` (`$1.50/$7.50`), and `gemini-4-carbon` /
@@ -116,7 +116,7 @@ gate above; it does not apply that generic quota sort. See
   (all `codex`): `gpt-6.1-sol` (`1/1` complete on `debug-invariants` at `high`; `0/1` `blocked` on
   `unspecified` at `xhigh`) and `gpt-6-luna` (`1/2` complete, `1/2` timed out on `implementation` at `max`).
 - `11` `claude`/`sonnet` records had `status: "native_handoff"` and `task_outcome: "not_run"`, which
-  previously counted as `0/11` quality failures until `NON_QUALITY_OUTCOMES` was updated in [telemetry.py](../scripts/telemetry.py).
+  previously counted as `0/11` quality failures until `NON_QUALITY_OUTCOMES` was updated in [telemetry.py](../../../../../src/py/telemetry.py).
 - Zero executed receipts exist for `agy`, `opencode`, non-dry `claude`, `gpt-6-astra`, or `gpt-6.1-terra`.
   Consequently, **no route clears `rank_candidates_by_telemetry`** (`min_runs = 3`, `min_wilson_delta > 0.05`).
 
@@ -126,14 +126,14 @@ Antigravity exposes `gemini-pro-orchestrator` and `gemini-pro-orchestrator-argon
 internally across models (such as Carbon and Hydrogen) during a session. Google's release post
 reports near-Carbon Terminal-Bench 4.0 results with qualitative efficiency gains (`24%` less quota,
 `19%` faster), but neither variant has a published TB4.1 score, standalone API tariff, or effort slug.
-Keep orchestrator slugs in [profiles.json](profiles.json) (`conductor`, `effort_candidate: "not_applicable"`)
+Keep orchestrator slugs in [profiles.json](../../../../../references/profiles.json) (`conductor`, `effort_candidate: "not_applicable"`)
 separate from single-model leaf workers (`gemini:carbon*`, `gemini:argon*`, `gemini:hydrogen*`, `gpt:sol`)
 when bounded execution, effort control, and API tariff accounting are required.
 
 ### Routing hypotheses (pending paired calibration)
 
 Because local `n = 4` telemetry cannot justify empirical reorders, all updates to the seven archetype
-routes in [routes.default.json](routes.default.json) are **grounded benchmark and pricing hypotheses**:
+routes in [routes.default.json](../../../../../references/routes.default.json) are **grounded benchmark and pricing hypotheses**:
 
 - `debug-invariants`: keeps `gpt:sol` (`high`) primary and promotes `claude:best` (`claude-opus-5-5`,
   tied `#1` TB4.1 at roughly half `claude-fable-5-2` cost) alongside `claude:frontier`.
@@ -158,14 +158,14 @@ routes in [routes.default.json](routes.default.json) are **grounded benchmark an
 These sources suggest evaluation tasks. They do not establish the current candidate order or prove
 that these seven labels are the right taxonomy. Source descriptions were audited on `2026-11-14`.
 
-| Source                                                                                                    | Useful evidence for a future evaluation                                                  | What it does not establish here                                                                                                                                        |
-| --------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [Terminal-Bench 4.1](https://www.tbench.ai/) (`n = 330`)                                                  | Cross-vendor CLI and terminal task completion under standardized agent harnesses.        | Behavior-preserving multi-module refactors, architectural tradeoffs, or local subscription quota fit.                                                                  |
-| DeepSWE v1.1 (vendor model cards)                                                                         | Repository-level issue resolution across active 2026-H2 models.                          | Cross-harness comparability when evaluation scaffolds differ across vendors.                                                                                           |
-| OSWorld-2.1 (offline subset)                                                                              | UI, browser, and computer-use execution across Anthropic, Google, and OpenAI cards.      | Design-system consistency, accessibility, or aesthetics beyond functional task completion.                                                                             |
-| FrontierSWE v2                                                                                            | Difficult software engineering tasks where flagship models separate (`0.55–0.70` range). | Complete cross-vendor coverage (several open-weight and mid-tier models are unpublished).                                                                              |
-| GraphWalks 256k–1M BFS & [MRCR](https://huggingface.co/datasets/openai/mrcr)                              | Long-context graph traversal, aggregation, and retrieval across `256K–1M` tokens.        | Architecture judgment or effective multi-worker coordination merely because context fits.                                                                              |
-| Legacy baselines ([SWE-bench](https://www.swebench.com/), [Aider](https://aider.chat/docs/leaderboards/)) | Historical context for earlier 2025/2026-H1 model generations only.                      | Current model selection; `SWE-bench Verified`, LiveCodeBench JSON, and Aider Polyglot lack 2026-H2 entries (`null` in [benchmarks.prior.json](benchmarks.prior.json)). |
+| Source                                                                                                    | Useful evidence for a future evaluation                                                  | What it does not establish here                                                                                                                                                                  |
+| --------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| [Terminal-Bench 4.1](https://www.tbench.ai/) (`n = 330`)                                                  | Cross-vendor CLI and terminal task completion under standardized agent harnesses.        | Behavior-preserving multi-module refactors, architectural tradeoffs, or local subscription quota fit.                                                                                            |
+| DeepSWE v1.1 (vendor model cards)                                                                         | Repository-level issue resolution across active 2026-H2 models.                          | Cross-harness comparability when evaluation scaffolds differ across vendors.                                                                                                                     |
+| OSWorld-2.1 (offline subset)                                                                              | UI, browser, and computer-use execution across Anthropic, Google, and OpenAI cards.      | Design-system consistency, accessibility, or aesthetics beyond functional task completion.                                                                                                       |
+| FrontierSWE v2                                                                                            | Difficult software engineering tasks where flagship models separate (`0.55–0.70` range). | Complete cross-vendor coverage (several open-weight and mid-tier models are unpublished).                                                                                                        |
+| GraphWalks 256k–1M BFS & [MRCR](https://huggingface.co/datasets/openai/mrcr)                              | Long-context graph traversal, aggregation, and retrieval across `256K–1M` tokens.        | Architecture judgment or effective multi-worker coordination merely because context fits.                                                                                                        |
+| Legacy baselines ([SWE-bench](https://www.swebench.com/), [Aider](https://aider.chat/docs/leaderboards/)) | Historical context for earlier 2025/2026-H1 model generations only.                      | Current model selection; `SWE-bench Verified`, LiveCodeBench JSON, and Aider Polyglot lack 2026-H2 entries (`null` in [benchmarks.prior.json](../../../../../references/benchmarks.prior.json)). |
 
 Different vendors may provide useful alternative approaches, but failure independence must be
 measured with paired tasks. Treat cross-vendor review as a hypothesis to test, not an automatic
@@ -177,9 +177,9 @@ model selectors.
 Run these checks together before refreshing priors, tariffs, or route hypotheses:
 
 1. **Detect catalog drift:** Run `ork radar diff` (or `node scripts/update-model-radar.mjs --dry-run`)
-   and `python3 plugins/orchestrate/skills/orchestrate/scripts/run_agent.py models --format json` to
+   and `python3 src/py/run_agent.py models --format json` to
    compare live `codex`, `agy`, `claude`, and `opencode` catalogs against tracked priors.
-2. **Inspect local telemetry:** Run `python3 plugins/orchestrate/skills/orchestrate/scripts/telemetry.py summarize`
+2. **Inspect local telemetry:** Run `python3 src/py/telemetry.py summarize`
    (or `ork telemetry --json`) to review executed quality counts, `wilson_lb_95`, and 14-day `degraded`
    alerts while confirming non-executed statuses stay excluded.
 3. **Audit official sources:** Re-verify vendor pricing pages (`platform.claude.com`, `developers.openai.com`,

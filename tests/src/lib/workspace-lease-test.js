@@ -8,9 +8,7 @@ import { describe, expect, it } from "vitest";
 
 import { acquireWorkspaceLease, withWorkspaceLease } from "../../../src/lib/workspace-lease.mjs";
 
-const scripts = fileURLToPath(
-  new URL("../../../plugins/orchestrate/skills/orchestrate/scripts/", import.meta.url),
-);
+const scripts = fileURLToPath(new URL("../../../src/py/", import.meta.url));
 const leaseUrl = new URL("../../../src/lib/workspace-lease.mjs", import.meta.url).href;
 const nextUrl = new URL("../../../src/lib/next.mjs", import.meta.url).href;
 
