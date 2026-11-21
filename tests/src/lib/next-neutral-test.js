@@ -1,12 +1,17 @@
 import { mkdtemp, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { expect, it } from "vitest";
+import { afterEach, expect, it } from "vitest";
 
 import { evaluateNextCandidates } from "../../../src/lib/next.mjs";
+import { retainFixtures } from "../../helpers/retain-fixtures.js";
+
+const temporary = [];
+afterEach(() => retainFixtures(temporary.splice(0)));
 
 const evaluate = async (agents) => {
   const created = await mkdtemp(path.join(tmpdir(), "orkest-next-"));
+  temporary.push(created);
   const cwd = await realpath(created);
   return evaluateNextCandidates({
     cwd,

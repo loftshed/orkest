@@ -10,7 +10,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
 import {
   auditLegacyRooms,
@@ -35,9 +35,15 @@ import {
   readView,
 } from "../../../src/lib/outbox.mjs";
 import { remoteObservations } from "../../../src/lib/remote-observations.mjs";
+import { retainFixtures } from "../../helpers/retain-fixtures.js";
+
+const temporary = [];
+afterEach(() => retainFixtures(temporary.splice(0)));
 
 function root() {
-  return mkdtempSync(path.join(tmpdir(), "ork-outbox-"));
+  const dir = mkdtempSync(path.join(tmpdir(), "ork-outbox-"));
+  temporary.push(dir);
+  return dir;
 }
 const bounds = { limit: 128, max_bytes: 65_536 };
 function quota(id, pct = 75) {

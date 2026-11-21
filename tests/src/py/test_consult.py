@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import importlib.util
 import io
@@ -21,7 +22,9 @@ if str(Path(__file__).resolve().parents[3] / "src/py") not in sys.path:
 SCRIPT = Path(__file__).resolve().parents[3] / "src/py" / "run_agent.py"
 # Never query real subscription accounts through monitor, and use the bundled routes only.
 os.environ["MONITOR_BIN"] = str(Path(__file__).parent / "no-monitor")
-os.environ["AGENT_EXECUTOR_CONFIG"] = str(Path(tempfile.mkdtemp()) / "absent-config.json")
+_CONFIG_DIR = tempfile.mkdtemp()
+atexit.register(shutil.rmtree, _CONFIG_DIR, True)
+os.environ["AGENT_EXECUTOR_CONFIG"] = str(Path(_CONFIG_DIR) / "absent-config.json")
 SPEC = importlib.util.spec_from_file_location("agent_executor_runner", SCRIPT)
 assert SPEC and SPEC.loader
 RUNNER = importlib.util.module_from_spec(SPEC)

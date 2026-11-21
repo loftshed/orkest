@@ -18,6 +18,10 @@ node scripts/release.js plan   # what the next release would publish
 
 Both scripts call `./node_modules/.bin` directly, so they work without pnpm on PATH. Single steps: `corepack pnpm validate` (skills, commands and path references), `lint`, `lint:fix`, `format`, `format:check`, `markdownlint`, `spell`.
 
+### Troubleshooting
+
+- **Inspecting failing test fixtures:** Tests delete their temporary directories by default. Re-run a single file with `ORKEST_TEST_RETAIN=1 ./node_modules/.bin/vitest run <test-file>` to keep its scratch directories for debugging.
+
 ## Workflow
 
 - **Issue-board driven delivery:** Track work as detailed, self-contained issues on the board (`gh issue` / the shared Orkest workboard) rather than accumulating unrelated changes into a single large branch.

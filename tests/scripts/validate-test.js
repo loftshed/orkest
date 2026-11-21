@@ -1,9 +1,13 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { expect, test } from "vitest";
+import { afterEach, expect, test } from "vitest";
 
 import { DESCRIPTION_BUDGET_CHARS, parseFrontmatter, validate } from "../../scripts/validate.js";
+import { retainFixtures } from "../helpers/retain-fixtures.js";
+
+const temporary = [];
+afterEach(() => retainFixtures(temporary.splice(0)));
 
 function write(root, file, contents) {
   const target = path.join(root, file);
@@ -13,6 +17,7 @@ function write(root, file, contents) {
 
 function fixtureRepo({ skillName = "demo", description = "Does a demo." } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "validate-"));
+  temporary.push(root);
   write(
     root,
     "plugins/demo/skills/demo/SKILL.md",

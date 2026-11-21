@@ -1,11 +1,15 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
 import { updateModelRadar } from "../../../scripts/update-model-radar.mjs";
 import { WORKFORCE_ROLES, workforceRoleInfo } from "../../../src/lib/horde-room.mjs";
 import { diffCatalogAgainstSeen, loadBenchmarkPriors, radarCli } from "../../../src/lib/radar.mjs";
+import { retainFixtures } from "../../helpers/retain-fixtures.js";
+
+const temporary = [];
+afterEach(() => retainFixtures(temporary.splice(0)));
 
 describe("ork radar and benchmark priors", () => {
   it("loads structured benchmark priors for all supported model families", async () => {
@@ -142,6 +146,7 @@ describe("ork radar and benchmark priors", () => {
 
   it("runs update-model-radar.mjs offline against a static fixture without LLM tokens", async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "radar-sync-"));
+    temporary.push(tmpDir);
     const fixturePath = path.join(tmpDir, "openrouter-models.json");
     fs.writeFileSync(
       fixturePath,
@@ -165,6 +170,7 @@ describe("ork radar and benchmark priors", () => {
 
   it("reads live cache, refreshes missing or stale catalogs, supports ack, matches prior families, and reports drift", async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "radar-live-cache-"));
+    temporary.push(tmpDir);
     const cacheDir = path.join(tmpDir, "cache");
     const runsDir = path.join(tmpDir, "runs");
     fs.mkdirSync(cacheDir, { recursive: true });

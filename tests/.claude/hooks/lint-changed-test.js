@@ -27,7 +27,7 @@ const send = (root, event, extra = {}) =>
   spawnSync(process.execPath, [hook], {
     cwd: root,
     encoding: "utf8",
-    env: { ...process.env, CLAUDE_PROJECT_DIR: root },
+    env: { ...process.env, CLAUDE_PROJECT_DIR: root, TMPDIR: root },
     input: JSON.stringify(eventInput(root, event, extra)),
   });
 
@@ -154,7 +154,7 @@ describe("Claude turn lint", () => {
         );
         const child = execute(process.execPath, [hook], {
           cwd: root,
-          env: { ...process.env, CLAUDE_PROJECT_DIR: root },
+          env: { ...process.env, CLAUDE_PROJECT_DIR: root, TMPDIR: root },
         });
         // execFile's promise exposes the actual child, so each process gets stdin.
         child.child.stdin.end(input);

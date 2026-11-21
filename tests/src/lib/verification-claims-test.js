@@ -9,7 +9,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
 import {
   extractTaskSpec,
@@ -23,8 +23,11 @@ import {
   parseColdReviewFindings,
   smeltWorktree,
 } from "../../../src/lib/smelter.mjs";
+import { retainFixtures } from "../../helpers/retain-fixtures.js";
 
-// Retained real repositories, with non-disposable markers: no cleanup or pruning.
+const temporary = [];
+afterEach(() => retainFixtures(temporary.splice(0)));
+
 function git(cwd, ...args) {
   return execFileSync("git", args, {
     cwd,
@@ -35,6 +38,7 @@ function git(cwd, ...args) {
 function fixture(taskSpec = {}, { high = false } = {}) {
   // Git and the gate report real paths; macOS temp directories sit behind a symlink.
   const created = mkdtempSync(path.join(tmpdir(), "ork-verification-retained-"));
+  temporary.push(created);
   const root = realpathSync(created);
   const repo = path.join(root, "repo");
   const wt = path.join(root, "candidate");

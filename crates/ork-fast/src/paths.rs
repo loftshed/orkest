@@ -1553,6 +1553,8 @@ mod tests {
         fs::write(dir.join("rooms-index.json"), r#"{"schema":"orkest.rooms-index.v1","rooms":[{"id":"old","closed":false,"sessions":["obsolete"]}]}"#).unwrap();
         assert!(has_active_room_for_session(&dir, "current"));
         assert!(!has_active_room_for_session(&dir, "obsolete"));
+        drop(db);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

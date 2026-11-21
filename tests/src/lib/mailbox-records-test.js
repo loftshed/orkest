@@ -15,7 +15,7 @@ import {
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { expect, test } from "vitest";
+import { afterEach, expect, test } from "vitest";
 
 import { putDeskItem } from "../../../src/lib/chief-outbox.mjs";
 import { readPeers } from "../../../src/lib/chief.mjs";
@@ -26,10 +26,15 @@ import { changeRecord, getRecord, recordSessionKey } from "../../../src/lib/mail
 import { openOrkestSqlite } from "../../../src/lib/orkest-sqlite.mjs";
 import { exportLegacyRoot } from "../../../src/lib/outbox-export.mjs";
 import { localStream, readPage } from "../../../src/lib/outbox.mjs";
+import { retainFixtures } from "../../helpers/retain-fixtures.js";
 
 const cli = fileURLToPath(new URL("../../../src/bin/mailbox-records.mjs", import.meta.url));
+const temporary = [];
+afterEach(() => retainFixtures(temporary.splice(0)));
 function temp() {
-  return mkdtempSync(path.join(tmpdir(), "ork-mailbox-cutover-"));
+  const dir = mkdtempSync(path.join(tmpdir(), "ork-mailbox-cutover-"));
+  temporary.push(dir);
+  return dir;
 }
 function call(root, op, req = {}) {
   return JSON.parse(

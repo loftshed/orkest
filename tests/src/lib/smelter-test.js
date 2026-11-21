@@ -50,8 +50,11 @@ import { retainFixtures } from "../../helpers/retain-fixtures.js";
 // Canonical Foundry state is per profile: every test gets its own disposable profile so state never
 // leaks between tests or reaches the real rooms database.
 const realHome = process.env.ORCHESTRATE_HOME;
+const temporary = [];
 beforeEach(() => {
-  process.env.ORCHESTRATE_HOME = mkdtempSync(path.join(tmpdir(), "orkest-smelter-home-"));
+  const home = mkdtempSync(path.join(tmpdir(), "orkest-smelter-home-"));
+  temporary.push(home);
+  process.env.ORCHESTRATE_HOME = home;
 });
 afterAll(() => {
   if (realHome === undefined) delete process.env.ORCHESTRATE_HOME;
@@ -80,8 +83,6 @@ function foundryRun(args, options) {
     ...options,
   });
 }
-
-const temporary = [];
 
 async function makeTempDir(prefix = "ork-smelter-test-") {
   const dir = await mkdtemp(path.join(tmpdir(), prefix));

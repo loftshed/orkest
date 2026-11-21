@@ -25,6 +25,7 @@ import {
   runPolicyCli,
   setRepoPolicyDeny,
 } from "../../../src/lib/policy.mjs";
+import { retainFixtures } from "../../helpers/retain-fixtures.js";
 
 function makeCaptureStream() {
   let buffer = "";
@@ -715,8 +716,12 @@ describe("ork cleanup --merged", () => {
     return { repo, worktree };
   }
 
-  afterEach(() => {
+  afterEach(async () => {
     process.exitCode = 0;
+    if (!root) return;
+    const target = root;
+    root = undefined;
+    await retainFixtures([target]);
   });
 
   it("parses --merged and refuses combinations that could run destructive cleanup", () => {

@@ -11,16 +11,19 @@ import { createRoom, parseTeam } from "../../../src/lib/horde-room.mjs";
 import { HordeView } from "../../../src/lib/horde-view.mjs";
 import { observeRoom } from "../../../src/lib/rooms.mjs";
 import { displayWidth, plain } from "../../../src/lib/tui-box.mjs";
+import { retainFixtures } from "../../helpers/retain-fixtures.js";
 
 const execute = promisify(execFile);
-// Scratch directories are deliberately retained. No teardown removes user content.
-afterEach(() => {
+const temporary = [];
+afterEach(async () => {
   vi.unstubAllEnvs();
   vi.useRealTimers();
+  await retainFixtures(temporary.splice(0));
 });
 
 async function fixture() {
   const root = await mkdtemp(path.join(tmpdir(), "ork-status-truth-"));
+  temporary.push(root);
   const room = createRoom(parseTeam("codex:luna"), { id: "truth", cwd: root });
   room.swarm = { maxAgents: 8 };
   const member = room.agents[0];
@@ -309,6 +312,7 @@ describe("rooms decision projection", () => {
     ]);
     // Store evidence outside the candidate checkout so writing it does not invalidate the audit.
     const evidenceRoot = await mkdtemp(path.join(tmpdir(), "ork-status-evidence-"));
+    temporary.push(evidenceRoot);
     task.runs[0].result_path = path.join(evidenceRoot, "result.json");
     await writeFile(task.runs[0].result_path, stdout);
     task.decisions.push({ run_id: "run", decision: "accept" });

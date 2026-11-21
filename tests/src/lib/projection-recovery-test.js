@@ -1,7 +1,7 @@
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { expect, it } from "vitest";
+import { afterEach, expect, it } from "vitest";
 
 import {
   commitAckTx,
@@ -24,6 +24,10 @@ import {
   createProjectionCheckpoint,
   rebuildProjections,
 } from "../../../src/lib/projection-recovery.mjs";
+import { retainFixtures } from "../../helpers/retain-fixtures.js";
+
+const temporary = [];
+afterEach(() => retainFixtures(temporary.splice(0)));
 
 function snapshot(db) {
   return Object.fromEntries(
@@ -33,6 +37,7 @@ function snapshot(db) {
 
 it("recovers private mailbox and Chief identities, room revisions and native hints from checkpoint plus committed tail", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "recovery-"));
+  temporary.push(dir);
   const source = path.join(dir, "mailbox-v1");
   ensureMailbox(source);
   const room = (id) => ({
@@ -183,6 +188,7 @@ it("recovers private mailbox and Chief identities, room revisions and native hin
 
 it("rejects a different history, a missing tail entry and a future schema", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "recovery-integrity-"));
+  temporary.push(dir);
   const source = path.join(dir, "source"),
     other = path.join(dir, "other");
   openRooms(source).close();

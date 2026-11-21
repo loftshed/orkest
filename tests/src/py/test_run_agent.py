@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import contextlib
 import hashlib
 import importlib.util
@@ -8,6 +9,7 @@ import io
 import json
 import os
 import shlex
+import shutil
 import stat
 import subprocess
 import sys
@@ -26,11 +28,15 @@ FIXTURES = Path(__file__).parent / "fixtures"
 # its own fake per test.
 os.environ["MONITOR_BIN"] = str(Path(__file__).parent / "no-monitor")
 # Routes and families come from the bundled defaults only, never the developer's own config.
-os.environ["AGENT_EXECUTOR_CONFIG"] = str(Path(tempfile.mkdtemp()) / "absent-config.json")
+_CONFIG_DIR = tempfile.mkdtemp()
+atexit.register(shutil.rmtree, _CONFIG_DIR, True)
+os.environ["AGENT_EXECUTOR_CONFIG"] = str(Path(_CONFIG_DIR) / "absent-config.json")
 # Runs prune their cache and mailbox once a day; tests that set no cache of their own get a scratch one,
 # never the developer's live store.
 os.environ.pop("AGENT_EXECUTOR_HOME", None)
-os.environ["XDG_CACHE_HOME"] = tempfile.mkdtemp()
+_CACHE_DIR = tempfile.mkdtemp()
+atexit.register(shutil.rmtree, _CACHE_DIR, True)
+os.environ["XDG_CACHE_HOME"] = _CACHE_DIR
 SPEC = importlib.util.spec_from_file_location("agent_executor_runner", SCRIPT)
 assert SPEC and SPEC.loader
 RUNNER = importlib.util.module_from_spec(SPEC)
@@ -430,6 +436,7 @@ class GitStateTests(unittest.TestCase):
     def test_sibling_worktree_activity_is_not_a_history_violation(self) -> None:
         before, activity_before = RUNNER.git_identity(self.repository.path), RUNNER.git_activity(self.repository.path)
         sibling = self.repository.path.parent / (self.repository.path.name + "-sibling")
+        self.addCleanup(shutil.rmtree, sibling, True)
         self.repository.git("worktree", "add", "-q", "-b", "sibling-work", str(sibling))
         (sibling / "sibling.txt").write_text("parallel work\n", encoding="utf-8")
         subprocess.run(["git", "-C", str(sibling), "add", "sibling.txt"], check=True)

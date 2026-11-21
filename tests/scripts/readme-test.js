@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { stripVTControlCharacters } from "node:util";
-import { expect, test } from "vitest";
+import { afterEach, expect, test } from "vitest";
 
 import {
   ansiToWindowSvg,
@@ -15,8 +15,11 @@ import {
   slashCommands,
 } from "../../scripts/lib/readme.js";
 import { main, staleScreenshots } from "../../scripts/readme.js";
+import { retainFixtures } from "../helpers/retain-fixtures.js";
 
 const repo = fileURLToPath(new URL("../..", import.meta.url));
+const temporary = [];
+afterEach(() => retainFixtures(temporary.splice(0)));
 
 test("a generated block is replaced between its markers and the rest is left alone", () => {
   const readme = "Intro\n\n<!-- generated:a -->\nold\n<!-- /generated:a -->\n\nOutro\n";
@@ -43,6 +46,7 @@ test("the command reference keeps the usage lines and drops the notes after them
 
 test("slash commands come from command frontmatter, without the repeated usage", () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "readme-commands-"));
+  temporary.push(directory);
   fs.writeFileSync(
     path.join(directory, "side.md"),
     '---\ndescription: Park an idea (/side [--later] <idea>)\nargument-hint: "[--later] <idea>"\n---\nBody\n',
@@ -73,6 +77,7 @@ test("captures ignore the caller's colour and time zone settings", async () => {
 
 test("a changed capture or a missing image is reported as stale", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "readme-stale-"));
+  temporary.push(root);
   fs.mkdirSync(path.join(root, "docs/images"), { recursive: true });
   const shot = { name: "view", ansi: "text" };
   expect(staleScreenshots(root, [shot])).toEqual(["view"]);
