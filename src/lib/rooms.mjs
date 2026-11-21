@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { mkdir, open, readdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { homedir, hostname } from "node:os";
 import path from "node:path";
@@ -43,7 +44,15 @@ import {
 } from "./worktree-provision.mjs";
 
 const execute = promisify(execFile);
-const plugin = fileURLToPath(new URL("../../plugins/orchestrate/", import.meta.url));
+function resolveSwarmReferencePath() {
+  const checkout = fileURLToPath(
+    new URL("../../adapters/skills/orchestrate/references/swarm.md", import.meta.url),
+  );
+  return existsSync(checkout)
+    ? checkout
+    : path.join(homedir(), ".agents/skills/orchestrate/references/swarm.md");
+}
+const swarmReferencePath = resolveSwarmReferencePath();
 const coordinatorPath = fileURLToPath(new URL("../../src/py/coordinator.py", import.meta.url));
 const authorityPath = fileURLToPath(new URL("../../src/py/authority.py", import.meta.url));
 
@@ -240,7 +249,7 @@ head or tail pipes. Codex judges each segment of a compound command on its own, 
 segment (jq, other python, node, a shell wrapper) can prompt; other hosts may judge the whole line.
 Do not request broader trust for arbitrary python, shell or jq. Preserve this rule in every delegated brief.
 
-Read ${path.join(plugin, "skills/orchestrate/references/swarm.md")} now. It describes the commands and
+Read ${swarmReferencePath} now. It describes the commands and
 native supervision contract. Use ${fileURLToPath(new URL("../bin/ork.mjs", import.meta.url))} through node if ork is not on PATH.
 
 When the user refers to lines they marked, run \`ork hall marks --room ${room.id} --member <member>\`
