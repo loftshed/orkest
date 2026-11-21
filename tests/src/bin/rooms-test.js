@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, realpath, rm, utimes, writeFile } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import path from "node:path";
@@ -1018,8 +1019,9 @@ describe("room CLI", () => {
   });
 
   it("propagates herdrPaneId and paneId onto observed agents and ignores legacy progress-v1 paths", async () => {
-    const rawRoot = await directory();
-    const root = await realpath(rawRoot);
+    const rawCache = await directory();
+    const root = path.join(await realpath(rawCache), "mailbox-v1");
+    await mkdir(root, { recursive: true });
     const rawCwd = await directory();
     const cwd = await realpath(rawCwd);
     const room = await newRoom(parseTeam("claude:haiku"), {
@@ -3232,6 +3234,46 @@ describe("bounded room continuations", () => {
       expect(brief).toContain("Do not request broader trust for");
       expect(brief).toContain("Preserve this rule in every delegated brief");
     }
+  });
+
+  it("points coordinator and lead briefs only at existing reference and script paths", async () => {
+    const assertReadablePathsExist = (brief) => {
+      const readMatches = brief
+        .matchAll(/\bRead\s+(\S+)\s+now\b/gu)
+        .map((m) => m[1])
+        .toArray();
+      expect(readMatches.length).toBeGreaterThan(0);
+      for (const filePath of readMatches) {
+        expect(existsSync(filePath), `missing file named in brief: ${filePath}`).toBe(true);
+      }
+      const toolMatches = [
+        ...brief.matchAll(/\bpython3\s+(\/\S+\.py)\b/gu).map((m) => m[1]),
+        ...brief.matchAll(/\bUse\s+(\/\S+\.mjs)\s+through node\b/gu).map((m) => m[1]),
+      ];
+      expect(toolMatches.length).toBeGreaterThan(0);
+      for (const filePath of toolMatches) {
+        expect(existsSync(filePath), `missing tool path named in brief: ${filePath}`).toBe(true);
+      }
+    };
+
+    const root = await directory();
+    const cwd = await directory();
+    const room = await newRoom(parseTeam("codex:luna"), {
+      id: "room-brief-paths",
+      cwd,
+      root,
+      engine: "codex",
+      objective: "Verify brief paths",
+    });
+    const lead = await reserveLead(room.id, "luna-1", "Lead verification", { root });
+    for (const brief of [coordinatorBrief(room), lead.brief]) {
+      expect(brief).toContain("adapters/skills/orchestrate/references/swarm.md");
+      expect(brief).not.toContain("plugins/orchestrate/");
+      assertReadablePathsExist(brief);
+    }
+    expect(() =>
+      assertReadablePathsExist("Read /nonexistent/plugins/orchestrate/references/swarm.md now."),
+    ).toThrow(/missing file named in brief/u);
   });
 });
 
