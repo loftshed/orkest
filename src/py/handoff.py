@@ -2192,6 +2192,14 @@ def withdraw(team: str, record: dict[str, Any], changed: dict[str, list], *, bas
 # Telling the user
 
 
+def current_notice(event: dict[str, Any]) -> str:
+    """The notice rendered now, so it names the script paths of this checkout; an old or partial event keeps its saved text."""
+    try:
+        return notice_for(event)
+    except (KeyError, TypeError):
+        return event["notice"]
+
+
 def notices(base: Path, me: dict[str, Any], moment: dt.datetime | None = None) -> str:
     """Handoff outcomes for this repository that this session has not shown yet, once per session, for a day
     after the outcome (viewing one does not extend it)."""
@@ -2218,7 +2226,7 @@ def notices(base: Path, me: dict[str, Any], moment: dt.datetime | None = None) -
                 continue
             current["toldSessions"] = [*(current.get("toldSessions") or []), me["session"]]
             write_private(path, json.dumps(current, indent=2, sort_keys=True) + "\n")
-        lines.append(current["notice"])
+        lines.append(current_notice(current))
     return "\n".join(lines)
 
 
@@ -2245,6 +2253,8 @@ def show(session: str) -> str:
         note = (directory / "note.md").read_text(encoding="utf-8")
     except OSError:
         note = "(no note: the handoff stopped before writing one)\n"
+    if event.get("notice"):
+        event = {**event, "notice": current_notice(event)}
     return note + "\n## Event\n\n```json\n" + json.dumps(event, indent=2, sort_keys=True) + "\n```\n"
 
 
