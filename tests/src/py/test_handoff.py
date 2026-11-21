@@ -1021,6 +1021,24 @@ class HandoffTests(unittest.TestCase):
         self.assertEqual(HANDOFF.notices(self.base, viewers[0], start + dt.timedelta(hours=23)), "")
         self.assertEqual(HANDOFF.notices(self.base, viewers[51], start + dt.timedelta(hours=25)), "")
 
+    def test_a_notice_recorded_before_the_checkout_moved_names_the_current_script(self) -> None:
+        self.register(PEER, "claude-b")
+        self.handoff(deliver=lambda *_: {"message": "m1", "wake": "queued", "wakeReason": "unrelated task"})
+        path = HANDOFF.session_dir(LEAD) / "event.json"
+        event = json.loads(path.read_text())
+        old = "/old/plugins/orchestrate/skills/orchestrate/scripts/handoff.py"
+        event["notice"] = event["notice"].replace(HANDOFF.script("handoff.py"), old)
+        path.write_text(json.dumps(event))
+        self.assertIn(old, json.loads(path.read_text())["notice"])
+        viewer = self.register("claude-viewer-moved", "claude-b", state="busy")
+        shown = HANDOFF.notices(self.base, viewer)
+        self.assertIn(HANDOFF.script("handoff.py"), shown)
+        self.assertNotIn(old, shown)
+        self.assertNotIn(old, HANDOFF.show(LEAD))
+        # An old or partial event keeps its saved text.
+        partial = {"notice": "saved text"}
+        self.assertEqual(HANDOFF.current_notice(partial), "saved text")
+
     def test_a_conductor_rebound_away_from_a_room_no_longer_conducts_it(self) -> None:
         self.store_room("r-rebound", "new-conductor")
         stored = HANDOFF.module("room_store").read_room(self.base, "r-rebound")
