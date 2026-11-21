@@ -1,12 +1,10 @@
-"""Python and ork-fast displays distinguish worker reports from recorded conductor decisions.
-
-Fixtures are retained by default: no teardown or exercised operation deletes files.
-"""
+"""Python and ork-fast displays distinguish worker reports from recorded conductor decisions."""
 
 from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
 import sys
 import tempfile
@@ -28,8 +26,9 @@ import room_tasks  # noqa: E402
 
 class StatusTruthTests(unittest.TestCase):
     def setUp(self):
-        # Deliberately use mkdtemp without cleanup so fixtures remain available for inspection.
         self.root = Path(tempfile.mkdtemp(prefix="orkest-status-truth-"))
+        if os.environ.get("ORKEST_TEST_RETAIN") != "1":
+            self.addCleanup(shutil.rmtree, self.root, True)
         self.base = self.root / "mailbox-v1"
         self.peer = mailbox.register(
             self.base, session="worker-a", harness="codex", cwd=str(self.root), pid=os.getpid()

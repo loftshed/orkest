@@ -10,8 +10,13 @@ import { HordeView } from "../../../src/lib/horde-view.mjs";
 import { isTerminalDisplayState, memberDisplayState } from "../../../src/lib/member-state.mjs";
 import { newRoom, observeRoom } from "../../../src/lib/rooms.mjs";
 import { plain } from "../../../src/lib/tui-box.mjs";
+import { retainFixtures } from "../../helpers/retain-fixtures.js";
 
-afterEach(() => vi.unstubAllEnvs());
+const temporary = [];
+afterEach(async () => {
+  vi.unstubAllEnvs();
+  await retainFixtures(temporary.splice(0));
+});
 
 const done = { status: "reported complete" };
 
@@ -108,6 +113,7 @@ describe("finished and answered notifications", () => {
 
 async function directory() {
   const created = await mkdtemp(path.join(tmpdir(), "orkest-finished-"));
+  temporary.push(created);
   return realpath(created);
 }
 

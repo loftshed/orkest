@@ -1,4 +1,4 @@
-"""Real runner/consultant inheritance; scratch repositories and artifacts are retained."""
+"""Real runner/consultant inheritance tests."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import contextlib
 import importlib.util
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -24,6 +25,8 @@ SPEC.loader.exec_module(support)
 class WorkspaceLeaseInheritanceTests(unittest.TestCase):
     def fixture(self):
         root = Path(tempfile.mkdtemp(prefix="orkest-inherited-lease-"))
+        if os.environ.get("ORKEST_TEST_RETAIN") != "1":
+            self.addCleanup(shutil.rmtree, root, True)
         repo = root / "repo"
         repo.mkdir()
         for args in (

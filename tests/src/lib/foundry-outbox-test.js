@@ -10,7 +10,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { exportLegacyFoundryStates, foundryStateKey } from "../../../src/lib/foundry-outbox.mjs";
 import {
@@ -27,6 +27,7 @@ import {
   updateRawRoom,
 } from "../../../src/lib/horde-room.mjs";
 import { openOrkestSqlite } from "../../../src/lib/orkest-sqlite.mjs";
+import { retainFixtures } from "../../helpers/retain-fixtures.js";
 
 /** Make every outbox append fail until the returned restore runs (the owner API's insert aborts). */
 function failAppends(root) {
@@ -52,16 +53,20 @@ const emitted = () => readEvents(root).filter((event) => event.kind === "foundry
 const realHome = process.env.ORCHESTRATE_HOME;
 const home = mkdtempSync(path.join(tmpdir(), "orkest-foundry-outbox-"));
 const root = mailboxRoot({ ORCHESTRATE_HOME: home });
+const temporary = [];
 beforeAll(() => {
   process.env.ORCHESTRATE_HOME = home;
 });
-afterAll(() => {
+afterEach(() => retainFixtures(temporary.splice(0)));
+afterAll(async () => {
   if (realHome === undefined) delete process.env.ORCHESTRATE_HOME;
   else process.env.ORCHESTRATE_HOME = realHome;
+  await retainFixtures([home]);
 });
 
 function worktree() {
   const raw = mkdtempSync(path.join(tmpdir(), "orkest-foundry-wt-"));
+  temporary.push(raw);
   const dir = realpathSync(raw);
   const file = resolveFoundryStatePath(dir);
   mkdirSync(path.dirname(file), { recursive: true });
@@ -230,6 +235,7 @@ describe("Foundry canonical state in the shared WAL store", () => {
     const f = worktree();
     writeFoundryState(f.dir, { status: "verified", attemptCount: 5 });
     renameSync(f.dir, f.dir + "-prior");
+    temporary.push(f.dir + "-prior");
     mkdirSync(path.dirname(f.file), { recursive: true });
     expect(loadFoundryState(f.dir).kind).toBe("missing");
     expect(writeFoundryState(f.dir, { status: "launching" }).attemptCount).toBe(1);
@@ -468,6 +474,7 @@ it("stages canonical Foundry state with its original admin destination without m
   const fixture = worktree();
   const state = writeFoundryState(fixture.dir, { status: "verified" });
   const destination = mkdtempSync(path.join(tmpdir(), "foundry-rollback-"));
+  temporary.push(destination);
   using db = openRooms(root);
   const { manifest } = exportLegacyFoundryStates(db, destination);
   const { entries } = JSON.parse(readFileSync(path.join(destination, manifest), "utf8"));

@@ -4,17 +4,20 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { expect, test } from "vitest";
+import { afterEach, expect, test } from "vitest";
 
 import {
   breakerRetryAt,
   probeDeadline,
   recordProbe,
 } from "../../../../src/lib/monitor/adaptive-probes.mjs";
+import { retainFixtures } from "../../../helpers/retain-fixtures.js";
 
 const cli = fileURLToPath(new URL("../../../../src/bin/monitor.mjs", import.meta.url));
 const usage = fileURLToPath(new URL("fixtures/agy-usage.json", import.meta.url));
 const run = promisify(execFile);
+const temporary = [];
+afterEach(() => retainFixtures(temporary.splice(0)));
 
 test("uses bounded successful nearest-rank samples, with cold-start, floor and account ceiling", () => {
   const account = { provider: "codex" };
@@ -65,6 +68,7 @@ test("uses bounded successful nearest-rank samples, with cold-start, floor and a
 
 test("fresh CLI processes share the timeout breaker, retain verified quota, and recover one probe", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "monitor-adaptive-"));
+  temporary.push(dir);
   const cache = path.join(dir, "cache");
   const cfg = path.join(dir, "config.json");
   const command = path.join(dir, "fake-agy");
@@ -174,6 +178,7 @@ else setTimeout(()=>process.stdout.write(fs.readFileSync(USAGE)), mode==='slow-s
 
 test("a warmed Codex JSON-RPC probe enforces the learned deadline on a real child", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "monitor-codex-deadline-"));
+  temporary.push(root);
   const cache = path.join(root, "cache");
   const config = path.join(root, "config.json");
   const command = path.join(root, "fake-codex");
@@ -257,6 +262,7 @@ test("a successful recovery sustains a slower baseline and a rolled-back clock p
 
 test("a restarted Claude probe recovers after wall-clock rollback and retains its verified quota", async () => {
   const home = await mkdtemp(path.join(tmpdir(), "monitor-claude-rollback-"));
+  temporary.push(home);
   const cache = path.join(home, "cache"),
     config = path.join(home, "config.json");
   const mode = path.join(home, "mode"),

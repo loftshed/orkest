@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import atexit
 import contextlib
 import importlib.util
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -15,9 +17,13 @@ from unittest import mock
 SCRIPT = Path(__file__).resolve().parents[3] / "src/py" / "run_agent.py"
 
 os.environ["MONITOR_BIN"] = str(Path(__file__).parent / "no-monitor")
-os.environ["AGENT_EXECUTOR_CONFIG"] = str(Path(tempfile.mkdtemp()) / "absent-config.json")
+_CONFIG_DIR = tempfile.mkdtemp()
+atexit.register(shutil.rmtree, _CONFIG_DIR, True)
+os.environ["AGENT_EXECUTOR_CONFIG"] = str(Path(_CONFIG_DIR) / "absent-config.json")
 os.environ.pop("AGENT_EXECUTOR_HOME", None)
-os.environ["XDG_CACHE_HOME"] = tempfile.mkdtemp()
+_CACHE_DIR = tempfile.mkdtemp()
+atexit.register(shutil.rmtree, _CACHE_DIR, True)
+os.environ["XDG_CACHE_HOME"] = _CACHE_DIR
 
 SPEC = importlib.util.spec_from_file_location("agent_executor_runner_native_policy", SCRIPT)
 assert SPEC and SPEC.loader

@@ -1,9 +1,10 @@
-"""Lease contract tests. Real fixtures are deliberately retained, never deleted."""
+"""Lease contract tests."""
 
 from __future__ import annotations
 
 import importlib.util
 import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -18,6 +19,8 @@ SPEC.loader.exec_module(support)
 class WorkspaceLeaseTests(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp(prefix="orkest-python-lease-"))
+        if os.environ.get("ORKEST_TEST_RETAIN") != "1":
+            self.addCleanup(shutil.rmtree, self.root, True)
         self.workspace = self.root / "workspace"
         self.workspace.mkdir()
         self.primary = self.root / "orchestrate"

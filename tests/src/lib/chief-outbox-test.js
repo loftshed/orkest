@@ -10,7 +10,7 @@ import {
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
 import {
   commitAckTx,
@@ -27,12 +27,16 @@ import {
 } from "../../../src/lib/chief.mjs";
 import { openRooms, roomsDbPath } from "../../../src/lib/horde-room.mjs";
 import { openOrkestSqlite } from "../../../src/lib/orkest-sqlite.mjs";
+import { retainFixtures } from "../../helpers/retain-fixtures.js";
 
 const CHIEF_BIN = fileURLToPath(new URL("../../../src/bin/chief.mjs", import.meta.url));
 const CHIEF_LIB = new URL("../../../src/lib/chief-outbox.mjs", import.meta.url).href;
+const temporary = [];
+afterEach(() => retainFixtures(temporary.splice(0)));
 
 function profile() {
   const home = mkdtempSync(path.join(tmpdir(), "orkest-chief-outbox-"));
+  temporary.push(home);
   const root = path.join(home, "mailbox-v1");
   mkdirSync(path.join(root, "chief"), { recursive: true });
   return { home, root };
@@ -325,6 +329,7 @@ it("restores active and acknowledged items and owed mailbox work from exported l
   };
   commitAckTx(root, tx);
   const destination = mkdtempSync(path.join(tmpdir(), "chief-rollback-"));
+  temporary.push(destination);
   using db = openRooms(root);
   expect(exportLegacyChiefDeskRows(db, destination)).toEqual({
     promoted: true,

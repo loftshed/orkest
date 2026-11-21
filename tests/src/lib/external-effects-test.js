@@ -10,17 +10,21 @@ import {
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { expect, it } from "vitest";
+import { afterEach, expect, it } from "vitest";
 
 import { loadFoundryState, writeFoundryState } from "../../../src/lib/foundry.mjs";
 import { createRoom, mailboxRoot, openRooms, updateRoom } from "../../../src/lib/horde-room.mjs";
 import { smeltWorktree } from "../../../src/lib/smelter.mjs";
 import { ensurePullRequest } from "../../../src/lib/worktree-pr.mjs";
+import { retainFixtures } from "../../helpers/retain-fixtures.js";
 
 const root = fileURLToPath(new URL("../../../", import.meta.url));
+const temporary = [];
+afterEach(() => retainFixtures(temporary.splice(0)));
 
 function fixture() {
   const dir = mkdtempSync(path.join(tmpdir(), "ork-effects-"));
+  temporary.push(dir);
   const repo = path.join(dir, "repo");
   const remote = path.join(dir, "owner", "project.git");
   mkdirSync(repo);

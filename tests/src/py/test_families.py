@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import contextlib
 import importlib.util
 import io
 import json
 import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,7 +15,9 @@ from unittest import mock
 
 os.environ["MONITOR_BIN"] = str(Path(__file__).parent / "no-monitor")
 # Families come from the bundled defaults only, never the developer's own config.
-os.environ["AGENT_EXECUTOR_CONFIG"] = str(Path(tempfile.mkdtemp()) / "absent-config.json")
+_CONFIG_DIR = tempfile.mkdtemp()
+atexit.register(shutil.rmtree, _CONFIG_DIR, True)
+os.environ["AGENT_EXECUTOR_CONFIG"] = str(Path(_CONFIG_DIR) / "absent-config.json")
 
 
 def load(name: str):

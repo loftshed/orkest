@@ -16,7 +16,7 @@ import path from "node:path";
 import { createInterface } from "node:readline";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import {
   collectActiveWorktreeAllowPaths,
@@ -46,19 +46,25 @@ import {
 } from "../../../src/lib/smelter.mjs";
 import { acquireWorkspaceLease } from "../../../src/lib/workspace-lease.mjs";
 import { listWorktreePorts } from "../../../src/lib/worktree-ports.mjs";
+import { retainFixtures } from "../../helpers/retain-fixtures.js";
 
 // Canonical Foundry state lives in the profile's rooms database: keep every test off the real one.
 const realHome = process.env.ORCHESTRATE_HOME;
+const stateHome = mkdtempSync(path.join(tmpdir(), "orkest-state-home-"));
+const temporary = [];
 beforeAll(() => {
-  process.env.ORCHESTRATE_HOME = mkdtempSync(path.join(tmpdir(), "orkest-state-home-"));
+  process.env.ORCHESTRATE_HOME = stateHome;
 });
-afterAll(() => {
+afterEach(() => retainFixtures(temporary.splice(0)));
+afterAll(async () => {
   if (realHome === undefined) delete process.env.ORCHESTRATE_HOME;
   else process.env.ORCHESTRATE_HOME = realHome;
+  await retainFixtures([stateHome]);
 });
 
 function fixture() {
   const rawRoot = mkdtempSync(path.join(tmpdir(), "orkest-state-"));
+  temporary.push(rawRoot);
   const root = realpathSync(rawRoot);
   const file = resolveFoundryStatePath(root);
   mkdirSync(path.dirname(file), { recursive: true });
@@ -75,6 +81,7 @@ function git(cwd, ...args) {
 
 function worktreeFixture() {
   const rawRoot = mkdtempSync(path.join(tmpdir(), "orkest-state-git-"));
+  temporary.push(rawRoot);
   const root = realpathSync(rawRoot);
   const repo = path.join(root, "repo");
   const worktree = path.join(root, "worktree");
@@ -756,6 +763,7 @@ describe("Foundry state pr record", () => {
 
 function foundryRepo({ config } = {}) {
   const created = mkdtempSync(path.join(tmpdir(), "orkest-foundry-prep-"));
+  temporary.push(created);
   const root = realpathSync(created);
   const repo = path.join(root, "repo");
   mkdirSync(repo);

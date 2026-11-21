@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -22,8 +24,9 @@ SPEC.loader.exec_module(COORDINATOR)
 
 class AcceptanceLeaseTests(unittest.TestCase):
     def setUp(self):
-        # Deliberately retained: no TemporaryDirectory or teardown deletion.
         self.root = Path(tempfile.mkdtemp(prefix="ork-acceptance-retained-"))
+        if os.environ.get("ORKEST_TEST_RETAIN") != "1":
+            self.addCleanup(shutil.rmtree, self.root, True)
         self.repo = self.root / "repo"
         self.repo.mkdir()
         self.git("init", "-b", "main")

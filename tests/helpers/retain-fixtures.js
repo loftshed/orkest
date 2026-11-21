@@ -2,9 +2,10 @@ import { randomUUID } from "node:crypto";
 import { renameSync } from "node:fs";
 import { rm } from "node:fs/promises";
 
-/** Retain scratch evidence locally; CI may explicitly opt into fixture cleanup. */
+/** Delete scratch fixtures by default; keep them only when ORKEST_TEST_RETAIN=1. */
 export async function retainFixtures(directories) {
-  if (process.env.ORKEST_TEST_CLEANUP !== "1") return;
+  if (process.env.ORKEST_TEST_RETAIN === "1" && process.env.ORKEST_TEST_CLEANUP !== "1") return;
+  if (process.env.ORKEST_TEST_CLEANUP === "0") return;
   for (const directory of directories) await rm(directory, { recursive: true, force: true });
 }
 

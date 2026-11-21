@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, renameSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { expect, it } from "vitest";
+import { afterEach, expect, it } from "vitest";
 
 import { deleteRoom, openRooms, updateRawRoom } from "../../../src/lib/horde-room.mjs";
 import { localStream, readPage } from "../../../src/lib/outbox.mjs";
@@ -10,9 +10,14 @@ import {
   createProjectionCheckpoint,
   rebuildProjections,
 } from "../../../src/lib/projection-recovery.mjs";
+import { retainFixtures } from "../../helpers/retain-fixtures.js";
+
+const temporary = [];
+afterEach(() => retainFixtures(temporary.splice(0)));
 
 it("keeps an existing scope with the same project through worktree changes and room recreation", async () => {
   const fixture = mkdtempSync(path.join(tmpdir(), "room-project-"));
+  temporary.push(fixture);
   const root = path.join(fixture, "store");
   const repo = path.join(fixture, "repo");
   const linked = path.join(fixture, "linked");
@@ -82,6 +87,7 @@ it("keeps an existing scope with the same project through worktree changes and r
 
 it("preserves and reserves a legacy active scope whose first verified identity is unknown", async () => {
   const root = mkdtempSync(path.join(tmpdir(), "room-unverified-"));
+  temporary.push(root);
   const cwd = path.join(root, "project");
   mkdirSync(cwd);
   await updateRawRoom("legacy", () => ({ id: "legacy", cwd }), { root, create: true });
@@ -102,6 +108,7 @@ it("preserves and reserves a legacy active scope whose first verified identity i
 
 it("continues an active standalone room through git init and retains its repository binding", async () => {
   const fixture = mkdtempSync(path.join(tmpdir(), "room-init-"));
+  temporary.push(fixture);
   const root = path.join(fixture, "store");
   const cwd = path.join(fixture, "repo");
   mkdirSync(cwd);
@@ -121,6 +128,7 @@ it("continues an active standalone room through git init and retains its reposit
 
 it("refuses a redirected repository or replacement directory for a continuing standalone room", async () => {
   const fixture = mkdtempSync(path.join(tmpdir(), "room-replaced-"));
+  temporary.push(fixture);
   const root = path.join(fixture, "store");
   const cwd = path.join(fixture, "standalone");
   const other = path.join(fixture, "other");

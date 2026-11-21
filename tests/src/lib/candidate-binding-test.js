@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, describe, expect, it } from "vitest";
 
 import {
   foundryRun,
@@ -15,6 +15,10 @@ import {
 import { mailboxRoot, openRooms } from "../../../src/lib/horde-room.mjs";
 import { nextCommand } from "../../../src/lib/next.mjs";
 import { smeltWorktree } from "../../../src/lib/smelter.mjs";
+import { retainFixtures } from "../../helpers/retain-fixtures.js";
+
+const temporary = [];
+afterEach(() => retainFixtures(temporary.splice(0)));
 
 // All Git mutations stay in retained scratch repositories; markers prohibit pruning.
 function git(cwd, ...args) {
@@ -34,6 +38,7 @@ afterAll(() => {
 function fixture({ high = false, allowPaths = ["change.txt"], state = true } = {}) {
   // Git reports real paths; macOS temp directories sit behind a symlink.
   const created = mkdtempSync(path.join(tmpdir(), "ork-candidate-retained-"));
+  temporary.push(created);
   const root = realpathSync(created);
   const repo = path.join(root, "repo");
   const wt = path.join(root, "candidate");

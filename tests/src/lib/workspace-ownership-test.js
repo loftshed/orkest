@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, describe, expect, it } from "vitest";
 
 import { foundryStateKey } from "../../../src/lib/foundry-outbox.mjs";
 import {
@@ -20,6 +20,10 @@ import { mailboxRoot, roomsDbPath } from "../../../src/lib/horde-room.mjs";
 import { nextCommand } from "../../../src/lib/next.mjs";
 import { smeltWorktree } from "../../../src/lib/smelter.mjs";
 import { acquireWorkspaceLease } from "../../../src/lib/workspace-lease.mjs";
+import { retainFixtures } from "../../helpers/retain-fixtures.js";
+
+const temporary = [];
+afterEach(() => retainFixtures(temporary.splice(0)));
 
 const foundryUrl = new URL("../../../src/lib/foundry.mjs", import.meta.url).href;
 const nextUrl = new URL("../../../src/lib/next.mjs", import.meta.url).href;
@@ -48,6 +52,7 @@ function stateText(wt) {
 }
 function fixture() {
   const root = mkdtempSync(path.join(tmpdir(), "ork-ownership-"));
+  temporary.push(root);
   const repo = path.join(root, "repo");
   mkdirSync(repo);
   git(repo, "init", "-b", "main");

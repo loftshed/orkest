@@ -4,17 +4,20 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
 import { acquireWorkspaceLease, withWorkspaceLease } from "../../../src/lib/workspace-lease.mjs";
+import { retainFixtures } from "../../helpers/retain-fixtures.js";
 
 const scripts = fileURLToPath(new URL("../../../src/py/", import.meta.url));
 const leaseUrl = new URL("../../../src/lib/workspace-lease.mjs", import.meta.url).href;
 const nextUrl = new URL("../../../src/lib/next.mjs", import.meta.url).href;
+const temporary = [];
+afterEach(() => retainFixtures(temporary.splice(0)));
 
-// Every fixture is retained. Only processes started by these tests are signalled.
 function fixture() {
   const root = mkdtempSync(path.join(tmpdir(), "orkest-lease-"));
+  temporary.push(root);
   const workspace = path.join(root, "workspace");
   mkdirSync(workspace);
   symlinkSync(root, path.join(root, "alias"));
