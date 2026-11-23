@@ -1,3 +1,4 @@
+import { execFile } from "node:child_process";
 import {
   mkdir,
   mkdtemp,
@@ -22,6 +23,7 @@ import {
   DEFAULT_UPDATE_INTERVAL_MS,
   getUpdateConfigPath,
   getUpdateStatePath,
+  POST_INSTALL_TIMEOUT_MS,
   readAutoUpdateConfig,
   readLocalGitHeadSha,
   resolveOrkestRepoRoot,
@@ -565,6 +567,150 @@ describe("Orkest auto-update (update.mjs)", () => {
     });
     expect(output.match(/Legacy state migration failed:/gu)).toHaveLength(1);
     expect(output).toContain("migration lock is busy");
+  });
+
+  // A git fake that is one commit behind until the merge lands, then up to date.
+  function behindThenLandedGit() {
+    let isMerged = false;
+    return (args) => {
+      if (args.includes("--abbrev-ref")) return "main\n";
+      if (args.includes("--porcelain") || args.includes("fetch")) return "";
+      if (args.includes("HEAD..origin/main")) return isMerged ? "0\n" : "1\n";
+      if (args.includes("origin/main..HEAD")) return "0\n";
+      if (args.includes("origin/main") && args.includes("rev-parse")) return "bbbb2222\n";
+      if (args.includes("HEAD") && args.includes("rev-parse")) {
+        return isMerged ? "bbbb2222\n" : "aaaa1111\n";
+      }
+      if (args.includes("merge")) {
+        isMerged = true;
+        return "Updating aaaa1111..bbbb2222\n";
+      }
+      return "";
+    };
+  }
+
+  it("records a failed post-install step as pending, still migrates, and names the command to finish", async () => {
+    const configDir = await makeTempDir();
+    const cacheDir = await makeTempDir();
+    const git = behindThenLandedGit();
+    let postInstallTimeout;
+    let isInstallBroken = true;
+    let migrations = 0;
+    const exec = (cmd, args, options, cb) => {
+      if (cmd === "git") return cb(null, git(args));
+      postInstallTimeout = options.timeout;
+      if (!isInstallBroken) return cb(null, "ok\n");
+      const error = Object.assign(new Error(`Command failed: python3 ${args[0]}`), { code: 3 });
+      return cb(error, "", "mailbox install: daemon did not answer\n");
+    };
+    let output = "";
+    const io = {
+      configDir,
+      cacheDir,
+      repoRoot: "/repo",
+      exec,
+      cleanupFn: async () => {
+        migrations += 1;
+        return null;
+      },
+      stdout: { write: (chunk) => (output += chunk) },
+    };
+
+    const result = await runUpdateCli(["--apply"], { ...io, now: 1000 });
+
+    expect(postInstallTimeout).toBe(POST_INSTALL_TIMEOUT_MS);
+    expect(POST_INSTALL_TIMEOUT_MS).toBeGreaterThanOrEqual(5 * 60 * 1000);
+    expect(migrations).toBe(1);
+    expect(result).toMatchObject({
+      status: "updated",
+      updated: true,
+      exitCode: 1,
+      postInstall: {
+        ok: false,
+        status: "failed",
+        command: "python3 /repo/src/py/install_mailbox.py",
+        error: "mailbox install: daemon did not answer (exit 3)",
+      },
+    });
+    expect(output).toContain("Orkest updated (aaaa111 -> bbbb222, 1 commit).");
+    expect(output).toContain("install_mailbox.py) failed: mailbox install: daemon did not answer");
+    expect(output).toContain("to finish it, run: python3 /repo/src/py/install_mailbox.py");
+    const saved = JSON.parse(await readFile(getUpdateStatePath({ cacheDir }), "utf8"));
+    expect(saved).toMatchObject({
+      status: "updated",
+      fromSha: "aaaa1111",
+      toSha: "bbbb2222",
+      pendingPostInstall: {
+        status: "failed",
+        command: "python3 /repo/src/py/install_mailbox.py",
+      },
+    });
+
+    output = "";
+    const status = await runUpdateCli(["status"], io);
+    expect(status).toMatchObject({ status: "updated", state: { pendingPostInstall: {} } });
+    expect(output).toContain(
+      `Orkest update status: updated (aaaa111 -> bbbb222 at ${new Date(1000).toISOString()}).`,
+    );
+    expect(output).toContain("to finish it, run: python3 /repo/src/py/install_mailbox.py");
+
+    // The next manual update has nothing to pull, so it finishes the pending step instead.
+    output = "";
+    isInstallBroken = false;
+    const retry = await runUpdateCli(["--apply"], { ...io, now: 2000 });
+    expect(retry).toMatchObject({ status: "up_to_date", postInstall: { ok: true, retried: true } });
+    expect(retry.exitCode).toBeUndefined();
+    expect(output).toContain("Finished the pending mailbox hook refresh (install_mailbox.py).");
+    const cleared = JSON.parse(await readFile(getUpdateStatePath({ cacheDir }), "utf8"));
+    expect(cleared.pendingPostInstall).toBeUndefined();
+    expect(cleared.lastUpdatedAt).toBe(new Date(1000).toISOString());
+  });
+
+  it("reports a slow post-install step as a timeout and keeps the update recorded", async () => {
+    const configDir = await makeTempDir();
+    const cacheDir = await makeTempDir();
+    const git = behindThenLandedGit();
+    // The post-install step is a real child process that outlives the timeout, as install_mailbox.py did.
+    const exec = (cmd, args, options, cb) => {
+      if (cmd === "git") return cb(null, git(args));
+      return new Promise((resolve, reject) => {
+        execFile(
+          process.execPath,
+          ["-e", "setTimeout(() => {}, 10_000)"],
+          { timeout: options.timeout },
+          (error, stdout, stderr) => (error ? reject(error) : resolve({ stdout, stderr })),
+        );
+      });
+    };
+    let output = "";
+
+    const result = await runUpdateCli(["--apply"], {
+      configDir,
+      cacheDir,
+      repoRoot: "/repo",
+      exec,
+      postInstallTimeoutMs: 200,
+      cleanupFn: async () => null,
+      stdout: { write: (chunk) => (output += chunk) },
+    });
+
+    expect(result).toMatchObject({
+      status: "updated",
+      updated: true,
+      exitCode: 1,
+      postInstall: { ok: false, status: "timed_out", error: "stopped after 0s" },
+    });
+    expect(output).toContain("install_mailbox.py) timed out");
+    expect(output).toContain("to finish it, run: python3 /repo/src/py/install_mailbox.py");
+    const saved = JSON.parse(await readFile(getUpdateStatePath({ cacheDir }), "utf8"));
+    expect(saved).toMatchObject({
+      status: "updated",
+      toSha: "bbbb2222",
+      pendingPostInstall: { status: "timed_out" },
+    });
+    expect(resolvePullUpdateOutcome(result, 5000).notice).toBe(
+      "Orkest updated, but its mailbox hook refresh (install_mailbox.py) timed out; run: python3 /repo/src/py/install_mailbox.py",
+    );
   });
 
   it("reads local git HEAD across loose refs, packed-refs, and linked worktrees, and resolves pruned worktrees", async () => {

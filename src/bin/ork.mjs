@@ -751,7 +751,7 @@ export async function main(
     );
   }
   if (argv[0] === "update") {
-    return optionalModuleCommand(
+    const result = await optionalModuleCommand(
       "../lib/update.mjs",
       ["updateCli", "runUpdateCli", "updateCommand"],
       argv.slice(1),
@@ -770,6 +770,11 @@ export async function main(
         return payload;
       },
     );
+    // An update whose post-install step did not finish still reports, but must not exit 0.
+    if (Number.isSafeInteger(result?.exitCode) && result.exitCode > 0) {
+      process.exitCode = result.exitCode;
+    }
+    return result;
   }
   if (argv[0] === "foundry" || argv[0] === "factory") {
     return foundryCommand(argv.slice(1), { stdout });

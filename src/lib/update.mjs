@@ -7,6 +7,8 @@ import { fileURLToPath } from "node:url";
 import { cacheHome, configHome } from "./runtime-paths.mjs";
 
 export const DEFAULT_UPDATE_INTERVAL_MS = 30 * 60 * 1000;
+// install_mailbox.py may compile ork-fast and runs a mailbox round-trip self-check; ork update is foreground.
+export const POST_INSTALL_TIMEOUT_MS = 10 * 60 * 1000;
 const UPDATE_SUBCOMMANDS = new Set(["run", "check", "status", "enable", "disable"]);
 const UPDATE_FLAGS = new Set(["--check", "--apply", "--auto", "--force", "--quiet", "--json"]);
 const UPDATE_HELP_TEXT = `Usage: ork update [run|check|status|enable|disable] [options]
@@ -53,7 +55,7 @@ async function execCommand(exec, command, args, options = {}) {
         args,
         {
           timeout: options.timeout ?? 15_000,
-          maxBuffer: 1024 * 1024,
+          maxBuffer: options.maxBuffer ?? 1024 * 1024,
           cwd: options.cwd,
           env: options.env,
         },
@@ -72,6 +74,10 @@ async function execCommand(exec, command, args, options = {}) {
   let callbackResult = null;
   let callbackError = null;
   const finish = (err, stdout = "", stderr = "") => {
+    if (err && typeof err === "object") {
+      err.stdout ??= stdout;
+      err.stderr ??= stderr;
+    }
     callbackError = err;
     callbackResult = { stdout: String(stdout || ""), stderr: String(stderr || "") };
   };
@@ -322,6 +328,20 @@ export async function runOrkestUpdate(options = {}) {
     ...(check.remoteSha && { remoteSha: check.remoteSha }),
   };
 
+  // A previous update landed but its post-install step did not finish: a manual run retries it.
+  if (
+    check.status === "up_to_date" &&
+    existingState.pendingPostInstall &&
+    options.auto !== true &&
+    !options.skipPostInstall
+  ) {
+    const postInstall = await runPostInstallStep(exec, repoRoot, options);
+    delete nextState.pendingPostInstall;
+    if (!postInstall.ok) nextState.pendingPostInstall = pendingRecord(postInstall, nowIso);
+    await writeJsonFile(statePath, nextState);
+    return { ...check, updated: false, postInstall: { ...postInstall, retried: true } };
+  }
+
   // Without opt-in, a background check only records that an update is waiting.
   const isRecordOnly = options.auto === true && !cfg.enabled;
   if (check.status !== "update_available" || isRecordOnly) {
@@ -338,12 +358,10 @@ export async function runOrkestUpdate(options = {}) {
 
   let migrationReport;
   let migrationError;
+  let postInstall;
   if (!options.skipPostInstall) {
-    const installMailboxPath = path.join(repoRoot, "src/py/install_mailbox.py");
-    await execCommand(exec, "python3", [installMailboxPath], {
-      cwd: repoRoot,
-      timeout: 15_000,
-    });
+    postInstall = await runPostInstallStep(exec, repoRoot, options);
+    // The legacy migration does not depend on the mailbox refresh, so a failed refresh does not skip it.
     try {
       let migrationRunner = typeof options.cleanupFn === "function" ? options.cleanupFn : null;
       if (!migrationRunner) {
@@ -363,6 +381,8 @@ export async function runOrkestUpdate(options = {}) {
     }
   }
 
+  // The fast-forward has landed whatever the post-install step did, so record it either way.
+  delete nextState.pendingPostInstall;
   const updatedState = {
     ...nextState,
     status: "updated",
@@ -372,6 +392,7 @@ export async function runOrkestUpdate(options = {}) {
     localSha: check.remoteSha,
     remoteSha: check.remoteSha,
     commitsBehind: check.commitsBehind,
+    ...(postInstall?.ok === false && { pendingPostInstall: pendingRecord(postInstall, nowIso) }),
   };
   await writeJsonFile(statePath, updatedState);
 
@@ -383,9 +404,76 @@ export async function runOrkestUpdate(options = {}) {
     fromSha: check.localSha,
     toSha: check.remoteSha,
     commitsBehind: check.commitsBehind,
+    ...(postInstall?.ok === false && { postInstall }),
     ...(migrationReport !== undefined && migrationReport !== null && { cleanup: migrationReport }),
     ...(migrationError !== undefined && { migrationError }),
   };
+}
+
+function pendingRecord(postInstall, nowIso) {
+  return {
+    step: postInstall.step,
+    command: postInstall.command,
+    status: postInstall.status,
+    error: postInstall.error,
+    failedAt: nowIso,
+  };
+}
+
+function shellQuote(value) {
+  return /^[\w@%+=:,./-]+$/u.test(value) ? value : `'${value.replaceAll("'", String.raw`'\''`)}'`;
+}
+
+/**
+ * Refresh the mailbox hooks after a fast-forward. It can compile ork-fast and runs the mailbox round-trip
+ * self-check, so it gets minutes, not seconds. A failure is returned, not thrown: the code has already moved.
+ */
+async function runPostInstallStep(exec, repoRoot, options) {
+  const installMailboxPath = path.join(repoRoot, "src/py/install_mailbox.py");
+  const step = "mailbox hook refresh (install_mailbox.py)";
+  const command = `python3 ${shellQuote(installMailboxPath)}`;
+  const timeoutMs = options.postInstallTimeoutMs ?? POST_INSTALL_TIMEOUT_MS;
+  try {
+    await execCommand(exec, "python3", [installMailboxPath], {
+      cwd: repoRoot,
+      env: options.env,
+      timeout: timeoutMs,
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    return { ok: true, step, command };
+  } catch (error) {
+    // execFile marks its own timeout kill with `killed` and a signal, but no string error code.
+    const isTimeout = error?.killed === true && typeof error.code !== "string";
+    const detail = isTimeout
+      ? `stopped after ${Math.round(timeoutMs / 1000)}s`
+      : lastOutputLine(error) || (error instanceof Error ? error.message : String(error));
+    return {
+      ok: false,
+      status: isTimeout ? "timed_out" : "failed",
+      step,
+      command,
+      error: detail,
+    };
+  }
+}
+
+function lastOutputLine(error) {
+  const linesOf = (text) =>
+    String(text || "")
+      .split(/\r?\n/u)
+      .map((line) => line.trim())
+      .filter(Boolean);
+  const stderrLines = linesOf(error?.stderr);
+  const lines = stderrLines.length > 0 ? stderrLines : linesOf(error?.stdout);
+  const code = Number.isSafeInteger(error?.code) ? ` (exit ${error.code})` : "";
+  return lines.length > 0 ? `${lines.at(-1)}${code}` : "";
+}
+
+function formatPendingPostInstall(pending) {
+  if (!pending) return "";
+  const what = pending.status === "timed_out" ? "timed out" : "failed";
+  const reason = pending.error ? `: ${String(pending.error).replaceAll(/\s+/gu, " ").trim()}` : "";
+  return `The ${pending.step} ${what}${reason}.\nThe update itself is in place; to finish it, run: ${pending.command}\n`;
 }
 
 function parseUpdateCliArgs(argv) {
@@ -520,11 +608,25 @@ export async function runUpdateCli(argv = [], io = {}) {
     }
   }
 
+  // The code moved, but the setup it needs did not finish: exit non-zero so scripts notice.
+  const isPostInstallPending = result.postInstall?.ok === false;
+  if (isPostInstallPending) result = { ...result, exitCode: 1 };
+
   if (isJsonOutput) {
     stdout.write(`${JSON.stringify(result, null, 2)}\n`);
     return result;
   }
-  if (isQuiet && result.status !== "updated") {
+  if (isQuiet && result.status !== "updated" && !isPostInstallPending) {
+    return result;
+  }
+  if (subcommand === "status") {
+    const { state } = result;
+    const landed =
+      state.status === "updated" && state.toSha
+        ? ` (${state.fromSha?.slice(0, 7)} -> ${state.toSha.slice(0, 7)} at ${state.lastUpdatedAt})`
+        : "";
+    stdout.write(`Orkest update status: ${result.status}${landed}.\n`);
+    stdout.write(formatPendingPostInstall(state.pendingPostInstall));
     return result;
   }
   switch (result.status) {
@@ -533,6 +635,7 @@ export async function runUpdateCli(argv = [], io = {}) {
         `Orkest updated (${result.fromSha?.slice(0, 7)} -> ${result.toSha?.slice(0, 7)}, ${result.commitsBehind} commit${result.commitsBehind === 1 ? "" : "s"}).\n`,
       );
       stdout.write(formatMigrationOutcome(result));
+      if (isPostInstallPending) stdout.write(formatPendingPostInstall(result.postInstall));
       break;
     }
     case "update_available": {
@@ -543,6 +646,9 @@ export async function runUpdateCli(argv = [], io = {}) {
     }
     case "up_to_date": {
       stdout.write(`Orkest is up to date (${result.branch} @ ${result.localSha?.slice(0, 7)}).\n`);
+      if (isPostInstallPending) stdout.write(formatPendingPostInstall(result.postInstall));
+      else if (result.postInstall)
+        stdout.write(`Finished the pending ${result.postInstall.step}.\n`);
       break;
     }
     case "enabled":
