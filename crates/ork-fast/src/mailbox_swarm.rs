@@ -1410,12 +1410,12 @@ pub fn swarm_coordinator_context(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mailbox_lifecycle::tests::{EnvGuard, TEST_ENV_LOCK, TestDir, make_peer, save_peer};
+    use crate::mailbox_lifecycle::tests::{EnvGuard, TestDir, lock_test_env, make_peer, save_peer};
     use serde_json::json;
 
     #[test]
     fn native_resume_hint_cannot_create_a_room_or_claim_an_inherited_room() {
-        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _lock = lock_test_env();
         let directory = TestDir::new("ork-swarm-resume-intent");
         let base = directory.path.join("mailbox-v1");
         let cwd = directory.path.to_str().unwrap();
@@ -1449,7 +1449,7 @@ mod tests {
 
     #[test]
     fn resume_finds_the_known_coordinator_whether_or_not_its_view_was_left_open() {
-        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _lock = lock_test_env();
         let directory = TestDir::new("ork-swarm-resume-membership");
         let base = directory.path.join("mailbox-v1");
         let cwd = directory.path.to_str().unwrap();

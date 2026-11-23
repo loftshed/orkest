@@ -1,0 +1,31 @@
+# Variables an agent session exports that no test may inherit.
+#
+# Vitest (isolated-profile.js), the Python runner (scripts/run_py_tests.py) and
+# the ork-fast tests (mailbox_lifecycle.rs) remove every match before any test
+# runs, so the suites behave the same inside an agent's shell as in CI. Tests
+# that need one of these set it themselves. One pattern per line; a trailing
+# `*` matches a prefix, and a leading `!` keeps a name the patterns would drop.
+
+# Knobs a developer sets for the test run itself.
+!ORKEST_TEST_RETAIN
+!ORKEST_TEST_CLEANUP
+
+# Orkest: mailbox, executor, swarm, resume, handoff and chief state.
+AGENT_*
+ORKEST_*
+ORCHESTRATE_*
+ORK_CHIEF_*
+
+# Harness sessions and their profile directories.
+CLAUDECODE
+CLAUDE_*
+CODEX_*
+OPENCODE
+OPENCODE_*
+ANTIGRAVITY_*
+GEMINI_*
+
+# Terminal multiplexers.
+HERDR_*
+TMUX
+TMUX_PANE

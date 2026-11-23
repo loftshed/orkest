@@ -779,9 +779,7 @@ mod tests {
 
     #[test]
     fn test_list_rooms_checked_completeness_on_partial_or_corrupt_stores() {
-        let _lock = crate::mailbox_lifecycle::tests::TEST_ENV_LOCK
-            .lock()
-            .unwrap();
+        let _lock = crate::mailbox_lifecycle::tests::lock_test_env();
         let mut env = crate::mailbox_lifecycle::tests::EnvGuard::new();
         env.set("ORKEST_NODE_BIN", "/nonexistent/node");
 
