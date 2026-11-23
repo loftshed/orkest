@@ -523,6 +523,8 @@ def deliver_due(
     hosts: frozenset[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Send one hint per due request through the mailbox; the existing wake path asks the host to act."""
+    from handoff_rest import resting
+
     moment = _now(moment)
     stamp = mailbox.stamp(moment)
     hosts = qualified_hosts() if hosts is None else hosts
@@ -545,6 +547,8 @@ def deliver_due(
             peer = _owner_peer(base, entry)
             if peer is None:
                 entry.update(availability="no live owner", updated_at=stamp)
+                continue
+            if resting(base, peer["session"]):
                 continue
             harness = "agy" if peer.get("harness") == "gemini" else peer.get("harness")
             if harness not in hosts:
@@ -661,7 +665,13 @@ def request_for_terminal(base: Path, directory: Path, state: dict[str, Any], run
 
 def request_at_stop(base: Path, me: dict[str, Any], room: dict[str, Any]) -> list[dict[str, Any]]:
     """The coordinator's turn stopped with authorized work left in its active room."""
-    if not room_store.is_active_room(room) or (room.get("conductor") or {}).get("paused"):
+    from handoff_rest import resting
+
+    if (
+        not room_store.is_active_room(room)
+        or (room.get("conductor") or {}).get("paused")
+        or resting(base, me["session"])
+    ):
         return []
     owner = {"session": me.get("session"), "harness": me.get("harness")}
     auth = _team_authority(base, room)

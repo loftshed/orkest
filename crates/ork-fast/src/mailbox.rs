@@ -832,6 +832,15 @@ fn run_on_base(
         is_subagent || me.get("isSubagent").is_some_and(paths::is_truthy_json) || agy_pending;
 
     if !suppress_toplevel
+        && matches!(
+            event.as_str(),
+            "SessionStart" | "UserPromptSubmit" | "PreInvocation"
+        )
+    {
+        mailbox_lifecycle::confirm_handoff_pane_start(&base, &session);
+    }
+
+    if !suppress_toplevel
         && !me.get("delegatedRun").is_some_and(paths::is_truthy_json)
         && !historical_adopted
         && !is_adopted_historical_session(&me, &native_session, &session)
@@ -1092,13 +1101,35 @@ fn run_on_base(
     } else {
         String::new()
     };
+    let stop_can_continue = event == "Stop"
+        && !phase_handoff
+        && !(gemini
+            && payload
+                .get("terminationReason")
+                .and_then(Value::as_str)
+                .is_some_and(|reason| {
+                    mailbox_lifecycle::ANTIGRAVITY_NO_CONTINUE.contains(&reason)
+                }));
     let handoff_notice = if !is_subagent && lifecycle_turn {
-        mailbox_lifecycle::handoff_turn(
-            &base,
-            &me,
-            matches!(event.as_str(), "SessionStart" | "UserPromptSubmit")
-                || (event == "PreInvocation" && !mid_turn),
-        )
+        if event == "Stop" {
+            mailbox_lifecycle::handoff_on_event(
+                &base,
+                &me,
+                false,
+                stop_can_continue,
+                payload
+                    .get("transcript_path")
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+            )
+        } else {
+            mailbox_lifecycle::handoff_turn(
+                &base,
+                &me,
+                matches!(event.as_str(), "SessionStart" | "UserPromptSubmit")
+                    || (event == "PreInvocation" && !mid_turn),
+            )
+        }
     } else {
         String::new()
     };
@@ -1200,7 +1231,12 @@ fn run_on_base(
         help_hint = rooms_work::help_board_hint(&base, &me, previous.as_ref());
     }
 
-    let delivered = mailbox_lifecycle::take(&base, &session, event == "Stop" || mid_turn, 20);
+    let resting = event == "Stop" && mailbox_lifecycle::handoff_resting_at_stop(&base, &session);
+    let delivered = if resting {
+        Vec::new()
+    } else {
+        mailbox_lifecycle::take(&base, &session, event == "Stop" || mid_turn, 20)
+    };
     let mut stale_wake_notice = String::new();
     if matches!(event.as_str(), "UserPromptSubmit" | "PreInvocation")
         && !mid_turn
@@ -1269,11 +1305,11 @@ fn run_on_base(
         };
     }
 
-    if event == "Stop" && !suppress_toplevel {
+    if event == "Stop" && !suppress_toplevel && !resting && handoff_notice.is_empty() {
         mailbox_lifecycle::continuation_at_stop(&base, &me);
     }
     if event == "Stop" {
-        if delivered.is_empty() {
+        if delivered.is_empty() && handoff_notice.is_empty() {
             if gemini {
                 let _ = writeln!(out_stream, "{{}}");
             }
@@ -1308,7 +1344,11 @@ fn run_on_base(
             "{}",
             json!({
                 "decision": decision,
-                "reason": format!("Peer messages arrived while you worked:\n\n{context}"),
+                "reason": if delivered.is_empty() {
+                    handoff_notice
+                } else {
+                    format!("Peer messages arrived while you worked:\n\n{context}")
+                },
             })
         );
         return Ok(());

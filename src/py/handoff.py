@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Automatic handoff when an orchestrating session runs out of usage, decided from facts and never guessed.
+"""Automatic quota handoff for an orchestrating session.
 
 A Claude `StopFailure` hook (error `rate_limit` or `billing_error`) or, for other harnesses, the periodic quota
 check records one exhaustion event per session and starts the handoff in a detached process. The handoff:
@@ -14,7 +14,9 @@ check records one exhaustion event per session and starts the handoff in a detac
 5. wakes or launches the successor with the note, and leaves a notice that every live session in the
    repository shows on its next turn. Anything unknown refuses with a reason and the same notice.
 
-Settings live under `handoff` in the Orkest config (`enabled`, `autoLaunch`, `excludeAccounts`).
+At a Stop boundary, fresh low quota instead requests a checkpoint and starts a planned offer.
+The offer keeps the current lead active until acceptance. Fresh planned successors can run in a
+sibling pane, using the same guarded executor as the headless fallback.
 """
 
 from __future__ import annotations
@@ -32,6 +34,7 @@ import os
 import re
 import secrets
 import shlex
+import shutil
 import socket
 import subprocess
 import sys
@@ -62,10 +65,24 @@ LEASE_WAIT_SECONDS = 900
 LEASE_POLL_SECONDS = 5
 # A launch that lost the lease to a short reader in the moment after the check is tried again after these.
 LAUNCH_RETRY_SECONDS = (10, 30)
+PANE_READY_SECONDS = 120
+PANE_EXIT_GRACE_SECONDS = 15
 LEASE_BUSY_EXIT = 27
 STATUS_LINES = 200
+CHECKPOINT_WAIT_SECONDS = 90
+CHECKPOINT_POLL_SECONDS = 3
+PANE_PARENT_VARS = (
+    "AGENT_MAILBOX_SESSION",
+    "AGENT_MAILBOX_PEER",
+    "AGENT_MAILBOX_LISTENER_SESSION",
+    "ORKEST_HANDOFF_SUCCESSOR",
+    "ORKEST_HANDOFF_STARTUP",
+    "ORKEST_RESUME_SWARM",
+    "ORKEST_RESUME_TARGET",
+    "ORKEST_SWARM_ROOM",
+)
 HARNESS_ENGINE = {"claude": "claude", "codex": "codex", "gemini": "agy", "opencode": "opencode"}
-FINAL = {"handed-over", "brief-ready", "refused", "ignored", "failed", "not-exhausted"}
+FINAL = {"handed-over", "offered", "brief-ready", "refused", "ignored", "failed", "not-exhausted", "not-low"}
 WOKEN = {"scheduled", "sent"}
 CHIEF_SCHEMA = "ork.chief.v1"
 CHIEF_UNVERIFIED_GRACE_SECONDS = 600
@@ -127,6 +144,14 @@ def session_dir(session: str) -> Path:
     return root() / mailbox().session_key(session)
 
 
+def files_dir(event: dict[str, Any]) -> Path:
+    directory = session_dir(event["session"])
+    # A pane command can be queued before it runs. It must always read its own offer and brief.
+    if event.get("kind") == "early" and re.fullmatch(r"[a-f0-9]{16}", event["id"]):
+        return directory / "offers" / event["id"]
+    return directory
+
+
 def write_private(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
@@ -174,9 +199,15 @@ def settings() -> dict[str, Any]:
     raw = (load_json(config_path()) or {}).get("handoff")
     raw = raw if isinstance(raw, dict) else {}
     excluded = raw.get("excludeAccounts")
+    threshold = raw.get("earlyPercentLeft")
+    if type(threshold) not in (int, float) or not 0 <= threshold <= 100:
+        threshold = succession().module("quota").LOW_USABLE_PCT
     return {
         "enabled": raw.get("enabled") is not False,
         "autoLaunch": raw.get("autoLaunch") is not False,
+        "early": raw.get("early") is not False,
+        "visible": raw.get("visible") is not False,
+        "earlyPercentLeft": threshold,
         "excludeAccounts": sorted({a for a in excluded if isinstance(a, str)}) if isinstance(excluded, list) else [],
     }
 
@@ -266,6 +297,8 @@ def record_exhaustion(
     details: str | None = None,
     moment: dt.datetime | None = None,
     spawn: Callable[[str, str], None] | None = None,
+    checkpoint: dict[str, Any] | None = None,
+    early_pool: str | None = None,
 ) -> dict[str, Any]:
     """Record one exhaustion event for a main session and start the handoff in the background.
 
@@ -285,14 +318,23 @@ def record_exhaustion(
         return {"status": "ignored", "reason": str(error)}
     with locked(directory):
         previous = load_json(directory / "event.json")
+        episode = None
         if previous:
+            previous_status = offer_status(previous)
+            was_early = previous.get("kind") == "early"
+            episode = previous.get("earlyEpisode", {"pool": None} if was_early else None)
+            if checkpoint is not None and episode is not None and episode["pool"] in (None, early_pool):
+                return {"status": "duplicate", "event": previous["id"], "reason": "already checkpointed for low quota"}
+            escalating = was_early and checkpoint is None
+            if previous_status == "offered" and not escalating:
+                return {"status": "duplicate", "event": previous["id"], "reason": "an offer is awaiting acceptance"}
             recorded = parse_time(previous.get("recordedAt"))
             age = (moment - recorded).total_seconds() if recorded is not None else None
-            if age is not None and age < DEDUPE_SECONDS:
+            if not was_early and age is not None and age < DEDUPE_SECONDS:
                 return {"status": "duplicate", "event": previous["id"]}
-            if previous.get("status") == "running" and not runner_gone(previous):
+            if not escalating and previous.get("status") == "running" and not runner_gone(previous):
                 return {"status": "duplicate", "event": previous["id"], "reason": "its handoff is still running"}
-            if (previous.get("status") == "handed-over" or previous.get("takenOver")) and not leads_active_team(
+            if (previous_status in {"handed-over", "accepted"} or previous.get("takenOver")) and not leads_active_team(
                 session
             ):
                 # One exhaustion, one successor: the old lead stays fenced until the user re-appoints it.
@@ -323,10 +365,63 @@ def record_exhaustion(
             "status": "recorded",
             "reasons": [],
             "toldSessions": [],
+            **({"kind": "early", "checkpoint": checkpoint} if checkpoint is not None else {}),
+            "earlyEpisode": {"pool": early_pool} if checkpoint is not None else episode,
         }
         save_event(directory, event, moment)
     (spawn or spawn_background)(session, event["id"])
     return {"status": "recorded", "event": event["id"]}
+
+
+def offer_status(event: dict[str, Any]) -> str:
+    if event.get("status") != "offered" or not event.get("team"):
+        return event.get("status", "unknown")
+    a = authority()
+    record = a.load(a.team_dir(event["team"])) or {}
+    offer = record.get("offer") or {}
+    if offer.get("automatic") == event["id"]:
+        return "expired" if a.automatic_offer_expired(offer) else "offered"
+    if any(entry.get("automatic") == event["id"] and entry["event"] == "accept" for entry in record.get("log", [])):
+        return "accepted"
+    return "superseded"
+
+
+def wait_for_checkpoint(base: Path, event: dict[str, Any], sleep: Callable[[float], None]) -> bool:
+    directory = session_dir(event["session"])
+    checkpoint = event["checkpoint"]
+    baseline = checkpoint["items"]
+    peer_session = event.get("peerSession") or event["session"]
+    for waited in range(0, CHECKPOINT_WAIT_SECONDS + 1, CHECKPOINT_POLL_SECONDS):
+        current = load_json(directory / "event.json") or {}
+        if current.get("id") != event["id"]:
+            return False  # A real exhaustion superseded this early checkpoint request.
+        peer = mailbox().load(mailbox().peer_path(base, peer_session))
+        items = []
+        if baseline and peer:
+            items = [
+                {"id": item["id"], "revision": item["checkpointRevision"], "handoff": item["handoff"]}
+                for item in module("mailbox_work").checkpoint_records(base, peer)
+                if item["id"] in baseline and item.get("checkpointRevision", 0) > baseline[item["id"]]
+            ]
+        complete = (
+            len(items) == len(baseline)
+            if baseline
+            else progress_revision(base, peer_session) > checkpoint["progressRevision"]
+        )
+        if current.get("checkpointStopAt") and complete:
+            event.update(checkpointStatus="checkpointed", checkpointPackets=items)
+            return True
+        if waited < CHECKPOINT_WAIT_SECONDS:
+            sleep(CHECKPOINT_POLL_SECONDS)
+    event.update(checkpointStatus="timed out", checkpointPackets=items)
+    return True
+
+
+def progress_revision(base: Path, session: str) -> int:
+    try:
+        return (base / "progress" / f"{mailbox().session_key(session)}.json").stat().st_mtime_ns
+    except OSError:
+        return 0
 
 
 def spawn_background(session: str, event_id: str) -> None:
@@ -381,29 +476,100 @@ def stop_failure(
     )
 
 
-def poll(base: Path, me: dict[str, Any], *, spawn: Callable | None = None) -> None:
-    """The periodic quota check for harnesses with no StopFailure (Codex, Antigravity): a session whose pool
-    monitor's cache reports blocked records the same event, at most every HOOK_CHECK_SECONDS. Whether it
-    leads anything is decided in the background (rooms need a slower lookup). Credits still work, so only
-    blocked counts here."""
+def below_threshold(pool: dict[str, Any], threshold: float) -> bool:
+    remaining = pool.get("availableNowPct")
+    return pool.get("status") in succession().USABLE and type(remaining) in (int, float) and remaining < threshold
+
+
+def poll(
+    base: Path,
+    me: dict[str, Any],
+    *,
+    at_stop: bool = False,
+    transcript: str | None = None,
+    spawn: Callable | None = None,
+) -> str:
+    """At Stop, ask for a low-quota checkpoint once. Preserve the periodic blocked-quota fallback."""
+    options = settings()
     acting = as_successor(me) or me
-    if acting.get("harness") == "claude" or (acting is me and ignored_peer(me)) or not settings()["enabled"]:
-        return
+    harness = acting.get("harness")
+    early = at_stop and options["early"] and harness in {"claude", "codex", "gemini"}
+    if not options["enabled"] or (acting is me and ignored_peer(me)):
+        return ""
+    early = early and not ignored_peer(me)
+    waiting = False
+    if early:
+        directory = session_dir(acting["session"])
+        previous = load_json(directory / "event.json") or {}
+        recorded = parse_time(previous.get("recordedAt"))
+        waiting = (
+            previous.get("status") == "recorded"
+            and recorded is not None
+            and (now() - recorded).total_seconds() < DEDUPE_SECONDS
+        ) or (previous.get("status") == "running" and not runner_gone(previous))
+        waiting = previous.get("kind") == "early" and waiting
+        if waiting:
+            with locked(directory):
+                current = load_json(directory / "event.json") or {}
+                if current.get("id") == previous["id"] and current.get("status") in {"recorded", "running"}:
+                    current["checkpointStopAt"] = stamp(now())
+                    save_event(directory, current)
     s = succession()
     checked = s.parse_time(me.get("handoffCheckedAt"))
-    if checked is not None and (now() - checked).total_seconds() < s.HOOK_CHECK_SECONDS:
-        return
-    mailbox().annotate(base, me["session"], handoffCheckedAt=stamp(now()))
+    late_due = harness != "claude" and (checked is None or (now() - checked).total_seconds() >= s.HOOK_CHECK_SECONDS)
+    if not early and not late_due:
+        return ""
+    if late_due:
+        mailbox().annotate(base, me["session"], handoffCheckedAt=stamp(now()))
     config = s.monitor_config()
     view = s.cached_view()
     if view is None:
-        return
-    account, _ = s.account_of(acting["harness"], acting.get("accountHome"), config, view=view)
+        return ""
+    account, _ = s.account_of(harness, acting.get("accountHome"), config, view=view)
     if account is None:
-        return
-    pool = s.pool_for(acting["harness"], session_model(acting), account, view, config)
-    if pool.get("status") == "blocked":
+        return ""
+    pool = s.pool_for(harness, session_model(acting), account, view, config)
+    fresh_at_stop = early and s.pool_fresh(pool, config)
+    low = below_threshold(pool, options["earlyPercentLeft"])
+    if fresh_at_stop and pool.get("status") in s.USABLE and not low and previous:
+        with locked(directory):
+            current = load_json(directory / "event.json") or {}
+            if current.get("id") == previous["id"] and current.get("earlyEpisode", current.get("kind") == "early"):
+                current["earlyEpisode"] = None
+                save_event(directory, current)
+    if fresh_at_stop and low and not waiting:
+        work = module("mailbox_work").checkpoint_records(base, me)
+        items = {item["id"]: item.get("checkpointRevision", 0) for item in work}
+        result = record_exhaustion(
+            me["session"],
+            me["harness"],
+            "quota:low",
+            source="Stop",
+            peer=me,
+            checkpoint={"items": items, "progressRevision": progress_revision(base, me["session"])},
+            early_pool=pool["pool"],
+            transcript=transcript,
+            spawn=spawn,
+        )
+        if result["status"] == "recorded":
+            items = (
+                (
+                    f" Use `python3 {script('peer_mailbox.py')} work checkpoint --session {me['session']}` on "
+                    + ", ".join(items)
+                    + " with a structured handoff packet (`files_touched`, `decisions_made`, `remaining_steps`, "
+                    "`blockers`, `verification_command_run`)."
+                )
+                if items
+                else ""
+            )
+            return (
+                "Orkest quota handoff: checkpoint your current work and update `ork progress` now."
+                + items
+                + " End this checkpoint turn promptly. Keep your current authority until the successor accepts."
+            )
+    elif late_due and pool.get("status") == "blocked":
         record_exhaustion(me["session"], me["harness"], "quota:blocked", source="quota-poll", peer=me, spawn=spawn)
+    return ""
 
 
 # Facts
@@ -746,9 +912,9 @@ def build_note(
     lines = [
         f"# Handoff note for session {event['session']}",
         "",
-        "Recorded facts only; no model wrote any of this.",
+        "Recorded facts only, including any progress and checkpoint entries attributed to the previous lead.",
         "",
-        "## Exhaustion",
+        "## Quota" if event.get("kind") == "early" else "## Exhaustion",
         "",
         f"- Session: {event['session']} ({event.get('name') or 'unnamed'}), {event['harness']}, "
         f"model {event.get('model') or 'unknown'}",
@@ -766,6 +932,12 @@ def build_note(
                 )
     else:
         lines.append("- none recorded")
+    if event.get("kind") == "early":
+        lines += ["", "## Workboard checkpoint", "", f"- Result: {event.get('checkpointStatus', 'waiting')}"]
+        for item in event.get("checkpointPackets", []):
+            lines.append(
+                f"- {item['id']} at revision {item['revision']}: {json.dumps(item['handoff'], sort_keys=True)}"
+            )
     lines += [
         "",
         "## Checkout",
@@ -1043,7 +1215,7 @@ def choose_successor(
     if not pool:
         refuse(f"monitor reports no pool for {lead['harness']} on account '{account}'")
         return result
-    result.update(account=account, pool=pool["pool"], status=pool["status"], stale=pool["stale"])
+    result.update(account=account, pool=pool["pool"], status=pool["status"], stale=pool["stale"], leadQuota=pool)
     context = pool["billing"]
     result["context"] = context
     if context is None:
@@ -1060,6 +1232,7 @@ def choose_successor(
             and candidate.get("billing") == context
             and candidate.get("status") == "available"
             and not candidate.get("stale")
+            and (not options.get("requireFresh") or s.pool_fresh(candidate, config))
             and (not deputy.get("account") or deputy["account"] == account_id)
             and (not deputy.get("harness") or deputy["harness"] == harness)
             and (not deputy.get("pool") or deputy["pool"] == candidate.get("pool"))
@@ -1290,9 +1463,13 @@ def handed_by_us(record: dict[str, Any], session: str) -> bool:
     appointed anyone since it accepted (an automatic designation withdrawn again does not count): then the
     same default may name its own successor."""
     previous = successor_record(session) or {}
-    events = [
-        entry.get("event") for entry in record.get("log") or [] if entry.get("event") not in {"task", "unregister"}
+    entries = [
+        entry
+        for entry in record.get("log") or []
+        if entry["event"] not in {"task", "unregister", "offer-cancelled"}
+        and not (entry["event"] == "offer" and entry.get("automatic"))
     ]
+    events = [entry["event"] for entry in entries]
     while events[-2:] == ["designate", "withdraw"]:
         events = events[:-2]
     return (
@@ -1302,6 +1479,42 @@ def handed_by_us(record: dict[str, Any], session: str) -> bool:
         and bool(events)
         and events[-1] == "accept"
     )
+
+
+def early_appointment(record: dict[str, Any], session: str) -> bool:
+    """Recognize an untouched automatic appointment, including records from before it was tagged."""
+    if record["generation"] != 1 or record.get("deputy"):
+        return False
+    entries = record["log"]
+    if not entries or any(
+        entry["event"] not in {"appoint", "designate", "withdraw", "offer", "offer-cancelled", "task", "unregister"}
+        for entry in entries
+    ):
+        return False
+    if entries[0].get("automatic"):
+        return True
+    # Older runs wrote the note before appointing. A note about an already appointed team names it explicitly.
+    appointed = parse_time(entries[0].get("at"))
+    if appointed is None or appointed.tzinfo is None:
+        return False
+    with contextlib.suppress(OSError), (session_dir(session) / "history.jsonl").open(encoding="utf-8") as history:
+        for line in history:
+            with contextlib.suppress(ValueError, OSError):
+                early = json.loads(line)
+                recorded = parse_time(early.get("recordedAt"))
+                updated = parse_time(early.get("updatedAt"))
+                if (
+                    early.get("kind") == "early"
+                    and early.get("team") == record["team"]
+                    and early.get("generation") == 1
+                    and recorded is not None
+                    and updated is not None
+                    and recorded <= appointed < updated + dt.timedelta(seconds=1)
+                    and f"\n## Team {record['team']}\n"
+                    not in (files_dir(early) / "note.md").read_text(encoding="utf-8")
+                ):
+                    return True
+    return False
 
 
 def fence(team: str, rooms: list[dict[str, Any]], *, base: Path, session: str, generation: int) -> dict[str, list]:
@@ -1377,6 +1590,13 @@ def brief(
     chief: dict[str, Any] | None = None,
 ) -> str:
     harness = successor["harness"]
+    transition = (
+        f"Session {event['session']} is low on quota and offered team {team} to you as "
+        f"session `{successor['session']}`. The current lead keeps authority until you accept.\n\n"
+        if event.get("kind") == "early"
+        else f"Session {event['session']} ran out of usage ({event['reason']}). Orkest fenced it and made you its "
+        f"successor as session `{successor['session']}`. Your generation of team {team} is pending.\n\n"
+    )
     chief_section = ""
     if chief:
         chief_section = (
@@ -1386,10 +1606,7 @@ def brief(
             "`ork chief bind` in this session if it should also hold the machine-wide Chief desk.\n"
         )
     return (
-        "# Continue as the lead after an automatic handoff\n\n"
-        f"Session {event['session']} ran out of usage ({event['reason']}). Orkest fenced it and made you its "
-        f"successor as session `{successor['session']}`. Your generation of team {team} is pending.\n\n"
-        "First, before any other work:\n\n"
+        "# Continue as the lead after an automatic handoff\n\n" + transition + "First, before any other work:\n\n"
         f"1. `python3 {script('authority.py')} show --team {team} --harness {harness}` and review it.\n"
         f"2. `python3 {script('authority.py')} accept --team {team} --session {successor['session']} "
         f"--harness {harness} --expect-generation {generation} --digest DIGEST`, with the digest show printed.\n\n"
@@ -1410,10 +1627,11 @@ def chief_brief(
     peer_session = event.get("peerSession") or event["session"]
     progress = mailbox().load(base / "progress" / f"{mailbox().session_key(peer_session)}.json") or {}
     successor = choice.get("successor") or {}
+    quota_event = "reached low quota" if event.get("kind") == "early" else "ran out of usage"
     lines = [
         "# Ork Chief handoff brief (no team takeover)",
         "",
-        "The machine-wide Chief session ran out of usage. `chief.json` was NOT modified automatically and no team was created.",
+        f"The machine-wide Chief session {quota_event}. Claim the desk separately with `ork chief bind`.",
         "",
         "## Chief event & binding",
         "",
@@ -1490,6 +1708,145 @@ def launch(command: list[str], env: dict[str, str]) -> dict[str, Any]:
     return {"exitCode": completed.returncode, "output": (completed.stdout + completed.stderr)[-2000:]}
 
 
+def launch_in_pane(
+    command: list[str],
+    env: dict[str, str],
+    *,
+    event: dict[str, Any],
+    successor: dict[str, Any],
+    team: str,
+    generation: int,
+    context: str,
+) -> dict[str, Any] | None:
+    """Start a native interactive harness in one sibling pane.
+
+    None means no pane could be opened, so the caller launches headless. `headlessBecause` means the
+    pane's harness never registered and was stopped, so the caller may launch headless once instead.
+    """
+    checkout = str(event["checkout"])
+    brief_path = files_dir(event) / "brief.md"
+    node = shutil.which("node")
+    chief = Path(__file__).resolve().parents[1] / "lib" / "chief.mjs"
+    if (
+        not node
+        or not chief.is_file()
+        or not (
+            env.get("HERDR_ENV") == "1"
+            or env.get("ORCA_PANE_KEY")
+            or env.get("ORCA_AGENT_PANE")
+            or env.get("TMUX_PANE")
+        )
+    ):
+        return None
+    if (env.get("ORCA_PANE_KEY") or env.get("ORCA_AGENT_PANE")) and not env.get("ORCA_TERMINAL_HANDLE"):
+        handle = module("orca_context").current_terminal(env)
+        if handle:
+            env = {**env, "ORCA_TERMINAL_HANDLE": handle}
+    attempt = brief_path.parent / ("pane-" + secrets.token_hex(8))
+    launcher = attempt / "launch.sh"
+    request = attempt / "request.json"
+    # The pane retries a busy lease itself, so the deadline covers those waits as well as startup.
+    deadline = time.monotonic() + sum(LAUNCH_RETRY_SECONDS) + PANE_READY_SECONDS
+    write_private(
+        request,
+        json.dumps(
+            {
+                "event": event["id"],
+                "predecessor": event["session"],
+                "team": team,
+                "generation": generation,
+                "checkout": checkout,
+                "brief": str(brief_path),
+                "deadline": deadline,
+                "retrySeconds": list(LAUNCH_RETRY_SECONDS),
+                "context": context,
+                **{
+                    key: successor[key]
+                    for key in ("session", "engine", "harness", "model", "account", "pool", "accountHome")
+                },
+            }
+        ),
+    )
+    account_vars = {
+        "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
+        "GEMINI_CLI_HOME",
+        "ANTIGRAVITY_APP_DATA_DIR",
+        "ORKEST_CLAUDE_ACCOUNT_HOME",
+        "ORKEST_CODEX_ACCOUNT_HOME",
+        "ORKEST_AGY_ACCOUNT_HOME",
+        "ORKEST_PINNED_CLAUDE_ACCOUNT",
+        "ORKEST_HANDOFF_LAUNCH",
+        "ORCHESTRATE_HOME",
+        "AGENT_EXECUTOR_HOME",
+        "ORCHESTRATE_CONFIG",
+        "AGENT_EXECUTOR_CONFIG",
+        "MONITOR_CONFIG",
+        "MONITOR_CACHE_DIR",
+        "MONITOR_BIN",
+        "PATH",
+        *PANE_PARENT_VARS,
+    }
+    child_env = {**env, "ORCHESTRATE_HOME": str(module("runtime_paths").cache_home())}
+    for var in PANE_PARENT_VARS:
+        child_env.pop(var, None)
+    names = sorted(
+        account_vars | {key for key in os.environ.keys() | env.keys() if os.environ.get(key) != env.get(key)}
+    )
+    lines = ["#!/bin/sh"]
+    for name in names:
+        if name != "ORCA_TERMINAL_HANDLE" and re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", name):
+            lines.append(f"export {name}={shlex.quote(child_env[name])}" if name in child_env else f"unset {name}")
+    # Orca can give the child its own terminal handle. Never export the parent's discovered handle.
+    if parent_handle := env.get("ORCA_TERMINAL_HANDLE"):
+        lines.append(
+            f'if [ "${{ORCA_TERMINAL_HANDLE:-}}" = {shlex.quote(parent_handle)} ]; then unset ORCA_TERMINAL_HANDLE; fi'
+        )
+    lines.append("exec " + shlex.join([sys.executable, str(Path(__file__).resolve()), "pane-start", str(request)]))
+    write_private(launcher, "\n".join(lines) + "\n")
+    launcher.chmod(0o700)
+    completed = subprocess.run(
+        [
+            node,
+            "--input-type=module",
+            "-e",
+            "const [module, workspace, launcher] = process.argv.slice(1);"
+            "const {launchSiblingPane} = await import(module);"
+            "console.log(JSON.stringify(launchSiblingPane({workspace, launcher})));",
+            chief.as_uri(),
+            checkout,
+            str(launcher),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=65,
+        env=env,
+        check=False,
+    )
+    if completed.returncode:
+        # An unconfirmed split may already have launched. Never start a second successor here.
+        raise ValueError("the pane launch was not confirmed")
+    if not (pane := json.loads(completed.stdout)):
+        return None
+    # The pane stops its own harness at the deadline and reports it, so wait a little longer for that.
+    while time.monotonic() < deadline + PANE_EXIT_GRACE_SECONDS:
+        attempts = (load_json(attempt / "attempts.json") or {}).get("attempts", 1)
+        if result := load_json(attempt / "exit.json"):
+            if result.pop("readyTimeout", False):
+                return {"headlessBecause": result["reason"], "pane": pane}
+            return {**result, "pane": pane, "attempts": attempts}
+        if ready := load_json(attempt / "ready.json"):
+            return {"exitCode": 0, "pane": pane, "nativeSession": ready["session"], "attempts": attempts}
+        time.sleep(0.1)
+    raise ValueError("the interactive harness did not confirm startup")
+
+
+def offer_current(team: str, event_id: str) -> bool:
+    a = authority()
+    offer = (a.load(a.team_dir(team)) or {}).get("offer") or {}
+    return offer.get("automatic") == event_id and not a.automatic_offer_expired(offer)
+
+
 def launch_command(event: dict[str, Any], successor: dict[str, Any], brief_path: Path) -> list[str]:
     command = [
         sys.executable,
@@ -1564,10 +1921,24 @@ def notice_for(event: dict[str, Any]) -> str:
     status, successor, team = event["status"], event.get("successor") or {}, event.get("team")
     reasons = "; ".join(event.get("reasons") or []) or "unknown"
     name = successor.get("name") or successor.get("session")
+    if event.get("kind") == "early" and status != "brief-ready":
+        if status == "offered":
+            delivery = event.get("delivery") or {}
+            how = "in a sibling pane" if delivery.get("pane") else "headless"
+            if delivery.get("headlessBecause"):
+                how = f"headless, because the visible pane failed ({delivery['headlessBecause']})"
+            if successor.get("kind") == "peer":
+                how = "through the mailbox"
+            return (
+                f"Orkest handoff: {who} reached low quota and offered team {team} to {name} {how}. "
+                f"Authority changes only on acceptance. Details: {show}"
+            )
+        return f"Orkest handoff: {who} reached low quota. Handoff {status}: {reasons}. Details: {show}"
     if status == "brief-ready":
         brief_hint = f" Brief: {event['brief']}." if event.get("brief") else ""
+        quota_event = "reached low quota" if event.get("kind") == "early" else "ran out of usage"
         return (
-            f"Orkest Chief handoff: {who} ran out of usage ({event['reason']}) while holding the Chief desk. "
+            f"Orkest Chief handoff: {who} {quota_event} ({event['reason']}) while holding the Chief desk. "
             f"A private Chief brief is ready (chief.json was not modified).{brief_hint} "
             f"Run `ork chief bind` in a session on another account to take over the Chief desk. Details: {show}"
         )
@@ -1620,7 +1991,13 @@ def chief_lock(base: Path) -> Iterator[None]:
             os.close(fd)
 
 
-def run(
+def run(session: str, event_id: str, **options: Any) -> dict[str, Any]:
+    # Checkpoint requests can be superseded by exhaustion. Only one worker may alter team authority at a time.
+    with locked(session_dir(session) / "worker"):
+        return run_claimed(session, event_id, **options)
+
+
+def run_claimed(
     session: str,
     event_id: str,
     *,
@@ -1674,7 +2051,7 @@ def run(
         with locked(directory):
             current = load_json(directory / "event.json") or {}
             finished = {**event, **current, **outcome} if current.get("id") == event_id else {**event, **outcome}
-            if finished["status"] in {"handed-over", "brief-ready", "refused", "failed"}:
+            if finished["status"] in {"handed-over", "offered", "brief-ready", "refused", "failed"}:
                 finished["notice"] = notice_for(finished)
                 finished["noticeAt"] = stamp(now())
             if current.get("id") == event_id:
@@ -1812,9 +2189,12 @@ def handoff(
     """Hand the claimed event over (see the module docstring). `event` already carries checkout_facts()."""
     a, s = authority(), succession()
     options = settings()
-    if not options["enabled"]:
+    early = event.get("kind") == "early"
+    if not options["enabled"] or (early and not options["early"]):
         return {"status": "ignored", "reasons": ["handoff is disabled"]}
     session = event["session"]
+    if early and not wait_for_checkpoint(base, event, sleep):
+        return {"status": "ignored", "reasons": ["superseded by quota exhaustion"]}
     conducted = (rooms or conducted_rooms)(base, session)
     found = find_team(session, conducted)
     chief = live_chief_binding(base, session, event=event, peers=peers)
@@ -1828,9 +2208,14 @@ def handoff(
     if found.get("why") and not found.get("tell") and not chief:
         return {**outcome, "status": "ignored", "reasons": [found["why"]]}
     record = found.get("record")
+    existing_offer = (record or {}).get("offer") or {}
+    if early and existing_offer and not a.automatic_offer_expired(existing_offer):
+        return refuse("the team already has an outstanding handover offer")
+    replace_automatic_offer = None if early else existing_offer.get("automatic")
     note = build_note(event, base=base, rooms=conducted, team=record, chief=chief)
-    write_private(session_dir(session) / "note.md", note)
-    outcome["note"] = str(session_dir(session) / "note.md")
+    note_path = files_dir(event) / "note.md"
+    write_private(note_path, note)
+    outcome["note"] = str(note_path)
     if not chief_only and found.get("why"):
         return refuse(found["why"])
     team = found.get("team")
@@ -1845,10 +2230,16 @@ def handoff(
         outcome["chain"] = {**chain, "count": chain["count"] + 1}
         if chain["count"] >= CHAIN_LIMIT:
             return refuse(f"handed over {chain['count']} times already from session {chain['origin']}; stopping there")
-        reappoint = bool(record) and not record.get("standing") and handed_by_us(record, session)
+        reappoint = (
+            not early
+            and bool(record)
+            and not record.get("standing")
+            and (not record.get("offer") or record["offer"].get("automatic"))
+            and (handed_by_us(record, session) or early_appointment(record, session))
+        )
         if record:
             outcome["generation"] = record["generation"]
-            if not record.get("standing") and not reappoint:
+            if not early and not record.get("standing") and not reappoint:
                 return refuse(f"team {team} has no standing takeover rule, so only the user can approve a takeover")
         appointing = record is None or reappoint
         # What this handoff fences: the conducted rooms under no team or this one, and their tasks.
@@ -1866,12 +2257,14 @@ def handoff(
 
     def choose(view: dict[str, Any] | None) -> dict[str, Any]:
         # Peers are read with each view: a session goes busy or idle while monitor is re-read.
+        live_peers = (peers if peers is not None else mailbox().peers(base)) if view else []
+        rest = module("handoff_rest")
         return choose_successor(
             lead,
             view=view,
             config=config,
-            peers=peers if peers is not None else mailbox().peers(base),
-            options=options,
+            peers=[peer for peer in live_peers if not rest.resting(base, peer["session"], view=view, config=config)],
+            options={**options, "requireFresh": early},
             deputy=None if reappoint else (record or {}).get("deputy"),
             allowed=lambda engine, config_dir, **policy_ctx: allowed_here(
                 policy, checkout, engine, config_dir, **policy_ctx
@@ -1881,15 +2274,21 @@ def handoff(
     def judge(choice: dict[str, Any]) -> dict[str, Any] | None:
         """A final outcome when this choice ends the handoff, else None."""
         if choice.get("status"):
-            if choice.get("stale") or choice["status"] not in (*s.EXHAUSTED, *s.USABLE):
+            if (
+                choice.get("stale")
+                or choice["status"] not in (*s.EXHAUSTED, *s.USABLE)
+                or (early and not s.pool_fresh(choice["leadQuota"], config))
+            ):
                 return refuse(
                     f"monitor's data for the pool {choice['pool']} is stale or unknown: whether it is out is unknown"
                 )
-            if choice["status"] not in s.EXHAUSTED:
+            if choice["status"] not in s.EXHAUSTED and not (
+                early and below_threshold(choice["leadQuota"], options["earlyPercentLeft"])
+            ):
                 # A rate limit with room left (a burst, an overload) is no exhausted pool: no handoff, no notice.
                 return {
                     **outcome,
-                    "status": "not-exhausted",
+                    "status": "not-low" if early else "not-exhausted",
                     "reasons": [f"monitor reports the pool {choice['pool']} {choice['status']}"],
                 }
         if record and record["lead"].get("pool") and choice.get("pool") and record["lead"]["pool"] != choice["pool"]:
@@ -1916,7 +2315,6 @@ def handoff(
                 "standing": AUTO_STANDING,
                 "lead": {**lead_entry, "session": session, "pool": choice["pool"]},
                 "deputy": deputy,
-                "offer": None,
                 "tasks": tasks,
             }
         else:
@@ -1924,7 +2322,7 @@ def handoff(
         return successor, deputy, planned
 
     # A 429 can come before monitor sees the pool out: re-read it fresh a few times before calling it a burst.
-    for delay in (0, *RECHECK_SECONDS):
+    for delay in (0,) if early else (0, *RECHECK_SECONDS):
         if delay:
             sleep(delay)
         view = fetch()
@@ -1934,7 +2332,7 @@ def handoff(
     if chief_only:
         if final := judge(choice):
             return final
-        brief_path = session_dir(session) / "brief.md"
+        brief_path = files_dir(event) / "brief.md"
         with chief_lock(base):
             # Verify against the original captured generation so a clear/rebind during quota retries is never adopted.
             current_binding = load_json(base / "chief.json")
@@ -1961,6 +2359,9 @@ def handoff(
         if final := judge(choice):
             return final
         successor, deputy, planned = plan(choice)
+        if early:
+            reasons, lead_status = [], None
+            break
         reasons, lead_status = s.monitor_evidence(planned, view=view, config=config, moment=s.now())
         if (
             reasons
@@ -1973,8 +2374,10 @@ def handoff(
         waited = True
         view = fetch()
         choice = choose(view)
-    if not reasons:
-        reasons = s.local_evidence(planned, lead_status=lead_status, moment=s.now())
+    if not early and not reasons:
+        reasons = s.local_evidence(
+            planned, lead_status=lead_status, moment=s.now(), replace_automatic_offer=replace_automatic_offer
+        )
     if reasons:
         return refuse("no standing takeover: " + "; ".join(reasons))
     if successor["kind"] == "launch":
@@ -1984,9 +2387,19 @@ def handoff(
                 "verified account home is unknown"
             )
         # A launched predecessor's own run holds the checkout until it ends: a successor waits for it.
-        wait = LEASE_WAIT_SECONDS if successor_record(session) else 0
+        wait = LEASE_WAIT_SECONDS if not early and successor_record(session) else 0
         if problem := launch_problem(checkout, wait=wait, sleep=sleep):
             return refuse(problem)
+    if early:
+        # Monitor refresh can take another turn. Recheck leadership before attaching any room or task.
+        current = load_json(session_dir(session) / "event.json") or {}
+        if current.get("id") != event["id"]:
+            return {"status": "ignored", "reasons": ["superseded by quota exhaustion"]}
+        conducted = (rooms or conducted_rooms)(base, session)
+        latest = find_team(session, conducted)
+        if latest.get("team") != team or latest.get("why") or latest.get("record") != record:
+            return refuse("leadership or the team changed while preparing the offer")
+        fenced_rooms, _ = fence_plan(team, conducted)
     outcome["successor"] = successor
     repository = (record or {}).get("repository") or event.get("repo")
     created = record is None
@@ -1995,8 +2408,8 @@ def handoff(
     def undo(error_changed: dict[str, list]) -> list[str]:
         """Undo this handoff's appointment or designation and fence; returns what is left, for the notice."""
         if appointing:
-            left = withdraw(team, record, error_changed, base=base, created=created)
-            if not left and created:
+            left = withdraw(team, record, error_changed, base=base, created=created and not early)
+            if not left and created and not early:
                 outcome.update(team=None, generation=None)
             return left
         return release_fence(
@@ -2010,16 +2423,23 @@ def handoff(
             if reappoint:
                 # Naming a deputy keeps the generation, so the lead's own work at it stands until the takeover.
                 record = a.designate(
-                    team, session, record["generation"], deputy=deputy, standing=AUTO_STANDING, lead_pool=choice["pool"]
+                    team,
+                    session,
+                    record["generation"],
+                    deputy=deputy,
+                    standing=AUTO_STANDING,
+                    lead_pool=choice["pool"],
+                    expected=record,
                 )
             else:
                 record = a.appoint(
                     team,
                     {**a.member(session, event["harness"]), "pool": choice["pool"]},
-                    deputy=deputy,
-                    standing=AUTO_STANDING,
+                    deputy=None if early else deputy,
+                    standing=None if early else AUTO_STANDING,
                     repository=repository,
                     expect_generation=0,
+                    automatic=event["id"] if early else None,
                 )
         except a.AuthorityError as error:
             return refuse(f"appointing team {team} failed: {error}")
@@ -2030,19 +2450,38 @@ def handoff(
         left = undo(getattr(error, "changed", changed))
         return refuse(f"putting the room's tasks under team {team} failed: {error}", *left)
     try:
-        taken = a.takeover(
-            team,
-            a.member(successor["session"], successor["harness"]),
-            record["generation"],
-            user_approved=False,
-            standing=True,
-            successor_account=successor["account"],
-            successor_repository=repository,
-        )
+        if early:
+            target_pool = s.pool_for(successor["harness"], successor["model"], successor["account"], view, config)
+            if not all(s.pool_fresh(pool, config) for pool in (choice["leadQuota"], target_pool)):
+                raise a.AuthorityError("a monitor measurement expired before the offer")
+            module("handoff_rest").prepare(
+                base,
+                event.get("peerSession") or session,
+                team,
+                event["id"],
+                choice["leadQuota"],
+                options["earlyPercentLeft"],
+            )
+            taken = a.offer(team, session, record["generation"], deputy, outcome["note"], automatic=event["id"])
+        else:
+            taken = a.takeover(
+                team,
+                a.member(successor["session"], successor["harness"]),
+                record["generation"],
+                user_approved=False,
+                standing=True,
+                successor_account=successor["account"],
+                successor_repository=repository,
+                replace_automatic_offer=replace_automatic_offer,
+            )
     except a.AuthorityError as error:
+        if early:
+            module("handoff_rest").release(base, event.get("peerSession") or session, event["id"])
         return refuse(str(error), *undo(changed))
-    outcome.update(generation=taken["generation"], takenOver=True)
-    mark_taken_over(session, event["id"], team, taken["generation"])
+    outcome.update(generation=taken["generation"])
+    if not early:
+        outcome["takenOver"] = True
+        mark_taken_over(session, event["id"], team, taken["generation"])
     # Written at once: the takeover happened, so a successor that runs out later is a step in this chain.
     write_private(
         root() / "successors" / f"{mailbox().session_key(successor['session'])}.json",
@@ -2060,8 +2499,7 @@ def handoff(
         )
         + "\n",
     )
-    note_path = session_dir(session) / "note.md"
-    brief_path = session_dir(session) / "brief.md"
+    brief_path = files_dir(event) / "brief.md"
     note_without_chief = build_note(event, base=base, rooms=conducted, team=record, chief=None)
     brief_without_chief = brief(event, note_without_chief, team, taken["generation"], successor, chief=None)
     current_chief = chief
@@ -2089,9 +2527,12 @@ def handoff(
         write_private(brief_path, brief_without_chief)
     try:
         if successor["kind"] == "peer":
+            transition = (
+                "is low on quota and offered you leadership" if early else "ran out of usage and you are its successor"
+            )
             message = (
-                f"Orkest handoff: {event['session']} ran out of usage and you are its successor for team {team} "
-                f"(pending generation {taken['generation']}). Read {brief_path}, then run authority.py show and "
+                f"Orkest handoff: {event['session']} {transition} for team {team} "
+                f"(generation {taken['generation']}). Read {brief_path}, then run authority.py show and "
                 "accept exactly as it says before any other work."
             )
             outcome["delivery"] = (deliver or deliver_peer)(base, event, successor, message)
@@ -2107,6 +2548,9 @@ def handoff(
                     "ORKEST_AGY_ACCOUNT_HOME",
                 }
             }
+            if early:
+                for variable in PANE_PARENT_VARS:
+                    env.pop(variable, None)
             env["ORKEST_HANDOFF_LAUNCH"] = successor["session"]  # run_agent hands it to this run alone
             launch_env = successor.get("launchEnv")
             if successor["harness"] == "claude":
@@ -2146,34 +2590,60 @@ def handoff(
                             "ORKEST_AGY_ACCOUNT_HOME": successor["accountHome"],
                         }
                 if not launch_env:
-                    return {
-                        **outcome,
-                        "status": "failed",
-                        "reasons": [f"cannot launch {successor['harness']} successor without verified account home"],
-                    }
+                    raise ValueError(f"cannot launch {successor['harness']} successor without verified account home")
                 for key, value in launch_env.items():
                     if value is None:
                         env.pop(key, None)
                     else:
                         env[key] = value
             command = launch_command(event, successor, brief_path)
-            # A short reader can take the lease between launch_problem() and the launch: try again then.
-            for attempt, delay in enumerate((0, *LAUNCH_RETRY_SECONDS), start=1):
-                if delay:
-                    sleep(delay)
-                outcome["delivery"] = {**(launcher or launch)(command, env), "attempts": attempt}
-                if outcome["delivery"].get("exitCode") != LEASE_BUSY_EXIT:
-                    break
+            delivery, headless_because = None, None
+            if launcher is None and early and options["visible"]:
+                # One pane at most: the pane retries a busy lease itself, and a pane that never
+                # registers falls back to the headless launch below, once, in this same episode.
+                delivery = launch_in_pane(
+                    command,
+                    env,
+                    event=event,
+                    successor=successor,
+                    team=team,
+                    generation=taken["generation"],
+                    context=choice["context"],
+                )
+                if delivery and delivery.get("headlessBecause"):
+                    if not offer_current(team, event["id"]):
+                        raise ValueError("the offer changed while the visible successor started")
+                    headless_because, delivery = delivery["headlessBecause"], None
+                if delivery is not None:
+                    outcome["delivery"] = delivery
+            if delivery is None:
+                # A short reader can take the lease between launch_problem() and the launch: try again then.
+                for attempt, delay in enumerate((0, *LAUNCH_RETRY_SECONDS), start=1):
+                    if delay:
+                        sleep(delay)
+                    outcome["delivery"] = {**(launcher or launch)(command, env), "attempts": attempt}
+                    if outcome["delivery"].get("exitCode") != LEASE_BUSY_EXIT:
+                        break
+                if headless_because:
+                    outcome["delivery"]["headlessBecause"] = headless_because
             code = outcome["delivery"].get("exitCode")
             if code not in (0, None):
+                if early:
+                    detail = outcome["delivery"].get("reason")
+                    raise ValueError(
+                        f"launching the successor failed (exit {code})" + (f": {detail}" if detail else "")
+                    )
                 return {
                     **outcome,
                     "status": "failed",
                     "reasons": [f"launching the successor failed (exit {code}), so its takeover stays pending"],
                 }
-    except Exception as error:  # noqa: BLE001 -- the takeover stands; the user must hear that delivery failed
+    except Exception as error:  # noqa: BLE001 -- the user must hear that delivery failed
+        if early:
+            a.cancel_automatic_offer(team, session, taken["generation"], event["id"])
+            module("handoff_rest").release(base, event.get("peerSession") or session, event["id"])
         return {**outcome, "status": "failed", "reasons": [f"delivering the handoff failed: {error}"]}
-    return {**outcome, "status": "handed-over", "reasons": []}
+    return {**outcome, "status": "offered" if early else "handed-over", "reasons": []}
 
 
 def withdraw(team: str, record: dict[str, Any], changed: dict[str, list], *, base: Path, created: bool) -> list[str]:
@@ -2235,7 +2705,14 @@ def notices(base: Path, me: dict[str, Any], moment: dt.datetime | None = None) -
 
 def summary(event: dict[str, Any]) -> dict[str, Any]:
     keys = ("id", "session", "name", "reason", "source", "recordedAt", "status", "reasons", "team", "generation")
-    return {key: event.get(key) for key in keys} | {"successor": (event.get("successor") or {}).get("session")}
+    summary = {key: event.get(key) for key in keys} | {"successor": (event.get("successor") or {}).get("session")}
+    if event.get("kind") == "early":
+        summary.update(kind="early", status=offer_status(event), checkpointStatus=event.get("checkpointStatus"))
+        if summary["status"] == "accepted":
+            summary["generation"] += 1
+        if pane := (event.get("delivery") or {}).get("pane"):
+            summary["pane"] = pane
+    return summary
 
 
 def status() -> dict[str, Any]:
@@ -2250,7 +2727,7 @@ def show(session: str) -> str:
     if event is None:
         raise ValueError(f"no handoff is recorded for session {session}")
     try:
-        note = (directory / "note.md").read_text(encoding="utf-8")
+        note = (files_dir(event) / "note.md").read_text(encoding="utf-8")
     except OSError:
         note = "(no note: the handoff stopped before writing one)\n"
     if event.get("notice"):
@@ -2269,11 +2746,15 @@ def main(argv: list[str] | None = None) -> int:
     run_parser = commands.add_parser("run", help=argparse.SUPPRESS)
     run_parser.add_argument("--session", required=True)
     run_parser.add_argument("--event", required=True)
+    pane_parser = commands.add_parser("pane-start", help=argparse.SUPPRESS)
+    pane_parser.add_argument("request", type=Path)
     args = parser.parse_args(argv)
     try:
         if args.action == "show":
             print(show(args.session), end="")
             return 0
+        if args.action == "pane-start":
+            return module("handoff_pane").start(args.request)
         if args.action == "status":
             output: Any = status()
         elif args.action in {"enable", "disable"}:

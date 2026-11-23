@@ -484,7 +484,11 @@ class SqliteSharedRoomTests(unittest.TestCase):
                     "agents": [{"id": "q1", "status": "queued"}],
                 },
             )
-            stale_env = {**os.environ, "ORKEST_SWARM_ROOM": "archived-room"}
+            stale_env = {
+                **os.environ,
+                "ORKEST_SWARM_ROOM": "archived-room",
+                "MONITOR_CACHE_DIR": str(root / "monitor-cache"),
+            }
             start_out = run_mailbox_hook(
                 {"hook_event_name": "SessionStart", "session_id": "coord-active", "cwd": str(checkout)},
                 harness="claude",

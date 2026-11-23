@@ -18,6 +18,7 @@ import {
   chiefStatus,
   installCompletionHook,
   isWithinPath,
+  launchSiblingPane,
   listDesk,
   missionBrief,
   planCompletionHook,
@@ -1164,6 +1165,34 @@ describe("ork chief", () => {
     });
     expect(readRawRoom("chief-mission-1", root).chief.state).toBe("done");
     expect(readRawRoom("chief-mission-1", root).conductor.status).toBe("completed");
+  });
+
+  it("still sends to a peer when its quota-rest check fails", async () => {
+    writePeer(root, {
+      session: "other-worker",
+      name: "Other",
+      cwd: makeRepo(tmp, "rest-check-peer"),
+      pid: process.pid,
+    });
+    const marker = path.join(root, "handoff-rest", `${sessionKey("other-worker")}.json`);
+    fs.mkdirSync(path.dirname(marker), { recursive: true });
+    fs.writeFileSync(marker, JSON.stringify({ team: "t", event: "e", pool: "p", threshold: 15 }));
+    const brokenBin = path.join(tmp, "broken-python");
+    fs.mkdirSync(brokenBin);
+    fs.writeFileSync(path.join(brokenBin, "python3"), "#!/bin/sh\nexit 1\n");
+    fs.chmodSync(path.join(brokenBin, "python3"), 0o755);
+    const runMailbox = mailboxMock(0);
+    const sent = await chiefSend({
+      to: "other-worker",
+      message: "still reachable",
+      from: "mission-2-orch",
+      root,
+      env: { ...env, PATH: `${brokenBin}${path.delimiter}${env.PATH}` },
+      now: NOW,
+      runMailbox,
+    });
+    expect(sent.target).toMatchObject({ session: "other-worker" });
+    expect(runMailbox).toHaveBeenCalled();
   });
 
   it("checks existing room IDs before provisioning a Chief spawn worktree", async () => {
@@ -3814,6 +3843,90 @@ describe("ork chief", () => {
           "tmux",
           `if [ "$1" = display-message ]; then echo %3; exit 0; fi\nprintf '%s\\n' "$@" '--' >> '${tmuxLog()}'\nif [ "$1" = new-window ]; then echo %9; fi`,
         );
+      });
+
+      it("opens quota successors beside their calling pane on each detectable backend", () => {
+        const launcher = path.join(tmp, "launch successor.sh");
+        const invoke = (backend, makeEnv, responses, expected) => {
+          const calls = [];
+          const launched = launchSiblingPane({
+            workspace: repo,
+            launcher,
+            env: makeEnv,
+            exec: (file, args) => {
+              calls.push([path.basename(file), args]);
+              return responses[calls.length - 1];
+            },
+          });
+          expect(launched).toMatchObject({ backend, ...expected });
+          return calls;
+        };
+        expect(invoke("tmux", tmuxEnv(), ["%3\n", "%9\n"], { tmuxPane: "%9" })[1]).toEqual([
+          "tmux",
+          [
+            "split-window",
+            "-h",
+            "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-t",
+            "%3",
+            "-c",
+            repo,
+            `'${launcher}'`,
+          ],
+        ]);
+        fakeBinary("herdr", "exit 1");
+        const herdrCalls = invoke(
+          "herdr",
+          { ...env, HERDR_ENV: "1", HERDR_PANE_ID: "w1:p1" },
+          [
+            '{"result":{"pane":{"pane_id":"w1:p1"}}}',
+            '{"result":{"pane":{"pane_id":"w1:p2"}}}',
+            "{}",
+          ],
+          { paneId: "w1:p2" },
+        );
+        expect(herdrCalls.slice(1)).toEqual([
+          [
+            "herdr",
+            ["pane", "split", "--current", "--direction", "right", "--cwd", repo, "--no-focus"],
+          ],
+          ["herdr", ["pane", "run", "w1:p2", `'${launcher}'`]],
+        ]);
+        fakeBinary("orca-ide", "exit 1");
+        const orcaCalls = invoke(
+          "orca",
+          {
+            ...env,
+            ORCA_PANE_KEY: "parent",
+            ORCA_TERMINAL_HANDLE: "term-1",
+            ORCA_CLI_COMMAND: "orca-ide",
+          },
+          [
+            '{"result":{"terminals":[{"handle":"term-1"}]}}',
+            '{"result":{"split":{"handle":"term-2"}}}',
+          ],
+          { orcaTerminalHandle: "term-2" },
+        );
+        expect(orcaCalls[1]).toEqual([
+          "orca-ide",
+          [
+            "terminal",
+            "split",
+            "--terminal",
+            "term-1",
+            "--direction",
+            "vertical",
+            "--command",
+            `'${launcher}'`,
+            "--json",
+          ],
+        ]);
+        expect(
+          launchSiblingPane({ workspace: repo, launcher, env: { HERDR_ENV: "1" } }),
+        ).toBeNull();
       });
 
       it("asks the detached gate's own quota check when no decision is injected", async () => {

@@ -588,6 +588,7 @@ def wake(target: dict, message_id: str, *, base: Path | None = None, retry: bool
             {"status": "unsupported", "reason": "this harness has no mailbox wake adapter; message remains queued"}
         )
     import peer_mailbox as mailbox
+    from handoff_rest import resting
 
     base = base or mailbox.root()
     stored = mailbox.load(mailbox.peer_path(base, target["session"])) or {}
@@ -598,6 +599,8 @@ def wake(target: dict, message_id: str, *, base: Path | None = None, retry: bool
     try:
         # Serialize queue inspection and admission across senders, without holding inbox locks.
         with mailbox.locked(base / "wakes" / mailbox.session_key(target["session"]) / "admission.json"):
+            if resting(base, target["session"]):
+                return with_phase({"status": "queued", "reason": "recipient is resting after a quota handoff"})
             if not unread(base, target, message_id):
                 return with_phase({"status": "queued", "reason": "message already handled or outside this project"})
             adapter = {"codex": wake_codex, "gemini": wake_gemini, "claude": wake_claude}.get(

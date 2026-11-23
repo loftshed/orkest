@@ -4031,14 +4031,14 @@ pub fn succession_notice(base: &Path, me: &Value) -> String {
     }
 }
 
-fn handoff_enabled() -> bool {
+fn handoff_option(name: &str) -> bool {
     let cfg_path = paths::config_path(None, None);
     let Some(cfg) = paths::read_json_file(&cfg_path) else {
         return true;
     };
     cfg.get("handoff")
         .and_then(Value::as_object)
-        .and_then(|h| h.get("enabled"))
+        .and_then(|h| h.get(name))
         != Some(&Value::Bool(false))
 }
 
@@ -4284,6 +4284,38 @@ fn deliver_non_repo_chief_notices(base: &Path, session: &str, now_secs: i64) -> 
 
 #[must_use]
 pub fn handoff_turn(base: &Path, me: &Value, notify_user: bool) -> String {
+    handoff_on_event(base, me, notify_user, false, "")
+}
+
+/// Confirm startup only for the native interactive process started by a handoff launcher.
+pub fn confirm_handoff_pane_start(base: &Path, session: &str) {
+    let (Some(path), Some(root)) = (env::var_os("ORKEST_HANDOFF_STARTUP"), base.parent()) else {
+        return;
+    };
+    let path = Path::new(&path);
+    let Some(directory) = path.parent() else {
+        return;
+    };
+    if path.file_name().is_some_and(|name| name == "ready.json")
+        && !path.exists()
+        && directory
+            .canonicalize()
+            .ok()
+            .zip(root.join("handoffs-v1").canonicalize().ok())
+            .is_some_and(|(directory, root)| directory.starts_with(root))
+        && directory.join("request.json").is_file()
+    {
+        let _ = paths::write_json_atomic(path, &json!({"session": session}));
+    }
+}
+
+pub fn handoff_on_event(
+    base: &Path,
+    me: &Value,
+    notify_user: bool,
+    at_stop: bool,
+    transcript: &str,
+) -> String {
     if me.get("isSubagent").is_some_and(paths::is_truthy_json)
         || identity::is_run_peer(Some(me))
         || me
@@ -4297,7 +4329,7 @@ pub fn handoff_turn(base: &Path, me: &Value, notify_user: bool) -> String {
     if me.get("delegatedRun").is_some_and(paths::is_truthy_json) && !has_handoff_successor {
         return String::new();
     }
-    if !handoff_enabled() {
+    if !handoff_option("enabled") {
         return String::new();
     }
 
@@ -4321,7 +4353,12 @@ pub fn handoff_turn(base: &Path, me: &Value, notify_user: bool) -> String {
             || paths::expand_home("~/.cache/monitor", None),
             |s| paths::expand_home(&s, None),
         );
-    let poll_eligible = if poll_due && monitor_cache.join("snapshot.json").is_file() {
+    let early_stop = at_stop
+        && handoff_option("early")
+        && matches!(harness, "claude" | "codex" | "gemini")
+        && !me.get("delegatedRun").is_some_and(paths::is_truthy_json);
+    let poll_eligible = if (poll_due || early_stop) && monitor_cache.join("snapshot.json").is_file()
+    {
         has_handoff_successor
             || is_live_chief
             || (!my_sid.is_empty()
@@ -4398,10 +4435,17 @@ pub fn handoff_turn(base: &Path, me: &Value, notify_user: bool) -> String {
             "base = pathlib.Path(sys.argv[2])\n",
             "me = json.loads(sys.stdin.read())\n",
             "if sys.argv[3] == '1':\n",
-            "    handoff.poll(base, me)\n",
-            "print(handoff.notices(base, me) if sys.argv[4] == '1' else '')\n",
+            "    checkpoint = handoff.poll(base, me, at_stop=sys.argv[5] == '1', transcript=sys.argv[6] or None)\n",
+            "    if checkpoint: print(checkpoint)\n",
+            "if sys.argv[4] == '1': print(handoff.notices(base, me))\n",
         ),
-        &[&base_str, poll_flag, notice_flag],
+        &[
+            &base_str,
+            poll_flag,
+            notice_flag,
+            if early_stop { "1" } else { "0" },
+            transcript,
+        ],
         Some(&me_bytes),
         Duration::from_secs(5),
         Some(&cache_dir_for_base(base)),
@@ -4416,6 +4460,29 @@ pub fn handoff_turn(base: &Path, me: &Value, notify_user: bool) -> String {
         (true, false) => python_text,
         (false, false) => format!("{chief_non_repo_notices}\n{python_text}"),
     }
+}
+
+pub fn handoff_resting_at_stop(base: &Path, session: &str) -> bool {
+    let Ok(key) = paths::session_key(session) else {
+        return false;
+    };
+    let marker = base.join("handoff-rest").join(format!("{key}.json"));
+    if !marker.is_file()
+        || paths::read_json_file(&marker).and_then(|value| value["released"].as_bool())
+            == Some(true)
+    {
+        return false;
+    }
+    let result = run_scripts_python(
+        "import pathlib, sys; sys.path.insert(0, sys.argv[1]); import handoff_rest; \
+         print(int(handoff_rest.resting(pathlib.Path(sys.argv[2]), sys.argv[3])))",
+        &[&base.to_string_lossy(), session],
+        None,
+        Duration::from_secs(5),
+        Some(&cache_dir_for_base(base)),
+    );
+    // Only a confirmed rest holds mail: a slow or failing check must not silence a session that still leads.
+    matches!(result, Some((true, ref value)) if value == "1")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

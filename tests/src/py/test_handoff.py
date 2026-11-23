@@ -139,6 +139,8 @@ class HandoffTests(unittest.TestCase):
         self.environment.start()
         os.environ.pop("ORCHESTRATE_HOME", None)
         os.environ.pop("ORKEST_HANDOFF_SUCCESSOR", None)
+        for var in ("ANTIGRAVITY_APP_DATA_DIR", "GEMINI_CLI_HOME", "CODEX_HOME"):
+            os.environ.pop(var, None)
         self.write()
         self.base = MAILBOX.root()
         self.lead = self.register(LEAD, "claude-a")
@@ -168,6 +170,7 @@ class HandoffTests(unittest.TestCase):
                 "billing": a.get("billing"),
                 "label": a.get("id"),
                 "configDir": a.get("configDir"),
+                "fetchedAt": a.get("fetchedAt", HANDOFF.now().isoformat()),
             }
             for a in self.config["accounts"]
         ]
@@ -327,6 +330,483 @@ class HandoffTests(unittest.TestCase):
         self.assertEqual([session for session, _ in self.spawned], ["codex-lead"])
         HANDOFF.poll(self.base, self.lead, spawn=self.spawn)  # Claude has StopFailure instead
         self.assertEqual(len(self.spawned), 1)
+
+    def test_claude_stop_requests_a_checkpoint_and_preserves_authority_until_acceptance(self) -> None:
+        self.set_lane("claude-a", status="available", usable=4)
+        self.register(PEER, "claude-b")
+        self.store_room()
+        work = HANDOFF.module("mailbox_work")
+        created = work.mutate(
+            self.base,
+            self.lead,
+            action="create",
+            key="handoff-test",
+            title="Resume deployment",
+            scope="Local checkout",
+            acceptance="Deployment verified",
+        )["item"]
+        claimed = work.mutate(
+            self.base,
+            self.lead,
+            action="claim",
+            item=created["id"],
+            revision=created["revision"],
+        )["item"]
+        env = {**os.environ, "CLAUDE_CONFIG_DIR": str(self.homes["claude-a"]), "PYTEST_CURRENT_TEST": "1"}
+        payload = {
+            "hook_event_name": "Stop",
+            "session_id": LEAD,
+            "cwd": str(self.repo),
+            "transcript_path": str(self.root / "t.jsonl"),
+        }
+        stop = ORK_FAST.run_mailbox_hook(payload, harness="claude", base=self.base, pid=os.getpid(), env=env)
+        self.assertEqual(stop["decision"], "block")
+        self.assertIn("checkpoint your current work", stop["reason"])
+        self.assertIn(claimed["id"], stop["reason"])
+        [event] = HANDOFF.status()["events"]
+        self.assertEqual((event["kind"], event["status"]), ("early", "recorded"))
+        work.mutate(
+            self.base,
+            self.lead,
+            action="checkpoint",
+            item=claimed["id"],
+            revision=claimed["revision"],
+            handoff={
+                "files_touched": ["README.md"],
+                "decisions_made": ["Preserve the current branch"],
+                "remaining_steps": ["Run checks"],
+                "blockers": [],
+                "verification_command_run": "git diff --check",
+            },
+        )
+        following = ORK_FAST.run_mailbox_hook(payload, harness="claude", base=self.base, pid=os.getpid(), env=env)
+        self.assertIsNone(following)
+        outcome = HANDOFF.run(LEAD, event["id"], base=self.base, deliver=self.deliver, sleep=self.sleeps.append)
+        self.assertEqual((outcome["status"], outcome["checkpointStatus"]), ("offered", "checkpointed"), outcome)
+        self.assertEqual(self.sleeps, [])
+        self.assertIn("Preserve the current branch", Path(outcome["note"]).read_text())
+        team = outcome["team"]
+        record = AUTHORITY.load(AUTHORITY.team_dir(team))
+        AUTHORITY.check(record, LEAD, 1)
+        with self.assertRaisesRegex(AUTHORITY.AuthorityError, "superseded"):
+            AUTHORITY.check(record, PEER, 1)
+        rest = HANDOFF.module("handoff_rest")
+        self.assertFalse(rest.resting(self.base, LEAD))
+        accepted = self.accept(team, PEER)
+        AUTHORITY.check(accepted, PEER, 2)
+        with self.assertRaisesRegex(AUTHORITY.AuthorityError, "superseded"):
+            AUTHORITY.check(accepted, LEAD, 1)
+        self.assertEqual(HANDOFF.status()["events"][0]["status"], "accepted")
+        self.assertTrue(rest.resting(self.base, LEAD))
+        wake = HANDOFF.module("mailbox_wake").wake(self.lead, "test-message", base=self.base)
+        self.assertEqual(wake["reason"], "recipient is resting after a quota handoff")
+        mail = MAILBOX.notify(self.base, self.lead, "Review the queued note when you return")
+        self.assertIsNone(
+            ORK_FAST.run_mailbox_hook(payload, harness="claude", base=self.base, pid=os.getpid(), env=env)
+        )
+        self.assertIn(mail["id"], {item["id"] for item in MAILBOX.incoming(self.base, LEAD)})
+        direct = ORK_FAST.run_mailbox_hook(
+            {**payload, "hook_event_name": "UserPromptSubmit", "prompt": "Show me the current state"},
+            harness="claude",
+            base=self.base,
+            pid=os.getpid(),
+            env=env,
+        )
+        self.assertIn("Review the queued note when you return", direct["hookSpecificOutput"]["additionalContext"])
+        self.assertNotEqual(direct.get("decision"), "block")
+        self.set_lane("claude-a", status="available", usable=80, stale=True)
+        self.assertTrue(rest.resting(self.base, LEAD))
+        self.set_lane("claude-a", stale=False)
+        self.assertFalse(rest.resting(self.base, LEAD))
+
+    def test_early_poll_excludes_stale_and_delegated_sessions_and_respects_the_threshold(self) -> None:
+        self.set_lane("claude-a", status="available", usable=14)
+        self.assertEqual(HANDOFF.poll(self.base, self.lead, at_stop=True, spawn=self.spawn), "")
+        HANDOFF.config_path().write_text(json.dumps({"handoff": {"earlyPercentLeft": 15, "early": False}}))
+        self.assertEqual(HANDOFF.poll(self.base, self.lead, at_stop=True, spawn=self.spawn), "")
+        HANDOFF.config_path().write_text(json.dumps({"handoff": {"earlyPercentLeft": 15}}))
+        for flags in (
+            {"isSubagent": True},
+            {"agySubagentPending": True},
+            {"delegatedRun": "r"},
+            {"run": "r", "role": "worker"},
+        ):
+            self.assertEqual(HANDOFF.poll(self.base, {**self.lead, **flags}, at_stop=True, spawn=self.spawn), "")
+        self.set_lane("claude-a", stale=True)
+        self.assertEqual(HANDOFF.poll(self.base, self.lead, at_stop=True, spawn=self.spawn), "")
+        self.set_lane("claude-a", stale=False)
+        self.assertEqual(HANDOFF.poll(self.base, self.lead, spawn=self.spawn), "")
+        self.assertEqual(self.spawned, [])
+        self.assertIn("checkpoint", HANDOFF.poll(self.base, self.lead, at_stop=True, spawn=self.spawn))
+        [(session, _)] = self.spawned
+        self.assertEqual(session, LEAD)
+
+    def test_codex_and_antigravity_only_request_early_checkpoint_at_stop(self) -> None:
+        self.config["accounts"].append({"id": "agy", "provider": "antigravity", "billing": "personal"})
+        self.lanes.append(lane("agy", "gemini-pro", usable=4))
+        self.set_lane("codex", usable=4)
+        for harness, home in (("codex", "/x"), ("gemini", "/y")):
+            me = MAILBOX.register(
+                self.base,
+                session=f"{harness}-lead",
+                harness=harness,
+                cwd=str(self.repo),
+                pid=os.getpid(),
+                state="idle",
+                account=home,
+            )
+            self.assertEqual(HANDOFF.poll(self.base, me, spawn=self.spawn), "")
+            self.assertIn("checkpoint", HANDOFF.poll(self.base, me, at_stop=True, spawn=self.spawn))
+        self.assertEqual([session for session, _ in self.spawned], ["codex-lead", "gemini-lead"])
+
+    def test_early_launch_wait_is_bounded_and_failed_delivery_clears_only_the_offer(self) -> None:
+        self.set_lane("claude-a", status="available", usable=4)
+        self.store_room()
+        self.assertIn("checkpoint", HANDOFF.poll(self.base, self.lead, at_stop=True, spawn=self.spawn))
+        [(session, identifier)] = self.spawned
+        outcome = HANDOFF.run(
+            session,
+            identifier,
+            base=self.base,
+            launcher=lambda command, env: {"exitCode": 1},
+            sleep=self.sleeps.append,
+        )
+        self.assertEqual(outcome["status"], "failed", outcome)
+        self.assertEqual(outcome["checkpointStatus"], "timed out")
+        self.assertEqual(sum(self.sleeps), 90)
+        team = AUTHORITY.load(AUTHORITY.team_dir(outcome["team"]))
+        AUTHORITY.check(team, LEAD, 1)
+        self.assertIsNone(team["offer"])
+        rest = HANDOFF.module("handoff_rest")
+        self.assertTrue(MAILBOX.load(rest.marker_path(self.base, LEAD))["released"])  # no Stop pays for a check
+        self.assertFalse(rest.resting(self.base, LEAD))
+        self.set_lane("claude-a", status="blocked", usable=0)
+        late = self.handoff()
+        self.assertEqual((late["status"], late["generation"]), ("handed-over", 2), late)
+
+    def test_expired_early_offer_does_not_block_exhaustion_or_request_another_checkpoint(self) -> None:
+        self.set_lane("claude-a", status="available", usable=4)
+        self.store_room()
+        self.assertIn("checkpoint", HANDOFF.poll(self.base, self.lead, at_stop=True, spawn=self.spawn))
+        [(session, identifier)] = self.spawned
+        early = HANDOFF.run(session, identifier, base=self.base, launcher=self.launcher, sleep=self.sleeps.append)
+        self.assertEqual(early["status"], "offered", early)
+        # Exercise the appointment shape left by the original implementation.
+        directory = AUTHORITY.team_dir(early["team"])
+        record = AUTHORITY.load(directory)
+        for entry in record["log"]:
+            entry.pop("automatic", None)
+        AUTHORITY.save(directory, record)
+        later = HANDOFF.now() + dt.timedelta(minutes=11)
+        with (
+            mock.patch.object(AUTHORITY, "automatic_offer_expired", return_value=True),
+            mock.patch.object(HANDOFF, "now", return_value=later),
+            mock.patch.object(SUCCESSION, "now", return_value=later),
+        ):
+            self.write()
+            self.assertEqual(HANDOFF.status()["events"][0]["status"], "expired")
+            self.assertEqual(HANDOFF.poll(self.base, self.lead, at_stop=True, spawn=self.spawn), "")
+            self.set_lane("claude-a", status="blocked", usable=0)
+            late = self.handoff()
+        self.assertEqual((late["status"], late["generation"]), ("handed-over", 2), late)
+
+    def test_exhaustion_supersedes_a_pending_early_offer(self) -> None:
+        self.set_lane("claude-a", status="available", usable=4)
+        self.store_room()
+        self.assertIn("checkpoint", HANDOFF.poll(self.base, self.lead, at_stop=True, spawn=self.spawn))
+        [(session, identifier)] = self.spawned
+        early = HANDOFF.run(session, identifier, base=self.base, launcher=self.launcher, sleep=self.sleeps.append)
+        self.assertEqual(early["status"], "offered", early)
+        self.set_lane("claude-a", status="blocked", usable=0)
+        late = self.handoff()
+        self.assertEqual((late["status"], late["generation"]), ("handed-over", 2), late)
+        with self.assertRaisesRegex(AUTHORITY.AuthorityError, "no handover is offered"):
+            self.accept(early["team"], early["successor"]["session"])
+        rest = HANDOFF.module("handoff_rest")
+        self.assertFalse(rest.resting(self.base, LEAD))  # the superseded offer's rest never starts
+        self.assertTrue(MAILBOX.load(rest.marker_path(self.base, LEAD))["released"])
+
+    def test_an_early_offer_does_not_turn_a_user_appointment_into_a_standing_rule(self) -> None:
+        self.set_lane("claude-a", status="available", usable=4)
+        self.store_room()
+        AUTHORITY.appoint(
+            "room-r1", {**AUTHORITY.member(LEAD, "claude"), "pool": "claude-a:all"}, repository=self.lead["repo"]
+        )
+        self.assertIn("checkpoint", HANDOFF.poll(self.base, self.lead, at_stop=True, spawn=self.spawn))
+        [(session, identifier)] = self.spawned
+        early = HANDOFF.run(session, identifier, base=self.base, launcher=self.launcher, sleep=self.sleeps.append)
+        self.assertEqual(early["status"], "offered", early)
+        self.set_lane("claude-a", status="blocked", usable=0)
+        late = self.handoff()
+        self.assertEqual(late["status"], "refused", late)
+        self.assertIn("no standing takeover rule", late["reasons"][0])
+        self.assertEqual(self.accept(early["team"], early["successor"]["session"])["generation"], 2)
+
+    def test_refused_early_handoff_requests_one_checkpoint_per_low_episode(self) -> None:
+        self.set_lane("claude-a", status="available", usable=4)
+        self.set_lane("claude-b", usable=4)
+        self.set_lane("codex", usable=4)
+        self.store_room()
+        self.assertIn("checkpoint", HANDOFF.poll(self.base, self.lead, at_stop=True, spawn=self.spawn))
+        [(session, identifier)] = self.spawned
+        early = HANDOFF.run(session, identifier, base=self.base, sleep=self.sleeps.append)
+        self.assertEqual(early["status"], "refused", early)
+        later = HANDOFF.now() + dt.timedelta(minutes=11)
+        with (
+            mock.patch.object(HANDOFF, "now", return_value=later),
+            mock.patch.object(SUCCESSION, "now", return_value=later),
+        ):
+            self.write()
+            self.assertEqual(HANDOFF.poll(self.base, self.lead, at_stop=True, spawn=self.spawn), "")
+            self.set_lane("claude-a", usable=80)
+            self.assertEqual(HANDOFF.poll(self.base, self.lead, at_stop=True, spawn=self.spawn), "")
+            self.set_lane("claude-a", usable=4)
+            self.assertIn("checkpoint", HANDOFF.poll(self.base, self.lead, at_stop=True, spawn=self.spawn))
+
+    def offered_with_marker(self, **lane_changes):
+        self.set_lane("claude-a", status="available", usable=4, **lane_changes)
+        self.register(PEER, "claude-b")
+        self.store_room()
+        self.assertIn("checkpoint", HANDOFF.poll(self.base, self.lead, at_stop=True, spawn=self.spawn))
+        [(session, identifier)] = self.spawned
+        offered = HANDOFF.run(session, identifier, base=self.base, deliver=self.deliver, sleep=self.sleeps.append)
+        self.assertEqual(offered["status"], "offered", offered)
+        rest = HANDOFF.module("handoff_rest")
+        return offered, rest, rest.marker_path(self.base, LEAD)
+
+    def test_an_expired_offer_releases_the_rest_marker(self) -> None:
+        _, rest, marker = self.offered_with_marker()
+        self.assertFalse(rest.resting(self.base, LEAD))  # pending: the lead keeps working, marker kept
+        self.assertFalse(MAILBOX.load(marker).get("released"))
+        with mock.patch.object(rest.authority, "automatic_offer_expired", return_value=True):
+            self.assertFalse(rest.resting(self.base, LEAD))
+        self.assertTrue(MAILBOX.load(marker)["released"])
+
+    def test_a_cancelled_offer_releases_the_rest_marker(self) -> None:
+        offered, rest, marker = self.offered_with_marker()
+        AUTHORITY.cancel_automatic_offer(offered["team"], LEAD, offered["generation"], offered["id"])
+        self.assertFalse(rest.resting(self.base, LEAD))
+        self.assertTrue(MAILBOX.load(marker)["released"])
+
+    def test_rest_without_a_low_window_reset_uses_another_window_reset(self) -> None:
+        reset = HANDOFF.now() + dt.timedelta(hours=2)
+        windows = [
+            {"id": "five-hour", "remainingPct": 3},
+            {"id": "weekly", "remainingPct": 50, "resetsAt": reset.isoformat()},
+        ]
+        rest = HANDOFF.module("handoff_rest")
+        rest.prepare(self.base, LEAD, "room-r1", "e1", {"pool": "p", "windows": windows, "blockedUntil": None}, 15)
+        self.assertEqual(MAILBOX.load(rest.marker_path(self.base, LEAD))["restingUntil"], reset.isoformat())
+
+    def test_rest_with_no_known_reset_ends_five_hours_after_acceptance(self) -> None:
+        offered, rest, marker = self.offered_with_marker()
+        self.assertIsNone(MAILBOX.load(marker)["restingUntil"])  # no window and no blockedUntil
+        accepted_at = HANDOFF.now()
+        with mock.patch.object(AUTHORITY, "now", return_value=accepted_at.isoformat()):
+            self.accept(offered["team"], PEER)
+        with mock.patch.object(rest.succession, "now", return_value=accepted_at + dt.timedelta(hours=4, minutes=59)):
+            self.assertTrue(rest.resting(self.base, LEAD, view={}))
+        with mock.patch.object(rest.succession, "now", return_value=accepted_at + rest.REST_CAP):
+            self.assertFalse(rest.resting(self.base, LEAD, view={}))
+        self.assertTrue(MAILBOX.load(marker)["released"])
+
+    def test_a_failing_rest_check_never_holds_peer_mail_at_stop(self) -> None:
+        offered, rest, marker = self.offered_with_marker()
+        self.accept(offered["team"], PEER)
+        self.assertTrue(rest.resting(self.base, LEAD))
+        broken = self.root / "broken-rest-scripts"
+        broken.mkdir()
+        (broken / "handoff_rest.py").write_text('raise RuntimeError("boom")\n')
+        mail = MAILBOX.notify(self.base, self.lead, "Still deliver this when the rest check fails")
+        payload = {"hook_event_name": "Stop", "session_id": LEAD, "cwd": str(self.repo)}
+        env = {**os.environ, "ORKEST_SCRIPTS_DIR": str(broken), "CLAUDE_CONFIG_DIR": str(self.homes["claude-a"])}
+        stop = ORK_FAST.run_mailbox_hook(payload, harness="claude", base=self.base, pid=os.getpid(), env=env)
+        self.assertIn("Still deliver this", stop["reason"])
+        self.assertNotIn(mail["id"], {item["id"] for item in MAILBOX.incoming(self.base, LEAD)})
+
+    def test_accepted_predecessor_rests_only_until_reset_when_monitor_has_no_recovery(self) -> None:
+        rest = HANDOFF.module("handoff_rest")
+        reset = HANDOFF.now() + dt.timedelta(minutes=10)
+        self.set_lane("claude-a", status="available", usable=4, blockedUntil=reset.isoformat())
+        self.register(PEER, "claude-b")
+        self.store_room()
+        self.assertIn("checkpoint", HANDOFF.poll(self.base, self.lead, at_stop=True, spawn=self.spawn))
+        [(session, identifier)] = self.spawned
+        offered = HANDOFF.run(session, identifier, base=self.base, deliver=self.deliver, sleep=self.sleeps.append)
+        self.assertEqual(offered["status"], "offered", offered)
+        self.accept(offered["team"], PEER)
+        with mock.patch.object(rest.succession, "now", return_value=reset - dt.timedelta(seconds=1)):
+            self.assertTrue(rest.resting(self.base, LEAD, view={}))
+        with mock.patch.object(rest.succession, "now", return_value=reset):
+            self.assertFalse(rest.resting(self.base, LEAD, view={}))
+        self.assertFalse(rest.resting(self.base, LEAD, view={}))
+
+    def test_early_launch_falls_back_to_guarded_headless_without_a_pane(self) -> None:
+        self.set_lane("claude-a", status="available", usable=4)
+        self.set_lane("codex", status="credits", usable=0)
+        self.store_room()
+        self.assertIn("checkpoint", HANDOFF.poll(self.base, self.lead, at_stop=True, spawn=self.spawn))
+        [(session, identifier)] = self.spawned
+        with mock.patch.dict(os.environ):
+            for name in ("HERDR_ENV", "ORCA_PANE_KEY", "ORCA_AGENT_PANE", "TMUX_PANE"):
+                os.environ.pop(name, None)
+            with mock.patch.object(HANDOFF, "launch", side_effect=self.launcher):
+                outcome = HANDOFF.run(session, identifier, base=self.base, sleep=self.sleeps.append)
+        self.assertEqual((outcome["status"], outcome["successor"]["account"]), ("offered", "claude-b"))
+        [(command, _)] = self.launched
+        self.assertIn("--detach", command)
+        self.assertNotIn("--allow-credits", command)
+        self.assertIn("headless", outcome["notice"])
+        self.assertIn("current lead keeps authority", Path(command[command.index("--brief") + 1]).read_text())
+
+    def visible_handoff(self, *, lease_race=False, blocked=False, native_exit=0, never_ready=False):
+        self.set_lane("claude-a", status="available", usable=4)
+        self.set_lane("codex", status="credits", usable=0)
+        self.store_room()
+        self.assertIn("checkpoint", HANDOFF.poll(self.base, self.lead, at_stop=True, spawn=self.spawn))
+        [(session, identifier)] = self.spawned
+        native = self.root / "claude"
+        observed = self.root / "native.json"
+        followup = self.root / "followup"
+        native.write_text(
+            f"#!{sys.executable}\n"
+            "import json, os, subprocess, sys\n"
+            f"with open({str(observed)!r}, 'w') as out:\n"
+            "    json.dump({'argv': sys.argv[1:], 'tty': os.isatty(0), 'home': os.environ['CLAUDE_CONFIG_DIR']}, out)\n"
+            f"if {native_exit}:\n"
+            f"    sys.exit({native_exit})\n"
+            f"if {never_ready}:\n"  # an untrusted folder: the harness waits and its hooks never run
+            "    import time; time.sleep(60)\n"
+            "subprocess.run("
+            f"[{str(ORK_FAST.find_ork_fast_bin())!r}, 'mailbox-hook', '--harness', 'claude'], "
+            "input=json.dumps({'hook_event_name': 'SessionStart', 'session_id': 'pane-native', 'cwd': os.getcwd()}), "
+            "text=True, check=True, capture_output=True)\n"
+            f"with open({str(followup)!r}, 'w') as out:\n"
+            "    out.write(input())\n"
+        )
+        native.chmod(0o700)
+        env = ORK_FAST.build_test_env(base=self.base, pid=os.getpid())
+        env.update(PATH=f"{self.root}{os.pathsep}{os.environ['PATH']}", TMUX_PANE="%1", PYTEST_CURRENT_TEST="1")
+        processes = []
+        attempts = 0
+        real_run = subprocess.run
+        support = HANDOFF.module("execution_support")
+        master, slave = os.openpty()
+
+        def split(command, *args, **kwargs):
+            nonlocal attempts
+            if command[1:3] != ["--input-type=module", "-e"]:
+                return real_run(command, *args, **kwargs)
+            attempts += 1
+            pane_env = {**kwargs["env"], "TMUX_PANE": f"%{attempts + 1}"}
+            if blocked:
+                self.set_lane("claude-b", status="blocked", usable=0)
+            if lease_race:
+                held, busy = threading.Event(), Path(command[-1]).with_name("attempts.json")
+
+                def hold():
+                    with support.workspace_lease(self.repo, self.base.parent):
+                        held.set()
+                        for _ in range(200):
+                            if (HANDOFF.load_json(busy) or {}).get("leaseBusy"):
+                                break
+                            time.sleep(0.05)
+
+                threading.Thread(target=hold, daemon=True).start()
+                held.wait(10)
+            processes.append(subprocess.Popen([command[-1]], stdin=slave, stdout=slave, stderr=slave, env=pane_env))
+            return subprocess.CompletedProcess(
+                command, 0, json.dumps({"backend": "tmux", "paneId": pane_env["TMUX_PANE"]}), ""
+            )
+
+        try:
+            with (
+                mock.patch.dict(os.environ, env, clear=True),
+                mock.patch.object(HANDOFF.subprocess, "run", side_effect=split),
+                mock.patch.object(HANDOFF, "LAUNCH_RETRY_SECONDS", (0.5, 0.5)),
+                mock.patch.object(HANDOFF, "PANE_READY_SECONDS", 3 if never_ready else 120),
+                mock.patch.object(HANDOFF, "launch", side_effect=self.launcher),
+            ):
+                for var in ("HERDR_ENV", "ORCA_PANE_KEY", "ORCA_AGENT_PANE"):
+                    os.environ.pop(var, None)
+                outcome = HANDOFF.run(session, identifier, base=self.base, sleep=self.sleeps.append)
+            self.panes = attempts
+            if outcome["status"] == "offered" and processes and not never_ready:
+                os.write(master, b"Please summarize progress.\n")
+                processes[-1].wait(timeout=5)
+            return (
+                outcome,
+                json.loads(observed.read_text()) if observed.exists() else None,
+                followup.read_text() if followup.exists() else None,
+            )
+        finally:
+            for process in processes:
+                if process.poll() is None:
+                    process.terminate()
+                    process.wait(timeout=5)
+            os.close(slave)
+            os.close(master)
+
+    def test_visible_handoff_retries_a_busy_lease_in_one_pane_and_leaves_an_interactive_successor(self) -> None:
+        outcome, native, followup = self.visible_handoff(lease_race=True)
+        self.assertEqual(outcome["status"], "offered", outcome)
+        self.assertEqual(
+            outcome["delivery"],
+            {"exitCode": 0, "pane": {"backend": "tmux", "paneId": "%2"}, "nativeSession": "pane-native", "attempts": 2},
+        )
+        self.assertEqual(self.panes, 1)  # the busy lease was retried inside the same pane
+        self.assertEqual(self.launched, [])
+        self.assertEqual(
+            (native["tty"], native["home"], followup), (True, str(self.homes["claude-b"]), "Please summarize progress.")
+        )
+        first_prompt = (HANDOFF.files_dir(outcome) / "brief.md").read_text()
+        self.assertEqual(native["argv"], ["--model", outcome["successor"]["model"], "--", first_prompt])
+        self.assertIn("current lead keeps authority", first_prompt)
+        self.assertEqual(self.accept(outcome["team"], outcome["successor"]["session"])["generation"], 2)
+
+    def test_visible_drops_the_offer_when_the_pane_quota_gate_refuses(self) -> None:
+        outcome, native, _ = self.visible_handoff(blocked=True)
+        self.assertEqual((outcome["status"], outcome["delivery"]["exitCode"]), ("failed", 15), outcome)
+        self.assertIn("selected successor pool is blocked", outcome["notice"])
+        self.assertIsNone(native)
+        team = AUTHORITY.load(AUTHORITY.team_dir(outcome["team"]))
+        self.assertEqual((team["lead"]["session"], team["offer"]), (LEAD, None))
+
+    def test_visible_falls_back_to_headless_once_when_the_pane_never_registers(self) -> None:
+        outcome, native, _ = self.visible_handoff(never_ready=True)
+        self.assertEqual(outcome["status"], "offered", outcome)
+        self.assertEqual(self.panes, 1)
+        self.assertIsNotNone(native)
+        [(command, _)] = self.launched
+        self.assertIn("--detach", command)
+        self.assertIn("did not register before the startup deadline", outcome["delivery"]["headlessBecause"])
+        self.assertIn("headless, because the visible pane failed", outcome["notice"])
+        self.assertIn("may not trust this folder", outcome["notice"])
+        team = AUTHORITY.load(AUTHORITY.team_dir(outcome["team"]))
+        self.assertEqual(team["offer"]["automatic"], outcome["id"])
+        self.assertEqual(self.accept(outcome["team"], outcome["successor"]["session"])["generation"], 2)
+
+    def test_visible_drops_the_offer_when_the_native_process_crashes_during_startup(self) -> None:
+        outcome, _, _ = self.visible_handoff(native_exit=9)
+        self.assertEqual((outcome["status"], outcome["delivery"]["exitCode"]), ("failed", 9), outcome)
+        self.assertIn("interactive harness exited during startup", outcome["notice"])
+
+    def test_early_offer_respects_a_room_rebound_during_quota_refresh(self) -> None:
+        self.set_lane("claude-a", status="available", usable=4)
+        self.store_room()
+        self.register(PEER, "claude-b")
+        self.assertIn("checkpoint", HANDOFF.poll(self.base, self.lead, at_stop=True, spawn=self.spawn))
+        [(session, identifier)] = self.spawned
+
+        def fetch():
+            self.store_room(session=THIRD)
+            return SUCCESSION.fresh_view()
+
+        outcome = HANDOFF.run(session, identifier, base=self.base, fetch=fetch, sleep=self.sleeps.append)
+        self.assertEqual(outcome["status"], "refused", outcome)
+        self.assertIn("leadership or the team changed", outcome["reasons"][0])
+        current = HANDOFF.module("room_store").read_room(self.base, "r1")
+        self.assertEqual((current["conductor"]["session"]["id"], current.get("authority")), (THIRD, None))
 
     # Choosing a successor
 
@@ -1097,7 +1577,17 @@ class HandoffTests(unittest.TestCase):
         (self.root / "orkest-config.json").write_text(
             json.dumps({"handoff": {"autoLaunch": False, "excludeAccounts": ["codex", 3]}})
         )
-        self.assertEqual(HANDOFF.settings(), {"enabled": True, "autoLaunch": False, "excludeAccounts": ["codex"]})
+        self.assertEqual(
+            HANDOFF.settings(),
+            {
+                "enabled": True,
+                "autoLaunch": False,
+                "excludeAccounts": ["codex"],
+                "early": True,
+                "visible": True,
+                "earlyPercentLeft": 10,
+            },
+        )
 
     def test_status_and_show(self) -> None:
         self.register(PEER, "claude-b")

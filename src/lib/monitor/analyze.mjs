@@ -193,6 +193,7 @@ export function buildLanes(accounts, now = Date.now()) {
       const lane = {
         ...base,
         poolId: pool.id,
+        windowIds: pool.windowIds,
         label: account.pools.length > 1 ? `${account.label} · ${pool.label}` : account.label,
         models: pool.models,
         families: pool.families ?? [],

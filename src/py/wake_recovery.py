@@ -86,6 +86,10 @@ def parse(value: Any) -> dt.datetime | None:
 
 def eligible(peer: dict[str, Any], *, base: Path | None = None) -> tuple[bool, str]:
     """Whether a retry may go out now: strictly idle, and its last turn did not end in a parking stop."""
+    from handoff_rest import resting
+
+    if base is not None and resting(base, peer["session"]):
+        return False, "recipient is resting after a quota handoff"
     if (reason := peer.get("lastStopReason")) in PARKED:
         return False, f"its last turn ended with {reason}; waiting for its user's next prompt"
     mailbox_wake.reconcile_runtime_state(base, peer)
