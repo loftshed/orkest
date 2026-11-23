@@ -3569,3 +3569,94 @@ describe("coordination reliability", () => {
     expect(deadMailboxRoom.conductor.sessionLive).toBe(false);
   });
 });
+
+describe("room quota gate", () => {
+  const lowClaude = (routes) =>
+    routes.map((route) =>
+      route.engine === "claude"
+        ? {
+            ...route,
+            status: "low",
+            label: "Claude · all models",
+            availableNowPct: 8,
+            alternative: { label: "Codex", engine: "codex", availableNowPct: 52 },
+          }
+        : { ...route, status: "available", label: route.engine, availableNowPct: 60 },
+    );
+  const sink = () => {
+    const lines = [];
+    return {
+      lines,
+      write: (text) => {
+        lines.push(text);
+      },
+    };
+  };
+
+  it("stops add, lead, dispatch and launch on a low pool and names the alternative", async () => {
+    const { root, room, taskDir, run } = await fixture();
+    const calls = [];
+    const record = async (args) => {
+      calls.push(args);
+      return run(args);
+    };
+    const stdout = sink();
+    const options = { stdout, stderr: sink(), root, run: record, quota: async (r) => lowClaude(r) };
+    const plan = path.join(taskDir, "plan.json");
+    await writeFile(plan, JSON.stringify({ members: [{ id: "haiku-1", taskDir }] }));
+    for (const argv of [
+      ["add", "--room", room.id, "--team", "claude:opus@builder"],
+      ["lead", "--room", room.id, "--member", "haiku-1", "--objective", "Own the cache"],
+      ["dispatch", "--room", room.id, "--member", "haiku-1", "--task-dir", taskDir],
+      ["launch", "--room", room.id, "--plan", plan],
+    ]) {
+      await expect(roomsCommand(argv, options)).rejects.toThrow(
+        /Claude · all models quota is low for claude:.*8% usable now.*Monitor's best alternative: Codex, 52% usable now \(engine codex\); see monitor recommend\.\nPass --confirm-low-quota/su,
+      );
+    }
+    // Nothing changed and nothing was dispatched.
+    expect((await readRoom(room.id, root)).agents.map((agent) => agent.id)).toEqual([
+      "haiku-1",
+      "luna-1",
+    ]);
+    expect(calls.filter((args) => args[0] === "dispatch")).toEqual([]);
+  });
+
+  it("goes ahead with --confirm-low-quota and prints the warning", async () => {
+    const { root, room } = await fixture();
+    const stderr = sink();
+    await roomsCommand(["add", "--room", room.id, "--team", "claude:opus", "--confirm-low-quota"], {
+      stdout: sink(),
+      stderr,
+      root,
+      quota: async (r) => lowClaude(r),
+    });
+    expect((await readRoom(room.id, root)).agents).toHaveLength(3);
+    expect(stderr.lines.join("")).toMatch(/^warning: Claude · all models quota is low/u);
+    await expect(
+      roomsCommand(["list", "--confirm-low-quota"], { stdout: sink(), root }),
+    ).rejects.toThrow("--confirm-low-quota is only valid on add, lead, dispatch or launch");
+  });
+
+  it("leaves healthy and unknown pools alone", async () => {
+    const { root, room } = await fixture();
+    const stderr = sink();
+    const seen = [];
+    const quota = async (routes) => {
+      seen.push(...routes.map((route) => route.engine));
+      return routes.map((route) => ({
+        ...route,
+        status: route.engine === "codex" ? "unknown" : "available",
+      }));
+    };
+    await roomsCommand(["add", "--room", room.id, "--team", "codex:sol,claude:opus"], {
+      stdout: sink(),
+      stderr,
+      root,
+      quota,
+    });
+    expect(seen).toEqual(["codex", "claude"]);
+    expect(stderr.lines).toEqual([]);
+    expect((await readRoom(room.id, root)).agents).toHaveLength(4);
+  });
+});

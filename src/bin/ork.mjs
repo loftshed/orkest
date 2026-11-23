@@ -71,7 +71,7 @@ ork label [--lines 1|2] -- codex|claude|agy|opencode [arguments]   (direct in He
 ork progress --session ID --goal TEXT --task TEXT --stage working [--role ROLE]
 ork name [--model <model>] [--effort <level>] [--harness <harness>] [--short]
 ork routes [--archetype <name>] [--json] [--width 120]
-ork quota [--line|--json] [--refresh]
+ork quota [--line [--width N]|--json] [--refresh]
 ork telemetry [--runs-dir <directory>] [--json] [--width 120]
 
 Interactive Horde opens a coordinator conversation alongside its swarm tree (default: Codex).
@@ -339,7 +339,12 @@ async function summaryCommand(argv, stdout) {
   const common = { help: { type: "boolean", short: "h" }, json: { type: "boolean" } };
   const options =
     command === "quota"
-      ? { ...common, line: { type: "boolean" }, refresh: { type: "boolean" } }
+      ? {
+          ...common,
+          line: { type: "boolean" },
+          refresh: { type: "boolean" },
+          width: { type: "string" },
+        }
       : {
           ...common,
           width: { type: "string" },
@@ -354,10 +359,14 @@ async function summaryCommand(argv, stdout) {
   }
   if (command === "quota") {
     if (values.line && values.json) throw new Error("Choose --line or --json");
+    if (values.width !== undefined && !values.line) throw new Error("--width applies to --line");
+    const lineWidth = values.width === undefined ? undefined : Number(values.width);
+    if (lineWidth !== undefined && (!Number.isSafeInteger(lineWidth) || lineWidth < 20))
+      throw new Error("--width must be a whole number of columns, at least 20");
     const accounts = await getAccounts({ force: values.refresh === true });
     let output;
     if (values.json) output = JSON.stringify(jsonView(accounts), null, 2);
-    else if (values.line) output = renderLine(accounts);
+    else if (values.line) output = renderLine(accounts, Date.now(), { width: lineWidth });
     else output = renderReport(accounts, { color: shouldUseColor(stdout) });
     stdout.write(`${output}\n`);
     return accounts;

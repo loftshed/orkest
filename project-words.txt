@@ -94,3 +94,7 @@ UNLCK
 WRLCK
 gmtime
 FFFD
+tzset
+yday
+wday
+mday

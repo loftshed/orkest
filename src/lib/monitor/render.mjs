@@ -198,9 +198,74 @@ export function pillText(account, now = Date.now()) {
   return pools.join(" ") + (account.ok === false ? "!" : "");
 }
 
-/** One line for tmux or a status line, one group per provider: "CW ☠5h · CP 16·78 3d · CX 49 4d · AG …". */
-export function renderLine(accounts, now = Date.now()) {
+/** The terse line, one group per provider: "CW ☠5h · CP 16·78 3d · CX 49 4d · AG …". No labels, no age. */
+export function terseLine(accounts, now = Date.now()) {
   return accounts.map((a) => `${a.short} ${pillText(a, now)}`).join(" · ");
+}
+
+const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const WEEK_MS = 7 * 24 * 3_600_000;
+
+/**
+ * A reset time in local time, as short as stays unambiguous: "3:10pm" today, "Thu 9:00am" within a week,
+ * "Nov 30" after that. ork-fast's turn-start quota line formats the same way.
+ */
+export function resetClock(ms, now = Date.now()) {
+  const d = new Date(ms);
+  const hour = d.getHours();
+  const time = `${hour % 12 || 12}:${String(d.getMinutes()).padStart(2, "0")}${hour < 12 ? "am" : "pm"}`;
+  if (d.toDateString() === new Date(now).toDateString()) return time;
+  if (ms > now && ms - now < WEEK_MS) return `${WEEKDAYS[d.getDay()]} ${time}`;
+  return `${MONTHS[d.getMonth()]} ${d.getDate()}`;
+}
+
+/** Data age in the largest whole unit: "0m", "12m", "3h", "2d". */
+export function dataAge(ms) {
+  const minutes = Math.max(0, Math.floor(ms / 60_000));
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  return hours < 48 ? `${hours}h` : `${Math.floor(hours / 24)}d`;
+}
+
+function gaugeText(g, now) {
+  const value = g.exhausted ? SKULL : `${Math.floor(g.pct)}%`;
+  const reset = g.resetsAt ? ` (↻${resetClock(g.resetsAt, now)})` : "";
+  return `${durationLabel(g.windowMins)} ${value}${g.expiring ? HOURGLASS : ""}${reset}`;
+}
+
+function poolText(p, now) {
+  if (p.credits) return `${gaugeText(p.weekly, now)}, on credits ${p.credits.text}`;
+  if (p.weekly?.exhausted) return gaugeText(p.weekly, now);
+  return [p.short, p.weekly]
+    .filter(Boolean)
+    .map((g) => gaugeText(g, now))
+    .join(" · ");
+}
+
+/** One account, every window named: "Claude 5h 18% (↻3:10pm) · wk 42% (↻Thu 9:00am)". */
+export function labeledAccountText(account, now = Date.now()) {
+  const label = account.label ?? account.short ?? account.id;
+  const failed = account.ok === false ? " (refresh failed)" : "";
+  const list = pills(account, now);
+  if (list.length === 0) return `${label} no data${failed}`;
+  const body = list.map((p) => (p.tag ? `${p.poolLabel} ` : "") + poolText(p, now)).join(", ");
+  return `${label} ${body}${failed}`;
+}
+
+/**
+ * One line for a status line or an agent: every window named, its reset time, and the age of the oldest
+ * reading, so a number read later cannot pass for a fresh one:
+ *   "Claude 5h 18% (↻3:10pm) · wk 42% (↻Thu 9:00am) | Codex wk 52% (↻Fri 2:30pm) · data 0m".
+ * With a width the labeled form falls back to the terse one when it does not fit; the age stays.
+ */
+export function renderLine(accounts, now = Date.now(), { width } = {}) {
+  if (accounts.length === 0) return "";
+  const fetched = accounts.map((a) => a.fetchedAt).filter(Number.isFinite);
+  const age = fetched.length > 0 ? ` · data ${dataAge(now - Math.min(...fetched))}` : "";
+  const full = accounts.map((a) => labeledAccountText(a, now)).join(" | ") + age;
+  if (!width || full.length <= width) return full;
+  return terseLine(accounts, now) + age;
 }
 
 const iso = (ms) => (ms ? new Date(ms).toISOString() : null);

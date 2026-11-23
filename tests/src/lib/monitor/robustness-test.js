@@ -59,8 +59,8 @@ test("a refresh lock left by a dead process is taken over instead of waited on",
   const started = Date.now();
   const result = runCli(["line", "--max-age", "0"], cache);
   expect(result.status, result.stderr).toBe(0);
-  // One pill per provider: 75% of the week left, rollover in under a day with capacity left, so it is expiring.
-  expect(result.stdout.trim()).toMatch(/^CX 75 2[34]h⏳$/);
+  // 75% of the week left, rollover in under a day with capacity left, so it is expiring; the data is new.
+  expect(result.stdout.trim()).toMatch(/^Codex wk 75%⏳ \(↻[^)]+\) · data 0m$/);
   expect(Date.now() - started < 15_000, "did not wait for the dead owner").toBeTruthy();
   expect(existsSync(path.join(cache, "refresh.lock")), "lock released afterwards").toBe(false);
 });

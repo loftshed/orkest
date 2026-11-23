@@ -10,6 +10,7 @@ mod mailbox_records;
 mod mailbox_swarm;
 mod mailbox_transcript;
 mod paths;
+mod quota_line;
 mod rooms_work;
 mod sha1;
 mod sha256;

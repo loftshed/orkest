@@ -14,7 +14,7 @@ import { redactCommand } from "./agent-processes.mjs";
 import { mapDiffLines, markText } from "./diff-marks.mjs";
 import { coalesceMessages, resolveMemberWorktree } from "./horde-room.mjs";
 import { memberDisplayState, MEMBER_OUTCOMES as OUTCOMES } from "./member-state.mjs";
-import { renderLine, timeLeft } from "./monitor/render.mjs";
+import { terseLine, timeLeft } from "./monitor/render.mjs";
 import {
   displayWidth,
   fit,
@@ -397,7 +397,7 @@ function quotaRows(accounts, width, tier, color, now = Date.now()) {
       const gap = WIDE_NERD_BRANDS.has(expandedShort) ? brandGap(expandedShort) : " ";
       entries.push({
         raw: plain(
-          `${expandedShort}${gap}${renderLine([account]) || "quota unavailable"}${creditSuffix}`,
+          `${expandedShort}${gap}${terseLine([account]) || "quota unavailable"}${creditSuffix}`,
         ),
       });
       continue;

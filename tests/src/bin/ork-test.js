@@ -316,6 +316,7 @@ describe("ork quota", () => {
     const result = JSON.parse((await app.run(["quota", "--json"])).stdout);
     expect(result.accounts).toEqual([]);
     expect((await app.run(["quota", "--line"])).stdout.trim()).toBe("");
+    expect((await app.run(["quota", "--line", "--width", "60"])).stdout.trim()).toBe("");
     expect((await app.run(["quota", "--refresh"])).stdout).toContain("Monitor");
   });
 });
@@ -344,6 +345,8 @@ describe("ork command validation", () => {
     ["telemetry", "--team", "claude:haiku"],
     ["telemetry", "--width", "NaN"],
     ["quota", "--json", "--line"],
+    ["quota", "--width", "80"],
+    ["quota", "--line", "--width", "10"],
     ["quota", "--archetype", "debug-invariants"],
   ])("rejects unrelated or invalid command options %j", async (...args) => {
     const app = await sandbox();

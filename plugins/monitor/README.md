@@ -154,7 +154,8 @@ instead of quota windows, the widget reports usage as unavailable rather than gu
 monitor [show]             table of every window plus where to spend next
 monitor watch              live view (r = refresh now, q = quit)
 monitor json               machine-readable snapshot, schema "monitor.snapshot.v1"
-monitor line               one line for tmux or a status line: "CW ☠3h · CP 98·75 3d · CX 45 5d · AG G76·3 2h C100·27 1d⏳"
+monitor line               one line for tmux or a status line: "Claude 5h 18% (↻3:10pm) · wk 42% (↻Thu 9:00am) · data 0m"
+                           [--width N] switches to the terse "CL 18·42 2d · data 0m" when the labeled line is wider
 monitor recommend          ranked pools [--family claude|gpt|gemini] [--json]
 monitor mcp                MCP server on stdio
 monitor init               detect accounts and write the config

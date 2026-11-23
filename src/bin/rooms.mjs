@@ -6,9 +6,11 @@ import {
   loadPresets,
   mailboxRoot,
   parseTeam,
+  readRoom,
   requireActiveRoom,
   updateRoom,
 } from "../lib/horde-room.mjs";
+import { checkRouteQuota, quotaGate } from "../lib/quota-gate.mjs";
 import { integrateMemberWorktree } from "../lib/room-integrate.mjs";
 import {
   archiveRoom,
@@ -56,8 +58,9 @@ ork rooms resume-status [--cwd PATH] [--json]   (read-only resume history)
 ork rooms show --room ID [--json]
 ork hall marks --room ID --member ID [--json]   (read marked diff lines; also ork rooms marks)
 ork rooms create --team TEAM [--group GROUP] [--title TITLE] [--cwd PATH] [--id ID] [--authority TEAM_ID]
-ork rooms add --room ID --team TEAM [--parent conductor|MEMBER] [--role ROLE] [--cwd PATH]
-ork rooms lead --room ID --member ID --objective TEXT [--role ROLE] [--cwd PATH] [--keep-worktree]   (reserves a native subswarm lead)
+ork rooms add --room ID --team TEAM [--parent conductor|MEMBER] [--role ROLE] [--cwd PATH] [--confirm-low-quota]
+ork rooms lead --room ID --member ID --objective TEXT [--role ROLE] [--cwd PATH] [--keep-worktree] [--confirm-low-quota]
+               (reserves a native subswarm lead)
 ork rooms role --room ID [--member ID|conductor] --role ROLE [--cwd PATH] [--keep-worktree]   (assign or switch workforce role)
 ork rooms worktree --room ID --member ID [--slug SLUG] [--branch BRANCH]   (create a disposable member checkout)
 ork rooms integrate --room ID --member ID --message SUBJECT [--target BRANCH]   (commit an accepted result into the smelter queue)
@@ -75,7 +78,9 @@ ork rooms dispatch --room ID --member ID --task-dir DIR [--kind investigation|im
                    [--protect-path PATH]...   (files an auto-correct round may not change)
                    [--task-spec FILE]   (required for continue, in the existing task/session)
                    [--max-continues N]   (first dispatch only, hard ceiling 6)
-ork rooms launch --room ID --plan FILE [--allow-credits]   (--allow-credits required when a plan member sets allowCredits: true)
+                   [--confirm-low-quota]   (go ahead on a low or blocked pool; only with the user's agreement)
+ork rooms launch --room ID --plan FILE [--allow-credits] [--confirm-low-quota]
+                 (--allow-credits required when a plan member sets allowCredits: true)
 ork rooms bind --room ID --member ID|conductor --session ID --engine ENGINE [--role ROLE] [--cwd PATH] [--keep-worktree]
 ork rooms recover --room ID
 
@@ -83,6 +88,8 @@ A room or task under a team (--authority) is fenced: init-task, dispatch, launch
 --lead-session and --lead-generation from authority.py show.
 
 create/add queue members. dispatch/launch use the coordinator and may start billable work.
+add, lead, dispatch and launch check the member's quota pool with monitor first: a low or blocked pool
+stops with monitor's best alternative until --confirm-low-quota is passed.
 Native dispatch returns a reservation for the conductor's native tools.
 launch plan: {"members":[{"id":"haiku-1","taskDir":"/absolute/task","kind":"investigation","timeout":"25m"}]}
              (an implementation member also takes "verifyCommands":["CMD"], "autoCorrect":1
@@ -99,6 +106,8 @@ export async function roomsCommand(
     run = coordinator,
     exec,
     refreshTerminal,
+    stderr = process.stderr,
+    quota = checkRouteQuota,
   } = {},
 ) {
   // parseArgs treats a separate negative number as an option; keep the cap's own error.
@@ -115,6 +124,7 @@ export async function roomsCommand(
       help: { type: "boolean" },
       json: { type: "boolean" },
       "allow-credits": { type: "boolean" },
+      "confirm-low-quota": { type: "boolean" },
       all: { type: "boolean" },
       "keep-worktree": { type: "boolean" },
       "verify-command": { type: "string", multiple: true },
@@ -171,6 +181,26 @@ export async function roomsCommand(
   if (values["allow-credits"] && action !== "dispatch" && action !== "launch") {
     throw new Error("--allow-credits is only valid on dispatch or launch");
   }
+  if (values["confirm-low-quota"] && !["add", "lead", "dispatch", "launch"].includes(action)) {
+    throw new Error("--confirm-low-quota is only valid on add, lead, dispatch or launch");
+  }
+  // Checked before anything changes; a confirmed warning still reaches the caller on stderr.
+  const checkQuota = async (routes) => {
+    const warnings = quotaGate(await quota(routes, { env }), {
+      confirmed: values["confirm-low-quota"] === true,
+    });
+    for (const warning of warnings) stderr.write(`warning: ${warning}\n`);
+  };
+  const memberRoutes = async (roomId, memberIds) => {
+    const room = await readRoom(roomId, root);
+    return memberIds.map((memberId) => {
+      const member =
+        memberId === "conductor"
+          ? room.conductor
+          : room.agents.find((agent) => agent.id === memberId);
+      return { engine: member?.engine, model: member?.model };
+    });
+  };
   const requireValue = (name) => {
     if (values[name] === undefined || values[name] === "") throw new Error(`--${name} is required`);
     return values[name];
@@ -305,7 +335,9 @@ export async function roomsCommand(
       break;
     }
     case "add": {
-      result = await growRoom(requireValue("room"), await team(), root, values.parent, {
+      const members = await team();
+      await checkQuota(members);
+      result = await growRoom(requireValue("room"), members, root, values.parent, {
         workforceRole: values.role,
         cwd: values.cwd,
       });
@@ -315,7 +347,9 @@ export async function roomsCommand(
     case "lead": {
       const roomId = requireValue("room");
       const memberId = requireValue("member");
-      result = await reserveLead(roomId, memberId, requireValue("objective"), {
+      const objective = requireValue("objective");
+      await checkQuota(await memberRoutes(roomId, [memberId]));
+      result = await reserveLead(roomId, memberId, objective, {
         root,
         workforceRole: values.role,
         cwd: values.cwd,
@@ -446,7 +480,11 @@ export async function roomsCommand(
       break;
     }
     case "dispatch": {
-      result = await dispatchMember(requireValue("room"), requireValue("member"), {
+      const roomId = requireValue("room");
+      const memberId = requireValue("member");
+      requireValue("task-dir");
+      await checkQuota(await memberRoutes(roomId, [memberId]));
+      result = await dispatchMember(roomId, memberId, {
         root,
         run,
         taskDir: requireValue("task-dir"),
@@ -488,6 +526,12 @@ export async function roomsCommand(
           "--allow-credits on launch requires a member in the launch plan with allowCredits: true",
         );
       }
+      await checkQuota(
+        await memberRoutes(
+          roomId,
+          plan.members.map((member) => member.id),
+        ),
+      );
       // Stop on first failure. Completed requests are safe to revisit using their persisted IDs.
       result = [];
       for (const member of plan.members)

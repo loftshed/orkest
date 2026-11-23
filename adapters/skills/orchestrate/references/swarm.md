@@ -65,9 +65,14 @@ peer; display names and free-form aliases do not establish ownership.
 
 ## Assign work
 
-1. Read repository instructions and the orchestrate skill. Inspect native tools, live model catalogs,
-   quota and peer work before choosing a useful split. Existing idle peers are not automatically
+1. Read repository instructions and the orchestrate skill. Inspect native tools, live model catalogs
+   and peer work before choosing a useful split. Existing idle peers are not automatically
    available. Prefer new bounded workers over interrupting unrelated sessions.
+   Read quota at the moment you choose: run `ork quota --refresh` (the same as `monitor show --refresh`)
+   or use the quota line injected at the start of the current turn. Never reuse a quota number from
+   earlier in the conversation. `ork rooms add`, `lead`, `dispatch` and `launch` stop on a `low` or
+   `blocked` pool and name monitor's best alternative; pass `--confirm-low-quota` only after the user
+   agrees. Orkest never switches accounts or billing for you.
 2. Add members to the current room with `ork rooms add --room ID --parent conductor --team TEAM`.
    `--parent` is your own member ID when you are a subswarm lead. Model selectors are resolved by
    the runner at dispatch. All branches share the room's member and depth limits.
