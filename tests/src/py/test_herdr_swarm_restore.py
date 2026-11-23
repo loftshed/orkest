@@ -82,6 +82,61 @@ class RestoreTests(unittest.TestCase):
         self.assertEqual([outcome["status"] for outcome in results], ["missing_pane", "missing_pane"])
         self.assertEqual(self.api.runs, [])
 
+    def _second_view_in_tab(self):
+        """Save a second room's view in another pane of the first view's tab, with per-pane processes."""
+        record = views.load(self.state)
+        second = views.state_path(self.base, "room-b", self.env)
+        other = {
+            "pane_id": "w1:p3",
+            "terminal_id": "second",
+            "label": "Swarm · Other work",
+            "tab_id": "t1",
+            "workspace_id": "w1",
+        }
+        views.save(
+            second, {**record, "room": "room-b", "pane": "w1:p3", "terminal_id": "second", "label": other["label"]}
+        )
+        self.api.pane.update(tab_id="t1", workspace_id="w1")
+        idle = self.api.info
+        processes = {"w1:p2": json.loads(json.dumps(idle)), "w1:p3": json.loads(json.dumps(idle))}
+
+        def call(*args):
+            if args[:2] == ("pane", "run"):
+                self.api.runs.append(args)
+                argv = shlex.split(args[3])[4:]
+                processes[args[2]]["foreground_processes"] = [{"pid": 200, "name": "node", "argv": argv}]
+                return {}
+            return FakeHerdr.call(self.api, *args)
+
+        self.enterContext(mock.patch.object(self.api, "panes", return_value=[self.api.pane, other]))
+        self.enterContext(mock.patch.object(self.api, "processes", side_effect=processes.__getitem__))
+        self.enterContext(mock.patch.object(self.api, "call", side_effect=call))
+        return other, processes
+
+    def test_saved_views_sharing_a_tab_each_restore_into_their_own_pane(self):
+        # Two coordinators in one tab each had a view before an upgrade. After a Herdr restart both
+        # panes come back as idle shells; restoring into its own pane adds no pane, so neither blocks.
+        self._second_view_in_tab()
+        outcomes = views.restore(self.base, self.env, self.api)
+        self.assertEqual(
+            sorted(outcomes, key=lambda outcome: outcome["room"]),
+            [{"room": "room-a", "status": "restored"}, {"room": "room-b", "status": "restored"}],
+        )
+        self.assertEqual(sorted(run[2] for run in self.api.runs), ["w1:p2", "w1:p3"])
+
+    def test_only_a_running_view_occupies_a_tab_for_a_new_split(self):
+        other, processes = self._second_view_in_tab()
+        tab = views.tab_swarm_views(self.base, self.env, self.api, self.api.pane, [self.api.pane, other], self.cli)
+        self.assertEqual(tab, {})
+        processes["w1:p3"]["foreground_processes"] = [
+            {"pid": 300, "name": "node", "argv": ["node", str(self.cli), "horde", "--attach-room", "room-b", "--view"]}
+        ]
+        tab = views.tab_swarm_views(self.base, self.env, self.api, self.api.pane, [self.api.pane, other], self.cli)
+        self.assertEqual(tab, {"w1:p3": "room-b"})
+        message = str(views.TabOccupied(set(tab.values())))
+        self.assertIn("room room-b", message)
+        self.assertIn("`ork swarm close --room room-b`", message)
+
     def test_snapshot_agents_are_not_counted_as_additional_panes(self):
         api = views.Herdr("herdr", self.env)
         snapshot = {"snapshot": {"panes": [self.api.pane], "agents": [self.api.pane]}}
@@ -453,6 +508,30 @@ class OrcaSwarmRestoreHardeningTests(unittest.TestCase):
         self.home = Path(self.temp.name).resolve()
         self.base = self.home / "mailbox-v1"
         self.base.mkdir(parents=True, exist_ok=True)
+
+    def test_automatic_orca_open_requires_saved_open_intent(self):
+        env = {"ORCA_PANE_KEY": "pane-1", "ORCA_TERMINAL_HANDLE": "term_coord"}
+        state = orca_context.view_path("room-1", self.home)
+        record = {"schema": orca_context.VIEW_SCHEMA, "room": "room-1", "environment": "", "terminalId": "term_view"}
+
+        def run(command, **_kwargs):
+            self.assertEqual(command[2], "list")
+            return subprocess.CompletedProcess(
+                command, 0, stdout=json.dumps({"result": {"terminals": [{"handle": "term_view"}]}}), stderr=""
+            )
+
+        def restore():
+            return orca_swarm_restore.toggle(
+                "open", base=self.base, room="room-1", respect_closed=True, env=env, run=run
+            )
+
+        with mock.patch.object(orca_context, "resolve_cli", return_value="/opt/orca/orca-ide"):
+            self.assertEqual(restore()["status"], "already_closed")
+            orca_context.save(state, {**record, "closed": True})
+            self.assertEqual(restore()["status"], "already_closed")
+            orca_context.save(state, {**record, "closed": False})
+            opened = restore()
+            self.assertEqual((opened["status"], opened["pane"]), ("already_open", "term_view"))
 
     def test_view_command_and_chief_toggle_without_room(self):
         cmd_room = orca_swarm_restore.view_command("room-1", self.home / "state.json", chief=False)

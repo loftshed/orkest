@@ -25,7 +25,7 @@ import {
   isCurrentHerdrAgent,
 } from "../lib/herdr-context.mjs";
 import { markHerdrViewClosed, syncHerdrViewLabel } from "../lib/herdr-view-state.mjs";
-import { createRoom, mailboxRoot, readRoom } from "../lib/horde-room.mjs";
+import { createRoom, mailboxRoot, readRoom, updateRawRoom } from "../lib/horde-room.mjs";
 import { fit, formatWorktreeBadge, HordeView, shortAgentName } from "../lib/horde-view.mjs";
 import { resolveMacosHudBinary, sendMacosHudToast } from "../lib/macos-hud.mjs";
 import {
@@ -1871,6 +1871,16 @@ export async function runHordeTui(
     try {
       await markHerdrViewClosed(initialRoom.id, env, exec);
       if (env.ORKEST_ORCA_VIEW_STATE) await markOrcaViewClosed(env.ORKEST_ORCA_VIEW_STATE);
+      if (env.ORKEST_TMUX_VIEW_ROOM && env.ORKEST_TMUX_VIEW_ROOM === initialRoom.id) {
+        await updateRawRoom(
+          initialRoom.id,
+          (room) => {
+            room.tmuxViewOpen = false;
+            return room;
+          },
+          { root: mailboxRoot(env) },
+        );
+      }
     } catch (error) {
       terminalError ??= error;
     } finally {

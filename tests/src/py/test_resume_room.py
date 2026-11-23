@@ -1,5 +1,6 @@
 """Resume ownership survives the original process and its mailbox registration."""
 
+import itertools
 import json
 import os
 import socket
@@ -18,6 +19,7 @@ sys.path.insert(0, str(SCRIPTS))
 import _ork_fast_test_helpers as ORK_FAST  # noqa: E402
 import agent_statusline_tmux as terminal  # noqa: E402
 import agent_terminal  # noqa: E402
+import herdr_swarm_restore as restoration  # noqa: E402
 import peer_mailbox as mailbox  # noqa: E402
 import room_store  # noqa: E402
 import swarm_status  # noqa: E402
@@ -133,38 +135,50 @@ if view.returncode: raise RuntimeError(view.stderr)
 print(json.dumps({'rooms': [r['id'] for r in rooms], 'room': room, 'notice': notice,
                   'name': peer['name'], 'view': json.loads(view.stdout), 'status': swarm_status.snapshot(room, base)}))
 """
-        for harness in ("claude", "codex", "gemini"):
-            for mode in ("target", "room"):
-                with self.subTest(harness=harness, mode=mode), tempfile.TemporaryDirectory() as temporary:
-                    home = Path(temporary).resolve()
-                    environment = self.environment(home)
-                    environment.update(TEST_HARNESS=harness, TEST_CLI=str(CLI))
-                    first = subprocess.run(
-                        [sys.executable, "-c", initial], env=environment, check=True, capture_output=True, text=True
-                    )
-                    previous = json.loads(first.stdout)
-                    self.assertFalse(previous["oldPeerExists"])
-                    environment.update(TEST_ROOM=previous["room"], ORKEST_RESUME_SWARM="1")
-                    environment["ORKEST_RESUME_TARGET" if mode == "target" else "ORKEST_SWARM_ROOM"] = (
-                        "old-native" if mode == "target" else previous["room"]
-                    )
-                    second = subprocess.run(
-                        [sys.executable, "-c", resumed], env=environment, check=False, capture_output=True, text=True
-                    )
-                    self.assertEqual(second.returncode, 0, second.stderr)
-                    result = json.loads(second.stdout)
-                    self.assertEqual(result["rooms"], [previous["room"]])
-                    self.assertEqual(result["room"]["conductor"]["session"]["id"], "new-native")
-                    self.assertIn("old-native", result["room"]["conductor"]["previousSessions"])
-                    self.assertIn("Finish the resume repair", result["notice"])
-                    self.assertEqual(result["status"]["conductor"]["name"], "noxox")
-                    self.assertEqual(result["view"]["progress"]["name"], result["name"])
-                    self.assertEqual(result["view"]["progress"]["model"], "resume-model")
-                    self.assertEqual(result["view"]["progress"]["task"], "Restore the coordinator header")
-                    self.assertNotIn("Coordinator session unavailable", result["view"]["header"])
-                    self.assertIn("resume-model", result["view"]["header"])
-                    self.assertEqual(result["status"]["conductor"]["model"], "resume-model")
-                    self.assertEqual(result["status"]["conductor"]["task"], "Restore the coordinator header")
+        cases = [(harness, mode, "open") for harness in ("claude", "codex", "gemini") for mode in ("target", "room")]
+        # A coordinator that closed its view, then resumed under a new session ID (for example
+        # `claude --resume X --fork-session`), is still rebound and still gets its summary.
+        cases += [(harness, "target", "closed") for harness in ("claude", "codex", "gemini")]
+        for harness, mode, intent in cases:
+            with self.subTest(harness=harness, mode=mode, intent=intent), tempfile.TemporaryDirectory() as temporary:
+                home = Path(temporary).resolve()
+                environment = self.environment(home)
+                environment.update(TEST_HARNESS=harness, TEST_CLI=str(CLI))
+                first = subprocess.run(
+                    [sys.executable, "-c", initial], env=environment, check=True, capture_output=True, text=True
+                )
+                previous = json.loads(first.stdout)
+                self.assertFalse(previous["oldPeerExists"])
+                environment.update(
+                    TEST_ROOM=previous["room"],
+                    ORKEST_RESUME_SWARM="1",
+                    ORKEST_RESUME_TARGET="old-native",
+                    HERDR_ENV="1",
+                    HERDR_SOCKET_PATH=str(home / "herdr.sock"),
+                )
+                if mode == "room":
+                    environment["ORKEST_SWARM_ROOM"] = previous["room"]
+                view_state = self.save_open_intent(home, previous["room"], environment)
+                if intent == "closed":
+                    view_state.with_suffix(".closed").touch()
+                second = subprocess.run(
+                    [sys.executable, "-c", resumed], env=environment, check=False, capture_output=True, text=True
+                )
+                self.assertEqual(second.returncode, 0, second.stderr)
+                result = json.loads(second.stdout)
+                self.assertEqual(result["rooms"], [previous["room"]])
+                self.assertEqual(result["room"]["conductor"]["session"]["id"], "new-native")
+                self.assertIn("old-native", result["room"]["conductor"]["previousSessions"])
+                self.assertIn("Finish the resume repair", result["notice"])
+                self.assertEqual(result["status"]["conductor"]["name"], "noxox")
+                self.assertEqual(result["view"]["progress"]["name"], result["name"])
+                self.assertEqual(result["view"]["progress"]["model"], "resume-model")
+                self.assertEqual(result["view"]["progress"]["task"], "Restore the coordinator header")
+                self.assertNotIn("Coordinator session unavailable", result["view"]["header"])
+                self.assertIn("resume-model", result["view"]["header"])
+                self.assertEqual(result["status"]["conductor"]["model"], "resume-model")
+                self.assertEqual(result["status"]["conductor"]["task"], "Restore the coordinator header")
+                self.assertEqual(view_state.with_suffix(".closed").exists(), intent == "closed")
 
     def room(self, base, home, session="native-id"):
         return room_store.put_room(
@@ -316,7 +330,7 @@ print(json.dumps({'rooms': [r['id'] for r in rooms], 'room': room, 'notice': not
                 self.assertNotIn("Resume repair", attacker_notice)
                 self.assertEqual(room_store.read_room(base, room["id"]), room)
 
-    def test_stale_room_environment_falls_back_to_live_promotion(self):
+    def test_stale_room_environment_does_not_promote_native_resume(self):
         for status in ("missing", "closed"):
             with self.subTest(status=status), tempfile.TemporaryDirectory() as temporary:
                 home = Path(temporary)
@@ -332,9 +346,9 @@ print(json.dumps({'rooms': [r['id'] for r in rooms], 'room': room, 'notice': not
                     base, peer, harness="claude", event="SessionStart", env=environment, cwd=home
                 )
                 live = [r for r in room_store.list_rooms(base) if r.get("status") != "closed"]
-                self.assertEqual(len(live), 1)
-                self.assertEqual(live[0]["conductor"]["session"]["id"], "new-session")
-                self.assertIn("Swarm", notice)
+                self.assertEqual(live, [])
+                self.assertNotIn("Swarm", notice)
+                self.assertEqual(list((base / "swarm-briefs").glob("*/conductor.md")), [])
 
     def test_dead_peer_in_a_reused_herdr_pane_is_not_selected(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -367,19 +381,38 @@ print(json.dumps({'rooms': [r['id'] for r in rooms], 'room': room, 'notice': not
                 notice = self._hook_notice(
                     base, attacker, harness="claude", event="SessionStart", env=environment, cwd=temporary
                 )
-                self.assertIn("Swarm", notice)
+                self.assertNotIn("Swarm", notice)
                 self.assertEqual(room_store.read_room(base, room["id"]), room)
                 separate = [r for r in room_store.list_rooms(base) if r["id"] != room["id"]]
-                self.assertEqual(len(separate), 1)
-                self.assertEqual(separate[0]["conductor"]["session"]["id"], "attacker")
+                self.assertEqual(separate, [])
+
+    def save_open_intent(self, home, room, environment):
+        path = restoration.state_path(home, room, environment)
+        restoration.save(
+            path,
+            {
+                "schema": restoration.SCHEMA,
+                "room": room,
+                "host": socket.gethostname(),
+                "endpoint": restoration.endpoint(environment),
+                "pane": "%10",
+                "terminal_id": "view-terminal",
+                "label": "Orkest Swarm",
+                "cli": str(CLI.resolve()),
+            },
+        )
+        return path
 
     def test_launcher_preserves_resume_target_for_hooks_without_the_old_peer(self):
-        for harness, command in (
+        launches = (
             ("claude", ["claude", "--resume", "old-native"]),
             ("codex", ["codex", "--model", "gpt", "resume", "old-native"]),
             ("gemini", ["agy", "--conversation=old-native"]),
-        ):
-            with self.subTest(harness=harness), tempfile.TemporaryDirectory() as temporary:
+            ("claude", ["claude", "--resume", "old-native", "--fork-session"]),
+        )
+        # Without saved open intent the room is still handed to the hook for rebinding, but no view opens.
+        for (harness, command), intent in itertools.product(launches, ("open", "closed")):
+            with self.subTest(command=command, intent=intent), tempfile.TemporaryDirectory() as temporary:
                 home = Path(temporary)
                 base = home / "mailbox-v1"
                 existing = self.room(base, home, "old-native")
@@ -389,6 +422,8 @@ print(json.dumps({'rooms': [r['id'] for r in rooms], 'room': room, 'notice': not
                 room_store.put_room(base, existing)
                 environment = self.environment(home)
                 environment.update(HERDR_ENV="1", HERDR_PANE_ID="%1", HERDR_SOCKET_PATH=str(home / "fake.sock"))
+                if intent == "open":
+                    self.save_open_intent(home, existing["id"], environment)
                 captured = {}
 
                 def launch(_binary, argv, env, captured=captured):
@@ -400,7 +435,7 @@ print(json.dumps({'rooms': [r['id'] for r in rooms], 'room': room, 'notice': not
                     patch.object(sys.stdin, "isatty", return_value=True),
                     patch.object(sys.stdout, "isatty", return_value=True),
                     patch.object(terminal.shutil, "which", return_value="/fake"),
-                    patch.object(terminal, "_open_herdr_swarm_view", return_value="%2"),
+                    patch.object(terminal, "_open_herdr_swarm_view", return_value="%2") as open_view,
                     patch.object(terminal.os, "execvpe", side_effect=launch),
                     patch.object(terminal.os, "chdir"),
                 ):
@@ -415,6 +450,7 @@ print(json.dumps({'rooms': [r['id'] for r in rooms], 'room': room, 'notice': not
                 self.assertEqual(captured["env"]["ORKEST_SWARM_ROOM"], "existing-room")
                 self.assertEqual(captured["env"]["ORKEST_RESUME_TARGET"], "old-native")
                 self.assertEqual(captured["env"]["ORKEST_RESUME_SWARM"], "1")
+                self.assertEqual(open_view.call_count, int(intent == "open"))
 
     def test_resume_launch_leaves_live_room_metadata_and_environment_alone(self):
         for inherited in (False, True):
@@ -454,14 +490,14 @@ print(json.dumps({'rooms': [r['id'] for r in rooms], 'room': room, 'notice': not
                 self.assertIsNone(captured["env"].get("ORKEST_SWARM_ROOM"), "launcher exported the live room")
                 self.assertEqual(room_store.read_room(base, room["id"]), room)
                 peer = mailbox.register(base, session="resumer", harness="claude", cwd=temporary, pid=os.getpid())
-                # Simulate a stale inherited room too: the hook must safely use a separate room.
+                # The old room may still appear in the child environment.
                 child_env = {**captured["env"], "ORKEST_SWARM_ROOM": room["id"], "HERDR_ENV": "0"}
                 notice = self._hook_notice(
                     base, peer, harness="claude", event="SessionStart", env=child_env, cwd=temporary
                 )
-                self.assertIn("Swarm", notice)
+                self.assertNotIn("Swarm", notice)
                 self.assertEqual(room_store.read_room(base, room["id"]), room)
-                self.assertEqual(len(room_store.list_rooms(base)), 2)
+                self.assertEqual(len(room_store.list_rooms(base)), 1)
 
     def test_dead_previous_id_does_not_match_a_room_with_a_live_owner(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -72,6 +72,28 @@ def load(path: Path) -> dict[str, Any] | None:
         return None
 
 
+def owns_record(record: dict[str, Any], room: str, env: dict[str, str]) -> bool:
+    return (
+        record.get("schema") == SCHEMA
+        and canonical_endpoint(record.get("endpoint")) == endpoint(env)
+        and record.get("host") == socket.gethostname()
+        and record.get("room") == room
+    )
+
+
+def saved_open(path: Path, room: str, env: dict[str, str]) -> bool:
+    record = load(path)
+    return bool(
+        record
+        and owns_record(record, room, env)
+        and isinstance(record.get("label"), str)
+        and record["label"].startswith(VALID_LABEL_PREFIXES)
+        and isinstance(record.get("cli"), str)
+        and isinstance(record.get("pane"), str)
+        and not path.with_suffix(".closed").exists()
+    )
+
+
 def save(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
@@ -113,17 +135,79 @@ class Herdr:
         return result.get("process_info", result)
 
 
-def view_process(info: dict[str, Any], cli: Path, room: str) -> bool:
+class TabOccupied(RuntimeError):
+    """A new view would put a second Swarm View in a tab that already shows one."""
+
+    def __init__(self, rooms: list[str] | set[str]) -> None:
+        self.rooms = sorted(set(rooms))
+        closes = ", ".join(f"`ork swarm close --room {room}`" for room in self.rooms)
+        shown = ", ".join(self.rooms)
+        noun = "the Swarm View for room" if len(self.rooms) == 1 else "Swarm Views for rooms"
+        super().__init__(f"this tab already shows {noun} {shown}; close it with {closes}, then open this one again")
+
+
+def running_view_room(info: dict[str, Any], cli: Path) -> str | None:
     for process in info.get("foreground_processes") or []:
         argv = process.get("argv") or []
-        if not isinstance(argv, list) or len(argv) < 6:
+        if not isinstance(argv, list) or len(argv) != 6:
             continue
         # Require the actual executable script and exact view arguments, not a shell command substring.
         if Path(str(argv[1])).resolve() != cli.resolve():
             continue
-        if argv[2:] == ["horde", "--attach-room", room, "--view"]:
-            return True
-    return False
+        if argv[2:4] == ["horde", "--attach-room"] and isinstance(argv[4], str) and argv[5] == "--view":
+            return argv[4]
+    return None
+
+
+def view_process(info: dict[str, Any], cli: Path, room: str) -> bool:
+    return running_view_room(info, cli) == room
+
+
+def tab_swarm_views(
+    base: Path,
+    env: dict[str, str],
+    api: Herdr,
+    pane: dict[str, Any],
+    panes: list[dict[str, Any]],
+    cli: Path,
+) -> dict[str, str]:
+    others = [
+        other
+        for other in panes
+        if other.get("workspace_id") == pane.get("workspace_id") and other.get("tab_id") == pane.get("tab_id")
+    ]
+    if not others:
+        return {}
+    saved = {}
+    for path in state_directory(base, env).glob("*.json"):
+        record = load(path)
+        room = record.get("room") if record else None
+        if (
+            record
+            and isinstance(room, str)
+            and owns_record(record, room, env)
+            and not path.with_suffix(".closed").exists()
+            and (owned := locate(record, others))
+        ):
+            saved[owned["pane_id"]] = record
+    # Only a running view occupies the tab. An idle shell with a saved record is a view
+    # waiting for restore into its own pane, which never needs a new split.
+    views = {}
+    for other in others:
+        pane_id = other["pane_id"]
+        info = api.processes(pane_id)
+        room = running_view_room(info, cli)
+        record = saved.get(pane_id)
+        if (
+            not room
+            and record
+            and isinstance(record.get("cli"), str)
+            and view_process(info, Path(record["cli"]), record["room"])
+        ):
+            room = record["room"]
+        if room:
+            views[pane_id] = room
+    return views
 
 
 def _process_shell_name(process: dict[str, Any]) -> str:
@@ -156,7 +240,15 @@ def idle_shell(info: dict[str, Any]) -> bool:
 
 
 def prepare(
-    base: Path, room: str, pane: str, cli: Path, env: dict[str, str], api: Herdr, *, chief: bool = False
+    base: Path,
+    room: str,
+    pane: str,
+    cli: Path,
+    env: dict[str, str],
+    api: Herdr,
+    *,
+    chief: bool = False,
+    reopen: bool = True,
 ) -> Path:
     path = state_path(base, room, env)
     label = swarm_pane_label(base, room)
@@ -187,7 +279,8 @@ def prepare(
             **({"chief": True} if chief else {}),
         },
     )
-    path.with_suffix(".closed").unlink(missing_ok=True)
+    if reopen:
+        path.with_suffix(".closed").unlink(missing_ok=True)
     path.with_suffix(".pending").unlink(missing_ok=True)
     return path
 
@@ -254,12 +347,9 @@ def restore(
         for path, record in records:
             if not record or record.get("schema") != SCHEMA:
                 continue
-            if (
-                canonical_endpoint(record.get("endpoint")) != endpoint(env)
-                or record.get("host") != socket.gethostname()
-            ):
-                continue
             if not isinstance(record.get("cli"), str) or not isinstance(record.get("room"), str):
+                continue
+            if not owns_record(record, record["room"], env):
                 continue
             if only_room is not None and record["room"] != only_room:
                 continue
@@ -294,6 +384,8 @@ def restore(
                     path.with_suffix(".pending").unlink(missing_ok=True)
                     status = "already_running"
                 elif idle_shell(info) and cli.is_file():
+                    # Restoring into the view's own saved pane adds no pane to the tab, so
+                    # other saved views in the tab do not block it.
                     # Recheck the close tombstone immediately before admitting a command.
                     if path.with_suffix(".closed").exists():
                         continue

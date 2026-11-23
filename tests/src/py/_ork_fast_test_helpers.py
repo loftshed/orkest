@@ -12,10 +12,12 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 SCRIPTS = REPO_ROOT / "src/py"
 
 _DEFAULT_PID = object()
+# Some hook tests replace os.environ with an isolated profile after importing this helper.
+_BUILD_BIN = os.environ.get("ORK_FAST_BIN")
 
 
 def find_ork_fast_bin() -> Path:
-    explicit = os.environ.get("ORK_FAST_BIN")
+    explicit = os.environ.get("ORK_FAST_BIN") or _BUILD_BIN
     if explicit:
         candidate = Path(explicit).expanduser()
         if candidate.is_file() and os.access(candidate, os.X_OK):

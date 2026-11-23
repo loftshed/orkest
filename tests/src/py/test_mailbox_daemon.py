@@ -601,6 +601,34 @@ d.serve(base)
         self.start()
         self.assertEqual(self.state["url"], old["url"])
 
+    def test_direct_serve_rejects_a_different_saved_port(self):
+        self.start()
+        old = daemon.load_state(self.base)
+        with socket.socket() as available:
+            available.bind(("127.0.0.1", 0))
+            port = available.getsockname()[1]
+        self.assertTrue(daemon.stop_service(self.base))
+        rejected = subprocess.run(
+            [
+                sys.executable,
+                "-B",
+                str(SCRIPTS / "mailbox_daemon.py"),
+                "serve",
+                "--root",
+                str(self.base),
+                "--port",
+                str(port),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        self.assertEqual(rejected.returncode, 1, rejected.stderr)
+        self.assertIn("use the persisted port", rejected.stderr)
+        self.assertEqual(daemon.load_state(self.base), old)
+        self.assertEqual(self.start()["url"], old["url"])
+
     def test_frozen_ten_question_evaluation_through_http_stays_unread(self):
         self.start()
         fixture = json.loads((Path(__file__).parent / "evaluations/snapshot.json").read_text())
