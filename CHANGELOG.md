@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.100.0
+
+- feat(handoff): spend expiring quota to zero instead of handing off early
+- feat(rooms): send corrections from ork hall dispatch and extend task deadlines
+- fix(swarm): keep a Swarm View closed with Herdr's own close-pane closed
+- fix(tests): keep the live agent session out of every test suite
+
 ## 0.99.2
 
 - fix(monitor): keep owner-only MCP configs owner-only and skip identical registrations

@@ -1,6 +1,6 @@
 {
   "name": "orkest",
-  "version": "0.99.2",
+  "version": "0.100.0",
   "private": true,
   "license": "MIT",
   "type": "module",
