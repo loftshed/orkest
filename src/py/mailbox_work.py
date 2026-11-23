@@ -318,22 +318,30 @@ def snapshot(base: Path, me: dict[str, Any], *, item: str | None = None) -> list
     return records
 
 
-def assigned(base: Path, me: dict[str, Any]) -> list[dict[str, Any]]:
-    """Read this session's active assignments without locks or presence side effects.
-
-    Writers replace the complete board atomically. This small projection is suitable for a
-    frequently refreshed display; the workboard remains the authority for transitions.
-    """
+def _owned_records(base: Path, me: dict[str, Any], states: set[str]) -> list[dict[str, Any]]:
     board = _read(base / "work" / "board.json")
     return [
-        {"id": item["id"], "title": item["title"], "state": item["state"]}
+        item
         for item in board["items"]
         if isinstance(item["owner"], dict)
         and _matches_session(me, item["owner"].get("session"))
-        and item["state"] in {"claimed", "blocked", "review"}
+        and item["state"] in states
         and isinstance(item["project"], dict)
         and mailbox.same_project(me, item["project"])
     ]
+
+
+def assigned(base: Path, me: dict[str, Any]) -> list[dict[str, Any]]:
+    """Read active assignments without locks or presence side effects."""
+    return [
+        {key: item[key] for key in ("id", "title", "state")}
+        for item in _owned_records(base, me, {"claimed", "blocked", "review"})
+    ]
+
+
+def checkpoint_records(base: Path, me: dict[str, Any]) -> list[dict[str, Any]]:
+    """Work items this session can checkpoint and their last structured checkpoint revisions."""
+    return _owned_records(base, me, {"claimed", "blocked"})
 
 
 def renew_leases(base: Path, me: dict[str, Any], *, force: bool = True) -> int:
@@ -631,6 +639,7 @@ def _transition(
         record.update(details)
         if handoff is not None:
             record["handoff"] = _normalize_handoff(handoff, record.get("handoff"))
+            record["checkpointRevision"] = record["revision"] + 1
         ttl = _normalize_lease_ttl(lease_ttl if lease_ttl is not None else record.get("leaseTtlSeconds"))
         record["leaseTtlSeconds"] = ttl
         record["leaseExpiresAt"] = _lease_expiry(ttl)

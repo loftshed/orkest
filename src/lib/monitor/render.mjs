@@ -295,6 +295,7 @@ export function jsonView(accounts, now = Date.now()) {
       label: l.label,
       accountId: l.accountId,
       poolId: l.poolId,
+      windowIds: l.windowIds,
       families: l.families,
       models: l.models ?? null,
       status: l.status,

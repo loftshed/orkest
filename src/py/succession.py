@@ -156,6 +156,12 @@ def pools(view: dict[str, Any] | None, config: dict[str, Any]) -> list[dict[str,
                 "alias": alias.strip() if isinstance(alias, str) and alias.strip() else None,
                 "status": quota.assess(lane),
                 "availableNowPct": lane.get("availableNowPct"),
+                "fetchedAt": view_acct.get("fetchedAt"),
+                "windows": [
+                    window
+                    for window in view_acct.get("windows", [])
+                    if window.get("id") in (lane.get("windowIds") or [])
+                ],
                 "surplusPts": lane.get("surplusPts"),
                 "subPoolOf": lane.get("subPoolOf"),
                 "blockedUntil": lane.get("blockedUntil"),
@@ -164,6 +170,16 @@ def pools(view: dict[str, Any] | None, config: dict[str, Any]) -> list[dict[str,
             }
         )
     return found
+
+
+def pool_fresh(pool: dict[str, Any], config: dict[str, Any]) -> bool:
+    fetched = parse_time(pool.get("fetchedAt"))
+    return (
+        not pool.get("stale")
+        and fetched is not None
+        and fetched.tzinfo is not None
+        and 0 <= (now() - fetched).total_seconds() <= max_age_seconds(config)
+    )
 
 
 def _resolve_child_path(raw: str) -> Path:
@@ -535,7 +551,13 @@ def monitor_evidence(
     return reasons, lead_pool["status"]
 
 
-def local_evidence(record: dict[str, Any], *, lead_status: str | None, moment: dt.datetime) -> list[str]:
+def local_evidence(
+    record: dict[str, Any],
+    *,
+    lead_status: str | None,
+    moment: dt.datetime,
+    replace_automatic_offer: str | None = None,
+) -> list[str]:
     """The fast half, re-read under the team lock: these change without a new generation."""
     rule = record.get("standing") or {"seconds": 0}
     reasons = []
@@ -566,7 +588,7 @@ def local_evidence(record: dict[str, Any], *, lead_status: str | None, moment: d
         if live and updated is not None and (moment - updated).total_seconds() < rule["seconds"]:
             reasons.append(f"task {task.get('task_id')} has a live run updated recently")
     offer = record.get("offer") or {}
-    if offer.get("to"):
+    if offer.get("to") and (not replace_automatic_offer or offer.get("automatic") != replace_automatic_offer):
         reasons.append(f"a handover is already offered to {offer['to']['session']}")
     return reasons
 

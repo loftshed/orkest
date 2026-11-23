@@ -38,6 +38,7 @@ HARNESS_HOST = {"claude": "claude", "codex": "codex", "gemini": "agy", "agy": "a
 LIVE_RUN = {"dispatching", "reserved", "active", "uncertain"}
 # Coordinator actions hold the team lock only briefly; an authority change waits at most this long.
 LOCK_WAIT_SECONDS = 30.0
+AUTOMATIC_OFFER_SECONDS = 600
 WRITING_KINDS = {"implementation", "correction", "verification", "continue"}
 
 
@@ -239,6 +240,7 @@ def computed_state(record: dict[str, Any], successor_harness: str | None = None)
         "status": record["status"],
         "lead": record["lead"],
         "offer_to": (record.get("offer") or {}).get("to"),
+        **({"automatic_offer": record["offer"]["automatic"]} if (record.get("offer") or {}).get("automatic") else {}),
         "checkouts": checkouts,
         "ancestry": ancestry,
         "runs": [{key: run[key] for key in ("run_id", "status", "kind", "transport")} for run in runs],
@@ -325,6 +327,7 @@ def appoint(
     expect_generation: int | None = None,
     standing: dict[str, Any] | None = None,
     repository: str | None = None,
+    automatic: str | None = None,
 ) -> dict[str, Any]:
     """Appoint the lead (the user's act). Re-appointing needs the current generation and fences the old lead.
 
@@ -358,7 +361,7 @@ def appoint(
             offer=None,
             handoff={"reason": "appoint", "from": previous, "heads": heads(record), "at": now()},
         )
-        log(record, "appoint", lead=lead, previous=previous)
+        log(record, "appoint", lead=lead, previous=previous, **({"automatic": automatic} if automatic else {}))
         save(directory, record)
         return record
 
@@ -371,6 +374,7 @@ def designate(
     deputy: dict[str, Any],
     standing: dict[str, Any],
     lead_pool: str | None = None,
+    expected: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Name a deputy and standing rule for the active lead without changing who leads, so the generation, and
     the lead's own commands at it, stand. For an automatic handoff from a lead it made; withdraw undoes it."""
@@ -384,6 +388,8 @@ def designate(
     with locked(directory, exclusive=True):
         record = require(directory)
         expect(record, expect_generation)
+        if expected is not None and record != expected:
+            raise AuthorityError("the team changed while preparing its deputy")
         if record["status"] != "active" or record["lead"]["session"] != lead_session:
             raise AuthorityError("only the active lead's own team can be given a deputy this way")
         record.update(
@@ -391,7 +397,6 @@ def designate(
             deputy=deputy,
             standing=standing,
             contexts={**(record.get("contexts") or {}), **facts.get("contexts", {})},
-            offer=None,
         )
         log(record, "designate", deputy=deputy)
         save(directory, record)
@@ -415,13 +420,15 @@ def withdraw(team: str, lead_session: str, expect_generation: int, *, remove: bo
                 raise AuthorityError("this team has a history beyond its appointment; it is not removed")
             (directory / "authority.json").unlink()
             return None
-        record.update(deputy=None, standing=None, offer=None)
+        record.update(deputy=None, standing=None)
         log(record, "withdraw")
         save(directory, record)
         return record
 
 
-def offer(team: str, caller: str, generation: int, to: dict[str, str], note: str = "") -> dict[str, Any]:
+def offer(
+    team: str, caller: str, generation: int, to: dict[str, str], note: str = "", *, automatic: str | None = None
+) -> dict[str, Any]:
     """A planned handover: the lead stays in charge until the successor accepts."""
     directory = team_dir(team)
     with locked(directory, exclusive=True):
@@ -429,10 +436,39 @@ def offer(team: str, caller: str, generation: int, to: dict[str, str], note: str
         expect(record, generation)
         if record["status"] != "active" or record["lead"]["session"] != caller:
             raise AuthorityError("only the active lead can offer a handover")
+        if automatic is not None and record.get("offer") and not automatic_offer_expired(record["offer"]):
+            raise AuthorityError("the team already has an outstanding handover offer")
         record["offer"] = {"to": to, "note": note.strip(), "heads": heads(record), "offered_at": now()}
-        log(record, "offer", to=to)
+        if automatic is not None:
+            record["offer"]["automatic"] = automatic
+            record["offer"]["expires_at"] = (
+                dt.datetime.now(dt.UTC) + dt.timedelta(seconds=AUTOMATIC_OFFER_SECONDS)
+            ).isoformat()
+        log(record, "offer", to=to, **({"automatic": automatic} if automatic else {}))
         save(directory, record)
         return record
+
+
+def automatic_offer_expired(offer: dict[str, Any]) -> bool:
+    expires = offer.get("expires_at")
+    return bool(offer.get("automatic") and expires and dt.datetime.fromisoformat(expires) <= dt.datetime.now(dt.UTC))
+
+
+def cancel_automatic_offer(team: str, caller: str, generation: int, event: str) -> bool:
+    """Cancel only this launch's offer. An accepted or replaced offer belongs to someone else."""
+    directory = team_dir(team)
+    with locked(directory, exclusive=True):
+        record = require(directory)
+        if (
+            record["generation"] != generation
+            or record["lead"]["session"] != caller
+            or (record.get("offer") or {}).get("automatic") != event
+        ):
+            return False
+        record["offer"] = None
+        log(record, "offer-cancelled", automatic=event)
+        save(directory, record)
+        return True
 
 
 def takeover(
@@ -445,6 +481,7 @@ def takeover(
     successor_account: str | None = None,
     successor_repository: str | None = None,
     view: dict[str, Any] | None = None,
+    replace_automatic_offer: str | None = None,
 ) -> dict[str, Any]:
     """The lead is presumed gone: fence it now; the successor's generation stays pending until it accepts.
 
@@ -480,7 +517,10 @@ def takeover(
         expect(record, expect_generation)
         if by_standing:
             reasons = module("succession").local_evidence(
-                record, lead_status=lead_status, moment=module("succession").now()
+                record,
+                lead_status=lead_status,
+                moment=module("succession").now(),
+                replace_automatic_offer=replace_automatic_offer,
             )
             if reasons:
                 raise AuthorityError("no standing takeover: " + "; ".join(reasons))
@@ -515,6 +555,11 @@ def accept(team: str, caller: dict[str, str], expect_generation: int, digest: st
             record["status"] == "active"
             and (record.get("offer") or {}).get("to", {}).get("session") == caller["session"]
         )
+        automatic = record["offer"].get("automatic") if planned else None
+        if automatic and automatic_offer_expired(record["offer"]):
+            raise AuthorityError("the automatic handover offer expired; ask the current lead for a fresh offer")
+        if automatic and caller["harness"] != record["offer"]["to"]["harness"]:
+            raise AuthorityError("the automatic offer names a different successor harness")
         pending = record["status"] == "pending" and record["lead"]["session"] == caller["session"]
         if not (planned or pending):
             raise AuthorityError("no handover is offered to this session and no takeover by it is pending")
@@ -534,7 +579,7 @@ def accept(team: str, caller: dict[str, str], expect_generation: int, digest: st
             previous = record["lead"]
             record.update(
                 generation=record["generation"] + 1,
-                lead=caller,
+                lead={**caller, **({"pool": record["offer"]["to"]["pool"]} if automatic else {})},
                 handoff={
                     "reason": "handover",
                     "from": previous,
@@ -544,8 +589,10 @@ def accept(team: str, caller: dict[str, str], expect_generation: int, digest: st
                 },
                 offer=None,
             )
+            if automatic:
+                record.update(deputy=None, standing=None)
         record["status"] = "active"
-        log(record, "accept", lead=caller, digest=digest)
+        log(record, "accept", lead=caller, digest=digest, **({"automatic": automatic} if automatic else {}))
         save(directory, record)
         return record
 

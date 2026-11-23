@@ -2153,6 +2153,28 @@ async function recordMissionOutcome(root, roomId, outcome, { now = Date.now(), e
   return decision;
 }
 
+function isRestingPeer(root, session, env) {
+  const key = sessionKey(session);
+  if (!key) return false;
+  const marker = path.join(root, "handoff-rest", `${key}.json`);
+  if (!existsSync(marker) || readJson(marker, 4096)?.released) return false;
+  const result = spawnSync(
+    "python3",
+    [
+      "-I",
+      "-c",
+      "import pathlib, sys; sys.path.insert(0, sys.argv[1]); import handoff_rest; " +
+        "print(int(handoff_rest.resting(pathlib.Path(sys.argv[2]), sys.argv[3])))",
+      SCRIPTS_DIR,
+      root,
+      session,
+    ],
+    { encoding: "utf8", timeout: 5000, env: { ...env, ORCHESTRATE_HOME: path.dirname(root) } },
+  );
+  // Only a confirmed rest holds mail: a slow or failing check must not silence a session that still leads.
+  return result.status === 0 && result.stdout.trim() === "1";
+}
+
 /** Ensures the desk holds one item for the report, then requests delivery if a Chief is live. */
 async function deliverMissionReport(room, { root, env, now, runMailbox }) {
   const report = room.chief?.report;
@@ -2169,7 +2191,8 @@ async function deliverMissionReport(room, { root, env, now, runMailbox }) {
   if (report.status === "delivered") return { status: "delivered", id: report.id };
   const chief = readChiefBinding({ root, now });
   const missionSession = room.chief?.mission?.session;
-  if (!chief || !missionSession) return { status: "queued", id: report.id };
+  if (!chief || !missionSession || isRestingPeer(root, chief.session, env))
+    return { status: "queued", id: report.id };
   const storeEnv = mailboxStoreEnv(root, env, runMailbox);
   if (!storeEnv) return { status: "queued", id: report.id, error: "mailbox root unreachable" };
   const result = runMailbox(
@@ -2388,6 +2411,10 @@ async function chiefSendBody({
     target = { tier: "chief", session: null, chief: true };
   }
   if (target.session && target.session === sender) throw new Error("That target is this session");
+  if (target.session && isRestingPeer(root, target.session, env)) {
+    if (!target.chief) throw new Error(`${target.label} is resting after a quota handoff`);
+    isChiefUnavailable = true;
+  }
   if (isChiefUnavailable) {
     const record = recordDesk(
       root,
@@ -3404,7 +3431,7 @@ function interactivePreviewArgv(selection, { workspace, launcher }) {
  * Splits the caller's pane (or tab/terminal) and starts the launcher there. Returns the persisted
  * identity; never retries a launch, since a timed-out split may already have opened a pane.
  */
-function launchInteractive(selection, { workspace, launcher, exec, env }) {
+function launchInteractive(selection, { workspace, launcher, exec, env, sibling = false }) {
   if (selection.backend === "herdr") {
     const split = JSON.parse(
       exec(
@@ -3432,7 +3459,7 @@ function launchInteractive(selection, { workspace, launcher, exec, env }) {
           "--direction",
           "vertical",
           "--command",
-          launcher,
+          sibling ? shellSingleQuote(launcher) : launcher,
           "--json",
         ],
         { env },
@@ -3454,13 +3481,53 @@ function launchInteractive(selection, { workspace, launcher, exec, env }) {
       orcaPaneKey: selection.context.paneKey,
     };
   }
+  const tmuxCommand = sibling ? ["split-window", "-h"] : ["new-window"];
   const paneId = exec(
     "tmux",
-    ["new-window", "-d", "-P", "-F", "#{pane_id}", "-t", selection.pane, "-c", workspace, launcher],
+    [
+      ...tmuxCommand,
+      "-d",
+      "-P",
+      "-F",
+      "#{pane_id}",
+      "-t",
+      selection.pane,
+      "-c",
+      workspace,
+      sibling ? shellSingleQuote(launcher) : launcher,
+    ],
     { env },
   ).trim();
   if (!TMUX_PANE_RE.test(paneId)) throw new Error(`tmux returned an unexpected pane: ${paneId}`);
   return { tmuxPane: paneId, paneId, terminalServer: selection.server };
+}
+
+/** Launch a prepared command beside its calling pane. Null means discovery failed before any split. */
+export function launchSiblingPane({ workspace, launcher, env = process.env, exec = defaultExec }) {
+  let selection;
+  try {
+    if (env.HERDR_ENV === "1" && !env.HERDR_PANE_ID) return null;
+    selection = selectInteractiveBackend(env, { exec });
+    if (selection.backend === "herdr") {
+      const current = JSON.parse(exec("herdr", ["pane", "current", "--current"], { env }));
+      if (!current?.result?.pane?.pane_id) return null;
+    } else if (selection.backend === "orca") {
+      const terminals = JSON.parse(exec(selection.cli, ["terminal", "list", "--json"], { env }));
+      const rows = (terminals?.result || terminals)?.terminals;
+      if (
+        !selection.context.terminalHandle ||
+        !Array.isArray(rows) ||
+        rows.every((row) => row.handle !== selection.context.terminalHandle)
+      )
+        return null;
+    }
+  } catch {
+    return null;
+  }
+  return {
+    backend: selection.backend,
+    ...launchInteractive(selection, { workspace, launcher, exec, env, sibling: true }),
+  };
 }
 
 export async function chiefSpawn({
