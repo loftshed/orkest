@@ -1,9 +1,9 @@
-import { existsSync, readFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 
 import { childEnv, expandHome, resolveBinary, run } from "./exec.mjs";
-import { editJsonSection } from "./harness-files.mjs";
+import { editJsonSection, stripJsonc } from "./harness-files.mjs";
 
 const NAME = "monitor";
 
@@ -43,10 +43,16 @@ function binary(name, override) {
  * installed Codex, agy, Gemini CLI and OpenCode. CLIs with an `mcp add` command are driven through it;
  * OpenCode gets a guarded config-file edit.
  */
-export function registrationPlan(config, launcher, { remove = false, home = homedir() } = {}) {
+export function registrationPlan(
+  config,
+  launcher,
+  { remove = false, home = homedir(), env: processEnv = process.env } = {},
+) {
   const plan = [];
-  const cli = (target, bin, args, env = {}) => {
-    if (bin) plan.push({ kind: "cli", target, bin, args, env });
+  // `configFile` is where the CLI keeps its MCP servers, so a step can tell an identical registration
+  // from a missing one and keep the file's owner-only mode, which some CLIs drop when they rewrite it.
+  const cli = (target, bin, args, env = {}, configFile = null) => {
+    if (bin) plan.push({ kind: "cli", target, bin, args, env, launcher, configFile });
   };
   const file = (target, apply) => {
     plan.push({ kind: "file", target, apply });
@@ -77,6 +83,7 @@ export function registrationPlan(config, launcher, { remove = false, home = home
         ? ["mcp", "remove", "--scope", "user", NAME]
         : ["mcp", "add", "--scope", "user", NAME, "--", launcher, "mcp"],
       { CLAUDE_CONFIG_DIR: isDefault ? null : dir },
+      { path: isDefault ? path.join(home, ".claude.json") : path.join(dir, ".claude.json") },
     );
   }
   const codexTarget = "Codex (CLI and app)";
@@ -93,12 +100,22 @@ export function registrationPlan(config, launcher, { remove = false, home = home
       codexTarget,
       binary("codex"),
       remove ? ["mcp", "remove", NAME] : ["mcp", "add", NAME, "--", launcher, "mcp"],
+      {},
+      {
+        path: path.join(
+          processEnv.CODEX_HOME ? expandHome(processEnv.CODEX_HOME) : path.join(home, ".codex"),
+          "config.toml",
+        ),
+        format: "toml",
+      },
     );
   }
   cli(
     "Antigravity (agy)",
     binary("agy"),
     remove ? ["mcp", "remove", NAME] : ["mcp", "add", NAME, launcher, "mcp"],
+    {},
+    { path: path.join(home, ".gemini", "config", "mcp_config.json") },
   );
   cli(
     "Gemini CLI",
@@ -106,6 +123,8 @@ export function registrationPlan(config, launcher, { remove = false, home = home
     remove
       ? ["mcp", "remove", "-s", "user", NAME]
       : ["mcp", "add", "-s", "user", NAME, launcher, "mcp"],
+    {},
+    { path: path.join(home, ".gemini", "settings.json") },
   );
 
   // OpenCode is one of orchestrate's execution engines, so its delegated runs can check quota too.
@@ -134,6 +153,106 @@ function fileStepStatus(target, result, remove) {
   return `✓ ${target}: ${remove ? "removed" : "added"}`;
 }
 
+/** Reads `[mcp_servers.<name>]` from a Codex config.toml: only the plain keys monitor uses. */
+function tomlServer(text, name) {
+  const lines = text.split(/\r?\n/u);
+  const header = new Set([`[mcp_servers.${name}]`, `[mcp_servers."${name}"]`]);
+  const start = lines.findIndex((line) => header.has(line.trim()));
+  if (start === -1) return null;
+  const entry = {};
+  const body = lines.slice(start + 1);
+  for (const line of body) {
+    if (line.trimStart().startsWith("[")) break;
+    const match = /^\s*([A-Za-z_][\w-]*)\s*=\s*(.+?)\s*$/u.exec(line);
+    if (!match) continue;
+    try {
+      entry[match[1]] = JSON.parse(match[2]);
+    } catch {
+      entry[match[1]] = undefined;
+    }
+  }
+  return entry;
+}
+
+function registeredEntry(configFile) {
+  try {
+    const text = readFileSync(configFile.path, "utf8");
+    if (configFile.format === "toml") return tomlServer(text, NAME);
+    return JSON.parse(stripJsonc(text))?.mcpServers?.[NAME] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** True when the CLI's config already runs `<launcher> mcp`, enabled, so `mcp add` would only rewrite it. */
+export function isAlreadyRegistered(step) {
+  if (!step.configFile) return false;
+  const entry = registeredEntry(step.configFile);
+  return (
+    Boolean(entry) &&
+    typeof entry === "object" &&
+    entry.command === step.launcher &&
+    Array.isArray(entry.args) &&
+    entry.args.length === 1 &&
+    entry.args[0] === "mcp" &&
+    (entry.type === undefined || entry.type === "stdio") &&
+    entry.disabled !== true &&
+    entry.enabled !== false
+  );
+}
+
+/** The mode of a config file that only its owner can read, which a CLI rewrite must not widen. */
+function ownerOnlyMode(file) {
+  try {
+    const info = statSync(file);
+    const mode = info.mode & 0o777;
+    return info.isFile() && (mode & 0o077) === 0 ? mode : null;
+  } catch {
+    return null;
+  }
+}
+
+function restoreMode(file, mode) {
+  if (mode === null) return;
+  try {
+    if ((statSync(file).mode & 0o777) !== mode) chmodSync(file, mode);
+  } catch {
+    // The CLI removed the file; there is nothing left to protect.
+  }
+}
+
+/** Runs one `mcp add` or `mcp remove` and returns its status line. */
+export async function applyCliStep(step, { remove = false } = {}) {
+  if (!remove && isAlreadyRegistered(step)) return `• ${step.target}: already registered`;
+  // agy rewrites mcp_config.json as 0644, exposing the peer-mailbox bearer token stored beside monitor.
+  const configPath = step.configFile?.path;
+  const mode = configPath ? ownerOnlyMode(configPath) : null;
+  const env = childEnv(step.env, { strip: [/^CLAUDE_CODE_/, "CLAUDECODE"] });
+  try {
+    const { code, stdout, stderr } = await run(step.bin, step.args, { env, timeoutMs: 60_000 });
+    const output = `${stdout}${stderr}`
+      .trim()
+      .split("\n")
+      .filter((l) => !/not trusted|^\s*$/i.test(l));
+    const already = !remove && output.some((l) => /already exists/i.test(l));
+    const absent =
+      remove &&
+      code !== 0 &&
+      output.some((l) => /not found|no .*(server|mcp)|does not exist/i.test(l));
+    let note = output[0] || `exit ${code}`;
+    if (absent) note = "not registered";
+    if (already) note = "already registered";
+    let mark = "✗";
+    if (already || absent) mark = "•";
+    if (code === 0) mark = "✓";
+    return `${mark} ${step.target}: ${note}`;
+  } catch (error) {
+    return `✗ ${step.target}: ${error.message}`;
+  } finally {
+    if (configPath) restoreMode(configPath, mode);
+  }
+}
+
 export async function registerMcp(config, { launcher, dryRun = false, remove = false } = {}) {
   const plan = registrationPlan(config, launcher, { remove });
   for (const step of plan) {
@@ -150,35 +269,19 @@ export async function registerMcp(config, { launcher, dryRun = false, remove = f
       }
       continue;
     }
-    let envPrefix = "";
-    if (step.env.CLAUDE_CONFIG_DIR === null) envPrefix = "env -u CLAUDE_CONFIG_DIR ";
-    if (step.env.CLAUDE_CONFIG_DIR) envPrefix = `CLAUDE_CONFIG_DIR=${step.env.CLAUDE_CONFIG_DIR} `;
-    const shown = `${envPrefix}${step.bin} ${step.args.map((a) => (/[\s"{]/.test(a) ? `'${a}'` : a)).join(" ")}`;
     if (dryRun) {
+      if (!remove && isAlreadyRegistered(step)) {
+        console.log(`${step.target}: already registered`);
+        continue;
+      }
+      let envPrefix = "";
+      if (step.env.CLAUDE_CONFIG_DIR === null) envPrefix = "env -u CLAUDE_CONFIG_DIR ";
+      if (step.env.CLAUDE_CONFIG_DIR)
+        envPrefix = `CLAUDE_CONFIG_DIR=${step.env.CLAUDE_CONFIG_DIR} `;
+      const shown = `${envPrefix}${step.bin} ${step.args.map((a) => (/[\s"{]/.test(a) ? `'${a}'` : a)).join(" ")}`;
       console.log(`${step.target}:\n  ${shown}`);
       continue;
     }
-    const env = childEnv(step.env, { strip: [/^CLAUDE_CODE_/, "CLAUDECODE"] });
-    try {
-      const { code, stdout, stderr } = await run(step.bin, step.args, { env, timeoutMs: 60_000 });
-      const output = `${stdout}${stderr}`
-        .trim()
-        .split("\n")
-        .filter((l) => !/not trusted|^\s*$/i.test(l));
-      const already = !remove && output.some((l) => /already exists/i.test(l));
-      const absent =
-        remove &&
-        code !== 0 &&
-        output.some((l) => /not found|no .*(server|mcp)|does not exist/i.test(l));
-      let note = output[0] || `exit ${code}`;
-      if (absent) note = "not registered";
-      if (already) note = "already registered";
-      let mark = "✗";
-      if (already || absent) mark = "•";
-      if (code === 0) mark = "✓";
-      console.log(`${mark} ${step.target}: ${note}`);
-    } catch (error) {
-      console.log(`✗ ${step.target}: ${error.message}`);
-    }
+    console.log(await applyCliStep(step, { remove }));
   }
 }
