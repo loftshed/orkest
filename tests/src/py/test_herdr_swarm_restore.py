@@ -20,6 +20,8 @@ import orca_swarm_restore  # noqa: E402
 import peer_mailbox as mailbox  # noqa: E402
 import room_store  # noqa: E402
 
+PANE_CLOSED_SCRIPT = "src/py/herdr_swarm_restore.py"
+
 
 class FakeHerdr:
     def __init__(self, cli):
@@ -206,6 +208,93 @@ class RestoreTests(unittest.TestCase):
         self.api.pane = None
         self.assertEqual(views.restore(self.base, self.env, self.api)[0]["status"], "missing_pane")
         self.assertEqual(self.api.runs, [])
+
+    def _pane_closed_env(self, pane):
+        payload = {"event": "pane_closed", "data": {"type": "pane_closed", "pane_id": pane, "workspace_id": "w1"}}
+        return {
+            **self.env,
+            "HERDR_PLUGIN_ID": "orkest.swarms",
+            "HERDR_PLUGIN_EVENT": "pane.closed",
+            "HERDR_PLUGIN_EVENT_JSON": json.dumps(payload),
+        }
+
+    def test_closing_the_view_pane_in_herdr_keeps_it_closed(self):
+        # The close_pane keybinding or `herdr pane close`: Herdr emits pane.closed after removing the pane.
+        env = self._pane_closed_env("w1:p2")
+        self.assertEqual(views.closed_pane_id(env), "w1:p2")
+        self.api.pane = None
+        self.assertEqual(
+            views.record_pane_closed(self.base, env, self.api, "w1:p2"), [{"room": "room-a", "status": "closed"}]
+        )
+        self.assertTrue(self.state.with_suffix(".closed").exists())
+        self.assertFalse(views.saved_open(self.state, "room-a", self.env))
+        self.assertEqual(
+            views.record_pane_closed(self.base, env, self.api, "w1:p2"),
+            [{"room": "room-a", "status": "already_closed"}],
+        )
+        # The pane coming back later (a recreated label match on cold start) is not restored either.
+        self.api.pane = {"pane_id": "w1:p2", "terminal_id": "other", "label": views.load(self.state)["label"]}
+        self.assertEqual(views.restore(self.base, self.env, self.api, allow_recreated=True), [])
+        self.assertEqual(self.api.runs, [])
+
+    def test_herdr_restart_or_crash_without_pane_closed_keeps_the_saved_view(self):
+        # A server stop, restart or crash emits no pane.closed; the pane comes back for session restore.
+        self.assertIsNone(views.closed_pane_id(self.env))
+        self.assertIsNone(views.closed_pane_id({**self.env, "HERDR_PLUGIN_EVENT": "startup"}))
+        self.assertIsNone(views.closed_pane_id({**self._pane_closed_env("w1:p2"), "HERDR_PLUGIN_EVENT_JSON": "{"}))
+        self.api.pane["label"] = views.load(self.state)["label"]
+        self.assertEqual(views.restore(self.base, self.env, self.api)[0]["status"], "restored")
+        self.assertFalse(self.state.with_suffix(".closed").exists())
+
+    def test_pane_closed_only_marks_a_verified_closed_view_pane(self):
+        # Another pane closing is not this view closing.
+        self.assertEqual(views.record_pane_closed(self.base, self.env, self.api, "w1:p7"), [])
+        # Still in the live snapshot: not closed.
+        self.assertEqual(
+            views.record_pane_closed(self.base, self.env, self.api, "w1:p2"),
+            [{"room": "room-a", "status": "still_open"}],
+        )
+        # A server that cannot answer is going away; never a user close.
+        with mock.patch.object(self.api, "panes", side_effect=RuntimeError("Herdr api snapshot failed")):
+            self.assertEqual(
+                views.record_pane_closed(self.base, self.env, self.api, "w1:p2"),
+                [{"room": "room-a", "status": "unverified"}],
+            )
+        # A record for another Herdr server with the same pane ID is not touched.
+        self.api.pane = None
+        other = {**self.env, "HERDR_SOCKET_PATH": str(self.base / "other.sock")}
+        self.assertEqual(views.record_pane_closed(self.base, other, self.api, "w1:p2"), [])
+        self.assertFalse(self.state.with_suffix(".closed").exists())
+        self.assertTrue(views.saved_open(self.state, "room-a", self.env))
+
+    def test_pane_closed_hook_runs_from_the_plugin_manifest(self):
+        import tomllib
+
+        manifest = tomllib.loads((SCRIPTS.parents[1] / "herdr-plugin.toml").read_text())
+        hooks = [hook for hook in manifest.get("events", []) if hook.get("on") == "pane.closed"]
+        self.assertEqual(hooks, [{"on": "pane.closed", "command": ["python3", PANE_CLOSED_SCRIPT, "--pane-closed"]}])
+        # Run the manifest command the way Herdr does: cwd is the plugin root, the event rides in the env.
+        herdr = self.base / "herdr"
+        herdr.write_text(
+            "#!" + sys.executable + "\nimport json, sys\n"
+            "assert sys.argv[1:] == ['api', 'snapshot'], sys.argv\n"
+            "print(json.dumps({'result': {'snapshot': {'panes': [{'pane_id': 'w1:p1'}]}}}))\n"
+        )
+        herdr.chmod(0o755)
+        env = {
+            "PATH": os.environ.get("PATH", ""),
+            "HOME": str(self.base),
+            "ORCHESTRATE_HOME": str(self.base),
+            "HERDR_ENV": "1",
+            "HERDR_BIN_PATH": str(herdr),
+            **self._pane_closed_env("w1:p2"),
+        }
+        command = [sys.executable if part == "python3" else part for part in hooks[0]["command"]]
+        result = subprocess.run(
+            command, cwd=SCRIPTS.parents[1], env=env, capture_output=True, text=True, timeout=30, check=True
+        )
+        self.assertEqual(json.loads(result.stdout)["views"], [{"room": "room-a", "status": "closed"}])
+        self.assertTrue(self.state.with_suffix(".closed").exists())
 
     def test_handoff_keeps_a_running_view_and_other_servers_are_ignored(self):
         self.api.info["foreground_processes"] = [

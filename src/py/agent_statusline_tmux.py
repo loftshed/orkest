@@ -666,6 +666,9 @@ def _open_herdr_swarm_view_unlocked(
     except (KeyError, TypeError, OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as error:
         print(f"Herdr could not open the room view: {error}", file=sys.stderr)
         return None
+    # A rolled-back restore puts this record back, so the pane.closed event for its own close
+    # does not name the saved view and is not taken for the user closing it.
+    previous_record = restoration.load(state)
     try:
         if restore_only and state.with_suffix(".closed").exists():
             raise RuntimeError("swarm view was closed while restoring")
@@ -679,6 +682,9 @@ def _open_herdr_swarm_view_unlocked(
             time.sleep(0.1)
     except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as error:
         print(f"Herdr room view setup failed: {error}", file=sys.stderr)
+        if restore_only and previous_record is not None:
+            with contextlib.suppress(OSError):
+                restoration.save(state, previous_record)
         try:
             api.call("plugin", "pane", "close", view_pane_id)
         except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as rollback_error:
