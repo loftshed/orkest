@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.98.2
+
+- fix(orchestrate): render handoff notices from the event at delivery
+- fix: point coordinator and lead briefs at the adapter swarm.md
+- fix(tests): delete test fixtures by default so runs stop filling /tmp
+
 ## 0.98.1
 
 - refactor: finish harness adapters and retire transitional Python paths (#254)
