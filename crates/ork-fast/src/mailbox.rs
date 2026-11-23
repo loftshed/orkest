@@ -1456,7 +1456,7 @@ mod tests {
 
     use super::*;
     use crate::mailbox_lifecycle::tests::{
-        EnvGuard, TEST_ENV_LOCK, TestDir, install_counting_python, make_peer, save_peer,
+        EnvGuard, TestDir, install_counting_python, lock_test_env, make_peer, save_peer,
         spawn_count, write_private_file,
     };
     use crate::paths::{fd_identity, lock_path_exclusive};
@@ -1525,7 +1525,7 @@ mod tests {
 
     #[test]
     fn test_try_fast_path_http_mode_and_single_probe_guarantee() {
-        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _lock = lock_test_env();
         let td = TestDir::new("ork-mailbox-http-fast");
         let cache_dir = td.path.join("orchestrate");
         let base = cache_dir.join("mailbox-v1");
@@ -1728,7 +1728,7 @@ mod tests {
 
     #[test]
     fn test_try_fast_path_quota_gate_and_gemini_classification_guard() {
-        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _lock = lock_test_env();
         let td = TestDir::new("ork-fast-quota-gemini");
         let base = td.path.join("cache/mailbox-v1");
         fs::create_dir_all(&base).unwrap();
@@ -1816,7 +1816,7 @@ mod tests {
 
     #[test]
     fn test_solo_martian_name_announcement_and_fast_path_re_announce() {
-        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _lock = lock_test_env();
         let td = TestDir::new("ork-solo-announce");
         let cache_dir = td.path.join("orchestrate");
         let base = cache_dir.join("mailbox-v1");
@@ -1948,7 +1948,7 @@ mod tests {
 
     #[test]
     fn test_mixed_agy_transcript_clears_sticky_inferred_child_unless_sqlite_confirmed() {
-        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _lock = lock_test_env();
         let td = TestDir::new("ork-agy-mixed-tr");
         let cache_dir = td.path.join("orchestrate");
         let base = cache_dir.join("mailbox-v1");
@@ -2058,7 +2058,7 @@ mod tests {
 
     #[test]
     fn test_ordinary_hook_retries_pending_chief_transfer_without_replaying_mail() {
-        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _lock = lock_test_env();
         let td = TestDir::new("ork-chief-hook-retry");
         let cache_dir = td.path.join("orchestrate");
         let base = cache_dir.join("mailbox-v1");
@@ -2175,7 +2175,7 @@ mod tests {
 
     #[test]
     fn test_agy_sqlite_provenance_conflict_unavailable_and_legacy_parent_session() {
-        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _lock = lock_test_env();
         let td = TestDir::new("ork-agy-provenance");
         let cache_dir = td.path.join("orchestrate");
         let base = cache_dir.join("mailbox-v1");
@@ -2333,7 +2333,7 @@ mod tests {
 
     #[test]
     fn test_duplicate_session_end_clear_for_adopted_predecessor_native_id_preserves_successor() {
-        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _lock = lock_test_env();
         let td = TestDir::new("ork-dup-clear-hook");
         let cache_dir = td.path.join("orchestrate");
         let base = cache_dir.join("mailbox-v1");
@@ -2459,7 +2459,7 @@ mod tests {
 
     #[test]
     fn test_agy_transcript_sender_supersedes_cohosted_inference() {
-        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _lock = lock_test_env();
         let td = TestDir::new("ork-agy-cohosted-supersede");
         let cache_dir = td.path.join("orchestrate");
         let base = cache_dir.join("mailbox-v1");
@@ -2556,7 +2556,7 @@ mod tests {
 
     #[test]
     fn test_agy_depth_only_sqlite_allows_transcript_to_supersede_cohosted_parent() {
-        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _lock = lock_test_env();
         let td = TestDir::new("ork-agy-depth-only-sqlite");
         let cache_dir = td.path.join("orchestrate");
         let base = cache_dir.join("mailbox-v1");

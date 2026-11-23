@@ -12,6 +12,23 @@ import time
 from pathlib import Path
 
 TESTS_DIR = Path("tests/src/py")
+AGENT_ENV = Path("tests/helpers/agent-env.txt")
+
+
+def without_agent_session(env: dict[str, str]) -> dict[str, str]:
+    """Drop the agent session this run may have been started from; see AGENT_ENV."""
+    lines = (line.strip() for line in AGENT_ENV.read_text(encoding="utf-8").splitlines())
+    patterns = [line for line in lines if line and not line.startswith("#")]
+    kept = {line[1:] for line in patterns if line.startswith("!")}
+
+    def matches(name: str, pattern: str) -> bool:
+        return name.startswith(pattern[:-1]) if pattern.endswith("*") else name == pattern
+
+    return {
+        name: value
+        for name, value in env.items()
+        if name in kept or not any(matches(name, pattern) for pattern in patterns)
+    }
 
 
 def run_test_file(test_file: Path, env: dict[str, str]) -> tuple[Path, int, float, str, str]:
@@ -27,8 +44,6 @@ def run_test_file(test_file: Path, env: dict[str, str]) -> tuple[Path, int, floa
             "XDG_STATE_HOME": str(Path(home, ".local", "state")),
             "XDG_DATA_HOME": str(Path(home, ".local", "share")),
         }
-        profile.pop("ORCHESTRATE_HOME", None)
-        profile.pop("AGENT_EXECUTOR_HOME", None)
         completed = subprocess.run(
             [sys.executable, "-B", "-m", "unittest", str(test_file)],
             capture_output=True,
@@ -49,7 +64,7 @@ def main() -> int:
     tests_root = str(TESTS_DIR.resolve())
     existing_pythonpath = os.environ.get("PYTHONPATH", "")
     env = {
-        **os.environ,
+        **without_agent_session(dict(os.environ)),
         "PYTHONPATH": f"{tests_root}{os.pathsep}{existing_pythonpath}" if existing_pythonpath else tests_root,
     }
     workers = min(3 if sys.platform == "darwin" else 8, os.cpu_count() or 4)
