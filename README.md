@@ -203,7 +203,7 @@ ork label [--lines 1|2] -- codex|claude|agy|opencode [arguments]   (direct in He
 ork progress --session ID --goal TEXT --task TEXT --stage working [--role ROLE]
 ork name [--model <model>] [--effort <level>] [--harness <harness>] [--short]
 ork routes [--archetype <name>] [--json] [--width 120]
-ork quota [--line|--json] [--refresh]
+ork quota [--line [--width N]|--json] [--refresh]
 ork telemetry [--runs-dir <directory>] [--json] [--width 120]
 ```
 

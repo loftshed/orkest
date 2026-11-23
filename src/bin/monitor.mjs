@@ -22,7 +22,8 @@ Usage:
   monitor [show]             table of every window plus where to spend next
   monitor watch              live full-screen view (r = refresh now, q = quit)
   monitor json               machine-readable snapshot (used by the menu bar app)
-  monitor line               one-line summary for tmux or a status line
+  monitor line               one-line summary for tmux or a status line: each window named,
+                             its reset time and the data age [--width N]
   monitor recommend          ranked pools to use next  [--family claude|gpt|gemini]
   monitor mcp                run as an MCP server on stdio
   monitor init               detect this machine's accounts and write the config [--force] [--dry-run]
@@ -38,6 +39,7 @@ Options:
   --max-age <seconds>        reuse cached data younger than this (default from config, 180)
   --interval <seconds>       watch: how often to re-query providers (default 120)
   --family <name>            recommend: claude, gpt or gemini
+  --width <columns>          line: use the terse form when the labeled one is wider
   --no-color                 plain output
 `;
 
@@ -49,6 +51,7 @@ try {
       refresh: { type: "boolean", short: "r" },
       "max-age": { type: "string" },
       interval: { type: "string" },
+      width: { type: "string" },
       family: { type: "string" },
       json: { type: "boolean" },
       command: { type: "string" },
@@ -191,7 +194,16 @@ try {
         break;
       }
       case "line": {
-        console.log(renderLine(await getAccounts({ force: values.refresh, maxAgeSeconds })));
+        const width = values.width === undefined ? undefined : Number(values.width);
+        if (width !== undefined && (!Number.isSafeInteger(width) || width < 20)) {
+          console.error(`monitor: --width must be a whole number of columns, at least 20`);
+          process.exit(2);
+        }
+        console.log(
+          renderLine(await getAccounts({ force: values.refresh, maxAgeSeconds }), Date.now(), {
+            width,
+          }),
+        );
         break;
       }
       case "recommend": {

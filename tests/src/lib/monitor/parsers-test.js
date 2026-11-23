@@ -15,8 +15,8 @@ import { parseCodexRateLimits } from "../../../../src/lib/monitor/providers/code
 import {
   jsonView,
   pillText,
-  renderLine,
   renderReport,
+  terseLine,
   timeLeft,
 } from "../../../../src/lib/monitor/render.mjs";
 import { parseResetText } from "../../../../src/lib/monitor/time.mjs";
@@ -326,7 +326,7 @@ test("an exhausted longer limit makes shorter ones unusable, never the other way
   expect(split.sections.map((s) => s.entries.map((e) => e.tag))).toStrictEqual([["C"], ["C"]]);
 });
 
-test("line: one group per provider, 5-hour · weekly, time to rollover, ☠ when the week is used up", () => {
+test("terse line: one group per provider, 5-hour · weekly, time to rollover, ☠ when the week is used up", () => {
   const [work, personal, ag] = sampleAccounts();
   const codex = {
     id: "codex",
@@ -350,7 +350,7 @@ test("line: one group per provider, 5-hour · weekly, time to rollover, ☠ when
   expect(pillText(ag, NOW)).toBe("G100·6 8h⏳ C100·27 1d⏳");
   expect(pillText({ ...codex, ok: false }, NOW)).toBe("52 5d!");
   expect(
-    renderLine(
+    terseLine(
       [{ ...work, short: "CW" }, { ...personal, short: "CP" }, codex, { ...ag, short: "AG" }],
       NOW,
     ),
@@ -397,7 +397,7 @@ function creditAccount({
 
 test("ChatGPT switches from weekly quota to remaining credits after exhaustion", () => {
   const account = creditAccount();
-  expect(renderLine([account], NOW)).toBe("CX 62,261.91 cr 5d");
+  expect(terseLine([account], NOW)).toBe("CX 62,261.91 cr 5d");
   const view = jsonView([account], NOW).accounts[0];
   expect(view.credits).toStrictEqual({
     hasCredits: true,
@@ -417,22 +417,22 @@ test("ChatGPT switches from weekly quota to remaining credits after exhaustion",
   expect(renderReport([account], { now: NOW })).toContain(
     "credit balance         62,261.91 cr left",
   );
-  expect(renderLine([{ ...account, ok: false }], NOW)).toBe("CX 62,261.91 cr 5d!");
+  expect(terseLine([{ ...account, ok: false }], NOW)).toBe("CX 62,261.91 cr 5d!");
 });
 
 test("ChatGPT waits for a measured refill before leaving credits", () => {
-  expect(renderLine([creditAccount({ usedPercent: 48 })], NOW)).toBe("CX 52 5d");
+  expect(terseLine([creditAccount({ usedPercent: 48 })], NOW)).toBe("CX 52 5d");
   // The same threshold as the ranking: under half a percent left is used up, so the pill shows credits.
   expect(jsonView([creditAccount({ usedPercent: 99.4 })], NOW).accounts[0].headline.text).toBe("0");
   expect(jsonView([creditAccount({ usedPercent: 99.8 })], NOW).accounts[0].headline.unit).toBe(
     "credits",
   );
-  expect(renderLine([creditAccount()], 1_790_779_510_001)).toBe("CX 62,261.91 cr");
+  expect(terseLine([creditAccount()], 1_790_779_510_001)).toBe("CX 62,261.91 cr");
   // A clock crossing alone does not establish that included quota is available.
   const back = jsonView([creditAccount()], 1_790_779_510_001).accounts[0];
   expect(back.pills[0].credits.text).toBe("62,261.91 cr");
   expect(back.windows[0].resetAwaitingRefresh).toBe(true);
-  expect(renderLine([creditAccount({ usedPercent: 0 })], NOW)).toBe("CX 100 5d");
+  expect(terseLine([creditAccount({ usedPercent: 0 })], NOW)).toBe("CX 100 5d");
   expect(back.credits.text).toBe("62,261.91 cr");
   expect(renderReport([creditAccount({ usedPercent: 48 })], { now: NOW })).toContain(
     "credit balance         62,261.91 cr left",
@@ -474,7 +474,7 @@ test.each([
   [{ hasCredits: true, unlimited: false, balance: "-1" }, "CX ☠5d", "out"],
 ])("ChatGPT renders credit reading %j as %s", (credits, line, level) => {
   const account = creditAccount({ credits });
-  expect(renderLine([account], NOW)).toBe(line);
+  expect(terseLine([account], NOW)).toBe(line);
   expect(jsonView([account], NOW).accounts[0].headline.level).toBe(level);
 });
 
@@ -486,8 +486,8 @@ test("the legacy Codex response supplies credits without attributing them to unr
     },
   });
   const account = { ...creditAccount(), ...parsed };
-  expect(renderLine([account], NOW)).toBe("CX 500 cr 5d");
-  expect(renderLine([{ ...account, provider: "claude" }], NOW)).toBe("CX ☠5d");
+  expect(terseLine([account], NOW)).toBe("CX 500 cr 5d");
+  expect(terseLine([{ ...account, provider: "claude" }], NOW)).toBe("CX ☠5d");
   const other = parseCodexRateLimits({
     rateLimitsByLimitId: {
       other: {
@@ -496,7 +496,7 @@ test("the legacy Codex response supplies credits without attributing them to unr
       },
     },
   });
-  expect(renderLine([{ ...account, ...other }], NOW)).toBe("CX ☠5d");
+  expect(terseLine([{ ...account, ...other }], NOW)).toBe("CX ☠5d");
 });
 
 test("renderReport and jsonView handle empty account lists and preserve configDir", () => {

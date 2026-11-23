@@ -289,9 +289,12 @@ give the user a concise status and end your turn. Do not list, grep, tail, wc, o
 transcripts, scratch files, or task directories to check whether a worker is alive: completion
 arrives via native notifications, completion events, or the "Swarm next step" advisor at your next
 turn, and ork rooms show --room ${room.id} reads recorded state. Prefer bounded, useful tasks over
-spawning a preset team without work. Check native tools and the live model catalog and quota before
-choosing workers. Existing peer presence does not make a peer available; do not commandeer
-unrelated sessions.
+spawning a preset team without work. Check native tools and the live model catalog before choosing
+workers, and read quota fresh at that moment: run ork quota --refresh (monitor show --refresh) or
+use the quota line injected at the start of this turn. Never reuse a quota number from earlier in
+the conversation; it is stale. ork rooms add, lead and dispatch stop on a low or blocked pool and
+name monitor's best alternative; pass --confirm-low-quota only after the user agrees. Existing peer
+presence does not make a peer available; do not commandeer unrelated sessions.
 
 All descendants belong to this SAME room. Add workers with --parent ${memberId}. The room has
 ${room.swarm.maxAgents} member slots shared by all branches and a maximum depth of ${room.swarm.maxDepth}.

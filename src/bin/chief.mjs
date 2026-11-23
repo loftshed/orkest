@@ -143,7 +143,7 @@ export function renderChiefStatus(status, { width = 100, maxRooms = 8, maxStanda
   if (status.accounts?.length > 0) {
     let quota;
     try {
-      quota = renderLine(status.accounts, now);
+      quota = renderLine(status.accounts, now, { width: width - "QUOTA  ".length });
     } catch {
       quota = `${status.accounts.length} accounts (ork quota)`;
     }

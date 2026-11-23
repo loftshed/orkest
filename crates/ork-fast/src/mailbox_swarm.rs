@@ -13,6 +13,7 @@ use crate::identity;
 use crate::mailbox_records;
 use crate::mailbox_transcript;
 use crate::paths;
+use crate::quota_line;
 use crate::rooms_work;
 use crate::sha256;
 use crate::sqlite;
@@ -468,7 +469,25 @@ fn auto_recover_task_cli(task_dir: &Path) -> Option<Value> {
     paths::read_json_file(&task_dir.join("task.json"))
 }
 
+/// The turn-start advisor: pending swarm actions (deduplicated by digest) and, every turn, a quota line
+/// read from monitor's cache at that moment, so the latest reading in the conversation is current.
 fn swarm_next_advisor(
+    base: &Path,
+    me: &mut Value,
+    room: Value,
+    room_id: &str,
+    member_id: &str,
+) -> String {
+    let actions = swarm_next_actions(base, me, room, room_id, member_id);
+    let quota = quota_line::turn_quota_line();
+    match (actions.is_empty(), quota.is_empty()) {
+        (_, true) => actions,
+        (true, false) => quota,
+        (false, false) => format!("{actions}\n{quota}"),
+    }
+}
+
+fn swarm_next_actions(
     base: &Path,
     me: &mut Value,
     mut room: Value,

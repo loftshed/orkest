@@ -1,0 +1,200 @@
+{
+  "_comment": "One monitor snapshot rendered by renderLine (src/lib/monitor/render.mjs) and ork-fast's turn-start quota line; times in UTC.",
+  "now": 1795446000000,
+  "config": {
+    "maxAgeSeconds": 180,
+    "accounts": [
+      {
+        "id": "claude",
+        "label": "Claude",
+        "provider": "claude"
+      },
+      {
+        "id": "codex",
+        "label": "Codex",
+        "provider": "codex"
+      },
+      {
+        "id": "antigravity",
+        "label": "Antigravity",
+        "provider": "antigravity"
+      }
+    ]
+  },
+  "snapshot": {
+    "version": 1,
+    "updatedAt": 1795445940000,
+    "accounts": {
+      "claude": {
+        "id": "claude",
+        "provider": "claude",
+        "ok": true,
+        "fetchedAt": 1795445880000,
+        "windows": [
+          {
+            "id": "5h",
+            "label": "5-hour",
+            "kind": "5h",
+            "windowMins": 300,
+            "usedPct": 82,
+            "remainingPct": 18,
+            "resetsAt": 1795464600000
+          },
+          {
+            "id": "week",
+            "label": "weekly",
+            "kind": "weekly",
+            "windowMins": 10080,
+            "usedPct": 58,
+            "remainingPct": 42,
+            "resetsAt": 1795683600000
+          },
+          {
+            "id": "week-fable",
+            "label": "Fable weekly",
+            "kind": "weekly",
+            "windowMins": 10080,
+            "usedPct": 7,
+            "remainingPct": 93,
+            "resetsAt": 1795683600000,
+            "scope": "Fable"
+          }
+        ],
+        "pools": [
+          {
+            "id": "all",
+            "label": "all models",
+            "families": [
+              "claude"
+            ],
+            "windowIds": [
+              "5h",
+              "week"
+            ]
+          },
+          {
+            "id": "fable",
+            "label": "Fable",
+            "families": [
+              "claude"
+            ],
+            "models": "Fable",
+            "windowIds": [
+              "5h",
+              "week",
+              "week-fable"
+            ]
+          }
+        ]
+      },
+      "codex": {
+        "id": "codex",
+        "provider": "codex",
+        "ok": true,
+        "fetchedAt": 1795445940000,
+        "windows": [
+          {
+            "id": "weekly",
+            "label": "weekly",
+            "kind": "weekly",
+            "windowMins": 10080,
+            "usedPct": 100,
+            "remainingPct": 0,
+            "resetsAt": 1796049900000
+          }
+        ],
+        "pools": [
+          {
+            "id": "codex",
+            "label": "Codex models",
+            "families": [
+              "gpt"
+            ],
+            "windowIds": [
+              "weekly"
+            ]
+          }
+        ],
+        "credits": {
+          "hasCredits": true,
+          "unlimited": false,
+          "balance": 62261.9129
+        }
+      },
+      "antigravity": {
+        "id": "antigravity",
+        "provider": "antigravity",
+        "ok": true,
+        "fetchedAt": 1795445700000,
+        "windows": [
+          {
+            "id": "gemini-weekly",
+            "label": "Gemini weekly",
+            "kind": "weekly",
+            "windowMins": 10080,
+            "usedPct": 51,
+            "remainingPct": 49,
+            "resetsAt": 1796457600000,
+            "pool": "gemini"
+          },
+          {
+            "id": "gemini-5h",
+            "label": "Gemini 5-hour",
+            "kind": "5h",
+            "windowMins": 300,
+            "usedPct": 0.1,
+            "remainingPct": 99.9,
+            "resetsAt": 1795462200000,
+            "pool": "gemini"
+          },
+          {
+            "id": "claude-gpt-weekly",
+            "label": "Claude & GPT weekly",
+            "kind": "weekly",
+            "windowMins": 10080,
+            "usedPct": 46,
+            "remainingPct": 54,
+            "resetsAt": 1795554000000,
+            "pool": "claude-gpt"
+          },
+          {
+            "id": "claude-gpt-5h",
+            "label": "Claude & GPT 5-hour",
+            "kind": "5h",
+            "windowMins": 300,
+            "usedPct": 100,
+            "remainingPct": 0,
+            "resetsAt": 1795462200000,
+            "pool": "claude-gpt"
+          }
+        ],
+        "pools": [
+          {
+            "id": "gemini",
+            "label": "Gemini",
+            "families": [
+              "gemini"
+            ],
+            "windowIds": [
+              "gemini-weekly",
+              "gemini-5h"
+            ]
+          },
+          {
+            "id": "claude-gpt",
+            "label": "Claude & GPT",
+            "families": [
+              "claude",
+              "gpt-oss"
+            ],
+            "windowIds": [
+              "claude-gpt-weekly",
+              "claude-gpt-5h"
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "line": "Claude 5h 18% (↻8:10pm) · wk 42% (↻Thu 9:00am) | Codex wk ☠ (↻Mon 2:45pm), on credits 62,261.91 cr | Antigravity Gemini 5h 99% (↻7:30pm) · wk 49% (↻Dec 5), Claude & GPT 5h ☠ (↻7:30pm) · wk 54%⏳ (↻Tue 9:00pm) · data 5m"
+}

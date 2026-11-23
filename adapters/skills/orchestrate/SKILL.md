@@ -277,7 +277,8 @@ see [references/archetype-rationale.md](references/archetype-rationale.md).
 python3 <orkest-checkout>/src/py/run_agent.py quota
 ```
 
-It reads live [monitor](https://github.com/loftshed/orkest/tree/main/plugins/monitor) data.
+It reads live [monitor](https://github.com/loftshed/orkest/tree/main/plugins/monitor) data. Run it, or
+`ork quota --refresh`, at the moment you choose; never reuse a quota number from earlier in the conversation.
 The route table decides which models fit the task; quota only chooses among fitting routes and never
 justifies a weaker model. Prefer pools marked expiring (capacity lost at the weekly rollover), then the
 most unused capacity. The runner refuses a blocked pool (exit 15; `--ignore-quota` only on the user's
