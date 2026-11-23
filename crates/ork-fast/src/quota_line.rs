@@ -3,7 +3,8 @@
 //! The per-account text mirrors `renderLine` in `src/lib/monitor/render.mjs`: every window named, its
 //! reset time, and the age of the oldest reading. Both are checked against
 //! `tests/crates/ork-fast/fixtures/quota-line.json`. Reading two small files keeps the hook fast; data past
-//! monitor's max age starts a background refresh instead of blocking the turn.
+//! monitor's max age starts a background refresh instead of blocking the turn. A closing note names the
+//! pools whose expiring quota a lead spends to zero instead of handing off early.
 
 use std::env;
 use std::os::unix::process::CommandExt;
@@ -29,6 +30,7 @@ const MONTHS: [&str; 12] = [
 
 struct Window {
     id: String,
+    label: String,
     mins: Option<f64>,
     pct: f64,
     resets_at: Option<i64>,
@@ -59,8 +61,13 @@ fn windows(account: &Value, now: i64) -> Vec<Window> {
         .map(|list| {
             list.iter()
                 .filter_map(|w| {
+                    let id = w.get("id")?.as_str()?.to_string();
                     Some(Window {
-                        id: w.get("id")?.as_str()?.to_string(),
+                        label: w
+                            .get("label")
+                            .and_then(Value::as_str)
+                            .map_or_else(|| id.clone(), str::to_string),
+                        id,
                         mins: number(w.get("windowMins")),
                         pct: number(w.get("remainingPct"))?,
                         resets_at: number(w.get("resetsAt"))
@@ -122,6 +129,68 @@ fn is_expiring(w: &Window, now: i64) -> bool {
     }
     let hours_left = (resets_at - now) as f64 / HOUR_MS;
     hours_left > 0.0 && hours_left <= (mins / 60.0) * 0.2
+}
+
+/// Monitor's use-it-or-lose-it window without its 5% floor: a lead already on the pool loses any
+/// remainder at the reset (`spend_to_zero` in src/py/quota.py).
+fn in_expiry_phase(w: &Window, now: i64) -> bool {
+    let (Some(resets_at), Some(mins)) = (w.resets_at, w.mins) else {
+        return false;
+    };
+    let hours_left = (resets_at - now) as f64 / HOUR_MS;
+    mins >= DAY_MINS
+        && w.pct > EXHAUSTED_PCT
+        && hours_left > 0.0
+        && hours_left <= (mins / 60.0) * 0.2
+}
+
+/// The expiring window a lead spends to zero instead of handing off early (`spend_to_zero` in
+/// src/py/quota.py): no window is exhausted, and every other window resets no later than it. Monitor
+/// reports no measured pace, so a window that resets later is assumed to run out first.
+fn spend_to_zero<'a>(ws: &[&'a Window], now: i64) -> Option<&'a Window> {
+    if ws.iter().any(|w| w.pct <= EXHAUSTED_PCT) {
+        return None;
+    }
+    let expiring = ws
+        .iter()
+        .filter(|w| in_expiry_phase(w, now))
+        .min_by_key(|w| w.resets_at)?;
+    let expires = expiring.resets_at?;
+    ws.iter()
+        .all(|w| std::ptr::eq(*w, *expiring) || w.resets_at.is_some_and(|r| r <= expires))
+        .then_some(*expiring)
+}
+
+/// "Claude weekly 8% (↻4:00pm)" for every shown pool whose expiring quota is spent to zero.
+fn spending_notes(accounts: &[(String, &Value)], now: i64) -> Vec<String> {
+    let mut notes = Vec::new();
+    for (label, account) in accounts {
+        let all = windows(account, now);
+        let pools = independent_pools(account);
+        for (_, pool_label, ids) in &pools {
+            let ws: Vec<&Window> = ids
+                .iter()
+                .filter_map(|id| all.iter().find(|w| &w.id == id))
+                .collect();
+            if let Some(w) = spend_to_zero(&ws, now) {
+                let name = if pools.len() > 1 {
+                    format!("{label} {pool_label}")
+                } else {
+                    label.clone()
+                };
+                let reset = w
+                    .resets_at
+                    .map(|r| format!(" (↻{})", reset_clock(r, now)))
+                    .unwrap_or_default();
+                notes.push(format!(
+                    "{name} {} {}%{reset}",
+                    w.label,
+                    w.pct.floor() as i64
+                ));
+            }
+        }
+    }
+    notes
 }
 
 fn gauge(w: &Window, now: i64) -> Gauge {
@@ -416,6 +485,13 @@ fn turn_line(snapshot: &Value, config: Option<&Value>, now: i64) -> (String, boo
     if !too_old.is_empty() {
         line.push_str(&format!(" | not shown: {}", too_old.join(", ")));
     }
+    let spending = spending_notes(&shown, now);
+    if !spending.is_empty() {
+        line.push_str(&format!(
+            ". Use it or lose it, spending expiring quota to zero (handoff only on exhaustion): {}",
+            spending.join(", ")
+        ));
+    }
     let prefix = if is_all_fresh {
         "Quota now (read at turn start; never reuse a quota number from an earlier turn)"
     } else {
@@ -540,6 +616,49 @@ mod tests {
         let (line, _) = turn_line(&fx["snapshot"], None, now);
         assert!(line.contains("Antigravity Gemini 5h 99%"));
         assert!(line.contains("Claude 5h 18%"));
+    }
+
+    #[test]
+    fn expiring_quota_is_spent_only_when_every_other_window_resets_in_time() {
+        let _lock = lock_test_env();
+        let mut env = EnvGuard::new();
+        env.set("TZ", "UTC");
+        let now: i64 = 1_795_446_000_000; // 3:00pm UTC
+        let hour = 3_600_000;
+        let snapshot = |short: (f64, i64), week: (f64, i64)| {
+            serde_json::json!({"accounts": {"claude": {
+                "provider": "claude",
+                "fetchedAt": now,
+                "windows": [
+                    {"id": "5h", "label": "5-hour", "windowMins": 300, "remainingPct": short.0, "resetsAt": now + short.1 * hour},
+                    {"id": "week", "label": "weekly", "windowMins": 10_080, "remainingPct": week.0, "resetsAt": now + week.1 * hour},
+                ],
+                "pools": [{"id": "all", "label": "all models", "windowIds": ["5h", "week"]}],
+            }}})
+        };
+        let note =
+            ". Use it or lose it, spending expiring quota to zero (handoff only on exhaustion): ";
+        // A low 5-hour window that refills before the weekly reset two hours away: keep spending.
+        let (line, _) = turn_line(&snapshot((6.0, 1), (9.0, 2)), None, now);
+        assert!(
+            line.ends_with(&format!("data 0m{note}Claude weekly 9% (↻5:00pm)")),
+            "{line}"
+        );
+        // The 5-hour window refills first, so the weekly limit is spent below monitor's 5% floor too.
+        let (line, _) = turn_line(&snapshot((40.0, 1), (3.0, 2)), None, now);
+        assert!(line.ends_with("Claude weekly 3% (↻5:00pm)"), "{line}");
+        // A 5-hour window with more percent left can still stop the agent before the weekly reset.
+        let (line, _) = turn_line(&snapshot((12.0, 4), (9.0, 2)), None, now);
+        assert!(!line.contains(note), "{line}");
+        // The 5-hour window runs out and refills only after the weekly reset: early handoff stays.
+        let (line, _) = turn_line(&snapshot((3.0, 4), (20.0, 1)), None, now);
+        assert!(!line.contains(note), "{line}");
+        // A low weekly limit with three days left is not expiring.
+        let (line, _) = turn_line(&snapshot((40.0, 3), (8.0, 72)), None, now);
+        assert!(!line.contains(note), "{line}");
+        // An exhausted window blocks the pool: it is not spent.
+        let (line, _) = turn_line(&snapshot((0.0, 1), (9.0, 2)), None, now);
+        assert!(!line.contains(note), "{line}");
     }
 
     #[test]

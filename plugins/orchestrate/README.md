@@ -361,6 +361,8 @@ At a completed turn, Claude Code, Codex and Antigravity leads can checkpoint the
 
 In the Orkest config, `handoff.early` and `handoff.visible` default to `true`. `handoff.earlyPercentLeft` defaults to Monitor's 10% rule. Orkest requests one checkpoint per low-quota episode. The checkpoint wait is 90 seconds and an outstanding automatic offer expires after 10 minutes. If the lead runs out before acceptance, the exhaustion handoff can still proceed. `handoff.py status` shows the checkpoint and offer status.
 
+Quota that is lost at its reset anyway is spent to zero, not handed off early. That applies when a day-or-longer limit is in the last 20% of its window (Monitor's use-it-or-lose-it rule) and every other window of the pool resets no later than that limit. A 5-hour window that resets later can stop the lead first, whatever its percentage, so it still hands off early, as does a low weekly limit with days left. The turn-start quota line names the pools being spent this way. `ork rooms` passes a low pool with a note instead of asking for `--confirm-low-quota` only when Monitor itself marks it use-it-or-lose-it, with at least 5% left.
+
 After acceptance, automated wakes, continuation notices and Chief delivery pause for the previous lead until its pool resets or fresh Monitor data shows recovery, whichever comes first. You can still type directly into that session.
 
 ## Troubleshooting

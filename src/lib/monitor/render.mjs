@@ -330,6 +330,7 @@ export function jsonView(accounts, now = Date.now()) {
           id: w.id,
           label: w.label,
           kind: w.kind,
+          windowMins: w.windowMins ?? null,
           usedPct: w.usedPct,
           remainingPct: w.remainingPct,
           resetsAt: iso(w.resetsAt),

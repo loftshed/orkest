@@ -72,7 +72,8 @@ peer; display names and free-form aliases do not establish ownership.
    or use the quota line injected at the start of the current turn. Never reuse a quota number from
    earlier in the conversation. `ork rooms add`, `lead`, `dispatch` and `launch` stop on a `low` or
    `blocked` pool and name monitor's best alternative; pass `--confirm-low-quota` only after the user
-   agrees. Orkest never switches accounts or billing for you.
+   agrees. A low pool monitor marks use it or lose it passes with a note.
+   Orkest never switches accounts or billing for you.
 2. Add members to the current room with `ork rooms add --room ID --parent conductor --team TEAM`.
    `--parent` is your own member ID when you are a subswarm lead. Model selectors are resolved by
    the runner at dispatch. All branches share the room's member and depth limits.

@@ -171,6 +171,7 @@ class HandoffTests(unittest.TestCase):
                 "label": a.get("id"),
                 "configDir": a.get("configDir"),
                 "fetchedAt": a.get("fetchedAt", HANDOFF.now().isoformat()),
+                **({"windows": self.windows[a.get("id")]} if a.get("id") in getattr(self, "windows", {}) else {}),
             }
             for a in self.config["accounts"]
         ]
@@ -562,6 +563,57 @@ class HandoffTests(unittest.TestCase):
             self.assertEqual(HANDOFF.poll(self.base, self.lead, at_stop=True, spawn=self.spawn), "")
             self.set_lane("claude-a", usable=4)
             self.assertIn("checkpoint", HANDOFF.poll(self.base, self.lead, at_stop=True, spawn=self.spawn))
+
+    def set_windows(self, account, short, week) -> None:
+        """A 5-hour and a weekly window on the account, each (% left, hours to reset), and its lane's status."""
+        moment = HANDOFF.now()
+        self.windows = {
+            account: [
+                {
+                    "id": window_id,
+                    "label": label,
+                    "windowMins": mins,
+                    "remainingPct": pct,
+                    "resetsAt": (moment + dt.timedelta(hours=hours)).isoformat(),
+                }
+                for window_id, label, mins, (pct, hours) in (
+                    ("5h", "5-hour", 300, short),
+                    ("week", "weekly", 10080, week),
+                )
+            ]
+        }
+        self.set_lane(account, status="available", usable=min(short[0], week[0]), windowIds=["5h", "week"])
+
+    def test_a_low_5h_window_with_the_weekly_reset_two_hours_away_keeps_spending(self) -> None:
+        self.set_windows("claude-a", short=(6, 1), week=(9, 2))
+        self.assertEqual(HANDOFF.poll(self.base, self.lead, at_stop=True, spawn=self.spawn), "")
+        self.assertEqual(self.spawned, [])
+        # An early checkpoint recorded before the weekly limit started expiring ends without a handoff.
+        self.set_windows("claude-a", short=(6, 1), week=(9, 60))
+        self.store_room()
+        self.assertIn("checkpoint", HANDOFF.poll(self.base, self.lead, at_stop=True, spawn=self.spawn))
+        [(session, identifier)] = self.spawned
+        self.set_windows("claude-a", short=(6, 1), week=(9, 2))
+        outcome = HANDOFF.run(session, identifier, base=self.base, launcher=self.launcher, sleep=self.sleeps.append)
+        self.assertEqual(outcome["status"], "not-low", outcome)
+        self.assertIn("spending expiring weekly quota (9% left", outcome["reasons"][0])
+        self.assertIn("handoff only on exhaustion", outcome["reasons"][0])
+
+    def test_a_low_weekly_limit_with_three_days_left_hands_off_early(self) -> None:
+        self.set_windows("claude-a", short=(40, 3), week=(8, 72))
+        self.assertIn("checkpoint", HANDOFF.poll(self.base, self.lead, at_stop=True, spawn=self.spawn))
+        self.assertEqual([session for session, _ in self.spawned], [LEAD])
+
+    def test_a_5h_window_running_out_before_the_weekly_reset_hands_off_early(self) -> None:
+        self.set_windows("claude-a", short=(3, 4), week=(20, 1))
+        self.assertIn("checkpoint", HANDOFF.poll(self.base, self.lead, at_stop=True, spawn=self.spawn))
+        self.assertEqual([session for session, _ in self.spawned], [LEAD])
+
+    def test_a_5h_window_with_more_percent_left_that_resets_after_the_weekly_hands_off_early(self) -> None:
+        # 12% of five hours can run dry long before the weekly 9% resets: the 5-hour window may stop the lead.
+        self.set_windows("claude-a", short=(12, 4), week=(9, 2))
+        self.assertIn("checkpoint", HANDOFF.poll(self.base, self.lead, at_stop=True, spawn=self.spawn))
+        self.assertEqual([session for session, _ in self.spawned], [LEAD])
 
     def offered_with_marker(self, **lane_changes):
         self.set_lane("claude-a", status="available", usable=4, **lane_changes)

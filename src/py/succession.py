@@ -144,6 +144,8 @@ def pools(view: dict[str, Any] | None, config: dict[str, Any]) -> list[dict[str,
             )
         )
         alias = view_acct.get("alias") or cfg_acct.get("alias")
+        windows = quota.lane_windows(lane, view)
+        status = quota.assess(lane)
         found.append(
             {
                 "pool": f"{account_id}:{lane.get('poolId')}",
@@ -154,14 +156,13 @@ def pools(view: dict[str, Any] | None, config: dict[str, Any]) -> list[dict[str,
                 "category": raw_category.strip() if isinstance(raw_category, str) and raw_category.strip() else None,
                 "tags": tags,
                 "alias": alias.strip() if isinstance(alias, str) and alias.strip() else None,
-                "status": quota.assess(lane),
+                "status": status,
                 "availableNowPct": lane.get("availableNowPct"),
                 "fetchedAt": view_acct.get("fetchedAt"),
-                "windows": [
-                    window
-                    for window in view_acct.get("windows", [])
-                    if window.get("id") in (lane.get("windowIds") or [])
-                ],
+                "windows": windows,
+                "spendToZero": quota.spend_to_zero(windows, expires_at=lane.get("expiresAt"), now=now())
+                if status in USABLE
+                else None,
                 "surplusPts": lane.get("surplusPts"),
                 "subPoolOf": lane.get("subPoolOf"),
                 "blockedUntil": lane.get("blockedUntil"),

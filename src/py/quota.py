@@ -257,6 +257,75 @@ def assess(lane: dict[str, Any]) -> str:
     return "available"
 
 
+# Monitor's "use it or lose it" (isExpiring in src/lib/monitor/analyze.mjs): a day-or-longer limit in the last
+# 20% of its window with at least 5% left. The 5% floor ranks where new work goes, so the quota gate keeps it;
+# a lead already on the pool loses any remainder at the reset, so its handoff drops the floor.
+EXPIRING_FRACTION = 0.2
+EXPIRING_MIN_PCT = 5
+DAY_MINS = 1440
+EXHAUSTED_PCT = 0.5
+
+
+def _reset_at(window: dict[str, Any]) -> dt.datetime | None:
+    value = window.get("resetsAt")
+    try:
+        reset = dt.datetime.fromisoformat(value.replace("Z", "+00:00")) if isinstance(value, str) else None
+    except ValueError:
+        return None
+    return reset if reset is not None and reset.tzinfo is not None else None
+
+
+def spend_to_zero(
+    windows: list[dict[str, Any]],
+    *,
+    expires_at: str | None = None,
+    min_pct: float = 0,
+    now: dt.datetime | None = None,
+) -> dict[str, Any] | None:
+    """The expiring window to spend to zero instead of handing off early, or None.
+
+    A day-or-longer window in its last 20% (with at least `min_pct` left) loses its remainder at the reset.
+    It is spent to zero only when no other window of the pool can stop the session first: every other window
+    resets no later than it. Percentages of windows of different lengths are not the same amount of quota,
+    and monitor reports no measured pace, so a window that resets later is assumed to run out first.
+    `expires_at` is monitor's lane `expiresAt`, used when the windows do not carry their length. The same
+    rule draws the turn-start quota line's note (`spend_to_zero` in crates/ork-fast/src/quota_line.rs).
+    """
+    moment = now or dt.datetime.now(dt.UTC)
+    measured = [w for w in windows if isinstance(w, dict) and _number(w.get("remainingPct")) is not None]
+    if any(_number(w["remainingPct"]) <= EXHAUSTED_PCT for w in measured):
+        return None  # an exhausted window blocks the pool: that is the exhaustion handoff's case
+    expiring = []
+    for window in measured:
+        reset, mins = _reset_at(window), _number(window.get("windowMins"))
+        if reset is None or reset <= moment or _number(window["remainingPct"]) < min_pct:
+            continue
+        hours_left = (reset - moment).total_seconds() / 3600
+        if (mins is not None and mins >= DAY_MINS and hours_left <= mins / 60 * EXPIRING_FRACTION) or (
+            mins is None and expires_at is not None and reset == _reset_at({"resetsAt": expires_at})
+        ):
+            expiring.append((reset, window))
+    if not expiring:
+        return None
+    expires, window = min(expiring, key=lambda item: item[0])
+    for other in measured:
+        reset = _reset_at(other)
+        if other is not window and (reset is None or reset > expires):
+            return None
+    return {
+        "window": window.get("label") or window.get("id"),
+        "remainingPct": _number(window["remainingPct"]),
+        "resetsAt": expires.isoformat(),
+    }
+
+
+def lane_windows(lane: dict[str, Any], view: dict[str, Any]) -> list[dict[str, Any]]:
+    """The account windows a monitor lane's pool is limited by."""
+    ids = lane.get("windowIds") or []
+    account = next((a for a in view.get("accounts", []) if a.get("id") == lane.get("accountId")), {})
+    return [w for w in account.get("windows") or [] if isinstance(w, dict) and w.get("id") in ids]
+
+
 def _prefer_claude_pool(candidates: list[dict[str, Any]], model: str | None) -> dict[str, Any]:
     lowered = model.lower() if model else ""
     target_pool = "fable" if ("fable" in lowered or "mythos" in lowered) else "all"
@@ -472,7 +541,14 @@ def check(
     )
     if lane is None:
         return {"status": "unknown", "detail": f"monitor has no allowed pool for {engine} {model}"}
-    return {"status": assess(lane), **summary(lane)}
+    status = assess(lane)
+    # New work goes only onto a pool monitor itself marks use it or lose it: its expiring flag, with the floor.
+    spend = (
+        spend_to_zero(lane_windows(lane, view), expires_at=lane.get("expiresAt"), min_pct=EXPIRING_MIN_PCT)
+        if status in ("available", "low") and lane.get("expiring") is True
+        else None
+    )
+    return {"status": status, **summary(lane), "spendToZero": spend}
 
 
 check_quota = check
