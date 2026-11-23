@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.99.0
+
+- feat(orchestrate): hand off before quota runs out to a visible successor (#261)
+- fix: open Swarm View only on request and keep closed views closed (#260)
+
 ## 0.98.2
 
 - fix(orchestrate): render handoff notices from the event at delivery
