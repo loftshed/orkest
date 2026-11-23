@@ -14,7 +14,9 @@ check records one exhaustion event per session and starts the handoff in a detac
 5. wakes or launches the successor with the note, and leaves a notice that every live session in the
    repository shows on its next turn. Anything unknown refuses with a reason and the same notice.
 
-At a Stop boundary, fresh low quota instead requests a checkpoint and starts a planned offer.
+At a Stop boundary, fresh low quota instead requests a checkpoint and starts a planned offer, unless the
+remainder is lost at an expiring reset that no other window outlasts (quota.spend_to_zero): that is spent to
+zero, and only real exhaustion hands off.
 The offer keeps the current lead active until acceptance. Fresh planned successors can run in a
 sibling pane, using the same guarded executor as the headless fallback.
 """
@@ -481,6 +483,19 @@ def below_threshold(pool: dict[str, Any], threshold: float) -> bool:
     return pool.get("status") in succession().USABLE and type(remaining) in (int, float) and remaining < threshold
 
 
+def spending_text(spend: dict[str, Any]) -> str:
+    return (
+        f"spending expiring {spend['window']} quota ({spend['remainingPct']:g}% left, resets {spend['resetsAt']}) "
+        "to zero; handoff only on exhaustion"
+    )
+
+
+def early_due(pool: dict[str, Any], threshold: float) -> bool:
+    """Low enough for an early handoff. Quota that is lost at its reset anyway is spent to zero instead
+    (`spendToZero`, quota.spend_to_zero); the exhaustion handoff still catches a real runout."""
+    return below_threshold(pool, threshold) and not pool.get("spendToZero")
+
+
 def poll(
     base: Path,
     me: dict[str, Any],
@@ -530,7 +545,7 @@ def poll(
         return ""
     pool = s.pool_for(harness, session_model(acting), account, view, config)
     fresh_at_stop = early and s.pool_fresh(pool, config)
-    low = below_threshold(pool, options["earlyPercentLeft"])
+    low = early_due(pool, options["earlyPercentLeft"])
     if fresh_at_stop and pool.get("status") in s.USABLE and not low and previous:
         with locked(directory):
             current = load_json(directory / "event.json") or {}
@@ -2283,13 +2298,18 @@ def handoff(
                     f"monitor's data for the pool {choice['pool']} is stale or unknown: whether it is out is unknown"
                 )
             if choice["status"] not in s.EXHAUSTED and not (
-                early and below_threshold(choice["leadQuota"], options["earlyPercentLeft"])
+                early and early_due(choice["leadQuota"], options["earlyPercentLeft"])
             ):
                 # A rate limit with room left (a burst, an overload) is no exhausted pool: no handoff, no notice.
+                spend = choice["leadQuota"].get("spendToZero") if early else None
                 return {
                     **outcome,
                     "status": "not-low" if early else "not-exhausted",
-                    "reasons": [f"monitor reports the pool {choice['pool']} {choice['status']}"],
+                    "reasons": [
+                        spending_text(spend)
+                        if spend
+                        else f"monitor reports the pool {choice['pool']} {choice['status']}"
+                    ],
                 }
         if record and record["lead"].get("pool") and choice.get("pool") and record["lead"]["pool"] != choice["pool"]:
             return refuse(f"the team records the lead's pool {record['lead']['pool']}, not {choice['pool']}")

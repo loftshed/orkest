@@ -2,7 +2,8 @@
  * Quota check before a room member is added, made a lead or dispatched. It reads monitor's snapshot (fresh,
  * or cached within monitor's max age) and asks quota.check, the decision run_agent's quota gate makes,
  * which pool pays for each engine and model. A `low` or `blocked` pool needs explicit confirmation; the
- * message names monitor's best alternative. Nothing here switches accounts or billing.
+ * message names monitor's best alternative. A low pool monitor marks use-it-or-lose-it (its `expiring` flag,
+ * with the 5% floor) passes with a note. Nothing here switches accounts or billing.
  */
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
@@ -24,7 +25,7 @@ payload = json.loads(sys.stdin.read())
 out = []
 for route in payload["routes"]:
     result = quota.check(route["engine"], route["model"], payload["view"])
-    out.append({key: result.get(key) for key in ("status", "label", "accountId", "poolId", "availableNowPct", "advice")})
+    out.append({key: result.get(key) for key in ("status", "label", "accountId", "poolId", "availableNowPct", "advice", "spendToZero")})
 print(json.dumps(out))
 `;
 
@@ -130,17 +131,28 @@ function describe(finding) {
   return `${pool} quota is ${state} for ${route}${detail ? ` (${detail})` : ""}.${alternative}`;
 }
 
+/** A low pool monitor marks use-it-or-lose-it (quota.check's spendToZero): spend it, do not gate. */
+const isSpentToZero = (finding) => finding.status === "low" && Boolean(finding.spendToZero);
+
+function spendNote(finding) {
+  const route = finding.model ? `${finding.engine}:${finding.model}` : finding.engine;
+  const spend = finding.spendToZero;
+  return `${finding.label || finding.engine} quota is low for ${route}, but its ${spend.window} remainder (${Math.floor(spend.remainingPct)}%) is lost at the reset (${spend.resetsAt}) unless spent: use it or lose it; a quota handoff happens only on exhaustion.`;
+}
+
 /**
  * Stops on a `low` or `blocked` pool unless confirmed; once confirmed, returns the warnings to print.
- * Healthy, unknown and unmonitored pools pass silently.
+ * A low pool monitor marks use-it-or-lose-it passes with a note. Healthy, unknown and unmonitored pools
+ * pass silently.
  */
 export function quotaGate(findings, { confirmed = false } = {}) {
-  const flagged = findings.filter((f) => GATED.has(f.status));
-  if (flagged.length === 0) return [];
+  const notes = findings.filter(isSpentToZero).map(spendNote);
+  const flagged = findings.filter((f) => GATED.has(f.status) && !isSpentToZero(f));
+  if (flagged.length === 0) return notes;
   const messages = flagged.map(describe);
   if (!confirmed)
     throw new Error(
       `${messages.join("\n")}\nPass --confirm-low-quota to go ahead on this pool anyway, after checking with the user. Orkest never switches accounts or billing for you.`,
     );
-  return messages;
+  return [...notes, ...messages];
 }

@@ -329,6 +329,93 @@ class CheckTests(unittest.TestCase):
         )
 
 
+NOW = dt.datetime(2026, 11, 23, 14, 0, tzinfo=dt.UTC)
+
+
+def windows(short: tuple[float, float], week: tuple[float, float], *, lengths: bool = True) -> list[dict]:
+    """A 5-hour and a weekly window, each (% left, hours to reset) from NOW."""
+    return [
+        {
+            "id": window_id,
+            "label": label,
+            **({"windowMins": mins} if lengths else {}),
+            "remainingPct": pct,
+            "resetsAt": (NOW + dt.timedelta(hours=hours)).isoformat(),
+        }
+        for window_id, label, mins, (pct, hours) in (("5h", "5-hour", 300, short), ("week", "weekly", 10080, week))
+    ]
+
+
+class SpendToZeroTests(unittest.TestCase):
+    def test_a_low_5h_window_that_refills_before_the_weekly_reset_keeps_spending(self) -> None:
+        spend = QUOTA.spend_to_zero(windows((6, 1), (9, 2)), now=NOW)
+        self.assertEqual(
+            spend,
+            {"window": "weekly", "remainingPct": 9, "resetsAt": (NOW + dt.timedelta(hours=2)).isoformat()},
+        )
+
+    def test_an_expiring_weekly_limit_is_spent_below_monitors_floor(self) -> None:
+        self.assertEqual(QUOTA.spend_to_zero(windows((40, 1), (3, 2)), now=NOW)["window"], "weekly")
+        # The quota gate keeps monitor's floor: new work does not go onto a nearly empty pool.
+        self.assertIsNone(QUOTA.spend_to_zero(windows((40, 1), (3, 2)), min_pct=5, now=NOW))
+
+    def test_a_low_weekly_limit_with_days_left_hands_off_early(self) -> None:
+        self.assertIsNone(QUOTA.spend_to_zero(windows((40, 3), (8, 72)), now=NOW))
+
+    def test_a_5h_window_that_runs_out_before_the_weekly_reset_hands_off_early(self) -> None:
+        self.assertIsNone(QUOTA.spend_to_zero(windows((3, 4), (20, 1)), now=NOW))
+
+    def test_a_5h_window_with_more_percent_left_that_resets_later_hands_off_early(self) -> None:
+        # 12% of five hours is not more quota than 9% of a week: the 5-hour window may stop the session first.
+        self.assertIsNone(QUOTA.spend_to_zero(windows((12, 4), (9, 2)), now=NOW))
+
+    def test_an_exhausted_or_unknown_window_is_not_spent(self) -> None:
+        self.assertIsNone(QUOTA.spend_to_zero(windows((0, 1), (9, 2)), now=NOW))
+        unknown = windows((6, 1), (9, 2))
+        del unknown[0]["resetsAt"]
+        self.assertIsNone(QUOTA.spend_to_zero(unknown, now=NOW))
+
+    def test_without_window_lengths_monitors_expiring_lane_decides(self) -> None:
+        bare = windows((6, 1), (9, 2), lengths=False)
+        self.assertIsNone(QUOTA.spend_to_zero(bare, now=NOW))
+        expires = (NOW + dt.timedelta(hours=2)).isoformat()
+        self.assertEqual(QUOTA.spend_to_zero(bare, expires_at=expires, now=NOW)["window"], "weekly")
+
+    def gemini(self, short: tuple[float, float], week: tuple[float, float], *, expiring: bool) -> dict:
+        """The view with Antigravity Gemini's 5-hour and weekly windows, each (% left, hours to reset)."""
+        spending = view()
+        reset = dt.datetime.now(dt.UTC)
+        spending["accounts"][3]["windows"] = [
+            {
+                "id": f"gemini-{window_id}",
+                "label": label,
+                "windowMins": mins,
+                "remainingPct": pct,
+                "resetsAt": (reset + dt.timedelta(hours=hours)).isoformat(),
+            }
+            for window_id, label, mins, (pct, hours) in (
+                ("5h", "5-hour", 300, short),
+                ("weekly", "weekly", 10080, week),
+            )
+        ]
+        spending["lanes"][3].update(
+            windowIds=["gemini-5h", "gemini-weekly"], availableNowPct=min(short[0], week[0]), expiring=expiring
+        )
+        return spending
+
+    def test_check_reports_it_for_the_quota_gate(self) -> None:
+        spending = self.gemini((40, 1), (6, 2), expiring=True)
+        result = QUOTA.check("agy", "gemini-3.8-flash-medium", spending)
+        self.assertEqual((result["status"], result["spendToZero"]["window"]), ("low", "weekly"))
+        self.assertIsNone(QUOTA.check("codex", "gpt-5.6-luna", spending)["spendToZero"])
+
+    def test_the_quota_gate_keeps_monitors_floor_for_new_work(self) -> None:
+        # Weekly 1% resetting in 30 hours: monitor ranks it low room, not use it or lose it.
+        for expiring in (False, True):
+            result = QUOTA.check("agy", "gemini-3.8-flash-medium", self.gemini((40, 3), (1, 30), expiring=expiring))
+            self.assertEqual((result["status"], result["spendToZero"]), ("low", None))
+
+
 class RecommendTests(unittest.TestCase):
     registry = {
         "profiles": [

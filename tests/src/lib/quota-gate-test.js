@@ -121,4 +121,60 @@ describe("quota gate", () => {
       "Claude quota is blocked for claude:claude-opus-5-5 (6% usable now; only 6% usable now: small tasks only). Monitor has no other pool with room now; see monitor recommend.",
     ]);
   });
+
+  // The view with Claude's 5-hour and weekly windows, each [% left, hours to reset], and monitor's flag.
+  const claudeWindows = (short, week, expiring) => {
+    const at = (hours) => new Date(Date.now() + hours * 3_600_000).toISOString();
+    const window = (id, label, windowMins, [remainingPct, hours]) => ({
+      id,
+      label,
+      windowMins,
+      remainingPct,
+      resetsAt: at(hours),
+    });
+    return {
+      ...view,
+      accounts: view.accounts.map((a) =>
+        a.id === "claude"
+          ? {
+              ...a,
+              windows: [window("5h", "5-hour", 300, short), window("week", "weekly", 10_080, week)],
+            }
+          : a,
+      ),
+      lanes: view.lanes.map((l) =>
+        l.accountId === "claude"
+          ? {
+              ...l,
+              windowIds: ["5h", "week"],
+              availableNowPct: Math.min(short[0], week[0]),
+              expiring,
+            }
+          : l,
+      ),
+    };
+  };
+  const claudeRoute = [{ engine: "claude", model: "claude-opus-5-5" }];
+
+  it("passes a use-it-or-lose-it pool with a note instead of refusing it", async () => {
+    const findings = await checkRouteQuota(claudeRoute, {
+      view: claudeWindows([6, 1], [9, 2], true),
+    });
+    expect(findings[0]).toMatchObject({ status: "low", spendToZero: { window: "weekly" } });
+    const [note] = quotaGate(findings);
+    expect(note).toBe(
+      `Claude quota is low for claude:claude-opus-5-5, but its weekly remainder (9%) is lost at the reset (${findings[0].spendToZero.resetsAt}) unless spent: use it or lose it; a quota handoff happens only on exhaustion.`,
+    );
+    // A low pool that is not expiring still needs confirmation.
+    expect(() => quotaGate([{ ...findings[0], spendToZero: null }])).toThrow("--confirm-low-quota");
+  });
+
+  it("refuses a nearly empty pool monitor ranks low room, not use it or lose it", async () => {
+    // Weekly 1% resetting in 30 hours with the 5-hour window at 40%: below monitor's 5% floor.
+    const findings = await checkRouteQuota(claudeRoute, {
+      view: claudeWindows([40, 3], [1, 30], false),
+    });
+    expect(findings[0]).toMatchObject({ status: "low", spendToZero: null });
+    expect(() => quotaGate(findings)).toThrow("--confirm-low-quota");
+  });
 });
