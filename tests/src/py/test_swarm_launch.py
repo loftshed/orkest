@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import io
 import json
 import os
 import pty
@@ -654,6 +655,9 @@ class HerdrSwarmLaunchTests(unittest.TestCase):
             "    print(json.dumps({'result': {'snapshot': {'panes': panes}}}))\n"
             "elif args[:2] == ['pane', 'process-info']:\n"
             "    pane = args[args.index('--pane') + 1]\n"
+            "    if state.get('fail_info_new') and pane not in ('w1:p1', 'w1:p99'):\n"
+            "        state_path.write_text(json.dumps(state))\n"
+            "        sys.exit(1)\n"
             "    run = next((r for r in reversed(state['runs']) if r['pane'] == pane), None)\n"
             "    argv = shlex.split(run['command'])[1:] if run else ['zsh']\n"
             "    while run and argv and '=' in argv[0]:\n"
@@ -679,8 +683,8 @@ class HerdrSwarmLaunchTests(unittest.TestCase):
             "    if target not in state['panes']:\n"
             "        sys.exit(1)\n"
             "    print(json.dumps({'ok': True, 'result': {'pane': {'pane_id': target, 'agent_session': state.get('agent_session')}}}))\n"
-            "elif args[:2] == ['pane', 'close']:\n"
-            "    target = args[args.index('--pane') + 1] if '--pane' in args else args[2]\n"
+            "elif args[:2] == ['pane', 'close'] or args[:3] == ['plugin', 'pane', 'close']:\n"
+            "    target = args[args.index('--pane') + 1] if '--pane' in args else args[-1]\n"
             "    if target in state['panes']:\n"
             "        state['panes'].remove(target)\n"
             "    state_path.write_text(json.dumps(state))\n"
@@ -1091,6 +1095,40 @@ class HerdrSwarmLaunchTests(unittest.TestCase):
             self.assertEqual(updated_room["conductor"]["session"]["id"], cleared_sid)
             self.assertIn(session_id, updated_room["conductor"]["previousSessions"])
 
+    def _herdr_pane_closed(self, home: Path, pane: str) -> list[dict[str, str]]:
+        """Run the orkest.swarms pane.closed hook the way Herdr does after closing `pane`."""
+        import herdr_swarm_restore as restoration
+
+        event = {"event": "pane_closed", "data": {"type": "pane_closed", "pane_id": pane, "workspace_id": "w1"}}
+        env = {**os.environ, "HERDR_PLUGIN_EVENT": "pane.closed", "HERDR_PLUGIN_EVENT_JSON": json.dumps(event)}
+        closed = restoration.closed_pane_id(env)
+        self.assertEqual(closed, pane)
+        return restoration.record_pane_closed(home, env, restoration.Herdr(env["HERDR_BIN_PATH"], env), closed)
+
+    def test_rolled_back_automatic_restore_is_not_taken_for_a_herdr_close(self):
+        import agent_statusline_tmux as terminal
+        import herdr_swarm_restore as restoration
+
+        with self._reused_pane_room() as (home, base, room, _session):
+            self.assertEqual(terminal.toggle_swarm_view("open", room=room["id"], base=base)["pane"], "w1:p2")
+            state_file = home / "herdr-state.json"
+            state = json.loads(state_file.read_text())
+            # The view is lost without a close event, and the replacement view never starts.
+            state["panes"].remove("w1:p2")
+            state["fail_info_new"] = True
+            state_file.write_text(json.dumps(state))
+            view_state = restoration.state_path(home, room["id"], dict(os.environ))
+            with contextlib.redirect_stderr(io.StringIO()):
+                restored = terminal.toggle_swarm_view("open", room=room["id"], base=base, respect_closed=True)
+            self.assertNotEqual(restored.get("status"), "opened")
+            calls = json.loads(state_file.read_text())["calls"]
+            self.assertIn(["plugin", "pane", "close", "w1:p3"], calls)
+            # Orkest closed its own rollback pane; Herdr reports that close like any other.
+            self.assertEqual(self._herdr_pane_closed(home, "w1:p3"), [])
+            self.assertEqual(restoration.load(view_state)["pane"], "w1:p2")
+            self.assertFalse(view_state.with_suffix(".closed").exists())
+            self.assertTrue(restoration.saved_open(view_state, room["id"], dict(os.environ)))
+
     def test_native_claude_launch_only_restores_a_saved_open_swarm_view(self):
         import agent_statusline_tmux as terminal
         import herdr_swarm_restore as restoration
@@ -1102,6 +1140,7 @@ class HerdrSwarmLaunchTests(unittest.TestCase):
             (["--resume", "native-session"], None),
             (["--resume", "native-session"], "missing"),
             (["--resume", "native-session"], "closed"),
+            (["--resume", "native-session"], "herdr_closed"),
             (["--resume", "native-session"], "open"),
         ):
             with self.subTest(args=args, intent=intent), self._reused_pane_room() as (home, base, room, _session):
@@ -1113,7 +1152,7 @@ class HerdrSwarmLaunchTests(unittest.TestCase):
                 binary.touch(mode=0o700)
                 state_file = home / "herdr-state.json"
                 state_path = restoration.state_path(home, room["id"], dict(os.environ))
-                if intent in ("closed", "open"):
+                if intent in ("closed", "herdr_closed", "open"):
                     opened = terminal.toggle_swarm_view("open", room=room["id"], base=base)
                     self.assertEqual(opened["pane"], "w1:p2")
                     if intent == "closed":
@@ -1121,10 +1160,16 @@ class HerdrSwarmLaunchTests(unittest.TestCase):
                             terminal.toggle_swarm_view("close", room=room["id"], base=base)["status"], "closed"
                         )
                     else:
-                        # Simulate loss of the live view while preserving the user's saved open intent.
+                        # The view pane goes away outside Orkest.
                         state = json.loads(state_file.read_text())
                         state["panes"].remove("w1:p2")
                         state_file.write_text(json.dumps(state))
+                    if intent == "herdr_closed":
+                        # Herdr's close-pane keybinding or `herdr pane close` emits pane.closed, and
+                        # the plugin hook records the user's close.
+                        self._herdr_pane_closed(home, "w1:p2")
+                    # "open": no pane.closed, as after a Herdr restart or crash that lost the pane,
+                    # so the user's saved open intent stands.
                 calls_before = len(json.loads(state_file.read_text())["calls"])
                 env = {}
 
@@ -1153,7 +1198,7 @@ class HerdrSwarmLaunchTests(unittest.TestCase):
                     sum(call[:3] == ["plugin", "pane", "open"] for call in new_calls), int(intent == "open")
                 )
                 self.assertEqual([row["id"] for row in room_store.list_rooms(base)], [room["id"]])
-                self.assertEqual(state_path.with_suffix(".closed").exists(), intent == "closed")
+                self.assertEqual(state_path.with_suffix(".closed").exists(), intent in ("closed", "herdr_closed"))
                 notice = (output or {}).get("hookSpecificOutput", {}).get("additionalContext", "")
                 if intent is None:
                     self.assertIsNone(env.get("ORKEST_SWARM_ROOM"))

@@ -8,6 +8,12 @@ platforms = ["macos", "linux"]
 [[startup]]
 command = ["python3", "src/py/herdr_swarm_restore.py", "--restore"]
 
+# Herdr's own close (keybinding or `herdr pane close`) keeps a Swarm View closed, like `q`.
+# A server stop, restart or crash emits no pane.closed, so saved views still come back.
+[[events]]
+on = "pane.closed"
+command = ["python3", "src/py/herdr_swarm_restore.py", "--pane-closed"]
+
 [[actions]]
 id = "toggle"
 title = "Toggle Orkest Swarm View"

@@ -427,6 +427,63 @@ def restore(
     return outcomes
 
 
+def closed_pane_id(env: dict[str, str]) -> str | None:
+    """The pane named by a Herdr `pane.closed` plugin event, or None for any other invocation."""
+    if env.get("HERDR_PLUGIN_EVENT") != "pane.closed":
+        return None
+    try:
+        payload = json.loads(env.get("HERDR_PLUGIN_EVENT_JSON") or "{}")
+    except ValueError:
+        return None
+    data = payload.get("data") if isinstance(payload, dict) else None
+    pane = data.get("pane_id") if isinstance(data, dict) else None
+    return pane if isinstance(pane, str) and pane else None
+
+
+def record_pane_closed(base: Path, env: dict[str, str], api: Herdr, pane: str) -> list[dict[str, str]]:
+    """Record a view pane closed in Herdr (keybinding, `herdr pane close`) as the user's close.
+
+    Herdr 0.9.5 emits `pane.closed` only for a deliberate close. A server stop, restart or crash
+    keeps the pane for session restore, and a view that exits on its own emits `pane.exited`, so
+    neither marks the view closed. Orkest's own closes hold the operation lock and settle the
+    record first: they already write `.closed`, or a rolled-back restore puts back the record
+    that names the old pane.
+    """
+    outcomes: list[dict[str, str]] = []
+    with operation_lock(base, env):
+        matches = [
+            (path, record)
+            for path in sorted(state_directory(base, env).glob("*.json"))
+            if (record := load(path))
+            and isinstance(record.get("room"), str)
+            and owns_record(record, record["room"], env)
+            and record.get("pane") == pane
+        ]
+        if not matches:
+            return outcomes
+        try:
+            live = {item["pane_id"] for item in api.panes()}
+        except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired):
+            # A server that cannot answer is shutting down or gone; that is never a user close.
+            return [{"room": record["room"], "status": "unverified"} for _path, record in matches]
+        for path, record in matches:
+            room = record["room"]
+            if pane in live:
+                outcomes.append({"room": room, "status": "still_open"})
+                continue
+            if path.with_suffix(".closed").exists():
+                outcomes.append({"room": room, "status": "already_closed"})
+                continue
+            path.with_suffix(".closed").touch(mode=0o600)
+            path.with_suffix(".pending").unlink(missing_ok=True)
+            mailbox = base / "mailbox-v1"
+            with contextlib.suppress(OSError, RuntimeError, ValueError):
+                if (room_store.read_room(mailbox, room) or {}).get("herdrViewPaneId") == pane:
+                    room_store.set_metadata(mailbox, room, herdrViewPaneId=None)
+            outcomes.append({"room": room, "status": "closed"})
+    return outcomes
+
+
 def adopt(base: Path, env: dict[str, str], api: Herdr, cli: Path) -> list[dict[str, str]]:
     with operation_lock(base, env):
         return _adopt_unlocked(base, env, api, cli)
@@ -818,6 +875,7 @@ def main() -> int:
     parser.add_argument("--restore", action="store_true")
     parser.add_argument("--adopt", action="store_true")
     parser.add_argument("--inventory", action="store_true")
+    parser.add_argument("--pane-closed", action="store_true", help="handle a Herdr pane.closed plugin event")
     parser.add_argument("--room", help="optional room ID to scope --inventory")
     args = parser.parse_args()
     env = dict(os.environ)
@@ -833,6 +891,11 @@ def main() -> int:
     cli = runtime_paths.node_runtime(__file__) / "bin/ork.mjs"
     if args.inventory:
         print(json.dumps(inventory(base, env, api, cli=cli, only_room=args.room)))
+        return 0
+    if args.pane_closed:
+        pane = closed_pane_id(env)
+        outcomes = record_pane_closed(base, env, api, pane) if pane else []
+        print(json.dumps({"status": "ok", "views": outcomes}))
         return 0
     if args.view:
         room = env.get("ORKEST_SWARM_ROOM")
