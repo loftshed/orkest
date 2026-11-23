@@ -55,7 +55,8 @@ conductor's own agent tools instead of starting a CLI session.
 An executor run stops after the runner's default 15 minutes. For a longer run, give the task enough
 time with `init-task --time-budget DURATION` (default `1h`), then pass `dispatch --timeout DURATION`
 (or `"timeout"` on a launch-plan member). The coordinator refuses a timeout longer than the task's
-remaining time instead of shortening it. A native dispatch takes no `--timeout`; it ends at the
+remaining time instead of shortening it; `ork hall extend-task --task-dir DIR --add 30m --reason TEXT`
+adds time to an existing task. A native dispatch takes no `--timeout`; it ends at the
 task deadline. See [coordinator.md](coordinator.md#initialize-and-dispatch).
 
 ```sh
@@ -87,7 +88,8 @@ restores the previous binding; retry an uncertain dispatch with the same request
 Continues default to 3 per member. Set `--max-continues N` on `init-task` or the first dispatch, or
 `max_continues` in the initial spec (0–6; hard ceiling 6). Later runs cannot raise it. Continues also
 consume the task's invocation allowance and deadline; use `init-task --invocation-allowance N` for
-more total invocations. The one-correction allowance stays separate.
+more total invocations. The one-correction allowance stays separate: send it with
+`dispatch --kind correction --evidence FILE` (see [Send a correction](swarm.md#send-a-correction)).
 
 A script that drives workers can show its own row in the Swarm View, with no reserved member. After
 the room exists, run these from the room's folder (the first from this skill directory's path):

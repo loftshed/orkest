@@ -28,8 +28,8 @@ raw file reads, tracing, or test output:
 
 1. **Follow-up on existing work: continue with the owning worker session.** When a worker
    leaves a gap, failing check, or review follow-up, send it back to the session that holds the file
-   context. Native subagent: message or resume it. Audited executor run: dispatch at most one
-   `coordinator.py dispatch --kind correction` with reviewed evidence; a second gap or a scope/history
+   context. Native subagent: message or resume it. Audited executor run: send at most one
+   [correction](#send-a-correction) with reviewed evidence; a second gap or a scope/history
    violation requires a new bounded task or explicit conductor takeover. Do not repair worker output
    in-session while a worker session can continue, and do not spawn a cold worker for the same slice.
 2. **Sustained exploration, edits you cannot state upfront, or test/build runs: delegate and yield.**
@@ -133,6 +133,35 @@ After review, record `accept` and run
 `ork hall integrate --room ID --member MEMBER --message "feat(scope): subject"` to commit the result and register it with the smelter queue. Recording
 `accept` alone never commits.
 Cross-harness workers are supported; subswarm leads stay in their parent's native harness.
+
+### Send a correction
+
+A correction resumes a finished executor run's session with evidence you reviewed, once per task.
+Write the evidence file outside the repository:
+
+```json
+{
+  "conclusion": "What the worker must fix",
+  "claims": [
+    { "statement": "Two tests fail", "source": "/abs/test-output.txt", "excerpt": "2 failing" }
+  ]
+}
+```
+
+Each claim quotes an exact `excerpt` from its absolute `source`: your notes or saved check output,
+never the worker's `result.json` or anything under the task's `runs/`. Optional fields are
+`question`, `owner`, `invalidation_trigger` and a claim's `kind` (`observation`, `fact`, `inference`).
+Then run `ork hall dispatch --room ID --member MEMBER --task-dir DIR --kind correction --evidence FILE`.
+The host captures each source and the checkout's HEAD, checks the excerpts and records a review
+receipt before it dispatches; nothing the worker reported counts. The receipt goes stale if a source,
+HEAD or the working tree changes first, and it can never accept work. To use a receipt you made
+with `coordinator.py capture` and `verify-evidence` ([coordinator.md](coordinator.md#pointdexter-capture-before-review)),
+pass `--review-id ID` instead.
+
+The correction inherits the session, model, effort, timeout and gates, and its `--timeout` must fit
+the task's remaining time. When the deadline is spent, add time with `ork hall extend-task --task-dir
+DIR --add 30m --reason TEXT`; runs already launched keep their deadline. A second gap needs a new
+task directory from `ork hall init-task` (the script calls it `coordinator.py init`) or a takeover.
 
 The default room has 12 member slots and 3 levels below its root. `--max-agents` and `--max-depth`
 choose those limits at creation. Slots include queued members and leads, remain allocated after

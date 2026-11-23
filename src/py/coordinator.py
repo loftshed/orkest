@@ -55,6 +55,9 @@ WORK_KINDS = {"implementation", "correction", "continue"}
 ABANDON_GRACE_SECONDS = 10.0
 
 
+EXTEND_HINT = "extend the task with `ork hall extend-task --task-dir DIR --add DURATION --reason TEXT`"
+
+
 class CoordinationError(ValueError):
     pass
 
@@ -669,7 +672,9 @@ def dispatch(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
             + "recover the unresolved dispatch before starting new work; only active read-only runs can overlap"
         )
     if RUNNER.deadline_remaining(state["deadline"]) <= 0:
-        raise CoordinationError("task deadline exhausted; conductor must investigate or replan")
+        raise CoordinationError(
+            "task deadline exhausted; " + EXTEND_HINT + " (coordinator.py extend), or investigate and replan"
+        )
     if args.timeout is not None:
         if args.transport == "native":
             raise CoordinationError("--timeout limits the executor runner; a native run ends at the task deadline")
@@ -822,7 +827,10 @@ def dispatch(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
         if not work or work["status"] != "finished" or any(run["kind"] == "correction" for run in state["runs"]):
             raise CoordinationError("one correction requires a finished implementation")
         if args.evidence is None and not args.review_id:
-            raise CoordinationError("correction requires conductor-reviewed --evidence")
+            raise CoordinationError(
+                "correction requires a host review receipt: pass --review-id from verify-evidence, or "
+                "`ork hall dispatch --kind correction --evidence FILE` to capture and review it in one step"
+            )
         previous_result = read(Path(work["result_path"]))
         if digest(Path(work["result_path"])) != work["result_sha256"] or not previous_result.get("session_id"):
             raise CoordinationError("previous result changed or has no exact session")
@@ -853,7 +861,7 @@ def dispatch(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
         account = prior_impl.get("account")
         claude_config_dir = prior_impl.get("claude_config_dir")
         if state.get("evidence_policy") == "host_receipts_required":
-            proof = EVIDENCE.receipt(state, args.review_id, RUNNER)
+            proof = EVIDENCE.receipt(state, args.review_id, RUNNER, correction=True)
             evidence_record = {"review_id": proof["review_id"]}
         else:
             evidence_record = check_evidence(args.evidence)
@@ -896,7 +904,7 @@ def dispatch(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -
         if RUNNER.parse_duration(timeout) > remaining:
             raise CoordinationError(
                 f"{'--timeout' if args.timeout else 'inherited --timeout'} {timeout} exceeds the task's remaining "
-                f"{int(remaining)}s; init the task with a longer --time-budget or pass a shorter --timeout"
+                f"{int(remaining)}s; pass a shorter --timeout, or {EXTEND_HINT} (coordinator.py extend)"
             )
     if not engine or not model_id:
         raise CoordinationError("dispatch requires an exact --engine and --model")
@@ -1258,9 +1266,45 @@ def review(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -> 
     return record
 
 
+def extend(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -> dict[str, Any]:
+    """Add time to a task's deadline. Runs already launched keep the deadline they were given."""
+    if state["status"] not in {"active", "accepted"}:
+        raise CoordinationError("only an active or accepted task can be extended; start a new bounded task")
+    if not args.reason.strip():
+        raise CoordinationError("extend requires a --reason")
+    added = RUNNER.parse_duration(args.add, option="--add")
+    now = dt.datetime.now(dt.UTC)
+    previous = state["deadline"]
+    deadline = (max(timestamp(previous), now) + dt.timedelta(seconds=added)).isoformat()
+    state.setdefault("deadline_extensions", []).append(
+        {"previous": previous, "deadline": deadline, "added": args.add, "reason": args.reason, "at": now.isoformat()}
+    )
+    state["deadline"] = deadline
+    save(directory, state)
+    return {
+        "previous_deadline": previous,
+        "deadline": deadline,
+        "remaining_seconds": int(RUNNER.deadline_remaining(deadline)),
+    }
+
+
+def review_correction(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -> dict[str, Any]:
+    """Capture a correction's cited files and mint its host review receipt in one step."""
+    work = latest_work(state)
+    if state["status"] != "active":
+        raise CoordinationError("task has been accepted or returned to the conductor")
+    if not work or work["status"] != "finished" or any(run["kind"] == "correction" for run in state["runs"]):
+        raise CoordinationError("one correction requires a finished implementation")
+    if state.get("evidence_policy") != "host_receipts_required":
+        raise CoordinationError("this older task takes dispatch --evidence directly")
+    if RUNNER.deadline_remaining(state["deadline"]) <= 0:
+        raise CoordinationError("task deadline exhausted; " + EXTEND_HINT + " (coordinator.py extend)")
+    return EVIDENCE.review_correction(state, directory, args.evidence, RUNNER, SUPPORT)
+
+
 def host_action(args: argparse.Namespace, directory: Path, state: dict[str, Any]) -> Any:
     action = args.action
-    if action in {"verify-evidence", "record-decision"} and any(
+    if action in {"verify-evidence", "review-correction", "record-decision"} and any(
         run["status"] not in {"finished", "cancelled"} for run in state["runs"]
     ):
         raise CoordinationError("finish/recover the active audit before evidence review")
@@ -1299,6 +1343,8 @@ def host_action(args: argparse.Namespace, directory: Path, state: dict[str, Any]
         result = EVIDENCE.capture(state, directory, args, RUNNER, SUPPORT)
     elif action == "verify-evidence":
         result = EVIDENCE.verify(state, read(args.packet), RUNNER)
+    elif action == "review-correction":
+        result = review_correction(args, directory, state)
     elif action == "register":
         result = EVIDENCE.register(state, read(args.packet))
     elif action == "record-decision":
@@ -1368,7 +1414,7 @@ def main(argv: list[str] | None = None) -> int:
     route.add_argument("--packet", type=Path, required=True)
     recommend = commands.add_parser("recommend")
     recommend.add_argument("--packet", type=Path, required=True)
-    init = commands.add_parser("init")
+    init = commands.add_parser("init", aliases=["init-task"])
     init.add_argument("--task-spec", type=Path, required=True)
     init.add_argument("--host", choices=("codex", "agy", "claude", "opencode", "other"))
     init.add_argument("--authority", help="team whose lead may change this task (see authority.py)")
@@ -1387,7 +1433,9 @@ def main(argv: list[str] | None = None) -> int:
         "capture",
         "capture-checks",
         "verify-evidence",
+        "review-correction",
         "register",
+        "extend",
         "record-decision",
         "ack",
         "native-attach",
@@ -1495,6 +1543,11 @@ def main(argv: list[str] | None = None) -> int:
         elif action == "ack":
             sub.add_argument("--run-id", required=True)
             sub.add_argument("--event-id", required=True)
+        elif action == "review-correction":
+            sub.add_argument("--evidence", type=Path, required=True, help="correction evidence JSON; see swarm.md")
+        elif action == "extend":
+            sub.add_argument("--add", required=True, help="time to add to the deadline, such as 30m")
+            sub.add_argument("--reason", required=True)
         elif action == "capture-checks":
             sub.add_argument("--run-id", required=True)
             sub.add_argument("--component", required=True)
@@ -1505,6 +1558,8 @@ def main(argv: list[str] | None = None) -> int:
             sub.add_argument("--reason", required=True)
             sub.add_argument("--verify-command", action="append", default=[])
     args = parser.parse_args(argv)
+    if args.action == "init-task":
+        args.action = "init"
     try:
         if args.action == "route":
             output = choose_route(read(args.packet))
@@ -1555,6 +1610,9 @@ def main(argv: list[str] | None = None) -> int:
                         output = reverify(args, directory, state)
                     elif args.action == "abandon":
                         output = abandon(args, directory, state)
+                    elif args.action == "extend":
+                        with task_json_lock(directory):
+                            output = extend(args, directory, state)
                     elif args.action == "show":
                         output = state
                     else:

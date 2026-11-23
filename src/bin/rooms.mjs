@@ -70,13 +70,17 @@ ork rooms pause|resume --room ID [--member conductor|MEMBER]   (gates new launch
 ork rooms init-task --task-spec FILE --task-dir DIR (--host codex|claude|agy|opencode|other | --authority TEAM_ID)
                     [--time-budget DURATION]   (task deadline, default 1h)
                     [--max-continues N] [--invocation-allowance N]   (continue cap 0-6, default 3)
-ork rooms dispatch --room ID --member ID --task-dir DIR [--kind investigation|implementation|consultation|challenge|continue]
+ork rooms extend-task --task-dir DIR --add DURATION --reason TEXT   (add time to a task's deadline)
+ork rooms dispatch --room ID --member ID --task-dir DIR
+                   [--kind investigation|implementation|consultation|challenge|continue|correction]
                    [--transport executor|native] [--packet FILE] [--request-id ID] [--role ROLE] [--cwd PATH]
                    [--timeout DURATION]   (executor runner limit, default 15m; must fit the task deadline)
                    [--allow-credits]   (Codex credit spend; only with the user's permission)
                    [--verify-command CMD]... [--auto-correct ROUNDS]   (implementation gates; rounds 0-2)
                    [--protect-path PATH]...   (files an auto-correct round may not change)
                    [--task-spec FILE]   (required for continue, in the existing task/session)
+                   [--evidence FILE | --review-id ID]   (required for correction; --evidence is
+                                                        captured and reviewed by the host)
                    [--max-continues N]   (first dispatch only, hard ceiling 6)
                    [--confirm-low-quota]   (go ahead on a low or blocked pool; only with the user's agreement)
 ork rooms launch --room ID --plan FILE [--allow-credits] [--confirm-low-quota]
@@ -84,7 +88,7 @@ ork rooms launch --room ID --plan FILE [--allow-credits] [--confirm-low-quota]
 ork rooms bind --room ID --member ID|conductor --session ID --engine ENGINE [--role ROLE] [--cwd PATH] [--keep-worktree]
 ork rooms recover --room ID
 
-A room or task under a team (--authority) is fenced: init-task, dispatch, launch and recover also need
+A room or task under a team (--authority) is fenced: init-task, extend-task, dispatch, launch and recover also need
 --lead-session and --lead-generation from authority.py show.
 
 create/add queue members. dispatch/launch use the coordinator and may start billable work.
@@ -161,6 +165,9 @@ export async function roomsCommand(
           "target",
           "role",
           "time-budget",
+          "add",
+          "evidence",
+          "review-id",
           "timeout",
           "auto-correct",
           "max-continues",
@@ -479,6 +486,19 @@ export async function roomsCommand(
 
       break;
     }
+    case "extend-task": {
+      result = await run([
+        "extend",
+        "--task-dir",
+        path.resolve(requireValue("task-dir")),
+        "--add",
+        requireValue("add"),
+        "--reason",
+        requireValue("reason"),
+        ...leadArgs,
+      ]);
+      break;
+    }
     case "dispatch": {
       const roomId = requireValue("room");
       const memberId = requireValue("member");
@@ -502,6 +522,8 @@ export async function roomsCommand(
         autoCorrect: values["auto-correct"],
         maxContinues: values["max-continues"],
         taskSpec: values["task-spec"],
+        evidence: values.evidence,
+        reviewId: values["review-id"],
         ...lead,
       });
 
