@@ -965,15 +965,44 @@ fn record_native_swarm_identity(base: &Path, me: &mut Value) {
     }
 }
 
-fn promote_resumed_coordinator(base: &Path, session: &str, cwd: &str) -> Option<Value> {
+/// The room the resumed (or forked-from) session already belongs to, if any.
+///
+/// A resume hint only recovers an existing membership. It never creates a room and never
+/// promotes a session that is not already a member or the conductor of an open room.
+fn resumed_swarm_membership(
+    base: &Path,
+    session: &str,
+    harness: &str,
+    cwd: &str,
+) -> Option<rooms_work::MatchedSwarmRoom> {
+    let target = env::var("ORKEST_RESUME_TARGET").ok()?;
+    if target.is_empty() || target == session {
+        return None;
+    }
+    rooms_work::find_session_swarm_room(base, &target, Some(harness), Some(cwd), None)
+}
+
+/// Move a known room's conductor binding to the resumed session. Showing the view is a
+/// separate decision: it follows the saved open intent, checked when the view restores.
+fn rebind_resumed_conductor(base: &Path, room: &str, session: &str, cwd: &str) -> Option<String> {
+    let cache_root = base.parent().unwrap_or(base);
     let cli = paths::runtime_root()?.join("src/bin/ork.mjs");
     if !cli.is_file() {
         return None;
     }
-    let cache_root = base.parent().unwrap_or(base);
     let mut cmd = Command::new(paths::node_binary());
     cmd.arg(cli)
-        .args(["hall", "promote", "--session", session, "--cwd", cwd])
+        .args([
+            "hall",
+            "promote",
+            "--room",
+            room,
+            "--session",
+            session,
+            "--cwd",
+            cwd,
+        ])
+        .env("ORKEST_SWARM_ROOM", room)
         .env("AGENT_EXECUTOR_HOME", cache_root)
         .env("ORCHESTRATE_HOME", cache_root)
         .stdin(std::process::Stdio::null());
@@ -981,8 +1010,7 @@ fn promote_resumed_coordinator(base: &Path, session: &str, cwd: &str) -> Option<
     if !out.status.success() {
         return None;
     }
-    let parsed: Value = serde_json::from_slice(&out.stdout).ok()?;
-    parsed.get("room").filter(|r| r.is_object()).cloned()
+    Some(room.to_string())
 }
 
 fn instance_key_for(me: &Value, room_id: &str) -> String {
@@ -1003,6 +1031,59 @@ fn instance_key_for(me: &Value, room_id: &str) -> String {
         })
         .unwrap_or_default();
     format!("{room_id}:{host_ref}")
+}
+
+/// Try once to restore a view whose open intent was saved. Returns whether an attempt ran,
+/// whatever its outcome: the caller records it, so a failing restore does not open and close
+/// a pane on every prompt. A failure is not the user's choice, so it never writes `.closed`.
+fn restore_known_swarm_view(base: &Path, me: &Value, room: &str, instance_key: &str) -> bool {
+    if me.get("swarmAutoReconnected").and_then(Value::as_str) == Some(instance_key) {
+        return false;
+    }
+    let socket = if herdr_active() {
+        None
+    } else {
+        let socket = me
+            .get("terminalServer")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| env::var("ORKEST_TERMINAL_SERVER").ok())
+            .filter(|value| !value.is_empty());
+        if socket.is_none() {
+            return false;
+        }
+        socket
+    };
+    let session = me.get("session").and_then(Value::as_str).unwrap_or("");
+    let harness = me.get("harness").and_then(Value::as_str).unwrap_or("");
+    let cwd = me.get("cwd").and_then(Value::as_str);
+    let _ = toggle_swarm_view_cli(
+        "open",
+        socket.as_deref(),
+        Some(room),
+        session,
+        harness,
+        cwd,
+        base,
+        true,
+    );
+    true
+}
+
+fn remember_swarm_restore(base: &Path, me: &mut Value, instance_key: &str) {
+    if me.get("swarmAutoReconnected").and_then(Value::as_str) != Some(instance_key)
+        && let Some(session) = me.get("session").and_then(Value::as_str)
+        && let Some(updated) = identity::annotate_peer(
+            base,
+            session,
+            &[(
+                "swarmAutoReconnected",
+                Value::String(instance_key.to_string()),
+            )],
+        )
+    {
+        *me = updated;
+    }
 }
 
 /// Auto-bind root swarm coordinator or reconnect resumed coordinator/lead (`mailbox_hooks.py::swarm_coordinator_context`).
@@ -1026,10 +1107,6 @@ pub fn swarm_coordinator_context(
         || (event == "PreInvocation" && !mid_turn);
     record_native_swarm_identity(base, me);
 
-    let mut room_id = active_env_swarm_room(base).unwrap_or_default();
-    let mut toggled_resume_view = false;
-    let mut resume_instance_key: Option<String> = None;
-
     let my_session = me
         .get("session")
         .and_then(Value::as_str)
@@ -1046,73 +1123,43 @@ pub fn swarm_coordinator_context(
         .unwrap_or("")
         .to_string();
 
-    if is_turn_start && env::var("ORKEST_RESUME_SWARM").as_deref() == Ok("1") {
-        if !room_id.is_empty()
-            && let Some(inherited) = sqlite::read_room(base, &room_id)
-            && let Some(cond) = inherited.get("conductor").filter(|v| v.is_object())
-        {
-            let other_owner = rooms_work::room_session_peers(base, &inherited, cond, true)
-                .into_iter()
-                .any(|o| o.get("session").and_then(Value::as_str) != Some(my_session.as_str()));
-            if other_owner {
-                // SAFETY: called single-threaded inside ork-fast process before child spawns.
-                unsafe {
-                    env::remove_var("ORKEST_SWARM_ROOM");
-                }
-            }
-        }
-        let Some(promoted) = promote_resumed_coordinator(base, &my_session, &my_cwd) else {
-            return String::new();
-        };
-        let Some(pid_room) = promoted.get("id").and_then(Value::as_str) else {
-            return String::new();
-        };
-        room_id = pid_room.to_string();
-        let item_key = instance_key_for(me, &room_id);
-        resume_instance_key = Some(item_key.clone());
-        let has_term = me.get("terminalServer").is_some_and(paths::is_truthy_json)
-            || env::var("ORKEST_TERMINAL_SERVER").is_ok_and(|v| !v.is_empty())
-            || herdr_active();
-        if me.get("swarmAutoReconnected").and_then(Value::as_str) != Some(item_key.as_str())
-            && has_term
-        {
-            let server_sock_owned = if herdr_active() {
-                None
-            } else {
-                me.get("terminalServer")
+    let native_resume = env::var("ORKEST_RESUME_SWARM").as_deref() == Ok("1");
+    let mut resumed_member = None;
+    let room_id = if !native_resume {
+        active_env_swarm_room(base)
+    } else if is_turn_start {
+        // A resume hint can recover a known binding. It cannot assign an unbound room
+        // or create a new one.
+        match resumed_swarm_membership(base, &my_session, &my_harness, &my_cwd) {
+            Some(matched) if matched.member_id.is_empty() || matched.member_id == "conductor" => {
+                matched
+                    .room
+                    .get("id")
                     .and_then(Value::as_str)
-                    .map(str::to_string)
-                    .or_else(|| env::var("ORKEST_TERMINAL_SERVER").ok())
-            };
-            if let Some(outcome) = toggle_swarm_view_cli(
-                "open",
-                server_sock_owned.as_deref(),
-                Some(&room_id),
-                &my_session,
-                &my_harness,
-                Some(&my_cwd),
-                base,
-                true,
-            ) {
-                toggled_resume_view = matches!(
-                    outcome.get("status").and_then(Value::as_str),
-                    Some("opened" | "already_open" | "starting" | "already_closed")
-                );
+                    .and_then(|room| rebind_resumed_conductor(base, room, &my_session, &my_cwd))
+            }
+            other => {
+                resumed_member = other;
+                None
             }
         }
+    } else {
+        None
     }
-
+    .unwrap_or_default();
     if room_id.is_empty() {
         if !is_turn_start {
             return String::new();
         }
-        let Some(matched) = rooms_work::find_session_swarm_room(
-            base,
-            &my_session,
-            Some(&my_harness),
-            Some(&my_cwd),
-            None,
-        ) else {
+        let Some(matched) = resumed_member.or_else(|| {
+            rooms_work::find_session_swarm_room(
+                base,
+                &my_session,
+                Some(&my_harness),
+                Some(&my_cwd),
+                None,
+            )
+        }) else {
             return String::new();
         };
         let Some(m_room_id) = matched
@@ -1138,37 +1185,7 @@ pub fn swarm_coordinator_context(
             room = rebound;
         }
         let item_key = instance_key_for(me, &m_room_id);
-        let mut toggled_view = false;
-        let has_term = me.get("terminalServer").is_some_and(paths::is_truthy_json)
-            || env::var("ORKEST_TERMINAL_SERVER").is_ok_and(|v| !v.is_empty())
-            || herdr_active();
-        if me.get("swarmAutoReconnected").and_then(Value::as_str) != Some(item_key.as_str())
-            && has_term
-        {
-            let server_sock_owned = if herdr_active() {
-                None
-            } else {
-                me.get("terminalServer")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-                    .or_else(|| env::var("ORKEST_TERMINAL_SERVER").ok())
-            };
-            if let Some(outcome) = toggle_swarm_view_cli(
-                "open",
-                server_sock_owned.as_deref(),
-                Some(&m_room_id),
-                &my_session,
-                &my_harness,
-                Some(&my_cwd),
-                base,
-                true,
-            ) {
-                toggled_view = matches!(
-                    outcome.get("status").and_then(Value::as_str),
-                    Some("opened" | "already_open" | "starting" | "already_closed")
-                );
-            }
-        }
+        let restore_attempted = restore_known_swarm_view(base, me, &m_room_id, &item_key);
         let delivered = deliver_swarm_brief_or_summary(
             base,
             me,
@@ -1178,16 +1195,8 @@ pub fn swarm_coordinator_context(
             &item_key,
             is_turn_start,
         );
-        if toggled_view
-            && delivered.is_empty()
-            && me.get("swarmAutoReconnected").and_then(Value::as_str) != Some(item_key.as_str())
-            && let Some(updated) = identity::annotate_peer(
-                base,
-                &my_session,
-                &[("swarmAutoReconnected", Value::String(item_key))],
-            )
-        {
-            *me = updated;
+        if restore_attempted {
+            remember_swarm_restore(base, me, &item_key);
         }
         if !delivered.is_empty() {
             return delivered;
@@ -1352,8 +1361,9 @@ pub fn swarm_coordinator_context(
     }
 
     if is_prompt_turn || (was_already_bound && is_turn_start) {
-        let allow_brief = (is_prompt_turn || env::var("ORKEST_RESUME_SWARM").as_deref() == Ok("1"))
-            && !cli_launched_with_brief;
+        let restore_attempted =
+            was_already_bound && restore_known_swarm_view(base, me, &room_id, &item_key);
+        let allow_brief = (is_prompt_turn || native_resume) && !cli_launched_with_brief;
         let delivered = deliver_swarm_brief_or_summary(
             base,
             me,
@@ -1363,30 +1373,12 @@ pub fn swarm_coordinator_context(
             &item_key,
             allow_brief,
         );
-        if toggled_resume_view
-            && let Some(ref room_key) = resume_instance_key
-            && me.get("swarmAutoReconnected").and_then(Value::as_str) != Some(room_key.as_str())
-            && let Some(updated) = identity::annotate_peer(
-                base,
-                &my_session,
-                &[("swarmAutoReconnected", Value::String(room_key.clone()))],
-            )
-        {
-            *me = updated;
+        if restore_attempted {
+            remember_swarm_restore(base, me, &item_key);
         }
         if !delivered.is_empty() {
             return delivered;
         }
-    } else if toggled_resume_view
-        && let Some(ref room_key) = resume_instance_key
-        && me.get("swarmAutoReconnected").and_then(Value::as_str) != Some(room_key.as_str())
-        && let Some(updated) = identity::annotate_peer(
-            base,
-            &my_session,
-            &[("swarmAutoReconnected", Value::String(room_key.clone()))],
-        )
-    {
-        *me = updated;
     }
 
     if is_turn_start {
@@ -1399,6 +1391,84 @@ pub fn swarm_coordinator_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mailbox_lifecycle::tests::{EnvGuard, TEST_ENV_LOCK, TestDir, make_peer, save_peer};
+    use serde_json::json;
+
+    #[test]
+    fn native_resume_hint_cannot_create_a_room_or_claim_an_inherited_room() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let directory = TestDir::new("ork-swarm-resume-intent");
+        let base = directory.path.join("mailbox-v1");
+        let cwd = directory.path.to_str().unwrap();
+        let mut env = EnvGuard::new();
+        env.set("HERDR_ENV", "0");
+        env.set("ORKEST_RESUME_SWARM", "1");
+        env.set("ORKEST_RESUME_TARGET", "ordinary-session");
+        env.set("ORKEST_SWARM_ROOM", "existing-room");
+        env.remove("CLAUDE_CODE_SESSION_ID");
+        let room = json!({
+            "schema": "agent-executor.room.v1",
+            "id": "existing-room",
+            "cwd": cwd,
+            "updatedAt": 1000,
+            "swarm": {"maxAgents": 4},
+            "conductor": {"engine": "claude", "role": "lead"},
+            "objective": "Existing swarm work",
+            "agents": [],
+        });
+        paths::write_json_atomic(&base.join("rooms/existing-room.json"), &room).unwrap();
+
+        let mut ordinary = make_peer("ordinary-session", "claude", cwd);
+        save_peer(&base, &ordinary);
+        assert_eq!(
+            swarm_coordinator_context(&base, &mut ordinary, "SessionStart", false),
+            ""
+        );
+        assert_eq!(sqlite::list_rooms(&base), vec![room]);
+        assert!(!base.join("swarm-briefs").exists());
+    }
+
+    #[test]
+    fn resume_finds_the_known_coordinator_whether_or_not_its_view_was_left_open() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let directory = TestDir::new("ork-swarm-resume-membership");
+        let base = directory.path.join("mailbox-v1");
+        let cwd = directory.path.to_str().unwrap();
+        let mut env = EnvGuard::new();
+        env.set("HERDR_ENV", "0");
+        env.remove("ORKEST_SWARM_ROOM");
+        env.remove("CLAUDE_CODE_SESSION_ID");
+        let host = paths::current_hostname().unwrap();
+        let room = json!({
+            "schema": "agent-executor.room.v1",
+            "id": "existing-room",
+            "machine": host,
+            "cwd": cwd,
+            "updatedAt": 1000,
+            "swarm": {"maxAgents": 4},
+            "conductor": {
+                "engine": "claude",
+                "role": "lead",
+                "session": {"id": "original-session", "engine": "claude", "machine": host, "cwd": cwd},
+            },
+            "objective": "Existing swarm work",
+            "agents": [],
+            // The view was closed: no saved open intent anywhere.
+            "tmuxViewOpen": false,
+        });
+        paths::write_json_atomic(&base.join("rooms/existing-room.json"), &room).unwrap();
+
+        env.set("ORKEST_RESUME_TARGET", "original-session");
+        let matched = resumed_swarm_membership(&base, "forked-session", "claude", cwd).unwrap();
+        assert_eq!(matched.room["id"], "existing-room");
+        assert_eq!(matched.member_id, "conductor");
+
+        // A session resuming itself, or resuming a conversation no room knows, has no membership.
+        assert!(resumed_swarm_membership(&base, "original-session", "claude", cwd).is_none());
+        env.set("ORKEST_RESUME_TARGET", "ordinary-session");
+        assert!(resumed_swarm_membership(&base, "forked-session", "claude", cwd).is_none());
+        assert_eq!(sqlite::list_rooms(&base), vec![room]);
+    }
 
     #[test]
     fn test_match_side_and_swarm_commands() {

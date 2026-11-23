@@ -115,6 +115,39 @@ class SwarmStatusTests(unittest.TestCase):
                 )
 
 
+@unittest.skipUnless(shutil.which("node"), "room metadata requires Node")
+class TmuxViewIntentTests(unittest.TestCase):
+    def test_tmux_room_from_before_the_open_flag_keeps_its_view_on_resume(self):
+        import agent_statusline_tmux as terminal
+
+        environment = {"TMUX": "/tmp/tmux-test/default,1,0", "HERDR_ENV": "0"}
+        cases = (
+            ({}, True),  # saved before the flag existed: the old launcher always showed the view
+            ({"tmuxViewOpen": True}, True),
+            ({"tmuxViewOpen": False}, False),  # closed after the upgrade
+            ({"herdrCoordinatorPaneId": "w1:p1"}, False),  # a Herdr room keeps its own record
+            ({"status": "closed", "closedAt": 1}, False),
+        )
+        for fields, expected in cases:
+            with self.subTest(fields=fields), tempfile.TemporaryDirectory() as temporary:
+                home = Path(temporary)
+                base = home / "mailbox-v1"
+                room_store.put_room(
+                    base,
+                    {
+                        "schema": "agent-executor.room.v1",
+                        "id": "legacy-room",
+                        "cwd": temporary,
+                        "machine": socket.gethostname(),
+                        "swarm": {"maxAgents": 4},
+                        "agents": [],
+                        "conductor": {"engine": "claude", "role": "lead"},
+                        **fields,
+                    },
+                )
+                self.assertIs(terminal._saved_swarm_open(base, "legacy-room", environment), expected)
+
+
 @unittest.skipUnless(shutil.which("tmux") and shutil.which("node"), "interactive launch requires tmux and Node")
 class SwarmLaunchTests(unittest.TestCase):
     def test_codex_conversation_and_reconnect(self):
@@ -287,12 +320,34 @@ class SwarmLaunchTests(unittest.TestCase):
                         subprocess.check_output([*tmux, "list-panes", "-F", "#{pane_id}"], text=True).splitlines(),
                         ["%0"],
                     )
+                    automatic = agent_statusline_tmux.toggle_swarm_view(
+                        "open", socket=Path(info["socket"]).name, room=info["room"], base=base, respect_closed=True
+                    )
+                    self.assertEqual(automatic["status"], "already_closed")
                     reopened = agent_statusline_tmux.toggle_swarm_view(
                         "toggle", socket=Path(info["socket"]).name, room=info["room"], base=base
                     )
                     self.assertEqual(reopened["status"], "opened")
                     panes = subprocess.check_output([*tmux, "list-panes", "-F", "#{pane_id}"], text=True).splitlines()
                     self.assertEqual(len(panes), 2)
+                    wait_for(
+                        lambda _: b"Swarm" in subprocess.check_output([*tmux, "capture-pane", "-p", "-t", panes[-1]]),
+                        master,
+                    )
+                    subprocess.run([*tmux, "send-keys", "-t", panes[-1], "q"], check=True)
+                    wait_for(
+                        lambda _: (
+                            subprocess.check_output([*tmux, "list-panes", "-F", "#{pane_id}"], text=True).splitlines()
+                            == ["%0"]
+                        ),
+                        master,
+                    )
+                    self.assertIs(room_store.read_room(base, info["room"]).get("tmuxViewOpen"), False)
+                    reopened = agent_statusline_tmux.toggle_swarm_view(
+                        "toggle", socket=Path(info["socket"]).name, room=info["room"], base=base
+                    )
+                    self.assertEqual(reopened["status"], "opened")
+                    panes = subprocess.check_output([*tmux, "list-panes", "-F", "#{pane_id}"], text=True).splitlines()
                 os.write(master, b"Redirect the investigation\n")
                 wait_for(lambda _: received.exists() and received.read_text() == "Redirect the investigation\n", master)
                 self.assertEqual(received.read_text(), "Redirect the investigation\n")
@@ -438,7 +493,7 @@ class HerdrSwarmLaunchTests(unittest.TestCase):
             room = room_store.read_room(base, opened["room"])
             self.assertEqual(room["conductor"]["session"]["id"], "fresh-native-session")
 
-    def test_new_coordinator_replaces_its_previous_room_view_after_opening_the_new_one(self):
+    def test_new_coordinator_closes_its_previous_room_view_before_opening_the_new_one(self):
         import agent_statusline_tmux
         import herdr_swarm_restore
 
@@ -463,7 +518,12 @@ class HerdrSwarmLaunchTests(unittest.TestCase):
             state = json.loads((home / "herdr-state.json").read_text())
             self.assertNotIn(old_view, state["panes"])
             self.assertIn(opened["pane"], state["panes"])
-            self.assertIn(["pane", "close", old_view], state["calls"])
+            replacement_open = next(
+                i
+                for i, call in enumerate(state["calls"])
+                if call[:3] == ["plugin", "pane", "open"] and f"ORKEST_SWARM_ROOM={opened['room']}" in call
+            )
+            self.assertLess(state["calls"].index(["pane", "close", old_view]), replacement_open)
             self.assertIsNone(room_store.read_room(base, "previous-room").get("herdrViewPaneId"))
             self.assertEqual(room_store.read_room(base, opened["room"])["herdrViewPaneId"], opened["pane"])
             old_state = herdr_swarm_restore.state_path(base.parent, previous["id"], environment)
@@ -485,14 +545,43 @@ class HerdrSwarmLaunchTests(unittest.TestCase):
                 base=base,
             )
             self.assertEqual(old_view, "w1:p2")
+            for target in ("w1:p1", old_view):
+                with self.subTest(target=target), patch.dict(os.environ, {"HERDR_PANE_ID": target}):
+                    opened = agent_statusline_tmux.toggle_swarm_view(
+                        "open", session_id=session, harness="codex", cwd=str(home), base=base
+                    )
+                    self.assertEqual(opened["status"], "error")
+                    # The user sees which room's view holds the tab and how to close it.
+                    self.assertIn("room previous-room", opened["reason"])
+                    self.assertIn("`ork swarm close --room previous-room`", opened["reason"])
+            state = json.loads((home / "herdr-state.json").read_text())
+            self.assertEqual(state["panes"], ["w1:p1", "w1:p99", old_view])
+            self.assertEqual(room_store.read_room(base, "previous-room")["herdrViewPaneId"], old_view)
+
+    def test_views_can_open_in_different_tabs_in_one_workspace(self):
+        import agent_statusline_tmux
+
+        with self._reused_pane_room() as (home, base, previous, session):
+            state_file = home / "herdr-state.json"
+            state = json.loads(state_file.read_text())
+            state["tabs"] = {"w1:p1": "t1", "w1:p99": "t2"}
+            state["aliases"] = {"w1:p100": "w1:p99"}
+            state_file.write_text(json.dumps(state))
+            old_view = agent_statusline_tmux._open_herdr_swarm_view(
+                str(home / "herdr"),
+                room=previous["id"],
+                cwd=str(home),
+                coordinator_pane="w1:p100",
+                workspace_id="w1",
+                environment=dict(os.environ),
+                base=base,
+            )
             opened = agent_statusline_tmux.toggle_swarm_view(
                 "open", session_id=session, harness="codex", cwd=str(home), base=base
             )
-            self.assertEqual(opened["status"], "opened")
-            self.assertEqual(opened["pane"], "w1:p3")
-            state = json.loads((home / "herdr-state.json").read_text())
-            self.assertIn(old_view, state["panes"])
-            self.assertEqual(room_store.read_room(base, "previous-room")["herdrViewPaneId"], old_view)
+            self.assertEqual((old_view, opened["status"], opened["pane"]), ("w1:p2", "opened", "w1:p3"))
+            self.assertEqual(json.loads(state_file.read_text())["panes"], ["w1:p1", "w1:p99", "w1:p2", "w1:p3"])
+            self.assertEqual(room_store.read_room(base, previous["id"])["herdrCoordinatorPaneId"], "w1:p99")
 
     def test_explicitly_attached_room_keeps_its_original_coordinator_and_workers(self):
         import agent_statusline_tmux
@@ -541,10 +630,15 @@ class HerdrSwarmLaunchTests(unittest.TestCase):
             "state = json.loads(state_path.read_text())\n"
             "args = sys.argv[1:]\n"
             "state['calls'].append(args)\n"
-            "if args[:3] == ['plugin', 'pane', 'open']:\n"
+            "if args[:3] == ['plugin', 'pane', 'open'] and state.get('fail_open'):\n"
+            "    state_path.write_text(json.dumps(state))\n"
+            "    sys.exit(1)\n"
+            "elif args[:3] == ['plugin', 'pane', 'open']:\n"
             "    pane_id = 'w1:p' + str(state['next_id'])\n"
             "    state['next_id'] += 1\n"
             "    state['panes'].append(pane_id)\n"
+            "    target = args[args.index('--target-pane') + 1]\n"
+            "    state.setdefault('tabs', {})[pane_id] = state.get('tabs', {}).get(target, 't1')\n"
             "    room = next(v.split('=',1)[1] for v in args if v.startswith('ORKEST_SWARM_ROOM='))\n"
             "    state['runs'].append({'pane': pane_id, 'command': 'env node ' + "
             + repr(str(CLI.resolve()))
@@ -556,7 +650,7 @@ class HerdrSwarmLaunchTests(unittest.TestCase):
             "    state_path.write_text(json.dumps(state))\n"
             "    print(json.dumps({'result': {'type': 'ok'}}))\n"
             "elif args[:2] == ['api', 'snapshot']:\n"
-            "    panes = [{'pane_id': p, 'terminal_id': p, 'label': state.get('labels', {}).get(p)} for p in state['panes']]\n"
+            "    panes = [{'pane_id': p, 'terminal_id': p, 'workspace_id': 'w1', 'tab_id': state.get('tabs', {}).get(p, 't1'), 'label': state.get('labels', {}).get(p)} for p in state['panes']]\n"
             "    print(json.dumps({'result': {'snapshot': {'panes': panes}}}))\n"
             "elif args[:2] == ['pane', 'process-info']:\n"
             "    pane = args[args.index('--pane') + 1]\n"
@@ -580,6 +674,7 @@ class HerdrSwarmLaunchTests(unittest.TestCase):
             "    print(json.dumps({'ok': True, 'result': {'panes': [{'pane_id': p} for p in state['panes']]}}))\n"
             "elif args[:2] == ['pane', 'current']:\n"
             "    target = args[args.index('--pane') + 1] if '--pane' in args else 'w1:p1'\n"
+            "    target = state.get('aliases', {}).get(target, target)\n"
             "    state_path.write_text(json.dumps(state))\n"
             "    if target not in state['panes']:\n"
             "        sys.exit(1)\n"
@@ -995,6 +1090,132 @@ class HerdrSwarmLaunchTests(unittest.TestCase):
             updated_room = room_store.read_room(base, "room-newer")
             self.assertEqual(updated_room["conductor"]["session"]["id"], cleared_sid)
             self.assertIn(session_id, updated_room["conductor"]["previousSessions"])
+
+    def test_native_claude_launch_only_restores_a_saved_open_swarm_view(self):
+        import agent_statusline_tmux as terminal
+        import herdr_swarm_restore as restoration
+
+        for args, intent in (
+            ([], None),
+            (["--resume"], None),
+            (["--session-id", "native-session"], None),
+            (["--resume", "native-session"], None),
+            (["--resume", "native-session"], "missing"),
+            (["--resume", "native-session"], "closed"),
+            (["--resume", "native-session"], "open"),
+        ):
+            with self.subTest(args=args, intent=intent), self._reused_pane_room() as (home, base, room, _session):
+                if intent is not None:
+                    room["conductor"]["engine"] = "claude"
+                    room["conductor"]["session"].update(id="native-session", engine="claude")
+                    room_store.put_room(base, room)
+                binary = home / "claude"
+                binary.touch(mode=0o700)
+                state_file = home / "herdr-state.json"
+                state_path = restoration.state_path(home, room["id"], dict(os.environ))
+                if intent in ("closed", "open"):
+                    opened = terminal.toggle_swarm_view("open", room=room["id"], base=base)
+                    self.assertEqual(opened["pane"], "w1:p2")
+                    if intent == "closed":
+                        self.assertEqual(
+                            terminal.toggle_swarm_view("close", room=room["id"], base=base)["status"], "closed"
+                        )
+                    else:
+                        # Simulate loss of the live view while preserving the user's saved open intent.
+                        state = json.loads(state_file.read_text())
+                        state["panes"].remove("w1:p2")
+                        state_file.write_text(json.dumps(state))
+                calls_before = len(json.loads(state_file.read_text())["calls"])
+                env = {}
+
+                def launch(_binary, _argv, child_env, env=env):
+                    env.update(child_env)
+                    raise SystemExit(0)
+
+                with (
+                    patch.object(sys.stdin, "isatty", return_value=True),
+                    patch.object(sys.stdout, "isatty", return_value=True),
+                    patch.object(terminal.os, "execvpe", side_effect=launch),
+                    patch.object(terminal.os, "chdir"),
+                    patch.dict(os.environ, {"ORKEST_SWARM_ROOM": room["id"], "ORKEST_RESUME_SWARM": "1"}),
+                ):
+                    with self.assertRaises(SystemExit):
+                        terminal.main(["--cwd", str(home), "--", "claude", *args])
+                output = ORK_FAST.run_mailbox_hook(
+                    {"hook_event_name": "UserPromptSubmit", "session_id": "native-session", "cwd": str(home)},
+                    harness="claude",
+                    base=base,
+                    env=env,
+                    allow_herdr=True,
+                )
+                new_calls = json.loads(state_file.read_text())["calls"][calls_before:]
+                self.assertEqual(
+                    sum(call[:3] == ["plugin", "pane", "open"] for call in new_calls), int(intent == "open")
+                )
+                self.assertEqual([row["id"] for row in room_store.list_rooms(base)], [room["id"]])
+                self.assertEqual(state_path.with_suffix(".closed").exists(), intent == "closed")
+                notice = (output or {}).get("hookSpecificOutput", {}).get("additionalContext", "")
+                if intent is None:
+                    self.assertIsNone(env.get("ORKEST_SWARM_ROOM"))
+                    self.assertIsNone(env.get("ORKEST_RESUME_SWARM"))
+                    self.assertNotIn("Reconnected to swarm room", notice)
+                    self.assertEqual(list((base / "swarm-briefs").glob("*/conductor.md")), [])
+                elif intent == "open":
+                    self.assertIn("Reconnected to swarm room previous-room", notice)
+
+    def test_failed_automatic_restore_is_tried_once_and_leaves_the_view_open_intent(self):
+        import agent_statusline_tmux as terminal
+        import herdr_swarm_restore as restoration
+
+        with self._reused_pane_room() as (home, base, room, _session):
+            session = "claude-coordinator-session"
+            mailbox.register(base, session=session, harness="claude", cwd=str(home), pid=os.getpid())
+            # No objective or agents: no reconnect summary records the instance, only the attempt can.
+            room.update(objective="", agents=[], messages=[])
+            room["conductor"]["engine"] = "claude"
+            room["conductor"]["session"].update(id=session, engine="claude")
+            room_store.put_room(base, room)
+            self.assertEqual(terminal.toggle_swarm_view("open", room=room["id"], base=base)["status"], "opened")
+            state_file = home / "herdr-state.json"
+            state = json.loads(state_file.read_text())
+            state["panes"].remove("w1:p2")
+            state["fail_open"] = True
+            state_file.write_text(json.dumps(state))
+            calls_before = len(state["calls"])
+            for _ in range(3):
+                ORK_FAST.run_mailbox_hook(
+                    {"hook_event_name": "UserPromptSubmit", "session_id": session, "cwd": str(home), "prompt": "hi"},
+                    harness="claude",
+                    base=base,
+                    allow_herdr=True,
+                )
+            calls = json.loads(state_file.read_text())["calls"][calls_before:]
+            self.assertEqual(sum(call[:3] == ["plugin", "pane", "open"] for call in calls), 1)
+            self.assertEqual(
+                mailbox.load(mailbox.peer_path(base, session)).get("swarmAutoReconnected"), f"{room['id']}:w1:p1"
+            )
+            view_state = restoration.state_path(home, room["id"], dict(os.environ))
+            # A failed restore is not the user's choice to close the view.
+            self.assertFalse(view_state.with_suffix(".closed").exists())
+            self.assertTrue(restoration.saved_open(view_state, room["id"], dict(os.environ)))
+
+    def test_swarm_and_horde_toggle_the_same_herdr_view(self):
+        with self._reused_pane_room() as (home, base, _room, session):
+
+            def submit(prompt):
+                result = ORK_FAST.run_mailbox_hook(
+                    {"hook_event_name": "UserPromptSubmit", "session_id": session, "cwd": str(home), "prompt": prompt},
+                    harness="codex",
+                    base=base,
+                    allow_herdr=True,
+                )
+                self.assertEqual(result["decision"], "block")
+                return result["reason"]
+
+            self.assertIn("Orkest Swarm View pane is now opened", submit("/swarm"))
+            self.assertIn("Orkest Swarm View pane is now closed", submit("/horde"))
+            state_file = home / "herdr-state.json"
+            self.assertEqual(json.loads(state_file.read_text())["panes"], ["w1:p1", "w1:p99"])
 
     def test_extract_resumed_session_id_ignores_codex_sandbox_flag(self):
         import agent_statusline_tmux
@@ -1751,7 +1972,13 @@ class HerdrSwarmLaunchTests(unittest.TestCase):
                 patch.dict(os.environ, env, clear=True),
                 patch.object(mailbox, "harness_pid", return_value=os.getpid()),
             ):
-                # Turn 1 opens the view pane once and persists swarmAutoReconnected even with empty objective/agents
+                opened = agent_statusline_tmux.toggle_swarm_view("open", room=room_id, base=base)
+                self.assertEqual(opened["status"], "opened")
+                state = json.loads(state_file.read_text())
+                state["panes"].remove(opened["pane"])
+                state_file.write_text(json.dumps(state))
+
+                # A missing view with saved open intent restores even with empty objective/agents.
                 ORK_FAST.run_mailbox_hook(
                     {"conversationId": parent_sid, "workspacePaths": [cwd], "transcriptPath": str(parent_t)},
                     harness="gemini",
@@ -1763,7 +1990,7 @@ class HerdrSwarmLaunchTests(unittest.TestCase):
                 )
                 first_calls = json.loads(state_file.read_text())["calls"]
                 open_calls = [c for c in first_calls if c[:3] == ["plugin", "pane", "open"]]
-                self.assertEqual(len(open_calls), 1)
+                self.assertEqual(len(open_calls), 2)
                 peer_after_start = mailbox.load(mailbox.peer_path(base, parent_sid))
                 self.assertEqual(peer_after_start.get("swarmAutoReconnected"), f"{room_id}:w1:p1")
 
@@ -1803,7 +2030,7 @@ class HerdrSwarmLaunchTests(unittest.TestCase):
                     allow_herdr=True,
                 )
                 calls_after_wake = json.loads(state_file.read_text())["calls"]
-                self.assertEqual(len([c for c in calls_after_wake if c[:3] == ["plugin", "pane", "open"]]), 1)
+                self.assertEqual(len([c for c in calls_after_wake if c[:3] == ["plugin", "pane", "open"]]), 2)
 
                 # Even if swarmAutoReconnected is reset, respect_closed=True still honors the user's .closed marker
                 mailbox.annotate(base, parent_sid, swarmAutoReconnected=None)
@@ -1817,13 +2044,13 @@ class HerdrSwarmLaunchTests(unittest.TestCase):
                     allow_herdr=True,
                 )
                 calls_after_reset = json.loads(state_file.read_text())["calls"]
-                self.assertEqual(len([c for c in calls_after_reset if c[:3] == ["plugin", "pane", "open"]]), 1)
+                self.assertEqual(len([c for c in calls_after_reset if c[:3] == ["plugin", "pane", "open"]]), 2)
 
                 # Explicit user open clears .closed and reopens the view pane
                 reopened = agent_statusline_tmux.toggle_swarm_view("open", room=room_id, base=base)
                 self.assertEqual(reopened["status"], "opened")
                 calls_after_explicit = json.loads(state_file.read_text())["calls"]
-                self.assertEqual(len([c for c in calls_after_explicit if c[:3] == ["plugin", "pane", "open"]]), 2)
+                self.assertEqual(len([c for c in calls_after_explicit if c[:3] == ["plugin", "pane", "open"]]), 3)
                 self.assertFalse(view_state.with_suffix(".closed").exists())
 
     def test_herdr_toggle_maps_subagent_pane_session_back_to_parent_room(self):

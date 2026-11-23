@@ -1077,11 +1077,14 @@ def serve(base: Path, port: int = 0) -> None:
     with locked_file(daemon_base(base) / "service.lock", blocking=False) as descriptor:
         if descriptor is None:
             raise mailbox.MailboxError("one service already owns this mailbox store")
+        state = load_state(base)
+        if state:
+            existing_port = endpoint(state["url"]).port
+            if port and port != existing_port:
+                raise mailbox.MailboxError("configured endpoint must remain stable; use the persisted port")
+            port = existing_port
         token = generate_token(base)
         mailbox.prune_send_journals(base)
-        state = load_state(base)
-        if state and not port:
-            port = endpoint(state["url"]).port
         try:
             server = HTTPDaemon(("127.0.0.1", port), base, token)
         except OSError as failure:

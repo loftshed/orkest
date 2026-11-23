@@ -429,7 +429,7 @@ def _node_room_lock(path: Path):
                 lock_dir.rmdir()
 
 
-def _update_room_metadata(base: Path, room_id: str, **fields: str | None) -> dict[str, object] | None:
+def _update_room_metadata(base: Path, room_id: str, **fields: str | bool | None) -> dict[str, object] | None:
     with contextlib.suppress(OSError, ValueError):
         return room_store.set_metadata(base, room_id, **fields)
     return None
@@ -530,25 +530,24 @@ def _open_herdr_swarm_view(
     workspace_id: str | None,
     environment: dict[str, str],
     base: Path,
+    restore_only: bool = False,
 ) -> str | None:
     import herdr_swarm_restore as restoration
 
     api = restoration.Herdr(herdr, environment)
     with restoration.operation_lock(base.parent, environment):
         state_path = restoration.state_path(base.parent, room, environment)
+        if restore_only and not restoration.saved_open(state_path, room, environment):
+            return None
         record = restoration.load(state_path)
         if record:
-            if (
-                record.get("schema") != restoration.SCHEMA
-                or record.get("host") != stdlib_socket.gethostname()
-                or record.get("endpoint") != restoration.endpoint(environment)
-                or record.get("room") != room
-            ):
+            if not restoration.owns_record(record, room, environment):
                 return None
             try:
                 owned = restoration.locate(record, api.panes())
                 if owned:
-                    state_path.with_suffix(".closed").unlink(missing_ok=True)
+                    if not restore_only:
+                        state_path.with_suffix(".closed").unlink(missing_ok=True)
                     outcomes = restoration.restore(base.parent, environment, api, locked=True, only_room=room)
                     outcome = outcomes[0]["status"] if outcomes else "missing_pane"
                     if outcome in {"already_running", "restored", "submitted"}:
@@ -561,68 +560,20 @@ def _open_herdr_swarm_view(
                     return None
             except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired):
                 return None
-        return _open_herdr_swarm_view_unlocked(
-            herdr,
-            room=room,
-            cwd=cwd,
-            coordinator_pane=coordinator_pane,
-            workspace_id=workspace_id,
-            environment=environment,
-            base=base,
-        )
-
-
-def _previous_herdr_view(
-    api: object,
-    *,
-    room: str,
-    cwd: str | None,
-    coordinator_pane: str,
-    workspace_id: str | None,
-    environment: dict[str, str],
-    base: Path,
-) -> tuple[Path, str, str] | None:
-    """Find a previous room display attached to this coordinator."""
-    import herdr_swarm_restore as restoration
-
-    panes = api.panes()
-    coordinator = next((pane for pane in panes if pane["pane_id"] == coordinator_pane), None)
-    if not coordinator:
-        return None
-    cli = runtime_paths.node_runtime(__file__) / "bin/ork.mjs"
-    candidates = []
-    for path in sorted(restoration.state_directory(base.parent, environment).glob("*.json")):
-        record = restoration.load(path)
-        if not record or record.get("schema") != restoration.SCHEMA or record.get("room") == room:
-            continue
-        if (
-            record.get("endpoint") != restoration.endpoint(environment)
-            or record.get("host") != stdlib_socket.gethostname()
-            or record.get("cli") != str(cli.resolve())
-            or path.with_suffix(".closed").exists()
-        ):
-            continue
-        old_room_id = record.get("room")
-        if not isinstance(old_room_id, str):
-            continue
-        old_room = room_store.read_room(base, old_room_id)
-        if not old_room or old_room.get("herdrCoordinatorPaneId") != coordinator_pane:
-            continue
-        if old_room.get("herdrWorkspaceId") and old_room["herdrWorkspaceId"] != workspace_id:
-            continue
-        if cwd and Path(str(old_room.get("cwd", ""))).resolve() != Path(cwd).resolve():
-            continue
-        owned = restoration.locate(record, panes)
-        if not owned:
-            continue
-        if coordinator.get("tab_id") and owned.get("tab_id") and coordinator["tab_id"] != owned["tab_id"]:
-            continue
-        if not restoration.view_process(api.processes(owned["pane_id"]), cli, old_room_id):
-            continue
-        candidates.append((path, owned["pane_id"], old_room_id))
-    if len(candidates) > 1:
-        raise ValueError("several room views match this coordinator")
-    return next(iter(candidates), None)
+        try:
+            return _open_herdr_swarm_view_unlocked(
+                herdr,
+                room=room,
+                cwd=cwd,
+                coordinator_pane=coordinator_pane,
+                workspace_id=workspace_id,
+                environment=environment,
+                base=base,
+                restore_only=restore_only,
+            )
+        except restoration.TabOccupied as occupied:
+            print(f"Swarm view not opened: {occupied}", file=sys.stderr)
+            return None
 
 
 def _open_herdr_swarm_view_unlocked(
@@ -636,6 +587,7 @@ def _open_herdr_swarm_view_unlocked(
     base: Path,
     is_coordinator: bool = True,
     chief: bool = False,
+    restore_only: bool = False,
 ) -> str | None:
     import herdr_swarm_restore as restoration
 
@@ -643,17 +595,45 @@ def _open_herdr_swarm_view_unlocked(
     cli = runtime_paths.node_runtime(__file__) / "bin/ork.mjs"
     state = restoration.state_path(base.parent, room, environment)
     try:
-        previous = None
-        if is_coordinator:
-            previous = _previous_herdr_view(
-                api,
-                room=room,
-                cwd=cwd,
-                coordinator_pane=coordinator_pane,
-                workspace_id=workspace_id,
-                environment=environment,
-                base=base,
+        panes = api.panes()
+        coordinator = next((pane for pane in panes if pane["pane_id"] == coordinator_pane), None)
+        if coordinator is None and coordinator_pane:
+            current = api.call("pane", "current", "--pane", coordinator_pane).get("pane") or {}
+            coordinator = next((pane for pane in panes if pane["pane_id"] == current.get("pane_id")), None)
+        if not coordinator:
+            return None
+        target_pane = coordinator["pane_id"]
+        views = restoration.tab_swarm_views(base.parent, environment, api, coordinator, panes, cli)
+        if views:
+            if len(views) != 1:
+                raise restoration.TabOccupied(set(views.values()))
+            old_pane, old_room_id = next(iter(views.items()))
+            if old_room_id == room:
+                return old_pane
+            if restore_only or not is_coordinator or old_pane == target_pane:
+                raise restoration.TabOccupied({old_room_id})
+            old_state = restoration.state_path(base.parent, old_room_id, environment)
+            old_record = restoration.load(old_state)
+            old_room = room_store.read_room(base, old_room_id)
+            owned = (
+                restoration.locate(old_record, panes)
+                if old_record and restoration.owns_record(old_record, old_room_id, environment)
+                else None
             )
+            if (
+                not old_room
+                or old_room.get("herdrCoordinatorPaneId") not in (coordinator_pane, target_pane)
+                or not owned
+                or (owned["pane_id"] != old_pane)
+            ):
+                raise restoration.TabOccupied({old_room_id})
+            if not restoration.view_process(api.processes(old_pane), cli, old_room_id):
+                raise ValueError("the existing swarm pane is not running its recorded view")
+            api.call("pane", "close", old_pane)
+            old_state.with_suffix(".closed").touch(mode=0o600)
+            _update_room_metadata(base, old_room_id, herdrViewPaneId=None)
+        if restore_only and not restoration.saved_open(state, room, environment):
+            return None
         opened = api.call(
             "plugin",
             "pane",
@@ -663,7 +643,7 @@ def _open_herdr_swarm_view_unlocked(
             "--entrypoint",
             "room",
             "--target-pane",
-            coordinator_pane,
+            target_pane,
             "--direction",
             "right",
             "--no-focus",
@@ -681,22 +661,22 @@ def _open_herdr_swarm_view_unlocked(
         if plugin_pane["plugin_id"] != "orkest.swarms" or plugin_pane["entrypoint"] != "room":
             return None
         view_pane_id = plugin_pane["pane"]["pane_id"]
+    except restoration.TabOccupied:
+        raise
     except (KeyError, TypeError, OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as error:
         print(f"Herdr could not open the room view: {error}", file=sys.stderr)
         return None
     try:
-        restoration.prepare(base.parent, room, view_pane_id, cli, environment, api, chief=chief)
+        if restore_only and state.with_suffix(".closed").exists():
+            raise RuntimeError("swarm view was closed while restoring")
+        restoration.prepare(
+            base.parent, room, view_pane_id, cli, environment, api, chief=chief, reopen=not restore_only
+        )
         deadline = time.monotonic() + 8
         while not restoration.view_process(api.processes(view_pane_id), cli, room):
             if time.monotonic() >= deadline:
                 raise RuntimeError("room view did not start")
             time.sleep(0.1)
-        if previous:
-            old_state, old_pane, old_room = previous
-            if restoration.view_process(api.processes(old_pane), cli, old_room):
-                api.call("pane", "close", old_pane)
-            old_state.with_suffix(".closed").touch(mode=0o600)
-            _update_room_metadata(base, old_room, herdrViewPaneId=None)
     except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as error:
         print(f"Herdr room view setup failed: {error}", file=sys.stderr)
         try:
@@ -704,7 +684,7 @@ def _open_herdr_swarm_view_unlocked(
         except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as rollback_error:
             print(f"Check Herdr pane {view_pane_id} for room {room}: {rollback_error}", file=sys.stderr)
         else:
-            if state.exists():
+            if state.exists() and not restore_only:
                 state.with_suffix(".closed").touch(mode=0o600)
         return None
     _update_room_metadata(
@@ -712,7 +692,7 @@ def _open_herdr_swarm_view_unlocked(
         room,
         herdrViewPaneId=view_pane_id,
         herdrEndpoint=restoration.endpoint(environment),
-        **({"herdrCoordinatorPaneId": coordinator_pane} if is_coordinator else {}),
+        **({"herdrCoordinatorPaneId": target_pane} if is_coordinator else {}),
         **({"herdrWorkspaceId": workspace_id} if is_coordinator and workspace_id else {}),
     )
     return view_pane_id
@@ -862,6 +842,45 @@ def _ensure_bound_room(
     return current_room, None
 
 
+def _saved_swarm_open(base: Path, room: str, environment: dict[str, str]) -> bool:
+    if not room:
+        return False
+    if environment.get("HERDR_ENV") == "1":
+        import herdr_swarm_restore as restoration
+
+        return restoration.saved_open(restoration.state_path(base.parent, room, environment), room, environment)
+    if not environment.get("TMUX") and not environment.get("ORKEST_TERMINAL_SERVER"):
+        import orca_context
+        import orca_swarm_restore
+
+        if context := orca_context.pane_context(environment):
+            return orca_swarm_restore.saved_open(base, room, context["environment"])
+    room_data = None
+    with contextlib.suppress(ValueError):
+        room_data = room_store.read_room(base, room)
+    if not isinstance(room_data, dict):
+        return False
+    if "tmuxViewOpen" in room_data:
+        return room_data["tmuxViewOpen"] is True
+    return _legacy_tmux_view_open(base, room, room_data)
+
+
+def _legacy_tmux_view_open(base: Path, room: str, room_data: dict[str, object]) -> bool:
+    """Treat an open room from before `tmuxViewOpen` existed as a tmux view left open.
+
+    Older launchers always split the view for a room and recorded nothing, and closing it
+    recorded nothing either. Closes now write `tmuxViewOpen: false`, so a missing flag means
+    the room predates it. Rooms shown in Herdr or Orca have their own records instead.
+    """
+    if room_data.get("closedAt") or room_data.get("status") == "closed":
+        return False
+    if any(room_data.get(key) for key in ("herdrEndpoint", "herdrViewPaneId", "herdrCoordinatorPaneId")):
+        return False
+    import orca_context
+
+    return not orca_context.view_path(room, base.parent).exists()
+
+
 def _toggle_herdr_swarm_view(
     action: str,
     *,
@@ -968,17 +987,22 @@ def _toggle_herdr_swarm_view_unlocked(
     environment.pop("TMUX", None)
     environment.pop("TMUX_PANE", None)
     environment["AGENT_EXECUTOR_HOME"] = str(base.parent)
-    resolved_room, room_error = _ensure_bound_room(
-        current_room=current_room,
-        session_id=session_id,
-        harness=harness,
-        cwd=cwd,
-        environment=environment,
-        base=base,
-    )
-    if not resolved_room:
-        return {"status": "error", "reason": room_error or "could not create swarm room"}
-    current_room = resolved_room
+    restore_only = action == "open" and respect_closed
+    if restore_only:
+        if not _saved_swarm_open(base, current_room, environment):
+            return {"status": "already_closed", "room": current_room, "backend": "herdr"}
+    else:
+        resolved_room, room_error = _ensure_bound_room(
+            current_room=current_room,
+            session_id=session_id,
+            harness=harness,
+            cwd=cwd,
+            environment=environment,
+            base=base,
+        )
+        if not resolved_room:
+            return {"status": "error", "reason": room_error or "could not create swarm room"}
+        current_room = resolved_room
     room_data = None
     with contextlib.suppress(ValueError):
         room_data = room_store.read_room(base, current_room)
@@ -1005,12 +1029,7 @@ def _toggle_herdr_swarm_view_unlocked(
     state_path = restoration.state_path(base.parent, current_room, environment)
     record = restoration.load(state_path)
     if record:
-        if (
-            record.get("schema") != restoration.SCHEMA
-            or record.get("endpoint") != restoration.endpoint(environment)
-            or record.get("host") != stdlib_socket.gethostname()
-            or record.get("room") != current_room
-        ):
+        if not restoration.owns_record(record, current_room, environment):
             return {
                 "status": "error",
                 "reason": "swarm pane ownership record does not match",
@@ -1032,25 +1051,31 @@ def _toggle_herdr_swarm_view_unlocked(
                         "backend": "herdr",
                     }
                 closed_marker = state_path.with_suffix(".closed").exists()
-                if action == "open" and respect_closed and closed_marker and restoration.idle_shell(info):
-                    return {"status": "already_closed", "room": current_room, "backend": "herdr"}
                 if (action == "open" or (action == "toggle" and closed_marker)) and restoration.idle_shell(info):
-                    state_path.with_suffix(".closed").unlink(missing_ok=True)
+                    if not restore_only:
+                        state_path.with_suffix(".closed").unlink(missing_ok=True)
                     outcomes = restoration.restore(base.parent, environment, api, locked=True, only_room=current_room)
                     outcome = outcomes[0]["status"] if outcomes else "missing_pane"
-                    status = "error"
-                    if outcome == "restored":
-                        status = "opened"
-                    elif outcome == "submitted":
-                        status = "starting"
-                    if outcome == "launch_pending":
+                    statuses = {"restored": "opened", "submitted": "starting", "already_running": "already_open"}
+                    if outcome in statuses:
                         return {
-                            "status": "error",
-                            "reason": "previous launch is unconfirmed; close the swarm view and open it again to retry",
+                            "status": statuses[outcome],
                             "room": current_room,
                             "backend": "herdr",
+                            "pane": recorded_view_pane,
                         }
-                    return {"status": status, "room": current_room, "backend": "herdr", "pane": recorded_view_pane}
+                    reasons = {
+                        "launch_pending": "previous launch is unconfirmed; close the swarm view and open it again to retry",
+                        "launch_unknown": "the swarm view launch could not be confirmed",
+                        "inspection_failed": "could not verify the swarm pane",
+                        "busy_or_unknown": "swarm pane is busy or ownership is unknown",
+                    }
+                    return {
+                        "status": "error",
+                        "reason": reasons.get(outcome, f"swarm view restore ended with {outcome}"),
+                        "room": current_room,
+                        "backend": "herdr",
+                    }
         except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired):
             return {
                 "status": "error",
@@ -1106,19 +1131,26 @@ def _toggle_herdr_swarm_view_unlocked(
         return {"status": "already_closed", "room": current_room, "backend": "herdr"}
     if recorded_view_pane and action == "open":
         return {"status": "already_open", "room": current_room, "backend": "herdr", "pane": recorded_view_pane}
-    if action == "open" and respect_closed and state_path.with_suffix(".closed").exists():
-        return {"status": "already_closed", "room": current_room, "backend": "herdr"}
-    pane_id = _open_herdr_swarm_view_unlocked(
-        herdr,
-        room=current_room,
-        cwd=cwd,
-        coordinator_pane=coordinator_pane,
-        workspace_id=effective_workspace,
-        environment=environment,
-        base=base,
-        is_coordinator=not recorded_coord_pane or recorded_coord_pane == coordinator_pane,
-        chief=chief or _is_chief_session(base, session_id),
-    )
+    try:
+        pane_id = _open_herdr_swarm_view_unlocked(
+            herdr,
+            room=current_room,
+            cwd=cwd,
+            coordinator_pane=coordinator_pane,
+            workspace_id=effective_workspace,
+            environment=environment,
+            base=base,
+            is_coordinator=not recorded_coord_pane or recorded_coord_pane == coordinator_pane,
+            chief=chief or _is_chief_session(base, session_id),
+            restore_only=restore_only,
+        )
+    except restoration.TabOccupied as occupied:
+        return {
+            "status": "error",
+            "reason": str(occupied),
+            "room": current_room,
+            "backend": "herdr",
+        }
     if not pane_id:
         return {
             "status": "error",
@@ -1214,8 +1246,12 @@ def toggle_swarm_view(
         for pane in view_panes:
             subprocess.run([*tmux_cmd, "kill-pane", "-t", pane], check=False)
         subprocess.run([*tmux_cmd, "select-pane", "-t", coordinator_pane], check=False)
+        if current_room:
+            _update_room_metadata(base, current_room, tmuxViewOpen=False)
         return {"status": "closed", "room": current_room, "socket": resolved_socket}
     if not view_panes and action == "close":
+        if current_room:
+            _update_room_metadata(base, current_room, tmuxViewOpen=False)
         return {"status": "already_closed", "room": current_room, "socket": resolved_socket}
     if view_panes and action == "open":
         return {"status": "already_open", "room": current_room, "socket": resolved_socket}
@@ -1263,17 +1299,21 @@ def toggle_swarm_view(
         bound = _bound_rooms(base, peer)
         if bound:
             current_room = bound[0][0]["id"]
-    resolved_room, room_error = _ensure_bound_room(
-        current_room=current_room,
-        session_id=session_id,
-        harness=harness,
-        cwd=cwd,
-        environment=environment,
-        base=base,
-    )
-    if not resolved_room:
-        return {"status": "error", "reason": room_error or "could not create swarm room"}
-    current_room = resolved_room
+    if action == "open" and respect_closed:
+        if not _saved_swarm_open(base, current_room, {**environment, "ORKEST_TERMINAL_SERVER": resolved_socket}):
+            return {"status": "already_closed", "room": current_room, "socket": resolved_socket}
+    else:
+        resolved_room, room_error = _ensure_bound_room(
+            current_room=current_room,
+            session_id=session_id,
+            harness=harness,
+            cwd=cwd,
+            environment=environment,
+            base=base,
+        )
+        if not resolved_room:
+            return {"status": "error", "reason": room_error or "could not create swarm room"}
+        current_room = resolved_room
     subprocess.run(
         [*tmux_cmd, "set-option", "-t", "orkest", "@orkest_room", current_room], env=environment, check=False
     )
@@ -1291,6 +1331,10 @@ def toggle_swarm_view(
             "-t",
             coordinator_pane,
             "-d",
+            "-e",
+            f"ORKEST_TMUX_VIEW_ROOM={current_room}",
+            "-e",
+            f"ORCHESTRATE_HOME={base.parent}",
             *(["-h", "-l", "40%"] if columns >= 120 else ["-v", "-l", "40%"]),
             "--",
             shutil.which("node") or "node",
@@ -1306,6 +1350,7 @@ def toggle_swarm_view(
     )
     if split.returncode != 0:
         return {"status": "error", "reason": "could not split tmux window for swarm view", "room": current_room}
+    _update_room_metadata(base, current_room, tmuxViewOpen=True)
     subprocess.run([*tmux_cmd, "bind-key", "Tab", "select-pane", "-t", ":.+"], env=environment, check=False)
     subprocess.run([*tmux_cmd, "select-pane", "-t", coordinator_pane], env=environment, check=False)
     return {"status": "opened", "room": current_room, "socket": resolved_socket}
@@ -1439,6 +1484,8 @@ def main(arguments: list[str]) -> int:
         print("ork label needs an interactive terminal", file=sys.stderr)
         return 2
     herdr_active = os.environ.get("HERDR_ENV") == "1"
+    explicit_room = bool(room)
+    restore_view = explicit_room
     if attach and herdr_active and room:
         herdr = os.environ.get("HERDR_BIN_PATH") or shutil.which("herdr")
         room_data = None
@@ -1529,32 +1576,30 @@ def main(arguments: list[str]) -> int:
                 or mailbox.room_session_peers(base_dir, selected, selected.get("conductor") or {})
             ):
                 room = None
+        if room and not explicit_room:
+            restore_view = _saved_swarm_open(mailbox.root(), room, dict(os.environ))
         if herdr_active:
-            import herdr_swarm_restore as restoration
-
             environment = dict(os.environ)
             environment.pop("TMUX", None)
             environment.pop("TMUX_PANE", None)
             environment.pop("ORKEST_TERMINAL_SERVER", None)
             environment.pop("HERDR_AGENT", None)
+            environment.pop("ORKEST_RESUME_SWARM", None)
+            environment.pop("ORKEST_RESUME_TARGET", None)
+            environment.pop("ORKEST_SWARM_ROOM", None)
             environment["ORKEST_TERMINAL_HARNESS"] = harness
-            if resume_swarm:
-                environment.pop("ORKEST_SWARM_ROOM", None)
+            # A resumed member of an open room is rebound whether or not its view was
+            # left open. Only saved open intent (or an explicit room) shows the view.
+            if resume_swarm and not explicit_room and room:
                 environment["ORKEST_RESUME_SWARM"] = "1"
                 if resumed_session:
                     environment["ORKEST_RESUME_TARGET"] = resumed_session
             if room:
                 environment["ORKEST_SWARM_ROOM"] = room
+            if room and (explicit_room or restore_view):
                 coordinator_pane = os.environ.get("HERDR_PANE_ID", "").strip()
                 workspace_id = os.environ.get("HERDR_WORKSPACE_ID", "").strip() or None
                 base_dir = mailbox.root()
-                _update_room_metadata(
-                    base_dir,
-                    room,
-                    herdrCoordinatorPaneId=coordinator_pane,
-                    herdrEndpoint=restoration.endpoint(environment),
-                    **({"herdrWorkspaceId": workspace_id} if workspace_id else {}),
-                )
                 herdr = os.environ.get("HERDR_BIN_PATH") or shutil.which("herdr")
                 if herdr:
                     view_pane = _open_herdr_swarm_view(
@@ -1565,6 +1610,7 @@ def main(arguments: list[str]) -> int:
                         workspace_id=workspace_id,
                         environment=environment,
                         base=base_dir,
+                        restore_only=not explicit_room,
                     )
                     if not view_pane:
                         print(
@@ -1654,8 +1700,10 @@ def main(arguments: list[str]) -> int:
                 )
     environment["ORKEST_TERMINAL_SERVER"] = socket
     environment["ORKEST_TERMINAL_HARNESS"] = harness
-    if resume_swarm:
-        environment.pop("ORKEST_SWARM_ROOM", None)
+    environment.pop("ORKEST_RESUME_SWARM", None)
+    environment.pop("ORKEST_RESUME_TARGET", None)
+    environment.pop("ORKEST_SWARM_ROOM", None)
+    if resume_swarm and not explicit_room and room:
         environment["ORKEST_RESUME_SWARM"] = "1"
         if resumed_session:
             environment["ORKEST_RESUME_TARGET"] = resumed_session
@@ -1763,7 +1811,7 @@ def main(arguments: list[str]) -> int:
 
     if room:
         subprocess.run([*base, "set-option", "-t", session, "@orkest_room", room], env=environment, check=True)
-        if not herdr_active:
+        if not herdr_active and restore_view:
             cli = runtime_paths.node_runtime(__file__) / "bin/ork.mjs"
             split = subprocess.run(
                 [
@@ -1772,6 +1820,8 @@ def main(arguments: list[str]) -> int:
                     "-t",
                     coordinator_pane,
                     "-d",
+                    "-e",
+                    f"ORKEST_TMUX_VIEW_ROOM={room}",
                     *(["-h", "-l", "40%"] if columns >= 120 else ["-v", "-l", "40%"]),
                     "--",
                     shutil.which("node") or "node",
@@ -1786,6 +1836,8 @@ def main(arguments: list[str]) -> int:
             )
             if split.returncode:
                 print("Swarm view could not open; the coordinator terminal is still available.", file=sys.stderr)
+            else:
+                _update_room_metadata(mailbox.root(), room, tmuxViewOpen=True)
             subprocess.run([*base, "bind-key", "Tab", "select-pane", "-t", ":.+"], env=environment, check=True)
             subprocess.run([*base, "select-pane", "-t", coordinator_pane], env=environment, check=False)
 

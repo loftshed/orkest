@@ -147,6 +147,17 @@ def _resolve_room(
     return current, session_id, harness, cwd
 
 
+def saved_open(base: Path, room: str, environment: str) -> bool:
+    record = orca_context.load(orca_context.view_path(room, base.parent))
+    return bool(
+        record
+        and record.get("schema") == orca_context.VIEW_SCHEMA
+        and record.get("room") == room
+        and record.get("environment") == environment
+        and record.get("closed") is False
+    )
+
+
 def toggle(
     action: str = "toggle",
     *,
@@ -192,6 +203,8 @@ def toggle(
     is_chief = (
         bool(chief) or environment.get("ORKEST_CHIEF_VIEW") == "1" or statusline._is_chief_session(base, session_id)
     )
+    if action == "open" and respect_closed and (not current or not saved_open(base, current, context["environment"])):
+        return {"status": "already_closed", "room": current, "backend": "orca"}
     if not current and not is_chief:
         if action == "close":
             return {"status": "already_closed", "backend": "orca"}
@@ -245,13 +258,6 @@ def toggle(
             "room": current,
             "backend": "orca",
             "pane": view,
-            **({"chief": True} if is_chief else {}),
-        }
-    if action == "open" and respect_closed and record and record.get("closed"):
-        return {
-            "status": "already_closed",
-            "room": current,
-            "backend": "orca",
             **({"chief": True} if is_chief else {}),
         }
     try:
