@@ -240,10 +240,10 @@ rule in every delegated brief. The objective authorizes relevant delegation, not
 publication, billing changes, or takeover of another session.
 
 Command boundaries: run each installed ork command (ork rooms add, ork hall worktree, ork progress,
-ork rooms dispatch) as its own standalone command. For host receipt capture, verify-evidence, review
-and correction dispatch use python3 with the exact absolute path of the installed orchestrate skill,
+ork rooms init-task, ork rooms dispatch) as its own standalone command. For host receipt capture,
+verify-evidence, review and record-decision use python3 with the exact absolute path of the installed orchestrate skill,
 standalone, for example python3 ${coordinatorPath} capture
---task-dir DIR. Relative script paths fail the trust policy and prompt. Inspect files with separate
+--task-dir DIR (its init-task subcommand is named init). Relative script paths fail the trust policy and prompt. Inspect files with separate
 read-only commands and a tool's own output limit (--limit, -n, the Read tool's offset and limit), not
 head or tail pipes. Codex judges each segment of a compound command on its own, so one unapproved
 segment (jq, other python, node, a shell wrapper) can prompt; other hosts may judge the whole line.
@@ -268,8 +268,8 @@ conversation available while workers run. Route every action:
 
 1. Follow-up on a worker's output (a gap, a failing check, or a review note): send it back to the
    session that did the work and holds the file context. Native subagent: message or resume it.
-   Audited executor run: dispatch at most one coordinator.py dispatch --kind correction with your
-   reviewed evidence; a second gap or a scope/history violation requires a new bounded task or
+   Audited executor run: send at most one ork rooms dispatch --kind correction --evidence FILE
+   (the correction flow in the swarm reference); a second gap or a scope/history violation requires a new bounded task or
    explicit conductor takeover. Do not repair worker output in-session while a worker session can
    continue, and do not start a cold worker for the same slice.
 2. Sustained exploration, multi-step tracing, implementation, or any test/build run: delegate in
@@ -310,7 +310,7 @@ Use inherited model settings unless an explicit, supported model choice is autho
 repeat this within the shared room limits. Never launch a peer CLI inside an audited worker job.
 
 Leaf work uses ork rooms init-task and dispatch, which preserve the existing runner's scope, leases,
-deadlines, evidence and review. Native workers use --transport native and your native supervision
+deadlines, evidence and review. ork rooms extend-task adds time to a task whose deadline is spent. Native workers use --transport native and your native supervision
 tools; other harnesses use executor transport. Use background dispatch and return to the user while
 work runs. Do not hold a writer lease as a lead while waiting for children to edit that checkout.
 Resolve write ownership before work begins. Writers in one checkout take turns; for concurrent
@@ -1102,6 +1102,16 @@ export async function createMemberWorktree(id, memberId, options = {}) {
   };
 }
 
+/** Say how to bring a task and a member's checkout together; a task's repository is fixed at init. */
+function repositoryMismatch(roomId, memberId, taskRepository, checkout, member) {
+  const fix = member?.worktree?.path
+    ? `Init a new task directory with ork hall init-task, from a task spec whose repository_root is ${checkout}`
+    : `Give the member its own checkout with ork hall worktree --room ${roomId} --member ${memberId}, ` +
+      "set the task spec's repository_root to the printed path and init a new task directory with " +
+      `ork hall init-task; or pass --cwd ${taskRepository} to dispatch the member in the task's repository`;
+  return `Task repository differs from room checkout: the task runs in ${taskRepository}, member ${memberId} in ${checkout}. ${fix}.`;
+}
+
 /** Persist intent before coordinator dispatch; retries use the same task and request. */
 export async function dispatchMember(id, memberId, options = {}) {
   const { root = mailboxRoot(), run = coordinator } = options;
@@ -1116,8 +1126,11 @@ export async function dispatchMember(id, memberId, options = {}) {
     targetMember?.worktree?.path || targetMember?.cwd || room.cwd,
   );
   const resolvedMemberCwd = options.cwd ? await realpath(options.cwd) : currentMemberCwd;
-  if ((await realpath(task.repository)) !== resolvedMemberCwd)
-    throw new Error("Task repository differs from room checkout");
+  const taskRepository = await realpath(task.repository);
+  if (taskRepository !== resolvedMemberCwd)
+    throw new Error(
+      repositoryMismatch(id, memberId, taskRepository, resolvedMemberCwd, targetMember),
+    );
   // A room under a team only runs that team's tasks, so a superseded lead cannot dodge the fence here.
   if (room.authority && task.authority?.team !== room.authority)
     throw new Error(
@@ -1125,10 +1138,33 @@ export async function dispatchMember(id, memberId, options = {}) {
     );
   const effectiveRole = options.workforceRole ?? targetMember?.workforceRole;
   const kind = options.kind || workforceRoleInfo(effectiveRole)?.defaultKind || "investigation";
-  if (!["implementation", "investigation", "consultation", "challenge", "continue"].includes(kind))
+  if (
+    ![
+      "implementation",
+      "investigation",
+      "consultation",
+      "challenge",
+      "continue",
+      "correction",
+    ].includes(kind)
+  )
     throw new Error("Unsupported dispatch kind");
+  if (kind === "correction" && !options.reviewId && !options.evidence)
+    throw new Error(
+      "correction needs --evidence FILE (the host captures and reviews it) or --review-id ID from coordinator.py verify-evidence",
+    );
+  if (options.reviewId && options.evidence)
+    throw new Error(
+      "Pass --evidence FILE or --review-id ID, not both: --evidence mints its own review",
+    );
+  if (kind !== "correction" && (options.reviewId || options.evidence))
+    throw new Error("--evidence and --review-id are only for --kind correction");
+  if (options.reviewId !== undefined && (typeof options.reviewId !== "string" || !options.reviewId))
+    throw new Error("--review-id needs the review ID that verify-evidence printed");
+  // A continue or correction resumes the member's own session in its existing task.
+  const isFollowUp = kind === "continue" || kind === "correction";
   const transport =
-    options.transport || (kind === "continue" && targetMember?.dispatch?.transport) || "executor";
+    options.transport || (isFollowUp && targetMember?.dispatch?.transport) || "executor";
   if (!["executor", "native"].includes(transport))
     throw new Error("Unsupported dispatch transport");
   if (options.allowCredits !== undefined && typeof options.allowCredits !== "boolean")
@@ -1185,6 +1221,8 @@ export async function dispatchMember(id, memberId, options = {}) {
     ...(autoCorrect !== undefined && { autoCorrect }),
     ...(maxContinues !== undefined && { maxContinues }),
     ...(options.taskSpec && { taskSpec: await realpath(options.taskSpec) }),
+    ...(options.evidence && { evidence: await realpath(options.evidence) }),
+    ...(options.reviewId && { reviewId: options.reviewId }),
   };
   const saved = await updateRoom(
     id,
@@ -1196,20 +1234,20 @@ export async function dispatchMember(id, memberId, options = {}) {
         throw new Error("Member checkout changed before dispatch");
       if (member.role === "lead")
         throw new Error("A subswarm lead uses native supervision, not worker dispatch");
-      if (kind === "continue" && !member.dispatch)
-        throw new Error("continue requires an existing member dispatch");
+      if (isFollowUp && !member.dispatch)
+        throw new Error(`${kind} requires an existing member dispatch`);
       // Only an explicit request ID can retry a continuation; review belongs to the coordinator.
       const continuing =
-        kind === "continue" &&
+        isFollowUp &&
         member.dispatch &&
-        (member.dispatch.kind !== "continue" ||
+        (member.dispatch.kind !== kind ||
           (options.requestId && options.requestId !== member.dispatch.requestId) ||
           !options.requestId);
       if (
         continuing &&
         (member.dispatch.taskId !== intent.taskId || member.dispatch.taskDir !== directory)
       )
-        throw new Error("continue must use the member's existing task");
+        throw new Error(`${kind} must use the member's existing task`);
       // A kept `restore` means a launch is still in flight, or its outcome is unknown. Replacing
       // that intent would let the two launches overwrite each other's binding.
       const hasPreviousRunEnded = task.runs.some(
@@ -1242,9 +1280,13 @@ export async function dispatchMember(id, memberId, options = {}) {
           "autoCorrect",
           "maxContinues",
           "taskSpec",
+          "evidence",
         ])
           if (JSON.stringify(member.dispatch[key]) !== JSON.stringify(intent[key]))
             throw new Error(`Existing dispatch differs: ${key}`);
+        // A retry may omit the review ID the first attempt minted from --evidence.
+        if (intent.reviewId && intent.reviewId !== member.dispatch.reviewId)
+          throw new Error("Existing dispatch differs: reviewId");
         if (options.cwd && resolvedMemberCwd !== currentMemberCwd)
           throw new Error("Existing dispatch differs: cwd");
         if (hasRole && requestedRole !== member.workforceRole)
@@ -1283,37 +1325,61 @@ export async function dispatchMember(id, memberId, options = {}) {
   );
   const member = memberOf(saved, memberId);
   const binding = member.dispatch;
-  const args = [
-    "dispatch",
-    "--task-dir",
-    binding.taskDir,
-    "--request-id",
-    binding.requestId,
-    "--kind",
-    binding.kind,
-    "--transport",
-    binding.transport,
-    ...(binding.kind === "continue" ? [] : ["--engine", member.engine, "--model", member.model]),
-    "--billing-mode",
-    binding.billingMode,
-    "--background",
-    ...leadArgs(options),
-  ];
-  if (binding.kind !== "continue" && member.effort)
-    args.push(member.engine === "opencode" ? "--variant" : "--effort", member.effort);
-  if (binding.packet) args.push("--packet", binding.packet);
-  if (binding.timeout) args.push("--timeout", binding.timeout);
-  const gates = binding.verifyCommands ?? [];
-  for (const command of gates) args.push("--verify-command", command);
-  const protectedPaths = binding.protectPaths ?? [];
-  for (const entry of protectedPaths) args.push("--protect-path", entry);
-  if (binding.autoCorrect !== undefined) args.push("--auto-correct", binding.autoCorrect);
-  if (binding.maxContinues !== undefined)
-    args.push("--max-continues", String(binding.maxContinues));
-  if (binding.taskSpec) args.push("--task-spec", binding.taskSpec);
-  if (binding.allowCredits) args.push("--allow-credits");
   let result;
   try {
+    // The host captures the cited files and mints the receipt; the worker's report never counts.
+    if (binding.kind === "correction" && !binding.reviewId) {
+      const receipt = await run([
+        "review-correction",
+        "--task-dir",
+        binding.taskDir,
+        "--evidence",
+        binding.evidence,
+        ...leadArgs(options),
+      ]);
+      binding.reviewId = receipt.review_id;
+      await updateRoom(
+        id,
+        (current) => {
+          const agent = memberOf(current, memberId);
+          if (agent.dispatch?.requestId === binding.requestId)
+            agent.dispatch.reviewId = binding.reviewId;
+          return current;
+        },
+        { root },
+      );
+    }
+    const args = [
+      "dispatch",
+      "--task-dir",
+      binding.taskDir,
+      "--request-id",
+      binding.requestId,
+      "--kind",
+      binding.kind,
+      "--transport",
+      binding.transport,
+      // A follow-up inherits the engine, model and effort of the session it resumes.
+      ...(isFollowUp ? [] : ["--engine", member.engine, "--model", member.model]),
+      "--billing-mode",
+      binding.billingMode,
+      "--background",
+      ...leadArgs(options),
+    ];
+    if (!isFollowUp && member.effort)
+      args.push(member.engine === "opencode" ? "--variant" : "--effort", member.effort);
+    if (binding.packet) args.push("--packet", binding.packet);
+    if (binding.timeout) args.push("--timeout", binding.timeout);
+    const gates = binding.verifyCommands ?? [];
+    for (const command of gates) args.push("--verify-command", command);
+    const protectedPaths = binding.protectPaths ?? [];
+    for (const entry of protectedPaths) args.push("--protect-path", entry);
+    if (binding.autoCorrect !== undefined) args.push("--auto-correct", binding.autoCorrect);
+    if (binding.maxContinues !== undefined)
+      args.push("--max-continues", String(binding.maxContinues));
+    if (binding.taskSpec) args.push("--task-spec", binding.taskSpec);
+    if (binding.reviewId) args.push("--review-id", binding.reviewId);
+    if (binding.allowCredits) args.push("--allow-credits");
     if (targetMember?.worktree?.path && resolvedMemberCwd === currentMemberCwd) {
       const env = options.env ?? process.env;
       let repoRoot;

@@ -579,6 +579,105 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("one correction", error)
 
+    def correction_evidence(self, source=None, excerpt="pnpm test: 2 failing in output.test"):
+        notes = self.fixture.external_path / "review-notes.txt"
+        notes.write_text("Conductor review\npnpm test: 2 failing in output.test\n")
+        path = self.fixture.external_path / "correction.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "conclusion": "Make output.test pass without changing the test",
+                    "claims": [{"statement": "Two tests fail", "source": str(source or notes), "excerpt": excerpt}],
+                }
+            )
+        )
+        return path
+
+    def test_review_correction_mints_a_receipt_that_sends_a_correction_but_never_accepts(self):
+        _, implemented = self.start()
+        code, error = self.call("review-correction", "--evidence", str(self.correction_evidence(excerpt="absent")))
+        self.assertEqual(code, 2)
+        self.assertIn("excerpt is absent", error)
+        code, receipt = self.call("review-correction", "--evidence", str(self.correction_evidence()))
+        self.assertEqual(code, 0, receipt)
+        self.assertEqual(
+            (receipt["purpose"], receipt["gaps"], receipt["owner"]),
+            ("correction", ["Make output.test pass without changing the test"], "conductor"),
+        )
+        self.assertEqual(list(receipt["versions"]), ["checkout"])
+        code, error = self.call(
+            "review", "--run-id", implemented["run_id"], "--decision", "accept", "--review-id", receipt["review_id"]
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("only sends a correction", error)
+        code, error = self.call(
+            "review", "--run-id", implemented["run_id"], "--decision", "supported", "--review-id", receipt["review_id"]
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("only sends a correction", error)
+        decision = self.fixture.external_path / "decision.json"
+        decision.write_text("{}")
+        code, error = self.call("record-decision", "--packet", str(decision), "--review-id", receipt["review_id"])
+        self.assertEqual(code, 2)
+        self.assertIn("only sends a correction", error)
+        with mock.patch.dict(os.environ, {"FAKE_CONTENT": "corrected output\n"}):
+            code, corrected = self.call(
+                "dispatch", "--kind", "correction", "--request-id", "repair", "--review-id", receipt["review_id"]
+            )
+        self.assertEqual((code, corrected["runner_status"]), (0, "completed"), corrected)
+        self.assertIn("Make output.test pass", json.dumps(corrected["task_spec"]["plan"]))
+
+    def test_review_correction_refuses_worker_output_and_a_changed_checkout(self):
+        _, run = self.start()
+        code, error = self.call("review-correction", "--evidence", str(self.correction_evidence(run["result_path"])))
+        self.assertEqual(code, 2)
+        self.assertIn("worker output is not verification", error)
+        self.assertEqual(COORDINATOR.load(self.directory)["evidence"]["reviews"], {})
+        code, receipt = self.call("review-correction", "--evidence", str(self.correction_evidence()))
+        self.assertEqual(code, 0, receipt)
+        (self.fixture.repository.path / "allowed" / "output.txt").write_text("edited after review\n")
+        code, error = self.call(
+            "dispatch", "--kind", "correction", "--request-id", "repair", "--review-id", receipt["review_id"]
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("workspace changed since check", error)
+
+    def test_dispatch_without_a_receipt_names_the_one_step_review(self):
+        self.start()
+        code, error = self.call("dispatch", "--kind", "correction", "--request-id", "repair")
+        self.assertEqual(code, 2)
+        self.assertIn("--evidence FILE", error)
+
+    def test_extend_adds_time_after_the_deadline_and_records_why(self):
+        state = COORDINATOR.load(self.directory)
+        state["deadline"] = "2000-01-01T00:00:00+00:00"
+        COORDINATOR.save(self.directory, state)
+        code, error = self.start()
+        self.assertEqual(code, 2)
+        self.assertIn("ork hall extend-task", error)
+        code, error = self.call("extend", "--add", "soon", "--reason", "more time")
+        self.assertEqual(code, 2)
+        self.assertIn("invalid --add", error)
+        code, extended = self.call("extend", "--add", "30m", "--reason", "correction needs a run")
+        self.assertEqual(code, 0, extended)
+        self.assertGreater(extended["remaining_seconds"], 1700)
+        self.assertEqual(COORDINATOR.load(self.directory)["deadline_extensions"][0]["reason"], "correction needs a run")
+        code, run = self.start()
+        self.assertEqual((code, run["runner_status"]), (0, "completed"), run)
+
+    def test_timeout_beyond_the_deadline_points_at_extend(self):
+        code, error = self.start("timed", "implementation", "--timeout", "2h")
+        self.assertEqual(code, 2)
+        self.assertIn("ork hall extend-task", error)
+        code, extended = self.call("extend", "--add", "2h", "--reason", "long implementation")
+        self.assertEqual(code, 0, extended)
+        self.assertEqual(self.start("timed", "implementation", "--timeout", "2h")[0], 0)
+
+    def test_init_task_is_an_alias_for_init(self):
+        self.directory = self.fixture.external_path / "aliased"
+        code, state = self.call("init-task", "--task-spec", str(self.spec_path), "--host", "claude")
+        self.assertEqual((code, state["status"]), (0, "active"), state)
+
     def test_acceptance_requires_current_untampered_evidence_and_workspace(self):
         _, run = self.start()
         proof = self.reviewed_evidence()

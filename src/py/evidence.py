@@ -9,6 +9,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import types
 import urllib.parse
 import urllib.request
 import uuid
@@ -289,11 +290,91 @@ def verify(state: dict[str, Any], packet: dict[str, Any], runner: Any) -> dict[s
     return receipt
 
 
-def receipt(state: dict[str, Any], review_id: str, runner: Any, *, acceptance: bool = False) -> dict[str, Any]:
+def review_correction(state: dict[str, Any], directory: Path, path: Path, runner: Any, support: Any) -> dict[str, Any]:
+    """Capture the files a correction cites and mint its review receipt, both host-side.
+
+    The receipt is bound to the checkout's HEAD and working tree, cites no worker output, and records
+    the correction as an open gap, so it can send a correction but never accept work.
+    """
+    evidence_file = path.expanduser().resolve(strict=True)
+    packet = json.loads(evidence_file.read_text(encoding="utf-8"))
+    if not isinstance(packet, dict):
+        raise ValueError("correction evidence must be a JSON object")
+    conclusion = packet.get("conclusion")
+    if not isinstance(conclusion, str) or not conclusion.strip():
+        raise ValueError("correction evidence requires a conclusion: what the worker must fix")
+    claims = packet.get("claims")
+    if not isinstance(claims, list) or not claims or not all(isinstance(claim, dict) for claim in claims):
+        raise ValueError("correction evidence requires claims, each citing an excerpt from a source file")
+    worker_output = (directory / "runs").resolve()
+    results = {Path(run["result_path"]).resolve() for run in state["runs"] if run.get("result_path")}
+    sources: dict[Path, Path] = {}
+    for claim in claims:
+        location = claim.get("source")
+        if not isinstance(location, str) or not Path(location).expanduser().is_absolute():
+            raise ValueError("each claim needs an absolute source path")
+        source = Path(location).expanduser().resolve(strict=True)
+        if source == evidence_file:
+            raise ValueError("a claim must cite a file other than the evidence file itself")
+        if source == worker_output or worker_output in source.parents or source in results:
+            raise ValueError("worker output is not verification; cite your own notes or check output")
+        sources[Path(location)] = source
+    repository = Path(state["repository"])
+    head = runner.git_identity(repository)["head"]
+    if not head:
+        raise ValueError("correction evidence needs a checkout with a commit to bind the review to")
+
+    def take(source_kind: str, **source: Any) -> dict[str, Any]:
+        arguments = types.SimpleNamespace(
+            **{"url": None, "path": None, "command": None, **source},
+            source_kind=source_kind,
+            component="checkout",
+            version=head,
+            authority="local",
+            updated_at=None,
+        )
+        return capture(state, directory, arguments, runner, support)
+
+    version = take("version", command="git rev-parse --verify HEAD")
+    if version["invalidated"]:
+        raise ValueError("could not record the checkout's HEAD: " + version["invalidated"])
+    captured = {location: take("observation", path=source)["source_id"] for location, source in sources.items()}
+    return verify(
+        state,
+        {
+            "question": packet.get("question") or "What must the correction fix?",
+            "conclusion": conclusion,
+            "owner": packet.get("owner") or "conductor",
+            "invalidation_trigger": packet.get("invalidation_trigger")
+            or "A cited file, the checkout's HEAD or its working tree changes",
+            "versions": {"checkout": head},
+            "version_sources": {"checkout": version["source_id"]},
+            "claims": [
+                {
+                    "kind": claim.get("kind", "observation"),
+                    "statement": claim.get("statement"),
+                    "citations": [{"source_id": captured[Path(claim["source"])], "excerpt": claim.get("excerpt")}],
+                }
+                for claim in claims
+            ],
+            "gaps": [conclusion],
+            "purpose": "correction",
+        },
+        runner,
+    )
+
+
+def receipt(
+    state: dict[str, Any], review_id: str, runner: Any, *, acceptance: bool = False, correction: bool = False
+) -> dict[str, Any]:
     evidence = registry(state)
     result = evidence["reviews"].get(review_id)
     if result is None:
         raise ValueError("host evidence review receipt required; worker flags are not verification")
+    if result.get("purpose") == "correction" and not correction:
+        raise ValueError(
+            "a review-correction receipt only sends a correction; review other decisions with verify-evidence"
+        )
     for source_id, expected in result["checked_sources"].items():
         source = evidence["sources"][source_id]
         validate_source(source, state, runner)

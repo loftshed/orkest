@@ -73,7 +73,8 @@ Each executor run also stops at the runner's `--timeout`: 15 minutes unless `dis
 DURATION` (`25m`, `1h30m`) sets another. The run records it, the runner gets it (agy's
 `--print-timeout` follows it), and a correction inherits it unless the correction passes its own.
 A timeout longer than the task's remaining time is refused, never shortened, so give `init
---time-budget` room for every run you plan. Native dispatch takes no `--timeout`; the host stops
+--time-budget` room for every run you plan, or add time later with `extend --add DURATION --reason
+TEXT`. Native dispatch takes no `--timeout`; the host stops
 its tool at the task deadline.
 
 `dispatch --auto-correct N` (0 to 2) lets the runner fix a failed `--verify-command` gate by resuming
@@ -219,7 +220,8 @@ ID` records supported advice. `dispatch --kind correction --request-id repair-1 
 inherits the original engine, model, effort, variant, billing, session, scope, checks, runner
 timeout, auto-correct rounds and protect paths; after `reverify` it still inherits the implementation
 run's setting, including an explicit 0. Only `--timeout` and `--auto-correct` may be overridden, and
-`--protect-path` may add paths. A correction must leave the task changed from where the
+`--protect-path` may add paths. `review-correction --evidence FILE` captures the files a correction
+cites and returns that review ID in one step ([format](swarm.md#send-a-correction)). A correction must leave the task changed from where the
 implementation began (`--expect-task-changes`): undoing the work ends `no_changes`. Add
 `--transport native` for a native continuation. No unchanged failed prompt or safety-violation
 resumption is allowed. Original failed/blocked outcomes remain unchanged.

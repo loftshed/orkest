@@ -3277,6 +3277,183 @@ describe("bounded room continuations", () => {
   });
 });
 
+describe("room corrections", () => {
+  async function finishedMember() {
+    const context = await fixture();
+    const { root, room, taskDir, task, run } = context;
+    await dispatchMember(room.id, "haiku-1", {
+      root,
+      taskDir,
+      run,
+      requestId: "first",
+      kind: "implementation",
+    });
+    task.runs[0].status = "finished";
+    const calls = [];
+    const record = async (args) => {
+      calls.push(args);
+      if (args[0] === "review-correction") return { review_id: "review-1" };
+      return run(args);
+    };
+    const evidence = path.join(taskDir, "correction.json");
+    await writeFile(evidence, JSON.stringify({ conclusion: "Fix the failing test", claims: [] }));
+    return { ...context, calls, record, evidence };
+  }
+
+  it("has the host review --evidence once, then dispatches the correction in the member's session", async () => {
+    const { root, room, taskDir, task, calls, record, evidence } = await finishedMember();
+    const options = {
+      root,
+      taskDir,
+      run: record,
+      kind: "correction",
+      evidence,
+      requestId: "repair",
+    };
+    const corrected = await dispatchMember(room.id, "haiku-1", options);
+    expect(corrected.dispatch).toMatchObject({ request_id: "repair", kind: "correction" });
+    const review = calls.find((args) => args[0] === "review-correction");
+    expect(review).toEqual([
+      "review-correction",
+      "--task-dir",
+      await realpath(taskDir),
+      "--evidence",
+      await realpath(evidence),
+    ]);
+    const sent = calls.find((args) => args[0] === "dispatch");
+    expect(sent.slice(sent.indexOf("--review-id"), sent.indexOf("--review-id") + 2)).toEqual([
+      "--review-id",
+      "review-1",
+    ]);
+    expect(sent).not.toContain("--engine");
+    expect(sent).not.toContain("--evidence");
+    expect(sent[sent.indexOf("--transport") + 1]).toBe("executor");
+    const stored = (await readRoom(room.id, root)).agents[0].dispatch;
+    expect(stored).toMatchObject({ kind: "correction", requestId: "repair", reviewId: "review-1" });
+    // A retry reuses the minted receipt instead of reviewing again.
+    calls.length = 0;
+    await dispatchMember(room.id, "haiku-1", options);
+    expect(calls.some((args) => args[0] === "review-correction")).toBe(false);
+    expect(task.runs.map((entry) => entry.request_id)).toEqual(["first", "repair"]);
+  });
+
+  it("passes an existing --review-id through without reviewing again", async () => {
+    const { root, room, taskDir, calls, record } = await finishedMember();
+    const stdout = { write: () => {} };
+    await roomsCommand(
+      [
+        "dispatch",
+        "--room",
+        room.id,
+        "--member",
+        "haiku-1",
+        "--task-dir",
+        taskDir,
+        "--kind",
+        "correction",
+        "--review-id",
+        "verified-7",
+      ],
+      { stdout, root, run: record },
+    );
+    expect(calls.some((args) => args[0] === "review-correction")).toBe(false);
+    const sent = calls.find((args) => args[0] === "dispatch");
+    expect(sent[sent.indexOf("--review-id") + 1]).toBe("verified-7");
+  });
+
+  it("refuses a correction without evidence and evidence on other kinds", async () => {
+    const { root, room, taskDir, record, evidence } = await finishedMember();
+    await expect(
+      dispatchMember(room.id, "haiku-1", { root, taskDir, run: record, kind: "correction" }),
+    ).rejects.toThrow("correction needs --evidence FILE");
+    await expect(
+      dispatchMember(room.id, "luna-1", {
+        root,
+        taskDir,
+        run: record,
+        kind: "investigation",
+        evidence,
+      }),
+    ).rejects.toThrow("only for --kind correction");
+    await expect(
+      dispatchMember(room.id, "haiku-1", {
+        root,
+        taskDir,
+        run: record,
+        kind: "correction",
+        evidence,
+        reviewId: "review-1",
+      }),
+    ).rejects.toThrow("not both");
+    expect((await readRoom(room.id, root)).agents[0].dispatch.kind).toBe("implementation");
+    await expect(
+      dispatchMember(room.id, "luna-1", {
+        root,
+        taskDir,
+        run: record,
+        kind: "correction",
+        evidence,
+      }),
+    ).rejects.toThrow("correction requires an existing member dispatch");
+  });
+
+  it("keeps the member's binding when the host refuses the evidence", async () => {
+    const { root, room, taskDir, task, run, evidence } = await finishedMember();
+    const refuse = async (args) => {
+      if (args[0] === "review-correction")
+        throw new Error("worker output is not verification; cite your own notes or check output");
+      return run(args);
+    };
+    await expect(
+      dispatchMember(room.id, "haiku-1", {
+        root,
+        taskDir,
+        run: refuse,
+        kind: "correction",
+        evidence,
+      }),
+    ).rejects.toThrow("worker output is not verification");
+    const member = (await readRoom(room.id, root)).agents[0];
+    expect(member.dispatch).toMatchObject({ requestId: "first", kind: "implementation" });
+    expect(task.runs).toHaveLength(1);
+  });
+
+  it("says how to give a member a checkout that matches the task", async () => {
+    const { root, room, taskDir, task, run } = await fixture();
+    task.repository = await directory();
+    await expect(dispatchMember(room.id, "haiku-1", { root, taskDir, run })).rejects.toThrow(
+      `ork hall worktree --room ${room.id} --member haiku-1`,
+    );
+    await expect(dispatchMember(room.id, "haiku-1", { root, taskDir, run })).rejects.toThrow(
+      `--cwd ${await realpath(task.repository)}`,
+    );
+  });
+
+  it("extends a task's deadline through the coordinator", async () => {
+    const { root, taskDir } = await fixture();
+    const calls = [];
+    const record = async (args) => {
+      calls.push(args);
+      return { deadline: "later" };
+    };
+    const stdout = { write: () => {} };
+    await expect(
+      roomsCommand(["extend-task", "--task-dir", taskDir, "--add", "30m"], {
+        stdout,
+        root,
+        run: record,
+      }),
+    ).rejects.toThrow("--reason is required");
+    await roomsCommand(
+      ["extend-task", "--task-dir", taskDir, "--add", "30m", "--reason", "correction run"],
+      { stdout, root, run: record },
+    );
+    expect(calls).toEqual([
+      ["extend", "--task-dir", path.resolve(taskDir), "--add", "30m", "--reason", "correction run"],
+    ]);
+  });
+});
+
 describe("coordination reliability", () => {
   async function readIndex(root) {
     return JSON.parse(await readFile(roomsIndexPath(root), "utf8"));
