@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.99.1
+
+- fix(quota): label the quota line, refresh it per turn, and guard low pools (#262)
+
 ## 0.99.0
 
 - feat(orchestrate): hand off before quota runs out to a visible successor (#261)
