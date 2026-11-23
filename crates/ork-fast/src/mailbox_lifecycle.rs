@@ -5413,7 +5413,47 @@ pub(crate) mod tests {
     use std::sync::{Arc, Mutex};
     use std::thread;
 
-    pub(crate) static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
+    static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
+    static AGENT_ENV_SCRUB: std::sync::Once = std::sync::Once::new();
+
+    /// Serialize a test that reads or changes the process environment.
+    ///
+    /// The first caller drops the agent session the suite was started from (the
+    /// shared list in tests/helpers/agent-env.txt), so ambient variables such as
+    /// CLAUDE_CODE_SESSION_ID never reach a test. A test that panicked restored
+    /// its EnvGuard while unwinding, so a poisoned lock is safe to take over.
+    pub(crate) fn lock_test_env() -> std::sync::MutexGuard<'static, ()> {
+        let guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        AGENT_ENV_SCRUB.call_once(scrub_agent_env);
+        guard
+    }
+
+    fn scrub_agent_env() {
+        let list = include_str!("../../../tests/helpers/agent-env.txt");
+        let patterns: Vec<&str> = list
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .collect();
+        let kept: Vec<&str> = patterns
+            .iter()
+            .filter_map(|p| p.strip_prefix('!'))
+            .collect();
+        let matches = |name: &str, pattern: &str| match pattern.strip_suffix('*') {
+            Some(prefix) => name.starts_with(prefix),
+            None => name == pattern,
+        };
+        for (name, _) in env::vars_os() {
+            let Some(name) = name.to_str() else { continue };
+            if !kept.contains(&name) && patterns.iter().any(|p| matches(name, p)) {
+                unsafe {
+                    env::remove_var(name);
+                }
+            }
+        }
+    }
     static TEST_DIR_SEQ: AtomicU64 = AtomicU64::new(0);
 
     pub(crate) struct TestDir {
@@ -5607,7 +5647,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_http_probe_health_request_cache_and_issue_recovery() {
-        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _lock = lock_test_env();
         let td = TestDir::new("ork-http-probe");
         let cache_dir = td.path.join("orchestrate");
         let base = cache_dir.join("mailbox-v1");
@@ -5803,7 +5843,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_http_probe_rejects_bad_urls_ports_perms_and_falls_back_on_failures() {
-        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _lock = lock_test_env();
         let td = TestDir::new("ork-http-reject");
         let cache_dir = td.path.join("orchestrate");
         let base = cache_dir.join("mailbox-v1");
@@ -6225,7 +6265,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_http_probe_legacy_agent_executor_store_id_and_symlink_base() {
-        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _lock = lock_test_env();
         let td = TestDir::new("ork-http-alias");
         let orchestrate = td.path.join("orchestrate");
         let base = orchestrate.join("mailbox-v1");
@@ -6288,7 +6328,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_handoff_turn_quota_gate_roles_and_notices() {
-        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _lock = lock_test_env();
         let td = TestDir::new("ork-handoff-gate");
         let cache_dir = td.path.join("orchestrate");
         let base = cache_dir.join("mailbox-v1");
@@ -6488,7 +6528,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_bootstrap_repo_env_marker_cache_and_invalidation() {
-        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _lock = lock_test_env();
         let td = TestDir::new("ork-bootstrap-cache");
         let base = td.path.join("cache/mailbox-v1");
         fs::create_dir_all(&base).unwrap();
@@ -6612,7 +6652,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_adopt_cleared_transfers_chief_safely_and_refuses_invalid_pairings() {
-        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _lock = lock_test_env();
         let td = TestDir::new("ork-chief-clear");
         let base = td.path.join("cache/mailbox-v1");
         fs::create_dir_all(base.join("cleared")).unwrap();
@@ -6820,7 +6860,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_dir_fd_symlink_and_fifo_safety_guards() {
-        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _lock = lock_test_env();
         let td = TestDir::new("ork-dir-fd-fifo");
         let cache_dir = td.path.join("orchestrate");
         let base = cache_dir.join("mailbox-v1");
@@ -6899,7 +6939,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_bootstrap_declines_cache_on_missing_dest_or_bad_index_or_git_env() {
-        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _lock = lock_test_env();
         let td = TestDir::new("ork-boot-decline");
         let base = td.path.join("cache/mailbox-v1");
         fs::create_dir_all(&base).unwrap();
@@ -6976,7 +7016,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_escaping_symlink_in_runtime_sources_forces_needs_full_check() {
-        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _lock = lock_test_env();
         let td = TestDir::new("ork-escape-rev");
         let cache_dir = td.path.join("orchestrate");
         let base = cache_dir.join("mailbox-v1");
@@ -6998,7 +7038,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_failed_chief_transfer_affinity_and_stale_birth_rejection() {
-        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _lock = lock_test_env();
         let td = TestDir::new("ork-chief-affinity");
         let base = td.path.join("cache/mailbox-v1");
         fs::create_dir_all(base.join("cleared")).unwrap();
@@ -7117,7 +7157,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_incomplete_room_list_keeps_handoff_conductor_gate_conservative() {
-        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _lock = lock_test_env();
         let mut env = EnvGuard::new();
         env.set("ORKEST_NODE_BIN", "/nonexistent/node");
 
@@ -7145,7 +7185,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_env_template_trailing_dot_treated_as_sensitive() {
-        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _lock = lock_test_env();
         assert!(!is_env_template_filename(".env.template."));
         assert!(!is_env_template_filename(".env.example."));
         assert!(is_sensitive_env_filename(".env.template."));
@@ -7209,7 +7249,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_chief_cas_same_session_revision_generation_overflow_and_birth_none() {
-        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _lock = lock_test_env();
         let td = TestDir::new("ork-chief-cas-gen");
         let base = td.path.join("cache/mailbox-v1");
         fs::create_dir_all(base.join("cleared")).unwrap();
@@ -7371,7 +7411,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_clear_stash_claim_lock_and_abort_on_claim_write_failure() {
-        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _lock = lock_test_env();
         let td = TestDir::new("ork-clear-stash-lock");
         let base = td.path.join("cache/mailbox-v1");
         fs::create_dir_all(base.join("cleared")).unwrap();
@@ -7452,7 +7492,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_clear_unread_mail_write_failure_preserves_source_and_retries() {
-        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _lock = lock_test_env();
         let td = TestDir::new("ork-clear-mail-loss");
         let base = td.path.join("cache/mailbox-v1");
         fs::create_dir_all(base.join("cleared")).unwrap();
@@ -7518,7 +7558,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_interrupted_claim_resumes_adoption_and_session_end_clear_is_idempotent() {
-        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _lock = lock_test_env();
         let td = TestDir::new("ork-interrupted-claim");
         let base = td.path.join("cache/mailbox-v1");
         fs::create_dir_all(base.join("cleared")).unwrap();
@@ -7600,7 +7640,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_claimed_chief_retry_never_expires_on_ttl_and_locks_first_observed_tuple() {
-        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _lock = lock_test_env();
         let td = TestDir::new("ork-chief-ttl-tuple");
         let base = td.path.join("cache/mailbox-v1");
         fs::create_dir_all(base.join("cleared")).unwrap();
@@ -7792,7 +7832,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_check_http_daemon_keeps_identity_and_defers_restart_when_revision_read_fails() {
-        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _lock = lock_test_env();
         let td = TestDir::new("ork-http-rev-fail");
         let cache_dir = td.path.join("orchestrate");
         let base = cache_dir.join("mailbox-v1");
@@ -7883,7 +7923,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_clear_requires_positive_matching_pid() {
-        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _lock = lock_test_env();
         let td = TestDir::new("ork-clear-pos-pid");
         let base = td.path.join("cache/mailbox-v1");
         fs::create_dir_all(base.join("cleared")).unwrap();
@@ -7967,7 +8007,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_end_session_clear_preserves_peer_when_stash_lock_or_write_fails() {
-        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _lock = lock_test_env();
         let td = TestDir::new("ork-clear-stash-fail");
         let base = td.path.join("cache/mailbox-v1");
         fs::create_dir_all(base.join("cleared")).unwrap();
@@ -8022,7 +8062,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_clear_checked_inbox_scan_keeps_claim_retryable_on_unreadable_inbox_or_entry() {
-        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _lock = lock_test_env();
         let td = TestDir::new("ork-clear-checked-scan");
         let base = td.path.join("cache/mailbox-v1");
         fs::create_dir_all(base.join("cleared")).unwrap();
@@ -8111,7 +8151,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_end_session_clear_preserves_unreadable_predecessor_peer_for_retry() {
-        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _lock = lock_test_env();
         let td = TestDir::new("ork-clear-unreadable-peer");
         let base = td.path.join("cache/mailbox-v1");
         fs::create_dir_all(base.join("cleared")).unwrap();

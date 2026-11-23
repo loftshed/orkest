@@ -131,6 +131,12 @@ async function readSharedUpdateState(options = {}) {
   }
 }
 
+function pendingPostInstallNotice(postInstall) {
+  if (postInstall?.ok !== false) return "";
+  const what = postInstall.status === "timed_out" ? "timed out" : "failed";
+  return `Orkest updated, but its ${postInstall.step} ${what}; run: ${postInstall.command}`;
+}
+
 export function resolvePullUpdateOutcome(res, nowMs = Date.now()) {
   if (res?.ok && res.updated) {
     const landedSha = res.toSha || res.remoteSha || res.localSha;
@@ -143,14 +149,14 @@ export function resolvePullUpdateOutcome(res, nowMs = Date.now()) {
         commitsBehind: res.commitsBehind,
         completedAt: nowMs,
       },
-      notice: "",
+      notice: pendingPostInstallNotice(res.postInstall),
     };
   }
   if (res?.ok && res.status === "up_to_date") {
     syncUpdateCacheAsCurrent(res.localSha || res.remoteSha, nowMs);
     return {
       updateState: null,
-      notice: "Orkest is already up to date.",
+      notice: pendingPostInstallNotice(res.postInstall) || "Orkest is already up to date.",
     };
   }
   return {

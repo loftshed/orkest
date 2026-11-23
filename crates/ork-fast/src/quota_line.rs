@@ -567,7 +567,7 @@ pub fn turn_quota_line() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mailbox_lifecycle::tests::{EnvGuard, TEST_ENV_LOCK};
+    use crate::mailbox_lifecycle::tests::{EnvGuard, lock_test_env};
 
     fn fixture() -> Value {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -577,7 +577,7 @@ mod tests {
 
     #[test]
     fn line_matches_the_js_renderer_on_the_shared_fixture() {
-        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _lock = lock_test_env();
         let mut env = EnvGuard::new();
         env.set("TZ", "UTC");
         let fx = fixture();
@@ -595,7 +595,7 @@ mod tests {
 
     #[test]
     fn old_readings_are_marked_and_very_old_ones_are_not_shown() {
-        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _lock = lock_test_env();
         let mut env = EnvGuard::new();
         env.set("TZ", "UTC");
         let fx = fixture();
@@ -620,7 +620,7 @@ mod tests {
 
     #[test]
     fn expiring_quota_is_spent_only_when_every_other_window_resets_in_time() {
-        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _lock = lock_test_env();
         let mut env = EnvGuard::new();
         env.set("TZ", "UTC");
         let now: i64 = 1_795_446_000_000; // 3:00pm UTC
@@ -663,7 +663,7 @@ mod tests {
 
     #[test]
     fn nothing_without_monitor_data() {
-        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _lock = lock_test_env();
         let mut env = EnvGuard::new();
         let dir = crate::mailbox_lifecycle::tests::TestDir::new("ork-fast-quota-line");
         env.set("MONITOR_CACHE_DIR", &dir.path);
