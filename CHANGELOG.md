@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.99.2
+
+- fix(monitor): keep owner-only MCP configs owner-only and skip identical registrations
+- fix(update): give the post-install step minutes and record the update when it fails
+
 ## 0.99.1
 
 - fix(quota): label the quota line, refresh it per turn, and guard low pools (#262)
