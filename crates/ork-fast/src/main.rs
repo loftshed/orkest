@@ -16,6 +16,7 @@ mod sha1;
 mod sha256;
 mod sqlite;
 mod statusline;
+mod statusline_mcp;
 mod terminal;
 
 use std::env;
@@ -31,6 +32,7 @@ SUBCOMMANDS:\n\
     lease-holder <path> [--read-only] [--namespace <ns>]\n\
     gate-hook --harness <claude|codex|gemini> [--fallback-script <gate.py>]\n\
     statusline [OPTIONS] [--fallback-script <agent_statusline.py>]\n\
+    statusline-mcp   (Codex custom status line provider over stdio MCP)\n\
     mailbox-hook --harness <claude|codex|gemini> [--event <Event>] [--fallback-script <peer_mailbox.py>]\n\
     herdr-status [--fallback-script <herdr_status.py>]\n\n\
 FLAGS:\n\
@@ -118,6 +120,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             statusline::run(&args[2..], fallback_script.as_deref())?;
         }
+        "statusline-mcp" => statusline_mcp::run()?,
         "mailbox-hook" => {
             let mut harness_opt: Option<String> = None;
             let mut event_opt: Option<String> = None;

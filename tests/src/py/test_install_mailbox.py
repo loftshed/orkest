@@ -405,6 +405,85 @@ class InstallMailboxTests(unittest.TestCase):
         installer.set_codex_timeout(self.path)
         self.assertEqual(self.path.read_bytes(), before)
 
+    def test_codex_statusline_fresh_config_registers_enables_and_selects_the_agent_bar(self):
+        config = self.base / "config.toml"
+        fast_bin = self.base / "bin/ork-fast"
+        with redirect_stdout(io.StringIO()):
+            self.assertTrue(installer.install_codex_statusline(config, fast_bin=fast_bin))
+        parsed = tomllib.loads(config.read_text())
+        server = parsed["mcp_servers"]["orkest-statusline"]
+        self.assertEqual((server["command"], server["args"]), (str(fast_bin), ["statusline-mcp"]))
+        self.assertIn("ORKEST_TERMINAL_SERVER", server["env_vars"])
+        self.assertIn("AGENT_EXECUTOR_HOME", server["env_vars"])
+        self.assertIs(parsed["features"]["tui_extensions_statusline"], True)
+        self.assertEqual(parsed["tui"]["status_line_provider"], {"server": "orkest-statusline", "tool": "statusline"})
+        self.assertEqual(config.stat().st_mode & 0o777, 0o600)
+
+    def test_codex_statusline_preserves_explicit_choices_comments_and_is_idempotent(self):
+        config = self.base / "config.toml"
+        original = textwrap.dedent(
+            """\
+            # user comment
+            model = "example"
+
+            [features]
+            tui_extensions_statusline = false # tried it, not for me
+
+            [tui]
+            theme = "dracula"
+            status_line_provider = { server = "mine", tool = "footer" }
+
+            [mcp_servers.orkest-statusline]
+            command = "/old/ork-fast"
+            args = ["statusline-mcp"]
+            enabled = false
+            startup_timeout_sec = 5
+            """
+        )
+        config.write_text(original)
+        fast_bin = self.base / "bin/ork-fast"
+        with redirect_stdout(io.StringIO()):
+            self.assertTrue(installer.install_codex_statusline(config, fast_bin=fast_bin))
+        text = config.read_text()
+        parsed = tomllib.loads(text)
+        self.assertIs(parsed["features"]["tui_extensions_statusline"], False)
+        self.assertEqual(
+            parsed["tui"], {"theme": "dracula", "status_line_provider": {"server": "mine", "tool": "footer"}}
+        )
+        server = parsed["mcp_servers"]["orkest-statusline"]
+        self.assertEqual(server["command"], str(fast_bin))
+        self.assertIs(server["enabled"], False)
+        self.assertEqual(server["startup_timeout_sec"], 5)
+        for kept in ("# user comment", "# tried it, not for me", 'theme = "dracula"'):
+            self.assertIn(kept, text)
+        self.assertEqual(len(list(self.base.glob("config.toml.mailbox-bak.*"))), 1)
+        before = config.read_bytes()
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertFalse(installer.install_codex_statusline(config, fast_bin=fast_bin))
+        self.assertIn("already registered", output.getvalue())
+        self.assertEqual(config.read_bytes(), before)
+        self.assertEqual(len(list(self.base.glob("config.toml.mailbox-bak.*"))), 1)
+
+    def test_codex_statusline_extends_dotted_and_existing_tables_and_keeps_a_default_choice(self):
+        config = self.base / "config.toml"
+        config.write_text('features.other = true\n\n[tui]\nstatus_line_provider = "default"\n\n[other]\nvalue = 7\n')
+        with redirect_stdout(io.StringIO()):
+            installer.install_codex_statusline(config, fast_bin=self.base / "ork-fast")
+        parsed = tomllib.loads(config.read_text())
+        self.assertEqual(parsed["features"], {"other": True, "tui_extensions_statusline": True})
+        self.assertEqual(parsed["tui"]["status_line_provider"], "default")
+        self.assertEqual(parsed["other"], {"value": 7})
+        with redirect_stdout(io.StringIO()):
+            self.assertFalse(installer.install_codex_statusline(config, fast_bin=self.base / "ork-fast", dry_run=True))
+
+    def test_codex_statusline_dry_run_reports_without_writing(self):
+        config = self.base / "config.toml"
+        config.write_text('model = "example"\n')
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertTrue(installer.install_codex_statusline(config, fast_bin=self.base / "ork-fast", dry_run=True))
+        self.assertIn("would register the Codex agent bar", output.getvalue())
+        self.assertEqual(config.read_text(), 'model = "example"\n')
+
     def test_trust_selects_only_our_four_exact_commands(self):
         command = shlex.join([str(self.fast_bin), "mailbox-hook", "--harness", "codex"])
         hooks = [
@@ -1555,6 +1634,8 @@ class AccountFederationTests(unittest.TestCase):
             parsed = tomllib.loads((self.base / home / "config.toml").read_text())
             self.assertEqual(parsed["mcp_servers"]["peer-mailbox"]["url"], self.URL)
             self.assertIn("monitor", parsed["mcp_servers"])
+            self.assertEqual(parsed["mcp_servers"]["orkest-statusline"]["args"], ["statusline-mcp"])
+            self.assertEqual(parsed["tui"]["status_line_provider"]["server"], "orkest-statusline")
             self.assertTrue((self.base / home / "hooks.json").is_file())
             self.assertTrue((self.base / home / "rules/orkest.rules").is_file())
         text = (self.base / ".codex-a/config.toml").read_text()
