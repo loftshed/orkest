@@ -46,7 +46,10 @@ export function validPayload({ scope, kind, entity, body }) {
         scope === "rooms-local" &&
         (keys(body, ["removed", "room"]) ||
           (keys(body, ["removed", "room", "project"]) &&
-            (body.project === null || hash.test(body.project)))) &&
+            (body.project === null || hash.test(body.project))) ||
+          (keys(body, ["removed", "room", "project", "projectVerified"]) &&
+            (body.project === null || hash.test(body.project)) &&
+            typeof body.projectVerified === "boolean")) &&
         typeof body.removed === "boolean" &&
         (body.removed ? body.room === null : body.room?.id === entity)
       );

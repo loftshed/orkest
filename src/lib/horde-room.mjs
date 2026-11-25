@@ -693,12 +693,15 @@ function projectRoomHint(db, room, isRemoved) {
 }
 
 function recordRoomState(db, room, isRemoved = false) {
-  const project = roomProject(db, room, isRemoved);
+  const project = roomProject(db, room, {
+    removed: isRemoved,
+    closing: !isRemoved && isClosedRoom(room),
+  });
   appendInTransaction(db, {
     scope: "rooms-local",
     entity: room.id,
     kind: "room.record",
-    body: { removed: isRemoved, room: isRemoved ? null : room, project },
+    body: { removed: isRemoved, room: isRemoved ? null : room, ...project },
   });
   appendInTransaction(db, {
     scope: `room:${room.id}`,
