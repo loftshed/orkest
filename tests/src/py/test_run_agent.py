@@ -3230,6 +3230,7 @@ class SteerTests(unittest.TestCase):
         block: bool = True,
         silent: bool = False,
         extra_env: dict[str, str] | None = None,
+        extra_args: tuple[str, ...] = (),
     ) -> dict:
         self.run_index += 1
         index = self.run_index
@@ -3265,6 +3266,7 @@ class SteerTests(unittest.TestCase):
         ]
         if model:
             argv += ["--model", model]
+        argv += extra_args
         output = io.StringIO()
         with (
             mock.patch.object(sys, "argv", argv),
@@ -3376,12 +3378,12 @@ class SteerTests(unittest.TestCase):
         self.launched = [*getattr(self, "launched", []), job]
         return job
 
-    def steer(self, reference: str, message: str, *extra: str) -> tuple[int, str]:
+    def steer(self, reference: str, message: str, *extra: str, env: dict[str, str] | None = None) -> tuple[int, str]:
         output = io.StringIO()
         argv = [str(SCRIPT), "steer", reference, "--message", message, *extra]
         with (
             mock.patch.object(sys, "argv", argv),
-            mock.patch.dict(os.environ, self.environment()),
+            mock.patch.dict(os.environ, self.environment(**(env or {}))),
             contextlib.redirect_stdout(output),
         ):
             return RUNNER.main(), output.getvalue()
@@ -3509,10 +3511,13 @@ class SteerTests(unittest.TestCase):
             inbox, _errors = RUNNER.completion_events(repository=self.repository.path, include_acknowledged=False)
         self.assertEqual([item["event_id"] for item in inbox], [values["AGENT_EVENT_ID"]])
 
-        # A steered job can be addressed again by its new event, and the finished job is refused.
-        error = self.steer_refused(values["AGENT_EVENT_ID"])
-        self.assertEqual(error.exit_code, RUNNER.EXIT_STEER_JOB_FINISHED)
-        self.assertIn("--session codex-thread-1 --resume-result", str(error))
+        # A steered job can be addressed again by its new event; once finished, the correction resumes the
+        # session as a new run from the newest segment's result.
+        resumed = self.steer_finished(values["AGENT_EVENT_ID"], "One more fix.", "again")
+        self.assertEqual(resumed["AGENT_STEER_STATUS"], "resumed")
+        self.assertEqual(resumed["AGENT_RESUMED_FROM"], values["AGENT_RESULT"])
+        self.assertEqual(Path(resumed["AGENT_JOB"]), job["job_dir"] / "steers" / "2" / "job.json")
+        self.assertEqual(self.wait_event(resumed["AGENT_EVENT_ID"])["status"], "completed")
 
     def test_each_resumable_engine_continues_its_own_session(self) -> None:
         cases = {
@@ -3766,12 +3771,173 @@ class SteerTests(unittest.TestCase):
         self.assertNotIn("steering", result)
         self.assertEqual(len(result["executor_attempts"]), 1)
 
-    def test_refuses_a_finished_job_and_points_to_session_resume(self) -> None:
+    def resume_env(self, name: str) -> dict[str, str]:
+        """What a resumed fake executor needs: its own capture file, and new content so the run changes files."""
+        return {"FAKE_CAPTURE": str(self.external_path / f"resume-capture-{name}.json"), "FAKE_CONTENT": f"{name}\n"}
+
+    def steer_finished(self, reference: str, message: str, name: str) -> dict[str, str]:
+        exit_code, output = self.steer(reference, message, env=self.resume_env(name))
+        self.assertEqual(exit_code, 0)
+        values = dict(line.split("=", 1) for line in output.splitlines() if line.startswith("AGENT_"))
+        self.launched.append({"pid": int(values["AGENT_JOB_PID"]), "event_path": values["AGENT_EVENT"]})
+        return values
+
+    def test_steering_a_finished_job_resumes_its_session_with_the_original_flags(self) -> None:
+        job = self.launch(block=False, model="gpt-5.6-luna", extra_args=("--effort", "low", "--verify-timeout", "3m"))
+        self.wait_event(job["event_id"])
+        message = job["job_dir"] / "steers" / "1.message.txt"
+        with mock.patch.dict(os.environ, self.environment()):
+            command = RUNNER.resume_command_for_job(job["job_dir"], message)
+        self.assertEqual((command[0], Path(command[1])), (sys.executable, SCRIPT.resolve()))
+        self.assertEqual(
+            command[2:],
+            [
+                "--cwd", str(self.repository.path.resolve()),
+                "--brief", str(message),
+                "--transport", "executor",
+                "--detach",
+                "--job-dir", str(job["job_dir"] / "steers" / "1"),
+                "--engine", "codex",
+                "--model", "gpt-5.6-luna",
+                "--effort", "low",
+                "--billing-mode", "unknown",
+                "--timeout", "5m",
+                "--notify", "none",
+                "--verify-timeout", "3m",
+                "--allow-path", "allowed",
+                "--verify-command", "test -f allowed/output.txt",
+                "--expect-changes",
+                "--session", "codex-thread-1",
+                "--resume-result", str(job["result_path"]),
+            ],
+        )  # fmt: skip
+
+        values = self.steer_finished(str(job["job_path"]), "Also handle the empty case.", "first")
+        self.assertEqual(
+            (values["AGENT_STEER_STATUS"], values["AGENT_STEER_MODE"], values["AGENT_SESSION"]),
+            ("resumed", "resume_finished", "codex-thread-1"),
+        )
+        self.assertEqual(values["AGENT_RESUMED_FROM"], str(job["result_path"]))
+        self.assertEqual(Path(values["AGENT_JOB"]), job["job_dir"] / "steers" / "1" / "job.json")
+        self.assertEqual(message.read_text(encoding="utf-8"), "Also handle the empty case.")
+        event = self.wait_event(values["AGENT_EVENT_ID"])
+        result = json.loads(Path(values["AGENT_RESULT"]).read_text(encoding="utf-8"))
+        self.assertEqual((event["status"], result["status"]), ("completed", "completed"), result.get("error"))
+        self.assertEqual(result["command"][1:4], ["exec", "resume", "codex-thread-1"])
+        self.assertEqual(
+            (result["session_id"], result["model"], result["effort"]["bound"]),
+            ("codex-thread-1", "gpt-5.6-luna", "low"),
+        )
+        self.assertEqual(result["verification_commands"], ["test -f allowed/output.txt"])
+        capture = json.loads(Path(self.resume_env("first")["FAKE_CAPTURE"]).read_text(encoding="utf-8"))
+        self.assertIn("Also handle the empty case.", capture["stdin"])
+
+        # Both manifests record how their run ended, and the job's next steer addresses the resumed run.
+        resumed_path = Path(values["AGENT_JOB"])
+        self.assertTrue(self.wait_until(lambda: json.loads(resumed_path.read_text())["status"] != "started"))
+        resumed_job = json.loads(resumed_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            (resumed_job["status"], resumed_job["exit_code"], resumed_job["error"]), ("completed", 0, None)
+        )
+        self.assertIsNotNone(resumed_job["finished_at"])
+        first_job = json.loads(job["job_path"].read_text(encoding="utf-8"))
+        self.assertEqual((first_job["status"], first_job["exit_code"]), ("completed", 0))
+        again = self.steer_finished(job["event_id"], "And the null case.", "second")
+        self.assertEqual(again["AGENT_RESUMED_FROM"], values["AGENT_RESULT"])
+        self.assertEqual(Path(again["AGENT_JOB"]), job["job_dir"] / "steers" / "2" / "job.json")
+        self.assertEqual(self.wait_event(again["AGENT_EVENT_ID"])["status"], "completed")
+
+    def test_each_resumable_status_resumes_its_session(self) -> None:
         job = self.launch(block=False)
         self.wait_event(job["event_id"])
-        error = self.steer_refused(str(job["job_path"]))
-        self.assertEqual(error.exit_code, RUNNER.EXIT_STEER_JOB_FINISHED)
-        self.assertIn(f"--session codex-thread-1 --resume-result {job['result_path']}", str(error))
+        support = RUNNER.bundled_module("execution_support")
+        result_path = job["result_path"]
+        for index, status in enumerate(sorted(support.RESUMABLE_STATUSES)):
+            with self.subTest(status=status):
+                result = json.loads(result_path.read_text(encoding="utf-8"))
+                result_path.write_text(json.dumps({**result, "status": status}), encoding="utf-8")
+                values = self.steer_finished(str(job["job_dir"]), f"Correction for {status}.", f"status-{index}")
+                self.assertEqual(values["AGENT_STEER_STATUS"], "resumed")
+                self.assertEqual(values["AGENT_RESUMED_FROM"], str(result_path))
+                event = self.wait_event(values["AGENT_EVENT_ID"])
+                self.assertEqual(event["status"], "completed", event.get("error"))
+                result_path = Path(values["AGENT_RESULT"])
+
+    def test_a_finished_job_that_cannot_resume_prints_a_new_run_that_runs_as_printed(self) -> None:
+        job = self.launch(block=False)
+        self.wait_event(job["event_id"])
+        result = json.loads(job["result_path"].read_text(encoding="utf-8"))
+        job["result_path"].write_text(
+            json.dumps({**result, "status": "scope_violation", "scope_violations": ["outside/x.txt"]}),
+            encoding="utf-8",
+        )
+        error = self.steer_refused(str(job["job_dir"]), message="Redo it inside allowed/.")
+        self.assertEqual(error.exit_code, RUNNER.EXIT_STEER_REJECTED)
+        reason, intro, fallback = str(error).splitlines()
+        self.assertIn("cannot resume a scope_violation result", reason)
+        self.assertIn("revert or accept those changes", reason)
+        self.assertIn(str(job["result_path"]), reason)
+        self.assertIn("new run instead", intro)
+        self.assertFalse((job["job_dir"] / "steers" / "1").exists(), "a refused steer launches nothing")
+
+        argv = shlex.split(fallback)
+        self.assertEqual(Path(argv[1]), SCRIPT.resolve())
+        parsed = RUNNER.parse_args(argv[2:])
+        self.assertIsNone(parsed.session)
+        self.assertIsNone(parsed.resume_result)
+        self.assertTrue(parsed.detach)
+        self.assertEqual(parsed.job_dir, job["job_dir"] / "steers" / "1")
+        self.assertEqual((parsed.allow_path, parsed.verify_command), (["allowed"], ["test -f allowed/output.txt"]))
+        brief = Path(parsed.brief).read_text(encoding="utf-8")
+        self.assertTrue(brief.startswith("# Objective\n\nCreate the fixture output."), brief)
+        self.assertTrue(brief.endswith("Redo it inside allowed/."), brief)
+
+        # Exactly as printed: a fresh detached run starts and finishes.
+        environment = {**os.environ, **self.environment(**self.resume_env("fallback"))}
+        launched = subprocess.run(argv, env=environment, capture_output=True, text=True, timeout=60, check=False)
+        self.assertEqual(launched.returncode, 0, launched.stderr)
+        values = dict(line.split("=", 1) for line in launched.stdout.splitlines() if line.startswith("AGENT_"))
+        self.launched.append({"pid": int(values["AGENT_JOB_PID"]), "event_path": values["AGENT_EVENT"]})
+        event = self.wait_event(values["AGENT_EVENT_ID"])
+        self.assertEqual(event["status"], "completed", event.get("error"))
+
+    def test_a_refused_resume_records_its_status_and_tells_the_conductor_once(self) -> None:
+        first = self.launch(block=False)
+        self.wait_event(first["event_id"])
+        baseline = json.loads(first["result_path"].read_text(encoding="utf-8"))
+        first["result_path"].write_text(json.dumps({**baseline, "status": "runner_failed"}), encoding="utf-8")
+        # Launched by hand, as in the issue, so the runner's own preflight refuses the resume.
+        job = self.launch(
+            block=False,
+            extra_args=("--session", "codex-thread-1", "--resume-result", str(first["result_path"])),
+        )
+        event = self.wait_event(job["event_id"])
+        self.assertEqual((event["status"], event["exit_code"]), ("preflight_failed", 4))
+        self.assertTrue(self.wait_until(lambda: json.loads(job["job_path"].read_text())["status"] != "started"))
+        manifest = json.loads(job["job_path"].read_text(encoding="utf-8"))
+        self.assertEqual((manifest["status"], manifest["exit_code"]), ("preflight_failed", 4))
+        self.assertIsNotNone(manifest["finished_at"])
+        self.assertIn("cannot resume a runner_failed result", manifest["error"])
+        self.assertIn("read the job's runner.stderr", manifest["error"])
+
+        with mock.patch.dict(os.environ, self.environment()):
+            inbox = MAILBOX.messages(MAILBOX.root(), job["mailbox"], unread_only=False)
+            self.assertEqual(len(inbox), 1, inbox)
+            self.assertEqual(inbox[0]["kind"], "update")
+            self.assertTrue(inbox[0]["text"].startswith("[preflight_failed] cannot resume a runner_failed result"))
+            self.assertIn(str(job["result_path"]), inbox[0]["text"])
+            # A retry, such as a re-published event, keeps the one message.
+            result = json.loads(job["result_path"].read_text(encoding="utf-8"))
+            RUNNER._JOB_STEERING_MOD.report_run_refusal(
+                result, event_id=job["event_id"], result_path=job["result_path"]
+            )
+            self.assertEqual(len(MAILBOX.messages(MAILBOX.root(), job["mailbox"], unread_only=False)), 1)
+
+        # Steering the refused job resumes from the result the refused run was resuming, not from the refusal.
+        first["result_path"].write_text(json.dumps(baseline), encoding="utf-8")
+        values = self.steer_finished(str(job["job_dir"]), "Try again.", "after-refusal")
+        self.assertEqual(values["AGENT_RESUMED_FROM"], str(first["result_path"]))
+        self.assertEqual(self.wait_event(values["AGENT_EVENT_ID"])["status"], "completed")
 
     def test_refuses_a_job_whose_runner_cannot_be_found(self) -> None:
         cache = self.external_path / "steer-cache" / "orchestrate"
@@ -4053,9 +4219,27 @@ class ProcessAndResumeRegressionTests(unittest.TestCase):
             "verification_commands": ["pytest"],
             "billing_mode": "subscription",
         }
-        for status in ("timed_out", "empty_output", "steered", "failed", "malformed_report"):
+        for status in sorted(support.RESUMABLE_STATUSES):
             with self.subTest(status=status):
                 support.validate_resume({**baseline, "status": status}, current)
+
+        # Each refusal names the status it saw and its own next step.
+        refusals = {}
+        for status in (*support.RESUME_REFUSALS, "something_new"):
+            with self.subTest(status=status), self.assertRaises(support.ContractError) as caught:
+                support.validate_resume({**baseline, "status": status, "error": "boom"}, current, source="/r.json")
+            refusals[status] = str(caught.exception)
+            self.assertTrue(refusals[status].startswith(f"cannot resume a {status} result (boom): "), refusals[status])
+            self.assertTrue(refusals[status].endswith("; see /r.json"), refusals[status])
+        self.assertEqual(len({text.split(": ", 1)[1] for text in refusals.values()}), len(refusals))
+        for field in ("scope_violations", "history_violations"):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(support.ContractError, "cannot resume a completed result with scope"):
+                    support.validate_resume({**baseline, field: ["x"]}, current)
+        with self.assertRaisesRegex(
+            support.ContractError, r"does not match model: the completed result has \"gpt-5.6-luna\" .*\"other\""
+        ):
+            support.validate_resume(baseline, {**current, "model": "other"})
 
         # Widening to worker-owned '.' covers any non-.git path:
         support.validate_resume(

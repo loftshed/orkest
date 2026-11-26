@@ -195,6 +195,8 @@ python3 <scripts>/run_agent.py \
   python3 <scripts>/run_agent.py steer <event-id> --cwd <repo> --message @lead.md
   ```
 
+  On a finished job, `steer` sends the message as a new detached run in `<job>/steers/<N>` that resumes the same session with the job's original flags, and prints its `AGENT_JOB…` lines. When the session cannot be resumed, it exits non-zero, names the result's status and prints a fresh-run command that runs as printed. A detached run that fails preflight posts the reason to its conductor mailbox, and every detached run records its final `status` in `job.json`.
+
 - **Isolated patch testing (`probe`):** Copy selected files into a temporary `/tmp` overlay, apply a candidate patch, and run a test command without touching the checkout:
 
   ```sh

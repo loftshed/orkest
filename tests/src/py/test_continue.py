@@ -313,7 +313,8 @@ class ContinueTests(unittest.TestCase):
         self.reviewed(run)
         code, error = self.follow("unsafe-resume")
         self.assertEqual(code, 2)
-        self.assertIn("investigation", error)
+        self.assertIn("cannot resume a scope_violation result", error)
+        self.assertIn("start a new run without --session or --resume-result", error)
 
     def test_continue_has_its_own_verification_gates_and_default_timeout(self):
         _, first = self.start()
