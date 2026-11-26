@@ -556,6 +556,8 @@ class InstallMailboxTests(unittest.TestCase):
         # The installer-owned orkest.sh only sources the canonical file; .zshrc keeps one inclusion.
         self.assertIn(str(canonical), wrapper.read_text())
         self.assertNotIn("command ork label", wrapper.read_text())
+        bash = subprocess.run(["bash", "-c", f". {shlex.quote(str(wrapper))}"], capture_output=True, text=True)
+        self.assertEqual((bash.returncode, bash.stderr), (0, ""))
         self.assertEqual(zshrc.read_text().count(installer.MANAGED_ZSHRC_START), 1)
         self.assertEqual((self.base / ".local/bin/ork").resolve(), ork_cli.resolve())
         self.assertTrue((self.base / ".claude/commands/swarm.md").is_file())
