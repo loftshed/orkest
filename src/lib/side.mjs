@@ -6,6 +6,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { knownEngines } from "./families-schema.mjs";
+import { commandInvocation } from "./harness-command.mjs";
 import {
   isActiveRoom,
   isClosedRoom,
@@ -1274,6 +1275,7 @@ export async function sideCommand(argv = [], context = {}) {
   const cacheDir = context.cacheDir ? path.resolve(context.cacheDir) : resolveAgentCacheDir(env);
 
   const classified = classifySideMode(rawIdea, options);
+  const swarmCommand = commandInvocation(options.harness, "swarm");
   const shortId =
     context.shortId || `${Date.now().toString(36)}-${crypto.randomBytes(3).toString("hex")}`;
   const sideId = `side-${shortId}`;
@@ -1333,7 +1335,7 @@ export async function sideCommand(argv = [], context = {}) {
     }
     const { item: workItem } = JSON.parse(res.stdout);
     const workId = workItem.id;
-    const summary = `Parked side mission ${workId} ("${classified.title}") on the workboard — visible in /swarm and ork next.`;
+    const summary = `Parked side mission ${workId} ("${classified.title}") on the workboard — visible in ${swarmCommand} and ork next.`;
     const payload = {
       schema: "ork.side.v1",
       sideId,
@@ -1597,10 +1599,10 @@ export async function sideCommand(argv = [], context = {}) {
 
   const summary =
     classified.mode === "investigate"
-      ? `Launched read-only side mission ${memberId} ("${classified.title}") in the background — visible in /swarm and ork next.`
+      ? `Launched read-only side mission ${memberId} ("${classified.title}") in the background — visible in ${swarmCommand} and ork next.`
       : `Launched side mission ${memberId} ("${classified.title}") in isolated worktree ${
           worktreePath ? path.basename(worktreePath) : branch
-        } — visible in /swarm and ork next.`;
+        } — visible in ${swarmCommand} and ork next.`;
 
   const payload = {
     schema: "ork.side.v1",

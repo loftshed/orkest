@@ -23,12 +23,15 @@ fn is_valid_terminal_server(s: &str) -> bool {
 fn check_slash_or_side_keywords(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     lower.contains("/side")
+        || lower.contains("$side")
         || lower.contains("!side")
         || lower.contains("side:")
         || lower.contains("ork side")
         || lower.contains("[orkest-side-command")
         || lower.contains("/swarm")
         || lower.contains("/horde")
+        || lower.contains("$swarm")
+        || lower.contains("$horde")
         || lower.contains("[orkest-swarm")
         || lower.contains("/clear")
 }
@@ -1461,6 +1464,19 @@ mod tests {
     };
     use crate::paths::{fd_identity, lock_path_exclusive};
     use crate::sha256;
+
+    #[test]
+    fn keyword_check_sends_codex_skill_forms_to_the_full_hook() {
+        for prompt in [
+            "$swarm",
+            "$horde close",
+            "$side fix the flaky test",
+            "/swarm",
+        ] {
+            assert!(check_slash_or_side_keywords(prompt), "{prompt}");
+        }
+        assert!(!check_slash_or_side_keywords("just keep going"));
+    }
 
     #[test]
     fn test_lock_retries_after_pruner_unlinks_inode() {

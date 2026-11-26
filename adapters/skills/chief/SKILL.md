@@ -1,6 +1,6 @@
 ---
 name: chief
-description: "Act as Ork Chief, the machine-wide Master Orchestrator, when the user types /chief, runs `ork chief`, asks for an overview of every running agent, room or orchestrator across repositories, or streams multi-repo goals to hand off. Bind the Chief desk, open the Chief View, brief cross-machine status, spawn autonomous room orchestrators in isolated worktrees, plan tickets with cross-model consultations, and steer or unblock running orchestrators while keeping the Chief session thin: never read source files, raw diffs or worker transcripts here."
+description: "Act as Ork Chief, the machine-wide Master Orchestrator, when the user invokes the chief skill (`/chief`, or `$chief` in Codex), runs `ork chief`, asks for an overview of every running agent, room or orchestrator across repositories, or streams multi-repo goals to hand off. Bind the Chief desk, open the Chief View, brief cross-machine status, spawn autonomous room orchestrators in isolated worktrees, plan tickets with cross-model consultations, and steer or unblock running orchestrators while keeping the Chief session thin: never read source files, raw diffs or worker transcripts here."
 ---
 
 # Chief
@@ -22,7 +22,7 @@ ork horde open --chief         # open the Chief View split pane beside this conv
 
 - `bind` is a singleton. If `status` shows another live Chief, tell the user which session holds
   the desk and ask before rebinding. A stale holder (dead process) can be replaced without asking.
-- `ork horde open --chief` returns at once (plain `/swarm` also opens Chief mode for the desk
+- `ork horde open --chief` returns at once (the plain swarm skill also opens Chief mode for the desk
   holder). `ork chief view` draws the same view in the current terminal and blocks, so suggest it
   to the user for a terminal of their own; never run it yourself. Keys for the user: Enter opens
   a room, Backspace returns, `o` focuses that room's orchestrator pane, `C` the Chief pane, `?` help.

@@ -178,6 +178,26 @@ describe("ork side (side missions)", () => {
       expect(calls[0].env.AGENT_MAILBOX_SESSION).toBe("side-coord-park01");
     });
 
+    it("names the Swarm View command the way the caller's harness invokes it", async () => {
+      const park = (harnessArgs) =>
+        sideCommand(["--later", "--json", ...harnessArgs, "refactor retry helper"], {
+          cwd: repoDir,
+          mailboxDir,
+          cacheDir,
+          shortId: "park02",
+          env: process.env,
+          runCommand: () => ({
+            status: 0,
+            stdout: JSON.stringify({ item: { id: "work-side-park02", state: "open" } }),
+            stderr: "",
+          }),
+        });
+
+      expect((await park(["--harness", "codex"])).summary).toContain("visible in $swarm and");
+      expect((await park(["--harness", "claude"])).summary).toContain("visible in /swarm and");
+      expect((await park([])).summary).toContain("visible in ork swarm and");
+    });
+
     it("creates an open workboard card with the requested scope", async () => {
       expect(spawnSync("git", ["init", repoDir]).status).toBe(0);
       const cli = path.resolve(import.meta.dirname, "../../../src/bin/ork.mjs");

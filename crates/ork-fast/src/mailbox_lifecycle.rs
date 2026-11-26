@@ -3828,8 +3828,9 @@ pub fn update_notice(base: &Path, me: &Value) -> String {
     } else {
         "new commits".to_string()
     };
+    let update = identity::command_invocation(me.get("harness").and_then(Value::as_str), "update");
     format!(
-        "An Orkest update is available ({what}). Tell the user it is there: run /update to apply it, then restart sessions."
+        "An Orkest update is available ({what}). Tell the user it is there: run {update} to apply it, then restart sessions."
     )
 }
 
