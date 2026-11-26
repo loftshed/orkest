@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.101.1
+
+- fix: name Orkest commands with each harness's prefix (#283)
+- fix(codex): keep the agent bar's spacing in Codex and center its icon (#282)
+- fix(setup): load the zsh-only shell setup only from zsh
+
 ## 0.101.0
 
 - feat(codex): show the Orkest agent bar in Codex's custom status line (#279)
