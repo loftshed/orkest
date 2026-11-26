@@ -252,8 +252,11 @@ def inline_table(data: dict[str, Any]) -> str:
     )
 
 
-def set_toml_server(text: str, server: dict[str, Any]) -> str:
+def set_toml_server(text: str, server: dict[str, Any], name: str = "peer-mailbox") -> str:
+    """Replace one `mcp_servers` entry in whatever TOML form it has, keeping all other text."""
     parsed = tomllib.loads(text)
+    bare = re.escape(name)
+    either = f'(?:{bare}|"{bare}")'
     lines = text.splitlines(keepends=True)
     section = ""
     for index, line in enumerate(lines):
@@ -265,27 +268,25 @@ def set_toml_server(text: str, server: dict[str, Any]) -> str:
             re.match(r'^([ \t]*(?:mcp_servers|"mcp_servers")\s*=\s*)(\{.*\})([ \t]*)$', code) if not section else None
         )
         direct = (
-            re.match(
-                r'^([ \t]*(?:mcp_servers|"mcp_servers")\.(?:peer-mailbox|"peer-mailbox")\s*=\s*)(\{.*\})([ \t]*)$', code
-            )
+            re.match(rf'^([ \t]*(?:mcp_servers|"mcp_servers")\.{either}\s*=\s*)(\{{.*\}})([ \t]*)$', code)
             if not section
             else None
         )
         nested = (
-            re.match(r'^([ \t]*(?:peer-mailbox|"peer-mailbox")\s*=\s*)(\{.*\})([ \t]*)$', code)
+            re.match(rf"^([ \t]*{either}\s*=\s*)(\{{.*\}})([ \t]*)$", code)
             if section in {"[mcp_servers]", '["mcp_servers"]'}
             else None
         )
         match = full or direct or nested
         if match:
-            value = {**parsed.get("mcp_servers", {}), "peer-mailbox": server} if full else server
+            value = {**parsed.get("mcp_servers", {}), name: server} if full else server
             lines[index] = (
                 match[1] + inline_table(value) + match[3] + annotation + ("\n" if line.endswith("\n") else "")
             )
             result = "".join(lines)
             tomllib.loads(result)
             return result
-    dotted = re.compile(r'^[ \t]*(?:mcp_servers|"mcp_servers")\.(?:peer-mailbox|"peer-mailbox")\.')
+    dotted = re.compile(rf'^[ \t]*(?:mcp_servers|"mcp_servers")\.{either}\.')
     root_dotted = set()
     section = ""
     for index, line in enumerate(lines):
@@ -307,7 +308,7 @@ def set_toml_server(text: str, server: dict[str, Any]) -> str:
             + "\n\n"
             + "\n".join(comments)
             + ("\n" if comments else "")
-            + toml_table(["mcp_servers", "peer-mailbox"], server)
+            + toml_table(["mcp_servers", name], server)
         )
         tomllib.loads(result)
         return result
@@ -315,13 +316,13 @@ def set_toml_server(text: str, server: dict[str, Any]) -> str:
     owned = []
     for index, match in enumerate(sections):
         header = match[0].split("#", 1)[0].strip()[1:-1]
-        if re.match(r'^(?:mcp_servers|"mcp_servers")\.(?:peer-mailbox|"peer-mailbox")(?:\.|$)', header):
+        if re.match(rf'^(?:mcp_servers|"mcp_servers")\.{either}(?:\.|$)', header):
             end = sections[index + 1].start() if index + 1 < len(sections) else len(text)
             owned.append((match.start(), end))
     comments = [comment(line) for start, end in owned for line in text[start:end].splitlines() if comment(line)]
-    replacement = "\n".join(comments) + ("\n" if comments else "") + toml_table(["mcp_servers", "peer-mailbox"], server)
+    replacement = "\n".join(comments) + ("\n" if comments else "") + toml_table(["mcp_servers", name], server)
     if not owned:
-        result = text.rstrip() + "\n\n" + replacement
+        result = (text.rstrip() + "\n\n" if text.strip() else "") + replacement
     else:
         result = text
         for start, end in reversed(owned):

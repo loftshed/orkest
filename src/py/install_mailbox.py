@@ -1517,7 +1517,26 @@ def configuration_status(
     return result
 
 
+_RUN_BACKUPS: set[str] | None = None
+
+
+@contextlib.contextmanager
+def _one_backup_per_file():
+    """Several edits to one file in a profile update keep the backup of its state before the update."""
+    global _RUN_BACKUPS
+    previous, _RUN_BACKUPS = _RUN_BACKUPS, set()
+    try:
+        yield
+    finally:
+        _RUN_BACKUPS = previous
+
+
 def backup(path: Path, *, keep_backups: int = DEFAULT_KEEP_BACKUPS) -> None:
+    key = str(path.absolute())
+    if _RUN_BACKUPS is not None:
+        if key in _RUN_BACKUPS:
+            return
+        _RUN_BACKUPS.add(key)
     configuration.backup(path)
     rotate_backups(path, keep_backups=keep_backups)
 
@@ -1945,6 +1964,87 @@ def permit_codex_tools(config: Path, *, dry_run: bool = False, codex_home: Path 
         initialize_codex(client)
         client.request("config/batchWrite", {"edits": edits, "reloadUserConfig": True})
     print(f"✓ scoped permission for {len(TOOLS)} local Codex mailbox tools")
+
+
+CODEX_STATUSLINE_SERVER = "orkest-statusline"
+CODEX_STATUSLINE_TOOL = "statusline"
+# Codex hands a stdio MCP server only a few variables (HOME, PATH, ...); these locate the mailbox,
+# the private tmux footer and the glyph tier.
+CODEX_STATUSLINE_ENV = [
+    "ORCHESTRATE_HOME",
+    "AGENT_EXECUTOR_HOME",
+    "XDG_CACHE_HOME",
+    "ORKEST_TERMINAL_SERVER",
+    "ORKEST_TERMINAL_HARNESS",
+    "TMUX",
+    "TMUX_PANE",
+    "TMUX_TMPDIR",
+    "HERDR_ENV",
+    "ORK_GLYPHS",
+    "COLUMNS",
+]
+
+
+def _set_toml_default(text: str, table: str, name: str, value: str) -> str:
+    """Add `table.name = value` unless the user already set it, keeping every other line as written."""
+    current = tomllib.loads(text).get(table)
+    if isinstance(current, dict) and name in current:
+        return text
+    assignment = f"{configuration.key(name)} = {value}\n"
+    header = re.search(rf'(?m)^[ \t]*\[[ \t]*(?:{table}|"{table}")[ \t]*\][ \t]*(?:#[^\n]*)?(?:\n|$)', text)
+    candidates = []
+    if header:
+        prefix = "" if header[0].endswith("\n") else "\n"
+        candidates.append(text[: header.end()] + prefix + assignment + text[header.end() :])
+    else:
+        body = text.rstrip("\n")
+        candidates.append(f"{body}\n\n[{table}]\n{assignment}" if body else f"[{table}]\n{assignment}")
+        # A table made of root dotted keys cannot take a [table] header; another root dotted key extends it.
+        first = re.search(r"(?m)^[ \t]*\[", text)
+        root = text[: first.start()] if first else text
+        rest = text[first.start() :] if first else ""
+        root = root.rstrip("\n")
+        candidates.append((f"{root}\n" if root else "") + f"{table}.{assignment}" + (f"\n{rest}" if rest else ""))
+    for updated in candidates:
+        try:
+            tomllib.loads(updated)
+        except tomllib.TOMLDecodeError:
+            continue
+        return updated
+    return text
+
+
+def codex_statusline_config(text: str, fast_bin: Path | str) -> str:
+    """Register the Orkest agent bar provider; enable and select it unless the user chose otherwise."""
+    parsed = tomllib.loads(text)
+    current = parsed.get("mcp_servers", {}).get(CODEX_STATUSLINE_SERVER, {})
+    if not isinstance(current, dict):
+        raise ValueError("Codex statusline provider configuration must be a table")
+    owned = configuration.TRANSPORT_FIELDS - {"enabled", "disabled"}
+    desired = {key: value for key, value in current.items() if key not in owned}
+    desired.update(command=str(fast_bin), args=["statusline-mcp"], env_vars=CODEX_STATUSLINE_ENV)
+    updated = text if current == desired else configuration.set_toml_server(text, desired, name=CODEX_STATUSLINE_SERVER)
+    updated = _set_toml_default(updated, "features", "tui_extensions_statusline", "true")
+    selection = configuration.inline_table({"server": CODEX_STATUSLINE_SERVER, "tool": CODEX_STATUSLINE_TOOL})
+    return _set_toml_default(updated, "tui", "status_line_provider", selection)
+
+
+def install_codex_statusline(config: Path, *, fast_bin: Path | str | None = None, dry_run: bool = False) -> bool:
+    """Show the Orkest agent bar in Codex's custom status line (`ork-fast statusline-mcp`)."""
+    if config.is_symlink():
+        raise ValueError("MCP configuration must be a regular local file")
+    text = config.read_text() if config.exists() else ""
+    updated = codex_statusline_config(text, _resolve_fast_bin(fast_bin))
+    if updated == text:
+        print("• Codex agent bar status line already registered")
+        return False
+    if dry_run:
+        print(f"would register the Codex agent bar status line: {config}")
+        return True
+    backup(config)
+    configuration.write_private(config, updated, expected=text if config.exists() else None)
+    print(f"✓ Codex agent bar status line registered: {config}")
+    return True
 
 
 CODEX_RULES_HEADER = """\
@@ -2721,7 +2821,7 @@ def apply_profile_target(
     before = _snapshot(files)
     buffer = io.StringIO()
     shared = {"dry_run": dry_run, "stdio": stdio, "daemon_url": daemon_url, "daemon_token": daemon_token}
-    with contextlib.redirect_stdout(buffer):
+    with contextlib.redirect_stdout(buffer), _one_backup_per_file():
         if harness == "claude":
             register(f"Claude ({root.name})", main, "mcpServers", "claude", **shared)
             install_hooks(root / "settings.json", peer_script, "claude", fast_bin=fast_bin, dry_run=dry_run)
@@ -2740,6 +2840,7 @@ def apply_profile_target(
             install_hooks(root / "hooks.json", peer_script, "codex", fast_bin=fast_bin, dry_run=dry_run)
             if trust_codex_hooks:
                 trust_codex(peer_script, root, fast_bin=fast_bin, dry_run=dry_run)
+            install_codex_statusline(main, fast_bin=fast_bin, dry_run=dry_run)
             ensure_monitor(
                 "Codex", main, "mcp_servers", "codex", launcher,
                 enabled=_plugin_enabled(main, "codex"), dry_run=dry_run,

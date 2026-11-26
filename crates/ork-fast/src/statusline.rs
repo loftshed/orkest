@@ -19,7 +19,7 @@ use crate::sqlite;
 use crate::terminal;
 
 const COLORS: [u32; 6] = [31, 32, 33, 34, 35, 36];
-const NERD_AGENT_GLYPH: &str = "󰚩";
+pub(crate) const NERD_AGENT_GLYPH: &str = "󰚩";
 const NERD_TASK_GLYPH: &str = "󰓾";
 const CHIEF_FOCUS_TEXT: &str = "Ork Chief — machine-wide master orchestrator";
 
@@ -27,7 +27,7 @@ fn is_live_chief_session(base: &Path, session: &str) -> bool {
     identity::is_live_chief_binding(base, Some(session), None, None)
 }
 
-fn palette_color(c: u32) -> u32 {
+pub(crate) fn palette_color(c: u32) -> u32 {
     match c {
         31 => 203,
         32 => 114,
@@ -228,7 +228,7 @@ fn shorten_name(s: &str, width: usize) -> String {
     format!("{}{suffix}", shorten(s, width - sw))
 }
 
-fn line_parts(item: &Value, mut width: usize, line: u32) -> Vec<(String, String)> {
+pub(crate) fn line_parts(item: &Value, mut width: usize, line: u32) -> Vec<(String, String)> {
     let get_str = |key: &str| -> String {
         item.get(key)
             .and_then(Value::as_str)
@@ -337,6 +337,23 @@ fn line_parts(item: &Value, mut width: usize, line: u32) -> Vec<(String, String)
     fitted
 }
 
+/// Whether a `line_parts` key renders bold in every bar renderer.
+pub(crate) fn part_bold(key: &str) -> bool {
+    matches!(key, "name" | "model" | "effort" | "repo" | "stage" | "task")
+}
+
+/// The xterm-256 foreground of a `line_parts` key; `None` keeps the terminal default.
+pub(crate) fn part_color(key: &str, name_color: u32, stage: &str, health: &str) -> Option<u32> {
+    match key {
+        "name" => Some(name_color),
+        "model" => Some(117),
+        "effort" => Some(180),
+        "separator" => Some(245),
+        "stage" => stage_color(stage, health),
+        _ => None,
+    }
+}
+
 fn stage_color(stage: &str, health: &str) -> Option<u32> {
     if health == "missing" || health == "stale" {
         return Some(221);
@@ -438,7 +455,17 @@ fn identity_item(
 ) -> Option<Value> {
     let payload_cwd = payload.get("cwd").and_then(Value::as_str);
     let peer = identity::session_peer(base, session, harness_opt, payload_cwd, true)?;
-    if !paths::valid_peer(&peer) {
+    peer_identity_item(base, session, &peer, payload)
+}
+
+/// The bar fields for an already resolved peer; `None` when it has no usable name.
+pub(crate) fn peer_identity_item(
+    base: &Path,
+    session: &str,
+    peer: &Value,
+    payload: &Value,
+) -> Option<Value> {
+    if !paths::valid_peer(peer) {
         return None;
     }
     let name = peer.get("name").and_then(Value::as_str).unwrap_or("");
@@ -503,8 +530,8 @@ fn identity_item(
         (String::new(), String::new())
     };
 
-    let mut progress = rooms_work::read_progress(base, &peer);
-    let rooms = rooms_work::bound_rooms(base, &peer);
+    let mut progress = rooms_work::read_progress(base, peer);
+    let rooms = rooms_work::bound_rooms(base, peer);
     let mut goal = if rooms.len() > 1 {
         "multiple rooms".to_string()
     } else if rooms.len() == 1 {
@@ -520,7 +547,7 @@ fn identity_item(
         String::new()
     };
 
-    let mut assignments = rooms_work::workboard_assigned(base, &peer);
+    let mut assignments = rooms_work::workboard_assigned(base, peer);
     let wc = rooms_work::work_context(&assignments);
     if let Some(ref p) = progress
         && p.work_context != wc
@@ -581,7 +608,7 @@ fn identity_item(
             focus.clear();
         }
         let note_stage =
-            rooms_work::legacy_task_note_stage(base, &peer, session, &focus).unwrap_or_default();
+            rooms_work::legacy_task_note_stage(base, peer, session, &focus).unwrap_or_default();
         (focus, note_stage)
     };
 
@@ -614,7 +641,7 @@ fn identity_item(
         .and_then(Value::as_str)
         .filter(|s| !s.trim().is_empty())
         .map(clean_text)
-        .unwrap_or_else(|| clean_text(&identity::repository_name(&peer)));
+        .unwrap_or_else(|| clean_text(&identity::repository_name(peer)));
     let repo = if repo_raw.is_empty() {
         "not set".to_string()
     } else {
@@ -1055,19 +1082,8 @@ pub fn run(args: &[String], fallback_script: Option<&Path>) -> io::Result<()> {
         let mut out = format!("#[align=left,bg=default,fg=default]{swatch}");
         let inner_parts = line_parts(&item_obj, width.saturating_sub(pad_width), line_opt);
         for (k, v) in inner_parts {
-            let bold = matches!(
-                k.as_str(),
-                "name" | "model" | "effort" | "repo" | "stage" | "task"
-            );
-            let weight = if bold { "bold" } else { "nobold" };
-            let color = match k.as_str() {
-                "name" => Some(bg),
-                "model" => Some(117),
-                "effort" => Some(180),
-                "separator" => Some(245),
-                "stage" => stage_color(&stage, &health),
-                _ => None,
-            };
+            let weight = if part_bold(&k) { "bold" } else { "nobold" };
+            let color = part_color(&k, bg, &stage, &health);
             let style = if colored {
                 if let Some(col) = color {
                     format!("fg=colour{col},{weight}")
@@ -1107,19 +1123,8 @@ pub fn run(args: &[String], fallback_script: Option<&Path>) -> io::Result<()> {
         let inner_parts = line_parts(&item_obj, width.saturating_sub(pad_width), line_opt);
         let mut out = swatch;
         for (k, v) in inner_parts {
-            let bold = matches!(
-                k.as_str(),
-                "name" | "model" | "effort" | "repo" | "stage" | "task"
-            );
-            let weight = if bold { "1" } else { "22" };
-            let color = match k.as_str() {
-                "name" => Some(bg),
-                "model" => Some(117),
-                "effort" => Some(180),
-                "separator" => Some(245),
-                "stage" => stage_color(&stage, &health),
-                _ => None,
-            };
+            let weight = if part_bold(&k) { "1" } else { "22" };
+            let color = part_color(&k, bg, &stage, &health);
             let fg = color.map_or("39".to_string(), |c| format!("38;5;{c}"));
             out.push_str(&format!("\x1b[{fg};{weight}m{v}\x1b[0m"));
         }

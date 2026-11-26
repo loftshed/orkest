@@ -43,6 +43,15 @@ environment variables. Discovery checks the configured/default XDG socket file b
 Herdr. Missing matches are cached until the next SessionStart; duplicate matches and ambiguous
 truncated IDs are rejected. Outside Herdr, Codex keeps its session-only title and tmux footer.
 
+Codex shows the Orkest agent bar through its experimental custom status line. Setup and
+`ork update` register the `orkest-statusline` MCP server (`ork-fast statusline-mcp`), enable
+`features.tui_extensions_statusline` and set
+`tui.status_line_provider = { server = "orkest-statusline", tool = "statusline" }`. They leave
+either setting alone when you have already set it. Restart Codex once to load the provider. It
+replaces Codex's built-in footer items. The bar is empty where the tmux footer already shows the
+agent, and a thread Orkest doesn't know shows only the model and state. To go back, choose the
+default in `/statusline`.
+
 The installer offers these optional settings only on a terminal and preserves explicit settings:
 
 ```toml
