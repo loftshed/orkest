@@ -143,11 +143,11 @@ class AgentStatuslineTests(unittest.TestCase):
         colored = self.run_status("--width", "200", payload={"session_id": "claude-123"})
         self.assertRegex(
             colored,
-            r"^\x1b\[0m\x1b\[48;5;[0-9]+;38;5;232;1m 󰚩 \x1b\[0m \x1b\[38;5;[0-9]+;1m(snorfle)\x1b\[0m",
+            r"^\x1b\[0m\x1b\[48;5;[0-9]+;38;5;232;1m 󰚩  \x1b\[0m \x1b\[38;5;[0-9]+;1m(snorfle)\x1b\[0m",
         )
         self.assertEqual(
             re.sub(r"\x1b\[[0-9;]*m", "", colored),
-            " 󰚩  snorfle | — / — | repo : project | stage : not set | goal : not set | task : not set\n",
+            " 󰚩   snorfle | — / — | repo : project | stage : not set | goal : not set | task : not set\n",
         )
         self.assertNotIn("\x1b[48;5;", colored[28:])
         unicode_colored = self.run_status(
@@ -163,7 +163,7 @@ class AgentStatuslineTests(unittest.TestCase):
         tmux_colored = self.run_status("--width", "200", "--tmux", payload={"session_id": "claude-123"})
         self.assertRegex(
             tmux_colored,
-            r"^#\[align=left,bg=default,fg=default\]#\[bg=colour[0-9]+,fg=colour232,bold\] 󰚩 #\[bg=default,fg=default\] #\[fg=colour[0-9]+,bold\]",
+            r"^#\[align=left,bg=default,fg=default\]#\[bg=colour[0-9]+,fg=colour232,bold\] 󰚩  #\[bg=default,fg=default\] #\[fg=colour[0-9]+,bold\]",
         )
         self.assertNotIn("fill=colour", tmux_colored)
         tmux_line2 = self.run_status("--width", "200", "--tmux", "--line", "2", payload={"session_id": "claude-123"})

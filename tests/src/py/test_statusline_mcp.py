@@ -151,7 +151,13 @@ class StatuslineProviderTests(unittest.TestCase):
         )
         swatch = tree["children"][0]
         self.assertRegex(swatch["props"]["background"], r"^#[0-9a-f]{6}$")
-        name = next(child for child in tree["children"] if texts(child) == ["snorfle"])
+        # Codex drops ASCII spaces at the edges of each row child, so the swatch pads with no-break
+        # spaces and the bar is a single inline text whose inner spaces Codex keeps.
+        self.assertFalse(texts(swatch)[0].startswith(" ") or texts(swatch)[0].endswith(" "))
+        self.assertTrue(texts(swatch)[0].startswith("\u00a0"))
+        line = tree["children"][1]
+        self.assertEqual(line["type"], "text")
+        name = next(child for child in line["children"] if texts(child) == ["snorfle"])
         self.assertEqual(name["props"]["color"], swatch["props"]["background"])
         self.assertEqual(name["props"]["weight"], "bold")
 
