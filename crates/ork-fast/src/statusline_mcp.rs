@@ -114,22 +114,25 @@ pub(crate) fn identity_tree(item: &Value, width: usize, nerd: bool) -> Value {
         .get("statusHealth")
         .and_then(Value::as_str)
         .unwrap_or("");
+    // Codex lays out every row child on its own and drops spaces at the edges of its text, so
+    // the swatch pads with no-break spaces and the bar is one inline text that keeps its spaces.
     let (swatch, pad) = if nerd {
-        (format!(" {} ", statusline::NERD_AGENT_GLYPH), 7)
+        (
+            format!("\u{a0}{}\u{a0}\u{a0}", statusline::NERD_AGENT_GLYPH),
+            8,
+        )
     } else {
-        ("  ".to_string(), 6)
+        ("\u{a0}\u{a0}".to_string(), 6)
     };
-    let mut children = vec![
-        json!({
-            "type": "row",
-            "props": {"gap": 0, "background": xterm_hex(name_color)},
-            "children": [text_node(
-                swatch,
-                json!({"color": xterm_hex(SWATCH_TEXT_COLOR), "weight": "bold"}),
-            )],
-        }),
-        json!(" "),
-    ];
+    let swatch = json!({
+        "type": "row",
+        "props": {"gap": 0, "background": xterm_hex(name_color)},
+        "children": [text_node(
+            swatch,
+            json!({"color": xterm_hex(SWATCH_TEXT_COLOR), "weight": "bold"}),
+        )],
+    });
+    let mut children = Vec::new();
     for (key, text) in statusline::line_parts(item, width.saturating_sub(pad), 0) {
         let mut props = serde_json::Map::new();
         if let Some(c) = statusline::part_color(&key, name_color, stage, health) {
@@ -140,7 +143,11 @@ pub(crate) fn identity_tree(item: &Value, width: usize, nerd: bool) -> Value {
         }
         children.push(text_node(text, Value::Object(props)));
     }
-    json!({"type": "row", "props": {"gap": 0, "wrap": "wrap"}, "children": children})
+    json!({
+        "type": "row",
+        "props": {"gap": 1, "wrap": "nowrap"},
+        "children": [swatch, {"type": "text", "children": children}],
+    })
 }
 
 fn tmux_socket_exists(server: &str) -> bool {
@@ -522,9 +529,14 @@ mod tests {
             "statusHealth": "fresh",
         });
         let tree = identity_tree(&item, 200, true);
-        let children = tree["children"].as_array().unwrap();
-        assert_eq!(children[0]["props"]["background"], "#ff5f5f");
-        let texts: Vec<&str> = children[2..]
+        let row = tree["children"].as_array().unwrap();
+        assert_eq!(row[0]["props"]["background"], "#ff5f5f");
+        // Codex trims spaces at a text node's edges, but not no-break spaces.
+        assert_eq!(row[0]["children"][0]["children"][0], "\u{a0}󰚩\u{a0}\u{a0}");
+        // One inline text node, so the spaces between parts survive Codex's layout.
+        assert_eq!(row[1]["type"], "text");
+        let children = row[1]["children"].as_array().unwrap();
+        let texts: Vec<&str> = children
             .iter()
             .map(|c| c["children"][0].as_str().unwrap())
             .collect();
@@ -532,10 +544,10 @@ mod tests {
             texts.concat(),
             "ziggy | gpt-5.5 / high | repo : orkest | stage : working | goal : Ship | task : Verify"
         );
-        assert_eq!(children[2]["props"]["color"], "#ff5f5f");
-        assert_eq!(children[2]["props"]["weight"], "bold");
-        assert_eq!(children[3]["props"]["color"], "#8a8a8a");
-        assert!(children[3]["props"].get("weight").is_none());
+        assert_eq!(children[0]["props"]["color"], "#ff5f5f");
+        assert_eq!(children[0]["props"]["weight"], "bold");
+        assert_eq!(children[1]["props"]["color"], "#8a8a8a");
+        assert!(children[1]["props"].get("weight").is_none());
         let serialized = tree.to_string();
         assert!(serialized.len() < 64 * 1024);
         assert!(children.len() < 256);

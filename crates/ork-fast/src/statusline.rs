@@ -19,6 +19,8 @@ use crate::sqlite;
 use crate::terminal;
 
 const COLORS: [u32; 6] = [31, 32, 33, 34, 35, 36];
+/// Nerd Font icons occupy one cell but draw about two wide, so every swatch pads the icon with
+/// one cell before it and two after to keep it centered.
 pub(crate) const NERD_AGENT_GLYPH: &str = "󰚩";
 const NERD_TASK_GLYPH: &str = "󰓾";
 const CHIEF_FOCUS_TEXT: &str = "Ork Chief — machine-wide master orchestrator";
@@ -1064,11 +1066,17 @@ pub fn run(args: &[String], fallback_script: Option<&Path>) -> io::Result<()> {
             == "nerd";
         let colored = !no_color_opt;
         let bg = palette_color(color_num);
-        let pad_width = if nerd && colored { 7 } else { 6 };
+        let pad_width = if nerd && colored && line_opt != 2 {
+            8
+        } else if nerd && colored {
+            7
+        } else {
+            6
+        };
         let swatch = if nerd && colored {
             if line_opt != 2 {
                 format!(
-                    "#[bg=colour{bg},fg=colour232,bold] {NERD_AGENT_GLYPH} #[bg=default,fg=default] "
+                    "#[bg=colour{bg},fg=colour232,bold] {NERD_AGENT_GLYPH}  #[bg=default,fg=default] "
                 )
             } else {
                 format!("#[fg=colour{bg}] {NERD_TASK_GLYPH} #[fg=default] ")
@@ -1109,7 +1117,7 @@ pub fn run(args: &[String], fallback_script: Option<&Path>) -> io::Result<()> {
         let bg = palette_color(color_num);
         let swatch = if nerd {
             if line_opt != 2 {
-                format!("\x1b[0m\x1b[48;5;{bg};38;5;232;1m {NERD_AGENT_GLYPH} \x1b[0m ")
+                format!("\x1b[0m\x1b[48;5;{bg};38;5;232;1m {NERD_AGENT_GLYPH}  \x1b[0m ")
             } else {
                 format!("\x1b[0m\x1b[38;5;{bg}m {NERD_TASK_GLYPH} \x1b[0m ")
             }
@@ -1119,7 +1127,13 @@ pub fn run(args: &[String], fallback_script: Option<&Path>) -> io::Result<()> {
             "\x1b[0m   ".to_string()
         };
 
-        let pad_width = if nerd { 7 } else { 6 };
+        let pad_width = if nerd && line_opt != 2 {
+            8
+        } else if nerd {
+            7
+        } else {
+            6
+        };
         let inner_parts = line_parts(&item_obj, width.saturating_sub(pad_width), line_opt);
         let mut out = swatch;
         for (k, v) in inner_parts {
