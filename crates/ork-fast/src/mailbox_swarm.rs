@@ -1,4 +1,5 @@
-//! Swarm coordinator/lead context, `/side` and `/swarm`/`/horde` turn-start intercepts, and advisor digest.
+//! Swarm coordinator/lead context, `/side` and `/swarm`/`/horde` turn-start intercepts (also Codex's
+//! `$side`, `$swarm` and `$horde` skill forms), and advisor digest.
 
 use std::collections::HashSet;
 use std::env;
@@ -92,7 +93,7 @@ fn match_side_args(cleaned: &str) -> Option<String> {
     }
     let trimmed = cleaned.trim();
     let lower = trimmed.to_ascii_lowercase();
-    for prefix in ["/orchestrate:side", "/side"] {
+    for prefix in ["/orchestrate:side", "/side", "$side"] {
         if let Some(rest) = lower.strip_prefix(prefix) {
             let orig_rest = &trimmed[prefix.len()..];
             if rest.is_empty() {
@@ -129,6 +130,8 @@ fn match_swarm_arg(cleaned: &str) -> Option<String> {
         "/orchestrate:horde",
         "/swarm",
         "/horde",
+        "$swarm",
+        "$horde",
     ] {
         if let Some(rest_l) = lower.strip_prefix(prefix) {
             let orig_rest = &trimmed[prefix.len()..];
@@ -192,7 +195,7 @@ fn shell_split_lenient(raw: &str) -> Vec<String> {
     tokens
 }
 
-/// Intercept `/side`, `[orkest-side-command: ...]`, `!side`, or `side:` on turn start.
+/// Intercept `/side`, `$side`, `[orkest-side-command: ...]`, `!side`, or `side:` on turn start.
 #[must_use]
 pub fn side_command_context(
     base: &Path,
@@ -222,9 +225,11 @@ pub fn side_command_context(
         return String::new();
     };
     if raw_args.is_empty() {
-        return "[orkest-side-dispatched] Usage: `/side [--later|--issue|--investigate] <idea>`. \
-                Let the user know in one short line and do not call any tools."
-            .to_string();
+        let side = identity::command_invocation(Some(harness), "side");
+        return format!(
+            "[orkest-side-dispatched] Usage: `{side} [--later|--issue|--investigate] <idea>`. \
+             Let the user know in one short line and do not call any tools."
+        );
     }
     let Some(runtime) = paths::runtime_root() else {
         return String::new();
@@ -361,7 +366,7 @@ fn toggle_swarm_view_cli(
         .filter(Value::is_object)
 }
 
-/// Toggle or open the Orkest Swarm View split pane when `/swarm` or `/horde` is submitted.
+/// Toggle or open the Orkest Swarm View split pane when `/swarm` or `/horde` (Codex: `$swarm`, `$horde`) is submitted.
 #[must_use]
 pub fn swarm_command_context(
     base: &Path,
@@ -813,7 +818,12 @@ fn swarm_next_actions(
     )
 }
 
-fn format_swarm_reconnection_summary(room: &Value, room_id: &str, member_id: &str) -> String {
+fn format_swarm_reconnection_summary(
+    room: &Value,
+    room_id: &str,
+    member_id: &str,
+    harness: Option<&str>,
+) -> String {
     let title = room
         .get("title")
         .and_then(Value::as_str)
@@ -874,10 +884,11 @@ fn format_swarm_reconnection_summary(room: &Value, room_id: &str, member_id: &st
         String::new()
     };
     let total = agents.len();
+    let swarm = identity::command_invocation(harness, "swarm");
     format!(
         "Reconnected to swarm room {room_id}{title_part} as {role_label}.{obj_part} \
          Horde members: {total} total ({active} active, {completed} completed, {blocked} blocked/failed). \
-         Run `ork rooms show --room {room_id}` to inspect your swarm or `/swarm` to toggle the Swarm View."
+         Run `ork rooms show --room {room_id}` to inspect your swarm or `{swarm}` to toggle the Swarm View."
     )
 }
 
@@ -899,6 +910,10 @@ fn deliver_swarm_brief_or_summary(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
+    let harness = me
+        .get("harness")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     if allow_brief && me.get("swarmBriefed").and_then(Value::as_str) != Some(room_id) {
         let brief_file = base
             .join("swarm-briefs")
@@ -928,7 +943,12 @@ fn deliver_swarm_brief_or_summary(
                 if has_state && !already_reconnected {
                     return format!(
                         "{brief_text}\n\n{}",
-                        format_swarm_reconnection_summary(room, room_id, member_id)
+                        format_swarm_reconnection_summary(
+                            room,
+                            room_id,
+                            member_id,
+                            harness.as_deref()
+                        )
                     );
                 }
                 return brief_text;
@@ -946,7 +966,7 @@ fn deliver_swarm_brief_or_summary(
         ) {
             *me = updated;
         }
-        return format_swarm_reconnection_summary(room, room_id, member_id);
+        return format_swarm_reconnection_summary(room, room_id, member_id, harness.as_deref());
     }
     String::new()
 }
@@ -1518,6 +1538,39 @@ mod tests {
         assert_eq!(
             match_swarm_arg("[orkest-swarm-command]"),
             Some(String::new())
+        );
+    }
+
+    #[test]
+    fn codex_skill_forms_reach_the_intercepts() {
+        assert_eq!(match_swarm_arg("$swarm"), Some(String::new()));
+        assert_eq!(match_swarm_arg("$horde close"), Some("close".to_string()));
+        assert_eq!(
+            match_side_args("$side check ci"),
+            Some("check ci".to_string())
+        );
+        assert_eq!(match_side_args("$side"), Some(String::new()));
+        assert_eq!(match_swarm_arg("$swarmed"), None);
+        assert_eq!(match_side_args("$sidecar"), None);
+    }
+
+    #[test]
+    fn reconnection_summary_names_the_swarm_command_for_the_harness() {
+        let room = json!({"objective": "Ship it", "agents": []});
+        let codex = format_swarm_reconnection_summary(&room, "r1", "conductor", Some("codex"));
+        assert!(
+            codex.contains("`$swarm` to toggle the Swarm View"),
+            "{codex}"
+        );
+        let claude = format_swarm_reconnection_summary(&room, "r1", "conductor", Some("claude"));
+        assert!(
+            claude.contains("`/swarm` to toggle the Swarm View"),
+            "{claude}"
+        );
+        let unknown = format_swarm_reconnection_summary(&room, "r1", "conductor", None);
+        assert!(
+            unknown.contains("`ork swarm` to toggle the Swarm View"),
+            "{unknown}"
         );
     }
 

@@ -1,6 +1,6 @@
 ---
 name: cleanup
-description: Audit, prune, and migrate legacy Orkest and agent-executor caches, disposable worktrees, staged daemon runtimes, and configuration backups, or quarantine merged worktrees, when the user types /cleanup or asks to clean up old Orkest versions.
+description: Audit, prune, and migrate legacy Orkest and agent-executor caches, disposable worktrees, staged daemon runtimes, and configuration backups, or quarantine merged worktrees, when the user invokes the cleanup skill (`/cleanup`, or `$cleanup` in Codex) or asks to clean up old Orkest versions.
 ---
 
 [orkest-cleanup-command]

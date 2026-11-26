@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Checks what still matters for a repository of skills and commands, and reports every
-// problem in one run: skill frontmatter and description budget, that ${CLAUDE_SKILL_DIR}
+// problem in one run: skill frontmatter and description budget, that shared skill text names
+// Orkest's commands in a harness-neutral way, that ${CLAUDE_SKILL_DIR}
 // paths and the files a command names point at real files, that no retired Claude Code
 // plugin manifest or ${CLAUDE_PLUGIN_ROOT} reference has come back, and the Orca manifest.
 
@@ -104,6 +105,32 @@ function checkSkill(skillDirectory, context) {
   return fields;
 }
 
+/** Orkest's own command names: the Claude commands in `adapters/claude/commands/`. */
+function orkestCommandNames(root) {
+  const directory = path.join(root, "adapters/claude/commands");
+  if (!fs.existsSync(directory)) return [];
+  return fs
+    .readdirSync(directory)
+    .filter((name) => name.endsWith(".md"))
+    .map((name) => name.slice(0, -".md".length));
+}
+
+// Every harness loads the shared skills, and Codex invokes them as `$name`, not `/name`. A line
+// that names an Orkest command as `/name` must also name the `$name` form.
+function checkSharedCommandNames(filePath, text, context) {
+  if (path.extname(filePath) !== ".md") return;
+  for (const [index, line] of text.split("\n").entries()) {
+    for (const name of context.commandNames) {
+      const slash = new RegExp(String.raw`(?<![\w./~:-])/${name}(?![\w-])`, "u");
+      if (slash.test(line) && !line.includes(`$${name}`)) {
+        context.errors.push(
+          `${relative(context, filePath)}:${index + 1}: /${name} needs Codex's $${name} beside it, or say "the ${name} skill"`,
+        );
+      }
+    }
+  }
+}
+
 function checkPathReferences(pluginDirectory, context) {
   const skillPattern = /\$\{CLAUDE_SKILL_DIR\}\/([\w./-]+)/gu;
   // A repo-relative path a command names in backticks, e.g. `src/lib/x.mjs`.
@@ -119,6 +146,7 @@ function checkPathReferences(pluginDirectory, context) {
       );
     }
     if (top === "skills" && skill) {
+      checkSharedCommandNames(filePath, text, context);
       const base = path.join(pluginDirectory, "skills", skill);
       for (const [, reference] of text.matchAll(skillPattern)) {
         const target = reference.replace(/[.,]+$/u, "");
@@ -187,7 +215,7 @@ export function checkOrcaManifest(root = REPO_ROOT) {
 
 export function validate(root = REPO_ROOT) {
   const errors = [];
-  const context = { errors, root };
+  const context = { commandNames: orkestCommandNames(root), errors, root };
   // Orkest installs through install.sh; a Claude Code plugin manifest or marketplace must not return.
   const pluginsRoot = path.join(root, "plugins");
   const retired = [".claude-plugin"];

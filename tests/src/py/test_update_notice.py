@@ -43,7 +43,7 @@ class UpdateNoticeTests(unittest.TestCase):
         git_shim.chmod(0o755)
         self._counter = 0
 
-    def _run_session_start(self, *, head="aaa", me=None):
+    def _run_session_start(self, *, head="aaa", me=None, harness="claude"):
         self._counter += 1
         session = f"update-notice-{self._counter}"
         env = {
@@ -67,7 +67,7 @@ class UpdateNoticeTests(unittest.TestCase):
             env["AGENT_MAILBOX_SESSION"] = run["worker"]
         out = fast.run_mailbox_hook(
             {"session_id": session, "cwd": str(self.home)},
-            harness="claude",
+            harness=harness,
             event="SessionStart",
             base=self.base,
             cwd=self.home,
@@ -77,14 +77,19 @@ class UpdateNoticeTests(unittest.TestCase):
             return ""
         return str((out.get("hookSpecificOutput") or {}).get("additionalContext") or "")
 
-    def notice(self, state, head="aaa", me=None):
+    def notice(self, state, head="aaa", me=None, harness="claude"):
         self.state.write_text(json.dumps(state))
-        return self._run_session_start(head=head, me=me)
+        return self._run_session_start(head=head, me=me, harness=harness)
 
     def test_names_the_update_and_how_to_apply_it(self):
         text = self.notice({"status": "update_available", "remoteSha": "bbb", "commitsBehind": 2})
         self.assertIn("2 new commits", text)
-        self.assertIn("/update", text)
+        self.assertIn("run /update to apply it", text)
+
+    def test_names_the_codex_skill_in_a_codex_session(self):
+        text = self.notice({"status": "update_available", "remoteSha": "bbb"}, harness="codex")
+        self.assertIn("run $update to apply it", text)
+        self.assertNotIn("/update", text)
 
     def test_silent_when_already_current_or_nothing_is_waiting(self):
         for state in (

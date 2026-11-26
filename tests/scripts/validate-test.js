@@ -48,6 +48,25 @@ test("validates relocated adapter skills and command references", () => {
   ]);
 });
 
+test("shared skill text names Orkest commands for every harness", () => {
+  const root = fixtureRepo();
+  write(root, "adapters/claude/commands/swarm.md", "---\ndescription: Swarm\n---\n");
+  const skill = (body) =>
+    write(
+      root,
+      "adapters/skills/demo/SKILL.md",
+      `---\nname: demo\ndescription: Test\n---\n${body}`,
+    );
+  skill("When the user types /swarm, run `ork swarm`.\n");
+  expect(validate(root)).toStrictEqual([
+    `adapters/skills/demo/SKILL.md:5: /swarm needs Codex's $swarm beside it, or say "the swarm skill"`,
+  ]);
+  skill(
+    "When the user invokes the swarm skill (`/swarm`, or `$swarm` in Codex), see ~/.x/swarm.\n",
+  );
+  expect(validate(root)).toStrictEqual([]);
+});
+
 test("a skill whose name differs from its directory is reported", () => {
   const errors = validate(fixtureRepo({ skillName: "other" }));
   expect(errors.length).toBe(1);

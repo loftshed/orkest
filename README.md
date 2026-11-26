@@ -209,7 +209,7 @@ ork telemetry [--runs-dir <directory>] [--json] [--width 120]
 
 <!-- /generated:commands -->
 
-Slash commands, in every installed harness (`install.sh` writes them; Claude Code lists each once, with no namespace):
+Slash commands, in every installed harness (`install.sh` writes them; Claude Code lists each once, with no namespace). Codex runs the skill forms with `$` instead: `$swarm`, `$side`, `$update`, `$chief` and `$cleanup`:
 
 <!-- generated:slash-commands -->
 

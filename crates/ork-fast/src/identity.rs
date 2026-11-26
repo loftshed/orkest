@@ -662,6 +662,19 @@ pub fn repository_name(peer: &Value) -> String {
     }
 }
 
+/// How a user invokes Orkest's `name` command in `harness` (`src/lib/harness-command.mjs` twin).
+///
+/// Claude Code, Antigravity and OpenCode run Orkest's commands and skills as `/name`; Codex runs
+/// skills as `$name`. An unknown harness gets the `ork name` CLI command, which works anywhere.
+#[must_use]
+pub fn command_invocation(harness: Option<&str>, name: &str) -> String {
+    match harness.map(str::trim) {
+        Some("codex") => format!("${name}"),
+        Some("claude" | "gemini" | "agy" | "antigravity" | "opencode") => format!("/{name}"),
+        _ => format!("ork {name}"),
+    }
+}
+
 #[must_use]
 pub fn detect_harness(payload: &Value) -> String {
     let transcript = payload
@@ -2366,6 +2379,17 @@ pub fn unregister_peer(base: &Path, session: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_invocation_uses_each_harness_prefix() {
+        assert_eq!(command_invocation(Some("claude"), "swarm"), "/swarm");
+        assert_eq!(command_invocation(Some("codex"), "swarm"), "$swarm");
+        assert_eq!(command_invocation(Some("gemini"), "side"), "/side");
+        assert_eq!(command_invocation(Some("agy"), "side"), "/side");
+        assert_eq!(command_invocation(Some("opencode"), "update"), "/update");
+        assert_eq!(command_invocation(None, "update"), "ork update");
+        assert_eq!(command_invocation(Some("other"), "swarm"), "ork swarm");
+    }
 
     #[test]
     fn test_martian_roundtrip_and_short_name() {
