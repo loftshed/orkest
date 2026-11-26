@@ -101,6 +101,10 @@ class StatuslineProviderTests(unittest.TestCase):
         self.addCleanup(temp.cleanup)
         self.home = Path(temp.name).resolve()
         self.base = self.home / "mailbox-v1"
+        # Unix socket paths are capped near 108 bytes, and CI temp directories are long.
+        sockets = tempfile.TemporaryDirectory(dir="/tmp", prefix="ork-")
+        self.addCleanup(sockets.cleanup)
+        self.tmux_tmpdir = Path(sockets.name)
         peer = mailbox.register(self.base, session=SESSION, harness="codex", cwd=str(self.home), pid=os.getpid())
         mailbox.annotate(self.base, SESSION, name="snorfle-test-high-footer-aa", person="snorfle")
         agent_progress.report(self.base, peer, goal="Ship labels", stage="working", task="Verify patch")
@@ -111,7 +115,7 @@ class StatuslineProviderTests(unittest.TestCase):
             "AGENT_EXECUTOR_HOME": str(self.home),
             "ORCHESTRATE_HOME": str(self.home),
             "ORK_GLYPHS": "ascii",
-            "TMUX_TMPDIR": str(self.home / "tmux"),
+            "TMUX_TMPDIR": str(self.tmux_tmpdir),
         }
 
     def start(self, **extra: str) -> Provider:
@@ -193,7 +197,7 @@ class StatuslineProviderTests(unittest.TestCase):
         tree, _ = provider.read(SESSION)
         self.assertIsNotNone(tree, "a recorded server with no live socket draws no footer")
 
-        sockets = self.home / "tmux" / f"tmux-{os.getuid()}"
+        sockets = self.tmux_tmpdir / f"tmux-{os.getuid()}"
         sockets.mkdir(parents=True)
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.addCleanup(listener.close)
