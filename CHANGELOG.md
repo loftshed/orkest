@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.101.0
+
+- feat(codex): show the Orkest agent bar in Codex's custom status line (#279)
+- fix(rooms): keep room identity stable across reboots and let close skip the check (#278)
+
 ## 0.100.0
 
 - feat(handoff): spend expiring quota to zero instead of handing off early
