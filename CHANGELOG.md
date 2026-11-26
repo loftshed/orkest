@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.101.2
+
+- fix(steer): resume a finished job and report a refused resume (#284)
+
 ## 0.101.1
 
 - fix: name Orkest commands with each harness's prefix (#283)
