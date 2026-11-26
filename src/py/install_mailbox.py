@@ -1212,7 +1212,11 @@ def _owned_shell_file(path: Path) -> bool:
 
 def _shell_shim_text(canonical: Path) -> str:
     quoted = shlex.quote(str(canonical))
-    return f"{SHELL_OWNER_HEADER} Sourced from ~/.zshrc.\n# Delegates to the canonical shell setup.\n[ -r {quoted} ] && . {quoted}\n"
+    return (
+        f"{SHELL_OWNER_HEADER} Sourced from ~/.zshrc.\n"
+        "# Delegates to the canonical shell setup, which is zsh-only.\n"
+        f'if [ -n "${{ZSH_VERSION-}}" ] && [ -r {quoted} ]; then . {quoted}; fi\n'
+    )
 
 
 def sync_shell_artifacts(home: Path, *, monitor_config: dict[str, Any] | None = None, dry_run: bool = False) -> str:
