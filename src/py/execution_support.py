@@ -217,6 +217,13 @@ def consultation_from_report(report: str, outcome: str | None) -> dict[str, Any]
         return {"status": "invalid", "request": None, "error": str(exc)}
 
 
+# A session may be resumed when its executor ran and the runner audited what it left, so the next run starts
+# from an audited workspace; resume_refusal() also requires a session_id and no violations. That holds for every
+# outcome the report contract gives, for a steered segment, and for a run stopped for quota (stopped_credits,
+# provider_quota_exhausted), as a long Chief room can be: its partial work was audited like any other, and the
+# resumed run passes the quota gate again. preflight_failed and runner_failed audited nothing,
+# native_handoff and dry_run ran no session, the *_violation statuses broke the audit, and
+# verification_mutation means the gates a resume must rerun unchanged write to the workspace.
 RESUMABLE_STATUSES = {
     "completed",
     "blocked",
@@ -227,7 +234,60 @@ RESUMABLE_STATUSES = {
     "timed_out",
     "empty_output",
     "steered",
+    "stopped_credits",
+    "provider_quota_exhausted",
 }
+
+NEW_RUN = "start a new run without --session or --resume-result"
+# Why each refused status cannot continue its session, and what to do instead.
+RESUME_REFUSALS = {
+    "preflight_failed": (
+        "it never started, so it audited no session; fix that error, then resume the result it was resuming "
+        "(its resumed_from) or " + NEW_RUN
+    ),
+    "runner_failed": "the runner stopped before it audited the session; read the job's runner.stderr, then " + NEW_RUN,
+    "native_handoff": (
+        "no executor ran it, so there is no session to resume; send the correction to the native worker with "
+        "the host's own messaging"
+    ),
+    "dry_run": "no model ran; launch the task without --dry-run",
+    "history_violation": "the run moved this worktree's HEAD, branch or reflog; review that history, then " + NEW_RUN,
+    "scope_violation": (
+        "the run changed paths outside its allowed scope; revert or accept those changes, then " + NEW_RUN
+    ),
+    "verification_mutation": (
+        "a --verify-command changed the workspace, and a resume reruns the same commands; make them read-only, "
+        "then " + NEW_RUN
+    ),
+}
+
+
+def _one_line(value: Any, limit: int = 300) -> str:
+    text = " ".join(str(value).split())
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+def resume_refusal(previous: dict[str, Any], *, source: str | Path | None = None) -> str | None:
+    """Why `previous` cannot be resumed, naming the status it records and the next step; None when it can."""
+    status = previous.get("status")
+    seen = status if isinstance(status, str) and status else "status-less"
+    where = f"; see {source}" if source else ""
+    if status not in RESUMABLE_STATUSES:
+        error = previous.get("error")
+        detail = f" ({_one_line(error)})" if error else ""
+        reason = RESUME_REFUSALS.get(
+            seen, "the runner cannot tell whether its session is safe to continue; inspect it, then " + NEW_RUN
+        )
+        return f"cannot resume a {seen} result{detail}: {reason}{where}"
+    if not isinstance(previous.get("session_id"), str) or not previous["session_id"].strip():
+        return f"cannot resume a {seen} result: it has no session_id, so its context is lost; {NEW_RUN}{where}"
+    violations = [*(previous.get("history_violations") or []), *(previous.get("scope_violations") or [])]
+    if violations:
+        return (
+            f"cannot resume a {seen} result with scope or history violations "
+            f"({_one_line(', '.join(map(str, violations)), 200)}): review them, then {NEW_RUN}{where}"
+        )
+    return None
 
 
 SELECTOR_TIERS: dict[str, int] = _FAMILIES.selector_capability_tiers()
@@ -251,17 +311,22 @@ def _path_covered(path: str, prefixes: list[str]) -> bool:
     return _REPO_PATHS.path_covered_by_prefixes(path, prefixes)
 
 
-def validate_resume(previous: dict[str, Any], expected: dict[str, Any]) -> None:
+def validate_resume(previous: dict[str, Any], expected: dict[str, Any], *, source: str | Path | None = None) -> None:
     if not isinstance(previous, dict):
         raise ContractError("resume baseline must be a JSON object")
     if previous.get("schema") != "agent-executor.result.v2":
         raise ContractError("resume baseline is not an agent-executor result")
-    if previous.get("status") not in RESUMABLE_STATUSES:
-        raise ContractError("this runner outcome requires conductor investigation before resumption")
-    if not isinstance(previous.get("session_id"), str) or not previous["session_id"].strip():
-        raise ContractError("resume baseline has no session_id")
-    if previous.get("scope_violations") or previous.get("history_violations"):
-        raise ContractError("cannot resume a result with scope or history violations")
+    if refusal := resume_refusal(previous, source=source):
+        raise ContractError(refusal)
+    where = f"; see {source}" if source else ""
+
+    def mismatch(field: str, actual: Any, value: Any) -> ContractError:
+        recorded, asked = (_one_line(json.dumps(item, default=str), 200) for item in (actual, value))
+        return ContractError(
+            f"resume result does not match {field}: the {previous.get('status')} result has {recorded} and this "
+            f"run asks for {asked}; pass the result's own value, or {NEW_RUN}{where}"
+        )
+
     for field, value in expected.items():
         if field == "executor_version":
             continue
@@ -274,7 +339,7 @@ def validate_resume(previous: dict[str, Any], expected: dict[str, Any]) -> None:
             if prev_paths != new_paths and (
                 not new_paths or not all(_path_covered(str(p), new_paths) for p in prev_paths)
             ):
-                raise ContractError(f"resume result does not match {field}")
+                raise mismatch(field, actual, value)
             continue
         if actual != value:
-            raise ContractError(f"resume result does not match {field}")
+            raise mismatch(field, actual, value)

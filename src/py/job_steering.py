@@ -5,9 +5,11 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as dt
+import io
 import json
 import os
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -26,6 +28,7 @@ CREDITS_WATCH_GRACE_SECONDS = 120.0
 CREDITS_WATCH_MAX_BLIND_LINES = 150
 
 STEER_PROTOCOL = 1
+JOB_LOCK_NAME = "job.lock"
 STEER_REQUEST_NAME = "steer-request.json"
 STEER_STATE_NAME = "steering.json"
 STEER_STATE_SCHEMA = "agent-executor.steering.v1"
@@ -85,6 +88,82 @@ def _bundled_module(name: str) -> Any:
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+@contextlib.contextmanager
+def job_manifest_lock(job_dir: Path) -> Any:
+    """Serialize writers of a job's job.json: the launcher, and the runner recording how the job ended."""
+    if fcntl is None:
+        yield
+        return
+    descriptor = os.open(job_dir / JOB_LOCK_NAME, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def update_job_manifest(job_dir: Path, fields: dict[str, Any]) -> None:
+    """Merge `fields` into an existing job.json, atomically and under the job's lock."""
+    job_path = job_dir / "job.json"
+    with job_manifest_lock(job_dir):
+        job = _attr("read_json_file")(job_path)
+        if job.get("schema") != "agent-executor.job.v1":
+            return
+        job.update(fields)
+        _attr("write_json_atomic")(job_path, job)
+
+
+def record_job_outcome(job_dir: Path, result: dict[str, Any]) -> None:
+    """Record how a detached job ended in its job.json, which otherwise says `started` forever."""
+    try:
+        update_job_manifest(
+            job_dir,
+            {
+                "status": result.get("status"),
+                "exit_code": result.get("exit_code"),
+                "finished_at": result.get("finished_at") or _attr("utc_now")(),
+                "error": result.get("error"),
+            },
+        )
+    except (OSError, ValueError, _attr("RunnerError", ValueError)) as error:
+        print(f"agent-executor: could not record the job outcome in {job_dir}: {error}", file=sys.stderr)
+
+
+# What the conductor of a detached run that ended before its executor reported should do next.
+REFUSAL_NEXT_STEPS = {
+    "preflight_failed": "The executor never started, so nothing changed. Do what the error says, then relaunch.",
+    "runner_failed": "The runner stopped before it finished. Read the job's runner.stderr and the result, then relaunch.",
+}
+
+
+def report_run_refusal(result: dict[str, Any], *, event_id: str, result_path: Path) -> None:
+    """Post why a detached run ended without a report to its conductor mailbox, once per event.
+
+    Call it before the result is written: the mailbox closes a run once its result exists.
+    """
+    status = result.get("status")
+    info = result.get("mailbox")
+    if status not in REFUSAL_NEXT_STEPS or not isinstance(info, dict):
+        return
+    mailbox = _bundled_module("peer_mailbox")
+    try:
+        base = mailbox.root()
+        worker = mailbox.load(mailbox.peer_path(base, str(info.get("worker"))))
+        if not mailbox.is_run_peer(worker) or worker.get("counterpart") != info.get("conductor"):
+            return
+        error = " ".join(str(result.get("error") or "no error recorded").split())[:4000]
+        mailbox.send(
+            base,
+            sender=worker,
+            to=str(info["conductor"]),
+            text=f"[{status}] {error}\nNext: {REFUSAL_NEXT_STEPS[status]}\nResult: {result_path}",
+            kind="update",
+            client_id=f"refused-{event_id}"[:80],
+        )
+    except Exception as error:  # A mailbox failure must not hide the run's own result.
+        print(f"agent-executor: could not report {status} to the conductor mailbox: {error}", file=sys.stderr)
 
 
 def interrupt_process(
@@ -400,21 +479,69 @@ def launch_detached(args: argparse.Namespace) -> int:
     environment = dict(os.environ)
     environment["PWD"] = str(repo)
     open_bin = _attr("open_private_binary")
-    with (
-        open_bin(stdout_path) as stdout_handle,
-        open_bin(stderr_path) as stderr_handle,
-    ):
-        process = subprocess.Popen(
-            command,
-            cwd=repo,
-            env=environment,
-            stdin=subprocess.DEVNULL,
-            stdout=stdout_handle,
-            stderr=stderr_handle,
-            start_new_session=True,
+    # The runner records its outcome in job.json under this lock, so a run that ends at once waits for it.
+    with job_manifest_lock(job_dir):
+        with (
+            open_bin(stdout_path) as stdout_handle,
+            open_bin(stderr_path) as stderr_handle,
+        ):
+            process = subprocess.Popen(
+                command,
+                cwd=repo,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_handle,
+                stderr=stderr_handle,
+                start_new_session=True,
+            )
+        threading.Thread(target=process.wait, daemon=True).start()
+        job_path = write_started_manifest(
+            args,
+            process=process,
+            command=command,
+            repo=repo,
+            job_dir=job_dir,
+            run_dir=run_dir,
+            result_path=result_path,
+            event_path=event_path,
+            notification_mode=notification_mode,
+            completion_hook=completion_hook,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            task_input="task_spec" if task_spec is not None else "brief",
+            enforced_paths=enforced_paths,
+            tracked_paths=tracked_paths,
+            scope_info=scope_info,
         )
-    threading.Thread(target=process.wait, daemon=True).start()
+    print("AGENT_JOB_STATUS=started")
+    print(f"AGENT_JOB_PID={process.pid}")
+    print(f"AGENT_JOB={job_path}")
+    print(f"AGENT_RESULT={result_path}")
+    print(f"AGENT_EVENT={event_path}")
+    print(f"AGENT_EVENT_ID={event_path.stem}")
+    print(f"AGENT_MAILBOX={mailbox_info['conductor']}")
+    return 0
 
+
+def write_started_manifest(
+    args: argparse.Namespace,
+    *,
+    process: subprocess.Popen[bytes],
+    command: list[str],
+    repo: Path,
+    job_dir: Path,
+    run_dir: Path,
+    result_path: Path,
+    event_path: Path,
+    notification_mode: str,
+    completion_hook: Path | None,
+    stdout_path: Path,
+    stderr_path: Path,
+    task_input: str,
+    enforced_paths: list[str],
+    tracked_paths: list[str],
+    scope_info: dict[str, Any],
+) -> Path:
     job = {
         "schema": "agent-executor.job.v1",
         "runner_version": _attr("RUNNER_VERSION", "unknown"),
@@ -424,7 +551,7 @@ def launch_detached(args: argparse.Namespace) -> int:
         "repository": str(repo),
         "engine": args.engine,
         "requested_model": args.model,
-        "task_input": "task_spec" if task_spec is not None else "brief",
+        "task_input": task_input,
         "allowed_paths": enforced_paths,
         "tracked_paths": tracked_paths,
         "scope_owner": scope_info["scope_owner"],
@@ -444,15 +571,8 @@ def launch_detached(args: argparse.Namespace) -> int:
         "command": _attr("command_preview")(command),
     }
     job_path = job_dir / "job.json"
-    _attr("write_json")(job_path, job)
-    print("AGENT_JOB_STATUS=started")
-    print(f"AGENT_JOB_PID={process.pid}")
-    print(f"AGENT_JOB={job_path}")
-    print(f"AGENT_RESULT={result_path}")
-    print(f"AGENT_EVENT={event_path}")
-    print(f"AGENT_EVENT_ID={event_path.stem}")
-    print(f"AGENT_MAILBOX={mailbox_info['conductor']}")
-    return 0
+    _attr("write_json_atomic")(job_path, job)
+    return job_path
 
 
 def executor_session_so_far(engine: str, stdout_path: Path, log_path: Path) -> str | None:
@@ -569,15 +689,12 @@ class JobSteering:
         _attr("write_json_atomic")(self.state_path, self.state)
 
     def _update_job_allowed_paths(self, enforced_paths: list[str]) -> None:
-        job_path = self.job_dir / "job.json"
         runner_error_cls = _attr("RunnerError", ValueError)
         with contextlib.suppress(runner_error_cls, OSError):
-            job_payload = _attr("read_json_file")(job_path)
-            if job_payload:
-                job_payload["allowed_paths"] = list(enforced_paths)
-                if "." in enforced_paths:
-                    job_payload["scope_owner"] = "worker"
-                _attr("write_json_atomic")(job_path, job_payload)
+            update_job_manifest(
+                self.job_dir,
+                {"allowed_paths": list(enforced_paths), **({"scope_owner": "worker"} if "." in enforced_paths else {})},
+            )
 
     def begin_segment(
         self,
@@ -841,7 +958,9 @@ def find_steerable_job_dir(reference: str) -> Path:
         raise _runner_error("steer needs a job directory, its job.json, or an exact event ID or AGENT_EVENT path", 4)
     runner_error_cls = _attr("RunnerError", ValueError)
     read_json = _attr("read_json_file")
-    for job_path in sorted((_attr("default_agent_cache_dir")() / "jobs-v1").glob("*/job.json")):
+    jobs = _attr("default_agent_cache_dir")() / "jobs-v1"
+    # A finished job resumed by `steer` runs as its own job in <job>/steers/<N>.
+    for job_path in sorted([*jobs.glob("*/job.json"), *jobs.glob("*/steers/*/job.json")]):
         try:
             job = read_json(job_path)
             state = read_json(job_path.parent / STEER_STATE_NAME)
@@ -882,24 +1001,265 @@ def steer_job_finished(job: dict[str, Any], state: dict[str, Any]) -> bool:
     return bool(current_event and Path(current_event).exists()) or state.get("phase") in ("auditing", "finished")
 
 
+def steer_auditing(state: dict[str, Any]) -> bool:
+    """The executor handed off and the runner is still auditing: there is no result to resume yet."""
+    return state.get("phase") == "auditing" and not Path(state.get("completion_event_path") or "/").exists()
+
+
 def steer_finished_error(job: dict[str, Any], state: dict[str, Any]) -> Exception:
-    result_path = Path(state.get("result_path") or job.get("result_path") or "")
-    session = None
-    runner_error_cls = _attr("RunnerError", ValueError)
-    with contextlib.suppress(runner_error_cls):
-        session = _attr("read_json_file")(result_path).get("session_id")
-    handoff = (
-        "the executor already handed off and the runner is auditing it; wait for the event, then "
-        if state.get("phase") == "auditing" and not Path(state.get("completion_event_path") or "/").exists()
-        else "the job already finished; review it, then "
+    event = state.get("completion_event_id") or job.get("completion_event_id")
+    when = (
+        f"the executor handed off and the runner is auditing it; wait for its event (run_agent.py events wait "
+        f"{event}), then"
+        if steer_auditing(state)
+        else "the job finished before its runner took the request;"
     )
     return _runner_error(
-        "nothing to steer: " + handoff + "send a correction as a new run on the same session: "
-        f"run_agent.py --cwd {job.get('repository')} --session {session or '<session_id from result.json>'} "
-        f"--resume-result {result_path} with the job's original engine, model, effort, scope and "
-        "--verify-command flags",
+        f"nothing to steer: {when} run the same steer command again to resume its session as a new run",
         _attr("EXIT_STEER_JOB_FINISHED", EXIT_STEER_JOB_FINISHED),
     )
+
+
+def root_job_dir(job_dir: Path) -> Path:
+    """The job a detached resume in <job>/steers/<N> continues, else `job_dir` itself."""
+    parent = job_dir.parent
+    if parent.name == "steers" and job_dir.name.isdigit() and (parent.parent / "job.json").is_file():
+        return parent.parent
+    return job_dir
+
+
+def active_job_dir(job_dir: Path) -> Path:
+    """The run a job's next steer addresses: its newest detached resume, else the job itself."""
+    steers = job_dir / "steers"
+    resumes = (
+        [int(entry.name) for entry in steers.iterdir() if entry.name.isdigit() and (entry / "job.json").is_file()]
+        if steers.is_dir()
+        else []
+    )
+    return steers / str(max(resumes)) if resumes else job_dir
+
+
+def next_steer_id(job_dir: Path) -> int:
+    steers = job_dir / "steers"
+    taken = [int(entry.name) for entry in steers.iterdir() if entry.name.isdigit()] if steers.is_dir() else []
+    return 1 + max(taken, default=0)
+
+
+def resume_baseline(job_dir: Path) -> tuple[Path, dict[str, Any]]:
+    """The result a correction to the job continues from, with its contents.
+
+    That is the newest segment of the job's newest run: a live steer's steers/<N>/run/result.json, else
+    run/result.json. A resume refused before it started changed nothing, so its own baseline stands.
+    """
+    read_json = _attr("read_json_file")
+    active = active_job_dir(root_job_dir(job_dir))
+    state = read_json(active / STEER_STATE_NAME)
+    job = read_json(active / "job.json")
+    path = Path(str(state.get("result_path") or job.get("result_path") or active / "run" / "result.json"))
+    seen: set[Path] = set()
+    while True:
+        result = read_json(path)
+        earlier = result.get("resumed_from")
+        if result.get("status") != "preflight_failed" or not isinstance(earlier, str) or path in seen:
+            return path, result
+        seen.add(path)
+        path = Path(earlier)
+
+
+def resume_command_for_job(
+    job_dir: Path,
+    message_path: Path,
+    *,
+    resume_dir: Path | None = None,
+    fresh: bool = False,
+    extra_allow_paths: list[str] | None = None,
+) -> list[str]:
+    """The run_agent command that sends the brief at `message_path` to a job as a new detached run.
+
+    The run resumes the session of resume_baseline() with the job's own flags: engine, model, effort,
+    variant, account, billing mode, timeouts, notification and completion hook come from the launch
+    recorded in job.json; scope and --verify-command gates come from the result, which validate_resume
+    compares. `fresh` leaves the session out, for a new run when the session cannot be resumed. The run's
+    job directory defaults to the job's next steers/<N>.
+    """
+    job_dir = root_job_dir(job_dir)
+    manifest = active_job_dir(job_dir) / "job.json"
+    launch = _attr("read_json_file")(manifest).get("command")
+    if not isinstance(launch, list) or len(launch) < 2 or not all(isinstance(item, str) for item in launch):
+        raise _runner_error(f"{manifest} records no runner command to take the job's flags from", 4)
+    try:
+        original = _attr("parse_args")(launch[2:])
+    except SystemExit as error:
+        raise _runner_error(f"cannot parse the runner command recorded in {manifest}", 4) from error
+    baseline_path, baseline = resume_baseline(job_dir)
+    tracked = list(
+        baseline["tracked_paths"] if isinstance(baseline.get("tracked_paths"), list) else original.track_path
+    )
+    allowed = (
+        [path for path in baseline["allowed_paths"] if path not in tracked]
+        if isinstance(baseline.get("allowed_paths"), list)
+        else list(original.allow_path)
+    )
+    allowed += [path for path in extra_allow_paths or [] if path not in allowed]
+    verify = (
+        baseline["verification_commands"]
+        if isinstance(baseline.get("verification_commands"), list)
+        else original.verify_command
+    )
+    # A resumed session stays on the model it ran; a new run may take the job's selector again.
+    model = original.model if fresh or not baseline.get("model") else baseline["model"]
+    variant = original.variant if fresh or original.engine != "opencode" else baseline.get("variant")
+    command = [sys.executable, str(Path(__file__).with_name("run_agent.py").resolve())]
+    command += ["--cwd", str(original.cwd), "--brief", str(message_path), "--transport", "executor", "--detach"]
+    command += ["--job-dir", str(resume_dir or job_dir / "steers" / str(next_steer_id(job_dir)))]
+    command += ["--engine", original.engine]
+    for flag, value in (
+        ("--model", model),
+        ("--variant", variant),
+        ("--effort", original.effort),
+        ("--account", original.account),
+        ("--claude-config-dir", original.claude_config_dir),
+        ("--conductor-model", original.conductor_model),
+        ("--billing-mode", original.billing_mode),
+        ("--timeout", original.timeout),
+        ("--deadline", original.deadline),
+        ("--notify", original.notify),
+        ("--completion-hook", original.completion_hook),
+        ("--verify-timeout", original.verify_timeout),
+        ("--auto-correct", original.auto_correct),
+        ("--retry-read-only", original.retry_read_only or None),
+        ("--heartbeat-seconds", original.heartbeat_seconds or None),
+    ):
+        if value is not None:
+            command += [flag, str(value)]
+    for flag, values in (
+        ("--allow-path", allowed),
+        ("--track-path", tracked),
+        ("--verify-command", verify),
+        ("--protect-path", original.protect_path),
+        ("--add-dir", original.add_dir if fresh else []),
+    ):
+        for value in values:
+            command += [flag, str(value)]
+    for flag, enabled in (
+        ("--expect-changes", original.expect_changes or bool(baseline.get("expected_changes"))),
+        # Judged from where the resumed task began, so it needs the --resume-result a new run lacks.
+        ("--expect-task-changes", original.expect_task_changes and not fresh),
+        ("--ignore-quota", original.ignore_quota),
+        ("--allow-credits", original.allow_credits),
+    ):
+        if enabled:
+            command.append(flag)
+    if not fresh:
+        command += ["--session", str(baseline.get("session_id")), "--resume-result", str(baseline_path)]
+    return command
+
+
+def resume_finished_job(args: argparse.Namespace, job_dir: Path, message: str, extra_allow_paths: list[str]) -> int:
+    """Send `message` to a finished job as a new detached run that resumes its session.
+
+    Refuses with the reason and a command that runs as printed when the session cannot be resumed.
+    """
+    read_json = _attr("read_json_file")
+    write_text = _attr("write_private_text")
+    if fcntl is None:
+        raise _runner_error("steering requires POSIX flock on this platform", 4)
+    steers_root = job_dir / "steers"
+    steers_root.mkdir(mode=0o700, exist_ok=True)
+    lock = os.open(job_dir / "steer.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise _runner_error(
+                "another steer of this job is in progress", _attr("EXIT_STEER_REJECTED", EXIT_STEER_REJECTED)
+            ) from error
+        active = active_job_dir(job_dir)
+        active_state = read_json(active / STEER_STATE_NAME)
+        if not _attr("steer_job_finished")(read_json(active / "job.json"), active_state):
+            raise _runner_error(
+                f"another correction resumed this job meanwhile and is running ({active}); run the same steer "
+                "command again to steer that run",
+                _attr("EXIT_STEER_REJECTED", EXIT_STEER_REJECTED),
+            )
+        steer_id = next_steer_id(job_dir)
+        resume_dir = steers_root / str(steer_id)
+        message_path = steers_root / f"{steer_id}.message.txt"
+        write_text(message_path, message)
+        runner = str(Path(__file__).with_name("run_agent.py").resolve())
+        rerun = shlex.join([sys.executable, runner, "steer", str(job_dir), "--message", f"@{message_path}"])
+        if steer_auditing(active_state):
+            raise _runner_error(
+                "nothing to steer yet: the executor handed off and the runner is auditing it; wait for its event "
+                f"(run_agent.py events wait {active_state.get('completion_event_id')}), then run: {rerun}",
+                _attr("EXIT_STEER_JOB_FINISHED", EXIT_STEER_JOB_FINISHED),
+            )
+        baseline_path, baseline = resume_baseline(job_dir)
+        support = _bundled_module("execution_support")
+        refusal = support.resume_refusal(baseline, source=baseline_path) or _attr("resume_drift")(
+            baseline,
+            Path(str(baseline.get("repository"))),
+            mutating=bool(baseline.get("allowed_paths")),
+        )
+        if refusal:
+            # A new run has no session to remember the task, so its brief restates it before the correction.
+            fresh_brief = steers_root / f"{steer_id}.new-run-brief.txt"
+            original = ""
+            if (job_dir / "brief.txt").is_file():
+                original = (job_dir / "brief.txt").read_text(encoding="utf-8")
+            elif (job_dir / "task-spec.json").is_file():
+                with contextlib.suppress(Exception):
+                    original = _attr("read_task_spec")(
+                        str(job_dir / "task-spec.json"), repo=Path(str(baseline.get("repository")))
+                    )[0]
+            prefix = original.rstrip() + "\n\n## Correction from the conductor\n\n" if original.strip() else ""
+            write_text(fresh_brief, prefix + message)
+            fallback = resume_command_for_job(
+                job_dir, fresh_brief, resume_dir=resume_dir, fresh=True, extra_allow_paths=extra_allow_paths
+            )
+            raise _runner_error(
+                f"{refusal}\nTo send this correction as a new run instead (the session's context is not carried "
+                f"over), run:\n{shlex.join(fallback)}",
+                _attr("EXIT_STEER_REJECTED", EXIT_STEER_REJECTED),
+            )
+        command = resume_command_for_job(
+            job_dir, message_path, resume_dir=resume_dir, extra_allow_paths=extra_allow_paths
+        )
+        launched = io.StringIO()
+        resumed_args = _attr("resolve_route")(_attr("parse_args")(command[2:]))
+        with contextlib.redirect_stdout(launched):
+            launch_code = _attr("execute")(resumed_args)
+    finally:
+        os.close(lock)
+    if launch_code != 0:
+        print(launched.getvalue(), end="")
+        return int(launch_code)
+    fields = dict(line.split("=", 1) for line in launched.getvalue().splitlines() if line.startswith("AGENT_"))
+    response = {
+        "status": "resumed",
+        "mode": "resume_finished",
+        "steer_id": steer_id,
+        "session_id": baseline.get("session_id"),
+        "resumed_from": str(baseline_path),
+        "message_path": str(message_path),
+        "job_path": fields.get("AGENT_JOB"),
+        "pid": int(fields["AGENT_JOB_PID"]) if fields.get("AGENT_JOB_PID", "").isdigit() else None,
+        "result_path": fields.get("AGENT_RESULT"),
+        "event_path": fields.get("AGENT_EVENT"),
+        "event_id": fields.get("AGENT_EVENT_ID"),
+        "mailbox": fields.get("AGENT_MAILBOX"),
+        "command": command,
+    }
+    if args.format == "json":
+        print(json.dumps(response, indent=2, ensure_ascii=True))
+        return 0
+    print("AGENT_STEER_STATUS=resumed")
+    print(f"AGENT_STEER_ID={steer_id}")
+    print("AGENT_STEER_MODE=resume_finished")
+    print(f"AGENT_SESSION={response['session_id']}")
+    print(f"AGENT_RESUMED_FROM={baseline_path}")
+    print(launched.getvalue(), end="")
+    return 0
 
 
 def wait_for_steer_response(
@@ -975,12 +1335,24 @@ def steer_main(argv: list[str] | None = None) -> int:
         raise _runner_error("steer requires --message and/or at least one --allow-path", 4)
     message = _attr("read_steer_message")(args.message) if args.message is not None else ""
     wait_seconds = _attr("parse_duration")(args.wait_timeout, option="--wait-timeout")
-    job_dir = _attr("find_steerable_job_dir")(args.job)
+    # A job resumed after it finished continues in <job>/steers/<N>; steer its newest run.
+    root = root_job_dir(_attr("find_steerable_job_dir")(args.job))
+    job_dir = active_job_dir(root)
     job_path = job_dir / "job.json"
     read_json = _attr("read_json_file")
     job = read_json(job_path)
     if job.get("schema") != "agent-executor.job.v1":
         raise _runner_error(f"not a detached agent-executor job: {job_path}", 4)
+
+    def resume_or_refuse() -> int:
+        if not message.strip():
+            raise _runner_error(
+                "the job already finished, so there is no run to widen; pass --message with --allow-path to "
+                "resume its session as a new run with the wider scope",
+                _attr("EXIT_STEER_JOB_FINISHED", EXIT_STEER_JOB_FINISHED),
+            )
+        return resume_finished_job(args, root, message, extra_allow_paths)
+
     repository = Path(str(job.get("repository"))).resolve()
     if args.cwd is not None:
         cwd = args.cwd.expanduser().resolve()
@@ -994,7 +1366,7 @@ def steer_main(argv: list[str] | None = None) -> int:
             )
     state = read_json(job_dir / STEER_STATE_NAME)
     if _attr("steer_job_finished")(job, state):
-        raise _attr("steer_finished_error")(job, state)
+        return resume_or_refuse()
     if job.get("steer_protocol") != _attr("STEER_PROTOCOL", STEER_PROTOCOL):
         raise _runner_error(
             f"this job was launched by agent-executor {job.get('runner_version')}, which cannot be steered; "
@@ -1010,7 +1382,7 @@ def steer_main(argv: list[str] | None = None) -> int:
     if not _attr("runner_process_alive")(job.get("pid"), original_event):
         state = read_json(job_dir / STEER_STATE_NAME)
         if _attr("steer_job_finished")(job, state):
-            raise _attr("steer_finished_error")(job, state)
+            return resume_or_refuse()
         raise _runner_error(
             f"the job's runner process (pid {job.get('pid')}) is not running and no completion event exists. "
             "The job died without reporting: inspect its job directory, then relaunch (or resume with "

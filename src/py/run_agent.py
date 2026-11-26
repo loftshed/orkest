@@ -1577,7 +1577,8 @@ def attach_tariff_estimate(result: dict[str, Any]) -> None:
         result["tariff_estimate"] = {"estimated_usd": None, "gaps": ["tariff_registry_unavailable_or_invalid"]}
 
 
-# The segment a detached runner is on, so an uncaught failure publishes to the event people wait on.
+# The segment a detached runner is on, so an uncaught failure publishes to the event people wait on,
+# and the job directory whose job.json records how the job ended.
 _ACTIVE_SEGMENT: dict[str, Path] = {}
 
 
@@ -1592,7 +1593,11 @@ def finish_run(
 ) -> int:
     result.setdefault("usage", bundled_module("usage").empty())
     attach_tariff_estimate(result)
+    if completion_event_path is not None:
+        _JOB_STEERING_MOD.report_run_refusal(result, event_id=completion_event_path.stem, result_path=result_path)
     write_run_result(result_path, result)
+    if job_dir := _ACTIVE_SEGMENT.get("job_dir"):
+        _JOB_STEERING_MOD.record_job_outcome(job_dir, result)
     if completion_event_path is not None:
         publish_completion_event(
             result=result,
@@ -1654,7 +1659,11 @@ def publish_uncaught_completion_failure(error: Exception, exit_code: int) -> Non
         mailbox_info = bundled_module("peer_mailbox").run_info(bundled_module("peer_mailbox").root(), run_id)
         if mailbox_info:
             result["mailbox"] = mailbox_info
+        _JOB_STEERING_MOD.report_run_refusal(result, event_id=event_path.stem, result_path=result_path)
         write_run_result(result_path, result)
+        job_dir = _ACTIVE_SEGMENT.get("job_dir") or (args.steer_dir.expanduser().resolve() if args.steer_dir else None)
+        if job_dir is not None:
+            _JOB_STEERING_MOD.record_job_outcome(job_dir, result)
         completion_hook: Path | None
         try:
             completion_hook = resolve_completion_hook(args.completion_hook)
@@ -2504,6 +2513,8 @@ find_steerable_job_dir = _JOB_STEERING_MOD.find_steerable_job_dir
 runner_process_alive = _JOB_STEERING_MOD.runner_process_alive
 steer_job_finished = _JOB_STEERING_MOD.steer_job_finished
 steer_finished_error = _JOB_STEERING_MOD.steer_finished_error
+resume_baseline = _JOB_STEERING_MOD.resume_baseline
+resume_command_for_job = _JOB_STEERING_MOD.resume_command_for_job
 wait_for_steer_response = _JOB_STEERING_MOD.wait_for_steer_response
 steer_main = _JOB_STEERING_MOD.steer_main
 
@@ -2668,6 +2679,28 @@ def usage_cost_source(previous: dict[str, Any] | None) -> dict[str, Any] | None:
     return source
 
 
+def resume_drift(
+    previous: dict[str, Any], repo: Path, *, mutating: bool, identity: dict[str, Any] | None = None
+) -> str | None:
+    """Why the worktree no longer matches the result a resume continues from, or None when it does."""
+    changed = None
+    if previous.get("git_identity_after") != (identity if identity is not None else git_identity(repo)):
+        changed = "this worktree's HEAD, branch or reflog moved"
+    elif (
+        mutating
+        and (previous.get("git_after") or {}).get("fingerprint")
+        != git_state(repo, list(previous.get("tracked_paths") or []))["fingerprint"]
+    ):
+        changed = "files in the workspace changed"
+    if changed is None:
+        return None
+    return (
+        f"cannot resume the {previous.get('status')} result: workspace or history changed since it was audited "
+        f"({changed}), so the session cannot continue under audit; review the change, then start a new run "
+        "without --session or --resume-result"
+    )
+
+
 def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
     if args.job_dir and not args.detach:
         raise RunnerError("--job-dir requires --detach", 4)
@@ -2717,6 +2750,7 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
         if completion_event_path is None or args.out_dir is None:
             raise RunnerError("--steer-dir is internal to detached jobs", 4)
         steering = JobSteering(args.steer_dir.expanduser().resolve(), engine=args.engine, deadline=args.deadline)
+        _ACTIVE_SEGMENT["job_dir"] = steering.job_dir
     started_at = utc_now()
     monotonic_start = time.monotonic()
     model = args.model or preferred_model(args.engine)
@@ -2861,6 +2895,7 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
                         ),
                         "billing_mode": args.billing_mode,
                     },
+                    source=args.resume_result.expanduser(),
                 )
             if (
                 args.expect_task_changes
@@ -2891,6 +2926,8 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
             "variant": variant,
             "full_permissions": True,
             "repository": str(repo),
+            # A refused resume changed nothing: the next correction continues from the same result.
+            "resumed_from": str(args.resume_result.expanduser().resolve()) if args.resume_result else None,
             "verification": verification_summary(
                 args.verify_command,
                 status="skipped" if args.verify_command else "not_requested",
@@ -2919,14 +2956,14 @@ def execute(args: argparse.Namespace, *, lease: int | None = None) -> int:
     git_metadata_before = git_metadata_snapshot(repo) if not enforced_paths else {}
     git_activity_before = git_activity(repo)
     if previous_result is not None and (
-        (
-            (bool(enforced_paths) or args.resume_new_task)
-            and previous_result.get("git_after", {}).get("fingerprint")
-            != git_state(repo, previous_result["tracked_paths"])["fingerprint"]
+        drift := resume_drift(
+            previous_result,
+            repo,
+            mutating=bool(enforced_paths) or args.resume_new_task,
+            identity=git_identity_before,
         )
-        or previous_result.get("git_identity_after") != git_identity_before
     ):
-        raise RunnerError("workspace or history changed since the resume result; investigate before correction", 4)
+        raise RunnerError(drift, 4)
     agy_stdin = args.engine == "agy" and version_at_least(version, AGY_STDIN_MIN_VERSION)
     # The session this segment runs in, when known before the executor prints it.
     segment_session: str | None = args.session or (
