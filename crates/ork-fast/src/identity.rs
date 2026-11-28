@@ -636,7 +636,43 @@ pub fn same_project(left: &Value, right: &Value) -> bool {
         .flatten()
         .filter_map(Value::as_str)
         .collect();
-    !l_rem.is_disjoint(&r_rem)
+    if !l_rem.is_disjoint(&r_rem) {
+        return true;
+    }
+    // Sessions started in the same directory outside Git share it as their project.
+    plain_directory(left, &l).is_some_and(|dir| Some(dir) == plain_directory(right, &r))
+}
+
+/// The directory of a record with no Git identity (`mailbox_store.plain_directory`).
+fn plain_directory(record: &Value, identity: &Value) -> Option<String> {
+    let has_repo = identity
+        .get("repo")
+        .and_then(Value::as_str)
+        .is_some_and(|repo| !repo.is_empty());
+    let has_remotes = identity
+        .get("remotes")
+        .and_then(Value::as_array)
+        .is_some_and(|remotes| !remotes.is_empty());
+    if has_repo || has_remotes {
+        return None;
+    }
+    let cwd = record.get("cwd").and_then(Value::as_str)?;
+    cwd.starts_with('/').then(|| normalize_path(cwd))
+}
+
+/// `os.path.normpath` for absolute POSIX paths.
+fn normalize_path(path: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            _ => parts.push(part),
+        }
+    }
+    format!("/{}", parts.join("/"))
 }
 
 #[must_use]
@@ -2389,6 +2425,23 @@ mod tests {
         assert_eq!(command_invocation(Some("opencode"), "update"), "/update");
         assert_eq!(command_invocation(None, "update"), "ork update");
         assert_eq!(command_invocation(Some("other"), "swarm"), "ork swarm");
+    }
+
+    #[test]
+    fn same_project_counts_one_directory_outside_git_as_a_project() {
+        let plain = |cwd: &str| json!({"cwd": cwd, "repo": "", "remotes": []});
+        assert!(same_project(&plain("/work/notes"), &plain("/work/notes/")));
+        assert!(same_project(
+            &plain("/work/notes"),
+            &plain("/work/x/../notes")
+        ));
+        assert!(!same_project(&plain("/work/notes"), &plain("/work/other")));
+        assert!(!same_project(&plain("relative"), &plain("relative")));
+        let git = json!({"cwd": "/work/notes", "repo": "/work/notes/.git", "remotes": []});
+        assert!(!same_project(&plain("/work/notes"), &git));
+        // A bare project identity carries no directory, so it still needs Git.
+        let bare = json!({"repo": null, "remotes": []});
+        assert!(!same_project(&bare, &bare));
     }
 
     #[test]

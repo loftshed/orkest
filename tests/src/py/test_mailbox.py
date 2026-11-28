@@ -1161,13 +1161,34 @@ class MailboxTests(unittest.TestCase):
             {p["session"] for p in json.loads(explicit.stdout)}, {"claude-session-1111", "codex-session-2222"}
         )
         me = self.peer("plain-session", "opencode", str(outside))
-        with self.assertRaisesRegex(MAILBOX.MailboxError, "in this project"):
+        with self.assertRaisesRegex(MAILBOX.MailboxError, "in this project.*another project needs scope cross-project"):
             MAILBOX.send(self.base, sender=me, to=self.claude["name"], text="Closed by default")
         MAILBOX.send(self.base, sender=me, to=self.claude["name"], text="Explicit coordination", scope="cross-project")
         self.assertEqual(
             [m["text"] for m in MAILBOX.take(self.base, self.claude["session"], scope="cross-project")],
             ["Explicit coordination"],
         )
+
+    def test_sessions_in_one_directory_outside_git_share_a_project(self):
+        outside = Path(self.temporary.name) / "notes"
+        outside.mkdir()
+        other_directory = Path(self.temporary.name) / "other-notes"
+        other_directory.mkdir()
+        me = self.peer("plain-claude", "claude", str(outside))
+        agy = self.peer("plain-gemini", "gemini", f"{outside}/")
+        stranger = self.peer("plain-elsewhere", "codex", str(other_directory))
+        self.assertTrue(MAILBOX.same_project(me, agy))
+        self.assertFalse(MAILBOX.same_project(me, stranger))
+        self.assertEqual({p["session"] for p in MAILBOX.scoped_peers(self.base, me)}, {"plain-claude", "plain-gemini"})
+        MAILBOX.send(self.base, sender=me, to=agy["name"], text="Same folder")
+        self.assertEqual([m["text"] for m in MAILBOX.take(self.base, agy["session"])], ["Same folder"])
+        listed = mailbox_cli(self.base, "peers", "--format", "json", cwd=outside, check=True)
+        self.assertEqual({p["session"] for p in json.loads(listed.stdout)}, {"plain-claude", "plain-gemini"})
+        notice = self.hook("plain-opencode", "opencode", outside, "SessionStart")["hookSpecificOutput"][
+            "additionalContext"
+        ]
+        self.assertIn(agy["name"], notice)
+        self.assertNotIn(stranger["name"], notice)
 
     def test_sessions_in_one_repository_are_told_about_each_other(self):
         repo = self.git_checkout("shared")

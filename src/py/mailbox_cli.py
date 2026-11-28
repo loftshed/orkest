@@ -62,6 +62,12 @@ def caller(args: argparse.Namespace, base: Path) -> dict[str, Any]:
     )
 
 
+def here_project() -> dict[str, Any]:
+    """Where a sessionless CLI call runs: its checkout, or outside Git the directory itself."""
+    cwd = os.getcwd()
+    return {**_MB.workspace(cwd), "cwd": cwd}
+
+
 def table(
     rows: list[dict[str, Any]],
     session: str | None,
@@ -392,8 +398,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.action == "name":
             # A fresh name for a session about to start, e.g. claude --name "$(... mailbox name --model opus-5.5)".
-            here = _MB.workspace(os.getcwd())
-            here["cwd"] = os.getcwd()
+            here = here_project()
             harness = args.harness or "claude"
             person = _MB.pick_martian(secrets.token_hex(8), _MB.taken_persons(base, ""))
             effort = args.effort or _MB.runtime_effort(harness)
@@ -413,13 +418,13 @@ def main(argv: list[str] | None = None) -> int:
                 raise MailboxError("pass --session (or set AGENT_MAILBOX_SESSION / CLAUDE_CODE_SESSION_ID)")
             output = _MB.clear_focus(base, session, only_if=args.only_if)
         elif args.action == "feedback-summary":
-            me = _MB.caller(args, base) if _MB.session_arg(args) else _MB.workspace(os.getcwd())
+            me = _MB.caller(args, base) if _MB.session_arg(args) else here_project()
             output = _MB.feedback_module().summary(base, peer=None if args.scope == "cross-project" else me)
         elif args.action == "wake-health":
             import mailbox_wake
             import wake_recovery
 
-            me = _MB.caller(args, base) if _MB.session_arg(args) else _MB.workspace(os.getcwd())
+            me = _MB.caller(args, base) if _MB.session_arg(args) else here_project()
             output = []
             for peer in _MB.scoped_peers(base, me, scope=args.scope):
                 row = {"name": peer["name"], "session": peer["session"], "harness": peer["harness"]}
@@ -442,7 +447,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.action == "wake-retry":
             import wake_recovery
 
-            me = _MB.caller(args, base) if _MB.session_arg(args) else _MB.workspace(os.getcwd())
+            me = _MB.caller(args, base) if _MB.session_arg(args) else here_project()
             if args.to:
                 sessions = [_MB.resolve(base, args.to, sender=me, scope=args.scope)["session"]]
             else:
@@ -459,7 +464,7 @@ def main(argv: list[str] | None = None) -> int:
                     raise MailboxError("status view uses --agent/--channel; use the work view for --item")
                 output = mailbox_status.observe(
                     base,
-                    _MB.workspace(os.getcwd()),
+                    here_project(),
                     agent=args.agent,
                     channel=args.channel,
                     since=args.since,
@@ -471,9 +476,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             if args.action == "board" and any((args.agent, args.channel, args.since)):
                 raise MailboxError("--agent, --channel and --since require --view status")
-            me = (
-                _MB.caller(args, base) if args.action == "work" or _MB.session_arg(args) else _MB.workspace(os.getcwd())
-            )
+            me = _MB.caller(args, base) if args.action == "work" or _MB.session_arg(args) else here_project()
             if args.action == "board":
                 output = mailbox_work.listing(base, me, item=args.item, limit=args.limit, offset=args.offset)
             else:
@@ -525,13 +528,13 @@ def main(argv: list[str] | None = None) -> int:
         elif args.action == "tasks":
             import mailbox_tasks
 
-            me = _MB.caller(args, base) if _MB.session_arg(args) else _MB.workspace(os.getcwd())
+            me = _MB.caller(args, base) if _MB.session_arg(args) else here_project()
             output = mailbox_tasks.listing(base, me, scope=args.scope, limit=args.limit, offset=args.offset)
             if args.format != "json":
                 print(mailbox_tasks.render(output))
                 return 0
         elif args.action == "peers":
-            me = _MB.caller(args, base) if _MB.session_arg(args) else _MB.workspace(os.getcwd())
+            me = _MB.caller(args, base) if _MB.session_arg(args) else here_project()
             caller_harness = args.harness or me.get("harness") or _MB.detect_harness()
             if not me.get("accountHome") and (own_account := _MB.account_home(caller_harness)):
                 me = {**me, "accountHome": own_account}
