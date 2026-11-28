@@ -923,6 +923,8 @@ def resolve(base: Path, address: str, *, sender: dict[str, Any], scope: str = "p
         names = ", ".join(peer["name"] for peer in live) or "none"
         boundary = "in this project" if scope == "project" else "on this machine"
         detail = f" (session ended; live peers: {names})" if ended else f"; live peers: {names}"
+        if scope == "project" and not ended:
+            detail += "; a session in another project needs scope cross-project"
         raise MailboxError(f"no live peer named {address!r} {boundary}{detail}", "peer_unavailable")
     if len(exact) > 1:
         options = ", ".join(f"{peer['name']} [{peer['session'][:8]}]" for peer in exact)

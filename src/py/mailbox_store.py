@@ -1097,13 +1097,25 @@ def project(peer: dict[str, Any]) -> dict[str, Any]:
     return _MB.workspace(cwd) if isinstance(cwd, str) else {}
 
 
+def plain_directory(record: dict[str, Any], identity: dict[str, Any]) -> str | None:
+    """The directory of a record with no Git identity, which is then its whole project."""
+    if identity.get("repo") or identity.get("remotes"):
+        return None
+    cwd = record.get("cwd")
+    return os.path.normpath(cwd) if isinstance(cwd, str) and os.path.isabs(cwd) else None
+
+
 def same_project(left: dict[str, Any], right: dict[str, Any]) -> bool:
-    left, right = project(left), project(right)
-    if left.get("repo") and left.get("repo") == right.get("repo"):
+    left_project, right_project = project(left), project(right)
+    if left_project.get("repo") and left_project.get("repo") == right_project.get("repo"):
         return True
-    left_remotes = {value for value in left.get("remotes", []) if isinstance(value, str)}
-    right_remotes = {value for value in right.get("remotes", []) if isinstance(value, str)}
-    return bool(left_remotes & right_remotes)
+    left_remotes = {value for value in left_project.get("remotes", []) if isinstance(value, str)}
+    right_remotes = {value for value in right_project.get("remotes", []) if isinstance(value, str)}
+    if left_remotes & right_remotes:
+        return True
+    # Sessions started in the same directory outside Git share it as their project.
+    directory = plain_directory(left, left_project)
+    return directory is not None and directory == plain_directory(right, right_project)
 
 
 def check_scope(scope: str) -> None:
